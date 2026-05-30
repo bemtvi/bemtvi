@@ -1,0 +1,17 @@
+[package]
+name = "nxvim-server"
+description = "Headless async editor server for nxvim (owns the core model, hosts the API and Lua)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rmpv.workspace = true
+tokio.workspace = true
+nxvim-core.workspace = true
+nxvim-rpc.workspace = true
+nxvim-lua.workspace = true

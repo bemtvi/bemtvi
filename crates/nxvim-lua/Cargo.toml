@@ -1,0 +1,13 @@
+[package]
+name = "nxvim-lua"
+description = "Lua runtime and vim.* bindings for nxvim (Lua 5.1, LuaJIT-compatible)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mlua.workspace = true

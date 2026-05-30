@@ -1,0 +1,19 @@
+[package]
+name = "nxvim"
+description = "A neovim-compatible modal editor, written in Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nxvim"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+nxvim-server.workspace = true
+nxvim-tui.workspace = true

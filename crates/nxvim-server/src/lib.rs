@@ -104,6 +104,11 @@ impl Server {
                 Value::from("mode"),
                 Value::from(self.editor.mode.short_code()),
             )])),
+            "nvim_win_get_cursor" => Ok(Value::Array(vec![
+                // (1-based line, 0-based column) like neovim.
+                Value::from((self.editor.cursor.line + 1) as u64),
+                Value::from(self.editor.cursor.col as u64),
+            ])),
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
             "nvim_get_api_info" => {
                 // [channel_id, metadata]; metadata kept minimal for now.

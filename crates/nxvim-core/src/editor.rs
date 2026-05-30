@@ -39,9 +39,24 @@ enum MotionKind {
     Linewise,
 }
 
+/// How a motion places the cursor when used as plain movement (not as an
+/// operator's range). This is what drives vim's `curswant` column memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveAxis {
+    /// Horizontal move: the resulting column becomes the new desired column.
+    Horizontal,
+    /// `$`/`End`: stick to end-of-line until a horizontal move clears it.
+    EndOfLine,
+    /// `gg`/`G`/etc.: jump to a line's first non-blank; resets desired column.
+    LineAnchor,
+    /// `j`/`k`: change line but keep the remembered desired column.
+    VerticalKeep,
+}
+
 struct MotionResult {
     target: usize,
     kind: MotionKind,
+    axis: MoveAxis,
 }
 
 /// The complete editor state for a single buffer/window.
@@ -59,7 +74,15 @@ pub struct Editor {
 
     width: usize,
     height: usize,
+    /// Remembered target column for vertical motion (vim's `curswant`).
     desired_col: usize,
+    /// When set, vertical motion sticks to end-of-line (set by `$`).
+    desired_eol: bool,
+    /// Per-key: the action just handled was a vertical/keep motion, so the
+    /// remembered column must be preserved rather than recomputed.
+    preserve_desired: bool,
+    /// Per-key: the action just handled requests end-of-line stickiness (`$`).
+    eol_request: bool,
     register: Register,
 
     // pending normal-mode state
@@ -101,6 +124,9 @@ impl Editor {
             width: 80,
             height: 24,
             desired_col: 0,
+            desired_eol: false,
+            preserve_desired: false,
+            eol_request: false,
             register: Register::default(),
             count: None,
             op_count: None,
@@ -128,10 +154,20 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
+        self.preserve_desired = false;
+        self.eol_request = false;
+
         match self.mode {
             Mode::Insert | Mode::Replace => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
             _ => self.handle_normal(key),
+        }
+
+        // Update vim's `curswant`: vertical motions keep the remembered column,
+        // every other action recomputes it from where the cursor landed.
+        if !self.preserve_desired {
+            self.desired_col = self.cursor.col;
+            self.desired_eol = self.eol_request;
         }
         self.ensure_visible();
     }
@@ -139,6 +175,8 @@ impl Editor {
     /// Run an ex-command directly (the `nvim_command` API entry point).
     pub fn command(&mut self, cmd: &str) {
         self.execute_ex(cmd);
+        self.desired_col = self.cursor.col;
+        self.desired_eol = false;
         self.ensure_visible();
     }
 
@@ -223,14 +261,9 @@ impl Editor {
             if let Some(op) = self.operator.take() {
                 self.apply_operator(op, m);
                 self.reset_pending();
-            } else if self.mode.is_visual() {
-                self.set_cursor_char(m.target);
-                self.clamp_cursor();
-                self.count = None;
             } else {
-                self.set_cursor_char(m.target);
-                self.clamp_cursor();
-                self.desired_col = self.cursor.col;
+                // Movement (normal or visual); selection follows the cursor.
+                self.apply_movement(m);
                 self.count = None;
             }
             return;
@@ -364,7 +397,8 @@ impl Editor {
             let count = self.effective_count();
             let last = self.cursor.line + count - 1;
             let target = self.buffer.line_start(last.min(self.buffer.line_count().saturating_sub(1)));
-            let m = MotionResult { target, kind: MotionKind::Linewise };
+            // axis is unused for the operator path, but the field is required.
+            let m = MotionResult { target, kind: MotionKind::Linewise, axis: MoveAxis::LineAnchor };
             self.operator = None;
             self.apply_operator(op, m);
             self.reset_pending();
@@ -389,6 +423,7 @@ impl Editor {
                 return Some(MotionResult {
                     target: self.buffer.line_start(target_line),
                     kind: MotionKind::Linewise,
+                    axis: MoveAxis::LineAnchor,
                 });
             }
             return None;
@@ -397,36 +432,66 @@ impl Editor {
         let motion = match (kc, ch) {
             (KeyCode::Left, _) | (_, Some('h')) | (KeyCode::Backspace, _) => {
                 let col = self.cursor.col.saturating_sub(count);
-                MotionResult { target: self.buffer.byte_at(line, col), kind: MotionKind::Exclusive }
+                MotionResult {
+                    target: self.buffer.byte_at(line, col),
+                    kind: MotionKind::Exclusive,
+                    axis: MoveAxis::Horizontal,
+                }
             }
             (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => {
                 let col = (self.cursor.col + count).min(self.line_len());
-                MotionResult { target: self.buffer.byte_at(line, col), kind: MotionKind::Exclusive }
+                MotionResult {
+                    target: self.buffer.byte_at(line, col),
+                    kind: MotionKind::Exclusive,
+                    axis: MoveAxis::Horizontal,
+                }
             }
-            (_, Some('0')) | (KeyCode::Home, _) => {
-                MotionResult { target: self.buffer.byte_at(line, 0), kind: MotionKind::Exclusive }
-            }
+            (_, Some('0')) | (KeyCode::Home, _) => MotionResult {
+                target: self.buffer.byte_at(line, 0),
+                kind: MotionKind::Exclusive,
+                axis: MoveAxis::Horizontal,
+            },
             (_, Some('^')) => {
                 let col = self.first_non_blank(line);
-                MotionResult { target: self.buffer.byte_at(line, col), kind: MotionKind::Exclusive }
+                MotionResult {
+                    target: self.buffer.byte_at(line, col),
+                    kind: MotionKind::Exclusive,
+                    axis: MoveAxis::Horizontal,
+                }
             }
             (_, Some('$')) | (KeyCode::End, _) => {
                 let l = (line + count - 1).min(last_line);
                 let len = self.buffer.line_len(l);
                 let col = len.saturating_sub(1);
-                MotionResult { target: self.buffer.byte_at(l, col), kind: MotionKind::Inclusive }
+                MotionResult {
+                    target: self.buffer.byte_at(l, col),
+                    kind: MotionKind::Inclusive,
+                    axis: MoveAxis::EndOfLine,
+                }
             }
             (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => {
                 let l = (line + count).min(last_line);
-                MotionResult { target: self.buffer.line_start(l), kind: MotionKind::Linewise }
+                MotionResult {
+                    target: self.buffer.line_start(l),
+                    kind: MotionKind::Linewise,
+                    axis: MoveAxis::VerticalKeep,
+                }
             }
             (KeyCode::Up, _) | (_, Some('k')) => {
                 let l = line.saturating_sub(count);
-                MotionResult { target: self.buffer.line_start(l), kind: MotionKind::Linewise }
+                MotionResult {
+                    target: self.buffer.line_start(l),
+                    kind: MotionKind::Linewise,
+                    axis: MoveAxis::VerticalKeep,
+                }
             }
             (_, Some('G')) => {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
-                MotionResult { target: self.buffer.line_start(l), kind: MotionKind::Linewise }
+                MotionResult {
+                    target: self.buffer.line_start(l),
+                    kind: MotionKind::Linewise,
+                    axis: MoveAxis::LineAnchor,
+                }
             }
             (_, Some('w')) | (_, Some('W')) => {
                 let mut idx = self.cursor_char();
@@ -439,12 +504,12 @@ impl Editor {
                     for _ in 0..count {
                         idx = self.word_end(idx);
                     }
-                    MotionResult { target: idx, kind: MotionKind::Inclusive }
+                    MotionResult { target: idx, kind: MotionKind::Inclusive, axis: MoveAxis::Horizontal }
                 } else {
                     for _ in 0..count {
                         idx = self.word_forward(idx);
                     }
-                    MotionResult { target: idx, kind: MotionKind::Exclusive }
+                    MotionResult { target: idx, kind: MotionKind::Exclusive, axis: MoveAxis::Horizontal }
                 }
             }
             (_, Some('b')) | (_, Some('B')) => {
@@ -452,18 +517,45 @@ impl Editor {
                 for _ in 0..count {
                     idx = self.word_backward(idx);
                 }
-                MotionResult { target: idx, kind: MotionKind::Exclusive }
+                MotionResult { target: idx, kind: MotionKind::Exclusive, axis: MoveAxis::Horizontal }
             }
             (_, Some('e')) | (_, Some('E')) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
                     idx = self.word_end(idx);
                 }
-                MotionResult { target: idx, kind: MotionKind::Inclusive }
+                MotionResult { target: idx, kind: MotionKind::Inclusive, axis: MoveAxis::Horizontal }
             }
             _ => return None,
         };
         Some(motion)
+    }
+
+    /// Apply a motion as plain cursor movement, maintaining vim's `curswant`.
+    fn apply_movement(&mut self, m: MotionResult) {
+        match m.axis {
+            MoveAxis::Horizontal => {
+                self.set_cursor_char(m.target);
+                self.clamp_cursor();
+            }
+            MoveAxis::EndOfLine => {
+                self.set_cursor_char(m.target);
+                self.clamp_cursor();
+                self.eol_request = true;
+            }
+            MoveAxis::LineAnchor => {
+                let line = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
+                self.cursor.line = line;
+                self.cursor.col = self.first_non_blank(line);
+                self.clamp_cursor();
+            }
+            MoveAxis::VerticalKeep => {
+                let line = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
+                self.cursor.line = line;
+                self.settle_desired_col(false);
+                self.preserve_desired = true;
+            }
+        }
     }
 
     fn word_forward(&self, mut idx: usize) -> usize {
@@ -1129,9 +1221,20 @@ impl Editor {
     fn move_vertical(&mut self, delta: i64, allow_eol: bool) {
         let new = (self.cursor.line as i64 + delta).max(0) as usize;
         self.cursor.line = new.min(self.buffer.line_count().saturating_sub(1));
+        self.settle_desired_col(allow_eol);
+        self.preserve_desired = true;
+    }
+
+    /// Place the cursor on the current line at the remembered desired column
+    /// (or end-of-line when `$`-sticky), clamped to the line and a char boundary.
+    fn settle_desired_col(&mut self, allow_eol: bool) {
         let len = self.line_len();
         let max_col = if allow_eol { len } else { len.saturating_sub(1) };
-        self.cursor.col = self.desired_col.min(max_col);
+        self.cursor.col = if self.desired_eol {
+            max_col
+        } else {
+            self.desired_col.min(max_col)
+        };
         self.snap_cursor();
     }
 

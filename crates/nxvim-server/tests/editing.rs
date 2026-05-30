@@ -69,6 +69,21 @@ async fn lines(rpc: &Rpc) -> Vec<String> {
     }
 }
 
+/// Cursor position as `(1-based line, 0-based column)`.
+async fn cursor(rpc: &Rpc) -> (usize, usize) {
+    let result = rpc
+        .request("nvim_win_get_cursor", vec![Value::from(0u64)])
+        .await
+        .expect("get_cursor");
+    match result {
+        Value::Array(a) => (
+            a.first().and_then(Value::as_u64).unwrap_or(0) as usize,
+            a.get(1).and_then(Value::as_u64).unwrap_or(0) as usize,
+        ),
+        _ => (0, 0),
+    }
+}
+
 fn temp_path(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +169,53 @@ async fn lua_vim_cmd_drives_the_editor() {
 
     assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
     std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn vertical_motion_preserves_desired_column() {
+    let (rpc, _incoming) = start(None).await;
+    // Long, short, long — the classic case where j/k must remember the column.
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "ohi<Esc>");
+    feed(&rpc, "ogoodbye world<Esc>");
+
+    // Top line, move to column 8 ('r' in "hello world").
+    feed(&rpc, "gg8l");
+    assert_eq!(cursor(&rpc).await, (1, 8));
+
+    // Down onto the short line: cursor clamps to its last column...
+    feed(&rpc, "j");
+    assert_eq!(cursor(&rpc).await, (2, 1));
+
+    // ...and down again onto a long line: the remembered column is restored.
+    feed(&rpc, "j");
+    assert_eq!(cursor(&rpc).await, (3, 8));
+
+    // Back up through the short line restores it too.
+    feed(&rpc, "kk");
+    assert_eq!(cursor(&rpc).await, (1, 8));
+}
+
+#[tokio::test]
+async fn dollar_sticks_to_end_of_line_through_j() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    feed(&rpc, "oto<Esc>");
+    feed(&rpc, "oomega!<Esc>");
+
+    // `$` on the first line, then move down: each line lands on its own end.
+    feed(&rpc, "gg$");
+    assert_eq!(cursor(&rpc).await, (1, 4)); // "alpha" -> last col
+
+    feed(&rpc, "j");
+    assert_eq!(cursor(&rpc).await, (2, 1)); // "to" -> last col
+
+    feed(&rpc, "j");
+    assert_eq!(cursor(&rpc).await, (3, 5)); // "omega!" -> last col
+
+    // A horizontal move clears the end-of-line stickiness.
+    feed(&rpc, "gg0jj");
+    assert_eq!(cursor(&rpc).await, (3, 0));
 }
 
 #[tokio::test]

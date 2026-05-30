@@ -25,8 +25,15 @@ use tokio::sync::{mpsc, oneshot};
 /// A message arriving from the peer that the consumer must act on.
 #[derive(Debug)]
 pub enum Incoming {
-    Request { id: u64, method: String, params: Vec<Value> },
-    Notification { method: String, params: Vec<Value> },
+    Request {
+        id: u64,
+        method: String,
+        params: Vec<Value>,
+    },
+    Notification {
+        method: String,
+        params: Vec<Value>,
+    },
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, Value>>>>>;
@@ -118,11 +125,8 @@ where
     }
 }
 
-async fn reader_task<R>(
-    mut reader: R,
-    in_tx: mpsc::UnboundedSender<Incoming>,
-    pending: Pending,
-) where
+async fn reader_task<R>(mut reader: R, in_tx: mpsc::UnboundedSender<Incoming>, pending: Pending)
+where
     R: AsyncRead + Unpin,
 {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);

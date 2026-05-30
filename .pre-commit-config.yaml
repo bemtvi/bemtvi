@@ -1,0 +1,25 @@
+# Pre-commit hooks for nxvim.
+#
+# Enable once per clone:  pre-commit install
+# Run manually on demand:  pre-commit run --all-files
+# Bypass in an emergency:  git commit --no-verify
+#
+# Install the runner with one of:  pipx install pre-commit | brew install pre-commit
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Check Rust formatting (rustfmt)
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint with clippy, treating warnings as errors
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

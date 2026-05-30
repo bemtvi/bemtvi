@@ -44,7 +44,12 @@ where
     };
     let lua = LuaRuntime::new().map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
 
-    let mut server = Server { editor, lua, rpc, ui: None };
+    let mut server = Server {
+        editor,
+        lua,
+        rpc,
+        ui: None,
+    };
 
     while let Some(message) = incoming.recv().await {
         server.handle(message);
@@ -186,15 +191,30 @@ impl Server {
         let lines = Value::Array(view.lines.iter().map(|l| Value::from(l.as_str())).collect());
         let map = vec![
             (Value::from("lines"), lines),
-            (Value::from("cursor_row"), Value::from(view.cursor_row as u64)),
-            (Value::from("cursor_col"), Value::from(view.cursor_col as u64)),
-            (Value::from("mode_label"), Value::from(view.mode_label.as_str())),
+            (
+                Value::from("cursor_row"),
+                Value::from(view.cursor_row as u64),
+            ),
+            (
+                Value::from("cursor_col"),
+                Value::from(view.cursor_col as u64),
+            ),
+            (
+                Value::from("mode_label"),
+                Value::from(view.mode_label.as_str()),
+            ),
             (Value::from("command_mode"), Value::from(view.command_mode)),
             (Value::from("cmdline"), Value::from(view.cmdline.as_str())),
             (Value::from("message"), Value::from(view.message.as_str())),
-            (Value::from("file_name"), Value::from(view.file_name.as_str())),
+            (
+                Value::from("file_name"),
+                Value::from(view.file_name.as_str()),
+            ),
             (Value::from("modified"), Value::from(view.modified)),
-            (Value::from("cursor_line"), Value::from(view.cursor_line as u64)),
+            (
+                Value::from("cursor_line"),
+                Value::from(view.cursor_line as u64),
+            ),
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);
@@ -202,7 +222,9 @@ impl Server {
 }
 
 fn uint(v: Option<&Value>, default: usize) -> usize {
-    v.and_then(Value::as_u64).map(|n| n as usize).unwrap_or(default)
+    v.and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(default)
 }
 
 fn text(v: Option<&Value>) -> String {

@@ -35,7 +35,12 @@ pub enum KeyCode {
 
 impl Key {
     pub fn new(code: KeyCode) -> Self {
-        Key { code, ctrl: false, alt: false, shift: false }
+        Key {
+            code,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
     }
 
     pub fn char(c: char) -> Self {
@@ -43,7 +48,12 @@ impl Key {
     }
 
     pub fn ctrl(c: char) -> Self {
-        Key { code: KeyCode::Char(c), ctrl: true, alt: false, shift: false }
+        Key {
+            code: KeyCode::Char(c),
+            ctrl: true,
+            alt: false,
+            shift: false,
+        }
     }
 
     /// Returns the bare character if this key is an unmodified (or shift-only)
@@ -137,5 +147,10 @@ fn parse_special(inner: &str) -> Option<Key> {
         }
     };
 
-    Some(Key { code, ctrl, alt, shift })
+    Some(Key {
+        code,
+        ctrl,
+        alt,
+        shift,
+    })
 }

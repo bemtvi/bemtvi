@@ -248,14 +248,23 @@ fn latest_view(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<(Value,
 fn view_lines(view: &[(Value, Value)]) -> Vec<String> {
     view_get(view, "lines")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn view_str(view: &[(Value, Value)], key: &str) -> String {
-    view_get(view, key).and_then(Value::as_str).unwrap_or("").to_string()
+    view_get(view, key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn view_get<'a>(view: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    view.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
+    view.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
 }

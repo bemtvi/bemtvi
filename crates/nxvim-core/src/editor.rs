@@ -396,9 +396,15 @@ impl Editor {
             // Doubled operator: linewise over `count` lines.
             let count = self.effective_count();
             let last = self.cursor.line + count - 1;
-            let target = self.buffer.line_start(last.min(self.buffer.line_count().saturating_sub(1)));
+            let target = self
+                .buffer
+                .line_start(last.min(self.buffer.line_count().saturating_sub(1)));
             // axis is unused for the operator path, but the field is required.
-            let m = MotionResult { target, kind: MotionKind::Linewise, axis: MoveAxis::LineAnchor };
+            let m = MotionResult {
+                target,
+                kind: MotionKind::Linewise,
+                axis: MoveAxis::LineAnchor,
+            };
             self.operator = None;
             self.apply_operator(op, m);
             self.reset_pending();
@@ -504,12 +510,20 @@ impl Editor {
                     for _ in 0..count {
                         idx = self.word_end(idx);
                     }
-                    MotionResult { target: idx, kind: MotionKind::Inclusive, axis: MoveAxis::Horizontal }
+                    MotionResult {
+                        target: idx,
+                        kind: MotionKind::Inclusive,
+                        axis: MoveAxis::Horizontal,
+                    }
                 } else {
                     for _ in 0..count {
                         idx = self.word_forward(idx);
                     }
-                    MotionResult { target: idx, kind: MotionKind::Exclusive, axis: MoveAxis::Horizontal }
+                    MotionResult {
+                        target: idx,
+                        kind: MotionKind::Exclusive,
+                        axis: MoveAxis::Horizontal,
+                    }
                 }
             }
             (_, Some('b')) | (_, Some('B')) => {
@@ -517,14 +531,22 @@ impl Editor {
                 for _ in 0..count {
                     idx = self.word_backward(idx);
                 }
-                MotionResult { target: idx, kind: MotionKind::Exclusive, axis: MoveAxis::Horizontal }
+                MotionResult {
+                    target: idx,
+                    kind: MotionKind::Exclusive,
+                    axis: MoveAxis::Horizontal,
+                }
             }
             (_, Some('e')) | (_, Some('E')) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
                     idx = self.word_end(idx);
                 }
-                MotionResult { target: idx, kind: MotionKind::Inclusive, axis: MoveAxis::Horizontal }
+                MotionResult {
+                    target: idx,
+                    kind: MotionKind::Inclusive,
+                    axis: MoveAxis::Horizontal,
+                }
             }
             _ => return None,
         };
@@ -603,7 +625,10 @@ impl Editor {
             idx += 1;
         }
         let cls = char_class(self.char_at(idx));
-        while idx + 1 < self.buffer.len_bytes() && idx + 1 <= last && char_class(self.char_at(idx + 1)) == cls {
+        while idx + 1 < self.buffer.len_bytes()
+            && idx < last
+            && char_class(self.char_at(idx + 1)) == cls
+        {
             idx += 1;
         }
         idx
@@ -621,7 +646,9 @@ impl Editor {
                 let l2 = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
                 let (a, b) = (min(l1, l2), max(l1, l2));
                 let lo = self.buffer.line_start(a);
-                let hi = self.buffer.line_start((b + 1).min(self.buffer.line_count()));
+                let hi = self
+                    .buffer
+                    .line_start((b + 1).min(self.buffer.line_count()));
                 (lo, hi, true, a)
             }
         };
@@ -653,7 +680,9 @@ impl Editor {
                 self.yank_range(lo, hi, linewise);
                 if linewise {
                     self.delete_range(lo, hi);
-                    let at = self.buffer.line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
+                    let at = self
+                        .buffer
+                        .line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
                     self.buffer.text.insert_char(at, '\n');
                     self.buffer.normalize();
                     self.cursor.line = first_line;
@@ -697,7 +726,9 @@ impl Editor {
             'c' => {
                 if linewise {
                     self.delete_range(lo, hi);
-                    let at = self.buffer.line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
+                    let at = self
+                        .buffer
+                        .line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
                     self.buffer.text.insert_char(at, '\n');
                     self.buffer.normalize();
                     self.cursor.line = first_line;
@@ -720,7 +751,9 @@ impl Editor {
         if self.mode == Mode::VisualLine {
             let (la, lb) = (min(a.line, b.line), max(a.line, b.line));
             let lo = self.buffer.line_start(la);
-            let hi = self.buffer.line_start((lb + 1).min(self.buffer.line_count()));
+            let hi = self
+                .buffer
+                .line_start((lb + 1).min(self.buffer.line_count()));
             (lo, hi, true, la)
         } else {
             let ca = self.buffer.byte_at(a.line, a.col);
@@ -738,7 +771,10 @@ impl Editor {
         if lo >= hi {
             return;
         }
-        self.register = Register { text: self.buffer.text.slice(lo..hi).to_string(), linewise };
+        self.register = Register {
+            text: self.buffer.text.slice(lo..hi).to_string(),
+            linewise,
+        };
     }
 
     /// Remove `[lo, hi)` bytes, recording undo and keeping the buffer invariant.
@@ -813,7 +849,8 @@ impl Editor {
         let repl: String = std::iter::repeat(c).take(count).collect();
         self.buffer.text.insert(lo, &repl);
         self.buffer.modified = true;
-        self.cursor.col = (lo - self.buffer.line_start(self.cursor.line)) + (count - 1) * c.len_utf8();
+        self.cursor.col =
+            (lo - self.buffer.line_start(self.cursor.line)) + (count - 1) * c.len_utf8();
         self.clamp_cursor();
     }
 
@@ -897,14 +934,19 @@ impl Editor {
         self.push_undo();
         if self.register.linewise {
             let at = if after {
-                self.buffer.line_start((self.cursor.line + 1).min(self.buffer.line_count()))
+                self.buffer
+                    .line_start((self.cursor.line + 1).min(self.buffer.line_count()))
             } else {
                 self.buffer.line_start(self.cursor.line)
             };
             let chunk = self.register.text.repeat(count);
             self.buffer.text.insert(at, &chunk);
             self.buffer.normalize();
-            self.cursor.line = if after { self.cursor.line + 1 } else { self.cursor.line };
+            self.cursor.line = if after {
+                self.cursor.line + 1
+            } else {
+                self.cursor.line
+            };
             self.cursor.col = self.first_non_blank(self.cursor.line);
         } else {
             let len = self.line_len();
@@ -1025,10 +1067,8 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.execute_ex(&cmd);
             }
-            KeyCode::Backspace => {
-                if self.cmdline.pop().is_none() {
-                    self.mode = Mode::Normal;
-                }
+            KeyCode::Backspace if self.cmdline.pop().is_none() => {
+                self.mode = Mode::Normal;
             }
             KeyCode::Char(c) => self.cmdline.push(c),
             _ => {}
@@ -1041,7 +1081,9 @@ impl Editor {
             return;
         }
         if let Ok(n) = cmd.parse::<usize>() {
-            let line = n.saturating_sub(1).min(self.buffer.line_count().saturating_sub(1));
+            let line = n
+                .saturating_sub(1)
+                .min(self.buffer.line_count().saturating_sub(1));
             self.cursor.line = line;
             self.cursor.col = self.first_non_blank(line);
             return;
@@ -1070,7 +1112,11 @@ impl Editor {
     }
 
     fn ex_write(&mut self, args: &str) {
-        let path = if args.is_empty() { None } else { Some(PathBuf::from(args)) };
+        let path = if args.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(args))
+        };
         match self.buffer.write(path) {
             Ok((bytes, lines)) => {
                 let name = self
@@ -1087,8 +1133,7 @@ impl Editor {
 
     fn ex_quit(&mut self, bang: bool) {
         if self.buffer.modified && !bang {
-            self.message =
-                "E37: No write since last change (add ! to override)".to_string();
+            self.message = "E37: No write since last change (add ! to override)".to_string();
         } else {
             self.should_quit = true;
         }
@@ -1096,8 +1141,7 @@ impl Editor {
 
     fn ex_edit(&mut self, args: &str, bang: bool) {
         if self.buffer.modified && !bang {
-            self.message =
-                "E37: No write since last change (add ! to override)".to_string();
+            self.message = "E37: No write since last change (add ! to override)".to_string();
             return;
         }
         if args.is_empty() {
@@ -1201,18 +1245,27 @@ impl Editor {
 
     fn first_non_blank(&self, line: usize) -> usize {
         let s = self.buffer.line(line);
-        s.chars().take_while(|c| *c == ' ' || *c == '\t').count().min(s.chars().count())
+        s.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .count()
+            .min(s.chars().count())
     }
 
     fn set_cursor_char(&mut self, idx: usize) {
-        let idx = self.buffer.text.floor_char_boundary(idx.min(self.last_char_idx()));
+        let idx = self
+            .buffer
+            .text
+            .floor_char_boundary(idx.min(self.last_char_idx()));
         let line = self.buffer.byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer.line_start(line);
     }
 
     fn set_cursor_char_insert(&mut self, idx: usize) {
-        let idx = self.buffer.text.floor_char_boundary(idx.min(self.buffer.len_bytes()));
+        let idx = self
+            .buffer
+            .text
+            .floor_char_boundary(idx.min(self.buffer.len_bytes()));
         let line = self.buffer.byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer.line_start(line);
@@ -1229,7 +1282,11 @@ impl Editor {
     /// (or end-of-line when `$`-sticky), clamped to the line and a char boundary.
     fn settle_desired_col(&mut self, allow_eol: bool) {
         let len = self.line_len();
-        let max_col = if allow_eol { len } else { len.saturating_sub(1) };
+        let max_col = if allow_eol {
+            len
+        } else {
+            len.saturating_sub(1)
+        };
         self.cursor.col = if self.desired_eol {
             max_col
         } else {
@@ -1244,7 +1301,11 @@ impl Editor {
             self.cursor.line = last_line;
         }
         let len = self.line_len();
-        let max_col = if self.mode.is_insert() { len } else { len.saturating_sub(1) };
+        let max_col = if self.mode.is_insert() {
+            len
+        } else {
+            len.saturating_sub(1)
+        };
         if self.cursor.col > max_col {
             self.cursor.col = max_col;
         }

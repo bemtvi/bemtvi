@@ -31,7 +31,11 @@ impl Default for Buffer {
 
 impl Buffer {
     pub fn empty() -> Self {
-        Buffer { text: Rope::from_str("\n"), path: None, modified: false }
+        Buffer {
+            text: Rope::from_str("\n"),
+            path: None,
+            modified: false,
+        }
     }
 
     /// Load a buffer from `path`. A missing file yields an empty buffer bound to
@@ -44,7 +48,11 @@ impl Buffer {
             Rope::new()
         };
         ensure_trailing_newline(&mut text);
-        Ok(Buffer { text, path: Some(path.to_path_buf()), modified: false })
+        Ok(Buffer {
+            text,
+            path: Some(path.to_path_buf()),
+            modified: false,
+        })
     }
 
     /// Number of editable lines (excludes the phantom final line).

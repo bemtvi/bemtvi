@@ -62,7 +62,11 @@ impl View {
 
         View {
             lines,
-            cursor_row: ed.cursor.line.saturating_sub(ed.top).min(height.saturating_sub(1)),
+            cursor_row: ed
+                .cursor
+                .line
+                .saturating_sub(ed.top)
+                .min(height.saturating_sub(1)),
             cursor_col: ed.cursor.col,
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,

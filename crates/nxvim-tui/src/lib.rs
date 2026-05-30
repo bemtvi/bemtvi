@@ -126,16 +126,24 @@ impl View {
         };
         self.lines = map_get(map, "lines")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         self.cursor_row = map_u64(map, "cursor_row") as u16;
         self.cursor_col = map_u64(map, "cursor_col") as u16;
         self.mode_label = map_str(map, "mode_label");
-        self.command_mode = map_get(map, "command_mode").and_then(Value::as_bool).unwrap_or(false);
+        self.command_mode = map_get(map, "command_mode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.cmdline = map_str(map, "cmdline");
         self.message = map_str(map, "message");
         self.file_name = map_str(map, "file_name");
-        self.modified = map_get(map, "modified").and_then(Value::as_bool).unwrap_or(false);
+        self.modified = map_get(map, "modified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.cursor_line = map_u64(map, "cursor_line") as usize;
     }
 }
@@ -163,7 +171,13 @@ fn render(frame: &mut Frame, view: &View) {
 }
 
 fn render_text(frame: &mut Frame, area: Rect, view: &View) {
-    let text = Text::from(view.lines.iter().cloned().map(Line::from).collect::<Vec<_>>());
+    let text = Text::from(
+        view.lines
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect::<Vec<_>>(),
+    );
     frame.render_widget(Paragraph::new(text), area);
 }
 
@@ -192,7 +206,9 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
 }
 
 fn map_u64(map: &[(Value, Value)], key: &str) -> u64 {
@@ -200,7 +216,10 @@ fn map_u64(map: &[(Value, Value)], key: &str) -> u64 {
 }
 
 fn map_str(map: &[(Value, Value)], key: &str) -> String {
-    map_get(map, key).and_then(Value::as_str).unwrap_or("").to_string()
+    map_get(map, key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Translate a crossterm key event into vim key-notation.

@@ -3,14 +3,20 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use ropey::Rope;
+use ropey::{LineType, Rope};
+
+/// The line-break convention nxvim tracks. `LF_CR` recognizes both Unix (`\n`)
+/// and DOS (`\r\n`) breaks, so files of either `fileformat` split into lines
+/// correctly. (Available via ropey's default `metric_lines_lf_cr` feature.)
+const LINE_TYPE: LineType = LineType::LF_CR;
 
 /// A text buffer.
 ///
-/// Invariant: the rope always ends with a trailing `\n`, so an empty buffer is
-/// `"\n"` (a single empty editable line). The number of *editable* lines is
-/// therefore `rope.len_lines() - 1`; the final phantom line after the last
-/// newline is never edited or displayed.
+/// Indices are **byte offsets** into the underlying UTF-8 (ropey 2.0's native
+/// metric — and the same model vim uses for columns). Invariant: the rope
+/// always ends with a trailing `\n`, so an empty buffer is `"\n"` (a single
+/// empty editable line) and the number of *editable* lines is
+/// `rope.len_lines() - 1`; the final phantom line is never edited or displayed.
 pub struct Buffer {
     pub text: Rope,
     pub path: Option<PathBuf>,
@@ -43,7 +49,7 @@ impl Buffer {
 
     /// Number of editable lines (excludes the phantom final line).
     pub fn line_count(&self) -> usize {
-        self.text.len_lines().saturating_sub(1)
+        self.text.len_lines(LINE_TYPE).saturating_sub(1)
     }
 
     /// Contents of editable line `idx`, without its trailing newline.
@@ -51,7 +57,7 @@ impl Buffer {
         if idx >= self.line_count() {
             return String::new();
         }
-        let mut s = self.text.line(idx).to_string();
+        let mut s = self.text.line(idx, LINE_TYPE).to_string();
         if s.ends_with('\n') {
             s.pop();
             if s.ends_with('\r') {
@@ -61,34 +67,28 @@ impl Buffer {
         s
     }
 
-    /// Number of characters in editable line `idx`, excluding the newline.
+    /// Number of bytes in editable line `idx`, excluding the newline.
     pub fn line_len(&self, idx: usize) -> usize {
-        if idx >= self.line_count() {
-            return 0;
-        }
-        let slice = self.text.line(idx);
-        let mut len = slice.len_chars();
-        if len > 0 && slice.char(len - 1) == '\n' {
-            len -= 1;
-            if len > 0 && slice.char(len - 1) == '\r' {
-                len -= 1;
-            }
-        }
-        len
+        self.line(idx).len()
     }
 
-    /// Char index at the start of editable line `idx`.
+    /// Byte offset at the start of editable line `idx`.
     pub fn line_start(&self, idx: usize) -> usize {
-        self.text.line_to_char(idx)
+        self.text.line_to_byte_idx(idx, LINE_TYPE)
     }
 
-    /// Char index for `(line, col)`.
-    pub fn char_at(&self, line: usize, col: usize) -> usize {
-        self.text.line_to_char(line) + col
+    /// Editable line containing byte offset `byte_idx`.
+    pub fn byte_to_line(&self, byte_idx: usize) -> usize {
+        self.text.byte_to_line_idx(byte_idx, LINE_TYPE)
     }
 
-    pub fn len_chars(&self) -> usize {
-        self.text.len_chars()
+    /// Byte offset for `(line, col)`, where `col` is a byte offset within the line.
+    pub fn byte_at(&self, line: usize, col: usize) -> usize {
+        self.line_start(line) + col
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.text.len()
     }
 
     /// All editable lines as owned strings (used by the API `get_lines`).
@@ -116,10 +116,10 @@ impl Buffer {
 }
 
 fn ensure_trailing_newline(text: &mut Rope) {
-    let n = text.len_chars();
+    let n = text.len();
     if n == 0 {
         text.insert_char(0, '\n');
-    } else if text.char(n - 1) != '\n' {
+    } else if text.get_char(n - 1).map(|c| c != '\n').unwrap_or(true) {
         text.insert_char(n, '\n');
     }
 }

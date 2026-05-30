@@ -1,4 +1,5 @@
-//! Async msgpack-RPC, framed exactly like neovim's RPC channel.
+//! Async msgpack-RPC transport. msgpack is used purely as a compact binary
+//! framing — this is nxvim's own protocol, not a neovim-compatible channel.
 //!
 //! Messages are msgpack arrays:
 //! * Request:      `[0, msgid, method, params]`

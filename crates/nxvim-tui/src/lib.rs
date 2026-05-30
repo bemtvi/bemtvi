@@ -1,25 +1,30 @@
 //! The terminal UI client.
 //!
-//! This is the rust-native analogue of neovim's built-in `tui/`. It is a *thin
-//! client*: it owns no editor state. It attaches to the server over RPC, sends
-//! keystrokes as vim key-notation (`nvim_input`), and paints whatever grid the
-//! server pushes via `redraw` notifications. A future native GUI is simply a
-//! different client speaking the same protocol.
+//! A thin RPC client that owns no editor state. It attaches to the server,
+//! sends keystrokes as vim key-notation (`nvim_input`), and renders the
+//! server's [`View`](nxvim view map) using **ratatui-native widgets, one per
+//! region**: the text area, the status line, and the command line are laid out
+//! with a ratatui `Layout` and drawn as separate widgets. There is no neovim UI
+//! protocol and no custom cell renderer.
 //!
-//! Rendering and terminal setup/teardown are delegated to
-//! [ratatui](https://ratatui.rs); we keep no custom renderer. Input and redraw
-//! are multiplexed with `tokio::select!`, so terminal events and server output
-//! are handled concurrently and the UI stays responsive.
+//! The client owns the screen layout: it reserves two rows (status + command)
+//! and tells the server only how tall the *text area* is, so scrolling stays
+//! correct. Input and redraw are multiplexed with `tokio::select!`.
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Rows reserved at the bottom for the status line and command line.
+const CHROME_ROWS: u16 = 2;
 
 /// Run the client over a connected stream until the server exits or disconnects.
 ///
@@ -47,14 +52,14 @@ where
         "nvim_ui_attach",
         vec![
             Value::from(size.width as u64),
-            Value::from(size.height as u64),
+            Value::from(text_height(size.height) as u64),
             Value::Map(vec![]),
         ],
     )
     .await
     .ok();
 
-    let mut grid = Grid::new(size.height as usize);
+    let mut view = View::default();
     let mut term_events = EventStream::new();
 
     loop {
@@ -70,7 +75,7 @@ where
                 Some(Ok(Event::Resize(w, h))) => {
                     rpc.notify(
                         "nvim_ui_try_resize",
-                        vec![Value::from(w as u64), Value::from(h as u64)],
+                        vec![Value::from(w as u64), Value::from(text_height(h) as u64)],
                     );
                 }
                 Some(Ok(_)) => {}
@@ -79,9 +84,8 @@ where
             message = incoming.recv() => match message {
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "redraw" => {
-                        if apply_redraw(&mut grid, &params) {
-                            terminal.draw(|frame| draw(frame, &grid))?;
-                        }
+                        view.update(&params);
+                        terminal.draw(|frame| render(frame, &view))?;
                     }
                     "nxvim_exit" => break,
                     _ => {}
@@ -95,62 +99,108 @@ where
     Ok(())
 }
 
-/// The latest grid pushed by the server. The server lays out full rows, so the
-/// client just needs to hold them and the cursor position.
-struct Grid {
+/// Text-area height = terminal height minus the chrome rows we render ourselves.
+fn text_height(terminal_height: u16) -> u16 {
+    terminal_height.saturating_sub(CHROME_ROWS).max(1)
+}
+
+/// The server's view, mirrored client-side for rendering.
+#[derive(Default)]
+struct View {
     lines: Vec<String>,
     cursor_row: u16,
     cursor_col: u16,
+    mode_label: String,
+    command_mode: bool,
+    cmdline: String,
+    message: String,
+    file_name: String,
+    modified: bool,
+    cursor_line: usize,
 }
 
-impl Grid {
-    fn new(height: usize) -> Self {
-        Grid {
-            lines: vec![String::new(); height],
-            cursor_row: 0,
-            cursor_col: 0,
-        }
-    }
-
-    fn resize(&mut self, height: usize) {
-        self.lines.resize(height, String::new());
+impl View {
+    fn update(&mut self, params: &[Value]) {
+        let Some(Value::Map(map)) = params.first() else {
+            return;
+        };
+        self.lines = map_get(map, "lines")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        self.cursor_row = map_u64(map, "cursor_row") as u16;
+        self.cursor_col = map_u64(map, "cursor_col") as u16;
+        self.mode_label = map_str(map, "mode_label");
+        self.command_mode = map_get(map, "command_mode").and_then(Value::as_bool).unwrap_or(false);
+        self.cmdline = map_str(map, "cmdline");
+        self.message = map_str(map, "message");
+        self.file_name = map_str(map, "file_name");
+        self.modified = map_get(map, "modified").and_then(Value::as_bool).unwrap_or(false);
+        self.cursor_line = map_u64(map, "cursor_line") as usize;
     }
 }
 
-/// Render the current grid with ratatui. One `Paragraph` for the whole frame,
-/// plus the cursor — ratatui diffs and clears for us.
-fn draw(frame: &mut Frame, grid: &Grid) {
-    let text = Text::from(grid.lines.iter().cloned().map(Line::from).collect::<Vec<_>>());
-    frame.render_widget(Paragraph::new(text), frame.area());
-    frame.set_cursor_position((grid.cursor_col, grid.cursor_row));
+/// Lay out the three regions and render each with its own widget.
+fn render(frame: &mut Frame, view: &View) {
+    let regions = Layout::vertical([
+        Constraint::Min(1),    // text area
+        Constraint::Length(1), // status line
+        Constraint::Length(1), // command line
+    ])
+    .split(frame.area());
+    let (text_area, status_area, cmd_area) = (regions[0], regions[1], regions[2]);
+
+    render_text(frame, text_area, view);
+    render_status(frame, status_area, view);
+    render_command(frame, cmd_area, view);
+
+    if view.command_mode {
+        let col = cmd_area.x + 1 + view.cmdline.chars().count() as u16;
+        frame.set_cursor_position((col, cmd_area.y));
+    } else {
+        frame.set_cursor_position((text_area.x + view.cursor_col, text_area.y + view.cursor_row));
+    }
 }
 
-/// Apply a batch of redraw events; returns `true` when a `flush` was seen.
-fn apply_redraw(grid: &mut Grid, events: &[Value]) -> bool {
-    let mut flush = false;
-    for event in events {
-        let Value::Array(parts) = event else { continue };
-        match parts.first().and_then(Value::as_str) {
-            Some("resize") => {
-                let h = parts.get(2).and_then(Value::as_u64).unwrap_or(0) as usize;
-                grid.resize(h);
-            }
-            Some("line") => {
-                let row = parts.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
-                let text = parts.get(2).and_then(Value::as_str).unwrap_or("");
-                if row < grid.lines.len() {
-                    grid.lines[row] = text.to_string();
-                }
-            }
-            Some("cursor") => {
-                grid.cursor_row = parts.get(1).and_then(Value::as_u64).unwrap_or(0) as u16;
-                grid.cursor_col = parts.get(2).and_then(Value::as_u64).unwrap_or(0) as u16;
-            }
-            Some("flush") => flush = true,
-            _ => {}
-        }
-    }
-    flush
+fn render_text(frame: &mut Frame, area: Rect, view: &View) {
+    let text = Text::from(view.lines.iter().cloned().map(Line::from).collect::<Vec<_>>());
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+fn render_status(frame: &mut Frame, area: Rect, view: &View) {
+    let modified = if view.modified { " [+]" } else { "" };
+    let left = format!(" {}  {}{}", view.mode_label, view.file_name, modified);
+    let right = format!("{},{} ", view.cursor_line, view.cursor_col + 1);
+
+    let width = area.width as usize;
+    let pad = width.saturating_sub(left.chars().count() + right.chars().count());
+    let line = format!("{left}{}{right}", " ".repeat(pad));
+
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().add_modifier(Modifier::REVERSED)),
+        area,
+    );
+}
+
+fn render_command(frame: &mut Frame, area: Rect, view: &View) {
+    let content = if view.command_mode {
+        format!(":{}", view.cmdline)
+    } else {
+        view.message.clone()
+    };
+    frame.render_widget(Paragraph::new(content), area);
+}
+
+fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
+}
+
+fn map_u64(map: &[(Value, Value)], key: &str) -> u64 {
+    map_get(map, key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn map_str(map: &[(Value, Value)], key: &str) -> String {
+    map_get(map, key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 /// Translate a crossterm key event into vim key-notation.

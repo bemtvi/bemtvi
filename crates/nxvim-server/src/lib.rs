@@ -168,38 +168,31 @@ impl Server {
         )
     }
 
+    /// Push the current view to the client as a single `redraw` notification
+    /// carrying an nxvim-native view map (no neovim grid protocol). The client
+    /// renders the regions with its own widgets.
     fn redraw(&mut self) {
         let (w, h) = match self.ui {
             Some(dims) => dims,
             None => return,
         };
-        let screen = self.editor.render(w, h);
+        let view = self.editor.view(w, h);
 
-        let mut events = Vec::with_capacity(screen.lines.len() + 4);
-        events.push(Value::Array(vec![
-            Value::from("resize"),
-            Value::from(screen.width as u64),
-            Value::from(screen.height as u64),
-        ]));
-        for (row, line) in screen.lines.iter().enumerate() {
-            events.push(Value::Array(vec![
-                Value::from("line"),
-                Value::from(row as u64),
-                Value::from(line.as_str()),
-            ]));
-        }
-        events.push(Value::Array(vec![
-            Value::from("cursor"),
-            Value::from(screen.cursor_row as u64),
-            Value::from(screen.cursor_col as u64),
-        ]));
-        events.push(Value::Array(vec![
-            Value::from("mode"),
-            Value::from(screen.mode.as_str()),
-        ]));
-        events.push(Value::Array(vec![Value::from("flush")]));
+        let lines = Value::Array(view.lines.iter().map(|l| Value::from(l.as_str())).collect());
+        let map = vec![
+            (Value::from("lines"), lines),
+            (Value::from("cursor_row"), Value::from(view.cursor_row as u64)),
+            (Value::from("cursor_col"), Value::from(view.cursor_col as u64)),
+            (Value::from("mode_label"), Value::from(view.mode_label.as_str())),
+            (Value::from("command_mode"), Value::from(view.command_mode)),
+            (Value::from("cmdline"), Value::from(view.cmdline.as_str())),
+            (Value::from("message"), Value::from(view.message.as_str())),
+            (Value::from("file_name"), Value::from(view.file_name.as_str())),
+            (Value::from("modified"), Value::from(view.modified)),
+            (Value::from("cursor_line"), Value::from(view.cursor_line as u64)),
+        ];
 
-        self.rpc.notify("redraw", events);
+        self.rpc.notify("redraw", vec![Value::Map(map)]);
     }
 }
 

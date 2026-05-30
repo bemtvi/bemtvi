@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use crate::buffer::Buffer;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
-use crate::screen::Screen;
+use crate::view::View;
 
 /// A cursor position within the current buffer (0-indexed line and column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -117,9 +117,12 @@ impl Editor {
 
     // ----- public API used by the server -----------------------------------
 
+    /// Resize the *text viewport*. The client owns the screen layout and tells
+    /// us only how tall the text area is (status/command lines are the client's
+    /// own regions), so the whole height here is editable rows.
     pub fn resize(&mut self, width: usize, height: usize) {
         self.width = width.max(1);
-        self.height = height.max(3);
+        self.height = height.max(1);
         self.ensure_visible();
     }
 
@@ -144,10 +147,11 @@ impl Editor {
         self.buffer.lines()
     }
 
-    /// Render the current state into a [`Screen`] of the given size.
-    pub fn render(&mut self, width: usize, height: usize) -> Screen {
+    /// Produce a [`View`] of the current state for a text viewport of the given
+    /// size. The client renders the view's regions with its own widgets.
+    pub fn view(&mut self, width: usize, height: usize) -> View {
         self.resize(width, height);
-        Screen::from_editor(self)
+        View::from_editor(self)
     }
 
     pub(crate) fn dims(&self) -> (usize, usize) {
@@ -155,7 +159,7 @@ impl Editor {
     }
 
     pub(crate) fn text_height(&self) -> usize {
-        self.height.saturating_sub(2).max(1)
+        self.height.max(1)
     }
 
     // ----- normal / visual mode --------------------------------------------
@@ -393,24 +397,24 @@ impl Editor {
         let motion = match (kc, ch) {
             (KeyCode::Left, _) | (_, Some('h')) | (KeyCode::Backspace, _) => {
                 let col = self.cursor.col.saturating_sub(count);
-                MotionResult { target: self.buffer.char_at(line, col), kind: MotionKind::Exclusive }
+                MotionResult { target: self.buffer.byte_at(line, col), kind: MotionKind::Exclusive }
             }
             (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => {
                 let col = (self.cursor.col + count).min(self.line_len());
-                MotionResult { target: self.buffer.char_at(line, col), kind: MotionKind::Exclusive }
+                MotionResult { target: self.buffer.byte_at(line, col), kind: MotionKind::Exclusive }
             }
             (_, Some('0')) | (KeyCode::Home, _) => {
-                MotionResult { target: self.buffer.char_at(line, 0), kind: MotionKind::Exclusive }
+                MotionResult { target: self.buffer.byte_at(line, 0), kind: MotionKind::Exclusive }
             }
             (_, Some('^')) => {
                 let col = self.first_non_blank(line);
-                MotionResult { target: self.buffer.char_at(line, col), kind: MotionKind::Exclusive }
+                MotionResult { target: self.buffer.byte_at(line, col), kind: MotionKind::Exclusive }
             }
             (_, Some('$')) | (KeyCode::End, _) => {
                 let l = (line + count - 1).min(last_line);
                 let len = self.buffer.line_len(l);
                 let col = len.saturating_sub(1);
-                MotionResult { target: self.buffer.char_at(l, col), kind: MotionKind::Inclusive }
+                MotionResult { target: self.buffer.byte_at(l, col), kind: MotionKind::Inclusive }
             }
             (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => {
                 let l = (line + count).min(last_line);
@@ -507,7 +511,7 @@ impl Editor {
             idx += 1;
         }
         let cls = char_class(self.char_at(idx));
-        while idx + 1 < self.buffer.len_chars() && idx + 1 <= last && char_class(self.char_at(idx + 1)) == cls {
+        while idx + 1 < self.buffer.len_bytes() && idx + 1 <= last && char_class(self.char_at(idx + 1)) == cls {
             idx += 1;
         }
         idx
@@ -522,7 +526,7 @@ impl Editor {
             MotionKind::Inclusive => (min(cur, m.target), max(cur, m.target) + 1, false, 0),
             MotionKind::Linewise => {
                 let l1 = self.cursor.line;
-                let l2 = self.buffer.text.char_to_line(m.target.min(self.last_char_idx()));
+                let l2 = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
                 let (a, b) = (min(l1, l2), max(l1, l2));
                 let lo = self.buffer.line_start(a);
                 let hi = self.buffer.line_start((b + 1).min(self.buffer.line_count()));
@@ -627,8 +631,8 @@ impl Editor {
             let hi = self.buffer.line_start((lb + 1).min(self.buffer.line_count()));
             (lo, hi, true, la)
         } else {
-            let ca = self.buffer.char_at(a.line, a.col);
-            let cb = self.buffer.char_at(b.line, b.col);
+            let ca = self.buffer.byte_at(a.line, a.col);
+            let cb = self.buffer.byte_at(b.line, b.col);
             let lo = min(ca, cb);
             let hi = max(ca, cb) + 1;
             (lo, hi.min(self.last_char_idx().max(lo + 1)), false, 0)
@@ -638,16 +642,16 @@ impl Editor {
     // ----- editing primitives ----------------------------------------------
 
     fn yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
-        let hi = hi.min(self.buffer.len_chars());
+        let (lo, hi) = self.snap_range(lo, hi);
         if lo >= hi {
             return;
         }
         self.register = Register { text: self.buffer.text.slice(lo..hi).to_string(), linewise };
     }
 
-    /// Remove `[lo, hi)` chars, recording undo and keeping the buffer invariant.
+    /// Remove `[lo, hi)` bytes, recording undo and keeping the buffer invariant.
     fn delete_range(&mut self, lo: usize, hi: usize) {
-        let hi = hi.min(self.buffer.len_chars());
+        let (lo, hi) = self.snap_range(lo, hi);
         if lo >= hi {
             return;
         }
@@ -657,13 +661,23 @@ impl Editor {
         self.buffer.modified = true;
     }
 
+    /// Clamp a byte range into bounds and onto char boundaries, so motion-derived
+    /// endpoints can never split a multi-byte char (a no-op for ASCII).
+    fn snap_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        let hi = hi.min(self.buffer.len_bytes());
+        let lo = self.buffer.text.floor_char_boundary(lo.min(hi));
+        let hi = self.buffer.text.ceil_char_boundary(hi);
+        (lo, hi)
+    }
+
     fn delete_under_cursor(&mut self, count: usize) {
         let len = self.line_len();
         if len == 0 {
             return;
         }
         let lo = self.cursor_char();
-        let hi = self.buffer.char_at(self.cursor.line, (self.cursor.col + count).min(len));
+        let line_end = self.buffer.byte_at(self.cursor.line, len);
+        let (hi, _) = self.advance_chars(lo, count, line_end);
         self.yank_range(lo, hi, false);
         self.delete_range(lo, hi);
         self.clamp_cursor();
@@ -674,7 +688,7 @@ impl Editor {
             return;
         }
         let new_col = self.cursor.col.saturating_sub(count);
-        let lo = self.buffer.char_at(self.cursor.line, new_col);
+        let lo = self.buffer.byte_at(self.cursor.line, new_col);
         let hi = self.cursor_char();
         self.yank_range(lo, hi, false);
         self.delete_range(lo, hi);
@@ -685,7 +699,7 @@ impl Editor {
     fn delete_to_eol(&mut self) {
         let len = self.line_len();
         let lo = self.cursor_char();
-        let hi = self.buffer.char_at(self.cursor.line, len);
+        let hi = self.buffer.byte_at(self.cursor.line, len);
         if lo < hi {
             self.yank_range(lo, hi, false);
             self.delete_range(lo, hi);
@@ -695,28 +709,31 @@ impl Editor {
 
     fn replace_char(&mut self, c: char, count: usize) {
         let len = self.line_len();
-        if self.cursor.col + count > len {
+        let lo = self.cursor_char();
+        let line_end = self.buffer.byte_at(self.cursor.line, len);
+        let (hi, crossed) = self.advance_chars(lo, count, line_end);
+        // `r` does nothing unless `count` whole characters remain on the line.
+        if crossed < count {
             return;
         }
         self.push_undo();
-        let lo = self.cursor_char();
-        let hi = lo + count;
         self.buffer.text.remove(lo..hi);
         let repl: String = std::iter::repeat(c).take(count).collect();
         self.buffer.text.insert(lo, &repl);
         self.buffer.modified = true;
-        self.cursor.col += count - 1;
+        self.cursor.col = (lo - self.buffer.line_start(self.cursor.line)) + (count - 1) * c.len_utf8();
         self.clamp_cursor();
     }
 
     fn toggle_case(&mut self, count: usize) {
-        let len = self.line_len();
-        if self.cursor.col >= len {
+        if self.cursor.col >= self.line_len() {
             return;
         }
         self.push_undo();
-        let n = count.min(len - self.cursor.col);
-        for _ in 0..n {
+        for _ in 0..count {
+            if self.cursor.col >= self.line_len() {
+                break;
+            }
             let idx = self.cursor_char();
             let c = self.char_at(idx);
             let swapped: String = if c.is_uppercase() {
@@ -724,9 +741,9 @@ impl Editor {
             } else {
                 c.to_uppercase().collect()
             };
-            self.buffer.text.remove(idx..idx + 1);
+            self.buffer.text.remove(idx..idx + c.len_utf8());
             self.buffer.text.insert(idx, &swapped);
-            self.cursor.col += 1;
+            self.cursor.col += swapped.len();
         }
         self.buffer.modified = true;
         self.clamp_cursor();
@@ -740,7 +757,7 @@ impl Editor {
                 break;
             }
             let cur_len = self.line_len();
-            let eol = self.buffer.char_at(self.cursor.line, cur_len);
+            let eol = self.buffer.byte_at(self.cursor.line, cur_len);
             // Remove the newline and any leading whitespace of the next line.
             let next_start = self.buffer.line_start(self.cursor.line + 1);
             let mut ws_end = next_start;
@@ -767,7 +784,7 @@ impl Editor {
     fn open_line(&mut self, below: bool) {
         self.push_undo();
         if below {
-            let at = self.buffer.char_at(self.cursor.line, self.line_len());
+            let at = self.buffer.byte_at(self.cursor.line, self.line_len());
             self.buffer.text.insert_char(at, '\n');
             self.cursor.line += 1;
         } else {
@@ -799,12 +816,18 @@ impl Editor {
             self.cursor.col = self.first_non_blank(self.cursor.line);
         } else {
             let len = self.line_len();
-            let col = if after && len > 0 { (self.cursor.col + 1).min(len) } else { self.cursor.col };
-            let at = self.buffer.char_at(self.cursor.line, col);
+            let cur = self.cursor_char();
+            let line_end = self.buffer.byte_at(self.cursor.line, len);
+            let at = if after && len > 0 {
+                self.buffer.text.ceil_char_boundary(cur + 1).min(line_end)
+            } else {
+                cur
+            };
             let chunk = self.register.text.repeat(count);
-            let inserted = chunk.chars().count();
+            let last_len = chunk.chars().next_back().map(char::len_utf8).unwrap_or(1);
+            let end = at + chunk.len();
             self.buffer.text.insert(at, &chunk);
-            self.set_cursor_char(at + inserted.saturating_sub(1));
+            self.set_cursor_char(end.saturating_sub(last_len));
         }
         self.buffer.normalize();
         self.buffer.modified = true;
@@ -853,17 +876,19 @@ impl Editor {
                 let len = self.line_len();
                 if self.cursor.col < len {
                     let at = self.cursor_char();
-                    self.buffer.text.remove(at..at + 1);
+                    let end = self.buffer.text.ceil_char_boundary(at + 1);
+                    self.buffer.text.remove(at..end);
                     self.buffer.modified = true;
                 }
             }
             KeyCode::Char(c) => {
                 let at = self.cursor_char();
                 if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
-                    self.buffer.text.remove(at..at + 1);
+                    let end = self.buffer.text.ceil_char_boundary(at + 1);
+                    self.buffer.text.remove(at..end);
                 }
                 self.buffer.text.insert_char(at, c);
-                self.cursor.col += 1;
+                self.cursor.col += c.len_utf8();
                 self.buffer.modified = true;
             }
             _ => {}
@@ -873,12 +898,14 @@ impl Editor {
     fn insert_backspace(&mut self) {
         if self.cursor.col > 0 {
             let at = self.cursor_char();
-            self.buffer.text.remove(at - 1..at);
-            self.cursor.col -= 1;
+            let start = self.buffer.line_start(self.cursor.line);
+            let prev = self.buffer.text.floor_char_boundary(at - 1).max(start);
+            self.buffer.text.remove(prev..at);
+            self.cursor.col = prev - start;
             self.buffer.modified = true;
         } else if self.cursor.line > 0 {
             let prev_len = self.buffer.line_len(self.cursor.line - 1);
-            let join_at = self.buffer.char_at(self.cursor.line - 1, prev_len);
+            let join_at = self.buffer.byte_at(self.cursor.line - 1, prev_len);
             self.buffer.text.remove(join_at..join_at + 1);
             self.cursor.line -= 1;
             self.cursor.col = prev_len;
@@ -1043,16 +1070,37 @@ impl Editor {
     // ----- cursor / scrolling helpers --------------------------------------
 
     fn cursor_char(&self) -> usize {
-        self.buffer.char_at(self.cursor.line, self.cursor.col)
+        self.buffer.byte_at(self.cursor.line, self.cursor.col)
     }
 
     fn char_at(&self, idx: usize) -> char {
-        self.buffer.text.char(idx)
+        // Non-boundary bytes (inside a multi-byte char) read as blank rather
+        // than panicking; cursor/operator positions are kept on boundaries.
+        self.buffer.text.get_char(idx).unwrap_or(' ')
+    }
+
+    /// Advance `count` characters forward from byte offset `from`, never passing
+    /// `limit`. Returns the new offset and how many characters were crossed.
+    fn advance_chars(&self, mut from: usize, count: usize, limit: usize) -> (usize, usize) {
+        let mut crossed = 0;
+        while crossed < count && from < limit {
+            from = self.buffer.text.ceil_char_boundary(from + 1).min(limit);
+            crossed += 1;
+        }
+        (from, crossed)
+    }
+
+    /// Snap the cursor column down to the nearest char boundary (a no-op for
+    /// ASCII), so byte offsets handed to the rope are always valid.
+    fn snap_cursor(&mut self) {
+        let start = self.buffer.line_start(self.cursor.line);
+        let abs = start + self.cursor.col;
+        self.cursor.col = self.buffer.text.floor_char_boundary(abs) - start;
     }
 
     fn last_char_idx(&self) -> usize {
         // The trailing '\n' is never a valid cursor position.
-        self.buffer.len_chars().saturating_sub(1)
+        self.buffer.len_bytes().saturating_sub(1)
     }
 
     fn line_len(&self) -> usize {
@@ -1065,15 +1113,15 @@ impl Editor {
     }
 
     fn set_cursor_char(&mut self, idx: usize) {
-        let idx = idx.min(self.last_char_idx());
-        let line = self.buffer.text.char_to_line(idx);
+        let idx = self.buffer.text.floor_char_boundary(idx.min(self.last_char_idx()));
+        let line = self.buffer.byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer.line_start(line);
     }
 
     fn set_cursor_char_insert(&mut self, idx: usize) {
-        let idx = idx.min(self.buffer.len_chars());
-        let line = self.buffer.text.char_to_line(idx);
+        let idx = self.buffer.text.floor_char_boundary(idx.min(self.buffer.len_bytes()));
+        let line = self.buffer.byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer.line_start(line);
     }
@@ -1084,6 +1132,7 @@ impl Editor {
         let len = self.line_len();
         let max_col = if allow_eol { len } else { len.saturating_sub(1) };
         self.cursor.col = self.desired_col.min(max_col);
+        self.snap_cursor();
     }
 
     fn clamp_cursor(&mut self) {
@@ -1096,6 +1145,7 @@ impl Editor {
         if self.cursor.col > max_col {
             self.cursor.col = max_col;
         }
+        self.snap_cursor();
     }
 
     fn scroll_half(&mut self, down: bool) {

@@ -12,9 +12,12 @@ reference. nxvim does not link against or embed any neovim code.
 
 ## Guiding principles
 
-1. **Compatibility first.** Keystrokes, modes, ex-commands, options, and the
-   `nvim_*` RPC API should match neovim's observable behavior. When in doubt,
-   the reference in `vendor/neovim` is the source of truth.
+1. **Editing compatibility first.** Keystrokes, modes, ex-commands, options, and
+   the Lua `vim.*` API should match neovim's observable behavior. When in doubt,
+   the reference in `vendor/neovim` is the source of truth. *Note:* nxvim does
+   **not** aim for neovim *UI/client* wire-compatibility — there is no
+   `ext_linegrid` protocol and external neovim GUIs are not a target. The
+   client↔server protocol is nxvim's own.
 2. **Client-server, always.** The editor is a headless server; every UI is a
    client. There is no "embedded-only" code path.
 3. **Async and responsive.** The UI never blocks on the editor and the editor
@@ -32,8 +35,8 @@ subsystems:
 
 | nxvim crate     | neovim counterpart                                   | responsibility                                                        |
 | --------------- | ---------------------------------------------------- | -------------------------------------------------------------------- |
-| `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c`, `grid.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and screen rendering. **Pure & synchronous.** |
-| `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport with neovim-compatible message framing.   |
+| `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
+| `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime and the `vim.*` standard library.           |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
@@ -106,36 +109,48 @@ onto a shared pool.
 
 ### RPC framing (`nxvim-rpc`)
 
-Identical to neovim's msgpack-RPC. Messages are msgpack arrays:
+A standard msgpack-RPC framing — chosen because it's a good async binary
+protocol, **not** for neovim interop. Messages are msgpack arrays:
 
 - Request: `[0, msgid, method, params]`
 - Response: `[1, msgid, error, result]`
 - Notification: `[2, method, params]`
 
-This means nxvim's transport is wire-compatible with neovim RPC clients; the
-remaining work for full interop is breadth of the `nvim_*` method surface.
+The method names happen to use the familiar `nvim_*` spelling (`nvim_input`,
+`nvim_command`, `nvim_buf_get_lines`, `nvim_ui_attach`), but they are nxvim's
+own methods with nxvim's own semantics — they are not a compatibility surface.
 
-### Redraw / UI protocol
+### View protocol (UI)
 
-Today the server renders the whole [`Screen`](../crates/nxvim-core/src/screen.rs)
-in the core and sends a `redraw` notification carrying a list of events
-(`resize`, `line`, `cursor`, `mode`, `flush`). This is *shaped like* neovim's
-`ext_linegrid` UI protocol — an array of events the client folds onto a grid —
-but simplified: full lines instead of per-cell `grid_line` runs, and no
-highlight attributes yet. Moving to the exact `ext_linegrid` cell encoding (so
-existing neovim GUIs could attach) is a planned step and only touches the
-server's `redraw` and the client's `apply_redraw`.
+The core projects editor state into a [`View`](../crates/nxvim-core/src/view.rs):
+the visible text rows, the cursor position, and the data a status/command line
+need (mode, file name, modified flag, ruler, message, command-line text). The
+server sends it as a single `redraw` notification carrying one msgpack map.
+
+The **client owns layout**. It reserves two rows for chrome and renders three
+ratatui-native widgets — text area, status line, command line — with a ratatui
+`Layout` (see [`nxvim-tui`](../crates/nxvim-tui/src/lib.rs)). Because layout is
+the client's job, the client tells the server only how tall the *text area* is
+(`nvim_ui_attach`/`nvim_ui_try_resize` carry the text-viewport height), so the
+core scrolls against the right window size. There is no grid, no cell encoding,
+and no `ext_linegrid`.
 
 ---
 
 ## Text model
 
-Buffers are backed by a [ropey](https://docs.rs/ropey) rope (`nxvim-core`'s
-`Buffer`). The key invariant: **the rope always ends with a trailing `\n`**, so
-an empty buffer is `"\n"` (one empty line) and the editable line count is
-`rope.len_lines() - 1`. The phantom final line is never displayed or edited.
-This keeps line/column math uniform and matches how vim treats files as a
-sequence of newline-terminated lines.
+Buffers are backed by a [ropey](https://docs.rs/ropey) 2.0 rope (`nxvim-core`'s
+`Buffer`). Indices are **byte offsets** — ropey 2.0's native metric, and the
+same column model vim uses — with lines tracked via ropey's `LineType::LF_CR`
+(so both Unix `\n` and DOS `\r\n` files split correctly). Editing operations
+snap byte ranges to char boundaries (`floor`/`ceil_char_boundary`) so a
+multi-byte character can never be split; for ASCII this is all a no-op. The key
+invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is
+`"\n"` (one empty line) and the editable line count is `rope.len_lines() - 1`.
+The phantom final line is never displayed or edited.
+
+(Display still assumes one cell per byte/char — no wide-char or tab-width
+handling yet — so cursor placement for non-ASCII text is approximate for now.)
 
 Undo is currently snapshot-based (cheap thanks to ropey's structural sharing);
 it will move to a change-tree closer to neovim's `undo.c` as editing grows.
@@ -166,10 +181,11 @@ deliberately portable: `crossterm` for the terminal, `ropey`, `tokio`, and
 `rmpv` are all cross-platform, and the in-process transport uses no OS-specific
 IPC.
 
-Because every front end is just an RPC client, a **native GUI** — notably a
-non-terminal GUI on Windows — is a future client crate (e.g. `nxvim-gui`)
-speaking the same protocol as `nxvim-tui`, with zero changes to the server or
-core. **For now nxvim is terminal-only;** the GUI is explicitly deferred, but
+The terminal client is built on [ratatui](https://ratatui.rs) (over crossterm).
+Because every front end is just a client of nxvim's own RPC, a **native GUI** —
+notably a non-terminal GUI on Windows — is a future client crate (e.g.
+`nxvim-gui`) consuming the same `View` protocol, with zero changes to the server
+or core. **For now nxvim is terminal-only;** the GUI is explicitly deferred, but
 the architecture is built so it slots in without a rewrite.
 
 ---
@@ -198,7 +214,6 @@ screen," and that is exactly the shape of these tests.
 **Similarities (by design):**
 
 - Headless, authoritative editor server with thin UI clients.
-- Wire-compatible msgpack-RPC framing and `nvim_*`-named API methods.
 - Single-threaded editor core; concurrency via async I/O.
 - Lua 5.1 scripting running inside the server.
 - Source organization mirroring neovim's subsystems (one crate per area).
@@ -208,18 +223,21 @@ screen," and that is exactly the shape of these tests.
 
 - Rust crates and ownership instead of C translation units and globals; no
   libuv (tokio), no longjmp error handling (Result/enums).
-- Rope-backed buffers with a strict trailing-newline invariant.
-- The redraw protocol is a simplified, neovim-shaped subset (full lines, no
-  highlight cells) rather than the complete `ext_linegrid` encoding — for now.
+- **Not** a neovim UI host: no `ext_linegrid`, no grid protocol, no goal of
+  attaching external neovim GUIs. The client gets a semantic `View` and lays out
+  ratatui widgets per region itself.
+- Rope-backed (ropey 2.0), byte-indexed buffers with a strict trailing-newline
+  invariant — closer to vim's own byte-column model.
 - Snapshot undo rather than a persistent undo tree — for now.
 
 **Not yet implemented (roadmap):**
 
-- Full `ext_linegrid` cells + syntax highlighting and Treesitter.
+- Syntax highlighting / Treesitter and styled `View` regions.
 - Multiple windows, tabs, and buffers; splits and the window layout tree.
-- Vimscript (`eval.c`) and the bulk of the `nvim_*` API surface.
+- Vimscript (`eval.c`) and a broad Lua `vim.*` API surface.
 - Options (`:set`), mappings (`:map`), registers beyond the unnamed register,
   search (`/`, `?`, `:s`), marks, folds, and macros.
+- Wide-character / tab-width aware display and cursor placement.
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).
 - PTY-driven e2e tests of the binary.

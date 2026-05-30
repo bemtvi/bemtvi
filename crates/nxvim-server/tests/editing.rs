@@ -157,46 +157,43 @@ async fn lua_vim_cmd_drives_the_editor() {
 }
 
 #[tokio::test]
-async fn screen_reflects_typed_text_and_mode() {
+async fn view_reflects_typed_text_and_mode() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello");
     // Barrier: ensure the input (and its redraw) have been processed.
     let _ = lines(&rpc).await;
 
-    let grid = drain_grid(&mut incoming, 24);
-    assert!(grid[0].starts_with("hello"), "first row was {:?}", grid[0]);
+    let view = latest_view(&mut incoming).expect("a redraw view");
 
-    let status = &grid[grid.len() - 2];
-    assert!(status.contains("INSERT"), "status row was {status:?}");
+    let first = view_lines(&view);
+    assert_eq!(first.first().map(String::as_str), Some("hello"));
+    assert_eq!(view_str(&view, "mode_label"), "INSERT");
 }
 
-/// Apply all currently-buffered `redraw` notifications onto a fresh grid.
-fn drain_grid(incoming: &mut UnboundedReceiver<Incoming>, height: usize) -> Vec<String> {
-    let mut rows = vec![String::new(); height];
-    while let Ok(message) = incoming.try_recv() {
-        let Incoming::Notification { method, params } = message else {
-            continue;
-        };
-        if method != "redraw" {
-            continue;
-        }
-        for event in &params {
-            let Value::Array(parts) = event else { continue };
-            match parts.first().and_then(Value::as_str) {
-                Some("resize") => {
-                    let h = parts.get(2).and_then(Value::as_u64).unwrap_or(height as u64) as usize;
-                    rows.resize(h, String::new());
-                }
-                Some("line") => {
-                    let row = parts.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let text = parts.get(2).and_then(Value::as_str).unwrap_or("");
-                    if row < rows.len() {
-                        rows[row] = text.to_string();
-                    }
-                }
-                _ => {}
+/// The most recent `redraw` view map currently buffered on the connection.
+fn latest_view(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<(Value, Value)>> {
+    let mut latest = None;
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "redraw" {
+            if let Some(Value::Map(map)) = params.into_iter().next() {
+                latest = Some(map);
             }
         }
     }
-    rows
+    latest
+}
+
+fn view_lines(view: &[(Value, Value)]) -> Vec<String> {
+    view_get(view, "lines")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+fn view_str(view: &[(Value, Value)], key: &str) -> String {
+    view_get(view, key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn view_get<'a>(view: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    view.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
 }

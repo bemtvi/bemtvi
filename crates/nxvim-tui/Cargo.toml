@@ -15,4 +15,5 @@ tokio.workspace = true
 futures.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+unicode-width.workspace = true
 nxvim-rpc.workspace = true

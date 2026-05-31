@@ -200,6 +200,10 @@ impl Server {
                 Value::from(view.cursor_col as u64),
             ),
             (
+                Value::from("cursor_screen_col"),
+                Value::from(view.cursor_screen_col as u64),
+            ),
+            (
                 Value::from("mode_label"),
                 Value::from(view.mode_label.as_str()),
             ),

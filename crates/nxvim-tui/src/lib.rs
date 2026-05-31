@@ -22,9 +22,13 @@ use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
+use unicode_width::UnicodeWidthChar;
 
 /// Rows reserved at the bottom for the status line and command line.
 const CHROME_ROWS: u16 = 2;
+/// Tab stop width in cells. Must match `nxvim_core::unicode::TABSTOP` so the
+/// painted text lines up with the server's reported screen columns.
+const TABSTOP: usize = 8;
 
 /// Run the client over a connected stream until the server exits or disconnects.
 ///
@@ -110,6 +114,7 @@ struct View {
     lines: Vec<String>,
     cursor_row: u16,
     cursor_col: u16,
+    cursor_screen_col: u16,
     mode_label: String,
     command_mode: bool,
     cmdline: String,
@@ -134,6 +139,7 @@ impl View {
             .unwrap_or_default();
         self.cursor_row = map_u64(map, "cursor_row") as u16;
         self.cursor_col = map_u64(map, "cursor_col") as u16;
+        self.cursor_screen_col = map_u64(map, "cursor_screen_col") as u16;
         self.mode_label = map_str(map, "mode_label");
         self.command_mode = map_get(map, "command_mode")
             .and_then(Value::as_bool)
@@ -166,7 +172,10 @@ fn render(frame: &mut Frame, view: &View) {
         let col = cmd_area.x + 1 + view.cmdline.chars().count() as u16;
         frame.set_cursor_position((col, cmd_area.y));
     } else {
-        frame.set_cursor_position((text_area.x + view.cursor_col, text_area.y + view.cursor_row));
+        frame.set_cursor_position((
+            text_area.x + view.cursor_screen_col,
+            text_area.y + view.cursor_row,
+        ));
     }
 }
 
@@ -174,11 +183,37 @@ fn render_text(frame: &mut Frame, area: Rect, view: &View) {
     let text = Text::from(
         view.lines
             .iter()
-            .cloned()
-            .map(Line::from)
+            .map(|l| Line::from(expand_tabs(l)))
             .collect::<Vec<_>>(),
     );
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Expand tabs to spaces at `TABSTOP`, tracking display width so wide characters
+/// before a tab advance the column correctly. No-op for tab-free lines; the
+/// result never contains a `\t`.
+///
+/// Per-`char` `UnicodeWidthChar` width matches the server's per-grapheme
+/// `unicode::virtcol` (`UnicodeWidthStr`) because str width is just the sum of
+/// its chars' widths — so the cursor's `cursor_screen_col` lines up with the
+/// glyphs painted here.
+fn expand_tabs(line: &str) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + TABSTOP);
+    let mut col = 0;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let spaces = TABSTOP - (col % TABSTOP);
+            out.push_str(&" ".repeat(spaces));
+            col += spaces;
+        } else {
+            out.push(ch);
+            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    out
 }
 
 fn render_status(frame: &mut Frame, area: Rect, view: &View) {

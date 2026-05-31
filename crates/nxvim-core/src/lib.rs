@@ -14,6 +14,7 @@ pub mod buffer;
 pub mod editor;
 pub mod input;
 pub mod mode;
+pub mod unicode;
 pub mod view;
 
 pub use buffer::Buffer;

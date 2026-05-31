@@ -6,11 +6,13 @@
 //! widgets. This keeps layout and styling a UI concern while the core stays the
 //! single source of truth for content, scrolling, and cursor placement.
 //!
-//! Columns are byte offsets (ropey's native metric and vim's column model). One
-//! display cell per byte for now — no wide-char/tab-width handling yet.
+//! Columns are byte offsets (ropey's native metric and vim's column model);
+//! `cursor_screen_col` additionally carries the cursor's screen-cell column,
+//! accounting for wide characters and tabs.
 
 use crate::editor::Editor;
 use crate::mode::Mode;
+use crate::unicode;
 
 /// A snapshot of everything a client needs to draw a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +24,10 @@ pub struct View {
     /// visible window; `col` is a byte/column offset within the line).
     pub cursor_row: usize,
     pub cursor_col: usize,
+    /// Cursor's screen-cell column on its line (wide-char and tab aware). Used
+    /// by clients to place the terminal cursor; `cursor_col` stays the byte
+    /// column for the ruler and `nvim_win_get_cursor`.
+    pub cursor_screen_col: usize,
     /// Uppercase mode name for the status line, e.g. `"NORMAL"`.
     pub mode_label: String,
     /// True while in command-line mode; the cursor then belongs to the command
@@ -60,6 +66,11 @@ impl View {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[No Name]".to_string());
 
+        let cursor_screen_col = {
+            let line = ed.buffer.line(ed.cursor.line);
+            unicode::virtcol(&line, ed.cursor.col, unicode::TABSTOP)
+        };
+
         View {
             lines,
             cursor_row: ed
@@ -68,6 +79,7 @@ impl View {
                 .saturating_sub(ed.top)
                 .min(height.saturating_sub(1)),
             cursor_col: ed.cursor.col,
+            cursor_screen_col,
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,
             cmdline: ed.cmdline.clone(),

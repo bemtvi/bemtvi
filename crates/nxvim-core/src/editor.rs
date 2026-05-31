@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::buffer::Buffer;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
+use crate::unicode;
 use crate::view::View;
 
 /// A cursor position within the current buffer (0-indexed line and column).
@@ -166,7 +167,7 @@ impl Editor {
         // Update vim's `curswant`: vertical motions keep the remembered column,
         // every other action recomputes it from where the cursor landed.
         if !self.preserve_desired {
-            self.desired_col = self.cursor.col;
+            self.desired_col = self.cursor_virtcol();
             self.desired_eol = self.eol_request;
         }
         self.ensure_visible();
@@ -175,7 +176,7 @@ impl Editor {
     /// Run an ex-command directly (the `nvim_command` API entry point).
     pub fn command(&mut self, cmd: &str) {
         self.execute_ex(cmd);
-        self.desired_col = self.cursor.col;
+        self.desired_col = self.cursor_virtcol();
         self.desired_eol = false;
         self.ensure_visible();
     }
@@ -437,7 +438,11 @@ impl Editor {
 
         let motion = match (kc, ch) {
             (KeyCode::Left, _) | (_, Some('h')) | (KeyCode::Backspace, _) => {
-                let col = self.cursor.col.saturating_sub(count);
+                let s = self.buffer.line(line);
+                let mut col = self.cursor.col;
+                for _ in 0..count {
+                    col = unicode::prev_grapheme(&s, col);
+                }
                 MotionResult {
                     target: self.buffer.byte_at(line, col),
                     kind: MotionKind::Exclusive,
@@ -445,7 +450,11 @@ impl Editor {
                 }
             }
             (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => {
-                let col = (self.cursor.col + count).min(self.line_len());
+                let s = self.buffer.line(line);
+                let mut col = self.cursor.col;
+                for _ in 0..count {
+                    col = unicode::next_grapheme(&s, col);
+                }
                 MotionResult {
                     target: self.buffer.byte_at(line, col),
                     kind: MotionKind::Exclusive,
@@ -467,8 +476,8 @@ impl Editor {
             }
             (_, Some('$')) | (KeyCode::End, _) => {
                 let l = (line + count - 1).min(last_line);
-                let len = self.buffer.line_len(l);
-                let col = len.saturating_sub(1);
+                let s = self.buffer.line(l);
+                let col = unicode::prev_grapheme(&s, s.len());
                 MotionResult {
                     target: self.buffer.byte_at(l, col),
                     kind: MotionKind::Inclusive,
@@ -588,11 +597,11 @@ impl Editor {
         let start = char_class(self.char_at(idx));
         if start != CharClass::Blank {
             while idx < last && char_class(self.char_at(idx)) == start {
-                idx += 1;
+                idx = self.next_grapheme_idx(idx);
             }
         }
         while idx < last && char_class(self.char_at(idx)) == CharClass::Blank {
-            idx += 1;
+            idx = self.next_grapheme_idx(idx);
         }
         idx
     }
@@ -601,16 +610,20 @@ impl Editor {
         if idx == 0 {
             return 0;
         }
-        idx -= 1;
+        idx = self.prev_grapheme_idx(idx);
         while idx > 0 && char_class(self.char_at(idx)) == CharClass::Blank {
-            idx -= 1;
+            idx = self.prev_grapheme_idx(idx);
         }
         if idx == 0 {
             return 0;
         }
         let cls = char_class(self.char_at(idx));
-        while idx > 0 && char_class(self.char_at(idx - 1)) == cls {
-            idx -= 1;
+        while idx > 0 {
+            let prev = self.prev_grapheme_idx(idx);
+            if char_class(self.char_at(prev)) != cls {
+                break;
+            }
+            idx = prev;
         }
         idx
     }
@@ -620,16 +633,17 @@ impl Editor {
         if idx >= last {
             return idx;
         }
-        idx += 1;
+        idx = self.next_grapheme_idx(idx);
         while idx < last && char_class(self.char_at(idx)) == CharClass::Blank {
-            idx += 1;
+            idx = self.next_grapheme_idx(idx);
         }
         let cls = char_class(self.char_at(idx));
-        while idx + 1 < self.buffer.len_bytes()
-            && idx < last
-            && char_class(self.char_at(idx + 1)) == cls
-        {
-            idx += 1;
+        while idx < last {
+            let next = self.next_grapheme_idx(idx);
+            if next > last || char_class(self.char_at(next)) != cls {
+                break;
+            }
+            idx = next;
         }
         idx
     }
@@ -789,12 +803,12 @@ impl Editor {
         self.buffer.modified = true;
     }
 
-    /// Clamp a byte range into bounds and onto char boundaries, so motion-derived
-    /// endpoints can never split a multi-byte char (a no-op for ASCII).
+    /// Clamp a byte range into bounds and onto grapheme boundaries, so a
+    /// motion-derived endpoint can never split a cluster (a no-op for ASCII).
     fn snap_range(&self, lo: usize, hi: usize) -> (usize, usize) {
         let hi = hi.min(self.buffer.len_bytes());
-        let lo = self.buffer.text.floor_char_boundary(lo.min(hi));
-        let hi = self.buffer.text.ceil_char_boundary(hi);
+        let lo = self.grapheme_floor_abs(lo.min(hi));
+        let hi = self.grapheme_ceil_abs(hi);
         (lo, hi)
     }
 
@@ -805,7 +819,7 @@ impl Editor {
         }
         let lo = self.cursor_char();
         let line_end = self.buffer.byte_at(self.cursor.line, len);
-        let (hi, _) = self.advance_chars(lo, count, line_end);
+        let (hi, _) = self.advance_graphemes(lo, count, line_end);
         self.yank_range(lo, hi, false);
         self.delete_range(lo, hi);
         self.clamp_cursor();
@@ -839,7 +853,7 @@ impl Editor {
         let len = self.line_len();
         let lo = self.cursor_char();
         let line_end = self.buffer.byte_at(self.cursor.line, len);
-        let (hi, crossed) = self.advance_chars(lo, count, line_end);
+        let (hi, crossed) = self.advance_graphemes(lo, count, line_end);
         // `r` does nothing unless `count` whole characters remain on the line.
         if crossed < count {
             return;
@@ -872,7 +886,8 @@ impl Editor {
             };
             self.buffer.text.remove(idx..idx + c.len_utf8());
             self.buffer.text.insert(idx, &swapped);
-            self.cursor.col += swapped.len();
+            let s = self.buffer.line(self.cursor.line);
+            self.cursor.col = unicode::next_grapheme(&s, self.cursor.col);
         }
         self.buffer.modified = true;
         self.clamp_cursor();
@@ -952,13 +967,18 @@ impl Editor {
             let len = self.line_len();
             let cur = self.cursor_char();
             let line_end = self.buffer.byte_at(self.cursor.line, len);
+            // Paste *after* lands past the whole grapheme under the cursor, never
+            // between a base char and its combining mark.
             let at = if after && len > 0 {
-                self.buffer.text.ceil_char_boundary(cur + 1).min(line_end)
+                self.next_grapheme_idx(cur).min(line_end)
             } else {
                 cur
             };
             let chunk = self.register.text.repeat(count);
-            let last_len = chunk.chars().next_back().map(char::len_utf8).unwrap_or(1);
+            // Byte length of the chunk's final grapheme, so the cursor lands on
+            // it (not on a trailing combining mark) — vim leaves it on the last
+            // pasted character.
+            let last_len = chunk.len() - unicode::prev_grapheme(&chunk, chunk.len());
             let end = at + chunk.len();
             self.buffer.text.insert(at, &chunk);
             self.set_cursor_char(end.saturating_sub(last_len));
@@ -982,9 +1002,9 @@ impl Editor {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 if self.cursor.col > 0 {
-                    self.cursor.col -= 1;
+                    let s = self.buffer.line(self.cursor.line);
+                    self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
                 }
-                self.desired_col = self.cursor.col;
                 self.clamp_cursor();
                 self.snapshot_taken = false;
             }
@@ -1002,15 +1022,23 @@ impl Editor {
                 self.cursor.col += 1;
                 self.buffer.modified = true;
             }
-            KeyCode::Left => self.cursor.col = self.cursor.col.saturating_sub(1),
-            KeyCode::Right => self.cursor.col = (self.cursor.col + 1).min(self.line_len()),
+            KeyCode::Left => {
+                let s = self.buffer.line(self.cursor.line);
+                self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
+            }
+            KeyCode::Right => {
+                let s = self.buffer.line(self.cursor.line);
+                self.cursor.col = unicode::next_grapheme(&s, self.cursor.col).min(s.len());
+            }
             KeyCode::Up => self.move_vertical(-1, true),
             KeyCode::Down => self.move_vertical(1, true),
             KeyCode::Delete => {
                 let len = self.line_len();
                 if self.cursor.col < len {
                     let at = self.cursor_char();
-                    let end = self.buffer.text.ceil_char_boundary(at + 1);
+                    let s = self.buffer.line(self.cursor.line);
+                    let end = self.buffer.line_start(self.cursor.line)
+                        + unicode::next_grapheme(&s, self.cursor.col);
                     self.buffer.text.remove(at..end);
                     self.buffer.modified = true;
                 }
@@ -1018,7 +1046,9 @@ impl Editor {
             KeyCode::Char(c) => {
                 let at = self.cursor_char();
                 if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
-                    let end = self.buffer.text.ceil_char_boundary(at + 1);
+                    let s = self.buffer.line(self.cursor.line);
+                    let end = self.buffer.line_start(self.cursor.line)
+                        + unicode::next_grapheme(&s, self.cursor.col);
                     self.buffer.text.remove(at..end);
                 }
                 self.buffer.text.insert_char(at, c);
@@ -1033,9 +1063,10 @@ impl Editor {
         if self.cursor.col > 0 {
             let at = self.cursor_char();
             let start = self.buffer.line_start(self.cursor.line);
-            let prev = self.buffer.text.floor_char_boundary(at - 1).max(start);
-            self.buffer.text.remove(prev..at);
-            self.cursor.col = prev - start;
+            let s = self.buffer.line(self.cursor.line);
+            let prev_col = unicode::prev_grapheme(&s, self.cursor.col);
+            self.buffer.text.remove(start + prev_col..at);
+            self.cursor.col = prev_col;
             self.buffer.modified = true;
         } else if self.cursor.line > 0 {
             let prev_len = self.buffer.line_len(self.cursor.line - 1);
@@ -1215,23 +1246,81 @@ impl Editor {
         self.buffer.text.get_char(idx).unwrap_or(' ')
     }
 
-    /// Advance `count` characters forward from byte offset `from`, never passing
-    /// `limit`. Returns the new offset and how many characters were crossed.
-    fn advance_chars(&self, mut from: usize, count: usize, limit: usize) -> (usize, usize) {
+    /// Byte offset one grapheme-cluster forward from `idx` over the whole buffer.
+    /// The trailing `\n` of each line is itself a single-byte grapheme.
+    fn next_grapheme_idx(&self, idx: usize) -> usize {
+        let line = self.buffer.byte_to_line(idx);
+        let start = self.buffer.line_start(line);
+        let s = self.buffer.line(line);
+        let rel = idx - start;
+        if rel < s.len() {
+            start + unicode::next_grapheme(&s, rel)
+        } else {
+            (idx + 1).min(self.buffer.len_bytes())
+        }
+    }
+
+    /// Byte offset one grapheme-cluster backward from `idx` over the whole buffer.
+    fn prev_grapheme_idx(&self, idx: usize) -> usize {
+        if idx == 0 {
+            return 0;
+        }
+        let line = self.buffer.byte_to_line(idx);
+        let start = self.buffer.line_start(line);
+        let s = self.buffer.line(line);
+        let rel = idx - start;
+        if rel == 0 {
+            idx - 1
+        } else {
+            start + unicode::prev_grapheme(&s, rel.min(s.len()))
+        }
+    }
+
+    /// Snap an absolute byte offset down to a grapheme boundary.
+    fn grapheme_floor_abs(&self, idx: usize) -> usize {
+        let line = self.buffer.byte_to_line(idx);
+        let start = self.buffer.line_start(line);
+        let s = self.buffer.line(line);
+        let rel = idx.saturating_sub(start).min(s.len());
+        start + unicode::floor_grapheme(&s, rel)
+    }
+
+    /// Snap an absolute byte offset up to a grapheme boundary.
+    fn grapheme_ceil_abs(&self, idx: usize) -> usize {
+        let floored = self.grapheme_floor_abs(idx);
+        if floored >= idx {
+            floored
+        } else {
+            self.next_grapheme_idx(floored)
+        }
+    }
+
+    /// Virtual (screen) column of the cursor on its current line.
+    fn cursor_virtcol(&self) -> usize {
+        let s = self.buffer.line(self.cursor.line);
+        unicode::virtcol(&s, self.cursor.col, unicode::TABSTOP)
+    }
+
+    /// Advance `count` grapheme clusters forward from byte offset `from`, never
+    /// passing `limit`. Returns the new offset and how many clusters were crossed.
+    fn advance_graphemes(&self, mut from: usize, count: usize, limit: usize) -> (usize, usize) {
         let mut crossed = 0;
         while crossed < count && from < limit {
-            from = self.buffer.text.ceil_char_boundary(from + 1).min(limit);
+            let next = self.next_grapheme_idx(from).min(limit);
+            if next == from {
+                break;
+            }
+            from = next;
             crossed += 1;
         }
         (from, crossed)
     }
 
-    /// Snap the cursor column down to the nearest char boundary (a no-op for
+    /// Snap the cursor column down to the nearest grapheme boundary (a no-op for
     /// ASCII), so byte offsets handed to the rope are always valid.
     fn snap_cursor(&mut self) {
-        let start = self.buffer.line_start(self.cursor.line);
-        let abs = start + self.cursor.col;
-        self.cursor.col = self.buffer.text.floor_char_boundary(abs) - start;
+        let s = self.buffer.line(self.cursor.line);
+        self.cursor.col = unicode::floor_grapheme(&s, self.cursor.col.min(s.len()));
     }
 
     fn last_char_idx(&self) -> usize {
@@ -1245,10 +1334,7 @@ impl Editor {
 
     fn first_non_blank(&self, line: usize) -> usize {
         let s = self.buffer.line(line);
-        s.chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .count()
-            .min(s.chars().count())
+        s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count()
     }
 
     fn set_cursor_char(&mut self, idx: usize) {
@@ -1259,6 +1345,7 @@ impl Editor {
         let line = self.buffer.byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer.line_start(line);
+        self.snap_cursor();
     }
 
     fn set_cursor_char_insert(&mut self, idx: usize) {
@@ -1269,6 +1356,7 @@ impl Editor {
         let line = self.buffer.byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer.line_start(line);
+        self.snap_cursor();
     }
 
     fn move_vertical(&mut self, delta: i64, allow_eol: bool) {
@@ -1278,21 +1366,24 @@ impl Editor {
         self.preserve_desired = true;
     }
 
-    /// Place the cursor on the current line at the remembered desired column
-    /// (or end-of-line when `$`-sticky), clamped to the line and a char boundary.
+    /// Place the cursor on the current line at the remembered desired *virtual*
+    /// column (or end-of-line when `$`-sticky), clamped to the line and a grapheme
+    /// boundary.
     fn settle_desired_col(&mut self, allow_eol: bool) {
-        let len = self.line_len();
-        let max_col = if allow_eol {
-            len
+        let s = self.buffer.line(self.cursor.line);
+        // Furthest valid resting byte: past-end for insert/allow_eol, otherwise
+        // the start of the last grapheme (normal mode can't rest past EOL).
+        let max_byte = if allow_eol {
+            s.len()
         } else {
-            len.saturating_sub(1)
+            unicode::prev_grapheme(&s, s.len())
         };
-        self.cursor.col = if self.desired_eol {
-            max_col
+        let target = if self.desired_eol {
+            max_byte
         } else {
-            self.desired_col.min(max_col)
+            unicode::byte_at_virtcol(&s, self.desired_col, unicode::TABSTOP).min(max_byte)
         };
-        self.snap_cursor();
+        self.cursor.col = unicode::floor_grapheme(&s, target);
     }
 
     fn clamp_cursor(&mut self) {

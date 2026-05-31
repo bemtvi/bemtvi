@@ -263,8 +263,184 @@ fn view_str(view: &[(Value, Value)], key: &str) -> String {
         .to_string()
 }
 
+fn view_u64(view: &[(Value, Value)], key: &str) -> u64 {
+    view_get(view, key).and_then(Value::as_u64).unwrap_or(0)
+}
+
 fn view_get<'a>(view: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     view.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .map(|(_, v)| v)
+}
+
+#[tokio::test]
+async fn screen_column_accounts_for_wide_characters() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "i日本<Esc>"); // each CJK char is 3 bytes wide, 2 cells wide
+    let _ = lines(&rpc).await; // barrier so the redraw is buffered
+    let view = latest_view(&mut incoming).expect("a redraw view");
+    // Cursor rests on the last char 本: byte column 3, screen column 2.
+    assert_eq!(view_u64(&view, "cursor_col"), 3);
+    assert_eq!(view_u64(&view, "cursor_screen_col"), 2);
+}
+
+#[tokio::test]
+async fn screen_column_expands_tabs_to_the_next_tabstop() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "i<Tab>x<Esc>");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+    // Cursor on 'x' at byte column 1; the leading tab puts it at screen col 8.
+    assert_eq!(view_u64(&view, "cursor_col"), 1);
+    assert_eq!(view_u64(&view, "cursor_screen_col"), 8);
+}
+
+#[tokio::test]
+async fn horizontal_motion_steps_over_multibyte_chars() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "in\u{e9}on<Esc>"); // "néon": n é(2 bytes) o n
+    feed(&rpc, "0");
+    assert_eq!(cursor(&rpc).await, (1, 0)); // 'n'
+    feed(&rpc, "l");
+    assert_eq!(cursor(&rpc).await, (1, 1)); // 'é'
+    feed(&rpc, "l");
+    assert_eq!(cursor(&rpc).await, (1, 3)); // 'o' — skipped é's second byte
+    feed(&rpc, "l");
+    assert_eq!(cursor(&rpc).await, (1, 4)); // last 'n'
+    feed(&rpc, "l");
+    assert_eq!(cursor(&rpc).await, (1, 4)); // stays put at end of line
+    feed(&rpc, "hh");
+    assert_eq!(cursor(&rpc).await, (1, 1)); // back across 'o' and onto 'é'
+}
+
+#[tokio::test]
+async fn x_deletes_a_whole_grapheme_cluster() {
+    let (rpc, _incoming) = start(None).await;
+    // 'e' + combining acute accent (one grapheme, three bytes) followed by 'x'.
+    feed(&rpc, "ie\u{0301}x<Esc>");
+    feed(&rpc, "0x");
+    assert_eq!(lines(&rpc).await, vec!["x"]);
+}
+
+#[tokio::test]
+async fn x_deletes_a_wide_char_and_leaves_the_rest() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "i日本<Esc>");
+    feed(&rpc, "0x");
+    assert_eq!(lines(&rpc).await, vec!["本"]);
+}
+
+#[tokio::test]
+async fn charwise_paste_keeps_a_combining_grapheme_intact() {
+    // "éx" is e + combining acute, then x. Yank the é cluster, then paste it
+    // after the cursor: it must land whole after é, never split between the
+    // base and its combining mark.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ie\u{0301}x<Esc>");
+    feed(&rpc, "0ylp");
+    assert_eq!(lines(&rpc).await, vec!["e\u{0301}e\u{0301}x"]);
+}
+
+#[tokio::test]
+async fn r_replaces_a_whole_grapheme_cluster() {
+    // `r` removes its range directly (it does not go through the grapheme-aware
+    // snap_range that `x` uses), so grapheme-stepping the advance is what keeps
+    // the combining mark from being orphaned onto the replacement character.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ie\u{0301}x<Esc>"); // "éx" as e + combining acute + x
+    feed(&rpc, "0rz"); // replace the first grapheme (é) with 'z'
+    assert_eq!(lines(&rpc).await, vec!["zx"]);
+}
+
+#[tokio::test]
+async fn insert_backspace_deletes_a_precomposed_char() {
+    let (rpc, _incoming) = start(None).await;
+    // Type "aé" (é precomposed, 2 bytes) then backspace once: the whole 'é' goes.
+    feed(&rpc, "ia\u{e9}");
+    feed(&rpc, "<BS>");
+    feed(&rpc, "<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a"]);
+}
+
+#[tokio::test]
+async fn insert_backspace_deletes_a_combining_grapheme() {
+    let (rpc, _incoming) = start(None).await;
+    // Type "a" then "e" + combining acute (one grapheme). Backspace must remove
+    // the WHOLE cluster (base + mark), not just the combining mark.
+    feed(&rpc, "iae\u{0301}");
+    feed(&rpc, "<BS>");
+    feed(&rpc, "<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a"]);
+}
+
+#[tokio::test]
+async fn dw_deletes_a_multibyte_word() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ih\u{e9}llo w\u{f6}rld<Esc>"); // "héllo wörld"
+    feed(&rpc, "0dw");
+    assert_eq!(lines(&rpc).await, vec!["w\u{f6}rld"]);
+}
+
+#[tokio::test]
+async fn b_and_e_handle_multibyte_words() {
+    // "foo wörld": w is byte 4, ö spans bytes 5..7, d is byte 9.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo w\u{f6}rld<Esc>");
+    // `b` lands on a word boundary, never inside ö's continuation byte.
+    feed(&rpc, "$b");
+    assert_eq!(cursor(&rpc).await, (1, 4)); // start of "wörld"
+    feed(&rpc, "b");
+    assert_eq!(cursor(&rpc).await, (1, 0)); // start of "foo"
+
+    // `e` lands on the last char of each word, stepping over the wide cluster.
+    feed(&rpc, "e");
+    assert_eq!(cursor(&rpc).await, (1, 2)); // last 'o' of "foo"
+    feed(&rpc, "e");
+    assert_eq!(cursor(&rpc).await, (1, 9)); // 'd' at the end of "wörld"
+}
+
+#[tokio::test]
+async fn vertical_motion_keeps_screen_column_across_wide_chars() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "i日本x<Esc>"); // screen columns: 日@0, 本@2, x@4
+    feed(&rpc, "oabcdef<Esc>"); // an ASCII line below it
+    feed(&rpc, "gg"); // line 1, on 日
+    feed(&rpc, "l"); // → 本, byte col 3, screen col 2
+    assert_eq!(cursor(&rpc).await, (1, 3));
+    feed(&rpc, "j"); // down: screen col 2 → byte col 2 ('c')
+    assert_eq!(cursor(&rpc).await, (2, 2));
+    feed(&rpc, "k"); // back up: screen col 2 → byte col 3 (本)
+    assert_eq!(cursor(&rpc).await, (1, 3));
+}
+
+#[tokio::test]
+async fn vertical_motion_keeps_screen_column_across_a_tab() {
+    // A leading tab expands to 8 cells, so 'x' sits at screen column 8 even
+    // though it is byte 1. Vertical motion must map that screen column onto the
+    // ASCII line below (where byte == screen column).
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "i<Tab>x<Esc>"); // line 1: "\tx"
+    feed(&rpc, "oabcdefghij<Esc>"); // line 2: ASCII
+    feed(&rpc, "ggl"); // line 1, onto 'x' at byte 1 / screen col 8
+    assert_eq!(cursor(&rpc).await, (1, 1));
+    feed(&rpc, "j"); // down: screen col 8 → byte 8 ('i')
+    assert_eq!(cursor(&rpc).await, (2, 8));
+    feed(&rpc, "k"); // back up: screen col 8 → byte 1 ('x')
+    assert_eq!(cursor(&rpc).await, (1, 1));
+}
+
+#[tokio::test]
+async fn dl_deletes_a_trailing_multibyte_grapheme() {
+    // `dl` on the last char must delete that whole grapheme (like `x`) and keep
+    // the line's newline. This relies on `l` advancing its motion target to
+    // end-of-line (s.len()) so the exclusive operator range covers the last
+    // character; clamping `l` short of EOL would make `dl` a no-op here.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "in\u{e9}on<Esc>"); // "néon"
+    feed(&rpc, "$dl"); // on last 'n' -> delete it
+    assert_eq!(lines(&rpc).await, vec!["n\u{e9}o"]);
+    feed(&rpc, "$dl"); // on 'o' -> delete it
+    assert_eq!(lines(&rpc).await, vec!["n\u{e9}"]);
+    feed(&rpc, "$dl"); // on 'é' -> delete the whole 2-byte cluster
+    assert_eq!(lines(&rpc).await, vec!["n"]);
 }

@@ -883,6 +883,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ropey",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -925,6 +927,7 @@ dependencies = [
  "ratatui",
  "rmpv",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

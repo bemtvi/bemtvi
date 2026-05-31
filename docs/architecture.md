@@ -149,8 +149,11 @@ invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is
 `"\n"` (one empty line) and the editable line count is `rope.len_lines() - 1`.
 The phantom final line is never displayed or edited.
 
-(Display still assumes one cell per byte/char — no wide-char or tab-width
-handling yet — so cursor placement for non-ASCII text is approximate for now.)
+Motion steps by **grapheme cluster** and the cursor's display column is computed
+as a **virtual column** (wide characters via `unicode-width`, tabs expanded to a
+fixed `tabstop` of 8), carried in the `View` as `cursor_screen_col`. `cursor.col`
+remains a byte offset (what `nvim_win_get_cursor` returns); the TUI expands tabs
+when painting so glyphs line up with that virtual column.
 
 Undo is currently snapshot-based (cheap thanks to ropey's structural sharing);
 it will move to a change-tree closer to neovim's `undo.c` as editing grows.
@@ -237,7 +240,6 @@ screen," and that is exactly the shape of these tests.
 - Vimscript (`eval.c`) and a broad Lua `vim.*` API surface.
 - Options (`:set`), mappings (`:map`), registers beyond the unnamed register,
   search (`/`, `?`, `:s`), marks, folds, and macros.
-- Wide-character / tab-width aware display and cursor placement.
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).
 - PTY-driven e2e tests of the binary.

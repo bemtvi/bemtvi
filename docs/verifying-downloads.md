@@ -24,3 +24,21 @@ gh attestation verify nxvim-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/nxvi
 
 A successful run confirms the artifact was produced by the `nxvim` release
 workflow at a specific commit, and was not tampered with afterwards.
+
+## macOS signature & notarization
+
+The macOS binaries are signed with an Apple **Developer ID Application** certificate, built
+with the hardened runtime, and **notarized** by Apple, so they run on any Mac without a
+Gatekeeper override. Confirm locally:
+
+```sh
+# Signature, authority chain, hardened runtime (look for flags=...(runtime)):
+codesign -dv --verbose=4 nxvim
+
+# Gatekeeper assessment — "accepted" / "source=Notarized Developer ID" (needs network):
+spctl -a -t exec -vv nxvim
+```
+
+The binaries are not stapled (Apple does not support stapling a notarization ticket to a
+standalone executable), so the `spctl` check performs an online verification. A terminal
+install (`curl … | tar xz`) sets no quarantine attribute and runs offline regardless.

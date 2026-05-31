@@ -7,6 +7,17 @@ on:
         description: "Version string used in archive names (e.g. 0.2.0 or edge)"
         required: true
         type: string
+    secrets:
+      MACOS_CERT_P12:
+        required: false
+      MACOS_CERT_PASSWORD:
+        required: false
+      AC_API_KEY_P8:
+        required: false
+      AC_API_KEY_ID:
+        required: false
+      AC_API_ISSUER_ID:
+        required: false
 
 jobs:
   build:
@@ -58,6 +69,76 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build --release -p nxvim --target ${{ matrix.target }}
+
+      - name: Import signing certificate (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          CERT="$RUNNER_TEMP/cert.p12"
+
+          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # Make the temp keychain searchable alongside the existing ones (word-splitting intended).
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/[\"[:space:]]//g')
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No Developer ID Application identity found in the imported certificate"
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          rm -f "$CERT"
+
+      - name: Codesign binary (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          # shellcheck disable=SC2154  # SIGN_KEYCHAIN/SIGN_IDENTITY arrive via $GITHUB_ENV
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/nxvim"
+          codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      - name: Notarize binary (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/nxvim"
+          KEY="$RUNNER_TEMP/ac_api.p8"
+          ZIP="$RUNNER_TEMP/nxvim-notarize.zip"
+
+          echo "$AC_API_KEY_P8" | base64 --decode > "$KEY"
+          ditto -c -k --keepParent "$BIN" "$ZIP"
+
+          if ! OUT="$(xcrun notarytool submit "$ZIP" --key "$KEY" --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait --timeout 30m 2>&1)"; then
+            printf '%s\n' "$OUT"
+            ID="$(printf '%s\n' "$OUT" | awk '/id:/{print $2; exit}')"
+            if [ -n "$ID" ]; then
+              xcrun notarytool log "$ID" --key "$KEY" --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" || true
+            fi
+            rm -f "$KEY"
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+          rm -f "$KEY"
 
       - name: Package (Unix)
         if: matrix.os != 'windows'

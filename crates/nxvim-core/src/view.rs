@@ -42,11 +42,17 @@ pub struct View {
     pub modified: bool,
     /// 1-based cursor line, for the status-line ruler.
     pub cursor_line: usize,
+    /// Per visible row (aligned with `lines`), the half-open screen-column span
+    /// `[start, end)` to paint as the visual-mode selection, or `None` when that
+    /// row carries no selection. All `None` outside visual modes. `end` may
+    /// exceed the row's text width to mark a selected newline (one extra cell) or
+    /// to fill a linewise selection to the viewport edge.
+    pub selection: Vec<Option<(usize, usize)>>,
 }
 
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
-        let (_, height) = ed.dims();
+        let (width, height) = ed.dims();
         let line_count = ed.buffer.line_count();
 
         let mut lines = Vec::with_capacity(height);
@@ -58,6 +64,8 @@ impl View {
                 lines.push("~".to_string());
             }
         }
+
+        let selection = selection_spans(ed, width, line_count);
 
         let file_name = ed
             .buffer
@@ -87,6 +95,58 @@ impl View {
             file_name,
             modified: ed.buffer.modified,
             cursor_line: ed.cursor.line + 1,
+            selection,
         }
     }
+}
+
+/// Compute, for each of the `height` visible rows, the half-open screen-column
+/// span to highlight as the visual selection (or `None`). Returns all-`None`
+/// outside visual modes.
+fn selection_spans(ed: &Editor, width: usize, line_count: usize) -> Vec<Option<(usize, usize)>> {
+    let (_, height) = ed.dims();
+    let mut spans = vec![None; height];
+    if !ed.mode.is_visual() {
+        return spans;
+    }
+
+    // Order the two ends of the selection by buffer position.
+    let a = ed.visual_anchor();
+    let c = ed.cursor;
+    let (start, end) = if (a.line, a.col) <= (c.line, c.col) {
+        (a, c)
+    } else {
+        (c, a)
+    };
+    let linewise = ed.mode == Mode::VisualLine;
+
+    for (row, span) in spans.iter_mut().enumerate() {
+        let buf_line = ed.top + row;
+        if buf_line >= line_count || buf_line < start.line || buf_line > end.line {
+            continue;
+        }
+        let text = ed.buffer.line(buf_line);
+
+        if linewise {
+            // Whole line, filled to the viewport edge — as vim paints it.
+            *span = Some((0, width));
+            continue;
+        }
+
+        // Charwise: clip the inclusive [start, end] region to this row.
+        let lo = if buf_line == start.line { start.col } else { 0 };
+        let start_col = unicode::virtcol(&text, lo, unicode::TABSTOP);
+        let end_col = if buf_line == end.line {
+            // Include the grapheme under the trailing cursor.
+            let hi = unicode::next_grapheme(&text, end.col.min(text.len()));
+            unicode::virtcol(&text, hi, unicode::TABSTOP)
+        } else {
+            // The selection continues onto the next line: highlight the text and
+            // one extra cell standing in for the selected newline.
+            unicode::virtcol(&text, text.len(), unicode::TABSTOP) + 1
+        };
+        *span = Some((start_col, end_col));
+    }
+
+    spans
 }

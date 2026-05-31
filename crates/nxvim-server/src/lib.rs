@@ -189,6 +189,17 @@ impl Server {
         let view = self.editor.view(w, h);
 
         let lines = Value::Array(view.lines.iter().map(|l| Value::from(l.as_str())).collect());
+        let selection = Value::Array(
+            view.selection
+                .iter()
+                .map(|s| match s {
+                    Some((start, end)) => {
+                        Value::Array(vec![Value::from(*start as u64), Value::from(*end as u64)])
+                    }
+                    None => Value::Nil,
+                })
+                .collect(),
+        );
         let map = vec![
             (Value::from("lines"), lines),
             (
@@ -219,6 +230,7 @@ impl Server {
                 Value::from("cursor_line"),
                 Value::from(view.cursor_line as u64),
             ),
+            (Value::from("selection"), selection),
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);

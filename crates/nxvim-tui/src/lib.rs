@@ -17,7 +17,7 @@ use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
@@ -122,6 +122,9 @@ struct View {
     file_name: String,
     modified: bool,
     cursor_line: usize,
+    /// Per visible row, the half-open screen-column span `[start, end)` to paint
+    /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
+    selection: Vec<Option<(u16, u16)>>,
 }
 
 impl View {
@@ -151,6 +154,20 @@ impl View {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         self.cursor_line = map_u64(map, "cursor_line") as usize;
+        self.selection = map_get(map, "selection")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|v| match v.as_array() {
+                        Some(pair) if pair.len() == 2 => Some((
+                            pair[0].as_u64().unwrap_or(0) as u16,
+                            pair[1].as_u64().unwrap_or(0) as u16,
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 }
 
@@ -180,13 +197,63 @@ fn render(frame: &mut Frame, view: &View) {
 }
 
 fn render_text(frame: &mut Frame, area: Rect, view: &View) {
+    let width = area.width as usize;
     let text = Text::from(
         view.lines
             .iter()
-            .map(|l| Line::from(expand_tabs(l)))
+            .enumerate()
+            .map(|(row, l)| {
+                let sel = view.selection.get(row).copied().flatten();
+                highlight_line(l, sel, width)
+            })
             .collect::<Vec<_>>(),
     );
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Build a display line, styling the screen columns in `sel` as the visual
+/// selection. `sel` is a half-open `[start, end)` span of screen cells; `end`
+/// may run past the text to mark a selected newline or fill a linewise
+/// selection, in which case the gap up to `max_width` is painted with blanks.
+fn highlight_line(line: &str, sel: Option<(u16, u16)>, max_width: usize) -> Line<'static> {
+    let expanded = expand_tabs(line);
+    let (start, end) = match sel {
+        Some((s, e)) if e > s => (s as usize, e as usize),
+        _ => return Line::from(expanded),
+    };
+
+    // Partition the (tab-expanded) cells into before / selected / after by their
+    // screen column, tracking width so wide glyphs advance two cells.
+    let (mut pre, mut mid, mut post) = (String::new(), String::new(), String::new());
+    let mut col = 0usize;
+    for ch in expanded.chars() {
+        if col < start {
+            pre.push(ch);
+        } else if col < end {
+            mid.push(ch);
+        } else {
+            post.push(ch);
+        }
+        col += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    // Extend the highlight past end-of-text (selected newline / linewise fill).
+    while col < end && col < max_width {
+        mid.push(' ');
+        col += 1;
+    }
+
+    let hl = Style::default().add_modifier(Modifier::REVERSED);
+    let mut spans = Vec::with_capacity(3);
+    if !pre.is_empty() {
+        spans.push(Span::raw(pre));
+    }
+    if !mid.is_empty() {
+        spans.push(Span::styled(mid, hl));
+    }
+    if !post.is_empty() {
+        spans.push(Span::raw(post));
+    }
+    Line::from(spans)
 }
 
 /// Expand tabs to spaces at `TABSTOP`, tracking display width so wide characters

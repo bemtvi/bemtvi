@@ -256,6 +256,24 @@ fn view_lines(view: &[(Value, Value)]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Per visible row, the highlighted screen-column span `[start, end)`, or
+/// `None` for rows with no visual selection.
+fn view_selection(view: &[(Value, Value)]) -> Vec<Option<(u64, u64)>> {
+    view_get(view, "selection")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|v| match v.as_array() {
+                    Some(pair) if pair.len() == 2 => {
+                        Some((pair[0].as_u64().unwrap_or(0), pair[1].as_u64().unwrap_or(0)))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn view_str(view: &[(Value, Value)], key: &str) -> String {
     view_get(view, key)
         .and_then(Value::as_str)
@@ -293,6 +311,77 @@ async fn screen_column_expands_tabs_to_the_next_tabstop() {
     // Cursor on 'x' at byte column 1; the leading tab puts it at screen col 8.
     assert_eq!(view_u64(&view, "cursor_col"), 1);
     assert_eq!(view_u64(&view, "cursor_screen_col"), 8);
+}
+
+#[tokio::test]
+async fn charwise_visual_highlights_the_selected_columns() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Back to column 0, then select three characters inclusively (h, e, l).
+    feed(&rpc, "0vll");
+    let _ = lines(&rpc).await; // barrier so the redraw is buffered
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    // Cursor rests on the third char, which is included → columns [0, 3).
+    assert_eq!(sel.first().copied().flatten(), Some((0, 3)));
+    // No other visible row is selected.
+    assert!(sel.iter().skip(1).all(Option::is_none));
+}
+
+#[tokio::test]
+async fn charwise_visual_spanning_lines_marks_the_newline_cell() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<Esc>");
+    // Top of buffer, column 0, then select down onto the second line's 'b'.
+    feed(&rpc, "gg0vj");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    // First line is fully selected plus one trailing cell for the newline.
+    assert_eq!(sel.first().copied().flatten(), Some((0, 4)));
+    // Second line is selected up to and including the char under the cursor.
+    assert_eq!(sel.get(1).copied().flatten(), Some((0, 1)));
+}
+
+#[tokio::test]
+async fn linewise_visual_highlights_the_whole_line_width() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    feed(&rpc, "V");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    // Linewise selection fills the line to the viewport edge (attached at 80).
+    assert_eq!(sel.first().copied().flatten(), Some((0, 80)));
+}
+
+#[tokio::test]
+async fn charwise_visual_selecting_backwards_orders_the_span() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>");
+    // Cursor rests on 'o' (col 4); select leftwards back to 'l' (col 2).
+    feed(&rpc, "vhh");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    // Anchor 'o' and cursor 'l' are both inclusive → columns [2, 5).
+    assert_eq!(sel.first().copied().flatten(), Some((2, 5)));
+}
+
+#[tokio::test]
+async fn leaving_visual_mode_clears_the_selection() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>");
+    feed(&rpc, "0vll<Esc>");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    assert!(sel.iter().all(Option::is_none));
 }
 
 #[tokio::test]

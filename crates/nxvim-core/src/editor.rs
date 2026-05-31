@@ -197,6 +197,12 @@ impl Editor {
         (self.width, self.height)
     }
 
+    /// The fixed end of the visual selection (the other end is [`Self::cursor`]).
+    /// Only meaningful while [`Self::mode`] is a visual mode.
+    pub(crate) fn visual_anchor(&self) -> Cursor {
+        self.visual_anchor
+    }
+
     pub(crate) fn text_height(&self) -> usize {
         self.height.max(1)
     }

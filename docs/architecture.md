@@ -127,6 +127,14 @@ the visible text rows, the cursor position, and the data a status/command line
 need (mode, file name, modified flag, ruler, message, command-line text). The
 server sends it as a single `redraw` notification carrying one msgpack map.
 
+The `View` also carries the first **styled** region: `selection`, a per-row
+array of half-open screen-column spans `[start, end)` marking the visual-mode
+selection (`None` for unselected rows). The core resolves the selection to
+screen columns (so wide chars and tabs are already accounted for); `end` may run
+one cell past a line's text to mark a selected newline, or to the viewport edge
+for a linewise selection. The client paints those cells with a highlight style —
+it owns *how* the region looks, the core owns *which* cells are in it.
+
 The **client owns layout**. It reserves two rows for chrome and renders three
 ratatui-native widgets — text area, status line, command line — with a ratatui
 `Layout` (see [`nxvim-tui`](../crates/nxvim-tui/src/lib.rs)). Because layout is
@@ -235,7 +243,8 @@ screen," and that is exactly the shape of these tests.
 
 **Not yet implemented (roadmap):**
 
-- Syntax highlighting / Treesitter and styled `View` regions.
+- Syntax highlighting / Treesitter (the `View` carries visual-selection spans,
+  but no syntax-driven styling yet).
 - Multiple windows, tabs, and buffers; splits and the window layout tree.
 - Vimscript (`eval.c`) and a broad Lua `vim.*` API surface.
 - Options (`:set`), mappings (`:map`), registers beyond the unnamed register,

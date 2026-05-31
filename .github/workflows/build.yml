@@ -1,0 +1,81 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string used in archive names (e.g. 0.2.0 or edge)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  runner: ubuntu-latest,   os: linux,   suffix: x86_64-linux-musl,  ext: tar.gz }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, os: linux,   suffix: aarch64-linux-musl, ext: tar.gz }
+          - { target: x86_64-apple-darwin,        runner: macos-15-intel,   os: macos,   suffix: x86_64-macos,       ext: tar.gz }
+          - { target: aarch64-apple-darwin,       runner: macos-14,         os: macos,   suffix: aarch64-macos,      ext: tar.gz }
+          - { target: x86_64-pc-windows-msvc,     runner: windows-latest,   os: windows, suffix: x86_64-windows,     ext: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute asset name
+        shell: bash
+        run: echo "ASSET=nxvim-${{ inputs.version }}-${{ matrix.suffix }}.${{ matrix.ext }}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Configure musl C toolchain (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          TLOW=$(echo "${{ matrix.target }}" | tr '-' '_')
+          TUP=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          {
+            echo "CC_${TLOW}=musl-gcc"
+            echo "CARGO_TARGET_${TUP}_LINKER=musl-gcc"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release -p nxvim --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" nxvim
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/nxvim.exe" -DestinationPath "dist/$env:ASSET"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: dist/${{ env.ASSET }}
+          if-no-files-found: error

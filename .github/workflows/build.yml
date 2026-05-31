@@ -22,7 +22,7 @@ jobs:
           - { target: aarch64-apple-darwin,       runner: macos-14,         os: macos,   suffix: aarch64-macos,      ext: tar.gz }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,   os: windows, suffix: x86_64-windows,     ext: zip }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Compute asset name
         shell: bash
@@ -74,7 +74,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/nxvim.exe" -DestinationPath "dist/$env:ASSET"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET }}
           path: dist/${{ env.ASSET }}

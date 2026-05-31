@@ -92,7 +92,7 @@ The five-target matrix is defined **once**, in `build.yml`; the publishing workf
 - A `strategy.matrix` over the five `{ target, runner, os }` entries; `fail-fast: false` so
   one target failing doesn't abort the others.
 - Steps per matrix job:
-  1. `actions/checkout@v4` (default, no submodules).
+  1. `actions/checkout@v6` (default, no submodules).
   2. Install the Rust toolchain (`dtolnay/rust-toolchain@stable`) with `targets: <target>`.
   3. Linux only: install `musl-tools`, export the `CC_*` / `*_LINKER` env vars.
   4. `Swatinem/rust-cache@v2` with `shared-key: <target>` (see Caching).
@@ -100,7 +100,7 @@ The five-target matrix is defined **once**, in `build.yml`; the publishing workf
   6. Package: copy the binary (`nxvim` / `nxvim.exe`) into an archive — `.tar.gz` on
      Unix, `.zip` on Windows — named per the table above. Binary is stripped (via Cargo
      profile, below).
-  7. `actions/upload-artifact@v4` uploading the single archive, named by target so the
+  7. `actions/upload-artifact@v7` uploading the single archive, named by target so the
      publish job can collect all five.
 
 ### `release-prep.yml` (open the release PR)
@@ -108,13 +108,13 @@ The five-target matrix is defined **once**, in `build.yml`; the publishing workf
 - `on: workflow_dispatch` with one input: `version` (e.g. `0.2.0`).
 - `permissions: { contents: write, pull-requests: write }`.
 - Steps:
-  1. `actions/checkout@v4`.
+  1. `actions/checkout@v6`.
   2. Validate `version` (semver shape) and that no `v<version>` tag already exists.
   3. Bump `[workspace.package] version` in the root `Cargo.toml` to `<version>`, then refresh
      `Cargo.lock` (e.g. `cargo update --workspace`) so the lockfile matches.
   4. git-cliff: regenerate full `CHANGELOG.md` with the upcoming release rendered under
      `v<version>` (`git cliff --tag v<version> -o CHANGELOG.md`).
-  5. Open a PR via `peter-evans/create-pull-request@v6`:
+  5. Open a PR via `peter-evans/create-pull-request@v8`:
      - branch `release/v<version>`, title `release: v<version>`, label `release`.
      - body: the `v<version>` changelog section, for at-a-glance review.
 - Note: PRs opened with `GITHUB_TOKEN` don't themselves trigger other workflows — irrelevant
@@ -131,9 +131,9 @@ The five-target matrix is defined **once**, in `build.yml`; the publishing workf
 - Job B — **build** (`needs: tag`): `uses: ./.github/workflows/build.yml` with
   `version: <version>`.
 - Job C — **publish** (`needs: [tag, build]`):
-  1. `actions/download-artifact@v4` collecting all five archives into `dist/`.
+  1. `actions/download-artifact@v8` collecting all five archives into `dist/`.
   2. Generate `dist/SHA256SUMS` aggregating the five archives.
-  3. `actions/attest-build-provenance@v2` over `dist/*` (the archives).
+  3. `actions/attest-build-provenance@v4` over `dist/*` (the archives).
   4. git-cliff: `git cliff --current` -> `RELEASE_NOTES.md` (the `v<version>` grouped notes;
      the tag created in Job A makes it "current"), appending the attestation-verify footer.
   5. `gh release create v<version> dist/* --notes-file RELEASE_NOTES.md --title v<version>`
@@ -151,7 +151,7 @@ The five-target matrix is defined **once**, in `build.yml`; the publishing workf
 - Job A: `uses: ./.github/workflows/build.yml` with `version: edge`.
 - Job B (`needs: build`):
   1. Download all five archives into `dist/`; generate `dist/SHA256SUMS`.
-  2. `actions/attest-build-provenance@v2` over `dist/*`.
+  2. `actions/attest-build-provenance@v4` over `dist/*`.
   3. git-cliff: `git cliff --unreleased` -> notes of changes since the last `v*` tag, under a
      header `Built from <short-sha> on <date>` (date/sha injected by the step, since scripts
      cannot call `Date.now()`-style APIs — here it's a shell `date`/`git rev-parse`).
@@ -196,7 +196,7 @@ self-triggering CHANGELOG push for `edge.yml` to filter.
 
 ## Provenance attestation
 
-- `actions/attest-build-provenance@v2` runs in the publish job of **both** workflows, over
+- `actions/attest-build-provenance@v4` runs in the publish job of **both** workflows, over
   the final asset files in `dist/`. It records that the artifacts were produced by this exact
   workflow run and commit (SLSA provenance), signed via GitHub's OIDC identity.
 - Required permissions on the publish job: `id-token: write`, `attestations: write` (plus

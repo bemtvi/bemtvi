@@ -18,7 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
@@ -45,7 +45,7 @@ jobs:
     needs: [tag, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: v${{ needs.tag.outputs.version }}
           fetch-depth: 0
@@ -56,7 +56,7 @@ jobs:
           tool: git-cliff
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nxvim-${{ needs.tag.outputs.version }}-*
           path: dist
@@ -69,7 +69,7 @@ jobs:
           sha256sum nxvim-* > SHA256SUMS
 
       - name: Attest provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/nxvim-${{ needs.tag.outputs.version }}-*"
 

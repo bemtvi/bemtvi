@@ -220,7 +220,7 @@ jobs:
           - { target: aarch64-apple-darwin,       runner: macos-14,         os: macos,   suffix: aarch64-macos,      ext: tar.gz }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,   os: windows, suffix: x86_64-windows,     ext: zip }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Compute asset name
         shell: bash
@@ -272,7 +272,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/nxvim.exe" -DestinationPath "dist/$env:ASSET"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET }}
           path: dist/${{ env.ASSET }}
@@ -328,7 +328,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -338,7 +338,7 @@ jobs:
           tool: git-cliff
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nxvim-edge-*
           path: dist
@@ -351,7 +351,7 @@ jobs:
           sha256sum nxvim-edge-* > SHA256SUMS
 
       - name: Attest provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/nxvim-edge-*"
 
@@ -441,7 +441,7 @@ jobs:
   prep:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -485,7 +485,7 @@ jobs:
         run: git cliff --tag "v${{ inputs.version }}" --current --strip header > RELEASE_NOTES.md
 
       - name: Open release PR
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: release/v${{ inputs.version }}
           title: "release: v${{ inputs.version }}"
@@ -552,7 +552,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
@@ -579,7 +579,7 @@ jobs:
     needs: [tag, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: v${{ needs.tag.outputs.version }}
           fetch-depth: 0
@@ -590,7 +590,7 @@ jobs:
           tool: git-cliff
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nxvim-${{ needs.tag.outputs.version }}-*
           path: dist
@@ -603,7 +603,7 @@ jobs:
           sha256sum nxvim-* > SHA256SUMS
 
       - name: Attest provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/nxvim-${{ needs.tag.outputs.version }}-*"
 

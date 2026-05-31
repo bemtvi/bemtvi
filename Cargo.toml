@@ -41,3 +41,4 @@ unicode-segmentation = "=1.13.2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true

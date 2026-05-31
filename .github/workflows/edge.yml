@@ -1,0 +1,94 @@
+name: edge
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: edge
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: edge
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nxvim-edge-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum nxvim-edge-* > SHA256SUMS
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/nxvim-edge-*"
+
+      - name: Build release notes
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%d)
+          {
+            echo "Rolling build of the \`main\` branch — **not a stable release.**"
+            echo
+            echo "Built from \`$SHA\` on $DATE."
+            echo
+            git cliff --unreleased --strip header
+            echo
+            echo "---"
+            echo "Verify a download's provenance:"
+            echo '```'
+            echo "gh attestation verify <file> --repo davidrios/nxvim"
+            echo '```'
+          } > EDGE_BODY.md
+
+      - name: Move edge tag
+        run: |
+          git tag -f edge
+          git push -f origin edge
+
+      - name: Publish edge prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view edge >/dev/null 2>&1; then
+            gh release edit edge \
+              --target "$GITHUB_SHA" \
+              --title "Bleeding edge (main)" \
+              --notes-file EDGE_BODY.md \
+              --prerelease
+            gh release upload edge dist/* --clobber
+          else
+            gh release create edge dist/* \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "Bleeding edge (main)" \
+              --notes-file EDGE_BODY.md
+          fi

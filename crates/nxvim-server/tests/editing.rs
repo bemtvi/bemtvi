@@ -84,6 +84,90 @@ async fn cursor(rpc: &Rpc) -> (usize, usize) {
     }
 }
 
+/// Feed `keys`, then deterministically return the `redraw` map the server
+/// emitted *for that input*. Works because the server processes messages
+/// serially: it writes each message's response and then its `redraw`. We send
+/// `nvim_input` then `nvim_get_mode`; the wire order is input-response,
+/// input-redraw, barrier-response, barrier-redraw. Since the input's redraw
+/// is written before the barrier's response, by the time the barrier `.await`
+/// resolves the input's redraw is already queued in `incoming` — so the first
+/// redraw we drain is the one for this input.
+async fn redraw_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> Vec<(Value, Value)> {
+    while incoming.try_recv().is_ok() {} // discard any buffered notifications from earlier in the test
+
+    // request (not notify): the server responds *then* redraws, and the barrier below relies on that ordering
+    rpc.request("nvim_input", vec![Value::from(keys)])
+        .await
+        .expect("input");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    loop {
+        match incoming.try_recv() {
+            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
+                match params.into_iter().next() {
+                    Some(Value::Map(map)) => return map,
+                    _ => panic!("redraw without a map"),
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => panic!("no redraw arrived for {keys:?}"),
+        }
+    }
+}
+
+/// Look up a top-level key in a redraw map.
+fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+/// Number of entries in the redraw's `lines` array.
+fn lines_len(map: &[(Value, Value)]) -> usize {
+    field(map, "lines")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+/// The `scroll` sub-map, or `None` when the redraw carries no scroll gesture.
+fn scroll(map: &[(Value, Value)]) -> Option<&Vec<(Value, Value)>> {
+    match field(map, "scroll") {
+        Some(Value::Map(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Read a u64 field out of the `scroll` sub-map.
+fn scroll_u64(map: &[(Value, Value)], key: &str) -> u64 {
+    let s = scroll(map).expect("scroll present");
+    s.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or_else(|| panic!("scroll.{key} missing"))
+}
+
+/// Number of entries in `scroll.lines`.
+fn scroll_lines_len(map: &[(Value, Value)]) -> usize {
+    let s = scroll(map).expect("scroll present");
+    s.iter()
+        .find(|(k, _)| k.as_str() == Some("lines"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+/// Write `n` lines ("line1".."lineN") to a temp file and return its path string.
+fn write_n_lines(tag: &str, n: usize) -> String {
+    let path = temp_path(tag);
+    let body: String = (1..=n).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(&path, body).expect("write temp file");
+    path.to_string_lossy().into_owned()
+}
+
 fn temp_path(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -532,4 +616,103 @@ async fn dl_deletes_a_trailing_multibyte_grapheme() {
     assert_eq!(lines(&rpc).await, vec!["n\u{e9}"]);
     feed(&rpc, "$dl"); // on 'é' -> delete the whole 2-byte cluster
     assert_eq!(lines(&rpc).await, vec!["n"]);
+}
+
+#[tokio::test]
+async fn redraw_has_no_scroll_for_plain_motion() {
+    let path = write_n_lines("noscroll", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let map = redraw_after(&rpc, &mut incoming, "j").await;
+
+    assert!(
+        scroll(&map).is_none(),
+        "a plain `j` must carry no scroll gesture"
+    );
+    assert_eq!(lines_len(&map), 24, "viewport stays one screen tall");
+}
+
+#[tokio::test]
+async fn ctrl_d_emits_half_page_scroll() {
+    let path = write_n_lines("cd", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let map = redraw_after(&rpc, &mut incoming, "<C-d>").await;
+
+    // Viewport height 24 → half page = 12.
+    assert_eq!(scroll_u64(&map, "from_top"), 0);
+    assert_eq!(scroll_u64(&map, "to_top"), 12);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 0);
+    assert_eq!(scroll_u64(&map, "to_cursor"), 12);
+    assert_eq!(scroll_u64(&map, "base_line"), 0);
+    assert_eq!(scroll_u64(&map, "duration_ms"), 96); // 12 * 8, within [80,160]
+                                                     // Window = |to-from| + height = 12 + 24.
+    assert_eq!(scroll_lines_len(&map), 36);
+}
+
+#[tokio::test]
+async fn ctrl_f_emits_full_page_scroll() {
+    let path = write_n_lines("cf", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let map = redraw_after(&rpc, &mut incoming, "<C-f>").await;
+
+    // Full page = height - 2 = 22.
+    assert_eq!(scroll_u64(&map, "from_top"), 0);
+    assert_eq!(scroll_u64(&map, "to_top"), 22);
+    assert_eq!(scroll_u64(&map, "duration_ms"), 160); // 22*8=176, clamped to 160
+    assert_eq!(scroll_lines_len(&map), 46); // 22 + 24
+}
+
+#[tokio::test]
+async fn ctrl_u_at_top_is_not_a_scroll() {
+    let path = write_n_lines("cu", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Already at the top: top can't move up, so no slide.
+    let map = redraw_after(&rpc, &mut incoming, "<C-u>").await;
+
+    assert!(
+        scroll(&map).is_none(),
+        "no viewport movement → no scroll gesture"
+    );
+}
+
+#[tokio::test]
+async fn scroll_window_pads_past_end_of_buffer() {
+    let path = write_n_lines("eof", 30);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let map = redraw_after(&rpc, &mut incoming, "<C-f>").await;
+
+    assert_eq!(scroll_u64(&map, "to_top"), 22);
+    assert_eq!(scroll_lines_len(&map), 46); // window length is fixed regardless of EOF
+                                            // The 30-line buffer fills rows 0..30; the rest are "~".
+    let s = scroll(&map).unwrap();
+    let lines = s
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("lines"))
+        .unwrap()
+        .1
+        .as_array()
+        .unwrap();
+    assert_eq!(lines.last().and_then(Value::as_str), Some("~"));
+}
+
+#[tokio::test]
+async fn ctrl_u_mid_buffer_scrolls_up() {
+    let path = write_n_lines("cu_mid", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Scroll down a full page first so there's room to scroll back up.
+    let _ = redraw_after(&rpc, &mut incoming, "<C-f>").await; // top 0 -> 22
+    let map = redraw_after(&rpc, &mut incoming, "<C-u>").await; // top 22 -> 10
+
+    assert_eq!(scroll_u64(&map, "from_top"), 22);
+    assert_eq!(scroll_u64(&map, "to_top"), 10);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 22);
+    assert_eq!(scroll_u64(&map, "to_cursor"), 10);
+    assert_eq!(scroll_u64(&map, "base_line"), 10); // min(from, to)
+    assert_eq!(scroll_u64(&map, "duration_ms"), 96); // 12 * 8
+    assert_eq!(scroll_lines_len(&map), 36); // |22 - 10| + 24
 }

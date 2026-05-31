@@ -21,7 +21,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::sleep;
 use unicode_width::UnicodeWidthChar;
 
 /// Rows reserved at the bottom for the status line and command line.
@@ -64,6 +66,7 @@ where
     .ok();
 
     let mut view = View::default();
+    let mut anim: Option<Animation> = None;
     let mut term_events = EventStream::new();
 
     loop {
@@ -89,13 +92,25 @@ where
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "redraw" => {
                         view.update(&params);
-                        terminal.draw(|frame| render(frame, &view))?;
+                        // A scroll gesture arms a fresh animation; any other
+                        // redraw (e.g. the result of a keypress) supersedes and
+                        // clears the in-flight one — the interrupt path.
+                        anim = view.scroll.as_ref().map(Animation::new);
+                        terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
                     }
                     "nxvim_exit" => break,
                     _ => {}
                 },
                 Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
                 None => break,
+            },
+            // Animation frame tick (~60fps). Disabled when nothing is animating,
+            // so the future is never even created in the idle case.
+            _ = sleep(Duration::from_millis(16)), if anim.is_some() => {
+                if anim.as_ref().is_some_and(|a| a.start.elapsed() >= a.duration) {
+                    anim = None; // settle: render the destination view below
+                }
+                terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
             },
         }
     }
@@ -125,6 +140,55 @@ struct View {
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
     selection: Vec<Option<(u16, u16)>>,
+    scroll: Option<ScrollData>,
+}
+
+/// The scroll gesture mirrored from the server's redraw, ready to animate.
+/// Line/cursor positions are kept as `f32` for interpolation; `lines`/`selection`
+/// are the band covering the slide, anchored at `base_line`.
+#[derive(Clone)]
+struct ScrollData {
+    from_top: f32,
+    to_top: f32,
+    from_cursor: f32,
+    to_cursor: f32,
+    duration: Duration,
+    base_line: usize,
+    lines: Vec<String>,
+    selection: Vec<Option<(u16, u16)>>,
+}
+
+/// An in-flight scroll animation, driven by the client's local clock.
+struct Animation {
+    from_top: f32,
+    to_top: f32,
+    from_cursor: f32,
+    to_cursor: f32,
+    start: Instant,
+    duration: Duration,
+    base_line: usize,
+    lines: Vec<String>,
+    selection: Vec<Option<(u16, u16)>>,
+}
+
+impl Animation {
+    fn new(s: &ScrollData) -> Self {
+        Animation {
+            from_top: s.from_top,
+            to_top: s.to_top,
+            from_cursor: s.from_cursor,
+            to_cursor: s.to_cursor,
+            start: Instant::now(),
+            duration: s.duration,
+            base_line: s.base_line,
+            lines: s.lines.clone(),
+            selection: s.selection.clone(),
+        }
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
 }
 
 impl View {
@@ -168,11 +232,46 @@ impl View {
                     .collect()
             })
             .unwrap_or_default();
+        self.scroll = match map_get(map, "scroll") {
+            Some(Value::Map(s)) => Some(ScrollData {
+                from_top: map_u64(s, "from_top") as f32,
+                to_top: map_u64(s, "to_top") as f32,
+                from_cursor: map_u64(s, "from_cursor") as f32,
+                to_cursor: map_u64(s, "to_cursor") as f32,
+                duration: Duration::from_millis(map_u64(s, "duration_ms")),
+                base_line: map_u64(s, "base_line") as usize,
+                lines: map_get(s, "lines")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                selection: map_get(s, "selection")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|v| match v.as_array() {
+                                Some(pair) if pair.len() == 2 => Some((
+                                    pair[0].as_u64().unwrap_or(0) as u16,
+                                    pair[1].as_u64().unwrap_or(0) as u16,
+                                )),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+            _ => None,
+        };
     }
 }
 
-/// Lay out the three regions and render each with its own widget.
-fn render(frame: &mut Frame, view: &View) {
+/// Lay out the three regions and render each with its own widget. When `anim`
+/// is present and unfinished, the text area shows an interpolated slice of the
+/// scroll band instead of the static viewport.
+fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     let regions = Layout::vertical([
         Constraint::Min(1),    // text area
         Constraint::Length(1), // status line
@@ -181,7 +280,30 @@ fn render(frame: &mut Frame, view: &View) {
     .split(frame.area());
     let (text_area, status_area, cmd_area) = (regions[0], regions[1], regions[2]);
 
-    render_text(frame, text_area, view);
+    let height = text_area.height as usize;
+    let frame_lines: Vec<String>;
+    let frame_sel: Vec<Option<(u16, u16)>>;
+    let cursor_row: u16;
+
+    match anim {
+        Some(a) => {
+            let raw = (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0);
+            let t = 1.0 - (1.0 - raw).powi(3); // ease-out cubic
+            let top = lerp(a.from_top, a.to_top, t).round() as usize;
+            let cur = lerp(a.from_cursor, a.to_cursor, t).round() as usize;
+            let off = top.saturating_sub(a.base_line);
+            frame_lines = a.lines.iter().skip(off).take(height).cloned().collect();
+            frame_sel = a.selection.iter().skip(off).take(height).copied().collect();
+            cursor_row = cur.saturating_sub(top) as u16;
+        }
+        None => {
+            frame_lines = view.lines.clone();
+            frame_sel = view.selection.clone();
+            cursor_row = view.cursor_row;
+        }
+    }
+
+    render_text(frame, text_area, &frame_lines, &frame_sel);
     render_status(frame, status_area, view);
     render_command(frame, cmd_area, view);
 
@@ -189,21 +311,25 @@ fn render(frame: &mut Frame, view: &View) {
         let col = cmd_area.x + 1 + view.cmdline.chars().count() as u16;
         frame.set_cursor_position((col, cmd_area.y));
     } else {
+        // The cursor row is interpolated during a slide, but the column comes
+        // straight from the destination view — correct because the scroll
+        // commands move only vertically. A future horizontal scroll would need
+        // to interpolate the column too.
         frame.set_cursor_position((
             text_area.x + view.cursor_screen_col,
-            text_area.y + view.cursor_row,
+            text_area.y + cursor_row,
         ));
     }
 }
 
-fn render_text(frame: &mut Frame, area: Rect, view: &View) {
+fn render_text(frame: &mut Frame, area: Rect, lines: &[String], selection: &[Option<(u16, u16)>]) {
     let width = area.width as usize;
     let text = Text::from(
-        view.lines
+        lines
             .iter()
             .enumerate()
             .map(|(row, l)| {
-                let sel = view.selection.get(row).copied().flatten();
+                let sel = selection.get(row).copied().flatten();
                 highlight_line(l, sel, width)
             })
             .collect::<Vec<_>>(),

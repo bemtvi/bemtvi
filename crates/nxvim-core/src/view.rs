@@ -14,6 +14,27 @@ use crate::editor::Editor;
 use crate::mode::Mode;
 use crate::unicode;
 
+/// A scroll gesture for the client to animate. Self-contained: it carries its
+/// own band of rendered lines (`lines`) and selection spans covering every row
+/// visible during the slide, anchored at `base_line`. The client interpolates
+/// `from`→`to` against its local clock and slices `lines` per frame; the main
+/// `View` fields stay the *destination* viewport for clients that don't animate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollAnim {
+    pub from_top: usize,
+    pub to_top: usize,
+    pub from_cursor: usize,
+    pub to_cursor: usize,
+    pub duration_ms: u64,
+    /// Buffer-line index of `lines[0]` (= `min(from_top, to_top)`).
+    pub base_line: usize,
+    /// `|to_top - from_top| + height` rows starting at `base_line`, "~"-padded
+    /// past end of buffer.
+    pub lines: Vec<String>,
+    /// Selection spans aligned with `lines` (same length).
+    pub selection: Vec<Option<(usize, usize)>>,
+}
+
 /// A snapshot of everything a client needs to draw a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
@@ -48,6 +69,9 @@ pub struct View {
     /// exceed the row's text width to mark a selected newline (one extra cell) or
     /// to fill a linewise selection to the viewport edge.
     pub selection: Vec<Option<(usize, usize)>>,
+    /// Present only on a redraw caused by a scroll command that moved the
+    /// viewport; carries the data a client needs to animate the slide.
+    pub scroll: Option<ScrollAnim>,
 }
 
 impl View {
@@ -55,17 +79,23 @@ impl View {
         let (width, height) = ed.dims();
         let line_count = ed.buffer.line_count();
 
-        let mut lines = Vec::with_capacity(height);
-        for row in 0..height {
-            let idx = ed.top + row;
-            if idx < line_count {
-                lines.push(ed.buffer.line(idx));
-            } else {
-                lines.push("~".to_string());
-            }
-        }
+        let lines = window_lines(ed, ed.top, height, line_count);
+        let selection = selection_spans(ed, width, line_count, ed.top, height);
 
-        let selection = selection_spans(ed, width, line_count);
+        let scroll = ed.pending_scroll().map(|ps| {
+            let base_line = ps.from_top.min(ps.to_top);
+            let count = ps.from_top.abs_diff(ps.to_top) + height;
+            ScrollAnim {
+                from_top: ps.from_top,
+                to_top: ps.to_top,
+                from_cursor: ps.from_cursor,
+                to_cursor: ps.to_cursor,
+                duration_ms: ps.duration_ms,
+                base_line,
+                lines: window_lines(ed, base_line, count, line_count),
+                selection: selection_spans(ed, width, line_count, base_line, count),
+            }
+        });
 
         let file_name = ed
             .buffer
@@ -96,16 +126,37 @@ impl View {
             modified: ed.buffer.modified,
             cursor_line: ed.cursor.line + 1,
             selection,
+            scroll,
         }
     }
 }
 
-/// Compute, for each of the `height` visible rows, the half-open screen-column
-/// span to highlight as the visual selection (or `None`). Returns all-`None`
-/// outside visual modes.
-fn selection_spans(ed: &Editor, width: usize, line_count: usize) -> Vec<Option<(usize, usize)>> {
-    let (_, height) = ed.dims();
-    let mut spans = vec![None; height];
+/// Build `count` rendered rows starting at buffer line `base`, padding rows past
+/// the end of the buffer with `"~"` (as vim shows below the last line).
+fn window_lines(ed: &Editor, base: usize, count: usize, line_count: usize) -> Vec<String> {
+    let mut lines = Vec::with_capacity(count);
+    for row in 0..count {
+        let idx = base + row;
+        if idx < line_count {
+            lines.push(ed.buffer.line(idx));
+        } else {
+            lines.push("~".to_string());
+        }
+    }
+    lines
+}
+
+/// Compute, for each of the `count` rows starting at buffer line `base`, the
+/// half-open screen-column span to highlight as the visual selection (or
+/// `None`). Returns all-`None` outside visual modes.
+fn selection_spans(
+    ed: &Editor,
+    width: usize,
+    line_count: usize,
+    base: usize,
+    count: usize,
+) -> Vec<Option<(usize, usize)>> {
+    let mut spans = vec![None; count];
     if !ed.mode.is_visual() {
         return spans;
     }
@@ -121,7 +172,7 @@ fn selection_spans(ed: &Editor, width: usize, line_count: usize) -> Vec<Option<(
     let linewise = ed.mode == Mode::VisualLine;
 
     for (row, span) in spans.iter_mut().enumerate() {
-        let buf_line = ed.top + row;
+        let buf_line = base + row;
         if buf_line >= line_count || buf_line < start.line || buf_line > end.line {
             continue;
         }

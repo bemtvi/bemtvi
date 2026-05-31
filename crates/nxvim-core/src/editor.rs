@@ -60,6 +60,19 @@ struct MotionResult {
     axis: MoveAxis,
 }
 
+/// A recorded scroll gesture (`<C-d>` / `<C-u>` / `<C-f>` / `<C-b>`) that moved
+/// the viewport, handed to the client so it can animate the slide. Lines/columns
+/// are absolute buffer lines; `duration_ms` is a suggested pacing the client may
+/// clamp or ignore.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingScroll {
+    pub from_top: usize,
+    pub to_top: usize,
+    pub from_cursor: usize,
+    pub to_cursor: usize,
+    pub duration_ms: u64,
+}
+
 /// The complete editor state for a single buffer/window.
 pub struct Editor {
     pub buffer: Buffer,
@@ -96,6 +109,13 @@ pub struct Editor {
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
     visual_anchor: Cursor,
+
+    /// Set by a scroll command at the moment it fires: `(top, cursor.line)`
+    /// *before* the move. Consumed at the end of `input` to build `pending_scroll`.
+    scroll_from: Option<(usize, usize)>,
+    /// The scroll gesture from the most recent input, projected into the next
+    /// `View` and then cleared (so it animates exactly once).
+    pending_scroll: Option<PendingScroll>,
 
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
@@ -136,6 +156,8 @@ impl Editor {
             pending_replace: false,
             snapshot_taken: false,
             visual_anchor: Cursor::default(),
+            scroll_from: None,
+            pending_scroll: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             lua_queue: Vec::new(),
@@ -171,6 +193,21 @@ impl Editor {
             self.desired_eol = self.eol_request;
         }
         self.ensure_visible();
+
+        // If this key was a scroll command that actually moved the viewport,
+        // record the gesture for the client to animate.
+        if let Some((from_top, from_cursor)) = self.scroll_from.take() {
+            if from_top != self.top {
+                let dist = from_top.abs_diff(self.top) as u64;
+                self.pending_scroll = Some(PendingScroll {
+                    from_top,
+                    to_top: self.top,
+                    from_cursor,
+                    to_cursor: self.cursor.line,
+                    duration_ms: (dist * 8).clamp(80, 160),
+                });
+            }
+        }
     }
 
     /// Run an ex-command directly (the `nvim_command` API entry point).
@@ -190,11 +227,17 @@ impl Editor {
     /// size. The client renders the view's regions with its own widgets.
     pub fn view(&mut self, width: usize, height: usize) -> View {
         self.resize(width, height);
-        View::from_editor(self)
+        let view = View::from_editor(self);
+        self.pending_scroll = None; // animate exactly once
+        view
     }
 
     pub(crate) fn dims(&self) -> (usize, usize) {
         (self.width, self.height)
+    }
+
+    pub(crate) fn pending_scroll(&self) -> Option<PendingScroll> {
+        self.pending_scroll
     }
 
     /// The fixed end of the visual selection (the other end is [`Self::cursor`]).
@@ -1410,22 +1453,24 @@ impl Editor {
     }
 
     fn scroll_half(&mut self, down: bool) {
-        let half = (self.text_height() / 2).max(1);
-        if down {
-            self.move_vertical(half as i64, false);
-        } else {
-            self.move_vertical(-(half as i64), false);
-        }
-        self.clamp_cursor();
+        let half = (self.text_height() / 2).max(1) as i64;
+        self.scroll_by(if down { half } else { -half });
     }
 
     fn scroll_page(&mut self, down: bool) {
-        let page = self.text_height().saturating_sub(2).max(1);
-        if down {
-            self.move_vertical(page as i64, false);
-        } else {
-            self.move_vertical(-(page as i64), false);
-        }
+        let page = self.text_height().saturating_sub(2).max(1) as i64;
+        self.scroll_by(if down { page } else { -page });
+    }
+
+    /// Scroll the viewport by `delta` lines, vim-style: move both `top` and the
+    /// cursor together so the cursor keeps its screen row. Records the pre-move
+    /// `(top, cursor.line)` in `scroll_from`; `input` turns that into a
+    /// `PendingScroll` if `top` actually changed.
+    fn scroll_by(&mut self, delta: i64) {
+        self.scroll_from = Some((self.top, self.cursor.line));
+        let last = self.buffer.line_count().saturating_sub(1) as i64;
+        self.top = (self.top as i64 + delta).clamp(0, last) as usize;
+        self.move_vertical(delta, false);
         self.clamp_cursor();
     }
 

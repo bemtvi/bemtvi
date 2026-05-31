@@ -200,6 +200,38 @@ impl Server {
                 })
                 .collect(),
         );
+        let scroll = match &view.scroll {
+            Some(s) => {
+                let scroll_lines =
+                    Value::Array(s.lines.iter().map(|l| Value::from(l.as_str())).collect());
+                let scroll_selection = Value::Array(
+                    s.selection
+                        .iter()
+                        .map(|sp| match sp {
+                            Some((start, end)) => Value::Array(vec![
+                                Value::from(*start as u64),
+                                Value::from(*end as u64),
+                            ]),
+                            None => Value::Nil,
+                        })
+                        .collect(),
+                );
+                Value::Map(vec![
+                    (Value::from("from_top"), Value::from(s.from_top as u64)),
+                    (Value::from("to_top"), Value::from(s.to_top as u64)),
+                    (
+                        Value::from("from_cursor"),
+                        Value::from(s.from_cursor as u64),
+                    ),
+                    (Value::from("to_cursor"), Value::from(s.to_cursor as u64)),
+                    (Value::from("duration_ms"), Value::from(s.duration_ms)),
+                    (Value::from("base_line"), Value::from(s.base_line as u64)),
+                    (Value::from("lines"), scroll_lines),
+                    (Value::from("selection"), scroll_selection),
+                ])
+            }
+            None => Value::Nil,
+        };
         let map = vec![
             (Value::from("lines"), lines),
             (
@@ -231,6 +263,7 @@ impl Server {
                 Value::from(view.cursor_line as u64),
             ),
             (Value::from("selection"), selection),
+            (Value::from("scroll"), scroll),
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);

@@ -1,0 +1,53 @@
+# git-cliff configuration — https://git-cliff.org
+# Conventional-commit changelog for nxvim. The rolling `edge` tag is ignored so
+# it is never treated as a release boundary.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented in this file.
+The format is based on conventional commits.
+"""
+# Tera template. The `<!-- N -->` group prefixes drive ordering and are stripped
+# from the rendered output.
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}\
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+    {% endfor %}\
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
+# Treat only v-prefixed semver tags as releases; never the rolling edge tag.
+tag_pattern = "v[0-9]*"
+ignore_tags = "^edge$"
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactor" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore|^ci|^build", group = "<!-- 6 -->Miscellaneous" },
+  { message = ".*", group = "<!-- 7 -->Other" },
+]

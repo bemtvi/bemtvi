@@ -32,7 +32,7 @@ Every target builds on a runner of its own architecture so the vendored-Lua C to
 | ------------------------------ | ----------------- | ----------------------------------------- |
 | `x86_64-unknown-linux-musl`    | `ubuntu-latest`   | `nxvim-<ver>-x86_64-linux-musl.tar.gz`    |
 | `aarch64-unknown-linux-musl`   | `ubuntu-24.04-arm`| `nxvim-<ver>-aarch64-linux-musl.tar.gz`   |
-| `x86_64-apple-darwin`          | `macos-13`        | `nxvim-<ver>-x86_64-macos.tar.gz`         |
+| `x86_64-apple-darwin`          | `macos-15-intel`  | `nxvim-<ver>-x86_64-macos.tar.gz`         |
 | `aarch64-apple-darwin`         | `macos-14`        | `nxvim-<ver>-aarch64-macos.tar.gz`        |
 | `x86_64-pc-windows-msvc`       | `windows-latest`  | `nxvim-<ver>-x86_64-windows.zip`          |
 

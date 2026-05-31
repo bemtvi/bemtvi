@@ -1,0 +1,73 @@
+name: release-prep
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, no leading v (e.g. 0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '$VERSION' (expected semver like 0.2.0)"
+            exit 1
+          fi
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Bump workspace version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          # Replace the first top-level `version = "..."` line, which is the
+          # [workspace.package] version (dependency versions like
+          # `crossterm = { version = "..." }` are not at column 0). awk is used
+          # instead of `sed -i '0,/re/'` because the latter is a GNU-only form.
+          awk -v v="$VERSION" '!done && /^version = "/ {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+          grep -m1 -E '^version = ' Cargo.toml
+
+      - name: Refresh Cargo.lock
+        run: cargo update --workspace
+
+      - name: Regenerate CHANGELOG.md
+        run: git cliff --tag "v${{ inputs.version }}" -o CHANGELOG.md
+
+      - name: Extract notes for PR body
+        run: git cliff --tag "v${{ inputs.version }}" --current --strip header > RELEASE_NOTES.md
+
+      - name: Open release PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: release/v${{ inputs.version }}
+          title: "release: v${{ inputs.version }}"
+          labels: release
+          commit-message: "chore(release): v${{ inputs.version }}"
+          body-path: RELEASE_NOTES.md
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+            CHANGELOG.md

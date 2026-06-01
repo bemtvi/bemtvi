@@ -8,6 +8,15 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# Lua-backend selection threaded through to nxvim-lua. The dep inherits
+# `default-features = false` from [workspace.dependencies], which is what lets
+# `--no-default-features` at the top turn lua51 off so luajit isn't enabled
+# alongside it.
+[features]
+default = ["lua51"]
+lua51 = ["nxvim-lua/lua51"]
+luajit = ["nxvim-lua/luajit"]
+
 [dependencies]
 anyhow.workspace = true
 rmpv.workspace = true

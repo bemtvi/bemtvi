@@ -12,6 +12,14 @@ rust-version.workspace = true
 name = "nxvim"
 path = "src/main.rs"
 
+# Lua backend, threaded down to nxvim-lua. Default is vendored PUC Lua 5.1;
+# `--no-default-features --features luajit` builds the binary on LuaJIT.
+# nxvim-server inherits `default-features = false` from [workspace.dependencies].
+[features]
+default = ["lua51"]
+lua51 = ["nxvim-server/lua51"]
+luajit = ["nxvim-server/luajit"]
+
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true

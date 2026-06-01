@@ -21,14 +21,23 @@ rust-version = "1.80"
 [workspace.dependencies]
 nxvim-core = { path = "crates/nxvim-core" }
 nxvim-rpc = { path = "crates/nxvim-rpc" }
-nxvim-server = { path = "crates/nxvim-server" }
-nxvim-lua = { path = "crates/nxvim-lua" }
+# default-features = false so the lua51/luajit backend toggle can be threaded
+# through these crates (see the mlua note below). Building any of them as a
+# workspace member still applies its own `default` feature (lua51).
+nxvim-server = { path = "crates/nxvim-server", default-features = false }
+nxvim-lua = { path = "crates/nxvim-lua", default-features = false }
 nxvim-tui = { path = "crates/nxvim-tui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
 # builds. Pre-release lines (ropey 2.0-beta, mlua 0.12-rc) are intentionally
 # avoided in favor of the latest stable releases.
+#
+# mlua's Lua-version features (`lua51` vs `luajit`) are mutually exclusive, so
+# the version is NOT selected here — only `vendored` is. The version is chosen
+# by `nxvim-lua`'s own `lua51` (default) / `luajit` features, threaded up
+# through `nxvim-server` and the `nxvim` binary. Benchmark LuaJIT with e.g.
+# `cargo run -p nxvim --no-default-features --features luajit`.
 anyhow = "=1.0.102"
 ropey = "=2.0.0-beta.1"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
@@ -36,7 +45,7 @@ ratatui = "=0.30.0"
 tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", "sync", "time", "process"] }
 futures = "=0.3.32"
 rmpv = "=1.3.1"
-mlua = { version = "=0.11.6", features = ["lua51", "vendored"] }
+mlua = { version = "=0.11.6", features = ["vendored"] }
 unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.2"
 portable-pty = "=0.9.0"

@@ -223,8 +223,14 @@ exactly as in neovim, and influence the editor through the same mechanisms RPC
 clients use. The VM loads the full safe stdlib **plus `debug`** (real plugins
 call `debug.getinfo` to locate their own install dir, and neovim exposes it),
 and the prelude ships a LuaJIT-compatible `bit` library since PUC Lua 5.1 lacks
-one. Swapping the vendored Lua 5.1 for LuaJIT is a build-level change isolated to
-`nxvim-lua`.
+one. The backend is a Cargo feature: `nxvim-lua` exposes `lua51` (default,
+vendored PUC Lua 5.1) and `luajit`, threaded up unchanged through `nxvim-server`
+and the `nxvim` binary. Build the whole stack on LuaJIT for benchmarking with
+`cargo build -p nxvim --no-default-features --features luajit` (likewise
+`cargo test -p nxvim-server --no-default-features --features luajit`). The two
+mlua version features are mutually exclusive, so `[workspace.dependencies].mlua`
+selects only `vendored` and each crate sets `default-features = false` on the
+inter-crate deps to keep the default `lua51` from leaking into a `luajit` build.
 
 **Effects flow through queues.** `vim.cmd(...)` / `vim.api.nvim_command(...)`
 queue ex-commands; `print(...)` / `vim.api.nvim_echo(...)` capture output;

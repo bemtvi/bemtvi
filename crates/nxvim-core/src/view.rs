@@ -33,6 +33,10 @@ pub struct ScrollAnim {
     pub lines: Vec<String>,
     /// Selection spans aligned with `lines` (same length).
     pub selection: Vec<Option<(usize, usize)>>,
+    /// 1-based buffer line number per row (aligned with `lines`), `None` for
+    /// `~` filler rows, so the number column slides with the text during the
+    /// animation.
+    pub numbers: Vec<Option<usize>>,
 }
 
 /// A snapshot of everything a client needs to draw a frame.
@@ -72,15 +76,28 @@ pub struct View {
     /// Present only on a redraw caused by a scroll command that moved the
     /// viewport; carries the data a client needs to animate the slide.
     pub scroll: Option<ScrollAnim>,
+    /// 1-based buffer line number per visible row (aligned with `lines`), or
+    /// `None` for `~` filler rows past the end of the buffer. The client formats
+    /// the number column (absolute / relative / hybrid) from these.
+    pub numbers: Vec<Option<usize>>,
+    /// `:set number` — show the absolute line number.
+    pub number: bool,
+    /// `:set relativenumber` — show numbers relative to the cursor line.
+    pub relativenumber: bool,
+    /// Width in cells of the number column (`0` when both options are off).
+    pub number_width: usize,
 }
 
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
-        let (width, height) = ed.dims();
+        let height = ed.dims().1;
         let line_count = ed.buffer.line_count();
+        // Selections fill to the text width — the area past the number gutter.
+        let width = ed.text_width();
 
         let lines = window_lines(ed, ed.top, height, line_count);
         let selection = selection_spans(ed, width, line_count, ed.top, height);
+        let numbers = window_numbers(ed.top, height, line_count);
 
         let scroll = ed.pending_scroll().map(|ps| {
             let base_line = ps.from_top.min(ps.to_top);
@@ -94,6 +111,7 @@ impl View {
                 base_line,
                 lines: window_lines(ed, base_line, count, line_count),
                 selection: selection_spans(ed, width, line_count, base_line, count),
+                numbers: window_numbers(base_line, count, line_count),
             }
         });
 
@@ -127,8 +145,23 @@ impl View {
             cursor_line: ed.cursor.line + 1,
             selection,
             scroll,
+            numbers,
+            number: ed.options.number,
+            relativenumber: ed.options.relativenumber,
+            number_width: ed.number_width(),
         }
     }
+}
+
+/// 1-based buffer line number for each of the `count` rows starting at buffer
+/// line `base`, `None` for rows past the end of the buffer (the `~` fillers).
+fn window_numbers(base: usize, count: usize, line_count: usize) -> Vec<Option<usize>> {
+    (0..count)
+        .map(|row| {
+            let idx = base + row;
+            (idx < line_count).then_some(idx + 1)
+        })
+        .collect()
 }
 
 /// Build `count` rendered rows starting at buffer line `base`, padding rows past

@@ -438,7 +438,23 @@ async fn linewise_visual_highlights_the_whole_line_width() {
     let view = latest_view(&mut incoming).expect("a redraw view");
 
     let sel = view_selection(&view);
-    // Linewise selection fills the line to the viewport edge (attached at 80).
+    // Linewise selection fills the line to the text edge: the viewport (attached
+    // at 80) minus the default 4-cell number gutter, so the highlight stops at
+    // the text area and never bleeds into the gutter.
+    assert_eq!(sel.first().copied().flatten(), Some((0, 76)));
+}
+
+#[tokio::test]
+async fn linewise_visual_fills_full_width_without_a_gutter() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    // With no number column the whole viewport width is text again.
+    feed(&rpc, ":set nonumber norelativenumber<CR>");
+    feed(&rpc, "V");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
     assert_eq!(sel.first().copied().flatten(), Some((0, 80)));
 }
 
@@ -733,4 +749,80 @@ async fn sleep_blocks_the_editor_for_the_requested_duration() {
         "follow-up returned too soon: {:?}",
         begin.elapsed()
     );
+}
+
+// ----- line-number column ---------------------------------------------------
+
+/// Read a top-level bool field out of a redraw map.
+fn field_bool(map: &[(Value, Value)], key: &str) -> bool {
+    field(map, key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The redraw's per-row `numbers` array as `Option<u64>` (None = `~` filler).
+fn numbers(map: &[(Value, Value)]) -> Vec<Option<u64>> {
+    field(map, "numbers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn number_column_is_on_by_default() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    assert!(field_bool(&map, "number"), "number on by default");
+    assert!(
+        field_bool(&map, "relativenumber"),
+        "relativenumber on by default"
+    );
+    // Small buffer → 4-cell gutter (vim's numberwidth minimum).
+    assert_eq!(field(&map, "number_width").and_then(Value::as_u64), Some(4));
+}
+
+#[tokio::test]
+async fn numbers_track_buffer_lines_and_filler_rows() {
+    let path = write_n_lines("nums", 2);
+    let (rpc, mut incoming) = start(Some(path)).await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    let nums = numbers(&map);
+    // Two real lines numbered 1, 2; everything below is a `~` filler (None).
+    assert_eq!(nums[0], Some(1));
+    assert_eq!(nums[1], Some(2));
+    assert!(
+        nums[2..].iter().all(|n| n.is_none()),
+        "fillers carry no number"
+    );
+}
+
+#[tokio::test]
+async fn set_nonumber_disables_the_gutter() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":set nonumber norelativenumber<CR>").await;
+
+    assert!(!field_bool(&map, "number"));
+    assert!(!field_bool(&map, "relativenumber"));
+    assert_eq!(
+        field(&map, "number_width").and_then(Value::as_u64),
+        Some(0),
+        "no number option → zero-width gutter"
+    );
+}
+
+#[tokio::test]
+async fn set_toggles_and_abbreviations_work() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // `nu!` toggles `number` off; `rnu` abbreviation stays on.
+    let map = redraw_after(&rpc, &mut incoming, ":set nu!<CR>").await;
+    assert!(!field_bool(&map, "number"), "nu! toggled number off");
+    assert!(
+        field_bool(&map, "relativenumber"),
+        "relativenumber untouched"
+    );
+
+    // `invnumber` toggles it back on.
+    let map = redraw_after(&rpc, &mut incoming, ":set invnumber<CR>").await;
+    assert!(field_bool(&map, "number"), "invnumber toggled number on");
 }

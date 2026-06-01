@@ -13,6 +13,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24; // text area is ROWS - 2 chrome rows = 22
+/// Default number-column width for a small buffer: nxvim ships with the hybrid
+/// number column on, sized to 4 cells (vim's `numberwidth` minimum). Text,
+/// selection, and cursor columns are all offset by this much.
+const GUTTER: u16 = 4;
 
 /// Start a server and attach with a text-area height matching the paint grid
 /// (ROWS - 2 chrome rows), so the captured `View` fills the grid exactly.
@@ -98,7 +102,9 @@ async fn typed_text_is_painted_with_the_mode_in_the_status_line() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello<Esc>");
     let buf = screen(&rpc, &mut incoming).await;
-    assert_eq!(row_text(&buf, 0).trim_end(), "hello");
+    // Row 0 is the cursor line: hybrid gutter shows its absolute number `1`
+    // (left-aligned in the 4-cell column) followed by the text.
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   hello");
     // Status line is row ROWS - 2 (index 22 of rows 0..24), just above cmdline.
     assert!(
         row_text(&buf, ROWS - 2).contains("NORMAL"),
@@ -108,14 +114,33 @@ async fn typed_text_is_painted_with_the_mode_in_the_status_line() {
 }
 
 #[tokio::test]
+async fn hybrid_number_column_shows_absolute_then_relative() {
+    let (rpc, mut incoming) = start(None).await;
+    // Three lines; leave the cursor on the middle one.
+    feed(&rpc, "ione<Esc>otwo<Esc>othree<Esc>kk"); // back up to line 1, then...
+    feed(&rpc, "j"); // ...land on line 2 (the middle).
+    let buf = screen(&rpc, &mut incoming).await;
+    // Cursor line (row 1) shows its absolute number left-aligned; the lines
+    // above and below show distance 1, right-aligned with a trailing space.
+    assert_eq!(row_text(&buf, 0).trim_end(), "  1 one");
+    assert_eq!(row_text(&buf, 1).trim_end(), "2   two");
+    assert_eq!(row_text(&buf, 2).trim_end(), "  1 three");
+}
+
+#[tokio::test]
 async fn a_visual_selection_is_highlighted_on_screen() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello world<Esc>0vll"); // select h,e,l -> screen cols [0,3)
     let buf = screen(&rpc, &mut incoming).await;
-    assert!(reversed(&buf, 0, 0));
-    assert!(reversed(&buf, 1, 0));
-    assert!(reversed(&buf, 2, 0));
-    assert!(!reversed(&buf, 3, 0));
+    // Selection columns are measured from the text, which starts past the gutter.
+    assert!(
+        !reversed(&buf, 0, 0),
+        "the number gutter is never highlighted"
+    );
+    assert!(reversed(&buf, GUTTER, 0));
+    assert!(reversed(&buf, GUTTER + 1, 0));
+    assert!(reversed(&buf, GUTTER + 2, 0));
+    assert!(!reversed(&buf, GUTTER + 3, 0));
 }
 
 #[tokio::test]
@@ -123,8 +148,9 @@ async fn wide_chars_align_on_screen() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "i日本<Esc>");
     let buf = screen(&rpc, &mut incoming).await;
-    assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "日");
-    assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "本");
+    // Wide glyphs start past the number gutter, each still occupying two cells.
+    assert_eq!(buf.cell((GUTTER, 0)).unwrap().symbol(), "日");
+    assert_eq!(buf.cell((GUTTER + 2, 0)).unwrap().symbol(), "本");
 }
 
 #[tokio::test]

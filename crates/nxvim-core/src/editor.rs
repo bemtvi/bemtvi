@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::buffer::Buffer;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
+use crate::options::{resolve_set, Options, SetOp};
 use crate::unicode;
 use crate::view::View;
 
@@ -85,6 +86,8 @@ pub struct Editor {
     /// Transient status message (the bottom line when not in command mode).
     pub message: String,
     pub should_quit: bool,
+    /// Editor options set via `:set` (number column, …).
+    pub options: Options,
 
     width: usize,
     height: usize,
@@ -147,6 +150,7 @@ impl Editor {
             cmdline: String::new(),
             message: String::new(),
             should_quit: false,
+            options: Options::default(),
             width: 80,
             height: 24,
             desired_col: 0,
@@ -247,6 +251,13 @@ impl Editor {
 
     pub(crate) fn dims(&self) -> (usize, usize) {
         (self.width, self.height)
+    }
+
+    /// Width in cells available for buffer text: the text-area width minus the
+    /// number column. Selection fills measure against this (and future soft-wrap
+    /// / horizontal scroll will too), so the gutter is never counted as text.
+    pub(crate) fn text_width(&self) -> usize {
+        self.width.saturating_sub(self.number_width())
     }
 
     pub(crate) fn pending_scroll(&self) -> Option<PendingScroll> {
@@ -1202,7 +1213,7 @@ impl Editor {
                 Ok(ms) => self.pending_sleep = Some(ms),
                 Err(e) => self.message = e,
             },
-            "set" | "se" => self.message = format!("(set {args} — not yet implemented)"),
+            "set" | "se" => self.ex_set(args),
             "noh" | "nohlsearch" => {}
             other => self.message = format!("E492: Not an editor command: {other}"),
         }
@@ -1255,6 +1266,53 @@ impl Editor {
             }
             Err(e) => self.message = e.to_string(),
         }
+    }
+
+    // ----- options ----------------------------------------------------------
+
+    /// Handle `:set {options}`. Each whitespace-separated token is a boolean
+    /// option with the usual `no`/`inv` prefixes and `!`/`?` suffixes (e.g.
+    /// `:set number relativenumber`, `:set nonu`, `:set rnu!`).
+    fn ex_set(&mut self, args: &str) {
+        for tok in args.split_whitespace() {
+            match resolve_set(tok) {
+                Some((name, op)) => self.apply_set(name, op),
+                None => self.message = format!("E518: Unknown option: {tok}"),
+            }
+        }
+    }
+
+    /// Apply one resolved `:set` operation to the named (canonical) option.
+    fn apply_set(&mut self, name: &str, op: SetOp) {
+        let slot = match name {
+            "number" => &mut self.options.number,
+            "relativenumber" => &mut self.options.relativenumber,
+            _ => return,
+        };
+        match op {
+            SetOp::On => *slot = true,
+            SetOp::Off => *slot = false,
+            SetOp::Toggle => *slot = !*slot,
+            SetOp::Query => {
+                let on = *slot;
+                self.message = if on {
+                    name.to_string()
+                } else {
+                    format!("no{name}")
+                };
+            }
+        }
+    }
+
+    /// Width in cells of the line-number column, `0` when no number option is
+    /// on. Sized like vim: at least 4 cells, widening to fit the buffer's
+    /// largest line number plus one trailing space.
+    pub(crate) fn number_width(&self) -> usize {
+        if !self.options.number && !self.options.relativenumber {
+            return 0;
+        }
+        let digits = digit_count(self.buffer.line_count());
+        (digits + 1).max(4)
     }
 
     // ----- undo / redo ------------------------------------------------------
@@ -1526,6 +1584,17 @@ enum CharClass {
     Blank,
     Word,
     Punct,
+}
+
+/// Number of decimal digits in `n` (at least 1, so `0` is one digit).
+fn digit_count(n: usize) -> usize {
+    let mut n = n;
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 fn char_class(c: char) -> CharClass {

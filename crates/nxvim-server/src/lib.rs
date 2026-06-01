@@ -196,33 +196,12 @@ impl Server {
         let view = self.editor.view(w, h);
 
         let lines = Value::Array(view.lines.iter().map(|l| Value::from(l.as_str())).collect());
-        let selection = Value::Array(
-            view.selection
-                .iter()
-                .map(|s| match s {
-                    Some((start, end)) => {
-                        Value::Array(vec![Value::from(*start as u64), Value::from(*end as u64)])
-                    }
-                    None => Value::Nil,
-                })
-                .collect(),
-        );
+        let selection = spans_value(&view.selection);
+        let numbers = numbers_value(&view.numbers);
         let scroll = match &view.scroll {
             Some(s) => {
                 let scroll_lines =
                     Value::Array(s.lines.iter().map(|l| Value::from(l.as_str())).collect());
-                let scroll_selection = Value::Array(
-                    s.selection
-                        .iter()
-                        .map(|sp| match sp {
-                            Some((start, end)) => Value::Array(vec![
-                                Value::from(*start as u64),
-                                Value::from(*end as u64),
-                            ]),
-                            None => Value::Nil,
-                        })
-                        .collect(),
-                );
                 Value::Map(vec![
                     (Value::from("from_top"), Value::from(s.from_top as u64)),
                     (Value::from("to_top"), Value::from(s.to_top as u64)),
@@ -234,7 +213,8 @@ impl Server {
                     (Value::from("duration_ms"), Value::from(s.duration_ms)),
                     (Value::from("base_line"), Value::from(s.base_line as u64)),
                     (Value::from("lines"), scroll_lines),
-                    (Value::from("selection"), scroll_selection),
+                    (Value::from("selection"), spans_value(&s.selection)),
+                    (Value::from("numbers"), numbers_value(&s.numbers)),
                 ])
             }
             None => Value::Nil,
@@ -271,10 +251,50 @@ impl Server {
             ),
             (Value::from("selection"), selection),
             (Value::from("scroll"), scroll),
+            (Value::from("numbers"), numbers),
+            (Value::from("number"), Value::from(view.number)),
+            (
+                Value::from("relativenumber"),
+                Value::from(view.relativenumber),
+            ),
+            (
+                Value::from("number_width"),
+                Value::from(view.number_width as u64),
+            ),
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);
     }
+}
+
+/// Encode per-row selection spans as an array of `[start, end]` pairs (`Nil`
+/// for unselected rows) for the redraw map.
+fn spans_value(spans: &[Option<(usize, usize)>]) -> Value {
+    Value::Array(
+        spans
+            .iter()
+            .map(|s| match s {
+                Some((start, end)) => {
+                    Value::Array(vec![Value::from(*start as u64), Value::from(*end as u64)])
+                }
+                None => Value::Nil,
+            })
+            .collect(),
+    )
+}
+
+/// Encode per-row 1-based line numbers as an array (`Nil` for `~` filler rows)
+/// for the redraw map.
+fn numbers_value(numbers: &[Option<usize>]) -> Value {
+    Value::Array(
+        numbers
+            .iter()
+            .map(|n| match n {
+                Some(n) => Value::from(*n as u64),
+                None => Value::Nil,
+            })
+            .collect(),
+    )
 }
 
 fn uint(v: Option<&Value>, default: usize) -> usize {

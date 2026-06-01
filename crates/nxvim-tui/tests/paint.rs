@@ -112,6 +112,61 @@ fn wide_chars_occupy_two_cells_each() {
     assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "本");
 }
 
+fn numbers(vals: &[Option<u64>]) -> Value {
+    Value::Array(
+        vals.iter()
+            .map(|v| match v {
+                Some(n) => Value::from(*n),
+                None => Value::Nil,
+            })
+            .collect(),
+    )
+}
+
+/// A view configured with the hybrid number column on (the server's default).
+fn numbered(lines_: Value, nums: &[Option<u64>], cursor_line: u64) -> View {
+    view(vec![
+        ("lines", lines_),
+        ("numbers", numbers(nums)),
+        ("number", Value::from(true)),
+        ("relativenumber", Value::from(true)),
+        ("number_width", Value::from(4u64)),
+        ("cursor_line", Value::from(cursor_line)),
+    ])
+}
+
+#[test]
+fn hybrid_gutter_shows_absolute_on_cursor_line_relative_elsewhere() {
+    // Cursor on line 2 of three; gutter is 4 cells, then the text.
+    let v = numbered(
+        lines(&["one", "two", "three"]),
+        &[Some(1), Some(2), Some(3)],
+        2,
+    );
+    let buf = paint(&v, 20, 5);
+    assert_eq!(row_text(&buf, 0).trim_end(), "  1 one"); // relative 1, right-aligned
+    assert_eq!(row_text(&buf, 1).trim_end(), "2   two"); // absolute 2, left-aligned
+    assert_eq!(row_text(&buf, 2).trim_end(), "  1 three"); // relative 1, right-aligned
+}
+
+#[test]
+fn filler_rows_have_a_blank_gutter() {
+    // One line of text; the rows below it are `~` fillers with no number.
+    let v = numbered(lines(&["only", "~"]), &[Some(1), None], 1);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   only");
+    // The `~` row's gutter is all blanks; the tilde sits in the text column.
+    assert_eq!(row_text(&buf, 1).trim_end(), "    ~");
+}
+
+#[test]
+fn gutter_disabled_paints_text_at_column_zero() {
+    // No number options (the Tier-1 default): text is flush left, no gutter.
+    let v = view(vec![("lines", lines(&["hello"]))]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(row_text(&buf, 0).trim_end(), "hello");
+}
+
 #[test]
 fn command_mode_renders_the_colon_line() {
     let v = view(vec![

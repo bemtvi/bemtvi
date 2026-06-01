@@ -135,6 +135,16 @@ one cell past a line's text to mark a selected newline, or to the viewport edge
 for a linewise selection. The client paints those cells with a highlight style —
 it owns *how* the region looks, the core owns *which* cells are in it.
 
+The same split governs the **number column**: the `View` carries the per-row
+1-based buffer line numbers (`numbers`, `None` for `~` filler rows), the
+`number`/`relativenumber` option flags, and the gutter width (`number_width`,
+sized like vim's `numberwidth`). The core owns *what* each line's number is; the
+client renders the gutter as its own ratatui widget — a horizontal split off the
+left of the text area — and decides *how* it looks, computing the relative
+offsets and the hybrid absolute-on-cursor-line formatting from that data. Text,
+selection, and cursor columns are all measured from the text sub-area, so they
+stay gutter-agnostic.
+
 The **client owns layout**. It reserves two rows for chrome and renders three
 ratatui-native widgets — text area, status line, command line — with a ratatui
 `Layout` (see [`nxvim-tui`](../crates/nxvim-tui/src/lib.rs)). Because layout is
@@ -264,8 +274,9 @@ screen," and that is exactly the shape of these tests.
   but no syntax-driven styling yet).
 - Multiple windows, tabs, and buffers; splits and the window layout tree.
 - Vimscript (`eval.c`) and a broad Lua `vim.*` API surface.
-- Options (`:set`), mappings (`:map`), registers beyond the unnamed register,
-  search (`/`, `?`, `:s`), marks, folds, and macros.
+- A broad options surface. `:set` exists, but only `number`/`relativenumber`
+  (the line-number column) are honored so far; mappings (`:map`), registers
+  beyond the unnamed register, search (`/`, `?`, `:s`), marks, folds, and macros.
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).
 

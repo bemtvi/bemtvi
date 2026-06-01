@@ -14,6 +14,7 @@ pub mod buffer;
 pub mod editor;
 pub mod input;
 pub mod mode;
+pub mod options;
 pub mod unicode;
 pub mod view;
 
@@ -21,4 +22,5 @@ pub use buffer::Buffer;
 pub use editor::{Cursor, Editor};
 pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;
+pub use options::Options;
 pub use view::View;

@@ -141,6 +141,14 @@ pub struct View {
     /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
     selection: Vec<Option<(u16, u16)>>,
     scroll: Option<ScrollData>,
+    /// Per visible row, the 1-based buffer line number (`None` for `~` fillers),
+    /// from which the client formats the number column.
+    numbers: Vec<Option<usize>>,
+    /// `:set number` / `:set relativenumber` flags and the gutter width in cells
+    /// (`0` when both are off), mirrored from the server.
+    number: bool,
+    relativenumber: bool,
+    number_width: u16,
 }
 
 /// The scroll gesture mirrored from the server's redraw, ready to animate.
@@ -156,6 +164,7 @@ struct ScrollData {
     base_line: usize,
     lines: Vec<String>,
     selection: Vec<Option<(u16, u16)>>,
+    numbers: Vec<Option<usize>>,
 }
 
 /// An in-flight scroll animation, driven by the client's local clock.
@@ -169,6 +178,7 @@ struct Animation {
     base_line: usize,
     lines: Vec<String>,
     selection: Vec<Option<(u16, u16)>>,
+    numbers: Vec<Option<usize>>,
 }
 
 impl Animation {
@@ -183,6 +193,7 @@ impl Animation {
             base_line: s.base_line,
             lines: s.lines.clone(),
             selection: s.selection.clone(),
+            numbers: s.numbers.clone(),
         }
     }
 }
@@ -218,20 +229,15 @@ impl View {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         self.cursor_line = map_u64(map, "cursor_line") as usize;
-        self.selection = map_get(map, "selection")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|v| match v.as_array() {
-                        Some(pair) if pair.len() == 2 => Some((
-                            pair[0].as_u64().unwrap_or(0) as u16,
-                            pair[1].as_u64().unwrap_or(0) as u16,
-                        )),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        self.selection = parse_spans(map_get(map, "selection"));
+        self.numbers = parse_numbers(map_get(map, "numbers"));
+        self.number = map_get(map, "number")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.relativenumber = map_get(map, "relativenumber")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.number_width = map_u64(map, "number_width") as u16;
         self.scroll = match map_get(map, "scroll") {
             Some(Value::Map(s)) => Some(ScrollData {
                 from_top: map_u64(s, "from_top") as f32,
@@ -248,20 +254,8 @@ impl View {
                             .collect()
                     })
                     .unwrap_or_default(),
-                selection: map_get(s, "selection")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .map(|v| match v.as_array() {
-                                Some(pair) if pair.len() == 2 => Some((
-                                    pair[0].as_u64().unwrap_or(0) as u16,
-                                    pair[1].as_u64().unwrap_or(0) as u16,
-                                )),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                selection: parse_spans(map_get(s, "selection")),
+                numbers: parse_numbers(map_get(s, "numbers")),
             }),
             _ => None,
         };
@@ -304,7 +298,12 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     let height = text_area.height as usize;
     let frame_lines: Vec<String>;
     let frame_sel: Vec<Option<(u16, u16)>>;
+    let frame_numbers: Vec<Option<usize>>;
     let cursor_row: u16;
+    // 1-based buffer line the cursor sits on, used to compute relative numbers.
+    // During a slide it tracks the interpolated cursor so the gutter stays in
+    // step with the moving text.
+    let current_line: usize;
 
     match anim {
         Some(a) => {
@@ -315,16 +314,32 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
             let off = top.saturating_sub(a.base_line);
             frame_lines = a.lines.iter().skip(off).take(height).cloned().collect();
             frame_sel = a.selection.iter().skip(off).take(height).copied().collect();
+            frame_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
             cursor_row = cur.saturating_sub(top) as u16;
+            current_line = cur + 1;
         }
         None => {
             frame_lines = view.lines.clone();
             frame_sel = view.selection.clone();
+            frame_numbers = view.numbers.clone();
             cursor_row = view.cursor_row;
+            current_line = view.cursor_line;
         }
     }
 
-    render_text(frame, text_area, &frame_lines, &frame_sel);
+    // Split a number-column gutter off the left of the text area when enabled.
+    // The gutter is its own widget; the text, selection, and cursor columns are
+    // all measured from the text sub-area, so they stay gutter-agnostic.
+    let text_inner = if view.number_width > 0 {
+        let cols = Layout::horizontal([Constraint::Length(view.number_width), Constraint::Min(0)])
+            .split(text_area);
+        render_gutter(frame, cols[0], &frame_numbers, current_line, view);
+        cols[1]
+    } else {
+        text_area
+    };
+
+    render_text(frame, text_inner, &frame_lines, &frame_sel);
     render_status(frame, status_area, view);
     render_command(frame, cmd_area, view);
 
@@ -337,9 +352,71 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
         // commands move only vertically. A future horizontal scroll would need
         // to interpolate the column too.
         frame.set_cursor_position((
-            text_area.x + view.cursor_screen_col,
-            text_area.y + cursor_row,
+            text_inner.x + view.cursor_screen_col,
+            text_inner.y + cursor_row,
         ));
+    }
+}
+
+/// Paint the line-number column. Each row shows, per the active options:
+/// absolute numbers (`number`), distance-from-cursor (`relativenumber`), or the
+/// hybrid — absolute on the cursor line, relative elsewhere — when both are on.
+/// The cursor line is rendered un-dimmed (vim's `CursorLineNr`); other rows are
+/// dimmed (`LineNr`). `~` filler rows get a blank gutter.
+fn render_gutter(
+    frame: &mut Frame,
+    area: Rect,
+    numbers: &[Option<usize>],
+    current_line: usize,
+    view: &View,
+) {
+    let width = area.width as usize;
+    let text = Text::from(
+        numbers
+            .iter()
+            .map(|num| {
+                let is_current = *num == Some(current_line);
+                let cell = gutter_cell(*num, current_line, view.number, view.relativenumber, width);
+                let style = if is_current {
+                    Style::default()
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                };
+                Line::from(Span::styled(cell, style))
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Build one `width`-cell gutter cell for a row whose buffer line is `num`
+/// (`None` for a `~` filler). Numbers are right-aligned with a trailing space,
+/// except the hybrid cursor line whose absolute number is left-aligned — vim's
+/// layout.
+fn gutter_cell(
+    num: Option<usize>,
+    current_line: usize,
+    number: bool,
+    relativenumber: bool,
+    width: usize,
+) -> String {
+    let Some(n) = num else {
+        return " ".repeat(width);
+    };
+    let is_current = n == current_line;
+    if number && relativenumber && is_current {
+        // Hybrid cursor line: absolute number, left-aligned.
+        format!("{n:<width$}")
+    } else {
+        let value = if !relativenumber {
+            n // number-only: absolute on every line
+        } else if is_current {
+            0 // relativenumber-only cursor line shows 0
+        } else {
+            n.abs_diff(current_line)
+        };
+        let field = width.saturating_sub(1); // reserve the trailing space
+        format!("{value:>field$} ")
     }
 }
 
@@ -469,6 +546,33 @@ fn map_str(map: &[(Value, Value)], key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// Parse a per-row array of `[start, end]` selection-span pairs (`Nil` rows
+/// become `None`).
+fn parse_spans(value: Option<&Value>) -> Vec<Option<(u16, u16)>> {
+    value
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|v| match v.as_array() {
+                    Some(pair) if pair.len() == 2 => Some((
+                        pair[0].as_u64().unwrap_or(0) as u16,
+                        pair[1].as_u64().unwrap_or(0) as u16,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a per-row array of 1-based line numbers (`Nil` rows become `None`).
+fn parse_numbers(value: Option<&Value>) -> Vec<Option<usize>> {
+    value
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|v| v.as_u64().map(|n| n as usize)).collect())
+        .unwrap_or_default()
 }
 
 /// Translate a crossterm key event into vim key-notation.

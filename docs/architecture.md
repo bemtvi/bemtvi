@@ -18,11 +18,16 @@ reference. nxvim does not link against or embed any neovim code.
    **not** aim for neovim *UI/client* wire-compatibility — there is no
    `ext_linegrid` protocol and external neovim GUIs are not a target. The
    client↔server protocol is nxvim's own.
-2. **Client-server, always.** The editor is a headless server; every UI is a
+2. **Lua plugins, not Vimscript.** The objective is to run neovim's plugin
+   ecosystem — but only plugins written in **Lua**. Supporting legacy Vimscript
+   (`.vim` plugins, the `eval.c` language) is an explicit non-goal and is not on
+   the roadmap. Compatibility work targets the Lua `vim.*` API surface that
+   modern plugins depend on.
+3. **Client-server, always.** The editor is a headless server; every UI is a
    client. There is no "embedded-only" code path.
-3. **Async and responsive.** The UI never blocks on the editor and the editor
+4. **Async and responsive.** The UI never blocks on the editor and the editor
    never blocks on the UI. Slow work on one side cannot freeze the other.
-4. **Rust-native, not a transliteration.** We mirror neovim's *organization*
+5. **Rust-native, not a transliteration.** We mirror neovim's *organization*
    and *behavior*, not its C. We use a rope, ownership, enums, async tasks, and
    crates instead of globals, longjmp, and libuv callbacks.
 
@@ -326,7 +331,8 @@ screen," and that is exactly the shape of these tests.
   dir today; installing them there is manual / a follow-up), treesitter
   injections, and a `:set`-driven highlight toggle.
 - Multiple windows, tabs, and buffers; splits and the window layout tree.
-- Vimscript (`eval.c`) and a broad Lua `vim.*` API surface.
+- A broad Lua `vim.*` API surface (enough to run real Lua plugins). Legacy
+  Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far; mappings (`:map`), registers
   beyond the unnamed register, search (`/`, `?`, `:s`), marks, folds, and macros.

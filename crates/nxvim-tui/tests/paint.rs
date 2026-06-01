@@ -4,7 +4,7 @@
 
 use nxvim_tui::{paint, View};
 use ratatui::buffer::Buffer;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 
 /// Build a `redraw` params vec (a one-element array holding the view map),
@@ -175,4 +175,160 @@ fn command_mode_renders_the_colon_line() {
     ]);
     let buf = paint(&v, 20, 5);
     assert_eq!(row_text(&buf, 4).trim_end(), ":w");
+}
+
+// ----- Phase 5: truecolor styles from the server's resolved payload ----------
+
+/// One `styles`-palette entry: `0xRRGGBB` ints for the colors present, attribute
+/// flags for the booleans present. Mirrors the server's `style_value` encoding.
+fn style(fields: Vec<(&str, Value)>) -> Value {
+    Value::Map(
+        fields
+            .into_iter()
+            .map(|(k, v)| (Value::from(k), v))
+            .collect(),
+    )
+}
+
+/// A 24-bit color as the `0xRRGGBB` integer the server sends.
+fn rgb(r: u8, g: u8, b: u8) -> Value {
+    Value::from(((r as u64) << 16) | ((g as u64) << 8) | b as u64)
+}
+
+/// One row of highlight spans as `[start, end, group, style_id]` (style id `Nil`
+/// to force the client's built-in fallback for that span).
+fn hl_row(spans: &[(u64, u64, &str, Option<u64>)]) -> Value {
+    Value::Array(
+        spans
+            .iter()
+            .map(|(s, e, group, id)| {
+                Value::Array(vec![
+                    Value::from(*s),
+                    Value::from(*e),
+                    Value::from(*group),
+                    id.map(Value::from).unwrap_or(Value::Nil),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn chrome(entries: Vec<(&str, u64)>) -> Value {
+    Value::Map(
+        entries
+            .into_iter()
+            .map(|(k, id)| (Value::from(k), Value::from(id)))
+            .collect(),
+    )
+}
+
+#[test]
+fn a_resolved_style_paints_its_truecolor_foreground() {
+    // Palette entry 0 is mauve; the span over cols 0..2 references it.
+    let v = view(vec![
+        ("lines", lines(&["fn x"])),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("fg", rgb(0xcb, 0xa6, 0xf7))])]),
+        ),
+        (
+            "highlights",
+            Value::Array(vec![hl_row(&[(0, 2, "keyword", Some(0))])]),
+        ),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().style().fg,
+        Some(Color::Rgb(0xcb, 0xa6, 0xf7)),
+        "the resolved keyword span paints its truecolor fg"
+    );
+    assert_eq!(
+        buf.cell((2, 0)).unwrap().style().fg,
+        Some(Color::Reset),
+        "a cell past the span is left at the default fg"
+    );
+}
+
+#[test]
+fn the_normal_background_fills_the_text_area() {
+    let v = view(vec![
+        ("lines", lines(&["hi"])),
+        (
+            "styles",
+            Value::Array(vec![style(vec![
+                ("fg", rgb(0xcd, 0xd6, 0xf4)),
+                ("bg", rgb(0x1e, 0x1e, 0x2e)),
+            ])]),
+        ),
+        ("chrome", chrome(vec![("normal", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    // An empty cell well past the text still carries the Normal background.
+    assert_eq!(
+        buf.cell((10, 0)).unwrap().style().bg,
+        Some(Color::Rgb(0x1e, 0x1e, 0x2e)),
+        "the editor background fills the whole text area"
+    );
+}
+
+#[test]
+fn the_visual_style_replaces_reverse_video_when_themed() {
+    let sel = Value::Array(vec![Value::Array(vec![
+        Value::from(0u64),
+        Value::from(2u64),
+    ])]);
+    let v = view(vec![
+        ("lines", lines(&["hi"])),
+        ("selection", sel),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x45, 0x47, 0x5a))])]),
+        ),
+        ("chrome", chrome(vec![("visual", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    let cell = buf.cell((0, 0)).unwrap().style();
+    assert_eq!(
+        cell.bg,
+        Some(Color::Rgb(0x45, 0x47, 0x5a)),
+        "the selection takes Visual's background"
+    );
+    assert!(
+        !cell.add_modifier.contains(Modifier::REVERSED),
+        "a themed Visual replaces reverse-video rather than adding to it"
+    );
+}
+
+#[test]
+fn no_colorscheme_falls_back_to_the_builtin_theme() {
+    // A span with a Nil style id and no palette: the client paints from its own
+    // built-in `group_style` (keyword → magenta), and the selection reverts to
+    // reverse-video — exactly today's default-startup behavior.
+    let sel = Value::Array(vec![Value::Array(vec![
+        Value::from(3u64),
+        Value::from(5u64),
+    ])]);
+    let v = view(vec![
+        ("lines", lines(&["fn x()"])),
+        ("selection", sel),
+        (
+            "highlights",
+            Value::Array(vec![hl_row(&[(0, 2, "keyword", None)])]),
+        ),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().style().fg,
+        Some(Color::Magenta),
+        "with no resolved style the client falls back to group_style"
+    );
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().style().bg,
+        Some(Color::Reset),
+        "no colorscheme means no editor background — terminal default shows through"
+    );
+    assert!(
+        reversed(&buf, 3, 0),
+        "with no Visual style the selection stays reverse-video"
+    );
 }

@@ -138,20 +138,38 @@ the visible text rows, the cursor position, and the data a status/command line
 need (mode, file name, modified flag, ruler, message, command-line text). The
 server sends it as a single `redraw` notification carrying one msgpack map.
 
-The `View` also carries the first **styled** region: `selection`, a per-row
+The `View` also carries the editor's **styled** regions: `selection`, a per-row
 array of half-open screen-column spans `[start, end)` marking the visual-mode
 selection (`None` for unselected rows). The core resolves the selection to
 screen columns (so wide chars and tabs are already accounted for); `end` may run
 one cell past a line's text to mark a selected newline, or to the viewport edge
-for a linewise selection. The client paints those cells with a highlight style —
-it owns *how* the region looks, the core owns *which* cells are in it.
+for a linewise selection. The core owns *which* cells are in it.
 
-The same split governs **syntax highlighting**: the `View`/`redraw` carries a
-per-row `highlights` array (aligned with `lines`) of screen-column spans
-`[start, end, group]`, where `group` is a treesitter capture name (`keyword`,
-`string`, …). The server resolves byte offsets to screen columns (the same
-tab/wide-char `virtcol` the selection uses) and the client maps each group to a
-color — *which* cells, server; *how* they look, client. (See
+**Color ownership lives on the server.** Originally the client owned *how* every
+group looked (a hardcoded ANSI theme). A colorscheme (catppuccin) moves that
+decision into the editor: a Lua theme defines the concrete color of every
+highlight group via `nvim_set_hl` (see [*Lua*](#lua)). So the server now
+**resolves** each group to a concrete style and the `redraw` carries styles, not
+bare group names — matching real neovim, where highlight groups + `termguicolors`
+live in the editor and the UI just paints attributes. Concretely the `redraw`
+map carries:
+
+- a per-frame `styles` palette — an array of resolved styles
+  `{ fg, bg, sp, bold, italic, … }` with colors as 24-bit `0xRRGGBB` ints,
+  deduped so identical styles cost one entry;
+- the per-row `highlights` array (aligned with `lines`) of screen-column spans
+  `[start, end, group, style_id]`, where `group` is the treesitter capture name
+  and `style_id` indexes `styles` (or is `nil` when no colorscheme resolved it);
+- a `chrome` map of editor-region → `style_id` for `Normal`, `LineNr`,
+  `CursorLineNr`, `Visual`, `StatusLine`, and `EndOfBuffer`.
+
+The server still owns *which* cells are in a group (byte offsets resolved to
+screen columns via the same tab/wide-char `virtcol` the selection uses); it now
+*also* resolves group → style. The client is a dumb truecolor renderer: it paints
+the `Normal` background across the text area, themes the gutter/selection/status
+from `chrome`, and colors each span from its `style_id`. When a span carries no
+resolved style (no colorscheme loaded), the client falls back to a small built-in
+theme, so default startup looks exactly as before. (See
 [*Syntax highlighting*](#syntax-highlighting-treesitter).)
 
 The same split governs the **number column**: the `View` carries the per-row
@@ -202,15 +220,36 @@ it will move to a change-tree closer to neovim's `undo.c` as editing grows.
 nxvim embeds **Lua 5.1** via [mlua] (`lua51`, vendored) — the dialect LuaJIT,
 and therefore neovim, is compatible with. Scripts run **inside the server**,
 exactly as in neovim, and influence the editor through the same mechanisms RPC
-clients use.
+clients use. The VM loads the full safe stdlib **plus `debug`** (real plugins
+call `debug.getinfo` to locate their own install dir, and neovim exposes it),
+and the prelude ships a LuaJIT-compatible `bit` library since PUC Lua 5.1 lacks
+one. Swapping the vendored Lua 5.1 for LuaJIT is a build-level change isolated to
+`nxvim-lua`.
 
-The bridge is currently narrow on purpose: `vim.cmd(...)` and
-`vim.api.nvim_command(...)` queue ex-commands; `print(...)` /
-`vim.api.nvim_echo(...)` capture output. After each chunk runs, the server
-drains those queues into the editor. The end-state is for `vim.api.nvim_*` to
-call the very same API functions remote clients invoke (`Lua → API → core`),
-making Lua a first-class peer of RPC. Swapping the vendored Lua 5.1 for LuaJIT
-is a build-level change isolated to `nxvim-lua`.
+**Effects flow through queues.** `vim.cmd(...)` / `vim.api.nvim_command(...)`
+queue ex-commands; `print(...)` / `vim.api.nvim_echo(...)` capture output;
+`vim.api.nvim_set_hl(...)` queues highlight-group definitions. After each chunk
+runs, the server drains those queues into the (pure, synchronous) core — Lua
+never mutates the editor directly. The end-state is for `vim.api.nvim_*` to call
+the very same API functions remote clients invoke (`Lua → API → core`).
+
+**A plugin runtime, not just a bridge.** nxvim resolves a config dir and
+**runtimepath** the way neovim does (`$NXVIM_CONFIG` / `$XDG_CONFIG_HOME/nxvim` /
+`~/.config/nxvim`, plus `pack/*/start/*` plugin discovery and `$NXVIM_RUNTIMEPATH`
+for tests), seeds `package.path` from it so `require` resolves plugin modules,
+and sources `<config>/init.lua` at startup — before the first frame. The `vim.*`
+surface real plugins reach for is provided as a bundled **Lua prelude**
+(`nxvim-lua/src/prelude.lua`, the analogue of neovim's `runtime/lua/vim/`):
+`vim.tbl_*`, `vim.split`, `vim.inspect`, `vim.g`/`vim.o`/`vim.opt`/`vim.env`,
+`vim.notify`, `vim.log`, user commands, and autocmds; FS/env-touching helpers
+(`vim.fn.stdpath`/`getftime`/`mkdir`, …) are Rust-backed. `:colorscheme <name>`
+sources `colors/<name>.lua` off the runtimepath and fires the `ColorScheme`
+autocmd. This is enough to run the **real, unmodified
+[catppuccin](https://github.com/catppuccin/nvim)** colorscheme: dropped onto the
+runtimepath, its `setup()` compiles the highlight table to Lua bytecode under
+`stdpath("cache")` and `load()` populates the highlight registry via
+`nvim_set_hl` — the same mechanics as under neovim. See
+[`docs/getting-started.md`](getting-started.md) to set it up.
 
 ---
 
@@ -240,11 +279,15 @@ or even slow the editor**:
   `BufferEdit`s, drained by the server each frame).
 
 The `View`/`redraw` carries the result as a per-row `highlights` array (see the
-*View protocol* above): screen-column spans tagged with a capture-group **name**
-(`keyword`, `string`, …). As with the visual selection, the server owns *which*
-cells are which group; the **client owns the colors** (its theme maps group →
-style). Full design:
-[`docs/superpowers/specs/2026-06-01-syntax-highlighting-design.md`](superpowers/specs/2026-06-01-syntax-highlighting-design.md).
+*View protocol* above): screen-column spans tagged with a capture-group name and
+a resolved `style_id`. The server owns *which* cells are which group **and**
+resolves group → concrete style (a colorscheme's `nvim_set_hl` table, or the
+capture-fallback chain); the client paints the truecolor it is handed, falling
+back to a small built-in theme only when no colorscheme resolved a span. Full
+designs:
+[syntax highlighting](superpowers/specs/2026-06-01-syntax-highlighting-design.md)
+and
+[the catppuccin colorscheme](superpowers/specs/2026-06-01-catppuccin-colorscheme-design.md).
 
 ---
 
@@ -331,8 +374,14 @@ screen," and that is exactly the shape of these tests.
   dir today; installing them there is manual / a follow-up), treesitter
   injections, and a `:set`-driven highlight toggle.
 - Multiple windows, tabs, and buffers; splits and the window layout tree.
-- A broad Lua `vim.*` API surface (enough to run real Lua plugins). Legacy
-  Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
+- A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
+  `nvim_set_hl`, and `:colorscheme` are in place — enough to run the real
+  catppuccin colorscheme unmodified (see [*Lua*](#lua)) — but the surface grows
+  only as plugins demand it. Known gaps for richer plugins: `vim.treesitter` is a
+  stub (nxvim highlights out-of-process), `vim.keymap`/`vim.api.nvim_set_keymap`,
+  `vim.loop`/`vim.uv`, buffer/window API beyond the single buffer, and the LSP
+  client. Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding
+  principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far; mappings (`:map`), registers
   beyond the unnamed register, search (`/`, `?`, `:s`), marks, folds, and macros.

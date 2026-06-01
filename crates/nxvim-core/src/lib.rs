@@ -12,6 +12,7 @@
 
 pub mod buffer;
 pub mod editor;
+pub mod highlight;
 pub mod input;
 pub mod mode;
 pub mod options;
@@ -20,6 +21,7 @@ pub mod view;
 
 pub use buffer::{Buffer, BufferEdit, EditBatch};
 pub use editor::{Cursor, Editor};
+pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;
 pub use options::Options;

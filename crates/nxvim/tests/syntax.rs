@@ -16,7 +16,7 @@ use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
 use nxvim_tui::{paint, ScrollHarness, View};
 use ratatui::buffer::Buffer;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
@@ -102,6 +102,16 @@ fn home_dir() -> PathBuf {
 
 /// Start a server (worker spawning enabled) editing `file`, attach a UI.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_with(file, Vec::new()).await
+}
+
+/// As [`start`], but seeds the server's `runtimepath` so a `colors/<name>.lua`
+/// fixture is findable by `:colorscheme <name>` — the Phase 5 paint path that
+/// turns resolved highlight groups into truecolor on screen.
+async fn start_with(
+    file: Option<String>,
+    runtimepath: Vec<PathBuf>,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -109,7 +119,14 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
             .enable_time()
             .build()
             .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, ServerInit { file }));
+        let _ = runtime.block_on(run_server(
+            server_end,
+            ServerInit {
+                file,
+                runtimepath,
+                ..Default::default()
+            },
+        ));
     });
     let (reader, writer) = tokio::io::split(client_end);
     let (rpc, incoming) = connect(reader, writer);
@@ -429,6 +446,134 @@ async fn the_keyword_is_painted_in_its_theme_color() {
         buf.cell((GUTTER, 0)).unwrap().style().fg,
         Some(Color::Magenta),
         "the `fn` keyword should paint in the keyword color"
+    );
+}
+
+// catppuccin-mocha-ish hex values the colors fixture below sets, mirrored here
+// as the RGB the painted cells must carry once the theme loads.
+const NORMAL_BG: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+const KEYWORD: Color = Color::Rgb(0xcb, 0xa6, 0xf7); // mauve
+const STRING: Color = Color::Rgb(0xa6, 0xe3, 0xa1); // green
+const VISUAL_BG: Color = Color::Rgb(0x45, 0x47, 0x5a); // surface1
+const CURSOR_LINE_NR: Color = Color::Rgb(0xfa, 0xb3, 0x87); // peach
+
+/// A `colors/cattest.lua` standing in for catppuccin: a handful of
+/// `nvim_set_hl` calls for the groups the paint test asserts (the syntax groups
+/// plus the editor chrome). `:colorscheme cattest` sources this off the
+/// runtimepath, exactly as the real plugin's `colors/catppuccin.lua` is sourced.
+const COLORS_FIXTURE: &str = "\
+vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+vim.api.nvim_set_hl(0, 'Keyword', { fg = '#cba6f7' })\n\
+vim.api.nvim_set_hl(0, 'String', { fg = '#a6e3a1' })\n\
+vim.api.nvim_set_hl(0, 'Visual', { bg = '#45475a' })\n\
+vim.api.nvim_set_hl(0, 'CursorLineNr', { fg = '#fab387' })\n\
+vim.api.nvim_set_hl(0, 'LineNr', { fg = '#6c7086' })\n\
+vim.api.nvim_set_hl(0, 'StatusLine', { fg = '#cdd6f4', bg = '#313244' })\n";
+
+/// Create a fresh runtimepath dir holding the `colors/cattest.lua` fixture.
+fn theme_runtimepath(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nxvim-theme-{}-{}", std::process::id(), tag));
+    std::fs::create_dir_all(dir.join("colors")).unwrap();
+    std::fs::write(dir.join("colors").join("cattest.lua"), COLORS_FIXTURE).unwrap();
+    dir
+}
+
+/// Poll redraws (bounded) until the painted view satisfies `done`, returning
+/// `(redraw params, painted buffer)`. Highlight resolution and the colorscheme
+/// load are independent async events, so we wait for the screen to actually
+/// reflect both rather than for a single barrier.
+async fn paint_until(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    done: impl Fn(&Buffer) -> bool,
+) -> (Vec<Value>, Buffer) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            let buf = paint(&View::from_redraw(&params), COLS, ROWS);
+            if done(&buf) {
+                return (params, buf);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the painted screen never satisfied the condition within timeout");
+}
+
+/// Phase 5, end to end: a loaded colorscheme turns the screen truecolor. Open a
+/// Rust source file, source a catppuccin-shaped `colors/` fixture via
+/// `:colorscheme`, and assert the real client paints the resolved styles —
+/// keyword foreground, string foreground, the editor background, the
+/// cursor-line gutter, and the visual selection.
+#[tokio::test]
+async fn a_loaded_colorscheme_paints_resolved_styles_truecolor() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let rtp = theme_runtimepath("paint");
+    // `fn` is a keyword; `"hi"` is a string — both on row 0.
+    let file = temp_rs("themed", "fn main() { let s = \"hi\"; }\n");
+    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
+
+    // Wait for treesitter spans (painted in the fallback theme), then load the
+    // colorscheme so subsequent redraws resolve those spans to truecolor.
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    feed(&rpc, ":colorscheme cattest<CR>");
+
+    const GUTTER: u16 = 4; // hybrid number column, width 4 → text at col 4
+    let (params, buf) = paint_until(&rpc, &mut incoming, |buf| {
+        buf.cell((GUTTER, 0)).unwrap().style().fg == Some(KEYWORD)
+    })
+    .await;
+
+    // The `fn` keyword paints mauve, sitting on the Normal background.
+    let kw = buf.cell((GUTTER, 0)).unwrap().style();
+    assert_eq!(kw.fg, Some(KEYWORD), "the `fn` keyword paints mauve");
+    assert_eq!(
+        kw.bg,
+        Some(NORMAL_BG),
+        "themed text sits on the Normal background"
+    );
+
+    // The string literal paints green. Locate its span in the resolved spans.
+    let hl = highlights_of(&params);
+    let str_start = hl[0]
+        .iter()
+        .find(|(_, _, group)| group.split('.').next() == Some("string"))
+        .map(|(start, _, _)| *start as u16)
+        .expect("a string span on row 0");
+    assert_eq!(
+        buf.cell((GUTTER + str_start, 0)).unwrap().style().fg,
+        Some(STRING),
+        "the string literal paints green"
+    );
+
+    // The cursor line's gutter number uses CursorLineNr (the cursor is on row 0).
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().style().fg,
+        Some(CURSOR_LINE_NR),
+        "the cursor-line number uses CursorLineNr"
+    );
+
+    // A visual selection takes the theme's Visual background — not reverse-video.
+    feed(&rpc, "v");
+    let (_, sel) = paint_until(&rpc, &mut incoming, |buf| {
+        buf.cell((GUTTER, 0)).unwrap().style().bg == Some(VISUAL_BG)
+    })
+    .await;
+    let cell = sel.cell((GUTTER, 0)).unwrap().style();
+    assert_eq!(cell.bg, Some(VISUAL_BG), "the selection uses Visual's bg");
+    assert_eq!(
+        cell.fg,
+        Some(KEYWORD),
+        "the selected keyword keeps its mauve foreground under Visual"
+    );
+    assert!(
+        !cell.add_modifier.contains(Modifier::REVERSED),
+        "Visual replaces reverse-video rather than compositing onto it"
     );
 }
 

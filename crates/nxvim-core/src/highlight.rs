@@ -1,0 +1,270 @@
+//! The highlight-group registry: nxvim's analogue of neovim's highlight table
+//! (`highlight_group.c`).
+//!
+//! A colorscheme (catppuccin, today) populates this by calling `nvim_set_hl`
+//! hundreds of times — each defining a group's foreground/background/special
+//! colors and attributes, or *linking* it to another group. This module is the
+//! pure, synchronous core of that: a `name -> `[`HlDef`] map plus a resolver
+//! that follows link chains to a concrete [`Style`]. It owns no I/O and no Lua;
+//! the server parses the Lua opts table, the core just stores and resolves.
+//!
+//! Per the *Architecture note* in the catppuccin design doc, color now lives in
+//! the editor (here), not the client: the server resolves each treesitter
+//! capture / chrome region to a concrete style and the client paints it. This
+//! module is the resolution half — [`Highlights::resolve_capture`] walks the
+//! standard `@`-group fallback chain (`function.call` -> `@function.call` ->
+//! `@function` -> `Function`) so a theme that only defines `Function` still
+//! colors function calls. Painting itself lands later (design doc, Phase 5).
+
+use std::collections::HashMap;
+
+/// A 24-bit truecolor value (`#rrggbb`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    /// Pack into the `0xRRGGBB` integer neovim's API reports colors as.
+    pub fn to_u32(self) -> u32 {
+        ((self.r as u32) << 16) | ((self.g as u32) << 8) | self.b as u32
+    }
+}
+
+/// A highlight group as defined by one `nvim_set_hl(0, name, opts)` call.
+///
+/// A group is either a **link** (`link` set — it's a pure alias and its own
+/// attributes are ignored, matching neovim) or a set of concrete attributes.
+/// catppuccin uses one or the other per group, never both.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct HlDef {
+    pub fg: Option<Rgb>,
+    pub bg: Option<Rgb>,
+    pub sp: Option<Rgb>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub undercurl: bool,
+    pub strikethrough: bool,
+    pub reverse: bool,
+    /// When set, this group is an alias for `link`; its own attrs are ignored.
+    pub link: Option<String>,
+}
+
+impl HlDef {
+    /// Whether this definition carries no usable style (no colors, no attrs, no
+    /// link) — the cleared state. Resolving such a group yields `None`.
+    fn is_blank(&self) -> bool {
+        self.fg.is_none()
+            && self.bg.is_none()
+            && self.sp.is_none()
+            && !self.bold
+            && !self.italic
+            && !self.underline
+            && !self.undercurl
+            && !self.strikethrough
+            && !self.reverse
+            && self.link.is_none()
+    }
+}
+
+/// A fully resolved concrete style: every link followed, no aliases left. This
+/// is what the renderer paints (server resolves, client draws — design Phase 5).
+#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
+pub struct Style {
+    pub fg: Option<Rgb>,
+    pub bg: Option<Rgb>,
+    pub sp: Option<Rgb>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub undercurl: bool,
+    pub strikethrough: bool,
+    pub reverse: bool,
+}
+
+impl Style {
+    /// A style with nothing set — treated as "no highlight" so capture
+    /// resolution falls through to the next candidate group.
+    fn is_empty(&self) -> bool {
+        self.fg.is_none()
+            && self.bg.is_none()
+            && self.sp.is_none()
+            && !self.bold
+            && !self.italic
+            && !self.underline
+            && !self.undercurl
+            && !self.strikethrough
+            && !self.reverse
+    }
+
+    fn from_def(def: &HlDef) -> Style {
+        Style {
+            fg: def.fg,
+            bg: def.bg,
+            sp: def.sp,
+            bold: def.bold,
+            italic: def.italic,
+            underline: def.underline,
+            undercurl: def.undercurl,
+            strikethrough: def.strikethrough,
+            reverse: def.reverse,
+        }
+    }
+}
+
+/// The global highlight-group table (namespace `0` only, which is all
+/// catppuccin needs). Maps group name -> definition; resolution follows links.
+#[derive(Default)]
+pub struct Highlights {
+    groups: HashMap<String, HlDef>,
+}
+
+/// Guards link resolution against a cycle (`A -> B -> A`): deep enough for any
+/// real theme's link chains, shallow enough to terminate a loop immediately.
+const MAX_LINK_DEPTH: usize = 32;
+
+impl Highlights {
+    /// A fresh registry. nxvim ships no built-in colorscheme (the client owns
+    /// the no-theme fallback look), so this starts empty — `:hi clear` returns
+    /// here.
+    pub fn new() -> Self {
+        Highlights::default()
+    }
+
+    /// Define (or redefine) a group, as `nvim_set_hl(0, name, opts)` does. A
+    /// blank definition (empty opts table) clears the group, matching neovim.
+    pub fn set(&mut self, name: &str, def: HlDef) {
+        if def.is_blank() {
+            self.groups.remove(name);
+        } else {
+            self.groups.insert(name.to_string(), def);
+        }
+    }
+
+    /// `:hi clear` — drop every group back to the empty default state.
+    pub fn clear(&mut self) {
+        self.groups.clear();
+    }
+
+    /// The raw (unresolved) definition for `name`, if any. `link` is still
+    /// present — callers wanting a concrete style use [`Highlights::resolve`].
+    pub fn get(&self, name: &str) -> Option<&HlDef> {
+        self.groups.get(name)
+    }
+
+    /// Resolve a group to a concrete [`Style`], following its link chain
+    /// (cycle-guarded). Returns `None` when the group is absent, cleared, or
+    /// links to a dead end — i.e. when it contributes no highlight.
+    pub fn resolve(&self, name: &str) -> Option<Style> {
+        let mut current = name;
+        for _ in 0..MAX_LINK_DEPTH {
+            let def = self.groups.get(current)?;
+            if let Some(link) = &def.link {
+                current = link;
+                continue;
+            }
+            let style = Style::from_def(def);
+            return if style.is_empty() { None } else { Some(style) };
+        }
+        None // cycle or pathologically deep chain
+    }
+
+    /// Resolve a treesitter capture name (`function.call`, `string`, …) to a
+    /// concrete style by walking the standard fallback chain: the `@`-group at
+    /// progressively shorter specificity, then the legacy syntax group. The
+    /// first candidate that resolves wins; an unknown capture yields `None`.
+    ///
+    /// `function.call` -> `@function.call` -> `@function` -> `Function`.
+    pub fn resolve_capture(&self, capture: &str) -> Option<Style> {
+        capture_fallbacks(capture)
+            .into_iter()
+            .find_map(|group| self.resolve(&group))
+    }
+}
+
+/// Parse a color as written in an `nvim_set_hl` opts table: a `#rrggbb` literal,
+/// a small set of named colors, or `"NONE"`. Returns `None` for `NONE` and for
+/// anything unrecognized (both mean "no color here").
+pub fn parse_color(spec: &str) -> Option<Rgb> {
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("none") || spec.is_empty() {
+        return None;
+    }
+    if let Some(hex) = spec.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Rgb { r, g, b });
+        }
+        return None;
+    }
+    named_color(spec)
+}
+
+/// The handful of named colors a theme might reference (the standard ANSI
+/// names). catppuccin's compiled output is all hex, so this is a safety net for
+/// the few groups that use a name; unknown names resolve to `None`.
+fn named_color(name: &str) -> Option<Rgb> {
+    let rgb = |r, g, b| Some(Rgb { r, g, b });
+    match name.to_ascii_lowercase().as_str() {
+        "black" => rgb(0, 0, 0),
+        "white" => rgb(255, 255, 255),
+        "red" => rgb(255, 0, 0),
+        "green" => rgb(0, 128, 0),
+        "blue" => rgb(0, 0, 255),
+        "yellow" => rgb(255, 255, 0),
+        "cyan" => rgb(0, 255, 255),
+        "magenta" => rgb(255, 0, 255),
+        "gray" | "grey" => rgb(128, 128, 128),
+        _ => None,
+    }
+}
+
+/// Build the ordered candidate groups for a capture name. For `a.b.c`:
+/// `@a.b.c`, `@a.b`, `@a`, then the legacy syntax group for the major segment
+/// (`a`) if one exists. This mirrors neovim's treesitter default-link fallback,
+/// so a theme styling only the broad group still colors specific captures.
+fn capture_fallbacks(capture: &str) -> Vec<String> {
+    let parts: Vec<&str> = capture.split('.').collect();
+    let mut out = Vec::with_capacity(parts.len() + 1);
+    for i in (1..=parts.len()).rev() {
+        out.push(format!("@{}", parts[..i].join(".")));
+    }
+    if let Some(legacy) = legacy_group(parts[0]) {
+        out.push(legacy.to_string());
+    }
+    out
+}
+
+/// Map a capture's major segment to the legacy syntax group that themes have
+/// always styled (`Comment`, `Function`, `Keyword`, …). The terminal fallback
+/// in [`capture_fallbacks`]: covers the captures nxvim-ts emits, so even a
+/// minimal theme that only sets legacy groups colors the buffer.
+fn legacy_group(major: &str) -> Option<&'static str> {
+    Some(match major {
+        "comment" => "Comment",
+        "string" => "String",
+        "character" => "Character",
+        "number" => "Number",
+        "boolean" => "Boolean",
+        "float" => "Float",
+        "constant" => "Constant",
+        "function" | "method" | "constructor" => "Function",
+        "keyword" | "keyword_operator" => "Keyword",
+        "conditional" => "Conditional",
+        "repeat" => "Repeat",
+        "include" => "Include",
+        "exception" => "Exception",
+        "type" | "namespace" | "module" => "Type",
+        "operator" => "Operator",
+        "punctuation" => "Delimiter",
+        "property" | "field" | "attribute" | "variable" => "Identifier",
+        "label" => "Label",
+        "tag" => "Tag",
+        _ => return None,
+    })
+}

@@ -17,6 +17,16 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread and return a connected client.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_with(ServerInit {
+        file,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Like [`start`], but with a fully-specified [`ServerInit`] — used by tests
+/// that need an explicit config dir / runtimepath (kept off the host's home).
+async fn start_with(init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
 
     std::thread::spawn(move || {
@@ -24,7 +34,7 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
             .enable_time()
             .build()
             .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, ServerInit { file }));
+        let _ = runtime.block_on(run_server(server_end, init));
     });
 
     let (reader, writer) = tokio::io::split(client_end);
@@ -172,6 +182,16 @@ fn temp_path(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("nxvim_test_{tag}_{}_{n}.txt", std::process::id()))
+}
+
+/// Create and return a fresh, uniquely-named temp directory for a test fixture
+/// (e.g. a throwaway config dir / runtimepath).
+fn temp_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}_{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
 }
 
 #[tokio::test]
@@ -825,4 +845,558 @@ async fn set_toggles_and_abbreviations_work() {
     // `invnumber` toggles it back on.
     let map = redraw_after(&rpc, &mut incoming, ":set invnumber<CR>").await;
     assert!(field_bool(&map, "number"), "invnumber toggled number on");
+}
+
+// ----- Lua plugin runtime (init.lua + require over the runtimepath) ----------
+
+#[tokio::test]
+async fn init_lua_runs_at_startup_and_require_resolves_runtimepath_modules() {
+    // A throwaway config dir doubling as a runtimepath entry. `init.lua` pulls a
+    // module off the runtimepath via `require` and prints the value it returns;
+    // observing it on the message line proves both the module search
+    // (`package.path` seeded from the runtimepath) and startup sourcing.
+    let dir = temp_dir("rtp");
+    std::fs::create_dir_all(dir.join("lua")).expect("create lua dir");
+    std::fs::write(
+        dir.join("lua").join("probe.lua"),
+        "return { greeting = 'loaded from probe' }\n",
+    )
+    .expect("write probe module");
+    std::fs::write(
+        dir.join("init.lua"),
+        "local probe = require('probe')\nprint(probe.greeting)\n",
+    )
+    .expect("write init.lua");
+
+    let (rpc, mut incoming) = start_with(ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir.clone()],
+        ..Default::default()
+    })
+    .await;
+
+    // Empty input is a no-op edit that still triggers a redraw, carrying the
+    // message `init.lua` left behind at startup.
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("loaded from probe"),
+        "init.lua should run and require() should resolve modules on the runtimepath"
+    );
+}
+
+#[tokio::test]
+async fn missing_init_lua_is_harmless() {
+    // A config dir with no init.lua must start cleanly (no config is normal).
+    let dir = temp_dir("noinit");
+    let (rpc, mut incoming) = start_with(ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir],
+        ..Default::default()
+    })
+    .await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some(""),
+        "no init.lua → no startup message or error"
+    );
+}
+
+// ----- vim.* surface (Phase 2): helpers, options, user commands -------------
+
+/// Start a server whose config dir / runtimepath is `dir`, after writing
+/// `init_lua` to `<dir>/init.lua`. Returns the connected client.
+async fn start_with_config(
+    dir: &std::path::Path,
+    init_lua: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    start_with(ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
+    })
+    .await
+}
+
+/// The message line from the redraw produced by a no-op input — i.e. whatever
+/// `init.lua` left behind at startup.
+async fn startup_message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> String {
+    let map = redraw_after(rpc, incoming, "").await;
+    field(&map, "message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn vim_tbl_deep_extend_merges_nested_tables() {
+    let dir = temp_dir("tbl");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local r = vim.tbl_deep_extend('force', {a=1, b={c=2}}, {b={d=3}})\n\
+         print(r.a .. ',' .. r.b.c .. ',' .. r.b.d)\n",
+    )
+    .await;
+    assert_eq!(startup_message(&rpc, &mut incoming).await, "1,2,3");
+}
+
+#[tokio::test]
+async fn vim_g_round_trips_a_global() {
+    let dir = temp_dir("vimg");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.g.colors_name = 'mocha'\nprint(vim.g.colors_name)\n",
+    )
+    .await;
+    assert_eq!(startup_message(&rpc, &mut incoming).await, "mocha");
+}
+
+#[tokio::test]
+async fn vim_cmd_is_callable_and_indexable() {
+    // The indexable form `vim.cmd.set("number")` must build and run `:set
+    // number`, observable as the redraw's `number` flag flipping on.
+    let dir = temp_dir("vimcmd");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.set('number')\n").await;
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert!(
+        field(&map, "number")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "vim.cmd.set('number') should enable the number option"
+    );
+}
+
+#[tokio::test]
+async fn vim_fn_stdpath_returns_an_nxvim_path() {
+    let dir = temp_dir("stdpath");
+    let (rpc, mut incoming) = start_with_config(&dir, "print(vim.fn.stdpath('cache'))\n").await;
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(
+        !msg.is_empty() && msg.contains("nxvim"),
+        "stdpath('cache') should be a non-empty nxvim path, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn user_command_registers_and_dispatches() {
+    // Register `:Greet` from init.lua, then invoke it with an argument; its
+    // callback's print() should land on the message line.
+    let dir = temp_dir("usercmd");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_user_command('Greet', function(o) print('hi ' .. o.args) end, {})\n",
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, ":Greet there<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("hi there"),
+        "typed :Greet should dispatch to the Lua user command"
+    );
+}
+
+#[tokio::test]
+async fn unknown_command_still_reports_the_standard_error() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":Frobnicate<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E492: Not an editor command: Frobnicate"),
+        "a command with no core handler and no user command is still an error"
+    );
+}
+
+#[tokio::test]
+async fn colorscheme_style_plugin_load_runs_clean() {
+    // A miniature plugin mimicking catppuccin's shape: setup() merges config,
+    // load() sets options/globals and fires nvim_set_hl (incl. a link), and it
+    // registers a user command and an autocmd. The whole load must run without a
+    // Lua error — proving the Phase 2 surface is broad enough for that pattern.
+    let dir = temp_dir("scheme");
+    std::fs::create_dir_all(dir.join("lua").join("minischeme")).expect("create module dir");
+    std::fs::write(
+        dir.join("lua").join("minischeme").join("init.lua"),
+        "local M = { options = {} }\n\
+         function M.setup(conf)\n\
+           M.options = vim.tbl_deep_extend('force', { flavour = 'default' }, conf or {})\n\
+         end\n\
+         function M.load()\n\
+           if not M.options.flavour then M.setup() end\n\
+           vim.o.termguicolors = true\n\
+           vim.g.colors_name = 'minischeme-' .. M.options.flavour\n\
+           vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+           vim.api.nvim_set_hl(0, 'Comment', { fg = '#6c7086', italic = true })\n\
+           vim.api.nvim_set_hl(0, '@keyword', { link = 'Keyword' })\n\
+           vim.api.nvim_create_user_command('MiniScheme', function() M.load() end, {})\n\
+           vim.api.nvim_create_autocmd('ColorScheme', { pattern = 'minischeme', callback = function() end })\n\
+         end\n\
+         return M\n",
+    )
+    .expect("write module");
+
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "require('minischeme').setup({ flavour = 'mocha' })\n\
+         require('minischeme').load()\n\
+         print('ok ' .. tostring(vim.g.colors_name) .. ' tgc=' .. tostring(vim.o.termguicolors))\n",
+    )
+    .await;
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "ok minischeme-mocha tgc=true",
+        "the colorscheme-style load path should complete without error"
+    );
+}
+
+// ----- highlight registry (Phase 3): nvim_set_hl, links, captures, colorscheme
+
+/// `#rrggbb` as the `0xRRGGBB` integer the highlight RPCs report colors as.
+fn hex(rgb: &str) -> u64 {
+    u32::from_str_radix(rgb.trim_start_matches('#'), 16).expect("hex color") as u64
+}
+
+/// Resolve a highlight group via `nvim_get_hl(0, { name = group })`, returning
+/// its concrete-style map (empty when the group is unstyled/absent).
+async fn get_hl(rpc: &Rpc, group: &str) -> Vec<(Value, Value)> {
+    let opts = Value::Map(vec![(Value::from("name"), Value::from(group))]);
+    let result = rpc
+        .request("nvim_get_hl", vec![Value::from(0u64), opts])
+        .await
+        .expect("get_hl");
+    match result {
+        Value::Map(map) => map,
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve a treesitter capture name through the `@`-group fallback chain;
+/// `None` when nothing in the registry matches.
+async fn resolve_capture(rpc: &Rpc, capture: &str) -> Option<Vec<(Value, Value)>> {
+    let result = rpc
+        .request("nxvim_resolve_capture", vec![Value::from(capture)])
+        .await
+        .expect("resolve_capture");
+    match result {
+        Value::Map(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// A color field (`fg`/`bg`/`sp`) from a resolved-style map.
+fn hl_color(map: &[(Value, Value)], key: &str) -> Option<u64> {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_u64())
+}
+
+/// Whether a boolean attribute (`bold`, `italic`, …) is set in a style map.
+fn hl_flag(map: &[(Value, Value)], key: &str) -> bool {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_bool())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn nvim_set_hl_stores_resolved_colors_and_attrs() {
+    // catppuccin-mocha-ish: Normal carries fg+bg, Comment fg+italic. The
+    // registry stores them and nvim_get_hl reads them back as RGB ints + flags.
+    let dir = temp_dir("hlset");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'Comment', { fg = '#6c7086', italic = true })\n",
+    )
+    .await;
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(hl_color(&normal, "fg"), Some(hex("cdd6f4")));
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("1e1e2e")));
+    let comment = get_hl(&rpc, "Comment").await;
+    assert_eq!(hl_color(&comment, "fg"), Some(hex("6c7086")));
+    assert!(hl_flag(&comment, "italic"), "Comment should be italic");
+}
+
+#[tokio::test]
+async fn nvim_get_hl_follows_links_to_the_target_color() {
+    // `@keyword` is a pure link to `Keyword`; resolving it must yield Keyword's
+    // concrete color and attributes, not an empty alias.
+    let dir = temp_dir("hllink");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'Keyword', { fg = '#cba6f7', bold = true })\n\
+         vim.api.nvim_set_hl(0, '@keyword', { link = 'Keyword' })\n",
+    )
+    .await;
+    let kw = get_hl(&rpc, "@keyword").await;
+    assert_eq!(hl_color(&kw, "fg"), Some(hex("cba6f7")));
+    assert!(
+        hl_flag(&kw, "bold"),
+        "linked group inherits the target's bold"
+    );
+}
+
+#[tokio::test]
+async fn capture_resolves_through_the_group_fallback_chain() {
+    // Only the broad groups are themed; specific captures must fall through to
+    // them. `string` -> String (green); `function.call` -> @function.call ->
+    // @function -> Function (blue); an unknown capture resolves to nothing.
+    let dir = temp_dir("capfb");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'String', { fg = '#a6e3a1' })\n\
+         vim.api.nvim_set_hl(0, 'Function', { fg = '#89b4fa' })\n",
+    )
+    .await;
+    let string = resolve_capture(&rpc, "string")
+        .await
+        .expect("string resolves");
+    assert_eq!(hl_color(&string, "fg"), Some(hex("a6e3a1")));
+    let call = resolve_capture(&rpc, "function.call")
+        .await
+        .expect("function.call resolves via fallback");
+    assert_eq!(hl_color(&call, "fg"), Some(hex("89b4fa")));
+    assert!(
+        resolve_capture(&rpc, "frobnicate").await.is_none(),
+        "an unknown capture has no resolved style"
+    );
+}
+
+#[tokio::test]
+async fn colorscheme_sources_the_file_and_fires_the_autocmd() {
+    // `:colorscheme cat` must source colors/cat.lua (populating the registry)
+    // and fire the ColorScheme autocmd registered in init.lua.
+    let dir = temp_dir("colo");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_autocmd('ColorScheme', \
+           { pattern = 'cat', callback = function(o) print('themed:' .. o.match) end })\n",
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, ":colorscheme cat<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("themed:cat"),
+        "the ColorScheme autocmd should fire with the scheme name"
+    );
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(hl_color(&normal, "fg"), Some(hex("cdd6f4")));
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("1e1e2e")));
+}
+
+#[tokio::test]
+async fn init_lua_colorscheme_themes_the_first_frame() {
+    // A colorscheme loaded from init.lua must be in effect before the first
+    // frame is served — so the startup redraw already carries resolved chrome,
+    // not bare defaults. (The real-plugin version of this is the Tier-3 PTY
+    // test `catppuccin_repaints_the_editor_in_truecolor`.)
+    let dir = temp_dir("startup_theme");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('cat')\n").await;
+
+    // The startup frame's `chrome.normal` indexes a `styles` entry carrying
+    // catppuccin's base background — i.e. the theme painted the very first frame.
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let normal_id = field(&map, "chrome")
+        .and_then(|c| chrome_id(c, "normal"))
+        .expect("Normal resolved in the startup frame's chrome");
+    let styles = field(&map, "styles")
+        .and_then(Value::as_array)
+        .expect("styles palette");
+    let normal = match &styles[normal_id] {
+        Value::Map(m) => m.as_slice(),
+        _ => panic!("style entry is not a map"),
+    };
+    assert_eq!(hl_color(normal, "bg"), Some(hex("1e1e2e")));
+    assert_eq!(hl_color(normal, "fg"), Some(hex("cdd6f4")));
+}
+
+/// The `style_id` a redraw's `chrome` map assigns to region `key`, if resolved.
+fn chrome_id(chrome: &Value, key: &str) -> Option<usize> {
+    match chrome {
+        Value::Map(entries) => entries
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_u64())
+            .map(|n| n as usize),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn colorscheme_missing_file_reports_e185() {
+    let dir = temp_dir("colomiss");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let map = redraw_after(&rpc, &mut incoming, ":colorscheme nope<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E185: Cannot find color scheme 'nope'"),
+        "a colorscheme with no file on the runtimepath is an error"
+    );
+}
+
+#[tokio::test]
+async fn hi_clear_empties_the_registry() {
+    let dir = temp_dir("hiclear");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4' })\n",
+    )
+    .await;
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "Normal").await, "fg"),
+        Some(hex("cdd6f4"))
+    );
+    let _ = redraw_after(&rpc, &mut incoming, ":hi clear<CR>").await;
+    assert!(
+        get_hl(&rpc, "Normal").await.is_empty(),
+        ":hi clear should empty the registry back to defaults"
+    );
+}
+
+// ----- compile step (Phase 4): bytecode round-trip + on-disk cache -----------
+
+/// Install a colorscheme fixture that exercises catppuccin's real compile
+/// mechanics under `dir`: its `load()` serializes a highlight table to Lua
+/// source, `loadstring`s it, `string.dump(fn, true)`s the result to bytecode,
+/// writes that to `<compile_path>/<flavour>` via `io.open(..., "wb")`, then on
+/// load `loadfile`s the cached bytecode and runs it (firing `nvim_set_hl`). A
+/// `vim.g._compiles` counter makes cache reuse observable. This mirrors the real
+/// plugin's `lib/compiler.lua` + `init.lua` load path; the actual catppuccin
+/// checkout is wired up in Phase 6. `compile_path` is a subdir of `dir` so the
+/// test can assert the cache file without touching `~/.cache`.
+fn write_compiler_fixture(dir: &std::path::Path) {
+    let module = dir.join("lua").join("compilescheme");
+    std::fs::create_dir_all(&module).expect("create module dir");
+    let compile_path = dir.join("cache");
+    std::fs::write(
+        module.join("init.lua"),
+        format!(
+            "local M = {{ options = {{ compile_path = {path:?}, flavour = 'mocha' }} }}\n\
+             local sep = package.config:sub(1, 1)\n\
+             local function inspect(t)\n\
+               local list = {{}}\n\
+               for k, v in pairs(t) do\n\
+                 if type(v) == 'string' then\n\
+                   list[#list + 1] = string.format('%s = \"%s\"', k, v)\n\
+                 else\n\
+                   list[#list + 1] = string.format('%s = %s', k, tostring(v))\n\
+                 end\n\
+               end\n\
+               return '{{ ' .. table.concat(list, ', ') .. ' }}'\n\
+             end\n\
+             local function compile(flavour)\n\
+               vim.g._compiles = (vim.g._compiles or 0) + 1\n\
+               local theme = {{\n\
+                 Normal = {{ fg = '#cdd6f4', bg = '#1e1e2e' }},\n\
+                 Comment = {{ fg = '#6c7086', italic = true }},\n\
+                 Keyword = {{ fg = '#cba6f7' }},\n\
+                 ['@keyword'] = {{ link = 'Keyword' }},\n\
+               }}\n\
+               local lines = {{\n\
+                 'return string.dump(function(flavour)\\n'\n\
+                 .. 'vim.o.termguicolors = true\\n'\n\
+                 .. 'vim.g.colors_name = \"compilescheme-' .. flavour .. '\"\\n'\n\
+                 .. 'local h = vim.api.nvim_set_hl',\n\
+               }}\n\
+               for group, color in pairs(theme) do\n\
+                 lines[#lines + 1] = string.format('h(0, \"%s\", %s)', group, inspect(color))\n\
+               end\n\
+               lines[#lines + 1] = 'end, true)'\n\
+               if vim.fn.isdirectory(M.options.compile_path) == 0 then\n\
+                 vim.fn.mkdir(M.options.compile_path, 'p')\n\
+               end\n\
+               local f = assert(loadstring(table.concat(lines, '\\n')), 'compile failed')\n\
+               local file = assert(io.open(M.options.compile_path .. sep .. flavour, 'wb'))\n\
+               file:write(f())\n\
+               file:close()\n\
+             end\n\
+             function M.setup(conf) M.options = vim.tbl_deep_extend('force', M.options, conf or {{}}) end\n\
+             function M.load(flavour)\n\
+               flavour = flavour or M.options.flavour\n\
+               local compiled = M.options.compile_path .. sep .. flavour\n\
+               local f = loadfile(compiled)\n\
+               if not f then\n\
+                 compile(flavour)\n\
+                 f = assert(loadfile(compiled), 'could not load cache')\n\
+               end\n\
+               f(flavour)\n\
+               print('compiles=' .. tostring(vim.g._compiles or 0))\n\
+             end\n\
+             return M\n",
+            path = compile_path.to_string_lossy(),
+        ),
+    )
+    .expect("write module");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("compilescheme.lua"),
+        "require('compilescheme').load()\n",
+    )
+    .expect("write colors file");
+}
+
+#[tokio::test]
+async fn colorscheme_compiles_to_bytecode_then_reuses_the_cache() {
+    // Strategy A end-to-end: the first `:colorscheme` compiles (serialize ->
+    // loadstring -> string.dump -> io.write), loads the cached bytecode via
+    // loadfile, and runs it to populate the registry. The second reuses the
+    // on-disk cache without recompiling (the compile counter stays at 1).
+    let dir = temp_dir("compile");
+    write_compiler_fixture(&dir);
+    let (rpc, mut incoming) = start_with(ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir.clone()],
+        ..Default::default()
+    })
+    .await;
+
+    // First load: no cache yet, so it compiles exactly once.
+    let first = redraw_after(&rpc, &mut incoming, ":colorscheme compilescheme<CR>").await;
+    assert_eq!(
+        field(&first, "message").and_then(Value::as_str),
+        Some("compiles=1"),
+        "first colorscheme load should compile once"
+    );
+
+    // The bytecode cache file was written to disk.
+    assert!(
+        dir.join("cache").join("mocha").is_file(),
+        "the compiled flavour should be cached on disk"
+    );
+
+    // The registry is populated through the real bytecode load path.
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(hl_color(&normal, "fg"), Some(hex("cdd6f4")));
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("1e1e2e")));
+    assert!(hl_flag(&get_hl(&rpc, "Comment").await, "italic"));
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "@keyword").await, "fg"),
+        Some(hex("cba6f7")),
+        "the linked @keyword resolves through the compiled table"
+    );
+
+    // Second load: the cache exists, so loadfile succeeds and no recompile
+    // happens — the counter is still 1.
+    let second = redraw_after(&rpc, &mut incoming, ":colorscheme compilescheme<CR>").await;
+    assert_eq!(
+        field(&second, "message").and_then(Value::as_str),
+        Some("compiles=1"),
+        "second load should reuse the cached bytecode, not recompile"
+    );
 }

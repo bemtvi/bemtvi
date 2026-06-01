@@ -9,6 +9,7 @@ use std::cmp::{max, min};
 use std::path::PathBuf;
 
 use crate::buffer::Buffer;
+use crate::highlight::Highlights;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::{resolve_set, Options, SetOp};
@@ -88,6 +89,10 @@ pub struct Editor {
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
+    /// The highlight-group registry a colorscheme populates via `nvim_set_hl`.
+    /// Mutated only by the server through the Lua drain path, keeping the core
+    /// state machine pure; queried when resolving captures/chrome to styles.
+    pub highlights: Highlights,
 
     width: usize,
     height: usize,
@@ -126,6 +131,13 @@ pub struct Editor {
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
 
+    /// Ex-commands the core didn't recognize, handed to the server to resolve
+    /// against Lua-defined user commands (`nvim_create_user_command`) before
+    /// falling back to an unknown-command error. Keeps the core ignorant of the
+    /// Lua command table while still routing typed `:Foo` and `vim.cmd.Foo()`
+    /// through one place.
+    pub deferred_commands: Vec<String>,
+
     /// Milliseconds the server should block after the current command, set by
     /// `:sleep` and drained via [`Editor::take_sleep`]. Models a slow editor
     /// operation; the server awaits it without freezing the UI.
@@ -151,6 +163,7 @@ impl Editor {
             message: String::new(),
             should_quit: false,
             options: Options::default(),
+            highlights: Highlights::new(),
             width: 80,
             height: 24,
             desired_col: 0,
@@ -170,6 +183,7 @@ impl Editor {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             lua_queue: Vec::new(),
+            deferred_commands: Vec::new(),
             pending_sleep: None,
         }
     }
@@ -1215,7 +1229,16 @@ impl Editor {
             },
             "set" | "se" => self.ex_set(args),
             "noh" | "nohlsearch" => {}
-            other => self.message = format!("E492: Not an editor command: {other}"),
+            // `:hi clear` resets the registry to defaults (empty); other `:hi`
+            // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
+            "hi" | "highlight" => {
+                if args.trim() == "clear" {
+                    self.highlights.clear();
+                }
+            }
+            // Unknown to the core: defer to the server, which resolves it
+            // against Lua user commands (or reports the unknown-command error).
+            _ => self.deferred_commands.push(cmd.to_string()),
         }
     }
 

@@ -27,7 +27,13 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
             .enable_time()
             .build()
             .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, ServerInit { file }));
+        let _ = runtime.block_on(run_server(
+            server_end,
+            ServerInit {
+                file,
+                ..Default::default()
+            },
+        ));
     });
     let (reader, writer) = tokio::io::split(client_end);
     let (rpc, incoming) = connect(reader, writer);

@@ -30,7 +30,12 @@ fn main() -> Result<()> {
 
     // The server runs on its own thread with its own single-threaded runtime,
     // so the (non-Send) editor + Lua state live entirely on that thread.
-    let init = ServerInit { file };
+    let (config_dir, runtimepath) = nxvim_server::default_runtime();
+    let init = ServerInit {
+        file,
+        config_dir,
+        runtimepath,
+    };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

@@ -18,7 +18,7 @@ use nxvim_rpc::{connect, Incoming};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
 use std::time::{Duration, Instant};
@@ -120,6 +120,12 @@ fn text_height(terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(CHROME_ROWS).max(1)
 }
 
+/// One treesitter highlight span in screen columns: `(start, end, group,
+/// style_id)`. `style_id` indexes the frame's style palette when the server
+/// resolved the capture through a loaded colorscheme; `None` falls back to the
+/// client's built-in [`group_style`].
+type HlSpan = (u16, u16, String, Option<usize>);
+
 /// The server's view, mirrored client-side for rendering.
 #[derive(Default)]
 pub struct View {
@@ -138,8 +144,21 @@ pub struct View {
     /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
     selection: Vec<Option<(u16, u16)>>,
     /// Per visible row, the treesitter highlight spans `(start_col, end_col,
-    /// group)` in screen columns. The client owns the group→color mapping.
-    highlights: Vec<Vec<(u16, u16, String)>>,
+    /// group, style_id)` in screen columns. `style_id` indexes [`View::styles`]
+    /// when the server resolved the span through a loaded colorscheme; `None`
+    /// means fall back to the client's built-in [`group_style`] theme.
+    highlights: Vec<Vec<HlSpan>>,
+    /// The per-frame style palette the server resolved from the active
+    /// colorscheme; `highlights`/chrome ids index into it. Empty with no theme.
+    styles: Vec<Style>,
+    /// Resolved editor-chrome styles (`None` when the theme leaves the group
+    /// undefined — the client then keeps its built-in look for that region).
+    normal: Option<Style>,
+    line_nr: Option<Style>,
+    cursor_line_nr: Option<Style>,
+    visual: Option<Style>,
+    status_line: Option<Style>,
+    end_of_buffer: Option<Style>,
     scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers),
     /// from which the client formats the number column.
@@ -166,8 +185,14 @@ struct ScrollData {
     selection: Vec<Option<(u16, u16)>>,
     numbers: Vec<Option<usize>>,
     /// Syntax highlights for the band (aligned with `lines`), so the slide is
-    /// colored frame by frame instead of flashing white until it settles.
-    highlights: Vec<Vec<(u16, u16, String)>>,
+    /// colored frame by frame instead of flashing white until it settles. Style
+    /// ids index `styles` below.
+    highlights: Vec<Vec<HlSpan>>,
+    /// The style palette captured with this gesture. Snapshotted (not read live
+    /// from [`View::styles`]) because a delayed highlight redraw arriving
+    /// mid-slide replaces the live palette, which would leave the band's frozen
+    /// style ids pointing at the wrong entries.
+    styles: Vec<Style>,
 }
 
 /// An in-flight scroll animation, driven by the client's local clock.
@@ -182,7 +207,9 @@ struct Animation {
     lines: Vec<String>,
     selection: Vec<Option<(u16, u16)>>,
     numbers: Vec<Option<usize>>,
-    highlights: Vec<Vec<(u16, u16, String)>>,
+    highlights: Vec<Vec<HlSpan>>,
+    /// Palette snapshot the band's style ids index into (see [`ScrollData`]).
+    styles: Vec<Style>,
 }
 
 impl Animation {
@@ -199,6 +226,7 @@ impl Animation {
             selection: s.selection.clone(),
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
+            styles: s.styles.clone(),
         }
     }
 }
@@ -266,6 +294,15 @@ impl View {
         self.cursor_line = map_u64(map, "cursor_line") as usize;
         self.selection = parse_spans(map_get(map, "selection"));
         self.highlights = parse_highlights(map_get(map, "highlights"));
+        // The style palette must land before chrome, which indexes into it.
+        self.styles = parse_styles(map_get(map, "styles"));
+        let chrome = |key| chrome_style(map_get(map, "chrome"), key, &self.styles);
+        self.normal = chrome("normal");
+        self.line_nr = chrome("line_nr");
+        self.cursor_line_nr = chrome("cursor_line_nr");
+        self.visual = chrome("visual");
+        self.status_line = chrome("status_line");
+        self.end_of_buffer = chrome("end_of_buffer");
         self.numbers = parse_numbers(map_get(map, "numbers"));
         self.number = map_get(map, "number")
             .and_then(Value::as_bool)
@@ -293,6 +330,9 @@ impl View {
                 selection: parse_spans(map_get(s, "selection")),
                 numbers: parse_numbers(map_get(s, "numbers")),
                 highlights: parse_highlights(map_get(s, "highlights")),
+                // The band's ids index this redraw's palette — snapshot it now,
+                // since a later redraw will replace `self.styles`.
+                styles: self.styles.clone(),
             }),
             _ => None,
         };
@@ -381,7 +421,7 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     // Syntax highlights for the painted rows — the static viewport, or, during a
     // slide, the matching slice of the over-scanned band so the scroll is colored
     // throughout instead of flashing white until it settles.
-    let frame_hl: Vec<Vec<(u16, u16, String)>>;
+    let frame_hl: Vec<Vec<HlSpan>>;
     let frame_numbers: Vec<Option<usize>>;
     let cursor_row: u16;
     // 1-based buffer line the cursor sits on, used to compute relative numbers.
@@ -419,6 +459,15 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
         }
     }
 
+    // Paint the whole text area with the theme's `Normal` background first (when
+    // a colorscheme is loaded), so every following widget's spans patch their
+    // foreground onto it and the gutter, end-of-line gaps, and `~` rows all share
+    // the editor background. With no theme this is skipped — the terminal default
+    // shows through, exactly as before.
+    if let Some(normal) = view.normal {
+        frame.render_widget(Block::default().style(normal), text_area);
+    }
+
     // Split a number-column gutter off the left of the text area when enabled.
     // The gutter is its own widget; the text, selection, and cursor columns are
     // all measured from the text sub-area, so they stay gutter-agnostic.
@@ -431,7 +480,25 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
         text_area
     };
 
-    render_text(frame, text_inner, &frame_lines, &frame_sel, &frame_hl);
+    // Token style ids index a palette captured with the frame they belong to:
+    // the in-flight animation's snapshot while sliding, else the live view's.
+    let theme = LineTheme {
+        palette: match anim {
+            Some(a) => &a.styles,
+            None => &view.styles,
+        },
+        visual: view.visual,
+        end_of_buffer: view.end_of_buffer,
+    };
+    render_text(
+        frame,
+        text_inner,
+        &frame_lines,
+        &frame_sel,
+        &frame_hl,
+        &frame_numbers,
+        &theme,
+    );
     render_status(frame, status_area, view);
     render_command(frame, cmd_area, view);
 
@@ -453,8 +520,9 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
 /// Paint the line-number column. Each row shows, per the active options:
 /// absolute numbers (`number`), distance-from-cursor (`relativenumber`), or the
 /// hybrid — absolute on the cursor line, relative elsewhere — when both are on.
-/// The cursor line is rendered un-dimmed (vim's `CursorLineNr`); other rows are
-/// dimmed (`LineNr`). `~` filler rows get a blank gutter.
+/// The cursor line uses the theme's `CursorLineNr`, other rows its `LineNr`;
+/// with no colorscheme loaded they fall back to un-dimmed / dimmed (vim's look
+/// out of the box). `~` filler rows get a blank gutter.
 fn render_gutter(
     frame: &mut Frame,
     area: Rect,
@@ -470,9 +538,10 @@ fn render_gutter(
                 let is_current = *num == Some(current_line);
                 let cell = gutter_cell(*num, current_line, view.number, view.relativenumber, width);
                 let style = if is_current {
-                    Style::default()
+                    view.cursor_line_nr.unwrap_or_default()
                 } else {
-                    Style::default().add_modifier(Modifier::DIM)
+                    view.line_nr
+                        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM))
                 };
                 Line::from(Span::styled(cell, style))
             })
@@ -512,15 +581,27 @@ fn gutter_cell(
     }
 }
 
+/// The theme inputs `highlight_line` needs that come from the active
+/// colorscheme: the frame's resolved style `palette` (spans index into it), the
+/// `visual` selection style, and the `end_of_buffer` style for `~` filler rows.
+/// All `None`/empty with no colorscheme, so the client keeps its built-in look.
+struct LineTheme<'a> {
+    palette: &'a [Style],
+    visual: Option<Style>,
+    end_of_buffer: Option<Style>,
+}
+
 fn render_text(
     frame: &mut Frame,
     area: Rect,
     lines: &[String],
     selection: &[Option<(u16, u16)>],
-    highlights: &[Vec<(u16, u16, String)>],
+    highlights: &[Vec<HlSpan>],
+    numbers: &[Option<usize>],
+    theme: &LineTheme,
 ) {
     let width = area.width as usize;
-    let empty: Vec<(u16, u16, String)> = Vec::new();
+    let empty: Vec<HlSpan> = Vec::new();
     let text = Text::from(
         lines
             .iter()
@@ -528,29 +609,46 @@ fn render_text(
             .map(|(row, l)| {
                 let sel = selection.get(row).copied().flatten();
                 let hl = highlights.get(row).unwrap_or(&empty);
-                highlight_line(l, sel, hl, width)
+                // A row with no buffer line is a `~` end-of-buffer filler.
+                let is_filler = matches!(numbers.get(row), Some(None));
+                highlight_line(l, sel, hl, width, is_filler, theme)
             })
             .collect::<Vec<_>>(),
     );
     frame.render_widget(Paragraph::new(text), area);
 }
 
-/// Build a display line, painting each screen cell with its treesitter group's
-/// style (from `hl`) and overlaying the visual selection (`sel`, a half-open
-/// `[start, end)` span of screen cells) as reverse-video on top. `end` may run
-/// past the text to mark a selected newline or fill a linewise selection, in
-/// which case the gap up to `max_width` is painted with reversed blanks.
+/// Build a display line, painting each screen cell with its highlight span's
+/// style (the resolved palette entry, or [`group_style`] as fallback) and
+/// overlaying the visual selection (`sel`, a half-open `[start, end)` span of
+/// screen cells) on top — the theme's `Visual` when loaded, reverse-video
+/// otherwise. `end` may run past the text to mark a selected newline or fill a
+/// linewise selection, in which case the gap up to `max_width` is painted with
+/// selected blanks. `~` filler rows are painted with the `EndOfBuffer` style.
 ///
 /// Both `hl` spans and `sel` are in screen columns (the server resolved byte
 /// offsets through the same tab/wide-char `virtcol` the gutter-less text area
-/// uses), so they line up with the glyphs painted here.
+/// uses), so they line up with the glyphs painted here. Token foregrounds patch
+/// onto the `Normal` background already painted across the text area.
 fn highlight_line(
     line: &str,
     sel: Option<(u16, u16)>,
-    hl: &[(u16, u16, String)],
+    hl: &[HlSpan],
     max_width: usize,
+    is_filler: bool,
+    theme: &LineTheme,
 ) -> Line<'static> {
     let expanded = expand_tabs(line);
+
+    // `~` rows carry no tokens or selection: paint the marker with the theme's
+    // EndOfBuffer style (default — terminal foreground — with no colorscheme).
+    if is_filler {
+        return Line::from(Span::styled(
+            expanded,
+            theme.end_of_buffer.unwrap_or_default(),
+        ));
+    }
+
     let sel = sel.filter(|(s, e)| e > s);
 
     // Walk cells left to right, coalescing runs of identical style into spans.
@@ -559,7 +657,7 @@ fn highlight_line(
     let mut run_style = Style::default();
     let mut col = 0usize;
     for ch in expanded.chars() {
-        let style = cell_style(col, sel, hl);
+        let style = cell_style(col, sel, hl, theme);
         if style != run_style && !run.is_empty() {
             spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
@@ -576,31 +674,42 @@ fn highlight_line(
         let e = (e as usize).min(max_width);
         if col < e {
             let pad = " ".repeat(e - col);
-            spans.push(Span::styled(
-                pad,
-                Style::default().add_modifier(Modifier::REVERSED),
-            ));
+            spans.push(Span::styled(pad, selection_style(Style::default(), theme)));
         }
     }
     Line::from(spans)
 }
 
-/// The style of the screen cell at column `col`: its treesitter group's color,
-/// with the selection's reverse-video composed on top when the cell is selected.
-fn cell_style(col: usize, sel: Option<(u16, u16)>, hl: &[(u16, u16, String)]) -> Style {
+/// The style of the screen cell at column `col`: its highlight span's resolved
+/// palette style (or [`group_style`] fallback when the span carries no id),
+/// with the selection composed on top when the cell is selected.
+fn cell_style(col: usize, sel: Option<(u16, u16)>, hl: &[HlSpan], theme: &LineTheme) -> Style {
     let mut style = Style::default();
-    for (start, end, group) in hl {
+    for (start, end, group, id) in hl {
         if col >= *start as usize && col < *end as usize {
-            style = group_style(group);
+            style = match id {
+                Some(i) => theme.palette.get(*i).copied().unwrap_or_default(),
+                None => group_style(group),
+            };
             break; // spans don't overlap
         }
     }
     if let Some((s, e)) = sel {
         if col >= s as usize && col < e as usize {
-            style = style.add_modifier(Modifier::REVERSED);
+            style = selection_style(style, theme);
         }
     }
     style
+}
+
+/// Compose the visual selection onto `base`: the theme's `Visual` style (its
+/// background swaps in, the cell's foreground is kept where `Visual` leaves it
+/// unset) when a colorscheme is loaded, reverse-video otherwise (vim's default).
+fn selection_style(base: Style, theme: &LineTheme) -> Style {
+    match theme.visual {
+        Some(visual) => base.patch(visual),
+        None => base.add_modifier(Modifier::REVERSED),
+    }
 }
 
 /// Map a treesitter capture group to a terminal style. Keyed on the group's
@@ -663,10 +772,11 @@ fn render_status(frame: &mut Frame, area: Rect, view: &View) {
     let pad = width.saturating_sub(left.chars().count() + right.chars().count());
     let line = format!("{left}{}{right}", " ".repeat(pad));
 
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().add_modifier(Modifier::REVERSED)),
-        area,
-    );
+    // The theme's StatusLine when loaded; reverse-video out of the box.
+    let style = view
+        .status_line
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(Paragraph::new(line).style(style), area);
 }
 
 fn render_command(frame: &mut Frame, area: Rect, view: &View) {
@@ -715,8 +825,11 @@ fn parse_spans(value: Option<&Value>) -> Vec<Option<(u16, u16)>> {
 }
 
 /// Parse the per-row `highlights` payload: an array (one entry per visible row)
-/// of `[start_col, end_col, group]` triples in screen columns.
-fn parse_highlights(value: Option<&Value>) -> Vec<Vec<(u16, u16, String)>> {
+/// of `[start_col, end_col, group, style_id]` spans in screen columns. The
+/// trailing `style_id` (an index into the frame's `styles` palette) is `Nil`
+/// when the server couldn't resolve the span through a colorscheme, in which
+/// case the client falls back to [`group_style`].
+fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
     value
         .and_then(Value::as_array)
         .map(|rows| {
@@ -728,13 +841,14 @@ fn parse_highlights(value: Option<&Value>) -> Vec<Vec<(u16, u16, String)>> {
                                 .iter()
                                 .filter_map(|span| {
                                     let t = span.as_array()?;
-                                    if t.len() != 3 {
+                                    if t.len() != 4 {
                                         return None;
                                     }
                                     Some((
                                         t[0].as_u64()? as u16,
                                         t[1].as_u64()? as u16,
                                         t[2].as_str()?.to_string(),
+                                        t[3].as_u64().map(|id| id as usize),
                                     ))
                                 })
                                 .collect()
@@ -744,6 +858,70 @@ fn parse_highlights(value: Option<&Value>) -> Vec<Vec<(u16, u16, String)>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Parse the per-frame `styles` palette: an array of `{ fg, bg, sp, <attrs> }`
+/// maps (colors as `0xRRGGBB` integers, attributes as `true` flags), each
+/// converted to the ratatui [`Style`] the renderer paints. Highlight spans and
+/// chrome regions index into the returned vec.
+fn parse_styles(value: Option<&Value>) -> Vec<Style> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().map(style_from_value).collect())
+        .unwrap_or_default()
+}
+
+/// Build a ratatui [`Style`] from one `styles`-palette entry. `fg`/`bg` become
+/// truecolor; `sp` sets the underline color; each present boolean adds its
+/// modifier. Absent fields are left unset so the style patches cleanly onto
+/// whatever it is painted over (e.g. the `Normal` background).
+fn style_from_value(value: &Value) -> Style {
+    let Value::Map(map) = value else {
+        return Style::default();
+    };
+    let mut style = Style::default();
+    if let Some(c) = rgb_color(map, "fg") {
+        style = style.fg(c);
+    }
+    if let Some(c) = rgb_color(map, "bg") {
+        style = style.bg(c);
+    }
+    if let Some(c) = rgb_color(map, "sp") {
+        style = style.underline_color(c);
+    }
+    for (key, modifier) in [
+        ("bold", Modifier::BOLD),
+        ("italic", Modifier::ITALIC),
+        ("underline", Modifier::UNDERLINED),
+        ("undercurl", Modifier::UNDERLINED),
+        ("strikethrough", Modifier::CROSSED_OUT),
+        ("reverse", Modifier::REVERSED),
+    ] {
+        if map_get(map, key).and_then(Value::as_bool).unwrap_or(false) {
+            style = style.add_modifier(modifier);
+        }
+    }
+    style
+}
+
+/// Read a `0xRRGGBB` color integer at `key` and unpack it into a truecolor
+/// [`Color::Rgb`]. `None` when the key is absent.
+fn rgb_color(map: &[(Value, Value)], key: &str) -> Option<Color> {
+    let packed = map_get(map, key).and_then(Value::as_u64)?;
+    let [_, r, g, b] = (packed as u32).to_be_bytes();
+    Some(Color::Rgb(r, g, b))
+}
+
+/// Resolve one chrome region (`normal`, `visual`, …) to its style by looking up
+/// its id in the `chrome` map and indexing the parsed `styles` palette. `None`
+/// when the theme left the group undefined (so the client keeps its built-in
+/// look for that region).
+fn chrome_style(chrome: Option<&Value>, key: &str, styles: &[Style]) -> Option<Style> {
+    let Some(Value::Map(map)) = chrome else {
+        return None;
+    };
+    let id = map_get(map, key).and_then(Value::as_u64)? as usize;
+    styles.get(id).copied()
 }
 
 /// Parse a per-row array of 1-based line numbers (`Nil` rows become `None`).

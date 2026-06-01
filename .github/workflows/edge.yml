@@ -1,8 +1,7 @@
 name: edge
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: edge

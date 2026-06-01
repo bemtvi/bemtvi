@@ -16,7 +16,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
@@ -92,10 +92,7 @@ where
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "redraw" => {
                         view.update(&params);
-                        // A scroll gesture arms a fresh animation; any other
-                        // redraw (e.g. the result of a keypress) supersedes and
-                        // clears the in-flight one — the interrupt path.
-                        anim = view.scroll.as_ref().map(Animation::new);
+                        anim = arm_animation(&view, anim.take());
                         terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
                     }
                     "nxvim_exit" => break,
@@ -140,6 +137,9 @@ pub struct View {
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
     selection: Vec<Option<(u16, u16)>>,
+    /// Per visible row, the treesitter highlight spans `(start_col, end_col,
+    /// group)` in screen columns. The client owns the group→color mapping.
+    highlights: Vec<Vec<(u16, u16, String)>>,
     scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers),
     /// from which the client formats the number column.
@@ -165,6 +165,9 @@ struct ScrollData {
     lines: Vec<String>,
     selection: Vec<Option<(u16, u16)>>,
     numbers: Vec<Option<usize>>,
+    /// Syntax highlights for the band (aligned with `lines`), so the slide is
+    /// colored frame by frame instead of flashing white until it settles.
+    highlights: Vec<Vec<(u16, u16, String)>>,
 }
 
 /// An in-flight scroll animation, driven by the client's local clock.
@@ -179,6 +182,7 @@ struct Animation {
     lines: Vec<String>,
     selection: Vec<Option<(u16, u16)>>,
     numbers: Vec<Option<usize>>,
+    highlights: Vec<Vec<(u16, u16, String)>>,
 }
 
 impl Animation {
@@ -194,12 +198,43 @@ impl Animation {
             lines: s.lines.clone(),
             selection: s.selection.clone(),
             numbers: s.numbers.clone(),
+            highlights: s.highlights.clone(),
         }
     }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Decide the scroll animation to run after a `redraw`, given any animation
+/// already in flight (`current`). The single owner of the animation's lifecycle,
+/// called by both the live event loop and the test driver so they can't diverge.
+///
+/// - A redraw carrying a scroll gesture (re)arms a fresh slide.
+/// - A redraw with no scroll gesture *that just repaints the slide's
+///   destination* — e.g. an async syntax-highlight reply for the lines we
+///   scrolled to — is left to play out: clearing it there would snap the view.
+/// - Any other scroll-less redraw is a real change (a keypress, edit, or cursor
+///   move) and interrupts the slide, as before.
+fn arm_animation(view: &View, current: Option<Animation>) -> Option<Animation> {
+    if let Some(s) = view.scroll.as_ref() {
+        return Some(Animation::new(s));
+    }
+    current.filter(|a| repaints_destination(view, a))
+}
+
+/// Whether `view` merely repaints the destination viewport `anim` is sliding
+/// toward — same first visible line and cursor line — rather than reflecting a
+/// new navigation state. Such a redraw (a delayed highlight reply) must not
+/// abort the slide.
+fn repaints_destination(view: &View, anim: &Animation) -> bool {
+    // `to_top` / `to_cursor` are whole line indices kept as `f32` for
+    // interpolation; the destination is reached at exactly those lines.
+    let dest_top = anim.to_top as usize + 1; // first visible line, 1-based
+    let dest_cursor = anim.to_cursor as usize + 1; // cursor line, 1-based
+    let top_line = view.numbers.first().copied().flatten();
+    top_line == Some(dest_top) && view.cursor_line == dest_cursor
 }
 
 impl View {
@@ -230,6 +265,7 @@ impl View {
             .unwrap_or(false);
         self.cursor_line = map_u64(map, "cursor_line") as usize;
         self.selection = parse_spans(map_get(map, "selection"));
+        self.highlights = parse_highlights(map_get(map, "highlights"));
         self.numbers = parse_numbers(map_get(map, "numbers"));
         self.number = map_get(map, "number")
             .and_then(Value::as_bool)
@@ -256,6 +292,7 @@ impl View {
                     .unwrap_or_default(),
                 selection: parse_spans(map_get(s, "selection")),
                 numbers: parse_numbers(map_get(s, "numbers")),
+                highlights: parse_highlights(map_get(s, "highlights")),
             }),
             _ => None,
         };
@@ -283,6 +320,49 @@ pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
     terminal.backend().buffer().clone()
 }
 
+/// A headless mirror of the client's render state — the `View` and the in-flight
+/// scroll `Animation` — driven by `redraw` notifications exactly as the live
+/// event loop drives them (via [`arm_animation`]). Lets tests exercise the
+/// scroll-animation lifecycle (which the event loop owns) without a real
+/// terminal or RPC connection. Not part of the client's runtime API.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ScrollHarness {
+    view: View,
+    anim: Option<Animation>,
+}
+
+#[doc(hidden)]
+impl ScrollHarness {
+    pub fn new() -> Self {
+        ScrollHarness::default()
+    }
+
+    /// Apply a `redraw` notification's params, arming/clearing the scroll
+    /// animation the same way the live event loop does.
+    pub fn on_redraw(&mut self, params: &[Value]) {
+        self.view.update(params);
+        self.anim = arm_animation(&self.view, self.anim.take());
+    }
+
+    /// Whether a scroll animation is currently in flight.
+    pub fn animating(&self) -> bool {
+        self.anim.is_some()
+    }
+
+    /// Paint the current frame — mid-animation when one is in flight — into a
+    /// `width`x`height` grid, via the same `render` the live client runs.
+    pub fn paint(&self, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &self.view, self.anim.as_ref()))
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+}
+
 /// Lay out the three regions and render each with its own widget. When `anim`
 /// is present and unfinished, the text area shows an interpolated slice of the
 /// scroll band instead of the static viewport.
@@ -298,6 +378,10 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     let height = text_area.height as usize;
     let frame_lines: Vec<String>;
     let frame_sel: Vec<Option<(u16, u16)>>;
+    // Syntax highlights for the painted rows — the static viewport, or, during a
+    // slide, the matching slice of the over-scanned band so the scroll is colored
+    // throughout instead of flashing white until it settles.
+    let frame_hl: Vec<Vec<(u16, u16, String)>>;
     let frame_numbers: Vec<Option<usize>>;
     let cursor_row: u16;
     // 1-based buffer line the cursor sits on, used to compute relative numbers.
@@ -315,6 +399,13 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
             frame_lines = a.lines.iter().skip(off).take(height).cloned().collect();
             frame_sel = a.selection.iter().skip(off).take(height).copied().collect();
             frame_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
+            frame_hl = a
+                .highlights
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
             cursor_row = cur.saturating_sub(top) as u16;
             current_line = cur + 1;
         }
@@ -322,6 +413,7 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
             frame_lines = view.lines.clone();
             frame_sel = view.selection.clone();
             frame_numbers = view.numbers.clone();
+            frame_hl = view.highlights.clone();
             cursor_row = view.cursor_row;
             current_line = view.cursor_line;
         }
@@ -339,7 +431,7 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
         text_area
     };
 
-    render_text(frame, text_inner, &frame_lines, &frame_sel);
+    render_text(frame, text_inner, &frame_lines, &frame_sel, &frame_hl);
     render_status(frame, status_area, view);
     render_command(frame, cmd_area, view);
 
@@ -420,64 +512,119 @@ fn gutter_cell(
     }
 }
 
-fn render_text(frame: &mut Frame, area: Rect, lines: &[String], selection: &[Option<(u16, u16)>]) {
+fn render_text(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[String],
+    selection: &[Option<(u16, u16)>],
+    highlights: &[Vec<(u16, u16, String)>],
+) {
     let width = area.width as usize;
+    let empty: Vec<(u16, u16, String)> = Vec::new();
     let text = Text::from(
         lines
             .iter()
             .enumerate()
             .map(|(row, l)| {
                 let sel = selection.get(row).copied().flatten();
-                highlight_line(l, sel, width)
+                let hl = highlights.get(row).unwrap_or(&empty);
+                highlight_line(l, sel, hl, width)
             })
             .collect::<Vec<_>>(),
     );
     frame.render_widget(Paragraph::new(text), area);
 }
 
-/// Build a display line, styling the screen columns in `sel` as the visual
-/// selection. `sel` is a half-open `[start, end)` span of screen cells; `end`
-/// may run past the text to mark a selected newline or fill a linewise
-/// selection, in which case the gap up to `max_width` is painted with blanks.
-fn highlight_line(line: &str, sel: Option<(u16, u16)>, max_width: usize) -> Line<'static> {
+/// Build a display line, painting each screen cell with its treesitter group's
+/// style (from `hl`) and overlaying the visual selection (`sel`, a half-open
+/// `[start, end)` span of screen cells) as reverse-video on top. `end` may run
+/// past the text to mark a selected newline or fill a linewise selection, in
+/// which case the gap up to `max_width` is painted with reversed blanks.
+///
+/// Both `hl` spans and `sel` are in screen columns (the server resolved byte
+/// offsets through the same tab/wide-char `virtcol` the gutter-less text area
+/// uses), so they line up with the glyphs painted here.
+fn highlight_line(
+    line: &str,
+    sel: Option<(u16, u16)>,
+    hl: &[(u16, u16, String)],
+    max_width: usize,
+) -> Line<'static> {
     let expanded = expand_tabs(line);
-    let (start, end) = match sel {
-        Some((s, e)) if e > s => (s as usize, e as usize),
-        _ => return Line::from(expanded),
-    };
+    let sel = sel.filter(|(s, e)| e > s);
 
-    // Partition the (tab-expanded) cells into before / selected / after by their
-    // screen column, tracking width so wide glyphs advance two cells.
-    let (mut pre, mut mid, mut post) = (String::new(), String::new(), String::new());
+    // Walk cells left to right, coalescing runs of identical style into spans.
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = Style::default();
     let mut col = 0usize;
     for ch in expanded.chars() {
-        if col < start {
-            pre.push(ch);
-        } else if col < end {
-            mid.push(ch);
-        } else {
-            post.push(ch);
+        let style = cell_style(col, sel, hl);
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
+        run_style = style;
+        run.push(ch);
         col += UnicodeWidthChar::width(ch).unwrap_or(0);
     }
-    // Extend the highlight past end-of-text (selected newline / linewise fill).
-    while col < end && col < max_width {
-        mid.push(' ');
-        col += 1;
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
     }
 
-    let hl = Style::default().add_modifier(Modifier::REVERSED);
-    let mut spans = Vec::with_capacity(3);
-    if !pre.is_empty() {
-        spans.push(Span::raw(pre));
-    }
-    if !mid.is_empty() {
-        spans.push(Span::styled(mid, hl));
-    }
-    if !post.is_empty() {
-        spans.push(Span::raw(post));
+    // Extend the selection past end-of-text (selected newline / linewise fill).
+    if let Some((_, e)) = sel {
+        let e = (e as usize).min(max_width);
+        if col < e {
+            let pad = " ".repeat(e - col);
+            spans.push(Span::styled(
+                pad,
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        }
     }
     Line::from(spans)
+}
+
+/// The style of the screen cell at column `col`: its treesitter group's color,
+/// with the selection's reverse-video composed on top when the cell is selected.
+fn cell_style(col: usize, sel: Option<(u16, u16)>, hl: &[(u16, u16, String)]) -> Style {
+    let mut style = Style::default();
+    for (start, end, group) in hl {
+        if col >= *start as usize && col < *end as usize {
+            style = group_style(group);
+            break; // spans don't overlap
+        }
+    }
+    if let Some((s, e)) = sel {
+        if col >= s as usize && col < e as usize {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+    }
+    style
+}
+
+/// Map a treesitter capture group to a terminal style. Keyed on the group's
+/// major family (the segment before the first `.`), so `function.call`,
+/// `function.builtin`, … all share `function`'s color. This is the client's
+/// theme — the *only* place that decides how a group looks. Unknown groups fall
+/// back to the default foreground. Indexed ANSI colors keep it terminal-portable.
+fn group_style(group: &str) -> Style {
+    let major = group.split('.').next().unwrap_or(group);
+    let style = Style::default();
+    match major {
+        "keyword" | "conditional" | "repeat" | "include" | "exception" | "keyword_operator" => {
+            style.fg(Color::Magenta)
+        }
+        "function" | "method" => style.fg(Color::Blue),
+        "constructor" | "type" | "namespace" | "module" => style.fg(Color::Yellow),
+        "string" | "character" => style.fg(Color::Green),
+        "number" | "boolean" | "float" | "constant" => style.fg(Color::Cyan),
+        "attribute" | "label" | "property" | "field" => style.fg(Color::Cyan),
+        "comment" => style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        "tag" => style.fg(Color::Red),
+        "operator" | "punctuation" => style.fg(Color::Gray),
+        _ => style,
+    }
 }
 
 /// Expand tabs to spaces at `TABSTOP`, tracking display width so wide characters
@@ -561,6 +708,38 @@ fn parse_spans(value: Option<&Value>) -> Vec<Option<(u16, u16)>> {
                         pair[1].as_u64().unwrap_or(0) as u16,
                     )),
                     _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the per-row `highlights` payload: an array (one entry per visible row)
+/// of `[start_col, end_col, group]` triples in screen columns.
+fn parse_highlights(value: Option<&Value>) -> Vec<Vec<(u16, u16, String)>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|span| {
+                                    let t = span.as_array()?;
+                                    if t.len() != 3 {
+                                        return None;
+                                    }
+                                    Some((
+                                        t[0].as_u64()? as u16,
+                                        t[1].as_u64()? as u16,
+                                        t[2].as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 })
                 .collect()
         })

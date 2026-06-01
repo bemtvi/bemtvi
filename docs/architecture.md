@@ -40,18 +40,24 @@ subsystems:
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime and the `vim.*` standard library.           |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
-| `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC.         |
+| `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **treesitter syntax worker**: a separate, crash-isolated process that loads installable grammars and parses incrementally. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
+| `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. Also re-invokes itself as the syntax worker (`--__ts-worker`). |
 
 Dependency direction is strictly one-way:
 
 ```
-        nxvim (bin)
-        /         \
- nxvim-server   nxvim-tui
-   /   |   \         \
-core  rpc  lua       rpc
-       \____________/
+        nxvim (bin) ───────────────┐
+        /         \                │ spawns (process, not a crate edge)
+ nxvim-server   nxvim-tui          ▼
+   /   |   \         \         nxvim-ts (worker mode)
+core  rpc  lua       rpc        /   \
+       \____________/        tree-sitter  rpc
 ```
+
+The syntax worker is a *process* edge, not a crate dependency: `nxvim-server`
+spawns and supervises it but never links tree-sitter. See
+[*Syntax highlighting*](#syntax-highlighting-treesitter) below and the design at
+[`docs/superpowers/specs/2026-06-01-syntax-highlighting-design.md`](superpowers/specs/2026-06-01-syntax-highlighting-design.md).
 
 `nxvim-core` has no async, no I/O beyond file read/write, and no transport
 dependencies. That keeps the hard part — vim semantics — testable and portable,
@@ -135,6 +141,14 @@ one cell past a line's text to mark a selected newline, or to the viewport edge
 for a linewise selection. The client paints those cells with a highlight style —
 it owns *how* the region looks, the core owns *which* cells are in it.
 
+The same split governs **syntax highlighting**: the `View`/`redraw` carries a
+per-row `highlights` array (aligned with `lines`) of screen-column spans
+`[start, end, group]`, where `group` is a treesitter capture name (`keyword`,
+`string`, …). The server resolves byte offsets to screen columns (the same
+tab/wide-char `virtcol` the selection uses) and the client maps each group to a
+color — *which* cells, server; *how* they look, client. (See
+[*Syntax highlighting*](#syntax-highlighting-treesitter).)
+
 The same split governs the **number column**: the `View` carries the per-row
 1-based buffer line numbers (`numbers`, `None` for `~` filler rows), the
 `number`/`relativenumber` option flags, and the gutter width (`number_width`,
@@ -192,6 +206,40 @@ drains those queues into the editor. The end-state is for `vim.api.nvim_*` to
 call the very same API functions remote clients invoke (`Lua → API → core`),
 making Lua a first-class peer of RPC. Swapping the vendored Lua 5.1 for LuaJIT
 is a build-level change isolated to `nxvim-lua`.
+
+---
+
+## Syntax highlighting (treesitter)
+
+nxvim is **treesitter-native only** — there is no regex/`syntax.vim` highlighter.
+All highlighting comes from [tree-sitter](https://tree-sitter.github.io) grammars
+and their `highlights.scm` queries, and is built so it **can never crash, stall,
+or even slow the editor**:
+
+- **A separate, supervised process.** Tree-sitter grammars are compiled C; a
+  buggy one can *segfault*. So parsing runs in a child process — the `nxvim`
+  binary re-invoked as `nxvim --__ts-worker` (`nxvim-ts`). The server is its RPC
+  client (same `nxvim-rpc` framing) and **respawns it** if it dies, with a
+  circuit breaker against crash-loops. The editor never links tree-sitter and
+  never blocks on the worker: redraws go out immediately with whatever spans are
+  cached, and the worker's `ts_highlights` replies arrive asynchronously as their
+  own redraw.
+- **Installable grammars.** Grammars are not bundled; they load dynamically by
+  filetype from a data directory laid out exactly like neovim's
+  (`<data>/parser/<lang>.so`, `<data>/queries/<lang>/highlights.scm`), so an
+  existing nvim-treesitter tree is drop-in usable.
+- **Incremental parsing.** The worker keeps a shadow buffer and a persistent
+  parse tree per buffer; the editor sends only **edit deltas** (`InputEdit`), so
+  per-edit cost scales with the edit, not the file — huge files stay responsive.
+  This rides a `Buffer` edit journal in `nxvim-core` (`changedtick` +
+  `BufferEdit`s, drained by the server each frame).
+
+The `View`/`redraw` carries the result as a per-row `highlights` array (see the
+*View protocol* above): screen-column spans tagged with a capture-group **name**
+(`keyword`, `string`, …). As with the visual selection, the server owns *which*
+cells are which group; the **client owns the colors** (its theme maps group →
+style). Full design:
+[`docs/superpowers/specs/2026-06-01-syntax-highlighting-design.md`](superpowers/specs/2026-06-01-syntax-highlighting-design.md).
 
 ---
 
@@ -267,11 +315,16 @@ screen," and that is exactly the shape of these tests.
 - Rope-backed (ropey 2.0), byte-indexed buffers with a strict trailing-newline
   invariant — closer to vim's own byte-column model.
 - Snapshot undo rather than a persistent undo tree — for now.
+- **Treesitter highlighting in a separate, crash-isolated process** with
+  installable grammars and incremental parsing (see
+  [*Syntax highlighting*](#syntax-highlighting-treesitter)) — neovim parses
+  in-process on the main loop.
 
 **Not yet implemented (roadmap):**
 
-- Syntax highlighting / Treesitter (the `View` carries visual-selection spans,
-  but no syntax-driven styling yet).
+- `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
+  dir today; installing them there is manual / a follow-up), treesitter
+  injections, and a `:set`-driven highlight toggle.
 - Multiple windows, tabs, and buffers; splits and the window layout tree.
 - Vimscript (`eval.c`) and a broad Lua `vim.*` API surface.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`

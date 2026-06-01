@@ -1,0 +1,19 @@
+[package]
+name = "nxvim-ts"
+description = "Crash-isolated treesitter syntax worker for nxvim (a separate process; loads installable grammars and streams highlight spans)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rmpv.workspace = true
+tokio.workspace = true
+ropey.workspace = true
+nxvim-rpc.workspace = true
+tree-sitter.workspace = true
+streaming-iterator.workspace = true
+libloading.workspace = true

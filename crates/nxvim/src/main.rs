@@ -10,7 +10,18 @@
 use anyhow::Result;
 use nxvim_server::{run as run_server, ServerInit};
 
+/// Internal flag that re-invokes this binary as the treesitter syntax worker
+/// (see `nxvim-ts`). Hidden from users; spawned only by the server.
+const TS_WORKER_FLAG: &str = "--__ts-worker";
+
 fn main() -> Result<()> {
+    // Worker mode: a separate, crash-isolated process that does all tree-sitter
+    // parsing and streams highlight spans back over stdio. It never starts an
+    // editor; if it dies, the server respawns it.
+    if std::env::args().any(|a| a == TS_WORKER_FLAG) {
+        return run_ts_worker();
+    }
+
     // Positional file argument, like `nvim file.txt`.
     let file = std::env::args().nth(1);
 
@@ -22,6 +33,7 @@ fn main() -> Result<()> {
     let init = ServerInit { file };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
             .enable_time()
             .build()
             .expect("failed to build server runtime");
@@ -39,4 +51,19 @@ fn main() -> Result<()> {
     // When the client exits, the dropped stream signals the server to wind down.
     let _ = server_thread.join();
     result
+}
+
+/// Run the treesitter worker over this process's stdio until the parent closes
+/// the pipe. Its own single-threaded runtime, with I/O enabled for the stdio
+/// pipes.
+fn run_ts_worker() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(nxvim_ts::run_worker(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    ));
+    Ok(())
 }

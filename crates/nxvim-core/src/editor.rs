@@ -770,7 +770,7 @@ impl Editor {
                     let at = self
                         .buffer
                         .line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
-                    self.buffer.text.insert_char(at, '\n');
+                    self.buffer.insert_char(at, '\n');
                     self.buffer.normalize();
                     self.cursor.line = first_line;
                     self.cursor.col = 0;
@@ -816,7 +816,7 @@ impl Editor {
                     let at = self
                         .buffer
                         .line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
-                    self.buffer.text.insert_char(at, '\n');
+                    self.buffer.insert_char(at, '\n');
                     self.buffer.normalize();
                     self.cursor.line = first_line;
                     self.cursor.col = 0;
@@ -871,7 +871,7 @@ impl Editor {
             return;
         }
         self.push_undo();
-        self.buffer.text.remove(lo..hi);
+        self.buffer.remove(lo..hi);
         self.buffer.normalize();
         self.buffer.modified = true;
     }
@@ -932,9 +932,9 @@ impl Editor {
             return;
         }
         self.push_undo();
-        self.buffer.text.remove(lo..hi);
+        self.buffer.remove(lo..hi);
         let repl: String = std::iter::repeat(c).take(count).collect();
-        self.buffer.text.insert(lo, &repl);
+        self.buffer.insert(lo, &repl);
         self.buffer.modified = true;
         self.cursor.col =
             (lo - self.buffer.line_start(self.cursor.line)) + (count - 1) * c.len_utf8();
@@ -957,8 +957,8 @@ impl Editor {
             } else {
                 c.to_uppercase().collect()
             };
-            self.buffer.text.remove(idx..idx + c.len_utf8());
-            self.buffer.text.insert(idx, &swapped);
+            self.buffer.remove(idx..idx + c.len_utf8());
+            self.buffer.insert(idx, &swapped);
             let s = self.buffer.line(self.cursor.line);
             self.cursor.col = unicode::next_grapheme(&s, self.cursor.col);
         }
@@ -986,10 +986,10 @@ impl Editor {
                     break;
                 }
             }
-            self.buffer.text.remove(eol..ws_end);
+            self.buffer.remove(eol..ws_end);
             // Insert a single separating space unless the line was empty.
             if cur_len > 0 {
-                self.buffer.text.insert_char(eol, ' ');
+                self.buffer.insert_char(eol, ' ');
             }
             self.cursor.col = cur_len;
         }
@@ -1002,11 +1002,11 @@ impl Editor {
         self.push_undo();
         if below {
             let at = self.buffer.byte_at(self.cursor.line, self.line_len());
-            self.buffer.text.insert_char(at, '\n');
+            self.buffer.insert_char(at, '\n');
             self.cursor.line += 1;
         } else {
             let at = self.buffer.line_start(self.cursor.line);
-            self.buffer.text.insert_char(at, '\n');
+            self.buffer.insert_char(at, '\n');
         }
         self.buffer.normalize();
         self.cursor.col = 0;
@@ -1028,7 +1028,7 @@ impl Editor {
                 self.buffer.line_start(self.cursor.line)
             };
             let chunk = self.register.text.repeat(count);
-            self.buffer.text.insert(at, &chunk);
+            self.buffer.insert(at, &chunk);
             self.buffer.normalize();
             self.cursor.line = if after {
                 self.cursor.line + 1
@@ -1053,7 +1053,7 @@ impl Editor {
             // pasted character.
             let last_len = chunk.len() - unicode::prev_grapheme(&chunk, chunk.len());
             let end = at + chunk.len();
-            self.buffer.text.insert(at, &chunk);
+            self.buffer.insert(at, &chunk);
             self.set_cursor_char(end.saturating_sub(last_len));
         }
         self.buffer.normalize();
@@ -1083,7 +1083,7 @@ impl Editor {
             }
             KeyCode::Enter => {
                 let at = self.cursor_char();
-                self.buffer.text.insert_char(at, '\n');
+                self.buffer.insert_char(at, '\n');
                 self.cursor.line += 1;
                 self.cursor.col = 0;
                 self.buffer.modified = true;
@@ -1091,7 +1091,7 @@ impl Editor {
             KeyCode::Backspace => self.insert_backspace(),
             KeyCode::Tab => {
                 let at = self.cursor_char();
-                self.buffer.text.insert_char(at, '\t');
+                self.buffer.insert_char(at, '\t');
                 self.cursor.col += 1;
                 self.buffer.modified = true;
             }
@@ -1112,7 +1112,7 @@ impl Editor {
                     let s = self.buffer.line(self.cursor.line);
                     let end = self.buffer.line_start(self.cursor.line)
                         + unicode::next_grapheme(&s, self.cursor.col);
-                    self.buffer.text.remove(at..end);
+                    self.buffer.remove(at..end);
                     self.buffer.modified = true;
                 }
             }
@@ -1122,9 +1122,9 @@ impl Editor {
                     let s = self.buffer.line(self.cursor.line);
                     let end = self.buffer.line_start(self.cursor.line)
                         + unicode::next_grapheme(&s, self.cursor.col);
-                    self.buffer.text.remove(at..end);
+                    self.buffer.remove(at..end);
                 }
-                self.buffer.text.insert_char(at, c);
+                self.buffer.insert_char(at, c);
                 self.cursor.col += c.len_utf8();
                 self.buffer.modified = true;
             }
@@ -1138,13 +1138,13 @@ impl Editor {
             let start = self.buffer.line_start(self.cursor.line);
             let s = self.buffer.line(self.cursor.line);
             let prev_col = unicode::prev_grapheme(&s, self.cursor.col);
-            self.buffer.text.remove(start + prev_col..at);
+            self.buffer.remove(start + prev_col..at);
             self.cursor.col = prev_col;
             self.buffer.modified = true;
         } else if self.cursor.line > 0 {
             let prev_len = self.buffer.line_len(self.cursor.line - 1);
             let join_at = self.buffer.byte_at(self.cursor.line - 1, prev_len);
-            self.buffer.text.remove(join_at..join_at + 1);
+            self.buffer.remove(join_at..join_at + 1);
             self.cursor.line -= 1;
             self.cursor.col = prev_len;
             self.buffer.modified = true;
@@ -1263,6 +1263,9 @@ impl Editor {
                 self.top = 0;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
+                // A freshly loaded buffer is a whole-content replacement: tell
+                // consumers (the syntax worker) to re-sync from full text.
+                self.buffer.mark_resync();
             }
             Err(e) => self.message = e.to_string(),
         }
@@ -1336,7 +1339,7 @@ impl Editor {
             });
             self.buffer.text = snap.text;
             self.cursor = snap.cursor;
-            self.buffer.modified = true;
+            self.buffer.mark_resync();
             self.clamp_cursor();
         } else {
             self.message = "Already at oldest change".to_string();
@@ -1351,7 +1354,7 @@ impl Editor {
             });
             self.buffer.text = snap.text;
             self.cursor = snap.cursor;
-            self.buffer.modified = true;
+            self.buffer.mark_resync();
             self.clamp_cursor();
         } else {
             self.message = "Already at newest change".to_string();

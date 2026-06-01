@@ -140,6 +140,11 @@ impl SyntaxClient {
         );
     }
 
+    /// `ts_close`: the editor deleted a buffer; drop the worker's state for it.
+    pub fn close(&self, buffer: u64) {
+        self.send("ts_close", vec![Value::Map(vec![kv_u64("buffer", buffer)])]);
+    }
+
     fn send(&self, method: &'static str, params: Vec<Value>) {
         let _ = self.cmd_tx.send(Cmd { method, params });
     }

@@ -11,7 +11,7 @@
 mod syntax;
 
 use nxvim_core::highlight::{HlDef, Style};
-use nxvim_core::{parse_color, parse_keys, unicode, Editor};
+use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor};
 use nxvim_lua::{HlSet, LuaRuntime};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
@@ -86,9 +86,6 @@ fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
     plugins
 }
 
-/// The single buffer id nxvim uses today (multiple buffers are on the roadmap).
-const BUFFER_ID: u64 = 0;
-
 /// A cached highlight span in buffer coordinates: a byte range within a line.
 #[derive(Clone)]
 struct ByteSpan {
@@ -97,7 +94,10 @@ struct ByteSpan {
     group: String,
 }
 
-/// Per-buffer treesitter sync bookkeeping (one buffer for now).
+/// Per-buffer treesitter sync bookkeeping. One of these per open buffer, keyed
+/// by [`BufferId`] in [`Server::syntax_states`], so a buffer keeps its parse
+/// state and span cache while another is in the window — switching back paints
+/// instantly instead of re-parsing.
 #[derive(Default)]
 struct SyntaxState {
     /// Detected filetype/language, `None` when the buffer has no known grammar.
@@ -121,7 +121,9 @@ struct Server {
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
     syntax: SyntaxClient,
-    syntax_state: SyntaxState,
+    /// Per-buffer syntax sync state, keyed by buffer id (entries created lazily
+    /// on first sync, dropped when the buffer is deleted).
+    syntax_states: HashMap<BufferId, SyntaxState>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -147,7 +149,7 @@ where
         rpc,
         ui: None,
         syntax,
-        syntax_state: SyntaxState::default(),
+        syntax_states: HashMap::new(),
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -240,6 +242,31 @@ impl Server {
                 Value::from(self.editor.cursor.col as u64),
             ])),
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
+            "nvim_list_bufs" => Ok(Value::Array(
+                self.editor
+                    .buffer_ids()
+                    .into_iter()
+                    .map(|id| Value::from(id.0))
+                    .collect(),
+            )),
+            "nvim_get_current_buf" => Ok(Value::from(self.editor.current_buffer_id().0)),
+            "nvim_set_current_buf" => {
+                let id = BufferId(uint(params.first(), 0) as u64);
+                self.editor.set_current_buffer(id);
+                self.run_pending();
+                Ok(Value::Nil)
+            }
+            "nvim_create_buf" => Ok(Value::from(self.editor.create_buffer().0)),
+            "nvim_buf_get_name" => {
+                // (buffer): the buffer's file name, "" if unnamed; 0 = current.
+                let handle = uint(params.first(), 0) as u64;
+                let id = if handle == 0 {
+                    self.editor.current_buffer_id()
+                } else {
+                    BufferId(handle)
+                };
+                Ok(Value::from(self.editor.buffer_name(id).unwrap_or_default()))
+            }
             "nvim_get_hl" => {
                 // (ns, { name = "<group>" }) -> the group resolved through its
                 // link chain to concrete colors/attrs, or `{}` if unstyled.
@@ -397,7 +424,17 @@ impl Server {
     }
 
     fn get_lines(&self, params: &[Value]) -> Value {
-        let lines = self.editor.lines();
+        // params[0] is the buffer handle: 0 = current, else a specific buffer.
+        // An unknown handle yields an empty list rather than erroring.
+        let handle = params.first().and_then(Value::as_u64).unwrap_or(0);
+        let lines = if handle == 0 {
+            self.editor.lines()
+        } else {
+            match self.editor.lines_of(BufferId(handle)) {
+                Some(lines) => lines,
+                None => return Value::Array(Vec::new()),
+            }
+        };
         let n = lines.len() as i64;
         let norm = |i: i64| -> i64 {
             if i < 0 {
@@ -523,10 +560,10 @@ impl Server {
     fn on_syntax_event(&mut self, event: SyntaxEvent) {
         match event {
             SyntaxEvent::Restarted => {
-                // Fresh worker, empty state: re-sync from full text next redraw.
-                self.syntax_state.opened = false;
-                self.syntax_state.pending = false;
-                self.syntax_state.spans.clear();
+                // A fresh worker holds no buffers, so every cached state is moot:
+                // drop them all and let the next sync re-`open` the current buffer
+                // (others re-open when next switched to).
+                self.syntax_states.clear();
                 self.redraw();
             }
             // `ts_highlights` updates the cache; any other notification (e.g.
@@ -540,79 +577,109 @@ impl Server {
         }
     }
 
-    /// Decide what (if anything) to send the syntax process this frame: an
-    /// `open` (first sync / after a resync / language change), an `edit` (text
-    /// deltas), or a `view` (scroll only). Coalesces while a request is pending.
+    /// Decide what (if anything) to send the syntax process this frame for the
+    /// *current* buffer: an `open` (first sync / resync / language change), an
+    /// `edit` (text deltas), or a `view` (scroll only). Coalesces while a request
+    /// is pending. Each buffer's state is keyed independently, so switching back
+    /// to a buffer reuses its cached parse rather than re-opening.
     fn sync_syntax(&mut self, height: usize) {
-        let language = filetype_of(self.editor.buffer.path.as_deref());
+        // Forget any buffers the editor has since deleted (frees worker memory).
+        self.reap_closed_buffers();
+
+        let buffer = self.editor.current_buffer_id();
+        let language = filetype_of(self.editor.buffer().path.as_deref());
         // Language gone (no path / unknown extension): nothing to highlight.
         let Some(language) = language else {
-            self.syntax_state.language = None;
+            if let Some(state) = self.syntax_states.get_mut(&buffer) {
+                state.language = None;
+            }
             return;
         };
         self.syntax.ensure_started();
 
-        let line_count = self.editor.buffer.line_count();
+        // Work on this buffer's state as an owned local (so we can freely borrow
+        // `self.editor` / `self.syntax` meanwhile), then put it back.
+        let mut state = self.syntax_states.remove(&buffer).unwrap_or_default();
+        let id = buffer.0;
+
+        let line_count = self.editor.buffer().line_count();
         // Highlight a one-screen overscan above and below the viewport, so the
         // lines a scroll reveals are already cached and colored — no white flash
         // during the smooth-scroll animation (whose band spans up to ~2 screens).
         let first = self.editor.top.saturating_sub(height).min(line_count);
         let last = (self.editor.top + 2 * height).min(line_count);
-        let tick = self.editor.buffer.changedtick;
-        let language_changed = self.syntax_state.language != Some(language);
-        self.syntax_state.language = Some(language);
+        let tick = self.editor.buffer().changedtick;
+        let language_changed = state.language != Some(language);
+        state.language = Some(language);
 
         // A fresh language or un-opened buffer needs a full open.
-        let needs_open = language_changed || !self.syntax_state.opened;
-
-        if needs_open {
-            let batch = self.editor.buffer.take_edits();
-            let _ = batch; // superseded by the full-text open
-            let text = self.editor.buffer.text.to_string();
-            self.syntax
-                .open(BUFFER_ID, tick, language, &text, first, last);
-            self.syntax_state.opened = true;
-            self.syntax_state.last_tick = tick;
-            self.syntax_state.last_view = (first, last);
-            self.syntax_state.pending = true;
-            return;
-        }
-
-        if tick != self.syntax_state.last_tick {
-            // Text changed. Wait if a request is already in flight (the deltas
+        if language_changed || !state.opened {
+            let _ = self.editor.buffer_mut().take_edits(); // superseded by full open
+            let text = self.editor.buffer().text.to_string();
+            self.syntax.open(id, tick, language, &text, first, last);
+            state.opened = true;
+            state.last_tick = tick;
+            state.last_view = (first, last);
+            state.pending = true;
+        } else if tick != state.last_tick {
+            // Text changed. Skip if a request is already in flight (the deltas
             // stay journaled and flush when its reply arrives).
-            if self.syntax_state.pending {
-                return;
+            if !state.pending {
+                let batch = self.editor.buffer_mut().take_edits();
+                if batch.resync {
+                    let text = self.editor.buffer().text.to_string();
+                    self.syntax.open(id, tick, language, &text, first, last);
+                } else {
+                    self.syntax
+                        .edit(id, tick, edits_value(&batch.edits), first, last);
+                }
+                state.last_tick = tick;
+                state.last_view = (first, last);
+                state.pending = true;
             }
-            let batch = self.editor.buffer.take_edits();
-            if batch.resync {
-                let text = self.editor.buffer.text.to_string();
-                self.syntax
-                    .open(BUFFER_ID, tick, language, &text, first, last);
-            } else {
-                self.syntax
-                    .edit(BUFFER_ID, tick, edits_value(&batch.edits), first, last);
-            }
-            self.syntax_state.last_tick = tick;
-            self.syntax_state.last_view = (first, last);
-            self.syntax_state.pending = true;
-            return;
+        } else if (first, last) != state.last_view && !state.pending {
+            // Text unchanged: re-query only if the viewport scrolled.
+            self.syntax.view(id, first, last);
+            state.last_view = (first, last);
+            state.pending = true;
         }
 
-        // Text unchanged: re-query only if the viewport scrolled.
-        if (first, last) != self.syntax_state.last_view && !self.syntax_state.pending {
-            self.syntax.view(BUFFER_ID, first, last);
-            self.syntax_state.last_view = (first, last);
-            self.syntax_state.pending = true;
+        self.syntax_states.insert(buffer, state);
+    }
+
+    /// Send `ts_close` for, and drop the state of, every buffer the worker still
+    /// tracks that the editor no longer has open (deleted via `:bdelete`).
+    fn reap_closed_buffers(&mut self) {
+        let live = self.editor.buffer_ids();
+        let dead: Vec<BufferId> = self
+            .syntax_states
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        for id in dead {
+            self.syntax_states.remove(&id);
+            self.syntax.close(id.0);
         }
     }
 
-    /// Replace the span cache from a `ts_highlights` reply.
+    /// Replace a buffer's span cache from its `ts_highlights` reply, routing by
+    /// the reply's `buffer` id. A reply for an unknown buffer (e.g. one closed
+    /// while the request was in flight) is dropped.
     fn store_spans(&mut self, params: &[Value]) {
-        self.syntax_state.pending = false;
         let Some(Value::Map(map)) = params.first() else {
             return;
         };
+        let buffer = BufferId(
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some("buffer"))
+                .and_then(|(_, v)| v.as_u64())
+                .unwrap_or(0),
+        );
+        let Some(state) = self.syntax_states.get_mut(&buffer) else {
+            return;
+        };
+        state.pending = false;
         let spans = map
             .iter()
             .find(|(k, _)| k.as_str() == Some("spans"))
@@ -634,7 +701,7 @@ impl Server {
                     .push(ByteSpan { start, end, group });
             }
         }
-        self.syntax_state.spans = cache;
+        state.spans = cache;
     }
 
     /// Build a per-row `highlights` payload from a row→buffer-line mapping
@@ -646,15 +713,21 @@ impl Server {
     /// its built-in theme for that group. Used for both the static viewport and
     /// the scroll-animation band (which share `styles`).
     fn highlights_for(&self, numbers: &[Option<usize>], styles: &mut StyleTable) -> Value {
+        // Spans for the buffer currently in the window (absent until its first
+        // `ts_highlights` reply lands, or for a buffer with no grammar).
+        let spans_by_line = self
+            .syntax_states
+            .get(&self.editor.current_buffer_id())
+            .map(|state| &state.spans);
         let rows = numbers
             .iter()
             .map(|num| match num {
                 Some(n) => {
                     let line_idx = n - 1;
-                    let Some(spans) = self.syntax_state.spans.get(&line_idx) else {
+                    let Some(spans) = spans_by_line.and_then(|m| m.get(&line_idx)) else {
                         return Value::Array(Vec::new());
                     };
-                    let text = self.editor.buffer.line(line_idx);
+                    let text = self.editor.buffer().line(line_idx);
                     let row = spans
                         .iter()
                         .map(|s| {

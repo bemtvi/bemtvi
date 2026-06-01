@@ -145,6 +145,11 @@ impl Engine {
         state.reparse();
     }
 
+    /// Forget a buffer's shadow text and parse tree (the editor deleted it).
+    pub fn close(&mut self, buffer: u64) {
+        self.buffers.remove(&buffer);
+    }
+
     /// Whether a buffer is known (opened) and which language it uses.
     pub fn language_of(&self, buffer: u64) -> Option<&str> {
         self.buffers.get(&buffer).map(|b| b.language.as_str())

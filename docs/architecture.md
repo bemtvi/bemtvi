@@ -215,6 +215,50 @@ it will move to a change-tree closer to neovim's `undo.c` as editing grows.
 
 ---
 
+## Buffers
+
+The editor holds **multiple open buffers** and switches the one window between
+them. `nxvim-core`'s `Editor` separates the two concerns vim keeps apart:
+
+- **Buffer state** (the "file"): the rope text, path, `modified`,
+  `changedtick`, the edit journal, **and** per-buffer undo/redo history. These
+  live in an `OpenBuffer` (the text `Buffer` plus its undo stacks and the
+  cursor/scroll position saved while the buffer is not current), stored in a
+  `BufferStore` keyed by a monotonic, 1-based `BufferId` that is never reused.
+- **Window state** (the "view"): the live cursor, scroll `top`, mode, and
+  pending-input state stay on `Editor`, alongside `current` (the shown buffer)
+  and `alternate` (vim's `#`). The register and options are still **global** —
+  buffer-local options are a follow-up.
+
+`Editor::buffer()` / `buffer_mut()` resolve the current buffer through the
+store, so the editing code is oblivious to how many buffers are open. There is
+always at least one buffer; deleting the last leaves a fresh `[No Name]`.
+
+The surface is the usual vim set: `:e` (open-or-switch, reusing the throwaway
+`[No Name]`), `:enew`, `:ls`/`:buffers`, `:b{N|name|#}`, `:bnext`/`:bprev`/
+`:bfirst`/`:blast`, `:bdelete`/`:bwipeout`, `<C-^>`, and multi-buffer
+`:wall`/`:qall`. The RPC layer mirrors neovim's `nvim_list_bufs`,
+`nvim_get_current_buf`, `nvim_set_current_buf`, `nvim_create_buf`,
+`nvim_buf_get_name`, and a buffer-addressed `nvim_buf_get_lines`.
+
+`:q` quits the editor, but only when nothing would be lost: with a modified
+buffer anywhere it refuses, switches the window to that buffer, and reports
+`E37` (so you see what's blocking) — matching neovim's behavior when exiting the
+last window with `hidden` buffers. `:q!` exits unconditionally. With one window
+`:q` and `:qa` coincide; real windows will split them later.
+
+The treesitter worker tracks each buffer independently: the server keeps a
+`SyntaxState` per `BufferId`, routes `ts_highlights` replies by id, and sends
+`ts_close` when a buffer is deleted — so switching back to a buffer paints from
+its cached parse instead of re-opening. (See
+[*Syntax highlighting*](#syntax-highlighting-treesitter).)
+
+What's still missing is **windows**: splits, the layout tree, and per-window
+cursors. With one window, each buffer's last cursor/scroll is saved on switch
+and restored on return.
+
+---
+
 ## Lua
 
 nxvim embeds **Lua 5.1** via [mlua] (`lua51`, vendored) — the dialect LuaJIT,
@@ -379,17 +423,19 @@ screen," and that is exactly the shape of these tests.
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up), treesitter
   injections, and a `:set`-driven highlight toggle.
-- Multiple windows, tabs, and buffers; splits and the window layout tree.
+- Multiple **windows**, tabs, and splits; the window layout tree. (Multiple
+  *buffers* are implemented — see [*Buffers*](#buffers) — but there is still
+  exactly one window onto one buffer.)
 - A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
   `nvim_set_hl`, and `:colorscheme` are in place — enough to run the real
   catppuccin colorscheme unmodified (see [*Lua*](#lua)) — but the surface grows
   only as plugins demand it. Known gaps for richer plugins: `vim.treesitter` is a
   stub (nxvim highlights out-of-process), `vim.keymap`/`vim.api.nvim_set_keymap`,
-  `vim.loop`/`vim.uv`, buffer/window API beyond the single buffer, and the LSP
-  client. Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding
-  principle 2.
+  `vim.loop`/`vim.uv`, the per-window API, and the LSP client. Legacy Vimscript
+  (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
-  (the line-number column) are honored so far; mappings (`:map`), registers
+  (the line-number column) are honored so far, and options are still global —
+  **buffer-local options** are the next gap. Also mappings (`:map`), registers
   beyond the unnamed register, search (`/`, `?`, `:s`), marks, folds, and macros.
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).

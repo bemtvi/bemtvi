@@ -19,7 +19,12 @@ repos:
       - id: cargo-clippy
         name: cargo clippy
         description: Lint with clippy, treating warnings as errors
-        entry: cargo clippy --all-targets --all-features -- -D warnings
+        # No `--all-features`: the `lua51` and `luajit` mlua backends are
+        # mutually exclusive (mlua-sys `compile_error!`s if both are on), so
+        # `--all-features` can't build. Lint the default backend (lua51); the
+        # luajit build is covered separately via `--no-default-features
+        # --features luajit` when needed.
+        entry: cargo clippy --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

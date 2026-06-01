@@ -772,3 +772,85 @@ async fn a_highlight_repaint_does_not_snap_an_in_flight_scroll() {
          (top line is now {top:?}) instead of continuing the slide",
     );
 }
+
+#[tokio::test]
+async fn switching_buffers_shows_each_buffers_own_highlights() {
+    // Per-buffer syntax state: each open buffer keeps its own span cache, so
+    // switching back to one shows *its* highlights, never the other buffer's.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let a = temp_rs("switch-a", "fn main() {}\n");
+    let b = temp_rs("switch-b", "struct S {}\n");
+    let (rpc, mut incoming) = start(Some(a)).await;
+
+    // Buffer A highlighted: capture row 0's spans.
+    let a_hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    let a_row0 = a_hl[0].clone();
+
+    // Open B in a second buffer; its row 0 differs from A's.
+    rpc.request("nvim_command", vec![Value::from(format!("e {b}"))])
+        .await
+        .expect("edit b");
+    let b_hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first()
+            .is_some_and(|row| !row.is_empty() && *row != a_row0)
+    })
+    .await;
+    assert_ne!(b_hl[0], a_row0, "B should highlight differently from A");
+
+    // Switch back to A with <C-^>: A's own spans return (not B's), proving the
+    // per-buffer cache is keyed and routed by buffer id.
+    feed(&rpc, "<C-^>");
+    let back = wait_for_highlights(&rpc, &mut incoming, |hl| hl.first() == Some(&a_row0)).await;
+    assert_eq!(back[0], a_row0, "switching back to A shows A's highlights");
+}
+
+#[tokio::test]
+async fn bdelete_sends_ts_close_to_the_worker() {
+    // Deleting a buffer frees its parse state in the worker via `ts_close`.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let record = std::env::temp_dir().join(format!("nxvim-ts-close-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&record);
+    std::env::set_var("NXVIM_TS_RECORD", &record);
+
+    let a = temp_rs("close-a", "fn a() {}\n");
+    let b = temp_rs("close-b", "fn b() {}\n");
+    let (rpc, mut incoming) = start(Some(a)).await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    rpc.request("nvim_command", vec![Value::from(format!("e {b}"))])
+        .await
+        .expect("edit b");
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+
+    // Delete the current buffer (b); the server reaps it and sends `ts_close`.
+    rpc.request("nvim_command", vec![Value::from("bd")])
+        .await
+        .expect("bdelete");
+
+    let mut closed = false;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.starts_with("ts_close"))
+        {
+            closed = true;
+            break;
+        }
+    }
+    std::env::remove_var("NXVIM_TS_RECORD");
+    let _ = std::fs::remove_file(&record);
+    assert!(closed, "expected a ts_close for the deleted buffer");
+}

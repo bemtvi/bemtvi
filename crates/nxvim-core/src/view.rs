@@ -91,7 +91,7 @@ pub struct View {
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
         let height = ed.dims().1;
-        let line_count = ed.buffer.line_count();
+        let line_count = ed.buffer().line_count();
         // Selections fill to the text width — the area past the number gutter.
         let width = ed.text_width();
 
@@ -116,14 +116,14 @@ impl View {
         });
 
         let file_name = ed
-            .buffer
+            .buffer()
             .path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[No Name]".to_string());
 
         let cursor_screen_col = {
-            let line = ed.buffer.line(ed.cursor.line);
+            let line = ed.buffer().line(ed.cursor.line);
             unicode::virtcol(&line, ed.cursor.col, unicode::TABSTOP)
         };
 
@@ -141,7 +141,7 @@ impl View {
             cmdline: ed.cmdline.clone(),
             message: ed.message.clone(),
             file_name,
-            modified: ed.buffer.modified,
+            modified: ed.buffer().modified,
             cursor_line: ed.cursor.line + 1,
             selection,
             scroll,
@@ -171,7 +171,7 @@ fn window_lines(ed: &Editor, base: usize, count: usize, line_count: usize) -> Ve
     for row in 0..count {
         let idx = base + row;
         if idx < line_count {
-            lines.push(ed.buffer.line(idx));
+            lines.push(ed.buffer().line(idx));
         } else {
             lines.push("~".to_string());
         }
@@ -209,7 +209,7 @@ fn selection_spans(
         if buf_line >= line_count || buf_line < start.line || buf_line > end.line {
             continue;
         }
-        let text = ed.buffer.line(buf_line);
+        let text = ed.buffer().line(buf_line);
 
         if linewise {
             // Whole line, filled to the viewport edge — as vim paints it.

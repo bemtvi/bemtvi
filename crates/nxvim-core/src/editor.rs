@@ -6,7 +6,8 @@
 //! and reads back state; it never blocks.
 
 use std::cmp::{max, min};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::buffer::Buffer;
 use crate::highlight::Highlights;
@@ -23,6 +24,12 @@ pub struct Cursor {
     pub col: usize,
 }
 
+/// Stable identifier for an open buffer. Monotonic and 1-based (buffer 1 is the
+/// first file, or the initial `[No Name]`); an id is never reused once assigned,
+/// matching vim's buffer numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BufferId(pub u64);
+
 #[derive(Debug, Clone, Default)]
 struct Register {
     text: String,
@@ -33,6 +40,71 @@ struct Register {
 struct Snapshot {
     text: ropey::Rope,
     cursor: Cursor,
+}
+
+/// A buffer as the editor holds it: the text [`Buffer`] plus the state vim keeps
+/// with the buffer rather than the window — undo/redo history and, while the
+/// buffer is not current, the last cursor/scroll position so switching back
+/// restores the view.
+struct OpenBuffer {
+    buffer: Buffer,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
+    /// Window position saved when this buffer stops being current; restored on
+    /// switch-back. Meaningless while the buffer *is* current — the live position
+    /// is then [`Editor::cursor`] / `Editor::top`.
+    saved_cursor: Cursor,
+    saved_top: usize,
+}
+
+impl OpenBuffer {
+    fn new(buffer: Buffer) -> Self {
+        OpenBuffer {
+            buffer,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            saved_cursor: Cursor::default(),
+            saved_top: 0,
+        }
+    }
+}
+
+/// The set of open buffers, keyed by [`BufferId`]. A `BTreeMap` keeps iteration
+/// id-sorted, which the buffer-list commands (`:ls`, `:bnext`) will rely on.
+struct BufferStore {
+    map: BTreeMap<BufferId, OpenBuffer>,
+    /// Next id to hand out; only ever increases, so ids are never reused.
+    next_id: u64,
+}
+
+impl BufferStore {
+    /// A store seeded with a single buffer at id 1, returned alongside that id.
+    fn with_one(buffer: Buffer) -> (Self, BufferId) {
+        let id = BufferId(1);
+        let mut map = BTreeMap::new();
+        map.insert(id, OpenBuffer::new(buffer));
+        (BufferStore { map, next_id: 2 }, id)
+    }
+
+    /// Add a buffer under a fresh id and return it.
+    fn insert(&mut self, buffer: Buffer) -> BufferId {
+        let id = BufferId(self.next_id);
+        self.next_id += 1;
+        self.map.insert(id, OpenBuffer::new(buffer));
+        id
+    }
+
+    fn get(&self, id: BufferId) -> &OpenBuffer {
+        self.map
+            .get(&id)
+            .expect("current buffer id is always valid")
+    }
+
+    fn get_mut(&mut self, id: BufferId) -> &mut OpenBuffer {
+        self.map
+            .get_mut(&id)
+            .expect("current buffer id is always valid")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,9 +147,16 @@ pub(crate) struct PendingScroll {
     pub duration_ms: u64,
 }
 
-/// The complete editor state for a single buffer/window.
+/// The complete editor state: the open buffers plus the single window's state.
 pub struct Editor {
-    pub buffer: Buffer,
+    /// All open buffers, keyed by id. [`Editor::current`] selects the one the
+    /// window shows; reach the current text model through [`Editor::buffer`].
+    buffers: BufferStore,
+    /// The buffer the window currently shows. Always present in `buffers`.
+    current: BufferId,
+    /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
+    /// sets it.
+    alternate: Option<BufferId>,
     pub mode: Mode,
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
@@ -125,9 +204,6 @@ pub struct Editor {
     /// `View` and then cleared (so it animates exactly once).
     pending_scroll: Option<PendingScroll>,
 
-    undo_stack: Vec<Snapshot>,
-    redo_stack: Vec<Snapshot>,
-
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
 
@@ -154,8 +230,11 @@ impl Editor {
     }
 
     fn with_buffer(buffer: Buffer) -> Self {
+        let (buffers, current) = BufferStore::with_one(buffer);
         Editor {
-            buffer,
+            buffers,
+            current,
+            alternate: None,
             mode: Mode::Normal,
             cursor: Cursor::default(),
             top: 0,
@@ -180,8 +259,6 @@ impl Editor {
             visual_anchor: Cursor::default(),
             scroll_from: None,
             pending_scroll: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
             pending_sleep: None,
@@ -189,6 +266,167 @@ impl Editor {
     }
 
     // ----- public API used by the server -----------------------------------
+
+    /// The current buffer's text model. The window always shows exactly one
+    /// buffer; this resolves it through the store, so the rest of the editor can
+    /// keep saying `self.buffer()` without caring how many buffers are open.
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffers.get(self.current).buffer
+    }
+
+    /// Mutable access to the current buffer's text model (see [`Editor::buffer`]).
+    pub fn buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.buffers.get_mut(self.current).buffer
+    }
+
+    /// The current buffer's full editor-side state (text + undo/redo + saved
+    /// position). Internal helper for the undo path and switching.
+    fn cur_mut(&mut self) -> &mut OpenBuffer {
+        self.buffers.get_mut(self.current)
+    }
+
+    /// The id of the buffer the window currently shows.
+    pub fn current_buffer_id(&self) -> BufferId {
+        self.current
+    }
+
+    /// All open buffer ids, ascending (the `nvim_list_bufs` order).
+    pub fn buffer_ids(&self) -> Vec<BufferId> {
+        self.buffers.map.keys().copied().collect()
+    }
+
+    /// Make `id` the current buffer (the `nvim_set_current_buf` entry point).
+    /// A no-op if `id` is not an open buffer.
+    pub fn set_current_buffer(&mut self, id: BufferId) {
+        self.switch_buffer(id);
+    }
+
+    /// The file name of buffer `id` (`""` for an unnamed buffer), or `None` if
+    /// no such buffer is open.
+    pub fn buffer_name(&self, id: BufferId) -> Option<String> {
+        self.buffers.map.get(&id).map(|ob| {
+            ob.buffer
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Create a new empty buffer and return its id, without switching to it
+    /// (the `nvim_create_buf` entry point).
+    pub fn create_buffer(&mut self) -> BufferId {
+        self.add_buffer(Buffer::empty())
+    }
+
+    /// Editable lines of buffer `id`, or `None` if no such buffer is open
+    /// (the buffer-addressed form of [`Editor::lines`]).
+    pub fn lines_of(&self, id: BufferId) -> Option<Vec<String>> {
+        self.buffers.map.get(&id).map(|ob| ob.buffer.lines())
+    }
+
+    // ----- buffer management ------------------------------------------------
+
+    /// Add a buffer to the store and return its id, without switching to it.
+    fn add_buffer(&mut self, buffer: Buffer) -> BufferId {
+        self.buffers.insert(buffer)
+    }
+
+    /// Make `id` the current buffer: stash the outgoing window position with its
+    /// buffer, record the alternate (`#`), and restore the incoming buffer's
+    /// saved position. A no-op if `id` is already current or not in the store.
+    ///
+    /// The window always lands in normal mode; transient pending/scroll state is
+    /// dropped. Syntax re-sync across the switch is the server's job (it notices
+    /// the current-buffer id changed), so this touches neither `modified` nor the
+    /// edit journal — switching a buffer must never make it look edited.
+    fn switch_buffer(&mut self, id: BufferId) {
+        if id == self.current || !self.buffers.map.contains_key(&id) {
+            return;
+        }
+        // Stash the outgoing position with its buffer; it becomes the alternate.
+        let (cursor, top) = (self.cursor, self.top);
+        let outgoing = self.current;
+        let out = self.buffers.get_mut(outgoing);
+        out.saved_cursor = cursor;
+        out.saved_top = top;
+        self.alternate = Some(outgoing);
+
+        self.enter_buffer(id);
+    }
+
+    /// Make `id` the current buffer and restore its saved window position,
+    /// landing in normal mode with transient state cleared. Unlike
+    /// [`Editor::switch_buffer`] this does *not* stash the outgoing position —
+    /// the caller is responsible for that (or the outgoing buffer is gone, as
+    /// when `:bdelete` removes the current one).
+    fn enter_buffer(&mut self, id: BufferId) {
+        let incoming = self.buffers.get(id);
+        let (saved_cursor, saved_top) = (incoming.saved_cursor, incoming.saved_top);
+        self.current = id;
+        self.cursor = saved_cursor;
+        self.top = saved_top;
+        self.mode = Mode::Normal;
+        self.reset_pending();
+        self.scroll_from = None;
+        self.pending_scroll = None;
+        self.message.clear();
+        self.clamp_cursor();
+        self.ensure_visible();
+    }
+
+    /// `<C-^>` — switch to the alternate buffer (`#`), or report `E23` when there
+    /// is none (e.g. only one buffer is open).
+    fn goto_alternate(&mut self) {
+        match self.alternate {
+            Some(id) => self.switch_buffer(id),
+            None => self.message = "E23: No alternate file".to_string(),
+        }
+    }
+
+    /// The id of an already-open buffer bound to `path`, if any. Matches by
+    /// canonical path when both resolve on disk (so `./a` and `a` are the same
+    /// file), else by the stored path verbatim (covers not-yet-written names).
+    fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
+        let target = std::fs::canonicalize(path).ok();
+        self.buffers.map.iter().find_map(|(id, ob)| {
+            let stored = ob.buffer.path.as_ref()?;
+            let same = match (&target, std::fs::canonicalize(stored).ok()) {
+                (Some(t), Some(c)) => *t == c,
+                _ => stored.as_path() == path,
+            };
+            same.then_some(*id)
+        })
+    }
+
+    /// Is the current buffer a throwaway scratch buffer — unnamed, unmodified,
+    /// and empty? `:e file` loads into such a buffer in place (vim's behavior),
+    /// rather than leaving a stray `[No Name]` behind.
+    fn current_is_throwaway(&self) -> bool {
+        let b = self.buffer();
+        b.path.is_none() && !b.modified && b.line_count() == 1 && b.line(0).is_empty()
+    }
+
+    /// Replace the current buffer's contents with `path`'s, preserving the buffer
+    /// id. Used by `:e` reload-in-place and to reuse a throwaway buffer. The
+    /// loaded buffer is unmodified; the whole-content swap is flagged for syntax
+    /// re-sync (`mark_resync` bumps `changedtick`, but we keep `modified` clear
+    /// because it is freshly read from disk).
+    fn load_into_current(&mut self, path: &Path) {
+        match Buffer::from_file(path) {
+            Ok(buf) => {
+                self.cursor = Cursor::default();
+                self.top = 0;
+                let ob = self.cur_mut();
+                ob.buffer = buf;
+                ob.undo_stack.clear();
+                ob.redo_stack.clear();
+                ob.buffer.mark_resync();
+                ob.buffer.modified = false;
+            }
+            Err(e) => self.message = e.to_string(),
+        }
+    }
 
     /// Resize the *text viewport*. The client owns the screen layout and tells
     /// us only how tall the text area is (status/command lines are the client's
@@ -251,7 +489,7 @@ impl Editor {
 
     /// Editable lines as owned strings (the `nvim_buf_get_lines` entry point).
     pub fn lines(&self) -> Vec<String> {
-        self.buffer.lines()
+        self.buffer().lines()
     }
 
     /// Produce a [`View`] of the current state for a text viewport of the given
@@ -373,7 +611,7 @@ impl Editor {
             return;
         }
 
-        // Ctrl-keyed scrolling.
+        // Ctrl-keyed scrolling, redo, and the alternate-buffer toggle.
         if key.ctrl {
             match key.code {
                 KeyCode::Char('d') => self.scroll_half(true),
@@ -381,6 +619,8 @@ impl Editor {
                 KeyCode::Char('f') => self.scroll_page(true),
                 KeyCode::Char('b') => self.scroll_page(false),
                 KeyCode::Char('r') => self.redo(),
+                // `<C-^>` / `<C-6>`: jump to the alternate buffer (`#`).
+                KeyCode::Char('^') | KeyCode::Char('6') => self.goto_alternate(),
                 _ => {}
             }
             self.reset_pending();
@@ -485,8 +725,8 @@ impl Editor {
             let count = self.effective_count();
             let last = self.cursor.line + count - 1;
             let target = self
-                .buffer
-                .line_start(last.min(self.buffer.line_count().saturating_sub(1)));
+                .buffer()
+                .line_start(last.min(self.buffer().line_count().saturating_sub(1)));
             // axis is unused for the operator path, but the field is required.
             let m = MotionResult {
                 target,
@@ -506,7 +746,7 @@ impl Editor {
 
     fn resolve_motion(&self, key: Key, count: usize, raw: Option<usize>) -> Option<MotionResult> {
         let line = self.cursor.line;
-        let last_line = self.buffer.line_count().saturating_sub(1);
+        let last_line = self.buffer().line_count().saturating_sub(1);
 
         let kc = key.code;
         let ch = key.as_char();
@@ -515,7 +755,7 @@ impl Editor {
             if ch == Some('g') {
                 let target_line = raw.map(|n| n - 1).unwrap_or(0).min(last_line);
                 return Some(MotionResult {
-                    target: self.buffer.line_start(target_line),
+                    target: self.buffer().line_start(target_line),
                     kind: MotionKind::Linewise,
                     axis: MoveAxis::LineAnchor,
                 });
@@ -525,48 +765,48 @@ impl Editor {
 
         let motion = match (kc, ch) {
             (KeyCode::Left, _) | (_, Some('h')) | (KeyCode::Backspace, _) => {
-                let s = self.buffer.line(line);
+                let s = self.buffer().line(line);
                 let mut col = self.cursor.col;
                 for _ in 0..count {
                     col = unicode::prev_grapheme(&s, col);
                 }
                 MotionResult {
-                    target: self.buffer.byte_at(line, col),
+                    target: self.buffer().byte_at(line, col),
                     kind: MotionKind::Exclusive,
                     axis: MoveAxis::Horizontal,
                 }
             }
             (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => {
-                let s = self.buffer.line(line);
+                let s = self.buffer().line(line);
                 let mut col = self.cursor.col;
                 for _ in 0..count {
                     col = unicode::next_grapheme(&s, col);
                 }
                 MotionResult {
-                    target: self.buffer.byte_at(line, col),
+                    target: self.buffer().byte_at(line, col),
                     kind: MotionKind::Exclusive,
                     axis: MoveAxis::Horizontal,
                 }
             }
             (_, Some('0')) | (KeyCode::Home, _) => MotionResult {
-                target: self.buffer.byte_at(line, 0),
+                target: self.buffer().byte_at(line, 0),
                 kind: MotionKind::Exclusive,
                 axis: MoveAxis::Horizontal,
             },
             (_, Some('^')) => {
                 let col = self.first_non_blank(line);
                 MotionResult {
-                    target: self.buffer.byte_at(line, col),
+                    target: self.buffer().byte_at(line, col),
                     kind: MotionKind::Exclusive,
                     axis: MoveAxis::Horizontal,
                 }
             }
             (_, Some('$')) | (KeyCode::End, _) => {
                 let l = (line + count - 1).min(last_line);
-                let s = self.buffer.line(l);
+                let s = self.buffer().line(l);
                 let col = unicode::prev_grapheme(&s, s.len());
                 MotionResult {
-                    target: self.buffer.byte_at(l, col),
+                    target: self.buffer().byte_at(l, col),
                     kind: MotionKind::Inclusive,
                     axis: MoveAxis::EndOfLine,
                 }
@@ -574,7 +814,7 @@ impl Editor {
             (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => {
                 let l = (line + count).min(last_line);
                 MotionResult {
-                    target: self.buffer.line_start(l),
+                    target: self.buffer().line_start(l),
                     kind: MotionKind::Linewise,
                     axis: MoveAxis::VerticalKeep,
                 }
@@ -582,7 +822,7 @@ impl Editor {
             (KeyCode::Up, _) | (_, Some('k')) => {
                 let l = line.saturating_sub(count);
                 MotionResult {
-                    target: self.buffer.line_start(l),
+                    target: self.buffer().line_start(l),
                     kind: MotionKind::Linewise,
                     axis: MoveAxis::VerticalKeep,
                 }
@@ -590,7 +830,7 @@ impl Editor {
             (_, Some('G')) => {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
                 MotionResult {
-                    target: self.buffer.line_start(l),
+                    target: self.buffer().line_start(l),
                     kind: MotionKind::Linewise,
                     axis: MoveAxis::LineAnchor,
                 }
@@ -662,13 +902,17 @@ impl Editor {
                 self.eol_request = true;
             }
             MoveAxis::LineAnchor => {
-                let line = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
+                let line = self
+                    .buffer()
+                    .byte_to_line(m.target.min(self.last_char_idx()));
                 self.cursor.line = line;
                 self.cursor.col = self.first_non_blank(line);
                 self.clamp_cursor();
             }
             MoveAxis::VerticalKeep => {
-                let line = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
+                let line = self
+                    .buffer()
+                    .byte_to_line(m.target.min(self.last_char_idx()));
                 self.cursor.line = line;
                 self.settle_desired_col(false);
                 self.preserve_desired = true;
@@ -744,12 +988,14 @@ impl Editor {
             MotionKind::Inclusive => (min(cur, m.target), max(cur, m.target) + 1, false, 0),
             MotionKind::Linewise => {
                 let l1 = self.cursor.line;
-                let l2 = self.buffer.byte_to_line(m.target.min(self.last_char_idx()));
+                let l2 = self
+                    .buffer()
+                    .byte_to_line(m.target.min(self.last_char_idx()));
                 let (a, b) = (min(l1, l2), max(l1, l2));
-                let lo = self.buffer.line_start(a);
+                let lo = self.buffer().line_start(a);
                 let hi = self
-                    .buffer
-                    .line_start((b + 1).min(self.buffer.line_count()));
+                    .buffer()
+                    .line_start((b + 1).min(self.buffer().line_count()));
                 (lo, hi, true, a)
             }
         };
@@ -770,7 +1016,7 @@ impl Editor {
                 self.yank_range(lo, hi, linewise);
                 self.delete_range(lo, hi);
                 if linewise {
-                    self.cursor.line = first_line.min(self.buffer.line_count().saturating_sub(1));
+                    self.cursor.line = first_line.min(self.buffer().line_count().saturating_sub(1));
                     self.cursor.col = self.first_non_blank(self.cursor.line);
                 } else {
                     self.set_cursor_char(lo);
@@ -782,10 +1028,10 @@ impl Editor {
                 if linewise {
                     self.delete_range(lo, hi);
                     let at = self
-                        .buffer
-                        .line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
-                    self.buffer.insert_char(at, '\n');
-                    self.buffer.normalize();
+                        .buffer()
+                        .line_start(first_line.min(self.buffer().line_count().saturating_sub(1)));
+                    self.buffer_mut().insert_char(at, '\n');
+                    self.buffer_mut().normalize();
                     self.cursor.line = first_line;
                     self.cursor.col = 0;
                 } else {
@@ -807,7 +1053,7 @@ impl Editor {
             'd' => {
                 self.delete_range(lo, hi);
                 if linewise {
-                    self.cursor.line = first_line.min(self.buffer.line_count().saturating_sub(1));
+                    self.cursor.line = first_line.min(self.buffer().line_count().saturating_sub(1));
                     self.cursor.col = self.first_non_blank(self.cursor.line);
                 } else {
                     self.set_cursor_char(lo);
@@ -828,10 +1074,10 @@ impl Editor {
                 if linewise {
                     self.delete_range(lo, hi);
                     let at = self
-                        .buffer
-                        .line_start(first_line.min(self.buffer.line_count().saturating_sub(1)));
-                    self.buffer.insert_char(at, '\n');
-                    self.buffer.normalize();
+                        .buffer()
+                        .line_start(first_line.min(self.buffer().line_count().saturating_sub(1)));
+                    self.buffer_mut().insert_char(at, '\n');
+                    self.buffer_mut().normalize();
                     self.cursor.line = first_line;
                     self.cursor.col = 0;
                 } else {
@@ -851,14 +1097,14 @@ impl Editor {
         let b = self.cursor;
         if self.mode == Mode::VisualLine {
             let (la, lb) = (min(a.line, b.line), max(a.line, b.line));
-            let lo = self.buffer.line_start(la);
+            let lo = self.buffer().line_start(la);
             let hi = self
-                .buffer
-                .line_start((lb + 1).min(self.buffer.line_count()));
+                .buffer()
+                .line_start((lb + 1).min(self.buffer().line_count()));
             (lo, hi, true, la)
         } else {
-            let ca = self.buffer.byte_at(a.line, a.col);
-            let cb = self.buffer.byte_at(b.line, b.col);
+            let ca = self.buffer().byte_at(a.line, a.col);
+            let cb = self.buffer().byte_at(b.line, b.col);
             let lo = min(ca, cb);
             let hi = max(ca, cb) + 1;
             (lo, hi.min(self.last_char_idx().max(lo + 1)), false, 0)
@@ -873,7 +1119,7 @@ impl Editor {
             return;
         }
         self.register = Register {
-            text: self.buffer.text.slice(lo..hi).to_string(),
+            text: self.buffer().text.slice(lo..hi).to_string(),
             linewise,
         };
     }
@@ -885,15 +1131,15 @@ impl Editor {
             return;
         }
         self.push_undo();
-        self.buffer.remove(lo..hi);
-        self.buffer.normalize();
-        self.buffer.modified = true;
+        self.buffer_mut().remove(lo..hi);
+        self.buffer_mut().normalize();
+        self.buffer_mut().modified = true;
     }
 
     /// Clamp a byte range into bounds and onto grapheme boundaries, so a
     /// motion-derived endpoint can never split a cluster (a no-op for ASCII).
     fn snap_range(&self, lo: usize, hi: usize) -> (usize, usize) {
-        let hi = hi.min(self.buffer.len_bytes());
+        let hi = hi.min(self.buffer().len_bytes());
         let lo = self.grapheme_floor_abs(lo.min(hi));
         let hi = self.grapheme_ceil_abs(hi);
         (lo, hi)
@@ -905,7 +1151,7 @@ impl Editor {
             return;
         }
         let lo = self.cursor_char();
-        let line_end = self.buffer.byte_at(self.cursor.line, len);
+        let line_end = self.buffer().byte_at(self.cursor.line, len);
         let (hi, _) = self.advance_graphemes(lo, count, line_end);
         self.yank_range(lo, hi, false);
         self.delete_range(lo, hi);
@@ -917,7 +1163,7 @@ impl Editor {
             return;
         }
         let new_col = self.cursor.col.saturating_sub(count);
-        let lo = self.buffer.byte_at(self.cursor.line, new_col);
+        let lo = self.buffer().byte_at(self.cursor.line, new_col);
         let hi = self.cursor_char();
         self.yank_range(lo, hi, false);
         self.delete_range(lo, hi);
@@ -928,7 +1174,7 @@ impl Editor {
     fn delete_to_eol(&mut self) {
         let len = self.line_len();
         let lo = self.cursor_char();
-        let hi = self.buffer.byte_at(self.cursor.line, len);
+        let hi = self.buffer().byte_at(self.cursor.line, len);
         if lo < hi {
             self.yank_range(lo, hi, false);
             self.delete_range(lo, hi);
@@ -939,19 +1185,19 @@ impl Editor {
     fn replace_char(&mut self, c: char, count: usize) {
         let len = self.line_len();
         let lo = self.cursor_char();
-        let line_end = self.buffer.byte_at(self.cursor.line, len);
+        let line_end = self.buffer().byte_at(self.cursor.line, len);
         let (hi, crossed) = self.advance_graphemes(lo, count, line_end);
         // `r` does nothing unless `count` whole characters remain on the line.
         if crossed < count {
             return;
         }
         self.push_undo();
-        self.buffer.remove(lo..hi);
+        self.buffer_mut().remove(lo..hi);
         let repl: String = std::iter::repeat(c).take(count).collect();
-        self.buffer.insert(lo, &repl);
-        self.buffer.modified = true;
+        self.buffer_mut().insert(lo, &repl);
+        self.buffer_mut().modified = true;
         self.cursor.col =
-            (lo - self.buffer.line_start(self.cursor.line)) + (count - 1) * c.len_utf8();
+            (lo - self.buffer().line_start(self.cursor.line)) + (count - 1) * c.len_utf8();
         self.clamp_cursor();
     }
 
@@ -971,12 +1217,12 @@ impl Editor {
             } else {
                 c.to_uppercase().collect()
             };
-            self.buffer.remove(idx..idx + c.len_utf8());
-            self.buffer.insert(idx, &swapped);
-            let s = self.buffer.line(self.cursor.line);
+            self.buffer_mut().remove(idx..idx + c.len_utf8());
+            self.buffer_mut().insert(idx, &swapped);
+            let s = self.buffer().line(self.cursor.line);
             self.cursor.col = unicode::next_grapheme(&s, self.cursor.col);
         }
-        self.buffer.modified = true;
+        self.buffer_mut().modified = true;
         self.clamp_cursor();
     }
 
@@ -984,13 +1230,13 @@ impl Editor {
         let joins = count.saturating_sub(1).max(1);
         self.push_undo();
         for _ in 0..joins {
-            if self.cursor.line + 1 >= self.buffer.line_count() {
+            if self.cursor.line + 1 >= self.buffer().line_count() {
                 break;
             }
             let cur_len = self.line_len();
-            let eol = self.buffer.byte_at(self.cursor.line, cur_len);
+            let eol = self.buffer().byte_at(self.cursor.line, cur_len);
             // Remove the newline and any leading whitespace of the next line.
-            let next_start = self.buffer.line_start(self.cursor.line + 1);
+            let next_start = self.buffer().line_start(self.cursor.line + 1);
             let mut ws_end = next_start;
             while ws_end < self.last_char_idx() {
                 let c = self.char_at(ws_end);
@@ -1000,31 +1246,31 @@ impl Editor {
                     break;
                 }
             }
-            self.buffer.remove(eol..ws_end);
+            self.buffer_mut().remove(eol..ws_end);
             // Insert a single separating space unless the line was empty.
             if cur_len > 0 {
-                self.buffer.insert_char(eol, ' ');
+                self.buffer_mut().insert_char(eol, ' ');
             }
             self.cursor.col = cur_len;
         }
-        self.buffer.normalize();
-        self.buffer.modified = true;
+        self.buffer_mut().normalize();
+        self.buffer_mut().modified = true;
         self.clamp_cursor();
     }
 
     fn open_line(&mut self, below: bool) {
         self.push_undo();
         if below {
-            let at = self.buffer.byte_at(self.cursor.line, self.line_len());
-            self.buffer.insert_char(at, '\n');
+            let at = self.buffer().byte_at(self.cursor.line, self.line_len());
+            self.buffer_mut().insert_char(at, '\n');
             self.cursor.line += 1;
         } else {
-            let at = self.buffer.line_start(self.cursor.line);
-            self.buffer.insert_char(at, '\n');
+            let at = self.buffer().line_start(self.cursor.line);
+            self.buffer_mut().insert_char(at, '\n');
         }
-        self.buffer.normalize();
+        self.buffer_mut().normalize();
         self.cursor.col = 0;
-        self.buffer.modified = true;
+        self.buffer_mut().modified = true;
         self.mode = Mode::Insert;
         self.snapshot_taken = true;
     }
@@ -1036,14 +1282,14 @@ impl Editor {
         self.push_undo();
         if self.register.linewise {
             let at = if after {
-                self.buffer
-                    .line_start((self.cursor.line + 1).min(self.buffer.line_count()))
+                self.buffer()
+                    .line_start((self.cursor.line + 1).min(self.buffer().line_count()))
             } else {
-                self.buffer.line_start(self.cursor.line)
+                self.buffer().line_start(self.cursor.line)
             };
             let chunk = self.register.text.repeat(count);
-            self.buffer.insert(at, &chunk);
-            self.buffer.normalize();
+            self.buffer_mut().insert(at, &chunk);
+            self.buffer_mut().normalize();
             self.cursor.line = if after {
                 self.cursor.line + 1
             } else {
@@ -1053,7 +1299,7 @@ impl Editor {
         } else {
             let len = self.line_len();
             let cur = self.cursor_char();
-            let line_end = self.buffer.byte_at(self.cursor.line, len);
+            let line_end = self.buffer().byte_at(self.cursor.line, len);
             // Paste *after* lands past the whole grapheme under the cursor, never
             // between a base char and its combining mark.
             let at = if after && len > 0 {
@@ -1067,11 +1313,11 @@ impl Editor {
             // pasted character.
             let last_len = chunk.len() - unicode::prev_grapheme(&chunk, chunk.len());
             let end = at + chunk.len();
-            self.buffer.insert(at, &chunk);
+            self.buffer_mut().insert(at, &chunk);
             self.set_cursor_char(end.saturating_sub(last_len));
         }
-        self.buffer.normalize();
-        self.buffer.modified = true;
+        self.buffer_mut().normalize();
+        self.buffer_mut().modified = true;
         self.clamp_cursor();
     }
 
@@ -1089,7 +1335,7 @@ impl Editor {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 if self.cursor.col > 0 {
-                    let s = self.buffer.line(self.cursor.line);
+                    let s = self.buffer().line(self.cursor.line);
                     self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
                 }
                 self.clamp_cursor();
@@ -1097,24 +1343,24 @@ impl Editor {
             }
             KeyCode::Enter => {
                 let at = self.cursor_char();
-                self.buffer.insert_char(at, '\n');
+                self.buffer_mut().insert_char(at, '\n');
                 self.cursor.line += 1;
                 self.cursor.col = 0;
-                self.buffer.modified = true;
+                self.buffer_mut().modified = true;
             }
             KeyCode::Backspace => self.insert_backspace(),
             KeyCode::Tab => {
                 let at = self.cursor_char();
-                self.buffer.insert_char(at, '\t');
+                self.buffer_mut().insert_char(at, '\t');
                 self.cursor.col += 1;
-                self.buffer.modified = true;
+                self.buffer_mut().modified = true;
             }
             KeyCode::Left => {
-                let s = self.buffer.line(self.cursor.line);
+                let s = self.buffer().line(self.cursor.line);
                 self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
             }
             KeyCode::Right => {
-                let s = self.buffer.line(self.cursor.line);
+                let s = self.buffer().line(self.cursor.line);
                 self.cursor.col = unicode::next_grapheme(&s, self.cursor.col).min(s.len());
             }
             KeyCode::Up => self.move_vertical(-1, true),
@@ -1123,24 +1369,24 @@ impl Editor {
                 let len = self.line_len();
                 if self.cursor.col < len {
                     let at = self.cursor_char();
-                    let s = self.buffer.line(self.cursor.line);
-                    let end = self.buffer.line_start(self.cursor.line)
+                    let s = self.buffer().line(self.cursor.line);
+                    let end = self.buffer().line_start(self.cursor.line)
                         + unicode::next_grapheme(&s, self.cursor.col);
-                    self.buffer.remove(at..end);
-                    self.buffer.modified = true;
+                    self.buffer_mut().remove(at..end);
+                    self.buffer_mut().modified = true;
                 }
             }
             KeyCode::Char(c) => {
                 let at = self.cursor_char();
                 if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
-                    let s = self.buffer.line(self.cursor.line);
-                    let end = self.buffer.line_start(self.cursor.line)
+                    let s = self.buffer().line(self.cursor.line);
+                    let end = self.buffer().line_start(self.cursor.line)
                         + unicode::next_grapheme(&s, self.cursor.col);
-                    self.buffer.remove(at..end);
+                    self.buffer_mut().remove(at..end);
                 }
-                self.buffer.insert_char(at, c);
+                self.buffer_mut().insert_char(at, c);
                 self.cursor.col += c.len_utf8();
-                self.buffer.modified = true;
+                self.buffer_mut().modified = true;
             }
             _ => {}
         }
@@ -1149,19 +1395,19 @@ impl Editor {
     fn insert_backspace(&mut self) {
         if self.cursor.col > 0 {
             let at = self.cursor_char();
-            let start = self.buffer.line_start(self.cursor.line);
-            let s = self.buffer.line(self.cursor.line);
+            let start = self.buffer().line_start(self.cursor.line);
+            let s = self.buffer().line(self.cursor.line);
             let prev_col = unicode::prev_grapheme(&s, self.cursor.col);
-            self.buffer.remove(start + prev_col..at);
+            self.buffer_mut().remove(start + prev_col..at);
             self.cursor.col = prev_col;
-            self.buffer.modified = true;
+            self.buffer_mut().modified = true;
         } else if self.cursor.line > 0 {
-            let prev_len = self.buffer.line_len(self.cursor.line - 1);
-            let join_at = self.buffer.byte_at(self.cursor.line - 1, prev_len);
-            self.buffer.remove(join_at..join_at + 1);
+            let prev_len = self.buffer().line_len(self.cursor.line - 1);
+            let join_at = self.buffer().byte_at(self.cursor.line - 1, prev_len);
+            self.buffer_mut().remove(join_at..join_at + 1);
             self.cursor.line -= 1;
             self.cursor.col = prev_len;
-            self.buffer.modified = true;
+            self.buffer_mut().modified = true;
         }
     }
 
@@ -1201,7 +1447,7 @@ impl Editor {
         if let Ok(n) = cmd.parse::<usize>() {
             let line = n
                 .saturating_sub(1)
-                .min(self.buffer.line_count().saturating_sub(1));
+                .min(self.buffer().line_count().saturating_sub(1));
             self.cursor.line = line;
             self.cursor.col = self.first_non_blank(line);
             return;
@@ -1212,16 +1458,31 @@ impl Editor {
             "w" | "write" => self.ex_write(args),
             "q" | "quit" => self.ex_quit(bang),
             "wq" | "x" | "xit" | "exit" => {
+                // Write the current buffer, then quit (`:q` rules: exit unless
+                // another buffer is still unsaved). A failed write leaves the
+                // current buffer modified, so `:q` then reports it.
                 self.ex_write(args);
-                self.should_quit = true;
+                self.ex_quit(bang);
             }
             "qa" | "qall" | "quita" | "quitall" => self.ex_quit(bang),
-            "wa" | "wall" => self.ex_write(""),
+            "wa" | "wall" => self.ex_write_all(),
             "wqa" | "xa" | "xall" => {
-                self.ex_write("");
-                self.should_quit = true;
+                self.ex_write_all();
+                self.ex_quit(bang);
             }
             "e" | "edit" => self.ex_edit(args, bang),
+            "ene" | "enew" => self.ex_enew(),
+            "ls" | "buffers" | "files" => self.ex_buffers(),
+            "b" | "bu" | "buf" | "buffer" => {
+                if let Some(id) = self.resolve_buffer(args) {
+                    self.switch_buffer(id);
+                }
+            }
+            "bn" | "bnext" => self.ex_bnext(parse_count_arg(args)),
+            "bp" | "bN" | "bprev" | "bprevious" | "bNext" => self.ex_bprev(parse_count_arg(args)),
+            "bf" | "bfirst" | "br" | "brewind" => self.ex_bfirst(),
+            "bl" | "blast" => self.ex_blast(),
+            "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => self.ex_bdelete(args, bang),
             "lua" => self.lua_queue.push(args.to_string()),
             "sleep" | "sl" => match parse_sleep(args) {
                 Ok(ms) => self.pending_sleep = Some(ms),
@@ -1248,10 +1509,10 @@ impl Editor {
         } else {
             Some(PathBuf::from(args))
         };
-        match self.buffer.write(path) {
+        match self.buffer_mut().write(path) {
             Ok((bytes, lines)) => {
                 let name = self
-                    .buffer
+                    .buffer()
                     .path
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -1262,36 +1523,293 @@ impl Editor {
         }
     }
 
+    /// `:q` — quit the editor, but only if nothing would be lost. With `!`, exit
+    /// unconditionally (discarding every buffer). Otherwise, if any buffer has
+    /// unsaved changes, *don't* quit: switch the window to that buffer (the
+    /// current one if it's the one modified, else the lowest-numbered modified
+    /// buffer) and report `E37`, so the user sees what's blocking the quit. With
+    /// no modified buffers, exit. (Single-window nxvim, so `:q` and `:qa` are the
+    /// same; real windows will split them later.)
     fn ex_quit(&mut self, bang: bool) {
-        if self.buffer.modified && !bang {
-            self.message = "E37: No write since last change (add ! to override)".to_string();
-        } else {
+        if bang {
             self.should_quit = true;
+            return;
         }
-    }
-
-    fn ex_edit(&mut self, args: &str, bang: bool) {
-        if self.buffer.modified && !bang {
+        if self.buffer().modified {
+            // Already showing the offending buffer.
             self.message = "E37: No write since last change (add ! to override)".to_string();
             return;
         }
+        match self.first_modified_buffer() {
+            Some(id) => {
+                // Surface the blocking buffer, then warn (the switch clears the
+                // message, so set it afterwards).
+                self.switch_buffer(id);
+                self.message = format!(
+                    "E37: No write since last change for buffer {} (add ! to override)",
+                    id.0
+                );
+            }
+            None => self.should_quit = true,
+        }
+    }
+
+    /// The lowest-numbered buffer with unsaved changes, if any.
+    fn first_modified_buffer(&self) -> Option<BufferId> {
+        self.buffers
+            .map
+            .iter()
+            .find(|(_, ob)| ob.buffer.modified)
+            .map(|(id, _)| *id)
+    }
+
+    fn ex_edit(&mut self, args: &str, bang: bool) {
         if args.is_empty() {
             self.message = "E32: No file name".to_string();
             return;
         }
-        match Buffer::from_file(args) {
-            Ok(buf) => {
-                self.buffer = buf;
-                self.cursor = Cursor::default();
-                self.top = 0;
-                self.undo_stack.clear();
-                self.redo_stack.clear();
-                // A freshly loaded buffer is a whole-content replacement: tell
-                // consumers (the syntax worker) to re-sync from full text.
-                self.buffer.mark_resync();
+        let path = PathBuf::from(args);
+
+        // Re-editing the current file reloads it in place (`:e` / `:e!`),
+        // discarding unsaved changes — so the modified guard applies here.
+        if self.buffer().path.as_deref() == Some(path.as_path()) {
+            if self.buffer().modified && !bang {
+                self.message = "E37: No write since last change (add ! to override)".to_string();
+                return;
             }
-            Err(e) => self.message = e.to_string(),
+            self.load_into_current(&path);
+            return;
         }
+
+        // The file is already open in another buffer: just switch to it. The
+        // current buffer stays in the list (vim's `hidden` behavior), so there is
+        // nothing to lose and no modified guard.
+        if let Some(id) = self.find_buffer_by_path(&path) {
+            self.switch_buffer(id);
+            return;
+        }
+
+        // A new file. Reuse a throwaway `[No Name]` buffer if that's all we have
+        // (so the first `:e` doesn't strand an empty buffer 1); otherwise open it
+        // in a fresh buffer and switch, keeping the current one open.
+        if self.current_is_throwaway() {
+            self.load_into_current(&path);
+        } else {
+            match Buffer::from_file(&path) {
+                Ok(buf) => {
+                    let id = self.add_buffer(buf);
+                    self.switch_buffer(id);
+                }
+                Err(e) => self.message = e.to_string(),
+            }
+        }
+    }
+
+    /// `:enew` — open a new, empty `[No Name]` buffer in the window. Reuses a
+    /// throwaway current buffer rather than stacking another empty one.
+    fn ex_enew(&mut self) {
+        if self.current_is_throwaway() {
+            return;
+        }
+        let id = self.add_buffer(Buffer::empty());
+        self.switch_buffer(id);
+    }
+
+    /// `:wall` — write every modified buffer that has a file name.
+    fn ex_write_all(&mut self) {
+        let mut written = 0;
+        for ob in self.buffers.map.values_mut() {
+            if ob.buffer.modified && ob.buffer.path.is_some() && ob.buffer.write(None).is_ok() {
+                written += 1;
+            }
+        }
+        self.message = format!("{written} buffer(s) written");
+    }
+
+    // ----- buffer list ------------------------------------------------------
+
+    /// `:ls` / `:buffers` — list the open buffers into the message line, one per
+    /// row (id-sorted), with vim's flag columns: `%` current / `#` alternate,
+    /// `a` active / `h` hidden, `+` modified.
+    fn ex_buffers(&mut self) {
+        let current = self.current;
+        let alternate = self.alternate;
+        let live_cursor = self.cursor.line;
+        let mut lines = Vec::new();
+        for (id, ob) in &self.buffers.map {
+            let flag = if *id == current {
+                '%'
+            } else if Some(*id) == alternate {
+                '#'
+            } else {
+                ' '
+            };
+            let active = if *id == current { 'a' } else { 'h' };
+            let modified = if ob.buffer.modified { '+' } else { ' ' };
+            let name = ob
+                .buffer
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "[No Name]".to_string());
+            let lnum = if *id == current {
+                live_cursor
+            } else {
+                ob.saved_cursor.line
+            } + 1;
+            lines.push(format!(
+                "{:>3} {flag}{active} {modified} \"{name}\" line {lnum}",
+                id.0
+            ));
+        }
+        self.message = lines.join("\n");
+    }
+
+    /// Resolve a `:buffer` / `:bdelete` argument to a buffer id: empty = current,
+    /// `#` = alternate, a number = that buffer id, otherwise a file-name
+    /// substring. Sets the appropriate `E86`/`E94`/`E93` message and returns
+    /// `None` when it can't resolve.
+    fn resolve_buffer(&mut self, arg: &str) -> Option<BufferId> {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return Some(self.current);
+        }
+        if arg == "#" {
+            return match self.alternate {
+                Some(id) => Some(id),
+                None => {
+                    self.message = "E23: No alternate file".to_string();
+                    None
+                }
+            };
+        }
+        if let Ok(n) = arg.parse::<u64>() {
+            let id = BufferId(n);
+            if self.buffers.map.contains_key(&id) {
+                return Some(id);
+            }
+            self.message = format!("E86: Buffer {n} does not exist");
+            return None;
+        }
+        let matches: Vec<BufferId> = self
+            .buffers
+            .map
+            .iter()
+            .filter(|(_, ob)| {
+                ob.buffer
+                    .path
+                    .as_ref()
+                    .is_some_and(|p| p.display().to_string().contains(arg))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        match matches.as_slice() {
+            [] => {
+                self.message = format!("E94: No matching buffer for {arg}");
+                None
+            }
+            [one] => Some(*one),
+            _ => {
+                self.message = format!("E93: More than one match for {arg}");
+                None
+            }
+        }
+    }
+
+    /// `:bnext` — switch to the buffer `count` positions later in id order,
+    /// wrapping around.
+    fn ex_bnext(&mut self, count: usize) {
+        let ids = self.buffer_ids();
+        let len = ids.len();
+        if let Some(i) = ids.iter().position(|id| *id == self.current) {
+            self.switch_buffer(ids[(i + count) % len]);
+        }
+    }
+
+    /// `:bprevious` — switch `count` positions earlier in id order, wrapping.
+    fn ex_bprev(&mut self, count: usize) {
+        let ids = self.buffer_ids();
+        let len = ids.len();
+        if let Some(i) = ids.iter().position(|id| *id == self.current) {
+            self.switch_buffer(ids[(i + len - count % len) % len]);
+        }
+    }
+
+    /// `:bfirst` — switch to the lowest-numbered buffer.
+    fn ex_bfirst(&mut self) {
+        if let Some(&id) = self.buffers.map.keys().next() {
+            self.switch_buffer(id);
+        }
+    }
+
+    /// `:blast` — switch to the highest-numbered buffer.
+    fn ex_blast(&mut self) {
+        if let Some(&id) = self.buffers.map.keys().next_back() {
+            self.switch_buffer(id);
+        }
+    }
+
+    /// `:bdelete` / `:bwipeout` — remove a buffer from the list (default the
+    /// current one). Refuses a modified buffer without `!`. When the current
+    /// buffer is removed, the window moves to the alternate (or the nearest
+    /// remaining id); removing the last buffer leaves a fresh `[No Name]`.
+    fn ex_bdelete(&mut self, args: &str, bang: bool) {
+        let Some(target) = self.resolve_buffer(args) else {
+            return;
+        };
+        if self.buffers.get(target).buffer.modified && !bang {
+            self.message = format!(
+                "E89: No write since last change for buffer {} (add ! to override)",
+                target.0
+            );
+            return;
+        }
+
+        // When removing the current buffer, move to the alternate if it's a
+        // distinct, still-open buffer (vim's behavior), else the nearest id.
+        let was_current = target == self.current;
+        let replacement = if was_current {
+            self.alternate
+                .filter(|a| *a != target && self.buffers.map.contains_key(a))
+                .or_else(|| self.neighbor_of(target))
+        } else {
+            None
+        };
+        self.buffers.map.remove(&target);
+        if self.alternate == Some(target) {
+            self.alternate = None;
+        }
+
+        if self.buffers.map.is_empty() {
+            // Never leave zero buffers: open a fresh, empty one in the window.
+            let id = self.add_buffer(Buffer::empty());
+            self.current = id;
+            self.alternate = None;
+            self.cursor = Cursor::default();
+            self.top = 0;
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            self.scroll_from = None;
+            self.pending_scroll = None;
+        } else if was_current {
+            // `current` now dangles; move to the chosen replacement (no stash —
+            // the outgoing buffer is gone).
+            self.enter_buffer(replacement.expect("a non-empty store has a neighbor"));
+        }
+    }
+
+    /// The nearest buffer to `id` in id order among the *other* open buffers:
+    /// the largest id below it, else the smallest above it. `None` if `id` is the
+    /// only buffer.
+    fn neighbor_of(&self, id: BufferId) -> Option<BufferId> {
+        let below = self.buffers.map.range(..id).next_back().map(|(k, _)| *k);
+        below.or_else(|| {
+            self.buffers
+                .map
+                .range((std::ops::Bound::Excluded(id), std::ops::Bound::Unbounded))
+                .next()
+                .map(|(k, _)| *k)
+        })
     }
 
     // ----- options ----------------------------------------------------------
@@ -1337,7 +1855,7 @@ impl Editor {
         if !self.options.number && !self.options.relativenumber {
             return 0;
         }
-        let digits = digit_count(self.buffer.line_count());
+        let digits = digit_count(self.buffer().line_count());
         (digits + 1).max(4)
     }
 
@@ -1347,66 +1865,72 @@ impl Editor {
         if self.snapshot_taken {
             return;
         }
-        self.undo_stack.push(Snapshot {
-            text: self.buffer.text.clone(),
+        let snap = Snapshot {
+            text: self.buffer().text.clone(),
             cursor: self.cursor,
-        });
-        self.redo_stack.clear();
+        };
+        let ob = self.cur_mut();
+        ob.undo_stack.push(snap);
+        ob.redo_stack.clear();
     }
 
     fn undo(&mut self) {
-        if let Some(snap) = self.undo_stack.pop() {
-            self.redo_stack.push(Snapshot {
-                text: self.buffer.text.clone(),
-                cursor: self.cursor,
-            });
-            self.buffer.text = snap.text;
-            self.cursor = snap.cursor;
-            self.buffer.mark_resync();
-            self.clamp_cursor();
-        } else {
+        let Some(snap) = self.cur_mut().undo_stack.pop() else {
             self.message = "Already at oldest change".to_string();
-        }
+            return;
+        };
+        let current = Snapshot {
+            text: self.buffer().text.clone(),
+            cursor: self.cursor,
+        };
+        let ob = self.cur_mut();
+        ob.redo_stack.push(current);
+        ob.buffer.text = snap.text;
+        self.cursor = snap.cursor;
+        self.buffer_mut().mark_resync();
+        self.clamp_cursor();
     }
 
     fn redo(&mut self) {
-        if let Some(snap) = self.redo_stack.pop() {
-            self.undo_stack.push(Snapshot {
-                text: self.buffer.text.clone(),
-                cursor: self.cursor,
-            });
-            self.buffer.text = snap.text;
-            self.cursor = snap.cursor;
-            self.buffer.mark_resync();
-            self.clamp_cursor();
-        } else {
+        let Some(snap) = self.cur_mut().redo_stack.pop() else {
             self.message = "Already at newest change".to_string();
-        }
+            return;
+        };
+        let current = Snapshot {
+            text: self.buffer().text.clone(),
+            cursor: self.cursor,
+        };
+        let ob = self.cur_mut();
+        ob.undo_stack.push(current);
+        ob.buffer.text = snap.text;
+        self.cursor = snap.cursor;
+        self.buffer_mut().mark_resync();
+        self.clamp_cursor();
     }
 
     // ----- cursor / scrolling helpers --------------------------------------
 
     fn cursor_char(&self) -> usize {
-        self.buffer.byte_at(self.cursor.line, self.cursor.col)
+        self.buffer().byte_at(self.cursor.line, self.cursor.col)
     }
 
     fn char_at(&self, idx: usize) -> char {
         // Non-boundary bytes (inside a multi-byte char) read as blank rather
         // than panicking; cursor/operator positions are kept on boundaries.
-        self.buffer.text.get_char(idx).unwrap_or(' ')
+        self.buffer().text.get_char(idx).unwrap_or(' ')
     }
 
     /// Byte offset one grapheme-cluster forward from `idx` over the whole buffer.
     /// The trailing `\n` of each line is itself a single-byte grapheme.
     fn next_grapheme_idx(&self, idx: usize) -> usize {
-        let line = self.buffer.byte_to_line(idx);
-        let start = self.buffer.line_start(line);
-        let s = self.buffer.line(line);
+        let line = self.buffer().byte_to_line(idx);
+        let start = self.buffer().line_start(line);
+        let s = self.buffer().line(line);
         let rel = idx - start;
         if rel < s.len() {
             start + unicode::next_grapheme(&s, rel)
         } else {
-            (idx + 1).min(self.buffer.len_bytes())
+            (idx + 1).min(self.buffer().len_bytes())
         }
     }
 
@@ -1415,9 +1939,9 @@ impl Editor {
         if idx == 0 {
             return 0;
         }
-        let line = self.buffer.byte_to_line(idx);
-        let start = self.buffer.line_start(line);
-        let s = self.buffer.line(line);
+        let line = self.buffer().byte_to_line(idx);
+        let start = self.buffer().line_start(line);
+        let s = self.buffer().line(line);
         let rel = idx - start;
         if rel == 0 {
             idx - 1
@@ -1428,9 +1952,9 @@ impl Editor {
 
     /// Snap an absolute byte offset down to a grapheme boundary.
     fn grapheme_floor_abs(&self, idx: usize) -> usize {
-        let line = self.buffer.byte_to_line(idx);
-        let start = self.buffer.line_start(line);
-        let s = self.buffer.line(line);
+        let line = self.buffer().byte_to_line(idx);
+        let start = self.buffer().line_start(line);
+        let s = self.buffer().line(line);
         let rel = idx.saturating_sub(start).min(s.len());
         start + unicode::floor_grapheme(&s, rel)
     }
@@ -1447,7 +1971,7 @@ impl Editor {
 
     /// Virtual (screen) column of the cursor on its current line.
     fn cursor_virtcol(&self) -> usize {
-        let s = self.buffer.line(self.cursor.line);
+        let s = self.buffer().line(self.cursor.line);
         unicode::virtcol(&s, self.cursor.col, unicode::TABSTOP)
     }
 
@@ -1469,49 +1993,49 @@ impl Editor {
     /// Snap the cursor column down to the nearest grapheme boundary (a no-op for
     /// ASCII), so byte offsets handed to the rope are always valid.
     fn snap_cursor(&mut self) {
-        let s = self.buffer.line(self.cursor.line);
+        let s = self.buffer().line(self.cursor.line);
         self.cursor.col = unicode::floor_grapheme(&s, self.cursor.col.min(s.len()));
     }
 
     fn last_char_idx(&self) -> usize {
         // The trailing '\n' is never a valid cursor position.
-        self.buffer.len_bytes().saturating_sub(1)
+        self.buffer().len_bytes().saturating_sub(1)
     }
 
     fn line_len(&self) -> usize {
-        self.buffer.line_len(self.cursor.line)
+        self.buffer().line_len(self.cursor.line)
     }
 
     fn first_non_blank(&self, line: usize) -> usize {
-        let s = self.buffer.line(line);
+        let s = self.buffer().line(line);
         s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count()
     }
 
     fn set_cursor_char(&mut self, idx: usize) {
         let idx = self
-            .buffer
+            .buffer()
             .text
             .floor_char_boundary(idx.min(self.last_char_idx()));
-        let line = self.buffer.byte_to_line(idx);
+        let line = self.buffer().byte_to_line(idx);
         self.cursor.line = line;
-        self.cursor.col = idx - self.buffer.line_start(line);
+        self.cursor.col = idx - self.buffer().line_start(line);
         self.snap_cursor();
     }
 
     fn set_cursor_char_insert(&mut self, idx: usize) {
         let idx = self
-            .buffer
+            .buffer()
             .text
-            .floor_char_boundary(idx.min(self.buffer.len_bytes()));
-        let line = self.buffer.byte_to_line(idx);
+            .floor_char_boundary(idx.min(self.buffer().len_bytes()));
+        let line = self.buffer().byte_to_line(idx);
         self.cursor.line = line;
-        self.cursor.col = idx - self.buffer.line_start(line);
+        self.cursor.col = idx - self.buffer().line_start(line);
         self.snap_cursor();
     }
 
     fn move_vertical(&mut self, delta: i64, allow_eol: bool) {
         let new = (self.cursor.line as i64 + delta).max(0) as usize;
-        self.cursor.line = new.min(self.buffer.line_count().saturating_sub(1));
+        self.cursor.line = new.min(self.buffer().line_count().saturating_sub(1));
         self.settle_desired_col(allow_eol);
         self.preserve_desired = true;
     }
@@ -1520,7 +2044,7 @@ impl Editor {
     /// column (or end-of-line when `$`-sticky), clamped to the line and a grapheme
     /// boundary.
     fn settle_desired_col(&mut self, allow_eol: bool) {
-        let s = self.buffer.line(self.cursor.line);
+        let s = self.buffer().line(self.cursor.line);
         // Furthest valid resting byte: past-end for insert/allow_eol, otherwise
         // the start of the last grapheme (normal mode can't rest past EOL).
         let max_byte = if allow_eol {
@@ -1537,7 +2061,7 @@ impl Editor {
     }
 
     fn clamp_cursor(&mut self) {
-        let last_line = self.buffer.line_count().saturating_sub(1);
+        let last_line = self.buffer().line_count().saturating_sub(1);
         if self.cursor.line > last_line {
             self.cursor.line = last_line;
         }
@@ -1569,7 +2093,7 @@ impl Editor {
     /// `PendingScroll` if `top` actually changed.
     fn scroll_by(&mut self, delta: i64) {
         self.scroll_from = Some((self.top, self.cursor.line));
-        let last = self.buffer.line_count().saturating_sub(1) as i64;
+        let last = self.buffer().line_count().saturating_sub(1) as i64;
         self.top = (self.top as i64 + delta).clamp(0, last) as usize;
         self.move_vertical(delta, false);
         self.clamp_cursor();
@@ -1653,6 +2177,16 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
 /// Parse a `:sleep` argument: `{n}` = seconds, `{n}m` = milliseconds, empty =
 /// 1 second (matching vim). Returns a vim-style `E475` error string for
 /// non-integer input.
+/// Parse a buffer-navigation count argument (`:bnext 2`). Empty / invalid / zero
+/// all mean 1, matching vim's default repeat count.
+fn parse_count_arg(args: &str) -> usize {
+    args.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
 fn parse_sleep(args: &str) -> Result<u64, String> {
     let a = args.trim();
     if a.is_empty() {

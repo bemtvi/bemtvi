@@ -11,6 +11,7 @@
 //! - `ts_open`  `{buffer, tick, language, text, first_line, last_line}`
 //! - `ts_edit`  `{buffer, tick, edits, first_line, last_line}`
 //! - `ts_view`  `{buffer, first_line, last_line}`
+//! - `ts_close` `{buffer}` — forget a deleted buffer's shadow + tree
 //! - `ts_highlights` `{buffer, tick, first_line, last_line, spans}` (worker→server)
 //! - `ts_error` `{buffer, language, message}` (worker→server)
 
@@ -113,6 +114,7 @@ fn handle(engine: &mut Engine, rpc: &Rpc, method: &str, params: &[Value]) {
             send_highlights(engine, rpc, map, buffer);
         }
         "ts_view" => send_highlights(engine, rpc, map, buffer),
+        "ts_close" => engine.close(buffer),
         _ => {}
     }
 }

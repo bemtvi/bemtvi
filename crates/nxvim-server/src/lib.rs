@@ -52,7 +52,7 @@ where
     };
 
     while let Some(message) = incoming.recv().await {
-        server.handle(message);
+        server.handle(message).await;
         if server.editor.should_quit {
             server.rpc.notify("nxvim_exit", vec![]);
             break;
@@ -62,7 +62,7 @@ where
 }
 
 impl Server {
-    fn handle(&mut self, message: Incoming) {
+    async fn handle(&mut self, message: Incoming) {
         match message {
             Incoming::Request { id, method, params } => {
                 match self.dispatch(&method, &params) {
@@ -75,6 +75,13 @@ impl Server {
                 let _ = self.dispatch(&method, &params);
                 self.redraw();
             }
+        }
+
+        // A `:sleep` parks the editor for the requested span. Awaiting (not
+        // blocking) keeps the RPC reader/writer tasks alive, so input typed
+        // during the sleep is buffered and applied once we wake.
+        if let Some(ms) = self.editor.take_sleep() {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
     }
 

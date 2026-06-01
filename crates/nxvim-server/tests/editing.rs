@@ -716,3 +716,21 @@ async fn ctrl_u_mid_buffer_scrolls_up() {
     assert_eq!(scroll_u64(&map, "duration_ms"), 96); // 12 * 8
     assert_eq!(scroll_lines_len(&map), 36); // |22 - 10| + 24
 }
+
+#[tokio::test]
+async fn sleep_blocks_the_editor_for_the_requested_duration() {
+    let (rpc, _incoming) = start(None).await;
+    // The command is acknowledged promptly; the server then sleeps. The next
+    // request can only be handled once the sleep finishes, so its round-trip
+    // time is a reliable *lower bound* on the sleep (lower bounds never flake).
+    rpc.request("nvim_command", vec![Value::from("sleep 150m")])
+        .await
+        .expect("sleep command");
+    let begin = std::time::Instant::now();
+    let _ = lines(&rpc).await;
+    assert!(
+        begin.elapsed() >= std::time::Duration::from_millis(120),
+        "follow-up returned too soon: {:?}",
+        begin.elapsed()
+    );
+}

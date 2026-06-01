@@ -204,16 +204,33 @@ the architecture is built so it slots in without a rewrite.
 ## Testing philosophy
 
 nxvim **does not use unit tests.** We test *functionality* — what the editor
-does for a user — not internal code structure. Two layers:
+does for a user — not internal code structure. Coverage is layered cheap →
+faithful, so the broad, fast tiers localize most failures and the slow PTY tier
+stays thin:
 
-- **Integration tests** (e.g. [`crates/nxvim-server/tests/editing.rs`](../crates/nxvim-server/tests/editing.rs))
+- **RPC / `View` integration** ([`crates/nxvim-server/tests/editing.rs`](../crates/nxvim-server/tests/editing.rs))
   start a real server, connect over real RPC, send vim key-notation via
   `nvim_input`, and assert on observable results: buffer contents
-  (`nvim_buf_get_lines`), bytes written to disk, and the rendered screen. They
-  treat the editor as a black box and exercise the whole stack
-  (RPC → server → core → Lua) end to end.
-- **e2e tests** (planned) will drive the actual `nxvim` binary through a PTY and
-  assert on the terminal output a user would really see.
+  (`nvim_buf_get_lines`), cursor, bytes written to disk, and the semantic
+  `redraw` `View`. They treat the editor as a black box and exercise the whole
+  stack (RPC → server → core → Lua) end to end.
+- **Tier 1 — client paint & key translation** ([`crates/nxvim-tui/tests/`](../crates/nxvim-tui/tests/))
+  render a known `View` into a cell grid via ratatui's `TestBackend`
+  (`nxvim_tui::paint`) and assert on the painted cells, and test the
+  crossterm-`KeyEvent`→key-notation translation (`nxvim_tui::encode_key`)
+  directly. Fast and fully deterministic — no process, no timing.
+- **Tier 2 — full-stack screen** ([`crates/nxvim/tests/screen.rs`](../crates/nxvim/tests/screen.rs))
+  drive the real server in-process, capture the real `redraw`, paint it with the
+  real client, and assert on the cell grid — the deterministic "what the user
+  sees" workhorse. Also asserts the non-blocking guarantee (a UI that never
+  drains redraws can't stall the editor).
+- **Tier 3 — PTY smoke** ([`crates/nxvim/tests/e2e.rs`](../crates/nxvim/tests/e2e.rs))
+  drive the actual `nxvim` binary through a pseudo-terminal (`portable-pty`),
+  send real key bytes, and assert on the parsed terminal screen (`vt100`) a user
+  would really see — proving real crossterm decode, real terminal escapes, and
+  process startup/args. Deliberately small; the slow/flaky surface. Includes a
+  responsiveness check that input typed during a slow editor op (`:sleep`) is
+  buffered and applied once the editor wakes.
 
 A bug should be reproducible as "these keystrokes produced the wrong text or
 screen," and that is exactly the shape of these tests.
@@ -251,7 +268,6 @@ screen," and that is exactly the shape of these tests.
   search (`/`, `?`, `:s`), marks, folds, and macros.
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).
-- PTY-driven e2e tests of the binary.
 
 [`tokio::io::duplex`]: https://docs.rs/tokio/latest/tokio/io/fn.duplex.html
 [mlua]: https://docs.rs/mlua

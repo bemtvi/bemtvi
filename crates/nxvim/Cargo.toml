@@ -17,3 +17,10 @@ anyhow.workspace = true
 tokio.workspace = true
 nxvim-server.workspace = true
 nxvim-tui.workspace = true
+
+[dev-dependencies]
+nxvim-rpc.workspace = true
+rmpv.workspace = true
+ratatui.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true

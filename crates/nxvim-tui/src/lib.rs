@@ -125,7 +125,7 @@ fn text_height(terminal_height: u16) -> u16 {
 
 /// The server's view, mirrored client-side for rendering.
 #[derive(Default)]
-struct View {
+pub struct View {
     lines: Vec<String>,
     cursor_row: u16,
     cursor_col: u16,
@@ -266,6 +266,27 @@ impl View {
             _ => None,
         };
     }
+
+    /// Build a view from a `redraw` notification's params — the client's own
+    /// parsing path — so tests and tools can paint a known view.
+    pub fn from_redraw(params: &[Value]) -> Self {
+        let mut view = View::default();
+        view.update(params);
+        view
+    }
+}
+
+/// Render `view` into a `width`x`height` cell grid using ratatui's test backend
+/// and return the painted buffer. This drives the *same* `render` the live
+/// client uses, so tests assert on exactly what a user would see.
+pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, view, None))
+        .expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 /// Lay out the three regions and render each with its own widget. When `anim`
@@ -451,7 +472,10 @@ fn map_str(map: &[(Value, Value)], key: &str) -> String {
 }
 
 /// Translate a crossterm key event into vim key-notation.
-fn encode_key(ev: KeyEvent) -> Option<String> {
+///
+/// Public so the crossterm -> vim key-notation contract can be exercised by
+/// integration tests in `nxvim-tui/tests/keys.rs`.
+pub fn encode_key(ev: KeyEvent) -> Option<String> {
     let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
     let alt = ev.modifiers.contains(KeyModifiers::ALT);
 

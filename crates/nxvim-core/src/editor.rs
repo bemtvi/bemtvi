@@ -122,6 +122,11 @@ pub struct Editor {
 
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
+
+    /// Milliseconds the server should block after the current command, set by
+    /// `:sleep` and drained via [`Editor::take_sleep`]. Models a slow editor
+    /// operation; the server awaits it without freezing the UI.
+    pending_sleep: Option<u64>,
 }
 
 impl Editor {
@@ -161,6 +166,7 @@ impl Editor {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             lua_queue: Vec::new(),
+            pending_sleep: None,
         }
     }
 
@@ -173,6 +179,13 @@ impl Editor {
         self.width = width.max(1);
         self.height = height.max(1);
         self.ensure_visible();
+    }
+
+    /// Take any pending `:sleep` duration in milliseconds, clearing it. The
+    /// server awaits this between message handling, so a slow editor operation
+    /// never blocks the client (a separate thread/process).
+    pub fn take_sleep(&mut self) -> Option<u64> {
+        self.pending_sleep.take()
     }
 
     /// Feed a single key into the editor.
@@ -1185,6 +1198,10 @@ impl Editor {
             }
             "e" | "edit" => self.ex_edit(args, bang),
             "lua" => self.lua_queue.push(args.to_string()),
+            "sleep" | "sl" => match parse_sleep(args) {
+                Ok(ms) => self.pending_sleep = Some(ms),
+                Err(e) => self.message = e,
+            },
             "set" | "se" => self.message = format!("(set {args} — not yet implemented)"),
             "noh" | "nohlsearch" => {}
             other => self.message = format!("E492: Not an editor command: {other}"),
@@ -1536,4 +1553,22 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
     }
     let args = cmd[i..].trim();
     (name, bang, args)
+}
+
+/// Parse a `:sleep` argument: `{n}` = seconds, `{n}m` = milliseconds, empty =
+/// 1 second (matching vim). Returns a vim-style `E475` error string for
+/// non-integer input.
+fn parse_sleep(args: &str) -> Result<u64, String> {
+    let a = args.trim();
+    if a.is_empty() {
+        return Ok(1000);
+    }
+    let invalid = || format!("E475: Invalid argument: {a}");
+    match a.strip_suffix('m') {
+        Some(ms) => ms.trim().parse::<u64>().map_err(|_| invalid()),
+        None => a
+            .parse::<u64>()
+            .map(|secs| secs.saturating_mul(1000))
+            .map_err(|_| invalid()),
+    }
 }

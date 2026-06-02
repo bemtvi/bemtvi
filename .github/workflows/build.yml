@@ -29,11 +29,8 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-musl,  runner: ubuntu-latest,   os: linux,   suffix: x86_64-linux-musl,  ext: tar.gz }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, os: linux,   suffix: aarch64-linux-musl, ext: tar.gz }
-          # macOS targets temporarily disabled: notarization is pending Apple
-          # Developer account provisioning. Re-enable these two rows once
-          # `xcrun notarytool` succeeds (the sign/notarize steps below are kept).
-          # - { target: x86_64-apple-darwin,        runner: macos-15-intel,   os: macos,   suffix: x86_64-macos,       ext: tar.gz }
-          # - { target: aarch64-apple-darwin,       runner: macos-14,         os: macos,   suffix: aarch64-macos,      ext: tar.gz }
+          - { target: x86_64-apple-darwin,        runner: macos-15-intel,   os: macos,   suffix: x86_64-macos,       ext: tar.gz }
+          - { target: aarch64-apple-darwin,       runner: macos-14,         os: macos,   suffix: aarch64-macos,      ext: tar.gz }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,   os: windows, suffix: x86_64-windows,     ext: zip }
     steps:
       - uses: actions/checkout@v6

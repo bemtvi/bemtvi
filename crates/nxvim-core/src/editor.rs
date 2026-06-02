@@ -427,6 +427,26 @@ impl Editor {
         Ok(Editor::with_buffer(Buffer::from_file(path.into())?))
     }
 
+    /// Open `path`, falling back to a buffer *named after* `path` (rather than an
+    /// unnamed scratch buffer) when the file exists but can't be read — a
+    /// directory, a permission error, invalid UTF-8. The failure is echoed so the
+    /// user sees it, and because the buffer keeps the name a later `:w` writes
+    /// back to the file the user asked for instead of silently clobbering a stray
+    /// one. Mirrors neovim, which opens a named buffer and reports an E-message on
+    /// an unreadable startup file. (A *missing* file is not an error here:
+    /// `from_file` already binds it as a new-file buffer.)
+    pub fn open_or_named(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match Buffer::from_file(&path) {
+            Ok(buffer) => Editor::with_buffer(buffer),
+            Err(e) => {
+                let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
+                editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
+                editor
+            }
+        }
+    }
+
     fn with_buffer(buffer: Buffer) -> Self {
         let (buffers, current) = BufferStore::with_one(buffer);
         Editor {

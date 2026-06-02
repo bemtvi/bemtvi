@@ -94,6 +94,17 @@ impl Buffer {
         }
     }
 
+    /// An empty buffer bound to `path` without touching the filesystem — the
+    /// fallback for a file that exists but can't be read (a directory, a
+    /// permission error, invalid UTF-8). Preserving the name means a later `:w`
+    /// targets the file the user asked for rather than a stray scratch buffer.
+    pub fn named(path: impl Into<PathBuf>) -> Self {
+        Buffer {
+            path: Some(path.into()),
+            ..Buffer::empty()
+        }
+    }
+
     /// Load a buffer from `path`. A missing file yields an empty buffer bound to
     /// that path (written on first save), matching `vim file-that-does-not-exist`.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {

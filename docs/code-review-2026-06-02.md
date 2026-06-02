@@ -237,20 +237,28 @@ dir's mode is `0o700`. Pre-fix it was `0o755` (umask default); post-fix `0o700`.
 
 # P2 — Reliability (worker supervision, startup, shutdown)
 
-## R4. Startup file-open failure is silently swallowed
+## R4. Startup file-open failure is silently swallowed ✅ DONE
 **File:** `crates/nxvim-server/src/lib.rs:139`
 **Severity:** Medium (data-loss footgun).
+**Status:** Implemented. Test:
+`editing.rs::unreadable_startup_file_keeps_its_name_and_echoes_the_error`.
 
 **Problem:** `Editor::open(path).unwrap_or_else(|_| Editor::new())` — `nxvim
 file.txt` on a permission error (or a directory, etc.) silently opens a *blank,
 unnamed* buffer; a later `:w` could clobber.
 
-**Fix:** On failure, create a buffer *named after* `path` (neovim's
-new-file-buffer behavior) and/or `echo` the error so the user sees it. Do not
-fall through to an unnamed buffer.
+**Fix applied:** New `Editor::open_or_named(path)` (replaces the
+`open(...).unwrap_or_else(Editor::new)` call in `run()`): on a read failure it
+builds a buffer *bound to* `path` via the new `Buffer::named(path)` (an empty
+buffer with the path set, no FS touch) and `echo`s
+`E484: Can't open file {path}: {err}`. The buffer keeps its name, so a later
+`:w` targets the intended file; a *missing* file is still the non-error
+new-file-buffer path inside `from_file`.
 
-**Verify:** `editing.rs`/`buffers.rs` test: start with an unreadable path, assert
-the buffer name is set (or an error is echoed) rather than `[No Name]`.
+**Test (verified fail-before / pass-after):** starts the server with a
+*directory* as `init.file` (reads fail with EISDIR — portable, no permission
+fiddling), asserts `nvim_buf_get_name(0)` equals the path (pre-fix it was `""`)
+and that the startup message names the file.
 
 ## R5. TS worker supervision — three weaknesses
 **File:** `crates/nxvim-server/src/syntax.rs`

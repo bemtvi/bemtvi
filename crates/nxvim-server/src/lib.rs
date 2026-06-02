@@ -136,7 +136,7 @@ where
     let (rpc, mut incoming) = connect(reader, writer);
 
     let editor = match init.file {
-        Some(path) => Editor::open(path).unwrap_or_else(|_| Editor::new()),
+        Some(path) => Editor::open_or_named(path),
         None => Editor::new(),
     };
     let lua =

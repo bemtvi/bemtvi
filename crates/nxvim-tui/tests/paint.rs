@@ -2,7 +2,7 @@
 //! and assert on exactly what a user would see. Synthetic views are the right
 //! input here — this pins the *client's painting contract*, not server logic.
 
-use nxvim_tui::{paint, View};
+use nxvim_tui::{paint, ScrollHarness, View};
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
@@ -396,4 +396,40 @@ fn close_button_geometry_matches_the_painted_x() {
         .map(|x| buf.cell((x, row)).map(|c| c.symbol()).unwrap_or(""))
         .collect();
     assert_eq!(bar, "[X]");
+}
+
+#[test]
+fn a_zero_duration_scroll_gesture_does_not_arm_an_animation() {
+    // R11: a scroll gesture with `duration_ms == 0` has no slide to play. Arming
+    // a degenerate animation would later divide elapsed time by a zero duration
+    // (NaN/inf progress → a one-frame glitch). `arm_animation` must skip it and
+    // leave the static destination viewport the redraw already carries.
+    let scroll = Value::Map(vec![
+        (Value::from("from_top"), Value::from(0u64)),
+        (Value::from("to_top"), Value::from(3u64)),
+        (Value::from("from_cursor"), Value::from(0u64)),
+        (Value::from("to_cursor"), Value::from(3u64)),
+        (Value::from("duration_ms"), Value::from(0u64)),
+        (Value::from("base_line"), Value::from(0u64)),
+        (
+            Value::from("lines"),
+            lines(&["l0", "l1", "l2", "l3", "l4", "l5"]),
+        ),
+    ]);
+    // The main view carries the destination viewport (lines l3..).
+    let params = redraw(vec![
+        ("lines", lines(&["l3", "l4", "l5"])),
+        ("scroll", scroll),
+    ]);
+
+    let mut client = ScrollHarness::new();
+    client.on_redraw(&params);
+    assert!(
+        !client.animating(),
+        "a zero-duration scroll must not arm an animation"
+    );
+
+    // The static destination is shown, and painting it can't produce NaN cells.
+    let buf = client.paint(20, 5);
+    assert_eq!(row_text(&buf, 0).trim_end(), "l3");
 }

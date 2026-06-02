@@ -420,12 +420,24 @@ server spawns the worker (the flag is always argv[1]).
 editor opens the file. Pre-fix the `any()` match ran the headless worker (blank
 screen, stdin read as RPC) → timeout; post-fix the file's contents render.
 
-## R11. Zero-duration scroll animation divides by zero → NaN
-**File:** `crates/nxvim-tui/src/lib.rs:522` (and `arm_animation` `:303`)
+## R11. Zero-duration scroll animation divides by zero → NaN ✅ DONE
+**File:** `crates/nxvim-tui/src/lib.rs` (`arm_animation`, `render`)
 **Severity:** Low (one-frame glitch, not a panic — `as usize` saturates NaN→0).
+**Status:** Implemented. Test:
+`crates/nxvim-tui/tests/paint.rs::a_zero_duration_scroll_gesture_does_not_arm_an_animation`.
 
-**Fix:** Guard `if a.duration.is_zero() { t = 1.0 } else { ... }`, or skip arming
-a zero-duration animation in `arm_animation`.
+**Fix applied (both):** `arm_animation` returns `None` for a scroll gesture whose
+`duration.is_zero()` — a degenerate slide is never armed; the redraw already
+carries the static destination viewport, so it's shown directly. As a belt-and-
+suspenders guard, `render` also computes progress as `1.0` when
+`a.duration.is_zero()` instead of dividing, so progress can never become
+NaN/inf even if an animation were armed some other way.
+
+**Test (verified fail-before / pass-after):** drives a synthetic scroll redraw
+with `duration_ms = 0` through `ScrollHarness` and asserts `!animating()` (no
+degenerate animation armed) and that the static destination paints. Pre-fix the
+zero-duration gesture armed an animation (`animating()` was `true`); post-fix it
+doesn't.
 
 ---
 

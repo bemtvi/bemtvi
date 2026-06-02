@@ -329,6 +329,13 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 ///   move) and interrupts the slide, as before.
 fn arm_animation(view: &View, current: Option<Animation>) -> Option<Animation> {
     if let Some(s) = view.scroll.as_ref() {
+        // A zero-duration gesture has no slide to play, and arming one would
+        // later divide elapsed time by a zero duration when computing progress
+        // (a NaN/inf that paints one glitched frame). Drop any in-flight slide
+        // and show the static destination the redraw already carries.
+        if s.duration.is_zero() {
+            return None;
+        }
         return Some(Animation::new(s));
     }
     current.filter(|a| repaints_destination(view, a))
@@ -546,7 +553,13 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
 
     match anim {
         Some(a) => {
-            let raw = (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0);
+            // `arm_animation` never arms a zero-duration slide; guard the divide
+            // anyway so progress can't become NaN/inf if that ever changes.
+            let raw = if a.duration.is_zero() {
+                1.0
+            } else {
+                (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0)
+            };
             let t = 1.0 - (1.0 - raw).powi(3); // ease-out cubic
             let top = lerp(a.from_top, a.to_top, t).round() as usize;
             let cur = lerp(a.from_cursor, a.to_cursor, t).round() as usize;

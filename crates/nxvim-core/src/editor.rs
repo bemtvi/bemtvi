@@ -267,6 +267,38 @@ struct MotionResult {
     axis: MoveAxis,
 }
 
+impl MotionResult {
+    /// A horizontal in-line motion (`h`/`l`/`0`/`^`/`w`/`b`/`e`/search-operator),
+    /// with the caller-chosen exclusive/inclusive `kind`.
+    fn horizontal(target: usize, kind: MotionKind) -> Self {
+        Self {
+            target,
+            kind,
+            axis: MoveAxis::Horizontal,
+        }
+    }
+
+    /// The common exclusive horizontal motion (`h`, `l`, `0`, `^`, `w`, `b`).
+    fn exclusive(target: usize) -> Self {
+        Self::horizontal(target, MotionKind::Exclusive)
+    }
+
+    /// An inclusive horizontal motion (`e`, and `cw` acting like `ce`).
+    fn inclusive(target: usize) -> Self {
+        Self::horizontal(target, MotionKind::Inclusive)
+    }
+
+    /// A linewise motion to the start of `target`'s line, with the given `axis`
+    /// (`VerticalKeep` for `j`/`k`, `LineAnchor` for `gg`/`G`/doubled operators).
+    fn linewise(target: usize, axis: MoveAxis) -> Self {
+        Self {
+            target,
+            kind: MotionKind::Linewise,
+            axis,
+        }
+    }
+}
+
 /// A recorded scroll gesture (`<C-d>` / `<C-u>` / `<C-f>` / `<C-b>`) that moved
 /// the viewport, handed to the client so it can animate the slide. Lines/columns
 /// are absolute buffer lines; `duration_ms` is a suggested pacing the client may
@@ -995,15 +1027,9 @@ impl Editor {
             // Doubled operator: linewise over `count` lines.
             let count = self.effective_count();
             let last = self.cursor.line + count - 1;
-            let target = self
-                .buffer()
-                .line_start(last.min(self.buffer().line_count().saturating_sub(1)));
+            let target = self.buffer().line_start(last.min(self.last_line()));
             // axis is unused for the operator path, but the field is required.
-            let m = MotionResult {
-                target,
-                kind: MotionKind::Linewise,
-                axis: MoveAxis::LineAnchor,
-            };
+            let m = MotionResult::linewise(target, MoveAxis::LineAnchor);
             self.operator = None;
             self.apply_operator(op, m);
             self.reset_pending();
@@ -1017,7 +1043,7 @@ impl Editor {
 
     fn resolve_motion(&self, key: Key, count: usize, raw: Option<usize>) -> Option<MotionResult> {
         let line = self.cursor.line;
-        let last_line = self.buffer().line_count().saturating_sub(1);
+        let last_line = self.last_line();
 
         let kc = key.code;
         let ch = key.as_char();
@@ -1025,11 +1051,8 @@ impl Editor {
         if self.gpending {
             if ch == Some('g') {
                 let target_line = raw.map(|n| n - 1).unwrap_or(0).min(last_line);
-                return Some(MotionResult {
-                    target: self.buffer().line_start(target_line),
-                    kind: MotionKind::Linewise,
-                    axis: MoveAxis::LineAnchor,
-                });
+                let target = self.buffer().line_start(target_line);
+                return Some(MotionResult::linewise(target, MoveAxis::LineAnchor));
             }
             return None;
         }
@@ -1041,11 +1064,7 @@ impl Editor {
                 for _ in 0..count {
                     col = unicode::prev_grapheme(&s, col);
                 }
-                MotionResult {
-                    target: self.buffer().byte_at(line, col),
-                    kind: MotionKind::Exclusive,
-                    axis: MoveAxis::Horizontal,
-                }
+                MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
             (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => {
                 let s = self.buffer().line(line);
@@ -1053,24 +1072,14 @@ impl Editor {
                 for _ in 0..count {
                     col = unicode::next_grapheme(&s, col);
                 }
-                MotionResult {
-                    target: self.buffer().byte_at(line, col),
-                    kind: MotionKind::Exclusive,
-                    axis: MoveAxis::Horizontal,
-                }
+                MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
-            (_, Some('0')) | (KeyCode::Home, _) => MotionResult {
-                target: self.buffer().byte_at(line, 0),
-                kind: MotionKind::Exclusive,
-                axis: MoveAxis::Horizontal,
-            },
+            (_, Some('0')) | (KeyCode::Home, _) => {
+                MotionResult::exclusive(self.buffer().byte_at(line, 0))
+            }
             (_, Some('^')) => {
                 let col = self.first_non_blank(line);
-                MotionResult {
-                    target: self.buffer().byte_at(line, col),
-                    kind: MotionKind::Exclusive,
-                    axis: MoveAxis::Horizontal,
-                }
+                MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
             (_, Some('$')) | (KeyCode::End, _) => {
                 let l = (line + count - 1).min(last_line);
@@ -1084,80 +1093,55 @@ impl Editor {
             }
             (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => {
                 let l = (line + count).min(last_line);
-                MotionResult {
-                    target: self.buffer().line_start(l),
-                    kind: MotionKind::Linewise,
-                    axis: MoveAxis::VerticalKeep,
-                }
+                MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
             (KeyCode::Up, _) | (_, Some('k')) => {
                 let l = line.saturating_sub(count);
-                MotionResult {
-                    target: self.buffer().line_start(l),
-                    kind: MotionKind::Linewise,
-                    axis: MoveAxis::VerticalKeep,
-                }
+                MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
             (_, Some('G')) => {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
-                MotionResult {
-                    target: self.buffer().line_start(l),
-                    kind: MotionKind::Linewise,
-                    axis: MoveAxis::LineAnchor,
-                }
+                MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
             }
-            (_, Some('w')) | (_, Some('W')) => {
-                let mut idx = self.cursor_char();
-                // Special case: `cw` on a non-blank acts like `ce` — it changes
-                // to the end of the word without swallowing the trailing space.
-                if self.operator == Some('c')
-                    && idx <= self.last_char_idx()
-                    && char_class(self.char_at(idx)) != CharClass::Blank
-                {
-                    for _ in 0..count {
-                        idx = self.word_end(idx);
-                    }
-                    MotionResult {
-                        target: idx,
-                        kind: MotionKind::Inclusive,
-                        axis: MoveAxis::Horizontal,
-                    }
-                } else {
-                    for _ in 0..count {
-                        idx = self.word_forward(idx);
-                    }
-                    MotionResult {
-                        target: idx,
-                        kind: MotionKind::Exclusive,
-                        axis: MoveAxis::Horizontal,
-                    }
-                }
-            }
+            (_, Some('w')) | (_, Some('W')) => self.word_motion(count),
             (_, Some('b')) | (_, Some('B')) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
                     idx = self.word_backward(idx);
                 }
-                MotionResult {
-                    target: idx,
-                    kind: MotionKind::Exclusive,
-                    axis: MoveAxis::Horizontal,
-                }
+                MotionResult::exclusive(idx)
             }
             (_, Some('e')) | (_, Some('E')) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
                     idx = self.word_end(idx);
                 }
-                MotionResult {
-                    target: idx,
-                    kind: MotionKind::Inclusive,
-                    axis: MoveAxis::Horizontal,
-                }
+                MotionResult::inclusive(idx)
             }
             _ => return None,
         };
         Some(motion)
+    }
+
+    /// Resolve a `w`/`W` word motion. Special case: `cw` on a non-blank acts like
+    /// `ce` — it changes to the end of the word without swallowing the trailing
+    /// space — so it returns an inclusive end-of-word target instead.
+    fn word_motion(&self, count: usize) -> MotionResult {
+        let mut idx = self.cursor_char();
+        if self.operator == Some('c')
+            && idx <= self.last_char_idx()
+            && char_class(self.char_at(idx)) != CharClass::Blank
+        {
+            for _ in 0..count {
+                idx = self.word_end(idx);
+            }
+            MotionResult::inclusive(idx)
+        } else {
+            for _ in 0..count {
+                idx = self.word_forward(idx);
+            }
+            MotionResult::exclusive(idx)
+        }
     }
 
     /// Apply a motion as plain cursor movement, maintaining vim's `curswant`.
@@ -1287,8 +1271,7 @@ impl Editor {
                 self.yank_range(lo, hi, linewise);
                 self.delete_range(lo, hi);
                 if linewise {
-                    self.cursor.line = first_line.min(self.buffer().line_count().saturating_sub(1));
-                    self.cursor.col = self.first_non_blank(self.cursor.line);
+                    self.settle_after_linewise_delete(first_line);
                 } else {
                     self.set_cursor_char(lo);
                 }
@@ -1297,14 +1280,7 @@ impl Editor {
             'c' => {
                 self.yank_range(lo, hi, linewise);
                 if linewise {
-                    self.delete_range(lo, hi);
-                    let at = self
-                        .buffer()
-                        .line_start(first_line.min(self.buffer().line_count().saturating_sub(1)));
-                    self.buffer_mut().insert_char(at, '\n');
-                    self.buffer_mut().normalize();
-                    self.cursor.line = first_line;
-                    self.cursor.col = 0;
+                    self.linewise_change(lo, hi, first_line);
                 } else {
                     self.delete_range(lo, hi);
                     self.set_cursor_char_insert(lo);
@@ -1316,6 +1292,26 @@ impl Editor {
         }
     }
 
+    /// Settle the cursor after a linewise delete: first non-blank of the line that
+    /// now occupies the deleted lines' position. Shared by `apply_operator` and
+    /// `visual_operate`.
+    fn settle_after_linewise_delete(&mut self, first_line: usize) {
+        self.cursor.line = first_line.min(self.last_line());
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+    }
+
+    /// Linewise change (`cc`/`S`, linewise-visual `c`): delete `lo..hi`, reopen a
+    /// single empty line at `first_line`, and park the cursor there for insert.
+    /// Shared by `apply_operator` and `visual_operate`.
+    fn linewise_change(&mut self, lo: usize, hi: usize, first_line: usize) {
+        self.delete_range(lo, hi);
+        let at = self.buffer().line_start(first_line.min(self.last_line()));
+        self.buffer_mut().insert_char(at, '\n');
+        self.buffer_mut().normalize();
+        self.cursor.line = first_line;
+        self.cursor.col = 0;
+    }
+
     fn visual_operate(&mut self, op: char) {
         let (lo, hi, linewise, first_line) = self.visual_range();
         self.push_undo();
@@ -1324,8 +1320,7 @@ impl Editor {
             'd' => {
                 self.delete_range(lo, hi);
                 if linewise {
-                    self.cursor.line = first_line.min(self.buffer().line_count().saturating_sub(1));
-                    self.cursor.col = self.first_non_blank(self.cursor.line);
+                    self.settle_after_linewise_delete(first_line);
                 } else {
                     self.set_cursor_char(lo);
                 }
@@ -1343,14 +1338,7 @@ impl Editor {
             }
             'c' => {
                 if linewise {
-                    self.delete_range(lo, hi);
-                    let at = self
-                        .buffer()
-                        .line_start(first_line.min(self.buffer().line_count().saturating_sub(1)));
-                    self.buffer_mut().insert_char(at, '\n');
-                    self.buffer_mut().normalize();
-                    self.cursor.line = first_line;
-                    self.cursor.col = 0;
+                    self.linewise_change(lo, hi, first_line);
                 } else {
                     self.delete_range(lo, hi);
                     self.set_cursor_char_insert(lo);
@@ -2038,11 +2026,7 @@ impl Editor {
         if let Some(op) = op {
             // The cursor now rests on the (offset-adjusted) match; the operator
             // spans from there back to where the search began.
-            let m = MotionResult {
-                target: origin,
-                kind: offset.motion_kind(),
-                axis: MoveAxis::Horizontal,
-            };
+            let m = MotionResult::horizontal(origin, offset.motion_kind());
             self.apply_operator(op, m);
         } else if wrapped {
             self.echo(match dir {
@@ -2075,7 +2059,7 @@ impl Editor {
                 self.move_to_match(t);
             }
             SearchOffset::Line(n) => {
-                let last_line = self.buffer().line_count().saturating_sub(1) as isize;
+                let last_line = self.last_line() as isize;
                 let line =
                     (self.buffer().byte_to_line(ms) as isize + n).clamp(0, last_line) as usize;
                 self.cursor.line = line;
@@ -2257,9 +2241,7 @@ impl Editor {
             return;
         }
         if let Ok(n) = cmd.parse::<usize>() {
-            let line = n
-                .saturating_sub(1)
-                .min(self.buffer().line_count().saturating_sub(1));
+            let line = n.saturating_sub(1).min(self.last_line());
             self.cursor.line = line;
             self.cursor.col = self.first_non_blank(line);
             return;
@@ -2890,47 +2872,56 @@ impl Editor {
 
     // ----- undo / redo ------------------------------------------------------
 
+    /// Capture the current text + cursor as an undo/redo snapshot.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            text: self.buffer().text.clone(),
+            cursor: self.cursor,
+        }
+    }
+
     fn push_undo(&mut self) {
         if self.snapshot_taken {
             return;
         }
-        let snap = Snapshot {
-            text: self.buffer().text.clone(),
-            cursor: self.cursor,
-        };
+        let snap = self.snapshot();
         let ob = self.cur_mut();
         ob.undo_stack.push(snap);
         ob.redo_stack.clear();
     }
 
     fn undo(&mut self) {
-        let Some(snap) = self.cur_mut().undo_stack.pop() else {
-            self.echo("Already at oldest change");
-            return;
-        };
-        let current = Snapshot {
-            text: self.buffer().text.clone(),
-            cursor: self.cursor,
-        };
-        let ob = self.cur_mut();
-        ob.redo_stack.push(current);
-        ob.buffer.text = snap.text;
-        self.cursor = snap.cursor;
-        self.buffer_mut().mark_resync();
-        self.clamp_cursor();
+        self.restore(true);
     }
 
     fn redo(&mut self) {
-        let Some(snap) = self.cur_mut().redo_stack.pop() else {
-            self.echo("Already at newest change");
+        self.restore(false);
+    }
+
+    /// Shared body of `undo`/`redo`: pop a snapshot off one history stack, push the
+    /// current state onto the other, and restore text + cursor. `from_undo` picks
+    /// the direction (undo: pop undo / push redo; redo: the reverse).
+    fn restore(&mut self, from_undo: bool) {
+        let popped = if from_undo {
+            self.cur_mut().undo_stack.pop()
+        } else {
+            self.cur_mut().redo_stack.pop()
+        };
+        let Some(snap) = popped else {
+            self.echo(if from_undo {
+                "Already at oldest change"
+            } else {
+                "Already at newest change"
+            });
             return;
         };
-        let current = Snapshot {
-            text: self.buffer().text.clone(),
-            cursor: self.cursor,
-        };
+        let current = self.snapshot();
         let ob = self.cur_mut();
-        ob.undo_stack.push(current);
+        if from_undo {
+            ob.redo_stack.push(current);
+        } else {
+            ob.undo_stack.push(current);
+        }
         ob.buffer.text = snap.text;
         self.cursor = snap.cursor;
         self.buffer_mut().mark_resync();
@@ -2938,6 +2929,12 @@ impl Editor {
     }
 
     // ----- cursor / scrolling helpers --------------------------------------
+
+    /// The last real line index (`line_count - 1`, saturating). The rope's phantom
+    /// trailing line is never included.
+    fn last_line(&self) -> usize {
+        self.buffer().line_count().saturating_sub(1)
+    }
 
     fn cursor_char(&self) -> usize {
         self.buffer().byte_at(self.cursor.line, self.cursor.col)
@@ -3064,7 +3061,7 @@ impl Editor {
 
     fn move_vertical(&mut self, delta: i64, allow_eol: bool) {
         let new = (self.cursor.line as i64 + delta).max(0) as usize;
-        self.cursor.line = new.min(self.buffer().line_count().saturating_sub(1));
+        self.cursor.line = new.min(self.last_line());
         self.settle_desired_col(allow_eol);
         self.preserve_desired = true;
     }
@@ -3090,7 +3087,7 @@ impl Editor {
     }
 
     fn clamp_cursor(&mut self) {
-        let last_line = self.buffer().line_count().saturating_sub(1);
+        let last_line = self.last_line();
         if self.cursor.line > last_line {
             self.cursor.line = last_line;
         }
@@ -3122,7 +3119,7 @@ impl Editor {
     /// `PendingScroll` if `top` actually changed.
     fn scroll_by(&mut self, delta: i64) {
         self.scroll_from = Some((self.top, self.cursor.line));
-        let last = self.buffer().line_count().saturating_sub(1) as i64;
+        let last = self.last_line() as i64;
         self.top = (self.top as i64 + delta).clamp(0, last) as usize;
         self.move_vertical(delta, false);
         self.clamp_cursor();

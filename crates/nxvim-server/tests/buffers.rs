@@ -385,6 +385,62 @@ async fn reediting_the_same_file_honors_the_modified_guard() {
 }
 
 #[tokio::test]
+async fn undoing_every_edit_clears_the_modified_flag() {
+    // Editing and then undoing back to the on-disk text must leave the buffer
+    // unmodified — the modified flag tracks divergence from disk, not whether any
+    // edit ever happened. Observed through the `:e` modified guard: a clean buffer
+    // reloads silently, a dirty one refuses with E37.
+    let a = temp_file("a", "a1\na2\n");
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    feed(&rpc, "oDIRTY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a1", "DIRTY", "a2"]);
+
+    // Undo the edit: text is back to disk, and so is the modified flag.
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["a1", "a2"]);
+
+    // `:e a` on the now-clean buffer reloads without complaint (no E37).
+    command(&rpc, &format!("e {}", name(&a))).await;
+    assert_eq!(message(&rpc, &mut incoming).await, "");
+    assert_eq!(lines(&rpc).await, vec!["a1", "a2"]);
+
+    std::fs::remove_file(&a).ok();
+}
+
+#[tokio::test]
+async fn redoing_back_past_a_save_marks_modified_again() {
+    // The clean point follows the file, not the original text: after saving, the
+    // saved state is the clean one. Undoing away from it is modified; redoing back
+    // to it is clean again.
+    let a = temp_file("a", "a1\na2\n");
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    feed(&rpc, "oDIRTY<Esc>");
+    command(&rpc, "w").await; // save: this state is now the clean one
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a1\nDIRTY\na2\n");
+
+    // Undo away from the saved state -> modified again. `:e a` refuses.
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["a1", "a2"]);
+    command(&rpc, &format!("e {}", name(&a))).await;
+    assert_eq!(
+        message(&rpc, &mut incoming).await,
+        "E37: No write since last change (add ! to override)"
+    );
+
+    // Redo back to the saved state -> clean again. `:e a` reloads silently.
+    feed(&rpc, "<C-r>");
+    assert_eq!(lines(&rpc).await, vec!["a1", "DIRTY", "a2"]);
+    command(&rpc, &format!("e {}", name(&a))).await;
+    assert_eq!(message(&rpc, &mut incoming).await, "");
+
+    std::fs::remove_file(&a).ok();
+}
+
+#[tokio::test]
 async fn enew_opens_an_empty_buffer_and_keeps_the_old_one() {
     let a = temp_file("a", "a1\na2\n");
     let (rpc, _incoming) = start().await;

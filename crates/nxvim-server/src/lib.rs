@@ -148,6 +148,11 @@ struct Server {
     /// Set when an LSP event changed something the client should see (e.g. a fresh
     /// `Initialized` that should trigger a `didOpen`). Coalesced like `syntax_dirty`.
     lsp_dirty: bool,
+    /// The `:LspDiagnostics` panel's per-line jump targets, in lockstep with its
+    /// lines. Non-empty only while that select-enabled panel owns the screen; a
+    /// `<CR>` on row `i` jumps to `lsp_panel_locations[i]`. Cleared when the
+    /// selection is consumed or any other panel takes over.
+    lsp_panel_locations: Vec<lsp::DiagLocation>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -181,6 +186,7 @@ where
         lsp_servers: HashMap::new(),
         lsp_ensured: HashSet::new(),
         lsp_dirty: false,
+        lsp_panel_locations: Vec::new(),
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -358,6 +364,9 @@ impl Server {
                 let lines = str_array(params.get(1));
                 let want_select = params.get(2).and_then(Value::as_bool).unwrap_or(false);
                 let cursor = params.get(3).and_then(Value::as_u64).unwrap_or(0) as usize;
+                // A scripted/RPC panel takes over the screen, so the LSP location
+                // list no longer owns a `<CR>`.
+                self.lsp_panel_locations.clear();
                 self.editor.open_panel(title, lines, want_select, cursor);
                 Ok(Value::Nil)
             }
@@ -441,7 +450,11 @@ impl Server {
                     lines,
                     wants_select,
                     cursor,
-                } => self.editor.open_panel(title, lines, wants_select, cursor),
+                } => {
+                    // A scripted panel replaces any LSP location list ownership.
+                    self.lsp_panel_locations.clear();
+                    self.editor.open_panel(title, lines, wants_select, cursor);
+                }
                 PanelOp::SetLines(lines) => self.editor.set_panel_lines(lines),
                 PanelOp::OnSelect(wants) => self.editor.set_panel_on_select(wants),
                 PanelOp::SetCursor(line) => self.editor.set_panel_cursor(line),
@@ -478,6 +491,15 @@ impl Server {
             // fire the Lua `on_select` callback. The callback may itself queue
             // commands / lua / panel ops, so this is inside the fixpoint loop.
             for (index, line) in std::mem::take(&mut self.editor.panel_selects) {
+                // A select on the `:LspDiagnostics` location list jumps to the
+                // chosen entry and closes the panel — it is the server's own
+                // panel, not a scripted one, so it never reaches Lua/RPC.
+                if let Some((Some(path), row, col)) = self.lsp_panel_locations.get(index).cloned() {
+                    self.lsp_panel_locations.clear();
+                    self.editor.close_panel();
+                    self.editor.jump_to(&path, row, col);
+                    continue;
+                }
                 self.rpc.notify(
                     "nxvim_panel_select",
                     vec![Value::Map(vec![
@@ -521,9 +543,22 @@ impl Server {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
             // Phase-1 LSP observability: dump server/document state into the panel.
             "LspInfo" => {
+                self.lsp_panel_locations.clear();
                 let lines = self.lsp_info_lines();
                 self.editor.open_panel("LSP info", lines, false, 0);
             }
+            // Phase-2: list the current buffer's diagnostics as a location list;
+            // `<CR>` on a row jumps to it (handled in `run_pending`).
+            "LspDiagnostics" => match self.diagnostics_location_list() {
+                Some((lines, locations)) => {
+                    self.lsp_panel_locations = locations;
+                    self.editor.open_panel("LSP diagnostics", lines, true, 0);
+                }
+                None => {
+                    self.lsp_panel_locations.clear();
+                    self.editor.echo("No diagnostics");
+                }
+            },
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor
@@ -630,7 +665,18 @@ impl Server {
         // into a per-frame, deduped `styles` palette; the client paints the RGB.
         let mut styles = StyleTable::default();
         let highlights = self.highlights_for(&view.numbers, &mut styles);
+        let diagnostics = self.diagnostics_for(&view.numbers, &mut styles);
         let chrome = self.chrome_styles(&mut styles);
+
+        // The message line shows the diagnostic under the cursor, but only when
+        // nothing more important (an error, command output) already holds it —
+        // and never via `echo`, so the under-cursor text doesn't flood
+        // `:messages` on every cursor move.
+        let message = if view.message.is_empty() {
+            self.diagnostic_under_cursor().unwrap_or_default()
+        } else {
+            view.message.clone()
+        };
 
         let lines = lines_value(&view.lines);
         let selection = spans_value(&view.selection);
@@ -673,7 +719,7 @@ impl Server {
                 Value::from("cmdline_prefix"),
                 Value::from(view.cmdline_prefix.to_string().as_str()),
             ),
-            (Value::from("message"), Value::from(view.message.as_str())),
+            (Value::from("message"), Value::from(message.as_str())),
             (
                 Value::from("file_name"),
                 Value::from(view.file_name.as_str()),
@@ -698,6 +744,7 @@ impl Server {
                 Value::from(view.number_width as u64),
             ),
             (Value::from("highlights"), highlights),
+            (Value::from("diagnostics"), diagnostics),
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
             (Value::from("panel"), panel),
@@ -967,14 +1014,14 @@ impl Server {
 /// styles (common across a theme's many same-colored groups) cost one wire entry
 /// and the spans/chrome just carry small integer ids into it.
 #[derive(Default)]
-struct StyleTable {
+pub(crate) struct StyleTable {
     list: Vec<Style>,
     index: HashMap<Style, usize>,
 }
 
 impl StyleTable {
     /// Return the index of `style` in the palette, appending it on first sight.
-    fn intern(&mut self, style: Style) -> usize {
+    pub(crate) fn intern(&mut self, style: Style) -> usize {
         if let Some(&i) = self.index.get(&style) {
             return i;
         }

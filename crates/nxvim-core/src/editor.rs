@@ -748,6 +748,50 @@ impl Editor {
         }
     }
 
+    /// Open or switch to the buffer for `path`, then place the cursor at the
+    /// 0-based `(line, byte_col)`, clamped to the buffer and a grapheme
+    /// boundary. Reuses the `:e` open-or-switch logic (so the jump reuses an
+    /// already-open buffer and records the alternate `#`), but never reloads in
+    /// place or guards on `modified` — a jump navigates, it does not discard
+    /// edits. The column is a **byte** offset into the target line; callers that
+    /// hold an LSP position convert the encoding to bytes first.
+    ///
+    /// A pure composition of the existing buffer-switch and cursor-set paths
+    /// (no new state), so every front end and the LSP go-to / diagnostics
+    /// location list share one navigation primitive.
+    pub fn jump_to(&mut self, path: &Path, line: usize, col: usize) {
+        let already_current = self.buffer().path.as_deref() == Some(path);
+        if !already_current {
+            if let Some(id) = self.find_buffer_by_path(path) {
+                self.switch_buffer(id);
+            } else if self.current_is_throwaway() {
+                self.load_into_current(path);
+            } else {
+                match Buffer::from_file(path) {
+                    Ok(buf) => {
+                        let id = self.add_buffer(buf);
+                        self.switch_buffer(id);
+                    }
+                    Err(e) => {
+                        self.echo(e.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Land the cursor at (line, byte col), clamped to the buffer. The whole
+        // position is rebuilt from a buffer byte index so it snaps to a grapheme
+        // boundary and a valid normal-mode resting cell, exactly like a search
+        // landing.
+        let line = line.min(self.last_line());
+        let byte = self.buffer().line_start(line) + col.min(self.buffer().line(line).len());
+        self.set_cursor_char(byte);
+        self.desired_col = self.cursor_virtcol();
+        self.desired_eol = false;
+        self.ensure_visible();
+    }
+
     /// Resize the *text viewport*. The client owns the screen layout and tells
     /// us only how tall the text area is (status/command lines are the client's
     /// own regions), so the whole height here is editable rows.

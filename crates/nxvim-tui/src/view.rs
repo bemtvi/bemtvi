@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use crate::anim::ScrollData;
 use crate::parse::{
-    chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_highlights,
-    parse_multi_spans, parse_numbers, parse_spans, parse_styles, HlSpan, IncSearchSpans,
-    SearchSpans,
+    chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_diagnostics,
+    parse_highlights, parse_multi_spans, parse_numbers, parse_spans, parse_styles, DiagSpan,
+    HlSpan, IncSearchSpans, SearchSpans,
 };
 
 /// The server's view, mirrored client-side for rendering.
@@ -44,6 +44,11 @@ pub struct View {
     /// means fall back to the client's built-in
     /// [`group_style`](crate::render::group_style) theme.
     pub(crate) highlights: Vec<Vec<HlSpan>>,
+    /// Per visible row, the LSP diagnostic underline spans `(start_col, end_col,
+    /// severity, style_id)` in screen columns, composed over the syntax/selection
+    /// in [`highlight_line`](crate::render). Empty for a buffer with no
+    /// diagnostics.
+    pub(crate) diagnostics: Vec<Vec<DiagSpan>>,
     /// The per-frame style palette the server resolved from the active
     /// colorscheme; `highlights`/chrome ids index into it. Empty with no theme.
     pub(crate) styles: Vec<Style>,
@@ -106,6 +111,7 @@ impl View {
         self.search = parse_multi_spans(map_get(map, "search"));
         self.incsearch = parse_spans(map_get(map, "incsearch"));
         self.highlights = parse_highlights(map_get(map, "highlights"));
+        self.diagnostics = parse_diagnostics(map_get(map, "diagnostics"));
         // The style palette must land before chrome, which indexes into it.
         self.styles = parse_styles(map_get(map, "styles"));
         let chrome = |key| chrome_style(map_get(map, "chrome"), key, &self.styles);

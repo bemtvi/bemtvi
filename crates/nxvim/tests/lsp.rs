@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
+use nxvim_tui::{paint, View};
+use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use serde_json::Value as Json;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -22,6 +24,10 @@ use tokio::sync::Mutex;
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
+/// The hybrid number-column width the editor ships with — diagnostic/text screen
+/// columns are offset by this much once the gutter is split off (matches
+/// `screen.rs`).
+const GUTTER: u16 = 4;
 
 /// Serializes the subprocess-spawning tests (shared env + server lifecycle).
 fn test_lock() -> &'static Mutex<()> {
@@ -271,6 +277,98 @@ fn did_change_text(recs: &[Json]) -> String {
         .collect()
 }
 
+/// The redraw map's top-level value for `key`, if present.
+fn redraw_get<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
+    let Value::Map(map) = params.first()? else {
+        return None;
+    };
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+/// Decode the `diagnostics` redraw key into per-row `(start, end, severity)`
+/// screen-column spans (dropping the trailing style-id, which is `Nil` with no
+/// colorscheme loaded).
+fn diagnostics_of(params: &[Value]) -> Vec<Vec<(u64, u64, u64)>> {
+    redraw_get(params, "diagnostics")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|s| {
+                                    let t = s.as_array()?;
+                                    Some((t[0].as_u64()?, t[1].as_u64()?, t[2].as_u64()?))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The redraw's message-line text.
+fn message_of(params: &[Value]) -> String {
+    redraw_get(params, "message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Poll (bounded) until a redraw whose `diagnostics` has at least one non-empty
+/// row arrives, returning that redraw's params.
+async fn wait_for_diagnostics(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Vec<Value> {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if diagnostics_of(&params).iter().any(|row| !row.is_empty()) {
+                return params;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("diagnostics never appeared in a redraw");
+}
+
+/// Poll (bounded) until a redraw whose message line equals `want` arrives,
+/// returning that redraw's params.
+async fn wait_for_message(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Vec<Value> {
+    for _ in 0..40 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if message_of(&params) == want {
+                return params;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("message line never became {want:?}");
+}
+
+/// A single LSP diagnostic as the mock script's `diagnostics` array expects it.
+fn diag(line: u32, start: u32, end: u32, severity: u32, message: &str) -> Json {
+    serde_json::json!({
+        "range": {
+            "start": { "line": line, "character": start },
+            "end": { "line": line, "character": end },
+        },
+        "severity": severity,
+        "message": message,
+    })
+}
+
 // ----- tests ----------------------------------------------------------------
 
 #[tokio::test]
@@ -511,4 +609,157 @@ async fn lsp_info_reports_the_running_server() {
     );
     assert!(body.contains("incremental"), "shows the sync kind:\n{body}");
     assert!(body.contains("attached"), "the buffer is attached:\n{body}");
+}
+
+// ----- Phase 2: diagnostics --------------------------------------------------
+
+#[tokio::test]
+async fn diagnostics_are_projected_with_screen_columns() {
+    // The headline conversion guard: a leading tab (expands to 8 cells) then a
+    // 2-byte `é` (1 cell), with a diagnostic over "diag" — utf-8 chars/bytes
+    // 3..7. It must surface on *screen* columns 9..13, proving both byte->screen
+    // (`virtcol` over the tab- and wide-aware line) and the LSP char->byte step.
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "diag-cols",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "diagnostics": [diag(0, 3, 7, 1, "bad diag")],
+        }),
+    );
+    let file = temp_file("diag-cols", "rs", "\tédiag\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    let params = wait_for_diagnostics(&rpc, &mut incoming).await;
+    let rows = diagnostics_of(&params);
+    assert_eq!(
+        rows[0],
+        vec![(9, 13, 1)],
+        "the diagnostic spans screen columns 9..13 at severity 1 (error)"
+    );
+}
+
+#[tokio::test]
+async fn the_diagnostic_under_the_cursor_shows_on_the_message_line() {
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "diag-msg",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "diagnostics": [diag(0, 4, 7, 1, "use of bad")],
+        }),
+    );
+    let file = temp_file("diag-msg", "rs", "let bad = 1\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    wait_for_diagnostics(&rpc, &mut incoming).await;
+
+    // The cursor opens at column 0 ('l'), off the diagnostic (chars 4..7) — `w`
+    // moves it onto "bad", and the message line picks up its text.
+    feed(&rpc, "w");
+    let params = wait_for_message(&rpc, &mut incoming, "use of bad").await;
+    assert_eq!(message_of(&params), "use of bad");
+
+    // Moving off the diagnostic clears the message again (it never went to
+    // `:messages`, so nothing lingers).
+    feed(&rpc, "$");
+    let params = wait_for_message(&rpc, &mut incoming, "").await;
+    assert_eq!(message_of(&params), "");
+}
+
+#[tokio::test]
+async fn lsp_diagnostics_panel_lists_and_jumps() {
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "diag-panel",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "diagnostics": [diag(1, 4, 5, 1, "x is bad")],
+        }),
+    );
+    let file = temp_file("diag-panel", "rs", "fn main() {}\nlet x = 1\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    wait_for_diagnostics(&rpc, &mut incoming).await;
+
+    rpc.request("nvim_command", vec![Value::from("LspDiagnostics")])
+        .await
+        .expect("LspDiagnostics");
+    let (title, lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP diagnostics");
+    assert_eq!(lines.len(), 1, "one diagnostic, one row: {lines:?}");
+    assert!(
+        lines[0].contains("2:5"),
+        "the row names the 1-based line:col, got {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("x is bad"),
+        "and the message: {:?}",
+        lines[0]
+    );
+
+    // `<CR>` on the entry closes the panel and jumps to the diagnostic — line 2
+    // (1-based), byte column 4.
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    let cursor = rpc
+        .request("nvim_win_get_cursor", vec![])
+        .await
+        .expect("cursor");
+    assert_eq!(
+        cursor,
+        Value::Array(vec![Value::from(2u64), Value::from(4u64)]),
+        "the cursor jumped to the diagnostic's line and column"
+    );
+}
+
+#[tokio::test]
+async fn a_diagnostic_cell_is_painted_with_an_underline() {
+    // Tier 2: the real client paint. A diagnostic cell carries the UNDERLINED
+    // modifier and the error severity's `sp` underline color, while an adjacent
+    // non-diagnostic cell carries neither — proving the span boundaries survive
+    // all the way to the rendered grid.
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "diag-paint",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "diagnostics": [diag(0, 4, 7, 1, "bad")],
+        }),
+    );
+    let file = temp_file("diag-paint", "rs", "let bad = 1\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    let params = wait_for_diagnostics(&rpc, &mut incoming).await;
+    let buf = paint(&View::from_redraw(&params), COLS, ROWS);
+
+    // "bad" sits at byte/screen columns 4..7 on line 0; the painted cells are
+    // offset by the number-column gutter.
+    let on = GUTTER + 4; // first cell of "bad"
+    let off = GUTTER + 7; // the space just after "bad"
+    assert_eq!(buf.cell((on, 0)).unwrap().symbol(), "b");
+    assert!(
+        buf.cell((on, 0))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the diagnostic cell is underlined"
+    );
+    assert_eq!(
+        buf.cell((on, 0)).unwrap().style().underline_color,
+        Some(Color::Red),
+        "with the error severity's built-in underline color"
+    );
+    assert!(
+        !buf.cell((off, 0))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the cell just past the diagnostic is not underlined"
+    );
 }

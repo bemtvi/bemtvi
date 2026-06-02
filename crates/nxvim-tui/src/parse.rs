@@ -10,6 +10,13 @@ use rmpv::Value;
 /// client's built-in [`group_style`](crate::render::group_style).
 pub(crate) type HlSpan = (u16, u16, String, Option<usize>);
 
+/// One diagnostic underline span in screen columns: `(start, end, severity,
+/// style_id)`. `severity` is `1`=error … `4`=hint; `style_id` indexes the
+/// frame's style palette when the server resolved the `DiagnosticUnderline*`
+/// group through a loaded colorscheme, `None` to fall back to a built-in
+/// severity-colored undercurl.
+pub(crate) type DiagSpan = (u16, u16, u8, Option<usize>);
+
 /// Per visible row, the screen-column spans of every search match (`hlsearch`).
 pub(crate) type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
@@ -122,6 +129,43 @@ pub(crate) fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
                                         t[0].as_u64()? as u16,
                                         t[1].as_u64()? as u16,
                                         t[2].as_str()?.to_string(),
+                                        t[3].as_u64().map(|id| id as usize),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the per-row `diagnostics` payload: an array (one entry per visible
+/// row) of `[start_col, end_col, severity, style_id]` underline spans in screen
+/// columns. The trailing `style_id` indexes the frame's `styles` palette when
+/// the server resolved the `DiagnosticUnderline*` group through a colorscheme;
+/// `Nil` falls back to a built-in severity color in
+/// [`diagnostic_style`](crate::render::diagnostic_style).
+pub(crate) fn parse_diagnostics(value: Option<&Value>) -> Vec<Vec<DiagSpan>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|span| {
+                                    let t = span.as_array()?;
+                                    if t.len() != 4 {
+                                        return None;
+                                    }
+                                    Some((
+                                        t[0].as_u64()? as u16,
+                                        t[1].as_u64()? as u16,
+                                        t[2].as_u64()? as u8,
                                         t[3].as_u64().map(|id| id as usize),
                                     ))
                                 })

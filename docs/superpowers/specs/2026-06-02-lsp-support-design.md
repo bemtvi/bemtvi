@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phase 1 complete** (lifecycle + document sync); Phases 2–7 planned.
+**Status:** In progress — **Phases 1–2 complete** (lifecycle + document sync; diagnostics); Phases 3–7 planned.
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -518,7 +518,44 @@ deps; the three workspace gates are green.
 
 ---
 
-### Phase 2 — Diagnostics
+### Phase 2 — Diagnostics — ✅ DONE
+
+> **Implementation notes (as built).** Faithful to the plan, with a few choices
+> worth recording:
+> - **`Editor::jump_to(path, line, col)` was pulled forward** (as the plan
+>   permits) and lives in `nxvim-core::editor` — a pure composition of the
+>   existing `:e` open-or-switch path and the search-landing cursor-set, taking a
+>   **byte** column (the server converts the LSP encoding first). It records the
+>   alternate `#` like `:e` and never reloads-in-place / guards `modified` (a jump
+>   navigates, it doesn't discard edits). Phase 3 reuses it for go-to.
+> - **Message line is injected at projection time, not via `echo`.** The
+>   under-cursor diagnostic (`diagnostic_under_cursor`, highest severity wins) is
+>   written into the redraw's `message` field **only when the editor's own
+>   message line is empty**, so it never pollutes `:messages` on every cursor
+>   move and never clobbers a real error/command message. It is recomputed each
+>   redraw from the cache + live cursor, so it is always current and self-clears.
+> - **`diagnostics` redraw key** mirrors `highlights`: per visible row, spans
+>   `[start_col, end_col, severity, style_id]` in screen columns, aligned with
+>   `numbers`. Severity is `1`=error … `4`=hint; `style_id` indexes the frame
+>   palette when `DiagnosticUnderline{Error,Warn,Info,Hint}` resolves through the
+>   registry, else `Nil`. A zero-width range is widened to one cell so it shows.
+> - **TUI composition** adds the underline **last** in `cell_style` (after syntax,
+>   search, and selection), so a diagnostic cell keeps its syntax fg + selection
+>   bg and only gains the `sp` underline color + undercurl/underline modifier
+>   (themed), or a built-in severity color (red/yellow/cyan/grey) with no theme.
+>   The slide band carries no diagnostics (they reappear when the scroll settles),
+>   matching how search spans are handled.
+> - **`:LspDiagnostics`** opens a select-enabled panel (`severity  line:col
+>   message`, sorted by position) backed by a server-side `lsp_panel_locations`
+>   list; a `<CR>` closes the panel and `jump_to`s the entry. Ownership of that
+>   `<CR>` is reset whenever any other (RPC / Lua / `:LspInfo`) panel opens, so a
+>   stale location list can never hijack a scripted panel's `on_select`.
+> - **Mock** gained a `diagnostics` script field; it pushes
+>   `textDocument/publishDiagnostics` for a document the instant it sees that
+>   document's `didOpen`. Tests (in `crates/nxvim/tests/lsp.rs`, reusing the
+>   Phase-1 mock harness) cover screen-column conversion (leading tab + 2-byte
+>   `é`), the under-cursor message line on/off, the panel list + `<CR>` jump, and
+>   a Tier-2 paint asserting an underlined error cell with the red `sp` color.
 
 **Goal / value.** The first visible payoff: squiggles + messages. Handle
 `textDocument/publishDiagnostics`, cache per buffer, and render them three ways:

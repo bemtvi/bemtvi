@@ -19,11 +19,19 @@ use std::path::{Path, PathBuf};
 use nxvim_core::unicode;
 use nxvim_core::{BufferEdit, BufferId};
 use nxvim_lsp::lsp_types::{
-    Diagnostic, Position, Range, TextDocumentContentChangeEvent, TextDocumentSyncKind, Url,
+    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent,
+    TextDocumentSyncKind, Url,
 };
 use nxvim_lsp::{LspEvent, LspNotify, PositionEncoding, ServerKey, ServerSpawn};
+use rmpv::Value;
 
-use crate::{filetype_of, Server};
+use crate::{filetype_of, Server, StyleTable};
+
+/// One entry in the `:LspDiagnostics` location list: the target file (the
+/// buffer's path, `None` for an unnamed buffer), 0-based line, and 0-based
+/// **byte** column the `<CR>` jump lands on (the LSP character already converted
+/// through the negotiated encoding). Indexed in lockstep with the panel's lines.
+pub(crate) type DiagLocation = (Option<PathBuf>, usize, usize);
 
 /// Per-buffer LSP document-sync bookkeeping, mirroring `SyntaxState`. One per
 /// open buffer that mapped to a configured server, keyed by [`BufferId`] in
@@ -43,9 +51,8 @@ pub(crate) struct LspDocState {
     /// `save_tick` of the last sync, mirrored to fire `didSave` exactly when the
     /// buffer is written (`save_tick` bumps only on a successful `:w`).
     last_save_tick: u64,
-    /// Latest `publishDiagnostics` for this buffer (cached in Phase 1; projected
-    /// to the redraw in Phase 2).
-    #[allow(dead_code)]
+    /// Latest `publishDiagnostics` for this buffer, projected into the redraw
+    /// (`diagnostics_for`) and the under-cursor message line.
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -231,13 +238,18 @@ impl Server {
             LspEvent::Diagnostics {
                 uri, diagnostics, ..
             } => {
-                // Phase 1 only caches; Phase 2 projects these into the redraw.
+                // Cache the latest publish for the matching buffer; the redraw
+                // projects whichever buffer is current (route by `uri`, dropping
+                // a publish for a buffer closed while it was in flight, as
+                // `store_spans` drops unknown-buffer syntax replies). Mark dirty
+                // so the coalesced repaint paints the new squiggles.
                 if let Some(state) = self
                     .lsp_states
                     .values_mut()
                     .find(|s| s.uri.as_ref() == Some(&uri))
                 {
                     state.diagnostics = diagnostics;
+                    self.lsp_dirty = true;
                 }
             }
             LspEvent::ServerExited { .. } => {
@@ -326,6 +338,157 @@ impl Server {
         lines
     }
 
+    /// The current buffer's cached diagnostics together with its server's
+    /// negotiated position encoding, or `None` when the buffer has no attached
+    /// server (so callers project nothing). Both borrows are released before any
+    /// `&mut self` use.
+    fn current_diagnostics(&self) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
+        let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
+        let key = state.server.as_ref()?;
+        let encoding = self.lsp_servers.get(key)?.encoding;
+        Some((&state.diagnostics, encoding))
+    }
+
+    /// Build the per-row `diagnostics` redraw payload from a row→buffer-line
+    /// mapping (`numbers`, 1-based, `None` for filler): each visible row's
+    /// diagnostic underline spans as `[start_col, end_col, severity, style_id]`
+    /// in **screen columns**. Mirrors [`Server::highlights_for`] — the LSP
+    /// character offsets are converted to bytes through the negotiated encoding,
+    /// then bytes to screen columns with the same tab/wide-char `virtcol` the
+    /// highlights and selection use, so squiggles line up with the glyphs.
+    /// `severity` is `1`=error … `4`=hint; `style_id` indexes the per-frame
+    /// `styles` palette when the matching `DiagnosticUnderline*` group resolves
+    /// through the registry (`Nil` otherwise, so the client falls back to a
+    /// built-in severity color).
+    pub(crate) fn diagnostics_for(
+        &self,
+        numbers: &[Option<usize>],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let Some((diags, encoding)) = self.current_diagnostics() else {
+            // One empty entry per row so the client's `diagnostics[row]` index
+            // stays aligned with `highlights`/`numbers`.
+            return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
+        };
+        let rows = numbers
+            .iter()
+            .map(|num| {
+                let Some(n) = num else {
+                    return Value::Array(Vec::new());
+                };
+                let line_idx = n - 1;
+                let text = self.editor.buffer().line(line_idx);
+                let spans = diags
+                    .iter()
+                    .filter_map(|d| {
+                        let (start_byte, end_byte) =
+                            self.diag_row_span(d, encoding, line_idx, &text)?;
+                        let start_col = unicode::virtcol(&text, start_byte, unicode::TABSTOP);
+                        let mut end_col = unicode::virtcol(&text, end_byte, unicode::TABSTOP);
+                        // A zero-width range (e.g. an empty span at end-of-line)
+                        // still needs one underlined cell to be visible.
+                        if end_col <= start_col {
+                            end_col = start_col + 1;
+                        }
+                        let severity = severity_code(d.severity);
+                        let style_id =
+                            match self.editor.highlights.resolve(severity_group(severity)) {
+                                Some(style) => Value::from(styles.intern(style) as u64),
+                                None => Value::Nil,
+                            };
+                        Some(Value::Array(vec![
+                            Value::from(start_col as u64),
+                            Value::from(end_col as u64),
+                            Value::from(severity as u64),
+                            style_id,
+                        ]))
+                    })
+                    .collect();
+                Value::Array(spans)
+            })
+            .collect();
+        Value::Array(rows)
+    }
+
+    /// The message of the highest-severity diagnostic whose range covers the
+    /// cursor, for the message line (shown only when no other message is set, so
+    /// `:messages` history stays clean). `None` when the cursor is on no
+    /// diagnostic. Newlines are flattened so it fits one line.
+    pub(crate) fn diagnostic_under_cursor(&self) -> Option<String> {
+        let (diags, encoding) = self.current_diagnostics()?;
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let line = self.editor.buffer().line(row);
+        diags
+            .iter()
+            .filter(|d| {
+                self.diag_row_span(d, encoding, row, &line)
+                    // Cover the resting cell of a zero-width range too.
+                    .is_some_and(|(s, e)| col >= s && col < e.max(s + 1))
+            })
+            .min_by_key(|d| severity_code(d.severity))
+            .map(|d| first_line(&d.message))
+    }
+
+    /// The `[start, end)` **byte** span a diagnostic occupies on buffer row
+    /// `line_idx` (whose text is `line`), or `None` if it does not reach that
+    /// row. Multi-line ends are clipped to the row: `0` before the range's first
+    /// line, the line length after its last. The LSP character offsets are
+    /// converted to bytes through the negotiated `encoding` (Decision 4).
+    fn diag_row_span(
+        &self,
+        d: &Diagnostic,
+        encoding: PositionEncoding,
+        line_idx: usize,
+        line: &str,
+    ) -> Option<(usize, usize)> {
+        let (s, e) = (d.range.start, d.range.end);
+        let row = line_idx as u32;
+        if row < s.line || row > e.line {
+            return None;
+        }
+        let start = if s.line == row {
+            byte_col(encoding, line, s.character as usize)
+        } else {
+            0
+        };
+        let end = if e.line == row {
+            byte_col(encoding, line, e.character as usize)
+        } else {
+            line.len()
+        };
+        Some((start, end))
+    }
+
+    /// Build the `:LspDiagnostics` location list for the current buffer: one
+    /// `severity  line:col  message` row per diagnostic (sorted by position) and
+    /// a parallel [`DiagLocation`] list the `<CR>` jump indexes. `None` when the
+    /// buffer has no diagnostics.
+    pub(crate) fn diagnostics_location_list(&self) -> Option<(Vec<String>, Vec<DiagLocation>)> {
+        let (diags, encoding) = self.current_diagnostics()?;
+        if diags.is_empty() {
+            return None;
+        }
+        let path = self.editor.buffer().path.clone();
+        let mut items: Vec<&Diagnostic> = diags.iter().collect();
+        items.sort_by_key(|d| (d.range.start.line, d.range.start.character));
+        let mut lines = Vec::with_capacity(items.len());
+        let mut locations = Vec::with_capacity(items.len());
+        for d in items {
+            let row = d.range.start.line as usize;
+            let character = d.range.start.character as usize;
+            lines.push(format!(
+                "{}  {}:{}  {}",
+                severity_short(severity_code(d.severity)),
+                row + 1,
+                character + 1,
+                first_line(&d.message),
+            ));
+            let line = self.editor.buffer().line(row);
+            locations.push((path.clone(), row, byte_col(encoding, &line, character)));
+        }
+        Some((lines, locations))
+    }
+
     /// Convert a batch of journaled byte-delta edits into LSP incremental content
     /// changes, each replacing the edit's old `(start..old_end)` range with its
     /// inserted text, in the server's negotiated position encoding.
@@ -377,6 +540,67 @@ fn encoding_label(encoding: PositionEncoding) -> &'static str {
         PositionEncoding::Utf16 => "utf-16",
         PositionEncoding::Utf32 => "utf-32",
     }
+}
+
+/// Byte offset of LSP `character` on `line`, the inverse of [`Server::lsp_position`]
+/// (Decision 4): UTF-8 is the identity (a character *is* a byte offset, clamped
+/// to the line), UTF-16/UTF-32 need column math. Clamped to the line length so a
+/// past-end character (a diagnostic whose range runs to EOL) lands at the end.
+fn byte_col(encoding: PositionEncoding, line: &str, character: usize) -> usize {
+    match encoding {
+        PositionEncoding::Utf8 => character.min(line.len()),
+        PositionEncoding::Utf16 => unicode::utf16_to_byte(line, character),
+        PositionEncoding::Utf32 => line
+            .char_indices()
+            .nth(character)
+            .map_or(line.len(), |(i, _)| i),
+    }
+}
+
+/// Map an LSP [`DiagnosticSeverity`] to nxvim's severity code (`1`=error,
+/// `2`=warning, `3`=info, `4`=hint). An absent severity is treated as an error,
+/// matching how most servers and neovim render an unspecified diagnostic. The
+/// constants aren't enum variants (lsp-types models them as a newtype), so this
+/// compares rather than pattern-matches.
+fn severity_code(severity: Option<DiagnosticSeverity>) -> u8 {
+    match severity {
+        Some(s) if s == DiagnosticSeverity::WARNING => 2,
+        Some(s) if s == DiagnosticSeverity::INFORMATION => 3,
+        Some(s) if s == DiagnosticSeverity::HINT => 4,
+        _ => 1,
+    }
+}
+
+/// The highlight group whose `sp`/underline style paints a diagnostic of this
+/// severity code, resolved through the registry like the chrome groups.
+fn severity_group(severity: u8) -> &'static str {
+    match severity {
+        2 => "DiagnosticUnderlineWarn",
+        3 => "DiagnosticUnderlineInfo",
+        4 => "DiagnosticUnderlineHint",
+        _ => "DiagnosticUnderlineError",
+    }
+}
+
+/// One-letter severity tag for the location-list column (`E`/`W`/`I`/`H`).
+fn severity_short(severity: u8) -> char {
+    match severity {
+        2 => 'W',
+        3 => 'I',
+        4 => 'H',
+        _ => 'E',
+    }
+}
+
+/// The first non-empty line of a (possibly multi-line, markdown) diagnostic
+/// message, for the single-line message line and location-list rows.
+fn first_line(message: &str) -> String {
+    message
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Human label for a document-sync kind.

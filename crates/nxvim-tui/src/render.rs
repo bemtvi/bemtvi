@@ -10,7 +10,7 @@ use rmpv::Value;
 use unicode_width::UnicodeWidthChar;
 
 use crate::anim::{arm_animation, lerp, Animation};
-use crate::parse::{HlSpan, IncSearchSpans, SearchSpans};
+use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans};
 use crate::view::{PanelData, View};
 
 /// Tab stop width in cells. Must match `nxvim_core::unicode::TABSTOP` so the
@@ -185,6 +185,13 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
         Some(_) => (&empty_search, &empty_incsearch),
         None => (&view.search, &view.incsearch),
     };
+    // Diagnostics, like search, are painted on the settled viewport only — the
+    // slide band carries none (squiggles reappear once the scroll lands).
+    let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
+    let frame_diag: &[Vec<DiagSpan>] = match anim {
+        Some(_) => &empty_diag,
+        None => &view.diagnostics,
+    };
     render_text(
         frame,
         text_inner,
@@ -193,6 +200,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
         frame_search,
         frame_incsearch,
         &frame_hl,
+        frame_diag,
         &frame_numbers,
         &theme,
     );
@@ -312,11 +320,13 @@ fn render_text(
     search: &[Vec<(u16, u16)>],
     incsearch: &[Option<(u16, u16)>],
     highlights: &[Vec<HlSpan>],
+    diagnostics: &[Vec<DiagSpan>],
     numbers: &[Option<usize>],
     theme: &LineTheme,
 ) {
     let width = area.width as usize;
     let empty: Vec<HlSpan> = Vec::new();
+    let empty_diag: Vec<DiagSpan> = Vec::new();
     let empty_search: Vec<(u16, u16)> = Vec::new();
     let text = Text::from(
         lines
@@ -327,9 +337,10 @@ fn render_text(
                 let matches = search.get(row).unwrap_or(&empty_search);
                 let cur = incsearch.get(row).copied().flatten();
                 let hl = highlights.get(row).unwrap_or(&empty);
+                let diag = diagnostics.get(row).unwrap_or(&empty_diag);
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
-                highlight_line(l, sel, matches, cur, hl, width, is_filler, theme)
+                highlight_line(l, sel, matches, cur, hl, diag, width, is_filler, theme)
             })
             .collect::<Vec<_>>(),
     );
@@ -355,6 +366,7 @@ fn highlight_line(
     search: &[(u16, u16)],
     incsearch: Option<(u16, u16)>,
     hl: &[HlSpan],
+    diag: &[DiagSpan],
     max_width: usize,
     is_filler: bool,
     theme: &LineTheme,
@@ -378,7 +390,7 @@ fn highlight_line(
     let mut run_style = Style::default();
     let mut col = 0usize;
     for ch in expanded.chars() {
-        let style = cell_style(col, sel, search, incsearch, hl, theme);
+        let style = cell_style(col, sel, search, incsearch, hl, diag, theme);
         if style != run_style && !run.is_empty() {
             spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
@@ -410,6 +422,7 @@ fn cell_style(
     search: &[(u16, u16)],
     incsearch: Option<(u16, u16)>,
     hl: &[HlSpan],
+    diag: &[DiagSpan],
     theme: &LineTheme,
 ) -> Style {
     let mut style = Style::default();
@@ -437,7 +450,42 @@ fn cell_style(
             style = selection_style(style, theme);
         }
     }
+    // A diagnostic adds its underline last, so it survives the selection: the
+    // cell keeps its syntax fg and selection bg and gains the severity's
+    // underline/undercurl + `sp` color.
+    for (start, end, severity, id) in diag {
+        if col >= *start as usize && col < *end as usize {
+            style = diagnostic_style(style, *severity, *id, theme);
+            break; // server already widened/clipped diagnostic spans per row
+        }
+    }
     style
+}
+
+/// Compose a diagnostic underline onto `base`: the colorscheme's resolved
+/// `DiagnosticUnderline*` style (its `sp` underline color + undercurl/underline
+/// modifier) when loaded, else a built-in undercurl in the severity's color. The
+/// cell's foreground/background are left untouched, so syntax and selection show
+/// through with only the underline added.
+fn diagnostic_style(base: Style, severity: u8, id: Option<usize>, theme: &LineTheme) -> Style {
+    match id.and_then(|i| theme.palette.get(i)) {
+        Some(style) => base.patch(*style),
+        None => base
+            .underline_color(severity_color(severity))
+            .add_modifier(Modifier::UNDERLINED),
+    }
+}
+
+/// The built-in underline color for a diagnostic severity (`1`=error … `4`=hint),
+/// used when no colorscheme defines the `DiagnosticUnderline*` group. Indexed
+/// ANSI colors keep it terminal-portable, matching the syntax/search fallbacks.
+fn severity_color(severity: u8) -> Color {
+    match severity {
+        2 => Color::Yellow,   // warning
+        3 => Color::Cyan,     // information
+        4 => Color::DarkGray, // hint
+        _ => Color::Red,      // error (and any unexpected code)
+    }
 }
 
 /// Compose a search-match highlight onto `base`: the colorscheme's resolved

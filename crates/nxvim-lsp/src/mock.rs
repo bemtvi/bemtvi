@@ -17,6 +17,10 @@
 //!   `textDocumentSync` capability.
 //! - `exit_after_initialize`: if `true`, the mock replies to `initialize` then
 //!   exits, to exercise the supervisor's respawn/breaker path.
+//! - `diagnostics`: an array of LSP `Diagnostic` objects (`{range, severity,
+//!   message}`). When set, the mock pushes a `textDocument/publishDiagnostics`
+//!   notification for a document the moment it receives that document's
+//!   `didOpen`, so a test can assert the editor renders them.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -60,6 +64,27 @@ pub fn run(script_path: &str) {
                 }
             }
             "exit" => return,
+            // On `didOpen`, push any scripted diagnostics for the just-opened
+            // document so the editor has something to render (real servers
+            // publish asynchronously after the open; the mock does it eagerly and
+            // deterministically). The notification needs no reply.
+            "textDocument/didOpen" => {
+                if let Some(diagnostics) = script.get("diagnostics") {
+                    if let Some(uri) = msg
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                    {
+                        write_message(
+                            &stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": { "uri": uri, "diagnostics": diagnostics },
+                            }),
+                        );
+                    }
+                }
+            }
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply.
             _ => {

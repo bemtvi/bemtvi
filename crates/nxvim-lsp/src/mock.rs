@@ -21,6 +21,11 @@
 //!   message}`). When set, the mock pushes a `textDocument/publishDiagnostics`
 //!   notification for a document the moment it receives that document's
 //!   `didOpen`, so a test can assert the editor renders them.
+//! - `definition` / `declaration` / `type_definition` / `implementation` /
+//!   `references`: the scripted result returned verbatim for the matching
+//!   `textDocument/*` request (a `Location`, an array of `Location`s, or — for
+//!   the goto family — a `LocationLink[]`; `references` is a `Location[]`).
+//!   Absent ⇒ a `null` result (no locations).
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -85,6 +90,16 @@ pub fn run(script_path: &str) {
                     }
                 }
             }
+            // Language-feature requests: answer with the scripted result for the
+            // matching script field (a Location / Location[] / LocationLink[]),
+            // or `null` if the script doesn't define one.
+            "textDocument/definition" => reply_scripted(&stdout, id, &script, "definition"),
+            "textDocument/declaration" => reply_scripted(&stdout, id, &script, "declaration"),
+            "textDocument/typeDefinition" => {
+                reply_scripted(&stdout, id, &script, "type_definition")
+            }
+            "textDocument/implementation" => reply_scripted(&stdout, id, &script, "implementation"),
+            "textDocument/references" => reply_scripted(&stdout, id, &script, "references"),
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply.
             _ => {
@@ -139,6 +154,15 @@ fn record(script: &Value, msg: &Value) {
         .open(path)
     {
         let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Answer a request with the script's `field` value (cloned), or `null` when the
+/// field is absent. A no-op if the message carried no id (a malformed request).
+fn reply_scripted(stdout: &std::io::Stdout, id: Option<Value>, script: &Value, field: &str) {
+    if let Some(id) = id {
+        let result = script.get(field).cloned().unwrap_or(Value::Null);
+        write_response(stdout, id, result);
     }
 }
 

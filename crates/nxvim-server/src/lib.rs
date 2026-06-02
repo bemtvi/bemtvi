@@ -11,10 +11,10 @@
 mod lsp;
 mod syntax;
 
-use lsp::{LspDocState, ServerRuntime};
+use lsp::{LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
-use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, PanelView};
+use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, Key, Mode, PanelView};
 use nxvim_lsp::{LspManager, ServerKey};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
@@ -153,6 +153,17 @@ struct Server {
     /// `<CR>` on row `i` jumps to `lsp_panel_locations[i]`. Cleared when the
     /// selection is consumed or any other panel takes over.
     lsp_panel_locations: Vec<lsp::DiagLocation>,
+    /// Monotonic generation counter stamped onto each language-feature request,
+    /// so a reply whose generation is behind the latest of its kind is dropped
+    /// (Decision 3 — the go-to analogue of the syntax `tick`).
+    lsp_req_gen: u64,
+    /// The in-flight language-feature request per kind (definition, references,
+    /// …), used to match a reply to its intent and drop stale ones.
+    lsp_requests: HashMap<LspReqKind, PendingLspReq>,
+    /// Whether the previous input key was a `g` armed as the prefix of a built-in
+    /// LSP normal-mode keymap (`gd`/`gD`/`gr`). The next key resolves it; a
+    /// non-LSP key replays the withheld `g` so `gg`/`ge`/… still work.
+    lsp_pending_g: bool,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -187,6 +198,9 @@ where
         lsp_ensured: HashSet::new(),
         lsp_dirty: false,
         lsp_panel_locations: Vec::new(),
+        lsp_req_gen: 0,
+        lsp_requests: HashMap::new(),
+        lsp_pending_g: false,
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -400,9 +414,57 @@ impl Server {
 
     fn input(&mut self, keys: &str) {
         for key in parse_keys(keys) {
+            // Built-in LSP normal-mode keymaps (Phase 3) are owned here, not in
+            // core, so the pure editor stays free of LSP concepts. A consumed key
+            // never reaches the editor.
+            if self.lsp_keymap(key) {
+                continue;
+            }
             self.editor.input(key);
         }
         self.run_pending();
+    }
+
+    /// The built-in LSP normal-mode keymaps: `gd` go-to-definition, `gD`
+    /// go-to-declaration, `gr` references. Returns `true` when the key was
+    /// consumed as (part of) a mapping and must not reach the editor.
+    ///
+    /// `g` is a two-key prefix, so it is withheld and the next key decides: an
+    /// LSP letter fires the request; anything else replays the withheld `g`
+    /// (then the caller feeds the current key), so `gg`/`ge`/… are untouched.
+    /// `g` is only armed in plain normal mode, leaving insert-mode text and
+    /// visual-mode `g`-commands alone; operator-pending also reports `Normal`,
+    /// but its non-LSP second key takes the replay path, preserving `dgg` & co.
+    /// (revisited once `vim.keymap` lands in Phase 7).
+    fn lsp_keymap(&mut self, key: Key) -> bool {
+        if self.lsp_pending_g {
+            self.lsp_pending_g = false;
+            match key.as_char() {
+                Some('d') => {
+                    self.request_lsp(LspReqKind::Definition);
+                    return true;
+                }
+                Some('D') => {
+                    self.request_lsp(LspReqKind::Declaration);
+                    return true;
+                }
+                Some('r') => {
+                    self.request_lsp(LspReqKind::References);
+                    return true;
+                }
+                // Not an LSP sequence: replay the `g` we withheld, then let the
+                // caller feed this key, so the editor sees the original pair.
+                _ => {
+                    self.editor.input(Key::char('g'));
+                    return false;
+                }
+            }
+        }
+        if self.editor.mode == Mode::Normal && key.as_char() == Some('g') {
+            self.lsp_pending_g = true;
+            return true;
+        }
+        false
     }
 
     fn run_command(&mut self, cmd: &str) {
@@ -559,6 +621,13 @@ impl Server {
                     self.editor.echo("No diagnostics");
                 }
             },
+            // Phase-3: go-to / references as ex-commands (the keymap-free path;
+            // the reply jumps the cursor or opens a panel location list).
+            "LspDefinition" => self.request_lsp(LspReqKind::Definition),
+            "LspDeclaration" => self.request_lsp(LspReqKind::Declaration),
+            "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition),
+            "LspImplementation" => self.request_lsp(LspReqKind::Implementation),
+            "LspReferences" => self.request_lsp(LspReqKind::References),
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor

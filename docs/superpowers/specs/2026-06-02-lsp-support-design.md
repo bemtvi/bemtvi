@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–2 complete** (lifecycle + document sync; diagnostics); Phases 3–7 planned.
+**Status:** In progress — **Phases 1–3 complete** (lifecycle + document sync; diagnostics; go-to definition & references); Phases 4–7 planned.
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -604,7 +604,57 @@ underline + message line + panel cover the MVP); `vim.diagnostic.*` Lua API
 
 ---
 
-### Phase 3 — Go-to definition & references
+### Phase 3 — Go-to definition & references — ✅ DONE
+
+> **Implementation notes (as built).** Faithful to the plan; choices worth
+> recording:
+> - **Request/reply plumbing lives in `nxvim-lsp`** as the design sketched:
+>   `LspRequest` (definition/declaration/typeDefinition/implementation/
+>   references, already in LSP coordinates), `ReqToken { kind: u16, generation:
+>   u64 }` (the manager never interprets it — it only echoes it back), and
+>   `LspReply::Locations(Vec<Location>)`. Every goto-family response shape
+>   (`Location`, `Location[]`, `LocationLink[]`) and `references` is **normalized
+>   to a flat `Vec<Location>` inside the manager** (`LocationLink` collapses to
+>   its `target_selection_range`), so the editor handles one shape. Each request
+>   is awaited on a **cloned `ServerSocket` in a detached task**, so a slow
+>   round-trip never stalls the per-server serve loop and the editor never blocks
+>   (Decision 3); the resolved value is forwarded as `LspEvent::Reply`.
+> - **Stale-drop is the editor's job, by token *and* cursor.** The server keeps
+>   one in-flight request per `LspReqKind` with the `(generation, buffer,
+>   cursor)` it was issued at. A reply is dropped when its generation is behind
+>   the latest of its kind (a newer request superseded it) **or** the buffer/
+>   cursor changed since it was issued — so "fire `gd`, move, reply arrives" never
+>   jumps. `$/cancelRequest` is left to a follow-up; the token drop already makes
+>   stale replies harmless.
+> - **Keymaps are intercepted in the server, not core** (core stays LSP-free, per
+>   the design's "no other core changes"). `Server::input` runs a tiny prefix
+>   recognizer: `gd`/`gD`/`gr` fire definition/declaration/references. `g` is a
+>   two-key prefix, so it is withheld and the next key decides — a non-LSP second
+>   key **replays the withheld `g`** before feeding the current key, so `gg`/`ge`/
+>   `dgg`/… are untouched (operator-pending reports `Normal`, but it takes the
+>   replay path). `g` is only armed in plain normal mode, leaving insert-mode text
+>   and visual `g`-commands alone. Revisited once `vim.keymap` lands (Phase 7).
+> - **Cross-file jumps refine the column after opening.** `jump_to` takes a byte
+>   column, but converting the target's LSP character needs the target line —
+>   which may be in a file the jump just opened. So a go-to does `jump_to(path,
+>   line, 0)` to open/land on the line, reads the now-loaded line, converts
+>   char→byte through the negotiated encoding, then `jump_to`s again (already
+>   current ⇒ just moves the cursor, so the alternate `#` is recorded once). A
+>   test proves a utf-16 cross-file definition lands on the right **byte** column
+>   past a 2-byte `é`.
+> - **Ex-commands too:** `:LspDefinition` / `:LspDeclaration` /
+>   `:LspTypeDefinition` / `:LspImplementation` / `:LspReferences` route to the
+>   same `request_lsp(kind)` path (the keymap-free entry, and the home for the two
+>   goto-family members without a default key). A single definition jumps; multiple
+>   results — and all references — open the existing select-enabled panel as a
+>   `path:line:col` location list, reusing the Phase-2 `lsp_panel_locations` `<CR>`
+>   jump. An empty reply shows a brief "No definition found"/… message.
+> - **Mock** gained `definition`/`declaration`/`type_definition`/`implementation`/
+>   `references` script fields (returned verbatim for the matching request).
+>   Tests (in `crates/nxvim/tests/lsp.rs`) cover the same-file `gd` jump (asserting
+>   the request was actually sent), a utf-16 cross-file `gd`, the `gr` references
+>   panel + `<CR>` jump, the empty-reply message, and the cursor-moved stale drop
+>   (`gdj` issues at (0,0) then moves before the reply, which must not jump).
 
 **Goal / value.** Navigation: `textDocument/definition` (+ `declaration`,
 `typeDefinition`, `implementation`) jumps the cursor; `textDocument/references`

@@ -357,6 +357,54 @@ async fn wait_for_message(
     panic!("message line never became {want:?}");
 }
 
+/// A `file://` URI for an absolute path string, matching how the editor forms
+/// one from a buffer path (the mock returns these in scripted goto/references
+/// results, and the server resolves them back to a path).
+fn file_uri(path: &str) -> String {
+    format!("file://{path}")
+}
+
+/// An LSP `Location` (zero-width range at `line:character`) for the mock script's
+/// `definition` / `references` / … fields.
+fn location(path: &str, line: u32, character: u32) -> Json {
+    serde_json::json!({
+        "uri": file_uri(path),
+        "range": {
+            "start": { "line": line, "character": character },
+            "end": { "line": line, "character": character },
+        }
+    })
+}
+
+/// The current cursor as `(1-based line, 0-based column)`, like neovim.
+async fn cursor(rpc: &Rpc) -> (u64, u64) {
+    match rpc
+        .request("nvim_win_get_cursor", vec![])
+        .await
+        .expect("cursor")
+    {
+        Value::Array(a) => (a[0].as_u64().unwrap(), a[1].as_u64().unwrap()),
+        other => panic!("unexpected cursor value: {other:?}"),
+    }
+}
+
+/// Poll (bounded) until the cursor reaches `want`, driving the loop so async LSP
+/// replies are processed. Panics with the last position seen if it never does.
+async fn wait_for_cursor(rpc: &Rpc, want: (u64, u64)) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if cursor(rpc).await == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "cursor never reached {want:?}; last was {:?}",
+        cursor(rpc).await
+    );
+}
+
 /// A single LSP diagnostic as the mock script's `diagnostics` array expects it.
 fn diag(line: u32, start: u32, end: u32, severity: u32, message: &str) -> Json {
     serde_json::json!({
@@ -762,4 +810,149 @@ async fn a_diagnostic_cell_is_painted_with_an_underline() {
             .contains(Modifier::UNDERLINED),
         "the cell just past the diagnostic is not underlined"
     );
+}
+
+// ----- Phase 3: go-to definition & references --------------------------------
+
+#[tokio::test]
+async fn gd_jumps_to_a_definition_in_the_same_file() {
+    let _guard = test_lock().lock().await;
+    // `target` is defined on line 0; the call site is on line 1. `gd` from the
+    // call site jumps to the definition's (line, col).
+    let file = temp_file("gd-same", "rs", "fn target() {}\nfn main() { target() }\n");
+    let record = configure_mock(
+        "gd-same",
+        serde_json::json!({ "definition": location(&file, 0, 3) }),
+    );
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Move to the call site (line 1) and request go-to-definition via the `gd`
+    // built-in keymap.
+    feed(&rpc, "jgd");
+    // The reply lands the cursor at the definition: 1-based line 1, byte col 3.
+    wait_for_cursor(&rpc, (1, 3)).await;
+
+    // The keymap actually issued the LSP request (not swallowed as editor motion).
+    assert!(
+        has_method(&record_lines(&record), "textDocument/definition"),
+        "gd should send a textDocument/definition request"
+    );
+}
+
+#[tokio::test]
+async fn gd_switches_buffers_for_a_cross_file_definition() {
+    let _guard = test_lock().lock().await;
+    // The definition lives in a *different* file, on a line with a 2-byte `é`
+    // before the target column — and the server negotiated utf-16. So the jump
+    // must (a) open/switch to the file, then (b) read its just-loaded line to
+    // convert the utf-16 character into a byte column. The `=` is utf-16 unit 9
+    // ("let café " is 9 units, é counting as one) but byte 10 (é is two bytes):
+    // landing on byte col 10 proves the cross-file char→byte conversion.
+    let other = temp_file("gd-other", "rs", "let café = 1\n");
+    let main = temp_file("gd-main", "rs", "fn main() {}\n");
+    let record = configure_mock(
+        "gd-cross",
+        serde_json::json!({
+            "position_encoding": "utf-16",
+            "definition": location(&other, 0, 9),
+        }),
+    );
+    let (rpc, _incoming) = start(Some(main)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gd");
+    // Switched to the other file, cursor on the `=`: 1-based line 1, byte col 10.
+    wait_for_cursor(&rpc, (1, 10)).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let café = 1".to_string()],
+        "the jump switched to the definition's buffer"
+    );
+}
+
+#[tokio::test]
+async fn gr_lists_references_in_the_panel_and_jumps() {
+    let _guard = test_lock().lock().await;
+    // Two references to `x`, on lines 1 and 2 (col 8 in each). `gr` lists them in
+    // a select panel; `<CR>` on the first jumps to it.
+    let file = temp_file("gr", "rs", "let x = 1\nlet y = x\nlet z = x\n");
+    let record = configure_mock(
+        "gr",
+        serde_json::json!({ "references": [location(&file, 1, 8), location(&file, 2, 8)] }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gr");
+    let (title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP references");
+    assert_eq!(
+        panel_lines.len(),
+        2,
+        "one row per reference: {panel_lines:?}"
+    );
+    assert!(
+        has_method(&record_lines(&record), "textDocument/references"),
+        "gr should send a textDocument/references request"
+    );
+
+    // `<CR>` on the first row jumps to it: 1-based line 2, byte col 8.
+    feed(&rpc, "<CR>");
+    wait_for_cursor(&rpc, (2, 8)).await;
+}
+
+#[tokio::test]
+async fn an_empty_definition_reply_reports_no_definition() {
+    let _guard = test_lock().lock().await;
+    // The server returns nothing for `gd`: a brief message, no jump, no panel.
+    let file = temp_file("gd-empty", "rs", "fn main() {}\n");
+    let record = configure_mock("gd-empty", serde_json::json!({}));
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gd");
+    let params = wait_for_message(&rpc, &mut incoming, "No definition found").await;
+    assert_eq!(message_of(&params), "No definition found");
+    // The cursor never left the origin.
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
+#[tokio::test]
+async fn a_definition_reply_is_dropped_if_the_cursor_moved() {
+    // Stale-reply drop (Decision 3): fire `gd`, move the cursor before the async
+    // reply lands, and the jump must be discarded — the move wins, not the
+    // now-irrelevant definition. `gdj` does exactly this in one input batch: the
+    // request is issued at (0,0), then `j` moves to (1,0) before the reply (which
+    // the select! loop only processes after the batch) is handled.
+    let _guard = test_lock().lock().await;
+    let file = temp_file(
+        "gd-stale",
+        "rs",
+        "fn target() {}\nfn main() {}\nlet z = 1\n",
+    );
+    let record = configure_mock(
+        "gd-stale",
+        serde_json::json!({ "definition": location(&file, 0, 3) }),
+    );
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gdj");
+    // Give the (now-stale) reply ample time to arrive and be dropped.
+    for _ in 0..8 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 0),
+        "the cursor stayed where `j` moved it; the stale definition reply did not jump"
+    );
+    // The request was genuinely sent (so we really exercised the drop, not a
+    // never-issued request).
+    assert!(has_method(
+        &record_lines(&record),
+        "textDocument/definition"
+    ));
 }

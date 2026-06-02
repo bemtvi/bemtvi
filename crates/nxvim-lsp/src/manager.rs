@@ -23,10 +23,12 @@ use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, GeneralClientCapabilities,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, PositionEncodingKind,
-    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncCapability,
-    TextDocumentSyncClientCapabilities, TextDocumentSyncKind, Url, VersionedTextDocumentIdentifier,
+    GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, InitializeResult,
+    InitializedParams, Location, MessageType, Position, PositionEncodingKind, ReferenceContext,
+    ReferenceParams, ServerCapabilities, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
+    TextDocumentSyncKind, Url, VersionedTextDocumentIdentifier,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -95,6 +97,57 @@ pub enum LspNotify {
     },
 }
 
+/// A language-feature request the editor fires; its reply returns later as an
+/// [`LspEvent::Reply`] carrying the same [`ReqToken`] (Decision 3). Already in LSP
+/// coordinates — the server converts the cursor's byte column to the negotiated
+/// encoding before sending, because only it has the buffer text. The manager
+/// ferries the request to the matching server's socket and forwards the reply.
+#[derive(Debug)]
+pub enum LspRequest {
+    Definition {
+        uri: Url,
+        position: Position,
+    },
+    Declaration {
+        uri: Url,
+        position: Position,
+    },
+    TypeDefinition {
+        uri: Url,
+        position: Position,
+    },
+    Implementation {
+        uri: Url,
+        position: Position,
+    },
+    References {
+        uri: Url,
+        position: Position,
+        include_declaration: bool,
+    },
+}
+
+/// The opaque correlation token the editor issues with a request and the manager
+/// echoes back on the reply (Decision 3). `kind` distinguishes the feature
+/// (definition vs references …) and `generation` is a monotonic counter the
+/// editor uses to drop a stale reply (one whose request was superseded, or whose
+/// cursor has since moved). The manager never interprets either field; it only
+/// ferries them, exactly as `tick` rides along an `ts_highlights` request.
+#[derive(Clone, Copy, Debug)]
+pub struct ReqToken {
+    pub kind: u16,
+    pub generation: u64,
+}
+
+/// The distilled result of an [`LspRequest`], normalized to a flat list of target
+/// locations: every goto-family response shape (`Location`, `Location[]`,
+/// `LocationLink[]`) and `references` collapse to this, so the editor handles one
+/// shape regardless of which feature asked.
+#[derive(Clone, Debug)]
+pub enum LspReply {
+    Locations(Vec<Location>),
+}
+
 /// Server → editor, delivered to the main loop's `select!`. The distilled events
 /// the editor acts on; lifecycle/framing/id-correlation are handled inside the
 /// manager by `async-lsp` and never surface here.
@@ -119,20 +172,41 @@ pub enum LspEvent {
     /// or stay down once the breaker gives up). Surfaced so the editor can tell
     /// the user instead of leaving buffers silently un-serviced.
     ServerExited { key: ServerKey, message: String },
+    /// The reply to an [`LspRequest`], tagged with the [`ReqToken`] the editor
+    /// issued so it can match the reply to its intent and drop stale ones.
+    Reply {
+        key: ServerKey,
+        token: ReqToken,
+        reply: LspReply,
+    },
     /// `window/logMessage` / `window/showMessage`, or a manager-level note.
     Log { key: ServerKey, message: String },
 }
 
 /// Commands from the editor to the supervisor, routed to per-server tasks by key.
 enum LspCommand {
-    Ensure { key: ServerKey, spawn: ServerSpawn },
-    Notify { key: ServerKey, note: LspNotify },
-    Shutdown { key: ServerKey },
+    Ensure {
+        key: ServerKey,
+        spawn: ServerSpawn,
+    },
+    Notify {
+        key: ServerKey,
+        note: LspNotify,
+    },
+    Request {
+        key: ServerKey,
+        token: ReqToken,
+        req: LspRequest,
+    },
+    Shutdown {
+        key: ServerKey,
+    },
 }
 
 /// A message from the supervisor to one per-server task.
 enum ServerMsg {
     Notify(LspNotify),
+    Request(ReqToken, LspRequest),
     Shutdown,
 }
 
@@ -192,6 +266,14 @@ impl LspManager {
         let _ = self.cmd_tx.send(LspCommand::Notify { key, note });
     }
 
+    /// Fire a language-feature request at `key`'s server; its reply returns later
+    /// as an [`LspEvent::Reply`] carrying `token`. Fire-and-forget like
+    /// [`LspManager::notify`] — the editor never awaits the round-trip (Decision
+    /// 3). Dropped if no such server is running.
+    pub fn request(&self, key: ServerKey, token: ReqToken, req: LspRequest) {
+        let _ = self.cmd_tx.send(LspCommand::Request { key, token, req });
+    }
+
     /// Cleanly `shutdown`/`exit` `key`'s server and forget it.
     pub fn shutdown(&self, key: ServerKey) {
         let _ = self.cmd_tx.send(LspCommand::Shutdown { key });
@@ -226,6 +308,11 @@ async fn run_supervisor(
             LspCommand::Notify { key, note } => {
                 if let Some(tx) = servers.get(&key) {
                     let _ = tx.send(ServerMsg::Notify(note));
+                }
+            }
+            LspCommand::Request { key, token, req } => {
+                if let Some(tx) = servers.get(&key) {
+                    let _ = tx.send(ServerMsg::Request(token, req));
                 }
             }
             LspCommand::Shutdown { key } => {
@@ -426,6 +513,22 @@ async fn run_server_once(
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(ServerMsg::Notify(note)) => apply_notify(&mut socket, note, log, name),
+                // A language-feature request: clone the socket and await the reply
+                // on a detached task, so a slow round-trip never stalls this serve
+                // loop (further sync/requests keep flowing) and the editor never
+                // blocks (Decision 3). The resolved value is forwarded as a Reply
+                // event tagged with the editor's token; staleness is the editor's
+                // call, not ours.
+                Some(ServerMsg::Request(token, req)) => {
+                    let mut sock = socket.clone();
+                    let tx = event_tx.clone();
+                    let key = key.clone();
+                    let log = log.clone();
+                    tokio::spawn(async move {
+                        let reply = issue_request(&mut sock, req, &log, key.language).await;
+                        let _ = tx.send(LspEvent::Reply { key, token, reply });
+                    });
+                }
                 // Explicit shutdown, or the manager dropped our sender: tear down.
                 Some(ServerMsg::Shutdown) | None => {
                     log.log(LogLevel::Info, name, "shutting down");
@@ -488,6 +591,121 @@ fn apply_notify(socket: &mut ServerSocket, note: LspNotify, log: &LspLog, name: 
             text_document: TextDocumentIdentifier { uri },
         }),
     };
+}
+
+/// Issue one language-feature [`LspRequest`] on the socket and await its reply,
+/// normalizing every goto-family / references response to a flat [`LspReply`].
+/// A transport error (a server that died mid-request, an unsupported method) is
+/// logged and degraded to an empty location list, so the editor uniformly sees
+/// "nothing found" rather than a hang.
+async fn issue_request(
+    sock: &mut ServerSocket,
+    req: LspRequest,
+    log: &LspLog,
+    name: &str,
+) -> LspReply {
+    if log.enabled(LogLevel::Debug) {
+        log.log(LogLevel::Debug, name, &describe_request(&req));
+    }
+    let locations = match req {
+        LspRequest::Definition { uri, position } => {
+            goto_locations(sock.definition(goto_params(uri, position)).await, log, name)
+        }
+        LspRequest::Declaration { uri, position } => goto_locations(
+            sock.declaration(goto_params(uri, position)).await,
+            log,
+            name,
+        ),
+        LspRequest::TypeDefinition { uri, position } => goto_locations(
+            sock.type_definition(goto_params(uri, position)).await,
+            log,
+            name,
+        ),
+        LspRequest::Implementation { uri, position } => goto_locations(
+            sock.implementation(goto_params(uri, position)).await,
+            log,
+            name,
+        ),
+        LspRequest::References {
+            uri,
+            position,
+            include_declaration,
+        } => {
+            let params = ReferenceParams {
+                text_document_position: text_document_position(uri, position),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: ReferenceContext {
+                    include_declaration,
+                },
+            };
+            match sock.references(params).await {
+                Ok(locs) => locs.unwrap_or_default(),
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("references failed: {e}"));
+                    Vec::new()
+                }
+            }
+        }
+    };
+    LspReply::Locations(locations)
+}
+
+/// Flatten a goto-family reply (definition/declaration/typeDefinition/
+/// implementation all share `GotoDefinitionResponse`) into a list of target
+/// locations, collapsing the `LocationLink` shape to its selection target. A
+/// transport error degrades to an empty list (logged).
+fn goto_locations(
+    result: Result<Option<GotoDefinitionResponse>, async_lsp::Error>,
+    log: &LspLog,
+    name: &str,
+) -> Vec<Location> {
+    match result {
+        Ok(None) => Vec::new(),
+        Ok(Some(GotoDefinitionResponse::Scalar(loc))) => vec![loc],
+        Ok(Some(GotoDefinitionResponse::Array(locs))) => locs,
+        Ok(Some(GotoDefinitionResponse::Link(links))) => links
+            .into_iter()
+            .map(|l| Location {
+                uri: l.target_uri,
+                range: l.target_selection_range,
+            })
+            .collect(),
+        Err(e) => {
+            log.log(LogLevel::Warn, name, &format!("goto request failed: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+/// The shared `GotoDefinitionParams` for the goto-family requests (a position in
+/// a document, with default progress params).
+fn goto_params(uri: Url, position: Position) -> GotoDefinitionParams {
+    GotoDefinitionParams {
+        text_document_position_params: text_document_position(uri, position),
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    }
+}
+
+/// A `(document, position)` pair shared by every position-based request.
+fn text_document_position(uri: Url, position: Position) -> TextDocumentPositionParams {
+    TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri },
+        position,
+    }
+}
+
+/// A one-line summary of an outgoing request for the DEBUG log.
+fn describe_request(req: &LspRequest) -> String {
+    let (label, pos) = match req {
+        LspRequest::Definition { position, .. } => ("definition", position),
+        LspRequest::Declaration { position, .. } => ("declaration", position),
+        LspRequest::TypeDefinition { position, .. } => ("typeDefinition", position),
+        LspRequest::Implementation { position, .. } => ("implementation", position),
+        LspRequest::References { position, .. } => ("references", position),
+    };
+    format!("→ {label} @ {}:{}", pos.line, pos.character)
 }
 
 /// A one-line summary of an outgoing notification for the DEBUG log.

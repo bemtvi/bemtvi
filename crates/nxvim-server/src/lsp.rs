@@ -19,10 +19,12 @@ use std::path::{Path, PathBuf};
 use nxvim_core::unicode;
 use nxvim_core::{BufferEdit, BufferId};
 use nxvim_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent,
+    Diagnostic, DiagnosticSeverity, Location, Position, Range, TextDocumentContentChangeEvent,
     TextDocumentSyncKind, Url,
 };
-use nxvim_lsp::{LspEvent, LspNotify, PositionEncoding, ServerKey, ServerSpawn};
+use nxvim_lsp::{
+    LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken, ServerKey, ServerSpawn,
+};
 use rmpv::Value;
 
 use crate::{filetype_of, Server, StyleTable};
@@ -54,6 +56,76 @@ pub(crate) struct LspDocState {
     /// Latest `publishDiagnostics` for this buffer, projected into the redraw
     /// (`diagnostics_for`) and the under-cursor message line.
     diagnostics: Vec<Diagnostic>,
+}
+
+/// Which language-feature request a [`ReqToken`] / [`PendingLspReq`] belongs to.
+/// The numeric mapping is what rides in the token's `kind` field across the
+/// manager and back; the editor owns its meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LspReqKind {
+    Definition,
+    Declaration,
+    TypeDefinition,
+    Implementation,
+    References,
+}
+
+impl LspReqKind {
+    fn as_u16(self) -> u16 {
+        match self {
+            LspReqKind::Definition => 0,
+            LspReqKind::Declaration => 1,
+            LspReqKind::TypeDefinition => 2,
+            LspReqKind::Implementation => 3,
+            LspReqKind::References => 4,
+        }
+    }
+
+    fn from_u16(value: u16) -> Option<Self> {
+        Some(match value {
+            0 => LspReqKind::Definition,
+            1 => LspReqKind::Declaration,
+            2 => LspReqKind::TypeDefinition,
+            3 => LspReqKind::Implementation,
+            4 => LspReqKind::References,
+            _ => return None,
+        })
+    }
+
+    /// Whether results always go to a panel location list (references) rather
+    /// than jumping a lone result directly (the goto family).
+    fn is_list(self) -> bool {
+        matches!(self, LspReqKind::References)
+    }
+
+    /// The message shown when the server returns no locations.
+    fn empty_message(self) -> &'static str {
+        match self {
+            LspReqKind::Definition => "No definition found",
+            LspReqKind::Declaration => "No declaration found",
+            LspReqKind::TypeDefinition => "No type definition found",
+            LspReqKind::Implementation => "No implementation found",
+            LspReqKind::References => "No references found",
+        }
+    }
+
+    /// The panel title for a multi-result location list.
+    fn panel_title(self) -> &'static str {
+        match self {
+            LspReqKind::References => "LSP references",
+            _ => "LSP locations",
+        }
+    }
+}
+
+/// A request in flight, kept per [`LspReqKind`] so a reply can be matched to it
+/// and stale ones dropped (Decision 3): the `generation` it was issued under,
+/// and the `buffer`/`cursor` it was issued at (a later reply whose generation
+/// differs, or that arrives after the cursor moved, is discarded).
+pub(crate) struct PendingLspReq {
+    pub(crate) generation: u64,
+    pub(crate) buffer: BufferId,
+    pub(crate) cursor: (usize, usize),
 }
 
 /// The negotiated runtime state of one server, learned from its `initialize`
@@ -252,6 +324,7 @@ impl Server {
                     self.lsp_dirty = true;
                 }
             }
+            LspEvent::Reply { token, reply, .. } => self.on_lsp_reply(token, reply),
             LspEvent::ServerExited { .. } => {
                 // The manager respawns per its breaker (or gives up cleanly). The
                 // editor stays fully responsive throughout; nothing to surface yet.
@@ -489,6 +562,177 @@ impl Server {
         Some((lines, locations))
     }
 
+    // ----- Phase 3: go-to definition / references --------------------------
+
+    /// Issue a language-feature request of `kind` at the cursor, recording its
+    /// generation so a stale reply is dropped (Decision 3): a newer request of
+    /// the same kind, or the cursor moving before the reply lands, invalidates
+    /// it. No-op (with a brief message) if the current buffer has no server that
+    /// has finished `initialize`, since the negotiated encoding isn't known yet.
+    pub(crate) fn request_lsp(&mut self, kind: LspReqKind) {
+        let Some((key, uri, encoding)) = self.current_lsp_target() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let position = self.lsp_position(encoding, row, col);
+
+        self.lsp_req_gen += 1;
+        let generation = self.lsp_req_gen;
+        self.lsp_requests.insert(
+            kind,
+            PendingLspReq {
+                generation,
+                buffer: self.editor.current_buffer_id(),
+                cursor: (row, col),
+            },
+        );
+
+        let token = ReqToken {
+            kind: kind.as_u16(),
+            generation,
+        };
+        let req = match kind {
+            LspReqKind::Definition => LspRequest::Definition { uri, position },
+            LspReqKind::Declaration => LspRequest::Declaration { uri, position },
+            LspReqKind::TypeDefinition => LspRequest::TypeDefinition { uri, position },
+            LspReqKind::Implementation => LspRequest::Implementation { uri, position },
+            LspReqKind::References => LspRequest::References {
+                uri,
+                position,
+                include_declaration: false,
+            },
+        };
+        self.lsp.request(key, token, req);
+    }
+
+    /// The current buffer's `(server, uri, encoding)` once its server finished
+    /// `initialize` (so the negotiated encoding is known) — the precondition for
+    /// any position-based request. `None` otherwise.
+    fn current_lsp_target(&self) -> Option<(ServerKey, Url, PositionEncoding)> {
+        let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
+        let key = state.server.clone()?;
+        let uri = state.uri.clone()?;
+        let encoding = self.lsp_servers.get(&key)?.encoding;
+        Some((key, uri, encoding))
+    }
+
+    /// Handle one [`LspEvent::Reply`]: match it to its pending request by token
+    /// and act, dropping it when a newer request of the same kind superseded it
+    /// (generation mismatch) or the cursor has since moved (Decision 3).
+    pub(crate) fn on_lsp_reply(&mut self, token: ReqToken, reply: LspReply) {
+        let Some(kind) = LspReqKind::from_u16(token.kind) else {
+            return;
+        };
+        let Some(pending) = self.lsp_requests.get(&kind) else {
+            return;
+        };
+        // A newer request of this kind is now in flight: this reply is stale.
+        if pending.generation != token.generation {
+            return;
+        }
+        let moved = pending.buffer != self.editor.current_buffer_id()
+            || pending.cursor != (self.editor.cursor.line, self.editor.cursor.col);
+        self.lsp_requests.remove(&kind);
+        if moved {
+            // The user moved on before the reply landed — honor the move, not the
+            // now-irrelevant jump.
+            return;
+        }
+
+        let LspReply::Locations(locations) = reply;
+        self.apply_lsp_locations(kind, locations);
+        self.lsp_dirty = true;
+    }
+
+    /// Act on a reply's target locations: a single goto result jumps the cursor;
+    /// references (or multiple goto results) open a select-enabled panel location
+    /// list; an empty result shows a brief message. The encoding is captured from
+    /// the *source* buffer before any jump switches buffers — a server reports
+    /// target positions in its own negotiated encoding.
+    fn apply_lsp_locations(&mut self, kind: LspReqKind, locations: Vec<Location>) {
+        if locations.is_empty() {
+            self.editor.echo(kind.empty_message());
+            return;
+        }
+        let encoding = self
+            .current_lsp_target()
+            .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
+        if !kind.is_list() && locations.len() == 1 {
+            self.jump_to_lsp_location(&locations[0], encoding);
+        } else {
+            self.open_locations_panel(kind, &locations, encoding);
+        }
+    }
+
+    /// Jump the cursor to one LSP [`Location`]. Opens/switches to the target on
+    /// its line first, then refines the column once the line text is loaded (the
+    /// char→byte conversion needs the target line, which may live in a file just
+    /// opened by the jump). The second `jump_to` finds the buffer already current
+    /// and only moves the cursor, so the alternate `#` is recorded exactly once.
+    fn jump_to_lsp_location(&mut self, loc: &Location, encoding: PositionEncoding) {
+        let Some(path) = uri_to_path(&loc.uri) else {
+            return;
+        };
+        let line = loc.range.start.line as usize;
+        let character = loc.range.start.character as usize;
+        self.editor.jump_to(&path, line, 0);
+        if self.editor.buffer().path.as_deref() == Some(path.as_path()) {
+            let landed = self.editor.cursor.line;
+            let text = self.editor.buffer().line(landed);
+            let byte = byte_col(encoding, &text, character);
+            self.editor.jump_to(&path, landed, byte);
+        }
+    }
+
+    /// Open a select-enabled panel listing `locations` (`path:line:col` per row),
+    /// backed by the [`DiagLocation`] jump list a `<CR>` indexes — the same panel
+    /// machinery the `:LspDiagnostics` list uses.
+    fn open_locations_panel(
+        &mut self,
+        kind: LspReqKind,
+        locations: &[Location],
+        encoding: PositionEncoding,
+    ) {
+        let mut lines = Vec::with_capacity(locations.len());
+        let mut locs: Vec<DiagLocation> = Vec::with_capacity(locations.len());
+        for loc in locations {
+            let Some(path) = uri_to_path(&loc.uri) else {
+                continue;
+            };
+            let row = loc.range.start.line as usize;
+            let character = loc.range.start.character as usize;
+            let byte = self.location_byte_col(&path, row, character, encoding);
+            lines.push(format!("{}:{}:{}", path.display(), row + 1, byte + 1));
+            locs.push((Some(path), row, byte));
+        }
+        if locs.is_empty() {
+            self.editor.echo(kind.empty_message());
+            return;
+        }
+        self.lsp_panel_locations = locs;
+        self.editor.open_panel(kind.panel_title(), lines, true, 0);
+    }
+
+    /// Best-effort LSP char→byte column for a target location: exact when the
+    /// target is the current buffer (its line text is in hand); otherwise the raw
+    /// character, which is already the byte offset under the UTF-8 encoding the
+    /// goto path negotiates. `jump_to` clamps to the line, so an over-long value
+    /// lands at end-of-line rather than panicking.
+    fn location_byte_col(
+        &self,
+        path: &Path,
+        row: usize,
+        character: usize,
+        encoding: PositionEncoding,
+    ) -> usize {
+        if self.editor.buffer().path.as_deref() == Some(path) {
+            byte_col(encoding, &self.editor.buffer().line(row), character)
+        } else {
+            character
+        }
+    }
+
     /// Convert a batch of journaled byte-delta edits into LSP incremental content
     /// changes, each replacing the edit's old `(start..old_end)` range with its
     /// inserted text, in the server's negotiated position encoding.
@@ -661,6 +905,12 @@ fn workspace_root(path: &Path) -> PathBuf {
 /// A `file://` URI for an absolute-ized path, or `None` if it can't be formed.
 pub(crate) fn path_to_uri(path: &Path) -> Option<Url> {
     Url::from_file_path(absolutize(path)).ok()
+}
+
+/// The filesystem path behind a `file://` URI (the inverse of [`path_to_uri`]),
+/// or `None` for a non-file URI — the target of a go-to jump or a panel location.
+fn uri_to_path(uri: &Url) -> Option<PathBuf> {
+    uri.to_file_path().ok()
 }
 
 /// Resolve `path` against the current directory if it is relative.

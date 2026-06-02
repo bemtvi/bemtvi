@@ -29,6 +29,17 @@ impl Grammar {
     /// panicking) for a missing parser, a missing symbol, an ABI mismatch, or an
     /// unparseable query — the worker turns that into a `ts_error` and moves on.
     pub fn load(data_dir: &Path, lang: &str) -> Result<Grammar> {
+        // Security boundary: `lang` flows into the parser `.so` path and the
+        // query directory, and we then `dlopen` that path — i.e. execute native
+        // code. A name containing `.`, `/`, `\`, or path components could escape
+        // `data_dir` (traversal / absolute path) and load an arbitrary shared
+        // object. Reject anything that isn't a plain grammar identifier before
+        // touching the filesystem. The worker only ever *should* see names from
+        // the server's fixed filetype table, but it must not assume that.
+        if !is_valid_language(lang) {
+            return Err(anyhow!("invalid language name '{lang}'"));
+        }
+
         let lib_path = parser_path(data_dir, lang)
             .ok_or_else(|| anyhow!("no parser for '{lang}' under {}", data_dir.display()))?;
 
@@ -63,6 +74,17 @@ impl Grammar {
             _lib: lib,
         })
     }
+}
+
+/// A grammar identifier: non-empty and only ASCII letters, digits, `_` or `-`
+/// (e.g. `rust`, `c`, `cpp`, `c_sharp`, `tsx`). Excluding `.`, `/`, `\` and the
+/// empty string is what makes path traversal and absolute-path escapes
+/// impossible when the name is joined into `data_dir`.
+fn is_valid_language(lang: &str) -> bool {
+    !lang.is_empty()
+        && lang
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// First existing `parser/<lang>.<ext>` over the platform's candidate

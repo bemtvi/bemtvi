@@ -394,15 +394,20 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     )?;
     func.set(
         "mkdir",
-        lua.create_function(|_, (path, _flags): (String, Option<String>)| {
-            // `mkdir(path, "p")` — create parents; return 1 on success, 0 on
-            // failure, matching Vimscript's truthy/falsey convention.
-            Ok(if std::fs::create_dir_all(&path).is_ok() {
-                1i64
-            } else {
-                0
-            })
-        })?,
+        lua.create_function(
+            |_, (path, _flags, prot): (String, Option<String>, Option<mlua::Value>)| {
+                // `mkdir(path, "p" [, prot])` — create parents; return 1 on
+                // success, 0 on failure (Vimscript's truthy/falsey convention).
+                // `prot` is the permission mask (neovim's third arg): an octal
+                // string like "0700" or a numeric mode. Honoring it means a
+                // private data/state dir isn't silently created world-readable.
+                Ok(if create_dir_all_mode(&path, parse_mode(prot)) {
+                    1i64
+                } else {
+                    0
+                })
+            },
+        )?,
     )?;
     func.set(
         "has",
@@ -509,6 +514,43 @@ fn getftime(path: &str) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(-1)
+}
+
+/// Resolve `mkdir`'s `prot` argument to a permission mode. Accepts an octal
+/// string (`"0700"`, `"700"`) or a numeric mode; defaults to `0o755` (neovim's
+/// default) when absent or unparseable.
+fn parse_mode(prot: Option<mlua::Value>) -> u32 {
+    const DEFAULT: u32 = 0o755;
+    match prot {
+        Some(mlua::Value::Integer(n)) => n as u32,
+        Some(mlua::Value::Number(n)) => n as u32,
+        Some(mlua::Value::String(s)) => s
+            .to_str()
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0o"), 8).ok())
+            .unwrap_or(DEFAULT),
+        _ => DEFAULT,
+    }
+}
+
+/// Create `path` (and parents) with permission `mode`. On Unix the mode is
+/// applied to every directory created; elsewhere `mode` is ignored. Returns
+/// whether the directory now exists.
+fn create_dir_all_mode(path: &str, mode: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(mode)
+            .create(path)
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir_all(path).is_ok()
+    }
 }
 
 /// Read a color field (`fg`/`bg`/`sp`) from an `nvim_set_hl` opts table. A

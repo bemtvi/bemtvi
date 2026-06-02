@@ -124,12 +124,31 @@ impl Engine {
             return; // never opened; the editor opens before editing
         };
         for e in edits {
-            // Patch the shadow: remove the old range, insert the new bytes.
-            if e.old_end_byte > e.start_byte {
-                state.shadow.remove(e.start_byte..e.old_end_byte);
+            // The byte offsets come off the wire; an out-of-range, mis-ordered,
+            // or mid-codepoint range would panic ropey and (under the worker's
+            // catch_unwind) leave the shadow and tree half-mutated, poisoning the
+            // buffer for every later edit. Validate against the live shadow and
+            // drop a delta that doesn't fit rather than trust it. `try_*` is a
+            // second guard so a mutation can still never panic.
+            let len = state.shadow.len();
+            let valid = e.start_byte <= e.old_end_byte
+                && e.old_end_byte <= len
+                && state.shadow.is_char_boundary(e.start_byte)
+                && state.shadow.is_char_boundary(e.old_end_byte);
+            if !valid {
+                continue;
             }
-            if !e.text.is_empty() {
-                state.shadow.insert(e.start_byte, &e.text);
+            // Patch the shadow: remove the old range, insert the new bytes.
+            if e.old_end_byte > e.start_byte
+                && state
+                    .shadow
+                    .try_remove(e.start_byte..e.old_end_byte)
+                    .is_err()
+            {
+                continue;
+            }
+            if !e.text.is_empty() && state.shadow.try_insert(e.start_byte, &e.text).is_err() {
+                continue;
             }
             if let Some(tree) = state.tree.as_mut() {
                 tree.edit(&InputEdit {

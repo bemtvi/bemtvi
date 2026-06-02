@@ -17,3 +17,6 @@ nxvim-rpc.workspace = true
 tree-sitter.workspace = true
 streaming-iterator.workspace = true
 libloading.workspace = true
+
+[dev-dependencies]
+tree-sitter-rust.workspace = true

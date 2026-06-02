@@ -976,6 +976,7 @@ dependencies = [
  "streaming-iterator",
  "tokio",
  "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]

@@ -170,14 +170,17 @@ fn parse_edits(value: Option<&Value>) -> Vec<WireEdit> {
             if a.len() != 10 {
                 return None;
             }
-            let u = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0) as usize;
+            // Drop the whole delta if any numeric field is absent or non-integer,
+            // rather than coercing it to 0 — a coerced field produces an edit
+            // whose bytes and points disagree, desyncing the shadow from the tree.
+            let u = |i: usize| Some(a.get(i)?.as_u64()? as usize);
             Some(WireEdit {
-                start_byte: u(0),
-                old_end_byte: u(1),
-                new_end_byte: u(2),
-                start_point: (u(3), u(4)),
-                old_end_point: (u(5), u(6)),
-                new_end_point: (u(7), u(8)),
+                start_byte: u(0)?,
+                old_end_byte: u(1)?,
+                new_end_byte: u(2)?,
+                start_point: (u(3)?, u(4)?),
+                old_end_point: (u(5)?, u(6)?),
+                new_end_point: (u(7)?, u(8)?),
                 text: a.get(9).and_then(Value::as_str).unwrap_or("").to_string(),
             })
         })

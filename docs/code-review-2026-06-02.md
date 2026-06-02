@@ -151,70 +151,83 @@ nxvim` (screen/e2e) still passes. Optionally a manual note in the PR.
 
 # P1 — Trust-boundary hardening (TS worker)
 
-## S1. TS worker: path traversal → arbitrary `dlopen` if `lang` becomes untrusted
-**File:** `crates/nxvim-ts/src/loader.rs:71-88` (`parser_path`, `query_path`) and
-`Grammar::load` (`:31-65`).
+## S1. TS worker: path traversal → arbitrary `dlopen` if `lang` becomes untrusted ✅ DONE
+**File:** `crates/nxvim-ts/src/loader.rs` (`Grammar::load`, `is_valid_language`).
 **Severity:** Medium (defense-in-depth; **not reachable today**).
+**Status:** Implemented. Test: `crates/nxvim-ts/tests/worker.rs::rejects_language_names_that_escape_the_data_dir`.
 
 **Problem:** `parser_path` does `dir.join(format!("{lang}.{ext}"))` and
 `query_path` does `data_dir.join("queries").join(lang).join(file)` with `lang`
 unvalidated. A `lang` of `../../../...` or an absolute path escapes `data_dir`,
-and `libloading::Library::new` (`:37`) then executes the loaded object's
-constructors = native code execution. Today `lang` only ever comes from the
-server's fixed `filetype_of` table (`server lib.rs:920-949`), so it is not
-attacker-reachable — but the worker is a separate trust boundary and must not
-assume its caller.
+and `libloading::Library::new` then executes the loaded object's constructors =
+native code execution. Today `lang` only ever comes from the server's fixed
+`filetype_of` table, so it is not attacker-reachable — but the worker is a
+separate trust boundary and must not assume its caller.
 
-**Fix:** At the top of `Grammar::load` (and/or in both path helpers), reject any
-`lang` not matching a strict allowlist: non-empty and `^[a-z0-9_]+$` (after the
-`-`→`_` normalization, or before — decide and be consistent with the symbol name
-at `:40`). Bail with an `anyhow!` error on violation. Optionally also canonicalize
-the resolved path and assert it starts with `data_dir`.
+**Fix applied:** `Grammar::load` rejects any `lang` failing `is_valid_language`
+(non-empty, only `[A-Za-z0-9_-]`) with `anyhow!("invalid language name '{lang}'")`
+*before* any path join or `dlopen`. Excluding `.`, `/`, `\` makes traversal and
+absolute-path escapes impossible; real grammar names (`rust`, `c_sharp`, `tsx`)
+pass.
 
-**Verify:** worker is process-isolated; add a `nxvim-ts`-level integration check
-if practical, or just reason + `cargo test --workspace`.
+**Test (verified fail-before / pass-after):** drives `run_worker` over a pipe,
+sends `ts_open` with `language: "../../../../etc/passwd"`, asserts the `ts_error`
+reply message contains "invalid language name". Pre-fix the message was the
+generic "no parser for …" (it still hit the filesystem); post-fix it's rejected
+up front.
 
-## S2. TS worker: edit offsets from the wire aren't bounds/boundary-checked
-**File:** `crates/nxvim-ts/src/engine.rs:128-133` (`edit`), with `parse_edits` at
-`crates/nxvim-ts/src/lib.rs:162-185` and the `catch_unwind` at `lib.rs:75`.
+## S2. TS worker: edit offsets from the wire aren't bounds/boundary-checked ✅ DONE
+**File:** `crates/nxvim-ts/src/engine.rs` (`edit`) and `parse_edits` in
+`crates/nxvim-ts/src/lib.rs`.
 **Severity:** Medium (per-buffer silent crash-loop).
+**Status:** Implemented. Test: `crates/nxvim-ts/tests/worker.rs::malformed_edit_neither_crashes_nor_silences_the_buffer`.
 
 **Problem:** `state.shadow.remove(e.start_byte..e.old_end_byte)` and
-`insert(e.start_byte, …)` use offsets straight off the wire. An
+`insert(e.start_byte, …)` used offsets straight off the wire. An
 `old_end_byte > shadow.len()`, `start_byte > len`, or a mid-codepoint offset
-panics ropey. The surrounding `catch_unwind(AssertUnwindSafe(...))` swallows the
-panic but leaves the shadow rope + parse tree **half-edited**, so every later
-message for that buffer panics again → silent "no highlights forever" for that
-buffer. Also `parse_edits` coerces any missing/non-int field to `0` via
-`unwrap_or(0)` (`lib.rs:170`-ish), silently turning a garbled edit into a no-op
-or an inconsistent `InputEdit` that desyncs the tree from the shadow.
+panics ropey. The surrounding `catch_unwind` swallows the panic but the handler's
+follow-up `send_highlights` never runs, so the buffer goes silently dark (and a
+partially-applied batch leaves the shadow/tree desynced). `parse_edits` also
+coerced any missing/non-int field to `0`, turning a garbled edit into an
+inconsistent `InputEdit`.
 
-**Fix:**
-1. In `parse_edits`, return `Option<Edit>` per entry and **drop the whole edit
-   batch (or `close` the buffer)** if any field is absent/non-integer, instead
-   of coercing to `0`.
-2. In `Engine::edit`, before mutating: validate each delta against
-   `shadow.len()` and `is_char_boundary` for `start_byte`/`old_end_byte`. On an
-   invalid edit, `self.close(buffer)` (drop the buffer so the next `open`
-   rebuilds it clean) rather than mutating partially.
-3. In `lib.rs:75`, on a caught panic during `ts_edit`, `engine.close(buffer)` so
-   the buffer is reset rather than left poisoned.
+**Fix applied:**
+1. `parse_edits` now reads each numeric field as `Option` and `?`-drops the
+   whole delta if any field is absent/non-integer (no more `unwrap_or(0)`).
+2. `Engine::edit` validates each delta against the live `shadow.len()` and
+   `is_char_boundary(start/old_end)` and `continue`s past an invalid one; the
+   actual mutations go through ropey's fallible `try_remove`/`try_insert` as a
+   second guard, so a mutation can never panic. The buffer stays alive and keeps
+   highlighting.
 
-**Verify:** feed an out-of-range / mid-codepoint edit delta and assert the worker
-keeps serving other buffers (no permanent silence). Likely a `nxvim/tests/syntax.rs`
-or `nxvim-ts` integration test.
+**Test (verified fail-before / pass-after):** opens a real rust buffer (compiled
+tree-sitter-rust fixture), drains its highlights, then sends a `ts_edit` whose
+offsets run far past the text and asserts a `ts_highlights` reply (tick=2) still
+arrives. Pre-fix the worker panicked (`index is out of bounds`), was caught by
+`catch_unwind`, and sent no reply → the test timed out.
 
-## S3. `vim.fn.mkdir` ignores its perms argument
-**File:** `crates/nxvim-lua/src/lib.rs:395-406`
+**Note:** the review also suggested `engine.close(buffer)` on a caught panic in
+`lib.rs` as a third layer; with the offsets now validated the panic no longer
+occurs, so that belt-and-suspenders reset was left out to keep the change
+minimal. Revisit if other panic sources in `ts_edit` surface.
+
+## S3. `vim.fn.mkdir` ignores its perms argument ✅ DONE
+**File:** `crates/nxvim-lua/src/lib.rs` (`mkdir`, `parse_mode`, `create_dir_all_mode`).
 **Severity:** Low (cheap, concrete).
+**Status:** Implemented. Test: `editing.rs::mkdir_honors_the_permissions_argument`.
 
-**Problem:** `mkdir(path, _flags)` discards the flags/perms arg and calls
+**Problem:** `mkdir(path, _flags)` discarded the perms arg and called
 `std::fs::create_dir_all`, producing `0777 & !umask` dirs. Data/state dirs that
-should be private get umask-default perms.
+should be private got umask-default perms.
 
-**Fix:** Honor the perms argument; at minimum, for the data/state stdpaths use
-`std::os::unix::fs::DirBuilderExt::mode(0o700)` via `fs::DirBuilder`. Keep it
-cross-platform (`#[cfg(unix)]` for the mode call).
+**Fix applied:** `mkdir` takes neovim's third `prot` argument (octal string like
+`"0700"` or a numeric mode); `parse_mode` resolves it (default `0o755`) and
+`create_dir_all_mode` applies it via `std::os::unix::fs::DirBuilderExt::mode` on
+Unix (`std::fs::create_dir_all` elsewhere).
+
+**Test (verified fail-before / pass-after):** an init.lua calling
+`vim.fn.mkdir(path, "p", "0700")` runs at startup; the test asserts the created
+dir's mode is `0o700`. Pre-fix it was `0o755` (umask default); post-fix `0o700`.
 
 > The broader Lua surface (`unsafe_new_with`, `debug` stdlib, C-module loading,
 > unvalidated FS/env paths) is **accepted** under the "config is user-trusted"

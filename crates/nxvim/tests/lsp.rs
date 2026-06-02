@@ -903,6 +903,37 @@ async fn gr_lists_references_in_the_panel_and_jumps() {
 }
 
 #[tokio::test]
+async fn panelopen_reopens_the_references_panel_and_still_jumps() {
+    let _guard = test_lock().lock().await;
+    // The headline `:panelopen` use case: dismiss the references list, bring it
+    // back, and the `<CR>` jump still works (its location list survived).
+    let file = temp_file("gr-reopen", "rs", "let x = 1\nlet y = x\nlet z = x\n");
+    let record = configure_mock(
+        "gr-reopen",
+        serde_json::json!({ "references": [location(&file, 1, 8), location(&file, 2, 8)] }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gr");
+    let (title, _lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP references");
+
+    // Dismiss the panel, then reopen it with `:panelopen`.
+    feed(&rpc, "<Esc>");
+    rpc.request("nvim_command", vec![Value::from("panelopen")])
+        .await
+        .expect("panelopen");
+    let (title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP references", "the references panel came back");
+    assert_eq!(panel_lines.len(), 2, "with its content: {panel_lines:?}");
+
+    // `<CR>` on the first row jumps just as it did before the panel was closed.
+    feed(&rpc, "<CR>");
+    wait_for_cursor(&rpc, (2, 8)).await;
+}
+
+#[tokio::test]
 async fn an_empty_definition_reply_reports_no_definition() {
     let _guard = test_lock().lock().await;
     // The server returns nothing for `gd`: a brief message, no jump, no panel.

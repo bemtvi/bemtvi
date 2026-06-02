@@ -370,6 +370,7 @@ pub(crate) struct PendingScroll {
 /// While a panel is open, [`Editor::input`] routes every key here instead of to
 /// the buffer, so the usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`)
 /// scroll the panel rather than the text.
+#[derive(Clone)]
 struct Panel {
     /// Label shown in the title bar (e.g. `Messages`, `Buffers`).
     title: String,
@@ -441,6 +442,10 @@ pub struct Editor {
     pub messages: Vec<String>,
     /// The bottom panel, when open (`:messages`, `:ls`). Grabs input focus.
     panel: Option<Panel>,
+    /// The most recently shown panel, retained after it closes (or is replaced)
+    /// so `:panelopen` can bring it back with its content and selection intact —
+    /// e.g. reopening an LSP references list. `None` until a panel has been shown.
+    last_panel: Option<Panel>,
     /// `<CR>` selections made in a select-enabled panel: each is `(0-based line
     /// index, line text)`. Drained by the server to fire the `on_select`
     /// scripting callback and the `nxvim_panel_select` RPC notification.
@@ -561,6 +566,7 @@ impl Editor {
             message: String::new(),
             messages: Vec::new(),
             panel: None,
+            last_panel: None,
             panel_selects: Vec::new(),
             should_quit: false,
             options: Options::default(),
@@ -3122,6 +3128,11 @@ impl Editor {
                 Err(e) => self.echo(e),
             },
             "mes" | "messages" | "message" => self.ex_messages(),
+            "panelopen" | "panelo" => {
+                if !self.reopen_last_panel() {
+                    self.echo("No panel to reopen");
+                }
+            }
             "set" | "se" => self.ex_set(args),
             "noh" | "nohlsearch" => self.search_active = false,
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
@@ -3492,6 +3503,11 @@ impl Editor {
         cursor: usize,
     ) {
         let cursor = cursor.min(lines.len().saturating_sub(1));
+        // A panel being replaced (without an explicit close first) is still the
+        // "last shown" one, so remember it for `:panelopen`.
+        if let Some(replaced) = self.panel.take() {
+            self.last_panel = Some(replaced);
+        }
         self.panel = Some(Panel {
             title: title.into(),
             lines,
@@ -3553,10 +3569,36 @@ impl Editor {
 
     /// Close the panel and return focus to the text window, which grows back.
     /// Public for the scripting surface (`vim.panel.close` /
-    /// `nxvim_panel_close`); a no-op when no panel is open.
+    /// `nxvim_panel_close`); a no-op when no panel is open. The closed panel is
+    /// retained as the `:panelopen` target (content + selection preserved).
     pub fn close_panel(&mut self) {
-        self.panel = None;
+        if let Some(closed) = self.panel.take() {
+            self.last_panel = Some(closed);
+        }
         self.ensure_visible();
+    }
+
+    /// Reopen the most recently shown panel (`:panelopen`) with its retained
+    /// content and selection — e.g. bringing an LSP references list back after it
+    /// was dismissed. Returns `false` (and changes nothing) when no panel has been
+    /// shown yet, so the caller can report it. The retained snapshot is kept, so
+    /// the panel can be reopened again after another close.
+    pub fn reopen_last_panel(&mut self) -> bool {
+        let Some(panel) = self.last_panel.clone() else {
+            return false;
+        };
+        // Re-clamp to the current content and reset the transient `gg` prefix, in
+        // case the snapshot was taken mid-keystroke.
+        let last = panel.lines.len().saturating_sub(1);
+        self.panel = Some(Panel {
+            cursor: panel.cursor.min(last),
+            top: panel.top.min(last),
+            gpending: false,
+            ..panel
+        });
+        self.ensure_visible();
+        self.scroll_panel_into_view();
+        true
     }
 
     /// Whether a panel is currently open (the `nxvim_panel_is_open` query).

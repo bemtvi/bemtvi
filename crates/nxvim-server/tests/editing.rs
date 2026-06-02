@@ -1692,6 +1692,41 @@ async fn panel_navigates_and_closes_with_q() {
 }
 
 #[tokio::test]
+async fn panelopen_reopens_the_last_panel() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":lua print('alpha')<CR>");
+    feed(&rpc, ":lua print('beta')<CR>");
+
+    // Open the messages panel, then close it.
+    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
+    let opened = panel_lines(&map);
+    assert!(opened.contains(&"alpha".to_string()));
+    let map = latest_after(&rpc, &mut incoming, "q").await;
+    assert!(panel(&map).is_none(), "q closed the panel");
+
+    // `:panelopen` brings the same panel back with identical title and content.
+    let map = latest_after(&rpc, &mut incoming, ":panelopen<CR>").await;
+    assert_eq!(panel_title(&map), "Messages", "the last panel reopens");
+    assert_eq!(
+        panel_lines(&map),
+        opened,
+        "reopened with the same content it had"
+    );
+}
+
+#[tokio::test]
+async fn panelopen_with_no_prior_panel_reports_nothing() {
+    let (rpc, mut incoming) = start(None).await;
+    // Nothing has ever been shown in a panel.
+    let map = latest_after(&rpc, &mut incoming, ":panelopen<CR>").await;
+    assert!(panel(&map).is_none(), "no panel to reopen, so none opens");
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("No panel to reopen"),
+    );
+}
+
+#[tokio::test]
 async fn panel_grabs_focus_so_the_buffer_is_not_edited() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ihello<Esc>"); // buffer: "hello"

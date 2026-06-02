@@ -272,7 +272,11 @@ window but simpler: a transient overlay that grabs input focus while open.
   open, `Editor::input` routes every key to it instead of to the buffer, so the
   usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`, arrows, `Home`/`End`)
   scroll the panel; `q`/`Q`/`<Esc>` close it and refocus the text window. The
-  buffer is untouched throughout.
+  buffer is untouched throughout. A closed (or replaced) panel is retained as a
+  single `last_panel` snapshot, so **`:panelopen`** brings the most recent panel
+  back with its content and selection intact — e.g. reopening an LSP references
+  list after it was dismissed (the server-side location list survives the close,
+  so a reopened list's `<CR>` still jumps).
 - **The editor splits the height it's told.** The client still reports only the
   text-viewport height (terminal minus the two chrome rows); the editor subtracts
   the panel's rows from that, so `text_height()` — and therefore the `lines` it

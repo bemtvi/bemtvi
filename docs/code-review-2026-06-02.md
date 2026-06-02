@@ -120,22 +120,29 @@ post-fix it returns with the E132 message and a follow-up edit
 (`ihi<Esc>` → `nvim_buf_get_lines`) still works, proving the loop stays
 responsive.
 
-## R3. TUI does not restore mouse mode on panic ("bricks the terminal")
-**File:** `crates/nxvim-tui/src/lib.rs:46-54` (`run`)
+## R3. TUI does not restore mouse mode on panic ("bricks the terminal") ✅ DONE
+**File:** `crates/nxvim-tui/src/lib.rs` (`run`, `MouseCapture`)
 **Severity:** High (user-visible terminal corruption).
+**Status:** Implemented. Test: `crates/nxvim-tui/tests/mouse.rs`.
 
 **Problem:** ratatui's panic hook restores raw mode + alternate screen, but
-`EnableMouseCapture` (`:50`) is enabled *outside* that hook and only disabled on
-the normal return path (`:52-53`). A panic mid-render (or any unwind in the
-event loop) skips `DisableMouseCapture`, leaving the terminal emitting mouse
-escape sequences. The `:49` comment ("OS resets the terminal anyway") is wrong
-for an unwind that returns to `main.rs` and joins the thread.
+`EnableMouseCapture` was enabled *outside* that hook and only disabled on the
+normal return path. A panic mid-render (or any unwind in the event loop) skipped
+`DisableMouseCapture`, leaving the terminal emitting mouse escape sequences. The
+old "OS resets the terminal anyway" comment was wrong for an unwind that returns
+to `main.rs` and joins the thread.
 
-**Fix:** Wrap the terminal setup in an RAII guard whose `Drop` runs
-`DisableMouseCapture` (and any other teardown), so it fires on both the normal
-and panic paths. Alternatively chain onto `std::panic::take_hook()` *before*
-`ratatui::init()` to also emit `DisableMouseCapture`. Prefer the Drop guard — it
-also covers the `?`-propagated `Err` path.
+**Fix applied:** Added a `pub struct MouseCapture<W: Write>` RAII guard:
+`enable()` turns mouse capture on, `Drop` turns it off — so it fires on the
+normal return *and* the panic-unwind path. `run()` holds the guard across the
+event loop and drops it before `ratatui::restore()`. Generic over the writer so
+it's testable against an in-memory sink; production passes `std::io::stdout()`.
+
+**Test (verified fail-before / pass-after):** `mouse.rs` drives the guard over a
+shared in-memory `Write` and asserts the exact `DisableMouseCapture` byte
+sequence is emitted on (a) normal scope exit and (b) a `catch_unwind` panic
+inside the guarded scope. Verified both fail when the `Drop` body is neutered
+(the pre-fix "disable skipped on panic" behavior) and pass with the guard.
 
 **Verify:** hard to unit-test; reason it through and confirm `cargo test -p
 nxvim` (screen/e2e) still passes. Optionally a manual note in the PR.

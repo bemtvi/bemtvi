@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
+use std::io::Write;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::sleep;
@@ -35,21 +36,47 @@ const CHROME_ROWS: u16 = 2;
 /// painted text lines up with the server's reported screen columns.
 const TABSTOP: usize = 8;
 
+/// RAII guard for terminal mouse capture: enables mouse reporting on creation
+/// and **disables it on drop**, including when the event loop unwinds on a
+/// panic. ratatui's panic hook restores raw mode and the alternate screen but
+/// does *not* touch mouse mode, so without a drop guard a panic would leave the
+/// terminal reporting mouse events — spraying the user's shell with escape
+/// codes on every click and move. The guard fires on the normal return path and
+/// the panic path alike. Generic over the writer so it can be tested against an
+/// in-memory sink; production uses `std::io::stdout()`.
+pub struct MouseCapture<W: Write> {
+    out: W,
+}
+
+impl<W: Write> MouseCapture<W> {
+    /// Enable mouse capture on `out`; the returned guard disables it on drop.
+    pub fn enable(mut out: W) -> Self {
+        let _ = crossterm::execute!(out, EnableMouseCapture);
+        Self { out }
+    }
+}
+
+impl<W: Write> Drop for MouseCapture<W> {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(self.out, DisableMouseCapture);
+    }
+}
+
 /// Run the client over a connected stream until the server exits or disconnects.
 ///
 /// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic
 /// hook that restores the terminal), so the user's shell is never left broken.
+/// Mouse capture is ours to manage — a [`MouseCapture`] guard disables it on
+/// drop so even a panic in the event loop can't leave mouse reporting on.
 pub async fn run<S>(stream: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut terminal = ratatui::init();
-    // Capture mouse events so the panel's `[X]` is clickable. ratatui's
-    // `init`/`restore` don't touch mouse mode, so we toggle it ourselves around
-    // the event loop (and on the panic path the OS resets the terminal anyway).
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Capture mouse events so the panel's `[X]` is clickable.
+    let mouse = MouseCapture::enable(std::io::stdout());
     let result = event_loop(stream, &mut terminal).await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    drop(mouse); // disable mouse capture before leaving the alternate screen
     ratatui::restore();
     result
 }

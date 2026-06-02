@@ -6,8 +6,9 @@
 //! document-sync bookkeeping ([`LspDocState`], keyed by [`BufferId`] like
 //! `SyntaxState`), byte↔LSP position conversion via `nxvim-core`'s pure unicode
 //! helpers, and the handling of [`LspEvent`]s. Document sync reuses the buffer
-//! edit journal (`take_edits`/`changedtick`) the syntax sync already drives, so
-//! no new core machinery is added (Decision 5).
+//! edit journal (`take_edits`/`changedtick`) the syntax sync already drives
+//! (Decision 5); the only added core signal is `Buffer::save_tick`, a monotonic
+//! write counter so `didSave` fires off a real save hook rather than a heuristic.
 //!
 //! All [`Server`] methods here run on the single editor thread and only ever
 //! hand the manager fire-and-forget [`LspNotify`]s, so a slow or hung server can
@@ -39,9 +40,9 @@ pub(crate) struct LspDocState {
     version: i32,
     /// `changedtick` of the last sync we sent (drives `didChange`).
     last_tick: u64,
-    /// `modified` as of the last sync, to detect a `:w` (modified cleared with no
-    /// text change ⇒ a write, not an undo-to-clean).
-    was_modified: bool,
+    /// `save_tick` of the last sync, mirrored to fire `didSave` exactly when the
+    /// buffer is written (`save_tick` bumps only on a successful `:w`).
+    last_save_tick: u64,
     /// Latest `publishDiagnostics` for this buffer (cached in Phase 1; projected
     /// to the redraw in Phase 2).
     #[allow(dead_code)]
@@ -107,7 +108,7 @@ impl Server {
         };
 
         let cur_tick = self.editor.buffer().changedtick;
-        let cur_modified = self.editor.buffer().modified;
+        let cur_save_tick = self.editor.buffer().save_tick;
 
         let mut state = self.lsp_states.remove(&buffer).unwrap_or_default();
         state.server = Some(key.clone());
@@ -133,6 +134,9 @@ impl Server {
             );
             state.opened = true;
             state.last_tick = cur_tick;
+            // The freshly-opened content is the on-disk state, so don't fire a
+            // spurious `didSave` for saves that predate the open.
+            state.last_save_tick = cur_save_tick;
         } else if tick_changed && sync_kind != TextDocumentSyncKind::NONE {
             let batch = self.editor.buffer_mut().take_edits();
             state.version += 1;
@@ -158,13 +162,12 @@ impl Server {
             state.last_tick = cur_tick;
         }
 
-        // Save: `modified` cleared with no text change since last observation is a
-        // `:w` (an undo-to-clean would have bumped `changedtick`, i.e.
-        // `tick_changed`).
-        if state.was_modified && !cur_modified && !tick_changed {
+        // Save: the buffer's write counter advanced since the last sync, so a `:w`
+        // landed bytes on disk (a real hook, not a `modified`-flag heuristic).
+        if state.opened && cur_save_tick != state.last_save_tick {
             self.lsp.notify(key, LspNotify::DidSave { uri, text: None });
+            state.last_save_tick = cur_save_tick;
         }
-        state.was_modified = cur_modified;
 
         self.lsp_states.insert(buffer, state);
     }

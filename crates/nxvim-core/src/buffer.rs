@@ -69,6 +69,11 @@ pub struct Buffer {
     /// Monotonic change counter (neovim's `b:changedtick`), bumped on every
     /// mutation. Lets a consumer cheaply tell whether the buffer changed.
     pub changedtick: u64,
+    /// Monotonic write counter, bumped on every successful [`Buffer::write`]
+    /// (`:w`). The save analogue of `changedtick`: a consumer mirrors it to tell,
+    /// without heuristics, exactly when the buffer was saved (drives LSP
+    /// `didSave`; a hook future `BufWritePost` autocmds can read too).
+    pub save_tick: u64,
     /// Journal of edits since the last [`Buffer::take_edits`].
     edits: Vec<BufferEdit>,
     /// Set when the entire rope was replaced (undo/redo/reload), so deltas are
@@ -89,6 +94,7 @@ impl Buffer {
             path: None,
             modified: false,
             changedtick: 0,
+            save_tick: 0,
             edits: Vec::new(),
             resync: false,
         }
@@ -125,6 +131,7 @@ impl Buffer {
             path: Some(path.to_path_buf()),
             modified: false,
             changedtick: 0,
+            save_tick: 0,
             edits: Vec::new(),
             resync: false,
         })
@@ -282,6 +289,9 @@ impl Buffer {
         let lines = self.line_count();
         self.path = Some(target);
         self.modified = false;
+        // Only on a successful write, so a consumer mirroring `save_tick` sees a
+        // save exactly when the bytes reached disk (a failed write is no save).
+        self.save_tick += 1;
         Ok((contents.len(), lines))
     }
 }

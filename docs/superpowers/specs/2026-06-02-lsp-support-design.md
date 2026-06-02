@@ -430,10 +430,13 @@ Proven entirely against the mock server, which records what it received.
 > - **Added deps** (under `[workspace.dependencies]`): `async-lsp =0.2.4`
 >   (`default-features = false`, features `omni-trait`, `tokio`), `lsp-types
 >   =0.95.1`, `serde_json =1.0.150`, `tokio-util =0.7.18` (feature `compat`).
-> - **`didSave` is detected heuristically** server-side (`modified` cleared with
->   no `changedtick` change ⇒ a `:w`, distinguished from undo-to-clean which bumps
->   the tick), since core exposes no save event and gains none (Decision 5 / "no
->   other core changes"). A dedicated save hook is a possible later refinement.
+> - **`didSave` uses a real save hook**, not a heuristic: `Buffer` gained a
+>   monotonic `save_tick` counter (the save analogue of `changedtick`), bumped
+>   only on a successful `Buffer::write`. The server mirrors it per buffer in
+>   `LspDocState` and fires `didSave` exactly when it advances — so undo-back-to-
+>   the-saved-state (which clears `modified` without a `:w`) is never mistaken for
+>   a save. This is a small, pure, editor-domain core addition (no I/O, no LSP
+>   concepts), and a future `BufWritePost` autocmd can read the same signal.
 > - **Tests live in `crates/nxvim/tests/lsp.rs`** (not `nxvim-server/tests/`):
 >   spawning the `nxvim --__lsp-mock` binary needs `CARGO_BIN_EXE_nxvim`, which is
 >   only set for the `nxvim` crate's integration tests — exactly where the syntax

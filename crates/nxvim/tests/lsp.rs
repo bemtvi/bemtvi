@@ -306,7 +306,7 @@ async fn writing_then_deleting_sends_did_save_and_did_close() {
     let (rpc, _incoming) = start(Some(file)).await;
     wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
 
-    // Edit then write: the cleared `modified` with no further text change is a :w.
+    // Edit then write: the buffer's write counter advances on a successful :w.
     feed(&rpc, "ohello<Esc>");
     rpc.request("nvim_command", vec![Value::from("w")])
         .await
@@ -320,6 +320,38 @@ async fn writing_then_deleting_sends_did_save_and_did_close() {
     let recs = wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didClose")).await;
     assert!(has_method(&recs, "textDocument/didSave"));
     assert!(has_method(&recs, "textDocument/didClose"));
+}
+
+#[tokio::test]
+async fn undo_back_to_the_saved_state_does_not_fire_did_save() {
+    // didSave is a real save hook (the buffer's write counter), not a
+    // `modified`-flag heuristic: undoing back to the on-disk content clears
+    // `modified` without any `:w`, and must NOT be mistaken for a save. Only a
+    // real write does.
+    let _guard = test_lock().lock().await;
+    let record = configure_mock("nosave", serde_json::json!({}));
+    let file = temp_file("nosave", "rs", "fn main() {}\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Edit, then undo straight back to the saved content (modified clears, no :w).
+    feed(&rpc, "ohello<Esc>u");
+    for _ in 0..6 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !has_method(&record_lines(&record), "textDocument/didSave"),
+        "undo-to-clean must not fire didSave; saw {:?}",
+        record_lines(&record)
+    );
+
+    // A genuine write now does fire it — proving the hook works, not just stays quiet.
+    feed(&rpc, "ohello<Esc>");
+    rpc.request("nvim_command", vec![Value::from("w")])
+        .await
+        .expect("write");
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didSave")).await;
 }
 
 #[tokio::test]

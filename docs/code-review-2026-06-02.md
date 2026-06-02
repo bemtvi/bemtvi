@@ -403,16 +403,22 @@ The Tier-3 PTY test spawns the real binary with that env set and asserts the
 process exits with code `101`. Pre-fix the process exited `0` (the panic was
 swallowed); post-fix it exits `101`.
 
-## R10. `--__ts-worker` matched anywhere in argv
-**File:** `crates/nxvim/src/main.rs:21`
+## R10. `--__ts-worker` matched anywhere in argv ✅ DONE
+**File:** `crates/nxvim/src/main.rs`
 **Severity:** Low.
+**Status:** Implemented. Test: `crates/nxvim/tests/e2e.rs::ts_worker_flag_past_argv1_still_opens_the_editor`.
 
-**Problem:** `std::env::args().any(|a| a == TS_WORKER_FLAG)` turns the editor into
-a worker if the flag appears as *any* argument (e.g. a file literally named that).
+**Problem:** `std::env::args().any(|a| a == TS_WORKER_FLAG)` turned the editor into
+a worker if the flag appeared as *any* argument (e.g. a file literally named that).
 
-**Fix:** Check only the first argument:
-`args().nth(1).as_deref() == Some(TS_WORKER_FLAG)` — matches how the worker is
-actually spawned.
+**Fix applied:** Check only the first argument:
+`std::env::args().nth(1).as_deref() == Some(TS_WORKER_FLAG)` — exactly how the
+server spawns the worker (the flag is always argv[1]).
+
+**Test (verified fail-before / pass-after):** the Tier-3 PTY test spawns
+`nxvim <file> --__ts-worker` (flag as a trailing positional) and asserts the
+editor opens the file. Pre-fix the `any()` match ran the headless worker (blank
+screen, stdin read as RPC) → timeout; post-fix the file's contents render.
 
 ## R11. Zero-duration scroll animation divides by zero → NaN
 **File:** `crates/nxvim-tui/src/lib.rs:522` (and `arm_animation` `:303`)

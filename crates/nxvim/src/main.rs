@@ -17,8 +17,11 @@ const TS_WORKER_FLAG: &str = "--__ts-worker";
 fn main() -> Result<()> {
     // Worker mode: a separate, crash-isolated process that does all tree-sitter
     // parsing and streams highlight spans back over stdio. It never starts an
-    // editor; if it dies, the server respawns it.
-    if std::env::args().any(|a| a == TS_WORKER_FLAG) {
+    // editor; if it dies, the server respawns it. Match the flag only as the
+    // *first* argument — exactly how the server spawns the worker — so a file
+    // literally named `--__ts-worker` (or the flag anywhere past argv[1]) opens
+    // the editor instead of silently turning it into a worker.
+    if std::env::args().nth(1).as_deref() == Some(TS_WORKER_FLAG) {
         return run_ts_worker();
     }
 

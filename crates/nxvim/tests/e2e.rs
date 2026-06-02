@@ -298,3 +298,29 @@ fn a_server_thread_panic_exits_nonzero() {
         status.exit_code()
     );
 }
+
+#[test]
+fn ts_worker_flag_past_argv1_still_opens_the_editor() {
+    // R10: the worker flag must only be honored as argv[1] (how the server
+    // spawns the worker). Passed as a later positional — e.g. a file literally
+    // named `--__ts-worker` — it must NOT silently turn the editor into a
+    // headless worker (which renders nothing and reads stdin as RPC).
+    let path = std::env::temp_dir().join(format!("nxvim_e2e_r10_{}.txt", std::process::id()));
+    std::fs::write(&path, "gamma\ndelta\n").unwrap();
+
+    // argv: [nxvim, <file>, --__ts-worker]. argv[1] is the real file, so the
+    // editor opens it; the trailing flag is just an extra positional.
+    let mut s = Session::spawn(&[path.to_str().unwrap(), "--__ts-worker"], 80, 24);
+    let ok = s.wait_until(Duration::from_secs(5), |scr| {
+        let t = scr.contents();
+        t.contains("gamma") && t.contains("delta")
+    });
+    assert!(
+        ok,
+        "the editor should have opened the file, not run as a worker:\n{}",
+        s.screen_text()
+    );
+
+    s.send(b":q!\r");
+    std::fs::remove_file(&path).ok();
+}

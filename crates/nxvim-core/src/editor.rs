@@ -476,6 +476,12 @@ pub struct Editor {
     /// operator is pending or in visual mode; the next key is the object kind
     /// (`w`, `(`, `{`, …). See `resolve` of the text object in `handle_normal`.
     pending_textobject: Option<char>,
+    /// Set to `'f'`/`'t'`/`'F'`/`'T'` while waiting for the find-char target;
+    /// the next key is the character to find.
+    pending_find: Option<char>,
+    /// The last find-char motion as `(kind, target)`, replayed by `;` (same
+    /// direction) and `,` (opposite). Persists across commands like vim.
+    last_find: Option<(char, char)>,
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
@@ -572,6 +578,8 @@ impl Editor {
             gpending: false,
             pending_replace: false,
             pending_textobject: None,
+            pending_find: None,
+            last_find: None,
             snapshot_taken: false,
             visual_anchor: Cursor::default(),
             scroll_from: None,
@@ -912,6 +920,7 @@ impl Editor {
             self.op_count = None;
             self.gpending = false;
             self.pending_textobject = None;
+            self.pending_find = None;
             if self.mode.is_visual() {
                 self.mode = Mode::Normal;
                 self.clamp_cursor();
@@ -931,6 +940,26 @@ impl Editor {
             }
             // Unknown object char cancels, like vim. In visual mode the
             // selection survives; in operator-pending the operator is dropped.
+            if self.mode.is_visual() {
+                self.gpending = false;
+            } else {
+                self.reset_pending();
+            }
+            return;
+        }
+
+        // Target char of a pending find-char motion (`f`/`t`/`F`/`T`).
+        if let Some(kind) = self.pending_find.take() {
+            let count = self.effective_count();
+            if let Some(target) = key.as_char() {
+                self.last_find = Some((kind, target));
+                if let Some(m) = self.find_motion(kind, target, count, false) {
+                    self.gpending = false;
+                    self.apply_resolved_motion(m);
+                    return;
+                }
+            }
+            // No match (or a non-char key): cancel like a failed motion.
             if self.mode.is_visual() {
                 self.gpending = false;
             } else {
@@ -967,6 +996,14 @@ impl Editor {
             }
         }
 
+        // `f`/`t`/`F`/`T` begin a find-char motion; the target follows on the
+        // next key (handled by the `pending_find` block above).
+        if let Some(c @ ('f' | 't' | 'F' | 'T')) = key.as_char() {
+            self.gpending = false;
+            self.pending_find = Some(c);
+            return;
+        }
+
         // Operator + motion resolution.
         let raw = if self.operator.is_some() {
             self.op_count.or(self.count)
@@ -977,19 +1014,7 @@ impl Editor {
 
         if let Some(m) = self.resolve_motion(key, count, raw) {
             self.gpending = false;
-            if let Some(op) = self.operator.take() {
-                self.apply_operator(op, m);
-                self.reset_pending();
-            } else {
-                // Movement (normal or visual); selection follows the cursor.
-                // Record the pre-move `(top, cursor.line)` so a motion that jumps
-                // off-screen (gg, G, 100j, …) animates the resulting scroll, just
-                // like the explicit scroll commands. `input`'s tail turns this into
-                // a `PendingScroll` only if `top` actually moved more than a line.
-                self.scroll_from = Some((self.top, self.cursor.line));
-                self.apply_movement(m);
-                self.count = None;
-            }
+            self.apply_resolved_motion(m);
             return;
         }
 
@@ -1155,6 +1180,113 @@ impl Editor {
 
     // ----- motions ----------------------------------------------------------
 
+    /// Apply a resolved motion: as an operator's range if one is pending,
+    /// otherwise as plain cursor movement (recording the pre-move position so
+    /// an off-screen jump animates its scroll, like the explicit scrolls).
+    fn apply_resolved_motion(&mut self, m: MotionResult) {
+        if let Some(op) = self.operator.take() {
+            self.apply_operator(op, m);
+            self.reset_pending();
+        } else {
+            self.scroll_from = Some((self.top, self.cursor.line));
+            self.apply_movement(m);
+            self.count = None;
+        }
+    }
+
+    /// Build a find-char motion. Forward (`f`/`t`) is inclusive, backward
+    /// (`F`/`T`) is exclusive, matching how vim feeds these to an operator.
+    fn find_motion(
+        &self,
+        kind: char,
+        target: char,
+        count: usize,
+        repeat: bool,
+    ) -> Option<MotionResult> {
+        let pos = self.find_char_target(kind, target, count, repeat)?;
+        if matches!(kind, 'f' | 't') {
+            Some(MotionResult::inclusive(pos))
+        } else {
+            Some(MotionResult::exclusive(pos))
+        }
+    }
+
+    /// Byte offset for a find-char motion on the cursor's line, or `None` if the
+    /// target is not found. `f`/`F` land on the target; `t`/`T` stop one
+    /// grapheme short. `repeat` (a `;`/`,` replay) hops over an immediately
+    /// adjacent match for `t`/`T`, so repeats make progress instead of sticking.
+    fn find_char_target(
+        &self,
+        kind: char,
+        target: char,
+        count: usize,
+        repeat: bool,
+    ) -> Option<usize> {
+        let line = self.cursor.line;
+        let s = self.buffer().line(line);
+        let base = self.buffer().line_start(line);
+        let cur = self.cursor.col;
+        let till = matches!(kind, 't' | 'T');
+        let char_at = |col: usize| s[col..].chars().next();
+
+        let hit = if matches!(kind, 'f' | 't') {
+            let mut col = unicode::next_grapheme(&s, cur);
+            if till && repeat && col < s.len() && char_at(col) == Some(target) {
+                col = unicode::next_grapheme(&s, col);
+            }
+            let mut found = 0;
+            let mut hit = None;
+            while col < s.len() {
+                if char_at(col) == Some(target) {
+                    found += 1;
+                    if found == count {
+                        hit = Some(col);
+                        break;
+                    }
+                }
+                col = unicode::next_grapheme(&s, col);
+            }
+            hit.map(|c| {
+                if till {
+                    unicode::prev_grapheme(&s, c)
+                } else {
+                    c
+                }
+            })
+        } else {
+            if cur == 0 {
+                return None;
+            }
+            let mut col = unicode::prev_grapheme(&s, cur);
+            if till && repeat && col > 0 && char_at(col) == Some(target) {
+                col = unicode::prev_grapheme(&s, col);
+            }
+            let mut found = 0;
+            let mut hit = None;
+            loop {
+                if char_at(col) == Some(target) {
+                    found += 1;
+                    if found == count {
+                        hit = Some(col);
+                        break;
+                    }
+                }
+                if col == 0 {
+                    break;
+                }
+                col = unicode::prev_grapheme(&s, col);
+            }
+            hit.map(|c| {
+                if till {
+                    unicode::next_grapheme(&s, c)
+                } else {
+                    c
+                }
+            })
+        };
+        hit.map(|col| base + col)
+    }
+
     fn resolve_motion(&self, key: Key, count: usize, raw: Option<usize>) -> Option<MotionResult> {
         let line = self.cursor.line;
         let last_line = self.last_line();
@@ -1169,6 +1301,23 @@ impl Editor {
                 return Some(MotionResult::linewise(target, MoveAxis::LineAnchor));
             }
             return None;
+        }
+
+        // `;` repeats the last find-char motion; `,` repeats it reversed.
+        if ch == Some(';') || ch == Some(',') {
+            let (kind, target) = self.last_find?;
+            let kind = if ch == Some(',') {
+                match kind {
+                    'f' => 'F',
+                    'F' => 'f',
+                    't' => 'T',
+                    'T' => 't',
+                    other => other,
+                }
+            } else {
+                kind
+            };
+            return self.find_motion(kind, target, count, true);
         }
 
         let motion = match (kc, ch) {
@@ -3810,6 +3959,7 @@ impl Editor {
         self.gpending = false;
         self.pending_replace = false;
         self.pending_textobject = None;
+        self.pending_find = None;
     }
 }
 

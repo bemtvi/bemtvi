@@ -11,7 +11,8 @@
 mod syntax;
 
 use nxvim_core::highlight::{HlDef, Style};
-use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor};
+use nxvim_core::view::ScrollAnim;
+use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, PanelView};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
@@ -562,12 +563,7 @@ impl Server {
         let start = norm(params.get(1).and_then(Value::as_i64).unwrap_or(0));
         let end = norm(params.get(2).and_then(Value::as_i64).unwrap_or(-1));
         let (start, end) = (start as usize, end.max(start) as usize);
-        Value::Array(
-            lines[start..end.min(lines.len())]
-                .iter()
-                .map(|l| Value::from(l.as_str()))
-                .collect(),
-        )
+        lines_value(&lines[start..end.min(lines.len())])
     }
 
     /// Push the current view to the client as a single `redraw` notification
@@ -591,46 +587,18 @@ impl Server {
         let highlights = self.highlights_for(&view.numbers, &mut styles);
         let chrome = self.chrome_styles(&mut styles);
 
-        let lines = Value::Array(view.lines.iter().map(|l| Value::from(l.as_str())).collect());
+        let lines = lines_value(&view.lines);
         let selection = spans_value(&view.selection);
         let search = multi_spans_value(&view.search);
         let incsearch = spans_value(&view.incsearch);
         let numbers = numbers_value(&view.numbers);
         let scroll = match &view.scroll {
-            Some(s) => {
-                let scroll_lines =
-                    Value::Array(s.lines.iter().map(|l| Value::from(l.as_str())).collect());
-                let scroll_highlights = self.highlights_for(&s.numbers, &mut styles);
-                Value::Map(vec![
-                    (Value::from("from_top"), Value::from(s.from_top as u64)),
-                    (Value::from("to_top"), Value::from(s.to_top as u64)),
-                    (
-                        Value::from("from_cursor"),
-                        Value::from(s.from_cursor as u64),
-                    ),
-                    (Value::from("to_cursor"), Value::from(s.to_cursor as u64)),
-                    (Value::from("duration_ms"), Value::from(s.duration_ms)),
-                    (Value::from("base_line"), Value::from(s.base_line as u64)),
-                    (Value::from("lines"), scroll_lines),
-                    (Value::from("selection"), spans_value(&s.selection)),
-                    (Value::from("numbers"), numbers_value(&s.numbers)),
-                    (Value::from("highlights"), scroll_highlights),
-                ])
-            }
+            Some(s) => self.project_band(s, &mut styles),
             None => Value::Nil,
         };
         // The bottom panel (`:messages`, `:ls`), `Nil` when none is open.
         let panel = match &view.panel {
-            Some(p) => {
-                let plines =
-                    Value::Array(p.lines.iter().map(|l| Value::from(l.as_str())).collect());
-                Value::Map(vec![
-                    (Value::from("title"), Value::from(p.title.as_str())),
-                    (Value::from("lines"), plines),
-                    (Value::from("cursor_row"), Value::from(p.cursor_row as u64)),
-                    (Value::from("height"), Value::from(p.height as u64)),
-                ])
-            }
+            Some(p) => project_panel(p),
             None => Value::Nil,
         };
 
@@ -691,6 +659,28 @@ impl Server {
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);
+    }
+
+    /// Project a scroll-animation band into the `scroll` sub-map a client animates
+    /// the slide from. Mirrors the main map's lines/selection/numbers/highlights
+    /// projection over the (taller) animation window.
+    fn project_band(&self, s: &ScrollAnim, styles: &mut StyleTable) -> Value {
+        let highlights = self.highlights_for(&s.numbers, styles);
+        Value::Map(vec![
+            (Value::from("from_top"), Value::from(s.from_top as u64)),
+            (Value::from("to_top"), Value::from(s.to_top as u64)),
+            (
+                Value::from("from_cursor"),
+                Value::from(s.from_cursor as u64),
+            ),
+            (Value::from("to_cursor"), Value::from(s.to_cursor as u64)),
+            (Value::from("duration_ms"), Value::from(s.duration_ms)),
+            (Value::from("base_line"), Value::from(s.base_line as u64)),
+            (Value::from("lines"), lines_value(&s.lines)),
+            (Value::from("selection"), spans_value(&s.selection)),
+            (Value::from("numbers"), numbers_value(&s.numbers)),
+            (Value::from("highlights"), highlights),
+        ])
     }
 
     // ----- treesitter syntax integration ------------------------------------
@@ -817,12 +807,7 @@ impl Server {
         let Some(Value::Map(map)) = params.first() else {
             return;
         };
-        let buffer = BufferId(
-            map.iter()
-                .find(|(k, _)| k.as_str() == Some("buffer"))
-                .and_then(|(_, v)| v.as_u64())
-                .unwrap_or(0),
-        );
+        let buffer = BufferId(u64_at(map, "buffer", 0));
         // The buffer the reply is for must still be open; its line count bounds
         // which line keys we accept, so a bogus `line` (e.g. `u64::MAX` from a
         // buggy/hostile worker) can't seed a junk entry that lives forever.
@@ -1022,6 +1007,21 @@ fn edits_value(edits: &[nxvim_core::BufferEdit]) -> Value {
     )
 }
 
+/// Encode a slice of text rows as a msgpack array of strings for the redraw map.
+fn lines_value(lines: &[String]) -> Value {
+    Value::Array(lines.iter().map(|l| Value::from(l.as_str())).collect())
+}
+
+/// Project the bottom panel (`:messages`, `:ls`) into its redraw sub-map.
+fn project_panel(p: &PanelView) -> Value {
+    Value::Map(vec![
+        (Value::from("title"), Value::from(p.title.as_str())),
+        (Value::from("lines"), lines_value(&p.lines)),
+        (Value::from("cursor_row"), Value::from(p.cursor_row as u64)),
+        (Value::from("height"), Value::from(p.height as u64)),
+    ])
+}
+
 /// Encode per-row selection spans as an array of `[start, end]` pairs (`Nil`
 /// for unselected rows) for the redraw map.
 fn spans_value(spans: &[Option<(usize, usize)>]) -> Value {
@@ -1116,6 +1116,15 @@ fn style_value(style: &Style) -> Value {
         }
     }
     Value::Map(map)
+}
+
+/// Read a `u64` field from a msgpack map slice, falling back to `default` when
+/// the key is absent or not an integer.
+fn u64_at(map: &[(Value, Value)], key: &str, default: u64) -> u64 {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(default)
 }
 
 /// A closure that looks up `key` in a msgpack map value (for reading RPC opts

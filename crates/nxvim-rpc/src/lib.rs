@@ -13,7 +13,7 @@
 //! tasks and never block the consumer.
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -125,6 +125,22 @@ where
     }
 }
 
+/// Largest single not-yet-complete frame we will buffer before concluding the
+/// peer is sending garbage (or an abusively large message) and tearing the
+/// connection down. Bounds memory against a peer that streams bytes which never
+/// finish a value. (rmpv itself caps str/bin preallocation at 64 KiB and never
+/// preallocates arrays/maps, so a huge length prefix can't OOM us before its
+/// data arrives — this guards the buffer that *holds* those bytes.)
+const MAX_FRAME: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Maximum container nesting we will decode. rmpv's decoder is recursive, so a
+/// peer sending deeply-nested arrays/maps can otherwise overflow the reader
+/// thread's stack and *abort the process* — a far worse outcome than a rejected
+/// message. This cap is well below where recursion threatens the stack and well
+/// above any legitimate RPC payload; exceeding it surfaces as a clean
+/// `DepthLimitExceeded`, which we treat as a malformed frame below.
+const MAX_DEPTH: usize = 128;
+
 async fn reader_task<R>(mut reader: R, in_tx: mpsc::UnboundedSender<Incoming>, pending: Pending)
 where
     R: AsyncRead + Unpin,
@@ -136,20 +152,34 @@ where
         loop {
             let parsed = {
                 let mut cur = Cursor::new(&buf[..]);
-                match rmpv::decode::read_value(&mut cur) {
-                    Ok(v) => Some((v, cur.position() as usize)),
-                    Err(_) => None, // truncated (need more) or empty
+                match rmpv::decode::read_value_with_max_depth(&mut cur, MAX_DEPTH) {
+                    Ok(v) => Ok(Some((v, cur.position() as usize))),
+                    // A short read means the frame isn't fully buffered yet, so
+                    // wait for more bytes. Any other decode error means the
+                    // stream is structurally corrupt (bad marker, depth blown)
+                    // and the leading bytes will never decode — tear the
+                    // connection down instead of re-reading the same bad prefix
+                    // forever.
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+                    Err(_) => Err(()),
                 }
             };
             match parsed {
-                Some((val, n)) => {
+                Ok(Some((val, n))) => {
                     buf.drain(..n);
                     if dispatch(val, &in_tx, &pending).is_err() {
                         return;
                     }
                 }
-                None => break,
+                Ok(None) => break,
+                Err(()) => return, // malformed frame: drop the connection
             }
+        }
+
+        // A frame that grows past the cap without ever completing is garbage or
+        // abusively large; refuse it rather than buffer without bound.
+        if buf.len() > MAX_FRAME {
+            return;
         }
 
         match reader.read(&mut chunk).await {

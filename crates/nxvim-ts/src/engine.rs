@@ -54,9 +54,17 @@ impl BufferState {
     fn reparse(&mut self) {
         let shadow = &self.shadow;
         let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
-        self.tree = self
+        // Keep the last good tree if the parse yields `None` (a timeout/cancel):
+        // overwriting it with `None` would throw away all incremental reuse and
+        // leave the buffer un-highlightable until a full re-open. Today no
+        // timeout/cancellation is configured so `parse_with_options` always
+        // returns `Some`, but this stays correct if one is ever added.
+        if let Some(tree) = self
             .parser
-            .parse_with_options(&mut callback, self.tree.as_ref(), None);
+            .parse_with_options(&mut callback, self.tree.as_ref(), None)
+        {
+            self.tree = Some(tree);
+        }
     }
 }
 

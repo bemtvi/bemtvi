@@ -363,16 +363,24 @@ test times out; with it, the proactive repaint lands. (The bounded-channel and
 line-clamp parts are non-behavioral hardening — not separately observable through
 the editor surface — and are covered by the full green syntax suite.)
 
-## R8. `reparse` discards the last good tree on a `None` result
-**File:** `crates/nxvim-ts/src/engine.rs:54-60`
+## R8. `reparse` discards the last good tree on a `None` result ✅ DONE
+**File:** `crates/nxvim-ts/src/engine.rs` (`BufferState::reparse`)
 **Severity:** Low.
+**Status:** Implemented (defensive; see note on testability).
 
-**Problem:** `parser.parse(...)` returning `None` (timeout/cancel) sets
+**Problem:** `parse_with_options(...)` returning `None` (timeout/cancel) set
 `self.tree = None`, throwing away the previous good tree and all incremental
 reuse until a full re-open.
 
-**Fix:** `if let Some(t) = parser.parse(...) { self.tree = Some(t); }` — keep the
-prior tree on `None`.
+**Fix applied:** `if let Some(tree) = parse_with_options(...) { self.tree =
+Some(tree); }` — keep the prior tree on `None`.
+
+**Testability:** the `None` branch is **unreachable today** — `reparse` passes
+`None` for the parse options, so no timeout or cancellation is configured and
+`parse_with_options` always returns `Some`. There is therefore no fail-before /
+pass-after path through the public worker surface; this is a defensive guard for
+a future where a parse timeout is added. The existing worker + syntax suites
+(which reparse on every `open`/`edit`) cover that reparse still yields a tree.
 
 ## R9. Server-thread panic looks like a clean quit
 **File:** `crates/nxvim/src/main.rs:57`

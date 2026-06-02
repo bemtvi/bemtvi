@@ -96,24 +96,29 @@ so in-flight `request().await` callers get `Err` instead of hanging). The
 per-chunk full re-parse is O(n²) over a large buffered frame — not fixed here;
 worth a separate streaming-decode pass.
 
-## R2. Server can be wedged by its own Lua — unbounded fixpoint loop
-**File:** `crates/nxvim-server/src/lib.rs:405-439` (`run_pending`)
+## R2. Server can be wedged by its own Lua — unbounded fixpoint loop ✅ DONE
+**File:** `crates/nxvim-server/src/lib.rs` (`run_pending`)
 **Severity:** High (DoS via user's own config/plugin).
+**Status:** Implemented. Test: `editing.rs::recursive_user_command_does_not_wedge_the_server`.
 
 **Problem:** The loop drains `lua_queue`, `deferred_commands`, and
-`panel_selects` until all three are empty (`:433-438`). A user command or an
-`on_select` callback that re-queues a command/lua/panel-op every round makes
-this loop forever, freezing the single-threaded server — no RPC message is
-processed, the client appears dead. Neovim bounds this (`maxfuncdepth`, E132).
+`panel_selects` until all three are empty. A user command or an `on_select`
+callback that re-queues a command/lua/panel-op every round makes this loop
+forever, freezing the single-threaded server — no RPC message is processed, the
+client appears dead. Neovim bounds this (`maxfuncdepth`, E132).
 
-**Fix:** Add an iteration cap (e.g. `const MAX_PENDING_ROUNDS: usize = 100;`).
-After the cap, clear the three queues, `self.editor.echo("E132: ...recursive
-... too deep")`, and `break`. Keep the existing early-exit when all empty.
+**Fix applied:** Added `const MAX_ROUNDS: usize = 100;` and a round counter.
+After draining, if work remains and the count hits the cap, clear the three
+queues, `echo("E132: command recursion limit exceeded")`, and `break`. The
+early-exit when all queues are empty is unchanged, so any legitimate finite
+chain (< 100 levels) converges normally.
 
-**Verify:** `editing.rs` test: register a Lua user command that calls
-`vim.cmd` of itself, invoke it, assert the server stays responsive (a
-subsequent `nvim_input`/`nvim_buf_get_lines` still returns) and the error is
-echoed.
+**Test (verified fail-before / pass-after):** registers a user command
+`Loop` whose callback runs `vim.cmd('Loop')`, triggers `:Loop<CR>` wrapped in a
+5s timeout. Pre-fix the request never returns (server spins) → timeout → fail;
+post-fix it returns with the E132 message and a follow-up edit
+(`ihi<Esc>` → `nvim_buf_get_lines`) still works, proving the loop stays
+responsive.
 
 ## R3. TUI does not restore mouse mode on panic ("bricks the terminal")
 **File:** `crates/nxvim-tui/src/lib.rs:46-54` (`run`)

@@ -1012,6 +1012,46 @@ async fn unknown_command_still_reports_the_standard_error() {
 }
 
 #[tokio::test]
+async fn recursive_user_command_does_not_wedge_the_server() {
+    // A user command whose callback re-invokes itself feeds run_pending's
+    // fixpoint loop forever: each round runs the Lua callback, which queues the
+    // command again. The server must cap the recursion, report it, and stay
+    // responsive — not spin and wedge the single-threaded loop.
+    let dir = temp_dir("recurse");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_user_command('Loop', function() vim.cmd('Loop') end, {})\n",
+    )
+    .await;
+
+    // Before the fix this never returns (the server thread spins in
+    // run_pending), so the whole exchange must complete within a timeout.
+    let map = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        redraw_after(&rpc, &mut incoming, ":Loop<CR>"),
+    )
+    .await
+    .expect("recursive command wedged the server: run_pending never converged");
+
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E132: command recursion limit exceeded"),
+        "self-recursive command should be capped with an error, not loop forever"
+    );
+
+    // The server is still alive and processing input after bailing out.
+    feed(&rpc, "ihi<Esc>");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), lines(&rpc))
+        .await
+        .expect("server unresponsive after capping recursion");
+    assert_eq!(
+        got,
+        vec!["hi".to_string()],
+        "editing should work normally once the runaway command is stopped"
+    );
+}
+
+#[tokio::test]
 async fn colorscheme_style_plugin_load_runs_clean() {
     // A miniature plugin mimicking catppuccin's shape: setup() merges config,
     // load() sets options/globals and fires nvim_set_hl (incl. a link), and it

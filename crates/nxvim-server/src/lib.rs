@@ -403,6 +403,14 @@ impl Server {
     /// Both queues feed each other — a user command can `vim.cmd(...)`, a `:lua`
     /// can define a command — so a single fixpoint loop covers them.
     fn run_pending(&mut self) {
+        // Cap on fixpoint rounds before we conclude the queued work is
+        // self-perpetuating — a command or `on_select` callback that re-queues
+        // itself every round (e.g. a user command whose body re-runs the same
+        // command). Without this the single-threaded server spins forever and
+        // stops servicing input. Generous enough that any legitimate finite
+        // chain converges first; mirrors neovim's `maxfuncdepth` recursion guard.
+        const MAX_ROUNDS: usize = 100;
+        let mut rounds = 0;
         loop {
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 if let Err(e) = self.lua.exec(&chunk) {
@@ -434,6 +442,17 @@ impl Server {
                 && self.editor.deferred_commands.is_empty()
                 && self.editor.panel_selects.is_empty()
             {
+                break;
+            }
+            rounds += 1;
+            if rounds >= MAX_ROUNDS {
+                // Drop the still-growing work and report it, rather than loop
+                // forever. The editor stays responsive to the next message.
+                self.editor.lua_queue.clear();
+                self.editor.deferred_commands.clear();
+                self.editor.panel_selects.clear();
+                self.editor
+                    .echo("E132: command recursion limit exceeded".to_string());
                 break;
             }
         }

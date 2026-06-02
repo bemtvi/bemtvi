@@ -260,27 +260,46 @@ new-file-buffer path inside `from_file`.
 fiddling), asserts `nvim_buf_get_name(0)` equals the path (pre-fix it was `""`)
 and that the startup message names the file.
 
-## R5. TS worker supervision — three weaknesses
+## R5. TS worker supervision — three weaknesses ✅ DONE
 **File:** `crates/nxvim-server/src/syntax.rs`
 **Severity:** Medium.
+**Status:** Implemented. Test:
+`crates/nxvim/tests/syntax.rs::an_unspawnable_worker_disables_syntax_instead_of_looping_forever`.
 
 1. **Breaker resets too eagerly** (`:236-238`): on hitting `MAX_CRASHES`, it
-   sleeps `COOLDOWN` then `crashes.clear()`. A permanently-poison grammar
-   respawns ~3×/30s forever. **Fix:** escalating backoff (double the cooldown
-   each trip) or a hard cap after which syntax stays down until the next
-   buffer/language change.
-2. **Spawn failures have no breaker** (`:176-189`): if `spawn()` keeps failing
-   (binary missing, fork limit) the loop retries every 1s forever and emits no
-   event, so the server never learns syntax is unavailable. **Fix:** apply the
-   same breaker/backoff to spawn failures; emit a one-time "syntax unavailable"
-   event. Note `current_exe()` falling back to bare `"nxvim"` (`:70`) compounds
-   this when nxvim isn't on `$PATH`.
+   slept `COOLDOWN` then `crashes.clear()`. A permanently-poison grammar
+   respawned ~3×/30s forever.
+2. **Spawn failures have no breaker** (`:176-189`): if `spawn()` kept failing
+   (binary missing, fork limit) the loop retried every 1s forever and emitted no
+   event, so the server never learned syntax was unavailable.
 3. **Child not reaped deterministically** (`:222`): `let _ = child.start_kill()`
-   sends SIGKILL but never `await child.wait()`; reaping relies on
-   `kill_on_drop` + drop timing. **Fix:** add `let _ = child.wait().await;`
-   after `start_kill()`. Also prefer `continue` over `return` when stdin/stdout
-   pipes are unexpectedly `None` (`:187-189`) so syntax isn't permanently
-   disabled.
+   sent SIGKILL but never `await child.wait()`; reaping relied on `kill_on_drop`
+   + drop timing. Missing stdio pipes `return`ed, permanently killing
+   supervision.
+
+**Fix applied:** The supervisor now drives one worker lifetime through
+`run_worker_once` and feeds *every* failure — spawn error, missing stdio pipe,
+or crash of a live child — into a single breaker over a sliding `WINDOW`
+(`10s`):
+- **(1, 2)** Escalating backoff (`200ms` doubling per windowed failure, capped at
+  `5s`) replaces the eager `clear()`; once failures within the window reach
+  `GIVE_UP = 5`, the supervisor emits a new one-shot `SyntaxEvent::Disabled`,
+  stops respawning, and idles draining commands (so the client's `send`s never
+  error) until the server exits. The server turns `Disabled` into a single
+  user-facing echo ("treesitter: syntax worker unavailable, highlighting
+  disabled"). Spawn failures flow through the same path, so a missing binary is
+  now bounded and surfaced instead of retried forever.
+- **(3)** `run_worker_once` always reaps with `start_kill()` **then**
+  `child.wait().await` (deterministic, no zombie/`kill_on_drop` reliance), and a
+  missing stdio pipe now returns a *failure* (→ breaker retry) instead of
+  `return`ing out of supervision.
+
+**Test (verified fail-before / pass-after):** points `NXVIM_TS_WORKER` at a
+non-existent binary (saved/restored under the suite lock), opens a `.rs` buffer,
+and polls redraws for the "highlighting disabled" message. Pre-fix (spawn
+failures retry forever, no event) the message never arrives and the test times
+out (~10s); post-fix the breaker gives up after ~3s of escalating backoff and
+the message surfaces.
 
 ## R6. RPC task death leaks peer task and hangs pending requests
 **File:** `crates/nxvim-rpc/src/lib.rs:103-104` (`connect`), `:119-124`

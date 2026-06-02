@@ -39,6 +39,11 @@ pub enum SyntaxEvent {
     /// A fresh worker process came up (initial spawn or a respawn). The server
     /// must re-`open` its buffers from full text.
     Restarted,
+    /// The supervisor gave up: the worker failed to spawn or kept crashing past
+    /// the breaker's limit, so syntax is permanently down for this server's life.
+    /// Sent once so the server can tell the user instead of leaving buffers
+    /// silently un-highlighted.
+    Disabled,
     /// A notification from the worker (`ts_highlights` / `ts_error`).
     Notification { method: String, params: Vec<Value> },
 }
@@ -156,90 +161,127 @@ fn kv_u64(key: &'static str, value: u64) -> (Value, Value) {
 
 /// Supervise the worker process for the life of the server: spawn it, pump
 /// commands to it and notifications back, and respawn it whenever it dies. A
-/// circuit breaker stops a crash-loop (a poison grammar) from burning CPU.
+/// circuit breaker stops a crash-loop (a poison grammar) — or a missing/broken
+/// worker binary that won't even spawn — from burning CPU forever.
 async fn supervise(
     program: PathBuf,
     mut cmd_rx: UnboundedReceiver<Cmd>,
     event_tx: UnboundedSender<SyntaxEvent>,
 ) {
-    // Recent restart timestamps, for the breaker.
-    let mut crashes: VecDeque<Instant> = VecDeque::new();
+    // Recent *failure* timestamps drive the breaker. A failure is a spawn error,
+    // a missing stdio pipe, or a crash of a live child — all the ways a worker
+    // lifetime can end other than the server shutting down.
+    let mut failures: VecDeque<Instant> = VecDeque::new();
     const WINDOW: Duration = Duration::from_secs(10);
-    const MAX_CRASHES: usize = 3;
-    const COOLDOWN: Duration = Duration::from_secs(30);
+    // Failures within `WINDOW` past this count mean the worker is persistently
+    // broken (a poison grammar or a missing binary): give up rather than respawn
+    // forever. Backoff between respawns escalates with the windowed failure
+    // count, so even below the give-up line we never hammer.
+    const GIVE_UP: usize = 5;
+    const BASE_BACKOFF: Duration = Duration::from_millis(200);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
     // The initial spawn needs no re-open: the server's first sync already sends
     // `ts_open` (buffered until the child connects). Only *re*-spawns must ask the
     // server to re-open, so the first full-text send isn't done twice.
     let mut first_spawn = true;
 
     loop {
-        let mut child = match spawn(&program) {
-            Ok(c) => c,
-            Err(_) => {
-                // Couldn't even spawn; wait and retry (server may be shutting down).
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if cmd_rx.is_closed() {
-                    return;
-                }
-                continue;
-            }
-        };
-        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
-            return;
-        };
-        let (rpc, mut incoming) = connect(stdout, stdin);
-
-        // A *re*-spawned process has no buffers; ask the server to re-open. The
-        // very first spawn is already covered by the server's initial sync.
-        if !first_spawn && event_tx.send(SyntaxEvent::Restarted).is_err() {
+        // Run one worker lifetime. `true` ⇒ the server is shutting down (clean
+        // exit); `false` ⇒ a worker failure that should trip the breaker.
+        if run_worker_once(&program, &mut cmd_rx, &event_tx, &mut first_spawn).await {
             return;
         }
-        first_spawn = false;
-
-        // Pump until the child dies or the server drops its command sender.
-        let server_gone = loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => match cmd {
-                    Some(cmd) => rpc.notify(cmd.method, cmd.params),
-                    None => break true, // server shutting down
-                },
-                msg = incoming.recv() => match msg {
-                    Some(Incoming::Notification { method, params }) => {
-                        if event_tx.send(SyntaxEvent::Notification { method, params }).is_err() {
-                            break true;
-                        }
-                    }
-                    Some(_) => {}
-                    None => break false, // child closed its pipe (died)
-                },
-                status = child.wait() => {
-                    let _ = status; // child exited (e.g. segfault/abort)
-                    break false;
-                }
-            }
-        };
-        // Best-effort reap so we don't leak a zombie.
-        let _ = child.start_kill();
-        if server_gone || cmd_rx.is_closed() {
+        if cmd_rx.is_closed() {
             return;
         }
 
-        // Circuit breaker: back off, and cool down hard on a crash storm.
+        // Breaker: record the failure and age out anything older than the window.
         let now = Instant::now();
-        crashes.push_back(now);
-        while crashes
+        failures.push_back(now);
+        while failures
             .front()
             .is_some_and(|t| now.duration_since(*t) > WINDOW)
         {
-            crashes.pop_front();
+            failures.pop_front();
         }
-        if crashes.len() >= MAX_CRASHES {
-            tokio::time::sleep(COOLDOWN).await;
-            crashes.clear();
-        } else {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+
+        if failures.len() >= GIVE_UP {
+            // Persistent failure. Stop respawning, tell the server once so it can
+            // surface "syntax unavailable", then idle — still draining commands so
+            // the client's `send`s never error — until the server shuts down.
+            // Syntax comes back on the next server start.
+            let _ = event_tx.send(SyntaxEvent::Disabled);
+            while cmd_rx.recv().await.is_some() {}
+            return;
         }
+
+        // Escalating backoff: 200ms, 400, 800, … doubling with the windowed
+        // failure count, capped, so a healthy worker (window long since drained)
+        // restarts promptly while a flapping one is throttled.
+        let backoff = (BASE_BACKOFF * (1u32 << (failures.len() - 1))).min(MAX_BACKOFF);
+        tokio::time::sleep(backoff).await;
     }
+}
+
+/// One worker lifetime: spawn, pump commands/notifications until the child dies
+/// or the server drops its command sender, then reap. Returns `true` only when
+/// the *server* is shutting down (a clean exit); every worker-side failure —
+/// spawn error, missing stdio pipe, crash — returns `false` so the supervisor's
+/// breaker decides whether to respawn.
+async fn run_worker_once(
+    program: &PathBuf,
+    cmd_rx: &mut UnboundedReceiver<Cmd>,
+    event_tx: &UnboundedSender<SyntaxEvent>,
+    first_spawn: &mut bool,
+) -> bool {
+    let mut child = match spawn(program) {
+        Ok(c) => c,
+        Err(_) => return false, // couldn't spawn → breaker
+    };
+    let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+        // Pipes unexpectedly missing: reap and treat as a failure so the breaker
+        // retries, rather than permanently disabling syntax.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return false;
+    };
+    let (rpc, mut incoming) = connect(stdout, stdin);
+
+    // A *re*-spawned process has no buffers; ask the server to re-open. The very
+    // first spawn is already covered by the server's initial sync.
+    if !*first_spawn && event_tx.send(SyntaxEvent::Restarted).is_err() {
+        return true; // server gone
+    }
+    *first_spawn = false;
+
+    let server_gone = loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(cmd) => rpc.notify(cmd.method, cmd.params),
+                None => break true, // server shutting down
+            },
+            msg = incoming.recv() => match msg {
+                Some(Incoming::Notification { method, params }) => {
+                    if event_tx.send(SyntaxEvent::Notification { method, params }).is_err() {
+                        break true;
+                    }
+                }
+                Some(_) => {}
+                None => break false, // child closed its pipe (died)
+            },
+            status = child.wait() => {
+                let _ = status; // child exited (e.g. segfault/abort)
+                break false;
+            }
+        }
+    };
+
+    // Deterministic reap: SIGKILL then await the exit, so we don't leak a zombie
+    // or depend on `kill_on_drop` timing.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    server_gone
 }
 
 fn spawn(program: &PathBuf) -> std::io::Result<tokio::process::Child> {

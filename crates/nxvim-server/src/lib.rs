@@ -692,6 +692,13 @@ impl Server {
                 self.syntax_states.clear();
                 self.redraw();
             }
+            SyntaxEvent::Disabled => {
+                // The supervisor gave up (worker won't spawn or keeps crashing).
+                // Tell the user once — buffers stay editable, just un-highlighted.
+                self.editor
+                    .echo("treesitter: syntax worker unavailable, highlighting disabled");
+                self.redraw();
+            }
             // `ts_highlights` updates the cache; any other notification (e.g.
             // `ts_error` — a grammar that wouldn't load/parse) is ignored, so the
             // buffer simply stays un-highlighted and editing is unaffected.

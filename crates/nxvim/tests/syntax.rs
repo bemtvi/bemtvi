@@ -265,6 +265,18 @@ async fn wait_for_highlights(
     highlights_of(&params)
 }
 
+/// The `message` line from a redraw map (empty if absent).
+fn message_of(params: &[Value]) -> String {
+    let Some(Value::Map(map)) = params.first() else {
+        return String::new();
+    };
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some("message"))
+        .and_then(|(_, v)| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Write `content` to a fresh temp `.rs` file and return its path as a string.
 fn temp_rs(name: &str, content: &str) -> String {
     let path = std::env::temp_dir().join(format!("nxvim-ts-{}-{}.rs", std::process::id(), name));
@@ -853,4 +865,50 @@ async fn bdelete_sends_ts_close_to_the_worker() {
     std::env::remove_var("NXVIM_TS_RECORD");
     let _ = std::fs::remove_file(&record);
     assert!(closed, "expected a ts_close for the deleted buffer");
+}
+
+#[tokio::test]
+async fn an_unspawnable_worker_disables_syntax_instead_of_looping_forever() {
+    // R5: a worker binary that can't be spawned (here, a path that doesn't exist)
+    // must not retry forever in silence. The supervisor's breaker gives up after
+    // a few failures and the server tells the user once. Before the fix, spawn
+    // failures had no breaker and emitted no event — the loop retried every 1s
+    // forever and the buffer stayed silently un-highlighted.
+    let _guard = test_lock().lock().await;
+
+    // Point the worker env at a non-existent binary just for this test, restoring
+    // it after so the sibling tests (which expect the real nxvim worker) are
+    // unaffected. The lock guarantees no other test runs while it's swapped.
+    let saved = std::env::var_os("NXVIM_TS_WORKER");
+    let bogus = std::env::temp_dir().join("nxvim-no-such-worker-binary");
+    std::env::set_var("NXVIM_TS_WORKER", &bogus);
+
+    let file = temp_rs("nospawn", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Poll redraws until the "syntax worker unavailable" message surfaces. The
+    // breaker gives up after ~5 escalating-backoff failures (~3s), so a generous
+    // bound here is plenty.
+    let mut disabled = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if message_of(&params).contains("highlighting disabled") {
+                disabled = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    match saved {
+        Some(v) => std::env::set_var("NXVIM_TS_WORKER", v),
+        None => std::env::remove_var("NXVIM_TS_WORKER"),
+    }
+
+    assert!(
+        disabled,
+        "an unspawnable worker should disable syntax and message the user, not retry forever"
+    );
 }

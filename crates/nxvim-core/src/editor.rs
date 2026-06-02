@@ -472,6 +472,10 @@ pub struct Editor {
     operator: Option<char>,
     gpending: bool,
     pending_replace: bool,
+    /// Set to `'i'` or `'a'` after a text-object introducer is seen while an
+    /// operator is pending or in visual mode; the next key is the object kind
+    /// (`w`, `(`, `{`, …). See `resolve` of the text object in `handle_normal`.
+    pending_textobject: Option<char>,
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
@@ -567,6 +571,7 @@ impl Editor {
             operator: None,
             gpending: false,
             pending_replace: false,
+            pending_textobject: None,
             snapshot_taken: false,
             visual_anchor: Cursor::default(),
             scroll_from: None,
@@ -906,9 +911,30 @@ impl Editor {
             self.count = None;
             self.op_count = None;
             self.gpending = false;
+            self.pending_textobject = None;
             if self.mode.is_visual() {
                 self.mode = Mode::Normal;
                 self.clamp_cursor();
+            }
+            return;
+        }
+
+        // Second key of a text object (`iw`, `aw`, `i(`, `a{`, …). The first
+        // key armed `pending_textobject`; this key names the object kind.
+        if let Some(ia) = self.pending_textobject.take() {
+            let count = self.effective_count();
+            if let Some(obj) = key.as_char() {
+                if let Some((lo, hi, linewise)) = self.text_object_range(ia, obj, count) {
+                    self.apply_text_object(lo, hi, linewise);
+                    return;
+                }
+            }
+            // Unknown object char cancels, like vim. In visual mode the
+            // selection survives; in operator-pending the operator is dropped.
+            if self.mode.is_visual() {
+                self.gpending = false;
+            } else {
+                self.reset_pending();
             }
             return;
         }
@@ -926,6 +952,17 @@ impl Editor {
         if !self.gpending {
             if let Some('g') = key.as_char() {
                 self.gpending = true;
+                return;
+            }
+        }
+
+        // `i`/`a` introduce a text object when an operator is pending or we're
+        // in visual mode. (In plain normal mode they stay insert/append, so
+        // this only fires in those two contexts.) The object kind follows on
+        // the next key, handled by the `pending_textobject` block above.
+        if self.operator.is_some() || self.mode.is_visual() {
+            if let Some(c @ ('i' | 'a')) = key.as_char() {
+                self.pending_textobject = Some(c);
                 return;
             }
         }
@@ -1311,6 +1348,520 @@ impl Editor {
         idx
     }
 
+    // ----- text objects -----------------------------------------------------
+
+    /// Resolve the absolute charwise byte range `[start, end)` for a text
+    /// object. `ia` is `'i'` (inner) or `'a'` (a/around); `obj` is the object
+    /// key. Returns `None` for an unknown object key or when no object exists
+    /// at the cursor.
+    fn text_object_range(&self, ia: char, obj: char, count: usize) -> Option<(usize, usize, bool)> {
+        // Charwise objects return `(lo, hi)`; tag them `false` here.
+        let charwise = |r: Option<(usize, usize)>| r.map(|(lo, hi)| (lo, hi, false));
+        match obj {
+            'w' => charwise(self.word_object(ia, count, false)),
+            'W' => charwise(self.word_object(ia, count, true)),
+            '(' | ')' | 'b' => self.pair_object(ia, '(', ')'),
+            '{' | '}' | 'B' => self.pair_object(ia, '{', '}'),
+            '[' | ']' => self.pair_object(ia, '[', ']'),
+            '<' | '>' => self.pair_object(ia, '<', '>'),
+            '"' | '\'' | '`' => charwise(self.quote_object(ia, obj)),
+            's' => charwise(self.sentence_object(ia, count)),
+            'p' => self.paragraph_object(ia, count), // linewise
+            _ => None,
+        }
+    }
+
+    /// Apply the pending operator (or extend the visual selection) to a text
+    /// object's range `[lo, hi)`. `linewise` objects (paragraph) select whole
+    /// lines; charwise objects span an exact byte range.
+    fn apply_text_object(&mut self, lo: usize, hi: usize, linewise: bool) {
+        if self.mode.is_visual() {
+            if linewise {
+                self.mode = Mode::VisualLine;
+                self.set_visual_span_lines(lo, hi);
+            } else {
+                // A linewise-visual charwise object (e.g. `viw`) drops to
+                // charwise, like vim.
+                if self.mode == Mode::VisualLine {
+                    self.mode = Mode::Visual;
+                }
+                self.set_visual_span(lo, hi);
+            }
+            self.gpending = false;
+            return;
+        }
+        if let Some(op) = self.operator.take() {
+            if linewise {
+                let first_line = self.buffer().byte_to_line(lo);
+                self.apply_operator_to_range(op, lo, hi, true, first_line);
+            } else {
+                self.apply_operator_to_range(op, lo, hi, false, 0);
+            }
+        }
+        self.reset_pending();
+    }
+
+    /// Set a linewise visual selection spanning the lines covered by the
+    /// byte range `[lo, hi)` (with `hi` a line-start boundary just past the
+    /// last line). Anchor on the first line, cursor on the last.
+    fn set_visual_span_lines(&mut self, lo: usize, hi: usize) {
+        let first = self.buffer().byte_to_line(lo);
+        let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+        self.visual_anchor = Cursor {
+            line: first,
+            col: 0,
+        };
+        self.cursor = Cursor { line: last, col: 0 };
+        self.clamp_cursor();
+    }
+
+    /// Set the visual selection to span `[lo, hi)`: anchor at the first char,
+    /// live cursor on the last char (inclusive). Empty ranges park both at `lo`.
+    fn set_visual_span(&mut self, lo: usize, hi: usize) {
+        self.set_cursor_char(lo);
+        self.visual_anchor = self.cursor;
+        let end = if hi > lo {
+            self.prev_grapheme_idx(hi)
+        } else {
+            lo
+        };
+        self.set_cursor_char(end);
+    }
+
+    /// Classify the char at `idx` for span-finding. `big = false` uses the
+    /// three-way `char_class` (`0` blank, `1` word, `2` punct); `big = true`
+    /// collapses to blank (`0`) vs non-blank (`1`) — vim's `WORD`.
+    fn span_class(&self, idx: usize, big: bool) -> u8 {
+        match char_class(self.char_at(idx)) {
+            CharClass::Blank => 0,
+            CharClass::Word => 1,
+            CharClass::Punct => {
+                if big {
+                    1
+                } else {
+                    2
+                }
+            }
+        }
+    }
+
+    /// `[start, end)` of the maximal run around `idx` of chars sharing its
+    /// `span_class`. Buffer-wide; `end` never passes the trailing phantom `\n`.
+    fn class_span(&self, idx: usize, big: bool) -> (usize, usize) {
+        let last = self.last_char_idx();
+        let idx = idx.min(last);
+        let cls = self.span_class(idx, big);
+        let mut start = idx;
+        while start > 0 {
+            let prev = self.prev_grapheme_idx(start);
+            if self.span_class(prev, big) != cls {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = idx;
+        while end < last && self.span_class(end, big) == cls {
+            end = self.next_grapheme_idx(end);
+        }
+        (start, end)
+    }
+
+    /// `iw`/`aw` (`big = false`) and `iW`/`aW` (`big = true`). `iw` is the run
+    /// under the cursor; `aw` adds the trailing whitespace (or, if there is
+    /// none, the leading whitespace). `count` extends over successive spans.
+    fn word_object(&self, ia: char, count: usize, big: bool) -> Option<(usize, usize)> {
+        let last = self.last_char_idx();
+        let cur = self.cursor_char();
+        let (start, end0) = self.class_span(cur, big);
+
+        if ia == 'i' {
+            let mut end = end0;
+            let mut remaining = count.saturating_sub(1);
+            while remaining > 0 && end < last {
+                let (_, e2) = self.class_span(end, big);
+                if e2 == end {
+                    break;
+                }
+                end = e2;
+                remaining -= 1;
+            }
+            return Some((start, end));
+        }
+
+        // `aw`: span plus surrounding whitespace.
+        let mut start = start;
+        let mut end = end0;
+        let mut took_trailing = false;
+        let mut units = count;
+
+        // Starting on whitespace: the first unit is the blank run plus the
+        // following word.
+        if self.span_class(cur, big) == 0 {
+            if end < last {
+                let (_, e2) = self.class_span(end, big);
+                end = e2;
+            }
+            took_trailing = true; // leading whitespace already covered
+            units = units.saturating_sub(1);
+        }
+
+        while units > 0 {
+            // Trailing whitespace after the current word.
+            if end < last && self.span_class(end, big) == 0 {
+                let (_, e2) = self.class_span(end, big);
+                end = e2;
+                took_trailing = true;
+            } else {
+                took_trailing = false;
+            }
+            units -= 1;
+            // Another word follows for a further count.
+            if units > 0 && end < last {
+                let (_, e2) = self.class_span(end, big);
+                end = e2;
+            }
+        }
+
+        // No trailing whitespace was consumed: take the leading whitespace.
+        if !took_trailing && start > 0 {
+            let prev = self.prev_grapheme_idx(start);
+            if self.span_class(prev, big) == 0 {
+                let (s2, _) = self.class_span(prev, big);
+                start = s2;
+            }
+        }
+        Some((start, end))
+    }
+
+    /// `i(`/`a(` and friends. Find the innermost `open`/`close` pair enclosing
+    /// the cursor; `i` excludes the brackets, `a` includes them. The bool is
+    /// the linewise flag (see the inner promotion below).
+    fn pair_object(&self, ia: char, open: char, close: char) -> Option<(usize, usize, bool)> {
+        let open_idx = self.find_unmatched_open(open, close, self.cursor_char())?;
+        let close_idx = self.find_match_close(open, close, open_idx)?;
+
+        if ia == 'i' {
+            // Linewise promotion: when the inner content is whole lines — the
+            // open bracket ends its line and the close bracket starts its line
+            // (modulo surrounding whitespace) — `i{`/`i(`/… select the lines
+            // *between* the brackets, linewise, leaving the bracket lines. vim
+            // keeps the object charwise in visual mode, so skip it there.
+            let open_line = self.buffer().byte_to_line(open_idx);
+            let close_line = self.buffer().byte_to_line(close_idx);
+            if !self.mode.is_visual()
+                && close_line > open_line
+                && self.rest_of_line_blank(open_idx)
+                && self.start_of_line_blank(close_idx)
+            {
+                let lo = self.buffer().line_start(open_line + 1);
+                let hi = self.buffer().line_start(close_line);
+                return Some((lo, hi, true));
+            }
+            return Some((self.next_grapheme_idx(open_idx), close_idx, false));
+        }
+        Some((open_idx, self.next_grapheme_idx(close_idx), false))
+    }
+
+    /// True if everything after byte `idx` to the end of its line is blank.
+    fn rest_of_line_blank(&self, idx: usize) -> bool {
+        let line = self.buffer().byte_to_line(idx);
+        let end = self.buffer().line_start(line) + self.buffer().line_len(line);
+        let mut i = self.next_grapheme_idx(idx);
+        while i < end {
+            if !matches!(self.char_at(i), ' ' | '\t') {
+                return false;
+            }
+            i = self.next_grapheme_idx(i);
+        }
+        true
+    }
+
+    /// True if everything before byte `idx` from its line start is blank.
+    fn start_of_line_blank(&self, idx: usize) -> bool {
+        let mut i = self.buffer().line_start(self.buffer().byte_to_line(idx));
+        while i < idx {
+            if !matches!(self.char_at(i), ' ' | '\t') {
+                return false;
+            }
+            i = self.next_grapheme_idx(i);
+        }
+        true
+    }
+
+    /// Scan backward from `from` (inclusive) for the `open` bracket that
+    /// encloses it, honoring nesting. A `close` on `from` itself is the closing
+    /// half of the wanted pair, so it is not counted.
+    fn find_unmatched_open(&self, open: char, close: char, from: usize) -> Option<usize> {
+        let mut idx = from;
+        let mut depth = 0i32;
+        loop {
+            let c = self.char_at(idx);
+            if c == close && idx != from {
+                depth += 1;
+            } else if c == open {
+                if depth == 0 {
+                    return Some(idx);
+                }
+                depth -= 1;
+            }
+            if idx == 0 {
+                return None;
+            }
+            idx = self.prev_grapheme_idx(idx);
+        }
+    }
+
+    /// Scan forward from `open_idx` for its matching `close`, honoring nesting.
+    fn find_match_close(&self, open: char, close: char, open_idx: usize) -> Option<usize> {
+        let last = self.last_char_idx();
+        let mut idx = open_idx;
+        let mut depth = 0i32;
+        loop {
+            let c = self.char_at(idx);
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            if idx >= last {
+                return None;
+            }
+            idx = self.next_grapheme_idx(idx);
+        }
+    }
+
+    /// `i"`/`a"` (and `'`, `` ` ``). Quote objects are confined to the cursor's
+    /// line: quotes are paired left-to-right (1st–2nd, 3rd–4th, …) and the pair
+    /// chosen is the one enclosing the cursor, else the first pair beginning at
+    /// or after it. `i"` is the text between the quotes; `a"` includes the
+    /// quotes plus the trailing whitespace (or, if none, the leading).
+    ///
+    /// A backslash escapes the following byte (vim's `quoteescape`), so `\"` is
+    /// not a delimiter and `\\` is a literal backslash followed by a real quote.
+    fn quote_object(&self, ia: char, quote: char) -> Option<(usize, usize)> {
+        let line = self.cursor.line;
+        let base = self.buffer().line_start(line);
+        let s = self.buffer().line(line);
+        let bytes = s.as_bytes();
+        let q = quote as u8;
+
+        // Quote positions on the line, paired in order. A `\` consumes the next
+        // byte, so escaped quotes are skipped (and `\\` leaves the quote real).
+        let mut quotes: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quotes.push(i);
+            }
+            i += 1;
+        }
+        let cursor_rel = self.cursor_char() - base;
+
+        // First left-to-right pair whose closing quote is at or after the
+        // cursor: it either encloses the cursor or is the next one ahead.
+        let (open, close) = quotes
+            .chunks_exact(2)
+            .map(|p| (p[0], p[1]))
+            .find(|&(_, c)| cursor_rel <= c)
+            // Dangling-quote fallback (odd quote count, e.g. `"trib"uto"`): the
+            // cursor is past the last complete pair but flanked by quotes, so
+            // pair the quote before it with the next one. This lets `i"`/`a"`
+            // work on both sides of a shared quote. (`"a" "b"`-style gaps still
+            // hit the normal path above and seek forward to the next string.)
+            .or_else(|| {
+                let l = *quotes.iter().rev().find(|&&p| p < cursor_rel)?;
+                let r = *quotes.iter().find(|&&p| p >= cursor_rel)?;
+                Some((l, r))
+            })?;
+
+        let (lo_rel, hi_rel) = match ia {
+            'i' => (open + 1, close),
+            _ => {
+                // `a"`: include the quotes, then the trailing whitespace.
+                let is_blank = |i: usize| bytes[i] == b' ' || bytes[i] == b'\t';
+                let mut hi = close + 1;
+                let trail_start = hi;
+                while hi < bytes.len() && is_blank(hi) {
+                    hi += 1;
+                }
+                if hi > trail_start {
+                    (open, hi)
+                } else {
+                    // No trailing whitespace: take the leading whitespace.
+                    let mut lo = open;
+                    while lo > 0 && is_blank(lo - 1) {
+                        lo -= 1;
+                    }
+                    (lo, hi)
+                }
+            }
+        };
+        Some((base + lo_rel, base + hi_rel))
+    }
+
+    /// `ip`/`ap` — a paragraph: a run of non-blank lines, or a run of blank
+    /// lines, delimited by the other kind. `ap` adds the trailing blank lines
+    /// (or, if none, the leading blank lines). Linewise; `count` extends over
+    /// successive blocks.
+    fn paragraph_object(&self, ia: char, count: usize) -> Option<(usize, usize, bool)> {
+        let total = self.buffer().line_count();
+        if total == 0 {
+            return None;
+        }
+        let blank = |l: usize| self.buffer().line_len(l) == 0;
+        let cur = self.cursor.line.min(total - 1);
+        let on_blank = blank(cur);
+
+        let mut first = cur;
+        while first > 0 && blank(first - 1) == on_blank {
+            first -= 1;
+        }
+        let mut last = cur;
+        while last + 1 < total && blank(last + 1) == on_blank {
+            last += 1;
+        }
+
+        // `count` extends over further blocks, alternating blank/non-blank.
+        let mut kind = on_blank;
+        for _ in 1..count {
+            if last + 1 >= total {
+                break;
+            }
+            kind = !kind;
+            while last + 1 < total && blank(last + 1) == kind {
+                last += 1;
+            }
+        }
+
+        if ia == 'a' {
+            // Include the trailing block of the opposite kind (blank lines after
+            // a normal paragraph); if there is none, take the preceding one.
+            let trailing = !blank(last);
+            if last + 1 < total && blank(last + 1) == trailing {
+                while last + 1 < total && blank(last + 1) == trailing {
+                    last += 1;
+                }
+            } else {
+                let leading = !blank(first);
+                while first > 0 && blank(first - 1) == leading {
+                    first -= 1;
+                }
+            }
+        }
+
+        let lo = self.buffer().line_start(first);
+        let hi = self.buffer().line_start((last + 1).min(total));
+        Some((lo, hi, true))
+    }
+
+    /// Byte bounds `[start, end)` of the paragraph (block of non-blank lines)
+    /// at the cursor; just the current line if the cursor is on a blank line.
+    fn current_paragraph_bytes(&self) -> (usize, usize) {
+        let total = self.buffer().line_count();
+        if total == 0 {
+            return (0, 0);
+        }
+        let blank = |l: usize| self.buffer().line_len(l) == 0;
+        let cur = self.cursor.line.min(total - 1);
+        let (mut first, mut last) = (cur, cur);
+        if !blank(cur) {
+            while first > 0 && !blank(first - 1) {
+                first -= 1;
+            }
+            while last + 1 < total && !blank(last + 1) {
+                last += 1;
+            }
+        }
+        let start = self.buffer().line_start(first);
+        let end = self.buffer().line_start((last + 1).min(total));
+        (start, end)
+    }
+
+    /// `is`/`as` — a sentence: text ending at `.`/`!`/`?` (optionally followed
+    /// by closing `)]"'`) and a space/tab or end of line. Bounded by the
+    /// surrounding paragraph. `is` is the sentence text; `as` adds the trailing
+    /// whitespace (or, if none, leading). Charwise; `count` extends over
+    /// successive sentences.
+    fn sentence_object(&self, ia: char, count: usize) -> Option<(usize, usize)> {
+        let (p_start, p_end) = self.current_paragraph_bytes();
+        if p_start >= p_end {
+            return None;
+        }
+        let is_ws = |c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r';
+        let is_close = |c: char| matches!(c, ')' | ']' | '"' | '\'');
+
+        // Each sentence as `(start, text_end, ws_end)`.
+        let mut segs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut s = p_start;
+        while s < p_end && is_ws(self.char_at(s)) {
+            s = self.next_grapheme_idx(s);
+        }
+        let mut i = s;
+        while i < p_end {
+            let c = self.char_at(i);
+            if c == '.' || c == '!' || c == '?' {
+                let mut j = self.next_grapheme_idx(i);
+                while j < p_end && is_close(self.char_at(j)) {
+                    j = self.next_grapheme_idx(j);
+                }
+                if j >= p_end || is_ws(self.char_at(j)) {
+                    let text_end = j;
+                    let mut k = j;
+                    while k < p_end && is_ws(self.char_at(k)) {
+                        k = self.next_grapheme_idx(k);
+                    }
+                    segs.push((s, text_end, k));
+                    s = k;
+                    i = k;
+                    continue;
+                }
+            }
+            i = self.next_grapheme_idx(i);
+        }
+        // Trailing run with no terminator.
+        if s < p_end {
+            let mut text_end = p_end;
+            while text_end > s && is_ws(self.char_at(self.prev_grapheme_idx(text_end))) {
+                text_end = self.prev_grapheme_idx(text_end);
+            }
+            segs.push((s, text_end, p_end));
+        }
+        if segs.is_empty() {
+            return None;
+        }
+
+        let cursor = self.cursor_char();
+        let mut idx = 0;
+        for (n, &(start, _, _)) in segs.iter().enumerate() {
+            if start <= cursor {
+                idx = n;
+            }
+        }
+        let start = segs[idx].0;
+        let end = (idx + count.max(1) - 1).min(segs.len() - 1);
+        let (_, text_end, ws_end) = segs[end];
+
+        if ia == 'i' {
+            Some((start, text_end))
+        } else if ws_end > text_end {
+            Some((start, ws_end))
+        } else {
+            // No trailing whitespace: take the leading whitespace instead.
+            let mut lo = start;
+            while lo > p_start && is_ws(self.char_at(self.prev_grapheme_idx(lo))) {
+                lo = self.prev_grapheme_idx(lo);
+            }
+            Some((lo, ws_end))
+        }
+    }
+
     // ----- operators --------------------------------------------------------
 
     fn apply_operator(&mut self, op: char, m: MotionResult) {
@@ -1331,6 +1882,21 @@ impl Editor {
                 (lo, hi, true, a)
             }
         };
+        self.apply_operator_to_range(op, lo, hi, linewise, first_line);
+    }
+
+    /// Apply `op` to the absolute byte range `[lo, hi)`. `linewise`/`first_line`
+    /// control linewise settling; charwise callers (motions, text objects) pass
+    /// `(false, 0)`. Unlike `apply_operator`, the range is explicit and need not
+    /// touch the cursor — text objects span both sides of it.
+    fn apply_operator_to_range(
+        &mut self,
+        op: char,
+        lo: usize,
+        hi: usize,
+        linewise: bool,
+        first_line: usize,
+    ) {
         if lo >= hi {
             return;
         }
@@ -3243,6 +3809,7 @@ impl Editor {
         self.operator = None;
         self.gpending = false;
         self.pending_replace = false;
+        self.pending_textobject = None;
     }
 }
 

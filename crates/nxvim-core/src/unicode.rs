@@ -92,3 +92,40 @@ fn grapheme_width(g: &str, col: usize, tabstop: usize) -> usize {
         UnicodeWidthStr::width(g)
     }
 }
+
+/// Number of UTF-16 code units in `line[..byte]` — i.e. the LSP
+/// `Position.character` for the byte offset `byte`, under the protocol's default
+/// UTF-16 position encoding. nxvim columns are byte offsets; this is the
+/// conversion that keeps a position correct the moment a line holds a non-ASCII
+/// character. ASCII is 1:1; a non-BMP scalar value (a surrogate pair) counts as
+/// two units. `byte` is clamped to `line.len()`, and a `byte` landing inside a
+/// multi-byte char counts the whole chars strictly before it (never panics).
+///
+/// UTF-8 is the identity on byte offsets, so the server applies this only when
+/// the negotiated encoding is UTF-16 (Decision 4).
+pub fn byte_to_utf16(line: &str, byte: usize) -> usize {
+    let mut units = 0;
+    for (i, ch) in line.char_indices() {
+        if i >= byte {
+            return units;
+        }
+        units += ch.len_utf16();
+    }
+    units
+}
+
+/// Inverse of [`byte_to_utf16`]: the byte offset `u16_units` UTF-16 code units
+/// into `line` (clamped to `line.len()`). A `u16_units` that would land in the
+/// middle of a surrogate pair snaps to the start of that character's next
+/// boundary's char — i.e. it stops at the first char whose cumulative unit count
+/// reaches the target, so the result is always a char boundary.
+pub fn utf16_to_byte(line: &str, u16_units: usize) -> usize {
+    let mut units = 0;
+    for (i, ch) in line.char_indices() {
+        if units >= u16_units {
+            return i;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
+}

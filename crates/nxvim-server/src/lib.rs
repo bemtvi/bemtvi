@@ -8,16 +8,19 @@
 //! native GUI later) attach over the same RPC channel and are never blocked by
 //! the server's bookkeeping.
 
+mod lsp;
 mod syntax;
 
+use lsp::{LspDocState, ServerRuntime};
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
 use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, PanelView};
+use nxvim_lsp::{LspManager, ServerKey};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syntax::{SyntaxClient, SyntaxEvent};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -130,6 +133,21 @@ struct Server {
     /// once per loop turn so a burst of worker notifications costs one `redraw`,
     /// not one per notification.
     syntax_dirty: bool,
+    /// The in-process LSP client: spawns/supervises N language servers and
+    /// bridges them to the [`LspEvent`] channel the main loop selects on.
+    lsp: LspManager,
+    /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
+    /// analogue).
+    lsp_states: HashMap<BufferId, LspDocState>,
+    /// Negotiated runtime state (encoding, sync kind) per started server, learned
+    /// from each `initialize` reply.
+    lsp_servers: HashMap<ServerKey, ServerRuntime>,
+    /// Server keys already handed to `ensure_server`, so a server is requested
+    /// once rather than on every redraw (the `SyntaxClient::ensure_started` guard).
+    lsp_ensured: HashSet<ServerKey>,
+    /// Set when an LSP event changed something the client should see (e.g. a fresh
+    /// `Initialized` that should trigger a `didOpen`). Coalesced like `syntax_dirty`.
+    lsp_dirty: bool,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -148,6 +166,7 @@ where
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     let (syntax, mut syntax_events) = SyntaxClient::new();
+    let (lsp, mut lsp_events) = LspManager::new();
 
     let mut server = Server {
         editor,
@@ -157,6 +176,11 @@ where
         syntax,
         syntax_states: HashMap::new(),
         syntax_dirty: false,
+        lsp,
+        lsp_states: HashMap::new(),
+        lsp_servers: HashMap::new(),
+        lsp_ensured: HashSet::new(),
+        lsp_dirty: false,
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -189,6 +213,19 @@ where
                     server.on_syntax_event(event);
                 }
                 if std::mem::take(&mut server.syntax_dirty) {
+                    server.redraw();
+                }
+            }
+            // Replies from the language servers (initialize handshakes, published
+            // diagnostics, server exits, log messages). Selecting here keeps the
+            // editor responsive regardless of any server's speed or health.
+            Some(event) = lsp_events.recv() => {
+                server.on_lsp_event(event);
+                // Coalesce a burst into a single repaint, as for syntax events.
+                while let Ok(event) = lsp_events.try_recv() {
+                    server.on_lsp_event(event);
+                }
+                if std::mem::take(&mut server.lsp_dirty) {
                     server.redraw();
                 }
             }
@@ -580,6 +617,8 @@ impl Server {
         // Drive the syntax process from the freshly-settled viewport, then paint
         // with whatever spans it has returned so far (this never blocks on it).
         self.sync_syntax(h);
+        // Drive LSP document sync for the current buffer (also non-blocking).
+        self.sync_lsp();
 
         // Resolve every highlight span and chrome region to a concrete style here
         // on the server (the registry lives in the core). Spans carry an index
@@ -950,7 +989,7 @@ impl StyleTable {
 /// Map a buffer's file extension to a treesitter language name. Unknown
 /// extensions (and paths with none) yield `None` — no highlighting, and no
 /// worker is spawned. This table is the seam where more languages plug in.
-fn filetype_of(path: Option<&std::path::Path>) -> Option<&'static str> {
+pub(crate) fn filetype_of(path: Option<&std::path::Path>) -> Option<&'static str> {
     let ext = path?.extension()?.to_str()?;
     // Test hook (debug builds only): a `.crash` file selects the reserved
     // `__crash` language, whose worker aborts on open — used to verify the editor

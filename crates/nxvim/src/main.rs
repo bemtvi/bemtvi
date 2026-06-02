@@ -14,6 +14,12 @@ use nxvim_server::{run as run_server, ServerInit};
 /// (see `nxvim-ts`). Hidden from users; spawned only by the server.
 const TS_WORKER_FLAG: &str = "--__ts-worker";
 
+/// Internal, debug-only flag that runs this binary as a scripted mock language
+/// server (see `nxvim_lsp::mock`), used by the LSP test suite as a hermetic
+/// stand-in for a real server. Never present in release builds.
+#[cfg(debug_assertions)]
+const LSP_MOCK_FLAG: &str = "--__lsp-mock";
+
 fn main() -> Result<()> {
     // Worker mode: a separate, crash-isolated process that does all tree-sitter
     // parsing and streams highlight spans back over stdio. It never starts an
@@ -23,6 +29,16 @@ fn main() -> Result<()> {
     // the editor instead of silently turning it into a worker.
     if std::env::args().nth(1).as_deref() == Some(TS_WORKER_FLAG) {
         return run_ts_worker();
+    }
+
+    // Mock language server mode (debug builds only): a hermetic, scripted LSP
+    // server the test suite spawns instead of a real one. Like the worker, it
+    // never starts an editor. The script path follows the flag.
+    #[cfg(debug_assertions)]
+    if std::env::args().nth(1).as_deref() == Some(LSP_MOCK_FLAG) {
+        let script = std::env::args().nth(2).unwrap_or_default();
+        nxvim_lsp::mock::run(&script);
+        return Ok(());
     }
 
     // Positional file argument, like `nvim file.txt`.

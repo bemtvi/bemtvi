@@ -8,6 +8,7 @@ members = [
     "crates/nxvim-lua",
     "crates/nxvim-tui",
     "crates/nxvim-ts",
+    "crates/nxvim-lsp",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ nxvim-server = { path = "crates/nxvim-server", default-features = false }
 nxvim-lua = { path = "crates/nxvim-lua", default-features = false }
 nxvim-tui = { path = "crates/nxvim-tui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
+nxvim-lsp = { path = "crates/nxvim-lsp" }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
 # builds. Pre-release lines (ropey 2.0-beta, mlua 0.12-rc) are intentionally
@@ -57,6 +59,23 @@ libloading = "=0.8.9"
 # Dev-only: a real grammar to compile into a test fixture (never linked into the
 # editor — nxvim loads grammars dynamically at runtime).
 tree-sitter-rust = "=0.24.2"
+
+# LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP
+# design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and
+# `$/cancelRequest`; lsp-types is the protocol type vocabulary.
+#
+# `lsp-types` is pinned to the exact version async-lsp 0.2.4 builds against
+# (0.95.1, which still uses `url::Url`); a newer line would resolve to a *second*
+# lsp-types and the types we construct wouldn't match async-lsp's API. Bump both
+# together. `default-features = false` drops async-lsp's `client-monitor`/`stdio`
+# (server-side helpers we don't use), keeping only the omni-trait client API and
+# the tokio integration.
+async-lsp = { version = "=0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
+lsp-types = "=0.95.1"
+serde_json = "=1.0.150"
+# `compat` bridges tokio's child-process pipes to the `futures` AsyncRead/Write
+# that async-lsp's MainLoop drives.
+tokio-util = { version = "=0.7.18", features = ["compat"] }
 
 [profile.release]
 lto = "thin"

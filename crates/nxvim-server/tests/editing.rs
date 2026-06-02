@@ -1994,6 +1994,20 @@ async fn n_and_capital_n_repeat_the_search() {
 }
 
 #[tokio::test]
+async fn greedy_pattern_steps_to_the_next_match_not_into_itself() {
+    // A greedy pattern matches one whole span per line ("foo bar" -> "foo",
+    // "baz foo" -> "baz foo"). Navigation must step between those distinct
+    // matches, not crawl one grapheme deeper into the match under the cursor:
+    // searching from the start of line 1's match lands on line 2, and `n` then
+    // moves to line 3 — never to (1,1) or (2,1) inside the current match.
+    let (rpc, _incoming) = search_fixture().await;
+    feed(&rpc, r"/.+o<CR>");
+    assert_eq!(cursor(&rpc).await, (2, 0));
+    feed(&rpc, "n");
+    assert_eq!(cursor(&rpc).await, (3, 0));
+}
+
+#[tokio::test]
 async fn n_honors_a_count() {
     let (rpc, _incoming) = search_fixture().await;
     // First match is (2,4); `2n` skips ahead two: (3,4) then wrap to (1,0).

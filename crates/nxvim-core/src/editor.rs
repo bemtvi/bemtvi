@@ -1937,9 +1937,12 @@ impl Editor {
         }
     }
 
-    /// The first match of `re` at or after byte `start`, scanning lines downward
-    /// to the end of the buffer, as a whole-buffer `(start, end)` range. `None` if
-    /// no match lies in `[start, end_of_buffer)`.
+    /// The first match of `re` whose start is at or after byte `start`, scanning
+    /// lines downward to the end of the buffer, as a whole-buffer `(start, end)`
+    /// range. Walks each line's non-overlapping match sequence (see
+    /// `SearchRegex::find_from`), so a greedy pattern doesn't yield a match that
+    /// overlaps the one the cursor already sits in. `None` if no match starts in
+    /// `[start, end_of_buffer)`.
     fn match_forward_from(&self, re: &SearchRegex, start: usize) -> Option<MatchRange> {
         let buf = self.buffer();
         let line_count = buf.line_count();
@@ -1947,7 +1950,7 @@ impl Editor {
         let mut col = start.saturating_sub(buf.line_start(line));
         while line < line_count {
             let text = buf.line(line);
-            if let Some((s, e)) = re.find_at(&text, col) {
+            if let Some((s, e)) = re.find_from(&text, col) {
                 let base = buf.line_start(line);
                 return Some((base + s, base + e));
             }

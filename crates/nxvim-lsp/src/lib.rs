@@ -19,6 +19,7 @@
 //! `lsp_types` re-export below is the exact version `async-lsp` builds against,
 //! so the types the server constructs match the client API with no version skew.
 
+mod log;
 mod manager;
 pub mod mock;
 

@@ -251,6 +251,81 @@ impl Server {
         }
     }
 
+    /// Build the `:LspInfo` report: the current buffer's server/encoding/sync/
+    /// version/diagnostics, then every running server and every attached buffer.
+    /// Phase-1 observability while there is no on-screen LSP feature yet.
+    pub(crate) fn lsp_info_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let current = self.editor.current_buffer_id();
+
+        lines.push("Current buffer".to_string());
+        match self.lsp_states.get(&current).filter(|s| s.server.is_some()) {
+            Some(state) => {
+                let key = state.server.as_ref().unwrap();
+                let runtime = self.lsp_servers.get(key);
+                lines.push(format!(
+                    "  server:      {} ({})",
+                    key.language,
+                    key.root.display()
+                ));
+                lines.push(format!(
+                    "  status:      {}",
+                    if !self.lsp_ensured.contains(key) {
+                        "not started"
+                    } else if runtime.is_none() {
+                        "starting (awaiting initialize)"
+                    } else if state.opened {
+                        "attached"
+                    } else {
+                        "initialized (didOpen pending)"
+                    }
+                ));
+                if let Some(runtime) = runtime {
+                    lines.push(format!(
+                        "  encoding:    {}    sync: {}",
+                        encoding_label(runtime.encoding),
+                        sync_label(runtime.sync_kind),
+                    ));
+                }
+                lines.push(format!("  version:     {}", state.version));
+                lines.push(format!("  diagnostics: {}", state.diagnostics.len()));
+            }
+            None => lines.push("  (no language server for this buffer)".to_string()),
+        }
+
+        lines.push(String::new());
+        lines.push("Running servers".to_string());
+        if self.lsp_servers.is_empty() {
+            lines.push("  (none)".to_string());
+        } else {
+            let mut servers: Vec<_> = self.lsp_servers.iter().collect();
+            servers.sort_by_key(|(k, _)| (k.language, k.root.clone()));
+            for (key, runtime) in servers {
+                let attached = self
+                    .lsp_states
+                    .values()
+                    .filter(|s| s.opened && s.server.as_ref() == Some(key))
+                    .count();
+                lines.push(format!(
+                    "  {} @ {} — {}, {}, {attached} buffer(s)",
+                    key.language,
+                    key.root.display(),
+                    encoding_label(runtime.encoding),
+                    sync_label(runtime.sync_kind),
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push(format!(
+            "Log: {}",
+            std::env::var("NXVIM_LSP_LOG_FILE").unwrap_or_else(|_| {
+                "$XDG_STATE_HOME/nxvim/lsp.log (or ~/.local/state/nxvim/lsp.log)".to_string()
+            })
+        ));
+        lines
+    }
+
     /// Convert a batch of journaled byte-delta edits into LSP incremental content
     /// changes, each replacing the edit's old `(start..old_end)` range with its
     /// inserted text, in the server's negotiated position encoding.
@@ -292,6 +367,24 @@ impl Server {
             line: row as u32,
             character: character as u32,
         }
+    }
+}
+
+/// Human label for a negotiated position encoding (matches the LSP wire names).
+fn encoding_label(encoding: PositionEncoding) -> &'static str {
+    match encoding {
+        PositionEncoding::Utf8 => "utf-8",
+        PositionEncoding::Utf16 => "utf-16",
+        PositionEncoding::Utf32 => "utf-32",
+    }
+}
+
+/// Human label for a document-sync kind.
+fn sync_label(kind: TextDocumentSyncKind) -> &'static str {
+    match kind {
+        TextDocumentSyncKind::FULL => "full",
+        TextDocumentSyncKind::INCREMENTAL => "incremental",
+        _ => "none",
     }
 }
 

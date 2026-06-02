@@ -443,6 +443,17 @@ Proven entirely against the mock server, which records what it received.
 >   worker tests live, for the same reason.
 > - **Workspace root** is currently the file's parent directory; root-marker
 >   search (`Cargo.toml`/`.git`) is a later refinement.
+> - **Observability (added for following along before any on-screen feature
+>   exists):** an `:LspInfo` ex-command opens the panel with the current buffer's
+>   server / encoding / sync-kind / version / cached-diagnostics count plus the
+>   list of running servers; and an append-only LSP log at
+>   `$XDG_STATE_HOME/nxvim/lsp.log` (else `~/.local/state/nxvim/lsp.log`) in the
+>   `[LEVEL][UTC ts] server\tmessage` shape, capturing lifecycle, server
+>   `window/logMessage`+`showMessage` at their mapped severity, captured server
+>   **stderr**, and (at DEBUG) outgoing `did*` sync traffic. Level is set by
+>   `$NXVIM_LSP_LOG_LEVEL` (`off`/`error`/`warn`/`info`/`debug`/`trace`, default
+>   `warn`); `$NXVIM_LSP_LOG_FILE` overrides the path. `window/logMessage` goes to
+>   the log only; `window/showMessage` (user-facing) also reaches `:messages`.
 
 **Prerequisites.** None.
 

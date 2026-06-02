@@ -60,7 +60,18 @@ fn configure_mock(tag: &str, extra: Json) -> PathBuf {
         format!("{bin} --__lsp-mock {}", script_path.display()),
     );
     std::env::set_var("NXVIM_TS_WORKER", bin);
+    // Redirect the LSP log to a temp file (never the real state dir) at DEBUG, so
+    // tests are hermetic and the log captures the sync traffic.
+    let log = lsp_log_path(tag);
+    let _ = std::fs::remove_file(&log);
+    std::env::set_var("NXVIM_LSP_LOG_FILE", &log);
+    std::env::set_var("NXVIM_LSP_LOG_LEVEL", "debug");
     record
+}
+
+/// The temp LSP-log path this test's mock writes to (mirrors `configure_mock`).
+fn lsp_log_path(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("nxvim-lsp-log-{}-{tag}.log", std::process::id()))
 }
 
 /// Parse the record file into the `{method, params}` objects the mock appended.
@@ -177,6 +188,67 @@ async fn wait_for_record(rpc: &Rpc, record: &Path, pred: impl Fn(&[Json]) -> boo
     );
 }
 
+/// Drain buffered notifications, returning the most recent `redraw` params.
+fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<Value>> {
+    let mut latest = None;
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "redraw" {
+            latest = Some(params);
+        }
+    }
+    latest
+}
+
+/// The bottom panel's `(title, lines)` from a redraw, if one is open.
+fn panel_of(params: &[Value]) -> Option<(String, Vec<String>)> {
+    let Value::Map(map) = params.first()? else {
+        return None;
+    };
+    let Value::Map(panel) = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("panel"))?
+        .1
+        .clone()
+    else {
+        return None;
+    };
+    let get = |key| {
+        panel
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v)
+    };
+    let title = get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let lines = get("lines")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((title, lines))
+}
+
+/// Poll (bounded) until a panel is open, returning its `(title, lines)`.
+async fn wait_for_panel(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> (String, Vec<String>) {
+    for _ in 0..40 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(panel) = drain_latest_redraw(incoming).and_then(|p| panel_of(&p)) {
+            return panel;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no panel opened within timeout");
+}
+
 /// Write `content` to a fresh temp file with `ext` and return its path string.
 fn temp_file(tag: &str, ext: &str, content: &str) -> String {
     let path = std::env::temp_dir().join(format!("nxvim-lsp-{}-{tag}.{ext}", std::process::id()));
@@ -228,6 +300,17 @@ async fn opening_a_rust_buffer_initializes_and_did_opens() {
     assert_eq!(doc["text"].as_str(), Some(content));
     assert_eq!(doc["languageId"].as_str(), Some("rust"));
     assert_eq!(doc["version"].as_i64(), Some(1));
+
+    // The LSP log got its START banner and (at DEBUG) the outgoing didOpen.
+    let log = std::fs::read_to_string(lsp_log_path("init")).unwrap_or_default();
+    assert!(
+        log.contains("[START]") && log.contains("LSP logging initiated"),
+        "the lsp log should carry a START banner, got:\n{log}"
+    );
+    assert!(
+        log.contains("didOpen"),
+        "the lsp log should record the outgoing didOpen at DEBUG, got:\n{log}"
+    );
 }
 
 #[tokio::test]
@@ -400,4 +483,32 @@ async fn the_editor_survives_a_server_that_exits_after_initialize() {
         ],
         "the editor must apply every keystroke regardless of the dying server"
     );
+}
+
+#[tokio::test]
+async fn lsp_info_reports_the_running_server() {
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "info",
+        serde_json::json!({ "position_encoding": "utf-8", "sync_kind": "incremental" }),
+    );
+    let file = temp_file("info", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    // Attach first (didOpen) so the server is initialized and the buffer attached.
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    rpc.request("nvim_command", vec![Value::from("LspInfo")])
+        .await
+        .expect("LspInfo");
+    let (title, lines) = wait_for_panel(&rpc, &mut incoming).await;
+
+    assert_eq!(title, "LSP info");
+    let body = lines.join("\n");
+    assert!(body.contains("rust"), "names the rust server:\n{body}");
+    assert!(
+        body.contains("utf-8"),
+        "shows the negotiated encoding:\n{body}"
+    );
+    assert!(body.contains("incremental"), "shows the sync kind:\n{body}");
+    assert!(body.contains("attached"), "the buffer is attached:\n{body}");
 }

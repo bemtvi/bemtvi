@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_lsp::router::Router;
@@ -22,14 +23,17 @@ use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, GeneralClientCapabilities,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, PositionEncodingKind,
     ServerCapabilities, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncCapability,
     TextDocumentSyncClientCapabilities, TextDocumentSyncKind, Url, VersionedTextDocumentIdentifier,
 };
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+use crate::log::{LogLevel, LspLog};
 
 /// Identifies one language server instance: a `(language, workspace-root)` pair.
 /// nxvim runs at most one child per key and routes a buffer to its server by it.
@@ -201,6 +205,10 @@ async fn run_supervisor(
     mut cmd_rx: UnboundedReceiver<LspCommand>,
     event_tx: UnboundedSender<LspEvent>,
 ) {
+    // Created here (not in `LspManager::new`) so the log file is opened lazily —
+    // only once a configured filetype is actually opened, never for an
+    // LSP-free session.
+    let log = Arc::new(LspLog::from_env());
     let mut servers: HashMap<ServerKey, UnboundedSender<ServerMsg>> = HashMap::new();
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -213,7 +221,7 @@ async fn run_supervisor(
                 }
                 let (tx, rx) = unbounded_channel();
                 servers.insert(key.clone(), tx);
-                tokio::spawn(run_server(key, spawn, rx, event_tx.clone()));
+                tokio::spawn(run_server(key, spawn, rx, event_tx.clone(), log.clone()));
             }
             LspCommand::Notify { key, note } => {
                 if let Some(tx) = servers.get(&key) {
@@ -237,6 +245,7 @@ async fn run_server(
     spawn: ServerSpawn,
     mut rx: UnboundedReceiver<ServerMsg>,
     event_tx: UnboundedSender<LspEvent>,
+    log: Arc<LspLog>,
 ) {
     // Recent failure timestamps drive the breaker (a window of repeated crashes
     // ⇒ persistently broken: stop respawning).
@@ -247,7 +256,7 @@ async fn run_server(
     const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
     loop {
-        match run_server_once(&key, &spawn, &mut rx, &event_tx).await {
+        match run_server_once(&key, &spawn, &mut rx, &event_tx, &log).await {
             ServerOutcome::Shutdown => return,
             ServerOutcome::Failed => {}
         }
@@ -266,9 +275,11 @@ async fn run_server(
         }
 
         if failures.len() >= GIVE_UP {
+            let message = format!("{} kept failing to start; giving up", spawn.program);
+            log.log(LogLevel::Error, key.language, &message);
             let _ = event_tx.send(LspEvent::Log {
                 key: key.clone(),
-                message: format!("lsp: {} kept failing to start; giving up", spawn.program),
+                message: format!("lsp: {message}"),
             });
             // Idle, still draining commands so the manager's sends never error,
             // until the manager drops us.
@@ -290,21 +301,32 @@ async fn run_server_once(
     spawn: &ServerSpawn,
     rx: &mut UnboundedReceiver<ServerMsg>,
     event_tx: &UnboundedSender<LspEvent>,
+    log: &Arc<LspLog>,
 ) -> ServerOutcome {
+    let name = key.language;
+    log.log(
+        LogLevel::Info,
+        name,
+        &format!("starting {} in {}", spawn.program, key.root.display()),
+    );
     let mut child = match Command::new(&spawn.program)
         .args(&spawn.args)
         .current_dir(&key.root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Captured (not null'd) so the server's stderr — panics, RA_LOG output —
+        // reaches the log; a reader task below drains it so the pipe never blocks.
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {
         Ok(child) => child,
         Err(e) => {
+            let message = format!("failed to spawn {}: {e}", spawn.program);
+            log.log(LogLevel::Error, name, &message);
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
-                message: format!("failed to spawn {}: {e}", spawn.program),
+                message,
             });
             return ServerOutcome::Failed;
         }
@@ -312,17 +334,33 @@ async fn run_server_once(
     let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
         let _ = child.start_kill();
         let _ = child.wait().await;
+        log.log(
+            LogLevel::Error,
+            name,
+            "server stdio pipes unexpectedly missing",
+        );
         let _ = event_tx.send(LspEvent::ServerExited {
             key: key.clone(),
             message: "server stdio pipes unexpectedly missing".to_string(),
         });
         return ServerOutcome::Failed;
     };
+    // Drain the server's stderr into the log, one line at a time, until it closes
+    // (server exit). Each line is logged at WARN so it shows at the default level.
+    if let Some(stderr) = child.stderr.take() {
+        let log = log.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                log.log(LogLevel::Warn, name, &format!("stderr: {line}"));
+            }
+        });
+    }
 
     // `async-lsp`'s `MainLoop` drives the `futures` AsyncRead/Write; bridge the
     // tokio child pipes with tokio-util's compat shims. Input is the child's
     // stdout (server→client), output its stdin (client→server).
-    let (mainloop, mut socket) = new_client(key.clone(), event_tx.clone());
+    let (mainloop, mut socket) = new_client(key.clone(), event_tx.clone(), log.clone());
     let mut mainloop_fut = tokio::spawn(async move {
         mainloop
             .run_buffered(stdout.compat(), stdin.compat_write())
@@ -346,6 +384,7 @@ async fn run_server_once(
         _ = &mut mainloop_fut => {
             let _ = child.start_kill();
             let _ = child.wait().await;
+            log.log(LogLevel::Error, name, "server exited during initialize");
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message: "server exited during initialize".to_string(),
@@ -359,6 +398,7 @@ async fn run_server_once(
             mainloop_fut.abort();
             let _ = child.start_kill();
             let _ = child.wait().await;
+            log.log(LogLevel::Error, name, &format!("initialize failed: {e}"));
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message: format!("initialize failed: {e}"),
@@ -367,12 +407,17 @@ async fn run_server_once(
         }
     };
     let _ = socket.initialized(InitializedParams {});
+    let encoding = encoding_of(&init_result.capabilities);
+    let sync_kind = sync_kind_of(&init_result.capabilities);
+    log.log(
+        LogLevel::Info,
+        name,
+        &format!("initialized: encoding={encoding:?}, sync={sync_kind:?}"),
+    );
     let _ = event_tx.send(LspEvent::Initialized {
         key: key.clone(),
-        caps: ServerCaps {
-            sync_kind: sync_kind_of(&init_result.capabilities),
-        },
-        encoding: encoding_of(&init_result.capabilities),
+        caps: ServerCaps { sync_kind },
+        encoding,
     });
 
     // Serve: ferry document-sync notifications to the socket until told to stop
@@ -380,9 +425,10 @@ async fn run_server_once(
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Some(ServerMsg::Notify(note)) => apply_notify(&mut socket, note),
+                Some(ServerMsg::Notify(note)) => apply_notify(&mut socket, note, log, name),
                 // Explicit shutdown, or the manager dropped our sender: tear down.
                 Some(ServerMsg::Shutdown) | None => {
+                    log.log(LogLevel::Info, name, "shutting down");
                     let _ = socket.shutdown(()).await;
                     let _ = socket.exit(());
                     mainloop_fut.abort();
@@ -395,6 +441,7 @@ async fn run_server_once(
                 // The loop ended: the child closed its pipe or exited.
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                log.log(LogLevel::Warn, name, "language server exited");
                 let _ = event_tx.send(LspEvent::ServerExited {
                     key: key.clone(),
                     message: "language server exited".to_string(),
@@ -407,7 +454,10 @@ async fn run_server_once(
 
 /// Translate an [`LspNotify`] into the corresponding `async-lsp` notification.
 /// Send errors are ignored: a dead socket is detected by the main loop ending.
-fn apply_notify(socket: &mut ServerSocket, note: LspNotify) {
+fn apply_notify(socket: &mut ServerSocket, note: LspNotify, log: &LspLog, name: &str) {
+    if log.enabled(LogLevel::Debug) {
+        log.log(LogLevel::Debug, name, &describe_notify(&note));
+    }
     let _ = match note {
         LspNotify::DidOpen {
             uri,
@@ -440,11 +490,26 @@ fn apply_notify(socket: &mut ServerSocket, note: LspNotify) {
     };
 }
 
+/// A one-line summary of an outgoing notification for the DEBUG log.
+fn describe_notify(note: &LspNotify) -> String {
+    match note {
+        LspNotify::DidOpen { version, text, .. } => {
+            format!("→ didOpen v{version} ({} bytes)", text.len())
+        }
+        LspNotify::DidChange {
+            version, changes, ..
+        } => format!("→ didChange v{version} ({} change(s))", changes.len()),
+        LspNotify::DidSave { .. } => "→ didSave".to_string(),
+        LspNotify::DidClose { .. } => "→ didClose".to_string(),
+    }
+}
+
 /// State shared by the client `MainLoop`'s notification handlers: which server
-/// this loop belongs to, and the channel to forward distilled events on.
+/// this loop belongs to, the channel to forward distilled events on, and the log.
 struct ClientState {
     key: ServerKey,
     event_tx: UnboundedSender<LspEvent>,
+    log: Arc<LspLog>,
 }
 
 /// Build the `async-lsp` client `MainLoop` and its `ServerSocket`. The bare
@@ -456,10 +521,19 @@ struct ClientState {
 fn new_client(
     key: ServerKey,
     event_tx: UnboundedSender<LspEvent>,
+    log: Arc<LspLog>,
 ) -> (MainLoop<Router<ClientState>>, ServerSocket) {
     MainLoop::new_client(|_server| {
-        let mut router = Router::new(ClientState { key, event_tx });
+        let mut router = Router::new(ClientState { key, event_tx, log });
         router.notification::<PublishDiagnostics>(|st, params| {
+            st.log.log(
+                LogLevel::Debug,
+                st.key.language,
+                &format!(
+                    "← publishDiagnostics ({} item(s))",
+                    params.diagnostics.len()
+                ),
+            );
             let _ = st.event_tx.send(LspEvent::Diagnostics {
                 key: st.key.clone(),
                 uri: params.uri,
@@ -468,14 +542,18 @@ fn new_client(
             });
             ControlFlow::Continue(())
         });
+        // `window/logMessage` is for the log only (not user-facing); route it to
+        // the file at the message's mapped severity.
         router.notification::<LogMessage>(|st, params| {
-            let _ = st.event_tx.send(LspEvent::Log {
-                key: st.key.clone(),
-                message: params.message,
-            });
+            st.log
+                .log(level_of(params.typ), st.key.language, &params.message);
             ControlFlow::Continue(())
         });
+        // `window/showMessage` IS user-facing: log it *and* forward it to the
+        // editor's `:messages`.
         router.notification::<ShowMessage>(|st, params| {
+            st.log
+                .log(level_of(params.typ), st.key.language, &params.message);
             let _ = st.event_tx.send(LspEvent::Log {
                 key: st.key.clone(),
                 message: params.message,
@@ -488,6 +566,17 @@ fn new_client(
         router.unhandled_event(|_st, _event| ControlFlow::Continue(()));
         router
     })
+}
+
+/// Map an LSP `window/*Message` severity to a log level (`LOG`, the most verbose,
+/// becomes `Debug`).
+fn level_of(typ: MessageType) -> LogLevel {
+    match typ {
+        MessageType::ERROR => LogLevel::Error,
+        MessageType::WARNING => LogLevel::Warn,
+        MessageType::INFO => LogLevel::Info,
+        _ => LogLevel::Debug,
+    }
 }
 
 /// The client capabilities we advertise at `initialize`: UTF-8 preferred over

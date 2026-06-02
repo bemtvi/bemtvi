@@ -519,6 +519,11 @@ impl Server {
         let args = cmd.get(name.len()..).unwrap_or("").trim_start();
         match name {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
+            // Phase-1 LSP observability: dump server/document state into the panel.
+            "LspInfo" => {
+                let lines = self.lsp_info_lines();
+                self.editor.open_panel("LSP info", lines, false, 0);
+            }
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor

@@ -25,7 +25,8 @@ use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use engine::{Engine, Span, WireEdit};
+use engine::Engine;
+use nxvim_rpc::syntax::{decode_edits, encode_spans};
 
 /// Resolve nxvim's data directory (where `parser/` and `queries/` live).
 /// `$NXVIM_DATA_DIR` overrides everything (used by tests); otherwise the
@@ -109,7 +110,7 @@ fn handle(engine: &mut Engine, rpc: &Rpc, method: &str, params: &[Value]) {
             }
         }
         "ts_edit" => {
-            let edits = parse_edits(map_get(map, "edits"));
+            let edits = decode_edits(map_get(map, "edits"));
             engine.edit(buffer, &edits);
             send_highlights(engine, rpc, map, buffer);
         }
@@ -135,56 +136,9 @@ fn send_highlights(engine: &mut Engine, rpc: &Rpc, map: &[(Value, Value)], buffe
             (Value::from("tick"), Value::from(tick)),
             (Value::from("first_line"), Value::from(first as u64)),
             (Value::from("last_line"), Value::from(last as u64)),
-            (Value::from("spans"), spans_value(&spans)),
+            (Value::from("spans"), encode_spans(&spans)),
         ])],
     );
-}
-
-fn spans_value(spans: &[Span]) -> Value {
-    Value::Array(
-        spans
-            .iter()
-            .map(|s| {
-                Value::Array(vec![
-                    Value::from(s.line as u64),
-                    Value::from(s.start_byte as u64),
-                    Value::from(s.end_byte as u64),
-                    Value::from(s.group.as_str()),
-                ])
-            })
-            .collect(),
-    )
-}
-
-/// Parse the `edits` array: each element is a 10-tuple
-/// `[start_byte, old_end_byte, new_end_byte, start_row, start_col,
-///   old_end_row, old_end_col, new_end_row, new_end_col, text]`.
-fn parse_edits(value: Option<&Value>) -> Vec<WireEdit> {
-    let Some(Value::Array(items)) = value else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let a = item.as_array()?;
-            if a.len() != 10 {
-                return None;
-            }
-            // Drop the whole delta if any numeric field is absent or non-integer,
-            // rather than coercing it to 0 — a coerced field produces an edit
-            // whose bytes and points disagree, desyncing the shadow from the tree.
-            let u = |i: usize| Some(a.get(i)?.as_u64()? as usize);
-            Some(WireEdit {
-                start_byte: u(0)?,
-                old_end_byte: u(1)?,
-                new_end_byte: u(2)?,
-                start_point: (u(3)?, u(4)?),
-                old_end_point: (u(5)?, u(6)?),
-                new_end_point: (u(7)?, u(8)?),
-                text: a.get(9).and_then(Value::as_str).unwrap_or("").to_string(),
-            })
-        })
-        .collect()
 }
 
 /// Append a one-line summary of an incoming message to the record file. For

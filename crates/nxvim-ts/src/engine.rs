@@ -18,28 +18,9 @@ use crate::loader::Grammar;
 
 const LINE_TYPE: LineType = LineType::LF_CR;
 
-/// One delta from the editor, shaped like tree-sitter's `InputEdit` plus the
-/// inserted bytes so the shadow can be patched.
-#[derive(Debug, Clone)]
-pub struct WireEdit {
-    pub start_byte: usize,
-    pub old_end_byte: usize,
-    pub new_end_byte: usize,
-    pub start_point: (usize, usize),
-    pub old_end_point: (usize, usize),
-    pub new_end_point: (usize, usize),
-    pub text: String,
-}
-
-/// A highlight span the worker reports: a byte range **within line `line`** and
-/// the capture-group name to paint it as.
-#[derive(Debug, Clone)]
-pub struct Span {
-    pub line: usize,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub group: String,
-}
+// The edit and span shapes are the shared syntax-wire types, defined once in
+// `nxvim-rpc` so this worker and the server can't drift apart (see that module).
+pub use nxvim_rpc::syntax::{EditWire, SpanWire};
 
 /// Per-buffer parse state.
 struct BufferState {
@@ -127,7 +108,7 @@ impl Engine {
     }
 
     /// Apply edit deltas to a buffer's shadow + tree, then reparse incrementally.
-    pub fn edit(&mut self, buffer: u64, edits: &[WireEdit]) {
+    pub fn edit(&mut self, buffer: u64, edits: &[EditWire]) {
         let Some(state) = self.buffers.get_mut(&buffer) else {
             return; // never opened; the editor opens before editing
         };
@@ -183,7 +164,12 @@ impl Engine {
     }
 
     /// Extract highlight spans for the visible line range `[first_line, last_line)`.
-    pub fn highlights(&mut self, buffer: u64, first_line: usize, last_line: usize) -> Vec<Span> {
+    pub fn highlights(
+        &mut self,
+        buffer: u64,
+        first_line: usize,
+        last_line: usize,
+    ) -> Vec<SpanWire> {
         let Some(state) = self.buffers.get(&buffer) else {
             return Vec::new();
         };
@@ -205,7 +191,7 @@ fn extract_spans(
     rope: &Rope,
     first_line: usize,
     last_line: usize,
-) -> Vec<Span> {
+) -> Vec<SpanWire> {
     let line_count = rope.len_lines(LINE_TYPE).saturating_sub(1);
     let last_line = last_line.min(line_count);
     if first_line >= last_line {
@@ -270,7 +256,7 @@ fn extract_spans(
                     while i < content_len && groups[i] == Some(g) {
                         i += 1;
                     }
-                    out.push(Span {
+                    out.push(SpanWire {
                         line,
                         start_byte: start,
                         end_byte: i,

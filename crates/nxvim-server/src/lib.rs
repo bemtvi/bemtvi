@@ -14,6 +14,7 @@ use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
 use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, PanelView};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
+use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
 use std::collections::HashMap;
@@ -824,22 +825,17 @@ impl Server {
             .and_then(|(_, v)| v.as_array());
         let mut cache: HashMap<usize, Vec<ByteSpan>> = HashMap::new();
         if let Some(spans) = spans {
-            for span in spans {
-                let Some(a) = span.as_array() else { continue };
-                if a.len() != 4 {
-                    continue;
-                }
-                let line = a[0].as_u64().unwrap_or(0) as usize;
-                if line >= line_count {
+            // Decode through the shared `SpanWire` so the wire tuple shape stays
+            // in lockstep with the worker's encoder.
+            for span in spans.iter().filter_map(SpanWire::decode) {
+                if span.line >= line_count {
                     continue; // out-of-range line: never displayed, don't cache it
                 }
-                let start = a[1].as_u64().unwrap_or(0) as usize;
-                let end = a[2].as_u64().unwrap_or(0) as usize;
-                let group = a[3].as_str().unwrap_or("").to_string();
-                cache
-                    .entry(line)
-                    .or_default()
-                    .push(ByteSpan { start, end, group });
+                cache.entry(span.line).or_default().push(ByteSpan {
+                    start: span.start_byte,
+                    end: span.end_byte,
+                    group: span.group,
+                });
             }
         }
         state.spans = cache;
@@ -986,25 +982,21 @@ fn filetype_of(path: Option<&std::path::Path>) -> Option<&'static str> {
 /// array `[start_byte, old_end_byte, new_end_byte, start_row, start_col,
 /// old_end_row, old_end_col, new_end_row, new_end_col, text]`.
 fn edits_value(edits: &[nxvim_core::BufferEdit]) -> Value {
-    Value::Array(
-        edits
-            .iter()
-            .map(|e| {
-                Value::Array(vec![
-                    Value::from(e.start_byte as u64),
-                    Value::from(e.old_end_byte as u64),
-                    Value::from(e.new_end_byte as u64),
-                    Value::from(e.start_point.0 as u64),
-                    Value::from(e.start_point.1 as u64),
-                    Value::from(e.old_end_point.0 as u64),
-                    Value::from(e.old_end_point.1 as u64),
-                    Value::from(e.new_end_point.0 as u64),
-                    Value::from(e.new_end_point.1 as u64),
-                    Value::from(e.text.as_str()),
-                ])
-            })
-            .collect(),
-    )
+    // Go through the shared `EditWire` so the wire tuple shape is defined once,
+    // in `nxvim-rpc`, and can't drift from the worker's decoder.
+    let wire: Vec<EditWire> = edits
+        .iter()
+        .map(|e| EditWire {
+            start_byte: e.start_byte,
+            old_end_byte: e.old_end_byte,
+            new_end_byte: e.new_end_byte,
+            start_point: e.start_point,
+            old_end_point: e.old_end_point,
+            new_end_point: e.new_end_point,
+            text: e.text.clone(),
+        })
+        .collect();
+    encode_edits(&wire)
 }
 
 /// Encode a slice of text rows as a msgpack array of strings for the redraw map.

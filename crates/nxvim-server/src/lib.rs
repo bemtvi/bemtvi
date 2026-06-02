@@ -560,6 +560,8 @@ impl Server {
 
         let lines = Value::Array(view.lines.iter().map(|l| Value::from(l.as_str())).collect());
         let selection = spans_value(&view.selection);
+        let search = multi_spans_value(&view.search);
+        let incsearch = spans_value(&view.incsearch);
         let numbers = numbers_value(&view.numbers);
         let scroll = match &view.scroll {
             Some(s) => {
@@ -621,6 +623,10 @@ impl Server {
             ),
             (Value::from("command_mode"), Value::from(view.command_mode)),
             (Value::from("cmdline"), Value::from(view.cmdline.as_str())),
+            (
+                Value::from("cmdline_prefix"),
+                Value::from(view.cmdline_prefix.to_string().as_str()),
+            ),
             (Value::from("message"), Value::from(view.message.as_str())),
             (
                 Value::from("file_name"),
@@ -632,6 +638,8 @@ impl Server {
                 Value::from(view.cursor_line as u64),
             ),
             (Value::from("selection"), selection),
+            (Value::from("search"), search),
+            (Value::from("incsearch"), incsearch),
             (Value::from("scroll"), scroll),
             (Value::from("numbers"), numbers),
             (Value::from("number"), Value::from(view.number)),
@@ -865,6 +873,8 @@ impl Server {
             ("line_nr", "LineNr"),
             ("cursor_line_nr", "CursorLineNr"),
             ("visual", "Visual"),
+            ("search", "Search"),
+            ("incsearch", "IncSearch"),
             ("status_line", "StatusLine"),
             ("end_of_buffer", "EndOfBuffer"),
         ];
@@ -974,6 +984,25 @@ fn spans_value(spans: &[Option<(usize, usize)>]) -> Value {
                     Value::Array(vec![Value::from(*start as u64), Value::from(*end as u64)])
                 }
                 None => Value::Nil,
+            })
+            .collect(),
+    )
+}
+
+/// Encode per-row *multiple* spans (the search-match highlight) as an array with
+/// one entry per visible row, each an array of `[start, end]` screen-column
+/// pairs (empty for rows with no match).
+fn multi_spans_value(rows: &[Vec<(usize, usize)>]) -> Value {
+    Value::Array(
+        rows.iter()
+            .map(|row| {
+                Value::Array(
+                    row.iter()
+                        .map(|(start, end)| {
+                            Value::Array(vec![Value::from(*start as u64), Value::from(*end as u64)])
+                        })
+                        .collect(),
+                )
             })
             .collect(),
     )

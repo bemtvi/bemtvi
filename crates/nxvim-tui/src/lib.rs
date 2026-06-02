@@ -152,6 +152,11 @@ fn text_height(terminal_height: u16) -> u16 {
 /// client's built-in [`group_style`].
 type HlSpan = (u16, u16, String, Option<usize>);
 
+/// Per visible row, the screen-column spans of every search match (`hlsearch`).
+type SearchSpans = Vec<Vec<(u16, u16)>>;
+/// Per visible row, the single span the live `incsearch` preview rests on.
+type IncSearchSpans = Vec<Option<(u16, u16)>>;
+
 /// The server's view, mirrored client-side for rendering.
 #[derive(Default)]
 pub struct View {
@@ -162,6 +167,8 @@ pub struct View {
     mode_label: String,
     command_mode: bool,
     cmdline: String,
+    /// The command-line prompt char (`:` ex, `/` / `?` search). Defaults to `:`.
+    cmdline_prefix: char,
     message: String,
     file_name: String,
     modified: bool,
@@ -169,6 +176,13 @@ pub struct View {
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
     selection: Vec<Option<(u16, u16)>>,
+    /// Per visible row, the half-open screen-column spans of every search match
+    /// (`hlsearch`). Empty inner vecs for rows with no match. Mirrors the
+    /// server's `View::search`.
+    search: SearchSpans,
+    /// Per visible row, the single span the live `incsearch` preview rests on, or
+    /// `None`. Mirrors the server's `View::incsearch`.
+    incsearch: IncSearchSpans,
     /// Per visible row, the treesitter highlight spans `(start_col, end_col,
     /// group, style_id)` in screen columns. `style_id` indexes [`View::styles`]
     /// when the server resolved the span through a loaded colorscheme; `None`
@@ -183,6 +197,8 @@ pub struct View {
     line_nr: Option<Style>,
     cursor_line_nr: Option<Style>,
     visual: Option<Style>,
+    search_style: Option<Style>,
+    incsearch_style: Option<Style>,
     status_line: Option<Style>,
     end_of_buffer: Option<Style>,
     scroll: Option<ScrollData>,
@@ -325,6 +341,7 @@ impl View {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         self.cmdline = map_str(map, "cmdline");
+        self.cmdline_prefix = map_str(map, "cmdline_prefix").chars().next().unwrap_or(':');
         self.message = map_str(map, "message");
         self.file_name = map_str(map, "file_name");
         self.modified = map_get(map, "modified")
@@ -332,6 +349,8 @@ impl View {
             .unwrap_or(false);
         self.cursor_line = map_u64(map, "cursor_line") as usize;
         self.selection = parse_spans(map_get(map, "selection"));
+        self.search = parse_multi_spans(map_get(map, "search"));
+        self.incsearch = parse_spans(map_get(map, "incsearch"));
         self.highlights = parse_highlights(map_get(map, "highlights"));
         // The style palette must land before chrome, which indexes into it.
         self.styles = parse_styles(map_get(map, "styles"));
@@ -340,6 +359,8 @@ impl View {
         self.line_nr = chrome("line_nr");
         self.cursor_line_nr = chrome("cursor_line_nr");
         self.visual = chrome("visual");
+        self.search_style = chrome("search");
+        self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
         self.end_of_buffer = chrome("end_of_buffer");
         self.numbers = parse_numbers(map_get(map, "numbers"));
@@ -481,6 +502,10 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     let height = text_area.height as usize;
     let frame_lines: Vec<String>;
     let frame_sel: Vec<Option<(u16, u16)>>;
+    // Search-match highlights for the static viewport. A search never starts a
+    // scroll animation, so the slide band carries none — left empty while sliding.
+    let empty_search: SearchSpans = Vec::new();
+    let empty_incsearch: IncSearchSpans = Vec::new();
     // Syntax highlights for the painted rows — the static viewport, or, during a
     // slide, the matching slice of the over-scanned band so the scroll is colored
     // throughout instead of flashing white until it settles.
@@ -551,13 +576,22 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
             None => &view.styles,
         },
         visual: view.visual,
+        search: view.search_style,
+        incsearch: view.incsearch_style,
         end_of_buffer: view.end_of_buffer,
+    };
+    // The slide band carries no search spans; the static viewport uses the view's.
+    let (frame_search, frame_incsearch): (&SearchSpans, &IncSearchSpans) = match anim {
+        Some(_) => (&empty_search, &empty_incsearch),
+        None => (&view.search, &view.incsearch),
     };
     render_text(
         frame,
         text_inner,
         &frame_lines,
         &frame_sel,
+        frame_search,
+        frame_incsearch,
         &frame_hl,
         &frame_numbers,
         &theme,
@@ -662,30 +696,40 @@ fn gutter_cell(
 struct LineTheme<'a> {
     palette: &'a [Style],
     visual: Option<Style>,
+    /// The `Search`/`IncSearch` match styles from the colorscheme; `None` falls
+    /// back to a built-in yellow highlight so matches show with no theme loaded.
+    search: Option<Style>,
+    incsearch: Option<Style>,
     end_of_buffer: Option<Style>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_text(
     frame: &mut Frame,
     area: Rect,
     lines: &[String],
     selection: &[Option<(u16, u16)>],
+    search: &[Vec<(u16, u16)>],
+    incsearch: &[Option<(u16, u16)>],
     highlights: &[Vec<HlSpan>],
     numbers: &[Option<usize>],
     theme: &LineTheme,
 ) {
     let width = area.width as usize;
     let empty: Vec<HlSpan> = Vec::new();
+    let empty_search: Vec<(u16, u16)> = Vec::new();
     let text = Text::from(
         lines
             .iter()
             .enumerate()
             .map(|(row, l)| {
                 let sel = selection.get(row).copied().flatten();
+                let matches = search.get(row).unwrap_or(&empty_search);
+                let cur = incsearch.get(row).copied().flatten();
                 let hl = highlights.get(row).unwrap_or(&empty);
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
-                highlight_line(l, sel, hl, width, is_filler, theme)
+                highlight_line(l, sel, matches, cur, hl, width, is_filler, theme)
             })
             .collect::<Vec<_>>(),
     );
@@ -704,9 +748,12 @@ fn render_text(
 /// offsets through the same tab/wide-char `virtcol` the gutter-less text area
 /// uses), so they line up with the glyphs painted here. Token foregrounds patch
 /// onto the `Normal` background already painted across the text area.
+#[allow(clippy::too_many_arguments)]
 fn highlight_line(
     line: &str,
     sel: Option<(u16, u16)>,
+    search: &[(u16, u16)],
+    incsearch: Option<(u16, u16)>,
     hl: &[HlSpan],
     max_width: usize,
     is_filler: bool,
@@ -731,7 +778,7 @@ fn highlight_line(
     let mut run_style = Style::default();
     let mut col = 0usize;
     for ch in expanded.chars() {
-        let style = cell_style(col, sel, hl, theme);
+        let style = cell_style(col, sel, search, incsearch, hl, theme);
         if style != run_style && !run.is_empty() {
             spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
@@ -757,7 +804,14 @@ fn highlight_line(
 /// The style of the screen cell at column `col`: its highlight span's resolved
 /// palette style (or [`group_style`] fallback when the span carries no id),
 /// with the selection composed on top when the cell is selected.
-fn cell_style(col: usize, sel: Option<(u16, u16)>, hl: &[HlSpan], theme: &LineTheme) -> Style {
+fn cell_style(
+    col: usize,
+    sel: Option<(u16, u16)>,
+    search: &[(u16, u16)],
+    incsearch: Option<(u16, u16)>,
+    hl: &[HlSpan],
+    theme: &LineTheme,
+) -> Style {
     let mut style = Style::default();
     for (start, end, group, id) in hl {
         if col >= *start as usize && col < *end as usize {
@@ -768,12 +822,32 @@ fn cell_style(col: usize, sel: Option<(u16, u16)>, hl: &[HlSpan], theme: &LineTh
             break; // spans don't overlap
         }
     }
+    // Search-match highlights ride on top of the syntax token: every match in
+    // the `Search` color, then the live incsearch match in `IncSearch` over it.
+    let in_span = |span: (u16, u16)| col >= span.0 as usize && col < span.1 as usize;
+    if search.iter().copied().any(in_span) {
+        style = search_style(style, theme.search, Color::Yellow);
+    }
+    if incsearch.is_some_and(in_span) {
+        style = search_style(style, theme.incsearch, Color::LightYellow);
+    }
+    // The visual selection sits on top of everything.
     if let Some((s, e)) = sel {
         if col >= s as usize && col < e as usize {
             style = selection_style(style, theme);
         }
     }
     style
+}
+
+/// Compose a search-match highlight onto `base`: the colorscheme's resolved
+/// `Search`/`IncSearch` style when loaded, else a built-in `fallback`-on-black
+/// highlight so matches stay visible with no theme.
+fn search_style(base: Style, themed: Option<Style>, fallback: Color) -> Style {
+    match themed {
+        Some(style) => base.patch(style),
+        None => base.bg(fallback).fg(Color::Black),
+    }
 }
 
 /// Compose the visual selection onto `base`: the theme's `Visual` style (its
@@ -855,7 +929,7 @@ fn render_status(frame: &mut Frame, area: Rect, view: &View) {
 
 fn render_command(frame: &mut Frame, area: Rect, view: &View) {
     let content = if view.command_mode {
-        format!(":{}", view.cmdline)
+        format!("{}{}", view.cmdline_prefix, view.cmdline)
     } else {
         view.message.clone()
     };
@@ -953,6 +1027,35 @@ fn parse_spans(value: Option<&Value>) -> Vec<Option<(u16, u16)>> {
                         pair[1].as_u64().unwrap_or(0) as u16,
                     )),
                     _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the per-row search-match payload: an array with one entry per visible
+/// row, each an array of `[start, end]` screen-column pairs (empty for rows with
+/// no match).
+fn parse_multi_spans(value: Option<&Value>) -> SearchSpans {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|v| match v.as_array() {
+                                    Some(pair) if pair.len() == 2 => Some((
+                                        pair[0].as_u64().unwrap_or(0) as u16,
+                                        pair[1].as_u64().unwrap_or(0) as u16,
+                                    )),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 })
                 .collect()
         })

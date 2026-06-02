@@ -18,8 +18,10 @@ cargo test -p nxvim-server --test editing <name>   # run a single test by name /
 
 # Lint & format — both are enforced by the pre-commit hook
 cargo fmt --all                     # format in place ( add `-- --check` to verify only )
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
+
+**Do not use `--all-features`** for `clippy` or `test`. The Lua backend is a Cargo feature with mutually-exclusive variants (`lua51` is the default, `luajit` the alternative); `--all-features` enables both at once, which makes `mlua-sys` fail its build script (`You can enable only one of the features: …`). Lint and test on the **default features** (standard `lua51`) as shown above. To check the other backend explicitly, swap it in deliberately (`--no-default-features --features luajit`), never via `--all-features`.
 
 A pre-commit hook (`.pre-commit-config.yaml`) runs `cargo fmt --check` + `cargo clippy -D warnings` on every commit. After a fresh clone, run `pre-commit install` once to enable it; bypass in an emergency with `git commit --no-verify`.
 

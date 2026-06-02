@@ -77,8 +77,11 @@ pub struct View {
     /// True while in command-line mode; the cursor then belongs to the command
     /// region, which the client owns.
     pub command_mode: bool,
-    /// Command-line contents (text after the leading `:`).
+    /// Command-line contents (text after the leading prompt char).
     pub cmdline: String,
+    /// The command-line prompt character: `:` for an ex command, `/` / `?` for a
+    /// forward / backward search. Only meaningful while `command_mode`.
+    pub cmdline_prefix: char,
     /// Transient status message (shown on the command line when not typing one).
     pub message: String,
     /// File name for the status line (`"[No Name]"` when unset).
@@ -92,6 +95,15 @@ pub struct View {
     /// exceed the row's text width to mark a selected newline (one extra cell) or
     /// to fill a linewise selection to the viewport edge.
     pub selection: Vec<Option<(usize, usize)>>,
+    /// Per visible row (aligned with `lines`), the half-open screen-column spans
+    /// of every search match on that row — the `Search`/`hlsearch` highlight.
+    /// Empty inner vecs for rows with no match; all empty when no search is
+    /// active (or it was cleared by `:noh`).
+    pub search: Vec<Vec<(usize, usize)>>,
+    /// Per visible row, the single match the live `incsearch` preview rests on
+    /// (the `IncSearch` highlight), or `None`. All `None` outside an active
+    /// incsearch preview.
+    pub incsearch: Vec<Option<(usize, usize)>>,
     /// Present only on a redraw caused by a scroll command that moved the
     /// viewport; carries the data a client needs to animate the slide.
     pub scroll: Option<ScrollAnim>,
@@ -122,6 +134,7 @@ impl View {
 
         let lines = window_lines(ed, ed.top, height, line_count);
         let selection = selection_spans(ed, width, line_count, ed.top, height);
+        let (search, incsearch) = ed.search_highlights(ed.top, height);
         let numbers = window_numbers(ed.top, height, line_count);
 
         let scroll = ed.pending_scroll().map(|ps| {
@@ -164,11 +177,14 @@ impl View {
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,
             cmdline: ed.cmdline.clone(),
+            cmdline_prefix: ed.cmdline_prefix(),
             message: ed.message.clone(),
             file_name,
             modified: ed.buffer().modified,
             cursor_line: ed.cursor.line + 1,
             selection,
+            search,
+            incsearch,
             scroll,
             numbers,
             number: ed.options.number,

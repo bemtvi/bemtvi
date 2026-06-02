@@ -16,6 +16,7 @@ pub mod highlight;
 pub mod input;
 pub mod mode;
 pub mod options;
+pub mod search;
 pub mod unicode;
 pub mod view;
 

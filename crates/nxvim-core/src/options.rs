@@ -12,6 +12,22 @@ pub struct Options {
     /// [`Options::number`] this gives vim's "hybrid" gutter: the absolute
     /// number on the cursor line, relative numbers elsewhere.
     pub relativenumber: bool,
+    /// Ignore case when searching (`/`, `?`, `n`, `N`).
+    pub ignorecase: bool,
+    /// Override [`Options::ignorecase`] for a pattern that contains an uppercase
+    /// character, making such a search case-sensitive. Only consulted when
+    /// `ignorecase` is on (vim's `smartcase`).
+    pub smartcase: bool,
+    /// Wrap searches around the ends of the buffer (vim's `wrapscan`). When off,
+    /// a forward search past the last match fails with `E385` rather than
+    /// continuing from the top (and `E384` for backward).
+    pub wrapscan: bool,
+    /// Highlight all matches of the last search pattern. (Honored in a later
+    /// phase; stored here so `:set` accepts it now.)
+    pub hlsearch: bool,
+    /// Preview the match incrementally while typing the search. (Honored in a
+    /// later phase; stored here so `:set` accepts it now.)
+    pub incsearch: bool,
 }
 
 impl Default for Options {
@@ -22,6 +38,13 @@ impl Default for Options {
         Options {
             number: true,
             relativenumber: true,
+            // Search defaults match modern neovim: case-sensitive unless asked
+            // otherwise, but wrapping, highlighting, and incremental preview on.
+            ignorecase: false,
+            smartcase: false,
+            wrapscan: true,
+            hlsearch: true,
+            incsearch: true,
         }
     }
 }
@@ -66,6 +89,11 @@ fn canonical(name: &str) -> Option<&'static str> {
     match name {
         "number" | "nu" => Some("number"),
         "relativenumber" | "rnu" => Some("relativenumber"),
+        "ignorecase" | "ic" => Some("ignorecase"),
+        "smartcase" | "scs" => Some("smartcase"),
+        "wrapscan" | "ws" => Some("wrapscan"),
+        "hlsearch" | "hls" => Some("hlsearch"),
+        "incsearch" | "is" => Some("incsearch"),
         _ => None,
     }
 }

@@ -7,7 +7,7 @@ use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
 use nxvim_tui::{paint, View};
 use ratatui::buffer::Buffer;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -103,6 +103,12 @@ fn reversed(buf: &Buffer, x: u16, y: u16) -> bool {
         .unwrap_or(false)
 }
 
+/// The background color of a painted cell — used to spot the search-match
+/// highlight (the built-in yellow fallback with no colorscheme loaded).
+fn bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).and_then(|c| c.style().bg)
+}
+
 #[tokio::test]
 async fn typed_text_is_painted_with_the_mode_in_the_status_line() {
     let (rpc, mut incoming) = start(None).await;
@@ -147,6 +153,41 @@ async fn a_visual_selection_is_highlighted_on_screen() {
     assert!(reversed(&buf, GUTTER + 1, 0));
     assert!(reversed(&buf, GUTTER + 2, 0));
     assert!(!reversed(&buf, GUTTER + 3, 0));
+}
+
+#[tokio::test]
+async fn search_matches_are_highlighted_on_screen() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo and foo<Esc>");
+    feed(&rpc, "/foo<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    // Both "foo" runs light up with the Search highlight (the built-in yellow
+    // with no colorscheme loaded); the gap between them does not. Columns are
+    // measured from the text, which starts past the number gutter.
+    assert_eq!(
+        bg(&buf, GUTTER, 0),
+        Some(Color::Yellow),
+        "first match start"
+    );
+    assert_eq!(
+        bg(&buf, GUTTER + 2, 0),
+        Some(Color::Yellow),
+        "first match end"
+    );
+    assert_ne!(
+        bg(&buf, GUTTER + 4, 0),
+        Some(Color::Yellow),
+        "the gap is not highlighted"
+    );
+    assert_eq!(bg(&buf, GUTTER + 8, 0), Some(Color::Yellow), "second match");
+    // `:noh` clears the highlight until the next search.
+    feed(&rpc, ":noh<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    assert_ne!(
+        bg(&buf, GUTTER, 0),
+        Some(Color::Yellow),
+        ":noh clears the match highlight"
+    );
 }
 
 #[tokio::test]

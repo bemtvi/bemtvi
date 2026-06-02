@@ -13,3 +13,4 @@ anyhow.workspace = true
 ropey.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+regex.workspace = true

@@ -59,6 +59,34 @@ async fn malformed_frame_closes_connection_instead_of_hanging() {
     );
 }
 
+/// An in-flight `request().await` must resolve to an error when the connection
+/// drops, not hang forever. Before the fix the reader exiting on EOF left the
+/// request's `oneshot::Sender` sitting in the `pending` map (kept alive by the
+/// `Rpc` handle the caller still holds), so the awaiter blocked indefinitely;
+/// the timeout elapses and the test fails. After the fix the teardown drains
+/// `pending`, dropping the sender so the receiver resolves to `Err`.
+#[tokio::test]
+async fn in_flight_request_fails_when_the_connection_drops() {
+    let (peer, rpc, peer_reader, _incoming) = rig();
+
+    // Fire a request the peer will never answer.
+    let handle = tokio::spawn(async move { rpc.request("never_answered", vec![]).await });
+
+    // Let it register in `pending` and flush, then drop both peer halves so the
+    // reader hits EOF (and the writer's next write fails).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(peer);
+    drop(peer_reader);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    match outcome {
+        Ok(Ok(Err(_))) => {} // resolved to an error — correct
+        Ok(Ok(Ok(v))) => panic!("request unexpectedly succeeded: {v:?}"),
+        Ok(Err(join)) => panic!("request task panicked: {join:?}"),
+        Err(_) => panic!("request hung after the connection dropped instead of erroring"),
+    }
+}
+
 /// A frame split across two reads (a genuinely truncated prefix, then the rest)
 /// must still be reassembled and dispatched — i.e. the malformed-frame teardown
 /// must not also kill legitimately-incomplete reads. Passes before and after

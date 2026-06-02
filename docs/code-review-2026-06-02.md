@@ -301,21 +301,32 @@ failures retry forever, no event) the message never arrives and the test times
 out (~10s); post-fix the breaker gives up after ~3s of escalating backoff and
 the message surfaces.
 
-## R6. RPC task death leaks peer task and hangs pending requests
-**File:** `crates/nxvim-rpc/src/lib.rs:103-104` (`connect`), `:119-124`
-(`writer_task`), `:128-160` (`reader_task`), `:184` (pending drain).
+## R6. RPC task death leaks peer task and hangs pending requests ✅ DONE
+**File:** `crates/nxvim-rpc/src/lib.rs` (`connect`).
 **Severity:** Medium.
+**Status:** Implemented. Test:
+`crates/nxvim-rpc/tests/transport.rs::in_flight_request_fails_when_the_connection_drops`.
 
-**Problem:** When one task dies (`break`/`return` on I/O error or EOF) it doesn't
-signal or abort the other, and — more importantly — entries in `pending` are
-never drained, so every outstanding `request().await` (`:75`) waits on a
-`oneshot::Receiver` whose `Sender` lingers in the map; in-flight requests hang
-until the whole `Rpc` is dropped.
+**Problem:** When one task died (`break`/`return` on I/O error or EOF) it didn't
+signal or abort the other, and — more importantly — entries in `pending` were
+never drained, so every outstanding `request().await` waited on a
+`oneshot::Receiver` whose `Sender` lingered in the map; in-flight requests hung
+until the whole `Rpc` was dropped.
 
-**Fix:** When `reader_task` exits, drain `pending` and drop all senders so each
-awaiter resolves to `Err("connection closed")`. Have the two tasks share a
-shutdown signal (a `tokio::sync::Notify`, a dropped channel, or `JoinHandle`
-abort) so writer death stops the reader and vice versa.
+**Fix applied:** `connect` now spawns a small coordinator task that `select!`s on
+both the reader and writer `JoinHandle`s. When either ends, it `abort()`s the
+survivor (so a dropped reader can't leave the writer parked on `out_rx`, and vice
+versa — the `JoinHandle`-abort shutdown signal the review suggested) and then
+`pending.lock().clear()`s, dropping every in-flight `oneshot::Sender` so each
+`request().await` resolves to `Err("rpc connection closed")`. Draining in the
+coordinator (rather than inside `reader_task`) covers teardown initiated from
+*either* side, including the writer-first case where the reader is aborted before
+it could drain.
+
+**Test (verified fail-before / pass-after):** fires a request the peer never
+answers, then drops both peer halves so the reader hits EOF. Pre-fix the spawned
+`request()` task blocks forever (sender lingers in `pending`) and the 2s timeout
+fires; post-fix the request resolves to an error promptly.
 
 **Pairs with R1** (structural-error teardown is the trigger for this drain).
 

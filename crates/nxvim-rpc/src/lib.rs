@@ -100,8 +100,23 @@ where
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
-    tokio::spawn(writer_task(writer, out_rx));
-    tokio::spawn(reader_task(reader, in_tx, pending.clone()));
+    let mut writer_handle = tokio::spawn(writer_task(writer, out_rx));
+    let mut reader_handle = tokio::spawn(reader_task(reader, in_tx, pending.clone()));
+
+    // Couple the two halves and fail in-flight requests on teardown. When either
+    // task ends — the reader on EOF/corrupt frame, the writer on a write error —
+    // the connection is dead: abort the survivor (so a dropped reader can't leave
+    // the writer parked on `out_rx`, and vice versa) and drain `pending`, so every
+    // outstanding `request().await` resolves to an error instead of blocking
+    // forever on a oneshot whose sender would otherwise linger in the map.
+    let cleanup = pending.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut writer_handle => reader_handle.abort(),
+            _ = &mut reader_handle => writer_handle.abort(),
+        }
+        cleanup.lock().unwrap().clear();
+    });
 
     let rpc = Rpc {
         out: out_tx,

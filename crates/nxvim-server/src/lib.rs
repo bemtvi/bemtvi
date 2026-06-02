@@ -12,7 +12,7 @@ mod syntax;
 
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor};
-use nxvim_lua::{HlSet, LuaRuntime};
+use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
 use std::collections::HashMap;
@@ -294,6 +294,44 @@ impl Server {
                 // [channel_id, metadata]; metadata kept minimal for now.
                 Ok(Value::Array(vec![Value::from(1u64), Value::Map(vec![])]))
             }
+            // ----- the bottom message panel (nxvim-native) -----------------
+            "nxvim_panel_open" => {
+                // (title, lines, want_select?, cursor?): open (or replace) and
+                // focus the panel. `want_select` (default false) makes `<CR>`
+                // emit an `nxvim_panel_select` notification for the client to act
+                // on. `cursor` (default 0) is the initially selected line
+                // (0-based); the panel scrolls to keep it visible.
+                let title = text(params.first());
+                let lines = str_array(params.get(1));
+                let want_select = params.get(2).and_then(Value::as_bool).unwrap_or(false);
+                let cursor = params.get(3).and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.editor.open_panel(title, lines, want_select, cursor);
+                Ok(Value::Nil)
+            }
+            "nxvim_panel_set_lines" => {
+                // (lines): replace the open panel's content (no-op if none open).
+                let lines = str_array(params.first());
+                self.editor.set_panel_lines(lines);
+                Ok(Value::Nil)
+            }
+            "nxvim_panel_set_select" => {
+                // (bool): toggle `<CR>` select events on the open panel.
+                let want = params.first().and_then(Value::as_bool).unwrap_or(false);
+                self.editor.set_panel_on_select(want);
+                Ok(Value::Nil)
+            }
+            "nxvim_panel_set_cursor" => {
+                // (line): move the open panel's selection (0-based) and scroll it
+                // into view (no-op if none open).
+                let line = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.editor.set_panel_cursor(line);
+                Ok(Value::Nil)
+            }
+            "nxvim_panel_close" => {
+                self.editor.close_panel();
+                Ok(Value::Nil)
+            }
+            "nxvim_panel_is_open" => Ok(Value::from(self.editor.panel_is_open())),
             other => Err(format!("Unknown method: {other}")),
         }
     }
@@ -319,7 +357,8 @@ impl Server {
             Err(_) => return,
         };
         if let Err(e) = self.lua.exec(&src) {
-            self.editor.message = format!("E5113: Error while sourcing init.lua: {e}");
+            self.editor
+                .echo(format!("E5113: Error while sourcing init.lua: {e}"));
         }
         self.apply_lua_effects();
         self.run_pending();
@@ -336,8 +375,25 @@ impl Server {
         for cmd in self.lua.take_commands() {
             self.editor.command(&cmd);
         }
-        if let Some(last) = self.lua.take_output().last() {
-            self.editor.message = last.clone();
+        // Each captured `print` / `nvim_echo` line becomes a message: the last
+        // is shown on the message line, and every line lands in `:messages`.
+        for line in self.lua.take_output() {
+            self.editor.echo(line);
+        }
+        // Panel requests from `vim.panel.*` drive the core's panel state.
+        for op in self.lua.take_panel_ops() {
+            match op {
+                PanelOp::Open {
+                    title,
+                    lines,
+                    wants_select,
+                    cursor,
+                } => self.editor.open_panel(title, lines, wants_select, cursor),
+                PanelOp::SetLines(lines) => self.editor.set_panel_lines(lines),
+                PanelOp::OnSelect(wants) => self.editor.set_panel_on_select(wants),
+                PanelOp::SetCursor(line) => self.editor.set_panel_cursor(line),
+                PanelOp::Close => self.editor.close_panel(),
+            }
         }
     }
 
@@ -350,14 +406,34 @@ impl Server {
         loop {
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 if let Err(e) = self.lua.exec(&chunk) {
-                    self.editor.message = format!("E5108: Error executing lua: {e}");
+                    self.editor.echo(format!("E5108: Error executing lua: {e}"));
                 }
                 self.apply_lua_effects();
             }
             for cmd in std::mem::take(&mut self.editor.deferred_commands) {
                 self.resolve_command(&cmd);
             }
-            if self.editor.lua_queue.is_empty() && self.editor.deferred_commands.is_empty() {
+            // `<CR>` selections on a select-enabled panel: notify RPC clients and
+            // fire the Lua `on_select` callback. The callback may itself queue
+            // commands / lua / panel ops, so this is inside the fixpoint loop.
+            for (index, line) in std::mem::take(&mut self.editor.panel_selects) {
+                self.rpc.notify(
+                    "nxvim_panel_select",
+                    vec![Value::Map(vec![
+                        (Value::from("index"), Value::from(index as u64 + 1)),
+                        (Value::from("line"), Value::from(line.as_str())),
+                    ])],
+                );
+                if let Err(e) = self.lua.run_panel_select(index, &line) {
+                    self.editor
+                        .echo(format!("E5108: Error in panel on_select: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            if self.editor.lua_queue.is_empty()
+                && self.editor.deferred_commands.is_empty()
+                && self.editor.panel_selects.is_empty()
+            {
                 break;
             }
         }
@@ -373,11 +449,14 @@ impl Server {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
-                    self.editor.message = format!("E5108: Error executing command {name}: {e}");
+                    self.editor
+                        .echo(format!("E5108: Error executing command {name}: {e}"));
                 }
                 self.apply_lua_effects();
             }
-            _ => self.editor.message = format!("E492: Not an editor command: {name}"),
+            _ => self
+                .editor
+                .echo(format!("E492: Not an editor command: {name}")),
         }
     }
 
@@ -392,23 +471,27 @@ impl Server {
             return; // `:colorscheme` with no arg is a query we don't surface yet
         }
         let Some(path) = self.find_runtime_file(&format!("colors/{name}.lua")) else {
-            self.editor.message = format!("E185: Cannot find color scheme '{name}'");
+            self.editor
+                .echo(format!("E185: Cannot find color scheme '{name}'"));
             return;
         };
         let src = match std::fs::read_to_string(&path) {
             Ok(src) => src,
             Err(e) => {
-                self.editor.message = format!("E185: Cannot read color scheme '{name}': {e}");
+                self.editor
+                    .echo(format!("E185: Cannot read color scheme '{name}': {e}"));
                 return;
             }
         };
         if let Err(e) = self.lua.exec(&src) {
-            self.editor.message = format!("E5108: Error loading colorscheme {name}: {e}");
+            self.editor
+                .echo(format!("E5108: Error loading colorscheme {name}: {e}"));
         }
         self.apply_lua_effects();
         let _ = self.lua.set_global_var("colors_name", name);
         if let Err(e) = self.lua.fire_autocmd("ColorScheme", name) {
-            self.editor.message = format!("E5108: Error in ColorScheme autocmd: {e}");
+            self.editor
+                .echo(format!("E5108: Error in ColorScheme autocmd: {e}"));
         }
         self.apply_lua_effects();
     }
@@ -501,6 +584,21 @@ impl Server {
             }
             None => Value::Nil,
         };
+        // The bottom panel (`:messages`, `:ls`), `Nil` when none is open.
+        let panel = match &view.panel {
+            Some(p) => {
+                let plines =
+                    Value::Array(p.lines.iter().map(|l| Value::from(l.as_str())).collect());
+                Value::Map(vec![
+                    (Value::from("title"), Value::from(p.title.as_str())),
+                    (Value::from("lines"), plines),
+                    (Value::from("cursor_row"), Value::from(p.cursor_row as u64)),
+                    (Value::from("height"), Value::from(p.height as u64)),
+                ])
+            }
+            None => Value::Nil,
+        };
+
         // Built last: every `highlights`/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
         let map = vec![
@@ -548,6 +646,7 @@ impl Server {
             (Value::from("highlights"), highlights),
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
+            (Value::from("panel"), panel),
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);
@@ -961,4 +1060,16 @@ fn uint(v: Option<&Value>, default: usize) -> usize {
 
 fn text(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Read an RPC array-of-strings argument (the panel methods' `lines`). Non-array
+/// values and non-string elements are dropped, yielding an empty list.
+fn str_array(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }

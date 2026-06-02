@@ -195,3 +195,21 @@ async fn editor_keeps_processing_when_the_ui_never_drains_redraws() {
     };
     assert_eq!(line, vec!["x".repeat(200)]);
 }
+
+#[tokio::test]
+async fn messages_command_renders_a_panel_at_the_bottom() {
+    let (rpc, mut incoming) = start(None).await;
+    // Build one history line, then open the messages panel.
+    feed(&rpc, ":lua print('hello panel')<CR>");
+    feed(&rpc, ":messages<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // Panel content height is 10, so it claims 11 rows (title + content). The
+    // panel sits below the status line, above the single command row, so its
+    // title bar lands at row ROWS-1-11 = 12.
+    let bar = row_text(&buf, ROWS - 12);
+    assert!(bar.contains("Messages"), "title bar: {bar:?}");
+    assert!(bar.contains("[X]"), "close button: {bar:?}");
+    // The first content row (just below the bar) shows the history line.
+    assert_eq!(row_text(&buf, ROWS - 11).trim_end(), "hello panel");
+}

@@ -1400,3 +1400,447 @@ async fn colorscheme_compiles_to_bytecode_then_reuses_the_cache() {
         "second load should reuse the cached bytecode, not recompile"
     );
 }
+
+// ----- bottom panel (`:messages`, `:ls`) ---------------------------------
+
+/// Drain to the *latest* redraw — the one reflecting the settled state after the
+/// preceding action. A barrier (`nvim_get_mode`) ensures that action's redraw is
+/// already queued; unlike [`redraw_after`] this tolerates leftover redraws from
+/// earlier fire-and-forget `feed`s/requests still in the channel.
+async fn drain_latest(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Vec<(Value, Value)> {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    tokio::task::yield_now().await; // let the reader task push buffered frames
+    let mut latest = None;
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "redraw" {
+            latest = params.into_iter().next();
+        }
+    }
+    match latest {
+        Some(Value::Map(map)) => map,
+        _ => panic!("no redraw arrived"),
+    }
+}
+
+/// Feed `keys`, then drain to the latest redraw (see [`drain_latest`]).
+async fn latest_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> Vec<(Value, Value)> {
+    rpc.notify("nvim_input", vec![Value::from(keys)]);
+    drain_latest(rpc, incoming).await
+}
+
+/// The `panel` sub-map from a redraw, or `None` when no panel is open.
+fn panel(map: &[(Value, Value)]) -> Option<&Vec<(Value, Value)>> {
+    match field(map, "panel") {
+        Some(Value::Map(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// The panel's content lines (empty when no panel is open).
+fn panel_lines(map: &[(Value, Value)]) -> Vec<String> {
+    panel(map)
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("lines"))
+                .and_then(|(_, v)| v.as_array())
+        })
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A field of the panel sub-map by key, as a u64 (`cursor_row`, `height`).
+fn panel_u64(map: &[(Value, Value)], key: &str) -> u64 {
+    panel(map)
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .and_then(|(_, v)| v.as_u64())
+        })
+        .unwrap_or(0)
+}
+
+/// The panel's title (empty when no panel is open).
+fn panel_title(map: &[(Value, Value)]) -> String {
+    panel(map)
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("title"))
+                .and_then(|(_, v)| v.as_str())
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn messages_command_shows_history_in_a_panel() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // Two printed lines build up the message history.
+    feed(&rpc, ":lua print('alpha')<CR>");
+    feed(&rpc, ":lua print('beta')<CR>");
+    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
+
+    // The panel opens with title "Messages" and the history (newest last).
+    assert_eq!(panel_title(&map), "Messages");
+    let lines = panel_lines(&map);
+    assert!(
+        lines.contains(&"alpha".to_string()) && lines.contains(&"beta".to_string()),
+        "history was: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn panel_navigates_and_closes_with_q() {
+    let (rpc, mut incoming) = start(None).await;
+    for i in 0..15 {
+        feed(&rpc, &format!(":lua print('line{i}')<CR>"));
+    }
+    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
+    // `:messages` opens scrolled to the end with the newest line selected, so the
+    // cursor sits on the last visible row.
+    let height = panel_u64(&map, "height");
+    assert_eq!(
+        panel_u64(&map, "cursor_row"),
+        height - 1,
+        "opens at the bottom"
+    );
+
+    // `gg` returns to the top; `j` moves the panel cursor down.
+    let map = latest_after(&rpc, &mut incoming, "gg").await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 0);
+    let map = latest_after(&rpc, &mut incoming, "j").await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 1);
+
+    // `G` jumps back to the last line; scrolled to the bottom again.
+    let map = latest_after(&rpc, &mut incoming, "G").await;
+    assert_eq!(panel_u64(&map, "cursor_row"), height - 1);
+
+    // `q` closes the panel — the redraw no longer carries one.
+    let map = latest_after(&rpc, &mut incoming, "q").await;
+    assert!(panel(&map).is_none(), "q should close the panel");
+}
+
+#[tokio::test]
+async fn panel_grabs_focus_so_the_buffer_is_not_edited() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>"); // buffer: "hello"
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    feed(&rpc, ":messages<CR>"); // open the panel (grabs focus)
+                                 // While the panel is focused these keys drive the panel, not the buffer:
+                                 // `i` and the letters are ignored, and the trailing <Esc> closes the panel.
+    feed(&rpc, "iworld<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"], "buffer must be untouched");
+}
+
+#[tokio::test]
+async fn panel_shrinks_the_text_window() {
+    let (rpc, mut incoming) = start(None).await;
+    // No panel: the text window fills the attached height.
+    let map = latest_after(&rpc, &mut incoming, "<Esc>").await;
+    let full = lines_len(&map);
+
+    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
+    let with_panel = lines_len(&map);
+    let panel_rows = panel_u64(&map, "height") + 1; // content + title bar
+    assert_eq!(
+        with_panel,
+        full - panel_rows as usize,
+        "the panel claims rows off the text window"
+    );
+}
+
+// ----- scriptable panel API (`vim.panel.*`, `nxvim_panel_*`) -------------
+
+#[tokio::test]
+async fn lua_vim_panel_opens_sets_and_closes() {
+    let (rpc, mut incoming) = start(None).await;
+    // Drive via `nvim_command` (not focused keystrokes): once the panel is open
+    // it grabs input focus, so a typed `:lua` would go to the panel — but a
+    // scripted command still reaches the editor.
+    let lua = |src: &str| rpc.request("nvim_command", vec![Value::from(format!("lua {src}"))]);
+
+    lua("vim.panel.open('Custom', {'one', 'two'})")
+        .await
+        .expect("open");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_title(&map), "Custom");
+    assert_eq!(panel_lines(&map), vec!["one", "two"]);
+
+    // set_lines(lines) replaces the content, keeping the title.
+    lua("vim.panel.set_lines({'alpha', 'beta', 'gamma'})")
+        .await
+        .expect("set_lines");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_title(&map), "Custom");
+    assert_eq!(panel_lines(&map), vec!["alpha", "beta", "gamma"]);
+
+    // close() dismisses it.
+    lua("vim.panel.close()").await.expect("close");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert!(
+        panel(&map).is_none(),
+        "vim.panel.close() should close the panel"
+    );
+}
+
+#[tokio::test]
+async fn rpc_nxvim_panel_open_set_close_and_query() {
+    let (rpc, mut incoming) = start(None).await;
+
+    assert_eq!(
+        rpc.request("nxvim_panel_is_open", vec![]).await.unwrap(),
+        Value::from(false),
+        "no panel open initially"
+    );
+
+    rpc.request(
+        "nxvim_panel_open",
+        vec![
+            Value::from("RPC"),
+            Value::Array(vec![Value::from("a"), Value::from("b")]),
+        ],
+    )
+    .await
+    .expect("panel_open");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_title(&map), "RPC");
+    assert_eq!(panel_lines(&map), vec!["a", "b"]);
+    assert_eq!(
+        rpc.request("nxvim_panel_is_open", vec![]).await.unwrap(),
+        Value::from(true)
+    );
+
+    rpc.request(
+        "nxvim_panel_set_lines",
+        vec![Value::Array(vec![Value::from("only")])],
+    )
+    .await
+    .expect("panel_set_lines");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_lines(&map), vec!["only"]);
+
+    rpc.request("nxvim_panel_close", vec![])
+        .await
+        .expect("panel_close");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert!(panel(&map).is_none());
+    assert_eq!(
+        rpc.request("nxvim_panel_is_open", vec![]).await.unwrap(),
+        Value::from(false)
+    );
+}
+
+#[tokio::test]
+async fn scripted_panel_is_navigable_like_the_builtin_one() {
+    let (rpc, mut incoming) = start(None).await;
+    let many: Vec<String> = (0..20).map(|i| format!("row{i}")).collect();
+    let lines = Value::Array(many.into_iter().map(Value::from).collect());
+    rpc.request("nxvim_panel_open", vec![Value::from("Big"), lines])
+        .await
+        .expect("panel_open");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 0);
+
+    // The panel grabs focus, so j/G navigate it (not the buffer).
+    let map = latest_after(&rpc, &mut incoming, "G").await;
+    let height = panel_u64(&map, "height");
+    assert_eq!(panel_u64(&map, "cursor_row"), height - 1);
+}
+
+#[tokio::test]
+async fn lua_vim_panel_opens_at_a_cursor_and_set_cursor_moves_it() {
+    let (rpc, mut incoming) = start(None).await;
+    let lua = |src: &str| rpc.request("nvim_command", vec![Value::from(format!("lua {src}"))]);
+
+    // open(title, lines, on_select, cursor): the 1-based cursor selects (and
+    // scrolls to) that line. 20 rows > the panel height, so line 20 scrolls to
+    // the bottom and the cursor sits on the last visible row.
+    lua("local t = {} for i = 1, 20 do t[i] = 'row' .. i end \
+         vim.panel.open('Jump', t, nil, 20)")
+    .await
+    .expect("open");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    let height = panel_u64(&map, "height");
+    assert_eq!(
+        panel_u64(&map, "cursor_row"),
+        height - 1,
+        "opens scrolled to the requested line"
+    );
+
+    // set_cursor(line) moves the selection back to the top (1-based line 1).
+    lua("vim.panel.set_cursor(1)").await.expect("set_cursor");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(
+        panel_u64(&map, "cursor_row"),
+        0,
+        "set_cursor moves to the top"
+    );
+}
+
+#[tokio::test]
+async fn rpc_nxvim_panel_open_cursor_and_set_cursor() {
+    let (rpc, mut incoming) = start(None).await;
+    let many: Vec<String> = (0..20).map(|i| format!("row{i}")).collect();
+    let lines = Value::Array(many.into_iter().map(Value::from).collect());
+
+    // open(title, lines, want_select, cursor): the 0-based cursor (19, the last
+    // line) opens scrolled to the bottom.
+    rpc.request(
+        "nxvim_panel_open",
+        vec![
+            Value::from("Big"),
+            lines,
+            Value::from(false),
+            Value::from(19u64),
+        ],
+    )
+    .await
+    .expect("panel_open");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    let height = panel_u64(&map, "height");
+    assert_eq!(
+        panel_u64(&map, "cursor_row"),
+        height - 1,
+        "opens at the cursor"
+    );
+
+    // set_cursor(line) moves the 0-based selection back to the top.
+    rpc.request("nxvim_panel_set_cursor", vec![Value::from(0u64)])
+        .await
+        .expect("panel_set_cursor");
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(
+        panel_u64(&map, "cursor_row"),
+        0,
+        "set_cursor moves to the top"
+    );
+}
+
+// ----- panel <CR> select handler (scriptable) ----------------------------
+
+/// Barrier, then return the params of the most recent `want` notification (e.g.
+/// `nxvim_panel_select`) buffered on the connection, or `None` if none arrived.
+async fn drain_notify(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Option<Vec<Value>> {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    tokio::task::yield_now().await;
+    let mut found = None;
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == want {
+            found = Some(params);
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn lua_panel_on_select_fires_on_enter() {
+    let (rpc, mut incoming) = start(None).await;
+    // Open with an on_select callback that echoes the selected line + 1-based
+    // index, so we can observe it firing on the message line.
+    rpc.request(
+        "nvim_command",
+        vec![Value::from(
+            "lua vim.panel.open('P', {'aaa', 'bbb'}, \
+             function(line, idx) print('sel:' .. line .. ':' .. idx) end)",
+        )],
+    )
+    .await
+    .expect("open");
+    drain_latest(&rpc, &mut incoming).await;
+
+    // Move to the second line (the panel has focus) and press <CR>.
+    let map = latest_after(&rpc, &mut incoming, "j<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("sel:bbb:2"),
+        "on_select(line, index) should fire for the focused line"
+    );
+}
+
+#[tokio::test]
+async fn lua_panel_on_select_setter_enables_enter() {
+    let (rpc, mut incoming) = start(None).await;
+    // Open without a handler, then attach one with the standalone setter.
+    rpc.request(
+        "nvim_command",
+        vec![Value::from("lua vim.panel.open('P', {'only'})")],
+    )
+    .await
+    .expect("open");
+    rpc.request(
+        "nvim_command",
+        vec![Value::from(
+            "lua vim.panel.on_select(function(line) print('got:' .. line) end)",
+        )],
+    )
+    .await
+    .expect("on_select");
+    drain_latest(&rpc, &mut incoming).await;
+
+    let map = latest_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("got:only")
+    );
+}
+
+#[tokio::test]
+async fn rpc_panel_select_notifies_when_select_enabled() {
+    let (rpc, mut incoming) = start(None).await;
+    rpc.request(
+        "nxvim_panel_open",
+        vec![
+            Value::from("P"),
+            Value::Array(vec![Value::from("x"), Value::from("y")]),
+            Value::from(true), // want_select
+        ],
+    )
+    .await
+    .expect("open");
+    drain_latest(&rpc, &mut incoming).await;
+
+    rpc.notify("nvim_input", vec![Value::from("j<CR>")]);
+    let params = drain_notify(&rpc, &mut incoming, "nxvim_panel_select")
+        .await
+        .expect("a panel_select notification");
+    let map = match params.into_iter().next() {
+        Some(Value::Map(m)) => m,
+        _ => panic!("notification without a map"),
+    };
+    assert_eq!(field(&map, "index").and_then(Value::as_u64), Some(2)); // 1-based
+    assert_eq!(field(&map, "line").and_then(Value::as_str), Some("y"));
+}
+
+#[tokio::test]
+async fn enter_does_nothing_without_a_select_handler() {
+    let (rpc, mut incoming) = start(None).await;
+    // A built-in viewer (`:messages`) opts out of select events.
+    rpc.request("nvim_command", vec![Value::from("messages")])
+        .await
+        .expect("messages");
+    drain_latest(&rpc, &mut incoming).await;
+
+    rpc.notify("nvim_input", vec![Value::from("<CR>")]);
+    assert!(
+        drain_notify(&rpc, &mut incoming, "nxvim_panel_select")
+            .await
+            .is_none(),
+        "a panel with no select handler must not emit select events"
+    );
+}

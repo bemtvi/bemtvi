@@ -12,13 +12,16 @@
 //! correct. Input and redraw are multiplexed with `tokio::select!`.
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
+};
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use rmpv::Value;
 use std::time::{Duration, Instant};
@@ -41,7 +44,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut terminal = ratatui::init();
+    // Capture mouse events so the panel's `[X]` is clickable. ratatui's
+    // `init`/`restore` don't touch mouse mode, so we toggle it ourselves around
+    // the event loop (and on the panic path the OS resets the terminal anyway).
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = event_loop(stream, &mut terminal).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -84,6 +92,24 @@ where
                         "nvim_ui_try_resize",
                         vec![Value::from(w as u64), Value::from(text_height(h) as u64)],
                     );
+                }
+                Some(Ok(Event::Mouse(m))) => {
+                    // A left-click on the focused panel's `[X]` closes it — the
+                    // same effect as pressing `q`, which the focused panel maps
+                    // to close. Guarded on a panel being open so a stray click
+                    // never injects a `q` into the buffer.
+                    if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                        if let Some(panel) = view.panel.as_ref() {
+                            let size = terminal.size().unwrap_or_default();
+                            if let Some((row, cols)) =
+                                close_button(size.width, size.height, panel.height)
+                            {
+                                if m.row == row && cols.contains(&m.column) {
+                                    rpc.notify("nvim_input", vec![Value::from("q")]);
+                                }
+                            }
+                        }
+                    }
                 }
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
@@ -168,6 +194,19 @@ pub struct View {
     number: bool,
     relativenumber: bool,
     number_width: u16,
+    /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
+    /// present it has input focus: the editing cursor is drawn inside it.
+    panel: Option<PanelData>,
+}
+
+/// The bottom panel mirrored from the server's redraw: a title, the visible
+/// content slice, the cursor row within it, and the content height to lay out.
+#[derive(Clone)]
+struct PanelData {
+    title: String,
+    lines: Vec<String>,
+    cursor_row: u16,
+    height: u16,
 }
 
 /// The scroll gesture mirrored from the server's redraw, ready to animate.
@@ -311,6 +350,22 @@ impl View {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         self.number_width = map_u64(map, "number_width") as u16;
+        self.panel = match map_get(map, "panel") {
+            Some(Value::Map(p)) => Some(PanelData {
+                title: map_str(p, "title"),
+                lines: map_get(p, "lines")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                cursor_row: map_u64(p, "cursor_row") as u16,
+                height: map_u64(p, "height") as u16,
+            }),
+            _ => None,
+        };
         self.scroll = match map_get(map, "scroll") {
             Some(Value::Map(s)) => Some(ScrollData {
                 from_top: map_u64(s, "from_top") as f32,
@@ -407,13 +462,21 @@ impl ScrollHarness {
 /// is present and unfinished, the text area shows an interpolated slice of the
 /// scroll band instead of the static viewport.
 fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
+    // The panel docks below the status line, claiming `height + 1` rows (content
+    // plus its title bar); `0` rows — an empty region — when no panel is open.
+    // The server already shrank the text `lines` to match, so the text area
+    // (`Min(1)`) lands at exactly the right height. The command line stays the
+    // very last row (where `:` typing and the cursor live).
+    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
     let regions = Layout::vertical([
-        Constraint::Min(1),    // text area
-        Constraint::Length(1), // status line
-        Constraint::Length(1), // command line
+        Constraint::Min(1),             // text area
+        Constraint::Length(1),          // status line
+        Constraint::Length(panel_rows), // panel (0 when none)
+        Constraint::Length(1),          // command line
     ])
     .split(frame.area());
-    let (text_area, status_area, cmd_area) = (regions[0], regions[1], regions[2]);
+    let (text_area, status_area, panel_area, cmd_area) =
+        (regions[0], regions[1], regions[2], regions[3]);
 
     let height = text_area.height as usize;
     let frame_lines: Vec<String>;
@@ -501,6 +564,17 @@ fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     );
     render_status(frame, status_area, view);
     render_command(frame, cmd_area, view);
+
+    // A focused panel owns the cursor: draw it on the panel's current line and
+    // skip the text/command cursor entirely.
+    if let Some(panel) = &view.panel {
+        let content = render_panel(frame, panel_area, panel);
+        frame.set_cursor_position((
+            content.x,
+            content.y + panel.cursor_row.min(content.height.saturating_sub(1)),
+        ));
+        return;
+    }
 
     if view.command_mode {
         let col = cmd_area.x + 1 + view.cmdline.chars().count() as u16;
@@ -786,6 +860,67 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
         view.message.clone()
     };
     frame.render_widget(Paragraph::new(content), area);
+}
+
+/// Render the bottom panel: a `─ Title ───────[X]─` top-border bar, then the
+/// content rows with the focused (cursor) line highlighted across the full
+/// width. The `[X]` at the right of the bar is the click-to-close button (see
+/// [`close_button`]). Returns the inner content [`Rect`] so the caller can
+/// place the editing cursor on the panel's current line.
+fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelData) -> Rect {
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title_top(Line::from(format!(" {} ", panel.title)).left_aligned())
+        .title_top(Line::from("[X]").right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let rows: Vec<Line> = (0..inner.height)
+        .map(|row| {
+            let text = panel
+                .lines
+                .get(row as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if row == panel.cursor_row {
+                // Fill the cursor line to the full width so the highlight reads
+                // as a selected row, not just selected text.
+                let filled = format!("{text:<width$}");
+                Line::from(Span::styled(
+                    filled,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ))
+            } else {
+                Line::from(text.to_string())
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(rows)), inner);
+    inner
+}
+
+/// Screen position of the panel's `[X]` close button on a `width`x`height`
+/// terminal showing a panel of content height `panel_height`: its top-border
+/// row and the 3-cell column range the `[X]` occupies. `None` when the terminal
+/// has no room to lay the panel out. Pure (no rendering) so the event loop's
+/// click hit-test and a test can share one definition.
+///
+/// Layout mirrors [`render`]: from the bottom up, one command row, then the
+/// panel's `panel_height + 1` rows (the panel sits below the status line) — so
+/// the border row is `height - 1 - (panel_height + 1)`.
+///
+/// `#[doc(hidden)] pub` so a Tier-1 test can pin this geometry against the
+/// painted `[X]`; not part of the client's runtime API.
+#[doc(hidden)]
+pub fn close_button(
+    width: u16,
+    height: u16,
+    panel_height: u16,
+) -> Option<(u16, std::ops::Range<u16>)> {
+    let row = height.checked_sub(panel_height + 2)?;
+    let start = width.checked_sub(3)?;
+    Some((row, start..width))
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {

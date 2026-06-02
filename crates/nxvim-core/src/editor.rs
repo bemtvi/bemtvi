@@ -15,7 +15,11 @@ use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::{resolve_set, Options, SetOp};
 use crate::unicode;
-use crate::view::View;
+use crate::view::{PanelView, View};
+
+/// Default content height of the bottom panel, in rows (vim's quickfix
+/// default). The projection clamps it down so the text window keeps a row.
+const PANEL_HEIGHT: usize = 10;
 
 /// A cursor position within the current buffer (0-indexed line and column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -147,6 +151,34 @@ pub(crate) struct PendingScroll {
     pub duration_ms: u64,
 }
 
+/// A bottom-docked, read-only, navigable panel — nxvim's home for multi-line
+/// output like `:messages` and `:ls`. It is **not** a vim window (there is
+/// still exactly one text window); it is a transient overlay that grabs focus
+/// while open and is dismissed with `q`/`Q`/`<Esc>` (or a click on its `[X]`).
+///
+/// While a panel is open, [`Editor::input`] routes every key here instead of to
+/// the buffer, so the usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`)
+/// scroll the panel rather than the text.
+struct Panel {
+    /// Label shown in the title bar (e.g. `Messages`, `Buffers`).
+    title: String,
+    /// The full content; the visible slice is `lines[top..top + height]`.
+    lines: Vec<String>,
+    /// Cursor line within `lines`.
+    cursor: usize,
+    /// First visible line of `lines` (vertical scroll within the panel).
+    top: usize,
+    /// Requested content height; [`Editor::panel_rows`] clamps it so the text
+    /// window always keeps at least one row.
+    height: usize,
+    /// `gg` is two keys; the first `g` arms this.
+    gpending: bool,
+    /// Whether `<CR>` on a line emits a select event (drained into the scripting
+    /// `on_select` callback / RPC notification). Built-in viewer panels opt out,
+    /// so a stale handler never fires on them.
+    wants_select: bool,
+}
+
 /// The complete editor state: the open buffers plus the single window's state.
 pub struct Editor {
     /// All open buffers, keyed by id. [`Editor::current`] selects the one the
@@ -164,7 +196,16 @@ pub struct Editor {
     /// Command-line contents (text after the leading `:`).
     pub cmdline: String,
     /// Transient status message (the bottom line when not in command mode).
+    /// Set via [`Editor::echo`], which also appends to `messages`.
     pub message: String,
+    /// History of every message shown, the backing store for `:messages`.
+    pub messages: Vec<String>,
+    /// The bottom panel, when open (`:messages`, `:ls`). Grabs input focus.
+    panel: Option<Panel>,
+    /// `<CR>` selections made in a select-enabled panel: each is `(0-based line
+    /// index, line text)`. Drained by the server to fire the `on_select`
+    /// scripting callback and the `nxvim_panel_select` RPC notification.
+    pub panel_selects: Vec<(usize, String)>,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -240,6 +281,9 @@ impl Editor {
             top: 0,
             cmdline: String::new(),
             message: String::new(),
+            messages: Vec::new(),
+            panel: None,
+            panel_selects: Vec::new(),
             should_quit: false,
             options: Options::default(),
             highlights: Highlights::new(),
@@ -380,7 +424,7 @@ impl Editor {
     fn goto_alternate(&mut self) {
         match self.alternate {
             Some(id) => self.switch_buffer(id),
-            None => self.message = "E23: No alternate file".to_string(),
+            None => self.echo("E23: No alternate file"),
         }
     }
 
@@ -424,7 +468,7 @@ impl Editor {
                 ob.buffer.mark_resync();
                 ob.buffer.modified = false;
             }
-            Err(e) => self.message = e.to_string(),
+            Err(e) => self.echo(e.to_string()),
         }
     }
 
@@ -446,6 +490,13 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
+        // A focused panel grabs every key (navigation + close), bypassing the
+        // buffer's mode handling and the `curswant`/scroll bookkeeping below.
+        if self.panel.is_some() {
+            self.handle_panel(key);
+            return;
+        }
+
         self.preserve_desired = false;
         self.eol_request = false;
 
@@ -492,6 +543,19 @@ impl Editor {
         self.buffer().lines()
     }
 
+    /// Show `msg` on the message line **and** record it in the `:messages`
+    /// history. This is the single place a user-facing message is set (errors,
+    /// command output, captured `print`), so the history stays complete; the
+    /// server routes its own messages through here too. Each non-empty line is
+    /// recorded separately so a multi-line echo lists cleanly in `:messages`.
+    pub fn echo(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        for line in msg.split('\n').filter(|l| !l.is_empty()) {
+            self.messages.push(line.to_string());
+        }
+        self.message = msg;
+    }
+
     /// Produce a [`View`] of the current state for a text viewport of the given
     /// size. The client renders the view's regions with its own widgets.
     pub fn view(&mut self, width: usize, height: usize) -> View {
@@ -499,10 +563,6 @@ impl Editor {
         let view = View::from_editor(self);
         self.pending_scroll = None; // animate exactly once
         view
-    }
-
-    pub(crate) fn dims(&self) -> (usize, usize) {
-        (self.width, self.height)
     }
 
     /// Width in cells available for buffer text: the text-area width minus the
@@ -523,7 +583,8 @@ impl Editor {
     }
 
     pub(crate) fn text_height(&self) -> usize {
-        self.height.max(1)
+        // The panel (when open) eats rows off the bottom of the text window.
+        self.height.saturating_sub(self.panel_rows()).max(1)
     }
 
     // ----- normal / visual mode --------------------------------------------
@@ -1486,8 +1547,9 @@ impl Editor {
             "lua" => self.lua_queue.push(args.to_string()),
             "sleep" | "sl" => match parse_sleep(args) {
                 Ok(ms) => self.pending_sleep = Some(ms),
-                Err(e) => self.message = e,
+                Err(e) => self.echo(e),
             },
+            "mes" | "messages" | "message" => self.ex_messages(),
             "set" | "se" => self.ex_set(args),
             "noh" | "nohlsearch" => {}
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
@@ -1517,9 +1579,9 @@ impl Editor {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                self.message = format!("\"{name}\" {lines}L, {bytes}B written");
+                self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
             }
-            Err(e) => self.message = e.to_string(),
+            Err(e) => self.echo(e.to_string()),
         }
     }
 
@@ -1537,7 +1599,7 @@ impl Editor {
         }
         if self.buffer().modified {
             // Already showing the offending buffer.
-            self.message = "E37: No write since last change (add ! to override)".to_string();
+            self.echo("E37: No write since last change (add ! to override)");
             return;
         }
         match self.first_modified_buffer() {
@@ -1545,10 +1607,10 @@ impl Editor {
                 // Surface the blocking buffer, then warn (the switch clears the
                 // message, so set it afterwards).
                 self.switch_buffer(id);
-                self.message = format!(
+                self.echo(format!(
                     "E37: No write since last change for buffer {} (add ! to override)",
                     id.0
-                );
+                ));
             }
             None => self.should_quit = true,
         }
@@ -1565,7 +1627,7 @@ impl Editor {
 
     fn ex_edit(&mut self, args: &str, bang: bool) {
         if args.is_empty() {
-            self.message = "E32: No file name".to_string();
+            self.echo("E32: No file name");
             return;
         }
         let path = PathBuf::from(args);
@@ -1574,7 +1636,7 @@ impl Editor {
         // discarding unsaved changes — so the modified guard applies here.
         if self.buffer().path.as_deref() == Some(path.as_path()) {
             if self.buffer().modified && !bang {
-                self.message = "E37: No write since last change (add ! to override)".to_string();
+                self.echo("E37: No write since last change (add ! to override)");
                 return;
             }
             self.load_into_current(&path);
@@ -1600,7 +1662,7 @@ impl Editor {
                     let id = self.add_buffer(buf);
                     self.switch_buffer(id);
                 }
-                Err(e) => self.message = e.to_string(),
+                Err(e) => self.echo(e.to_string()),
             }
         }
     }
@@ -1623,12 +1685,12 @@ impl Editor {
                 written += 1;
             }
         }
-        self.message = format!("{written} buffer(s) written");
+        self.echo(format!("{written} buffer(s) written"));
     }
 
     // ----- buffer list ------------------------------------------------------
 
-    /// `:ls` / `:buffers` — list the open buffers into the message line, one per
+    /// `:ls` / `:buffers` — list the open buffers into the bottom panel, one per
     /// row (id-sorted), with vim's flag columns: `%` current / `#` alternate,
     /// `a` active / `h` hidden, `+` modified.
     fn ex_buffers(&mut self) {
@@ -1636,7 +1698,11 @@ impl Editor {
         let alternate = self.alternate;
         let live_cursor = self.cursor.line;
         let mut lines = Vec::new();
-        for (id, ob) in &self.buffers.map {
+        let mut current_row = 0;
+        for (row, (id, ob)) in self.buffers.map.iter().enumerate() {
+            if *id == current {
+                current_row = row;
+            }
             let flag = if *id == current {
                 '%'
             } else if Some(*id) == alternate {
@@ -1662,7 +1728,22 @@ impl Editor {
                 id.0
             ));
         }
-        self.message = lines.join("\n");
+        self.open_panel("Buffers", lines, false, current_row);
+        // Wire `<CR>` to jump to the picked buffer, using the same scripting
+        // `on_select` mechanism a plugin would: a prelude helper parses the
+        // buffer number off the selected line and switches to it. Queued as Lua
+        // (like `:lua`); the server runs it after the panel is open, so it sets
+        // the handler on this very panel.
+        self.lua_queue
+            .push("vim.panel.on_select(vim._panel_select_buffer)".to_string());
+    }
+
+    /// `:messages` — show the message history in the bottom panel, opened
+    /// scrolled to the end with the newest line selected.
+    fn ex_messages(&mut self) {
+        let lines = self.messages.clone();
+        let last = lines.len().saturating_sub(1);
+        self.open_panel("Messages", lines, false, last);
     }
 
     /// Resolve a `:buffer` / `:bdelete` argument to a buffer id: empty = current,
@@ -1678,7 +1759,7 @@ impl Editor {
             return match self.alternate {
                 Some(id) => Some(id),
                 None => {
-                    self.message = "E23: No alternate file".to_string();
+                    self.echo("E23: No alternate file");
                     None
                 }
             };
@@ -1688,7 +1769,7 @@ impl Editor {
             if self.buffers.map.contains_key(&id) {
                 return Some(id);
             }
-            self.message = format!("E86: Buffer {n} does not exist");
+            self.echo(format!("E86: Buffer {n} does not exist"));
             return None;
         }
         let matches: Vec<BufferId> = self
@@ -1705,12 +1786,12 @@ impl Editor {
             .collect();
         match matches.as_slice() {
             [] => {
-                self.message = format!("E94: No matching buffer for {arg}");
+                self.echo(format!("E94: No matching buffer for {arg}"));
                 None
             }
             [one] => Some(*one),
             _ => {
-                self.message = format!("E93: More than one match for {arg}");
+                self.echo(format!("E93: More than one match for {arg}"));
                 None
             }
         }
@@ -1758,10 +1839,10 @@ impl Editor {
             return;
         };
         if self.buffers.get(target).buffer.modified && !bang {
-            self.message = format!(
+            self.echo(format!(
                 "E89: No write since last change for buffer {} (add ! to override)",
                 target.0
-            );
+            ));
             return;
         }
 
@@ -1812,6 +1893,197 @@ impl Editor {
         })
     }
 
+    // ----- panel ------------------------------------------------------------
+
+    /// Open (or replace) the bottom panel with `title` + `lines` and focus it.
+    /// The text window shrinks to make room; the cursor is re-clamped so it
+    /// stays visible in the reduced viewport. `wants_select` enables `<CR>`
+    /// select events on the panel (the scripting `on_select` callback / RPC
+    /// notification); the built-in viewer panels pass `false`. `cursor` is the
+    /// initially selected line (0-based, clamped to the last line); the panel is
+    /// scrolled so it is visible — `:messages` opens on its last line, `:ls` on
+    /// the current buffer.
+    ///
+    /// Public so it can be driven from the scripting surface (`vim.panel.open`
+    /// and the `nxvim_panel_open` RPC), as well as the `:messages` / `:ls`
+    /// ex-commands.
+    pub fn open_panel(
+        &mut self,
+        title: impl Into<String>,
+        lines: Vec<String>,
+        wants_select: bool,
+        cursor: usize,
+    ) {
+        let cursor = cursor.min(lines.len().saturating_sub(1));
+        self.panel = Some(Panel {
+            title: title.into(),
+            lines,
+            cursor,
+            top: 0,
+            height: PANEL_HEIGHT,
+            gpending: false,
+            wants_select,
+        });
+        self.ensure_visible();
+        self.scroll_panel_into_view();
+    }
+
+    /// Enable or disable `<CR>` select events on the open panel
+    /// (`vim.panel.on_select`). A no-op when no panel is open.
+    pub fn set_panel_on_select(&mut self, wants: bool) {
+        if let Some(panel) = self.panel.as_mut() {
+            panel.wants_select = wants;
+        }
+    }
+
+    /// Move the open panel's selection to `index` (0-based, clamped to the last
+    /// line) and scroll it into view (`vim.panel.set_cursor` /
+    /// `nxvim_panel_set_cursor`). A no-op when no panel is open.
+    pub fn set_panel_cursor(&mut self, index: usize) {
+        if let Some(panel) = self.panel.as_mut() {
+            let last = panel.lines.len().saturating_sub(1);
+            panel.cursor = index.min(last);
+        }
+        self.scroll_panel_into_view();
+    }
+
+    /// Replace the open panel's content (`vim.panel.set_lines` /
+    /// `nxvim_panel_set_lines`), keeping its title and re-clamping the cursor and
+    /// scroll to the new content. A no-op when no panel is open.
+    pub fn set_panel_lines(&mut self, lines: Vec<String>) {
+        if let Some(panel) = self.panel.as_mut() {
+            let last = lines.len().saturating_sub(1);
+            panel.lines = lines;
+            panel.cursor = panel.cursor.min(last);
+            panel.top = panel.top.min(last);
+        }
+        self.scroll_panel_into_view();
+    }
+
+    /// Re-derive the open panel's `top` so its `cursor` line stays within the
+    /// visible window — the shared scroll step for opening, content swaps, and
+    /// keyboard motion. A no-op when no panel is open.
+    fn scroll_panel_into_view(&mut self) {
+        let ph = self.panel_content_height().max(1);
+        if let Some(panel) = self.panel.as_mut() {
+            if panel.cursor < panel.top {
+                panel.top = panel.cursor;
+            } else if panel.cursor >= panel.top + ph {
+                panel.top = panel.cursor + 1 - ph;
+            }
+        }
+    }
+
+    /// Close the panel and return focus to the text window, which grows back.
+    /// Public for the scripting surface (`vim.panel.close` /
+    /// `nxvim_panel_close`); a no-op when no panel is open.
+    pub fn close_panel(&mut self) {
+        self.panel = None;
+        self.ensure_visible();
+    }
+
+    /// Whether a panel is currently open (the `nxvim_panel_is_open` query).
+    pub fn panel_is_open(&self) -> bool {
+        self.panel.is_some()
+    }
+
+    /// Total screen rows the panel occupies (its content plus the one title
+    /// row), clamped so the text window always keeps at least one row. `0` when
+    /// no panel is open.
+    fn panel_rows(&self) -> usize {
+        match &self.panel {
+            None => 0,
+            Some(p) => (p.height + 1).min(self.height.saturating_sub(1)),
+        }
+    }
+
+    /// The panel's visible content height (its rows minus the title), `0` when
+    /// no panel is open or it has been clamped to nothing.
+    fn panel_content_height(&self) -> usize {
+        self.panel_rows().saturating_sub(1)
+    }
+
+    /// Project the panel into the renderable [`PanelView`]: the visible slice of
+    /// its content, the cursor's row within that slice, and the clamped content
+    /// height. `None` when no panel is open. (`pub(crate)` so [`View`] can build
+    /// it while [`Panel`] stays private.)
+    pub(crate) fn panel_view(&self) -> Option<PanelView> {
+        let p = self.panel.as_ref()?;
+        let height = self.panel_content_height();
+        let lines = p.lines.iter().skip(p.top).take(height).cloned().collect();
+        Some(PanelView {
+            title: p.title.clone(),
+            lines,
+            cursor_row: p.cursor.saturating_sub(p.top),
+            height,
+        })
+    }
+
+    /// Handle one key while the panel is focused: `q`/`Q`/`<Esc>` close it,
+    /// `<CR>` selects the current line (when the panel opted into select events),
+    /// and the usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`, arrows,
+    /// `Home`/`End`) move the panel cursor, scrolling the panel to keep it
+    /// visible. Everything else is ignored — the buffer is untouched while the
+    /// panel has focus.
+    fn handle_panel(&mut self, key: Key) {
+        self.message.clear();
+
+        // Close keys drop the panel and refocus the text window.
+        if key.code == KeyCode::Esc || matches!(key.as_char(), Some('q') | Some('Q')) {
+            self.close_panel();
+            return;
+        }
+
+        // `<CR>` selects the current line: record it for the server to dispatch
+        // to the scripting `on_select` handler. Only for select-enabled panels,
+        // so a stale handler can't fire on a built-in `:messages` viewer.
+        if key.code == KeyCode::Enter {
+            if let Some(p) = &self.panel {
+                if p.wants_select {
+                    if let Some(line) = p.lines.get(p.cursor) {
+                        self.panel_selects.push((p.cursor, line.clone()));
+                    }
+                }
+            }
+            return;
+        }
+
+        let ph = self.panel_content_height().max(1);
+        let half = (ph / 2).max(1);
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        let last = panel.lines.len().saturating_sub(1);
+
+        // `gg` is two keys; the first `g` arms `gpending`.
+        if panel.gpending {
+            panel.gpending = false;
+            if key.as_char() == Some('g') {
+                panel.cursor = 0;
+            }
+        } else if key.as_char() == Some('g') {
+            panel.gpending = true;
+        } else {
+            match (key.code, key.as_char()) {
+                (KeyCode::Down, _) | (_, Some('j')) => panel.cursor = (panel.cursor + 1).min(last),
+                (KeyCode::Up, _) | (_, Some('k')) => panel.cursor = panel.cursor.saturating_sub(1),
+                (_, Some('G')) => panel.cursor = last,
+                (KeyCode::Char('d'), _) if key.ctrl => {
+                    panel.cursor = (panel.cursor + half).min(last)
+                }
+                (KeyCode::Char('u'), _) if key.ctrl => {
+                    panel.cursor = panel.cursor.saturating_sub(half)
+                }
+                (KeyCode::Home, _) => panel.cursor = 0,
+                (KeyCode::End, _) => panel.cursor = last,
+                _ => {}
+            }
+        }
+
+        // Scroll the panel so the cursor line stays within the visible window.
+        self.scroll_panel_into_view();
+    }
+
     // ----- options ----------------------------------------------------------
 
     /// Handle `:set {options}`. Each whitespace-separated token is a boolean
@@ -1821,7 +2093,7 @@ impl Editor {
         for tok in args.split_whitespace() {
             match resolve_set(tok) {
                 Some((name, op)) => self.apply_set(name, op),
-                None => self.message = format!("E518: Unknown option: {tok}"),
+                None => self.echo(format!("E518: Unknown option: {tok}")),
             }
         }
     }
@@ -1839,11 +2111,12 @@ impl Editor {
             SetOp::Toggle => *slot = !*slot,
             SetOp::Query => {
                 let on = *slot;
-                self.message = if on {
+                let label = if on {
                     name.to_string()
                 } else {
                     format!("no{name}")
                 };
+                self.echo(label);
             }
         }
     }
@@ -1876,7 +2149,7 @@ impl Editor {
 
     fn undo(&mut self) {
         let Some(snap) = self.cur_mut().undo_stack.pop() else {
-            self.message = "Already at oldest change".to_string();
+            self.echo("Already at oldest change");
             return;
         };
         let current = Snapshot {
@@ -1893,7 +2166,7 @@ impl Editor {
 
     fn redo(&mut self) {
         let Some(snap) = self.cur_mut().redo_stack.pop() else {
-            self.message = "Already at newest change".to_string();
+            self.echo("Already at newest change");
             return;
         };
         let current = Snapshot {

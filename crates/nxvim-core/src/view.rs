@@ -39,6 +39,25 @@ pub struct ScrollAnim {
     pub numbers: Vec<Option<usize>>,
 }
 
+/// The renderable form of the bottom [`Panel`](crate::editor): a title, the
+/// visible slice of its content, the cursor's row within that slice, and the
+/// content height the client lays the panel out to. `None` in [`View::panel`]
+/// when no panel is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelView {
+    /// Label shown in the panel's title bar (e.g. `Messages`, `Buffers`).
+    pub title: String,
+    /// The visible content rows (already scrolled); never longer than `height`.
+    /// The client pads shorter content with blank rows.
+    pub lines: Vec<String>,
+    /// Cursor row within the visible slice.
+    pub cursor_row: usize,
+    /// Content height in rows (excludes the title row). The client lays the
+    /// whole panel out as `height + 1` rows; the editor sized it so the text
+    /// window keeps at least one row.
+    pub height: usize,
+}
+
 /// A snapshot of everything a client needs to draw a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
@@ -86,11 +105,17 @@ pub struct View {
     pub relativenumber: bool,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
+    /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
+    /// present it has input focus, so the client draws the editing cursor inside
+    /// the panel rather than the text window.
+    pub panel: Option<PanelView>,
 }
 
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
-        let height = ed.dims().1;
+        // The text window height — the full UI height minus any rows the bottom
+        // panel claims (so `lines` is sized to the area the client paints text).
+        let height = ed.text_height();
         let line_count = ed.buffer().line_count();
         // Selections fill to the text width — the area past the number gutter.
         let width = ed.text_width();
@@ -149,6 +174,7 @@ impl View {
             number: ed.options.number,
             relativenumber: ed.options.relativenumber,
             number_width: ed.number_width(),
+            panel: ed.panel_view(),
         }
     }
 }

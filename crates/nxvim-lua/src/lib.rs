@@ -40,6 +40,36 @@ pub struct HlSet {
     pub link: Option<String>,
 }
 
+/// A request to the bottom message panel, queued by the `vim.panel.*` functions
+/// and drained by the server into the core (which owns the panel state). nxvim's
+/// own surface — the panel is not a neovim concept.
+#[derive(Clone, Debug)]
+pub enum PanelOp {
+    /// `vim.panel.open(title, lines[, on_select[, cursor]])` — open (or replace)
+    /// and focus the panel. `wants_select` is set when an `on_select` callback
+    /// was given, enabling `<CR>` select events. `cursor` is the initially
+    /// selected line (0-based; the panel scrolls to keep it visible).
+    Open {
+        title: String,
+        lines: Vec<String>,
+        wants_select: bool,
+        cursor: usize,
+    },
+    /// `vim.panel.set_lines(lines)` — replace the open panel's content.
+    SetLines(Vec<String>),
+    /// `vim.panel.on_select(fn|nil)` — enable/disable `<CR>` select events on the
+    /// open panel (the callback itself lives in the Lua registry).
+    OnSelect(bool),
+    /// `vim.panel.set_cursor(line)` — move the open panel's selection to the
+    /// given line (0-based) and scroll it into view.
+    SetCursor(usize),
+    /// `vim.panel.close()` — close the panel.
+    Close,
+}
+
+/// Lua registry key under which the panel's `on_select` callback is stored.
+const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
+
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 struct Shared {
@@ -50,6 +80,8 @@ struct Shared {
     /// Highlight-group definitions from `nvim_set_hl`, applied to the core
     /// registry after the chunk drains (so the core stays the sole mutator).
     highlights: Vec<HlSet>,
+    /// Panel requests from `vim.panel.*`, applied to the core after the chunk.
+    panel_ops: Vec<PanelOp>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -118,6 +150,24 @@ impl LuaRuntime {
     /// last drain, for the server to apply to the core registry.
     pub fn take_highlights(&self) -> Vec<HlSet> {
         std::mem::take(&mut self.shared.borrow_mut().highlights)
+    }
+
+    /// Take the panel requests queued by `vim.panel.*` since the last drain, for
+    /// the server to apply to the core (which owns the panel state).
+    pub fn take_panel_ops(&self) -> Vec<PanelOp> {
+        std::mem::take(&mut self.shared.borrow_mut().panel_ops)
+    }
+
+    /// Fire the panel's `on_select` callback for the line at `index` (0-based,
+    /// passed to Lua 1-based) with text `line`. A no-op when no callback is
+    /// registered. Errors (a throwing handler) are returned for the server to
+    /// surface. Called when the user hits `<CR>` on a select-enabled panel.
+    pub fn run_panel_select(&self, index: usize, line: &str) -> mlua::Result<()> {
+        let cb: Option<mlua::Function> = self.lua.named_registry_value(PANEL_ON_SELECT)?;
+        if let Some(f) = cb {
+            f.call::<()>((line.to_string(), index as i64 + 1))?;
+        }
+        Ok(())
     }
 
     /// Set `vim.g[key] = value` from Rust — used to record `g:colors_name` when
@@ -245,6 +295,81 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     )?;
     vim.set("api", api)?;
 
+    // `vim.panel`: nxvim's scriptable handle on the bottom message panel
+    // (`:messages` / `:ls`'s home). Each call queues a [`PanelOp`] the server
+    // drains into the core after the chunk runs — same "Lua queues, core
+    // mutates" flow as `vim.cmd` / `nvim_set_hl`.
+    let panel = lua.create_table()?;
+    // `open(title, lines[, on_select[, cursor]])`: `on_select` is a
+    // `function(line, index)` called when the user hits `<CR>` on a line (index
+    // is 1-based). It is stored in the Lua registry; passing it enables select
+    // events for this panel. `cursor` is the initially selected line (1-based,
+    // matching the `on_select` index); it defaults to the first line.
+    let sh = shared.clone();
+    panel.set(
+        "open",
+        lua.create_function(
+            move |lua,
+                  (title, lines, on_select, cursor): (
+                String,
+                Option<Vec<String>>,
+                Option<mlua::Function>,
+                Option<usize>,
+            )| {
+                store_panel_callback(lua, on_select.clone())?;
+                sh.borrow_mut().panel_ops.push(PanelOp::Open {
+                    title,
+                    lines: lines.unwrap_or_default(),
+                    wants_select: on_select.is_some(),
+                    cursor: cursor.map(|c| c.saturating_sub(1)).unwrap_or(0),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    panel.set(
+        "set_lines",
+        lua.create_function(move |_, lines: Vec<String>| {
+            sh.borrow_mut().panel_ops.push(PanelOp::SetLines(lines));
+            Ok(())
+        })?,
+    )?;
+    // `on_select(fn|nil)`: set or clear the open panel's `<CR>` handler.
+    let sh = shared.clone();
+    panel.set(
+        "on_select",
+        lua.create_function(move |lua, on_select: Option<mlua::Function>| {
+            store_panel_callback(lua, on_select.clone())?;
+            sh.borrow_mut()
+                .panel_ops
+                .push(PanelOp::OnSelect(on_select.is_some()));
+            Ok(())
+        })?,
+    )?;
+    // `set_cursor(line)`: move the open panel's selection (1-based, matching the
+    // `on_select` index) and scroll it into view.
+    let sh = shared.clone();
+    panel.set(
+        "set_cursor",
+        lua.create_function(move |_, line: usize| {
+            sh.borrow_mut()
+                .panel_ops
+                .push(PanelOp::SetCursor(line.saturating_sub(1)));
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    panel.set(
+        "close",
+        lua.create_function(move |lua, ()| {
+            store_panel_callback(lua, None)?; // drop the handler with the panel
+            sh.borrow_mut().panel_ops.push(PanelOp::Close);
+            Ok(())
+        })?,
+    )?;
+    vim.set("panel", panel)?;
+
     // `vim.fn`: the Vimscript builtins the load path calls. Only the ones that
     // need real filesystem / environment access are Rust-backed; the rest of
     // `vim.*` is pure Lua in the prelude.
@@ -307,6 +432,16 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Store (or clear) the panel's `on_select` callback in the Lua registry. `None`
+/// stores `nil`, so [`LuaRuntime::run_panel_select`] reads it back as "no
+/// handler" — keeping a closed/replaced panel from firing a stale callback.
+fn store_panel_callback(lua: &Lua, cb: Option<mlua::Function>) -> mlua::Result<()> {
+    match cb {
+        Some(f) => lua.set_named_registry_value(PANEL_ON_SELECT, f),
+        None => lua.set_named_registry_value(PANEL_ON_SELECT, mlua::Value::Nil),
+    }
 }
 
 /// Prepend each runtimepath entry's `lua/` directory to Lua's `package.path`,

@@ -259,6 +259,70 @@ and restored on return.
 
 ---
 
+## The message panel
+
+Multi-line, browsable output — `:messages` (the message history) and `:ls` (the
+buffer list) — lives in a **panel**: a bottom-docked, read-only, navigable
+region that is explicitly **not** a vim window (there is still one text window
+onto one buffer). It is nxvim-native, closest in spirit to neovim's quickfix
+window but simpler: a transient overlay that grabs input focus while open.
+
+- **State lives in the core.** `Editor` holds an `Option<Panel>` (title, content
+  lines, a cursor line, a scroll `top`, and a requested height). While a panel is
+  open, `Editor::input` routes every key to it instead of to the buffer, so the
+  usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`, arrows, `Home`/`End`)
+  scroll the panel; `q`/`Q`/`<Esc>` close it and refocus the text window. The
+  buffer is untouched throughout.
+- **The editor splits the height it's told.** The client still reports only the
+  text-viewport height (terminal minus the two chrome rows); the editor subtracts
+  the panel's rows from that, so `text_height()` — and therefore the `lines` it
+  projects — already account for the panel. No extra resize round-trip is needed:
+  the redraw reports the panel's clamped content height, and the client lays out
+  `height + 1` rows (content + a `─ Title ──[X]─` title bar) from it, **below the
+  status line** and above the command row, leaving the text area at exactly the
+  row count the core projected.
+- **A message history feeds it.** `Editor::echo` is the one place a user-facing
+  message is set; it records each line in a `messages` history (the backing store
+  for `:messages`) as well as showing it on the message line. The server routes
+  its own messages (errors, captured `print`/`nvim_echo`) through the same call.
+- **It's scriptable.** `Editor::open_panel`/`set_panel_lines`/`set_panel_cursor`/
+  `close_panel` are public, exposed two ways: a Lua `vim.panel.open(title, lines)`
+  / `set_lines(lines)` / `set_cursor(line)` / `close()` table (queued as
+  `PanelOp`s and drained by the server, the same "Lua queues, core mutates" flow
+  as `vim.cmd`/`nvim_set_hl`), and the `nxvim_panel_open` / `nxvim_panel_set_lines`
+  / `nxvim_panel_set_cursor` / `nxvim_panel_close` (plus `nxvim_panel_is_open`)
+  RPC methods, which manipulate the core directly so they work even while the
+  panel holds input focus. So a plugin can use the panel as a general output
+  surface, not just for `:messages`/`:ls`.
+- **It opens on a chosen line.** `open_panel` takes an initial cursor; the panel
+  scrolls so that line is visible. Scripts pass it as a fourth argument
+  (`vim.panel.open(title, lines, on_select, line)`, 1-based to match the
+  `on_select` index, or the `cursor` param on `nxvim_panel_open`, 0-based) and can
+  move it later with `set_cursor`. The two built-ins use this: `:messages` opens
+  scrolled to the end with the newest line selected, and `:ls` opens with the
+  current buffer selected.
+- **`<CR>` is a scriptable callback.** Pressing Enter on a line of a
+  *select-enabled* panel records `(index, line)` in the core (`panel_selects`);
+  the server drains it — the reverse of the queue flow, like an autocmd —
+  invoking the Lua `on_select(line, index)` handler (kept in the Lua registry)
+  and emitting an `nxvim_panel_select` RPC notification for non-Lua clients.
+  Selection is opt-in per panel (`vim.panel.open(title, lines, on_select)` /
+  `vim.panel.on_select(fn)`, or `want_select` on `nxvim_panel_open`): the
+  built-in `:messages` viewer opts out, so a stale handler never fires on it.
+  `:ls` itself rides this path — it opens its panel, then queues
+  `vim.panel.on_select(vim._panel_select_buffer)` (a prelude helper that parses
+  the buffer number off the selected line, jumps to it, and closes the list), so
+  pressing `<CR>` on a listed buffer switches to it.
+- **The `[X]` is clickable.** The client enables mouse capture and hit-tests a
+  left-click against the title bar's close button (`close_button`), sending the
+  close key when hit — the only mouse interaction in the client today.
+
+The redraw carries the panel as a `panel` map (`title`, `lines`, `cursor_row`,
+`height`), `Nil` when none is open; the client draws the editing cursor inside
+the panel while it has focus.
+
+---
+
 ## Lua
 
 nxvim embeds **Lua 5.1** via [mlua] (`lua51`, vendored) — the dialect LuaJIT,

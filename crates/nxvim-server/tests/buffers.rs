@@ -109,6 +109,53 @@ async fn message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Strin
     msg
 }
 
+/// The bottom panel's `(title, content lines, selected row)`, read off the
+/// latest `redraw`. The selected row is `cursor_row`, relative to the visible
+/// slice. `None` when no panel is open. Drains to the most recent redraw like
+/// [`message`] does.
+async fn panel(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<(String, Vec<String>, usize)> {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let mut result = None;
+    while let Ok(inc) = incoming.try_recv() {
+        if let Incoming::Notification { method, params } = inc {
+            if method == "redraw" {
+                if let Some(Value::Map(map)) = params.into_iter().next() {
+                    let p = map
+                        .iter()
+                        .find(|(k, _)| k.as_str() == Some("panel"))
+                        .map(|(_, v)| v);
+                    result = match p {
+                        Some(Value::Map(panel)) => {
+                            let get = |key| panel.iter().find(|(k, _)| k.as_str() == Some(key));
+                            let title = get("title")
+                                .and_then(|(_, v)| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let lines = get("lines")
+                                .and_then(|(_, v)| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let cursor_row = get("cursor_row")
+                                .and_then(|(_, v)| v.as_u64())
+                                .unwrap_or(0) as usize;
+                            Some((title, lines, cursor_row))
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+    result
+}
+
 /// A uniquely-named temp file path with the given contents. `.txt` so no
 /// treesitter grammar is involved (keeps these tests free of the syntax worker).
 fn temp_file(tag: &str, contents: &str) -> PathBuf {
@@ -339,19 +386,24 @@ async fn ls_lists_open_buffers_with_flags() {
     command(&rpc, &format!("e {}", name(&b))).await; // buffer 2, current
 
     command(&rpc, "ls").await;
-    let listing = message(&rpc, &mut incoming).await;
+    let (title, rows, selected) = panel(&rpc, &mut incoming)
+        .await
+        .expect(":ls opens the panel");
 
-    // Two rows, one per buffer; current is `%a`, the alternate is `#h`.
-    let rows: Vec<&str> = listing.lines().collect();
-    assert_eq!(rows.len(), 2, "listing was: {listing:?}");
+    // `:ls` opens the "Buffers" panel: one row per buffer; current is `%a`, the
+    // alternate is `#h`.
+    assert_eq!(title, "Buffers");
+    assert_eq!(rows.len(), 2, "listing was: {rows:?}");
     assert!(
         rows[0].contains("#h") && rows[0].contains(&name(&a)),
-        "{listing:?}"
+        "{rows:?}"
     );
     assert!(
         rows[1].contains("%a") && rows[1].contains(&name(&b)),
-        "{listing:?}"
+        "{rows:?}"
     );
+    // The panel opens with the current buffer (row 1, `%a`) selected.
+    assert_eq!(selected, 1, "current buffer starts selected");
 
     std::fs::remove_file(&a).ok();
     std::fs::remove_file(&b).ok();
@@ -533,6 +585,36 @@ async fn quit_warns_and_shows_a_modified_buffer_instead_of_losing_it() {
     // Now showing the modified buffer a; `:q` again still warns (a is current).
     command(&rpc, "q").await;
     assert!(message(&rpc, &mut incoming).await.starts_with("E37"));
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[tokio::test]
+async fn ls_enter_jumps_to_the_selected_buffer() {
+    let a = temp_file("a", "a1\n");
+    let b = temp_file("b", "b1\n");
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await; // buffer 1
+    command(&rpc, &format!("e {}", name(&b))).await; // buffer 2 (current)
+
+    // `:ls` opens the focused buffer panel with the current buffer (buffer 2,
+    // row 1) selected; its rows are id-sorted, so `k` moves up to buffer 1 (a).
+    // `<CR>` then jumps to that buffer and dismisses the list.
+    command(&rpc, "ls").await;
+    feed(&rpc, "k<CR>");
+
+    assert_eq!(
+        current_buf(&rpc).await,
+        1,
+        "selected buffer becomes current"
+    );
+    assert_eq!(lines(&rpc).await, vec!["a1"]);
+    assert!(
+        panel(&rpc, &mut incoming).await.is_none(),
+        "selecting a buffer closes the list"
+    );
 
     std::fs::remove_file(&a).ok();
     std::fs::remove_file(&b).ok();

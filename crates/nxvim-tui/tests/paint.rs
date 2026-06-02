@@ -332,3 +332,68 @@ fn no_colorscheme_falls_back_to_the_builtin_theme() {
         "with no Visual style the selection stays reverse-video"
     );
 }
+
+// ----- bottom panel (`:messages`, `:ls`) ---------------------------------
+
+/// A `panel` redraw sub-map: title, content lines, cursor row, content height.
+fn panel(title: &str, content: &[&str], cursor_row: u64, height: u64) -> Value {
+    Value::Map(vec![
+        (Value::from("title"), Value::from(title)),
+        (Value::from("lines"), lines(content)),
+        (Value::from("cursor_row"), Value::from(cursor_row)),
+        (Value::from("height"), Value::from(height)),
+    ])
+}
+
+#[test]
+fn panel_renders_a_title_bar_with_a_close_button_then_content() {
+    // height 2 panel -> 3 panel rows (title + 2 content). On an 8-row grid the
+    // panel sits below the status line: text rows 0..3, status row 3, panel
+    // rows 4,5,6, command row 7.
+    let v = view(vec![
+        ("lines", lines(&["text"])),
+        ("panel", panel("Messages", &["alpha", "beta"], 0, 2)),
+    ]);
+    let buf = paint(&v, 20, 8);
+
+    let bar = row_text(&buf, 4);
+    assert!(bar.contains("Messages"), "title bar: {bar:?}");
+    assert!(
+        bar.contains("[X]"),
+        "close button on the title bar: {bar:?}"
+    );
+    assert!(bar.contains('─'), "title bar is a top border: {bar:?}");
+
+    assert_eq!(row_text(&buf, 5).trim_end(), "alpha");
+    assert_eq!(row_text(&buf, 6).trim_end(), "beta");
+}
+
+#[test]
+fn panel_cursor_row_is_highlighted() {
+    let v = view(vec![
+        ("lines", lines(&["text"])),
+        ("panel", panel("Messages", &["alpha", "beta"], 1, 2)),
+    ]);
+    let buf = paint(&v, 20, 8);
+    // cursor_row 1 -> the second content row (grid row 6) is the focused line.
+    assert!(reversed(&buf, 0, 6), "the cursor line is highlighted");
+    assert!(!reversed(&buf, 0, 5), "other panel lines are not");
+}
+
+#[test]
+fn close_button_geometry_matches_the_painted_x() {
+    // Same layout as the render test: 20x8 grid, panel content height 2.
+    let (row, cols) = nxvim_tui::close_button(20, 8, 2).expect("a close button");
+    assert_eq!(row, 4, "the [X] sits on the panel's top-border row");
+
+    let v = view(vec![
+        ("lines", lines(&["text"])),
+        ("panel", panel("Messages", &["alpha", "beta"], 0, 2)),
+    ]);
+    let buf = paint(&v, 20, 8);
+    // Every reported column on that row is part of the painted "[X]".
+    let bar: String = cols
+        .map(|x| buf.cell((x, row)).map(|c| c.symbol()).unwrap_or(""))
+        .collect();
+    assert_eq!(bar, "[X]");
+}

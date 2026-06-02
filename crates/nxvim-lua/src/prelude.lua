@@ -351,3 +351,15 @@ do
     end,
   })
 end
+
+-- The `:ls` panel's <CR> handler: jump to the buffer whose number leads the
+-- selected listing line (`"  2 %a "name" line 1"`), then dismiss the list. The
+-- core installs this via `vim.panel.on_select` when `:ls` opens its panel, so
+-- the buffer list rides the same scripting select path a plugin would use.
+function vim._panel_select_buffer(line)
+  local n = tonumber(line:match("^%s*(%d+)"))
+  if n then
+    vim.panel.close()
+    vim.cmd("buffer " .. n)
+  end
+end

@@ -148,11 +148,6 @@ struct Server {
     /// Set when an LSP event changed something the client should see (e.g. a fresh
     /// `Initialized` that should trigger a `didOpen`). Coalesced like `syntax_dirty`.
     lsp_dirty: bool,
-    /// The `:LspDiagnostics` panel's per-line jump targets, in lockstep with its
-    /// lines. Non-empty only while that select-enabled panel owns the screen; a
-    /// `<CR>` on row `i` jumps to `lsp_panel_locations[i]`. Cleared when the
-    /// selection is consumed or any other panel takes over.
-    lsp_panel_locations: Vec<lsp::DiagLocation>,
     /// Monotonic generation counter stamped onto each language-feature request,
     /// so a reply whose generation is behind the latest of its kind is dropped
     /// (Decision 3 — the go-to analogue of the syntax `tick`).
@@ -197,7 +192,6 @@ where
         lsp_servers: HashMap::new(),
         lsp_ensured: HashSet::new(),
         lsp_dirty: false,
-        lsp_panel_locations: Vec::new(),
         lsp_req_gen: 0,
         lsp_requests: HashMap::new(),
         lsp_pending_g: false,
@@ -378,9 +372,6 @@ impl Server {
                 let lines = str_array(params.get(1));
                 let want_select = params.get(2).and_then(Value::as_bool).unwrap_or(false);
                 let cursor = params.get(3).and_then(Value::as_u64).unwrap_or(0) as usize;
-                // A scripted/RPC panel takes over the screen, so the LSP location
-                // list no longer owns a `<CR>`.
-                self.lsp_panel_locations.clear();
                 self.editor.open_panel(title, lines, want_select, cursor);
                 Ok(Value::Nil)
             }
@@ -513,8 +504,6 @@ impl Server {
                     wants_select,
                     cursor,
                 } => {
-                    // A scripted panel replaces any LSP location list ownership.
-                    self.lsp_panel_locations.clear();
                     self.editor.open_panel(title, lines, wants_select, cursor);
                 }
                 PanelOp::SetLines(lines) => self.editor.set_panel_lines(lines),
@@ -553,15 +542,9 @@ impl Server {
             // fire the Lua `on_select` callback. The callback may itself queue
             // commands / lua / panel ops, so this is inside the fixpoint loop.
             for (index, line) in std::mem::take(&mut self.editor.panel_selects) {
-                // A select on the `:LspDiagnostics` location list jumps to the
-                // chosen entry and closes the panel — it is the server's own
-                // panel, not a scripted one, so it never reaches Lua/RPC.
-                if let Some((Some(path), row, col)) = self.lsp_panel_locations.get(index).cloned() {
-                    self.lsp_panel_locations.clear();
-                    self.editor.close_panel();
-                    self.editor.jump_to(&path, row, col);
-                    continue;
-                }
+                // Navigable LSP location lists (diagnostics, references) jump in
+                // the core itself when their target line is selected, so they
+                // never reach here — only scripted/RPC select panels do.
                 self.rpc.notify(
                     "nxvim_panel_select",
                     vec![Value::Map(vec![
@@ -605,21 +588,17 @@ impl Server {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
             // Phase-1 LSP observability: dump server/document state into the panel.
             "LspInfo" => {
-                self.lsp_panel_locations.clear();
                 let lines = self.lsp_info_lines();
                 self.editor.open_panel("LSP info", lines, false, 0);
             }
-            // Phase-2: list the current buffer's diagnostics as a location list;
-            // `<CR>` on a row jumps to it (handled in `run_pending`).
+            // Phase-2: list the current buffer's diagnostics as a navigable
+            // location list; `<CR>` on a row jumps to it (handled in the core).
             "LspDiagnostics" => match self.diagnostics_location_list() {
-                Some((lines, locations)) => {
-                    self.lsp_panel_locations = locations;
-                    self.editor.open_panel("LSP diagnostics", lines, true, 0);
+                Some((lines, targets)) => {
+                    self.editor.open_panel("LSP diagnostics", lines, false, 0);
+                    self.editor.set_panel_targets(targets);
                 }
-                None => {
-                    self.lsp_panel_locations.clear();
-                    self.editor.echo("No diagnostics");
-                }
+                None => self.editor.echo("No diagnostics"),
             },
             // Phase-3: go-to / references as ex-commands (the keymap-free path;
             // the reply jumps the cursor or opens a panel location list).

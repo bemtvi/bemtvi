@@ -275,8 +275,13 @@ window but simpler: a transient overlay that grabs input focus while open.
   buffer is untouched throughout. A closed (or replaced) panel is retained as a
   single `last_panel` snapshot, so **`:panelopen`** brings the most recent panel
   back with its content and selection intact — e.g. reopening an LSP references
-  list after it was dismissed (the server-side location list survives the close,
-  so a reopened list's `<CR>` still jumps).
+  list after it was dismissed.
+- **Panels can navigate.** A panel may carry a per-line jump target (`set_panel_targets`,
+  a location list like LSP references/diagnostics): `<CR>` on a target line
+  `jump_to`s it (open-or-switch buffer + set cursor) and closes the panel. The
+  targets are part of the `Panel`, so they ride along in the `:panelopen`
+  snapshot — a reopened list still jumps. A line without a target falls back to
+  the select path below.
 - **The editor splits the height it's told.** The client still reports only the
   text-viewport height (terminal minus the two chrome rows); the editor subtracts
   the panel's rows from that, so `text_height()` — and therefore the `lines` it

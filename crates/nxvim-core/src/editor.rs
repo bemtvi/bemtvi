@@ -389,6 +389,13 @@ struct Panel {
     /// `on_select` callback / RPC notification). Built-in viewer panels opt out,
     /// so a stale handler never fires on them.
     wants_select: bool,
+    /// Per-line jump target `(path, line, col)` for a **navigable** panel (a
+    /// location list, e.g. LSP references): `<CR>` on a line with a target jumps
+    /// there via [`Editor::jump_to`] instead of firing a select event. Indexed in
+    /// lockstep with `lines`; a missing/`None` entry leaves that line
+    /// non-navigable. Empty for an ordinary panel. Because it lives in the panel,
+    /// it travels with the `:panelopen` snapshot — so a reopened list still jumps.
+    targets: Vec<Option<(PathBuf, usize, usize)>>,
 }
 
 /// The complete editor state: the open buffers plus the single window's state.
@@ -3516,9 +3523,23 @@ impl Editor {
             height: PANEL_HEIGHT,
             gpending: false,
             wants_select,
+            targets: Vec::new(),
         });
         self.ensure_visible();
         self.scroll_panel_into_view();
+    }
+
+    /// Attach per-line jump targets to the open panel, making it a navigable
+    /// location list: `<CR>` on a line whose target is `Some((path, line, col))`
+    /// jumps there (and closes the panel) via [`Editor::jump_to`], instead of
+    /// firing a select event. The list is indexed in lockstep with the panel's
+    /// lines (a shorter list or a `None` entry leaves that line non-navigable). A
+    /// no-op when no panel is open. The targets ride along in the `:panelopen`
+    /// snapshot, so a reopened list still jumps.
+    pub fn set_panel_targets(&mut self, targets: Vec<Option<(PathBuf, usize, usize)>>) {
+        if let Some(panel) = self.panel.as_mut() {
+            panel.targets = targets;
+        }
     }
 
     /// Enable or disable `<CR>` select events on the open panel
@@ -3549,6 +3570,8 @@ impl Editor {
             panel.lines = lines;
             panel.cursor = panel.cursor.min(last);
             panel.top = panel.top.min(last);
+            // The content changed, so any per-line jump targets no longer align.
+            panel.targets.clear();
         }
         self.scroll_panel_into_view();
     }
@@ -3653,10 +3676,24 @@ impl Editor {
             return;
         }
 
-        // `<CR>` selects the current line: record it for the server to dispatch
-        // to the scripting `on_select` handler. Only for select-enabled panels,
-        // so a stale handler can't fire on a built-in `:messages` viewer.
         if key.code == KeyCode::Enter {
+            // A navigable location-list line jumps to its target and closes the
+            // panel behind the jump. Owned here (the core already has `jump_to`)
+            // so the targets travel with the `:panelopen` snapshot and a reopened
+            // list still navigates.
+            if let Some(Some((path, line, col))) = self
+                .panel
+                .as_ref()
+                .and_then(|p| p.targets.get(p.cursor).cloned())
+            {
+                self.close_panel();
+                self.jump_to(&path, line, col);
+                return;
+            }
+            // Otherwise `<CR>` selects the current line: record it for the server
+            // to dispatch to the scripting `on_select` handler. Only for
+            // select-enabled panels, so a stale handler can't fire on a built-in
+            // `:messages` viewer.
             if let Some(p) = &self.panel {
                 if p.wants_select {
                     if let Some(line) = p.lines.get(p.cursor) {

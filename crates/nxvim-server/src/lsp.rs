@@ -29,11 +29,12 @@ use rmpv::Value;
 
 use crate::{filetype_of, Server, StyleTable};
 
-/// One entry in the `:LspDiagnostics` location list: the target file (the
-/// buffer's path, `None` for an unnamed buffer), 0-based line, and 0-based
-/// **byte** column the `<CR>` jump lands on (the LSP character already converted
-/// through the negotiated encoding). Indexed in lockstep with the panel's lines.
-pub(crate) type DiagLocation = (Option<PathBuf>, usize, usize);
+/// One per-line jump target for a navigable LSP panel (diagnostics, references,
+/// …), handed to [`nxvim_core::Editor::set_panel_targets`]: `Some((path, 0-based
+/// line, 0-based **byte** column))` — the LSP character already converted through
+/// the negotiated encoding — or `None` for a non-navigable line. Indexed in
+/// lockstep with the panel's lines, and retained in the `:panelopen` snapshot.
+pub(crate) type PanelTarget = Option<(PathBuf, usize, usize)>;
 
 /// Per-buffer LSP document-sync bookkeeping, mirroring `SyntaxState`. One per
 /// open buffer that mapped to a configured server, keyed by [`BufferId`] in
@@ -534,9 +535,9 @@ impl Server {
 
     /// Build the `:LspDiagnostics` location list for the current buffer: one
     /// `severity  line:col  message` row per diagnostic (sorted by position) and
-    /// a parallel [`DiagLocation`] list the `<CR>` jump indexes. `None` when the
-    /// buffer has no diagnostics.
-    pub(crate) fn diagnostics_location_list(&self) -> Option<(Vec<String>, Vec<DiagLocation>)> {
+    /// a parallel [`PanelTarget`] list to attach as the panel's jump targets.
+    /// `None` when the buffer has no diagnostics.
+    pub(crate) fn diagnostics_location_list(&self) -> Option<(Vec<String>, Vec<PanelTarget>)> {
         let (diags, encoding) = self.current_diagnostics()?;
         if diags.is_empty() {
             return None;
@@ -545,7 +546,7 @@ impl Server {
         let mut items: Vec<&Diagnostic> = diags.iter().collect();
         items.sort_by_key(|d| (d.range.start.line, d.range.start.character));
         let mut lines = Vec::with_capacity(items.len());
-        let mut locations = Vec::with_capacity(items.len());
+        let mut targets = Vec::with_capacity(items.len());
         for d in items {
             let row = d.range.start.line as usize;
             let character = d.range.start.character as usize;
@@ -557,9 +558,10 @@ impl Server {
                 first_line(&d.message),
             ));
             let line = self.editor.buffer().line(row);
-            locations.push((path.clone(), row, byte_col(encoding, &line, character)));
+            let byte = byte_col(encoding, &line, character);
+            targets.push(path.clone().map(|p| (p, row, byte)));
         }
-        Some((lines, locations))
+        Some((lines, targets))
     }
 
     // ----- Phase 3: go-to definition / references --------------------------
@@ -685,8 +687,8 @@ impl Server {
         }
     }
 
-    /// Open a select-enabled panel listing `locations` (`path:line:col` per row),
-    /// backed by the [`DiagLocation`] jump list a `<CR>` indexes — the same panel
+    /// Open a navigable panel listing `locations` (`path:line:col` per row), with
+    /// a per-row jump target attached so `<CR>` navigates — the same panel
     /// machinery the `:LspDiagnostics` list uses.
     fn open_locations_panel(
         &mut self,
@@ -695,7 +697,7 @@ impl Server {
         encoding: PositionEncoding,
     ) {
         let mut lines = Vec::with_capacity(locations.len());
-        let mut locs: Vec<DiagLocation> = Vec::with_capacity(locations.len());
+        let mut targets: Vec<PanelTarget> = Vec::with_capacity(locations.len());
         for loc in locations {
             let Some(path) = uri_to_path(&loc.uri) else {
                 continue;
@@ -704,14 +706,14 @@ impl Server {
             let character = loc.range.start.character as usize;
             let byte = self.location_byte_col(&path, row, character, encoding);
             lines.push(format!("{}:{}:{}", path.display(), row + 1, byte + 1));
-            locs.push((Some(path), row, byte));
+            targets.push(Some((path, row, byte)));
         }
-        if locs.is_empty() {
+        if targets.is_empty() {
             self.editor.echo(kind.empty_message());
             return;
         }
-        self.lsp_panel_locations = locs;
-        self.editor.open_panel(kind.panel_title(), lines, true, 0);
+        self.editor.open_panel(kind.panel_title(), lines, false, 0);
+        self.editor.set_panel_targets(targets);
     }
 
     /// Best-effort LSP char→byte column for a target location: exact when the

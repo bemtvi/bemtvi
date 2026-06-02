@@ -545,11 +545,13 @@ deps; the three workspace gates are green.
 >   (themed), or a built-in severity color (red/yellow/cyan/grey) with no theme.
 >   The slide band carries no diagnostics (they reappear when the scroll settles),
 >   matching how search spans are handled.
-> - **`:LspDiagnostics`** opens a select-enabled panel (`severity  line:col
->   message`, sorted by position) backed by a server-side `lsp_panel_locations`
->   list; a `<CR>` closes the panel and `jump_to`s the entry. Ownership of that
->   `<CR>` is reset whenever any other (RPC / Lua / `:LspInfo`) panel opens, so a
->   stale location list can never hijack a scripted panel's `on_select`.
+> - **`:LspDiagnostics`** opens a **navigable** panel (`severity  line:col
+>   message`, sorted by position) whose per-line jump targets are attached via
+>   `Editor::set_panel_targets`; a `<CR>` on a target line `jump_to`s it and
+>   closes the panel. *(Originally a server-side `lsp_panel_locations` list keyed
+>   by panel-select index; that was replaced — see the Phase-3 note — by making
+>   the panel itself navigable in the core, so the targets travel with the
+>   `:panelopen` snapshot and can't drift from the panel they belong to.)*
 > - **Mock** gained a `diagnostics` script field; it pushes
 >   `textDocument/publishDiagnostics` for a document the instant it sees that
 >   document's `didOpen`. Tests (in `crates/nxvim/tests/lsp.rs`, reusing the
@@ -646,9 +648,16 @@ underline + message line + panel cover the MVP); `vim.diagnostic.*` Lua API
 >   `:LspTypeDefinition` / `:LspImplementation` / `:LspReferences` route to the
 >   same `request_lsp(kind)` path (the keymap-free entry, and the home for the two
 >   goto-family members without a default key). A single definition jumps; multiple
->   results — and all references — open the existing select-enabled panel as a
->   `path:line:col` location list, reusing the Phase-2 `lsp_panel_locations` `<CR>`
->   jump. An empty reply shows a brief "No definition found"/… message.
+>   results — and all references — open a **navigable** panel as a `path:line:col`
+>   location list (`Editor::set_panel_targets` attaches the per-row jump targets;
+>   a `<CR>` `jump_to`s in the core). An empty reply shows a brief "No definition
+>   found"/… message.
+> - **Navigable panels supersede `lsp_panel_locations`.** The Phase-2 server-side
+>   location list (keyed by panel-select index, cleared on jump) was replaced by
+>   making the panel itself carry per-line jump targets in the core. This both
+>   removes the cross-layer select bookkeeping *and* fixes a reopen bug: because
+>   the targets live in the `Panel`, they travel with the `:panelopen` snapshot,
+>   so a references list dismissed by a `<CR>` jump still navigates when reopened.
 > - **Mock** gained `definition`/`declaration`/`type_definition`/`implementation`/
 >   `references` script fields (returned verbatim for the matching request).
 >   Tests (in `crates/nxvim/tests/lsp.rs`) cover the same-file `gd` jump (asserting

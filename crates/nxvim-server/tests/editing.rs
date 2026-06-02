@@ -2994,3 +2994,115 @@ async fn di_paren_linewise_with_no_content_lines_is_a_noop() {
     feed(&rpc, "ggdi(");
     assert_eq!(lines(&rpc).await, vec!["foo(", ")"]);
 }
+
+// ----- f/t/F/T find-char motions -------------------------------------------
+
+#[tokio::test]
+async fn f_moves_onto_the_target_char() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0fo");
+    assert_eq!(cursor(&rpc).await, (1, 4));
+}
+
+#[tokio::test]
+async fn f_with_a_count_finds_the_nth_match() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // 'l' is at columns 2, 3, 9; the 3rd is column 9.
+    feed(&rpc, "03fl");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+}
+
+#[tokio::test]
+async fn t_stops_before_the_target_char() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0to");
+    assert_eq!(cursor(&rpc).await, (1, 3));
+}
+
+#[tokio::test]
+async fn cap_f_searches_backward() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Cursor rests on the final 'd' (column 10); back to the 'o' at column 7.
+    feed(&rpc, "Fo");
+    assert_eq!(cursor(&rpc).await, (1, 7));
+}
+
+#[tokio::test]
+async fn cap_t_stops_after_the_backward_target() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "To");
+    assert_eq!(cursor(&rpc).await, (1, 8));
+}
+
+#[tokio::test]
+async fn f_does_nothing_when_the_char_is_absent() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0fz");
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
+#[tokio::test]
+async fn dfx_deletes_through_the_target() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0dfo");
+    assert_eq!(lines(&rpc).await, vec![" world"]);
+}
+
+#[tokio::test]
+async fn dtx_deletes_up_to_the_target() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0dto");
+    assert_eq!(lines(&rpc).await, vec!["o world"]);
+}
+
+#[tokio::test]
+async fn d_cap_f_deletes_backward_excluding_the_cursor() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Cursor on 'd' (col 10); dFo deletes "orl" (cols 7..10), keeping 'd'.
+    feed(&rpc, "dFo");
+    assert_eq!(lines(&rpc).await, vec!["hello wd"]);
+}
+
+#[tokio::test]
+async fn semicolon_repeats_the_find() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0fo;");
+    // 'o' at col 4, then the next 'o' at col 7.
+    assert_eq!(cursor(&rpc).await, (1, 7));
+}
+
+#[tokio::test]
+async fn comma_repeats_the_find_reversed() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // fo -> col 4, ; -> col 7, , reverses back to col 4.
+    feed(&rpc, "0fo;,");
+    assert_eq!(cursor(&rpc).await, (1, 4));
+}
+
+#[tokio::test]
+async fn semicolon_after_t_skips_the_adjacent_match() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia-b-c-d<Esc>");
+    // t- lands at col 0 (before the '-' at col 1); ; must advance, not stick.
+    feed(&rpc, "0t-;");
+    assert_eq!(cursor(&rpc).await, (1, 2));
+}
+
+#[tokio::test]
+async fn v_f_then_delete_includes_the_target() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0vfod");
+    assert_eq!(lines(&rpc).await, vec![" world"]);
+}

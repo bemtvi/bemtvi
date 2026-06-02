@@ -4,8 +4,9 @@
 //! vim's column model), but *movement* steps by grapheme cluster and *display*
 //! accounts for wide characters and tabs. These pure helpers convert between
 //! byte offset, grapheme boundary, and virtual (screen) column over a line
-//! `&str`. ASCII is handled correctly and efficiently (each ASCII char is its
-//! own single-byte grapheme); there is no separate fast path.
+//! `&str`. ASCII is handled correctly either way (each ASCII char is its own
+//! single-byte grapheme); [`floor_grapheme`] additionally takes an all-ASCII
+//! fast path to skip grapheme segmentation on the cursor hot path.
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -38,6 +39,12 @@ pub fn prev_grapheme(line: &str, byte: usize) -> usize {
 pub fn floor_grapheme(line: &str, byte: usize) -> usize {
     if byte >= line.len() {
         return line.len();
+    }
+    // Fast path for an all-ASCII line (the common case, and this is on the cursor
+    // hot path): every byte is its own single-byte grapheme, so `byte` is already
+    // a boundary. The `is_ascii` scan is far cheaper than grapheme segmentation.
+    if line.is_ascii() {
+        return byte;
     }
     let mut last = 0;
     for (i, _) in line.grapheme_indices(true) {

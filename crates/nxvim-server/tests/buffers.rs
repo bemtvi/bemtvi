@@ -280,6 +280,30 @@ async fn reediting_an_open_file_switches_back_and_restores_the_cursor() {
 }
 
 #[tokio::test]
+async fn reediting_a_redundant_spelling_of_the_path_reuses_the_buffer() {
+    // The buffer match normalizes paths lexically (no filesystem access), so a
+    // different spelling of the same file — here with a redundant `/./` — finds
+    // the open buffer instead of opening a duplicate.
+    let a = temp_file("a", "a1\na2\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    assert_eq!(list_bufs(&rpc).await, vec![1]);
+
+    // `/tmp/dir/file` -> `/tmp/dir/./file`: same file, different spelling.
+    let redundant = a.parent().unwrap().join(".").join(a.file_name().unwrap());
+    command(&rpc, &format!("e {}", name(&redundant))).await;
+    assert_eq!(lines(&rpc).await, vec!["a1", "a2"]);
+    assert_eq!(
+        list_bufs(&rpc).await,
+        vec![1],
+        "the redundant spelling reused buffer 1 rather than opening a duplicate"
+    );
+
+    std::fs::remove_file(&a).ok();
+}
+
+#[tokio::test]
 async fn ctrl_caret_toggles_the_alternate_buffer() {
     let a = temp_file("a", "a1\na2\n");
     let b = temp_file("b", "b1\nb2\n");

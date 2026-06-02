@@ -22,6 +22,36 @@ use crate::view::{PanelView, View};
 /// default). The projection clamps it down so the text window keeps a row.
 const PANEL_HEIGHT: usize = 10;
 
+/// Cap on the retained `:messages` history. Older entries are dropped once the
+/// log exceeds this, so a long session can't grow it without bound (vim likewise
+/// caps `:messages`).
+const MAX_MESSAGES: usize = 1000;
+
+/// Lexically normalize a path — collapse `.`, `..`, and redundant separators —
+/// **without touching the filesystem** (no symlink resolution, no existence
+/// check), so the pure core stays free of blocking I/O. Enough to treat `./a`
+/// and `a` as the same buffer for [`Editor::find_buffer_by_path`].
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // The root's parent is the root; drop a leading/over-popped `..`
+                // only past a real segment, else keep it (relative-path prefix).
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// A cursor position within the current buffer (0-indexed line and column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cursor {
@@ -652,17 +682,15 @@ impl Editor {
     }
 
     /// The id of an already-open buffer bound to `path`, if any. Matches by
-    /// canonical path when both resolve on disk (so `./a` and `a` are the same
-    /// file), else by the stored path verbatim (covers not-yet-written names).
+    /// *lexically* normalized path (so `./a` and `a` are the same buffer),
+    /// **without touching the filesystem** — the pure core never does the
+    /// blocking `canonicalize` syscall this used to run on every `:e`. Symlinks
+    /// are not resolved, matching vim's path-based (not inode-based) buffer dedup.
     fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
-        let target = std::fs::canonicalize(path).ok();
+        let target = normalize_path(path);
         self.buffers.map.iter().find_map(|(id, ob)| {
             let stored = ob.buffer.path.as_ref()?;
-            let same = match (&target, std::fs::canonicalize(stored).ok()) {
-                (Some(t), Some(c)) => *t == c,
-                _ => stored.as_path() == path,
-            };
-            same.then_some(*id)
+            (normalize_path(stored) == target).then_some(*id)
         })
     }
 
@@ -775,6 +803,10 @@ impl Editor {
         let msg = msg.into();
         for line in msg.split('\n').filter(|l| !l.is_empty()) {
             self.messages.push(line.to_string());
+        }
+        // Bound the history so a long-running session can't grow it forever.
+        if self.messages.len() > MAX_MESSAGES {
+            self.messages.drain(0..self.messages.len() - MAX_MESSAGES);
         }
         self.message = msg;
     }

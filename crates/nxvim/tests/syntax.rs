@@ -287,6 +287,58 @@ fn temp_rs(name: &str, content: &str) -> String {
 // ----- tests ----------------------------------------------------------------
 
 #[tokio::test]
+async fn an_edit_proactively_repaints_coalesced_highlights() {
+    // R7: worker events are now coalesced — a burst of replies costs one redraw
+    // instead of one per reply. This guards that coalescing never *loses* the
+    // final proactive repaint: after an edit, the worker replies asynchronously
+    // and the new line must light up with no further client interaction.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("burst", "fn a() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Drain the initial highlights for the single line `fn a() {}`.
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+
+    // Open a line above and type a fresh function in one rapid burst, then leave
+    // insert mode. The buffer is now two lines; crucially the *original* `fn a()`
+    // moves to row 1, which carried no highlight before — a post-edit-only
+    // discriminator. Each inserted char is its own edit → a flurry of worker
+    // replies that get coalesced into (ideally) one repaint.
+    feed(&rpc, "ggOfn bbbbbbbb() {}<Esc>");
+
+    // Wait for an *unsolicited* redraw — no `barrier`/poll requests, which would
+    // themselves trigger a client-path redraw and mask a missing proactive
+    // syntax repaint — that carries the `fn` keyword on the new row 1.
+    let mut painted = false;
+    for _ in 0..150 {
+        match tokio::time::timeout(Duration::from_millis(100), incoming.recv()).await {
+            Ok(Some(Incoming::Notification { method, params })) if method == "redraw" => {
+                let hl = highlights_of(&params);
+                if hl.get(1).is_some_and(|row| {
+                    row.iter().any(|(s, e, g)| {
+                        *s == 0 && *e == 2 && g.split('.').next() == Some("keyword")
+                    })
+                }) {
+                    painted = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {} // idle tick: keep waiting for the async repaint
+        }
+    }
+    assert!(
+        painted,
+        "the async worker reply should proactively repaint row 1's `fn` keyword"
+    );
+}
+
+#[tokio::test]
 async fn a_rust_buffer_gets_treesitter_highlights() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();

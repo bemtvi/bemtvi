@@ -554,6 +554,12 @@ impl Editor {
         self.buffers.map.get(&id).map(|ob| ob.buffer.lines())
     }
 
+    /// Number of editable lines in buffer `id`, or `None` if no such buffer is
+    /// open. Cheap (no text copy), unlike [`Editor::lines_of`].
+    pub fn line_count_of(&self, id: BufferId) -> Option<usize> {
+        self.buffers.map.get(&id).map(|ob| ob.buffer.line_count())
+    }
+
     // ----- buffer management ------------------------------------------------
 
     /// Add a buffer to the store and return its id, without switching to it.

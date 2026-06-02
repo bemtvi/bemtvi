@@ -19,7 +19,15 @@ use std::time::{Duration, Instant};
 use nxvim_rpc::{connect, Incoming};
 use rmpv::Value;
 use tokio::process::Command;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
+
+/// Bound on the worker→editor event channel. A flooding or buggy worker can
+/// otherwise grow it without limit; past this many un-consumed events the
+/// supervisor's `send().await` simply backpressures (which throttles the worker
+/// through its stdout pipe) rather than buffering forever.
+const EVENT_CAPACITY: usize = 1024;
 
 /// Environment override for the worker executable. Defaults to the current
 /// binary (so the real `nxvim` re-invokes itself). Tests point this at the built
@@ -61,15 +69,15 @@ pub struct SyntaxClient {
 struct StartKit {
     program: PathBuf,
     cmd_rx: UnboundedReceiver<Cmd>,
-    event_tx: UnboundedSender<SyntaxEvent>,
+    event_tx: Sender<SyntaxEvent>,
 }
 
 impl SyntaxClient {
     /// Create the client and the receiver the server loop selects on. No process
     /// is spawned until [`SyntaxClient::ensure_started`].
-    pub fn new() -> (SyntaxClient, UnboundedReceiver<SyntaxEvent>) {
+    pub fn new() -> (SyntaxClient, Receiver<SyntaxEvent>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
-        let (event_tx, event_rx) = unbounded_channel();
+        let (event_tx, event_rx) = channel(EVENT_CAPACITY);
         let program = std::env::var(WORKER_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nxvim")));
@@ -166,7 +174,7 @@ fn kv_u64(key: &'static str, value: u64) -> (Value, Value) {
 async fn supervise(
     program: PathBuf,
     mut cmd_rx: UnboundedReceiver<Cmd>,
-    event_tx: UnboundedSender<SyntaxEvent>,
+    event_tx: Sender<SyntaxEvent>,
 ) {
     // Recent *failure* timestamps drive the breaker. A failure is a spawn error,
     // a missing stdio pipe, or a crash of a live child — all the ways a worker
@@ -211,7 +219,7 @@ async fn supervise(
             // surface "syntax unavailable", then idle — still draining commands so
             // the client's `send`s never error — until the server shuts down.
             // Syntax comes back on the next server start.
-            let _ = event_tx.send(SyntaxEvent::Disabled);
+            let _ = event_tx.send(SyntaxEvent::Disabled).await;
             while cmd_rx.recv().await.is_some() {}
             return;
         }
@@ -232,7 +240,7 @@ async fn supervise(
 async fn run_worker_once(
     program: &PathBuf,
     cmd_rx: &mut UnboundedReceiver<Cmd>,
-    event_tx: &UnboundedSender<SyntaxEvent>,
+    event_tx: &Sender<SyntaxEvent>,
     first_spawn: &mut bool,
 ) -> bool {
     let mut child = match spawn(program) {
@@ -250,7 +258,7 @@ async fn run_worker_once(
 
     // A *re*-spawned process has no buffers; ask the server to re-open. The very
     // first spawn is already covered by the server's initial sync.
-    if !*first_spawn && event_tx.send(SyntaxEvent::Restarted).is_err() {
+    if !*first_spawn && event_tx.send(SyntaxEvent::Restarted).await.is_err() {
         return true; // server gone
     }
     *first_spawn = false;
@@ -263,7 +271,11 @@ async fn run_worker_once(
             },
             msg = incoming.recv() => match msg {
                 Some(Incoming::Notification { method, params }) => {
-                    if event_tx.send(SyntaxEvent::Notification { method, params }).is_err() {
+                    if event_tx
+                        .send(SyntaxEvent::Notification { method, params })
+                        .await
+                        .is_err()
+                    {
                         break true;
                     }
                 }

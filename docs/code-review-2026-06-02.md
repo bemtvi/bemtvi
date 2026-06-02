@@ -330,20 +330,38 @@ fires; post-fix the request resolves to an error promptly.
 
 **Pairs with R1** (structural-error teardown is the trigger for this drain).
 
-## R7. Worker event channel unbounded + redraw per notification
-**File:** `crates/nxvim-server/src/syntax.rs:67` (`unbounded_channel`),
-`crates/nxvim-server/src/lib.rs:667-685` (`on_syntax_event` → `redraw()`).
+## R7. Worker event channel unbounded + redraw per notification ✅ DONE
+**File:** `crates/nxvim-server/src/syntax.rs` (event channel),
+`crates/nxvim-server/src/lib.rs` (`run` loop, `on_syntax_event`, `store_spans`).
 **Severity:** Medium.
+**Status:** Implemented. Test:
+`crates/nxvim/tests/syntax.rs::an_edit_proactively_repaints_coalesced_highlights`.
 
-**Problem:** A flooding/buggy worker can grow the event channel without bound and
-starve the editor `select!` loop; each `ts_highlights` reply triggers a full
-`redraw()` (re-projecting the whole view).
+**Problem:** A flooding/buggy worker could grow the event channel without bound;
+each `ts_highlights` reply triggered a full `redraw()` (re-projecting the whole
+view).
 
-**Fix:** Bound the channel (`channel(N)` with drop-oldest/`try_send`) **or**
-coalesce: set a `syntax_dirty` flag on each event and call `redraw()` once per
-loop turn instead of per-notification. Also clamp `store_spans` line keys to
-`line_count` (`lib.rs:776-812`) so a bogus `line: u64::MAX` reply can't seed a
-junk map entry.
+**Fix applied (all three):**
+- **Bounded channel.** The worker→editor event channel is now
+  `mpsc::channel(EVENT_CAPACITY = 1024)`; the supervisor `send().await`s, so past
+  the cap it *backpressures* (throttling the worker through its stdout pipe)
+  instead of buffering without limit. The command channel stays unbounded (the
+  editor never floods it).
+- **Coalesced redraws.** `on_syntax_event` now sets a `syntax_dirty` flag instead
+  of redrawing; the `run` loop drains every queued event with `try_recv()` and
+  `redraw()`s at most once per turn. A burst of replies costs one re-projection,
+  not one each.
+- **Clamped line keys.** `store_spans` looks up the target buffer's line count
+  (new cheap `Editor::line_count_of`) and skips any span whose `line >=
+  line_count`, so a bogus `line` (e.g. `u64::MAX`) can't seed a junk cache entry.
+
+**Test (verified fail-before / pass-after):** after an edit, waits for an
+*unsolicited* redraw (no `barrier` polling, which would itself trigger a
+client-path redraw and mask the bug) carrying the new row 1's `fn` keyword.
+With the coalesced `redraw()` removed the async repaint never arrives and the
+test times out; with it, the proactive repaint lands. (The bounded-channel and
+line-clamp parts are non-behavioral hardening — not separately observable through
+the editor surface — and are covered by the full green syntax suite.)
 
 ## R8. `reparse` discards the last good tree on a `None` result
 **File:** `crates/nxvim-ts/src/engine.rs:54-60`

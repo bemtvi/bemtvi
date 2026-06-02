@@ -124,6 +124,10 @@ struct Server {
     /// Per-buffer syntax sync state, keyed by buffer id (entries created lazily
     /// on first sync, dropped when the buffer is deleted).
     syntax_states: HashMap<BufferId, SyntaxState>,
+    /// Set when a syntax event changed something the client should see. Drained
+    /// once per loop turn so a burst of worker notifications costs one `redraw`,
+    /// not one per notification.
+    syntax_dirty: bool,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -150,6 +154,7 @@ where
         ui: None,
         syntax,
         syntax_states: HashMap::new(),
+        syntax_dirty: false,
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -175,6 +180,15 @@ where
             // regardless of the worker's speed or health.
             Some(event) = syntax_events.recv() => {
                 server.on_syntax_event(event);
+                // Coalesce a burst: drain everything queued right now, then redraw
+                // at most once — a fast/flooding worker would otherwise force a
+                // full view re-projection per notification.
+                while let Ok(event) = syntax_events.try_recv() {
+                    server.on_syntax_event(event);
+                }
+                if std::mem::take(&mut server.syntax_dirty) {
+                    server.redraw();
+                }
             }
         }
     }
@@ -690,21 +704,21 @@ impl Server {
                 // drop them all and let the next sync re-`open` the current buffer
                 // (others re-open when next switched to).
                 self.syntax_states.clear();
-                self.redraw();
+                self.syntax_dirty = true;
             }
             SyntaxEvent::Disabled => {
                 // The supervisor gave up (worker won't spawn or keeps crashing).
                 // Tell the user once — buffers stay editable, just un-highlighted.
                 self.editor
                     .echo("treesitter: syntax worker unavailable, highlighting disabled");
-                self.redraw();
+                self.syntax_dirty = true;
             }
             // `ts_highlights` updates the cache; any other notification (e.g.
             // `ts_error` — a grammar that wouldn't load/parse) is ignored, so the
             // buffer simply stays un-highlighted and editing is unaffected.
             SyntaxEvent::Notification { method, params } if method == "ts_highlights" => {
                 self.store_spans(&params);
-                self.redraw();
+                self.syntax_dirty = true;
             }
             SyntaxEvent::Notification { .. } => {}
         }
@@ -809,6 +823,12 @@ impl Server {
                 .and_then(|(_, v)| v.as_u64())
                 .unwrap_or(0),
         );
+        // The buffer the reply is for must still be open; its line count bounds
+        // which line keys we accept, so a bogus `line` (e.g. `u64::MAX` from a
+        // buggy/hostile worker) can't seed a junk entry that lives forever.
+        let Some(line_count) = self.editor.line_count_of(buffer) else {
+            return;
+        };
         let Some(state) = self.syntax_states.get_mut(&buffer) else {
             return;
         };
@@ -825,6 +845,9 @@ impl Server {
                     continue;
                 }
                 let line = a[0].as_u64().unwrap_or(0) as usize;
+                if line >= line_count {
+                    continue; // out-of-range line: never displayed, don't cache it
+                }
                 let start = a[1].as_u64().unwrap_or(0) as usize;
                 let end = a[2].as_u64().unwrap_or(0) as usize;
                 let group = a[3].as_str().unwrap_or("").to_string();

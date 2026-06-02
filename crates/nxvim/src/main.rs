@@ -37,6 +37,13 @@ fn main() -> Result<()> {
         runtimepath,
     };
     let server_thread = std::thread::spawn(move || {
+        // Test-only fault injection (debug builds only): force a server-thread
+        // panic so the parent's crash handling below can be exercised end to end.
+        // Compiled out of release builds entirely.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("NXVIM_PANIC_TEST").is_some() {
+            panic!("NXVIM_PANIC_TEST: injected server-thread panic");
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -54,8 +61,29 @@ fn main() -> Result<()> {
     let result = runtime.block_on(nxvim_tui::run(client_end));
 
     // When the client exits, the dropped stream signals the server to wind down.
-    let _ = server_thread.join();
+    // Report a server-thread *panic* as a non-zero exit with a diagnostic: the
+    // old `let _ = join()` discarded the payload, so a server crash exited 0 and
+    // looked exactly like a clean `:q`. This takes precedence over `result`,
+    // since a crashed server is the more important failure to surface.
+    if let Err(payload) = server_thread.join() {
+        eprintln!(
+            "nxvim: server thread panicked: {}",
+            panic_message(payload.as_ref())
+        );
+        std::process::exit(101); // Rust's conventional panic exit code
+    }
     result
+}
+
+/// Best-effort human-readable text from a thread panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
 }
 
 /// Run the treesitter worker over this process's stdio until the parent closes

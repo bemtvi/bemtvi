@@ -382,15 +382,26 @@ pass-after path through the public worker surface; this is a defensive guard for
 a future where a parse timeout is added. The existing worker + syntax suites
 (which reparse on every `open`/`edit`) cover that reparse still yields a tree.
 
-## R9. Server-thread panic looks like a clean quit
-**File:** `crates/nxvim/src/main.rs:57`
+## R9. Server-thread panic looks like a clean quit ✅ DONE
+**File:** `crates/nxvim/src/main.rs`
 **Severity:** Medium.
+**Status:** Implemented. Test: `crates/nxvim/tests/e2e.rs::a_server_thread_panic_exits_nonzero`.
 
-**Problem:** `let _ = server_thread.join()` discards the panic payload; the exit
-code stays `0`, so a server crash is indistinguishable from a normal quit.
+**Problem:** `let _ = server_thread.join()` discarded the panic payload; the exit
+code stayed `0`, so a server crash was indistinguishable from a normal quit.
 
-**Fix:** Inspect `join()`'s `Result`; on `Err`, print a diagnostic (downcast the
-payload to `&str`/`String` if possible) and return a non-zero exit code.
+**Fix applied:** `main` now inspects `server_thread.join()`; on `Err` it prints
+`nxvim: server thread panicked: <message>` (via a `panic_message` helper that
+downcasts the payload to `&str`/`String`) and `std::process::exit(101)` (Rust's
+conventional panic code). This check takes precedence over the client's
+`result`, since a crashed server is the more important failure to surface.
+
+**Test (verified fail-before / pass-after):** a debug-only, env-gated
+fault-injection hook (`NXVIM_PANIC_TEST`, behind `#[cfg(debug_assertions)]` so it
+is compiled out of release builds) forces the server thread to panic at startup.
+The Tier-3 PTY test spawns the real binary with that env set and asserts the
+process exits with code `101`. Pre-fix the process exited `0` (the panic was
+swallowed); post-fix it exits `101`.
 
 ## R10. `--__ts-worker` matched anywhere in argv
 **File:** `crates/nxvim/src/main.rs:21`

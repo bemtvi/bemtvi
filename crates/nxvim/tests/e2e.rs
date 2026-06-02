@@ -96,6 +96,20 @@ impl Session {
     fn screen_text(&self) -> String {
         self.parser.lock().unwrap().screen().contents()
     }
+
+    /// Poll for the child to exit, returning its status (or `None` on timeout).
+    fn wait_exit(&mut self, timeout: Duration) -> Option<portable_pty::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self._child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for Session {
@@ -264,4 +278,23 @@ fn catppuccin_repaints_the_editor_in_truecolor() {
 
     s.send(b":q!\r");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_server_thread_panic_exits_nonzero() {
+    // R9: a panic on the server thread must surface as a non-zero exit, not look
+    // like a clean `:q` (the old `let _ = join()` discarded the payload and
+    // exited 0). The debug-only `NXVIM_PANIC_TEST` hook forces that panic; with
+    // it set the process must exit with the panic code 101.
+    let mut s = Session::spawn_with_env(&[], &[("NXVIM_PANIC_TEST", "1")], 80, 24);
+    let status = s
+        .wait_exit(Duration::from_secs(10))
+        .expect("nxvim should exit promptly after the server thread panics");
+    assert!(!status.success(), "a server-thread panic must not exit 0");
+    assert_eq!(
+        status.exit_code(),
+        101,
+        "expected the panic exit code 101, got {}",
+        status.exit_code()
+    );
 }

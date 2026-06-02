@@ -33,13 +33,22 @@ impl SearchRegex {
         Ok(SearchRegex { re })
     }
 
-    /// The first match in `line` starting at byte offset `from` or later, as a
-    /// `(start, end)` byte range. `^` still anchors to the line start (offset 0),
-    /// never to `from`.
-    pub(crate) fn find_at(&self, line: &str, from: usize) -> Option<(usize, usize)> {
+    /// The first match in the line's **non-overlapping** left-to-right sequence
+    /// (the same one `find_all` and the highlighter walk) whose start is at byte
+    /// offset `from` or later, as a `(start, end)` byte range. `^` still anchors
+    /// to the line start (offset 0), never to `from`.
+    ///
+    /// This deliberately differs from a raw "leftmost match at-or-after `from`":
+    /// a greedy pattern such as `.+ab` can also match *starting inside* an earlier
+    /// match, and a raw scan from `from` would return that overlapping sub-match.
+    /// Skipping to the next match in the non-overlapping sequence keeps `n`
+    /// stepping between the matches the user actually sees highlighted, instead of
+    /// crawling one grapheme deeper into the current one.
+    pub(crate) fn find_from(&self, line: &str, from: usize) -> Option<(usize, usize)> {
         self.re
-            .find_at(line, from.min(line.len()))
+            .find_iter(line)
             .map(|m| (m.start(), m.end()))
+            .find(|(s, _)| *s >= from)
     }
 
     /// Every match in `line`, left to right, as `(start, end)` byte ranges.

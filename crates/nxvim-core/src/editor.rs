@@ -203,6 +203,10 @@ enum CmdlineKind {
 struct Snapshot {
     text: ropey::Rope,
     cursor: Cursor,
+    /// Undo-sequence number of the state this snapshot captures (see
+    /// [`OpenBuffer::cur_seq`]), so undo/redo can tell when it has landed back
+    /// on the last-saved state and clear `modified`.
+    seq: u64,
 }
 
 /// A buffer as the editor holds it: the text [`Buffer`] plus the state vim keeps
@@ -213,6 +217,18 @@ struct OpenBuffer {
     buffer: Buffer,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
+    /// Monotonic id of the current text state. A fresh number is minted for each
+    /// edit; undo/redo carry it on their snapshots. Compared against `saved_seq`
+    /// to decide whether the buffer matches what's on disk. (Neovim's
+    /// `b_u_seq_cur`.)
+    cur_seq: u64,
+    /// `cur_seq` as of the last write, or `None` once an edit has diverged from
+    /// disk past the point any retained snapshot can return to. The buffer is
+    /// `modified` exactly when `Some(cur_seq) != saved_seq`. (Neovim's
+    /// `b_u_save_nr`.)
+    saved_seq: Option<u64>,
+    /// Source of the next `cur_seq`; only ever increments.
+    next_seq: u64,
     /// Window position saved when this buffer stops being current; restored on
     /// switch-back. Meaningless while the buffer *is* current — the live position
     /// is then [`Editor::cursor`] / `Editor::top`.
@@ -226,6 +242,10 @@ impl OpenBuffer {
             buffer,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            // A freshly loaded buffer matches disk: state 0 is the saved state.
+            cur_seq: 0,
+            saved_seq: Some(0),
+            next_seq: 1,
             saved_cursor: Cursor::default(),
             saved_top: 0,
         }
@@ -457,8 +477,9 @@ pub struct Editor {
     snapshot_taken: bool,
     visual_anchor: Cursor,
 
-    /// Set by a scroll command at the moment it fires: `(top, cursor.line)`
-    /// *before* the move. Consumed at the end of `input` to build `pending_scroll`.
+    /// Set by a scroll command or a cursor motion at the moment it fires:
+    /// `(top, cursor.line)` *before* the move. Consumed at the end of `input` to
+    /// build `pending_scroll` when the viewport ends up moving more than a line.
     scroll_from: Option<(usize, usize)>,
     /// The scroll gesture from the most recent input, projected into the next
     /// `View` and then cleared (so it animates exactly once).
@@ -716,6 +737,10 @@ impl Editor {
                 ob.buffer = buf;
                 ob.undo_stack.clear();
                 ob.redo_stack.clear();
+                // Reloaded from disk: a fresh state that is, by definition, saved.
+                ob.cur_seq = ob.next_seq;
+                ob.next_seq += 1;
+                ob.saved_seq = Some(ob.cur_seq);
                 ob.buffer.mark_resync();
                 ob.buffer.modified = false;
             }
@@ -765,10 +790,25 @@ impl Editor {
         }
         self.ensure_visible();
 
-        // If this key was a scroll command that actually moved the viewport,
-        // record the gesture for the client to animate.
+        // If this key moved the viewport — an explicit scroll command, or a
+        // motion that jumped off-screen — record the gesture for the client to
+        // animate. A one-line shift (holding `j`/`k` at the edge) is left alone
+        // so continuous scrolling stays crisp.
         if let Some((from_top, from_cursor)) = self.scroll_from.take() {
-            if from_top != self.top {
+            if from_top.abs_diff(self.top) > 1 {
+                // Cap the visual travel so a huge jump (e.g. `G` in a big file)
+                // animates a bounded slide of the last couple of screens instead
+                // of projecting thousands of lines into the view.
+                let cap = self.text_height().saturating_mul(2).max(1);
+                let clamp = |from: usize, to: usize| {
+                    if from > to {
+                        from.min(to + cap)
+                    } else {
+                        from.max(to.saturating_sub(cap))
+                    }
+                };
+                let from_top = clamp(from_top, self.top);
+                let from_cursor = clamp(from_cursor, self.cursor.line);
                 let dist = from_top.abs_diff(self.top) as u64;
                 self.pending_scroll = Some(PendingScroll {
                     from_top,
@@ -905,6 +945,11 @@ impl Editor {
                 self.reset_pending();
             } else {
                 // Movement (normal or visual); selection follows the cursor.
+                // Record the pre-move `(top, cursor.line)` so a motion that jumps
+                // off-screen (gg, G, 100j, …) animates the resulting scroll, just
+                // like the explicit scroll commands. `input`'s tail turns this into
+                // a `PendingScroll` only if `top` actually moved more than a line.
+                self.scroll_from = Some((self.top, self.cursor.line));
                 self.apply_movement(m);
                 self.count = None;
             }
@@ -1937,9 +1982,12 @@ impl Editor {
         }
     }
 
-    /// The first match of `re` at or after byte `start`, scanning lines downward
-    /// to the end of the buffer, as a whole-buffer `(start, end)` range. `None` if
-    /// no match lies in `[start, end_of_buffer)`.
+    /// The first match of `re` whose start is at or after byte `start`, scanning
+    /// lines downward to the end of the buffer, as a whole-buffer `(start, end)`
+    /// range. Walks each line's non-overlapping match sequence (see
+    /// `SearchRegex::find_from`), so a greedy pattern doesn't yield a match that
+    /// overlaps the one the cursor already sits in. `None` if no match starts in
+    /// `[start, end_of_buffer)`.
     fn match_forward_from(&self, re: &SearchRegex, start: usize) -> Option<MatchRange> {
         let buf = self.buffer();
         let line_count = buf.line_count();
@@ -1947,7 +1995,7 @@ impl Editor {
         let mut col = start.saturating_sub(buf.line_start(line));
         while line < line_count {
             let text = buf.line(line);
-            if let Some((s, e)) = re.find_at(&text, col) {
+            if let Some((s, e)) = re.find_from(&text, col) {
                 let base = buf.line_start(line);
                 return Some((base + s, base + e));
             }
@@ -2338,6 +2386,10 @@ impl Editor {
         };
         match self.buffer_mut().write(path) {
             Ok((bytes, lines)) => {
+                // The current state is now what's on disk — undoing/redoing back
+                // to it should read as clean.
+                let ob = self.cur_mut();
+                ob.saved_seq = Some(ob.cur_seq);
                 let name = self
                     .buffer()
                     .path
@@ -2447,6 +2499,7 @@ impl Editor {
         let mut written = 0;
         for ob in self.buffers.map.values_mut() {
             if ob.buffer.modified && ob.buffer.path.is_some() && ob.buffer.write(None).is_ok() {
+                ob.saved_seq = Some(ob.cur_seq);
                 written += 1;
             }
         }
@@ -2904,11 +2957,13 @@ impl Editor {
 
     // ----- undo / redo ------------------------------------------------------
 
-    /// Capture the current text + cursor as an undo/redo snapshot.
+    /// Capture the current text + cursor + sequence number as an undo/redo
+    /// snapshot.
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             text: self.buffer().text.clone(),
             cursor: self.cursor,
+            seq: self.buffers.get(self.current).cur_seq,
         }
     }
 
@@ -2920,6 +2975,10 @@ impl Editor {
         let ob = self.cur_mut();
         ob.undo_stack.push(snap);
         ob.redo_stack.clear();
+        // The edit about to happen produces a brand-new state — mint its id so
+        // undo can later recognise (and redo can return to) this exact point.
+        ob.cur_seq = ob.next_seq;
+        ob.next_seq += 1;
     }
 
     fn undo(&mut self) {
@@ -2955,8 +3014,14 @@ impl Editor {
             ob.undo_stack.push(current);
         }
         ob.buffer.text = snap.text;
+        ob.cur_seq = snap.seq;
+        // We're back on a previously-seen state: it's clean only if it's the one
+        // last written to disk. (`mark_resync` below sets `modified = true`, so
+        // decide this first and re-assert it afterwards.)
+        let clean = ob.saved_seq == Some(ob.cur_seq);
         self.cursor = snap.cursor;
         self.buffer_mut().mark_resync();
+        self.buffer_mut().modified = !clean;
         self.clamp_cursor();
     }
 

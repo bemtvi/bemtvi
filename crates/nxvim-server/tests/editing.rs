@@ -782,6 +782,75 @@ async fn ctrl_u_mid_buffer_scrolls_up() {
 }
 
 #[tokio::test]
+async fn count_motion_emits_scroll() {
+    let path = write_n_lines("count_j", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // `30j` lands the cursor on line 30; ensure_visible drags top to 30+1-24 = 7.
+    let map = redraw_after(&rpc, &mut incoming, "30j").await;
+
+    assert_eq!(scroll_u64(&map, "from_top"), 0);
+    assert_eq!(scroll_u64(&map, "to_top"), 7);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 0);
+    assert_eq!(scroll_u64(&map, "to_cursor"), 30);
+    assert_eq!(scroll_u64(&map, "base_line"), 0);
+    assert_eq!(scroll_u64(&map, "duration_ms"), 80); // 7*8=56, clamped up to 80
+    assert_eq!(scroll_lines_len(&map), 31); // |7 - 0| + 24
+}
+
+#[tokio::test]
+async fn g_to_last_line_emits_capped_scroll() {
+    let path = write_n_lines("big_g", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // `G` jumps to line 99; top settles at 99+1-24 = 76. The raw travel is 76
+    // lines, but it's capped to two screens (2*24 = 48) so the slide stays bounded.
+    let map = redraw_after(&rpc, &mut incoming, "G").await;
+
+    assert_eq!(scroll_u64(&map, "from_top"), 28); // 76 - 48 (cap)
+    assert_eq!(scroll_u64(&map, "to_top"), 76);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 51); // 99 - 48 (cap)
+    assert_eq!(scroll_u64(&map, "to_cursor"), 99);
+    assert_eq!(scroll_u64(&map, "base_line"), 28);
+    assert_eq!(scroll_u64(&map, "duration_ms"), 160); // 48*8=384, clamped to 160
+    assert_eq!(scroll_lines_len(&map), 72); // 48 + 24
+}
+
+#[tokio::test]
+async fn gg_back_to_top_emits_capped_scroll() {
+    let path = write_n_lines("gg", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let _ = redraw_after(&rpc, &mut incoming, "G").await; // jump to the bottom first
+    let map = redraw_after(&rpc, &mut incoming, "gg").await; // ...then back to the top
+
+    assert_eq!(scroll_u64(&map, "from_top"), 48); // 0 + 48 (cap)
+    assert_eq!(scroll_u64(&map, "to_top"), 0);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 48);
+    assert_eq!(scroll_u64(&map, "to_cursor"), 0);
+    assert_eq!(scroll_u64(&map, "base_line"), 0);
+    assert_eq!(scroll_u64(&map, "duration_ms"), 160);
+    assert_eq!(scroll_lines_len(&map), 72);
+}
+
+#[tokio::test]
+async fn single_line_edge_scroll_is_not_animated() {
+    let path = write_n_lines("edge", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Move to the last visible row (line 23) without scrolling, then step one
+    // line further: the viewport nudges by exactly one line, which must stay
+    // crisp rather than animate — otherwise held `j`/`k` would feel laggy.
+    let _ = redraw_after(&rpc, &mut incoming, "23j").await;
+    let map = redraw_after(&rpc, &mut incoming, "j").await;
+
+    assert!(
+        scroll(&map).is_none(),
+        "a one-line viewport shift must carry no scroll gesture"
+    );
+}
+
+#[tokio::test]
 async fn sleep_blocks_the_editor_for_the_requested_duration() {
     let (rpc, _incoming) = start(None).await;
     // The command is acknowledged promptly; the server then sleeps. The next
@@ -1991,6 +2060,20 @@ async fn n_and_capital_n_repeat_the_search() {
     assert_eq!(cursor(&rpc).await, (3, 4));
     feed(&rpc, "N"); // opposite direction -> back to (2,4)
     assert_eq!(cursor(&rpc).await, (2, 4));
+}
+
+#[tokio::test]
+async fn greedy_pattern_steps_to_the_next_match_not_into_itself() {
+    // A greedy pattern matches one whole span per line ("foo bar" -> "foo",
+    // "baz foo" -> "baz foo"). Navigation must step between those distinct
+    // matches, not crawl one grapheme deeper into the match under the cursor:
+    // searching from the start of line 1's match lands on line 2, and `n` then
+    // moves to line 3 — never to (1,1) or (2,1) inside the current match.
+    let (rpc, _incoming) = search_fixture().await;
+    feed(&rpc, r"/.+o<CR>");
+    assert_eq!(cursor(&rpc).await, (2, 0));
+    feed(&rpc, "n");
+    assert_eq!(cursor(&rpc).await, (3, 0));
 }
 
 #[tokio::test]

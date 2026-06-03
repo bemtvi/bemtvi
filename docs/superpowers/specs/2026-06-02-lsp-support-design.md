@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–4 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help); Phases 5–7 planned.
+**Status:** In progress — **Phases 1–4 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help); Phases 5–7 planned (**Phase 5 plan refined 2026-06-03** — ordering-by-importance and a stay-open, live-refreshing menu are now in scope, with tests; see its section).
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -775,54 +775,207 @@ exist); markdown styling beyond plain text.
 
 ### Phase 5 — Completion (the popup menu)
 
+> **Plan refined 2026-06-03.** Two behaviors the original phase under-specified
+> are now first-class, each with tests that pin it: the menu is **ordered by
+> importance** (the typed prefix filters and ranks, so `use nv` surfaces
+> `nva`/`nvb` and never `self`/`pub`), and once shown the menu **stays open and
+> refreshes live** as you keep typing rather than flickering closed. Deterministic
+> prefix + subsequence ranking with a `sortText` tiebreak moves from *Scope out*
+> into *Scope in*; only advanced fuzzy/typo scoring and snippet expansion stay
+> deferred. *(The stale `feature/lsp-completion` branch is **not** a reference — it
+> predates this refinement and is ignored.)*
+
 **Goal / value.** The big UI lift and the headline feature:
 `textDocument/completion` driven from insert mode, shown in a **new popup-menu
-(pmenu) surface**, accepting an item inserts its text (+ `additionalTextEdits`).
+(pmenu) surface** that filters, ranks, and live-refreshes as you type; accepting
+an item replaces the typed word with its text (+ `additionalTextEdits`).
 
-**Prerequisites.** Phases 1–3 (sync, tokens, edit application groundwork).
+**Prerequisites.** Phases 1–3 (sync, tokens, byte↔encoding position conversion,
+the `jump_to`/edit-application groundwork).
+
+**The two behaviors to nail (this refinement's focus).** They are the acceptance
+bar — what makes a completion menu feel real, and the easiest things to get subtly
+wrong:
+1. **Ordered by importance.** With the cursor after `use nv`, the menu shows the
+   items whose name matches `nv` — `nva`, `nvb` — *ahead of and to the exclusion
+   of* irrelevant names like `self` or `pub`. "Importance" is, in order: how well
+   the item matches what was typed (exact/prefix beats a mere subsequence beats no
+   match — which is dropped), then the server's own `sortText` priority, then the
+   label alphabetically as a stable tiebreak. The menu is **never** left in raw
+   server-array order once a prefix is typed.
+2. **Stays open and refreshes live.** Triggering opens the menu once; **typing
+   more word characters keeps the same menu open and updates its contents in
+   place** — it does not close and reopen. Each keystroke recomputes the prefix
+   and re-ranks: if the last list was complete (`isIncomplete: false`) the
+   refilter is **client-side** against the cached items (no new request); if it was
+   incomplete (`isIncomplete: true`) a **fresh `textDocument/completion`** fires at
+   the new cursor and its result replaces the list when it lands. Typing a non-word
+   character, moving the cursor out of the word, leaving insert mode, or an empty
+   result set dismisses it.
 
 **Scope (in):**
-- A **pmenu surface**: a new redraw region (`pmenu` map: items, selected index,
-  anchor screen position, dimensions) the server projects, and a **ratatui pmenu
-  widget** in the TUI that floats over the text area at the anchor (this is the
-  first overlay widget; build it minimally — a bordered list with a selected
-  row). Core stays out of it: the server owns the menu model and drives it from
-  insert-mode state, exactly as it owns diagnostics.
-- Trigger: manual `<C-x><C-o>`/`<C-Space>` first; auto-trigger on typing is a
-  follow-up toggle once the manual path is solid.
-- Request completion at the cursor (token); on reply, populate the pmenu
-  (respect `isIncomplete`, `CompletionItemKind` for an icon/label, `filterText`).
-  Navigate with `<C-n>`/`<C-p>`/arrows; `<CR>`/`<Tab>` accepts → apply the item's
-  `textEdit` (or insert `insertText`/`label`) + any `additionalTextEdits` via
-  `Buffer::insert`/`remove`; `<Esc>`/`<C-e>` cancels.
-- `completionItem/resolve` for lazy docs/detail (optional within this phase).
+- **The pmenu surface (redraw key + widget).** A new top-level `pmenu` redraw key
+  — `Nil` when closed, else a map the server projects each frame, the way it
+  projects `diagnostics`/`panel`:
+  - `items`: the ranked, filtered visible items, each `{label, kind, detail?}`
+    (`kind` = `CompletionItemKind` as a small int → the client maps it to an
+    icon/letter; `detail` is the right-aligned type/source hint when present);
+  - `selected`: the selected index, `Nil` until the user navigates (so accept can
+    fall back to the first item);
+  - `row`, `col`: the anchor — the screen cell of the **start of the completion
+    word** (one row below the cursor; flipped above if there's no room), so the
+    menu's left edge lines up under the word being completed. `col` =
+    `cursor_screen_col` minus the prefix's screen width; `cursor_screen_col`
+    already rides the redraw, so **no core change** for the anchor;
+  - `width`, `height`: dimensions clamped to the viewport (the list scrolls when
+    taller than `height`).
+  A minimal **ratatui pmenu widget** in the TUI floats this over the text area at
+  `(row, col)` — the first overlay widget: a bordered list, the `selected` row
+  reverse-highlighted, drawn **last** so it sits above the text. Core stays out of
+  it: the server owns the menu model and drives it from insert-mode state, exactly
+  as it owns diagnostics.
+- **Request/reply plumbing.** A new `LspRequest::Completion { uri, position }` and
+  `LspReply::Completion { is_incomplete, items }` distilled in the manager
+  (normalize the `CompletionItem[]` vs `CompletionList` response shapes; reduce
+  each item to `{label, kind, detail, filter_text, sort_text, insert_text,
+  text_edit, additional_text_edits}` with ranges still in the negotiated encoding
+  for the editor to convert). Rides the existing `ReqToken`/generation path and
+  per-kind stale-drop — a reply for a superseded generation, or one that arrives
+  after the menu closed, is dropped.
+- **The completion word (prefix).** A pure server helper: the run of identifier
+  characters (`[A-Za-z0-9_]`) immediately left of the cursor on the current line,
+  in bytes. It is both the **filter string** and the **default replace range**
+  (word-start..cursor) for items carrying only `insertText`/`label`; an item with
+  an explicit `textEdit` uses the server-provided range instead.
+- **Filtering & ranking (the ordering).** Client-side, deterministic, table-free,
+  re-run whenever the item set or prefix changes. For typed prefix `p` and an
+  item's filter string `f` (= `filterText` else `label`):
+  - compute a **match tier** — `0` exact (`f == p`), `1` case-sensitive prefix,
+    `2` case-insensitive prefix, `3` `p` a case-insensitive subsequence of `f`,
+    else **drop the item**;
+  - sort survivors by the tuple `(tier, sort_text_or_label, label)` ascending — so
+    match quality dominates, the server's `sortText` orders items of equal quality,
+    and the label is the final stable tiebreak.
+  An empty prefix (just triggered, nothing typed) keeps every item (all tier `≤2`
+  against the empty string) in `sortText` order — the correct "show everything the
+  server offered, in its priority" initial state. *(This is the "ordered by
+  importance" contract; advanced fuzzy scoring — typo tolerance, gap/cluster
+  penalties — is out, see below.)*
+- **The menu state machine (server-owned, in `lsp.rs`/`lib.rs`).** A
+  `CompletionMenu` holds the raw last list, `is_incomplete`, the anchor (buffer row
+  + word-start byte col), the live prefix, the ranked visible items, and the
+  selected index. Insert-mode keys are intercepted while it is open, extending the
+  `lsp_keymap` insert-mode arm that already owns `<C-k>`:
+  - **trigger** `<C-x><C-o>` / `<C-Space>`: fire a request at the cursor; on reply,
+    build the menu and project `pmenu`. (Auto-trigger on a typed identifier char is
+    a follow-up *toggle* once manual is solid — but **live refresh while already
+    open is in scope here**, since that is the headline behavior.)
+  - **word char** while open: let the editor insert it, then recompute the prefix
+    and **refresh in place** — refilter the cache when the last list was complete,
+    else re-request. The menu closes for a word char only if the result is empty.
+  - **`<BS>`** while open: editor deletes, prefix shrinks, refresh (re-request if
+    the prior list was incomplete); closes if the cursor backs out of the word.
+  - **`<C-n>`/`<C-p>`/`<Down>`/`<Up>`**: move `selected` (wrapping); no buffer
+    change, menu stays open.
+  - **`<CR>`/`<Tab>`**: accept the selected (or first) item, then close.
+  - **`<Esc>`/`<C-e>`**: close without inserting (`<Esc>` then also leaves insert,
+    as usual).
+  - any other key, a cursor move, or a mode change: close, then let the key take
+    its normal effect.
+- **Accept = an edit applier.** Convert each edit's LSP range → byte range through
+  the negotiated encoding, apply via `Buffer::insert`/`remove` (in reverse order
+  within a document so earlier offsets stay valid), `normalize()`, and set the
+  cursor to the end of the primary insertion. One accept is **one undo step** and
+  flows to the next `didChange` through the shared edit journal (`take_edits`), so
+  the server's document version stays consistent. This is the same applier
+  Phase 6 generalizes to multi-file `WorkspaceEdit`s. (Setting the cursor and
+  grouping the undo are editor-domain, not LSP — any small core helper added here
+  takes no LSP types, keeping `nxvim-core` LSP-free.)
 
-**Scope (out):** snippets (`InsertTextFormat.Snippet` placeholder expansion) —
-insert the plain text for now, snippet expansion is a follow-up; fuzzy ranking
-beyond the server's order + prefix filter.
+**Scope (out):**
+- **Snippets** (`InsertTextFormat.Snippet` placeholder/tab-stop expansion) —
+  insert the snippet's plain text for now; expansion is a cross-phase follow-up.
+- **Advanced fuzzy ranking** — typo tolerance and gap-weighted scoring beyond the
+  prefix + subsequence + `sortText` order above.
+- **`completionItem/resolve`** for lazy `documentation`/`detail` — optional; wire
+  it only if trivial, else defer (the menu shows the eager `detail`).
+- **Float chrome** — the pmenu is a minimal overlay until real float layout exists
+  (cross-phase note); no documentation popup beside the menu yet.
 
-**Files.** `crates/nxvim-core/src/view.rs` *only if* the pmenu anchor needs a
-core-computed cursor screen position already available (it does:
-`cursor_screen_col` exists — so likely **no** core change), `crates/nxvim-server/src/lsp.rs`,
-`crates/nxvim-server/src/lib.rs` (pmenu redraw key + insert-mode menu state
-machine), `crates/nxvim-tui/src/{render.rs, lib.rs}` (pmenu widget + key
-handling while the menu is open), `crates/nxvim-server/tests/lsp.rs`, a Tier-2
-screen test in `crates/nxvim/tests/`.
+**Files.** `crates/nxvim-lsp/src/manager.rs` (the `Completion` request + the
+`CompletionList`/item distillation) and `crates/nxvim-lsp/src/mock.rs` (the
+`completion` + `completion_sequence` script fields, below); `crates/nxvim-server/src/lsp.rs`
+(prefix, ranking, menu model, accept applier); `crates/nxvim-server/src/lib.rs`
+(the `pmenu` redraw key + the insert-mode menu state machine + key interception);
+`crates/nxvim-tui/src/{view.rs, render.rs}` (the `pmenu` `View` field + the overlay
+widget); `crates/nxvim/tests/lsp.rs`, plus a Tier-2 screen test in
+`crates/nxvim/tests/`. **No core change** is anticipated (the anchor reuses
+`cursor_screen_col`; ranking/menu live in the server) beyond, at most, a tiny
+LSP-free cursor-set / undo-group helper for accept.
 
-**Tests.**
-- Trigger completion; mock returns items; poll a redraw until `pmenu` appears
-  with the expected items and selection.
-- `<C-n>`/`<C-p>` move selection; `<CR>` inserts the accepted item's text
-  (assert buffer contents) including an `additionalTextEdits` (e.g. an
-  auto-import line); `<Esc>` dismisses without inserting.
-- Tier-2 screen: the pmenu is painted over the text at the cursor anchor with the
-  selected row highlighted.
-- Non-ASCII line: the inserted edit lands at the right byte offset (encoding).
+**Mock additions.** To drive ordering and live-refresh deterministically, the mock
+gains two script fields (mirroring the existing `definition`/`hover` fields):
+- `completion`: a single scripted response — a `CompletionItem[]` or a
+  `CompletionList` (`{isIncomplete, items}`) — returned for every
+  `textDocument/completion` (the client-side-filter, ranking, accept, and encoding
+  tests use this).
+- `completion_sequence`: an array of responses consumed **one per
+  `textDocument/completion` request**, overriding `completion` when present — so a
+  test returns a broad `isIncomplete: true` list first and a narrowed list on the
+  re-request, proving the live re-request path. (The mock already records every
+  request, so a test can also assert *how many* completion requests were sent.)
 
-**Done when.** The above pass; gates green. *(This phase is the largest; if it
-overflows a context, split at the pmenu-widget boundary: 5a = surface + widget +
-manual navigation with mock items, 5b = real completion request + accept/edit
-application.)*
+**Tests.** A new `pmenu_of(params) -> Option<(Vec<String> /*labels*/, i64
+/*selected*/)>` helper mirrors `panel_of`/`diagnostics_of`, and a `wait_for_pmenu`
+poller mirrors `wait_for_panel`. Then:
+- **Ordering by importance — the headline (`use nv` → `nva`, `nvb`, not `self`/
+  `pub`).** Buffer `use ` (cursor at end, insert mode); `completion` returns, in a
+  deliberately unhelpful order, `[pub, self, nvb, nva]` with `isIncomplete:false`.
+  Trigger, then `feed("nv")`. Assert the `pmenu` `items` are **exactly**
+  `["nva", "nvb"]` in that order with `self`/`pub` absent; the menu is **still
+  open** across both keystrokes; and **only one** `textDocument/completion` was
+  recorded (a complete list ⇒ client-side filter, no re-request).
+- **Ranking honors `sortText` over the label.** Two prefix-matching items whose
+  `sortText` order is the reverse of their alphabetical order (label `config`
+  `sortText:"2"`, label `connect` `sortText:"1"`); type their shared prefix and
+  assert the menu lists `["connect", "config"]` — `sortText` wins, so the order is
+  by importance, not alphabet. Include a third, subsequence-only item and assert it
+  ranks **below** both prefix matches.
+- **Stays open and refreshes live from the server (`isIncomplete`).**
+  `completion_sequence` = `[broad isIncomplete:true list, narrowed isIncomplete:true
+  list]`. Type `n`, trigger → menu open with the broad items. `feed("v")` → assert
+  the menu **stayed open** (the `pmenu` key never went `Nil` between redraws), a
+  **second** `textDocument/completion` was sent, and the items are now the narrowed
+  set — a live server refresh, not just a client filter.
+- **Accept inserts the item + `additionalTextEdits`.** `completion` item
+  `{label:"println", insertText:"println", additionalTextEdits:[insert
+  "use std::io;\n" at line 0]}`; trigger, `<C-n>` to select, `<CR>`. Assert the
+  typed word became `println` (prefix **replaced**, not appended) **and** the
+  import line was added; the menu closed; a single undo restores both.
+- **Navigate, and dismiss without inserting.** After a trigger, `<C-n>` moves
+  `selected` (assert the index); `<C-e>` closes the menu with the buffer unchanged;
+  separately `<Esc>` closes it and leaves insert mode, buffer unchanged — no
+  control key leaked a literal character (the `<C-k>` test's "no literal `k`"
+  pattern).
+- **Tier-2 screen paint.** The pmenu paints as a bordered overlay anchored at the
+  word start (`col` = gutter + word-start screen col, one row below the cursor),
+  the selected row reverse-highlighted, the cells under it belonging to the menu
+  (not the text). Assert specific cells and the selected-row style, the
+  `a_diagnostic_cell_is_painted_with_an_underline` pattern.
+- **Encoding.** On a line with a leading 2-byte `é` and a `utf-16` server, accept an
+  item whose `textEdit` range is in utf-16 units; assert the replacement lands at
+  the right **byte** offset (the completion analogue of the cross-file `é` test).
+- **Resilience.** A completion request whose reply never arrives (or arrives after
+  the menu was dismissed) leaves the editor fully editable and inserts nothing; a
+  stale reply (generation superseded by the re-request) is dropped.
+
+**Done when.** All of the above pass; `nxvim-core` still carries no LSP/async/JSON
+deps; the three workspace gates are green. *(Largest phase: if it overflows a
+context, split at the pmenu-widget boundary — 5a = surface + widget + manual
+navigation against static mock items, **including the ordering/ranking and the
+stay-open client-side refilter**; 5b = the `isIncomplete` re-request live refresh +
+accept/edit application + encoding. The mock fields and the `pmenu` redraw shape
+land in 5a so 5b is purely behavior.)*
 
 ---
 

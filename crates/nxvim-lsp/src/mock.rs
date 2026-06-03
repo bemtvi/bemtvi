@@ -26,6 +26,12 @@
 //!   `textDocument/*` request (a `Location`, an array of `Location`s, or — for
 //!   the goto family — a `LocationLink[]`; `references` is a `Location[]`).
 //!   Absent ⇒ a `null` result (no locations).
+//! - `hover`: the scripted `Hover` result (`{contents, range?}`, where
+//!   `contents` is a `MarkupContent`, a `MarkedString`, or an array) returned for
+//!   `textDocument/hover`. Absent ⇒ `null` (no hover).
+//! - `signature_help`: the scripted `SignatureHelp` result (`{signatures,
+//!   activeSignature?, activeParameter?}`) returned for
+//!   `textDocument/signatureHelp`. Absent ⇒ `null` (no signature help).
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -100,6 +106,8 @@ pub fn run(script_path: &str) {
             }
             "textDocument/implementation" => reply_scripted(&stdout, id, &script, "implementation"),
             "textDocument/references" => reply_scripted(&stdout, id, &script, "references"),
+            "textDocument/hover" => reply_scripted(&stdout, id, &script, "hover"),
+            "textDocument/signatureHelp" => reply_scripted(&stdout, id, &script, "signature_help"),
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply.
             _ => {

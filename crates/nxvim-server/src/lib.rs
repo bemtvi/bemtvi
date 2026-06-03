@@ -14,7 +14,9 @@ mod syntax;
 use lsp::{LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
-use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, Key, Mode, PanelView};
+use nxvim_core::{
+    parse_color, parse_keys, unicode, BufferId, Editor, Key, KeyCode, Mode, PanelView,
+};
 use nxvim_lsp::{LspManager, ServerKey};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
@@ -416,17 +418,20 @@ impl Server {
         self.run_pending();
     }
 
-    /// The built-in LSP normal-mode keymaps: `gd` go-to-definition, `gD`
-    /// go-to-declaration, `gr` references. Returns `true` when the key was
-    /// consumed as (part of) a mapping and must not reach the editor.
+    /// The built-in LSP keymaps: `gd` go-to-definition, `gD` go-to-declaration,
+    /// `gr` references, `K` hover (all normal mode), and `<C-k>` signature help
+    /// (insert mode). Returns `true` when the key was consumed as (part of) a
+    /// mapping and must not reach the editor.
     ///
     /// `g` is a two-key prefix, so it is withheld and the next key decides: an
     /// LSP letter fires the request; anything else replays the withheld `g`
     /// (then the caller feeds the current key), so `gg`/`ge`/… are untouched.
-    /// `g` is only armed in plain normal mode, leaving insert-mode text and
-    /// visual-mode `g`-commands alone; operator-pending also reports `Normal`,
-    /// but its non-LSP second key takes the replay path, preserving `dgg` & co.
-    /// (revisited once `vim.keymap` lands in Phase 7).
+    /// `g`/`K` are only armed in plain normal mode, leaving insert-mode text and
+    /// visual-mode `g`/`K` alone; operator-pending also reports `Normal`, but its
+    /// non-LSP second key takes the replay path, preserving `dgg` & co. `<C-k>`
+    /// fires only in insert mode (where it would otherwise insert a literal `k`),
+    /// the manual signature-help trigger. (Revisited once `vim.keymap` lands in
+    /// Phase 7.)
     fn lsp_keymap(&mut self, key: Key) -> bool {
         if self.lsp_pending_g {
             self.lsp_pending_g = false;
@@ -451,8 +456,23 @@ impl Server {
                 }
             }
         }
-        if self.editor.mode == Mode::Normal && key.as_char() == Some('g') {
-            self.lsp_pending_g = true;
+        if self.editor.mode == Mode::Normal {
+            match key.as_char() {
+                Some('g') => {
+                    self.lsp_pending_g = true;
+                    return true;
+                }
+                Some('K') => {
+                    self.request_lsp(LspReqKind::Hover);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // `<C-k>` in insert mode requests signature help (consumed here so it
+        // never reaches the editor as a literal `k` insertion).
+        if self.editor.mode == Mode::Insert && key.ctrl && key.code == KeyCode::Char('k') {
+            self.request_lsp(LspReqKind::SignatureHelp);
             return true;
         }
         false
@@ -607,6 +627,10 @@ impl Server {
             "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition),
             "LspImplementation" => self.request_lsp(LspReqKind::Implementation),
             "LspReferences" => self.request_lsp(LspReqKind::References),
+            // Phase-4: hover docs into the panel, signature help on the message
+            // line (the keymap-free path for `K` / `<C-k>`).
+            "LspHover" => self.request_lsp(LspReqKind::Hover),
+            "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp),
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor

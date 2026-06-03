@@ -993,3 +993,107 @@ async fn a_definition_reply_is_dropped_if_the_cursor_moved() {
         "textDocument/definition"
     ));
 }
+
+#[tokio::test]
+async fn k_shows_hover_docs_in_the_panel() {
+    let _guard = test_lock().lock().await;
+    // The mock returns markdown hover contents; `K` opens the panel with the
+    // markup rendered as plain lines (the trailing blank line is trimmed).
+    let file = temp_file("hover", "rs", "fn target() {}\n");
+    let record = configure_mock(
+        "hover",
+        serde_json::json!({
+            "hover": {
+                "contents": {
+                    "kind": "markdown",
+                    "value": "fn target()\n\nThe target function\n",
+                }
+            }
+        }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "K");
+    let (title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP hover");
+    assert_eq!(
+        panel_lines,
+        vec![
+            "fn target()".to_string(),
+            String::new(),
+            "The target function".to_string(),
+        ],
+        "the hover markup is rendered as plain lines, trailing blank trimmed"
+    );
+    assert!(
+        has_method(&record_lines(&record), "textDocument/hover"),
+        "K should send a textDocument/hover request"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_hover_reply_reports_no_information() {
+    let _guard = test_lock().lock().await;
+    // The server has nothing to say at the cursor: a brief message, no panel.
+    let file = temp_file("hover-empty", "rs", "fn main() {}\n");
+    let record = configure_mock("hover-empty", serde_json::json!({}));
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "K");
+    let params = wait_for_message(&rpc, &mut incoming, "No hover information").await;
+    assert_eq!(message_of(&params), "No hover information");
+    assert!(panel_of(&params).is_none(), "an empty hover opens no panel");
+}
+
+#[tokio::test]
+async fn ctrl_k_shows_signature_help_with_the_active_parameter() {
+    let _guard = test_lock().lock().await;
+    // The mock returns a two-parameter signature with the second parameter active;
+    // `<C-k>` in insert mode renders the active signature on the message line with
+    // its active parameter highlighted in brackets.
+    let file = temp_file("sighelp", "rs", "fn add(a: i32, b: i32) -> i32 { a }\n");
+    let record = configure_mock(
+        "sighelp",
+        serde_json::json!({
+            "signature_help": {
+                "signatures": [
+                    {
+                        "label": "fn add(a: i32, b: i32) -> i32",
+                        "parameters": [ { "label": "a: i32" }, { "label": "b: i32" } ],
+                    }
+                ],
+                "activeSignature": 0,
+                "activeParameter": 1,
+            }
+        }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Enter insert mode, then trigger signature help with `<C-k>` (which must not
+    // insert a literal `k`).
+    feed(&rpc, "i<C-k>");
+    let params = wait_for_message(
+        &rpc,
+        &mut incoming,
+        "fn add(a: i32, b: i32) -> i32    [b: i32]",
+    )
+    .await;
+    assert_eq!(
+        message_of(&params),
+        "fn add(a: i32, b: i32) -> i32    [b: i32]"
+    );
+    assert!(
+        has_method(&record_lines(&record), "textDocument/signatureHelp"),
+        "<C-k> should send a textDocument/signatureHelp request"
+    );
+
+    // The buffer is unchanged: `<C-k>` was consumed as a mapping, not typed.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn add(a: i32, b: i32) -> i32 { a }".to_string()],
+        "<C-k> did not insert a literal k"
+    );
+}

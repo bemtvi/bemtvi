@@ -69,6 +69,8 @@ pub(crate) enum LspReqKind {
     TypeDefinition,
     Implementation,
     References,
+    Hover,
+    SignatureHelp,
 }
 
 impl LspReqKind {
@@ -79,6 +81,8 @@ impl LspReqKind {
             LspReqKind::TypeDefinition => 2,
             LspReqKind::Implementation => 3,
             LspReqKind::References => 4,
+            LspReqKind::Hover => 5,
+            LspReqKind::SignatureHelp => 6,
         }
     }
 
@@ -89,6 +93,8 @@ impl LspReqKind {
             2 => LspReqKind::TypeDefinition,
             3 => LspReqKind::Implementation,
             4 => LspReqKind::References,
+            5 => LspReqKind::Hover,
+            6 => LspReqKind::SignatureHelp,
             _ => return None,
         })
     }
@@ -99,7 +105,9 @@ impl LspReqKind {
         matches!(self, LspReqKind::References)
     }
 
-    /// The message shown when the server returns no locations.
+    /// The message shown when the server returns no result. The location-list
+    /// kinds phrase it as "found"; hover/signatureHelp have their own wording but
+    /// are handled off the location path, so these are their fallbacks too.
     fn empty_message(self) -> &'static str {
         match self {
             LspReqKind::Definition => "No definition found",
@@ -107,6 +115,8 @@ impl LspReqKind {
             LspReqKind::TypeDefinition => "No type definition found",
             LspReqKind::Implementation => "No implementation found",
             LspReqKind::References => "No references found",
+            LspReqKind::Hover => "No hover information",
+            LspReqKind::SignatureHelp => "No signature help",
         }
     }
 
@@ -604,6 +614,8 @@ impl Server {
                 position,
                 include_declaration: false,
             },
+            LspReqKind::Hover => LspRequest::Hover { uri, position },
+            LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
         };
         self.lsp.request(key, token, req);
     }
@@ -642,9 +654,43 @@ impl Server {
             return;
         }
 
-        let LspReply::Locations(locations) = reply;
-        self.apply_lsp_locations(kind, locations);
+        match reply {
+            LspReply::Locations(locations) => self.apply_lsp_locations(kind, locations),
+            LspReply::Hover(lines) => self.show_hover(lines),
+            LspReply::SignatureHelp {
+                signature,
+                active_parameter,
+            } => self.show_signature_help(signature, active_parameter),
+        }
         self.lsp_dirty = true;
+    }
+
+    /// Render a hover reply: open the bottom panel with the markup's plain lines
+    /// (the panel is the hover surface until floats exist — Decision 7). An empty
+    /// reply shows a brief message instead of an empty panel.
+    fn show_hover(&mut self, lines: Vec<String>) {
+        if lines.is_empty() {
+            self.editor.echo(LspReqKind::Hover.empty_message());
+            return;
+        }
+        self.editor.open_panel("LSP hover", lines, false, 0);
+    }
+
+    /// Render a signature-help reply on the message line: the active signature's
+    /// label, with its active parameter appended in brackets when known (a plain
+    /// message line can't style the parameter inline). Triggered manually in
+    /// insert mode, so it stays out of the way until asked for. Empty ⇒ a brief
+    /// message.
+    fn show_signature_help(&mut self, signature: Option<String>, active_parameter: Option<String>) {
+        let Some(signature) = signature else {
+            self.editor.echo(LspReqKind::SignatureHelp.empty_message());
+            return;
+        };
+        let message = match active_parameter {
+            Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
+            _ => signature,
+        };
+        self.editor.echo(message);
     }
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;

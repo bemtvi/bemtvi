@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–3 complete** (lifecycle + document sync; diagnostics; go-to definition & references); Phases 4–7 planned.
+**Status:** In progress — **Phases 1–4 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help); Phases 5–7 planned.
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -701,7 +701,47 @@ search (a later/optional add).
 
 ---
 
-### Phase 4 — Hover & signature help
+### Phase 4 — Hover & signature help — ✅ DONE
+
+> **Implementation notes (as built).** Faithful to the plan; choices worth
+> recording:
+> - **Request/reply reuses the Phase-3 token plumbing verbatim.** Two new
+>   `LspRequest` variants (`Hover`, `SignatureHelp`) ride the same
+>   `ReqToken`/generation path and the same per-`LspReqKind` stale-drop (by
+>   generation *and* cursor) — so a hover/signature reply that arrives after the
+>   cursor moved is discarded, exactly like go-to. No new staleness machinery.
+> - **The reply is distilled in the manager, not the editor.** `LspReply` gained
+>   `Hover(Vec<String>)` (the markup extracted to plain display lines — a
+>   `MarkedString`, an array joined by blank lines, or a `MarkupContent.value`,
+>   with trailing blanks trimmed) and `SignatureHelp { signature, active_parameter
+>   }` (the active signature's label + its active parameter's text). Every protocol
+>   response shape collapses inside `nxvim-lsp` before it reaches the editor, the
+>   way goto responses already normalize to a flat `Vec<Location>`. The editor
+>   does **no** markup parsing.
+> - **Hover → the panel; signature help → the message line.** Hover docs can be
+>   multi-line, so they open the bottom panel (`"LSP hover"`, non-navigable). A
+>   signature is one line and is wanted *while typing*, so it renders on the
+>   message line via `echo` — `format!("{signature}    [{param}]")`, the active
+>   parameter bracketed since a plain message line can't style it inline. An empty
+>   reply (`Hover(vec![])` / both fields `None`) shows a brief "No hover
+>   information" / "No signature help" instead of an empty panel.
+> - **Active parameter:** the per-signature `activeParameter` (LSP 3.16+) wins
+>   over the top-level one; `ParameterLabel::Simple` is used verbatim,
+>   `LabelOffsets` are sliced out of the signature label on char boundaries
+>   (UTF-16 units, exact for ASCII, best-effort otherwise — display only).
+> - **Keymaps, in the server (core stays LSP-free).** `K` (normal mode) fires
+>   hover; `<C-k>` (insert mode) fires signature help. `K` joins the `g`-prefix
+>   recognizer's normal-mode arm (it was previously an unbound no-op); `<C-k>` is
+>   intercepted in insert mode *before* the editor, where it would otherwise
+>   insert a literal `k`. Both have ex-command twins (`:LspHover`,
+>   `:LspSignatureHelp`) — the keymap-free path. Signature help is **manual-only**;
+>   auto-trigger on `(`/`,` is deferred to keep insert mode untouched until
+>   completion (Phase 5), as the plan directs.
+> - **Mock** gained `hover` and `signature_help` script fields (returned verbatim
+>   for the matching request). Tests (in `crates/nxvim/tests/lsp.rs`) cover the `K`
+>   hover panel (markdown → plain lines, trailing blank trimmed, request actually
+>   sent), the empty-hover message (no panel), and the `<C-k>` signature line with
+>   the active parameter bracketed (asserting no literal `k` was inserted).
 
 **Goal / value.** `textDocument/hover` on `K` shows docs in the panel;
 `textDocument/signatureHelp` shows the active signature (panel or message line).

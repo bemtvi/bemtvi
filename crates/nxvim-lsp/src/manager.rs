@@ -23,9 +23,10 @@ use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, GeneralClientCapabilities,
-    GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, InitializeResult,
-    InitializedParams, Location, MessageType, Position, PositionEncodingKind, ReferenceContext,
-    ReferenceParams, ServerCapabilities, TextDocumentClientCapabilities,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, Location, MarkedString, MessageType,
+    ParameterLabel, Position, PositionEncodingKind, ReferenceContext, ReferenceParams,
+    ServerCapabilities, SignatureHelp, SignatureHelpParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
     TextDocumentSyncKind, Url, VersionedTextDocumentIdentifier,
@@ -125,6 +126,14 @@ pub enum LspRequest {
         position: Position,
         include_declaration: bool,
     },
+    Hover {
+        uri: Url,
+        position: Position,
+    },
+    SignatureHelp {
+        uri: Url,
+        position: Position,
+    },
 }
 
 /// The opaque correlation token the editor issues with a request and the manager
@@ -139,13 +148,25 @@ pub struct ReqToken {
     pub generation: u64,
 }
 
-/// The distilled result of an [`LspRequest`], normalized to a flat list of target
-/// locations: every goto-family response shape (`Location`, `Location[]`,
-/// `LocationLink[]`) and `references` collapse to this, so the editor handles one
-/// shape regardless of which feature asked.
+/// The distilled result of an [`LspRequest`]. Each variant is already reduced to
+/// what the editor renders, so the protocol's many response shapes never leak
+/// past the manager: goto-family/`references` collapse to a flat location list,
+/// hover/signatureHelp to plain display lines (markup extracted, never styled
+/// here — full markdown rendering is a follow-up).
 #[derive(Clone, Debug)]
 pub enum LspReply {
+    /// Target locations for a goto-family request or `references` (every
+    /// `Location`/`Location[]`/`LocationLink[]` shape normalized to one list).
     Locations(Vec<Location>),
+    /// Hover contents as plain display lines (empty ⇒ the server had nothing).
+    Hover(Vec<String>),
+    /// The active signature's label and, when known, its active parameter's text.
+    /// Both `None` ⇒ no signature help (no signatures, or the server returned
+    /// nothing).
+    SignatureHelp {
+        signature: Option<String>,
+        active_parameter: Option<String>,
+    },
 }
 
 /// Server → editor, delivered to the main loop's `select!`. The distilled events
@@ -607,25 +628,27 @@ async fn issue_request(
     if log.enabled(LogLevel::Debug) {
         log.log(LogLevel::Debug, name, &describe_request(&req));
     }
-    let locations = match req {
-        LspRequest::Definition { uri, position } => {
-            goto_locations(sock.definition(goto_params(uri, position)).await, log, name)
-        }
-        LspRequest::Declaration { uri, position } => goto_locations(
+    match req {
+        LspRequest::Definition { uri, position } => LspReply::Locations(goto_locations(
+            sock.definition(goto_params(uri, position)).await,
+            log,
+            name,
+        )),
+        LspRequest::Declaration { uri, position } => LspReply::Locations(goto_locations(
             sock.declaration(goto_params(uri, position)).await,
             log,
             name,
-        ),
-        LspRequest::TypeDefinition { uri, position } => goto_locations(
+        )),
+        LspRequest::TypeDefinition { uri, position } => LspReply::Locations(goto_locations(
             sock.type_definition(goto_params(uri, position)).await,
             log,
             name,
-        ),
-        LspRequest::Implementation { uri, position } => goto_locations(
+        )),
+        LspRequest::Implementation { uri, position } => LspReply::Locations(goto_locations(
             sock.implementation(goto_params(uri, position)).await,
             log,
             name,
-        ),
+        )),
         LspRequest::References {
             uri,
             position,
@@ -639,16 +662,144 @@ async fn issue_request(
                     include_declaration,
                 },
             };
-            match sock.references(params).await {
+            let locations = match sock.references(params).await {
                 Ok(locs) => locs.unwrap_or_default(),
                 Err(e) => {
                     log.log(LogLevel::Warn, name, &format!("references failed: {e}"));
                     Vec::new()
                 }
-            }
+            };
+            LspReply::Locations(locations)
+        }
+        LspRequest::Hover { uri, position } => {
+            let params = HoverParams {
+                text_document_position_params: text_document_position(uri, position),
+                work_done_progress_params: Default::default(),
+            };
+            hover_reply(sock.hover(params).await, log, name)
+        }
+        LspRequest::SignatureHelp { uri, position } => {
+            let params = SignatureHelpParams {
+                context: None,
+                text_document_position_params: text_document_position(uri, position),
+                work_done_progress_params: Default::default(),
+            };
+            signature_help_reply(sock.signature_help(params).await, log, name)
+        }
+    }
+}
+
+/// Distill a `textDocument/hover` reply into plain display lines: extract the
+/// markup's text (a `MarkedString`, an array of them joined by blank lines, or a
+/// `MarkupContent` value), split into lines, and drop trailing blank lines so the
+/// panel isn't padded. `None`/an error degrades to an empty list ("no
+/// information"), so the editor never hangs waiting on a feature a server lacks.
+fn hover_reply(
+    result: Result<Option<Hover>, async_lsp::Error>,
+    log: &LspLog,
+    name: &str,
+) -> LspReply {
+    let hover = match result {
+        Ok(Some(hover)) => hover,
+        Ok(None) => return LspReply::Hover(Vec::new()),
+        Err(e) => {
+            log.log(LogLevel::Warn, name, &format!("hover failed: {e}"));
+            return LspReply::Hover(Vec::new());
         }
     };
-    LspReply::Locations(locations)
+    let text = match hover.contents {
+        HoverContents::Scalar(ms) => marked_string_text(ms),
+        HoverContents::Array(parts) => parts
+            .into_iter()
+            .map(marked_string_text)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        HoverContents::Markup(markup) => markup.value,
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    LspReply::Hover(lines)
+}
+
+/// The text of a `MarkedString` (a plain markdown string, or the code of a
+/// language-tagged block — the language fence is dropped since hover is rendered
+/// as plain lines).
+fn marked_string_text(ms: MarkedString) -> String {
+    match ms {
+        MarkedString::String(s) => s,
+        MarkedString::LanguageString(ls) => ls.value,
+    }
+}
+
+/// Distill a `textDocument/signatureHelp` reply into the active signature's label
+/// and active parameter text. The active signature is `activeSignature` (default
+/// the first); the active parameter is the signature's own `activeParameter` when
+/// present, else the top-level one. `None`/an error/no signatures degrades to a
+/// "no signature help" (both fields `None`).
+fn signature_help_reply(
+    result: Result<Option<SignatureHelp>, async_lsp::Error>,
+    log: &LspLog,
+    name: &str,
+) -> LspReply {
+    let none = LspReply::SignatureHelp {
+        signature: None,
+        active_parameter: None,
+    };
+    let help = match result {
+        Ok(Some(help)) => help,
+        Ok(None) => return none,
+        Err(e) => {
+            log.log(LogLevel::Warn, name, &format!("signatureHelp failed: {e}"));
+            return none;
+        }
+    };
+    let active = help.active_signature.unwrap_or(0) as usize;
+    let Some(sig) = help
+        .signatures
+        .get(active)
+        .or_else(|| help.signatures.first())
+    else {
+        return none;
+    };
+    // A per-signature `activeParameter` (3.16+) overrides the top-level one.
+    let param_idx = sig
+        .active_parameter
+        .or(help.active_parameter)
+        .map(|i| i as usize);
+    let active_parameter = param_idx
+        .and_then(|i| sig.parameters.as_ref()?.get(i))
+        .map(|p| parameter_text(&p.label, &sig.label));
+    LspReply::SignatureHelp {
+        signature: Some(sig.label.clone()),
+        active_parameter,
+    }
+}
+
+/// The display text of a parameter: its label string, or the substring of the
+/// signature label at the given offsets. Offsets are UTF-16 code units into the
+/// signature label (per LSP); they are sliced on char boundaries here, exact for
+/// the common ASCII case and best-effort otherwise (this is display-only).
+fn parameter_text(label: &ParameterLabel, signature: &str) -> String {
+    match label {
+        ParameterLabel::Simple(s) => s.clone(),
+        ParameterLabel::LabelOffsets([start, end]) => {
+            let (start, end) = (*start as usize, *end as usize);
+            let mut unit = 0usize;
+            let mut out = String::new();
+            for c in signature.chars() {
+                if unit >= end {
+                    break;
+                }
+                if unit >= start {
+                    out.push(c);
+                }
+                unit += c.len_utf16();
+            }
+            out
+        }
+    }
 }
 
 /// Flatten a goto-family reply (definition/declaration/typeDefinition/
@@ -704,6 +855,8 @@ fn describe_request(req: &LspRequest) -> String {
         LspRequest::TypeDefinition { position, .. } => ("typeDefinition", position),
         LspRequest::Implementation { position, .. } => ("implementation", position),
         LspRequest::References { position, .. } => ("references", position),
+        LspRequest::Hover { position, .. } => ("hover", position),
+        LspRequest::SignatureHelp { position, .. } => ("signatureHelp", position),
     };
     format!("→ {label} @ {}:{}", pos.line, pos.character)
 }

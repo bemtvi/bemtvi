@@ -504,8 +504,12 @@ screen," and that is exactly the shape of these tests.
   catppuccin colorscheme unmodified (see [*Lua*](#lua)) — but the surface grows
   only as plugins demand it. Known gaps for richer plugins: `vim.treesitter` is a
   stub (nxvim highlights out-of-process), `vim.keymap`/`vim.api.nvim_set_keymap`,
-  `vim.loop`/`vim.uv`, the per-window API, and the LSP client. Legacy Vimscript
-  (`eval.c`) is **not** on the roadmap — see guiding principle 2.
+  `vim.loop`/`vim.uv`, the per-window API, and the `vim.lsp`/`vim.diagnostic` API
+  (the LSP client itself is implemented natively — diagnostics, go-to, hover,
+  signature help, behind a built-in config; see the
+  [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md) — but
+  it is not yet exposed to Lua). Legacy Vimscript (`eval.c`) is **not** on the
+  roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far, and options are still global —
   **buffer-local options** are the next gap. Also mappings (`:map`), registers

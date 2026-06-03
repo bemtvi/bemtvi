@@ -47,11 +47,18 @@ pub struct ScrollAnim {
 pub struct PanelView {
     /// Label shown in the panel's title bar (e.g. `Messages`, `Buffers`).
     pub title: String,
-    /// The visible content rows (already scrolled); never longer than `height`.
-    /// The client pads shorter content with blank rows.
+    /// The visible content rows (already scrolled and **word-wrapped** to the
+    /// panel width); never longer than `height`. The client pads shorter content
+    /// with blank rows. A long logical entry occupies several consecutive rows.
     pub lines: Vec<String>,
-    /// Cursor row within the visible slice.
+    /// First display row (within the visible slice) of the selected logical
+    /// entry. The client places the editing cursor here.
     pub cursor_row: usize,
+    /// Number of consecutive display rows the selected entry occupies in the
+    /// visible slice (≥ 1 — more than one when the entry wrapped). The client
+    /// highlights `cursor_row .. cursor_row + cursor_span` as the focused line, so
+    /// the whole wrapped entry reads as selected.
+    pub cursor_span: usize,
     /// Content height in rows (excludes the title row). The client lays the
     /// whole panel out as `height + 1` rows; the editor sized it so the text
     /// window keeps at least one row.

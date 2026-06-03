@@ -381,6 +381,31 @@ fn panel_cursor_row_is_highlighted() {
 }
 
 #[test]
+fn a_wrapped_entry_highlights_its_whole_span() {
+    // A long location-list/hover entry wraps to several display rows; the focused
+    // entry's `cursor_span` rows are all highlighted, so it reads as one line.
+    let panel = Value::Map(vec![
+        (Value::from("title"), Value::from("LSP hover")),
+        (
+            Value::from("lines"),
+            lines(&["wrapped line one", "wrapped line two", "next entry"]),
+        ),
+        (Value::from("cursor_row"), Value::from(0u64)),
+        (Value::from("cursor_span"), Value::from(2u64)),
+        (Value::from("height"), Value::from(3u64)),
+    ]);
+    let v = view(vec![("lines", lines(&["text"])), ("panel", panel)]);
+    let buf = paint(&v, 20, 9);
+    // height 3 -> panel content rows 5,6,7. The selected entry spans rows 5 and 6.
+    assert!(reversed(&buf, 0, 5), "first wrapped row is highlighted");
+    assert!(
+        reversed(&buf, 0, 6),
+        "second wrapped row is highlighted too"
+    );
+    assert!(!reversed(&buf, 0, 7), "the next entry is not");
+}
+
+#[test]
 fn close_button_geometry_matches_the_painted_x() {
     // Same layout as the render test: 20x8 grid, panel content height 2.
     let (row, cols) = nxvim_tui::close_button(20, 8, 2).expect("a close button");

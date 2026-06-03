@@ -598,6 +598,9 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelData) -> Rect {
     frame.render_widget(block, area);
 
     let width = inner.width as usize;
+    // The selected entry may span several rows when it word-wrapped; highlight the
+    // whole span so a wrapped entry still reads as one focused line.
+    let cursor_end = panel.cursor_row.saturating_add(panel.cursor_span.max(1));
     let rows: Vec<Line> = (0..inner.height)
         .map(|row| {
             let text = panel
@@ -605,7 +608,7 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelData) -> Rect {
                 .get(row as usize)
                 .map(String::as_str)
                 .unwrap_or("");
-            if row == panel.cursor_row {
+            if row >= panel.cursor_row && row < cursor_end {
                 // Fill the cursor line to the full width so the highlight reads
                 // as a selected row, not just selected text.
                 let filled = format!("{text:<width$}");

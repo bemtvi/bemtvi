@@ -83,6 +83,9 @@ pub(crate) struct PanelData {
     pub(crate) title: String,
     pub(crate) lines: Vec<String>,
     pub(crate) cursor_row: u16,
+    /// Display rows the selected (possibly wrapped) entry spans; the whole span
+    /// is drawn as the focused line. Defaults to 1 (an unwrapped entry).
+    pub(crate) cursor_span: u16,
     pub(crate) height: u16,
 }
 
@@ -136,6 +139,11 @@ impl View {
                 title: map_str(p, "title"),
                 lines: map_str_array(p, "lines"),
                 cursor_row: map_u16(p, "cursor_row"),
+                // Older redraws (and the panel test fixtures) omit the span; an
+                // unwrapped entry occupies exactly one row.
+                cursor_span: map_get(p, "cursor_span")
+                    .and_then(Value::as_u64)
+                    .map_or(1, |n| n as u16),
                 height: map_u16(p, "height"),
             }),
             _ => None,

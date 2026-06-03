@@ -398,6 +398,47 @@ struct Panel {
     targets: Vec<Option<(PathBuf, usize, usize)>>,
 }
 
+/// Word-wrap `text` into rows no wider than `width` screen cells, for the bottom
+/// [`Panel`] (nxvim's only multi-line, wrap-able surface — long hover docs,
+/// messages, and location-list rows). Breaks after the last space that fits so
+/// words stay whole, hard-breaking a run longer than `width`; an empty line
+/// yields a single empty row so it still occupies one. Width is counted in screen
+/// cells (tabs and wide chars via [`unicode::byte_at_virtcol`]), matching how the
+/// panel is painted, so a wrapped row never overflows its column.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        // Bytes of `rest` that fit in `width` cells (a grapheme boundary).
+        let mut take = unicode::byte_at_virtcol(rest, width, unicode::TABSTOP);
+        if take == 0 {
+            // A single grapheme wider than `width`: take it whole so we progress.
+            take = unicode::next_grapheme(rest, 0).max(1);
+        }
+        if take >= rest.len() {
+            rows.push(rest.to_string());
+            break;
+        }
+        match rest[..take].rfind(' ') {
+            // Break after the last space that fits (dropped), keeping words whole.
+            Some(sp) if sp > 0 => {
+                rows.push(rest[..sp].trim_end().to_string());
+                rest = &rest[sp + 1..];
+            }
+            // No usable space: hard-break mid-run at the width.
+            _ => {
+                rows.push(rest[..take].to_string());
+                rest = &rest[take..];
+            }
+        }
+    }
+    rows
+}
+
 /// The complete editor state: the open buffers plus the single window's state.
 pub struct Editor {
     /// All open buffers, keyed by id. [`Editor::current`] selects the one the
@@ -3580,14 +3621,39 @@ impl Editor {
     /// visible window — the shared scroll step for opening, content swaps, and
     /// keyboard motion. A no-op when no panel is open.
     fn scroll_panel_into_view(&mut self) {
-        let ph = self.panel_content_height().max(1);
-        if let Some(panel) = self.panel.as_mut() {
-            if panel.cursor < panel.top {
-                panel.top = panel.cursor;
-            } else if panel.cursor >= panel.top + ph {
-                panel.top = panel.cursor + 1 - ph;
-            }
+        let height = self.panel_content_height().max(1);
+        let width = self.panel_width();
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        if panel.cursor < panel.top {
+            // Cursor above the window: pin the window to it.
+            panel.top = panel.cursor;
+            return;
         }
+        // Cursor at/below the window: raise `top` toward `cursor` until the lines
+        // `[top..=cursor]`, **word-wrapped**, fit in `height` display rows — so the
+        // selected entry's last wrapped row stays visible. (A single entry taller
+        // than the panel can't fully fit; the loop stops at `top == cursor`,
+        // showing it from its first row.) Wrapping makes this display-row aware,
+        // where the old logical-line arithmetic clipped tall entries.
+        while panel.top < panel.cursor {
+            let rows: usize = panel.lines[panel.top..=panel.cursor]
+                .iter()
+                .map(|line| wrap_to_width(line, width).len())
+                .sum();
+            if rows <= height {
+                break;
+            }
+            panel.top += 1;
+        }
+    }
+
+    /// The panel's content width in screen cells: the full terminal width, since
+    /// the panel spans it edge to edge with only a top border (no side borders,
+    /// no number gutter). Drives the word-wrap in [`Editor::panel_view`].
+    fn panel_width(&self) -> usize {
+        self.width.max(1)
     }
 
     /// Close the panel and return focus to the text window, which grows back.
@@ -3645,18 +3711,45 @@ impl Editor {
         self.panel_rows().saturating_sub(1)
     }
 
-    /// Project the panel into the renderable [`PanelView`]: the visible slice of
-    /// its content, the cursor's row within that slice, and the clamped content
-    /// height. `None` when no panel is open. (`pub(crate)` so [`View`] can build
-    /// it while [`Panel`] stays private.)
+    /// Project the panel into the renderable [`PanelView`]: the visible content
+    /// **word-wrapped** to the panel width, the selected entry's first display row
+    /// and how many rows it spans, and the clamped content height. `None` when no
+    /// panel is open. (`pub(crate)` so [`View`] can build it while [`Panel`] stays
+    /// private.)
+    ///
+    /// Wrapping is display-only: `cursor`/`top` remain logical-entry indices (so
+    /// `j`/`k`/`<CR>`/jump targets address whole entries), but each entry expands
+    /// to one or more display rows here so long text is laid out across rows
+    /// instead of clipped at the panel's right edge.
     pub(crate) fn panel_view(&self) -> Option<PanelView> {
         let p = self.panel.as_ref()?;
         let height = self.panel_content_height();
-        let lines = p.lines.iter().skip(p.top).take(height).cloned().collect();
+        let width = self.panel_width();
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut cursor_row = 0;
+        let mut cursor_span = 1;
+        let mut logical = p.top;
+        while lines.len() < height && logical < p.lines.len() {
+            let start = lines.len();
+            for row in wrap_to_width(&p.lines[logical], width) {
+                if lines.len() >= height {
+                    break;
+                }
+                lines.push(row);
+            }
+            if logical == p.cursor {
+                cursor_row = start;
+                cursor_span = lines.len().saturating_sub(start).max(1);
+            }
+            logical += 1;
+        }
+
         Some(PanelView {
             title: p.title.clone(),
             lines,
-            cursor_row: p.cursor.saturating_sub(p.top),
+            cursor_row,
+            cursor_span,
             height,
         })
     }

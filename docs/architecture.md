@@ -290,6 +290,16 @@ window but simpler: a transient overlay that grabs input focus while open.
   `height + 1` rows (content + a `─ Title ──[X]─` title bar) from it, **below the
   status line** and above the command row, leaving the text area at exactly the
   row count the core projected.
+- **Long lines wrap, they don't clip.** The panel is full-width with no
+  horizontal scroll, so `panel_view` **word-wraps** each entry to the panel width
+  when it projects (breaking on spaces, hard-breaking an over-long run; counted in
+  screen cells, so tabs/wide chars line up). Wrapping is display-only: the
+  `cursor`/`top` stay *logical-entry* indices, so `j`/`k`/`<CR>`/jump targets still
+  address whole entries and a long hover/message/location row is laid out across
+  rows instead of being cut at the right edge. The projection carries a
+  `cursor_span` (how many display rows the selected entry occupies) so the client
+  highlights the whole wrapped entry as one focused line, and the vertical
+  scroll-into-view is display-row aware so a tall entry's last row stays visible.
 - **A message history feeds it.** `Editor::echo` is the one place a user-facing
   message is set; it records each line in a `messages` history (the backing store
   for `:messages`) as well as showing it on the message line. The server routes

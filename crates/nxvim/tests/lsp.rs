@@ -1033,6 +1033,33 @@ async fn k_shows_hover_docs_in_the_panel() {
 }
 
 #[tokio::test]
+async fn a_long_hover_line_wraps_in_the_panel() {
+    let _guard = test_lock().lock().await;
+    // A hover line longer than the panel width must wrap across rows, not clip.
+    // The panel spans the full terminal width (COLS), so a 100-char unbroken run
+    // hard-breaks into an 80-cell row and a 20-cell row.
+    let file = temp_file("hover-wrap", "rs", "fn main() {}\n");
+    let long = "a".repeat(100);
+    let record = configure_mock(
+        "hover-wrap",
+        serde_json::json!({
+            "hover": { "contents": { "kind": "markdown", "value": long } }
+        }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "K");
+    let (title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP hover");
+    assert_eq!(
+        panel_lines,
+        vec!["a".repeat(COLS as usize), "a".repeat(100 - COLS as usize)],
+        "the long line wrapped to the panel width instead of being clipped"
+    );
+}
+
+#[tokio::test]
 async fn an_empty_hover_reply_reports_no_information() {
     let _guard = test_lock().lock().await;
     // The server has nothing to say at the cursor: a brief message, no panel.

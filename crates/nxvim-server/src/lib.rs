@@ -1173,6 +1173,10 @@ fn project_panel(p: &PanelView) -> Value {
         (Value::from("title"), Value::from(p.title.as_str())),
         (Value::from("lines"), lines_value(&p.lines)),
         (Value::from("cursor_row"), Value::from(p.cursor_row as u64)),
+        (
+            Value::from("cursor_span"),
+            Value::from(p.cursor_span as u64),
+        ),
         (Value::from("height"), Value::from(p.height as u64)),
     ])
 }

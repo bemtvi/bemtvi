@@ -47,6 +47,38 @@ async fn start_with_config(
     (rpc, incoming)
 }
 
+/// Like [`start_with_config`] but also opens `file` in the initial buffer, so the
+/// startup lifecycle seed (`BufReadPost`→`FileType`→`BufEnter`) fires for it.
+async fn start_with_file_and_config(
+    dir: &std::path::Path,
+    file: &str,
+    init_lua: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    let init = ServerInit {
+        file: Some(file.to_string()),
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+    };
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("server runtime");
+        let _ = runtime.block_on(run_server(server_end, init));
+    });
+    let (reader, writer) = tokio::io::split(client_end);
+    let (rpc, incoming) = connect(reader, writer);
+    rpc.request(
+        "nvim_ui_attach",
+        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
+    )
+    .await
+    .expect("ui attach");
+    (rpc, incoming)
+}
+
 /// Feed `keys`, then deterministically return the `redraw` map the server emitted
 /// for that input (same serial-ordering trick as `editing.rs::redraw_after`).
 async fn redraw_after(
@@ -242,4 +274,92 @@ async fn buf_get_name_and_expand_read_the_snapshot() {
     )
     .await;
     assert_eq!(msg, "/tmp/foo/bar.rs|bar.rs|/tmp/foo");
+}
+
+// ----- Phase 2: editor-emitted buffer lifecycle events -----------------------
+
+#[tokio::test]
+async fn opening_a_file_fires_filetype_with_filetype_and_path() {
+    // The startup seed fires FileType for the opened buffer, with the pattern set
+    // to the detected filetype and `args.file` the buffer's path.
+    let dir = temp_dir("au_ft");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('FileType', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'ft=' .. a.match .. ' file=' .. a.file end })\n",
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, '|'))").await;
+    assert_eq!(msg, format!("ft=rust file={}", file.display()));
+}
+
+#[tokio::test]
+async fn lifecycle_order_is_bufreadpost_filetype_bufenter() {
+    // First open of a file fires the three events in neovim's order.
+    let dir = temp_dir("au_order");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         local function rec(tag) return function() _G.log[#_G.log+1] = tag end end\n\
+         vim.api.nvim_create_autocmd('BufReadPost', { callback = rec('read') })\n\
+         vim.api.nvim_create_autocmd('FileType', { callback = rec('ft') })\n\
+         vim.api.nvim_create_autocmd('BufEnter', { callback = rec('enter') })\n",
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "read,ft,enter");
+}
+
+#[tokio::test]
+async fn switching_buffers_fires_bufenter_but_not_refire_filetype() {
+    // Opening a second file announces it (FileType fires once); switching back to
+    // the first, already-announced buffer fires BufEnter only — no FileType re-fire.
+    let dir = temp_dir("au_switch");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.lua");
+    std::fs::write(&a, "fn main() {}\n").expect("write a");
+    std::fs::write(&b, "return {}\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('FileType', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'ft' .. a.buf end })\n\
+         vim.api.nvim_create_autocmd('BufEnter', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'be' .. a.buf end })\n",
+    )
+    .await;
+    // startup: buffer 1 (a.rs) -> ft1, be1.
+    // :edit b.lua -> buffer 2 announced -> ft2, be2.
+    // :b1 -> back to buffer 1, already announced -> be1 only.
+    redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
+    redraw_after(&rpc, &mut incoming, ":b1<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "ft1,be1,ft2,be2,be1");
+}
+
+#[tokio::test]
+async fn bufreadpost_callback_reads_buffer_name_from_snapshot() {
+    // A BufReadPost callback resolves the buffer that fired via the snapshot —
+    // nvim_buf_get_name(0) returns its path.
+    let dir = temp_dir("au_readname");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.seen = nil\n\
+         vim.api.nvim_create_autocmd('BufReadPost', {\n\
+         \x20 callback = function() _G.seen = vim.api.nvim_buf_get_name(0) end })\n",
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(_G.seen)").await;
+    assert_eq!(msg, file.display().to_string());
 }

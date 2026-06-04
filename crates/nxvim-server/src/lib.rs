@@ -17,7 +17,7 @@ use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syntax::{SyntaxClient, SyntaxEvent};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -130,6 +130,13 @@ struct Server {
     /// once per loop turn so a burst of worker notifications costs one `redraw`,
     /// not one per notification.
     syntax_dirty: bool,
+    /// The buffer that was current the last time lifecycle events were emitted;
+    /// `None` until the startup seed. A change here means a `BufEnter` (fired on
+    /// every entry).
+    last_buffer_id: Option<BufferId>,
+    /// Buffers that have already had their fire-once events (`BufReadPost` /
+    /// `FileType`) emitted, so re-entering them doesn't re-announce.
+    announced: HashSet<BufferId>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -157,6 +164,8 @@ where
         syntax,
         syntax_states: HashMap::new(),
         syntax_dirty: false,
+        last_buffer_id: None,
+        announced: HashSet::new(),
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -165,6 +174,12 @@ where
     if let Some(config_dir) = &init.config_dir {
         server.source_init(&config_dir.join("init.lua"));
     }
+
+    // Startup seed: the initial buffer and the config's autocmds both exist now,
+    // so fire the first buffer's lifecycle events (`BufReadPost`→`FileType`→
+    // `BufEnter` for a file arg, `BufEnter` alone for the bare `[No Name]`).
+    server.emit_lifecycle_events();
+    server.run_pending();
 
     loop {
         tokio::select! {
@@ -269,6 +284,7 @@ impl Server {
             "nvim_set_current_buf" => {
                 let id = BufferId(uint(params.first(), 0) as u64);
                 self.editor.set_current_buffer(id);
+                self.emit_lifecycle_events();
                 self.run_pending();
                 Ok(Value::Nil)
             }
@@ -355,13 +371,73 @@ impl Server {
     fn input(&mut self, keys: &str) {
         for key in parse_keys(keys) {
             self.editor.input(key);
+            // Per *key*, not per message: a batched `o…<Esc>` must still see the
+            // transition into insert on the `o`, which a once-per-input diff would
+            // miss (it'd see only the settled Normal end-state).
+            self.emit_lifecycle_events();
         }
         self.run_pending();
     }
 
     fn run_command(&mut self, cmd: &str) {
         self.editor.command(cmd);
+        self.emit_lifecycle_events();
         self.run_pending();
+    }
+
+    /// Diff the editor's current buffer against what was last announced and fire
+    /// the buffer-lifecycle autocmds the transition implies — the central,
+    /// server-side emission point (design D1) that keeps `nxvim-core` free of
+    /// event types. Called after each applied input (per key in [`Server::input`],
+    /// after `:`-commands and `nvim_set_current_buf`) and once at startup.
+    ///
+    /// Ordering on first opening a file mirrors neovim: `BufReadPost` → `FileType`
+    /// → `BufEnter`. `BufReadPost`/`FileType` fire **once** per buffer (gated by
+    /// `announced`) and **only for file-backed buffers** — a `[No Name]` buffer was
+    /// never read from a file. `BufEnter` fires on **every** entry. A cheap no-op
+    /// for the vast majority of keys, which change neither buffer nor mode.
+    fn emit_lifecycle_events(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        let unannounced = !self.announced.contains(&buf);
+        let entered = self.last_buffer_id != Some(buf);
+        if !unannounced && !entered {
+            return; // fast path: same buffer, already announced — nothing to fire
+        }
+
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let file_backed = !name.is_empty();
+
+        // Fire-once per buffer, file-backed only: BufReadPost then FileType.
+        if unannounced {
+            self.announced.insert(buf);
+            if file_backed {
+                self.fire_lifecycle("BufReadPost", &name, buf, &name);
+                // FileType's pattern is the filetype derived from the path; skip
+                // it entirely when nothing is detected (matching neovim).
+                if let Some(ft) = filetype_of(self.editor.buffer().path.as_deref()) {
+                    self.fire_lifecycle("FileType", ft, buf, &name);
+                }
+            }
+        }
+
+        // Fire-every on entry: BufEnter, for both file-backed and [No Name].
+        if entered {
+            self.last_buffer_id = Some(buf);
+            self.fire_lifecycle("BufEnter", &name, buf, &name);
+        }
+    }
+
+    /// Push the current-buffer snapshot into the VM, fire `event` for `pattern` /
+    /// `file` with buffer context, surface any callback error, and fold in the Lua
+    /// effects the callbacks left. Deferred ex-commands the callbacks queue are
+    /// drained by the caller's `run_pending`.
+    fn fire_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId, file: &str) {
+        let _ = self.lua.set_buf_snapshot(buf.0, file);
+        if let Err(e) = self.lua.fire_autocmd_buf(event, pattern, buf.0, file) {
+            self.editor
+                .echo(format!("E5108: Error in {event} autocmd: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// Source a startup Lua file (the user's `init.lua`). Missing files are

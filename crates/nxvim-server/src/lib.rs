@@ -629,6 +629,10 @@ impl Server {
                 Value::from("cmdline_prefix"),
                 Value::from(view.cmdline_prefix.to_string().as_str()),
             ),
+            (
+                Value::from("cmdline_cursor"),
+                Value::from(view.cmdline_cursor as u64),
+            ),
             (Value::from("message"), Value::from(view.message.as_str())),
             (
                 Value::from("file_name"),

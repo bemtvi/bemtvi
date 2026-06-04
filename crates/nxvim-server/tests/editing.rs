@@ -2221,6 +2221,119 @@ async fn search_history_recalls_previous_patterns() {
     );
 }
 
+#[tokio::test]
+async fn command_history_recalls_previous_commands() {
+    // `:<Up>` walks back through previously-submitted ex commands (newest first),
+    // replacing the typed line — the ex-command analogue of search history.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set number<CR>");
+    feed(&rpc, ":set nonumber<CR>");
+    let _ = lines(&rpc).await; // barrier before capturing
+    let map = redraw_after(&rpc, &mut incoming, ":<Up>").await;
+    assert_eq!(
+        field(&map, "cmdline").and_then(Value::as_str),
+        Some("set nonumber")
+    );
+    assert_eq!(
+        field(&map, "cmdline_prefix").and_then(Value::as_str),
+        Some(":")
+    );
+    // A second <Up> (still in the open prompt) reaches the older command.
+    let map = redraw_after(&rpc, &mut incoming, "<Up>").await;
+    assert_eq!(
+        field(&map, "cmdline").and_then(Value::as_str),
+        Some("set number")
+    );
+}
+
+#[tokio::test]
+async fn cmdline_left_arrow_inserts_mid_line() {
+    // <Left> backs the command cursor over one char; typing then inserts there
+    // rather than at the end. ":abc" + <Left> + "X" → "abXc".
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":abc<Left>X").await;
+    assert_eq!(field(&map, "cmdline").and_then(Value::as_str), Some("abXc"));
+    assert_eq!(
+        field(&map, "cmdline_cursor").and_then(Value::as_u64),
+        Some(3)
+    );
+}
+
+#[tokio::test]
+async fn cmdline_backspace_and_delete_act_at_the_cursor() {
+    let (rpc, mut incoming) = start(None).await;
+    // <Left> puts the cursor between b and c; <BS> removes the char before it (b).
+    let map = redraw_after(&rpc, &mut incoming, ":abc<Left><BS>").await;
+    assert_eq!(field(&map, "cmdline").and_then(Value::as_str), Some("ac"));
+    assert_eq!(
+        field(&map, "cmdline_cursor").and_then(Value::as_u64),
+        Some(1)
+    );
+    // Fresh line: Home then <Del> removes the char under the cursor (the first).
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>:abc<Home><Del>").await;
+    assert_eq!(field(&map, "cmdline").and_then(Value::as_str), Some("bc"));
+    assert_eq!(
+        field(&map, "cmdline_cursor").and_then(Value::as_u64),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn cmdline_home_and_end_jump_to_the_ends() {
+    let (rpc, mut incoming) = start(None).await;
+    // Home sends the cursor to the start; inserting prepends.
+    let map = redraw_after(&rpc, &mut incoming, ":abc<Home>X").await;
+    assert_eq!(field(&map, "cmdline").and_then(Value::as_str), Some("Xabc"));
+    // End jumps back to the tail; inserting appends.
+    let map = redraw_after(&rpc, &mut incoming, "<End>Y").await;
+    assert_eq!(
+        field(&map, "cmdline").and_then(Value::as_str),
+        Some("XabcY")
+    );
+    assert_eq!(
+        field(&map, "cmdline_cursor").and_then(Value::as_u64),
+        Some(5)
+    );
+}
+
+#[tokio::test]
+async fn cmdline_mid_line_edit_changes_the_executed_command() {
+    // The point of in-line editing: fix a command before running it. Backing up
+    // and inserting the missing space turns ":setnumber" into ":set number",
+    // which enables the number option observably.
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        ":setnumber<Left><Left><Left><Left><Left><Left><Space><CR>",
+    )
+    .await;
+    assert!(
+        field(&map, "number")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "inserting a space mid-line should run :set number, enabling the option"
+    );
+}
+
+#[tokio::test]
+async fn command_history_up_arrow_reruns_last_command() {
+    // The workflow that matters: open `:`, press <Up> to recall the last command,
+    // <CR> to rerun it. Here recalling and submitting `:set number` re-enables the
+    // number option observably in the redraw.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set number<CR>");
+    feed(&rpc, ":set nonumber<CR>");
+    let _ = lines(&rpc).await; // barrier
+    let map = redraw_after(&rpc, &mut incoming, ":<Up><Up><CR>").await;
+    assert!(
+        field(&map, "number")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "rerunning :set number from history should re-enable the number option"
+    );
+}
+
 // ----- search highlighting (phase 3: hlsearch / incsearch) ------------------
 
 /// Per visible row, the search-match spans `[start, end)` (the `Search`

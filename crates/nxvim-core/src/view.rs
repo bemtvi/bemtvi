@@ -82,6 +82,10 @@ pub struct View {
     /// The command-line prompt character: `:` for an ex command, `/` / `?` for a
     /// forward / backward search. Only meaningful while `command_mode`.
     pub cmdline_prefix: char,
+    /// Cursor position within `cmdline` as a character count from its start, so
+    /// the client can place the command cursor mid-line after `<Left>`/`<Right>`
+    /// edits. Only meaningful while `command_mode`.
+    pub cmdline_cursor: usize,
     /// Transient status message (shown on the command line when not typing one).
     pub message: String,
     /// File name for the status line (`"[No Name]"` when unset).
@@ -178,6 +182,7 @@ impl View {
             command_mode: ed.mode == Mode::Command,
             cmdline: ed.cmdline.clone(),
             cmdline_prefix: ed.cmdline_prefix(),
+            cmdline_cursor: ed.cmdline_cursor(),
             message: ed.message.clone(),
             file_name,
             modified: ed.buffer().modified,

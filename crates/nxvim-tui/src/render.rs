@@ -211,7 +211,9 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     }
 
     if view.command_mode {
-        let col = cmd_area.x + 1 + view.cmdline.chars().count() as u16;
+        // +1 for the leading prompt char; the cursor follows `cmdline_cursor`
+        // (a char offset) so it sits mid-line after `<Left>`/`<Right>` edits.
+        let col = cmd_area.x + 1 + view.cmdline_cursor as u16;
         frame.set_cursor_position((col, cmd_area.y));
     } else {
         // The cursor row is interpolated during a slide, but the column comes

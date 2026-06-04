@@ -279,29 +279,72 @@ vim._autocmds = vim._autocmds or {}
 vim._augroups = vim._augroups or {}
 local augroup_seq, autocmd_seq = 0, 0
 
+-- vim._cur_buf: the current-buffer snapshot the server refreshes (via
+-- vim._set_cur_buf) immediately before firing a buffer/mode autocmd, so a
+-- callback can resolve "the buffer that fired" — nvim_buf_get_name(0) and
+-- expand('%') read it. An interim until a real per-bufnr registry exists; with
+-- the core single-message-at-a-time it can't go stale mid-dispatch.
+vim._cur_buf = vim._cur_buf or { bufnr = 0, name = "" }
+
+function vim._set_cur_buf(bufnr, name)
+  vim._cur_buf = { bufnr = bufnr or 0, name = name or "" }
+end
+
 function vim.api.nvim_create_user_command(name, command, _opts)
   vim._user_commands[name] = command
 end
 
-function vim.api.nvim_create_augroup(name, _opts)
-  augroup_seq = augroup_seq + 1
-  vim._augroups[name] = augroup_seq
-  return augroup_seq
+-- nvim_create_augroup(name[, {clear=…}]): define (or look up) an augroup. When
+-- the group already exists and `clear` is set (the default), its autocmds are
+-- removed first — so re-sourcing a config that recreates its groups doesn't
+-- double-register. The group id is stable across recreation (callers store it
+-- and pass it as `opts.group` to nvim_create_autocmd).
+function vim.api.nvim_create_augroup(name, opts)
+  opts = opts or {}
+  local clear = opts.clear ~= false -- absent → clear, matching neovim's default
+  local id = vim._augroups[name]
+  if id and clear then
+    vim._autocmds = vim.tbl_filter(function(au) return au.group ~= id end, vim._autocmds)
+  end
+  if not id then
+    augroup_seq = augroup_seq + 1
+    id = augroup_seq
+    vim._augroups[name] = id
+  end
+  return id
 end
 
+-- nvim_create_autocmd(event, opts): register a callback/command for `event`.
+-- `opts.group` (numeric id or augroup name) ties it to a group so a later
+-- `clear` can drop it; `opts.buffer` makes it buffer-local (only fires for that
+-- buffer; 0 resolves to the current snapshot buffer at registration time).
 function vim.api.nvim_create_autocmd(event, opts)
+  opts = opts or {}
   autocmd_seq = autocmd_seq + 1
-  vim._autocmds[#vim._autocmds + 1] = { id = autocmd_seq, event = event, opts = opts or {} }
+  local group = opts.group
+  if type(group) == "string" then group = vim._augroups[group] end
+  local buffer = opts.buffer
+  if buffer == 0 then buffer = vim._cur_buf and vim._cur_buf.bufnr or 0 end
+  vim._autocmds[#vim._autocmds + 1] =
+    { id = autocmd_seq, event = event, opts = opts, group = group, buffer = buffer }
   return autocmd_seq
 end
 
--- Fire the registered autocmds for `event` whose pattern matches `pattern`.
--- Called from Rust (LuaRuntime::fire_autocmd) when the editor triggers an event
--- — today only `ColorScheme`, after a theme loads. A function handler runs with
--- the usual callback args table; a string `command` is queued as an ex-command.
--- Match rules: event equals (or is in) the registered event; pattern is nil/"*",
--- equals `pattern`, or is in the registered pattern list.
-function vim._fire(event, pattern)
+-- nvim_del_autocmd(id): remove the autocmd with this id, so it stops firing.
+function vim.api.nvim_del_autocmd(id)
+  vim._autocmds = vim.tbl_filter(function(au) return au.id ~= id end, vim._autocmds)
+end
+
+-- Fire the registered autocmds for `event` whose pattern matches `pattern`,
+-- with optional buffer context. Called from Rust (LuaRuntime::fire_autocmd*)
+-- when the editor triggers an event, and from nvim_exec_autocmds. A function
+-- handler runs with the callback args table `{id, event, match, buf, file}`; a
+-- string `command` is queued as an ex-command. Match rules: event equals (or is
+-- in) the registered event; pattern is nil/"*", equals `pattern`, or is in the
+-- registered pattern list; a buffer-local autocmd only fires for its `buffer`.
+-- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
+-- case `file` falls back to `pattern` (the old behavior).
+function vim._fire(event, pattern, buf, file)
   for _, au in ipairs(vim._autocmds) do
     local ev = au.event
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
@@ -309,16 +352,106 @@ function vim._fire(event, pattern)
       local pat = au.opts.pattern
       local pat_ok = pat == nil or pat == "*" or pat == pattern
         or (type(pat) == "table" and vim.tbl_contains(pat, pattern))
-      if pat_ok then
+      local buf_ok = au.buffer == nil or au.buffer == buf
+      if pat_ok and buf_ok then
         local cb = au.opts.callback
         if type(cb) == "function" then
-          cb({ id = au.id, event = event, match = pattern, file = pattern })
+          cb({ id = au.id, event = event, match = pattern, buf = buf, file = file or pattern })
         elseif type(au.opts.command) == "string" then
           vim.cmd(au.opts.command)
         end
       end
     end
   end
+end
+
+-- nvim_exec_autocmds(event, opts): fire `event` (or a list of events) manually.
+-- `opts.pattern` (string or list) is matched as in registration; `opts.buffer`
+-- supplies the buffer context (defaulting to the current snapshot buffer), and
+-- the callback's `args.file` is the snapshot name when firing for it.
+function vim.api.nvim_exec_autocmds(event, opts)
+  opts = opts or {}
+  local events = type(event) == "table" and event or { event }
+  local buf = opts.buffer
+  if buf == nil then buf = vim._cur_buf and vim._cur_buf.bufnr or nil end
+  local file
+  if vim._cur_buf and buf == vim._cur_buf.bufnr then file = vim._cur_buf.name end
+  local patterns = opts.pattern
+  for _, ev in ipairs(events) do
+    if type(patterns) == "table" then
+      for _, p in ipairs(patterns) do vim._fire(ev, p, buf, file) end
+    else
+      vim._fire(ev, patterns, buf, file)
+    end
+  end
+end
+
+-- nvim_get_autocmds(opts): introspect the registered autocmds — a debugging
+-- affordance for confirming what `clear`/`del` left behind. Returns a list of
+-- `{id, event, group, group_name, pattern, buffer, command}` entries, optionally
+-- filtered by `opts.event` (string or list) and `opts.group` (id or name). Run
+-- it interactively as `:lua print(vim.inspect(vim.api.nvim_get_autocmds({})))`.
+function vim.api.nvim_get_autocmds(opts)
+  opts = opts or {}
+  local want_events = opts.event and (type(opts.event) == "table" and opts.event or { opts.event })
+  local want_group = opts.group
+  if type(want_group) == "string" then want_group = vim._augroups[want_group] end
+  -- reverse map: group id → its registered name, for human-readable output
+  local group_name = {}
+  for nm, id in pairs(vim._augroups) do group_name[id] = nm end
+  local out = {}
+  for _, au in ipairs(vim._autocmds) do
+    -- match if any requested event is among the autocmd's events
+    local ev_ok = true
+    if want_events then
+      ev_ok = false
+      local evs = type(au.event) == "table" and au.event or { au.event }
+      for _, w in ipairs(want_events) do
+        if vim.tbl_contains(evs, w) then ev_ok = true break end
+      end
+    end
+    local group_ok = want_group == nil or au.group == want_group
+    if ev_ok and group_ok then
+      out[#out + 1] = {
+        id = au.id,
+        event = au.event,
+        group = au.group,
+        group_name = au.group and group_name[au.group] or nil,
+        pattern = au.opts.pattern,
+        buffer = au.buffer,
+        command = type(au.opts.command) == "string" and au.opts.command or nil,
+      }
+    end
+  end
+  return out
+end
+
+-- nvim_buf_get_name(bufnr): the snapshot buffer's name when `bufnr` is 0/nil or
+-- matches the snapshot, else "". Snapshot-backed (vim._cur_buf) as an interim
+-- until a real per-bufnr registry exists. (A separate, core-backed
+-- nvim_buf_get_name *RPC* method serves remote clients; this is the in-VM Lua
+-- binding autocmd callbacks reach for.)
+function vim.api.nvim_buf_get_name(bufnr)
+  local cur = vim._cur_buf or { bufnr = 0, name = "" }
+  if bufnr == nil or bufnr == 0 or bufnr == cur.bufnr then return cur.name end
+  return ""
+end
+
+-- vim.fn.expand: the `%` (current file) forms autocmd callbacks use to resolve
+-- paths, backed by the snapshot. Supports `%`, `%:p` (absolute — for the first
+-- cut the stored path is taken as-is), `%:h` (head/dir), `%:t` (tail/basename),
+-- and `%:p:h`. Unknown expressions return the stored name unchanged.
+function vim.fn.expand(expr)
+  local cur = vim._cur_buf or { bufnr = 0, name = "" }
+  local name = cur.name or ""
+  if expr == "%" or expr == "%:p" then
+    return name
+  elseif expr == "%:h" or expr == "%:p:h" then
+    return name:match("^(.*)/[^/]*$") or ""
+  elseif expr == "%:t" then
+    return name:match("[^/]*$") or name
+  end
+  return name
 end
 
 -- vim.api.nvim_set_hl is installed from Rust (it captures the group definition

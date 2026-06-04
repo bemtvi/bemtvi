@@ -417,6 +417,33 @@ fn diag(line: u32, start: u32, end: u32, severity: u32, message: &str) -> Json {
     })
 }
 
+/// True when a redraw carries at least one treesitter highlight span — i.e. the
+/// syntax worker has replied, so it is now caught up (non-pending) and will drain
+/// the buffer's edit journal before the LSP sync on the next edit.
+fn has_highlights(params: &[Value]) -> bool {
+    redraw_get(params, "highlights")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.as_array().is_some_and(|spans| !spans.is_empty()))
+        })
+}
+
+/// Poll until a redraw shows syntax highlights (the worker has caught up).
+async fn wait_for_highlights(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if has_highlights(&params) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("syntax highlights never appeared (the worker never replied)");
+}
+
 // ----- tests ----------------------------------------------------------------
 
 #[tokio::test]
@@ -489,6 +516,43 @@ async fn typing_sends_an_incremental_did_change_with_a_version_bump() {
     assert!(
         change["params"]["contentChanges"][0]["range"].is_object(),
         "incremental changes carry a range"
+    );
+}
+
+#[tokio::test]
+async fn did_change_reaches_the_server_after_the_syntax_worker_drains() {
+    // Regression: the syntax worker and the LSP client each drain the buffer's
+    // edit journal, and the syntax sync runs first. Once the worker has caught up
+    // (not mid-parse), it consumed the edits before the LSP sync could — leaving
+    // the language server's document frozen at `didOpen` (every `didChange`
+    // carried 0 changes), so completion and friends ran against stale text. With
+    // independent journals, an edit must still reach the server after syntax has
+    // drained. This deterministically reproduces it by settling syntax first.
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "sync-share",
+        serde_json::json!({ "sync_kind": "incremental" }),
+    );
+    let file = temp_file("sync-share", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Let the syntax worker reply (highlights appear), so it is now non-pending
+    // and drains the journal before the LSP sync on the next edit.
+    wait_for_highlights(&rpc, &mut incoming).await;
+
+    // Type a distinctive change; the server must still receive it as a real
+    // content change (before the fix this `didChange` was empty and `ZZZ` never
+    // arrived).
+    feed(&rpc, "oZZZ<Esc>");
+    // `did_change_text` concatenates every `didChange`'s content-change texts;
+    // the inserted `ZZZ` shows up there only if the server actually received the
+    // change (before the fix, the journal was drained by syntax, so this batch's
+    // `didChange` was empty and `ZZZ` never arrived — this would time out).
+    let recs = wait_for_record(&rpc, &record, |r| did_change_text(r).contains("ZZZ")).await;
+    assert!(
+        did_change_text(&recs).contains("ZZZ"),
+        "the language server received the edit after syntax drained the journal"
     );
 }
 

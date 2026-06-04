@@ -74,11 +74,22 @@ pub struct Buffer {
     /// without heuristics, exactly when the buffer was saved (drives LSP
     /// `didSave`; a hook future `BufWritePost` autocmds can read too).
     pub save_tick: u64,
-    /// Journal of edits since the last [`Buffer::take_edits`].
+    /// Journal of edits since the last [`Buffer::take_edits`] (the treesitter
+    /// worker's stream).
     edits: Vec<BufferEdit>,
     /// Set when the entire rope was replaced (undo/redo/reload), so deltas are
     /// meaningless and a full re-sync is required.
     resync: bool,
+    /// A **second**, independent edit journal drained by [`Buffer::take_lsp_edits`]
+    /// for the LSP `didChange` stream. The treesitter worker and the LSP client
+    /// consume edits at different rates — the worker coalesces while a parse is in
+    /// flight, the LSP client emits a `didChange` every frame — so one destructive
+    /// journal would let whichever drains first (the syntax sync runs first) starve
+    /// the other, freezing the language server's copy of the document. Recording
+    /// each edit into both journals keeps the two drain cursors independent.
+    lsp_edits: Vec<BufferEdit>,
+    /// `resync` for the LSP journal (whole-rope replacement: undo/redo/reload).
+    lsp_resync: bool,
 }
 
 impl Default for Buffer {
@@ -97,6 +108,8 @@ impl Buffer {
             save_tick: 0,
             edits: Vec::new(),
             resync: false,
+            lsp_edits: Vec::new(),
+            lsp_resync: false,
         }
     }
 
@@ -134,6 +147,8 @@ impl Buffer {
             save_tick: 0,
             edits: Vec::new(),
             resync: false,
+            lsp_edits: Vec::new(),
+            lsp_resync: false,
         })
     }
 
@@ -237,16 +252,19 @@ impl Buffer {
     }
 
     /// Mark that the whole rope was replaced (undo/redo, file reload), so any
-    /// pending deltas are moot and the consumer must re-sync from full text.
+    /// pending deltas are moot and the consumer must re-sync from full text. Both
+    /// edit journals (syntax and LSP) are reset, so neither sends stale deltas.
     pub fn mark_resync(&mut self) {
         self.edits.clear();
+        self.lsp_edits.clear();
         self.resync = true;
+        self.lsp_resync = true;
         self.changedtick += 1;
         self.modified = true;
     }
 
-    /// Drain the journal of edits accumulated since the last call. The returned
-    /// batch is `resync` if the whole rope was replaced in the interim.
+    /// Drain the treesitter edit journal accumulated since the last call. The
+    /// returned batch is `resync` if the whole rope was replaced in the interim.
     pub fn take_edits(&mut self) -> EditBatch {
         EditBatch {
             edits: std::mem::take(&mut self.edits),
@@ -254,8 +272,19 @@ impl Buffer {
         }
     }
 
+    /// Drain the **LSP** edit journal — the independent `didChange` stream
+    /// (parallel to [`Buffer::take_edits`], so the syntax sync draining first can
+    /// no longer starve the language server's view of the document).
+    pub fn take_lsp_edits(&mut self) -> EditBatch {
+        EditBatch {
+            edits: std::mem::take(&mut self.lsp_edits),
+            resync: std::mem::replace(&mut self.lsp_resync, false),
+        }
+    }
+
     fn record(&mut self, edit: BufferEdit) {
-        self.edits.push(edit);
+        self.edits.push(edit.clone());
+        self.lsp_edits.push(edit);
         self.changedtick += 1;
         self.modified = true;
     }

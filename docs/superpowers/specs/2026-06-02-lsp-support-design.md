@@ -185,8 +185,20 @@ and a `changedtick`, drained by `take_edits()` — built for treesitter. LSP
 incremental sync (`TextDocumentSyncKind.Incremental`) needs exactly a range +
 replacement text per change, which is the same delta in LSP coordinates. The
 server converts each `BufferEdit` to an LSP `TextDocumentContentChangeEvent` (or
-sends full text when a server requests `Full` sync, or on `resync`). **No new
-core machinery** — the journal is shared between the syntax and LSP syncs.
+sends full text when a server requests `Full` sync, or on `resync`).
+
+> **Corrected during Phase 5 (2026-06-03).** The original plan said the *same*
+> journal is shared between the syntax and LSP syncs with **no new core
+> machinery**. That is wrong: `take_edits()` is **destructive**, and the syntax
+> sync runs first, so once the worker is caught up (not mid-parse) it drained the
+> journal before the LSP sync ran — every `didChange` then carried **0 changes**
+> and the language server's document froze at `didOpen` (completion, hover, …
+> answered against stale text). The fix is a **second, parallel journal**:
+> `Buffer` records each edit into both, and the LSP sync drains its own via
+> `take_lsp_edits()`, independent of the worker's drain rate. (Plus: a request
+> first flushes pending changes via `sync_lsp`, since requests fire during input —
+> ahead of `redraw`'s sync — so the server never answers a document older than the
+> cursor the request was issued at.)
 
 ### Decision 6: built-in server config first; `vim.lsp.*` last
 

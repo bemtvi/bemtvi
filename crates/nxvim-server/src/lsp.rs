@@ -244,8 +244,9 @@ impl Server {
 
         if !state.opened {
             // First open (or re-open after a respawn): full text supersedes any
-            // journaled deltas, so drop them.
-            let _ = self.editor.buffer_mut().take_edits();
+            // journaled deltas, so drop the LSP journal (the syntax journal is
+            // drained independently by `sync_syntax`).
+            let _ = self.editor.buffer_mut().take_lsp_edits();
             let text = self.editor.buffer().text.to_string();
             state.version = 1;
             self.lsp.notify(
@@ -263,7 +264,7 @@ impl Server {
             // spurious `didSave` for saves that predate the open.
             state.last_save_tick = cur_save_tick;
         } else if tick_changed && sync_kind != TextDocumentSyncKind::NONE {
-            let batch = self.editor.buffer_mut().take_edits();
+            let batch = self.editor.buffer_mut().take_lsp_edits();
             state.version += 1;
             // Full sync (server's choice, or a whole-rope replacement where deltas
             // are meaningless) sends the entire text; otherwise incremental deltas.
@@ -617,6 +618,12 @@ impl Server {
     /// it. No-op (with a brief message) if the current buffer has no server that
     /// has finished `initialize`, since the negotiated encoding isn't known yet.
     pub(crate) fn request_lsp(&mut self, kind: LspReqKind) {
+        // Flush any pending document edits as a `didChange` *before* the request,
+        // so the server computes against the current buffer text. Requests are
+        // fired during input — ahead of `redraw`'s own `sync_lsp` — so without
+        // this the server would answer a stale document (e.g. completion ranges
+        // computed against text the user already changed).
+        self.sync_lsp();
         let Some((key, uri, encoding)) = self.current_lsp_target() else {
             self.editor.echo("No language server attached");
             return;

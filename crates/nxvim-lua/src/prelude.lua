@@ -546,7 +546,9 @@ function vim.keymap.set(mode, lhs, rhs, opts)
     vim._keymap_fns[id] = rhs
     rhs_data = { kind = "lua", id = id }
   else
-    rhs_data = { kind = "str", str = tostring(rhs) }
+    -- <leader> is expanded in the string RHS too, not just the LHS, matching
+    -- neovim — so a remap RHS can name another <leader> mapping.
+    rhs_data = { kind = "str", str = keymap_expand_leader(tostring(rhs)) }
   end
   vim._keymaps[#vim._keymaps + 1] = {
     id = id,

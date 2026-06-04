@@ -306,6 +306,30 @@ async fn remap_rhs_chains_through_another_mapping() {
     );
 }
 
+/// `<leader>` is expanded in the string RHS too (not just the LHS), so a remap
+/// RHS can name another `<leader>` mapping. Here `<leader>a` → `<leader>b`
+/// (remap) reaches `<leader>b`'s function, with the leader a space.
+#[tokio::test]
+async fn leader_is_expanded_in_the_rhs() {
+    let dir = temp_dir("keymap_leader_rhs");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.g.mapleader = ' '\n\
+         vim.keymap.set('n', '<leader>a', '<leader>b', { remap = true })\n\
+         vim.keymap.set('n', '<leader>b', function() print('VIA_LEADER_B') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]); // barrier: drains the insert redraws
+    let redraw = redraw_after(&rpc, &mut incoming, "<Space>a").await;
+    assert_eq!(
+        message(&redraw),
+        "VIA_LEADER_B",
+        "<leader>a's RHS <leader>b expanded and chained"
+    );
+}
+
 /// A self-referential `remap` map terminates at the depth cap instead of looping:
 /// `x` → `x` (remap) exhausts its re-feed budget and then falls through to a
 /// literal `x`, which deletes one char. The test completing at all proves it

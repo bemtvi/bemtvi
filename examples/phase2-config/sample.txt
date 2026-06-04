@@ -1,0 +1,8 @@
+first line — try gg from lower down to jump back up here
+second line
+third line: put the cursor here and press Y then p to test the y$ map
+fourth line
+fifth line — select with v, press L to extend to end of line (x-mode map)
+sixth line
+seventh line
+eighth line — last line

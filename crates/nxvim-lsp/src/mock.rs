@@ -40,6 +40,16 @@
 //!   so a test can return a broad `isIncomplete:true` list first and a narrowed
 //!   list on the re-request, exercising the live re-request path. Past the end of
 //!   the array ⇒ `null`.
+//! - `formatting`: the `TextEdit[]` returned for `textDocument/formatting`.
+//! - `rename`: the `WorkspaceEdit` returned for `textDocument/rename` (either a
+//!   `{changes}` map or `{documentChanges}`).
+//! - `code_action`: the `(CodeAction | Command)[]` returned for
+//!   `textDocument/codeAction` (tests script `CodeAction`s carrying an eager
+//!   `edit`). Absent ⇒ `null` (no actions).
+//! - `reply_delay_ms`: milliseconds the mock sleeps before sending each scripted
+//!   request *reply* (definition/hover/formatting/…), so a test can edit the
+//!   buffer before the reply lands and prove the editor's stale-drop (e.g. the
+//!   formatting content-version guard). `0`/absent ⇒ no delay.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -120,6 +130,9 @@ pub fn run(script_path: &str) {
             "textDocument/references" => reply_scripted(&stdout, id, &script, "references"),
             "textDocument/hover" => reply_scripted(&stdout, id, &script, "hover"),
             "textDocument/signatureHelp" => reply_scripted(&stdout, id, &script, "signature_help"),
+            "textDocument/formatting" => reply_scripted(&stdout, id, &script, "formatting"),
+            "textDocument/rename" => reply_scripted(&stdout, id, &script, "rename"),
+            "textDocument/codeAction" => reply_scripted(&stdout, id, &script, "code_action"),
             // Completion: a `completion_sequence` entry (one per request) wins over
             // the single `completion` field, so a test can narrow the list on the
             // re-request triggered as the prefix grows.
@@ -201,8 +214,13 @@ fn completion_result(script: &Value, call: &mut usize) -> Value {
 
 /// Answer a request with the script's `field` value (cloned), or `null` when the
 /// field is absent. A no-op if the message carried no id (a malformed request).
+/// Honors `reply_delay_ms`: sleeps that long before replying, so a test can edit
+/// the buffer before the reply lands (exercising the editor's stale-drop).
 fn reply_scripted(stdout: &std::io::Stdout, id: Option<Value>, script: &Value, field: &str) {
     if let Some(id) = id {
+        if let Some(ms) = script.get("reply_delay_ms").and_then(Value::as_u64) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         let result = script.get(field).cloned().unwrap_or(Value::Null);
         write_response(stdout, id, result);
     }

@@ -18,14 +18,14 @@ use std::path::{Path, PathBuf};
 
 use nxvim_core::unicode;
 use nxvim_core::view::View;
-use nxvim_core::{BufferEdit, BufferId, Mode};
+use nxvim_core::{Buffer, BufferEdit, BufferId, Mode};
 use nxvim_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, TextDocumentContentChangeEvent,
-    TextDocumentSyncKind, Url,
+    TextDocumentSyncKind, TextEdit, Url,
 };
 use nxvim_lsp::{
-    CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken,
-    ServerKey, ServerSpawn,
+    CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
+    PositionEncoding, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
 };
 use rmpv::Value;
 
@@ -74,6 +74,9 @@ pub(crate) enum LspReqKind {
     Hover,
     SignatureHelp,
     Completion,
+    Formatting,
+    Rename,
+    CodeAction,
 }
 
 impl LspReqKind {
@@ -87,6 +90,9 @@ impl LspReqKind {
             LspReqKind::Hover => 5,
             LspReqKind::SignatureHelp => 6,
             LspReqKind::Completion => 7,
+            LspReqKind::Formatting => 8,
+            LspReqKind::Rename => 9,
+            LspReqKind::CodeAction => 10,
         }
     }
 
@@ -100,6 +106,9 @@ impl LspReqKind {
             5 => LspReqKind::Hover,
             6 => LspReqKind::SignatureHelp,
             7 => LspReqKind::Completion,
+            8 => LspReqKind::Formatting,
+            9 => LspReqKind::Rename,
+            10 => LspReqKind::CodeAction,
             _ => return None,
         })
     }
@@ -123,6 +132,9 @@ impl LspReqKind {
             LspReqKind::Hover => "No hover information",
             LspReqKind::SignatureHelp => "No signature help",
             LspReqKind::Completion => "No completions",
+            LspReqKind::Formatting => "No formatting changes",
+            LspReqKind::Rename => "No rename changes",
+            LspReqKind::CodeAction => "No code actions available",
         }
     }
 
@@ -143,6 +155,11 @@ pub(crate) struct PendingLspReq {
     pub(crate) generation: u64,
     pub(crate) buffer: BufferId,
     pub(crate) cursor: (usize, usize),
+    /// The buffer's `changedtick` when the request was issued, for the
+    /// content-version stale-drop of an *apply* reply (formatting/rename/code
+    /// action return edits computed against this text; applying them after any
+    /// edit would corrupt the buffer). Unused by the cursor-based kinds.
+    pub(crate) tick: u64,
 }
 
 /// The negotiated runtime state of one server, learned from its `initialize`
@@ -200,7 +217,7 @@ impl Server {
         };
         let key = ServerKey {
             language,
-            root: workspace_root(&path),
+            root: self.lsp_root_for(language, &path),
         };
         // Ensure the server exactly once per key (the `ensure_started` analogue):
         // resolving the command scans `PATH`, and `ensure_server` is a channel
@@ -275,7 +292,7 @@ impl Server {
                     text: self.editor.buffer().text.to_string(),
                 }]
             } else {
-                self.incremental_changes(&batch.edits, encoding)
+                incremental_changes_in(self.editor.buffer(), &batch.edits, encoding)
             };
             self.lsp.notify(
                 key.clone(),
@@ -304,6 +321,17 @@ impl Server {
         if let Some(state) = self.lsp_states.get_mut(&buffer) {
             state.server = None;
         }
+    }
+
+    /// The workspace root for `path` (of `language`), cached per file path so the
+    /// root-marker search runs once rather than on every redraw's `sync_lsp`.
+    fn lsp_root_for(&mut self, language: &str, path: &Path) -> PathBuf {
+        if let Some(root) = self.lsp_roots.get(path) {
+            return root.clone();
+        }
+        let root = workspace_root(language, path);
+        self.lsp_roots.insert(path.to_path_buf(), root.clone());
+        root
     }
 
     /// Send `didClose` for, and forget the state of, every buffer the editor has
@@ -630,22 +658,7 @@ impl Server {
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
-
-        self.lsp_req_gen += 1;
-        let generation = self.lsp_req_gen;
-        self.lsp_requests.insert(
-            kind,
-            PendingLspReq {
-                generation,
-                buffer: self.editor.current_buffer_id(),
-                cursor: (row, col),
-            },
-        );
-
-        let token = ReqToken {
-            kind: kind.as_u16(),
-            generation,
-        };
+        let token = self.register_lsp_request(kind);
         let req = match kind {
             LspReqKind::Definition => LspRequest::Definition { uri, position },
             LspReqKind::Declaration => LspRequest::Declaration { uri, position },
@@ -659,8 +672,125 @@ impl Server {
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
             LspReqKind::Completion => LspRequest::Completion { uri, position },
+            // Formatting/rename/codeAction don't share the uniform {uri, position}
+            // shape and have their own issue functions below.
+            LspReqKind::Formatting | LspReqKind::Rename | LspReqKind::CodeAction => return,
         };
         self.lsp.request(key, token, req);
+    }
+
+    /// Bump the request generation and register the in-flight request for `kind`
+    /// (buffer/cursor/`changedtick` at issue time), returning its [`ReqToken`].
+    /// The single home for the staleness bookkeeping every issue function shares.
+    fn register_lsp_request(&mut self, kind: LspReqKind) -> ReqToken {
+        self.lsp_req_gen += 1;
+        let generation = self.lsp_req_gen;
+        self.lsp_requests.insert(
+            kind,
+            PendingLspReq {
+                generation,
+                buffer: self.editor.current_buffer_id(),
+                cursor: (self.editor.cursor.line, self.editor.cursor.col),
+                tick: self.editor.buffer().changedtick,
+            },
+        );
+        ReqToken {
+            kind: kind.as_u16(),
+            generation,
+        }
+    }
+
+    // ----- Phase 6: formatting / rename / code action ----------------------
+
+    /// `:LspFormat` — request `textDocument/formatting` for the current buffer.
+    /// On reply, the `TextEdit[]` is applied iff the buffer hasn't changed since
+    /// (the content-version guard in [`Server::on_lsp_reply`]).
+    pub(crate) fn request_lsp_format(&mut self) {
+        self.sync_lsp();
+        let Some((key, uri, _encoding)) = self.current_lsp_target() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let token = self.register_lsp_request(LspReqKind::Formatting);
+        self.lsp.request(key, token, LspRequest::Formatting { uri });
+    }
+
+    /// `:LspRename {newname}` — request `textDocument/rename` at the cursor with
+    /// the new name. On reply the returned `WorkspaceEdit` is applied across the
+    /// open buffers it touches.
+    pub(crate) fn request_lsp_rename(&mut self, new_name: &str) {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            self.editor
+                .echo("E471: Argument required: :LspRename {newname}");
+            return;
+        }
+        self.sync_lsp();
+        let Some((key, uri, encoding)) = self.current_lsp_target() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let position = self.lsp_position(encoding, row, col);
+        let token = self.register_lsp_request(LspReqKind::Rename);
+        self.lsp.request(
+            key,
+            token,
+            LspRequest::Rename {
+                uri,
+                position,
+                new_name: new_name.to_string(),
+            },
+        );
+    }
+
+    /// `:LspCodeAction` — request `textDocument/codeAction` at the cursor, passing
+    /// the diagnostics under the cursor as context. On reply the action titles are
+    /// listed in the panel; `<CR>` applies the chosen action's eager edit.
+    pub(crate) fn request_lsp_code_action(&mut self) {
+        self.sync_lsp();
+        let Some((key, uri, encoding)) = self.current_lsp_target() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let position = self.lsp_position(encoding, row, col);
+        let diagnostics = self.diagnostics_at_cursor();
+        let token = self.register_lsp_request(LspReqKind::CodeAction);
+        self.lsp.request(
+            key,
+            token,
+            LspRequest::CodeAction {
+                uri,
+                // A point range at the cursor; a visual-selection range is a
+                // follow-up (needs the selection extent threaded through).
+                range: Range {
+                    start: position,
+                    end: position,
+                },
+                diagnostics,
+            },
+        );
+    }
+
+    /// The cached diagnostics whose range covers the cursor, cloned as the
+    /// `context.diagnostics` for a code-action request (empty when none / no
+    /// server). They are already in the server's negotiated encoding, as the
+    /// server sent them.
+    fn diagnostics_at_cursor(&self) -> Vec<Diagnostic> {
+        let Some((diags, encoding)) = self.current_diagnostics() else {
+            return Vec::new();
+        };
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let line = self.editor.buffer().line(row);
+        diags
+            .iter()
+            .filter(|d| {
+                self.diag_row_span(d, encoding, row, &line)
+                    .is_some_and(|(s, e)| col >= s && col < e.max(s + 1))
+            })
+            .cloned()
+            .collect()
     }
 
     /// The current buffer's `(server, uri, encoding)` once its server finished
@@ -694,6 +824,11 @@ impl Server {
         }
         let buffer_changed = pending.buffer != self.editor.current_buffer_id();
         let cursor_moved = pending.cursor != (self.editor.cursor.line, self.editor.cursor.col);
+        // An apply reply (formatting/rename/codeAction) carries whole-document
+        // edits computed against the request-time text, so a content change since
+        // then must drop it — applying stale edits would corrupt the buffer. A
+        // mere cursor move is fine to apply over.
+        let tick_changed = pending.tick != self.editor.buffer().changedtick;
         self.lsp_requests.remove(&kind);
 
         match reply {
@@ -728,6 +863,27 @@ impl Server {
                     return;
                 }
                 self.show_signature_help(signature, active_parameter);
+                self.lsp_dirty = true;
+            }
+            LspReply::Edits(edits) => {
+                if buffer_changed || tick_changed {
+                    return;
+                }
+                self.apply_formatting_edits(edits);
+                self.lsp_dirty = true;
+            }
+            LspReply::WorkspaceEdit(changes) => {
+                if buffer_changed || tick_changed {
+                    return;
+                }
+                self.apply_workspace_edit(changes);
+                self.lsp_dirty = true;
+            }
+            LspReply::CodeActions(actions) => {
+                if buffer_changed || tick_changed {
+                    return;
+                }
+                self.show_code_actions(actions);
                 self.lsp_dirty = true;
             }
         }
@@ -1144,65 +1300,217 @@ impl Server {
     }
 
     /// Convert an LSP [`Range`] (in the negotiated `encoding`) to an absolute
-    /// buffer byte range, resolving each endpoint against its line's text.
+    /// **current-buffer** byte range, resolving each endpoint against its line.
     fn lsp_range_to_bytes(
         &self,
         range: &Range,
         encoding: PositionEncoding,
     ) -> std::ops::Range<usize> {
-        self.lsp_pos_to_byte(range.start, encoding)..self.lsp_pos_to_byte(range.end, encoding)
+        lsp_range_to_bytes_in(self.editor.buffer(), range, encoding)
     }
 
-    /// Absolute buffer byte offset of an LSP [`Position`] in the negotiated
-    /// `encoding` (the character offset converted against its line, the row added
-    /// as a line start).
-    fn lsp_pos_to_byte(&self, pos: Position, encoding: PositionEncoding) -> usize {
-        let row = pos.line as usize;
-        let line = self.editor.buffer().line(row);
-        self.editor.buffer().line_start(row) + byte_col(encoding, &line, pos.character as usize)
-    }
-
-    /// Convert a batch of journaled byte-delta edits into LSP incremental content
-    /// changes, each replacing the edit's old `(start..old_end)` range with its
-    /// inserted text, in the server's negotiated position encoding.
-    fn incremental_changes(
-        &self,
-        edits: &[BufferEdit],
-        encoding: PositionEncoding,
-    ) -> Vec<TextDocumentContentChangeEvent> {
-        edits
-            .iter()
-            .map(|e| TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: self.lsp_position(encoding, e.start_point.0, e.start_point.1),
-                    end: self.lsp_position(encoding, e.old_end_point.0, e.old_end_point.1),
-                }),
-                range_length: None,
-                text: e.text.clone(),
-            })
-            .collect()
-    }
-
-    /// A buffer `(row, byte-column)` point as an LSP [`Position`], converting the
-    /// byte column to the server's encoding (Decision 4): UTF-8 is the identity
-    /// (an LSP UTF-8 character *is* a byte offset), UTF-16/UTF-32 need column
-    /// math over the line text.
+    /// A current-buffer `(row, byte-column)` point as an LSP [`Position`] in the
+    /// server's negotiated encoding (Decision 4).
     fn lsp_position(&self, encoding: PositionEncoding, row: usize, byte_col: usize) -> Position {
-        let character = match encoding {
-            PositionEncoding::Utf8 => byte_col,
-            PositionEncoding::Utf16 => {
-                let line = self.editor.buffer().line(row);
-                unicode::byte_to_utf16(&line, byte_col)
-            }
-            PositionEncoding::Utf32 => {
-                let line = self.editor.buffer().line(row);
-                line[..byte_col.min(line.len())].chars().count()
-            }
-        };
-        Position {
-            line: row as u32,
-            character: character as u32,
+        lsp_position_in(self.editor.buffer(), encoding, row, byte_col)
+    }
+
+    // ----- Phase 6 appliers ------------------------------------------------
+
+    /// Apply whole-document formatting edits to the current buffer (one undo
+    /// step) and re-sync so the server's version stays consistent. Empty ⇒ a
+    /// brief message (already formatted), so a no-op re-run is visible.
+    fn apply_formatting_edits(&mut self, edits: Vec<TextEdit>) {
+        if edits.is_empty() {
+            self.editor.echo(LspReqKind::Formatting.empty_message());
+            return;
         }
+        let id = self.editor.current_buffer_id();
+        let encoding = self.buffer_encoding(id).unwrap_or(PositionEncoding::Utf8);
+        let buffer = self.editor.buffer();
+        let byte_edits = edits
+            .iter()
+            .map(|e| {
+                (
+                    lsp_range_to_bytes_in(buffer, &e.range, encoding),
+                    e.new_text.clone(),
+                )
+            })
+            .collect();
+        self.editor.apply_edits_to(id, byte_edits);
+        self.sync_lsp_buffer(id);
+    }
+
+    /// Apply a normalized workspace edit (from rename or a code action) across the
+    /// open buffers it touches. Each URI that maps to an **open** buffer has its
+    /// edits converted to bytes against *that* buffer (its negotiated encoding),
+    /// applied as one undo step, and the buffer re-synced; URIs with no open
+    /// buffer are skipped (the unopened-file case is scoped out). An edit that
+    /// touches no open buffer reports a brief message.
+    fn apply_workspace_edit(&mut self, changes: WorkspaceEditData) {
+        let mut touched = 0usize;
+        for (uri, edits) in changes {
+            if edits.is_empty() {
+                continue;
+            }
+            let Some(id) = self.buffer_id_for_uri(&uri) else {
+                // Not an open buffer: editing an unopened file is a follow-up.
+                continue;
+            };
+            let encoding = self.buffer_encoding(id).unwrap_or(PositionEncoding::Utf8);
+            let Some(buffer) = self.editor.buffer_of(id) else {
+                continue;
+            };
+            let byte_edits = edits
+                .iter()
+                .map(|e| {
+                    (
+                        lsp_range_to_bytes_in(buffer, &e.range, encoding),
+                        e.new_text.clone(),
+                    )
+                })
+                .collect();
+            self.editor.apply_edits_to(id, byte_edits);
+            self.sync_lsp_buffer(id);
+            touched += 1;
+        }
+        if touched == 0 {
+            self.editor.echo("No applicable changes");
+        }
+    }
+
+    /// The **open** buffer a workspace-edit URI refers to, or `None` (we edit only
+    /// open buffers). First an exact match against the URI we sent at `didOpen`
+    /// (what diagnostics route by); then a canonicalized-path fallback, so a
+    /// server that resolves symlinks in its returned URI — e.g. `/var` →
+    /// `/private/var` on macOS — still matches the buffer we opened under the
+    /// un-resolved path.
+    fn buffer_id_for_uri(&self, uri: &Url) -> Option<BufferId> {
+        if let Some(id) = self
+            .lsp_states
+            .iter()
+            .find_map(|(id, s)| (s.uri.as_ref() == Some(uri)).then_some(*id))
+        {
+            return Some(id);
+        }
+        let target = uri_to_path(uri).and_then(|p| std::fs::canonicalize(p).ok())?;
+        self.editor.buffer_ids().into_iter().find(|id| {
+            self.editor
+                .buffer_of(*id)
+                .and_then(|b| b.path.as_ref())
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .is_some_and(|c| c == target)
+        })
+    }
+
+    /// Flush a `didChange` for buffer `id` (which need not be current) after a
+    /// workspace edit touched it, so the server's document version stays
+    /// consistent (the plan's `sync_lsp_buffer`). The current buffer is delegated
+    /// to the normal `sync_lsp` path (so each journal entry reaches exactly one
+    /// `didChange`); a non-current, attached buffer drains its own journal and
+    /// sends the deltas (or full text) here. A no-op for an unopened / unattached
+    /// / sync-none buffer (its journal is still drained so it can't replay later).
+    fn sync_lsp_buffer(&mut self, id: BufferId) {
+        if id == self.editor.current_buffer_id() {
+            self.sync_lsp();
+            return;
+        }
+        let Some(state) = self.lsp_states.get(&id) else {
+            return;
+        };
+        if !state.opened {
+            return;
+        }
+        let (Some(key), Some(uri)) = (state.server.clone(), state.uri.clone()) else {
+            return;
+        };
+        let Some(&ServerRuntime {
+            encoding,
+            sync_kind,
+        }) = self.lsp_servers.get(&key)
+        else {
+            return;
+        };
+        let batch = self.editor.take_lsp_edits_of(id).unwrap_or_default();
+        if sync_kind == TextDocumentSyncKind::NONE || batch.is_empty() {
+            return;
+        }
+        let cur_tick = self
+            .editor
+            .buffer_of(id)
+            .map(|b| b.changedtick)
+            .unwrap_or(0);
+        let changes = if batch.resync || sync_kind == TextDocumentSyncKind::FULL {
+            let text = self
+                .editor
+                .buffer_of(id)
+                .map(|b| b.text.to_string())
+                .unwrap_or_default();
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }]
+        } else {
+            let buffer = self.editor.buffer_of(id).unwrap();
+            incremental_changes_in(buffer, &batch.edits, encoding)
+        };
+        let version = {
+            let state = self.lsp_states.get_mut(&id).unwrap();
+            state.version += 1;
+            state.last_tick = cur_tick;
+            state.version
+        };
+        self.lsp.notify(
+            key,
+            LspNotify::DidChange {
+                uri,
+                version,
+                changes,
+            },
+        );
+    }
+
+    /// The negotiated position encoding of buffer `id`'s attached server, or
+    /// `None` if the buffer has no server that finished `initialize`.
+    fn buffer_encoding(&self, id: BufferId) -> Option<PositionEncoding> {
+        let key = self.lsp_states.get(&id)?.server.as_ref()?;
+        Some(self.lsp_servers.get(key)?.encoding)
+    }
+
+    /// List a code-action reply's titles in a select-enabled panel and stash the
+    /// actions so a `<CR>` select applies the chosen one (the `panel_selects`
+    /// path, keyed by select index — see the design's code-action note). An empty
+    /// reply shows a brief message instead of an empty panel.
+    fn show_code_actions(&mut self, actions: Vec<CodeActionData>) {
+        if actions.is_empty() {
+            self.editor.echo(LspReqKind::CodeAction.empty_message());
+            return;
+        }
+        let lines: Vec<String> = actions.iter().map(|a| a.title.clone()).collect();
+        self.lsp_code_actions = actions;
+        self.editor
+            .open_panel(CODE_ACTION_PANEL_TITLE, lines, true, 0);
+    }
+
+    /// Apply the code action selected (by index) in the code-action panel: its
+    /// eager `edit` across the open buffers, or a brief message if it carries
+    /// none (a lazy/command action — `codeAction/resolve` is scoped out). Clears
+    /// the stashed actions and closes the panel either way.
+    pub(crate) fn apply_code_action(&mut self, index: usize) {
+        let action = self.lsp_code_actions.get(index).cloned();
+        self.lsp_code_actions.clear();
+        self.editor.close_panel();
+        let Some(action) = action else {
+            return;
+        };
+        match action.edit {
+            Some(changes) => self.apply_workspace_edit(changes),
+            None => self
+                .editor
+                .echo("Code action has no edit (resolve/command unsupported)"),
+        }
+        self.lsp_dirty = true;
     }
 }
 
@@ -1213,6 +1521,81 @@ fn encoding_label(encoding: PositionEncoding) -> &'static str {
         PositionEncoding::Utf16 => "utf-16",
         PositionEncoding::Utf32 => "utf-32",
     }
+}
+
+/// The panel title for the `:LspCodeAction` list. The server recognizes a panel
+/// select by this title to route it to [`Server::apply_code_action`] instead of
+/// the generic scripting `on_select` path.
+pub(crate) const CODE_ACTION_PANEL_TITLE: &str = "LSP code actions";
+
+/// Convert an LSP [`Range`] (in `encoding`) to an absolute byte range in
+/// `buffer`, resolving each endpoint against its line — the buffer-addressed form
+/// of [`Server::lsp_range_to_bytes`], for a workspace edit that touches a
+/// non-current buffer.
+fn lsp_range_to_bytes_in(
+    buffer: &Buffer,
+    range: &Range,
+    encoding: PositionEncoding,
+) -> std::ops::Range<usize> {
+    lsp_pos_to_byte_in(buffer, range.start, encoding)
+        ..lsp_pos_to_byte_in(buffer, range.end, encoding)
+}
+
+/// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:
+/// the character offset converted against its line, the row added as a line start.
+fn lsp_pos_to_byte_in(buffer: &Buffer, pos: Position, encoding: PositionEncoding) -> usize {
+    let row = pos.line as usize;
+    let line = buffer.line(row);
+    buffer.line_start(row) + byte_col(encoding, &line, pos.character as usize)
+}
+
+/// A `(row, byte-column)` point in `buffer` as an LSP [`Position`] in `encoding`
+/// (Decision 4): UTF-8 is the identity (an LSP UTF-8 character *is* a byte
+/// offset), UTF-16/UTF-32 need column math over the line text. The buffer-
+/// addressed form of [`Server::lsp_position`].
+fn lsp_position_in(
+    buffer: &Buffer,
+    encoding: PositionEncoding,
+    row: usize,
+    byte_col: usize,
+) -> Position {
+    let character = match encoding {
+        PositionEncoding::Utf8 => byte_col,
+        PositionEncoding::Utf16 => {
+            let line = buffer.line(row);
+            unicode::byte_to_utf16(&line, byte_col)
+        }
+        PositionEncoding::Utf32 => {
+            let line = buffer.line(row);
+            line[..byte_col.min(line.len())].chars().count()
+        }
+    };
+    Position {
+        line: row as u32,
+        character: character as u32,
+    }
+}
+
+/// Convert a batch of journaled byte-delta edits in `buffer` into LSP incremental
+/// content changes (each replacing the edit's old `(start..old_end)` range with
+/// its inserted text, in `encoding`) — the buffer-addressed form of the
+/// current-buffer conversion `sync_lsp` does inline.
+fn incremental_changes_in(
+    buffer: &Buffer,
+    edits: &[BufferEdit],
+    encoding: PositionEncoding,
+) -> Vec<TextDocumentContentChangeEvent> {
+    edits
+        .iter()
+        .map(|e| TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: lsp_position_in(buffer, encoding, e.start_point.0, e.start_point.1),
+                end: lsp_position_in(buffer, encoding, e.old_end_point.0, e.old_end_point.1),
+            }),
+            range_length: None,
+            text: e.text.clone(),
+        })
+        .collect()
 }
 
 /// Byte offset of LSP `character` on `line`, the inverse of [`Server::lsp_position`]
@@ -1389,12 +1772,46 @@ fn binary_on_path(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
 
-/// The workspace root for a file: its absolute parent directory. Phase 1 uses
-/// the containing directory directly; root-marker search (`Cargo.toml`, `.git`,
-/// …) is a later refinement.
-fn workspace_root(path: &Path) -> PathBuf {
+/// The workspace root for `path` (of `language`), the directory passed to the
+/// server as `root_uri` and used as its working directory:
+/// 1. `$NXVIM_LSP_ROOT`, if set — an explicit override (handy for testing against
+///    a real project, or unusual layouts); relative values resolve against the
+///    cwd.
+/// 2. otherwise, the nearest ancestor holding a language root marker
+///    (`Cargo.toml` for rust, `go.mod` for go, `pyproject.toml`/… for python, …),
+///    then any `.git` ancestor — so a server opened on `src/main.rs` still roots
+///    at the project, which servers like rust-analyzer require.
+/// 3. otherwise, the file's own directory (the Phase-1 fallback).
+fn workspace_root(language: &str, path: &Path) -> PathBuf {
+    if let Some(root) = std::env::var_os("NXVIM_LSP_ROOT") {
+        return absolutize(Path::new(&root));
+    }
     let abs = absolutize(path);
-    abs.parent().map(Path::to_path_buf).unwrap_or(abs)
+    let dir = abs.parent().unwrap_or(&abs);
+    find_root_marker(language, dir).unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// Walk up from `start` for the nearest ancestor that holds a root marker for
+/// `language` (preferred), then any ancestor with a `.git` (the VCS fallback).
+/// `None` if neither is found, so the caller falls back to the file's directory.
+fn find_root_marker(language: &str, start: &Path) -> Option<PathBuf> {
+    let markers: &[&str] = match language {
+        "rust" => &["Cargo.toml"],
+        "go" => &["go.mod", "go.work"],
+        "python" => &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+        ],
+        "lua" => &[".luarc.json", ".luarc.jsonc"],
+        _ => &[],
+    };
+    start
+        .ancestors()
+        .find(|dir| markers.iter().any(|m| dir.join(m).is_file()))
+        .or_else(|| start.ancestors().find(|dir| dir.join(".git").exists()))
+        .map(Path::to_path_buf)
 }
 
 /// A `file://` URI for an absolute-ized path, or `None` if it can't be formed.

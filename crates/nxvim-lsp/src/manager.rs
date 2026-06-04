@@ -21,16 +21,21 @@ use async_lsp::router::Router;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    ClientCapabilities, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    AnnotatedTextEdit, ClientCapabilities, CodeActionClientCapabilities, CodeActionContext,
+    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams,
+    CodeActionResponse, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
     CompletionTextEdit, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GeneralClientCapabilities,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, Location, MarkedString, MessageType,
-    ParameterLabel, Position, PositionEncodingKind, ReferenceContext, ReferenceParams,
-    ServerCapabilities, SignatureHelp, SignatureHelpParams, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
-    TextDocumentSyncKind, TextEdit, Url, VersionedTextDocumentIdentifier,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
+    DocumentFormattingClientCapabilities, DocumentFormattingParams, FormattingOptions,
+    GeneralClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
+    MessageType, OneOf, ParameterLabel, Position, PositionEncodingKind, Range, ReferenceContext,
+    ReferenceParams, RenameClientCapabilities, RenameParams, ServerCapabilities, SignatureHelp,
+    SignatureHelpParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentEdit, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind, TextEdit,
+    Url, VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceEdit,
+    WorkspaceEditClientCapabilities,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -139,6 +144,25 @@ pub enum LspRequest {
         uri: Url,
         position: Position,
     },
+    /// `textDocument/formatting` — whole-document formatting; the reply is a
+    /// `TextEdit[]` (in the negotiated encoding) the editor applies to the buffer.
+    Formatting {
+        uri: Url,
+    },
+    /// `textDocument/rename` — the reply is a `WorkspaceEdit` the editor applies
+    /// across the open buffers it touches.
+    Rename {
+        uri: Url,
+        position: Position,
+        new_name: String,
+    },
+    /// `textDocument/codeAction` for a range, with the diagnostics there as
+    /// context; the reply is the available actions (titles + eager edits).
+    CodeAction {
+        uri: Url,
+        range: Range,
+        diagnostics: Vec<Diagnostic>,
+    },
 }
 
 /// The opaque correlation token the editor issues with a request and the manager
@@ -181,6 +205,35 @@ pub enum LspReply {
         is_incomplete: bool,
         items: Vec<CompletionItemData>,
     },
+    /// Whole-document text edits from `textDocument/formatting`, ranges still in
+    /// the negotiated position encoding (an empty list ⇒ already formatted).
+    Edits(Vec<TextEdit>),
+    /// A normalized workspace edit from `textDocument/rename` (an empty list ⇒
+    /// the server renamed nothing).
+    WorkspaceEdit(WorkspaceEditData),
+    /// The code actions available at the cursor — titles for the panel plus each
+    /// action's eager edit (`None` ⇒ a lazy/command action with nothing to apply).
+    CodeActions(Vec<CodeActionData>),
+}
+
+/// A [`WorkspaceEdit`] normalized to per-document text edits: the protocol's
+/// `changes` map and the versioned `documentChanges` (with `OneOf`/annotation
+/// edits, and edit-vs-resource operations) both collapse to one
+/// `(Url, Vec<TextEdit>)` list. File resource operations (create/rename/delete)
+/// are **dropped** — the editor applies only to already-open buffers (the
+/// unopened-file case is scoped out). Ranges stay in the negotiated encoding for
+/// the editor to convert, like the goto/completion normalizations.
+pub type WorkspaceEditData = Vec<(Url, Vec<TextEdit>)>;
+
+/// One code action distilled for the editor: its `title` for the panel list, and
+/// its eager `edit` (a normalized [`WorkspaceEditData`]) when the server returned
+/// one. `edit` is `None` for a bare `Command` or a lazy action that would need a
+/// `codeAction/resolve` round-trip (scoped out) — applying such an action is a
+/// no-op the editor reports.
+#[derive(Clone, Debug)]
+pub struct CodeActionData {
+    pub title: String,
+    pub edit: Option<WorkspaceEditData>,
 }
 
 /// One completion candidate, distilled from a protocol [`CompletionItem`] to the
@@ -728,7 +781,133 @@ async fn issue_request(
             };
             completion_reply(sock.completion(params).await, log, name)
         }
+        LspRequest::Formatting { uri } => {
+            let params = DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                options: formatting_options(),
+                work_done_progress_params: Default::default(),
+            };
+            match sock.formatting(params).await {
+                Ok(edits) => LspReply::Edits(edits.unwrap_or_default()),
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("formatting failed: {e}"));
+                    LspReply::Edits(Vec::new())
+                }
+            }
+        }
+        LspRequest::Rename {
+            uri,
+            position,
+            new_name,
+        } => {
+            let params = RenameParams {
+                text_document_position: text_document_position(uri, position),
+                new_name,
+                work_done_progress_params: Default::default(),
+            };
+            match sock.rename(params).await {
+                Ok(Some(edit)) => LspReply::WorkspaceEdit(normalize_workspace_edit(edit)),
+                Ok(None) => LspReply::WorkspaceEdit(Vec::new()),
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("rename failed: {e}"));
+                    LspReply::WorkspaceEdit(Vec::new())
+                }
+            }
+        }
+        LspRequest::CodeAction {
+            uri,
+            range,
+            diagnostics,
+        } => {
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range,
+                context: CodeActionContext {
+                    diagnostics,
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            match sock.code_action(params).await {
+                Ok(resp) => LspReply::CodeActions(code_actions(resp.unwrap_or_default())),
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("codeAction failed: {e}"));
+                    LspReply::CodeActions(Vec::new())
+                }
+            }
+        }
     }
+}
+
+/// The `FormattingOptions` for `textDocument/formatting`. nxvim has no
+/// `:set shiftwidth`/`expandtab` yet, so these are fixed: `tab_size: 8` to match
+/// the editor's `TABSTOP`, and spaces. Real, option-driven values are a follow-up
+/// for when `:set` grows them.
+fn formatting_options() -> FormattingOptions {
+    FormattingOptions {
+        tab_size: 8,
+        insert_spaces: true,
+        ..Default::default()
+    }
+}
+
+/// Distill a `textDocument/codeAction` response (a mixed `(Command | CodeAction)[]`)
+/// into the editor-facing list: a `CodeAction`'s `title` + normalized eager
+/// `edit`; a bare `Command` keeps its title with no edit (its `command` would
+/// need `workspace/executeCommand`, scoped out).
+fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
+    resp.into_iter()
+        .map(|item| match item {
+            CodeActionOrCommand::CodeAction(ca) => CodeActionData {
+                title: ca.title,
+                edit: ca.edit.map(normalize_workspace_edit),
+            },
+            CodeActionOrCommand::Command(cmd) => CodeActionData {
+                title: cmd.title,
+                edit: None,
+            },
+        })
+        .collect()
+}
+
+/// Normalize a [`WorkspaceEdit`] to flat per-document [`TextEdit`]s (see
+/// [`WorkspaceEditData`]). `documentChanges` (versioned) is preferred when present
+/// — collapsing the `OneOf<TextEdit, AnnotatedTextEdit>` and dropping file
+/// resource operations — else the plain `changes` map is used.
+fn normalize_workspace_edit(edit: WorkspaceEdit) -> WorkspaceEditData {
+    if let Some(changes) = edit.document_changes {
+        return match changes {
+            DocumentChanges::Edits(edits) => edits.into_iter().map(text_document_edit).collect(),
+            DocumentChanges::Operations(ops) => ops
+                .into_iter()
+                .filter_map(|op| match op {
+                    DocumentChangeOperation::Edit(e) => Some(text_document_edit(e)),
+                    // create/rename/delete file ops are scoped out (open buffers only).
+                    DocumentChangeOperation::Op(_) => None,
+                })
+                .collect(),
+        };
+    }
+    edit.changes
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Flatten one [`TextDocumentEdit`] to `(uri, TextEdit[])`, collapsing each
+/// `OneOf<TextEdit, AnnotatedTextEdit>` to a plain edit (the change annotation is
+/// dropped — nxvim does not surface them).
+fn text_document_edit(edit: TextDocumentEdit) -> (Url, Vec<TextEdit>) {
+    let edits = edit
+        .edits
+        .into_iter()
+        .map(|oneof| match oneof {
+            OneOf::Left(te) => te,
+            OneOf::Right(AnnotatedTextEdit { text_edit, .. }) => text_edit,
+        })
+        .collect();
+    (edit.text_document.uri, edits)
 }
 
 /// Distill a `textDocument/completion` reply into [`LspReply::Completion`],
@@ -959,6 +1138,21 @@ fn describe_request(req: &LspRequest) -> String {
         LspRequest::Hover { position, .. } => ("hover", position),
         LspRequest::SignatureHelp { position, .. } => ("signatureHelp", position),
         LspRequest::Completion { position, .. } => ("completion", position),
+        LspRequest::Rename {
+            position, new_name, ..
+        } => {
+            return format!(
+                "→ rename '{new_name}' @ {}:{}",
+                position.line, position.character
+            )
+        }
+        LspRequest::Formatting { .. } => return "→ formatting".to_string(),
+        LspRequest::CodeAction { range, .. } => {
+            return format!(
+                "→ codeAction @ {}:{}",
+                range.start.line, range.start.character
+            )
+        }
     };
     format!("→ {label} @ {}:{}", pos.line, pos.character)
 }
@@ -1053,7 +1247,12 @@ fn level_of(typ: MessageType) -> LogLevel {
 }
 
 /// The client capabilities we advertise at `initialize`: UTF-8 preferred over
-/// UTF-16 for positions (Decision 4), and document-save notifications.
+/// UTF-16 for positions (Decision 4), document-save notifications, and the edit
+/// features Phase 6 needs. Most consequential is
+/// `codeAction.codeActionLiteralSupport` — **without it a server returns legacy
+/// `Command[]` rather than a `CodeAction` carrying an `edit`**, and "apply the
+/// edit" becomes impossible; we also declare `formatting`/`rename` and
+/// `workspaceEdit.documentChanges` so servers offer those features.
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         general: Some(GeneralClientCapabilities {
@@ -1066,6 +1265,42 @@ fn client_capabilities() -> ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
             synchronization: Some(TextDocumentSyncClientCapabilities {
                 did_save: Some(true),
+                ..Default::default()
+            }),
+            formatting: Some(DocumentFormattingClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            rename: Some(RenameClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
+            }),
+            code_action: Some(CodeActionClientCapabilities {
+                code_action_literal_support: Some(CodeActionLiteralSupport {
+                    code_action_kind: CodeActionKindLiteralSupport {
+                        // The standard kinds; servers fall back gracefully for any
+                        // value outside this set, per the protocol.
+                        value_set: [
+                            "",
+                            "quickfix",
+                            "refactor",
+                            "refactor.extract",
+                            "refactor.inline",
+                            "refactor.rewrite",
+                            "source",
+                            "source.organizeImports",
+                        ]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    },
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        workspace: Some(WorkspaceClientCapabilities {
+            workspace_edit: Some(WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
                 ..Default::default()
             }),
             ..Default::default()

@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–5 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing); Phases 6–7 planned.
+**Status:** In progress — **Phases 1–6 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions); Phase 7 (`vim.lsp.*` Lua surface) planned.
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -453,8 +453,12 @@ Proven entirely against the mock server, which records what it received.
 >   spawning the `nxvim --__lsp-mock` binary needs `CARGO_BIN_EXE_nxvim`, which is
 >   only set for the `nxvim` crate's integration tests — exactly where the syntax
 >   worker tests live, for the same reason.
-> - **Workspace root** is currently the file's parent directory; root-marker
->   search (`Cargo.toml`/`.git`) is a later refinement.
+> - **Workspace root** (refined during Phase 6): `$NXVIM_LSP_ROOT` overrides it
+>   explicitly; otherwise the nearest ancestor holding a language root marker
+>   (`Cargo.toml` for rust, `go.mod` for go, `pyproject.toml`/… for python, …)
+>   then any `.git` ancestor, falling back to the file's parent directory. The
+>   resolved root is cached per file path so the marker walk doesn't run on every
+>   redraw. (Originally the bare parent directory.)
 > - **Observability (added for following along before any on-screen feature
 >   exists):** an `:LspInfo` ex-command opens the panel with the current buffer's
 >   server / encoding / sync-kind / version / cached-diagnostics count plus the
@@ -1053,7 +1057,81 @@ land in 5a so 5b is purely behavior.)*
 
 ---
 
-### Phase 6 — Edits: formatting, rename, code actions
+### Phase 6 — Edits: formatting, rename, code actions — ✅ DONE
+
+> **Implementation notes (as built).** Faithful to the refined plan; choices
+> worth recording:
+> - **The multi-buffer applier is a new, LSP-free core entry.**
+>   `Editor::apply_edits_to(id, edits)` applies a document's byte-range edits to a
+>   **given** `BufferId` (current or not) as **one independent undo step for that
+>   buffer** — a sibling of Phase 5's current-buffer `apply_edits`, built on a new
+>   `push_undo_for(id)` that snapshots an arbitrary buffer's history (it does *not*
+>   consult the current buffer's `snapshot_taken` insert-group flag, since a
+>   workspace edit is a one-shot normal-mode mutation per buffer). Edits apply
+>   highest-start-first; the current buffer's cursor is clamped to the new text, a
+>   non-current buffer's saved cursor is clamped on the switch back by
+>   `enter_buffer`. Three small read-only core accessors support the server side:
+>   `buffer_of(id)` (read a non-current buffer's text to convert LSP positions),
+>   `buffer_id_for_path(path)` (route a WorkspaceEdit URI to its open buffer), and
+>   `take_lsp_edits_of(id)` (drain a non-current buffer's LSP journal) — plus
+>   `panel_title()` (so the server recognizes the code-action panel). Core gains
+>   **no** LSP types.
+> - **`WorkspaceEdit` normalization lives in `nxvim-lsp`** (the goto/hover
+>   pattern): `changes` and the versioned `documentChanges` (collapsing
+>   `OneOf<TextEdit, AnnotatedTextEdit>`, dropping file create/rename/delete
+>   resource ops) both reduce to a flat `WorkspaceEditData = Vec<(Url,
+>   Vec<TextEdit>)>`, ranges left in the negotiated encoding. `CodeActionData
+>   { title, edit: Option<WorkspaceEditData> }` keeps only the eager edit (a bare
+>   `Command` or a lazy `edit: None` action carries `None` — `codeAction/resolve`
+>   and `workspace/executeCommand` stay out, per Scope).
+> - **A workspace edit is matched to its open buffer by URI, not by path.** Each
+>   URI is resolved to a buffer the way diagnostics are: an exact match against the
+>   `file://` URI sent at `didOpen` (always absolute, so a buffer opened by a
+>   *relative* path still matches — the early bug here was a lexical path compare),
+>   with a canonicalized-path fallback for a server that resolves symlinks in its
+>   returned URI (e.g. macOS `/var` → `/private/var`). Only open buffers are
+>   edited; an unopened-file URI is skipped (Scope out).
+> - **A per-buffer `sync_lsp_buffer(id)`** flushes `didChange` for each
+>   non-current buffer a workspace edit touched (the current buffer is delegated to
+>   the normal `sync_lsp`, so each journal entry reaches exactly one `didChange`).
+>   It drains that buffer's LSP journal and sends incremental deltas (or full text
+>   on `resync`/`FULL`) against *that* buffer's text + encoding, bumping its
+>   version — built on buffer-addressed free functions (`lsp_range_to_bytes_in` /
+>   `lsp_position_in` / `incremental_changes_in` taking a `&Buffer`), to which the
+>   current-buffer methods now delegate.
+> - **Stale-drop for an apply is content-version based.** `PendingLspReq` gained a
+>   `tick` (the buffer's `changedtick` at issue time); an `Edits`/`WorkspaceEdit`/
+>   `CodeActions` reply is dropped when the buffer changed since the request
+>   (`buffer_changed || tick_changed`) — a cursor move alone is fine to apply over,
+>   unlike the goto/hover kinds. Proven by a test that delays the formatting reply
+>   (a new mock `reply_delay_ms`), edits in the gap, and asserts the edit stands.
+> - **Capabilities advertised at `initialize`:** `textDocument.formatting`,
+>   `textDocument.rename`, `textDocument.codeAction.codeActionLiteralSupport` (the
+>   standard kind set — without it a server returns legacy `Command[]` with no
+>   edit), and `workspace.workspaceEdit { documentChanges: true }`.
+> - **Three ex-commands, each with its own issue function** (the uniform
+>   `request_lsp(kind)` `{uri, position}` path doesn't fit): `:LspFormat` (sends
+>   `FormattingOptions { tab_size: 8, insert_spaces: true }`, fixed until `:set`
+>   lands), `:LspRename {newname}` (reads the dispatcher's arg; empty ⇒ `E471`),
+>   and `:LspCodeAction` (a point range at the cursor + the diagnostics there as
+>   context — a visual-selection range is a follow-up). A shared
+>   `register_lsp_request(kind)` centralizes the generation/buffer/cursor/tick
+>   bookkeeping all issue functions share.
+> - **Code actions use the `panel_selects` path** (per the design's note): the
+>   titles open a select-enabled panel, the resolved actions are stashed in a
+>   server-side `Vec<CodeActionData>` keyed by select index, and a `<CR>` is routed
+>   to `apply_code_action` **only when the open panel's title matches** the
+>   code-action panel (so a select on some other panel can't misroute). The action
+>   applies via the same `apply_workspace_edit` rename uses; the panel closes.
+> - **`format_on_save` was descoped** to a cross-phase follow-up (it inverts the
+>   core-owned, synchronous `:w` and needs a deferred-write pre-write hook).
+> - **Mock** gained `formatting` / `rename` / `code_action` script fields (via the
+>   existing `reply_scripted` path) plus `reply_delay_ms`. Tests (in
+>   `crates/nxvim/tests/lsp.rs`) cover `:LspFormat` rewrite + idempotent re-run, the
+>   content-version drop, a **two-file** rename across open buffers (each
+>   independently undoable, cursor survives, sibling read by handle), the
+>   code-action panel + `<CR>` apply, a utf-16 formatting edit landing at the right
+>   **byte** past `é`, and a format/rename never-blocks resilience check.
 
 > **Plan sanity-checked & refined 2026-06-04** (against the Phase 1–5 code as
 > built). Phase 6 is the **first feature that mutates buffers other than the

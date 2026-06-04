@@ -1651,3 +1651,369 @@ async fn completion_never_blocks_the_editor() {
         "the editor stays fully editable; completion inserted nothing"
     );
 }
+
+// ----- Phase 6: formatting / rename / code actions --------------------------
+
+/// An LSP `TextEdit` (`{range, newText}`) for the mock's `formatting`/`rename`/
+/// `code_action` script fields. Positions are in the server's negotiated encoding.
+fn text_edit(sl: u32, sc: u32, el: u32, ec: u32, new: &str) -> Json {
+    serde_json::json!({
+        "range": {
+            "start": { "line": sl, "character": sc },
+            "end": { "line": el, "character": ec },
+        },
+        "newText": new,
+    })
+}
+
+/// A `WorkspaceEdit` with a `changes` map built from `(path, TextEdit[])` pairs
+/// (used directly as the `rename` reply, or nested as a code action's `edit`).
+fn ws_changes(entries: &[(&str, Vec<Json>)]) -> Json {
+    let mut changes = serde_json::Map::new();
+    for (path, edits) in entries {
+        changes.insert(file_uri(path), Json::Array(edits.clone()));
+    }
+    let mut edit = serde_json::Map::new();
+    edit.insert("changes".to_string(), Json::Object(changes));
+    Json::Object(edit)
+}
+
+/// Run an ex-command over RPC (awaiting the dispatch, not the async LSP reply).
+async fn cmd(rpc: &Rpc, command: &str) {
+    rpc.request("nvim_command", vec![Value::from(command)])
+        .await
+        .expect("command");
+}
+
+/// Poll (bounded) until the current buffer's lines equal `want`.
+async fn wait_for_lines(rpc: &Rpc, want: &[&str]) {
+    for _ in 0..80 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if lines(rpc)
+            .await
+            .iter()
+            .map(String::as_str)
+            .eq(want.iter().copied())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("buffer never became {want:?}; saw {:?}", lines(rpc).await);
+}
+
+/// The current buffer id.
+async fn current_buf(rpc: &Rpc) -> u64 {
+    rpc.request("nvim_get_current_buf", vec![])
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap()
+}
+
+/// Make buffer `id` current (the `nvim_set_current_buf` entry point).
+async fn set_buf(rpc: &Rpc, id: u64) {
+    rpc.request("nvim_set_current_buf", vec![Value::from(id)])
+        .await
+        .unwrap();
+}
+
+/// Editable lines of buffer `id` (read by handle, without switching to it).
+async fn lines_of_buf(rpc: &Rpc, id: u64) -> Vec<String> {
+    let result = rpc
+        .request(
+            "nvim_buf_get_lines",
+            vec![
+                Value::from(id),
+                Value::from(0i64),
+                Value::from(-1i64),
+                Value::Boolean(false),
+            ],
+        )
+        .await
+        .unwrap();
+    match result {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn lsp_format_rewrites_the_buffer_and_is_idempotent() {
+    let _guard = test_lock().lock().await;
+    // The mock returns a whole-line replacement; `:LspFormat` rewrites the buffer.
+    // The edit replaces line 0 incl. its newline ((0,0)..(1,0)) with the canonical
+    // text, so a re-run on the already-formatted line is a no-op (idempotent).
+    let record = configure_mock(
+        "fmt",
+        serde_json::json!({ "formatting": [text_edit(0, 0, 1, 0, "let x = 1;\n")] }),
+    );
+    let file = temp_file("fmt", "rs", "let x=1;\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspFormat").await;
+    wait_for_lines(&rpc, &["let x = 1;"]).await;
+
+    // Re-format: the line is already canonical, so it stays unchanged.
+    cmd(&rpc, "LspFormat").await;
+    for _ in 0..6 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let x = 1;".to_string()],
+        "re-formatting already-formatted text is a no-op"
+    );
+}
+
+#[tokio::test]
+async fn a_formatting_reply_is_dropped_after_an_intervening_edit() {
+    let _guard = test_lock().lock().await;
+    // Content-version guard: the formatting reply is delayed; an edit lands before
+    // it does, so applying the (now stale, whole-document) edit would corrupt the
+    // buffer. The reply must be dropped, leaving the user's edit intact.
+    let record = configure_mock(
+        "fmt-stale",
+        serde_json::json!({
+            "formatting": [text_edit(0, 0, 1, 0, "FORMATTED\n")],
+            "reply_delay_ms": 200,
+        }),
+    );
+    let file = temp_file("fmt-stale", "rs", "original\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Fire format (the mock sleeps before replying), then edit before it lands.
+    cmd(&rpc, "LspFormat").await;
+    feed(&rpc, "A!<Esc>");
+    barrier(&rpc).await;
+    // The request really went out (so the drop path is exercised, not a no-op),
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/formatting")).await;
+    // and after the reply delay elapses the stale reply has been dropped.
+    for _ in 0..10 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["original!".to_string()],
+        "the late formatting reply was dropped; the user's edit stands"
+    );
+}
+
+#[tokio::test]
+async fn rename_applies_a_workspace_edit_across_open_buffers() {
+    let _guard = test_lock().lock().await;
+    // Rename returns a two-file WorkspaceEdit; both open buffers change, each is
+    // independently undoable, and the active buffer's cursor survives.
+    let file_a = temp_file("rename-a", "rs", "foo = foo\n");
+    let file_b = temp_file("rename-b", "rs", "use foo\n");
+    let record = configure_mock(
+        "rename",
+        serde_json::json!({
+            "rename": ws_changes(&[
+                (&file_a, vec![text_edit(0, 0, 0, 3, "xyz"), text_edit(0, 6, 0, 9, "xyz")]),
+                (&file_b, vec![text_edit(0, 4, 0, 7, "xyz")]),
+            ])
+        }),
+    );
+    let (rpc, _incoming) = start(Some(file_a)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    let buf_a = current_buf(&rpc).await;
+
+    // Open B (so the rename can reach it), wait for its didOpen, then back to A.
+    cmd(&rpc, &format!("e {file_b}")).await;
+    wait_for_record(&rpc, &record, |r| {
+        count_method(r, "textDocument/didOpen") >= 2
+    })
+    .await;
+    let buf_b = current_buf(&rpc).await;
+    set_buf(&rpc, buf_a).await;
+
+    // Cursor at the start of A; rename foo → xyz.
+    feed(&rpc, "gg0");
+    cmd(&rpc, "LspRename xyz").await;
+    wait_for_lines(&rpc, &["xyz = xyz"]).await;
+
+    // The other open buffer changed too (read by handle, no switch).
+    assert_eq!(
+        lines_of_buf(&rpc, buf_b).await,
+        vec!["use xyz".to_string()],
+        "the rename reached the other open buffer"
+    );
+    // The active buffer's cursor survived at a valid resting cell.
+    assert_eq!(cursor(&rpc).await, (1, 0), "the active cursor survived");
+
+    // Undo on A reverts only A; B is untouched (independent undo histories).
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["foo = foo".to_string()]);
+    assert_eq!(
+        lines_of_buf(&rpc, buf_b).await,
+        vec!["use xyz".to_string()],
+        "B is unaffected by A's undo"
+    );
+    // Switch to B and undo there.
+    set_buf(&rpc, buf_b).await;
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["use foo".to_string()]);
+}
+
+#[tokio::test]
+async fn a_code_action_lists_in_the_panel_and_applies_on_enter() {
+    let _guard = test_lock().lock().await;
+    // The code-action list opens in the panel; `<CR>` on a row applies that
+    // action's eager edit (and no control key leaks a literal character).
+    let file = temp_file("ca", "rs", "let x=1;\n");
+    let edit = ws_changes(&[(&file, vec![text_edit(0, 0, 1, 0, "let x = 1;\n")])]);
+    let record = configure_mock(
+        "ca",
+        serde_json::json!({
+            "code_action": [{ "title": "Add spaces", "edit": edit }]
+        }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspCodeAction").await;
+    let (title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(title, "LSP code actions");
+    assert_eq!(panel_lines, vec!["Add spaces".to_string()]);
+
+    // `<CR>` applies the chosen action and closes the panel.
+    feed(&rpc, "<CR>");
+    wait_for_lines(&rpc, &["let x = 1;"]).await;
+    assert!(
+        !rpc.request("nxvim_panel_is_open", vec![])
+            .await
+            .unwrap()
+            .as_bool()
+            .unwrap(),
+        "the code-action panel closed after applying"
+    );
+}
+
+#[tokio::test]
+async fn a_formatting_edit_lands_at_the_right_byte_with_utf16() {
+    let _guard = test_lock().lock().await;
+    // The edit analogue of the cross-file `é` test: a leading 2-byte `é` and a
+    // utf-16 server. The edit's range is in utf-16 units (char 1..2 = the `x`
+    // after `é`); applying it must convert to byte 2..3, so `x` → `X` lands as
+    // `éX=1`, not corrupting the `é`.
+    let record = configure_mock(
+        "fmt-utf16",
+        serde_json::json!({
+            "position_encoding": "utf-16",
+            "formatting": [text_edit(0, 1, 0, 2, "X")],
+        }),
+    );
+    let file = temp_file("fmt-utf16", "rs", "éx=1\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspFormat").await;
+    wait_for_lines(&rpc, &["éX=1"]).await;
+}
+
+#[tokio::test]
+async fn format_and_rename_never_block_the_editor() {
+    let _guard = test_lock().lock().await;
+    // Resilience: format/rename requests whose server offers nothing (null replies)
+    // leave the editor fully editable and the buffer unchanged.
+    let record = configure_mock("edit-resil", serde_json::json!({}));
+    let file = temp_file("edit-resil", "rs", "fn main() {}\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspFormat").await;
+    cmd(&rpc, "LspRename bar").await;
+    // Both requests were genuinely sent; their null replies applied nothing.
+    wait_for_record(&rpc, &record, |r| {
+        has_method(r, "textDocument/formatting") && has_method(r, "textDocument/rename")
+    })
+    .await;
+    // The editor still edits.
+    feed(&rpc, "ook<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string(), "ok".to_string()],
+        "the editor stays fully editable; the null edit replies changed nothing"
+    );
+}
+
+/// Restores an env var to its prior value on drop, so a test that sets a
+/// process-global env var leaves it as it found it even on a panic.
+struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+impl EnvGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvGuard(key, prev)
+    }
+}
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => std::env::set_var(self.0, v),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_workspace_root_is_configurable_via_env() {
+    let _guard = test_lock().lock().await;
+    // `$NXVIM_LSP_ROOT` overrides the workspace root the client sends as `rootUri`
+    // (and uses as the server's working dir) — the knob for pointing the editor at
+    // a real project root when testing against a live server.
+    let root = std::env::temp_dir().join(format!("nxvim-lsp-root-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let record = configure_mock("ws-root", serde_json::json!({}));
+    let _env = EnvGuard::set("NXVIM_LSP_ROOT", &root);
+    let file = temp_file("ws-root", "rs", "fn main() {}\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "initialize")).await;
+    let root_uri = find(&recs, "initialize").unwrap()["params"]["rootUri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        root_uri,
+        file_uri(root.to_str().unwrap()),
+        "rootUri honors NXVIM_LSP_ROOT"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_matches_a_buffer_opened_through_a_symlink() {
+    let _guard = test_lock().lock().await;
+    // A server may canonicalize symlinks in the URI it returns (e.g. macOS
+    // `/var` → `/private/var`), so it differs from the URI we sent at `didOpen`.
+    // The apply must still match the open buffer — by canonicalized path. The
+    // buffer is opened via a symlink; the rename is keyed by the real path.
+    let real = temp_file("rename-sym-real", "rs", "foo = 1\n");
+    let link = std::env::temp_dir().join(format!("nxvim-lsp-sym-{}.rs", std::process::id()));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let record = configure_mock(
+        "rename-sym",
+        serde_json::json!({
+            "rename": ws_changes(&[(&real, vec![text_edit(0, 0, 0, 3, "bar")])])
+        }),
+    );
+    let (rpc, _incoming) = start(Some(link.to_str().unwrap().to_string())).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gg0");
+    cmd(&rpc, "LspRename bar").await;
+    wait_for_lines(&rpc, &["bar = 1"]).await;
+    let _ = std::fs::remove_file(&link);
+}

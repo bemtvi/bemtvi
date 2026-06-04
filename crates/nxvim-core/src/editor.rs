@@ -9,7 +9,7 @@ use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, EditBatch};
 use crate::highlight::Highlights;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
@@ -658,6 +658,26 @@ impl Editor {
         &mut self.buffers.get_mut(self.current).buffer
     }
 
+    /// Read-only access to buffer `id`'s text model, or `None` if no such buffer
+    /// is open — the buffer-addressed form of [`Editor::buffer`], for callers that
+    /// must read a *non-current* buffer (e.g. converting LSP positions against
+    /// each document a multi-file workspace edit touches). Mutation still goes
+    /// through [`Editor::apply_edits_to`], so this stays read-only.
+    pub fn buffer_of(&self, id: BufferId) -> Option<&Buffer> {
+        self.buffers.map.get(&id).map(|ob| &ob.buffer)
+    }
+
+    /// Drain buffer `id`'s LSP edit journal — the buffer-addressed form of the
+    /// drain `sync_lsp` does on the current buffer via `take_lsp_edits`, so the
+    /// server can flush a `didChange` for a *non-current* buffer a workspace edit
+    /// just touched. `None` if no such buffer is open.
+    pub fn take_lsp_edits_of(&mut self, id: BufferId) -> Option<EditBatch> {
+        self.buffers
+            .map
+            .get_mut(&id)
+            .map(|ob| ob.buffer.take_lsp_edits())
+    }
+
     /// The current buffer's full editor-side state (text + undo/redo + saved
     /// position). Internal helper for the undo path and switching.
     fn cur_mut(&mut self) -> &mut OpenBuffer {
@@ -894,6 +914,78 @@ impl Editor {
         self.desired_col = self.cursor_virtcol();
         self.desired_eol = false;
         self.ensure_visible();
+    }
+
+    /// Apply a batch of non-overlapping byte-range replacements to a **specific**
+    /// (possibly non-current) buffer as one independent undo step for that buffer.
+    /// The LSP-free multi-buffer sibling of [`Editor::apply_edits`]: a workspace
+    /// edit (an LSP rename / code action) touches several open buffers at once,
+    /// and each must remain independently undoable, so this snapshots and edits
+    /// `id` on its own undo history rather than the active buffer's insert group.
+    /// Edits apply highest-start-first (so an earlier offset never shifts), the
+    /// buffer is re-normalized, and the current buffer's cursor is clamped to the
+    /// new text (a non-current buffer's saved cursor is clamped when switched
+    /// back). A no-op if `id` is unknown or `edits` is empty.
+    ///
+    /// Takes plain byte ranges and text — no LSP types — keeping `nxvim-core`
+    /// LSP-free; the server converts LSP ranges to bytes (per buffer, per the
+    /// negotiated encoding) before calling.
+    pub fn apply_edits_to(
+        &mut self,
+        id: BufferId,
+        mut edits: Vec<(std::ops::Range<usize>, String)>,
+    ) {
+        if edits.is_empty() || !self.buffers.map.contains_key(&id) {
+            return;
+        }
+        self.push_undo_for(id);
+        // Highest start first: applying a later edit can't shift an earlier one.
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        for (range, text) in edits {
+            let buf = &mut self.buffers.get_mut(id).buffer;
+            let len = buf.len_bytes();
+            let start = buf.text.floor_char_boundary(range.start.min(len));
+            let end = buf.text.floor_char_boundary(range.end.min(len));
+            if start < end {
+                buf.remove(start..end);
+            }
+            if !text.is_empty() {
+                buf.insert(start, &text);
+            }
+        }
+        self.buffers.get_mut(id).buffer.normalize();
+        if id == self.current {
+            self.clamp_cursor();
+            self.desired_col = self.cursor_virtcol();
+            self.desired_eol = false;
+            self.ensure_visible();
+        }
+        // A non-current buffer's saved cursor is clamped by `enter_buffer` on the
+        // switch back, so nothing to do here.
+    }
+
+    /// Push an undo snapshot for buffer `id` (the buffer-addressed [`push_undo`],
+    /// minting a fresh sequence number) so a subsequent edit to it is a distinct,
+    /// independently-undoable step. Unlike [`Editor::push_undo`] it does not
+    /// consult `snapshot_taken` (that flag tracks the *current* buffer's insert
+    /// session); a workspace edit is a one-shot, normal-mode mutation per buffer.
+    /// The snapshot's cursor is the live cursor when `id` is current, else the
+    /// buffer's saved cursor.
+    fn push_undo_for(&mut self, id: BufferId) {
+        let (text, cursor, seq) = {
+            let ob = self.buffers.get(id);
+            let cursor = if id == self.current {
+                self.cursor
+            } else {
+                ob.saved_cursor
+            };
+            (ob.buffer.text.clone(), cursor, ob.cur_seq)
+        };
+        let ob = self.buffers.get_mut(id);
+        ob.undo_stack.push(Snapshot { text, cursor, seq });
+        ob.redo_stack.clear();
+        ob.cur_seq = ob.next_seq;
+        ob.next_seq += 1;
     }
 
     /// Resize the *text viewport*. The client owns the screen layout and tells
@@ -3742,6 +3834,14 @@ impl Editor {
     /// Whether a panel is currently open (the `nxvim_panel_is_open` query).
     pub fn panel_is_open(&self) -> bool {
         self.panel.is_some()
+    }
+
+    /// The open panel's title, or `None` if no panel is open — lets the server
+    /// recognize *which* panel a `<CR>` select came from (e.g. route a select on
+    /// the LSP code-action list to applying that action, not the generic
+    /// `on_select` path).
+    pub fn panel_title(&self) -> Option<&str> {
+        self.panel.as_ref().map(|p| p.title.as_str())
     }
 
     /// Total screen rows the panel occupies (its content plus the one title

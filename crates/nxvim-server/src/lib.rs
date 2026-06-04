@@ -11,13 +11,15 @@
 mod lsp;
 mod syntax;
 
-use lsp::{CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
+use lsp::{
+    CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime, CODE_ACTION_PANEL_TITLE,
+};
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
 use nxvim_core::{
     parse_color, parse_keys, unicode, BufferId, Editor, Key, KeyCode, Mode, PanelView,
 };
-use nxvim_lsp::{LspManager, ServerKey};
+use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
@@ -165,6 +167,14 @@ struct Server {
     /// like the diagnostics cache; projected into the `pmenu` redraw key and
     /// driven by the insert-mode key interception in [`Server::lsp_keymap`].
     completion: Option<CompletionMenu>,
+    /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
+    /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
+    /// edit; cleared on apply. Empty when no code-action panel is active.
+    lsp_code_actions: Vec<CodeActionData>,
+    /// Cache of a buffer file path → its resolved workspace root, so the
+    /// root-marker search (a filesystem walk) runs once per file rather than on
+    /// every redraw's `sync_lsp`.
+    lsp_roots: HashMap<PathBuf, PathBuf>,
     /// Whether the previous insert-mode key was a `<C-x>` armed as the prefix of
     /// the `<C-x><C-o>` omni-completion trigger. The next key resolves it (a
     /// `<C-o>` fires completion; anything else is handled normally).
@@ -207,6 +217,8 @@ where
         lsp_pending_g: false,
         completion: None,
         lsp_pending_ctrl_x: false,
+        lsp_code_actions: Vec::new(),
+        lsp_roots: HashMap::new(),
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -679,6 +691,14 @@ impl Server {
             // fire the Lua `on_select` callback. The callback may itself queue
             // commands / lua / panel ops, so this is inside the fixpoint loop.
             for (index, line) in std::mem::take(&mut self.editor.panel_selects) {
+                // The `:LspCodeAction` list (Phase 6) is a select-enabled panel:
+                // a `<CR>` on row `index` applies that action's edit, keyed to the
+                // currently-open code-action panel by title so a select on some
+                // *other* select panel can't misroute here.
+                if self.editor.panel_title() == Some(CODE_ACTION_PANEL_TITLE) {
+                    self.apply_code_action(index);
+                    continue;
+                }
                 // Navigable LSP location lists (diagnostics, references) jump in
                 // the core itself when their target line is selected, so they
                 // never reach here — only scripted/RPC select panels do.
@@ -748,6 +768,11 @@ impl Server {
             // line (the keymap-free path for `K` / `<C-k>`).
             "LspHover" => self.request_lsp(LspReqKind::Hover),
             "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp),
+            // Phase-6: buffer-mutating features. Format/code-action take no
+            // argument; rename reads the new name the dispatcher split off.
+            "LspFormat" => self.request_lsp_format(),
+            "LspRename" => self.request_lsp_rename(args),
+            "LspCodeAction" => self.request_lsp_code_action(),
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor

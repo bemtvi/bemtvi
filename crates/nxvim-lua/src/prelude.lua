@@ -501,20 +501,42 @@ local keymap_seq = 0
 
 vim.keymap = vim.keymap or {}
 
--- Normalize the `mode` argument to a list of single-char mode codes. A bare
--- string is one mode; a list passes through. (Mode-list fan-out and the v/x/o
--- equivalences are the server's job in Phase 2; Phase 1 ships single 'n' maps.)
+-- Normalize the `mode` argument to a list of mode codes. A bare string is one
+-- mode (`'n'`, `'x'`, `''` = all); a list passes through unchanged. Each code's
+-- expansion to the editor modes it covers (v/x → Visual+VisualLine, `''` → all)
+-- is the server's job — it owns the per-mode tries.
 local function keymap_modes(mode)
   if type(mode) == "table" then return mode end
   return { mode }
 end
 
+-- Expand <leader>/<localleader> in an LHS to the current mapleader/maplocalleader
+-- (vim.g.mapleader / vim.g.maplocalleader, each defaulting to "\" as in vim),
+-- matching neovim's *set-time* expansion: the leader in force when the map is
+-- defined is baked in, so a later mapleader change doesn't retroactively move it.
+-- The notation names match case-insensitively (`<Leader>` == `<leader>`). The
+-- replacement is returned from a function so gsub takes it literally (a leader
+-- like "%" or "\" is not reinterpreted as a pattern/replacement metacharacter).
+local function keymap_expand_leader(lhs)
+  local leader = vim.g.mapleader
+  if leader == nil then leader = "\\" end
+  local localleader = vim.g.maplocalleader
+  if localleader == nil then localleader = "\\" end
+  lhs = lhs:gsub("<[lL][eE][aA][dD][eE][rR]>", function() return leader end)
+  lhs = lhs:gsub("<[lL][oO][cC][aA][lL][lL][eE][aA][dD][eE][rR]>", function()
+    return localleader
+  end)
+  return lhs
+end
+
 -- vim.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
 -- `rhs` is a function (stored in vim._keymap_fns) or a string (fed as keys).
--- `opts.noremap` defaults to true (the vim.keymap.set convention); `opts.desc`
--- is stored but unused; `opts.buffer` / `opts.default` are recorded for the
--- precedence ladder the server applies (buffer-local maps and built-in defaults
--- arrive in later phases, but the fields ride along from day one).
+-- Maps are non-recursive by default (the vim.keymap.set convention); pass
+-- `opts.remap = true` for a recursive map whose RHS keys are re-fed through the
+-- mapping layer (or, equivalently, `opts.noremap = false`). `opts.desc` is stored
+-- but unused; `opts.buffer` / `opts.default` are recorded for the precedence
+-- ladder the server applies (buffer-local maps and built-in defaults arrive in
+-- later phases, but the fields ride along from day one).
 function vim.keymap.set(mode, lhs, rhs, opts)
   opts = opts or {}
   keymap_seq = keymap_seq + 1
@@ -529,9 +551,10 @@ function vim.keymap.set(mode, lhs, rhs, opts)
   vim._keymaps[#vim._keymaps + 1] = {
     id = id,
     modes = keymap_modes(mode),
-    lhs = lhs,
+    lhs = keymap_expand_leader(lhs),
     rhs = rhs_data,
-    noremap = opts.noremap ~= false, -- absent → noremap, matching vim.keymap.set
+    -- noremap unless either `noremap = false` or `remap = true` is given.
+    noremap = opts.noremap ~= false and not opts.remap,
     buffer = opts.buffer,
     desc = opts.desc,
     default = opts.default or false,

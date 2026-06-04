@@ -1,8 +1,9 @@
 # Keymap (`vim.keymap` / `:map`) — design & phased implementation plan
 
 **Date:** 2026-06-04
-**Status:** **Phase 1 implemented** on `main` (the matcher + normal-mode
-`vim.keymap.set`, global, `noremap`); Phases 2–4 and the backport remain planned.
+**Status:** **Phases 1–2 implemented** on `main` (the matcher + normal-mode
+`vim.keymap.set`, global; recursive `remap`, `<leader>`, mode-lists, and Visual
+maps); Phases 3–4 and the backport remain planned (`omap` deferred — see Phase 2).
 Foundation work for **`main`**, deliberately independent of — and unaware of — the
 LSP feature. **Implemented on `main` first** (it has no LSP
 dependency), then **backported to `feature/lsp-integration`**, where it subsumes
@@ -356,7 +357,31 @@ three gates are green.
 
 ---
 
-### Phase 2 — remap feeding, `<leader>`, and the visual/operator modes
+### Phase 2 — remap feeding, `<leader>`, and the visual/operator modes — ✅ implemented
+
+> **Landed.** Recursive (`remap`) RHS, `<leader>`/`<localleader>` expansion, mode
+> **lists**, and Visual-mode (`v`/`x`) maps. `opts.remap = true` (or
+> `opts.noremap = false`) marks a map recursive; its RHS keys are re-fed *through*
+> the matcher (`Keymaps::fire` → `feed_key`), bounded by a **shared** re-feed budget
+> (`MAX_MAP_DEPTH`, vim's `maxmapdepth`) reset once per real keystroke — a shared
+> budget, not a per-branch depth, so a fan-out cycle (`a`→`bb`, `b`→`a`) stays
+> linear instead of exploding; at the cap the remaining keys fall through as a
+> literal feed. `<leader>` is expanded from `vim.g.mapleader` (default `\`) at
+> set-time in `prelude.lua` (`keymap_expand_leader`). A declared map-mode now
+> fans out to the editor-mode tries it covers via `keymap::mode_buckets`
+> (`'v'`/`'x'` → Visual + Visual-Line, `''` → normal + visual). The matcher also
+> now re-processes the ambiguous *remainder* after firing a shorter map (Phase 1
+> replayed it raw). Covered by the Phase 2 block in `tests/keymaps.rs`.
+>
+> **`omap` deferred (the decision this phase owed).** nxvim still has no
+> operator-pending *mode* — a pending operator lives in private `editor.operator`
+> while `editor.mode == Normal`, so there is no trie the matcher could select by.
+> `mode_buckets("o")` therefore maps to nothing and `''` expands to normal+visual
+> only (vim's n+v+o minus the unreachable `o`). The normal-trie replay path already
+> preserves `d{motion}`/`dgg` (the operator is core state the replayed keys feed),
+> so no fidelity is lost for the mappings real configs use; a true `omap` trie
+> awaits a small pure-core accessor for the pending operator and is left to a later
+> phase / on-demand.
 
 **Goal / value.** Complete normal-family mapping fidelity: recursive (`remap`) RHS,
 `<leader>` expansion, mode **lists**, and the Visual / Operator-pending modes real

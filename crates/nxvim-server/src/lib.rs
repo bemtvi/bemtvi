@@ -439,8 +439,11 @@ impl Server {
                 self.apply_lua_effects();
             }
             MappingRhs::Keys(keys, _noremap) => {
-                // Phase 1: `noremap` only — fed straight to the editor, bypassing
-                // the trie (no re-mapping). Recursive remap feeding is Phase 2.
+                // A string RHS that reaches the server is fed straight to the
+                // editor, bypassing the trie. The matcher only hands these over
+                // for the non-remapping cases: a `noremap` RHS, or a `remap` RHS
+                // that exhausted its re-feed budget (recursive remap expansion
+                // happens inside the matcher's `feed`, never here).
                 for key in keys {
                     self.editor.input(key);
                     self.emit_lifecycle_events();

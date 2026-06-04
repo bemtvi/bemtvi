@@ -256,3 +256,118 @@ async fn last_set_mapping_wins() {
         "the later mapping shadows the earlier"
     );
 }
+
+// ----- Phase 2: remap, <leader>, and the visual modes -----------------------
+
+/// `<leader>` in the LHS is expanded from `vim.g.mapleader` at set-time. With the
+/// leader a space, `<leader>w` fires on `<Space>w`.
+#[tokio::test]
+async fn leader_is_expanded_at_set_time() {
+    let dir = temp_dir("keymap_leader");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.g.mapleader = ' '\n\
+         vim.keymap.set('n', '<leader>w', function() print('LEAD') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]); // barrier: drains the insert redraws
+    let redraw = redraw_after(&rpc, &mut incoming, "<Space>w").await;
+    assert_eq!(message(&redraw), "LEAD", "<leader>w fired on <Space>w");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "the keys didn't reach core"
+    );
+}
+
+/// A `remap` string RHS is re-fed *through the matcher*, so its keys trigger
+/// further mappings: `a` → `b` (remap) reaches `b`'s function. (`noremap` would
+/// instead feed a literal `b` to the editor and never see `b`'s map.)
+#[tokio::test]
+async fn remap_rhs_chains_through_another_mapping() {
+    let dir = temp_dir("keymap_remap");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'a', 'b', { remap = true })\n\
+         vim.keymap.set('n', 'b', function() print('VIA_B') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]); // barrier: drains the insert redraws
+    let redraw = redraw_after(&rpc, &mut incoming, "a").await;
+    assert_eq!(message(&redraw), "VIA_B", "a remapped to b reached b's fn");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "a never entered insert; b never reached the editor"
+    );
+}
+
+/// A self-referential `remap` map terminates at the depth cap instead of looping:
+/// `x` → `x` (remap) exhausts its re-feed budget and then falls through to a
+/// literal `x`, which deletes one char. The test completing at all proves it
+/// didn't hang.
+#[tokio::test]
+async fn self_referential_remap_terminates() {
+    let dir = temp_dir("keymap_cycle");
+    let (rpc, _incoming) =
+        start_with_config(&dir, "vim.keymap.set('n', 'x', 'x', { remap = true })\n").await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // `x` loops x→x until the budget runs out, then feeds one literal x: 'h' gone.
+    feed(&rpc, "x");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["ello"],
+        "the cycle bottomed out in a single literal x (one char deleted)"
+    );
+}
+
+/// A mode *list* maps in every listed mode: `{ 'n', 'v' }` fires both in Normal
+/// and after entering Visual with `v`.
+#[tokio::test]
+async fn mode_list_maps_in_each_mode() {
+    let dir = temp_dir("keymap_modelist");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set({ 'n', 'v' }, '<Space>m', function() print('MULTI') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]); // barrier: drains the insert redraws
+    let normal = redraw_after(&rpc, &mut incoming, "<Space>m").await;
+    assert_eq!(message(&normal), "MULTI", "fired in normal mode");
+
+    // `v` enters Visual; the same map fires there too.
+    let visual = redraw_after(&rpc, &mut incoming, "v<Space>m").await;
+    assert_eq!(message(&visual), "MULTI", "fired in visual mode");
+}
+
+/// An `x`-mode map is Visual-only: it fires once Visual is entered, and a plain
+/// Normal-mode press of the same key does not fire it.
+#[tokio::test]
+async fn visual_only_map_does_not_fire_in_normal() {
+    let dir = temp_dir("keymap_xmode");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('x', 'U', function() print('XU') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]); // barrier: drains the insert redraws
+
+    // In Normal, `U` is not an x-mode match — it must not fire the mapping.
+    let normal = redraw_after(&rpc, &mut incoming, "U").await;
+    assert_ne!(message(&normal), "XU", "x-mode map must not fire in normal");
+
+    // Enter Visual with `v`, then `U` fires.
+    let visual = redraw_after(&rpc, &mut incoming, "vU").await;
+    assert_eq!(message(&visual), "XU", "x-mode map fired in visual");
+}

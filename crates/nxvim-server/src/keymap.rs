@@ -31,9 +31,10 @@ pub enum MappingRhs {
     /// A Lua function RHS, keyed by id in `vim._keymap_fns`; the server runs it
     /// via `LuaRuntime::run_keymap` and folds in the effects.
     Lua(u64),
-    /// A string RHS already parsed to keys, with its `noremap` flag. Phase 1
-    /// only feeds `noremap` RHSs straight to the editor; recursive (remap)
-    /// feeding through the matcher is Phase 2.
+    /// A string RHS already parsed to keys, with its `noremap` flag. A `noremap`
+    /// RHS is fed straight to the editor (bypassing the trie); a remap RHS is
+    /// re-fed *through the matcher* so its keys can themselves trigger mappings
+    /// (see [`Keymaps::fire`], bounded by the `remap_budget`).
     Keys(Vec<Key>, bool),
 }
 
@@ -128,12 +129,25 @@ pub struct Keymaps {
     /// `vim._keymaps_version` the tries were last compiled from. The server
     /// rebuilds only when the live version advances (checked once per batch).
     pub version: u64,
-    /// Per-mode tries, keyed by mode code (`'n'`, `'i'`, …).
+    /// Per-mode tries, keyed by the editor-mode code the matcher selects them by
+    /// (`mode_key`: `'n'`, `'i'`, `'v'`, `'V'`, …). A map's declared mode expands
+    /// to one or more of these buckets at build time (see [`mode_buckets`]).
     tries: HashMap<char, Trie>,
     /// Keys withheld as a live prefix, awaiting the key that extends, completes,
     /// or breaks them. Persists across batches (no auto-flush — design D4).
     pending: Vec<Key>,
+    /// Remaining recursive-`remap` re-feeds for the current keystroke (vim's
+    /// `maxmapdepth`). Reset at the top of every [`feed`](Keymaps::feed) and
+    /// decremented on each remap expansion, so a self-referential map (`a`→`a`,
+    /// or `a`↔`b`) runs out of budget and falls through to a literal key instead
+    /// of looping. It is a *shared* budget across the whole expansion tree, not a
+    /// per-branch depth, so a fan-out remap (`a`→`bb`, `b`→`a`) stays linear.
+    remap_budget: usize,
 }
+
+/// The recursive-remap re-feed cap (vim's `maxmapdepth` is 1000; a smaller cap is
+/// plenty — it only has to break self-referential maps cleanly).
+const MAX_MAP_DEPTH: usize = 100;
 
 impl Keymaps {
     /// (Re)compile the per-mode tries from a registry snapshot. Entries are
@@ -157,11 +171,12 @@ impl Keymaps {
                 RawRhs::Str(s) => MappingRhs::Keys(parse_keys(&s), entry.noremap),
             };
             for mode in &entry.modes {
-                // Phase 1 stores maps under their raw single-char mode code; the
-                // mode-list fan-out and the v/x/o equivalences are Phase 2.
-                if let Some(code) = mode.chars().next() {
+                // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out
+                // to the editor-mode tries it covers — `'v'` lands in both the
+                // Visual and Visual-Line tries, `''` in normal+visual, etc.
+                for &bucket in mode_buckets(mode) {
                     self.tries
-                        .entry(code)
+                        .entry(bucket)
                         .or_default()
                         .insert(&lhs, rhs.clone());
                 }
@@ -172,6 +187,9 @@ impl Keymaps {
     /// Feed one input key in `mode` and return the steps it produced. The server
     /// calls this for every parsed key, executing the steps in order.
     pub fn feed(&mut self, mode: Mode, key: Key) -> Vec<Step> {
+        // Fresh remap budget per real keystroke (vim resets `maxmapdepth` once a
+        // typed char is consumed; a keystroke is exactly that boundary).
+        self.remap_budget = MAX_MAP_DEPTH;
         let mut steps = Vec::new();
         self.feed_key(mode, key, &mut steps);
         steps
@@ -192,7 +210,7 @@ impl Keymaps {
             Classify::Prefix => {} // hold: wait for the next key
             Classify::Complete(rhs) => {
                 self.pending.clear();
-                steps.push(Step::Fire(rhs));
+                self.fire(mode, rhs, steps);
             }
             Classify::None => {
                 // This key broke every live prefix. Resolve the previously
@@ -203,31 +221,75 @@ impl Keymaps {
                     // The key on its own starts no mapping: straight to the editor.
                     steps.push(Step::Editor(key));
                 } else {
-                    self.resolve_buffered(mode_key, &buffered, steps);
+                    self.resolve_buffered(mode, &buffered, steps);
                     self.feed_key(mode, key, steps);
                 }
             }
         }
     }
 
+    /// Execute a fired mapping. A `remap` string RHS is re-fed key-by-key *through
+    /// the matcher* so its keys can themselves trigger further mappings, bounded by
+    /// the shared `remap_budget` so a self-referential map terminates (at the cap
+    /// the remaining keys fall through as a literal feed). Everything else — a
+    /// `noremap` string RHS, a Lua function, a future native action — is handed to
+    /// the server as a [`Step::Fire`] (a `noremap` RHS the server feeds straight to
+    /// the editor; a Lua/native RHS it invokes).
+    fn fire(&mut self, mode: Mode, rhs: MappingRhs, steps: &mut Vec<Step>) {
+        match rhs {
+            MappingRhs::Keys(keys, false) if self.remap_budget > 0 => {
+                self.remap_budget -= 1;
+                for key in keys {
+                    self.feed_key(mode, key, steps);
+                }
+            }
+            other => steps.push(Step::Fire(other)),
+        }
+    }
+
     /// Resolve a run of buffered keys that no longer extends any mapping: fire the
     /// longest complete mapping that prefixes them (the ambiguous shorter map),
-    /// then replay the remainder to the editor; with no complete prefix, replay
-    /// them all (the withheld keys were not a mapping). Phase 1 replays the
-    /// remainder raw — re-feeding it through the matcher is part of remap (Phase 2).
-    fn resolve_buffered(&mut self, mode_key: char, buffered: &[Key], steps: &mut Vec<Step>) {
-        match self.tries[&mode_key].longest_complete(buffered) {
+    /// then re-process the remainder through the matcher (it follows a completed
+    /// map and may itself begin a new one — strictly shorter than `buffered`, so
+    /// this terminates). With no complete prefix the withheld keys were not a
+    /// mapping at all: replay them to the editor raw (re-feeding them would just
+    /// re-withhold the same live prefix and loop).
+    fn resolve_buffered(&mut self, mode: Mode, buffered: &[Key], steps: &mut Vec<Step>) {
+        match self.tries[&mode_key(mode)].longest_complete(buffered) {
             Some((rhs, used)) => {
-                steps.push(Step::Fire(rhs));
-                steps.extend(buffered[used..].iter().copied().map(Step::Editor));
+                self.fire(mode, rhs, steps);
+                for &key in &buffered[used..] {
+                    self.feed_key(mode, key, steps);
+                }
             }
             None => steps.extend(buffered.iter().copied().map(Step::Editor)),
         }
     }
 }
 
-/// The trie key for an editor mode — the first char of its `mode()` short code
-/// (`Normal` → `'n'`, `Insert` → `'i'`, …).
+/// The trie key the matcher selects for the *current editor mode* — the first
+/// char of its `mode()` short code (`Normal` → `'n'`, `Insert` → `'i'`,
+/// `Visual` → `'v'`, `VisualLine` → `'V'`, `Command` → `'c'`). Paired with
+/// [`mode_buckets`], which decides which of these tries a declared map lands in.
 fn mode_key(mode: Mode) -> char {
     mode.short_code().chars().next().unwrap_or('n')
+}
+
+/// The editor-mode trie buckets a declared map-mode code lands in — the build-time
+/// counterpart of [`mode_key`]. A `'v'`/`'x'` map covers both Visual and
+/// Visual-Line (nxvim has no Select mode, so they coincide); `''` (vim's `:map`)
+/// covers normal + visual. Operator-pending (`'o'`) is **deferred**: nxvim has no
+/// operator-pending *mode* (a pending operator lives in private core state while
+/// `editor.mode == Normal`), so there is no trie to select it by — the normal-trie
+/// replay path already preserves `d{motion}`/`dgg`, and a true `omap` trie awaits a
+/// core accessor for the pending operator. An unknown code maps to nothing.
+fn mode_buckets(code: &str) -> &'static [char] {
+    match code {
+        "n" => &['n'],
+        "i" => &['i'],
+        "c" => &['c'],
+        "v" | "x" => &['v', 'V'],
+        "" => &['n', 'v', 'V'],
+        _ => &[],
+    }
 }

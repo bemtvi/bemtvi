@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–6 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions); Phase 7 (`vim.lsp.*` Lua surface, driven by the real nvim-lspconfig) planned — split into **7a** (config framework + attach lifecycle) and **7b** (Lua entry points), and gated on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md).
+**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b** (the `vim.lsp.buf.*` / `vim.diagnostic.*` Lua entry points) is next. 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md). *(One human step remains for 7a: add the `vendor/nvim-lspconfig` submodule — see the Phase 7a notes — to run the `lspconfig.rs` end-to-end test, which skips until then.)*
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -1333,7 +1333,69 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 
 ---
 
-#### Phase 7a — config framework + attach lifecycle
+#### Phase 7a — config framework + attach lifecycle — ✅ DONE
+
+> **Implementation notes (as built).** Faithful to the plan; choices worth
+> recording:
+> - **`LspOp::Start` is the new queue**, the LSP analogue of `PanelOp`: a
+>   `vim.lsp.start` (Rust `vim._lsp_start`) pushes `{name, cmd, root, filetype,
+>   bufnr}` into `nxvim-lua`'s `Shared`; the server drains it in `apply_lua_effects`
+>   (right after panel ops) into `Server::apply_lsp_op`, which ensures the
+>   `(name, root)` client and binds the buffer. The whole start path is one more
+>   effect on the existing "Lua queues, server applies" flow.
+> - **`sync_lsp` is now sync-only.** It no longer spawns: it acts only on buffers a
+>   `vim.lsp.start` already bound (`state.server`), sending `didOpen`/`didChange`/
+>   `didSave` exactly as before. The built-in `filetype→cmd` table,
+>   `workspace_root`/`find_root_marker`/`lsp_root_for`, the `lsp_roots` cache, and
+>   the redraw-loop auto-spawn are **gone**. `$NXVIM_LSP_CMD` (override the argv —
+>   the mock hook) and `$NXVIM_LSP_ROOT` (override the resolved root) survive as the
+>   only env hooks, applied in `apply_lsp_op`.
+> - **The `languageId` is carried, not re-derived.** `LspDocState` gained a
+>   `language_id` (the buffer's filetype, set when the dispatcher binds the buffer)
+>   used verbatim for `didOpen` — the server no longer calls `filetype_of` in sync.
+> - **`ServerKey.language: &'static str` → `name: String`** (arbitrary user config
+>   names). The buffer round-trips its `BufferId` as the dispatcher's `args.buf`
+>   (the server snapshots `buf.0` before firing `FileType`), so `LspOp::Start.bufnr`
+>   maps straight back to the `BufferId` to bind.
+> - **Root is resolved in Lua, never re-resolved in Rust.** `vim.fs.root`
+>   (supporting nested equal-priority marker groups, the Neovim 0.11 shape) walks
+>   `root_markers` from the buffer's directory; a `function(bufnr, on_dir)`
+>   root_dir drives the start through its `on_dir` callback (so it can decline). The
+>   server takes the resolved string as-is (falling back to the file's directory, or
+>   `$NXVIM_LSP_ROOT`).
+> - **Supporting `vim.*` surface** (prelude, pure Lua over Rust primitives):
+>   `vim.fs.root/find/dirname/basename/parents/joinpath/normalize`, `vim.uri_from_fname/
+>   uri_to_fname/uri_from_bufnr`, `vim.fn.getcwd/bufname/fnamemodify`,
+>   `vim.lsp.protocol.make_client_capabilities` (stub — caps stay Rust-owned),
+>   `vim.validate`/`vim.deprecate` (no-ops). Rust-backed: `nvim_get_runtime_file`
+>   (runtimepath `lsp/` discovery, single-`*` glob), `vim._read_file`/`vim._readdir`.
+> - **`vim.lsp.config` is a `setmetatable` table:** `__call` merges a user override,
+>   `__index` returns the resolved chain (`'*'` ← `lsp/<name>.lua` runtimepath base
+>   ← user override, via `tbl_deep_extend('force', …)`), `__newindex` redefines
+>   (replaces the override and drops the base). `vim.lsp.enable` installs **one**
+>   shared `FileType` autocmd (augroup `nxvim.lsp.enable`) that, per opened buffer,
+>   starts every enabled config whose resolved `filetypes` matches.
+> - **Tests.** All 40 Phase 1–6 LSP tests migrate to the Lua start path with **no**
+>   per-test change beyond the harness: the `start` helper now sources a temp
+>   `init.lua` (`vim.lsp.config('mock', {cmd=…, filetypes={'rust',…}})` +
+>   `vim.lsp.enable('mock')`); the mock command is still injected via
+>   `$NXVIM_LSP_CMD`. Because auto-spawn is gone, every passing `didOpen`/feature
+>   assertion now *proves* the framework drove the start. The `:LspInfo` server name
+>   is the config name (`mock`) rather than the filetype. A new
+>   `crates/nxvim/tests/lspconfig.rs` runs the **real** vendored
+>   `lsp/lua_ls.lua` (pure `root_markers`, no `vim.system`/`cargo metadata`): it
+>   enables `lua_ls`, opens a `.lua` file under a temp project with a `.luarc.json`
+>   marker one dir up, and asserts `initialize` (with the **real** resolved root) →
+>   `didOpen` (languageId `lua`) → diagnostics. It **skips cleanly** when
+>   `vendor/nvim-lspconfig` isn't checked out.
+>
+> **Pending (needs a human action):** the `vendor/nvim-lspconfig` git submodule
+> itself is **not** added — the agent's `git submodule add` was declined as it
+> stages third-party code for execution. Add it to exercise `lspconfig.rs`:
+> `git submodule add https://github.com/neovim/nvim-lspconfig vendor/nvim-lspconfig`
+> (mirrors the existing `vendor/neovim`). The `vim.fs.root`/`vim.fn.has` surface was
+> written against the current `lsp/lua_ls.lua`, but the end-to-end run is unverified
+> until the submodule lands.
 
 **Goal.** A server starts *only* when user Lua calls `vim.lsp.enable` and a matching
 file opens; the real vendored `lsp/{rust_analyzer,gopls,pyright,lua_ls}.lua` load,

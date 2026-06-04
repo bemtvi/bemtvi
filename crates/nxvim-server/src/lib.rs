@@ -11,7 +11,7 @@
 mod lsp;
 mod syntax;
 
-use lsp::{LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
+use lsp::{CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
 use nxvim_core::{
@@ -161,6 +161,14 @@ struct Server {
     /// LSP normal-mode keymap (`gd`/`gD`/`gr`). The next key resolves it; a
     /// non-LSP key replays the withheld `g` so `gg`/`ge`/… still work.
     lsp_pending_g: bool,
+    /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
+    /// like the diagnostics cache; projected into the `pmenu` redraw key and
+    /// driven by the insert-mode key interception in [`Server::lsp_keymap`].
+    completion: Option<CompletionMenu>,
+    /// Whether the previous insert-mode key was a `<C-x>` armed as the prefix of
+    /// the `<C-x><C-o>` omni-completion trigger. The next key resolves it (a
+    /// `<C-o>` fires completion; anything else is handled normally).
+    lsp_pending_ctrl_x: bool,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -197,6 +205,8 @@ where
         lsp_req_gen: 0,
         lsp_requests: HashMap::new(),
         lsp_pending_g: false,
+        completion: None,
+        lsp_pending_ctrl_x: false,
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -419,19 +429,20 @@ impl Server {
     }
 
     /// The built-in LSP keymaps: `gd` go-to-definition, `gD` go-to-declaration,
-    /// `gr` references, `K` hover (all normal mode), and `<C-k>` signature help
-    /// (insert mode). Returns `true` when the key was consumed as (part of) a
-    /// mapping and must not reach the editor.
+    /// `gr` references, `K` hover (all normal mode); the completion popup and its
+    /// `<C-x><C-o>` / `<C-Space>` triggers, plus `<C-k>` signature help (insert
+    /// mode). Returns `true` when the key was consumed as (part of) a mapping and
+    /// must not reach the editor.
     ///
     /// `g` is a two-key prefix, so it is withheld and the next key decides: an
     /// LSP letter fires the request; anything else replays the withheld `g`
     /// (then the caller feeds the current key), so `gg`/`ge`/… are untouched.
     /// `g`/`K` are only armed in plain normal mode, leaving insert-mode text and
     /// visual-mode `g`/`K` alone; operator-pending also reports `Normal`, but its
-    /// non-LSP second key takes the replay path, preserving `dgg` & co. `<C-k>`
-    /// fires only in insert mode (where it would otherwise insert a literal `k`),
-    /// the manual signature-help trigger. (Revisited once `vim.keymap` lands in
-    /// Phase 7.)
+    /// non-LSP second key takes the replay path, preserving `dgg` & co. The
+    /// insert-mode arm ([`Server::completion_insert_key`]) owns the popup; `<C-k>`
+    /// fires signature help (where it would otherwise insert a literal `k`).
+    /// (Revisited once `vim.keymap` lands in Phase 7.)
     fn lsp_keymap(&mut self, key: Key) -> bool {
         if self.lsp_pending_g {
             self.lsp_pending_g = false;
@@ -456,6 +467,13 @@ impl Server {
                 }
             }
         }
+        // Insert-mode completion: the triggers and, while the popup is open, its
+        // navigation / accept / dismiss / live-refresh keys (Phase 5). A "passes
+        // through" key (e.g. `<C-k>`, a non-word char) closes the menu here and
+        // falls through to take its normal effect below.
+        if self.editor.mode == Mode::Insert && self.completion_insert_key(key) {
+            return true;
+        }
         if self.editor.mode == Mode::Normal {
             match key.as_char() {
                 Some('g') => {
@@ -476,6 +494,105 @@ impl Server {
             return true;
         }
         false
+    }
+
+    /// Insert-mode completion key handling (Phase 5): the omni triggers
+    /// (`<C-x><C-o>` / `<C-Space>`) and, while the popup is open, its keys.
+    /// Returns `true` when the key is consumed; `false` lets it fall through to
+    /// the rest of [`Server::lsp_keymap`] and the editor (e.g. `<C-k>`, or a plain
+    /// character typed with no menu open).
+    fn completion_insert_key(&mut self, key: Key) -> bool {
+        // `<C-x>` arms the omni-completion prefix; a following `<C-o>` triggers.
+        if self.lsp_pending_ctrl_x {
+            self.lsp_pending_ctrl_x = false;
+            if key.ctrl && key.code == KeyCode::Char('o') {
+                self.request_lsp(LspReqKind::Completion);
+                return true;
+            }
+            // Not `<C-o>`: the `<C-x>` is dropped; handle `key` normally below.
+        }
+        // While the popup is open, route its keys. A key it doesn't claim closes
+        // the menu and returns `false`, so it falls through to act normally.
+        if self.completion_menu_open() && self.completion_menu_key(key) {
+            return true;
+        }
+        // Triggers — only with no menu open (a passthrough above just closed one).
+        if !self.completion_menu_open() {
+            if key.ctrl && key.code == KeyCode::Char(' ') {
+                self.request_lsp(LspReqKind::Completion);
+                return true;
+            }
+            if key.ctrl && key.code == KeyCode::Char('x') {
+                self.lsp_pending_ctrl_x = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handle one key while the completion popup is open. Returns `true` when the
+    /// key is consumed (navigation, accept, refresh); `false` after **closing**
+    /// the menu, so the caller lets the key take its normal effect (`<Esc>` also
+    /// leaves insert, a non-word char is inserted, `<C-k>` fires signature help).
+    /// A word character or backspace is applied to the editor first, then the menu
+    /// re-ranks (or re-requests) against the new prefix in place.
+    fn completion_menu_key(&mut self, key: Key) -> bool {
+        if key.ctrl {
+            return match key.code {
+                KeyCode::Char('n') => {
+                    self.lsp_menu_move(1);
+                    true
+                }
+                KeyCode::Char('p') => {
+                    self.lsp_menu_move(-1);
+                    true
+                }
+                KeyCode::Char('y') => {
+                    self.lsp_menu_accept();
+                    true
+                }
+                KeyCode::Char('e') => {
+                    self.lsp_menu_close();
+                    true
+                }
+                // Any other ctrl key (e.g. `<C-k>`): dismiss, then let it act.
+                _ => {
+                    self.lsp_menu_close();
+                    false
+                }
+            };
+        }
+        match key.code {
+            KeyCode::Down => {
+                self.lsp_menu_move(1);
+                true
+            }
+            KeyCode::Up => {
+                self.lsp_menu_move(-1);
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.lsp_menu_accept();
+                true
+            }
+            // A word character or backspace edits the buffer, then refreshes the
+            // menu against the new prefix (the editor inserts/deletes first).
+            KeyCode::Backspace => {
+                self.editor.input(key);
+                self.lsp_menu_after_edit();
+                true
+            }
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '_' => {
+                self.editor.input(key);
+                self.lsp_menu_after_edit();
+                true
+            }
+            // `<Esc>` and any other key dismiss the menu, then take normal effect.
+            _ => {
+                self.lsp_menu_close();
+                false
+            }
+        }
     }
 
     fn run_command(&mut self, cmd: &str) {
@@ -764,6 +881,10 @@ impl Server {
             Some(p) => project_panel(p),
             None => Value::Nil,
         };
+        // The insert-mode completion popup, `Nil` when none is open. The text
+        // area width (frame minus the number gutter) bounds the overlay so it
+        // can't spill past the editable region.
+        let pmenu = self.pmenu_value(&view, w.saturating_sub(view.number_width));
 
         // Built last: every `highlights`/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
@@ -820,6 +941,7 @@ impl Server {
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
             (Value::from("panel"), panel),
+            (Value::from("pmenu"), pmenu),
         ];
 
         self.rpc.notify("redraw", vec![Value::Map(map)]);

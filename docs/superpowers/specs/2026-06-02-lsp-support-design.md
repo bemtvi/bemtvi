@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–4 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help); Phases 5–7 planned (**Phase 5 plan refined 2026-06-03** — ordering-by-importance and a stay-open, live-refreshing menu are now in scope, with tests; see its section).
+**Status:** In progress — **Phases 1–5 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing); Phases 6–7 planned.
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -773,7 +773,69 @@ exist); markdown styling beyond plain text.
 
 ---
 
-### Phase 5 — Completion (the popup menu)
+### Phase 5 — Completion (the popup menu) — ✅ DONE
+
+> **Implementation notes (as built).** Faithful to the refined plan; choices
+> worth recording:
+> - **The `pmenu` redraw key + a bordered ratatui overlay.** A new top-level
+>   `pmenu` redraw key — `Nil` when closed, else `{items, selected, row, col,
+>   width, height}` — projected each frame the way `diagnostics`/`panel` are.
+>   `items` are `[label, kind, detail]` tuples (the ranked, filtered visible set);
+>   `selected` is `Nil` until the user navigates; `row`/`col` anchor the box one
+>   row below the cursor at the **word-start screen column** (`col` reuses
+>   `cursor_screen_col`'s `virtcol` math, so no core change — the client adds the
+>   number gutter). The TUI draws a `Borders::ALL` box (`Clear`ed first so it's
+>   opaque), the selected row reverse-highlighted, **last** so it floats over the
+>   text. The box flips above the cursor when there's no room below, and the list
+>   scrolls to keep the selection visible. The `kind`/`detail` ride the protocol
+>   but the minimal widget paints the label only (a kind icon is a follow-up).
+> - **Reuses the Phase-3 token plumbing.** `LspRequest::Completion` /
+>   `LspReply::Completion { is_incomplete, items }` ride the same
+>   `ReqToken`/generation path and per-`LspReqKind` pending slot as goto/hover —
+>   so re-requests supersede by generation and a stale reply is dropped. The
+>   manager distills `CompletionItem[]`/`CompletionList` to a flat
+>   `Vec<CompletionItemData>` (label, kind, detail, sort/filter/insert text, and
+>   the `textEdit`/`additionalTextEdits` normalized to plain `TextEdit`s with
+>   ranges **still in the negotiated encoding** for the editor to convert).
+> - **Completion is the one reply that follows the moving cursor.** Unlike
+>   goto/hover (dropped on a cursor move), a completion reply is dropped only on a
+>   **buffer change** — the menu tracks the cursor as you type, so each keystroke
+>   may re-request without the in-flight reply being discarded. It is also dropped
+>   if the user has left insert mode by the time it lands (the menu is unwanted).
+> - **Ordering is a deterministic tier sort.** Per item, a match tier — `0` exact,
+>   `1` case-sensitive prefix, `2` case-insensitive prefix, `3` case-insensitive
+>   subsequence, else **dropped** — then `(tier, sortText‖label, label)` ascending.
+>   An empty prefix keeps everything at tier ≤ 1, so a just-triggered menu shows
+>   the whole list in `sortText` order. (Advanced fuzzy scoring stays out.)
+> - **Stay-open refresh.** A word char / `<BS>` while open edits the buffer first,
+>   then re-ranks **in place**: a *complete* list refilters the cache client-side
+>   (no request); an *incomplete* one fires a fresh request and keeps the current
+>   items showing until the reply re-ranks them — so the `pmenu` key never goes
+>   `Nil` mid-refresh. The menu closes on a non-word char, the cursor leaving the
+>   word, leaving insert, or a complete list filtering to empty.
+> - **Accept = a shared edit applier in core.** A new **LSP-free**
+>   `Editor::apply_edits(edits, cursor_byte)` applies non-overlapping byte-range
+>   replacements highest-start-first (so earlier offsets stay valid), `normalize`s,
+>   and sets the cursor — **one undo step** that folds into the surrounding insert
+>   block (so a single `u` reverts the accept *and* the typed prefix, as in vim).
+>   The server converts the item's edit ranges (encoding-aware), computes the final
+>   cursor as "end of the primary insertion, shifted by edits before it", and calls
+>   it. Phase 6 generalizes the same applier to `WorkspaceEdit`.
+> - **Keys, in the server (core stays LSP-free).** The insert-mode arm of
+>   `lsp_keymap` owns the popup: `<C-x><C-o>` (a `<C-x>`-armed two-key prefix) and
+>   `<C-Space>` trigger; while open, `<C-n>`/`<C-p>`/`<Down>`/`<Up>` navigate,
+>   `<CR>`/`<Tab>`/`<C-y>` accept, `<Esc>`/`<C-e>` dismiss (`<Esc>` also leaves
+>   insert), a word char / `<BS>` refreshes, and any other key dismisses then takes
+>   its normal effect (so `<C-k>` signature help still fires after closing).
+> - **Mock** gained `completion` (one scripted response for every request) and
+>   `completion_sequence` (one response **per request**, for the re-request path).
+>   Tests (in `crates/nxvim/tests/lsp.rs`) cover the headline ordering (`use nv` →
+>   `nva`,`nvb`, one request), `sortText`-over-label ranking with a subsequence
+>   tail, the `isIncomplete` live re-request (menu stays open, second request,
+>   narrowed items), accept replacing the prefix + applying an `additionalTextEdit`
+>   with single-undo, navigate/dismiss leaking no literal char, a Tier-2 bordered
+>   paint, a utf-16 `textEdit` landing at the right byte past `é`, and a
+>   never-blocks resilience check.
 
 > **Plan refined 2026-06-03.** Two behaviors the original phase under-specified
 > are now first-class, each with tests that pin it: the menu is **ordered by

@@ -1124,3 +1124,466 @@ async fn ctrl_k_shows_signature_help_with_the_active_parameter() {
         "<C-k> did not insert a literal k"
     );
 }
+
+// ----- Phase 5: completion (the popup menu) ----------------------------------
+
+/// The `pmenu` redraw key as `(labels, selected)`, or `None` when no popup is
+/// open (the key is `Nil`). `selected` is `-1` until the user navigates.
+fn pmenu_of(params: &[Value]) -> Option<(Vec<String>, i64)> {
+    let Value::Map(map) = params.first()? else {
+        return None;
+    };
+    let pmenu = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("pmenu"))?
+        .1
+        .clone();
+    let Value::Map(pm) = pmenu else {
+        return None; // Nil ⇒ no popup
+    };
+    let get = |key: &str| {
+        pm.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v)
+    };
+    let labels = get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| it.as_array()?.first()?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let selected = get("selected").and_then(Value::as_i64).unwrap_or(-1);
+    Some((labels, selected))
+}
+
+/// Drain every buffered `redraw` (oldest first), returning their params — so a
+/// test can assert the popup never closed *between* keystrokes, not just at the
+/// end.
+fn drain_all_redraws(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "redraw" {
+            out.push(params);
+        }
+    }
+    out
+}
+
+/// Poll until a redraw whose `pmenu` satisfies `pred` arrives, returning it.
+async fn wait_for_pmenu_where(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    pred: impl Fn(&(Vec<String>, i64)) -> bool,
+) -> Vec<Value> {
+    for _ in 0..60 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if pmenu_of(&params).as_ref().is_some_and(&pred) {
+                return params;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the completion popup never reached the expected state");
+}
+
+/// Poll until the completion popup is open, returning that redraw's params.
+async fn wait_for_pmenu(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Vec<Value> {
+    wait_for_pmenu_where(rpc, incoming, |_| true).await
+}
+
+/// Poll until the popup's item labels equal `want`, asserting it stays open the
+/// whole time (no drained redraw shows `pmenu: Nil`) — i.e. it refreshes in
+/// place rather than closing and reopening.
+async fn wait_for_pmenu_items(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &[&str],
+) {
+    for _ in 0..60 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        for params in drain_all_redraws(incoming) {
+            let Some((labels, _)) = pmenu_of(&params) else {
+                panic!("the completion popup closed during a live refresh");
+            };
+            if labels.iter().map(String::as_str).eq(want.iter().copied()) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the popup items never became {want:?}");
+}
+
+/// Poll until a redraw shows the popup closed (`pmenu: Nil`).
+async fn wait_for_pmenu_closed(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) {
+    for _ in 0..40 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if pmenu_of(&params).is_none() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the completion popup never closed");
+}
+
+/// How many recorded messages carried `method`.
+fn count_method(recs: &[Json], method: &str) -> usize {
+    recs.iter().filter(|r| r["method"] == method).count()
+}
+
+/// A bare `CompletionItem` (just a label).
+fn citem(label: &str) -> Json {
+    serde_json::json!({ "label": label })
+}
+
+/// A `CompletionItem[]` response (a `CompletionResponse::Array`, always complete).
+fn completion_items(labels: &[&str]) -> Json {
+    serde_json::json!(labels.iter().map(|l| citem(l)).collect::<Vec<_>>())
+}
+
+/// A `CompletionList` response with the given `isIncomplete` flag.
+fn completion_list(incomplete: bool, labels: &[&str]) -> Json {
+    serde_json::json!({
+        "isIncomplete": incomplete,
+        "items": labels.iter().map(|l| citem(l)).collect::<Vec<_>>(),
+    })
+}
+
+#[tokio::test]
+async fn completion_orders_by_importance_and_filters_the_prefix() {
+    let _guard = test_lock().lock().await;
+    // The headline: with `use nv` typed, the menu shows the items matching `nv`
+    // (`nva`, `nvb`) — ahead of and to the exclusion of `self`/`pub` — even though
+    // the server returned them in a deliberately unhelpful order. A complete list
+    // means the narrowing is a client-side refilter: exactly one request is sent.
+    let record = configure_mock(
+        "compl-order",
+        serde_json::json!({ "completion": completion_items(&["pub", "self", "nvb", "nva"]) }),
+    );
+    let file = temp_file("compl-order", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Open a line, type `use `, trigger: the popup opens with everything (empty
+    // prefix), ordered by the server priority (here, the label).
+    feed(&rpc, "ouse <C-x><C-o>");
+    let params = wait_for_pmenu(&rpc, &mut incoming).await;
+    assert_eq!(
+        pmenu_of(&params).unwrap().0,
+        vec!["nva", "nvb", "pub", "self"],
+        "an empty prefix shows every candidate"
+    );
+
+    // Type `n` then `v`: the menu stays open and narrows in place to the `nv`
+    // matches, in importance order — `self`/`pub` gone.
+    feed(&rpc, "n");
+    wait_for_pmenu_items(&rpc, &mut incoming, &["nva", "nvb"]).await;
+    feed(&rpc, "v");
+    wait_for_pmenu_items(&rpc, &mut incoming, &["nva", "nvb"]).await;
+
+    // A complete list ⇒ the narrowing filtered the cache; no extra request fired.
+    assert_eq!(
+        count_method(&record_lines(&record), "textDocument/completion"),
+        1,
+        "a complete list is filtered client-side, not re-requested"
+    );
+}
+
+#[tokio::test]
+async fn completion_ranking_honors_sort_text_over_the_label() {
+    let _guard = test_lock().lock().await;
+    // Two prefix matches whose `sortText` order reverses their alphabetical order
+    // (`config` sorts after `connect`), plus a subsequence-only item. Importance
+    // wins: `sortText` orders the prefix matches, and the subsequence ranks below.
+    let record = configure_mock(
+        "compl-sort",
+        serde_json::json!({
+            "completion": [
+                { "label": "config", "sortText": "2" },
+                { "label": "connect", "sortText": "1" },
+                { "label": "disconnect" },
+            ]
+        }),
+    );
+    let file = temp_file("compl-sort", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "ocon<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    // `connect` (sortText 1) before `config` (sortText 2); `disconnect` (only a
+    // subsequence of `con`) last.
+    wait_for_pmenu_items(&rpc, &mut incoming, &["connect", "config", "disconnect"]).await;
+}
+
+#[tokio::test]
+async fn an_incomplete_list_re_requests_and_the_menu_stays_open() {
+    let _guard = test_lock().lock().await;
+    // `isIncomplete:true` ⇒ each narrowing keystroke fires a fresh request whose
+    // result replaces the list, rather than filtering the cache. The popup stays
+    // open across the round-trip (never goes `Nil`).
+    let record = configure_mock(
+        "compl-live",
+        serde_json::json!({
+            "completion_sequence": [
+                completion_list(true, &["nano", "never", "nvidia", "nvim"]),
+                completion_list(true, &["nvidia", "nvim"]),
+            ]
+        }),
+    );
+    let file = temp_file("compl-live", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Type `n`, trigger → the broad list (filtered to the `n` matches).
+    feed(&rpc, "on<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    wait_for_pmenu_items(&rpc, &mut incoming, &["nano", "never", "nvidia", "nvim"]).await;
+    assert_eq!(
+        count_method(&record_lines(&record), "textDocument/completion"),
+        1
+    );
+
+    // Type `v`: a *second* request lands the narrowed list, and the menu stayed
+    // open throughout (the helper fails if any redraw showed it closed).
+    feed(&rpc, "v");
+    wait_for_pmenu_items(&rpc, &mut incoming, &["nvidia", "nvim"]).await;
+    let recs = wait_for_record(&rpc, &record, |r| {
+        count_method(r, "textDocument/completion") >= 2
+    })
+    .await;
+    assert_eq!(
+        count_method(&recs, "textDocument/completion"),
+        2,
+        "an incomplete list re-requests on the narrowing keystroke"
+    );
+}
+
+#[tokio::test]
+async fn accepting_a_completion_inserts_the_item_and_additional_edits() {
+    let _guard = test_lock().lock().await;
+    // Accept replaces the typed word with the item (not appends) and applies its
+    // `additionalTextEdits` (an inserted `use` line) — all one undo step.
+    let record = configure_mock(
+        "compl-accept",
+        serde_json::json!({
+            "completion": [{
+                "label": "println",
+                "insertText": "println",
+                "additionalTextEdits": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 0 },
+                    },
+                    "newText": "use std::io;\n",
+                }],
+            }]
+        }),
+    );
+    let file = temp_file("compl-accept", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Open a line, type the prefix `pr`, trigger, select the item, accept.
+    feed(&rpc, "opr<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-n><CR>");
+    barrier(&rpc).await;
+
+    // The word became `println` (replaced, not `prprintln`), and the import line
+    // was inserted at the top.
+    assert_eq!(
+        lines(&rpc).await,
+        vec![
+            "use std::io;".to_string(),
+            "fn main() {}".to_string(),
+            "println".to_string(),
+        ],
+        "accept replaced the prefix and applied the additional edit"
+    );
+    wait_for_pmenu_closed(&rpc, &mut incoming).await;
+
+    // A single undo restores both the insertion and the import.
+    feed(&rpc, "<Esc>u");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string()],
+        "one undo reverts the whole accept"
+    );
+}
+
+#[tokio::test]
+async fn navigating_and_dismissing_the_completion_menu() {
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "compl-nav",
+        serde_json::json!({ "completion": completion_items(&["alpha", "beta"]) }),
+    );
+    let file = temp_file("compl-nav", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Open a line, trigger: both items, nothing selected yet.
+    feed(&rpc, "o<C-x><C-o>");
+    let params = wait_for_pmenu(&rpc, &mut incoming).await;
+    assert_eq!(pmenu_of(&params).unwrap().0, vec!["alpha", "beta"]);
+    assert_eq!(pmenu_of(&params).unwrap().1, -1, "nothing selected yet");
+
+    // `<C-n>` highlights the first item.
+    feed(&rpc, "<C-n>");
+    let params = wait_for_pmenu_where(&rpc, &mut incoming, |(_, sel)| *sel == 0).await;
+    assert_eq!(pmenu_of(&params).unwrap().1, 0);
+
+    // `<C-e>` dismisses without inserting; the buffer keeps only the empty line
+    // `o` opened (no stray `e` from the control key).
+    feed(&rpc, "<C-e>");
+    wait_for_pmenu_closed(&rpc, &mut incoming).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string(), String::new()],
+        "<C-e> inserted nothing"
+    );
+
+    // Re-open, then `<Esc>` dismisses the menu AND leaves insert mode, still
+    // inserting no literal character.
+    feed(&rpc, "<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<Esc>");
+    wait_for_pmenu_closed(&rpc, &mut incoming).await;
+    let mode = match rpc.request("nvim_get_mode", vec![]).await.unwrap() {
+        Value::Map(m) => m
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("mode"))
+            .and_then(|(_, v)| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    assert_eq!(mode, "n", "<Esc> returned to normal mode");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string(), String::new()],
+        "<Esc> inserted nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_completion_popup_paints_as_a_bordered_overlay() {
+    let _guard = test_lock().lock().await;
+    // Tier 2: the real client paint. The popup is a bordered box anchored one row
+    // below the cursor at the word-start column (past the gutter); the selected
+    // row is reverse-highlighted, and its cells belong to the menu, not the text.
+    let record = configure_mock(
+        "compl-paint",
+        serde_json::json!({ "completion": completion_items(&["alpha", "beta"]) }),
+    );
+    let file = temp_file("compl-paint", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Open an empty line (cursor at column 0), trigger, select the first item.
+    feed(&rpc, "o<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-n>");
+    let params = wait_for_pmenu_where(&rpc, &mut incoming, |(_, sel)| *sel == 0).await;
+    let buf = paint(&View::from_redraw(&params), COLS, ROWS);
+
+    // The box's top-left border sits at the word start: gutter (4) + col 0, one
+    // row below the cursor (cursor row 1 ⇒ border row 2).
+    assert_eq!(
+        buf.cell((GUTTER, 2)).unwrap().symbol(),
+        "┌",
+        "the popup is a bordered box anchored under the word"
+    );
+    // Inside the border: the selected item `alpha` (reversed), then `beta`.
+    let item_col = GUTTER + 1;
+    assert_eq!(buf.cell((item_col, 3)).unwrap().symbol(), "a");
+    assert!(
+        buf.cell((item_col, 3))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "the selected row is reverse-highlighted"
+    );
+    assert_eq!(buf.cell((item_col, 4)).unwrap().symbol(), "b");
+    assert!(
+        !buf.cell((item_col, 4))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "an unselected row is not highlighted"
+    );
+}
+
+#[tokio::test]
+async fn accepting_a_utf16_text_edit_lands_at_the_right_byte() {
+    let _guard = test_lock().lock().await;
+    // The completion analogue of the cross-file `é` test: a line with a leading
+    // 2-byte `é` and a utf-16 server. The item's `textEdit` range is in utf-16
+    // units (char 1..2 = the `x` after `é`); accepting must convert it to byte
+    // 2..3, so `x` → `xyz` lands as `éxyz`, not corrupting the `é`.
+    let record = configure_mock(
+        "compl-utf16",
+        serde_json::json!({
+            "position_encoding": "utf-16",
+            "completion": [{
+                "label": "xyz",
+                "textEdit": {
+                    "range": {
+                        "start": { "line": 0, "character": 1 },
+                        "end": { "line": 0, "character": 2 },
+                    },
+                    "newText": "xyz",
+                },
+            }],
+        }),
+    );
+    let file = temp_file("compl-utf16", "rs", "éx\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Append (insert at end of line, after `x`), trigger, select, accept.
+    feed(&rpc, "A<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-n><CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["éxyz".to_string()],
+        "the utf-16 edit range converted to the right byte offset (after é)"
+    );
+}
+
+#[tokio::test]
+async fn completion_never_blocks_the_editor() {
+    let _guard = test_lock().lock().await;
+    // Resilience: a trigger whose server offers nothing (a null reply) opens no
+    // menu and the editor keeps editing — text typed right after the trigger
+    // lands normally and completion inserts nothing.
+    let record = configure_mock("compl-resil", serde_json::json!({}));
+    let file = temp_file("compl-resil", "rs", "fn main() {}\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Open a line, type `foo`, trigger (null reply ⇒ no menu), keep typing `bar`.
+    feed(&rpc, "ofoo<C-x><C-o>bar<Esc>");
+    // The request was genuinely sent (so the resilience path was exercised), and
+    // its null reply opened no menu.
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/completion")).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string(), "foobar".to_string()],
+        "the editor stays fully editable; completion inserted nothing"
+    );
+}

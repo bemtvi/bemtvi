@@ -32,6 +32,14 @@
 //! - `signature_help`: the scripted `SignatureHelp` result (`{signatures,
 //!   activeSignature?, activeParameter?}`) returned for
 //!   `textDocument/signatureHelp`. Absent ⇒ `null` (no signature help).
+//! - `completion`: the scripted `textDocument/completion` result — a
+//!   `CompletionItem[]` or a `CompletionList` (`{isIncomplete, items}`) —
+//!   returned for every completion request. Absent ⇒ `null` (no candidates).
+//! - `completion_sequence`: an array of completion results consumed **one per
+//!   `textDocument/completion` request** (overriding `completion` when present),
+//!   so a test can return a broad `isIncomplete:true` list first and a narrowed
+//!   list on the re-request, exercising the live re-request path. Past the end of
+//!   the array ⇒ `null`.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -49,6 +57,10 @@ pub fn run(script_path: &str) {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
+
+    // How many `textDocument/completion` requests we've answered, so
+    // `completion_sequence` can hand back a different list per request.
+    let mut completion_calls = 0usize;
 
     while let Some(msg) = read_message(&mut reader) {
         // Record every client→server message (so tests can read back what the
@@ -108,6 +120,15 @@ pub fn run(script_path: &str) {
             "textDocument/references" => reply_scripted(&stdout, id, &script, "references"),
             "textDocument/hover" => reply_scripted(&stdout, id, &script, "hover"),
             "textDocument/signatureHelp" => reply_scripted(&stdout, id, &script, "signature_help"),
+            // Completion: a `completion_sequence` entry (one per request) wins over
+            // the single `completion` field, so a test can narrow the list on the
+            // re-request triggered as the prefix grows.
+            "textDocument/completion" => {
+                if let Some(id) = id {
+                    let result = completion_result(&script, &mut completion_calls);
+                    write_response(&stdout, id, result);
+                }
+            }
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply.
             _ => {
@@ -163,6 +184,19 @@ fn record(script: &Value, msg: &Value) {
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// The completion result for the `call`-th `textDocument/completion` request
+/// (0-based), advancing `call`. `completion_sequence[call]` wins when present
+/// (`null` past its end); otherwise the single `completion` field is reused for
+/// every request; `null` when neither is scripted.
+fn completion_result(script: &Value, call: &mut usize) -> Value {
+    let n = *call;
+    *call += 1;
+    if let Some(seq) = script.get("completion_sequence").and_then(Value::as_array) {
+        return seq.get(n).cloned().unwrap_or(Value::Null);
+    }
+    script.get("completion").cloned().unwrap_or(Value::Null)
 }
 
 /// Answer a request with the script's `field` value (cloned), or `null` when the

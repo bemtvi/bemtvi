@@ -21,7 +21,8 @@ use async_lsp::router::Router;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    ClientCapabilities, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    CompletionTextEdit, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, GeneralClientCapabilities,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     InitializeParams, InitializeResult, InitializedParams, Location, MarkedString, MessageType,
@@ -29,7 +30,7 @@ use lsp_types::{
     ServerCapabilities, SignatureHelp, SignatureHelpParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
-    TextDocumentSyncKind, Url, VersionedTextDocumentIdentifier,
+    TextDocumentSyncKind, TextEdit, Url, VersionedTextDocumentIdentifier,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -134,6 +135,10 @@ pub enum LspRequest {
         uri: Url,
         position: Position,
     },
+    Completion {
+        uri: Url,
+        position: Position,
+    },
 }
 
 /// The opaque correlation token the editor issues with a request and the manager
@@ -167,6 +172,34 @@ pub enum LspReply {
         signature: Option<String>,
         active_parameter: Option<String>,
     },
+    /// Completion candidates (a `CompletionItem[]` and a `CompletionList` both
+    /// normalized to this shape). `is_incomplete` ⇒ the server's list is partial,
+    /// so the editor re-requests as the typed prefix narrows rather than
+    /// filtering the cache. The items' edit ranges stay in the server's negotiated
+    /// position encoding for the editor to convert (it owns the buffer text).
+    Completion {
+        is_incomplete: bool,
+        items: Vec<CompletionItemData>,
+    },
+}
+
+/// One completion candidate, distilled from a protocol [`CompletionItem`] to the
+/// fields the editor's menu needs. `kind` is the `CompletionItemKind` as a small
+/// int (`0` = unspecified) the client maps to an icon. `text_edit` and
+/// `additional_text_edits` keep their ranges in the negotiated position encoding;
+/// the editor converts them to byte ranges on accept (only it has the buffer
+/// text). When `text_edit` is `None`, the editor replaces the completion word
+/// (the identifier run left of the cursor) with `insert_text` (else `label`).
+#[derive(Clone, Debug)]
+pub struct CompletionItemData {
+    pub label: String,
+    pub kind: u8,
+    pub detail: Option<String>,
+    pub filter_text: Option<String>,
+    pub sort_text: Option<String>,
+    pub insert_text: Option<String>,
+    pub text_edit: Option<TextEdit>,
+    pub additional_text_edits: Vec<TextEdit>,
 }
 
 /// Server → editor, delivered to the main loop's `select!`. The distilled events
@@ -686,7 +719,75 @@ async fn issue_request(
             };
             signature_help_reply(sock.signature_help(params).await, log, name)
         }
+        LspRequest::Completion { uri, position } => {
+            let params = CompletionParams {
+                text_document_position: text_document_position(uri, position),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            };
+            completion_reply(sock.completion(params).await, log, name)
+        }
     }
+}
+
+/// Distill a `textDocument/completion` reply into [`LspReply::Completion`],
+/// normalizing the two response shapes — a bare `CompletionItem[]` (always
+/// complete) and a `CompletionList` (which carries its own `isIncomplete`) — to
+/// one. `None`/an error degrades to an empty, complete list, so the editor
+/// uniformly sees "no candidates" rather than a hang.
+fn completion_reply(
+    result: Result<Option<CompletionResponse>, async_lsp::Error>,
+    log: &LspLog,
+    name: &str,
+) -> LspReply {
+    let (is_incomplete, items) = match result {
+        Ok(Some(CompletionResponse::Array(items))) => (false, items),
+        Ok(Some(CompletionResponse::List(list))) => (list.is_incomplete, list.items),
+        Ok(None) => (false, Vec::new()),
+        Err(e) => {
+            log.log(LogLevel::Warn, name, &format!("completion failed: {e}"));
+            (false, Vec::new())
+        }
+    };
+    LspReply::Completion {
+        is_incomplete,
+        items: items.into_iter().map(completion_item).collect(),
+    }
+}
+
+/// Reduce a protocol [`CompletionItem`] to the editor-facing [`CompletionItemData`]:
+/// keep the label/kind/detail/sort+filter text and insert text, and normalize the
+/// `CompletionTextEdit` (an `Edit`, or an `InsertAndReplace` collapsed to its
+/// `replace` range) plus the `additionalTextEdits` to plain [`TextEdit`]s whose
+/// ranges stay in the negotiated encoding.
+fn completion_item(item: CompletionItem) -> CompletionItemData {
+    let text_edit = item.text_edit.map(|edit| match edit {
+        CompletionTextEdit::Edit(e) => e,
+        CompletionTextEdit::InsertAndReplace(ir) => TextEdit {
+            range: ir.replace,
+            new_text: ir.new_text,
+        },
+    });
+    CompletionItemData {
+        label: item.label,
+        kind: kind_code(item.kind),
+        detail: item.detail,
+        filter_text: item.filter_text,
+        sort_text: item.sort_text,
+        insert_text: item.insert_text,
+        text_edit,
+        additional_text_edits: item.additional_text_edits.unwrap_or_default(),
+    }
+}
+
+/// The numeric `CompletionItemKind` (`1`=Text … `25`=TypeParameter), via serde so
+/// it tracks the protocol enum without a hand-maintained arm per kind. `0` for an
+/// unspecified kind, which the client renders without an icon.
+fn kind_code(kind: Option<CompletionItemKind>) -> u8 {
+    kind.and_then(|k| serde_json::to_value(k).ok())
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u8
 }
 
 /// Distill a `textDocument/hover` reply into plain display lines: extract the
@@ -857,6 +958,7 @@ fn describe_request(req: &LspRequest) -> String {
         LspRequest::References { position, .. } => ("references", position),
         LspRequest::Hover { position, .. } => ("hover", position),
         LspRequest::SignatureHelp { position, .. } => ("signatureHelp", position),
+        LspRequest::Completion { position, .. } => ("completion", position),
     };
     format!("→ {label} @ {}:{}", pos.line, pos.character)
 }

@@ -8,8 +8,8 @@ use std::time::Duration;
 use crate::anim::ScrollData;
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_diagnostics,
-    parse_highlights, parse_multi_spans, parse_numbers, parse_spans, parse_styles, DiagSpan,
-    HlSpan, IncSearchSpans, SearchSpans,
+    parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items, parse_spans,
+    parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem, SearchSpans,
 };
 
 /// The server's view, mirrored client-side for rendering.
@@ -74,6 +74,23 @@ pub struct View {
     /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
     /// present it has input focus: the editing cursor is drawn inside it.
     pub(crate) panel: Option<PanelData>,
+    /// The insert-mode completion popup, or `None` when none is open. Drawn last,
+    /// as an overlay over the text area.
+    pub(crate) pmenu: Option<PmenuData>,
+}
+
+/// The insert-mode completion popup mirrored from the server's redraw: the ranked
+/// items, the selected index (`None` until the user navigates), and the overlay's
+/// anchor and content size in **text-area cells** (the client adds the gutter and
+/// text-area origin, then draws a bordered box around the content).
+#[derive(Clone)]
+pub(crate) struct PmenuData {
+    pub(crate) items: Vec<PmenuItem>,
+    pub(crate) selected: Option<usize>,
+    pub(crate) row: u16,
+    pub(crate) col: u16,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 /// The bottom panel mirrored from the server's redraw: a title, the visible
@@ -144,6 +161,19 @@ impl View {
                 cursor_span: map_get(p, "cursor_span")
                     .and_then(Value::as_u64)
                     .map_or(1, |n| n as u16),
+                height: map_u16(p, "height"),
+            }),
+            _ => None,
+        };
+        self.pmenu = match map_get(map, "pmenu") {
+            Some(Value::Map(p)) => Some(PmenuData {
+                items: parse_pmenu_items(map_get(p, "items")),
+                selected: map_get(p, "selected")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize),
+                row: map_u16(p, "row"),
+                col: map_u16(p, "col"),
+                width: map_u16(p, "width"),
                 height: map_u16(p, "height"),
             }),
             _ => None,

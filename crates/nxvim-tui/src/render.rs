@@ -4,14 +4,14 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use rmpv::Value;
 use unicode_width::UnicodeWidthChar;
 
 use crate::anim::{arm_animation, lerp, Animation};
 use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans};
-use crate::view::{PanelData, View};
+use crate::view::{PanelData, PmenuData, View};
 
 /// Tab stop width in cells. Must match `nxvim_core::unicode::TABSTOP` so the
 /// painted text lines up with the server's reported screen columns.
@@ -206,6 +206,15 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     );
     render_status(frame, status_area, view);
     render_command(frame, cmd_area, view);
+
+    // The insert-mode completion popup floats over the text area, drawn after the
+    // text so it sits on top. The editing cursor (placed below) stays visible
+    // above the menu. A panel and the popup never coexist (the popup is
+    // insert-mode; a focused panel grabs every key), so this never fights the
+    // panel cursor handled next.
+    if let Some(pmenu) = &view.pmenu {
+        render_pmenu(frame, text_inner, pmenu);
+    }
 
     // A focused panel owns the cursor: draw it on the panel's current line and
     // skip the text/command cursor entirely.
@@ -623,6 +632,81 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelData) -> Rect {
         .collect();
     frame.render_widget(Paragraph::new(Text::from(rows)), inner);
     inner
+}
+
+/// Draw the completion popup as a bordered overlay over the text area: a box
+/// anchored at `(pmenu.col, pmenu.row)` in `text_area` cells — so its left edge
+/// lines up under the completion word, past the number gutter — with each item on
+/// its own row and the selected row reverse-highlighted. The box is `Clear`ed
+/// first so the text beneath doesn't bleed through; the list scrolls to keep the
+/// selected item visible when there are more items than rows. The box is clamped
+/// to `text_area` so it never paints outside the editable region.
+fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData) {
+    let x = text_area.x.saturating_add(pmenu.col);
+    let y = text_area.y.saturating_add(pmenu.row);
+    // Content size plus a one-cell border all round, clamped to the text area.
+    let width = pmenu
+        .width
+        .saturating_add(2)
+        .min(text_area.right().saturating_sub(x));
+    let height = pmenu
+        .height
+        .saturating_add(2)
+        .min(text_area.bottom().saturating_sub(y));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    // Need room for the border plus at least one content cell each way.
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let block = Block::new().borders(Borders::ALL);
+    let inner = block.inner(area);
+    // Clear the cells first so the overlay is opaque, then the border, then rows.
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    // Scroll so the selected item stays in view; show from the top otherwise.
+    let start = match pmenu.selected {
+        Some(s) if s >= rows => s + 1 - rows,
+        _ => 0,
+    };
+    let lines: Vec<Line> = (0..inner.height)
+        .map(|r| {
+            let idx = start + r as usize;
+            let Some((label, _kind, detail)) = pmenu.items.get(idx) else {
+                return Line::from(" ".repeat(width));
+            };
+            let style = if Some(idx) == pmenu.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(pmenu_row(label, detail, width), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// One popup row padded to `width` cells: the `label` left-aligned, and the
+/// `detail` (a type/source hint) right-aligned when it fits after a one-cell gap.
+/// A too-long label is truncated. Char-count widths are exact for the ASCII
+/// identifiers completion labels usually are.
+fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
+    let label: String = label.chars().take(width).collect();
+    let label_w = label.chars().count();
+    let detail_w = detail.chars().count();
+    if !detail.is_empty() && label_w + 1 + detail_w <= width {
+        let pad = width - label_w - detail_w;
+        format!("{label}{}{detail}", " ".repeat(pad))
+    } else {
+        format!("{label:<width$}")
+    }
 }
 
 /// Screen position of the panel's `[X]` close button on a `width`x`height`

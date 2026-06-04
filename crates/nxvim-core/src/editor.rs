@@ -859,6 +859,43 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// Apply a batch of non-overlapping byte-range replacements as **one undo
+    /// step**, then place the cursor at `cursor_byte` (clamped to a valid insert
+    /// position). Each `(range, text)` removes `range` and inserts `text` at its
+    /// start; the batch is applied in descending start order so an earlier edit
+    /// never invalidates a later one's offsets. The buffer is re-normalized after.
+    ///
+    /// Takes plain byte ranges and text — no LSP types — so `nxvim-core` stays
+    /// LSP-free while the server's completion-accept (and, later, formatting /
+    /// rename appliers) share one primitive. The edits fold into the current undo
+    /// group when one is open (accepting a completion mid-insert is part of that
+    /// insert's undo block, as in vim); in normal mode they form their own step.
+    pub fn apply_edits(
+        &mut self,
+        mut edits: Vec<(std::ops::Range<usize>, String)>,
+        cursor_byte: usize,
+    ) {
+        self.push_undo();
+        // Highest start first: applying a later edit can't shift an earlier one.
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        for (range, text) in edits {
+            let len = self.buffer().len_bytes();
+            let start = self.buffer().text.floor_char_boundary(range.start.min(len));
+            let end = self.buffer().text.floor_char_boundary(range.end.min(len));
+            if start < end {
+                self.buffer_mut().remove(start..end);
+            }
+            if !text.is_empty() {
+                self.buffer_mut().insert(start, &text);
+            }
+        }
+        self.buffer_mut().normalize();
+        self.set_cursor_char_insert(cursor_byte);
+        self.desired_col = self.cursor_virtcol();
+        self.desired_eol = false;
+        self.ensure_visible();
+    }
+
     /// Resize the *text viewport*. The client owns the screen layout and tells
     /// us only how tall the text area is (status/command lines are the client's
     /// own regions), so the whole height here is editable rows.

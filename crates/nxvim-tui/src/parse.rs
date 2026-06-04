@@ -22,6 +22,35 @@ pub(crate) type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
 pub(crate) type IncSearchSpans = Vec<Option<(u16, u16)>>;
 
+/// One completion-popup row: `(label, kind, detail)`. `kind` is the
+/// `CompletionItemKind` as a small int (`0` = unspecified) the client could map
+/// to an icon; `detail` is `""` when the server provided none.
+pub(crate) type PmenuItem = (String, u8, String);
+
+/// Parse the `pmenu` redraw key's `items` array into `(label, kind, detail)`
+/// rows. Malformed entries are dropped, yielding an empty list.
+pub(crate) fn parse_pmenu_items(value: Option<&Value>) -> Vec<PmenuItem> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let t = item.as_array()?;
+                    if t.len() != 3 {
+                        return None;
+                    }
+                    Some((
+                        t[0].as_str()?.to_string(),
+                        t[1].as_u64()? as u8,
+                        t[2].as_str().unwrap_or("").to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))

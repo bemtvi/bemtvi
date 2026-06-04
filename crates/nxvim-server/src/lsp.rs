@@ -17,13 +17,15 @@
 use std::path::{Path, PathBuf};
 
 use nxvim_core::unicode;
-use nxvim_core::{BufferEdit, BufferId};
+use nxvim_core::view::View;
+use nxvim_core::{BufferEdit, BufferId, Mode};
 use nxvim_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, TextDocumentContentChangeEvent,
     TextDocumentSyncKind, Url,
 };
 use nxvim_lsp::{
-    LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken, ServerKey, ServerSpawn,
+    CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken,
+    ServerKey, ServerSpawn,
 };
 use rmpv::Value;
 
@@ -71,6 +73,7 @@ pub(crate) enum LspReqKind {
     References,
     Hover,
     SignatureHelp,
+    Completion,
 }
 
 impl LspReqKind {
@@ -83,6 +86,7 @@ impl LspReqKind {
             LspReqKind::References => 4,
             LspReqKind::Hover => 5,
             LspReqKind::SignatureHelp => 6,
+            LspReqKind::Completion => 7,
         }
     }
 
@@ -95,6 +99,7 @@ impl LspReqKind {
             4 => LspReqKind::References,
             5 => LspReqKind::Hover,
             6 => LspReqKind::SignatureHelp,
+            7 => LspReqKind::Completion,
             _ => return None,
         })
     }
@@ -117,6 +122,7 @@ impl LspReqKind {
             LspReqKind::References => "No references found",
             LspReqKind::Hover => "No hover information",
             LspReqKind::SignatureHelp => "No signature help",
+            LspReqKind::Completion => "No completions",
         }
     }
 
@@ -144,6 +150,35 @@ pub(crate) struct PendingLspReq {
 pub(crate) struct ServerRuntime {
     encoding: PositionEncoding,
     sync_kind: TextDocumentSyncKind,
+}
+
+/// The live insert-mode completion popup (Phase 5), server-owned like the
+/// diagnostics cache. Held in [`Server::completion`]; `None` when no menu is
+/// open. It keeps the server's last candidate list verbatim plus the live
+/// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
+/// re-ranks (or re-requests) in place rather than closing and reopening.
+pub(crate) struct CompletionMenu {
+    /// The buffer the menu belongs to; a reply for any other buffer is dropped.
+    buffer: BufferId,
+    /// `(row, word-start byte column)` the completion word begins at — the menu's
+    /// screen anchor and the default replace range's start. Fixed while the menu
+    /// is open (typing only extends the word to the right).
+    anchor: (usize, usize),
+    /// The identifier run typed since `anchor` (`line[anchor.col..cursor.col]`):
+    /// both the filter string and, for an item without an explicit `textEdit`, the
+    /// text the accept replaces.
+    prefix: String,
+    /// The server's `isIncomplete` for the current list: when set, a narrowing
+    /// keystroke re-requests instead of filtering the cache client-side.
+    is_incomplete: bool,
+    /// The server's last candidate list, verbatim (ranking is recomputed from it).
+    raw: Vec<CompletionItemData>,
+    /// Indices into `raw`, filtered to those matching `prefix` and ordered by
+    /// importance (match tier, then `sortText`, then label). The projected menu.
+    visible: Vec<usize>,
+    /// The selected entry as an index into `visible`, or `None` until the user
+    /// navigates (accept then falls back to the first visible item).
+    selected: Option<usize>,
 }
 
 impl Server {
@@ -616,6 +651,7 @@ impl Server {
             },
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
+            LspReqKind::Completion => LspRequest::Completion { uri, position },
         };
         self.lsp.request(key, token, req);
     }
@@ -633,7 +669,11 @@ impl Server {
 
     /// Handle one [`LspEvent::Reply`]: match it to its pending request by token
     /// and act, dropping it when a newer request of the same kind superseded it
-    /// (generation mismatch) or the cursor has since moved (Decision 3).
+    /// (generation mismatch). The goto/hover/signature kinds also drop on a cursor
+    /// move (Decision 3) — the user moved on, so the jump/popup is now irrelevant.
+    /// Completion is the exception: its menu *follows* the moving cursor while
+    /// open (each typed character may re-request), so it is dropped only when the
+    /// buffer changed — staleness there is the generation token's job alone.
     pub(crate) fn on_lsp_reply(&mut self, token: ReqToken, reply: LspReply) {
         let Some(kind) = LspReqKind::from_u16(token.kind) else {
             return;
@@ -645,24 +685,45 @@ impl Server {
         if pending.generation != token.generation {
             return;
         }
-        let moved = pending.buffer != self.editor.current_buffer_id()
-            || pending.cursor != (self.editor.cursor.line, self.editor.cursor.col);
+        let buffer_changed = pending.buffer != self.editor.current_buffer_id();
+        let cursor_moved = pending.cursor != (self.editor.cursor.line, self.editor.cursor.col);
         self.lsp_requests.remove(&kind);
-        if moved {
-            // The user moved on before the reply landed — honor the move, not the
-            // now-irrelevant jump.
-            return;
-        }
 
         match reply {
-            LspReply::Locations(locations) => self.apply_lsp_locations(kind, locations),
-            LspReply::Hover(lines) => self.show_hover(lines),
+            LspReply::Completion {
+                is_incomplete,
+                items,
+            } => {
+                if buffer_changed {
+                    return;
+                }
+                self.on_completion_reply(is_incomplete, items);
+            }
+            LspReply::Locations(locations) => {
+                if buffer_changed || cursor_moved {
+                    return;
+                }
+                self.apply_lsp_locations(kind, locations);
+                self.lsp_dirty = true;
+            }
+            LspReply::Hover(lines) => {
+                if buffer_changed || cursor_moved {
+                    return;
+                }
+                self.show_hover(lines);
+                self.lsp_dirty = true;
+            }
             LspReply::SignatureHelp {
                 signature,
                 active_parameter,
-            } => self.show_signature_help(signature, active_parameter),
+            } => {
+                if buffer_changed || cursor_moved {
+                    return;
+                }
+                self.show_signature_help(signature, active_parameter);
+                self.lsp_dirty = true;
+            }
         }
-        self.lsp_dirty = true;
     }
 
     /// Render a hover reply: open the bottom panel with the markup's plain lines
@@ -781,6 +842,319 @@ impl Server {
         }
     }
 
+    // ----- Phase 5: completion (the popup menu) ----------------------------
+
+    /// Handle a `textDocument/completion` reply (already past the generation /
+    /// buffer staleness checks in [`Server::on_lsp_reply`]). Builds the menu on
+    /// the initial trigger, or replaces its list on a live re-request, then
+    /// re-ranks against the current prefix. Dropped if the user has left insert
+    /// mode (the menu is unwanted) or nothing matches (nothing to show).
+    fn on_completion_reply(&mut self, is_incomplete: bool, items: Vec<CompletionItemData>) {
+        if self.editor.mode != Mode::Insert {
+            return;
+        }
+        let buffer = self.editor.current_buffer_id();
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let line = self.editor.buffer().line(row);
+        let (word_start, prefix) = completion_word(&line, col);
+        match self.completion.as_mut() {
+            // A refresh for the open menu: swap in the new list, re-rank in place.
+            Some(menu) => {
+                menu.raw = items;
+                menu.is_incomplete = is_incomplete;
+                menu.anchor = (row, word_start);
+                menu.prefix = prefix;
+            }
+            // The initial trigger opens the menu; an empty offer opens nothing.
+            None => {
+                if items.is_empty() {
+                    return;
+                }
+                self.completion = Some(CompletionMenu {
+                    buffer,
+                    anchor: (row, word_start),
+                    prefix,
+                    is_incomplete,
+                    raw: items,
+                    visible: Vec::new(),
+                    selected: None,
+                });
+            }
+        }
+        self.rerank_menu();
+        // Nothing matches what was typed: dismiss rather than show an empty popup.
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|m| m.visible.is_empty())
+        {
+            self.completion = None;
+        }
+        self.lsp_dirty = true;
+    }
+
+    /// Recompute the menu's `visible` list: filter `raw` to the items matching the
+    /// live `prefix` and order them by importance — match tier (exact ▸ prefix ▸
+    /// subsequence), then the server's `sortText`, then the label as a stable
+    /// tiebreak. Clears the selection, since the candidate set changed.
+    fn rerank_menu(&mut self) {
+        let Some(menu) = self.completion.as_mut() else {
+            return;
+        };
+        let prefix = menu.prefix.as_str();
+        let mut ranked: Vec<(u8, &str, &str, usize)> = menu
+            .raw
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let filter = item.filter_text.as_deref().unwrap_or(&item.label);
+                let tier = match_tier(filter, prefix)?;
+                let secondary = item.sort_text.as_deref().unwrap_or(&item.label);
+                Some((tier, secondary, item.label.as_str(), i))
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)).then(a.2.cmp(b.2)));
+        let visible: Vec<usize> = ranked.into_iter().map(|(_, _, _, i)| i).collect();
+        menu.visible = visible;
+        menu.selected = None;
+    }
+
+    /// Whether a completion menu is currently open (the insert-mode key path
+    /// checks this before routing a key to the menu).
+    pub(crate) fn completion_menu_open(&self) -> bool {
+        self.completion.is_some()
+    }
+
+    /// Move the menu selection by `delta`, wrapping. From no selection, `+1`
+    /// highlights the first item and `-1` the last (vim's `<C-n>`/`<C-p>`).
+    pub(crate) fn lsp_menu_move(&mut self, delta: isize) {
+        let Some(menu) = self.completion.as_mut() else {
+            return;
+        };
+        let n = menu.visible.len();
+        if n == 0 {
+            return;
+        }
+        menu.selected = Some(match menu.selected {
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    n - 1
+                }
+            }
+            Some(i) => (i as isize + delta).rem_euclid(n as isize) as usize,
+        });
+        self.lsp_dirty = true;
+    }
+
+    /// Close the menu without inserting, dropping any in-flight completion request
+    /// so a late reply can't reopen it.
+    pub(crate) fn lsp_menu_close(&mut self) {
+        if self.completion.take().is_some() {
+            self.lsp_requests.remove(&LspReqKind::Completion);
+            self.lsp_dirty = true;
+        }
+    }
+
+    /// Accept the selected item (or the first, when nothing is highlighted):
+    /// replace the completion word — or the item's explicit `textEdit` range —
+    /// with its text, apply any `additionalTextEdits`, and leave the cursor after
+    /// the inserted text, all as one undo step. Stays in insert mode, as vim does.
+    pub(crate) fn lsp_menu_accept(&mut self) {
+        let Some(menu) = self.completion.take() else {
+            return;
+        };
+        // No refresh should land after an accept.
+        self.lsp_requests.remove(&LspReqKind::Completion);
+        self.lsp_dirty = true;
+        let Some(&raw_idx) = menu.visible.get(menu.selected.unwrap_or(0)) else {
+            return;
+        };
+        let item = &menu.raw[raw_idx];
+        let encoding = self
+            .current_lsp_target()
+            .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
+
+        // The primary edit: the item's explicit textEdit, else replace the word
+        // (anchor..cursor) with insertText (falling back to the label).
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let (primary_range, primary_text) = match &item.text_edit {
+            Some(edit) => (
+                self.lsp_range_to_bytes(&edit.range, encoding),
+                edit.new_text.clone(),
+            ),
+            None => {
+                let start = self.editor.buffer().line_start(menu.anchor.0) + menu.anchor.1;
+                let end = self.editor.buffer().line_start(row) + col;
+                let text = item
+                    .insert_text
+                    .clone()
+                    .unwrap_or_else(|| item.label.clone());
+                (start..end, text)
+            }
+        };
+
+        let mut edits = vec![(primary_range.clone(), primary_text.clone())];
+        for ate in &item.additional_text_edits {
+            edits.push((
+                self.lsp_range_to_bytes(&ate.range, encoding),
+                ate.new_text.clone(),
+            ));
+        }
+        // The cursor lands after the primary insertion, shifted by the net length
+        // of any edits that fall before it (e.g. an inserted `use` import).
+        let shift: isize = edits
+            .iter()
+            .skip(1)
+            .filter(|(r, _)| r.start < primary_range.start)
+            .map(|(r, t)| t.len() as isize - (r.end - r.start) as isize)
+            .sum();
+        let cursor_byte = (primary_range.start + primary_text.len()) as isize + shift;
+        self.editor.apply_edits(edits, cursor_byte.max(0) as usize);
+    }
+
+    /// After the editor inserted a word character or backspaced while the menu was
+    /// open, recompute the prefix and refresh: a complete list refilters
+    /// client-side; an incomplete one re-requests at the new cursor (the current
+    /// items stay shown until that reply lands). Closes the menu if the cursor
+    /// left the word, or if a complete list now has nothing to offer.
+    pub(crate) fn lsp_menu_after_edit(&mut self) {
+        let Some(menu) = self.completion.as_ref() else {
+            return;
+        };
+        let buffer = self.editor.current_buffer_id();
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        // Left the word (backspaced before the anchor, changed line/buffer): the
+        // menu no longer applies.
+        if buffer != menu.buffer || row != menu.anchor.0 || col < menu.anchor.1 {
+            self.lsp_menu_close();
+            return;
+        }
+        let line = self.editor.buffer().line(row);
+        let region = &line[menu.anchor.1..col.min(line.len())];
+        if !region.chars().all(is_word_char) {
+            self.lsp_menu_close();
+            return;
+        }
+        let prefix = region.to_string();
+        let incomplete = menu.is_incomplete;
+        self.completion.as_mut().unwrap().prefix = prefix;
+        if incomplete {
+            // The cached list was partial: ask the server for the narrowed set.
+            // The current items stay shown until the reply re-ranks them.
+            self.request_lsp(LspReqKind::Completion);
+        } else {
+            self.rerank_menu();
+            if self
+                .completion
+                .as_ref()
+                .is_some_and(|m| m.visible.is_empty())
+            {
+                self.lsp_menu_close();
+                return;
+            }
+        }
+        self.lsp_dirty = true;
+    }
+
+    /// Project the open completion menu into the `pmenu` redraw value (`Nil` when
+    /// closed or nothing matches): the ranked visible items, the selected index,
+    /// and the overlay's anchor/size in screen cells. The menu sits one row below
+    /// the cursor, flipped above when there's no room; `col` is the word-start
+    /// screen column (the client adds the number gutter), so the box lines up
+    /// under the word being completed — reusing `cursor_screen_col`'s math, no
+    /// core change. `text_width` is the text area's cell width (the frame minus
+    /// the number gutter), used only to keep the box from overflowing it.
+    pub(crate) fn pmenu_value(&self, view: &View, text_width: usize) -> Value {
+        let Some(menu) = &self.completion else {
+            return Value::Nil;
+        };
+        if menu.visible.is_empty() {
+            return Value::Nil;
+        }
+        let (arow, acol) = menu.anchor;
+        let line = self.editor.buffer().line(arow);
+        let anchor_col = unicode::virtcol(&line, acol, unicode::TABSTOP);
+        let cursor_row = view.cursor_row;
+        let text_height = view.lines.len();
+
+        let items: Vec<Value> = menu
+            .visible
+            .iter()
+            .map(|&i| {
+                let item = &menu.raw[i];
+                Value::Array(vec![
+                    Value::from(item.label.as_str()),
+                    Value::from(item.kind as u64),
+                    Value::from(item.detail.as_deref().unwrap_or("")),
+                ])
+            })
+            .collect();
+        let count = items.len();
+
+        // Width: the widest item, clamped so the bordered box fits the text area.
+        let content_w = menu
+            .visible
+            .iter()
+            .map(|&i| pmenu_item_width(&menu.raw[i]))
+            .max()
+            .unwrap_or(1);
+        let max_w = text_width.saturating_sub(anchor_col).max(1);
+        let width = content_w.clamp(1, max_w);
+
+        // Place the box below if its border+content+border fits, else above;
+        // clamp the content height to the room available.
+        const MAX_H: usize = 10;
+        let want = count.min(MAX_H);
+        let below = text_height.saturating_sub(cursor_row + 1);
+        let above = cursor_row;
+        let (row, height) = if want + 2 <= below {
+            (cursor_row + 1, want)
+        } else if want + 2 <= above {
+            (cursor_row - (want + 2), want)
+        } else if below >= above {
+            (cursor_row + 1, below.saturating_sub(2).clamp(1, want))
+        } else {
+            let h = above.saturating_sub(2).clamp(1, want);
+            (cursor_row.saturating_sub(h + 2), h)
+        };
+
+        Value::Map(vec![
+            (Value::from("items"), Value::Array(items)),
+            (
+                Value::from("selected"),
+                match menu.selected {
+                    Some(i) => Value::from(i as u64),
+                    None => Value::Nil,
+                },
+            ),
+            (Value::from("row"), Value::from(row as u64)),
+            (Value::from("col"), Value::from(anchor_col as u64)),
+            (Value::from("width"), Value::from(width as u64)),
+            (Value::from("height"), Value::from(height as u64)),
+        ])
+    }
+
+    /// Convert an LSP [`Range`] (in the negotiated `encoding`) to an absolute
+    /// buffer byte range, resolving each endpoint against its line's text.
+    fn lsp_range_to_bytes(
+        &self,
+        range: &Range,
+        encoding: PositionEncoding,
+    ) -> std::ops::Range<usize> {
+        self.lsp_pos_to_byte(range.start, encoding)..self.lsp_pos_to_byte(range.end, encoding)
+    }
+
+    /// Absolute buffer byte offset of an LSP [`Position`] in the negotiated
+    /// `encoding` (the character offset converted against its line, the row added
+    /// as a line start).
+    fn lsp_pos_to_byte(&self, pos: Position, encoding: PositionEncoding) -> usize {
+        let row = pos.line as usize;
+        let line = self.editor.buffer().line(row);
+        self.editor.buffer().line_start(row) + byte_col(encoding, &line, pos.character as usize)
+    }
+
     /// Convert a batch of journaled byte-delta edits into LSP incremental content
     /// changes, each replacing the edit's old `(start..old_end)` range with its
     /// inserted text, in the server's negotiated position encoding.
@@ -847,6 +1221,72 @@ fn byte_col(encoding: PositionEncoding, line: &str, character: usize) -> usize {
             .nth(character)
             .map_or(line.len(), |(i, _)| i),
     }
+}
+
+/// Whether `c` belongs to a completion word — an identifier run: ASCII
+/// alphanumeric or `_` (the default `iskeyword`, locale specifics aside).
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The completion word: the run of identifier characters immediately left of the
+/// byte `cursor` on `line`, as `(word_start_byte, prefix)`. An empty prefix when
+/// the cursor isn't preceded by an identifier char (a just-triggered menu with
+/// nothing typed). Both the menu's filter string and its default replace range.
+fn completion_word(line: &str, cursor: usize) -> (usize, String) {
+    let cursor = cursor.min(line.len());
+    let mut start = cursor;
+    for (i, c) in line[..cursor].char_indices().rev() {
+        if is_word_char(c) {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    (start, line[start..cursor].to_string())
+}
+
+/// The match tier of an item's `filter` string against the typed `prefix`, lower
+/// = better: `0` exact, `1` case-sensitive prefix, `2` case-insensitive prefix,
+/// `3` case-insensitive subsequence; `None` ⇒ no match (the item is dropped). An
+/// empty prefix matches everything at tier ≤ 1, so a just-triggered menu shows
+/// the whole list in the server's `sortText` order.
+fn match_tier(filter: &str, prefix: &str) -> Option<u8> {
+    if prefix.is_empty() {
+        return Some(if filter.is_empty() { 0 } else { 1 });
+    }
+    if filter == prefix {
+        return Some(0);
+    }
+    if filter.starts_with(prefix) {
+        return Some(1);
+    }
+    let (filter, prefix) = (filter.to_lowercase(), prefix.to_lowercase());
+    if filter.starts_with(&prefix) {
+        return Some(2);
+    }
+    if is_subsequence(&prefix, &filter) {
+        return Some(3);
+    }
+    None
+}
+
+/// Whether every character of `needle` appears in `haystack` in order (a
+/// subsequence). Callers lowercase both for a case-insensitive match.
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut hay = haystack.chars();
+    needle.chars().all(|nc| hay.by_ref().any(|hc| hc == nc))
+}
+
+/// Display width (cells) of a completion item's menu row: the label plus, when
+/// present, a gap and the right-aligned detail. Sizes the popup box.
+fn pmenu_item_width(item: &CompletionItemData) -> usize {
+    let label = item.label.chars().count();
+    let detail = match item.detail.as_deref() {
+        Some(d) if !d.is_empty() => 1 + d.chars().count(),
+        _ => 0,
+    };
+    label + detail
 }
 
 /// Map an LSP [`DiagnosticSeverity`] to nxvim's severity code (`1`=error,

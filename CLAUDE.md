@@ -27,6 +27,10 @@ A pre-commit hook (`.pre-commit-config.yaml`) runs `cargo fmt --check` + `cargo 
 
 `vendor/neovim` is a git submodule kept purely as a behavioral/source-layout reference — it is never built or linked. It is not needed to build nxvim; populate it only if you want the reference: `git submodule update --init vendor/neovim`.
 
+## Workflow
+
+- **Bug fixes are test-driven.** For every bug-fix request, first write a test that *fails* while the bug exists and *passes* once the fix is in place. Confirm it fails, implement the fix, confirm it passes, then coordinate with the requester to validate the behavior. A test written before the fix proves the bug is real and that the fix isn't a no-op, and it guards against regression. (See the testing conventions below for where tests live.)
+
 ## Conventions that will bite you if missed
 
 - **No unit tests.** Behavior is verified end-to-end through the running server: a test starts a real server over an in-process RPC pipe, feeds vim key-notation via `nvim_input`, and asserts on `nvim_buf_get_lines` / cursor / the `redraw` view. Put new coverage in `crates/nxvim-server/tests/editing.rs` (helpers: `start`, `feed`, `lines`, `cursor`) — do **not** add `#[test]` unit tests inside the crates. (Rationale: architecture.md → *Testing philosophy*.)

@@ -133,6 +133,21 @@ async fn cursor(rpc: &Rpc) -> (usize, usize) {
     }
 }
 
+/// The editor's `mode()` short code (`"n"`, `"i"`, …). Awaiting it also barriers.
+async fn mode(rpc: &Rpc) -> String {
+    let result = rpc
+        .request("nvim_get_mode", vec![])
+        .await
+        .expect("get_mode");
+    match result {
+        Value::Map(map) => field(&map, "mode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -394,4 +409,182 @@ async fn visual_only_map_does_not_fire_in_normal() {
     // Enter Visual with `v`, then `U` fires.
     let visual = redraw_after(&rpc, &mut incoming, "vU").await;
     assert_eq!(message(&visual), "XU", "x-mode map fired in visual");
+}
+
+// ----- Phase 3: insert/command mode, buffer-local maps, deletion ------------
+
+/// An insert-mode map fires while inserting: `jk` → `<Esc>` leaves insert, and a
+/// lone `j` still inserts a literal `j` (the withheld prefix is replayed when the
+/// next key breaks the `jk` sequence). The matcher selects the Insert trie by the
+/// editor's current mode.
+#[tokio::test]
+async fn insert_mode_map_fires_and_lone_prefix_inserts() {
+    let dir = temp_dir("keymap_insert");
+    let (rpc, _incoming) = start_with_config(&dir, "vim.keymap.set('i', 'jk', '<Esc>')\n").await;
+
+    // Type some text, then `jk` to leave insert — the map fires in insert mode.
+    feed(&rpc, "ihello");
+    assert_eq!(mode(&rpc).await, "i", "i entered insert mode");
+    feed(&rpc, "jk");
+    assert_eq!(mode(&rpc).await, "n", "jk fired <Esc>, back to normal");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "neither j nor k was inserted"
+    );
+
+    // A lone `j` (no following `k`) still inserts: the withheld `j` is replayed
+    // when the next key breaks `jk`. `<Esc>` both proves the replay and flushes
+    // the trailing prefix (the D4 no-timer gap — a final key flushes `pending`).
+    feed(&rpc, "oj<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello", "j"],
+        "the lone j was inserted on its own line"
+    );
+}
+
+/// A command-line map fires in command mode: with `'c'` mapping `jj` → `xy`,
+/// typing `:` then `jj` edits the command line so it reads `xy` — the mapped keys
+/// never reach the line themselves. Observed through the `cmdline` the redraw
+/// carries (no need to *submit* the line, so ex-command semantics stay out of it).
+#[tokio::test]
+async fn command_mode_map_edits_the_command_line() {
+    let dir = temp_dir("keymap_cmdline");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.keymap.set('c', 'jj', 'xy')\n").await;
+
+    let redraw = redraw_after(&rpc, &mut incoming, ":jj").await;
+    assert_eq!(
+        field(&redraw, "command_mode").and_then(Value::as_bool),
+        Some(true),
+        ": entered command mode"
+    );
+    assert_eq!(
+        field(&redraw, "cmdline").and_then(Value::as_str),
+        Some("xy"),
+        "jj fired its c-mode map, inserting xy into the command line"
+    );
+}
+
+/// A buffer-local map fires only in the buffer it was set for: it works in
+/// buffer 1, does nothing after `:enew` opens buffer 2, and works again once
+/// buffer 1 is current. (The buffer-local > global rung of D6, here with no global
+/// to fall back to.) The map *edits its buffer* (inserts a `Z`) rather than
+/// printing, so each buffer's contents are an unambiguous, per-buffer witness —
+/// the shared message line would carry a stale marker across the switches.
+#[tokio::test]
+async fn buffer_local_map_fires_only_in_its_buffer() {
+    let dir = temp_dir("keymap_buflocal");
+    // Bound to buffer 1 — the startup buffer's id. Inserts a `Z` at the cursor.
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', '<Space>b', 'iZ<Esc>', { buffer = 1 })\n",
+    )
+    .await;
+
+    // Give buffer 1 real content (also makes it non-throwaway, so the later
+    // `:enew` opens a *second* buffer instead of reusing this empty one).
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // Buffer 1: `<Space>b` fires `iZ<Esc>`, inserting a Z at column 0.
+    feed(&rpc, "<Space>b");
+    assert_eq!(lines(&rpc).await, vec!["Zhello"], "fires in its own buffer");
+
+    // `:enew` opens buffer 2; the buffer-1-local map is not in force there, so the
+    // keys fall through (<Space>/b are normal-mode motions) and edit nothing.
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, "<Space>b");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "must not fire in another buffer"
+    );
+
+    // Back to buffer 1: the map is live again — a second Z lands at column 0.
+    feed(&rpc, ":buffer 1<CR>");
+    feed(&rpc, "<Space>b");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["ZZhello"],
+        "live again in its buffer"
+    );
+}
+
+/// `vim.keymap.del` stops a map firing; and re-`set`ting the same map (an
+/// augroup-`clear`-style re-source) leaves exactly one mapping, so it can't
+/// double-fire. The function RHS appends a marker char so a double-fire would be
+/// observable as two chars.
+#[tokio::test]
+async fn del_removes_a_map_and_resourcing_does_not_double_fire() {
+    let dir = temp_dir("keymap_del");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        // Set the same map twice (the re-source case), then a third that we delete.
+        "vim.keymap.set('n', '<Space>a', 'A')\n\
+         vim.keymap.set('n', '<Space>a', 'A')\n\
+         vim.keymap.set('n', '<Space>d', 'A')\n\
+         vim.keymap.del('n', '<Space>d')\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // `<Space>a` is mapped to `A` (append). Despite being set twice, it fires once
+    // — one `A` press worth of insert, appending one literal after the line.
+    feed(&rpc, "<Space>aX<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["helloX"],
+        "double-set map fired once (A appended, X typed)"
+    );
+
+    // `<Space>d` was deleted: it no longer maps to `A`. The keys fall through —
+    // `<Space>` moves right, `d` begins an operator — so nothing is inserted.
+    feed(&rpc, "<Space>dd");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "the deleted map didn't fire; dd fell through and deleted the line"
+    );
+}
+
+/// The lower-level `nvim_set_keymap` defaults to *remappable* (design D5 — the
+/// `:map`-family default, opposite of `vim.keymap.set`'s `noremap` default), while
+/// an explicit `{ noremap = true }` opts out. With a user map `p` → `iX<Esc>`:
+/// `Q` (remappable) chains through `p` and inserts an `X`; `W` (noremap) feeds a
+/// literal `p` to the editor (native paste), bypassing the map. Observed through
+/// buffer contents — a per-buffer witness, unlike the shared message line.
+#[tokio::test]
+async fn nvim_set_keymap_defaults_to_remappable() {
+    let dir = temp_dir("keymap_lowlevel");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'p', 'iX<Esc>')\n\
+         vim.api.nvim_set_keymap('n', 'Q', 'p', {})\n\
+         vim.api.nvim_set_keymap('n', 'W', 'p', { noremap = true })\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // Q is remappable (the nvim_set_keymap default): its RHS `p` re-feeds through
+    // the matcher and triggers the user's `p` → `iX<Esc>` map, inserting an X.
+    feed(&rpc, "Q");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["Xhello"],
+        "Q remapped through p, inserting X"
+    );
+
+    // W is noremap: its `p` is fed straight to the editor (native paste of the
+    // empty unnamed register), bypassing the `p` map — no second X.
+    feed(&rpc, "W");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["Xhello"],
+        "W (noremap) bypassed the p map"
+    );
 }

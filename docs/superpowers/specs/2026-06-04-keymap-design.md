@@ -1,9 +1,11 @@
 # Keymap (`vim.keymap` / `:map`) — design & phased implementation plan
 
 **Date:** 2026-06-04
-**Status:** **Phases 1–2 implemented** on `main` (the matcher + normal-mode
+**Status:** **Phases 1–3 implemented** on `main` (the matcher + normal-mode
 `vim.keymap.set`, global; recursive `remap`, `<leader>`, mode-lists, and Visual
-maps); Phases 3–4 and the backport remain planned (`omap` deferred — see Phase 2).
+maps; insert/command-mode maps, buffer-local maps, `vim.keymap.del`, and the
+low-level `nvim_set_keymap`/`nvim_buf_set_keymap`/`nvim_del_keymap`/`nvim_buf_del_keymap`
+family); Phase 4 and the backport remain planned (`omap` deferred — see Phase 2).
 Foundation work for **`main`**, deliberately independent of — and unaware of — the
 LSP feature. **Implemented on `main` first** (it has no LSP
 dependency), then **backported to `feature/lsp-integration`**, where it subsumes
@@ -425,7 +427,31 @@ ambiguity timer and `expr` (Phase 4).
 
 ---
 
-### Phase 3 — insert & command mode, buffer-local maps, deletion
+### Phase 3 — insert & command mode, buffer-local maps, deletion — ✅ implemented
+
+> **Landed.** Insert/command-mode maps, **buffer-local** maps (`opts.buffer`,
+> `0` = current), `vim.keymap.del`, and the low-level
+> `nvim_set_keymap`/`nvim_buf_set_keymap`/`nvim_del_keymap`/`nvim_buf_del_keymap`
+> family. Insert and command maps needed **no new matcher code** — the engine
+> already selects a per-mode trie by `editor.mode` (`mode_key`/`mode_buckets`
+> covered `'i'`/`'c'` from Phase 1), so the work was the Lua surface plus tests.
+> **Buffer-local** maps are where D6's *buffer-local > global* rung first does real
+> work: the server now caches the registry **snapshot** and (re)compiles the tries
+> via `build_for(buffer)`, dropping buffer-local entries scoped to *other* buffers
+> and letting the surviving ones overwrite globals at the same LHS. The rebuild is
+> gated on `(version, current_buffer)` rather than version alone (`needs_build`),
+> so a buffer switch re-scopes the maps even with no registry change; like the
+> version check it is once-per-batch, so a mid-batch switch takes effect next batch.
+> A startup seed (`set_buf_snapshot` before `source_init`) makes `buffer = 0`
+> resolve to the real startup buffer at config-time, matching neovim (the same
+> `vim._cur_buf` snapshot `nvim_create_autocmd`'s `buffer = 0` already used).
+> `vim.keymap.set`/`del` and the `nvim_*` family share two pure-Lua helpers
+> (`keymap_register`/`keymap_remove`); the only behavioral split is the `noremap`
+> default (D5 — `set` true, the `nvim_*`/`:map` family false). `keymap_remove`
+> drops only the requested modes from a matched entry (surviving if it covered
+> more), and frees a function RHS only when no modes remain — so a re-sourced
+> config leaves exactly one mapping and can't double-fire. Covered by the Phase 3
+> block in `tests/keymaps.rs`; a runnable playground is `examples/phase3-config`.
 
 **Goal / value.** The remaining modes and scoping: insert-mode maps (the `jk`→`<Esc>`
 class), command-line maps, **buffer-local** mappings (`opts.buffer`, the `on_attach`

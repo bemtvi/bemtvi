@@ -180,6 +180,17 @@ where
         keymaps: Keymaps::default(),
     };
 
+    // Seed the current-buffer snapshot before sourcing config, so a buffer-local
+    // map declared with `buffer = 0` (or `nvim_create_autocmd`'s `buffer = 0`)
+    // resolves to the real startup buffer rather than the default `0` — the buffer
+    // already exists at config time, matching neovim. Lifecycle emission refreshes
+    // it again before each autocmd fires; this just makes it valid earlier.
+    {
+        let buf = server.editor.current_buffer_id();
+        let name = server.editor.buffer_name(buf).unwrap_or_default();
+        let _ = server.lua.set_buf_snapshot(buf.0, &name);
+    }
+
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.
@@ -398,13 +409,22 @@ impl Server {
         self.run_pending();
     }
 
-    /// Check `vim._keymaps_version` and recompile the per-mode tries if it
-    /// advanced. Cheap on the common path: one integer read across the bridge.
+    /// Bring the keymap tries up to date for the current buffer. Re-reads the
+    /// registry only when `vim._keymaps_version` advanced (one integer read across
+    /// the bridge on the common path), and rebuilds the per-mode tries when either
+    /// the snapshot or the current buffer changed — the latter so a buffer-local
+    /// map (design D6) is in force exactly in its own buffer. Both checks are
+    /// cheap; a mapping set or a buffer switched *mid-batch* takes effect on the
+    /// next batch, the same accepted ordering the version check already implies.
     fn refresh_keymaps(&mut self) {
         let version = self.lua.keymaps_version();
         if version != self.keymaps.version {
             let snapshot = self.lua.keymaps_snapshot();
-            self.keymaps.rebuild(version, snapshot);
+            self.keymaps.set_snapshot(version, snapshot);
+        }
+        let buffer = self.editor.current_buffer_id().0;
+        if self.keymaps.needs_build(buffer) {
+            self.keymaps.build_for(buffer);
         }
     }
 

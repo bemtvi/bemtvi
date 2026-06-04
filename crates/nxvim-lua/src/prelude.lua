@@ -529,16 +529,23 @@ local function keymap_expand_leader(lhs)
   return lhs
 end
 
--- vim.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
--- `rhs` is a function (stored in vim._keymap_fns) or a string (fed as keys).
--- Maps are non-recursive by default (the vim.keymap.set convention); pass
--- `opts.remap = true` for a recursive map whose RHS keys are re-fed through the
--- mapping layer (or, equivalently, `opts.noremap = false`). `opts.desc` is stored
--- but unused; `opts.buffer` / `opts.default` are recorded for the precedence
--- ladder the server applies (buffer-local maps and built-in defaults arrive in
--- later phases, but the fields ride along from day one).
-function vim.keymap.set(mode, lhs, rhs, opts)
-  opts = opts or {}
+-- Resolve a `buffer` opt to a concrete buffer number: 0 means "the current
+-- buffer", resolved at call-time against the snapshot the server refreshes (the
+-- same convention nvim_create_autocmd uses), so a buffer-local map declared with
+-- `buffer = 0` is pinned to the buffer that was current when it was set.
+local function keymap_resolve_buffer(buffer)
+  if buffer == 0 then return vim._cur_buf and vim._cur_buf.bufnr or 0 end
+  return buffer
+end
+
+-- Register one keymap entry into vim._keymaps — the shared core of vim.keymap.set
+-- and the lower-level nvim_set_keymap / nvim_buf_set_keymap. `modes` is a list of
+-- mode codes; `rhs` a function (stored in vim._keymap_fns) or a string (fed as
+-- keys); `noremap` is already resolved by the caller (set defaults it true, the
+-- nvim_* family false — design D5). `<leader>` is expanded in both the LHS and a
+-- string RHS at set-time, matching neovim. Bumps the version so the server
+-- rebuilds its tries.
+local function keymap_register(modes, lhs, rhs, noremap, buffer, desc, default)
   keymap_seq = keymap_seq + 1
   local id = keymap_seq
   local rhs_data
@@ -552,16 +559,91 @@ function vim.keymap.set(mode, lhs, rhs, opts)
   end
   vim._keymaps[#vim._keymaps + 1] = {
     id = id,
-    modes = keymap_modes(mode),
+    modes = modes,
     lhs = keymap_expand_leader(lhs),
     rhs = rhs_data,
-    -- noremap unless either `noremap = false` or `remap = true` is given.
-    noremap = opts.noremap ~= false and not opts.remap,
-    buffer = opts.buffer,
-    desc = opts.desc,
-    default = opts.default or false,
+    noremap = noremap,
+    buffer = keymap_resolve_buffer(buffer),
+    desc = desc,
+    default = default or false,
   }
   vim._keymaps_version = vim._keymaps_version + 1
+end
+
+-- Remove the mappings for `lhs` in `modes` at the given `buffer` scope (nil for
+-- global, a resolved number for buffer-local) — the shared core of vim.keymap.del
+-- and the nvim_*_del_keymap family. A matched entry loses only the requested
+-- modes; it survives (with the rest) if it covered more, and is dropped — along
+-- with any function RHS it held — only when no modes remain. Re-sourcing a config
+-- that re-sets the same map therefore leaves exactly one mapping, so it can't
+-- double-fire. Bumps the version so the server rebuilds its tries.
+local function keymap_remove(modes, lhs, buffer)
+  lhs = keymap_expand_leader(lhs)
+  local want = {}
+  for _, m in ipairs(modes) do want[m] = true end
+  local kept = {}
+  for _, e in ipairs(vim._keymaps) do
+    if e.lhs == lhs and e.buffer == buffer then
+      local remaining = {}
+      for _, m in ipairs(e.modes) do
+        if not want[m] then remaining[#remaining + 1] = m end
+      end
+      if #remaining > 0 then
+        e.modes = remaining
+        kept[#kept + 1] = e
+      elseif e.rhs.kind == "lua" then
+        vim._keymap_fns[e.id] = nil
+      end
+    else
+      kept[#kept + 1] = e
+    end
+  end
+  vim._keymaps = kept
+  vim._keymaps_version = vim._keymaps_version + 1
+end
+
+-- vim.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
+-- `rhs` is a function (stored in vim._keymap_fns) or a string (fed as keys).
+-- Maps are non-recursive by default (the vim.keymap.set convention); pass
+-- `opts.remap = true` for a recursive map whose RHS keys are re-fed through the
+-- mapping layer (or, equivalently, `opts.noremap = false`). `opts.desc` is stored
+-- but unused; `opts.buffer` ties the map to one buffer (0 = current), `opts.default`
+-- marks an overridable built-in — both feed the precedence ladder the server applies.
+function vim.keymap.set(mode, lhs, rhs, opts)
+  opts = opts or {}
+  -- noremap unless either `noremap = false` or `remap = true` is given.
+  local noremap = opts.noremap ~= false and not opts.remap
+  keymap_register(keymap_modes(mode), lhs, rhs, noremap, opts.buffer, opts.desc, opts.default)
+end
+
+-- vim.keymap.del(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
+-- `opts.buffer` (0 = current) targets a buffer-local map; absent targets globals.
+function vim.keymap.del(mode, lhs, opts)
+  opts = opts or {}
+  keymap_remove(keymap_modes(mode), lhs, keymap_resolve_buffer(opts.buffer))
+end
+
+-- The lower-level nvim_set_keymap / nvim_buf_set_keymap (+ their del partners)
+-- that vim.keymap.set normalizes onto: single-char `mode`, and — matching the
+-- `:map`-family default (design D5) — *remappable* unless `opts.noremap` is set.
+-- A function RHS rides `opts.callback` (the API's escape hatch), else `rhs` is the
+-- key string. nvim_buf_*_keymap take a leading `buffer` (0 = current).
+function vim.api.nvim_set_keymap(mode, lhs, rhs, opts)
+  opts = opts or {}
+  keymap_register({ mode }, lhs, opts.callback or rhs, opts.noremap == true, nil, opts.desc, opts.default)
+end
+
+function vim.api.nvim_buf_set_keymap(buffer, mode, lhs, rhs, opts)
+  opts = opts or {}
+  keymap_register({ mode }, lhs, opts.callback or rhs, opts.noremap == true, buffer, opts.desc, opts.default)
+end
+
+function vim.api.nvim_del_keymap(mode, lhs)
+  keymap_remove({ mode }, lhs, nil)
+end
+
+function vim.api.nvim_buf_del_keymap(buffer, mode, lhs)
+  keymap_remove({ mode }, lhs, keymap_resolve_buffer(buffer))
 end
 
 -- Invoke the function RHS for entry `id` (called from Rust when a Lua-backed

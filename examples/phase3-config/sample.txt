@@ -1,0 +1,8 @@
+first line — press i, type something, then jk to leave insert mode
+second line: <Space>b prints a buffer-local message (only in this buffer)
+third line — try T (runs R's action via the low-level remap) vs U (literal R)
+fourth line: type : then qq to see the command line read ":quit"
+fifth line — <Space>g was deleted at startup; pressing it does nothing
+sixth line
+seventh line
+eighth line — last line

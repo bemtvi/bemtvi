@@ -126,9 +126,21 @@ impl Trie {
 /// built from, and the withhold/replay buffer. One of these lives on the server.
 #[derive(Default)]
 pub struct Keymaps {
-    /// `vim._keymaps_version` the tries were last compiled from. The server
-    /// rebuilds only when the live version advances (checked once per batch).
+    /// `vim._keymaps_version` the cached [`snapshot`](Self::snapshot) was last
+    /// pulled at. The server re-reads the registry only when the live version
+    /// advances (checked once per batch).
     pub version: u64,
+    /// The registry snapshot, pre-sorted into precedence order (lowest first), so
+    /// [`build_for`](Self::build_for) can compile a buffer's tries by a single
+    /// linear insert without re-sorting. Kept across buffer switches: a switch
+    /// rebuilds the tries from this same snapshot, filtered to the new buffer.
+    snapshot: Vec<RawKeymap>,
+    /// The buffer the cached `tries` were built for, or `None` when they need a
+    /// (re)build — set on a version bump or after a buffer switch. Buffer-local
+    /// maps for *other* buffers are filtered out of the tries (design D6's
+    /// buffer-local > global rung), so this gates a rebuild when the current
+    /// buffer changes even though the registry version did not.
+    built_buffer: Option<u64>,
     /// Per-mode tries, keyed by the editor-mode code the matcher selects them by
     /// (`mode_key`: `'n'`, `'i'`, `'v'`, `'V'`, …). A map's declared mode expands
     /// to one or more of these buckets at build time (see [`mode_buckets`]).
@@ -150,25 +162,50 @@ pub struct Keymaps {
 const MAX_MAP_DEPTH: usize = 100;
 
 impl Keymaps {
-    /// (Re)compile the per-mode tries from a registry snapshot. Entries are
-    /// applied in precedence order — **buffer-local > global**, within a scope
-    /// **user (non-default) > default**, and among equals **last-set wins** — by
-    /// inserting lowest-precedence first so higher-precedence entries overwrite at
-    /// the same LHS path (D6). Phase 1 exercises only the last-set-wins rung
-    /// (all maps are global, non-default); the buffer/default keys are present so
-    /// later phases and the LSP backport are a data change, not an engine change.
-    pub fn rebuild(&mut self, version: u64, mut snapshot: Vec<RawKeymap>) {
+    /// Cache a fresh registry snapshot (read when `vim._keymaps_version`
+    /// advanced) and remember its version. Entries are sorted once into
+    /// precedence order — **buffer-local > global**, within a scope **user
+    /// (non-default) > default**, and among equals **last-set wins** — so
+    /// [`build_for`](Self::build_for) can replay them lowest-first and let
+    /// higher-precedence entries overwrite at the same LHS path (D6). Marks the
+    /// tries stale (via [`needs_build`](Self::needs_build)) so the server rebuilds
+    /// them before the next match.
+    pub fn set_snapshot(&mut self, version: u64, mut snapshot: Vec<RawKeymap>) {
         self.version = version;
-        self.tries.clear();
         snapshot.sort_by_key(|e| (e.buffer.is_some(), !e.default, e.seq));
-        for entry in snapshot {
+        self.snapshot = snapshot;
+        self.built_buffer = None;
+    }
+
+    /// Whether the cached tries need a (re)build for `buffer` — true after a
+    /// version bump (which clears [`built_buffer`](Self::built_buffer)) or when the
+    /// current buffer differs from the one the tries were built for.
+    pub fn needs_build(&self, buffer: u64) -> bool {
+        self.built_buffer != Some(buffer)
+    }
+
+    /// (Re)compile the per-mode tries for `buffer` from the cached snapshot,
+    /// keeping global maps and the buffer-local maps scoped to `buffer` while
+    /// dropping buffer-local maps for *other* buffers. Because the snapshot is
+    /// pre-sorted (buffer-local last within a scope), the surviving buffer-local
+    /// entries overwrite the globals at the same LHS — the buffer-local > global
+    /// rung of D6. Phase 1 exercised only last-set-wins (all global); this is
+    /// where the buffer rung first does real work.
+    pub fn build_for(&mut self, buffer: u64) {
+        self.built_buffer = Some(buffer);
+        self.tries.clear();
+        for entry in &self.snapshot {
+            // Skip buffer-local maps that belong to a different buffer.
+            if matches!(entry.buffer, Some(b) if b != buffer) {
+                continue;
+            }
             let lhs = parse_keys(&entry.lhs);
             if lhs.is_empty() {
                 continue;
             }
-            let rhs = match entry.rhs {
-                RawRhs::Lua(id) => MappingRhs::Lua(id),
-                RawRhs::Str(s) => MappingRhs::Keys(parse_keys(&s), entry.noremap),
+            let rhs = match &entry.rhs {
+                RawRhs::Lua(id) => MappingRhs::Lua(*id),
+                RawRhs::Str(s) => MappingRhs::Keys(parse_keys(s), entry.noremap),
             };
             for mode in &entry.modes {
                 // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out

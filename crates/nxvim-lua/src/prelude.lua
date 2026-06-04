@@ -496,3 +496,359 @@ function vim._panel_select_buffer(line)
     vim.cmd("buffer " .. n)
   end
 end
+
+-- ----- vim.fs: path helpers --------------------------------------------------
+-- The subset of neovim's `vim.fs` the real `lsp/<server>.lua` config files reach
+-- for to resolve a workspace root. Pure string/path math layered over the
+-- Rust-backed `vim._readdir` / `vim.fn.getftime` / `vim.fn.getcwd` primitives.
+
+vim.fs = vim.fs or {}
+
+-- Join path segments with `/`, collapsing duplicate separators.
+function vim.fs.joinpath(...)
+  return (table.concat({ ... }, "/"):gsub("//+", "/"))
+end
+
+-- Expand a leading `~` and collapse duplicate / trailing slashes. (Minimal: no
+-- `..` resolution — the config files don't need it.)
+function vim.fs.normalize(path, _opts)
+  if type(path) ~= "string" then return path end
+  if path == "~" or vim.startswith(path, "~/") then
+    path = (os.getenv("HOME") or "") .. path:sub(2)
+  end
+  path = path:gsub("//+", "/")
+  if #path > 1 then path = (path:gsub("/$", "")) end
+  return path
+end
+
+-- The directory part of `path` ("." when there is none, "/" at the root).
+function vim.fs.dirname(path)
+  if not path or path == "" then return "." end
+  path = path:gsub("/+$", "")
+  local dir = path:match("^(.*)/[^/]*$")
+  if dir == nil then return "." end
+  if dir == "" then return "/" end
+  return dir
+end
+
+-- The final component of `path`.
+function vim.fs.basename(path)
+  if not path then return nil end
+  return (path:gsub("/+$", ""):match("[^/]*$"))
+end
+
+-- Iterate the ancestors of `start` (each parent in turn, excluding `start`),
+-- usable as `for dir in vim.fs.parents(path) do … end`.
+function vim.fs.parents(start)
+  return function(_, dir)
+    local parent = vim.fs.dirname(dir)
+    if parent == dir then return nil end
+    return parent
+  end, nil, start
+end
+
+-- Does `path` exist on disk (file or directory)? `getftime` stats both and
+-- returns -1 only when the path can't be stat'd.
+local function fs_exists(path)
+  return vim.fn.getftime(path) ~= -1
+end
+
+-- vim.fs.find(names, opts): find paths matching `names` (a name, list of names,
+-- or `function(name, path)` predicate). `opts.upward` walks ancestors of
+-- `opts.path` (default cwd); otherwise it descends breadth-first. `opts.limit`
+-- caps results (default 1). Enough for the root_dir helpers configs use.
+function vim.fs.find(names, opts)
+  opts = opts or {}
+  local matches
+  if type(names) == "function" then
+    matches = names
+  else
+    local list = type(names) == "table" and names or { names }
+    matches = function(n) return vim.tbl_contains(list, n) end
+  end
+  local path = opts.path or vim.fn.getcwd()
+  local limit = opts.limit or 1
+  local results = {}
+  local function consider(dir, entry)
+    if matches(entry, dir) then
+      results[#results + 1] = vim.fs.joinpath(dir, entry)
+    end
+  end
+  if opts.upward then
+    local dir = path
+    while dir do
+      for _, entry in ipairs(vim._readdir(dir)) do
+        consider(dir, entry)
+        if #results >= limit then return results end
+      end
+      local parent = vim.fs.dirname(dir)
+      if parent == dir then break end
+      dir = parent
+    end
+  else
+    local queue, scanned = { path }, 0
+    while #queue > 0 and scanned < 4096 do
+      local dir = table.remove(queue, 1)
+      scanned = scanned + 1
+      for _, entry in ipairs(vim._readdir(dir)) do
+        local full = vim.fs.joinpath(dir, entry)
+        consider(dir, entry)
+        if #results >= limit then return results end
+        if vim.fn.isdirectory(full) == 1 then queue[#queue + 1] = full end
+      end
+    end
+  end
+  return results
+end
+
+-- vim.fs.root(source, marker): the nearest ancestor of `source` (a path, or a
+-- bufnr — 0/snapshot resolves to the current buffer's name, else cwd) that holds
+-- `marker`. `marker` is a filename, a `function(name, path)` predicate, a list
+-- (equal priority — any present matches), or a list of such groups tried in
+-- order ("a then b" priority). Returns nil if none match. This is what the
+-- vendored `lsp/<server>.lua` files call to compute their `root_dir`.
+function vim.fs.root(source, marker)
+  local path
+  if type(source) == "number" then
+    path = vim.api.nvim_buf_get_name(source)
+    if path == nil or path == "" then path = vim.fn.getcwd() end
+  else
+    path = source
+  end
+  path = vim.fs.normalize(path)
+  -- Start at the path's directory when it is a file.
+  local start = path
+  if vim.fn.isdirectory(path) == 0 then start = vim.fs.dirname(path) end
+  -- Normalize `marker` to an ordered list of equal-priority groups.
+  local groups
+  if type(marker) == "table" and type(marker[1]) == "table" then
+    groups = marker
+  else
+    groups = { marker }
+  end
+  for _, group in ipairs(groups) do
+    local names = type(group) == "table" and group or { group }
+    local dir = start
+    while dir do
+      for _, m in ipairs(names) do
+        if type(m) == "function" then
+          for _, entry in ipairs(vim._readdir(dir)) do
+            if m(entry, dir) then return dir end
+          end
+        elseif fs_exists(vim.fs.joinpath(dir, m)) then
+          return dir
+        end
+      end
+      local parent = vim.fs.dirname(dir)
+      if parent == dir then break end
+      dir = parent
+    end
+  end
+  return nil
+end
+
+-- ----- vim.uri ---------------------------------------------------------------
+-- Minimal `file://` URI conversion. (The server does its own, encoding-aware URI
+-- handling for actual LSP traffic; these back config-file path computations.)
+
+function vim.uri_from_fname(path)
+  path = vim.fs.normalize(path)
+  if path:sub(1, 1) ~= "/" then path = "/" .. path end
+  return "file://" .. path
+end
+
+function vim.uri_to_fname(uri)
+  local path = (uri:gsub("^file://", ""))
+  return (path:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+function vim.uri_from_bufnr(bufnr)
+  return vim.uri_from_fname(vim.api.nvim_buf_get_name(bufnr))
+end
+
+-- ----- additional vim.fn -----------------------------------------------------
+
+-- vim.fn.bufname(bufnr): the buffer's name, snapshot-backed via nvim_buf_get_name.
+function vim.fn.bufname(bufnr) return vim.api.nvim_buf_get_name(bufnr or 0) end
+
+-- vim.fn.fnamemodify(fname, mods): apply the `:p`/`:h`/`:t`/`:r`/`:e` filename
+-- modifiers (left to right) configs use. `:p` absolutizes against cwd.
+function vim.fn.fnamemodify(fname, mods)
+  local result = fname or ""
+  local i = 1
+  while i <= #(mods or "") do
+    if mods:sub(i, i) == ":" then
+      local m = mods:sub(i + 1, i + 1)
+      if m == "p" then
+        if result:sub(1, 1) ~= "/" then result = vim.fs.joinpath(vim.fn.getcwd(), result) end
+      elseif m == "h" then
+        result = vim.fs.dirname(result)
+      elseif m == "t" then
+        result = vim.fs.basename(result)
+      elseif m == "r" then
+        result = (result:gsub("%.[^./]*$", ""))
+      elseif m == "e" then
+        result = result:match("%.([^./]*)$") or ""
+      end
+      i = i + 2
+    else
+      i = i + 1
+    end
+  end
+  return result
+end
+
+-- vim.validate / vim.deprecate: argument validation and deprecation notices in
+-- neovim. Config files call them defensively; nxvim makes them no-ops (never
+-- erroring) so a config that validates its opts loads unimpeded.
+function vim.validate(...) end
+
+function vim.deprecate(...) end
+
+-- ----- vim.lsp: the config framework (Neovim 0.11 core) ----------------------
+-- nxvim's LSP machinery (the nxvim-lsp client + server-side document sync) is
+-- driven entirely from this Lua surface, exactly like neovim 0.11: a user calls
+-- `vim.lsp.config(name, …)` / `vim.lsp.enable(name)` (or drops an
+-- `lsp/<name>.lua` on the runtimepath), and an opened file of a matching
+-- filetype starts the server. There is no built-in server table — zero config
+-- means no LSP. `vim.lsp.start` queues an `LspOp` (Rust `vim._lsp_start`) the
+-- server drains into its `LspManager`.
+
+vim.lsp = vim.lsp or {}
+vim.lsp.protocol = vim.lsp.protocol or {}
+
+-- Client capabilities are owned and advertised by the Rust client at
+-- `initialize`; this stub lets a config that merges into them run without error.
+function vim.lsp.protocol.make_client_capabilities() return {} end
+
+vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
+vim._lsp_base_cache = vim._lsp_base_cache or {}   -- name -> lsp/<name>.lua result (false = none)
+vim._lsp_enabled = vim._lsp_enabled or {}         -- name -> enabled?
+
+-- Load and cache `lsp/<name>.lua` off the runtimepath (the base config layer).
+-- Returns its returned table, or nil when absent / not a table.
+local function lsp_base_config(name)
+  local cached = vim._lsp_base_cache[name]
+  if cached ~= nil then return cached or nil end
+  local cfg = false
+  local files = vim.api.nvim_get_runtime_file("lsp/" .. name .. ".lua", false)
+  if files and files[1] then
+    local src = vim._read_file(files[1])
+    if src then
+      local chunk = loadstring(src, "@" .. files[1])
+      if chunk then
+        local ok, ret = pcall(chunk)
+        if ok and type(ret) == "table" then cfg = ret end
+      end
+    end
+  end
+  vim._lsp_base_cache[name] = cfg
+  return cfg or nil
+end
+
+-- The resolved config for `name`: the `'*'` wildcard layer, then the
+-- `lsp/<name>.lua` runtimepath base, then the user override — deep-merged with
+-- the rightmost winning (neovim's `vim.lsp.config[name]` chain).
+local function lsp_resolve(name)
+  return vim.tbl_deep_extend(
+    "force",
+    vim._lsp_user_config["*"] or {},
+    lsp_base_config(name) or {},
+    vim._lsp_user_config[name] or {}
+  )
+end
+
+-- vim.lsp.config: callable to merge an override (`vim.lsp.config(name, opts)` —
+-- `'*'` is the all-clients layer), indexable for the resolved config
+-- (`vim.lsp.config[name]`), and assignable to redefine (`vim.lsp.config[name] =
+-- opts`, which replaces the override layer and drops the runtimepath base).
+vim.lsp.config = setmetatable({}, {
+  __call = function(_, name, opts)
+    if type(name) ~= "string" then error("vim.lsp.config: name must be a string") end
+    local prev = vim._lsp_user_config[name] or {}
+    vim._lsp_user_config[name] = vim.tbl_deep_extend("force", prev, opts or {})
+  end,
+  __index = function(_, name) return lsp_resolve(name) end,
+  __newindex = function(_, name, opts)
+    vim._lsp_user_config[name] = opts or {}
+    vim._lsp_base_cache[name] = false -- a redefine overrides the resolved chain
+  end,
+})
+
+-- Queue a start for `bufnr` from a fully-resolved config (root already computed).
+local function lsp_start_resolved(name, cfg, bufnr, ft, root)
+  local cmd = cfg.cmd
+  if type(cmd) == "function" then cmd = cmd() end
+  vim.lsp.start(
+    { name = name, cmd = cmd or {}, root_dir = root, filetypes = cfg.filetypes },
+    { bufnr = bufnr, filetype = ft }
+  )
+end
+
+-- Resolve `cfg`'s root_dir (string | `function(bufnr, on_dir)` | `root_markers`
+-- upward search) and start the server. A function root_dir drives the start
+-- through its `on_dir` callback, so it can decline (never calling it) to skip a
+-- buffer — the mechanism `vim.lsp.enable`'s docs describe.
+local function lsp_start_for(name, cfg, bufnr, ft)
+  local rd = cfg.root_dir
+  if type(rd) == "function" then
+    rd(bufnr, function(root) lsp_start_resolved(name, cfg, bufnr, ft, root) end)
+  elseif type(rd) == "string" then
+    lsp_start_resolved(name, cfg, bufnr, ft, rd)
+  elseif cfg.root_markers then
+    lsp_start_resolved(name, cfg, bufnr, ft, vim.fs.root(bufnr, cfg.root_markers))
+  else
+    lsp_start_resolved(name, cfg, bufnr, ft, nil)
+  end
+end
+
+-- The shared FileType dispatcher body: for every enabled config whose resolved
+-- `filetypes` includes `ft`, resolve the root and start the server for `bufnr`.
+function vim.lsp._on_filetype(bufnr, ft)
+  if not ft or ft == "" then return end
+  for name, on in pairs(vim._lsp_enabled) do
+    if on then
+      local cfg = vim.lsp.config[name]
+      if cfg.filetypes and vim.tbl_contains(cfg.filetypes, ft) then
+        lsp_start_for(name, cfg, bufnr, ft)
+      end
+    end
+  end
+end
+
+-- Install the single shared FileType autocmd that drives all enabled configs
+-- (idempotent — `vim.lsp.enable` may be called many times).
+local function lsp_ensure_dispatcher()
+  if vim._lsp_dispatcher_installed then return end
+  vim._lsp_dispatcher_installed = true
+  local group = vim.api.nvim_create_augroup("nxvim.lsp.enable", { clear = true })
+  vim.api.nvim_create_autocmd("FileType", {
+    group = group,
+    callback = function(args) vim.lsp._on_filetype(args.buf, args.match) end,
+  })
+end
+
+-- vim.lsp.enable(name|list[, enable]): mark configs for auto-activation (on
+-- current and future buffers) and install the FileType dispatcher. `enable=false`
+-- turns a config off (future buffers won't start it). `'*'` is not a valid name.
+function vim.lsp.enable(name, enable)
+  local names = type(name) == "table" and name or { name }
+  local on = enable ~= false
+  for _, n in ipairs(names) do
+    if n == "*" then error("vim.lsp.enable: '*' is not a valid LSP config name") end
+    vim._lsp_enabled[n] = on
+  end
+  lsp_ensure_dispatcher()
+end
+
+-- vim.lsp.start(config[, opts]): start (or reuse) the server for `config`
+-- (`{name, cmd, root_dir}`) and attach a buffer (`opts.bufnr`, default the
+-- snapshot buffer). `opts.filetype` is the buffer's filetype (the LSP
+-- languageId). Reuse on `(name, root)` is the server's job; here it just queues.
+function vim.lsp.start(config, opts)
+  opts = opts or {}
+  local bufnr = opts.bufnr or (vim._cur_buf and vim._cur_buf.bufnr) or 0
+  local cmd = config.cmd or {}
+  if type(cmd) == "function" then cmd = cmd() end
+  vim._lsp_start(config.name, cmd, config.root_dir, opts.filetype or "", bufnr)
+end

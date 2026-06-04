@@ -67,6 +67,32 @@ pub enum PanelOp {
     Close,
 }
 
+/// A request to start (or attach a buffer to) a language server, queued by
+/// `vim.lsp.start` after user Lua — directly, or through the `vim.lsp.enable`
+/// FileType dispatcher — resolved the config. The root is resolved **in Lua**
+/// (string / `root_markers` upward search / a `function(bufnr, on_dir)`), so the
+/// server never re-resolves it; it only ensures the `(name, root)` client exists
+/// and binds `bufnr` to it. The server's analogue of [`PanelOp`] for LSP.
+#[derive(Clone, Debug)]
+pub enum LspOp {
+    /// `vim.lsp.start({name, cmd, root_dir}, {bufnr, filetype})`.
+    Start {
+        /// The config name (`vim.lsp.config('<name>', …)`), the client identity.
+        name: String,
+        /// The full server argv (program + args). The server may override this
+        /// with `$NXVIM_LSP_CMD` (the test/mock hook), as the old built-in table did.
+        cmd: Vec<String>,
+        /// The workspace root, already resolved in Lua (`None` ⇒ the server falls
+        /// back to the file's directory).
+        root: Option<String>,
+        /// The buffer's filetype, used verbatim as the LSP `languageId`.
+        filetype: String,
+        /// The buffer to attach, as the `BufferId` the server snapshotted into
+        /// `vim._cur_buf` before firing `FileType` (so it round-trips exactly).
+        bufnr: u64,
+    },
+}
+
 /// Lua registry key under which the panel's `on_select` callback is stored.
 const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
 
@@ -82,6 +108,9 @@ struct Shared {
     highlights: Vec<HlSet>,
     /// Panel requests from `vim.panel.*`, applied to the core after the chunk.
     panel_ops: Vec<PanelOp>,
+    /// Server-start requests from `vim.lsp.start` (driven by `vim.lsp.enable`),
+    /// drained by the server into its `LspManager` after the chunk.
+    lsp_ops: Vec<LspOp>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -113,6 +142,7 @@ impl LuaRuntime {
         };
         let shared = Rc::new(RefCell::new(Shared::default()));
         install_vim(&lua, &shared)?;
+        install_runtime_api(&lua, &shared, &runtimepath)?;
         seed_package_path(&lua, &runtimepath)?;
         // The pure-Lua half of `vim.*`, layered over the Rust bridge above.
         lua.load(include_str!("prelude.lua"))
@@ -156,6 +186,12 @@ impl LuaRuntime {
     /// the server to apply to the core (which owns the panel state).
     pub fn take_panel_ops(&self) -> Vec<PanelOp> {
         std::mem::take(&mut self.shared.borrow_mut().panel_ops)
+    }
+
+    /// Take the server-start requests queued by `vim.lsp.start` since the last
+    /// drain, for the server to apply to its `LspManager`.
+    pub fn take_lsp_ops(&self) -> Vec<LspOp> {
+        std::mem::take(&mut self.shared.borrow_mut().lsp_ops)
     }
 
     /// Fire the panel's `on_select` callback for the line at `index` (0-based,
@@ -463,6 +499,148 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Install the `vim.*` functions that need the host filesystem / environment /
+/// runtimepath and feed the LSP framework (Phase 7a): `nvim_get_runtime_file`
+/// (runtimepath `lsp/` discovery), `vim.fn.getcwd`, the `vim._read_file` /
+/// `vim._readdir` filesystem primitives the pure-Lua `vim.fs` builds on, and
+/// `vim._lsp_start` (the queue `vim.lsp.start` pushes onto). Separated from
+/// [`install_vim`] because these capture the runtimepath, known only here.
+fn install_runtime_api(
+    lua: &Lua,
+    shared: &Rc<RefCell<Shared>>,
+    runtimepath: &[PathBuf],
+) -> mlua::Result<()> {
+    let vim: Table = lua.globals().get("vim")?;
+    let api: Table = vim.get("api")?;
+    let func: Table = vim.get("fn")?;
+
+    // `nvim_get_runtime_file(name, all)`: full paths of files matching `name`
+    // (a runtimepath-relative path, the final component optionally globbed with
+    // `*`) across the runtimepath. `all=false` returns the first match only. The
+    // `lsp/<server>.lua` config-discovery primitive.
+    let rtp = runtimepath.to_vec();
+    api.set(
+        "nvim_get_runtime_file",
+        lua.create_function(move |lua, (name, all): (String, Option<bool>)| {
+            let hits = get_runtime_file(&rtp, &name, all.unwrap_or(false));
+            lua.create_sequence_from(hits)
+        })?,
+    )?;
+
+    // `vim.fn.getcwd()`: the process working directory (the root fallback and the
+    // base for relative->absolute path math in `vim.fs`/`fnamemodify`).
+    func.set(
+        "getcwd",
+        lua.create_function(|_, ()| {
+            Ok(std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default())
+        })?,
+    )?;
+
+    // `vim._read_file(path)`: the file's contents, or nil if unreadable. Backs the
+    // pure-Lua loader that sources an `lsp/<name>.lua` config (via `loadstring`),
+    // sidestepping any `loadfile` sandbox question.
+    vim.set(
+        "_read_file",
+        lua.create_function(|_, path: String| Ok(std::fs::read_to_string(&path).ok()))?,
+    )?;
+
+    // `vim._readdir(path)`: the entry names directly under `path` (no `.`/`..`),
+    // or an empty list if it can't be read. Backs `vim.fs.find`/predicate markers.
+    vim.set(
+        "_readdir",
+        lua.create_function(|lua, path: String| {
+            let names: Vec<String> = std::fs::read_dir(&path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            lua.create_sequence_from(names)
+        })?,
+    )?;
+
+    // `vim._lsp_start(name, cmd, root, filetype, bufnr)`: queue an [`LspOp::Start`]
+    // for the server to drain. The Lua-facing `vim.lsp.start` wrapper (prelude)
+    // resolves the config and root, then calls this.
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_start",
+        lua.create_function(
+            move |_,
+                  (name, cmd, root, filetype, bufnr): (
+                String,
+                Vec<String>,
+                Option<String>,
+                String,
+                u64,
+            )| {
+                sh.borrow_mut().lsp_ops.push(LspOp::Start {
+                    name,
+                    cmd,
+                    root,
+                    filetype,
+                    bufnr,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    Ok(())
+}
+
+/// Full paths of the files matching `name` across `runtimepath`, the engine of
+/// `nvim_get_runtime_file`. `name` is a runtimepath-relative path whose final
+/// component may contain a single `*` glob; earlier components are matched
+/// literally. Stops at the first hit when `!all`.
+fn get_runtime_file(runtimepath: &[PathBuf], name: &str, all: bool) -> Vec<String> {
+    let (dir_part, file_part) = name.rsplit_once('/').unwrap_or(("", name));
+    let mut out = Vec::new();
+    for rt in runtimepath {
+        let base = if dir_part.is_empty() {
+            rt.clone()
+        } else {
+            rt.join(dir_part)
+        };
+        if file_part.contains('*') {
+            let Ok(entries) = std::fs::read_dir(&base) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                if glob_match(file_part, &fname.to_string_lossy()) {
+                    out.push(entry.path().to_string_lossy().into_owned());
+                    if !all {
+                        return out;
+                    }
+                }
+            }
+        } else {
+            let full = base.join(file_part);
+            if full.exists() {
+                out.push(full.to_string_lossy().into_owned());
+                if !all {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Match a single path component against a glob with at most one `*` (the only
+/// form `nvim_get_runtime_file` callers use, e.g. `lsp/*.lua`).
+fn glob_match(pat: &str, name: &str) -> bool {
+    match pat.split_once('*') {
+        Some((pre, suf)) => {
+            name.len() >= pre.len() + suf.len() && name.starts_with(pre) && name.ends_with(suf)
+        }
+        None => pat == name,
+    }
 }
 
 /// Store (or clear) the panel's `on_select` callback in the Lua registry. `None`

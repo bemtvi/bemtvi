@@ -45,16 +45,18 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::log::{LogLevel, LspLog};
 
-/// Identifies one language server instance: a `(language, workspace-root)` pair.
-/// nxvim runs at most one child per key and routes a buffer to its server by it.
+/// Identifies one language server instance: a `(name, workspace-root)` pair.
+/// `name` is the user-chosen LSP config name (`vim.lsp.config('<name>', …)` /
+/// `vim.lsp.enable('<name>')`), arbitrary rather than a fixed filetype. nxvim runs
+/// at most one child per key and routes a buffer to its server by it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ServerKey {
-    pub language: &'static str,
+    pub name: String,
     pub root: PathBuf,
 }
 
 /// How to launch a server: the program and its arguments. The working directory
-/// is the key's `root`. Derived from the built-in config table (or the
+/// is the key's `root`. Derived from the resolved Lua config's `cmd` (or the
 /// `NXVIM_LSP_CMD` test override) by the server.
 #[derive(Clone, Debug)]
 pub struct ServerSpawn {
@@ -482,7 +484,7 @@ async fn run_server(
 
         if failures.len() >= GIVE_UP {
             let message = format!("{} kept failing to start; giving up", spawn.program);
-            log.log(LogLevel::Error, key.language, &message);
+            log.log(LogLevel::Error, &key.name, &message);
             let _ = event_tx.send(LspEvent::Log {
                 key: key.clone(),
                 message: format!("lsp: {message}"),
@@ -509,7 +511,7 @@ async fn run_server_once(
     event_tx: &UnboundedSender<LspEvent>,
     log: &Arc<LspLog>,
 ) -> ServerOutcome {
-    let name = key.language;
+    let name = key.name.as_str();
     log.log(
         LogLevel::Info,
         name,
@@ -555,10 +557,11 @@ async fn run_server_once(
     // (server exit). Each line is logged at WARN so it shows at the default level.
     if let Some(stderr) = child.stderr.take() {
         let log = log.clone();
+        let name = key.name.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                log.log(LogLevel::Warn, name, &format!("stderr: {line}"));
+                log.log(LogLevel::Warn, &name, &format!("stderr: {line}"));
             }
         });
     }
@@ -644,7 +647,7 @@ async fn run_server_once(
                     let key = key.clone();
                     let log = log.clone();
                     tokio::spawn(async move {
-                        let reply = issue_request(&mut sock, req, &log, key.language).await;
+                        let reply = issue_request(&mut sock, req, &log, &key.name).await;
                         let _ = tx.send(LspEvent::Reply { key, token, reply });
                     });
                 }
@@ -1234,7 +1237,7 @@ fn new_client(
         router.notification::<PublishDiagnostics>(|st, params| {
             st.log.log(
                 LogLevel::Debug,
-                st.key.language,
+                &st.key.name,
                 &format!(
                     "← publishDiagnostics ({} item(s))",
                     params.diagnostics.len()
@@ -1252,14 +1255,14 @@ fn new_client(
         // the file at the message's mapped severity.
         router.notification::<LogMessage>(|st, params| {
             st.log
-                .log(level_of(params.typ), st.key.language, &params.message);
+                .log(level_of(params.typ), &st.key.name, &params.message);
             ControlFlow::Continue(())
         });
         // `window/showMessage` IS user-facing: log it *and* forward it to the
         // editor's `:messages`.
         router.notification::<ShowMessage>(|st, params| {
             st.log
-                .log(level_of(params.typ), st.key.language, &params.message);
+                .log(level_of(params.typ), &st.key.name, &params.message);
             let _ = st.event_tx.send(LspEvent::Log {
                 key: st.key.clone(),
                 message: params.message,

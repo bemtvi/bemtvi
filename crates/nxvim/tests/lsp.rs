@@ -101,8 +101,31 @@ fn has_method(recs: &[Json], method: &str) -> bool {
 
 // ----- server harness -------------------------------------------------------
 
-/// Start a server (LSP + syntax enabled) editing `file`, attach a UI. Mirrors the
-/// syntax tests' harness.
+/// A temp config dir whose `init.lua` registers the mock language server through
+/// the Phase 7a Lua start path — `vim.lsp.config('mock', …)` + `vim.lsp.enable` —
+/// for the filetypes the tests open. There is no built-in auto-spawn anymore, so
+/// every LSP test starts its server this way. The config's `cmd` is a placeholder:
+/// the real command is injected per-test via `$NXVIM_LSP_CMD` (see
+/// `configure_mock`), which the server honors over the config's `cmd`.
+fn lsp_config_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("nxvim-lsp-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create lsp config dir");
+        std::fs::write(
+            dir.join("init.lua"),
+            "vim.lsp.config('mock', { cmd = { 'mock' }, \
+             filetypes = { 'rust', 'go', 'python', 'lua' } })\n\
+             vim.lsp.enable('mock')\n",
+        )
+        .expect("write init.lua");
+        dir
+    })
+    .clone()
+}
+
+/// Start a server (LSP via the injected `init.lua`, syntax enabled) editing
+/// `file`, attach a UI. Mirrors the syntax tests' harness.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {
@@ -115,6 +138,7 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
             server_end,
             ServerInit {
                 file,
+                config_dir: Some(lsp_config_dir()),
                 ..Default::default()
             },
         ));
@@ -714,7 +738,7 @@ async fn lsp_info_reports_the_running_server() {
 
     assert_eq!(title, "LSP info");
     let body = lines.join("\n");
-    assert!(body.contains("rust"), "names the rust server:\n{body}");
+    assert!(body.contains("mock"), "names the mock server:\n{body}");
     assert!(
         body.contains("utf-8"),
         "shows the negotiated encoding:\n{body}"

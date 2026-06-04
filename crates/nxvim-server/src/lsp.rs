@@ -2,8 +2,9 @@
 //!
 //! Where `nxvim-lsp` owns the client machinery (spawning/supervising servers and
 //! the JSON-RPC bridge — the `SyntaxClient` analogue), this module owns the
-//! *editor* half: the built-in filetype→server config table, per-buffer
-//! document-sync bookkeeping ([`LspDocState`], keyed by [`BufferId`] like
+//! *editor* half: draining the `vim.lsp.start` queue into the manager
+//! ([`Server::apply_lsp_op`]), per-buffer document-sync bookkeeping
+//! ([`LspDocState`], keyed by [`BufferId`] like
 //! `SyntaxState`), byte↔LSP position conversion via `nxvim-core`'s pure unicode
 //! helpers, and the handling of [`LspEvent`]s. Document sync reuses the buffer
 //! edit journal (`take_edits`/`changedtick`) the syntax sync already drives
@@ -27,9 +28,10 @@ use nxvim_lsp::{
     CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
     PositionEncoding, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
 };
+use nxvim_lua::LspOp;
 use rmpv::Value;
 
-use crate::{filetype_of, Server, StyleTable};
+use crate::{Server, StyleTable};
 
 /// One per-line jump target for a navigable LSP panel (diagnostics, references,
 /// …), handed to [`nxvim_core::Editor::set_panel_targets`]: `Some((path, 0-based
@@ -43,8 +45,11 @@ pub(crate) type PanelTarget = Option<(PathBuf, usize, usize)>;
 /// [`Server::lsp_states`].
 #[derive(Default)]
 pub(crate) struct LspDocState {
-    /// Which server owns this buffer (`None` for an unsupported filetype).
+    /// Which server owns this buffer (`None` until a `vim.lsp.start` binds one).
     server: Option<ServerKey>,
+    /// The LSP `languageId` for `didOpen` — the buffer's filetype, set when the
+    /// `vim.lsp.enable` dispatcher binds the buffer (no longer re-derived in sync).
+    language_id: String,
     /// The document URI, kept so `didClose` can be sent after the buffer is gone.
     uri: Option<Url>,
     /// Has `didOpen` been sent for the current server instance?
@@ -203,52 +208,91 @@ pub(crate) struct CompletionMenu {
 }
 
 impl Server {
-    /// Drive LSP document sync for the *current* buffer this frame: ensure its
-    /// server is started, then send `didOpen`/`didChange`/`didSave` as the buffer
-    /// state requires. Called from `redraw()` alongside `sync_syntax`. Never
+    /// Apply one [`LspOp`] drained from the Lua runtime — a `vim.lsp.start` queued
+    /// by user Lua (directly, or through the `vim.lsp.enable` `FileType`
+    /// dispatcher). Ensures the `(name, root)` server exists and binds `bufnr` to
+    /// it; the next [`Server::sync_lsp`] sends `didOpen`. Phase 7a's replacement
+    /// for the built-in auto-spawn: a server starts *only* via this path.
+    pub(crate) fn apply_lsp_op(&mut self, op: LspOp) {
+        let LspOp::Start {
+            name,
+            cmd,
+            root,
+            filetype,
+            bufnr,
+        } = op;
+        let buffer = BufferId(bufnr);
+        // The buffer must be open and file-backed to host an LSP document.
+        let Some(name_str) = self.editor.buffer_name(buffer).filter(|n| !n.is_empty()) else {
+            return;
+        };
+        let path = PathBuf::from(&name_str);
+        let Some(uri) = path_to_uri(&path) else {
+            return;
+        };
+        // Root: `$NXVIM_LSP_ROOT` overrides (the test hook), else the root Lua
+        // resolved, else the file's own directory. Rust never re-runs the marker
+        // search — that is the config's job now (`vim.fs.root` in Lua).
+        let root = lsp_root_override()
+            .or_else(|| root.map(|r| absolutize(Path::new(&r))))
+            .unwrap_or_else(|| {
+                let abs = absolutize(&path);
+                abs.parent().map(Path::to_path_buf).unwrap_or(abs)
+            });
+        let key = ServerKey { name, root };
+        // Spawn command: `$NXVIM_LSP_CMD` overrides the whole argv (the mock hook,
+        // the LSP analogue of `NXVIM_TS_WORKER`), else the config's `cmd`. An
+        // empty command can't start a server.
+        let Some(spawn) = lsp_spawn(&cmd) else {
+            return;
+        };
+        if !self.lsp_ensured.contains(&key) {
+            self.lsp.ensure_server(key.clone(), spawn);
+            self.lsp_ensured.insert(key.clone());
+        }
+        let state = self.lsp_states.entry(buffer).or_default();
+        // Rebinding to a different server re-opens the document under it.
+        if state.server.as_ref() != Some(&key) {
+            state.opened = false;
+            state.version = 0;
+        }
+        state.server = Some(key);
+        state.language_id = filetype;
+        state.uri = Some(uri);
+        // Wake a sync so the bound buffer opens as soon as the server initializes.
+        self.lsp_dirty = true;
+    }
+
+    /// Drive LSP document sync for the *current* buffer this frame: for a buffer a
+    /// `vim.lsp.start` already bound to a server, send `didOpen`/`didChange`/
+    /// `didSave` as its state requires. Called from `redraw()` alongside
+    /// `sync_syntax`. Never spawns (that is [`Server::apply_lsp_op`]) and never
     /// blocks: every send is a fire-and-forget [`LspNotify`].
     pub(crate) fn sync_lsp(&mut self) {
         self.reap_closed_lsp_buffers();
 
         let buffer = self.editor.current_buffer_id();
+        // Only buffers a `vim.lsp.start` bound to a server are synced — there is no
+        // auto-start (Phase 7a: LSP startup is 100% user Lua).
+        let Some(key) = self.lsp_states.get(&buffer).and_then(|s| s.server.clone()) else {
+            return;
+        };
         let Some(path) = self.editor.buffer().path.clone() else {
-            self.clear_lsp_server(buffer);
             return;
         };
-        let Some(language) = filetype_of(Some(&path)) else {
-            self.clear_lsp_server(buffer);
-            return;
-        };
-        let key = ServerKey {
-            language,
-            root: self.lsp_root_for(language, &path),
-        };
-        // Ensure the server exactly once per key (the `ensure_started` analogue):
-        // resolving the command scans `PATH`, and `ensure_server` is a channel
-        // send — neither should run on every redraw. A filetype with no
-        // configured/installed server clears the buffer's server marker and stops.
-        if !self.lsp_ensured.contains(&key) {
-            let Some(spawn) = lsp_spawn_for(language) else {
-                self.clear_lsp_server(buffer);
-                return;
-            };
-            self.lsp.ensure_server(key.clone(), spawn);
-            self.lsp_ensured.insert(key.clone());
-        }
         let Some(uri) = path_to_uri(&path) else {
             return;
         };
 
         // The encoding/sync kind aren't known until the server's `initialize`
         // reply lands (the `Initialized` event). Until then, just remember the
-        // intended server so the buffer opens as soon as it's ready.
+        // intended URI so the buffer opens as soon as it's ready.
         let Some(&ServerRuntime {
             encoding,
             sync_kind,
         }) = self.lsp_servers.get(&key)
         else {
             let state = self.lsp_states.entry(buffer).or_default();
-            state.server = Some(key);
             state.uri = Some(uri);
             return;
         };
@@ -270,11 +314,12 @@ impl Server {
             let _ = self.editor.buffer_mut().take_lsp_edits();
             let text = self.editor.buffer().text.to_string();
             state.version = 1;
+            let language_id = state.language_id.clone();
             self.lsp.notify(
                 key.clone(),
                 LspNotify::DidOpen {
                     uri: uri.clone(),
-                    language_id: language.to_string(),
+                    language_id,
                     version: state.version,
                     text,
                 },
@@ -317,25 +362,6 @@ impl Server {
         }
 
         self.lsp_states.insert(buffer, state);
-    }
-
-    /// Mark a buffer as no longer served (its filetype lost a server). The doc
-    /// state is kept so a later re-detection re-opens cleanly.
-    fn clear_lsp_server(&mut self, buffer: BufferId) {
-        if let Some(state) = self.lsp_states.get_mut(&buffer) {
-            state.server = None;
-        }
-    }
-
-    /// The workspace root for `path` (of `language`), cached per file path so the
-    /// root-marker search runs once rather than on every redraw's `sync_lsp`.
-    fn lsp_root_for(&mut self, language: &str, path: &Path) -> PathBuf {
-        if let Some(root) = self.lsp_roots.get(path) {
-            return root.clone();
-        }
-        let root = workspace_root(language, path);
-        self.lsp_roots.insert(path.to_path_buf(), root.clone());
-        root
     }
 
     /// Send `didClose` for, and forget the state of, every buffer the editor has
@@ -429,7 +455,7 @@ impl Server {
                 let runtime = self.lsp_servers.get(key);
                 lines.push(format!(
                     "  server:      {} ({})",
-                    key.language,
+                    key.name,
                     key.root.display()
                 ));
                 lines.push(format!(
@@ -463,7 +489,7 @@ impl Server {
             lines.push("  (none)".to_string());
         } else {
             let mut servers: Vec<_> = self.lsp_servers.iter().collect();
-            servers.sort_by_key(|(k, _)| (k.language, k.root.clone()));
+            servers.sort_by_key(|(k, _)| (k.name.clone(), k.root.clone()));
             for (key, runtime) in servers {
                 let attached = self
                     .lsp_states
@@ -472,7 +498,7 @@ impl Server {
                     .count();
                 lines.push(format!(
                     "  {} @ {} — {}, {}, {attached} buffer(s)",
-                    key.language,
+                    key.name,
                     key.root.display(),
                     encoding_label(runtime.encoding),
                     sync_label(runtime.sync_kind),
@@ -1775,84 +1801,31 @@ fn sync_label(kind: TextDocumentSyncKind) -> &'static str {
     }
 }
 
-/// The built-in filetype→server-command table (Decision 6), the `filetype_of`
-/// analogue. A real server is used only if its binary is on `PATH`. The
-/// `NXVIM_LSP_CMD` env var overrides the whole table with a single command (the
-/// mock, in tests) — the LSP analogue of `NXVIM_TS_WORKER`.
-pub(crate) fn lsp_spawn_for(language: &str) -> Option<ServerSpawn> {
-    if let Ok(cmd) = std::env::var("NXVIM_LSP_CMD") {
-        let mut parts = cmd.split_whitespace().map(str::to_string);
+/// Resolve the argv for a `vim.lsp.start`'s `cmd` into a [`ServerSpawn`]:
+/// `$NXVIM_LSP_CMD` overrides the whole command (the mock hook, the LSP analogue
+/// of `NXVIM_TS_WORKER`), else the config's `cmd` is used verbatim. `None` when no
+/// program can be determined (an empty `cmd` and no override).
+fn lsp_spawn(cmd: &[String]) -> Option<ServerSpawn> {
+    if let Ok(override_cmd) = std::env::var("NXVIM_LSP_CMD") {
+        let mut parts = override_cmd.split_whitespace().map(str::to_string);
         let program = parts.next()?;
         return Some(ServerSpawn {
             program,
             args: parts.collect(),
         });
     }
-    let (program, args): (&str, &[&str]) = match language {
-        "rust" => ("rust-analyzer", &[]),
-        "python" => ("pyright-langserver", &["--stdio"]),
-        "go" => ("gopls", &[]),
-        "lua" => ("lua-language-server", &[]),
-        _ => return None,
-    };
-    if !binary_on_path(program) {
-        return None;
-    }
+    let (program, args) = cmd.split_first()?;
     Some(ServerSpawn {
-        program: program.to_string(),
-        args: args.iter().map(|s| s.to_string()).collect(),
+        program: program.clone(),
+        args: args.to_vec(),
     })
 }
 
-/// Whether `program` resolves to a file on `PATH` (gating server auto-start on
-/// the binary actually being installed).
-fn binary_on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
-}
-
-/// The workspace root for `path` (of `language`), the directory passed to the
-/// server as `root_uri` and used as its working directory:
-/// 1. `$NXVIM_LSP_ROOT`, if set — an explicit override (handy for testing against
-///    a real project, or unusual layouts); relative values resolve against the
-///    cwd.
-/// 2. otherwise, the nearest ancestor holding a language root marker
-///    (`Cargo.toml` for rust, `go.mod` for go, `pyproject.toml`/… for python, …),
-///    then any `.git` ancestor — so a server opened on `src/main.rs` still roots
-///    at the project, which servers like rust-analyzer require.
-/// 3. otherwise, the file's own directory (the Phase-1 fallback).
-fn workspace_root(language: &str, path: &Path) -> PathBuf {
-    if let Some(root) = std::env::var_os("NXVIM_LSP_ROOT") {
-        return absolutize(Path::new(&root));
-    }
-    let abs = absolutize(path);
-    let dir = abs.parent().unwrap_or(&abs);
-    find_root_marker(language, dir).unwrap_or_else(|| dir.to_path_buf())
-}
-
-/// Walk up from `start` for the nearest ancestor that holds a root marker for
-/// `language` (preferred), then any ancestor with a `.git` (the VCS fallback).
-/// `None` if neither is found, so the caller falls back to the file's directory.
-fn find_root_marker(language: &str, start: &Path) -> Option<PathBuf> {
-    let markers: &[&str] = match language {
-        "rust" => &["Cargo.toml"],
-        "go" => &["go.mod", "go.work"],
-        "python" => &[
-            "pyproject.toml",
-            "setup.py",
-            "setup.cfg",
-            "requirements.txt",
-        ],
-        "lua" => &[".luarc.json", ".luarc.jsonc"],
-        _ => &[],
-    };
-    start
-        .ancestors()
-        .find(|dir| markers.iter().any(|m| dir.join(m).is_file()))
-        .or_else(|| start.ancestors().find(|dir| dir.join(".git").exists()))
-        .map(Path::to_path_buf)
+/// `$NXVIM_LSP_ROOT`, absolutized, if set — an explicit workspace-root override
+/// that supersedes the root Lua resolved (handy for tests, and for pinning a root
+/// against an unusual layout). Relative values resolve against the cwd.
+fn lsp_root_override() -> Option<PathBuf> {
+    std::env::var_os("NXVIM_LSP_ROOT").map(|root| absolutize(Path::new(&root)))
 }
 
 /// A `file://` URI for an absolute-ized path, or `None` if it can't be formed.

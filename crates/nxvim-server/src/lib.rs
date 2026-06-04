@@ -171,10 +171,6 @@ struct Server {
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
     lsp_code_actions: Vec<CodeActionData>,
-    /// Cache of a buffer file path → its resolved workspace root, so the
-    /// root-marker search (a filesystem walk) runs once per file rather than on
-    /// every redraw's `sync_lsp`.
-    lsp_roots: HashMap<PathBuf, PathBuf>,
     /// Whether the previous insert-mode key was a `<C-x>` armed as the prefix of
     /// the `<C-x><C-o>` omni-completion trigger. The next key resolves it (a
     /// `<C-o>` fires completion; anything else is handled normally).
@@ -229,7 +225,6 @@ where
         completion: None,
         lsp_pending_ctrl_x: false,
         lsp_code_actions: Vec::new(),
-        lsp_roots: HashMap::new(),
         last_buffer_id: None,
         announced: HashSet::new(),
         last_mode: Mode::Normal,
@@ -755,6 +750,11 @@ impl Server {
                 PanelOp::SetCursor(line) => self.editor.set_panel_cursor(line),
                 PanelOp::Close => self.editor.close_panel(),
             }
+        }
+        // Server-start requests from `vim.lsp.start` (the `vim.lsp.enable` FileType
+        // dispatcher) bind a buffer to its language server and ensure it is spawned.
+        for op in self.lua.take_lsp_ops() {
+            self.apply_lsp_op(op);
         }
     }
 

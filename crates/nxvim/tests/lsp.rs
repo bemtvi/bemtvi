@@ -1899,6 +1899,41 @@ async fn a_code_action_lists_in_the_panel_and_applies_on_enter() {
 }
 
 #[tokio::test]
+async fn a_lazy_code_action_is_resolved_before_applying() {
+    let _guard = test_lock().lock().await;
+    // A lazy action arrives with no `edit` (only `data`); selecting it fires
+    // `codeAction/resolve`, and the resolved edit (returned with the action) is
+    // what gets applied.
+    let file = temp_file("ca-resolve", "rs", "let x=1;\n");
+    let resolved = serde_json::json!({
+        "title": "Add spaces",
+        "edit": ws_changes(&[(&file, vec![text_edit(0, 0, 1, 0, "let x = 1;\n")])]),
+    });
+    let record = configure_mock(
+        "ca-resolve",
+        serde_json::json!({
+            // No `edit` here — only `data`, so the client must resolve it.
+            "code_action": [{ "title": "Add spaces", "data": { "id": 1 } }],
+            "code_action_resolve": resolved,
+        }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspCodeAction").await;
+    let (_title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(panel_lines, vec!["Add spaces".to_string()]);
+
+    // `<CR>` resolves then applies; the resolve round-trip really happened.
+    feed(&rpc, "<CR>");
+    wait_for_lines(&rpc, &["let x = 1;"]).await;
+    assert!(
+        has_method(&record_lines(&record), "codeAction/resolve"),
+        "the lazy action was resolved before applying"
+    );
+}
+
+#[tokio::test]
 async fn a_formatting_edit_lands_at_the_right_byte_with_utf16() {
     let _guard = test_lock().lock().await;
     // The edit analogue of the cross-file `é` test: a leading 2-byte `é` and a

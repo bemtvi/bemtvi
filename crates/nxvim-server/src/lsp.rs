@@ -77,6 +77,7 @@ pub(crate) enum LspReqKind {
     Formatting,
     Rename,
     CodeAction,
+    ResolveCodeAction,
 }
 
 impl LspReqKind {
@@ -93,6 +94,7 @@ impl LspReqKind {
             LspReqKind::Formatting => 8,
             LspReqKind::Rename => 9,
             LspReqKind::CodeAction => 10,
+            LspReqKind::ResolveCodeAction => 11,
         }
     }
 
@@ -109,6 +111,7 @@ impl LspReqKind {
             8 => LspReqKind::Formatting,
             9 => LspReqKind::Rename,
             10 => LspReqKind::CodeAction,
+            11 => LspReqKind::ResolveCodeAction,
             _ => return None,
         })
     }
@@ -135,6 +138,7 @@ impl LspReqKind {
             LspReqKind::Formatting => "No formatting changes",
             LspReqKind::Rename => "No rename changes",
             LspReqKind::CodeAction => "No code actions available",
+            LspReqKind::ResolveCodeAction => "Code action returned no edit",
         }
     }
 
@@ -672,9 +676,12 @@ impl Server {
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
             LspReqKind::Completion => LspRequest::Completion { uri, position },
-            // Formatting/rename/codeAction don't share the uniform {uri, position}
-            // shape and have their own issue functions below.
-            LspReqKind::Formatting | LspReqKind::Rename | LspReqKind::CodeAction => return,
+            // Formatting/rename/codeAction(+resolve) don't share the uniform
+            // {uri, position} shape and have their own issue functions below.
+            LspReqKind::Formatting
+            | LspReqKind::Rename
+            | LspReqKind::CodeAction
+            | LspReqKind::ResolveCodeAction => return,
         };
         self.lsp.request(key, token, req);
     }
@@ -884,6 +891,18 @@ impl Server {
                     return;
                 }
                 self.show_code_actions(actions);
+                self.lsp_dirty = true;
+            }
+            LspReply::ResolvedCodeAction(edit) => {
+                if buffer_changed || tick_changed {
+                    return;
+                }
+                match edit {
+                    Some(changes) => self.apply_workspace_edit(changes),
+                    None => self
+                        .editor
+                        .echo(LspReqKind::ResolveCodeAction.empty_message()),
+                }
                 self.lsp_dirty = true;
             }
         }
@@ -1493,10 +1512,11 @@ impl Server {
             .open_panel(CODE_ACTION_PANEL_TITLE, lines, true, 0);
     }
 
-    /// Apply the code action selected (by index) in the code-action panel: its
-    /// eager `edit` across the open buffers, or a brief message if it carries
-    /// none (a lazy/command action — `codeAction/resolve` is scoped out). Clears
-    /// the stashed actions and closes the panel either way.
+    /// Apply the code action selected (by index) in the code-action panel: apply
+    /// its eager `edit` now, else resolve a lazy action's edit
+    /// (`codeAction/resolve`) and apply when the reply lands, else (a bare
+    /// command) a brief message. Clears the stashed actions and closes the panel
+    /// either way.
     pub(crate) fn apply_code_action(&mut self, index: usize) {
         let action = self.lsp_code_actions.get(index).cloned();
         self.lsp_code_actions.clear();
@@ -1504,13 +1524,34 @@ impl Server {
         let Some(action) = action else {
             return;
         };
-        match action.edit {
-            Some(changes) => self.apply_workspace_edit(changes),
-            None => self
-                .editor
-                .echo("Code action has no edit (resolve/command unsupported)"),
+        if let Some(changes) = action.edit {
+            self.apply_workspace_edit(changes);
+            self.lsp_dirty = true;
+        } else if let Some(raw) = action.resolve {
+            // A lazy action: ask the server to fill in its edit, then apply when
+            // the reply lands (reply-as-event, like format/rename).
+            self.resolve_code_action(raw);
+        } else {
+            // A bare `Command` — running it needs `workspace/executeCommand`,
+            // which is a scoped-out follow-up.
+            self.editor
+                .echo("Code action has no edit (command unsupported)");
+            self.lsp_dirty = true;
         }
-        self.lsp_dirty = true;
+    }
+
+    /// Fire a `codeAction/resolve` for a lazy action, recording it as a pending
+    /// apply request (content-version guarded, like format/rename); its resolved
+    /// edit is applied in [`Server::on_lsp_reply`].
+    fn resolve_code_action(&mut self, action: Box<nxvim_lsp::lsp_types::CodeAction>) {
+        self.sync_lsp();
+        let Some((key, _uri, _encoding)) = self.current_lsp_target() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let token = self.register_lsp_request(LspReqKind::ResolveCodeAction);
+        self.lsp
+            .request(key, token, LspRequest::ResolveCodeAction { action });
     }
 }
 

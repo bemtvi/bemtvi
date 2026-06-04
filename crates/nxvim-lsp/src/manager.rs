@@ -21,11 +21,12 @@ use async_lsp::router::Router;
 use async_lsp::{LanguageServer, MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    AnnotatedTextEdit, ClientCapabilities, CodeActionClientCapabilities, CodeActionContext,
-    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams,
-    CodeActionResponse, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    CompletionTextEdit, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
+    AnnotatedTextEdit, ClientCapabilities, CodeAction, CodeActionCapabilityResolveSupport,
+    CodeActionClientCapabilities, CodeActionContext, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
+    Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
     DocumentFormattingClientCapabilities, DocumentFormattingParams, FormattingOptions,
     GeneralClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
     HoverParams, InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
@@ -163,6 +164,12 @@ pub enum LspRequest {
         range: Range,
         diagnostics: Vec<Diagnostic>,
     },
+    /// `codeAction/resolve` — populate a lazy action's `edit`. The full original
+    /// [`CodeAction`] (incl. its `data`) is round-tripped to the server, which
+    /// returns it with the `edit` filled in.
+    ResolveCodeAction {
+        action: Box<CodeAction>,
+    },
 }
 
 /// The opaque correlation token the editor issues with a request and the manager
@@ -212,8 +219,11 @@ pub enum LspReply {
     /// the server renamed nothing).
     WorkspaceEdit(WorkspaceEditData),
     /// The code actions available at the cursor — titles for the panel plus each
-    /// action's eager edit (`None` ⇒ a lazy/command action with nothing to apply).
+    /// action's eager edit (`None` ⇒ a lazy action to resolve, or a bare command).
     CodeActions(Vec<CodeActionData>),
+    /// The edit a `codeAction/resolve` produced for a lazy action (`None` ⇒ the
+    /// resolved action still carried no edit, or the request failed).
+    ResolvedCodeAction(Option<WorkspaceEditData>),
 }
 
 /// A [`WorkspaceEdit`] normalized to per-document text edits: the protocol's
@@ -225,15 +235,17 @@ pub enum LspReply {
 /// the editor to convert, like the goto/completion normalizations.
 pub type WorkspaceEditData = Vec<(Url, Vec<TextEdit>)>;
 
-/// One code action distilled for the editor: its `title` for the panel list, and
-/// its eager `edit` (a normalized [`WorkspaceEditData`]) when the server returned
-/// one. `edit` is `None` for a bare `Command` or a lazy action that would need a
-/// `codeAction/resolve` round-trip (scoped out) — applying such an action is a
-/// no-op the editor reports.
+/// One code action distilled for the editor: its `title` for the panel list, its
+/// eager `edit` (a normalized [`WorkspaceEditData`]) when the server returned one,
+/// and `resolve` — the original [`CodeAction`] to round-trip through
+/// `codeAction/resolve` when there is no eager edit (a lazy action). Exactly one
+/// of `edit`/`resolve` is set for an applicable `CodeAction`; a bare `Command`
+/// has neither (its `command` would need `workspace/executeCommand`, scoped out).
 #[derive(Clone, Debug)]
 pub struct CodeActionData {
     pub title: String,
     pub edit: Option<WorkspaceEditData>,
+    pub resolve: Option<Box<CodeAction>>,
 }
 
 /// One completion candidate, distilled from a protocol [`CompletionItem`] to the
@@ -838,6 +850,19 @@ async fn issue_request(
                 }
             }
         }
+        LspRequest::ResolveCodeAction { action } => match sock.code_action_resolve(*action).await {
+            Ok(resolved) => {
+                LspReply::ResolvedCodeAction(resolved.edit.map(normalize_workspace_edit))
+            }
+            Err(e) => {
+                log.log(
+                    LogLevel::Warn,
+                    name,
+                    &format!("codeAction/resolve failed: {e}"),
+                );
+                LspReply::ResolvedCodeAction(None)
+            }
+        },
     }
 }
 
@@ -860,13 +885,24 @@ fn formatting_options() -> FormattingOptions {
 fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
     resp.into_iter()
         .map(|item| match item {
-            CodeActionOrCommand::CodeAction(ca) => CodeActionData {
-                title: ca.title,
-                edit: ca.edit.map(normalize_workspace_edit),
-            },
+            CodeActionOrCommand::CodeAction(ca) => {
+                let title = ca.title.clone();
+                let edit = ca
+                    .edit
+                    .as_ref()
+                    .map(|e| normalize_workspace_edit(e.clone()));
+                // With no eager edit, keep the original action to resolve lazily.
+                let resolve = edit.is_none().then(|| Box::new(ca));
+                CodeActionData {
+                    title,
+                    edit,
+                    resolve,
+                }
+            }
             CodeActionOrCommand::Command(cmd) => CodeActionData {
                 title: cmd.title,
                 edit: None,
+                resolve: None,
             },
         })
         .collect()
@@ -1153,6 +1189,9 @@ fn describe_request(req: &LspRequest) -> String {
                 range.start.line, range.start.character
             )
         }
+        LspRequest::ResolveCodeAction { action } => {
+            return format!("→ codeAction/resolve '{}'", action.title)
+        }
     };
     format!("→ {label} @ {}:{}", pos.line, pos.character)
 }
@@ -1294,6 +1333,13 @@ fn client_capabilities() -> ClientCapabilities {
                         .collect(),
                     },
                 }),
+                // We resolve a lazy action's `edit` on demand (`codeAction/resolve`)
+                // and round-trip its `data`, so declare both — else a server that
+                // only offers `edit` lazily would withhold it.
+                resolve_support: Some(CodeActionCapabilityResolveSupport {
+                    properties: vec!["edit".to_string()],
+                }),
+                data_support: Some(true),
                 ..Default::default()
             }),
             ..Default::default()

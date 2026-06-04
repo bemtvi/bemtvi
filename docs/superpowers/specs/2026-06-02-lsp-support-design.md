@@ -1081,9 +1081,17 @@ land in 5a so 5b is purely behavior.)*
 >   `OneOf<TextEdit, AnnotatedTextEdit>`, dropping file create/rename/delete
 >   resource ops) both reduce to a flat `WorkspaceEditData = Vec<(Url,
 >   Vec<TextEdit>)>`, ranges left in the negotiated encoding. `CodeActionData
->   { title, edit: Option<WorkspaceEditData> }` keeps only the eager edit (a bare
->   `Command` or a lazy `edit: None` action carries `None` — `codeAction/resolve`
->   and `workspace/executeCommand` stay out, per Scope).
+>   { title, edit, resolve }` carries an eager edit when the server sent one, else
+>   the original `CodeAction` (boxed) to resolve lazily; a bare `Command` has
+>   neither (running it via `workspace/executeCommand` stays out, per Scope).
+> - **Lazy code actions are resolved on demand** (`codeAction/resolve`, added
+>   after the initial Phase 6). Selecting an action with no eager `edit` round-
+>   trips the original `CodeAction` (incl. its `data`) back to the server via
+>   `code_action_resolve`; the resolved `edit` is applied when the reply lands
+>   (reply-as-event, content-version guarded like format/rename). The client
+>   advertises `codeAction.resolveSupport { properties: ["edit"] }` + `dataSupport`
+>   so a server that only offers `edit` lazily still surfaces it. This is the
+>   common rust-analyzer path (most of its actions arrive lazy).
 > - **A workspace edit is matched to its open buffer by URI, not by path.** Each
 >   URI is resolved to a buffer the way diagnostics are: an exact match against the
 >   `file://` URI sent at `didOpen` (always absolute, so a buffer opened by a
@@ -1125,13 +1133,15 @@ land in 5a so 5b is purely behavior.)*
 >   applies via the same `apply_workspace_edit` rename uses; the panel closes.
 > - **`format_on_save` was descoped** to a cross-phase follow-up (it inverts the
 >   core-owned, synchronous `:w` and needs a deferred-write pre-write hook).
-> - **Mock** gained `formatting` / `rename` / `code_action` script fields (via the
->   existing `reply_scripted` path) plus `reply_delay_ms`. Tests (in
->   `crates/nxvim/tests/lsp.rs`) cover `:LspFormat` rewrite + idempotent re-run, the
->   content-version drop, a **two-file** rename across open buffers (each
->   independently undoable, cursor survives, sibling read by handle), the
->   code-action panel + `<CR>` apply, a utf-16 formatting edit landing at the right
->   **byte** past `é`, and a format/rename never-blocks resilience check.
+> - **Mock** gained `formatting` / `rename` / `code_action` / `code_action_resolve`
+>   script fields (via the existing `reply_scripted` path) plus `reply_delay_ms`.
+>   Tests (in `crates/nxvim/tests/lsp.rs`) cover `:LspFormat` rewrite + idempotent
+>   re-run, the content-version drop, a **two-file** rename across open buffers
+>   (each independently undoable, cursor survives, sibling read by handle), the
+>   code-action panel + `<CR>` apply, a **lazy action resolved before applying**, a
+>   utf-16 formatting edit landing at the right **byte** past `é`, a format/rename
+>   never-blocks resilience check, the env-configurable `rootUri`, and a rename
+>   through a symlinked path.
 
 > **Plan sanity-checked & refined 2026-06-04** (against the Phase 1–5 code as
 > built). Phase 6 is the **first feature that mutates buffers other than the
@@ -1227,11 +1237,9 @@ per-document `apply_edits` this phase lifts into a multi-buffer applier.
 - **Workspace edits to unopened files** and **resource operations**
   (`create`/`rename`/`delete` file in `documentChanges`) — apply only to
   already-open buffers; open-then-edit (or direct on-disk write) is a follow-up.
-- **`codeAction/resolve`** — real servers often return a lazy `CodeAction` with
-  `edit: None` + `data`, needing a resolve round-trip to populate the edit.
-  Phase 6 applies only actions that arrive with an **eager** `edit` (the mock
-  returns those); resolving lazy actions, and running an action's `command` via
-  `workspace/executeCommand`, are follow-ups.
+- **Running an action's `command`** via `workspace/executeCommand` — a follow-up.
+  *(`codeAction/resolve` for a lazy `edit: None` + `data` action was initially
+  scoped out here but is now implemented — see the as-built note above.)*
 - **`format_on_save`** — inverts `:w` (see the refinement note); follow-up.
 - **Range / on-type formatting.**
 
@@ -1356,9 +1364,9 @@ diagnostics + go-to + hover + completion + format end-to-end; gates green.
   core-owned and synchronous, formatting is async, so format-on-save intercepts
   the write, requests formatting, and writes to disk only when the reply lands (a
   deferred write + a new core pre-write hook). Its own design.
-- **Lazy / command code actions** — `codeAction/resolve` for actions returned with
-  `edit: None`, and running an action's `command` via `workspace/executeCommand`.
-  Phase 6 applies only eager-`edit` actions.
+- **Command code actions** — running an action's `command` via
+  `workspace/executeCommand` (Phase 6 applies edits — eager or lazily resolved via
+  `codeAction/resolve` — but does not execute commands).
 - **Workspace edits to unopened files & resource operations** — `WorkspaceEdit`
   `create`/`rename`/`delete` file ops, and edits to files not currently open
   (open-then-edit or direct on-disk write). Phase 6 edits only open buffers.

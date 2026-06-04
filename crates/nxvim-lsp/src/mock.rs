@@ -45,7 +45,10 @@
 //!   `{changes}` map or `{documentChanges}`).
 //! - `code_action`: the `(CodeAction | Command)[]` returned for
 //!   `textDocument/codeAction` (tests script `CodeAction`s carrying an eager
-//!   `edit`). Absent ⇒ `null` (no actions).
+//!   `edit`, or lazy ones with only `data` to drive `codeAction/resolve`). Absent
+//!   ⇒ `null` (no actions).
+//! - `code_action_resolve`: the resolved `CodeAction` (with its `edit` filled in)
+//!   returned for `codeAction/resolve`. Absent ⇒ `null`.
 //! - `reply_delay_ms`: milliseconds the mock sleeps before sending each scripted
 //!   request *reply* (definition/hover/formatting/…), so a test can edit the
 //!   buffer before the reply lands and prove the editor's stale-drop (e.g. the
@@ -133,6 +136,7 @@ pub fn run(script_path: &str) {
             "textDocument/formatting" => reply_scripted(&stdout, id, &script, "formatting"),
             "textDocument/rename" => reply_scripted(&stdout, id, &script, "rename"),
             "textDocument/codeAction" => reply_scripted(&stdout, id, &script, "code_action"),
+            "codeAction/resolve" => reply_scripted(&stdout, id, &script, "code_action_resolve"),
             // Completion: a `completion_sequence` entry (one per request) wins over
             // the single `completion` field, so a test can narrow the list on the
             // re-request triggered as the prefix grows.

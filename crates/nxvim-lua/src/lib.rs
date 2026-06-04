@@ -188,6 +188,32 @@ impl LuaRuntime {
         fire.call((event, pattern))
     }
 
+    /// Fire an autocmd *with buffer context* — the callback `args` carry the real
+    /// `buf` (bufnr) and `file` (path), and a buffer-local autocmd registered for
+    /// `buf` matches. Used by the server's buffer/mode lifecycle events
+    /// (`BufReadPost`, `FileType`, `BufEnter`, …), which know which buffer fired.
+    pub fn fire_autocmd_buf(
+        &self,
+        event: &str,
+        pattern: &str,
+        buf: u64,
+        file: &str,
+    ) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let fire: mlua::Function = vim.get("_fire")?;
+        fire.call((event, pattern, buf, file))
+    }
+
+    /// Refresh the `vim._cur_buf` snapshot the prelude reads back through
+    /// `nvim_buf_get_name(0)` / `expand('%')`. The server pushes this immediately
+    /// before firing a buffer/mode autocmd so a callback can resolve the buffer
+    /// that fired. (Interim until a real per-bufnr registry exists.)
+    pub fn set_buf_snapshot(&self, bufnr: u64, name: &str) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let set: mlua::Function = vim.get("_set_cur_buf")?;
+        set.call((bufnr, name))
+    }
+
     /// Whether `name` was registered via `nvim_create_user_command` (so the
     /// server can route a deferred `:Name …` to its Lua callback).
     pub fn has_user_command(&self, name: &str) -> bool {

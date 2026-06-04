@@ -455,6 +455,11 @@ pub struct Editor {
     pub top: usize,
     /// Command-line contents (text after the leading `:` / `/` / `?`).
     pub cmdline: String,
+    /// Cursor position within [`Editor::cmdline`], as a byte offset in `0..=len`
+    /// (always on a char boundary). Insertion, deletion, and the projected
+    /// command cursor are all relative to it, so `<Left>`/`<Right>` edit mid-line
+    /// rather than only at the end. Reset to 0 each time a command line opens.
+    cmdline_col: usize,
     /// What the command line is editing (`:` ex vs `/`,`?` search). Decides the
     /// prompt char and what `<CR>` submits. Only meaningful in [`Mode::Command`].
     cmdline_kind: CmdlineKind,
@@ -473,8 +478,13 @@ pub struct Editor {
     /// Past search patterns, oldest first, recalled with `<Up>`/`<Down>` (and
     /// `<C-p>`/`<C-n>`) in the search command line.
     search_history: Vec<String>,
-    /// Position within [`Editor::search_history`] while browsing it; `None` when
-    /// editing a fresh line. Reset each time a search prompt opens.
+    /// Past `:` ex commands, oldest first, recalled with the same keys in the ex
+    /// command line. Only interactively-typed lines are recorded — a programmatic
+    /// `nvim_command` runs through [`Editor::command`] and never lands here.
+    ex_history: Vec<String>,
+    /// Position within the active history ([`Editor::search_history`] or
+    /// [`Editor::ex_history`], per the open prompt's kind) while browsing it;
+    /// `None` when editing a fresh line. Reset each time a command line opens.
     hist_idx: Option<usize>,
     /// Whether `hlsearch` highlighting is currently showing. Set by a search,
     /// cleared by `:nohlsearch`; gates the match spans projected into the `View`.
@@ -603,11 +613,13 @@ impl Editor {
             cursor: Cursor::default(),
             top: 0,
             cmdline: String::new(),
+            cmdline_col: 0,
             cmdline_kind: CmdlineKind::Ex,
             last_search: None,
             search_operator: None,
             pending_search_count: 1,
             search_history: Vec::new(),
+            ex_history: Vec::new(),
             hist_idx: None,
             search_active: false,
             search_origin: Cursor::default(),
@@ -2706,7 +2718,9 @@ impl Editor {
     fn enter_command(&mut self) {
         self.mode = Mode::Command;
         self.cmdline.clear();
+        self.cmdline_col = 0;
         self.cmdline_kind = CmdlineKind::Ex;
+        self.hist_idx = None;
         self.message.clear();
         self.reset_pending();
     }
@@ -2719,6 +2733,7 @@ impl Editor {
     fn enter_search(&mut self, dir: SearchDir, count: usize) {
         self.mode = Mode::Command;
         self.cmdline.clear();
+        self.cmdline_col = 0;
         self.cmdline_kind = CmdlineKind::Search(dir);
         self.pending_search_count = count.max(1);
         self.hist_idx = None;
@@ -2735,10 +2750,14 @@ impl Editor {
             }
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.cmdline);
+                self.cmdline_col = 0;
                 let kind = self.cmdline_kind;
                 self.mode = Mode::Normal;
                 match kind {
-                    CmdlineKind::Ex => self.execute_ex(&text),
+                    CmdlineKind::Ex => {
+                        self.remember_ex(&text);
+                        self.execute_ex(&text);
+                    }
                     CmdlineKind::Search(dir) => {
                         // Commit from the saved origin, not the incsearch preview
                         // hop, so the count search lands deterministically (and
@@ -2749,20 +2768,30 @@ impl Editor {
                 }
                 return;
             }
-            // Backspacing past the start of an empty command line exits, like Esc.
-            // (When the line is non-empty, evaluating the guard's `pop()` removes
-            // the last char as a side effect and we fall through to re-preview.)
-            KeyCode::Backspace if self.cmdline.pop().is_none() => {
+            // Backspacing an empty command line exits, like Esc. With text, it
+            // deletes the char before the cursor (a no-op at the very start).
+            KeyCode::Backspace if self.cmdline.is_empty() => {
                 self.cancel_cmdline();
                 return;
             }
-            // Search-history recall (`<Up>`/`<C-p>` older, `<Down>`/`<C-n>`
-            // newer); a no-op for an ex command line.
+            KeyCode::Backspace => self.cmdline_backspace(),
+            // `<Del>` removes the char *under* the cursor.
+            KeyCode::Delete => self.cmdline_delete(),
+            // Within-line cursor motion: arrows by a char, Home/End (and the
+            // vim-cmdline `<C-b>`/`<C-e>`) to the ends.
+            KeyCode::Left => self.cmdline_cursor_left(),
+            KeyCode::Right => self.cmdline_cursor_right(),
+            KeyCode::Home => self.cmdline_col = 0,
+            KeyCode::End => self.cmdline_col = self.cmdline.len(),
+            KeyCode::Char('b') if key.ctrl => self.cmdline_col = 0,
+            KeyCode::Char('e') if key.ctrl => self.cmdline_col = self.cmdline.len(),
+            // Command-history recall (`<Up>`/`<C-p>` older, `<Down>`/`<C-n>`
+            // newer), over whichever history the open prompt's kind selects.
             KeyCode::Up => self.cmdline_history_prev(),
             KeyCode::Down => self.cmdline_history_next(),
             KeyCode::Char('p') if key.ctrl => self.cmdline_history_prev(),
             KeyCode::Char('n') if key.ctrl => self.cmdline_history_next(),
-            KeyCode::Char(c) if !key.ctrl => self.cmdline.push(c),
+            KeyCode::Char(c) if !key.ctrl => self.cmdline_insert(c),
             _ => {}
         }
         // The command line still has focus: refresh the live incsearch preview
@@ -2784,6 +2813,54 @@ impl Editor {
         }
         self.mode = Mode::Normal;
         self.cmdline.clear();
+        self.cmdline_col = 0;
+    }
+
+    // ----- command-line editing ---------------------------------------------
+
+    /// Insert `c` at the command cursor and step the cursor past it.
+    fn cmdline_insert(&mut self, c: char) {
+        self.cmdline.insert(self.cmdline_col, c);
+        self.cmdline_col += c.len_utf8();
+    }
+
+    /// Delete the char before the command cursor (`<BS>`); a no-op at the start.
+    fn cmdline_backspace(&mut self) {
+        if let Some(prev) = self.cmdline_prev_boundary() {
+            self.cmdline.remove(prev);
+            self.cmdline_col = prev;
+        }
+    }
+
+    /// Delete the char under the command cursor (`<Del>`); a no-op at the end.
+    fn cmdline_delete(&mut self) {
+        if self.cmdline_col < self.cmdline.len() {
+            self.cmdline.remove(self.cmdline_col);
+        }
+    }
+
+    /// Move the command cursor one char left (`<Left>`).
+    fn cmdline_cursor_left(&mut self) {
+        if let Some(prev) = self.cmdline_prev_boundary() {
+            self.cmdline_col = prev;
+        }
+    }
+
+    /// Move the command cursor one char right (`<Right>`).
+    fn cmdline_cursor_right(&mut self) {
+        if let Some(c) = self.cmdline[self.cmdline_col..].chars().next() {
+            self.cmdline_col += c.len_utf8();
+        }
+    }
+
+    /// Byte offset of the char boundary immediately before the command cursor,
+    /// or `None` when it's already at the start. (Char-aware so multibyte input
+    /// in the command line edits one whole character at a time.)
+    fn cmdline_prev_boundary(&self) -> Option<usize> {
+        self.cmdline[..self.cmdline_col]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
     }
 
     // ----- search -----------------------------------------------------------
@@ -2830,6 +2907,15 @@ impl Editor {
     fn remember_search(&mut self, pattern: &str) {
         if self.search_history.last().map(String::as_str) != Some(pattern) {
             self.search_history.push(pattern.to_string());
+        }
+    }
+
+    /// Record an interactively-submitted `:` command in the ex history, skipping
+    /// an empty line or a consecutive duplicate (vim collapses repeats).
+    fn remember_ex(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() && self.ex_history.last().map(String::as_str) != Some(cmd) {
+            self.ex_history.push(cmd.to_string());
         }
     }
 
@@ -3225,35 +3311,46 @@ impl Editor {
         (matches, current)
     }
 
-    /// `<Up>`/`<C-p>` in the search command line — recall the previous history
-    /// entry (the newest first), replacing the typed line. A no-op outside a
-    /// search prompt or with an empty history.
+    /// The history list for the open command line's kind: ex commands for `:`,
+    /// search patterns for `/`,`?`.
+    fn active_history(&self) -> &[String] {
+        match self.cmdline_kind {
+            CmdlineKind::Ex => &self.ex_history,
+            CmdlineKind::Search(_) => &self.search_history,
+        }
+    }
+
+    /// `<Up>`/`<C-p>` in the command line — recall the previous history entry
+    /// (the newest first), replacing the typed line. A no-op with an empty
+    /// history.
     fn cmdline_history_prev(&mut self) {
-        if !matches!(self.cmdline_kind, CmdlineKind::Search(_)) || self.search_history.is_empty() {
+        let len = self.active_history().len();
+        if len == 0 {
             return;
         }
         let idx = match self.hist_idx {
-            None => self.search_history.len() - 1,
+            None => len - 1,
             Some(i) => i.saturating_sub(1),
         };
         self.hist_idx = Some(idx);
-        self.cmdline = self.search_history[idx].clone();
+        self.cmdline = self.active_history()[idx].clone();
+        self.cmdline_col = self.cmdline.len();
     }
 
-    /// `<Down>`/`<C-n>` in the search command line — move to a newer history
-    /// entry, or back to an empty line once past the newest.
+    /// `<Down>`/`<C-n>` in the command line — move to a newer history entry, or
+    /// back to an empty line once past the newest.
     fn cmdline_history_next(&mut self) {
-        if !matches!(self.cmdline_kind, CmdlineKind::Search(_)) {
-            return;
-        }
+        let len = self.active_history().len();
         match self.hist_idx {
-            Some(i) if i + 1 < self.search_history.len() => {
+            Some(i) if i + 1 < len => {
                 self.hist_idx = Some(i + 1);
-                self.cmdline = self.search_history[i + 1].clone();
+                self.cmdline = self.active_history()[i + 1].clone();
+                self.cmdline_col = self.cmdline.len();
             }
             Some(_) => {
                 self.hist_idx = None;
                 self.cmdline.clear();
+                self.cmdline_col = 0;
             }
             None => {}
         }
@@ -3267,6 +3364,12 @@ impl Editor {
             CmdlineKind::Ex => ':',
             CmdlineKind::Search(dir) => dir.prefix(),
         }
+    }
+
+    /// The command cursor's position as a character offset from the start of
+    /// [`Editor::cmdline`], for the client to place the terminal cursor.
+    pub(crate) fn cmdline_cursor(&self) -> usize {
+        self.cmdline[..self.cmdline_col].chars().count()
     }
 
     fn execute_ex(&mut self, raw: &str) {

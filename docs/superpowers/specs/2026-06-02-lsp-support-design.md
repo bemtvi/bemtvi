@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–6 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions); Phase 7 (`vim.lsp.*` Lua surface) planned.
+**Status:** In progress — **Phases 1–6 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions); Phase 7 (`vim.lsp.*` Lua surface, driven by the real nvim-lspconfig) planned — split into **7a** (config framework + attach lifecycle) and **7b** (Lua entry points), and gated on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md).
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -1302,46 +1302,123 @@ mock fields land in 6a so 6b is purely the code-action surface.)*
 
 ### Phase 7 — `vim.lsp.*` / `vim.diagnostic.*` Lua API & config
 
-**Goal / value.** Make it plugin-compatible: replace the built-in filetype→cmd
-table with the Lua surface real configs drive, so a user's `init.lua` (or an
-lspconfig-style setup) starts and configures servers. This is what turns the
-machinery from "nxvim-native LSP" into "runs the ecosystem's LSP config."
+**Goal / value.** Make it plugin-compatible: drive LSP entirely from the Lua
+surface real configs use, so a user's `init.lua` — running the **real
+nvim-lspconfig** — starts and configures servers. This is what turns the machinery
+from "nxvim-native LSP" into "runs the ecosystem's LSP config."
 
-**Prerequisites.** Phases 1–6 (the full feature set behind the native config).
+**Key framing — nvim-lspconfig is data-only (Neovim 0.11+).** The modern plugin no
+longer ships a `require'lspconfig'.xxx.setup{}` framework; it ships
+`lsp/<server>.lua` files that just `return` a config table, activated by
+`vim.lsp.enable(name)`. So "use the real nvim-lspconfig" means implementing
+Neovim 0.11's **core** framework: `vim.lsp.config`/`vim.lsp.enable`, runtimepath
+`lsp/` discovery, a FileType-driven attach lifecycle, and the supporting
+`vim.fs`/`vim.uri`/`vim.fn` surface those config files call. That is the bulk of
+the work, and it is split into **7a** (config framework + attach lifecycle) and
+**7b** (Lua entry points to the existing features).
 
-**Scope (in):** the minimal but real surface modern configs touch, layered on the
-`nxvim-lua` queue/effect pattern (`vim.cmd`/`nvim_set_hl` style — Lua queues
-ops, the server drains them into the `LspManager`):
-- `vim.lsp.start(config)` / `vim.lsp.config(name, opts)` / `vim.lsp.enable(name)`
-  / `vim.lsp.buf_attach_client` — start/attach servers from Lua, replacing the
-  built-in table (which becomes a fallback/example).
-- `vim.lsp.buf.*` (`definition`, `references`, `hover`, `rename`, `format`,
-  `code_action`, `completion`) — Lua entry points to the Phase 3–6 features, so
-  user keymaps can call them (needs `vim.keymap.set`, which this phase adds if not
-  already present — coordinate with the separate keymap roadmap item).
-- `vim.diagnostic.*` (`get`, `setloclist`/panel, `goto_next`/`goto_prev`,
-  `config` for display toggles) over the Phase-2 diagnostics cache.
-- Surface server capabilities/notifications Lua needs (`on_attach` callback,
-  `client.server_capabilities`).
+**Prerequisites.** Phases 1–6, **and the autocmd lifecycle foundation**
+([2026-06-04-autocmd-lifecycle-design.md](2026-06-04-autocmd-lifecycle-design.md)) —
+`vim.lsp.enable` hangs its whole machinery off a `FileType` autocmd with buffer
+context, which the editor does not emit today. Phase 7a assumes that foundation's
+Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 
-**Scope (out):** the *entire* `vim.lsp` surface (it's vast) — implement what
-common configs require and grow it as plugins demand, per architecture.md's
-"surface grows only as plugins demand it." Legacy Vimscript configs are a non-goal.
+**Decisions for this phase.**
+- **Remove the built-in `filetype→cmd` table entirely; no default `init.lua`.** LSP
+  startup is 100% user Lua, exactly like neovim — zero config means no LSP. (This
+  forces every Phase 1–6 test to migrate from auto-spawn to the Lua start path.)
+- **Vendor nvim-lspconfig as a git submodule** (like `vendor/neovim`) so a CI test
+  runs the *real* `lsp/*.lua` files against the mock server — **and** keep the
+  existing `pack/*/start/*` runtimepath discovery for real user installs.
 
-**Files.** `crates/nxvim-lua/src/lib.rs` + `prelude.lua` (the `vim.lsp`/
-`vim.diagnostic` tables, queued ops), `crates/nxvim-server/src/lsp.rs` /
-`lib.rs` (drain Lua LSP ops; route `vim.lsp.buf.*` to the existing feature paths;
-fire `LspAttach`/`LspDetach` autocmds), `crates/nxvim-server/tests/lsp.rs`.
+---
+
+#### Phase 7a — config framework + attach lifecycle
+
+**Goal.** A server starts *only* when user Lua calls `vim.lsp.enable` and a matching
+file opens; the real vendored `lsp/{rust_analyzer,gopls,pyright,lua_ls}.lua` load,
+resolve their real root logic, and start the mock; all Phase 1–6 features keep
+working through the new start path.
+
+**Scope (in).**
+- **`vim.lsp.config`** — a callable *and* indexable table (`setmetatable`):
+  `vim.lsp.config(name, opts)` merges into a per-name override layer;
+  `vim.lsp.config[name]` returns the deep-merged resolved config (`'*'` wildcard ←
+  `lsp/name.lua` runtimepath base ← user override, via `vim.tbl_deep_extend`);
+  `vim.lsp.config[name] = opts` assignment form.
+- **runtimepath `lsp/` discovery** — Rust-backed `vim.api.nvim_get_runtime_file`
+  (the `LuaRuntime` owns `runtimepath`); the base config layer is `lsp/<name>.lua`
+  sourced off the runtimepath.
+- **`vim.lsp.enable(name|list)`** — marks names enabled and installs **one shared**
+  `FileType` dispatcher that resolves the merged config, computes `root_dir`
+  (string | `function(bufnr, on_dir)` | `root_markers` upward search) **in Lua**,
+  and calls `vim.lsp.start`.
+- **`vim.lsp.start(config)`** — queues an `LspOp::Start { name, cmd, root, filetype,
+  bufnr }` (root already resolved in Lua; Rust never re-resolves), drained on the
+  existing `nxvim-lua` effect pattern into `LspManager::ensure_server`.
+- **Supporting `vim.*` surface** real config files call: `vim.fs.root/find/dirname/
+  parents/joinpath`, `vim.uri_from_fname/uri_to_fname/uri_from_bufnr`,
+  `vim.fn.getcwd/expand/fnamemodify/bufname`, Lua-exposed `vim.api.nvim_buf_get_name`,
+  `vim.lsp.protocol.make_client_capabilities` (stub — caps stay Rust-owned),
+  `vim.validate`/`vim.deprecate` (no-ops).
+- **Remove** `lsp_spawn_for`/`workspace_root`/`find_root_marker` and the redraw-loop
+  auto-spawn in `sync_lsp` (now sync-only); `ServerKey.language: &'static str` →
+  `name: String` (arbitrary server names); the buffer binds to its `(name, root)`
+  client when `vim.lsp.start` drains. `reuse_client` = the existing `lsp_ensured`
+  dedup on `(name, root)`.
+
+**Files.** `crates/nxvim-lua/src/{lib.rs,prelude.lua}` (the `vim.lsp.config`
+metatable, `enable` dispatcher, `LspOp` queue, `vim.fs`/`vim.uri`/`vim.fn` shims,
+`nvim_get_runtime_file`); `crates/nxvim-server/src/{lsp.rs,lib.rs}` (drain `LspOp`s
+into `ensure_server`, bind buffer→client, rewrite `sync_lsp`, remove the built-in
+table); `crates/nxvim-lsp/src/manager.rs` (`ServerKey.name`); `vendor/nvim-lspconfig`
+(submodule); `crates/nxvim/tests/{lsp.rs,lspconfig.rs}`.
 
 **Tests.**
-- An `init.lua` calling `vim.lsp.start{...}` (pointed at the mock) attaches and
-  produces diagnostics/hover/definition through the *Lua* path (not the built-in
-  table).
-- `vim.diagnostic.get`/`goto_next` behave against canned diagnostics.
-- A Lua keymap calling `vim.lsp.buf.definition()` jumps the cursor.
+- Migrate the Phase 1–6 tests: a temp `init.lua` does `vim.lsp.config('mock', …)` +
+  `vim.lsp.enable('mock')` (mock cmd still injected via `NXVIM_LSP_CMD`); features
+  prove out through the Lua start path, not auto-spawn.
+- New `lspconfig.rs`: runtimepath points at vendored nvim-lspconfig; override one
+  server's `cmd` to the mock; `vim.lsp.enable`; open a matching file under a temp
+  project with the right root marker; assert `initialize` (real root) → `didOpen` →
+  diagnostics — proving the **real** `lsp/<server>.lua` loaded and ran. Skip cleanly
+  when the submodule is absent.
 
-**Done when.** A realistic Lua-driven setup against the mock exercises
-diagnostics + go-to + hover + completion + format end-to-end; gates green.
+**Done when.** A server starts only via user Lua; the real vendored
+rust_analyzer/gopls/pyright/lua_ls configs load and start the mock; all migrated
+Phase 1–6 features pass; `nxvim-core` still carries no LSP/async/JSON deps; gates green.
+
+---
+
+#### Phase 7b — Lua entry points to the features
+
+**Goal.** Let user keymaps and configs invoke the Phase 3–6 features and the
+diagnostics cache from Lua.
+
+**Prerequisites.** Phase 7a.
+
+**Scope (in).**
+- `vim.lsp.buf.*` (`definition`, `declaration`, `type_definition`, `implementation`,
+  `references`, `hover`, `signature_help`, `rename`, `format`, `code_action`,
+  `completion`) — route to the existing feature paths.
+- `vim.diagnostic.*` (`get`, `setloclist`/panel, `goto_next`/`goto_prev`, `config`)
+  over the Phase-2 diagnostics cache.
+- `vim.keymap.set` (coordinate with the separate keymap roadmap item).
+- Fire `LspAttach`/`LspDetach`; surface `client.server_capabilities` and invoke the
+  config's `on_attach` (the firing hook may land in 7a; its body needs this surface).
+
+**Scope (out).** The *entire* `vim.lsp` surface (it's vast) — implement what common
+configs require and grow it as plugins demand, per architecture.md's "surface grows
+only as plugins demand it." Legacy Vimscript configs are a non-goal.
+
+**Tests.**
+- `vim.diagnostic.get`/`goto_next` behave against canned diagnostics.
+- A Lua keymap (`vim.keymap.set('n', 'gd', vim.lsp.buf.definition)`) jumps the cursor.
+- An `on_attach` that sets buffer-local keymaps runs on attach.
+
+**Done when.** A realistic Lua-driven setup (real nvim-lspconfig + user keymaps via
+`on_attach`) exercises diagnostics + go-to + hover + completion + format end-to-end;
+gates green.
 
 ---
 

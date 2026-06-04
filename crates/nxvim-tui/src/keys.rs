@@ -46,3 +46,40 @@ pub fn encode_key(ev: KeyEvent) -> Option<String> {
     };
     Some(notation)
 }
+
+/// Encode a bracketed-paste payload as a single vim key-notation string.
+///
+/// A terminal with bracketed paste enabled delivers an entire paste as one
+/// [`Event::Paste`](crossterm::event::Event::Paste) carrying the whole text, so
+/// the client forwards it as **one** `nvim_input` (and the server does one
+/// redraw) instead of one notification — and one full redraw — per character.
+/// That per-character round-trip is what makes an unbracketed paste crawl in
+/// visibly.
+///
+/// The text is the raw clipboard string, so the few characters that are special
+/// to the server's notation parser (and to the editor's per-key model) are
+/// escaped here: a literal `<` becomes `<lt>` (otherwise it would open a
+/// `<...>` form), `\t` becomes `<Tab>`, and a line break becomes `<CR>` so it
+/// goes through `KeyCode::Enter` rather than inserting a stray `\n` char. A
+/// `\r\n` pair collapses to a single `<CR>`. Everything else passes through
+/// verbatim. Public so the contract is exercised by `nxvim-tui/tests/paste.rs`.
+pub fn encode_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => out.push_str("<lt>"),
+            '\t' => out.push_str("<Tab>"),
+            '\n' => out.push_str("<CR>"),
+            '\r' => {
+                out.push_str("<CR>");
+                // Swallow the '\n' of a CRLF pair so it yields one line break.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}

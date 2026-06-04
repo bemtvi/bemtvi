@@ -22,14 +22,14 @@ mod parse;
 mod render;
 mod view;
 
-pub use keys::encode_key;
+pub use keys::{encode_key, encode_paste};
 pub use render::{close_button, paint, ScrollHarness};
 pub use view::View;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseButton,
-    MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
@@ -82,6 +82,33 @@ impl<W: Write> Drop for MouseCapture<W> {
     }
 }
 
+/// RAII guard for terminal bracketed paste: turns the mode on at creation and
+/// **off on drop**, including on a panic unwind. With it on, the terminal hands
+/// a paste to the client as a single [`Event::Paste`] carrying the whole text,
+/// so the client forwards one `nvim_input` and the server does one redraw —
+/// instead of the per-character storm an unbracketed paste produces, which
+/// makes pasted text trickle in one char at a time. Drops cleanly on the panic
+/// path too, so a crash never leaves the terminal in bracketed-paste mode.
+/// Generic over the writer for the same in-memory testability as
+/// [`MouseCapture`]; production uses `std::io::stdout()`.
+pub struct BracketedPaste<W: Write> {
+    out: W,
+}
+
+impl<W: Write> BracketedPaste<W> {
+    /// Enable bracketed paste on `out`; the returned guard disables it on drop.
+    pub fn enable(mut out: W) -> Self {
+        let _ = crossterm::execute!(out, EnableBracketedPaste);
+        Self { out }
+    }
+}
+
+impl<W: Write> Drop for BracketedPaste<W> {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(self.out, DisableBracketedPaste);
+    }
+}
+
 /// Run the client over a connected stream until the server exits or disconnects.
 ///
 /// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic
@@ -95,8 +122,12 @@ where
     let mut terminal = ratatui::init();
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
+    // Receive a paste as one event instead of one keystroke per character.
+    let paste = BracketedPaste::enable(std::io::stdout());
     let result = event_loop(stream, &mut terminal).await;
-    drop(mouse); // disable mouse capture before leaving the alternate screen
+    // Restore both terminal modes before leaving the alternate screen.
+    drop(paste);
+    drop(mouse);
     ratatui::restore();
     result
 }
@@ -138,6 +169,16 @@ where
                             rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
                             flush_armed = true;
                         }
+                    }
+                }
+                Some(Ok(Event::Paste(text))) => {
+                    // Bracketed paste: the whole clipboard arrives as one event,
+                    // so forward it as a single `nvim_input` (one redraw) rather
+                    // than the per-character trickle of an unbracketed paste.
+                    let notation = encode_paste(&text);
+                    if !notation.is_empty() {
+                        rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
+                        flush_armed = true;
                     }
                 }
                 Some(Ok(Event::Resize(w, h))) => {

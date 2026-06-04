@@ -8,8 +8,10 @@
 //! native GUI later) attach over the same RPC channel and are never blocked by
 //! the server's bookkeeping.
 
+mod keymap;
 mod syntax;
 
+use keymap::{Keymaps, MappingRhs, Step};
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
 use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, Mode, PanelView};
@@ -141,6 +143,10 @@ struct Server {
     /// (from a non-insert mode) fires `InsertEnter`; tracked here so the per-key
     /// diff can spot the edge without touching the core's insert chokepoints.
     last_mode: Mode,
+    /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
+    /// `Server::input` runs every key through before `editor.input`. Rebuilt from
+    /// `vim._keymaps` when its version advances (checked once per input batch).
+    keymaps: Keymaps,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -171,6 +177,7 @@ where
         last_buffer_id: None,
         announced: HashSet::new(),
         last_mode: Mode::Normal,
+        keymaps: Keymaps::default(),
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -374,14 +381,72 @@ impl Server {
     }
 
     fn input(&mut self, keys: &str) {
+        // Rebuild the keymap tries if the registry changed since the last batch —
+        // once per `nvim_input`, not per key, so each keystroke only walks the
+        // cached trie (design §6). A map a callback sets mid-batch takes effect on
+        // the next batch, an accepted ordering.
+        self.refresh_keymaps();
         for key in parse_keys(keys) {
-            self.editor.input(key);
-            // Per *key*, not per message: a batched `o…<Esc>` must still see the
-            // transition into insert on the `o`, which a once-per-input diff would
-            // miss (it'd see only the settled Normal end-state).
-            self.emit_lifecycle_events();
+            // The mapping layer interposes here, ahead of `editor.input`: each key
+            // is run through the withhold/replay matcher, which hands back the
+            // steps to apply (raw editor keys and/or a fired mapping).
+            let mode = self.editor.mode;
+            for step in self.keymaps.feed(mode, key) {
+                self.apply_step(step);
+            }
         }
         self.run_pending();
+    }
+
+    /// Check `vim._keymaps_version` and recompile the per-mode tries if it
+    /// advanced. Cheap on the common path: one integer read across the bridge.
+    fn refresh_keymaps(&mut self) {
+        let version = self.lua.keymaps_version();
+        if version != self.keymaps.version {
+            let snapshot = self.lua.keymaps_snapshot();
+            self.keymaps.rebuild(version, snapshot);
+        }
+    }
+
+    /// Apply one matcher [`Step`]: a raw key goes to the editor (with the per-key
+    /// lifecycle diff, exactly as the old bare loop did); a fired mapping runs its
+    /// RHS.
+    fn apply_step(&mut self, step: Step) {
+        match step {
+            Step::Editor(key) => {
+                self.editor.input(key);
+                // Per *key*, not per message: a batched `o…<Esc>` must still see
+                // the transition into insert on the `o`, which a once-per-input
+                // diff would miss (it'd see only the settled Normal end-state).
+                self.emit_lifecycle_events();
+            }
+            Step::Fire(rhs) => self.fire_mapping(rhs),
+        }
+    }
+
+    /// Execute a fired mapping's RHS (design D7 — a `match` over the enum from day
+    /// one, so the LSP backport adds its native action as one more arm). A Lua
+    /// function is invoked and its effects folded in (any deferred ex-commands
+    /// converge in the batch's trailing `run_pending`, like the autocmd path); a
+    /// `noremap` string RHS is fed key-by-key straight to the editor.
+    fn fire_mapping(&mut self, rhs: MappingRhs) {
+        match rhs {
+            MappingRhs::Lua(id) => {
+                if let Err(e) = self.lua.run_keymap(id) {
+                    self.editor
+                        .echo(format!("E5108: Error executing keymap: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            MappingRhs::Keys(keys, _noremap) => {
+                // Phase 1: `noremap` only — fed straight to the editor, bypassing
+                // the trie (no re-mapping). Recursive remap feeding is Phase 2.
+                for key in keys {
+                    self.editor.input(key);
+                    self.emit_lifecycle_events();
+                }
+            }
+        }
     }
 
     fn run_command(&mut self, cmd: &str) {

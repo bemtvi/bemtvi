@@ -70,6 +70,41 @@ pub enum PanelOp {
 /// Lua registry key under which the panel's `on_select` callback is stored.
 const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
 
+/// One `vim.keymap.set` entry, read back from `vim._keymaps` as plain data for
+/// the server to compile into its per-mode prefix tries. Unlike autocmds — whose
+/// *matching* stays in Lua (`vim._fire`) — keymap matching happens in Rust, so
+/// the runtime exposes the registry as a snapshot rather than a dispatcher.
+#[derive(Clone, Debug)]
+pub struct RawKeymap {
+    /// Mode codes the entry applies to (single-char: `"n"`, `"i"`, …).
+    pub modes: Vec<String>,
+    /// The unparsed LHS notation (`"gd"`, `"<Space>x"`); the server runs it
+    /// through `parse_keys` to get the trie path.
+    pub lhs: String,
+    /// What fires when the LHS matches.
+    pub rhs: RawRhs,
+    /// `true` to feed a string RHS straight to the editor (no re-mapping).
+    pub noremap: bool,
+    /// Buffer handle for a buffer-local map; `None` for a global one.
+    pub buffer: Option<u64>,
+    /// The `desc` opt — stored, surfaced later; unused by matching.
+    pub desc: Option<String>,
+    /// A built-in default (overridable by a user map); `false` for user maps.
+    pub default: bool,
+    /// The registry sequence id — also the function-RHS key and the
+    /// last-set-wins tiebreaker in the precedence ladder.
+    pub seq: u64,
+}
+
+/// A keymap's right-hand side, as carried in the snapshot.
+#[derive(Clone, Debug)]
+pub enum RawRhs {
+    /// A function RHS, keyed by id in `vim._keymap_fns` (run via `run_keymap`).
+    Lua(u64),
+    /// A string RHS — key notation the server parses and feeds.
+    Str(String),
+}
+
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 struct Shared {
@@ -168,6 +203,72 @@ impl LuaRuntime {
             f.call::<()>((line.to_string(), index as i64 + 1))?;
         }
         Ok(())
+    }
+
+    /// The current `vim._keymaps_version`, bumped by every `vim.keymap.set`/`del`.
+    /// The server reads it once per input batch and rebuilds its tries only when
+    /// it advanced — so per keystroke it walks the cached trie, never the bridge.
+    /// `0` on any error (a malformed VM simply yields no mappings).
+    pub fn keymaps_version(&self) -> u64 {
+        self.read_keymaps_version().unwrap_or(0)
+    }
+
+    fn read_keymaps_version(&self) -> mlua::Result<u64> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        Ok(vim.get::<Option<u64>>("_keymaps_version")?.unwrap_or(0))
+    }
+
+    /// Pull `vim._keymaps` across the bridge as a list of [`RawKeymap`]s for the
+    /// server to compile into per-mode tries. A read error yields an empty
+    /// snapshot (the editor keeps running with no user mappings).
+    pub fn keymaps_snapshot(&self) -> Vec<RawKeymap> {
+        self.read_keymaps().unwrap_or_default()
+    }
+
+    fn read_keymaps(&self) -> mlua::Result<Vec<RawKeymap>> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let list: Table = vim.get("_keymaps")?;
+        let mut out = Vec::new();
+        for entry in list.sequence_values::<Table>() {
+            let entry = entry?;
+            let modes = entry
+                .get::<Option<Vec<String>>>("modes")?
+                .unwrap_or_default();
+            let lhs: String = entry.get("lhs")?;
+            let noremap = entry.get::<Option<bool>>("noremap")?.unwrap_or(true);
+            let buffer = entry.get::<Option<u64>>("buffer")?;
+            let desc = entry.get::<Option<String>>("desc")?;
+            let default = entry.get::<Option<bool>>("default")?.unwrap_or(false);
+            let seq = entry.get::<Option<u64>>("id")?.unwrap_or(0);
+            let rhs_tbl: Table = entry.get("rhs")?;
+            let kind: String = rhs_tbl.get("kind")?;
+            let rhs = if kind == "lua" {
+                RawRhs::Lua(rhs_tbl.get::<u64>("id")?)
+            } else {
+                RawRhs::Str(rhs_tbl.get::<String>("str")?)
+            };
+            out.push(RawKeymap {
+                modes,
+                lhs,
+                rhs,
+                noremap,
+                buffer,
+                desc,
+                default,
+                seq,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Invoke the function RHS registered under `id` (the `run_user_command` /
+    /// `run_panel_select` analogue), called when a Lua-backed mapping fires.
+    /// Effects land in [`Shared`] and drain through the server's
+    /// `apply_lua_effects`. Errors (a throwing handler) are returned to surface.
+    pub fn run_keymap(&self, id: u64) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let run: mlua::Function = vim.get("_run_keymap")?;
+        run.call::<()>(id)
     }
 
     /// Set `vim.g[key] = value` from Rust — used to record `g:colors_name` when

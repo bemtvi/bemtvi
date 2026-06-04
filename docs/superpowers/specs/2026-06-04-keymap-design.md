@@ -1,8 +1,10 @@
 # Keymap (`vim.keymap` / `:map`) — design & phased implementation plan
 
 **Date:** 2026-06-04
-**Status:** Planned. Foundation work for **`main`**, deliberately independent of —
-and unaware of — the LSP feature. **Implemented on `main` first** (it has no LSP
+**Status:** **Phase 1 implemented** on `main` (the matcher + normal-mode
+`vim.keymap.set`, global, `noremap`); Phases 2–4 and the backport remain planned.
+Foundation work for **`main`**, deliberately independent of — and unaware of — the
+LSP feature. **Implemented on `main` first** (it has no LSP
 dependency), then **backported to `feature/lsp-integration`**, where it subsumes
 that branch's hand-rolled `lsp_keymap` / `lsp_pending_g` recognizer and delivers the
 LSP plan's promise that `gd`/`K`/… are rebindable. The LSP design doc
@@ -286,7 +288,18 @@ one focused context window.
 
 ---
 
-### Phase 1 — The matcher + normal-mode `vim.keymap.set` (global)
+### Phase 1 — The matcher + normal-mode `vim.keymap.set` (global) — ✅ implemented
+
+> **Landed.** The engine is in `crates/nxvim-server/src/keymap.rs` (trie +
+> withhold/replay matcher), wired through `Server::input`; the Lua surface is in
+> `prelude.lua` (`vim.keymap.set`, `vim._keymaps`/`_keymap_fns`/`_keymaps_version`,
+> `vim._run_keymap`) with the snapshot reader / `run_keymap` in `nxvim-lua`'s
+> `lib.rs`; the one core change (`#[derive(Hash)]` on `Key`/`KeyCode`) is in
+> `input.rs`. Covered by `crates/nxvim-server/tests/keymaps.rs`. **One realized
+> divergence:** with no input timer, a trailing live-prefix stays buffered until
+> the next key flushes it (rather than firing at a `timeoutlen` boundary), so the
+> `gg`-replay test sends a final motion to flush — exactly the D4 gap Phase 4's
+> idle-flush closes.
 
 **Goal / value.** Stand up the whole engine and the headline surface on `main`: a
 user (or a config) can map a normal-mode key/sequence to a **Lua function** or a

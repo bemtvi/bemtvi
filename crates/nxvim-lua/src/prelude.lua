@@ -485,6 +485,67 @@ do
   })
 end
 
+-- ----- keymaps ---------------------------------------------------------------
+-- vim.keymap.set / .del store entries in a pure-Lua registry the server reads
+-- back as data (unlike autocmds, whose *matching* stays in Lua); the server
+-- compiles the snapshot into per-mode prefix tries and matches keystrokes there.
+-- A function RHS is held in vim._keymap_fns keyed by the entry's stable id and
+-- invoked from Rust via vim._run_keymap(id) — the run_user_command analogue.
+-- Every mutation bumps vim._keymaps_version so the server rebuilds its tries
+-- only when the registry actually changed (checked once per input batch).
+
+vim._keymaps = vim._keymaps or {}
+vim._keymap_fns = vim._keymap_fns or {}
+vim._keymaps_version = vim._keymaps_version or 0
+local keymap_seq = 0
+
+vim.keymap = vim.keymap or {}
+
+-- Normalize the `mode` argument to a list of single-char mode codes. A bare
+-- string is one mode; a list passes through. (Mode-list fan-out and the v/x/o
+-- equivalences are the server's job in Phase 2; Phase 1 ships single 'n' maps.)
+local function keymap_modes(mode)
+  if type(mode) == "table" then return mode end
+  return { mode }
+end
+
+-- vim.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
+-- `rhs` is a function (stored in vim._keymap_fns) or a string (fed as keys).
+-- `opts.noremap` defaults to true (the vim.keymap.set convention); `opts.desc`
+-- is stored but unused; `opts.buffer` / `opts.default` are recorded for the
+-- precedence ladder the server applies (buffer-local maps and built-in defaults
+-- arrive in later phases, but the fields ride along from day one).
+function vim.keymap.set(mode, lhs, rhs, opts)
+  opts = opts or {}
+  keymap_seq = keymap_seq + 1
+  local id = keymap_seq
+  local rhs_data
+  if type(rhs) == "function" then
+    vim._keymap_fns[id] = rhs
+    rhs_data = { kind = "lua", id = id }
+  else
+    rhs_data = { kind = "str", str = tostring(rhs) }
+  end
+  vim._keymaps[#vim._keymaps + 1] = {
+    id = id,
+    modes = keymap_modes(mode),
+    lhs = lhs,
+    rhs = rhs_data,
+    noremap = opts.noremap ~= false, -- absent → noremap, matching vim.keymap.set
+    buffer = opts.buffer,
+    desc = opts.desc,
+    default = opts.default or false,
+  }
+  vim._keymaps_version = vim._keymaps_version + 1
+end
+
+-- Invoke the function RHS for entry `id` (called from Rust when a Lua-backed
+-- mapping fires). A no-op if no function is registered under that id.
+function vim._run_keymap(id)
+  local fn = vim._keymap_fns[id]
+  if fn then fn() end
+end
+
 -- The `:ls` panel's <CR> handler: jump to the buffer whose number leads the
 -- selected listing line (`"  2 %a "name" line 1"`), then dismiss the list. The
 -- core installs this via `vim.panel.on_select` when `:ls` opens its panel, so

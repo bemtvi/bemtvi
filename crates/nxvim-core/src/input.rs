@@ -7,7 +7,11 @@
 //! mapping (crossterm key events -> notation) before sending.
 
 /// A logical key, independent of any terminal encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` is derived so the server's keymap trie can key a node's children by
+/// `Key` in a `HashMap` (see `nxvim-server`'s `keymap.rs`). It is the sole
+/// concession the user-mapping engine asks of the otherwise mapping-unaware core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key {
     pub code: KeyCode,
     pub ctrl: bool,
@@ -15,7 +19,7 @@ pub struct Key {
     pub shift: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyCode {
     Char(char),
     Enter,

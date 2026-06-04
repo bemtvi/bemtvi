@@ -5,7 +5,11 @@
 `vim.keymap.set`, global; recursive `remap`, `<leader>`, mode-lists, and Visual
 maps; insert/command-mode maps, buffer-local maps, `vim.keymap.del`, and the
 low-level `nvim_set_keymap`/`nvim_buf_set_keymap`/`nvim_del_keymap`/`nvim_buf_del_keymap`
-family); Phase 4 and the backport remain planned (`omap` deferred — see Phase 2).
+family). **Phase 4 substantially implemented** on `feat/keymap-phase-1`: the
+`timeoutlen` idle flush (D4), `<nowait>`/`<silent>`/`<unique>`, and `<expr>` (with a
+textlock sandbox); the **`:map`-family ex-commands are indefinitely postponed,
+possibly out of scope** and `<Plug>` stays deferred (see Phase 4). The backport
+remains planned (`omap` deferred — see Phase 2).
 Foundation work for **`main`**, deliberately independent of — and unaware of — the
 LSP feature. **Implemented on `main` first** (it has no LSP
 dependency), then **backported to `feature/lsp-integration`**, where it subsumes
@@ -545,7 +549,12 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
     `unique_*`); `<Plug>` is still deferred (lower value until there are plugins).
 - **`:map`-family ex-commands** (`nnoremap`, `inoremap`, `vmap`, …) parsed in the
   server and normalized onto the same registry — interactive parity for muscle memory,
-  explicitly *not* a Vimscript-config goal.
+  explicitly *not* a Vimscript-config goal. **❌ Indefinitely postponed (decision
+  2026-06-04), possibly out of scope.** The `vim.keymap.set` / `nvim_*_keymap` Lua
+  surface is the compatibility target modern configs use, and it's complete; the
+  `:map` family would only add interactive muscle-memory parity. Not on the roadmap
+  — revisit only if a concrete need surfaces. (`<Plug>` likewise remains deferred —
+  lower value until there are plugins.)
 
 **Scope (out):** full Vimscript; `<SID>`/script-local maps; `:map`'s `<buffer>`/`<expr>`
 arg parsing beyond the common forms.
@@ -652,9 +661,11 @@ or the Lua surface.
   as the autocmd emission). The one concession is a `Hash` derive on `Key`/`KeyCode`.
 - **No real `timeoutlen`** — the single deliberate divergence (design §3 / D4); every
   non-ambiguous and within-batch case is faithful.
-- **`vim.keymap.set` first, `:map` last** — the Lua surface modern configs use is the
-  priority; Vimscript `:map` parity is an optional tail, mirroring how the LSP plan
-  put `vim.lsp.*` first and Vimscript configs out of scope.
+- **`vim.keymap.set` only; `:map` indefinitely postponed** — the Lua surface modern
+  configs use is the priority, and it's complete. Vimscript `:map`-family parity was
+  the optional tail; as of 2026-06-04 it is **indefinitely postponed, possibly out of
+  scope** (see Phase 4), mirroring how the LSP plan put `vim.lsp.*` first and
+  Vimscript configs out of scope.
 - **Built-in keys are defaults, not hard-coding** — on the backport the LSP keys (and
   any future built-ins) ride the same registry and are user-overridable (D6/D7),
   replacing the bespoke `lsp_keymap` recognizer rather than re-implementing it.

@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b** (the `vim.lsp.buf.*` / `vim.diagnostic.*` Lua entry points) is next. 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md). *(One human step remains for 7a: add the `vendor/nvim-lspconfig` submodule — see the Phase 7a notes — to run the `lspconfig.rs` end-to-end test, which skips until then.)*
+**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b** (the `vim.lsp.buf.*` / `vim.diagnostic.*` Lua entry points) is next. 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`).
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -1389,13 +1389,11 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   `didOpen` (languageId `lua`) → diagnostics. It **skips cleanly** when
 >   `vendor/nvim-lspconfig` isn't checked out.
 >
-> **Pending (needs a human action):** the `vendor/nvim-lspconfig` git submodule
-> itself is **not** added — the agent's `git submodule add` was declined as it
-> stages third-party code for execution. Add it to exercise `lspconfig.rs`:
-> `git submodule add https://github.com/neovim/nvim-lspconfig vendor/nvim-lspconfig`
-> (mirrors the existing `vendor/neovim`). The `vim.fs.root`/`vim.fn.has` surface was
-> written against the current `lsp/lua_ls.lua`, but the end-to-end run is unverified
-> until the submodule lands.
+> **Submodule.** `vendor/nvim-lspconfig` is a git submodule (mirroring
+> `vendor/neovim`); populate a fresh clone with
+> `git submodule update --init vendor/nvim-lspconfig`. With it checked out,
+> `lspconfig.rs` runs the real `lsp/lua_ls.lua` and passes end-to-end (verified
+> against `nvim-lspconfig` v2.9.0-52-g229b7905); without it the test skips.
 
 **Goal.** A server starts *only* when user Lua calls `vim.lsp.enable` and a matching
 file opens; the real vendored `lsp/{rust_analyzer,gopls,pyright,lua_ls}.lua` load,

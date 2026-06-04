@@ -2,7 +2,9 @@
 
 **Date:** 2026-06-04
 **Status:** Planned — foundation work, independent of any feature branch. Unblocks
-LSP Phase 7 (`vim.lsp.*`), format-on-save, ftplugin, and buffer-local keymaps.
+LSP Phase 7 (`vim.lsp.*`), ftplugin, and buffer-local keymaps. The `BufWritePre`
+write seam (which format-on-save hooks) is split into its own design —
+[`2026-06-04-bufwritepre-write-seam-design.md`](2026-06-04-bufwritepre-write-seam-design.md).
 
 This document is both the design for nxvim's autocommand event lifecycle **and** a
 phase-by-phase implementation plan. Each phase is written to be handed off to a
@@ -25,11 +27,15 @@ next wave of features need a real event lifecycle:
 - **`FileType`** — the hook ftplugins and `vim.lsp.enable` attach to.
 - **`BufReadPost` / `BufEnter`** — per-buffer setup, buffer-local state.
 - **`InsertEnter`** — mode-driven behavior.
-- **`BufWritePre`** — the seam format-on-save will hook (write is core-owned and
-  synchronous, so this is also an architectural seam, not just an event).
 
-This phase delivers those five events, buffer-aware callback args, and complete
+This phase delivers those four events, buffer-aware callback args, and complete
 augroup/registration semantics — the foundation everything else builds on.
+
+`BufWritePre` is deliberately **not** here. It is a true *pre-action* hook on a
+core-owned, synchronous write, not a function of observable settled state, so it
+needs a different mechanism (core-side write deferral) than the state-diff this doc
+establishes. It is its own design:
+[`2026-06-04-bufwritepre-write-seam-design.md`](2026-06-04-bufwritepre-write-seam-design.md).
 
 ## Design
 
@@ -46,27 +52,30 @@ augroup/registration semantics — the foundation everything else builds on.
 
 ### The model this phase establishes
 
-**1. The server emits buffer/mode events centrally, by diffing settled editor
-state.** `nxvim-core` stays pure (no Lua, no event types) — so the server, after
-each input/command has settled (the redraw path), compares the editor's current
-state against what it last announced and fires the events that the transition
-implies. One chokepoint, no `fire` calls scattered through core. New `Server`
-tracking fields: `last_buffer_id`, `last_mode`, and an `announced: HashSet<BufferId>`
-(buffers that have already had `BufReadPost`/`FileType`).
+**1. The server emits buffer/mode events centrally, by diffing editor state after
+each applied input.** `nxvim-core` stays pure (no Lua, no event types) — so the
+server compares the editor's current state against what it last announced and fires
+the events the transition implies. The diff runs **per applied input** — after each
+`Server::input` key (`editor.input(key)`), and after the `nvim_command` and
+`nvim_set_current_buf` dispatch arms — not once per settled message. (Per-key is
+what lets a single batched `nvim_input("o…<Esc>")` still fire `InsertEnter` on the
+`o`: a once-per-message diff would see only the Normal end-state and miss it.) The
+diff is a cheap no-op for the vast majority of keys that change neither buffer nor
+mode. A one-time **startup seed** runs after `source_init` (the initial buffer and
+the config's autocmds both exist by then) to fire the first buffer's events.
 
-Ordering on first opening a file mirrors neovim closely enough:
-`BufReadPost` → `FileType` → `BufEnter`. A plain buffer **switch** (no read) fires
-only `BufEnter`. `FileType` fires **once** per buffer (filetype is derived from the
-path via `filetype_of`); `BufEnter` fires on **every** entry.
+New `Server` tracking fields: `last_buffer_id`, `last_mode`, and an
+`announced: HashSet<BufferId>` (buffers that have already had `BufReadPost`/`FileType`).
 
-**2. `BufWritePre` is the one event the core write path must cooperate with.**
-`:w` is core-owned and synchronous (`Editor::ex_write` → `Buffer::write`), and
-core cannot call Lua. So the **server intercepts** `:w`/`:write`/`:wq`/`:x` before
-delegating to core: fire `BufWritePre` (callbacks may edit the buffer), drain Lua
-effects, *then* let core write. This is deliberately the same seam format-on-save
-will later use to turn an async format into a pre-write step.
+Ordering on first opening a *file* mirrors neovim closely enough:
+`BufReadPost` → `FileType` → `BufEnter`. `BufReadPost` and `FileType` fire **once**
+per buffer and **only for file-backed buffers** — a fresh `:enew`/`[No Name]` (and
+the bare-`nxvim` startup buffer) was never read from a file, so it fires only
+`BufEnter`. A plain buffer **switch** (no read) fires only `BufEnter`. `FileType`'s
+pattern is the filetype derived from the path via `filetype_of` (skipped when it
+detects nothing); `BufEnter` fires on **every** entry.
 
-**3. Buffer context via a current-buffer snapshot.** Callbacks need to know *which*
+**2. Buffer context via a current-buffer snapshot.** Callbacks need to know *which*
 buffer fired (`args.buf`) and resolve it (`vim.api.nvim_buf_get_name(0)`,
 `vim.fn.expand('%:p:h')`). Until Lua has a real buffer registry, the server pushes
 a small snapshot — `vim._cur_buf = {bufnr, name}` — into the VM immediately before
@@ -78,10 +87,14 @@ firing, and `nvim_buf_get_name`/`expand('%')` read it. `vim._fire` gains optiona
 
 - **D1 — Central server-side emission, not core hooks.** Keeps `nxvim-core` pure
   and gives one place to reason about event ordering. Buffer/mode events are a
-  function of *observable settled state*, so a post-settle diff is sufficient and
-  avoids threading an event bus through the synchronous core. *Exception:*
-  `BufWritePre` (a true pre-action hook) is emitted by intercepting the write
-  command in the server.
+  function of *observable editor state*, so the server diffs that state after each
+  applied input (model §1) instead of threading an event bus through the synchronous
+  core. The diff runs per key/command — not once per settled message — so a
+  within-batch transition (enter *and* leave insert inside one `nvim_input`) isn't
+  masked; this is the same diff mechanism, only at a finer cadence, so it stays a
+  design decision here rather than a separate doc. `BufWritePre` is **not** modeled
+  this way: a pre-action write hook can't be reconstructed from after-the-fact state,
+  so it gets its own core-deferral design (the write-seam doc).
 - **D2 — Snapshot for buffer context.** A `vim._cur_buf` snapshot backs
   `nvim_buf_get_name(0)`/`expand('%')` synchronously during dispatch. No async
   window exists (the core is single-message-at-a-time; `vim.schedule` runs inline),
@@ -98,14 +111,21 @@ firing, and `nvim_buf_get_name`/`expand('%')` read it. `vim._fire` gains optiona
 - `crates/nxvim-lua/src/prelude.lua` — `vim._fire` args; augroup `clear` + per-autocmd
   `group`; `vim._cur_buf` snapshot; `nvim_exec_autocmds`; `nvim_del_autocmd`.
 - `crates/nxvim-lua/src/lib.rs` — `fire_autocmd` gains buffer context
-  (`fire_autocmd_buf`/`set_buf_snapshot`); expose `vim.api.nvim_buf_get_name` and the
-  minimal `vim.fn.expand('%'...)` backed by the snapshot.
-- `crates/nxvim-server/src/lib.rs` — the central `emit_lifecycle_events()` step
-  (state diff: `last_buffer_id`, `last_mode`, `announced`) run after dispatch
-  settles; the `:w` intercept for `BufWritePre`; new `Server` fields.
-- Tests in `crates/nxvim/tests/` (new `autocmds.rs`) — black-box via `nvim_input` /
-  RPC, asserting on observable effects (a callback that runs `:` commands or writes
-  a marker), per the project's no-unit-test rule.
+  (`fire_autocmd_buf`/`set_buf_snapshot`); add the **Lua** binding
+  `vim.api.nvim_buf_get_name` and the minimal `vim.fn.expand('%'...)`, both backed by
+  the snapshot. (Note: a `nvim_buf_get_name` *RPC* method already exists on the server
+  — `lib.rs:276`, core-backed — and is separate; the Lua binding is snapshot-backed as
+  an interim until a real per-bufnr registry exists.)
+- `crates/nxvim-server/src/lib.rs` — the `emit_lifecycle_events()` diff step
+  (`last_buffer_id`, `last_mode`, `announced`), called after each applied input — the
+  per-key loop in `Server::input` (`lib.rs:356`), the `nvim_command` and
+  `nvim_set_current_buf` arms, and once at startup after `source_init` (`lib.rs:166`);
+  new `Server` fields. (No `:w` interception — that's the separate write-seam doc.)
+- Tests in `crates/nxvim-server/tests/autocmds.rs` (new file, sibling to `buffers.rs`)
+  — black-box via `nvim_input` / RPC, asserting on observable effects (a callback that
+  runs `:` commands or `print`s a marker), per the project's no-unit-test rule. It
+  carries its own `start`/`start_with_config`/`feed`/`lines` helpers, copied from the
+  `editing.rs`/`buffers.rs` pattern (integration-test files don't share a module).
 
 ---
 
@@ -120,9 +140,12 @@ firing. Independently testable with **zero** editor lifecycle wiring, via
 
 **Scope (in).**
 - `vim._fire(event, pattern, buf, file)` → callback `args = {id, event, match, buf, file}`.
-- `vim._cur_buf = {bufnr, name}` snapshot + `vim._set_cur_buf`; expose
-  `vim.api.nvim_buf_get_name(bufnr)` (0 / snapshot bufnr → snapshot name) and a
-  minimal `vim.fn.expand` for `%`, `%:p`, `%:h`, `%:t`.
+- `vim._cur_buf = {bufnr, name}` snapshot + `vim._set_cur_buf`; add the Lua
+  `vim.api.nvim_buf_get_name(bufnr)` binding (0 / snapshot bufnr → snapshot name) and a
+  minimal `vim.fn.expand` for `%`, `%:p`, `%:h`, `%:t`. `%` is the path as stored on
+  the buffer; `%:p` wants an absolute path, so the snapshot should carry an absolute
+  `name` (or `expand` canonicalizes) — for the first cut `%:p` ≈ the stored path is
+  acceptable.
 - `nvim_create_augroup(name, {clear=true})` clears the group's autocmds; each
   autocmd stores `opts.group`; `nvim_create_autocmd` honors `opts.group` and
   `opts.buffer` (buffer-local match).
@@ -132,7 +155,7 @@ firing. Independently testable with **zero** editor lifecycle wiring, via
 **Scope (out).** Any editor-emitted events (Phases 2–3). A real per-bufnr buffer
 registry (snapshot only).
 
-**Tests** (`crates/nxvim/tests/autocmds.rs`).
+**Tests** (`crates/nxvim-server/tests/autocmds.rs`).
 - A callback registered for a custom event runs on `nvim_exec_autocmds` and sees
   the right `args.buf`/`args.match` (assert via a command the callback runs).
 - `nvim_create_augroup(name, {clear=true})` re-run drops the prior callback (no
@@ -153,16 +176,22 @@ with buffer context.
 
 **Scope (in).**
 - `Server` tracking: `last_buffer_id`, `announced: HashSet<BufferId>`.
-- `emit_lifecycle_events()` run after each input/command settles (in the
-  `redraw` path, before `sync_lsp`/`sync_syntax`): if the current buffer left the
-  `announced` set, snapshot it and fire `BufReadPost` then `FileType`
-  (pattern = filetype from `filetype_of`, only if detected), mark announced; if the
-  current buffer differs from `last_buffer_id`, fire `BufEnter`. Each fire pushes
-  the buffer snapshot first and drains Lua effects after.
+- `emit_lifecycle_events()` — the state diff, called after each applied input: the
+  per-key loop in `Server::input` (`lib.rs:356`), the `nvim_command` and
+  `nvim_set_current_buf` arms, and a one-time startup seed after `source_init`
+  (`lib.rs:166`). *Not* inside `redraw()` — its `view` is already computed before
+  `sync_syntax`, and it also fires on syntax-only events where nothing transitioned.
+  If the current buffer left the `announced` set: snapshot it, and **only for a
+  file-backed buffer** fire `BufReadPost` then `FileType` (pattern = filetype from
+  `filetype_of`, only if detected); mark announced. If the current buffer differs from
+  `last_buffer_id`, fire `BufEnter`. Each fire pushes the buffer snapshot first and
+  drains Lua effects after. (LSP's `sync_lsp` is a future downstream consumer, not
+  present today.)
 - Covers startup (initial file arg), `:edit`, and buffer switches
-  (`nvim_set_current_buf`, `:bnext`, `:b`, `<C-^>`).
+  (`nvim_set_current_buf`, `:bnext`, `:b`, `<C-^>`) — the diff is mechanism-agnostic,
+  so any path that changes the current buffer is caught.
 
-**Scope (out).** `InsertEnter`, `BufWritePre` (Phase 3).
+**Scope (out).** `InsertEnter` (Phase 3); `BufWritePre` (separate write-seam doc).
 
 **Tests.**
 - Opening a `.rs` file fires `FileType` with `match == "rust"` and `args.file`
@@ -176,34 +205,34 @@ first open; gates green.
 
 ---
 
-## Phase 3 — Mode & write events (`InsertEnter`, `BufWritePre`)
+## Phase 3 — Mode event (`InsertEnter`)
 
-**Goal / value.** The remaining two: a mode-transition event and the pre-write
-seam. `BufWritePre` is the structural one — it establishes how the synchronous,
-core-owned write cooperates with Lua, which format-on-save later reuses.
+**Goal / value.** The mode-transition event, completing the set this doc covers.
+Mode-driven plugins (completion, snippet engines) hook `InsertEnter`.
 
 **Prerequisites.** Phase 2.
 
 **Scope (in).**
 - `InsertEnter`: `Server` tracks `last_mode`; `emit_lifecycle_events()` fires
-  `InsertEnter` when the mode transitions into `Mode::Insert` (covers `i/I/a/A/o/O/C`
-  without touching the multiple core insert chokepoints — the diff sees the result).
-- `BufWritePre`: the server intercepts `:w`/`:write`/`:wq`/`:x`/`:wa` before
-  delegating to `Editor::ex_write`; fires `BufWritePre` (snapshot pushed), drains
-  Lua effects (callbacks may edit the buffer), then runs the core write.
+  `InsertEnter` when the mode transitions into `Mode::Insert` (covers `i/I/a/A/o/O/C`,
+  `cc`/`s`/`S`, etc. without touching the many core insert chokepoints — the diff sees
+  the result). Because the diff runs **per applied key** (model §1), a batched
+  `nvim_input("o…<Esc>")` still fires it on the `o`.
+- *Fidelity note:* neovim also fires `InsertEnter` when entering **Replace** (`R`,
+  `Mode::Replace`). This doc fires on `Mode::Insert` only; either extend the condition
+  to "enters Insert *or* Replace" or record Replace as a known gap.
 
-**Scope (out).** `BufWritePost`, `InsertLeave`, `TextChanged`, `BufWinEnter`, etc.
-— add as consumers appear. Format-on-save itself (separate design; this only lays
-the `BufWritePre` seam).
+**Scope (out).** `InsertLeave`, `TextChanged`, `BufWinEnter`, `BufWritePost`, etc. —
+add as consumers appear. `BufWritePre` and format-on-save are their own design (the
+write-seam doc).
 
 **Tests.**
 - Entering insert via `i` (and via `o`) fires `InsertEnter` exactly once per entry.
-- `:w` fires `BufWritePre` before the file is written; a `BufWritePre` callback that
-  edits the buffer is reflected in the **written file on disk** (proves pre-write
-  ordering and the edit-then-write seam).
+  Per-key emission means even `feed("o<Esc>")` fires it on the `o`; a test that leaves
+  the editor in insert (feed `i`/`o`, assert, then `<Esc>`) reads most clearly.
 
-**Done when.** The above pass; `:w` semantics otherwise unchanged when no
-`BufWritePre` autocmd is registered; gates green.
+**Done when.** The above pass; entering insert from each command fires `InsertEnter`
+exactly once; gates green.
 
 ---
 
@@ -211,5 +240,7 @@ the `BufWritePre` seam).
 
 - **LSP Phase 7** (`docs/superpowers/specs/2026-06-02-lsp-support-design.md`) —
   `vim.lsp.enable` installs a `FileType` autocmd; depends on Phase 2.
-- **Format-on-save** — reuses the Phase 3 `BufWritePre` seam.
+- **`BufWritePre` write seam + format-on-save**
+  ([`2026-06-04-bufwritepre-write-seam-design.md`](2026-06-04-bufwritepre-write-seam-design.md))
+  — the pre-write hook this doc deliberately excludes; needs core-side write deferral.
 - **Buffer-local keymaps / ftplugin** — depend on Phase 2 + buffer context.

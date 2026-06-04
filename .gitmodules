@@ -1,3 +1,6 @@
 [submodule "vendor/neovim"]
 	path = vendor/neovim
 	url = https://github.com/neovim/neovim.git
+[submodule "vendor/nvim-lspconfig"]
+	path = vendor/nvim-lspconfig
+	url = https://github.com/neovim/nvim-lspconfig

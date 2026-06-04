@@ -1,10 +1,15 @@
 # Autocmd lifecycle — design & phased implementation plan
 
 **Date:** 2026-06-04
-**Status:** Planned — foundation work, independent of any feature branch. Unblocks
-LSP Phase 7 (`vim.lsp.*`), ftplugin, and buffer-local keymaps. The `BufWritePre`
-write seam (which format-on-save hooks) is split into its own design —
+**Status:** Implemented (Phases 1–3) — foundation work, independent of any feature
+branch. Unblocks LSP Phase 7 (`vim.lsp.*`), ftplugin, and buffer-local keymaps.
+The `BufWritePre` write seam (which format-on-save hooks) is split into its own
+design —
 [`2026-06-04-bufwritepre-write-seam-design.md`](2026-06-04-bufwritepre-write-seam-design.md).
+
+All three phases below are landed and covered by `crates/nxvim-server/tests/autocmds.rs`:
+the registration/dispatch bridge (Phase 1), the `BufReadPost`/`FileType`/`BufEnter`
+buffer lifecycle events (Phase 2), and `InsertEnter` (Phase 3).
 
 This document is both the design for nxvim's autocommand event lifecycle **and** a
 phase-by-phase implementation plan. Each phase is written to be handed off to a

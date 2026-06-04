@@ -488,6 +488,19 @@ with the completion popup is **backport** work, not this phase.
 
 ### Phase 4 — fidelity & the long tail
 
+> **Idle-flush landed (the `timeoutlen` item).** The TUI now arms a `TIMEOUT_LEN`
+> (1000ms, vim's default) timer after each keystroke and, on idle, notifies
+> `nxvim_input_flush`; the server turns that into `Keymaps::flush(mode)`, which
+> resolves a trailing live-prefix exactly as the next-key break path would —
+> firing the longest complete (ambiguous *shorter*) map, else replaying the
+> withheld keys raw. This closes the D4 gap: `gg` (with `gh` mapped) jumps to the
+> top on idle without a following key, and an ambiguous `j`/`jk` resolves to `j`.
+> The server stays timer-free (the timer lives in the client's existing
+> `select!` render loop), so tests stay deterministic — they call the flush RPC
+> directly rather than waiting on wall-clock. Covered by the Phase 4 block in
+> `tests/keymaps.rs`. The remaining Phase 4 items (`expr`, `<Plug>`/`<nowait>`/
+> `<silent>`, `:map` ex-commands) remain pick-per-demand.
+
 **Goal / value.** The harder corners, added as real configs demand them: an
 ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowait`,
 `<silent>`/`desc` surfacing, and (optionally) the Vimscript `:map`-family.
@@ -495,9 +508,10 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
 **Prerequisites.** Phase 3.
 
 **Scope (in, pick per demand).**
-- **Ambiguity / `timeoutlen`:** a synthetic "flush pending" the client sends on input
-  idle (the TUI already owns a render loop), letting an ambiguous shorter map resolve
-  without the next key — closing the D4 gap as far as a timer-less core allows.
+- **Ambiguity / `timeoutlen`:** ✅ a synthetic "flush pending" the client sends on
+  input idle (the TUI already owns a render loop), letting an ambiguous shorter map
+  resolve without the next key — closing the D4 gap as far as a timer-less core
+  allows. *(Implemented — see the note above.)*
 - **`expr` maps:** RHS function returns the keys to feed (then fed per `noremap`).
 - **`<Plug>` / `<unique>` / `<nowait>` / `<silent>`** semantics.
 - **`:map`-family ex-commands** (`nnoremap`, `inoremap`, `vmap`, …) parsed in the

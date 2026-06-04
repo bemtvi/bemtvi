@@ -281,6 +281,13 @@ impl Server {
                 self.input(&keys);
                 Ok(Value::from(keys.len() as u64))
             }
+            "nxvim_input_flush" => {
+                // The TUI's synthetic `timeoutlen` idle flush (design D4): resolve a
+                // trailing live-prefix withheld in the matcher without waiting for
+                // the next keystroke. A no-op when nothing is pending.
+                self.input_flush();
+                Ok(Value::Nil)
+            }
             "nvim_command" => {
                 let cmd = text(params.first());
                 self.run_command(&cmd);
@@ -405,6 +412,20 @@ impl Server {
             for step in self.keymaps.feed(mode, key) {
                 self.apply_step(step);
             }
+        }
+        self.run_pending();
+    }
+
+    /// Resolve a withheld key-prefix on input idle — the matcher's `timeoutlen`
+    /// flush (design D4). Mirrors [`input`](Self::input)'s drive, but the steps come
+    /// from [`Keymaps::flush`] (no incoming key) instead of `feed`. Refreshing the
+    /// tries first keeps the flush consistent with a registry/buffer change since the
+    /// last batch; with nothing pending the whole call is a no-op.
+    fn input_flush(&mut self) {
+        self.refresh_keymaps();
+        let mode = self.editor.mode;
+        for step in self.keymaps.flush(mode) {
+            self.apply_step(step);
         }
         self.run_pending();
     }

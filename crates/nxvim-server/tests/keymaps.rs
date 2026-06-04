@@ -54,6 +54,17 @@ fn feed(rpc: &Rpc, keys: &str) {
     rpc.notify("nvim_input", vec![Value::from(keys)]);
 }
 
+/// Send the synthetic idle flush (`nxvim_input_flush`) the TUI fires after
+/// `timeoutlen` with no further input — resolving any key the matcher withheld as
+/// a live prefix. Stands in for the wall-clock timer the tests deliberately don't
+/// wait on (design D4: timing is out of scope; the flush *mechanism* is what we
+/// assert). Awaited so it has been processed before the following assertion.
+async fn flush(rpc: &Rpc) {
+    rpc.request("nxvim_input_flush", vec![])
+        .await
+        .expect("input flush");
+}
+
 /// Feed `keys`, then deterministically return the `redraw` map the server emitted
 /// for that input (the serial-ordering trick from `autocmds.rs`).
 async fn redraw_after(
@@ -587,4 +598,108 @@ async fn nvim_set_keymap_defaults_to_remappable() {
         vec!["Xhello"],
         "W (noremap) bypassed the p map"
     );
+}
+
+// ----- Phase 4: the `timeoutlen` idle flush (design D4) ----------------------
+
+/// The blessed fix for the timer-less divergence: with `gh` mapped, pressing `gg`
+/// withholds the second `g` as a live prefix of `gh`, so go-to-top doesn't fire on
+/// the keystroke alone. The TUI's idle flush (`nxvim_input_flush`) resolves it —
+/// the withheld `g` replays to the editor and `gg` jumps to the top — *without*
+/// the user pressing another key, which is what the pre-Phase-4 engine required.
+#[tokio::test]
+async fn idle_flush_completes_a_withheld_prefix() {
+    let dir = temp_dir("keymap_flush_gg");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'gh', function() print('GH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    // `gg` alone leaves the second `g` withheld (a live prefix of `gh`), so the
+    // cursor hasn't moved yet — exactly the trailing-prefix lag.
+    feed(&rpc, "gg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "the second g is still withheld; go-to-top hasn't fired"
+    );
+
+    // The idle flush replays the withheld g; core sees `gg` and jumps to line 1 —
+    // no following keystroke needed.
+    flush(&rpc).await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "the idle flush completed gg → go-to-top"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line1", "line2", "line3"],
+        "the g-sequence was motion only; the buffer is untouched"
+    );
+}
+
+/// An ambiguous map (`j` is both a complete map *and* a prefix of `jk`) is held
+/// rather than fired on the keystroke, since a following `k` would take the longer
+/// map. The idle flush resolves the ambiguity in favor of the **shorter** map —
+/// vim's `timeoutlen` behavior — firing `j`'s RHS without a next key.
+#[tokio::test]
+async fn idle_flush_resolves_ambiguous_shorter_map() {
+    let dir = temp_dir("keymap_flush_ambig");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'j', function() print('SHORT') end)\n\
+         vim.keymap.set('n', 'jk', function() print('LONG') end)\n",
+    )
+    .await;
+
+    // `j` alone is ambiguous (it could continue to `jk`), so nothing fires yet.
+    let redraw = redraw_after(&rpc, &mut incoming, "j").await;
+    assert_eq!(message(&redraw), "", "j is held pending the ambiguity");
+
+    // The idle flush fires the shorter map.
+    while incoming.try_recv().is_ok() {}
+    flush(&rpc).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let mut fired = String::new();
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "redraw" {
+            if let Some(Value::Map(map)) = params.into_iter().next() {
+                if !message(&map).is_empty() {
+                    fired = message(&map);
+                }
+            }
+        }
+    }
+    assert_eq!(fired, "SHORT", "the idle flush fired the shorter (j) map");
+}
+
+/// The flush is a no-op when nothing is withheld: the client arms it after every
+/// keystroke and fires it unconditionally on idle, so a flush with an empty pending
+/// buffer must not perturb editor state.
+#[tokio::test]
+async fn idle_flush_with_nothing_pending_is_a_noop() {
+    let dir = temp_dir("keymap_flush_noop");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'gh', function() print('GH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+    assert_eq!(cursor(&rpc).await, (1, 0));
+
+    // No prefix is outstanding here (the `0` completed). Flushing changes nothing.
+    flush(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "flush left the buffer alone"
+    );
+    assert_eq!(cursor(&rpc).await, (1, 0), "flush left the cursor alone");
 }

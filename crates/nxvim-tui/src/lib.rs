@@ -46,6 +46,16 @@ use render::render;
 /// Rows reserved at the bottom for the status line and command line.
 const CHROME_ROWS: u16 = 2;
 
+/// How long the client waits after a keystroke, with no further input, before
+/// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`
+/// (default 1000ms). The server has no input timer (it processes `nvim_input`
+/// batches synchronously), so a trailing key that is a *live prefix* of a mapping
+/// stays withheld in the matcher until something flushes it. This idle flush is
+/// that something: it lets an ambiguous shorter map (`j` with `jk` mapped) or a
+/// replayed prefix (the second `g` of `gg` with `gh` mapped) resolve without the
+/// user pressing another key — the timer-less divergence's blessed fix (design D4).
+const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
+
 /// RAII guard for terminal mouse capture: enables mouse reporting on creation
 /// and **disables it on drop**, including when the event loop unwinds on a
 /// panic. ratatui's panic hook restores raw mode and the alternate screen but
@@ -113,6 +123,11 @@ where
     let mut view = View::default();
     let mut anim: Option<Animation> = None;
     let mut term_events = EventStream::new();
+    // Armed by each keystroke; when the `TIMEOUT_LEN` branch wins (no further input
+    // arrived), we send one `nxvim_input_flush` and disarm. The `sleep` is recreated
+    // each loop pass, so any event — including the next key — restarts the countdown,
+    // which is exactly `timeoutlen`'s reset-on-input semantics.
+    let mut flush_armed = false;
 
     loop {
         tokio::select! {
@@ -121,6 +136,7 @@ where
                     if key.kind != KeyEventKind::Release {
                         if let Some(notation) = encode_key(key) {
                             rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
+                            flush_armed = true;
                         }
                     }
                 }
@@ -171,6 +187,14 @@ where
                     anim = None; // settle: render the destination view below
                 }
                 terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
+            },
+            // `timeoutlen` idle flush: a keystroke armed the timer and nothing
+            // followed within `TIMEOUT_LEN`, so nudge the server to resolve any key
+            // it withheld as a live prefix (design D4). Harmless when nothing is
+            // pending. Disarmed so it fires at most once per idle gap.
+            _ = sleep(TIMEOUT_LEN), if flush_armed => {
+                rpc.notify("nxvim_input_flush", vec![]);
+                flush_armed = false;
             },
         }
     }

@@ -15,8 +15,11 @@
 //! which case the buffered keys are **replayed** to the editor and the current key
 //! re-processed (this is the generalization the LSP branch's hand-rolled
 //! `lsp_pending_g` recognizer becomes on the backport). The one divergence from
-//! neovim: a trailing live-prefix with no following key stays buffered until the
-//! next keystroke flushes it, rather than resolving on a wall-clock timeout.
+//! neovim: a trailing live-prefix with no following key has no wall-clock
+//! `timeoutlen` to resolve it on; instead the client sends a synthetic idle flush
+//! ([`Keymaps::flush`], the `nxvim_input_flush` RPC) after `timeoutlen` of no
+//! input, which resolves the buffer exactly as the next-key break path would —
+//! keeping the server itself timer-free (design D4, Phase 4).
 
 use std::collections::HashMap;
 
@@ -229,6 +232,45 @@ impl Keymaps {
         self.remap_budget = MAX_MAP_DEPTH;
         let mut steps = Vec::new();
         self.feed_key(mode, key, &mut steps);
+        steps
+    }
+
+    /// Resolve whatever is withheld in `pending` *as if a `timeoutlen` boundary
+    /// had passed* — the synthetic idle flush that closes the D4 gap (design §3 /
+    /// D4). The TUI sends this after an idle gap with no following key; the server
+    /// turns it into a [`flush`](Keymaps::flush) so a trailing live-prefix fires
+    /// without waiting for the *next* keystroke.
+    ///
+    /// Semantics are the next-key break path with no next key: fire the longest
+    /// complete mapping that prefixes the buffer (the ambiguous *shorter* map —
+    /// e.g. `j` when both `j` and `jk` are mapped), then re-feed the remainder; with
+    /// no complete prefix the withheld keys were not a mapping, so replay them raw
+    /// (e.g. the second `g` of `gg` reaches the editor, completing go-to-top). Empty
+    /// `pending` makes this a no-op, so the client can flush unconditionally on idle.
+    ///
+    /// The loop drains any remainder a re-feed re-withholds (overlapping maps can
+    /// leave a deeper prefix buffered); it terminates because each pass consumes at
+    /// least one key, so `pending` strictly shrinks. The defensive break guards the
+    /// invariant in case that ever fails to hold.
+    pub fn flush(&mut self, mode: Mode) -> Vec<Step> {
+        self.remap_budget = MAX_MAP_DEPTH;
+        let mut steps = Vec::new();
+        let mode_key = mode_key(mode);
+        while !self.pending.is_empty() {
+            let before = self.pending.len();
+            let buffered: Vec<Key> = self.pending.drain(..).collect();
+            if self.tries.contains_key(&mode_key) {
+                self.resolve_buffered(mode, &buffered, &mut steps);
+            } else {
+                // No trie for the current mode (the prefix was withheld in another
+                // mode, then the mode changed): the keys can't be a mapping here.
+                steps.extend(buffered.into_iter().map(Step::Editor));
+            }
+            if self.pending.len() >= before {
+                steps.extend(self.pending.drain(..).map(Step::Editor));
+                break;
+            }
+        }
         steps
     }
 

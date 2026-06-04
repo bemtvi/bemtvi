@@ -1463,7 +1463,10 @@ diagnostics cache from Lua.
   `completion`) — route to the existing feature paths.
 - `vim.diagnostic.*` (`get`, `setloclist`/panel, `goto_next`/`goto_prev`, `config`)
   over the Phase-2 diagnostics cache.
-- `vim.keymap.set` (coordinate with the separate keymap roadmap item).
+- `vim.keymap.set` — provided by the separate **keymap design**
+  ([2026-06-04-keymap-design.md](2026-06-04-keymap-design.md)); 7b's go-to-via-keymap
+  and `on_attach` buffer-local maps depend on that doc's **Phase 1** (and Phase 3 for
+  buffer-local).
 - Fire `LspAttach`/`LspDetach`; surface `client.server_capabilities` and invoke the
   config's `on_attach` (the firing hook may land in 7a; its body needs this surface).
 

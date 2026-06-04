@@ -45,3 +45,52 @@ end)
 vim.keymap.set("n", "jk", function()
   print("jk (the longer map)")
 end)
+
+--------------------------------------------------------------------------------
+-- 3. <nowait>: skip the wait entirely. `,` is a complete map AND a prefix of
+--    `,x`, but it's marked nowait, so it fires the INSTANT you press it.
+--    TYPE:  ,            (just the comma)
+--    SEE :  "comma (nowait — fired without waiting for ,x)" immediately — no
+--           pause, no need to press anything else. (Pressing `,x` can never
+--           reach the longer map now; that's the nowait trade-off.)
+--------------------------------------------------------------------------------
+vim.keymap.set("n", ",", function()
+  print("comma (nowait — fired without waiting for ,x)")
+end, { nowait = true })
+vim.keymap.set("n", ",x", function()
+  print("you won't see this — , fired first")
+end)
+
+--------------------------------------------------------------------------------
+-- 4. <silent>: run the mapping but keep the command line clean.
+--    TYPE:  <Space>n     -> SEE the message "not silent: you can read me".
+--    TYPE:  <Space>q     -> SEE nothing on the command line, BUT the output is
+--           still logged: run  :messages  and "silent: only in :messages" is
+--           there. <silent> hides the transient display, not the history.
+--------------------------------------------------------------------------------
+vim.keymap.set("n", "<leader>n", function()
+  print("not silent: you can read me")
+end)
+vim.keymap.set("n", "<leader>q", function()
+  print("silent: only in :messages")
+end, { silent = true })
+
+--------------------------------------------------------------------------------
+-- 5. <unique>: refuse to clobber an existing map. We map `<leader>u`, then try
+--    to re-map it with unique = true — which errors (E227) instead of
+--    overwriting. The pcall below captures that error so sourcing still
+--    succeeds; press <Space>u to confirm the ORIGINAL map survived.
+--    TYPE:  <Space>u  -> SEE "original <leader>u (the unique re-map was refused)".
+--------------------------------------------------------------------------------
+vim.keymap.set("n", "<leader>u", function()
+  print("original <leader>u (the unique re-map was refused)")
+end)
+local ok, err = pcall(function()
+  vim.keymap.set("n", "<leader>u", function()
+    print("you won't see this — unique refused the overwrite")
+  end, { unique = true })
+end)
+if not ok then
+  -- E227 surfaced as expected; leave a breadcrumb in :messages.
+  print("(<leader>u unique clash refused: " .. tostring(err) .. ")")
+end

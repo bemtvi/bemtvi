@@ -513,7 +513,21 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
   resolve without the next key — closing the D4 gap as far as a timer-less core
   allows. *(Implemented — see the note above.)*
 - **`expr` maps:** RHS function returns the keys to feed (then fed per `noremap`).
-- **`<Plug>` / `<unique>` / `<nowait>` / `<silent>`** semantics.
+- **`<nowait>` / `<silent>` / `<unique>`:** ✅ map-option semantics.
+  - **`nowait`** — a per-entry flag the matcher reads in `classify`: a complete
+    mapping that is *also* a prefix of a longer one fires the instant it matches
+    instead of being held (so an ambiguous short map needs neither the idle flush
+    nor the next key). Stored on the trie node's `Mapping`.
+  - **`silent`** — carried on `Step::Fire`; the server snapshots the message line
+    before the fire and restores it after, so the mapping's `:cmd` echo / `print`
+    doesn't linger on the command line. `:messages` history is intentionally
+    untouched — the output is logged, only its transient display is hidden.
+  - **`unique`** — a set-time check in `keymap_register` (`keymap_clashes`): a
+    clash at the same mode/lhs/buffer scope raises vim's `E227` instead of
+    overwriting. Pure-Lua, never stored on the entry.
+
+    Covered by the Phase 4 block in `tests/keymaps.rs` (`nowait_*`, `silent_*`,
+    `unique_*`); `<Plug>` is still deferred (lower value until there are plugins).
 - **`:map`-family ex-commands** (`nnoremap`, `inoremap`, `vmap`, …) parsed in the
   server and normalized onto the same registry — interactive parity for muscle memory,
   explicitly *not* a Vimscript-config goal.
@@ -521,8 +535,10 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
 **Scope (out):** full Vimscript; `<SID>`/script-local maps; `:map`'s `<buffer>`/`<expr>`
 arg parsing beyond the common forms.
 
-**Tests.** Per item: an ambiguous `j`/`jk` pair resolving on idle-flush; an `expr` map
-feeding computed keys; `:nnoremap` parity with `vim.keymap.set`.
+**Tests.** Per item: an ambiguous `j`/`jk` pair resolving on idle-flush; `<nowait>`
+firing the short map immediately, `<silent>` hiding the message line while `:messages`
+keeps it, `<unique>` raising E227 on a clash; an `expr` map feeding computed keys;
+`:nnoremap` parity with `vim.keymap.set`.
 
 **Done when.** The chosen items pass; gates green.
 

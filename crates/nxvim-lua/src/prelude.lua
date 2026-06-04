@@ -538,14 +538,38 @@ local function keymap_resolve_buffer(buffer)
   return buffer
 end
 
+-- Does a mapping already exist for `lhs` overlapping any of `modes` at the given
+-- `buffer` scope? Backs `<unique>` (opts.unique): vim errors (E227) rather than
+-- overwrite. Compares the already-leader-expanded `lhs`/resolved `buffer` the
+-- caller holds, and treats any mode overlap as a clash.
+local function keymap_clashes(modes, lhs, buffer)
+  local want = {}
+  for _, m in ipairs(modes) do want[m] = true end
+  for _, e in ipairs(vim._keymaps) do
+    if e.lhs == lhs and e.buffer == buffer then
+      for _, m in ipairs(e.modes) do
+        if want[m] then return true end
+      end
+    end
+  end
+  return false
+end
+
 -- Register one keymap entry into vim._keymaps — the shared core of vim.keymap.set
 -- and the lower-level nvim_set_keymap / nvim_buf_set_keymap. `modes` is a list of
 -- mode codes; `rhs` a function (stored in vim._keymap_fns) or a string (fed as
--- keys); `noremap` is already resolved by the caller (set defaults it true, the
--- nvim_* family false — design D5). `<leader>` is expanded in both the LHS and a
--- string RHS at set-time, matching neovim. Bumps the version so the server
+-- keys). `opts` is a normalized table the callers fill in: `noremap` (set defaults
+-- it true, the nvim_* family false — design D5), `buffer`, `desc`, `default`, and
+-- the Phase-4 flags `nowait` / `silent` (read by the matcher / fire path) and
+-- `unique` (a set-time check, never stored). `<leader>` is expanded in both the LHS
+-- and a string RHS at set-time, matching neovim. Bumps the version so the server
 -- rebuilds its tries.
-local function keymap_register(modes, lhs, rhs, noremap, buffer, desc, default)
+local function keymap_register(modes, lhs, rhs, opts)
+  lhs = keymap_expand_leader(lhs)
+  local buffer = keymap_resolve_buffer(opts.buffer)
+  if opts.unique and keymap_clashes(modes, lhs, buffer) then
+    error("E227: mapping already exists for " .. lhs, 0)
+  end
   keymap_seq = keymap_seq + 1
   local id = keymap_seq
   local rhs_data
@@ -560,12 +584,14 @@ local function keymap_register(modes, lhs, rhs, noremap, buffer, desc, default)
   vim._keymaps[#vim._keymaps + 1] = {
     id = id,
     modes = modes,
-    lhs = keymap_expand_leader(lhs),
+    lhs = lhs,
     rhs = rhs_data,
-    noremap = noremap,
-    buffer = keymap_resolve_buffer(buffer),
-    desc = desc,
-    default = default or false,
+    noremap = opts.noremap,
+    buffer = buffer,
+    desc = opts.desc,
+    nowait = opts.nowait or false,
+    silent = opts.silent or false,
+    default = opts.default or false,
   }
   vim._keymaps_version = vim._keymaps_version + 1
 end
@@ -613,7 +639,15 @@ function vim.keymap.set(mode, lhs, rhs, opts)
   opts = opts or {}
   -- noremap unless either `noremap = false` or `remap = true` is given.
   local noremap = opts.noremap ~= false and not opts.remap
-  keymap_register(keymap_modes(mode), lhs, rhs, noremap, opts.buffer, opts.desc, opts.default)
+  keymap_register(keymap_modes(mode), lhs, rhs, {
+    noremap = noremap,
+    buffer = opts.buffer,
+    desc = opts.desc,
+    default = opts.default,
+    nowait = opts.nowait,
+    silent = opts.silent,
+    unique = opts.unique,
+  })
 end
 
 -- vim.keymap.del(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
@@ -630,12 +664,28 @@ end
 -- key string. nvim_buf_*_keymap take a leading `buffer` (0 = current).
 function vim.api.nvim_set_keymap(mode, lhs, rhs, opts)
   opts = opts or {}
-  keymap_register({ mode }, lhs, opts.callback or rhs, opts.noremap == true, nil, opts.desc, opts.default)
+  keymap_register({ mode }, lhs, opts.callback or rhs, {
+    noremap = opts.noremap == true,
+    buffer = nil,
+    desc = opts.desc,
+    default = opts.default,
+    nowait = opts.nowait,
+    silent = opts.silent,
+    unique = opts.unique,
+  })
 end
 
 function vim.api.nvim_buf_set_keymap(buffer, mode, lhs, rhs, opts)
   opts = opts or {}
-  keymap_register({ mode }, lhs, opts.callback or rhs, opts.noremap == true, buffer, opts.desc, opts.default)
+  keymap_register({ mode }, lhs, opts.callback or rhs, {
+    noremap = opts.noremap == true,
+    buffer = buffer,
+    desc = opts.desc,
+    default = opts.default,
+    nowait = opts.nowait,
+    silent = opts.silent,
+    unique = opts.unique,
+  })
 end
 
 function vim.api.nvim_del_keymap(mode, lhs)

@@ -41,12 +41,28 @@ pub enum MappingRhs {
     Keys(Vec<Key>, bool),
 }
 
+/// A compiled mapping at a trie node: its RHS plus the option flags that change
+/// how it matches (`nowait`) or how its effects surface (`silent`).
+#[derive(Clone, Debug)]
+pub struct Mapping {
+    /// What fires when this mapping matches.
+    pub rhs: MappingRhs,
+    /// `<nowait>`: fire the moment this mapping completes, even if it is also a
+    /// prefix of a longer one — don't hold it waiting for the longer map (which,
+    /// timer-less, would otherwise need the idle flush or the next key to resolve).
+    pub nowait: bool,
+    /// `<silent>`: the message line this mapping's execution produces is suppressed
+    /// (the server snapshots/restores it around the fire); `:messages` is unaffected.
+    pub silent: bool,
+}
+
 /// A unit of work [`Keymaps::feed`] hands back for the server to apply, in order.
 pub enum Step {
     /// Send this key to `editor.input` (then `emit_lifecycle_events`).
     Editor(Key),
-    /// Fire this mapping's RHS.
-    Fire(MappingRhs),
+    /// Fire this mapping's RHS; `silent` carries the `<silent>` flag the server
+    /// honors by restoring the message line after the fire.
+    Fire { rhs: MappingRhs, silent: bool },
 }
 
 /// A node in a per-mode prefix trie: the mapping that ends here (if any) and the
@@ -54,7 +70,7 @@ pub enum Step {
 #[derive(Default)]
 struct Node {
     children: HashMap<Key, Node>,
-    mapping: Option<MappingRhs>,
+    mapping: Option<Mapping>,
 }
 
 /// A prefix trie of LHS key-paths → mapping, one per mode.
@@ -67,28 +83,30 @@ struct Trie {
 enum Classify {
     /// A live prefix of at least one mapping (possibly itself complete): hold.
     Prefix,
-    /// A complete mapping that no longer mapping extends: fire it now.
-    Complete(MappingRhs),
+    /// A complete mapping to fire now — either nothing longer extends it, or it is
+    /// `<nowait>` so it fires without waiting for a longer continuation.
+    Complete(Mapping),
     /// Not a prefix of anything: the sequence broke every live mapping.
     None,
 }
 
 impl Trie {
-    /// Insert `keys` → `rhs`. A later insert at the same path overwrites an
+    /// Insert `keys` → `mapping`. A later insert at the same path overwrites an
     /// earlier one, which is how the precedence ladder resolves to last-wins
-    /// (callers insert lowest-precedence first; see [`Keymaps::rebuild`]).
-    fn insert(&mut self, keys: &[Key], rhs: MappingRhs) {
+    /// (callers insert lowest-precedence first; see [`Keymaps::build_for`]).
+    fn insert(&mut self, keys: &[Key], mapping: Mapping) {
         let mut node = &mut self.root;
         for k in keys {
             node = node.children.entry(*k).or_default();
         }
-        node.mapping = Some(rhs);
+        node.mapping = Some(mapping);
     }
 
-    /// Classify `keys` against the trie. `Complete` is returned only for a
-    /// mapping with no longer continuation — a mapping that is *also* a prefix of
-    /// a longer one (ambiguous, e.g. `j` & `jk`) is held as `Prefix` and resolved
-    /// when a later key breaks it (via [`Trie::longest_complete`]).
+    /// Classify `keys` against the trie. A mapping that is *also* a prefix of a
+    /// longer one (ambiguous, e.g. `j` & `jk`) is normally held as `Prefix` and
+    /// resolved when a later key breaks it (via [`Trie::longest_complete`]) — unless
+    /// it is `<nowait>`, in which case it fires the moment it completes, ignoring
+    /// the longer continuation (vim's `<nowait>` semantics).
     fn classify(&self, keys: &[Key]) -> Classify {
         let mut node = &self.root;
         for k in keys {
@@ -98,24 +116,25 @@ impl Trie {
             }
         }
         match (&node.mapping, node.children.is_empty()) {
-            (Some(rhs), true) => Classify::Complete(rhs.clone()),
-            (Some(_), false) => Classify::Prefix, // complete but also a prefix: hold
-            (None, false) => Classify::Prefix,    // live prefix, not yet complete
-            (None, true) => Classify::None,       // unreachable in a well-formed trie
+            (Some(m), true) => Classify::Complete(m.clone()), // complete, nothing longer
+            (Some(m), false) if m.nowait => Classify::Complete(m.clone()), // nowait: fire now
+            (Some(_), false) => Classify::Prefix,             // complete but also a prefix: hold
+            (None, false) => Classify::Prefix,                // live prefix, not yet complete
+            (None, true) => Classify::None,                   // unreachable in a well-formed trie
         }
     }
 
     /// The longest prefix of `keys` that is a complete mapping, with its length —
     /// used to fire the shorter map when an ambiguous sequence finally breaks.
-    fn longest_complete(&self, keys: &[Key]) -> Option<(MappingRhs, usize)> {
+    fn longest_complete(&self, keys: &[Key]) -> Option<(Mapping, usize)> {
         let mut node = &self.root;
         let mut best = None;
         for (i, k) in keys.iter().enumerate() {
             match node.children.get(k) {
                 Some(n) => {
                     node = n;
-                    if let Some(rhs) = &node.mapping {
-                        best = Some((rhs.clone(), i + 1));
+                    if let Some(m) = &node.mapping {
+                        best = Some((m.clone(), i + 1));
                     }
                 }
                 None => break,
@@ -210,6 +229,11 @@ impl Keymaps {
                 RawRhs::Lua(id) => MappingRhs::Lua(*id),
                 RawRhs::Str(s) => MappingRhs::Keys(parse_keys(s), entry.noremap),
             };
+            let mapping = Mapping {
+                rhs,
+                nowait: entry.nowait,
+                silent: entry.silent,
+            };
             for mode in &entry.modes {
                 // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out
                 // to the editor-mode tries it covers — `'v'` lands in both the
@@ -218,7 +242,7 @@ impl Keymaps {
                     self.tries
                         .entry(bucket)
                         .or_default()
-                        .insert(&lhs, rhs.clone());
+                        .insert(&lhs, mapping.clone());
                 }
             }
         }
@@ -287,9 +311,9 @@ impl Keymaps {
         let classify = self.tries[&mode_key].classify(&self.pending);
         match classify {
             Classify::Prefix => {} // hold: wait for the next key
-            Classify::Complete(rhs) => {
+            Classify::Complete(mapping) => {
                 self.pending.clear();
-                self.fire(mode, rhs, steps);
+                self.fire(mode, mapping, steps);
             }
             Classify::None => {
                 // This key broke every live prefix. Resolve the previously
@@ -313,16 +337,24 @@ impl Keymaps {
     /// the remaining keys fall through as a literal feed). Everything else — a
     /// `noremap` string RHS, a Lua function, a future native action — is handed to
     /// the server as a [`Step::Fire`] (a `noremap` RHS the server feeds straight to
-    /// the editor; a Lua/native RHS it invokes).
-    fn fire(&mut self, mode: Mode, rhs: MappingRhs, steps: &mut Vec<Step>) {
-        match rhs {
+    /// the editor; a Lua/native RHS it invokes), carrying the `<silent>` flag.
+    ///
+    /// `<silent>` on a *remap* RHS is not threaded onto the re-fed keys: the inner
+    /// maps they trigger surface with their own flags, matching the fact that the
+    /// outer map's effect is just to type those keys. The flag bites on the terminal
+    /// fire (Lua / `noremap` string), which is where a message would be produced.
+    fn fire(&mut self, mode: Mode, mapping: Mapping, steps: &mut Vec<Step>) {
+        match mapping.rhs {
             MappingRhs::Keys(keys, false) if self.remap_budget > 0 => {
                 self.remap_budget -= 1;
                 for key in keys {
                     self.feed_key(mode, key, steps);
                 }
             }
-            other => steps.push(Step::Fire(other)),
+            rhs => steps.push(Step::Fire {
+                rhs,
+                silent: mapping.silent,
+            }),
         }
     }
 
@@ -335,8 +367,8 @@ impl Keymaps {
     /// re-withhold the same live prefix and loop).
     fn resolve_buffered(&mut self, mode: Mode, buffered: &[Key], steps: &mut Vec<Step>) {
         match self.tries[&mode_key(mode)].longest_complete(buffered) {
-            Some((rhs, used)) => {
-                self.fire(mode, rhs, steps);
+            Some((mapping, used)) => {
+                self.fire(mode, mapping, steps);
                 for &key in &buffered[used..] {
                     self.feed_key(mode, key, steps);
                 }

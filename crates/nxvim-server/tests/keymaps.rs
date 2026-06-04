@@ -105,6 +105,21 @@ fn message(map: &[(Value, Value)]) -> String {
         .to_string()
 }
 
+/// The open panel's lines from a redraw map (`:messages` / `:ls` content); empty
+/// when no panel is open.
+fn panel_lines(map: &[(Value, Value)]) -> Vec<String> {
+    match field(map, "panel") {
+        Some(Value::Map(p)) => match field(p, "lines") {
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 /// Fetch all buffer lines. Awaiting it also barriers: every message sent before
 /// it has been processed by the server.
 async fn lines(rpc: &Rpc) -> Vec<String> {
@@ -702,4 +717,101 @@ async fn idle_flush_with_nothing_pending_is_a_noop() {
         "flush left the buffer alone"
     );
     assert_eq!(cursor(&rpc).await, (1, 0), "flush left the cursor alone");
+}
+
+// ----- Phase 4: <nowait> / <silent> / <unique> ------------------------------
+
+/// `<nowait>` fires a complete map the instant it matches, even when it is a
+/// prefix of a longer one — so an ambiguous short map resolves on the keystroke
+/// alone, with no idle flush and no next key. Contrast `idle_flush_resolves_
+/// ambiguous_shorter_map`, where the same `j`/`jk` pair *without* nowait holds `j`.
+#[tokio::test]
+async fn nowait_map_fires_immediately_despite_a_longer_map() {
+    let dir = temp_dir("keymap_nowait");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'j', function() print('JNOW') end, { nowait = true })\n\
+         vim.keymap.set('n', 'jk', function() print('JK') end)\n",
+    )
+    .await;
+
+    let redraw = redraw_after(&rpc, &mut incoming, "j").await;
+    assert_eq!(
+        message(&redraw),
+        "JNOW",
+        "nowait fired j immediately, without waiting for a possible jk"
+    );
+}
+
+/// `<silent>` runs the mapping but suppresses the message line it would leave: the
+/// command line keeps whatever was there before, while the output still lands in
+/// `:messages`. A non-silent twin shows its message, proving the suppression is the
+/// flag's doing and not an empty effect.
+#[tokio::test]
+async fn silent_map_hides_its_message_but_keeps_the_history() {
+    let dir = temp_dir("keymap_silent");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', '<Space>l', function() print('LOUD') end)\n\
+         vim.keymap.set('n', '<Space>s', function() print('QUIET') end, { silent = true })\n",
+    )
+    .await;
+
+    // The non-silent map shows its message on the command line.
+    let loud = redraw_after(&rpc, &mut incoming, "<Space>l").await;
+    assert_eq!(message(&loud), "LOUD");
+
+    // The silent map fires (its print runs) but leaves the visible line as it was —
+    // here still "LOUD" from the previous map, i.e. "QUIET" never reached it.
+    let quiet = redraw_after(&rpc, &mut incoming, "<Space>s").await;
+    assert_eq!(
+        message(&quiet),
+        "LOUD",
+        "the silent map did not change the command line"
+    );
+
+    // But the output was still logged: :messages lists both lines.
+    let msgs = redraw_after(&rpc, &mut incoming, ":messages<CR>").await;
+    let history = panel_lines(&msgs);
+    assert!(
+        history.iter().any(|l| l.contains("QUIET")),
+        "the silent map's output is still in :messages: {history:?}"
+    );
+    assert!(
+        history.iter().any(|l| l.contains("LOUD")),
+        "the loud map's output is in :messages too: {history:?}"
+    );
+}
+
+/// `<unique>` refuses to overwrite an existing map: the set raises vim's E227 and
+/// the original mapping stands. (The config captures the error via `pcall` and
+/// stashes it behind another key so the black-box test can observe both effects.)
+#[tokio::test]
+async fn unique_map_errors_on_a_clash_and_keeps_the_original() {
+    let dir = temp_dir("keymap_unique");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'U', function() print('ORIGINAL') end)\n\
+         local ok, err = pcall(function()\n\
+           vim.keymap.set('n', 'U', function() print('SHADOW') end, { unique = true })\n\
+         end)\n\
+         vim.keymap.set('n', 'E', function() print(ok and 'NO ERROR' or err) end)\n",
+    )
+    .await;
+
+    // The unique set errored, so U still fires the original (no override).
+    let orig = redraw_after(&rpc, &mut incoming, "U").await;
+    assert_eq!(
+        message(&orig),
+        "ORIGINAL",
+        "the unique clash did not overwrite the existing U map"
+    );
+
+    // And the captured error is vim's E227.
+    let err = redraw_after(&rpc, &mut incoming, "E").await;
+    assert!(
+        message(&err).contains("E227"),
+        "the unique clash raised E227, got {:?}",
+        message(&err)
+    );
 }

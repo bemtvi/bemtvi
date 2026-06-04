@@ -461,7 +461,7 @@ impl Server {
                 // diff would miss (it'd see only the settled Normal end-state).
                 self.emit_lifecycle_events();
             }
-            Step::Fire(rhs) => self.fire_mapping(rhs),
+            Step::Fire { rhs, silent } => self.fire_mapping(rhs, silent),
         }
     }
 
@@ -470,7 +470,24 @@ impl Server {
     /// function is invoked and its effects folded in (any deferred ex-commands
     /// converge in the batch's trailing `run_pending`, like the autocmd path); a
     /// `noremap` string RHS is fed key-by-key straight to the editor.
-    fn fire_mapping(&mut self, rhs: MappingRhs) {
+    ///
+    /// `<silent>` (`silent`) suppresses the message line the mapping leaves: the
+    /// line is snapshotted before the fire and restored after, so a `:cmd` echo or
+    /// `print` the mapping triggers doesn't linger on the command line. The
+    /// `:messages` history (appended by `echo`) is deliberately *not* rewound — the
+    /// output is still logged, only its transient display is hidden, matching vim's
+    /// "no messages on the command line while executing this mapping." (Effects a
+    /// Lua RHS *defers* to the trailing `run_pending` fall outside this window — an
+    /// accepted corner, the same ordering caveat the rest of the fire path carries.)
+    fn fire_mapping(&mut self, rhs: MappingRhs, silent: bool) {
+        let restore = silent.then(|| self.editor.message.clone());
+        self.fire_mapping_inner(rhs);
+        if let Some(message) = restore {
+            self.editor.message = message;
+        }
+    }
+
+    fn fire_mapping_inner(&mut self, rhs: MappingRhs) {
         match rhs {
             MappingRhs::Lua(id) => {
                 if let Err(e) = self.lua.run_keymap(id) {

@@ -89,6 +89,11 @@ pub struct RawKeymap {
     pub buffer: Option<u64>,
     /// The `desc` opt — stored, surfaced later; unused by matching.
     pub desc: Option<String>,
+    /// `<nowait>`: fire this mapping the moment it completes, even when it is a
+    /// prefix of a longer one (the matcher reads this in `classify`).
+    pub nowait: bool,
+    /// `<silent>`: suppress the message line the mapping's execution produces.
+    pub silent: bool,
     /// A built-in default (overridable by a user map); `false` for user maps.
     pub default: bool,
     /// The registry sequence id — also the function-RHS key and the
@@ -238,6 +243,8 @@ impl LuaRuntime {
             let noremap = entry.get::<Option<bool>>("noremap")?.unwrap_or(true);
             let buffer = entry.get::<Option<u64>>("buffer")?;
             let desc = entry.get::<Option<String>>("desc")?;
+            let nowait = entry.get::<Option<bool>>("nowait")?.unwrap_or(false);
+            let silent = entry.get::<Option<bool>>("silent")?.unwrap_or(false);
             let default = entry.get::<Option<bool>>("default")?.unwrap_or(false);
             let seq = entry.get::<Option<u64>>("id")?.unwrap_or(0);
             let rhs_tbl: Table = entry.get("rhs")?;
@@ -254,6 +261,8 @@ impl LuaRuntime {
                 noremap,
                 buffer,
                 desc,
+                nowait,
+                silent,
                 default,
                 seq,
             });

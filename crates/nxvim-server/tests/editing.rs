@@ -364,6 +364,29 @@ async fn view_reflects_typed_text_and_mode() {
     assert_eq!(view_str(&view, "mode_label"), "INSERT");
 }
 
+#[tokio::test]
+async fn capital_r_enters_replace_mode_and_overwrites() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello");
+    feed(&rpc, "<Esc>");
+
+    // `R` enters Replace mode: the status line reflects it...
+    feed(&rpc, "0R");
+    let _ = lines(&rpc).await; // barrier
+    let view = latest_view(&mut incoming).expect("a redraw view");
+    assert_eq!(view_str(&view, "mode_label"), "REPLACE");
+
+    // ...and typed characters overwrite rather than insert.
+    feed(&rpc, "HE");
+    assert_eq!(lines(&rpc).await, vec!["HEllo"]);
+
+    // Leaving Replace mode returns to normal.
+    feed(&rpc, "<Esc>");
+    let _ = lines(&rpc).await; // barrier
+    let view = latest_view(&mut incoming).expect("a redraw view");
+    assert_eq!(view_str(&view, "mode_label"), "NORMAL");
+}
+
 /// The most recent `redraw` view map currently buffered on the connection.
 fn latest_view(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<(Value, Value)>> {
     let mut latest = None;

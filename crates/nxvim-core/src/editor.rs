@@ -1276,6 +1276,11 @@ impl Editor {
                 self.pending_replace = true;
                 return;
             }
+            'R' => {
+                self.push_undo();
+                self.snapshot_taken = true;
+                self.mode = Mode::Replace;
+            }
             'p' => self.paste(true, count),
             'P' => self.paste(false, count),
             'u' => self.undo(),

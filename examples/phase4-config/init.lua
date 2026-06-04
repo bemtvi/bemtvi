@@ -94,3 +94,24 @@ if not ok then
   -- E227 surfaced as expected; leave a breadcrumb in :messages.
   print("(<leader>u unique clash refused: " .. tostring(err) .. ")")
 end
+
+--------------------------------------------------------------------------------
+-- 6. <expr>: the RHS function RETURNS the keys to feed, computed at press time.
+--    Here `H` jumps to the top or the bottom depending on a flag a second key
+--    flips — the whole point of <expr>: the keys depend on state.
+--    TYPE:  G   (go to the last line)  then  H   -> SEE the cursor jump to the
+--           TOP (the flag starts true, so H returns "gg").
+--    TYPE:  <Space>f  to flip the flag, then  H  -> SEE it jump to the BOTTOM (H
+--           now returns "G").  (<Space>f is a normal map; H is the <expr> one.)
+--    The sandbox: an <expr> RHS must only compute keys — if it tries to change
+--    the editor (e.g. vim.cmd("...")), it raises a textlock error and feeds
+--    nothing. Reading state (vim.g, vim.b, …) is fine.
+--------------------------------------------------------------------------------
+vim.g.expr_top = true
+vim.keymap.set("n", "H", function()
+  return vim.g.expr_top and "gg" or "G"
+end, { expr = true })
+vim.keymap.set("n", "<leader>f", function()
+  vim.g.expr_top = not vim.g.expr_top
+  print("expr target flipped -> " .. (vim.g.expr_top and "top (gg)" or "bottom (G)"))
+end)

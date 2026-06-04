@@ -94,6 +94,10 @@ pub struct RawKeymap {
     pub nowait: bool,
     /// `<silent>`: suppress the message line the mapping's execution produces.
     pub silent: bool,
+    /// `<expr>`: a function RHS computes the keys to feed (its return value) rather
+    /// than acting directly; the server runs it via `run_keymap_expr` and feeds the
+    /// result. Ignored for a string RHS (nxvim has no expression evaluator).
+    pub expr: bool,
     /// A built-in default (overridable by a user map); `false` for user maps.
     pub default: bool,
     /// The registry sequence id — also the function-RHS key and the
@@ -245,6 +249,7 @@ impl LuaRuntime {
             let desc = entry.get::<Option<String>>("desc")?;
             let nowait = entry.get::<Option<bool>>("nowait")?.unwrap_or(false);
             let silent = entry.get::<Option<bool>>("silent")?.unwrap_or(false);
+            let expr = entry.get::<Option<bool>>("expr")?.unwrap_or(false);
             let default = entry.get::<Option<bool>>("default")?.unwrap_or(false);
             let seq = entry.get::<Option<u64>>("id")?.unwrap_or(0);
             let rhs_tbl: Table = entry.get("rhs")?;
@@ -263,6 +268,7 @@ impl LuaRuntime {
                 desc,
                 nowait,
                 silent,
+                expr,
                 default,
                 seq,
             });
@@ -278,6 +284,18 @@ impl LuaRuntime {
         let vim: Table = self.lua.globals().get("vim")?;
         let run: mlua::Function = vim.get("_run_keymap")?;
         run.call::<()>(id)
+    }
+
+    /// Invoke an `<expr>` function RHS and return the **keys it produced** (its
+    /// return value, coerced to a string; `nil`/`false` → `""`). The function runs
+    /// under the prelude's `vim._expr_lock` so the editor-mutating funnels refuse
+    /// (the textlock contract — see `vim._run_keymap_expr`); any effects it queued
+    /// anyway are discarded by the server, which feeds only the returned keys. An
+    /// error (a throwing handler, or a textlock violation) is returned to surface.
+    pub fn run_keymap_expr(&self, id: u64) -> mlua::Result<String> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let run: mlua::Function = vim.get("_run_keymap_expr")?;
+        run.call::<String>(id)
     }
 
     /// Set `vim.g[key] = value` from Rust — used to record `g:colors_name` when

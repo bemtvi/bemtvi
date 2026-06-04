@@ -54,6 +54,10 @@ pub struct Mapping {
     /// `<silent>`: the message line this mapping's execution produces is suppressed
     /// (the server snapshots/restores it around the fire); `:messages` is unaffected.
     pub silent: bool,
+    /// `<expr>`: a function RHS computes the keys to feed rather than acting; the
+    /// server runs it via `run_keymap_expr` and feeds the returned keys. Only a Lua
+    /// RHS is affected — a string RHS ignores it (nxvim has no expression evaluator).
+    pub expr: bool,
 }
 
 /// A unit of work [`Keymaps::feed`] hands back for the server to apply, in order.
@@ -61,8 +65,13 @@ pub enum Step {
     /// Send this key to `editor.input` (then `emit_lifecycle_events`).
     Editor(Key),
     /// Fire this mapping's RHS; `silent` carries the `<silent>` flag the server
-    /// honors by restoring the message line after the fire.
-    Fire { rhs: MappingRhs, silent: bool },
+    /// honors by restoring the message line after the fire, and `expr` the
+    /// `<expr>` flag (run the Lua RHS for its returned keys, then feed them).
+    Fire {
+        rhs: MappingRhs,
+        silent: bool,
+        expr: bool,
+    },
 }
 
 /// A node in a per-mode prefix trie: the mapping that ends here (if any) and the
@@ -233,6 +242,7 @@ impl Keymaps {
                 rhs,
                 nowait: entry.nowait,
                 silent: entry.silent,
+                expr: entry.expr,
             };
             for mode in &entry.modes {
                 // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out
@@ -337,7 +347,8 @@ impl Keymaps {
     /// the remaining keys fall through as a literal feed). Everything else — a
     /// `noremap` string RHS, a Lua function, a future native action — is handed to
     /// the server as a [`Step::Fire`] (a `noremap` RHS the server feeds straight to
-    /// the editor; a Lua/native RHS it invokes), carrying the `<silent>` flag.
+    /// the editor; a Lua/native RHS it invokes), carrying the `<silent>`/`<expr>`
+    /// flags the server honors.
     ///
     /// `<silent>` on a *remap* RHS is not threaded onto the re-fed keys: the inner
     /// maps they trigger surface with their own flags, matching the fact that the
@@ -354,6 +365,7 @@ impl Keymaps {
             rhs => steps.push(Step::Fire {
                 rhs,
                 silent: mapping.silent,
+                expr: mapping.expr,
             }),
         }
     }

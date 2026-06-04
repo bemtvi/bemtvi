@@ -462,7 +462,15 @@ end
 -- vim.cmd("…") queues a raw ex-command (the Rust function installed earlier);
 -- vim.cmd.colorscheme("x") / vim.cmd.set("number") build "<name> <args…>".
 do
-  local raw = vim.cmd
+  local raw_cmd = vim.cmd
+  -- An <expr> mapping RHS must not change editor state (textlock): while
+  -- vim._expr_lock is set, running an ex-command raises instead of mutating.
+  local function raw(c)
+    if vim._expr_lock then
+      error("E5555: <expr> mapping must not change the editor (vim.cmd is blocked)", 0)
+    end
+    return raw_cmd(c)
+  end
   local function build(name, ...)
     local first = ...
     if type(first) == "table" then
@@ -560,8 +568,8 @@ end
 -- mode codes; `rhs` a function (stored in vim._keymap_fns) or a string (fed as
 -- keys). `opts` is a normalized table the callers fill in: `noremap` (set defaults
 -- it true, the nvim_* family false — design D5), `buffer`, `desc`, `default`, and
--- the Phase-4 flags `nowait` / `silent` (read by the matcher / fire path) and
--- `unique` (a set-time check, never stored). `<leader>` is expanded in both the LHS
+-- the Phase-4 flags `nowait` / `silent` / `expr` (read by the matcher / fire path)
+-- and `unique` (a set-time check, never stored). `<leader>` is expanded in both LHS
 -- and a string RHS at set-time, matching neovim. Bumps the version so the server
 -- rebuilds its tries.
 local function keymap_register(modes, lhs, rhs, opts)
@@ -591,6 +599,7 @@ local function keymap_register(modes, lhs, rhs, opts)
     desc = opts.desc,
     nowait = opts.nowait or false,
     silent = opts.silent or false,
+    expr = opts.expr or false,
     default = opts.default or false,
   }
   vim._keymaps_version = vim._keymaps_version + 1
@@ -646,6 +655,7 @@ function vim.keymap.set(mode, lhs, rhs, opts)
     default = opts.default,
     nowait = opts.nowait,
     silent = opts.silent,
+    expr = opts.expr,
     unique = opts.unique,
   })
 end
@@ -671,6 +681,7 @@ function vim.api.nvim_set_keymap(mode, lhs, rhs, opts)
     default = opts.default,
     nowait = opts.nowait,
     silent = opts.silent,
+    expr = opts.expr,
     unique = opts.unique,
   })
 end
@@ -684,6 +695,7 @@ function vim.api.nvim_buf_set_keymap(buffer, mode, lhs, rhs, opts)
     default = opts.default,
     nowait = opts.nowait,
     silent = opts.silent,
+    expr = opts.expr,
     unique = opts.unique,
   })
 end
@@ -701,6 +713,31 @@ end
 function vim._run_keymap(id)
   local fn = vim._keymap_fns[id]
   if fn then fn() end
+end
+
+-- Textlock for <expr> mappings. An <expr> RHS must *compute* the keys to feed and
+-- not change editor state (vim's textlock); while this is set the mutation funnels
+-- (currently vim.cmd) refuse. A simple, honest sandbox: the common offender raises
+-- rather than silently no-ops, and the server additionally discards any effects an
+-- <expr> RHS queued, so nothing it did leaks regardless.
+vim._expr_lock = false
+
+-- Run the <expr> function RHS for entry `id` and return the keys it produced (its
+-- return value coerced to a string; nil/false → ""). Runs under vim._expr_lock so
+-- vim.cmd refuses; pcall guarantees the lock is cleared even if the RHS throws,
+-- after which the error is re-raised for Rust to surface (the mapping then feeds
+-- nothing). A no-op id yields "".
+function vim._run_keymap_expr(id)
+  local fn = vim._keymap_fns[id]
+  if not fn then return "" end
+  vim._expr_lock = true
+  local ok, result = pcall(fn)
+  vim._expr_lock = false
+  if not ok then
+    error(result, 0)
+  end
+  if result == nil or result == false then return "" end
+  return tostring(result)
 end
 
 -- The `:ls` panel's <CR> handler: jump to the buffer whose number leads the

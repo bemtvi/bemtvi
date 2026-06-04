@@ -815,3 +815,101 @@ async fn unique_map_errors_on_a_clash_and_keeps_the_original() {
         message(&err)
     );
 }
+
+// ----- Phase 4: <expr> maps -------------------------------------------------
+
+/// An `<expr>` map's function RHS *returns the keys to feed* rather than acting.
+/// Here `Q` returns a computed string (a real edit sequence) and it is fed; a plain
+/// (non-expr) function map `N` with the same body has its return value **ignored**
+/// — the contrast proves it's the `expr` flag, not the body, doing the work.
+#[tokio::test]
+async fn expr_map_feeds_its_returned_keys() {
+    let dir = temp_dir("keymap_expr");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'Q', function() return 'iEXPR<Esc>' end, { expr = true })\n\
+         vim.keymap.set('n', 'N', function() return 'iNOPE<Esc>' end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // N is a normal function map: its return value is ignored, nothing is inserted.
+    feed(&rpc, "N");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "a plain function map ignores its return value"
+    );
+
+    // Q is <expr>: the returned `iEXPR<Esc>` is fed, inserting EXPR at the cursor.
+    feed(&rpc, "Q");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["EXPRhello"],
+        "the expr map fed its returned keys"
+    );
+}
+
+/// An `<expr>` RHS that returns different keys depending on editor state — the
+/// whole point of `<expr>`. `J` returns `gg` or `G` based on a Lua global a plain
+/// map flips, so the computed motion follows the state at trigger time.
+#[tokio::test]
+async fn expr_map_computes_keys_from_state() {
+    let dir = temp_dir("keymap_expr_dyn");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.g.go_top = true\n\
+         vim.keymap.set('n', 'J', function()\n\
+           return vim.g.go_top and 'gg' or 'G'\n\
+         end, { expr = true })\n\
+         vim.keymap.set('n', 'F', function() vim.g.go_top = false end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ia<CR>b<CR>c<Esc>"); // three lines; cursor on line 3
+    assert_eq!(cursor(&rpc).await.0, 3);
+
+    // go_top is true: J computes `gg` → jump to the top.
+    feed(&rpc, "J");
+    assert_eq!(cursor(&rpc).await.0, 1, "expr returned gg while go_top");
+
+    // Flip the state, then J computes `G` → jump to the bottom.
+    feed(&rpc, "F");
+    feed(&rpc, "J");
+    assert_eq!(cursor(&rpc).await.0, 3, "expr returned G after the flip");
+}
+
+/// The `<expr>` sandbox (textlock): an expr RHS must compute keys, not change the
+/// editor. A function that calls `vim.cmd` raises under the lock, so the mapping
+/// aborts — nothing is fed and the buffer is untouched — and the error surfaces.
+#[tokio::test]
+async fn expr_map_sandbox_blocks_editor_mutation() {
+    let dir = temp_dir("keymap_expr_lock");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'S', function()\n\
+           vim.cmd('normal! dd')\n\
+           return 'x'\n\
+         end, { expr = true })\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // S's RHS calls vim.cmd under the textlock: it raises, so neither the `dd` nor
+    // the returned `x` takes effect — the line is intact.
+    let redraw = redraw_after(&rpc, &mut incoming, "S").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "the sandboxed vim.cmd did not run, and no keys were fed"
+    );
+    assert!(
+        message(&redraw).contains("E5555") || message(&redraw).contains("Error"),
+        "the textlock violation surfaced an error, got {:?}",
+        message(&redraw)
+    );
+}

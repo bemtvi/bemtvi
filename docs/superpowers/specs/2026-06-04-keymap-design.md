@@ -512,7 +512,22 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
   input idle (the TUI already owns a render loop), letting an ambiguous shorter map
   resolve without the next key — closing the D4 gap as far as a timer-less core
   allows. *(Implemented — see the note above.)*
-- **`expr` maps:** RHS function returns the keys to feed (then fed per `noremap`).
+- **`expr` maps:** ✅ a function RHS computes the keys to feed (its return value)
+  instead of acting; the server runs it via `run_keymap_expr` and feeds the result.
+  - The flag rides the same path as `nowait`/`silent` (`RawKeymap.expr` →
+    `Mapping.expr` → `Step::Fire { expr }`); the fire path branches to `fire_expr`,
+    which runs the Lua RHS, takes its returned string, and feeds those keys straight
+    to the editor (noremap — the computed keys aren't themselves remapped, matching
+    `<expr>`'s noremap-by-default use).
+  - **Sandbox (textlock).** An `<expr>` RHS must *compute*, not mutate. It runs under
+    the prelude's `vim._expr_lock`, which makes `vim.cmd` raise (the main mutation
+    funnel); the server additionally **discards** any effects it queued (`print`,
+    highlights, panel ops), so only the returned keys take effect. A throwing handler
+    or a textlock violation surfaces an error and feeds nothing. (Scope cut: only a
+    Lua function RHS is `<expr>` — nxvim has no expression evaluator for a string
+    RHS; and the sandbox guards `vim.cmd` rather than every conceivable mutation,
+    with the discard as the catch-all.) Covered by the `expr_*` tests in
+    `tests/keymaps.rs`.
 - **`<nowait>` / `<silent>` / `<unique>`:** ✅ map-option semantics.
   - **`nowait`** — a per-entry flag the matcher reads in `classify`: a complete
     mapping that is *also* a prefix of a longer one fires the instant it matches

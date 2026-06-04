@@ -461,7 +461,7 @@ impl Server {
                 // diff would miss (it'd see only the settled Normal end-state).
                 self.emit_lifecycle_events();
             }
-            Step::Fire { rhs, silent } => self.fire_mapping(rhs, silent),
+            Step::Fire { rhs, silent, expr } => self.fire_mapping(rhs, silent, expr),
         }
     }
 
@@ -479,12 +479,56 @@ impl Server {
     /// "no messages on the command line while executing this mapping." (Effects a
     /// Lua RHS *defers* to the trailing `run_pending` fall outside this window — an
     /// accepted corner, the same ordering caveat the rest of the fire path carries.)
-    fn fire_mapping(&mut self, rhs: MappingRhs, silent: bool) {
+    ///
+    /// `<expr>` (`expr`) routes a Lua RHS through [`fire_expr`](Self::fire_expr): the
+    /// function is run for its *return value* (the keys to feed), under a textlock
+    /// that stops it mutating the editor. (A non-Lua `expr` RHS falls through to the
+    /// normal path — nxvim has no expression evaluator for a string RHS.)
+    fn fire_mapping(&mut self, rhs: MappingRhs, silent: bool, expr: bool) {
         let restore = silent.then(|| self.editor.message.clone());
-        self.fire_mapping_inner(rhs);
+        match (expr, rhs) {
+            (true, MappingRhs::Lua(id)) => self.fire_expr(id),
+            (_, rhs) => self.fire_mapping_inner(rhs),
+        }
         if let Some(message) = restore {
             self.editor.message = message;
         }
+    }
+
+    /// Run an `<expr>` Lua RHS and feed the keys it returns. The function computes
+    /// keys rather than acting (vim's `<expr>`): it runs under the prelude's textlock
+    /// (`vim._expr_lock`, which makes `vim.cmd` raise), and whatever effects it
+    /// queued anyway are **discarded** here — only the returned keys take effect, fed
+    /// straight to the editor (noremap; the computed keys are not themselves
+    /// remapped, the common case for `<expr>`, which is noremap by default). An error
+    /// (a throwing handler, or a textlock violation) is surfaced and nothing is fed.
+    fn fire_expr(&mut self, id: u64) {
+        match self.lua.run_keymap_expr(id) {
+            Ok(keys) => {
+                self.discard_lua_effects();
+                for key in parse_keys(&keys) {
+                    self.editor.input(key);
+                    self.emit_lifecycle_events();
+                }
+            }
+            Err(e) => {
+                self.discard_lua_effects();
+                self.editor
+                    .echo(format!("E5108: Error executing keymap: {e}"));
+            }
+        }
+    }
+
+    /// Drop every side effect the last Lua chunk queued without applying any of them
+    /// — the `<expr>` sandbox's safety net: an `<expr>` RHS that printed, set a
+    /// highlight, or queued a panel op despite the textlock has those effects thrown
+    /// away here, so only its returned keys ever reach the editor. Mirrors the drains
+    /// in [`apply_lua_effects`](Self::apply_lua_effects), but discards each.
+    fn discard_lua_effects(&mut self) {
+        let _ = self.lua.take_highlights();
+        let _ = self.lua.take_commands();
+        let _ = self.lua.take_output();
+        let _ = self.lua.take_panel_ops();
     }
 
     fn fire_mapping_inner(&mut self, rhs: MappingRhs) {

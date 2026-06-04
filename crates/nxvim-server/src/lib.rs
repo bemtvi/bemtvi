@@ -12,7 +12,7 @@ mod syntax;
 
 use nxvim_core::highlight::{HlDef, Style};
 use nxvim_core::view::ScrollAnim;
-use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, PanelView};
+use nxvim_core::{parse_color, parse_keys, unicode, BufferId, Editor, Mode, PanelView};
 use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
@@ -137,6 +137,10 @@ struct Server {
     /// Buffers that have already had their fire-once events (`BufReadPost` /
     /// `FileType`) emitted, so re-entering them doesn't re-announce.
     announced: HashSet<BufferId>,
+    /// The editor mode at the last lifecycle diff. A transition *into* insert
+    /// (from a non-insert mode) fires `InsertEnter`; tracked here so the per-key
+    /// diff can spot the edge without touching the core's insert chokepoints.
+    last_mode: Mode,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -166,6 +170,7 @@ where
         syntax_dirty: false,
         last_buffer_id: None,
         announced: HashSet::new(),
+        last_mode: Mode::Normal,
     };
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -394,14 +399,23 @@ impl Server {
     /// Ordering on first opening a file mirrors neovim: `BufReadPost` → `FileType`
     /// → `BufEnter`. `BufReadPost`/`FileType` fire **once** per buffer (gated by
     /// `announced`) and **only for file-backed buffers** — a `[No Name]` buffer was
-    /// never read from a file. `BufEnter` fires on **every** entry. A cheap no-op
-    /// for the vast majority of keys, which change neither buffer nor mode.
+    /// never read from a file. `BufEnter` fires on **every** entry. `InsertEnter`
+    /// fires on a transition *into* insert (covering `i/a/o/C/cc/s/…` without
+    /// touching the core insert chokepoints — the diff sees the result). A cheap
+    /// no-op for the vast majority of keys, which change neither buffer nor mode.
     fn emit_lifecycle_events(&mut self) {
         let buf = self.editor.current_buffer_id();
+        let mode = self.editor.mode;
         let unannounced = !self.announced.contains(&buf);
         let entered = self.last_buffer_id != Some(buf);
-        if !unannounced && !entered {
-            return; // fast path: same buffer, already announced — nothing to fire
+        // A transition *into* insert (or replace — neovim fires InsertEnter for
+        // both), measured against the last diff so staying in insert won't re-fire.
+        let entered_insert = mode.is_insert() && !self.last_mode.is_insert();
+        // Track the mode every call — even the no-op fast path — so a later entry
+        // is still seen after an insert→normal round trip that took the fast path.
+        self.last_mode = mode;
+        if !unannounced && !entered && !entered_insert {
+            return; // fast path: nothing transitioned
         }
 
         let name = self.editor.buffer_name(buf).unwrap_or_default();
@@ -424,6 +438,11 @@ impl Server {
         if entered {
             self.last_buffer_id = Some(buf);
             self.fire_lifecycle("BufEnter", &name, buf, &name);
+        }
+
+        // Mode event: InsertEnter, with the entered mode's code as the pattern.
+        if entered_insert {
+            self.fire_lifecycle("InsertEnter", mode.short_code(), buf, &name);
         }
     }
 

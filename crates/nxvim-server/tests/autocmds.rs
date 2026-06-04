@@ -363,3 +363,53 @@ async fn bufreadpost_callback_reads_buffer_name_from_snapshot() {
     let msg = lua_message(&rpc, &mut incoming, "print(_G.seen)").await;
     assert_eq!(msg, file.display().to_string());
 }
+
+// ----- Phase 3: mode event (InsertEnter) -------------------------------------
+
+#[tokio::test]
+async fn entering_insert_fires_insertenter_once_per_entry() {
+    // InsertEnter fires on the transition *into* insert — once on the `i`, not
+    // per typed character — and again on a fresh entry via `o`.
+    let dir = temp_dir("au_insert");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('InsertEnter', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    // `iabc<Esc>`: enter insert (fires once), type three chars (stay in insert —
+    // no re-fire), leave. The count proves typing doesn't re-trigger the event.
+    redraw_after(&rpc, &mut incoming, "iabc<Esc>").await;
+    let after_i = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(
+        after_i, "1",
+        "InsertEnter fires once on i, not per typed char"
+    );
+    // `o<Esc>`: open a line (a fresh insert entry) and leave — fires again.
+    redraw_after(&rpc, &mut incoming, "o<Esc>").await;
+    let after_o = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(
+        after_o, "2",
+        "re-entering insert via o fires InsertEnter again"
+    );
+}
+
+#[tokio::test]
+async fn insertenter_sees_buffer_context() {
+    // The InsertEnter callback resolves the current buffer via the snapshot, just
+    // like the buffer events do.
+    let dir = temp_dir("au_insert_ctx");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.seen = nil\n\
+         vim.api.nvim_create_autocmd('InsertEnter', {\n\
+         \x20 callback = function(a) _G.seen = a.buf .. ':' .. vim.api.nvim_buf_get_name(0) end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "i<Esc>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(_G.seen)").await;
+    assert_eq!(msg, format!("1:{}", file.display()));
+}

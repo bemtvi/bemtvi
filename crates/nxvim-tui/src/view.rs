@@ -21,6 +21,9 @@ pub struct View {
     pub(crate) cursor_screen_col: u16,
     pub(crate) mode_label: String,
     pub(crate) command_mode: bool,
+    /// True while `r` waits for its replacement character (a one-shot replace
+    /// that stays in normal mode). Drives the replace cursor shape.
+    pub(crate) pending_replace: bool,
     pub(crate) cmdline: String,
     /// The command-line prompt char (`:` ex, `/` / `?` search). Defaults to `:`.
     pub(crate) cmdline_prefix: char,
@@ -119,6 +122,9 @@ impl View {
         self.command_mode = map_get(map, "command_mode")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        self.pending_replace = map_get(map, "pending_replace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.cmdline = map_str(map, "cmdline");
         self.cmdline_prefix = map_str(map, "cmdline_prefix").chars().next().unwrap_or(':');
         self.message = map_str(map, "message");
@@ -196,6 +202,19 @@ impl View {
             }),
             _ => None,
         };
+    }
+
+    /// Whether the editor is in insert mode, mirrored from the server's
+    /// `mode_label`. Drives the thin-bar "edit cursor" shape.
+    pub(crate) fn is_insert(&self) -> bool {
+        self.mode_label == "INSERT"
+    }
+
+    /// Whether the editor is replacing: either `R` replace mode (`mode_label`)
+    /// or `r` waiting for its one replacement char. Both drive the underline
+    /// cursor shape, matching vim's replace/operator-pending feedback.
+    pub(crate) fn is_replace(&self) -> bool {
+        self.mode_label == "REPLACE" || self.pending_replace
     }
 
     /// Build a view from a `redraw` notification's params — the client's own

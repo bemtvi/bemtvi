@@ -2,7 +2,8 @@
 //! and assert on exactly what a user would see. Synthetic views are the right
 //! input here — this pins the *client's painting contract*, not server logic.
 
-use nxvim_tui::{paint, ScrollHarness, View};
+use crossterm::cursor::SetCursorStyle;
+use nxvim_tui::{cursor_style, paint, ScrollHarness, View};
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
@@ -51,6 +52,30 @@ fn reversed(buf: &Buffer, x: u16, y: u16) -> bool {
 
 fn lines(strs: &[&str]) -> Value {
     Value::Array(strs.iter().map(|s| Value::from(*s)).collect())
+}
+
+#[test]
+fn cursor_shape_follows_the_mode() {
+    // Insert shows the thin "edit cursor" bar, replace an underline, and every
+    // other mode keeps the block — matching vim/neovim's default `guicursor`.
+    let insert = view(vec![("mode_label", Value::from("INSERT"))]);
+    assert_eq!(cursor_style(&insert), SetCursorStyle::SteadyBar);
+
+    let replace = view(vec![("mode_label", Value::from("REPLACE"))]);
+    assert_eq!(cursor_style(&replace), SetCursorStyle::SteadyUnderScore);
+
+    // `r` waits for its replacement char in normal mode — still the replace cursor.
+    let pending_r = view(vec![("pending_replace", Value::from(true))]);
+    assert_eq!(cursor_style(&pending_r), SetCursorStyle::SteadyUnderScore);
+
+    for label in ["NORMAL", "VISUAL", "V-LINE", "COMMAND"] {
+        let v = view(vec![("mode_label", Value::from(label))]);
+        assert_eq!(
+            cursor_style(&v),
+            SetCursorStyle::SteadyBlock,
+            "{label} mode should keep the block cursor"
+        );
+    }
 }
 
 #[test]

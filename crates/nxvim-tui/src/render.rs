@@ -1,6 +1,7 @@
 //! The renderer: lays the three regions out and paints each with a ratatui
 //! widget, plus the headless [`paint`]/[`ScrollHarness`] test entry points.
 
+use crossterm::cursor::SetCursorStyle;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -28,6 +29,22 @@ pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
         .draw(|frame| render(frame, view, None))
         .expect("draw");
     terminal.backend().buffer().clone()
+}
+
+/// The terminal cursor shape for the current mode, matching vim/neovim's default
+/// `guicursor`: insert mode gets a thin vertical bar (the "edit cursor"), replace
+/// mode an underline, and every other mode the steady block. The live client
+/// emits this after each redraw (the shape is a terminal-wide setting, not
+/// something ratatui's per-frame cursor *position* controls); the headless tests
+/// assert on it without a real terminal.
+pub fn cursor_style(view: &View) -> SetCursorStyle {
+    if view.is_insert() {
+        SetCursorStyle::SteadyBar
+    } else if view.is_replace() {
+        SetCursorStyle::SteadyUnderScore
+    } else {
+        SetCursorStyle::SteadyBlock
+    }
 }
 
 /// A headless mirror of the client's render state — the `View` and the in-flight

@@ -84,6 +84,10 @@ pub struct View {
     /// True while in command-line mode; the cursor then belongs to the command
     /// region, which the client owns.
     pub command_mode: bool,
+    /// True while `r` waits for its replacement character (a one-shot replace
+    /// that stays in normal mode). Clients show the replace cursor shape while it
+    /// holds, mirroring vim's operator-pending feedback.
+    pub pending_replace: bool,
     /// Command-line contents (text after the leading prompt char).
     pub cmdline: String,
     /// The command-line prompt character: `:` for an ex command, `/` / `?` for a
@@ -183,6 +187,7 @@ impl View {
             cursor_screen_col,
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,
+            pending_replace: ed.pending_replace(),
             cmdline: ed.cmdline.clone(),
             cmdline_prefix: ed.cmdline_prefix(),
             message: ed.message.clone(),

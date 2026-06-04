@@ -23,10 +23,11 @@ mod render;
 mod view;
 
 pub use keys::encode_key;
-pub use render::{close_button, paint, ScrollHarness};
+pub use render::{close_button, cursor_style, paint, ScrollHarness};
 pub use view::View;
 
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseButton,
     MouseEventKind,
@@ -72,6 +73,31 @@ impl<W: Write> Drop for MouseCapture<W> {
     }
 }
 
+/// RAII guard that restores the terminal's **default cursor shape on drop**. The
+/// client swaps the cursor to a thin bar in insert mode (see
+/// [`cursor_style`](render::cursor_style)); this guarantees the user's configured
+/// cursor comes back when the client leaves — on the normal return path and on a
+/// panic-unwind alike. Like [`MouseCapture`], it exists because ratatui's panic
+/// hook restores raw mode and the alternate screen but *not* the cursor shape, so
+/// without it a panic in insert mode would leave the user's shell with a bar
+/// cursor. Generic over the writer for testing; production uses `std::io::stdout()`.
+pub struct CursorStyleGuard<W: Write> {
+    out: W,
+}
+
+impl<W: Write> CursorStyleGuard<W> {
+    /// Take ownership of `out`; the returned guard resets the cursor on drop.
+    pub fn new(out: W) -> Self {
+        Self { out }
+    }
+}
+
+impl<W: Write> Drop for CursorStyleGuard<W> {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(self.out, SetCursorStyle::DefaultUserShape);
+    }
+}
+
 /// Run the client over a connected stream until the server exits or disconnects.
 ///
 /// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic
@@ -85,7 +111,11 @@ where
     let mut terminal = ratatui::init();
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
+    // Restore the user's cursor shape on the way out — the loop switches it to a
+    // bar in insert mode and must not leak that into their shell.
+    let cursor = CursorStyleGuard::new(std::io::stdout());
     let result = event_loop(stream, &mut terminal).await;
+    drop(cursor); // reset cursor shape before leaving the alternate screen
     drop(mouse); // disable mouse capture before leaving the alternate screen
     ratatui::restore();
     result
@@ -113,6 +143,9 @@ where
     let mut view = View::default();
     let mut anim: Option<Animation> = None;
     let mut term_events = EventStream::new();
+    // The cursor shape last sent to the terminal, so we re-emit the escape only
+    // when the mode actually changes the shape rather than on every redraw.
+    let mut cursor_shape: Option<SetCursorStyle> = None;
 
     loop {
         tokio::select! {
@@ -157,6 +190,13 @@ where
                         view.update(&params);
                         anim = arm_animation(&view, anim.take());
                         terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
+                        // Match the cursor shape to the mode (a thin bar in insert
+                        // mode). Emitted only on change so it doesn't flicker.
+                        let want = cursor_style(&view);
+                        if cursor_shape != Some(want) {
+                            let _ = crossterm::execute!(std::io::stdout(), want);
+                            cursor_shape = Some(want);
+                        }
                     }
                     "nxvim_exit" => break,
                     _ => {}

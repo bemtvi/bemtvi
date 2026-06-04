@@ -1019,6 +1019,13 @@ impl Editor {
         self.pending_scroll
     }
 
+    /// True while `r` is waiting for the single character to replace with (a
+    /// one-shot replace that stays in normal mode). Clients use it to show the
+    /// replace cursor shape, matching vim's operator-pending feedback.
+    pub(crate) fn pending_replace(&self) -> bool {
+        self.pending_replace
+    }
+
     /// The fixed end of the visual selection (the other end is [`Self::cursor`]).
     /// Only meaningful while [`Self::mode`] is a visual mode.
     pub(crate) fn visual_anchor(&self) -> Cursor {

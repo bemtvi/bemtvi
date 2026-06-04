@@ -907,6 +907,10 @@ impl Server {
                 Value::from(view.mode_label.as_str()),
             ),
             (Value::from("command_mode"), Value::from(view.command_mode)),
+            (
+                Value::from("pending_replace"),
+                Value::from(view.pending_replace),
+            ),
             (Value::from("cmdline"), Value::from(view.cmdline.as_str())),
             (
                 Value::from("cmdline_prefix"),

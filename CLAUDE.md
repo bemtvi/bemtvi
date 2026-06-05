@@ -33,6 +33,7 @@ A pre-commit hook (`.pre-commit-config.yaml`) runs `cargo fmt --check` + `cargo 
 
 ## Conventions that will bite you if missed
 
+- **No silent stubs or skips.** Every unimplemented function, missing piece, or unsupported path must fail *loud* — raise/error with the name of what's missing — never return a fake/empty value or silently no-op. A stub that quietly succeeds makes broken behavior look like working behavior (e.g. an LSP server that "starts" but ignores its config). If something can't be done yet, say so at runtime. (See `docs/lsp-completion-plan.md` for the LSP application of this.)
 - **No unit tests.** Behavior is verified end-to-end through the running server: a test starts a real server over an in-process RPC pipe, feeds vim key-notation via `nvim_input`, and asserts on `nvim_buf_get_lines` / cursor / the `redraw` view. Put new coverage in `crates/nxvim-server/tests/editing.rs` (helpers: `start`, `feed`, `lines`, `cursor`) — do **not** add `#[test]` unit tests inside the crates. (Rationale: architecture.md → *Testing philosophy*.)
 - **`nxvim-core` stays pure and synchronous** — no async, no I/O beyond `Buffer` file read/write, no transport types. All async / RPC / Lua lives in `nxvim-server` and above, so every front end shares identical editing behavior.
 - **Dependencies are pinned exactly** (`=x.y.z`) in the root `Cargo.toml` under `[workspace.dependencies]`. Add a new dependency there with an exact version, then pull it into a crate with `<dep>.workspace = true`.

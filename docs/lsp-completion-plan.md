@@ -1,0 +1,313 @@
+# Making nvim-lspconfig *actually* work — completion plan
+
+## Why this document exists
+
+The Phase-7b work made all ~400 vendored `lsp/<server>.lua` configs **load and
+start without crashing**. That is necessary but **not sufficient**: a config can
+start a server and still not *work*, because nxvim currently:
+
+- **drops the config's `settings` / `init_options` / `capabilities`** — they are
+  never sent at `initialize`, so a server runs on defaults no matter what the
+  config (or user) set;
+- **never calls the config lifecycle hooks** (`before_init`, `on_init`,
+  `on_exit`) — e.g. rust_analyzer copies `settings → initializationOptions` in
+  `before_init`, which never runs;
+- **stubs out a swathe of the API** (`vim.lsp.util.*`, `client:request`,
+  `vim.ui.*`, buffer/window getters) so server-specific commands, handlers, and
+  floating-preview features silently no-op;
+- **swallows config-load errors** (`lsp_base_config` `pcall`s the chunk and
+  degrades to `{}`), so a config that hits a gap disappears silently.
+
+The guiding principle for the rest of the work, set in Phase 0: **fail loud.**
+A not-yet-implemented function raises with its own name instead of returning a
+fake value, so every gap a real config hits is visible and trackable rather than
+quietly wrong.
+
+This plan is divided into self-contained phases. Each is sized to be picked up
+and implemented in a single focused session without the others loaded. Phases
+list their dependencies; later phases assume earlier ones landed.
+
+---
+
+## Status legend
+
+- ✅ done   🚧 in progress   ⬜ not started
+
+---
+
+## Phase 0 — Fail loud: stubs raise `not implemented` 🚧
+
+**Goal.** Replace every *hollow* stub (returns fake/empty data or silently
+no-ops) with a raise that names the function, and record each hit so the gaps
+are trackable. Functions that faithfully perform the operation (even if
+synchronously) stay and are listed as *known approximations*.
+
+**Why.** Silent degradation is worse than a crash here: it makes a broken server
+look configured. Loud failures turn "we think it works" into a concrete, ranked
+list of what to build (the later phases).
+
+**Scope (files).** `crates/nxvim-lua/src/prelude.lua` only.
+
+**Approach.**
+- Add `vim._notimpl(name)`: records `name` into `vim._notimpl_hits` (a set, for
+  introspection / a future `:checkhealth`) and `error("nxvim: not implemented: "
+  .. name, 2)`.
+- Convert these hollow stubs to call it:
+  - `vim.lsp.util.*` (make_position_params, make_text_document_params,
+    make_given_range_params, locations_to_items, get_effective_tabstop,
+    open_floating_preview, apply_workspace_edit, show_document)
+  - `vim.lsp.omnifunc`, `vim.lsp.rpc.connect`, the `get_clients` client
+    `:request`
+  - `vim.ui.select` / `input` / `open`
+  - `vim.api.nvim_get_current_win`, `nvim_win_get_cursor`, `nvim_buf_is_loaded`,
+    `nvim_buf_get_lines`, `nvim_buf_set_lines`, `nvim_set_option_value`
+  - `vim.fn.bufnr`, `setreg`, `setqflist`, `confirm`
+  - `vim.uri_to_bufnr`, `vim.defer_fn`
+  - `vim.bo`: option *writes* and non-`filetype` reads raise (the `filetype`
+    read stays real — it backs `root_dir` filetype checks)
+- **Keep (real or faithful for every input nxvim produces):**
+  `vim.api.nvim_get_current_buf` (snapshot = the real current buffer),
+  `vim.fn.finddir` (real `vim.fs` search), `vim.fn.substitute` (identity — only
+  used by `lspconfig.util.strip_archive_subpath`, correct for every non-archive
+  path, and nxvim never produces archive buffers), `vim.schedule` (runs
+  immediately — a safe "soon" in the synchronous model). List these in the doc as
+  known approximations, not gaps.
+
+**Tests.**
+- The config sweep (`lspconfig_configs.rs`) still passes: the raising stubs are
+  not on the load/`root_dir`/`cmd` path. Add `gdscript` to its allowlist
+  (top-level `vim.lsp.rpc.connect` now raises → TCP transport is a known gap).
+- Add a prelude test asserting a representative stub raises with its name.
+
+**Done when.** Every hollow stub raises a named error; the sweep is green with
+the documented allowlist; `vim._notimpl_hits` accumulates hit names.
+
+**Depends on.** Nothing.
+
+---
+
+## Phase 1 — Stop swallowing config-load & start failures ⬜
+
+**Goal.** Make a config that errors at load (now possible after Phase 0) or a
+server that fails to start **visible**, not degraded-to-`{}`.
+
+**Why.** `lsp_base_config` does `pcall(chunk)` and returns `{}` on failure, so a
+config that hits a not-implemented gap vanishes. With Phase 0 raising, this
+swallowing actively hides the signal.
+
+**Scope.** `prelude.lua` (`lsp_base_config`, `lsp_resolve_cmd`), a small report
+surface. Optionally a `vim.lsp` health/report function.
+
+**Approach.**
+- When `lsp_base_config`'s chunk errors, record `{name, error}` into
+  `vim._lsp_load_errors` and echo a one-line warning (don't hard-crash the whole
+  editor — one broken server shouldn't wedge startup — but make it loud).
+- When `lsp_resolve_cmd` skips a server (non-argv / builder threw), record
+  `{name, reason}` into `vim._lsp_skipped` instead of silently returning.
+- Add `vim.lsp._report()` (and wire a `:LspInfo`-style command later) listing:
+  enabled servers, which started, which were skipped/failed and why, and the
+  `vim._notimpl_hits` set.
+
+**Tests.** A config that references a not-implemented symbol at load surfaces in
+`vim._lsp_load_errors`; a non-argv cmd surfaces in `vim._lsp_skipped`.
+
+**Done when.** No config failure is silent; `vim.lsp._report()` enumerates them.
+
+**Depends on.** Phase 0.
+
+---
+
+## Phase 2 — Forward `settings` / `init_options` / `capabilities` ⬜
+
+**Goal.** Send the config's `settings`, `init_options`, and merged
+`capabilities` to the server, so it runs *configured*, not on defaults.
+
+**Why.** This is the single biggest "starts but doesn't work" gap. Today
+`InitializeParams` (manager.rs:607) sets only `process_id`, `root_uri`,
+`capabilities: client_capabilities()`; `vim.lsp.start` forwards only
+`{name,cmd,root_dir,filetype,bufnr}`. Everything a config configures is dropped.
+
+**Scope.** `prelude.lua` (`vim.lsp.start` / `lsp_start_resolved`), `lib.rs`
+(`vim._lsp_start` signature, `LspOp::Start` fields), `nxvim-server` (apply path),
+`nxvim-lsp/manager.rs` (`InitializeParams`, post-init `didChangeConfiguration`).
+
+**Approach.**
+- Thread `settings`, `init_options`, `capabilities` from the resolved config
+  through `vim._lsp_start` → `LspOp::Start` as JSON (reuse the `vim.json`/serde
+  bridge → `serde_json::Value`).
+- In `manager.rs`: set `InitializeParams.initialization_options =
+  init_options (or settings fallback)`, and **merge** the config's
+  `capabilities` over `client_capabilities()`.
+- After `initialized`, send `workspace/didChangeConfiguration { settings }`.
+
+**Tests.** Start a real server with a sentinel setting and assert the
+`initialize`/`didChangeConfiguration` payload carries it (a mock LSP server over
+the existing `$NXVIM_LSP_CMD` hook can echo what it received).
+
+**Done when.** A configured `settings`/`init_options` demonstrably reaches the
+server.
+
+**Depends on.** Phase 0 (clean baseline). Independent of the event loop.
+
+---
+
+## Phase 3 — Lifecycle hooks: `before_init` / `on_init` / `on_exit` ⬜
+
+**Goal.** Call the config's lifecycle hooks at the right moments so configs that
+shape init params or react to the server (e.g. rust_analyzer's
+`before_init` copying `settings['rust-analyzer'] → initializationOptions`) work.
+
+**Why.** Several configs *only* become correct through `before_init`; without it
+Phase 2's forwarding still misses what they compute.
+
+**Scope.** A Rust→Lua call path (the server invokes a Lua function around the
+handshake), `prelude.lua` (store hooks per client), `manager.rs` (call points).
+
+**Approach.**
+- Before sending `initialize`, call `before_init(init_params, config)` in Lua,
+  let it mutate a params table, read it back into `InitializeParams`.
+- After `initialize` result, call `on_init(client, result)`.
+- On exit, call `on_exit(code, signal, client)`.
+- Requires a synchronous Rust→Lua call with a params round-trip (msgpack/JSON).
+
+**Tests.** A config whose `before_init` sets an init option is honored at
+`initialize`.
+
+**Done when.** The three hooks fire with correct arguments and their mutations
+take effect.
+
+**Depends on.** Phase 2 (params plumbing).
+
+---
+
+## Phase 4 — Async runtime / event loop ⬜ (foundational)
+
+**Goal.** A real scheduler so deferred work runs off-tick: `vim.schedule`
+genuinely defers, `vim.defer_fn(fn, ms)` honors the delay, `vim.system` runs the
+child asynchronously with an off-tick `on_exit`, and `vim.uv` timers exist.
+
+**Why.** Root cause behind several Phase-0 raises and the synchronous-`vim.system`
+caveat. Unblocks real `client:request` (Phase 5) and removes the
+"blocks the server thread" limitation.
+
+**Scope.** `nxvim-server` main loop (a task/callback queue the Lua VM drains),
+`nxvim-lua` (a Rust→Lua deferred-callback registry), `prelude.lua`
+(`vim.schedule`/`defer_fn` re-pointed at it, `vim.uv` timer funcs).
+
+**Approach.** Add a server-side queue of pending Lua callbacks (keyed by id) that
+the main loop services between RPC messages; `vim.system`/timers register a
+callback id, and completion enqueues it. Carefully keep the single-threaded,
+one-message-at-a-time invariant.
+
+**Tests.** `vim.defer_fn` runs after the tick, not inline; an async
+`vim.system` callback fires on a later tick.
+
+**Done when.** Deferred callbacks run off-tick; `vim.system` no longer blocks.
+
+**Depends on.** Phase 0. (Large; the pivot for the back half.)
+
+---
+
+## Phase 5 — Real `client:request` + response handlers ⬜
+
+**Goal.** `client:request(method, params, handler, bufnr)` issues a real LSP
+request and routes the response back to the Lua `handler` — enabling
+server-specific commands (`:LspCargoReload`, organize-imports,
+switchSourceHeader) and config `handlers`.
+
+**Why.** These are dead today (the `:request` stub returns false). Many configs'
+value-add lives here.
+
+**Scope.** `nxvim-lsp` (issue arbitrary request, correlate response),
+`nxvim-server` (route response → Lua callback via Phase 4's queue),
+`prelude.lua` (real client `:request`/`:notify`, `handlers` dispatch).
+
+**Approach.** Generic request bridge: Lua queues `{method, params, handler_id}`;
+the manager sends it; the response enqueues `handler(err, result)` on the
+callback queue. Wire config `handlers[method]` into the response path.
+
+**Tests.** A round-trip request to a mock server returns a result to the Lua
+handler; a config command that issues a request works end-to-end.
+
+**Done when.** `client:request` and `handlers` work against a real/mock server.
+
+**Depends on.** Phase 4 (callback queue).
+
+---
+
+## Phase 6 — Buffer / window Lua API ⬜
+
+**Goal.** Real `nvim_buf_get_lines`/`set_lines`/`is_loaded`, buffer-local options
+(`vim.bo` backed by a store), `nvim_win_*`, and cursor access — the surface
+`vim.lsp.util.*` and handlers need.
+
+**Why.** Phase 7 (`vim.lsp.util.*`) and many handlers manipulate buffer text and
+window/cursor state, which Lua currently can't touch.
+
+**Scope.** `nxvim-lua` (expose core buffer/window ops to Lua via the effect
+queue + synchronous getters), `nxvim-core`/`nxvim-server` (the backing ops),
+`prelude.lua` (un-stub the Phase-0 raises).
+
+**Approach.** Extend the Lua↔core bridge with read getters (lines, cursor, win)
+and queued mutations (set_lines), plus a per-buffer option store for `vim.bo`.
+
+**Tests.** `nvim_buf_get_lines`/`set_lines` round-trip on a real buffer; a
+`vim.bo[buf].x = v` write is observable.
+
+**Done when.** The Phase-0 buffer/window raises become real implementations.
+
+**Depends on.** Phase 0; benefits from Phase 4.
+
+---
+
+## Phase 7 — `vim.lsp.util.*` real implementations ⬜
+
+**Goal.** Implement the LSP utility helpers configs call in on_attach/handlers:
+`make_position_params` (cursor + `offset_encoding`), `make_text_document_params`,
+`make_given_range_params`, `locations_to_items` (→ loclist items),
+`open_floating_preview` (→ nxvim panel/float), `apply_workspace_edit`
+(multi-buffer edits), `show_document` (jump).
+
+**Why.** Turns the Phase-0 `vim.lsp.util.*` raises into working features that
+config-shipped commands depend on.
+
+**Scope.** `prelude.lua` + the buffer/window API (Phase 6) + the panel/float
+surface; `apply_workspace_edit` reuses the rename/workspace-edit path in
+`manager.rs`.
+
+**Tests.** `make_position_params` reflects the real cursor; `apply_workspace_edit`
+edits multiple buffers; `open_floating_preview` shows content in the panel.
+
+**Done when.** The `vim.lsp.util.*` raises are gone and back the real features.
+
+**Depends on.** Phase 6 (buffer/window), the panel surface.
+
+---
+
+## Phase 8 — `vim.ui.*` + server command dispatch ⬜
+
+**Goal.** `vim.ui.select`/`input` via nxvim's panel/prompt, and dispatch of
+server `workspace/executeCommand` + config `commands` (so `:Format`-style and
+code-action commands run).
+
+**Why.** Completes the interactive surface (code-action pickers, rename input,
+server commands) the remaining configs use.
+
+**Scope.** `prelude.lua` (`vim.ui.*` → panel/prompt), command registry +
+`executeCommand` request, `vim.lsp.commands` dispatch.
+
+**Tests.** A code action that needs a `vim.ui.select` choice completes; an
+`executeCommand` reaches the server.
+
+**Done when.** The `vim.ui.*` raises are gone; server/config commands dispatch.
+
+**Depends on.** Phases 5 (requests) and 7 (util).
+
+---
+
+## Suggested order
+
+`0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8`. Phases 2 and 3 deliver the most
+"starts → works" value early and need no event loop; Phase 4 is the pivot the
+back half (5, 7, 8) builds on. After each phase, the set of `vim._notimpl_hits`
+a real config triggers shrinks — that set is the running scoreboard.

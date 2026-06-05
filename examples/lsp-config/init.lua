@@ -79,5 +79,22 @@ vim.lsp.config("lua_ls", { on_attach = on_attach })
 --------------------------------------------------------------------------------
 vim.lsp.enable("lua_ls")
 
+--------------------------------------------------------------------------------
+-- 4. REAL nvim-lspconfig CONFIGS, OUT OF THE BOX. You don't have to spell a
+--    server out by hand: nvim-lspconfig ships an `lsp/<server>.lua` for each one,
+--    and `vim.lsp.enable(name)` loads it straight off the runtimepath. Point the
+--    runtimepath at a checkout (the repo vendors one) and enable by name:
+--
+--        NXVIM_CONFIG=examples/lsp-config \
+--          NXVIM_RUNTIMEPATH=$PWD/vendor/nvim-lspconfig \
+--          cargo run -p nxvim -- crates/nxvim-core/src/editor.rs
+--
+--    rust_analyzer's config resolves its workspace root by shelling out to
+--    `cargo metadata` — nxvim runs that inline via `vim.system` — so opening a
+--    `.rs` file in a Cargo project Just Works. Needs `rust-analyzer` on PATH.
+--    (Uncomment to try; harmless if the binary is absent — no server just starts.)
+--------------------------------------------------------------------------------
+-- vim.lsp.enable("rust_analyzer")
+
 -- A leader you can feel: <Space> drives the <leader> maps above.
 vim.g.mapleader = " "

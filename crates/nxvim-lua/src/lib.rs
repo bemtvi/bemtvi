@@ -992,6 +992,84 @@ fn install_runtime_api(
         })?,
     )?;
 
+    // `vim._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),
+    // block until it exits, and return `{ code, stdout, stderr }`. The pure-Lua
+    // `vim.system` wrapper layers neovim's object shape (`:wait()` / `on_exit`)
+    // over it. It is synchronous because the Lua VM has no event loop yet (see
+    // `vim.schedule`): an `lsp/<server>.lua` `root_dir` that shells out — e.g.
+    // rust_analyzer's `cargo metadata` / `rustc --print sysroot` — runs to
+    // completion inline on the input tick. Unlike neovim, a spawn failure (a
+    // missing tool) degrades to `code = -1` with the message on `stderr` instead
+    // of raising, so it can never break `vim.lsp.enable` on a machine that lacks
+    // the toolchain. stdout/stderr are returned as Lua byte strings (so non-UTF-8
+    // output survives), independent of the `text` flag, which is accepted and
+    // ignored.
+    vim.set(
+        "_system",
+        lua.create_function(
+            |lua,
+             (cmd, cwd, env, _text): (
+                Vec<String>,
+                Option<String>,
+                Option<Table>,
+                Option<bool>,
+            )| {
+                let Some((program, args)) = cmd.split_first() else {
+                    return Err(mlua::Error::external(
+                        "vim.system: cmd must be a non-empty list",
+                    ));
+                };
+                let mut command = std::process::Command::new(program);
+                command.args(args).stdin(std::process::Stdio::null());
+                if let Some(dir) = cwd {
+                    command.current_dir(dir);
+                }
+                if let Some(env_tbl) = env {
+                    for (k, v) in env_tbl.pairs::<String, String>().flatten() {
+                        command.env(k, v);
+                    }
+                }
+                let result = lua.create_table()?;
+                match command.output() {
+                    Ok(output) => {
+                        result.set("code", output.status.code().unwrap_or(-1))?;
+                        result.set("stdout", lua.create_string(&output.stdout)?)?;
+                        result.set("stderr", lua.create_string(&output.stderr)?)?;
+                    }
+                    Err(e) => {
+                        result.set("code", -1)?;
+                        result.set("stdout", "")?;
+                        result.set("stderr", format!("vim.system: failed to spawn {program}: {e}"))?;
+                    }
+                }
+                Ok(result)
+            },
+        )?,
+    )?;
+
+    // `vim._json_decode(str)`: parse a JSON document into the equivalent Lua value
+    // (objects -> string-keyed tables, arrays -> sequences, `null` -> nil). Backs
+    // `vim.json.decode`; raises on malformed input, matching neovim. The config
+    // path that reaches for it is rust_analyzer's `root_dir`, decoding the
+    // `cargo metadata` output to read `workspace_root`.
+    vim.set(
+        "_json_decode",
+        lua.create_function(|lua, text: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(mlua::Error::external)?;
+            json_to_lua(lua, &value)
+        })?,
+    )?;
+
+    // `vim._json_encode(value)`: serialize a Lua value to a JSON string, using the
+    // same array-vs-object rule as [`lua_to_rmpv`]. Backs `vim.json.encode`.
+    vim.set(
+        "_json_encode",
+        lua.create_function(|_, value: mlua::Value| {
+            serde_json::to_string(&lua_to_json(&value)?).map_err(mlua::Error::external)
+        })?,
+    )?;
+
     Ok(())
 }
 
@@ -1234,4 +1312,98 @@ fn lua_table_to_rmpv(t: &mlua::Table) -> mlua::Result<rmpv::Value> {
         }
         Ok(rmpv::Value::Map(map))
     }
+}
+
+/// Convert a parsed [`serde_json::Value`] into the equivalent `mlua::Value` for
+/// `vim.json.decode`: objects become string-keyed tables, arrays become Lua
+/// sequences, and JSON `null` becomes `nil` (so a null-valued object key reads
+/// back absent — fine for the `cargo metadata` shape the `lsp/<server>.lua`
+/// configs decode, which only index present string/array fields).
+fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value> {
+    use serde_json::Value as J;
+    Ok(match value {
+        J::Null => mlua::Value::Nil,
+        J::Bool(b) => mlua::Value::Boolean(*b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => mlua::Value::Integer(i),
+            None => mlua::Value::Number(n.as_f64().unwrap_or(0.0)),
+        },
+        J::String(s) => mlua::Value::String(lua.create_string(s)?),
+        J::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.raw_set(i + 1, json_to_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        J::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, v) in map {
+                t.raw_set(k.as_str(), json_to_lua(lua, v)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+    })
+}
+
+/// Convert an `mlua::Value` to a [`serde_json::Value`] for `vim.json.encode`,
+/// using the same array-vs-object rule as [`lua_to_rmpv`]: a table whose keys are
+/// exactly `1..=len` is an array, anything else an object (keys coerced to
+/// strings); non-serializable values (functions / userdata) collapse to `null`.
+fn lua_to_json(value: &mlua::Value) -> mlua::Result<serde_json::Value> {
+    use mlua::Value as L;
+    Ok(match value {
+        L::Nil => serde_json::Value::Null,
+        L::Boolean(b) => serde_json::Value::Bool(*b),
+        L::Integer(i) => serde_json::Value::from(*i),
+        L::Number(n) => serde_json::Value::from(*n),
+        L::String(s) => serde_json::Value::from(s.to_str()?.to_string()),
+        L::Table(t) => lua_table_to_json(t)?,
+        _ => serde_json::Value::Null,
+    })
+}
+
+/// Table half of [`lua_to_json`]: array iff every key is an integer in `1..=len`.
+fn lua_table_to_json(t: &mlua::Table) -> mlua::Result<serde_json::Value> {
+    let len = t.raw_len() as i64;
+    let mut entries: Vec<(i64, serde_json::Value)> = Vec::new();
+    let mut map = serde_json::Map::new();
+    let mut is_seq = true;
+    for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (k, v) = pair?;
+        let jv = lua_to_json(&v)?;
+        match &k {
+            mlua::Value::Integer(i) if *i >= 1 && *i <= len => entries.push((*i, jv)),
+            _ => {
+                is_seq = false;
+                map.insert(json_key(&k)?, jv);
+            }
+        }
+    }
+    if is_seq {
+        entries.sort_by_key(|(i, _)| *i);
+        Ok(serde_json::Value::Array(
+            entries.into_iter().map(|(_, v)| v).collect(),
+        ))
+    } else {
+        // Re-emit the integer-keyed entries we provisionally treated as sequence.
+        for (i, v) in entries {
+            map.insert(i.to_string(), v);
+        }
+        Ok(serde_json::Value::Object(map))
+    }
+}
+
+/// Coerce a Lua table key to the JSON object key string `vim.json.encode` uses.
+fn json_key(k: &mlua::Value) -> mlua::Result<String> {
+    Ok(match k {
+        mlua::Value::String(s) => s.to_str()?.to_string(),
+        mlua::Value::Integer(i) => i.to_string(),
+        mlua::Value::Number(n) => n.to_string(),
+        _ => {
+            return Err(mlua::Error::external(
+                "vim.json.encode: table key is not a string or number",
+            ))
+        }
+    })
 }

@@ -1236,6 +1236,131 @@ async fn colorscheme_style_plugin_load_runs_clean() {
     );
 }
 
+// ----- vim.* surface the lsp/<server>.lua configs reach for --------------------
+// nvim-lspconfig's `lsp/rust_analyzer.lua` (loaded by `vim.lsp.enable`) calls
+// vim.tbl_get / vim.fs.relpath / vim.system / vim.json / vim.lsp.get_clients in
+// its `root_dir`; before these existed, enabling it raised
+// "attempt to call field 'tbl_get' (a nil value)". These cover the surface.
+
+#[tokio::test]
+async fn vim_tbl_get_follows_a_nested_key_path() {
+    let dir = temp_dir("tblget");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local t = { a = { b = { c = 42 } } }\n\
+         print(tostring(vim.tbl_get(t, 'a', 'b', 'c')) .. ' '\n\
+           .. tostring(vim.tbl_get(t, 'a', 'x', 'c')) .. ' '\n\
+           .. tostring(vim.tbl_get(t, 'a', 'b', 'c', 'd')))\n",
+    )
+    .await;
+    // Present path -> value; a missing intermediate key -> nil; descending past a
+    // scalar (c is 42, not a table) -> nil rather than an error.
+    assert_eq!(startup_message(&rpc, &mut incoming).await, "42 nil nil");
+}
+
+#[tokio::test]
+async fn vim_fs_relpath_is_segment_aware() {
+    let dir = temp_dir("relpath");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "print(vim.fs.relpath('/a/b', '/a/b/c/d') .. ' '\n\
+           .. tostring(vim.fs.relpath('/a/b', '/a/bc')) .. ' '\n\
+           .. vim.fs.relpath('/a/b', '/a/b'))\n",
+    )
+    .await;
+    // Subpath -> relative remainder; "/a/bc" is NOT under "/a/b" (segment
+    // boundary) -> nil; an equal path -> ".".
+    assert_eq!(startup_message(&rpc, &mut incoming).await, "c/d nil .");
+}
+
+#[tokio::test]
+async fn vim_json_decodes_and_encodes() {
+    let dir = temp_dir("vimjson");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local d = vim.json.decode('{\"workspace_root\":\"/w\",\"n\":3,\"arr\":[10,20]}')\n\
+         print(d.workspace_root .. ' ' .. d.n .. ' ' .. d.arr[2] .. ' ' .. vim.json.encode({ a = 1 }))\n",
+    )
+    .await;
+    // Object -> string-keyed table, array -> 1-based sequence; encode emits an
+    // object for a non-sequence table.
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "/w 3 20 {\"a\":1}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn vim_system_runs_a_command_synchronously() {
+    let dir = temp_dir("vimsystem");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local r = vim.system({ '/bin/echo', '-n', 'hello' }):wait()\n\
+         local cb\n\
+         vim.system({ '/bin/echo', '-n', 'world' }, {}, function(o) cb = o.stdout end)\n\
+         print(r.code .. ' ' .. r.stdout .. ' ' .. cb)\n",
+    )
+    .await;
+    // `:wait()` returns {code, stdout, stderr}; the on_exit callback (no event
+    // loop yet) fires synchronously with the same shape.
+    assert_eq!(startup_message(&rpc, &mut incoming).await, "0 hello world");
+}
+
+#[tokio::test]
+async fn vim_lsp_get_clients_starts_empty() {
+    let dir = temp_dir("getclients");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "print(#vim.lsp.get_clients() .. ' ' .. #vim.lsp.get_clients({ name = 'nope' }))\n",
+    )
+    .await;
+    // No server has attached, so the list is empty with and without a filter.
+    assert_eq!(startup_message(&rpc, &mut incoming).await, "0 0");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lspconfig_style_root_dir_resolves_through_the_new_surface() {
+    // A miniature `lsp/<name>.lua` shaped exactly like rust_analyzer's: its
+    // `root_dir` reaches for vim.tbl_get, vim.system (shelling out), vim.json,
+    // vim.fs.relpath and vim.lsp.get_clients. Driven through `vim.lsp.enable` +
+    // the FileType dispatcher, the whole config must evaluate without a Lua error
+    // — the regression the user hit ("attempt to call field 'tbl_get'").
+    let dir = temp_dir("lspprobe");
+    std::fs::create_dir_all(dir.join("lsp")).expect("create lsp dir");
+    std::fs::write(
+        dir.join("lsp").join("probe.lua"),
+        // root_dir deliberately does NOT call on_dir: this asserts the API
+        // surface a config evaluates, not the (separately covered) server spawn.
+        r#"return {
+  cmd = { 'true' },
+  filetypes = { 'probe' },
+  root_dir = function(bufnr, on_dir)
+    local deep = vim.tbl_get(vim.lsp.config['probe'], 'settings', 'probe', 'missing')
+    local res = vim.system({ '/bin/echo', '{"workspace_root":"/tmp/proj","n":2}' }, { text = true }):wait()
+    local decoded = vim.json.decode(res.stdout)
+    local rel = vim.fs.relpath('/a/b', '/a/x')
+    local nclients = #vim.lsp.get_clients({ name = 'probe' })
+    print(string.format('probe %s %s %d %s %d',
+      decoded.workspace_root, tostring(deep), decoded.n, tostring(rel), nclients))
+  end,
+}
+"#,
+    )
+    .expect("write lsp config");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.lsp.enable('probe')\nvim.lsp._on_filetype(0, 'probe')\n",
+    )
+    .await;
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "probe /tmp/proj nil 2 nil 0",
+        "an lspconfig-style root_dir should evaluate the new vim.* surface cleanly"
+    );
+}
+
 // ----- highlight registry (Phase 3): nvim_set_hl, links, captures, colorscheme
 
 /// `#rrggbb` as the `0xRRGGBB` integer the highlight RPCs report colors as.

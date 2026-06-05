@@ -106,6 +106,21 @@ function vim.tbl_values(t)
   return values
 end
 
+-- vim.tbl_get(o, ...): follow the `...` keys into nested table `o`, returning the
+-- value reached or nil if any step is missing (or hits a non-table before the
+-- last key). The safe nested access `lsp/<server>.lua` configs use to read deep
+-- settings (e.g. rust_analyzer's `settings['rust-analyzer'].cargo.sysrootSrc`).
+function vim.tbl_get(o, ...)
+  local keys = { ... }
+  if #keys == 0 then return nil end
+  for i, k in ipairs(keys) do
+    if type(o) ~= "table" then return nil end
+    o = o[k]
+    if o == nil then return nil end
+  end
+  return o
+end
+
 function vim.tbl_filter(f, t)
   local out = {}
   for _, v in ipairs(t) do
@@ -291,6 +306,15 @@ function vim._set_cur_buf(bufnr, name, filetype)
 end
 
 function vim.api.nvim_create_user_command(name, command, _opts)
+  vim._user_commands[name] = command
+end
+
+-- nvim_buf_create_user_command(buffer, name, command, opts): in neovim this
+-- registers a *buffer-local* command; nxvim has no per-buffer command registry
+-- yet, so it registers globally (the buffer scope is ignored). Enough for an
+-- `on_attach` that defines a convenience command (e.g. rust_analyzer's
+-- `:LspCargoReload`) to load without error.
+function vim.api.nvim_buf_create_user_command(_buffer, name, command, _opts)
   vim._user_commands[name] = command
 end
 
@@ -903,6 +927,23 @@ function vim.fs.root(source, marker)
   return nil
 end
 
+-- vim.fs.relpath(base, target): `target` expressed relative to `base`, or nil
+-- when `base` is not an ancestor of `target` (the two are compared on a path
+-- *segment* boundary, so "/a/b" is not an ancestor of "/a/bc"). Equal paths give
+-- ".". Both are normalized first. rust_analyzer's `root_dir` uses it to decide
+-- whether a file lives under a toolchain/registry/sysroot directory.
+function vim.fs.relpath(base, target, _opts)
+  base = vim.fs.normalize(base)
+  target = vim.fs.normalize(target)
+  if base == target then return "." end
+  -- A trailing "/" makes the comparison segment-aligned; normalize strips it
+  -- from "/a/b" (len > 1) but leaves the root "/" as-is, which already ends in /.
+  local prefix = base
+  if prefix:sub(-1) ~= "/" then prefix = prefix .. "/" end
+  if target:sub(1, #prefix) == prefix then return target:sub(#prefix + 1) end
+  return nil
+end
+
 -- ----- vim.uri ---------------------------------------------------------------
 -- Minimal `file://` URI conversion. (The server does its own, encoding-aware URI
 -- handling for actual LSP traffic; these back config-file path computations.)
@@ -954,6 +995,43 @@ function vim.fn.fnamemodify(fname, mods)
   return result
 end
 
+-- ----- vim.system / vim.json -------------------------------------------------
+
+-- vim.system(cmd, opts, on_exit): run `cmd` (an argv list) to completion and
+-- return a handle. `opts` may carry `cwd`, `env` (a {VAR=value} dict layered on
+-- the inherited environment), and `text` (accepted; output is always returned as
+-- a string). `on_exit`, if given (or passed in `opts`'s place), is called with
+-- the result. The handle's `:wait()` returns `{ code, stdout, stderr }`.
+--
+-- Caveat vs neovim: there is no event loop yet (see vim.schedule), so the process
+-- is run *synchronously* on the current tick — `:wait()` and `on_exit` both see a
+-- result that is already complete, and a long command blocks the server. This is
+-- exactly what lets an `lsp/<server>.lua` `root_dir` that shells out (rust_analyzer
+-- runs `cargo metadata` / `rustc --print sysroot`) resolve inline during
+-- `vim.lsp.enable`. The Rust `vim._system` does the blocking spawn.
+function vim.system(cmd, opts, on_exit)
+  if type(opts) == "function" then
+    on_exit, opts = opts, nil
+  end
+  opts = opts or {}
+  local result = vim._system(cmd, opts.cwd, opts.env, opts.text ~= false)
+  if on_exit then on_exit(result) end
+  return setmetatable({ pid = result.pid }, {
+    __index = {
+      wait = function() return result end,
+      kill = function() end, -- already exited; nothing to signal
+    },
+  })
+end
+
+-- vim.json.encode/decode: JSON (de)serialization, backed by the Rust serde_json
+-- bridge. `decode` maps objects to string-keyed tables, arrays to sequences, and
+-- `null` to nil; `encode` treats a `1..n` table as an array and any other as an
+-- object. `decode` raises on malformed input (neovim parity).
+vim.json = vim.json or {}
+function vim.json.encode(value) return vim._json_encode(value) end
+function vim.json.decode(str, _opts) return vim._json_decode(str) end
+
 -- vim.validate / vim.deprecate: argument validation and deprecation notices in
 -- neovim. Config files call them defensively; nxvim makes them no-ops (never
 -- erroring) so a config that validates its opts loads unimpeded.
@@ -972,6 +1050,12 @@ function vim.deprecate(...) end
 
 vim.lsp = vim.lsp or {}
 vim.lsp.protocol = vim.lsp.protocol or {}
+
+-- vim.lsp.commands: the registry a server's workspace/executeCommand handlers map
+-- into (a config's `before_init` may populate it, e.g. rust_analyzer's
+-- `rust-analyzer.runSingle`). nxvim doesn't dispatch through it yet, but it must
+-- exist so assigning into it doesn't index nil.
+vim.lsp.commands = vim.lsp.commands or {}
 
 -- Client capabilities are owned and advertised by the Rust client at
 -- `initialize`; this stub lets a config that merges into them run without error.
@@ -993,6 +1077,34 @@ function vim.lsp._remove_client(id) vim.lsp._clients[id] = nil end
 -- vim.lsp.get_client_by_id(id): the registered client table (with `name` and
 -- `server_capabilities`), or nil once its server has exited.
 function vim.lsp.get_client_by_id(id) return vim.lsp._clients[id] end
+
+-- vim.lsp.get_clients(filter): the list of active clients, each a
+-- `{ id, name, server_capabilities, config, request }` table. `filter` narrows by
+-- `id` and/or `name`; a `bufnr` filter is accepted but not honored — nxvim has no
+-- Lua-side buffer->client map yet, so it returns the name/id matches across all
+-- buffers. `config` is the resolved `vim.lsp.config[name]`. `request` is a stub
+-- (synchronous client requests aren't wired yet) so a config that calls
+-- `client:request(...)` — e.g. rust_analyzer's `:LspCargoReload` — loads and runs
+-- without erroring (the request is a no-op). `get_active_clients` is the
+-- deprecated neovim alias, kept for configs that still call it.
+function vim.lsp.get_clients(filter)
+  filter = filter or {}
+  local out = {}
+  for id, c in pairs(vim.lsp._clients) do
+    if (filter.id == nil or filter.id == id) and (filter.name == nil or filter.name == c.name) then
+      out[#out + 1] = {
+        id = c.id,
+        name = c.name,
+        server_capabilities = c.server_capabilities,
+        config = vim.lsp.config[c.name],
+        request = function() return false end,
+      }
+    end
+  end
+  return out
+end
+
+vim.lsp.get_active_clients = vim.lsp.get_clients
 
 -- Load and cache `lsp/<name>.lua` off the runtimepath (the base config layer).
 -- Returns its returned table, or nil when absent / not a table.

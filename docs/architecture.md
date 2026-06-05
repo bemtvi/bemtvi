@@ -521,6 +521,15 @@ screen," and that is exactly the shape of these tests.
   native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
   `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
   the [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md)).
+  The `lsp/<server>.lua` configs run unmodified: the host-utility helpers they
+  reach for — `vim.system`, `vim.json`, `vim.tbl_get`, `vim.fs.relpath`,
+  `vim.lsp.get_clients` — are in place, so e.g. rust_analyzer resolves its
+  workspace root via `cargo metadata` out of the box. **Caveat:** with no event
+  loop yet, `vim.system` runs the child process *synchronously* on the current
+  tick — `:wait()` and the `on_exit` callback both see an already-complete
+  result, and a slow command blocks the server thread (`vim.schedule` likewise
+  runs its callback immediately). This is enough for the short shell-outs a
+  `root_dir` performs; making it truly async is gated on the event loop below.
   The surface still grows only as plugins demand it; known gaps for richer plugins:
   `vim.treesitter` is a stub (nxvim highlights out-of-process), `vim.loop`/`vim.uv`,
   and the per-window API. Legacy Vimscript (`eval.c`) is **not** on the roadmap —
@@ -529,6 +538,19 @@ screen," and that is exactly the shape of these tests.
   (the line-number column) are honored so far, and options are still global —
   **buffer-local options** are the next gap. Also mappings (`:map`), registers
   beyond the unnamed register, search (`/`, `?`, `:s`), marks, folds, and macros.
+- **Per-buffer user commands.** User commands live in one global registry, so
+  `nvim_buf_create_user_command(buffer, …)` currently registers *globally*
+  (the buffer argument is ignored) — enough for an `on_attach` that defines a
+  convenience command (e.g. rust_analyzer's `:LspCargoReload`) to load without
+  error, but the command then exists everywhere rather than only in its buffer.
+  A per-buffer command registry (the command analogue of buffer-local options /
+  buffer-local keymaps, which `vim._keymaps` already scopes) is the fix.
+- **An async Lua runtime (event loop).** Today all Lua runs synchronously on the
+  input tick: `vim.schedule(fn)` invokes `fn` immediately and `vim.system` blocks
+  until the child exits (see the LSP caveat above). The target is a real loop so
+  deferred work, timers (`vim.defer_fn`/`vim.uv` timers), and `vim.system`'s
+  `on_exit` fire off-tick — letting `root_dir` shell-outs and other slow work run
+  without stalling the server, and unblocking the `vim.loop`/`vim.uv` surface.
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).
 

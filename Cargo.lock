@@ -1116,6 +1116,7 @@ dependencies = [
  "anyhow",
  "mlua",
  "rmpv",
+ "serde_json",
 ]
 
 [[package]]

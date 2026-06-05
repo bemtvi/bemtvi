@@ -22,3 +22,4 @@ luajit = ["mlua/luajit"]
 anyhow.workspace = true
 mlua.workspace = true
 rmpv.workspace = true
+serde_json.workspace = true

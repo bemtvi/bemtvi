@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b Slice 1 complete** (the `vim.lsp.buf.*` Lua entry points — definition/references/hover/rename/format/code_action route through the existing native paths). **7b** continues with Slice 2 (`vim.diagnostic.*`) then Slice 3 (`LspAttach`/`on_attach`, which closes the phase). 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`).
+**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b Slices 1–2 complete** (the `vim.lsp.buf.*` Lua entry points route through the existing native paths; `vim.diagnostic.*` — `get`/`goto_next`/`goto_prev`/`setloclist`/`config` — plus a value-returning `nvim_exec_lua`). **7b** finishes with Slice 3 (`LspAttach`/`on_attach`, which closes the phase). 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`).
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -1566,10 +1566,61 @@ text), rename (cross-buffer edit). One-per-kind is overkill.
 
 ---
 
-##### Slice 2 — `vim.diagnostic.*`
+##### Slice 2 — `vim.diagnostic.*` — ✅ DONE
 
 `get` uses the mirror; `goto_next`/`goto_prev`/`setloclist` use the action queue plus
 the existing jump/panel logic.
+
+> **Implementation notes (as built).** Faithful to the plan; the two `Ask first`
+> questions were settled as: **honor what's possible** (wire `config({underline=…})`
+> to the one diagnostic surface nxvim has — the underline spans — and store the rest)
+> and **match neovim** field indexing.
+> - **Rust→Lua mirror.** A new `LuaRuntime::set_diagnostics(bufnr, &[DiagnosticData])`
+>   writes `vim._diagnostics[bufnr]` (via a prelude `vim._set_diagnostics`); the
+>   server calls it from the `LspEvent::Diagnostics` handler on **every**
+>   `publishDiagnostics` (the same spot it caches `state.diagnostics`). Keyed by
+>   `bufnr`, the mirror never goes stale on a buffer switch — `get(0)` resolves
+>   `0` → current via `vim._cur_buf`, which `BufEnter` already refreshes — so the
+>   plan's extra "push on buffer switch" is unnecessary in this design (noted as a
+>   deliberate, documented deviation). `DiagnosticData` is a new public
+>   `nxvim-lua` struct with neovim's shape: 0-based `lnum`/`col`/`end_lnum`/`end_col`,
+>   `severity` 1=ERROR…4=HINT, `message`, optional `source`. `col`/`end_col` are the
+>   raw LSP character offsets — byte columns under the UTF-8 nxvim advertises first
+>   (the negotiated default), correct for the common case; a utf-16-only server would
+>   diverge past non-ASCII (documented, not yet converted — would need the target
+>   buffer's line text).
+> - **`nvim_exec_lua` (new RPC).** Slice 2 needed a value-returning Lua call to expose
+>   the synchronous `vim.diagnostic.get` to RPC and the black-box tests, so a minimal
+>   `nvim_exec_lua(code[, args])` was added: `LuaRuntime::eval_to_value` evaluates the
+>   chunk and a small `lua_to_rmpv` converter maps the result to an `rmpv::Value`
+>   (sequence-table → array, other table → map, scalars as-is; functions/userdata →
+>   nil). `args` is accepted but not yet threaded in. Effects the chunk queued drain
+>   afterward (`apply_lua_effects` + `run_pending`), exactly like `:lua`. This pulled
+>   `rmpv` into `nxvim-lua` as a dep (it already underlies the RPC layer).
+> - **Actions on the existing queue.** Three new `LspOp`s —
+>   `DiagnosticGoto { forward, severity }`, `DiagnosticSetloclist`,
+>   `DiagnosticConfig { underline }` — ride the Slice-1 op queue.
+>   `Server::diagnostic_goto` resolves every (optionally severity-filtered)
+>   diagnostic to a 0-based `(line, byte col)` (reusing the underline path's
+>   `byte_col` conversion), sorts, picks the first strictly after/before
+>   `editor.cursor`, **wraps**, and `jump_to`s the *current* file (same buffer ⇒ no
+>   file open, just a cursor move that snaps to a valid cell). `DiagnosticSetloclist`
+>   reuses `diagnostics_location_list()` + the navigable panel (`:LspDiagnostics`'s
+>   surface). `DiagnosticConfig` flips a server `diagnostics_underline` flag (default
+>   true) that gates `diagnostics_for`, so `underline = false` clears the squiggles
+>   while the message line / location list stay.
+> - **Lua surface** (`prelude.lua`, new `vim.diagnostic`): the `severity` constants
+>   (with the number→name reverse map), `get(bufnr, opts)` reading the mirror
+>   (`nil` → all buffers, `0` → current, `opts.severity` number filter, entries
+>   copied out with their `bufnr`), `goto_next`/`goto_prev`/`setloclist` →
+>   `vim._diagnostic_*`, and `config(opts)` merging into a stored table and pushing
+>   the resolved `underline` bool (an explicit `false` disables; a table/true
+>   enables).
+> - **Tests** (`crates/nxvim/tests/lsp.rs`, +4): `get(0)` field shape + severity
+>   filter (through `nvim_exec_lua`), `goto_next`/`goto_prev` across two diagnostics
+>   with forward/backward **wrap**, `setloclist` opening the navigable panel (+`<CR>`
+>   jump), and `config({underline=false})` draining the underline spans out of the
+>   redraw (then re-enabling).
 
 > **❓ Ask first (before coding Slice 2):**
 > - **`vim.diagnostic.config(opts)` and `vim.lsp.buf.format({async=…})` option

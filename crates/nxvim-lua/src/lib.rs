@@ -109,6 +109,50 @@ pub enum LspOp {
     },
     /// `vim.lsp.buf.code_action()` — request `textDocument/codeAction` at the cursor.
     CodeAction,
+    /// `vim.diagnostic.goto_next()` / `goto_prev()` — move the cursor to the next
+    /// (`forward`) or previous diagnostic in the current buffer, wrapping.
+    DiagnosticGoto {
+        /// `true` for `goto_next`, `false` for `goto_prev`.
+        forward: bool,
+        /// Restrict to a single severity (`vim.diagnostic.severity.*`, 1=ERROR…
+        /// 4=HINT); `None` considers all severities.
+        severity: Option<u8>,
+    },
+    /// `vim.diagnostic.setloclist()` — open the current buffer's diagnostics as
+    /// the navigable panel location list (the `:LspDiagnostics` surface).
+    DiagnosticSetloclist,
+    /// `vim.diagnostic.config({ underline = … })` — toggle the one diagnostic
+    /// surface nxvim has (the underline spans). Other config keys (virt-text,
+    /// signs) have no surface yet and are stored Lua-side without an op.
+    DiagnosticConfig {
+        /// Whether diagnostic underline spans are painted (neovim's `underline`,
+        /// default on; `false` disables the squiggles).
+        underline: bool,
+    },
+}
+
+/// One diagnostic mirrored into the Lua `vim._diagnostics[bufnr]` table so the
+/// synchronous getter `vim.diagnostic.get` can read it without reaching the live
+/// `Server` (the Rust→Lua mirror, the analogue of `vim._set_cur_buf`). Fields
+/// match neovim's `vim.diagnostic.get` shape: 0-based positions and severity
+/// numbered 1=ERROR…4=HINT. `col`/`end_col` are in the server's negotiated
+/// position encoding — byte offsets under the UTF-8 nxvim advertises first.
+#[derive(Clone, Debug)]
+pub struct DiagnosticData {
+    /// 0-based start line.
+    pub lnum: i64,
+    /// 0-based start column.
+    pub col: i64,
+    /// 0-based end line.
+    pub end_lnum: i64,
+    /// 0-based (exclusive) end column.
+    pub end_col: i64,
+    /// Severity, 1=ERROR…4=HINT.
+    pub severity: u8,
+    /// The diagnostic message (may be multi-line).
+    pub message: String,
+    /// The reporting source (server/linter name), if any.
+    pub source: Option<String>,
 }
 
 /// Lua registry key under which the panel's `on_select` callback is stored.
@@ -226,6 +270,42 @@ impl LuaRuntime {
     /// Run a Lua chunk. Errors are returned for the server to surface.
     pub fn exec(&self, chunk: &str) -> mlua::Result<()> {
         self.lua.load(chunk).exec()
+    }
+
+    /// Evaluate a Lua chunk and convert its return value to an RPC [`rmpv::Value`]
+    /// — the `nvim_exec_lua` entry point. The chunk is loaded as an expression
+    /// when it is one, else as statements with an explicit `return` (mlua's
+    /// `eval` tries both), so `vim.diagnostic.get(0)` and `return …` both work.
+    /// Exposes synchronous getters to RPC and to the black-box tests; effects the
+    /// chunk queued (ops, panel, commands) are drained by the caller afterward,
+    /// exactly like a `:lua` chunk.
+    pub fn eval_to_value(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
+        let value: mlua::Value = self.lua.load(chunk).eval()?;
+        lua_to_rmpv(&value)
+    }
+
+    /// Mirror a buffer's diagnostics into `vim._diagnostics[bufnr]` as the plain
+    /// data `vim.diagnostic.get` reads back (the Rust→Lua state mirror). Called on
+    /// every `publishDiagnostics`; keyed by `bufnr`, so it never goes stale on a
+    /// buffer switch (the getter resolves `0` → current via `vim._cur_buf`).
+    pub fn set_diagnostics(&self, bufnr: u64, diags: &[DiagnosticData]) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let set: mlua::Function = vim.get("_set_diagnostics")?;
+        let list = self.lua.create_table()?;
+        for (i, d) in diags.iter().enumerate() {
+            let t = self.lua.create_table()?;
+            t.set("lnum", d.lnum)?;
+            t.set("col", d.col)?;
+            t.set("end_lnum", d.end_lnum)?;
+            t.set("end_col", d.end_col)?;
+            t.set("severity", d.severity)?;
+            t.set("message", d.message.clone())?;
+            if let Some(src) = &d.source {
+                t.set("source", src.clone())?;
+            }
+            list.set(i + 1, t)?;
+        }
+        set.call((bufnr, list))
     }
 
     /// Take ex-commands queued by `vim.cmd` since the last drain.
@@ -785,6 +865,45 @@ fn install_runtime_api(
         })?,
     )?;
 
+    // `vim._diagnostic_goto(forward, severity)`: queue [`LspOp::DiagnosticGoto`]
+    // — the cursor move `vim.diagnostic.goto_next`/`goto_prev` drive.
+    let sh = shared.clone();
+    vim.set(
+        "_diagnostic_goto",
+        lua.create_function(move |_, (forward, severity): (bool, Option<u16>)| {
+            sh.borrow_mut().lsp_ops.push(LspOp::DiagnosticGoto {
+                forward,
+                severity: severity.map(|s| s as u8),
+            });
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._diagnostic_setloclist()`: queue [`LspOp::DiagnosticSetloclist`] — open
+    // the diagnostics location-list panel.
+    let sh = shared.clone();
+    vim.set(
+        "_diagnostic_setloclist",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().lsp_ops.push(LspOp::DiagnosticSetloclist);
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._diagnostic_config(underline)`: queue [`LspOp::DiagnosticConfig`] — the
+    // prelude resolves the merged `underline` to a bool and pushes it so the
+    // server gates the squiggle rendering.
+    let sh = shared.clone();
+    vim.set(
+        "_diagnostic_config",
+        lua.create_function(move |_, underline: bool| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::DiagnosticConfig { underline });
+            Ok(())
+        })?,
+    )?;
+
     Ok(())
 }
 
@@ -976,5 +1095,55 @@ fn stringify(lua: &Lua, value: &mlua::Value) -> String {
     match lua.coerce_string(value.clone()) {
         Ok(Some(s)) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
         _ => format!("{value:?}"),
+    }
+}
+
+/// Convert an `mlua::Value` to an RPC [`rmpv::Value`] for `nvim_exec_lua`. A
+/// table with contiguous `1..=n` integer keys becomes an array (a Lua sequence);
+/// any other table becomes a map; an empty table becomes an empty array.
+/// Functions / userdata / threads (not representable over msgpack) collapse to
+/// nil. Covers the scalar-and-table shapes nxvim's synchronous getters return.
+fn lua_to_rmpv(value: &mlua::Value) -> mlua::Result<rmpv::Value> {
+    use mlua::Value as L;
+    Ok(match value {
+        L::Nil => rmpv::Value::Nil,
+        L::Boolean(b) => rmpv::Value::from(*b),
+        L::Integer(i) => rmpv::Value::from(*i),
+        L::Number(n) => rmpv::Value::from(*n),
+        L::String(s) => rmpv::Value::from(s.to_str()?.to_string()),
+        L::Table(t) => lua_table_to_rmpv(t)?,
+        // Non-serializable Lua values have no msgpack representation.
+        _ => rmpv::Value::Nil,
+    })
+}
+
+/// Table half of [`lua_to_rmpv`]: array iff every key is an integer in `1..=len`.
+fn lua_table_to_rmpv(t: &mlua::Table) -> mlua::Result<rmpv::Value> {
+    let len = t.raw_len() as i64;
+    let mut entries: Vec<(i64, rmpv::Value)> = Vec::new();
+    let mut map: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+    let mut is_seq = true;
+    for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (k, v) = pair?;
+        let rv = lua_to_rmpv(&v)?;
+        match &k {
+            mlua::Value::Integer(i) if *i >= 1 && *i <= len => entries.push((*i, rv)),
+            _ => {
+                is_seq = false;
+                map.push((lua_to_rmpv(&k)?, rv));
+            }
+        }
+    }
+    if is_seq {
+        entries.sort_by_key(|(i, _)| *i);
+        Ok(rmpv::Value::Array(
+            entries.into_iter().map(|(_, v)| v).collect(),
+        ))
+    } else {
+        // Re-emit the integer-keyed entries we provisionally treated as sequence.
+        for (i, v) in entries {
+            map.push((rmpv::Value::from(i), v));
+        }
+        Ok(rmpv::Value::Map(map))
     }
 }

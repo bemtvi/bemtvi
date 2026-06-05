@@ -28,7 +28,7 @@ use nxvim_lsp::{
     CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
     PositionEncoding, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
 };
-use nxvim_lua::LspOp;
+use nxvim_lua::{DiagnosticData, LspOp};
 use rmpv::Value;
 
 use crate::{Server, StyleTable};
@@ -235,6 +235,25 @@ impl Server {
             }
             LspOp::CodeAction => {
                 self.request_lsp_code_action();
+                return;
+            }
+            LspOp::DiagnosticGoto { forward, severity } => {
+                self.diagnostic_goto(forward, severity);
+                return;
+            }
+            LspOp::DiagnosticSetloclist => {
+                match self.diagnostics_location_list() {
+                    Some((lines, targets)) => {
+                        self.editor.open_panel("LSP diagnostics", lines, false, 0);
+                        self.editor.set_panel_targets(targets);
+                    }
+                    None => self.editor.echo("No diagnostics"),
+                }
+                return;
+            }
+            LspOp::DiagnosticConfig { underline } => {
+                self.diagnostics_underline = underline;
+                self.lsp_dirty = true;
                 return;
             }
         };
@@ -447,13 +466,19 @@ impl Server {
                 // a publish for a buffer closed while it was in flight, as
                 // `store_spans` drops unknown-buffer syntax replies). Mark dirty
                 // so the coalesced repaint paints the new squiggles.
-                if let Some(state) = self
+                let mirror = self
                     .lsp_states
-                    .values_mut()
-                    .find(|s| s.uri.as_ref() == Some(&uri))
-                {
-                    state.diagnostics = diagnostics;
+                    .iter_mut()
+                    .find(|(_, s)| s.uri.as_ref() == Some(&uri))
+                    .map(|(id, state)| {
+                        state.diagnostics = diagnostics;
+                        (id.0, diagnostic_mirror_data(&state.diagnostics))
+                    });
+                if let Some((bufnr, data)) = mirror {
                     self.lsp_dirty = true;
+                    // Mirror into `vim._diagnostics[bufnr]` so the synchronous
+                    // `vim.diagnostic.get` (Slice 2) can read it from pure Lua.
+                    let _ = self.lua.set_diagnostics(bufnr, &data);
                 }
             }
             LspEvent::Reply { token, reply, .. } => self.on_lsp_reply(token, reply),
@@ -570,7 +595,14 @@ impl Server {
         numbers: &[Option<usize>],
         styles: &mut StyleTable,
     ) -> Value {
-        let Some((diags, encoding)) = self.current_diagnostics() else {
+        // `vim.diagnostic.config({ underline = false })` hides the squiggles; the
+        // message line and the location list (other surfaces) are unaffected.
+        let diags_encoding = if self.diagnostics_underline {
+            self.current_diagnostics()
+        } else {
+            None
+        };
+        let Some((diags, encoding)) = diags_encoding else {
             // One empty entry per row so the client's `diagnostics[row]` index
             // stays aligned with `highlights`/`numbers`.
             return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
@@ -693,6 +725,61 @@ impl Server {
             targets.push(path.clone().map(|p| (p, row, byte)));
         }
         Some((lines, targets))
+    }
+
+    /// `vim.diagnostic.goto_next`/`goto_prev`: move the cursor to the next
+    /// (`forward`) or previous diagnostic in the current buffer, wrapping around
+    /// the ends. `severity` (1=ERROR…4=HINT) restricts the set when set. A no-op
+    /// when the buffer has no (matching) diagnostics. Reuses the same byte-column
+    /// conversion the underline path uses, then `jump_to`s the *current* file so
+    /// the move snaps to a valid resting cell (no file open — same buffer).
+    pub(crate) fn diagnostic_goto(&mut self, forward: bool, severity: Option<u8>) {
+        let Some((diags, encoding)) = self.current_diagnostics() else {
+            return;
+        };
+        // Resolve every (matching) diagnostic to a 0-based (line, byte col) and
+        // sort by position, so "next/previous from the cursor" is a list walk.
+        let mut positions: Vec<(usize, usize)> = diags
+            .iter()
+            .filter(|d| severity.map_or(true, |s| severity_code(d.severity) == s))
+            .map(|d| {
+                let row = d.range.start.line as usize;
+                let line = self.editor.buffer().line(row);
+                (
+                    row,
+                    byte_col(encoding, &line, d.range.start.character as usize),
+                )
+            })
+            .collect();
+        if positions.is_empty() {
+            return;
+        }
+        positions.sort_unstable();
+        positions.dedup();
+
+        let cur = (self.editor.cursor.line, self.editor.cursor.col);
+        // The next strictly-after (forward) or strictly-before (backward) target,
+        // wrapping to the first/last when the cursor is past the last/before the
+        // first — neovim's `goto_next`/`goto_prev` wrap behavior.
+        let target = if forward {
+            positions
+                .iter()
+                .find(|&&p| p > cur)
+                .copied()
+                .unwrap_or(positions[0])
+        } else {
+            positions
+                .iter()
+                .rev()
+                .find(|&&p| p < cur)
+                .copied()
+                .unwrap_or(positions[positions.len() - 1])
+        };
+
+        let (line, byte) = target;
+        if let Some(path) = self.editor.buffer().path.clone() {
+            self.editor.jump_to(&path, line, byte);
+        }
     }
 
     // ----- Phase 3: go-to definition / references --------------------------
@@ -1785,6 +1872,26 @@ fn severity_code(severity: Option<DiagnosticSeverity>) -> u8 {
         Some(s) if s == DiagnosticSeverity::HINT => 4,
         _ => 1,
     }
+}
+
+/// Project a buffer's cached diagnostics into the plain [`DiagnosticData`] the
+/// Lua mirror (`vim._diagnostics`) holds for `vim.diagnostic.get`. Positions are
+/// the raw 0-based LSP coordinates; `col`/`end_col` are byte offsets under the
+/// UTF-8 encoding nxvim advertises first (the negotiated default), matching
+/// neovim's byte-column `get` shape for the common case.
+fn diagnostic_mirror_data(diags: &[Diagnostic]) -> Vec<DiagnosticData> {
+    diags
+        .iter()
+        .map(|d| DiagnosticData {
+            lnum: d.range.start.line as i64,
+            col: d.range.start.character as i64,
+            end_lnum: d.range.end.line as i64,
+            end_col: d.range.end.character as i64,
+            severity: severity_code(d.severity),
+            message: d.message.clone(),
+            source: d.source.clone(),
+        })
+        .collect()
 }
 
 /// The highlight group whose `sp`/underline style paints a diagnostic of this

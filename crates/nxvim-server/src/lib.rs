@@ -169,6 +169,10 @@ struct Server {
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
     lsp_code_actions: Vec<CodeActionData>,
+    /// Whether diagnostic underline spans are painted, toggled by
+    /// `vim.diagnostic.config({ underline = … })` (Slice 2). Default `true`; the
+    /// one diagnostic-config key with a backing surface in nxvim.
+    diagnostics_underline: bool,
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
     /// every entry).
@@ -221,6 +225,7 @@ where
         lsp_requests: HashMap::new(),
         completion: None,
         lsp_code_actions: Vec::new(),
+        diagnostics_underline: true,
         last_buffer_id: None,
         announced: HashSet::new(),
         last_mode: Mode::Normal,
@@ -402,6 +407,24 @@ impl Server {
                 let cmd = text(params.first());
                 self.run_command(&cmd);
                 Ok(Value::Nil)
+            }
+            // `nvim_exec_lua(code[, args])`: evaluate a Lua chunk and return its
+            // value over RPC — the entry point for synchronous getters like
+            // `vim.diagnostic.get`. Effects the chunk queued (LSP ops, panel,
+            // commands) drain afterward, exactly like a `:lua` chunk. `args` is
+            // accepted for call-compatibility but not yet threaded into the chunk.
+            "nvim_exec_lua" => {
+                let code = text(params.first());
+                let value = match self.lua.eval_to_value(&code) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        self.editor.echo(format!("E5108: Error executing lua: {e}"));
+                        Value::Nil
+                    }
+                };
+                self.apply_lua_effects();
+                self.run_pending();
+                Ok(value)
             }
             "nvim_get_mode" => Ok(Value::Map(vec![(
                 Value::from("mode"),

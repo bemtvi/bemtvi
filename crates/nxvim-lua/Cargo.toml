@@ -21,3 +21,4 @@ luajit = ["mlua/luajit"]
 [dependencies]
 anyhow.workspace = true
 mlua.workspace = true
+rmpv.workspace = true

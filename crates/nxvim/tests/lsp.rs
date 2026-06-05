@@ -127,6 +127,16 @@ fn lsp_config_dir() -> PathBuf {
 /// Start a server (LSP via the injected `init.lua`, syntax enabled) editing
 /// `file`, attach a UI. Mirrors the syntax tests' harness.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_with_config_dir(file, lsp_config_dir()).await
+}
+
+/// Like [`start`], but with an explicit `config_dir` — for tests that need a
+/// `vim.lsp.config`/`enable` arrangement other than the shared one (e.g. enabling
+/// the server *interactively, after* the buffer is already open).
+async fn start_with_config_dir(
+    file: Option<String>,
+    config_dir: PathBuf,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -138,7 +148,7 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
             server_end,
             ServerInit {
                 file,
-                config_dir: Some(lsp_config_dir()),
+                config_dir: Some(config_dir),
                 ..Default::default()
             },
         ));
@@ -2075,4 +2085,50 @@ async fn rename_matches_a_buffer_opened_through_a_symlink() {
     cmd(&rpc, "LspRename bar").await;
     wait_for_lines(&rpc, &["bar = 1"]).await;
     let _ = std::fs::remove_file(&link);
+}
+
+/// `vim.lsp.enable` called **interactively, after the buffer is already open**
+/// must start the server for that buffer — not merely arm a `FileType` autocmd
+/// for *future* buffers. Opening the file fires `FileType` once; a later
+/// `:lua vim.lsp.enable(...)` used to no-op because the dispatcher caught nothing.
+/// Mirrors neovim, whose `enable` processes already-loaded buffers on the spot.
+#[tokio::test]
+async fn enable_after_open_starts_the_server_for_the_current_buffer() {
+    let _guard = test_lock().lock().await;
+    let record = configure_mock("enable_late", serde_json::json!({}));
+    let file = temp_file("enable_late", "rs", "fn main() {}\n");
+
+    // A config dir that *defines* the mock but does not enable it, so opening the
+    // rust buffer starts nothing — the enable is the interactive step below.
+    let cfg = std::env::temp_dir().join(format!("nxvim-lsp-cfg-late-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).expect("create config dir");
+    std::fs::write(
+        cfg.join("init.lua"),
+        "vim.lsp.config('mock', { cmd = { 'mock' }, filetypes = { 'rust' } })\n",
+    )
+    .expect("write init.lua");
+
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg).await;
+
+    // Nothing enabled yet: the open rust buffer must not have started a server.
+    for _ in 0..4 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        record_lines(&record).is_empty(),
+        "no server should start before enable, got {:?}",
+        record_lines(&record)
+    );
+
+    // Enable interactively, after the buffer's FileType already fired. The server
+    // must start for the current buffer and run the handshake + didOpen.
+    cmd(&rpc, "lua vim.lsp.enable('mock')").await;
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    let open = find(&recs, "textDocument/didOpen").expect("a didOpen after a late enable");
+    assert_eq!(
+        open["params"]["textDocument"]["languageId"].as_str(),
+        Some("rust"),
+        "the late enable opened the current rust buffer against the server"
+    );
 }

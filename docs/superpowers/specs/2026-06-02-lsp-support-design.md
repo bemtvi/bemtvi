@@ -1374,7 +1374,14 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   ← user override, via `tbl_deep_extend('force', …)`), `__newindex` redefines
 >   (replaces the override and drops the base). `vim.lsp.enable` installs **one**
 >   shared `FileType` autocmd (augroup `nxvim.lsp.enable`) that, per opened buffer,
->   starts every enabled config whose resolved `filetypes` matches.
+>   starts every enabled config whose resolved `filetypes` matches. It **also**
+>   processes the already-open current buffer on the spot (via `_on_filetype` over
+>   the `vim._cur_buf` snapshot, which now carries the buffer's `filetype`) — so an
+>   interactive `:lua vim.lsp.enable(…)` after a file is already open starts the
+>   server immediately, matching neovim's "process loaded buffers" behavior instead
+>   of silently arming only future `FileType` events. The retroactive start is
+>   idempotent server-side (`lsp_ensured` + the same-key bind), so the overlap with
+>   the startup `FileType` (when `enable` runs from `init.lua`) is a harmless no-op.
 > - **Tests.** All 40 Phase 1–6 LSP tests migrate to the Lua start path with **no**
 >   per-test change beyond the harness: the `start` helper now sources a temp
 >   `init.lua` (`vim.lsp.config('mock', {cmd=…, filetypes={'rust',…}})` +

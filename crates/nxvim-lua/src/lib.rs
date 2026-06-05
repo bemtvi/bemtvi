@@ -371,11 +371,13 @@ impl LuaRuntime {
     /// Refresh the `vim._cur_buf` snapshot the prelude reads back through
     /// `nvim_buf_get_name(0)` / `expand('%')`. The server pushes this immediately
     /// before firing a buffer/mode autocmd so a callback can resolve the buffer
-    /// that fired. (Interim until a real per-bufnr registry exists.)
-    pub fn set_buf_snapshot(&self, bufnr: u64, name: &str) -> mlua::Result<()> {
+    /// that fired. `filetype` is the buffer's detected filetype (`""` when none),
+    /// which `vim.lsp.enable` reads to start a server for the already-open buffer.
+    /// (Interim until a real per-bufnr registry exists.)
+    pub fn set_buf_snapshot(&self, bufnr: u64, name: &str, filetype: &str) -> mlua::Result<()> {
         let vim: Table = self.lua.globals().get("vim")?;
         let set: mlua::Function = vim.get("_set_cur_buf")?;
-        set.call((bufnr, name))
+        set.call((bufnr, name, filetype))
     }
 
     /// Whether `name` was registered via `nvim_create_user_command` (so the

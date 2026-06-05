@@ -277,12 +277,15 @@ where
     // Seed the current-buffer snapshot before sourcing config, so a buffer-local
     // map declared with `buffer = 0` (or `nvim_create_autocmd`'s `buffer = 0`)
     // resolves to the real startup buffer rather than the default `0` — the buffer
-    // already exists at config time, matching neovim. Lifecycle emission refreshes
-    // it again before each autocmd fires; this just makes it valid earlier.
+    // already exists at config time, matching neovim. Carrying the filetype too
+    // lets a `vim.lsp.enable(...)` in `init.lua` start a server for it. Lifecycle
+    // emission refreshes it again before each autocmd fires; this makes it valid
+    // earlier.
     {
         let buf = server.editor.current_buffer_id();
         let name = server.editor.buffer_name(buf).unwrap_or_default();
-        let _ = server.lua.set_buf_snapshot(buf.0, &name);
+        let ft = filetype_of(server.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = server.lua.set_buf_snapshot(buf.0, &name, ft);
     }
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
@@ -822,7 +825,8 @@ impl Server {
     /// effects the callbacks left. Deferred ex-commands the callbacks queue are
     /// drained by the caller's `run_pending`.
     fn fire_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId, file: &str) {
-        let _ = self.lua.set_buf_snapshot(buf.0, file);
+        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buf.0, file, ft);
         if let Err(e) = self.lua.fire_autocmd_buf(event, pattern, buf.0, file) {
             self.editor
                 .echo(format!("E5108: Error in {event} autocmd: {e}"));

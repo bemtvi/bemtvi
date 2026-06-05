@@ -284,10 +284,10 @@ local augroup_seq, autocmd_seq = 0, 0
 -- callback can resolve "the buffer that fired" — nvim_buf_get_name(0) and
 -- expand('%') read it. An interim until a real per-bufnr registry exists; with
 -- the core single-message-at-a-time it can't go stale mid-dispatch.
-vim._cur_buf = vim._cur_buf or { bufnr = 0, name = "" }
+vim._cur_buf = vim._cur_buf or { bufnr = 0, name = "", filetype = "" }
 
-function vim._set_cur_buf(bufnr, name)
-  vim._cur_buf = { bufnr = bufnr or 0, name = name or "" }
+function vim._set_cur_buf(bufnr, name, filetype)
+  vim._cur_buf = { bufnr = bufnr or 0, name = name or "", filetype = filetype or "" }
 end
 
 function vim.api.nvim_create_user_command(name, command, _opts)
@@ -1094,6 +1094,18 @@ function vim.lsp.enable(name, enable)
     vim._lsp_enabled[n] = on
   end
   lsp_ensure_dispatcher()
+  -- Process the already-open current buffer on the spot (neovim parity): its
+  -- `FileType` has already fired, so the dispatcher just installed won't catch
+  -- it, and an interactive `vim.lsp.enable(...)` would otherwise be a no-op until
+  -- the next file opened. A start is idempotent server-side, so the overlap with
+  -- the startup `FileType` (when this runs from `init.lua`) is harmless. Only on
+  -- an *enable* — a disable must not start anything.
+  if on then
+    local cur = vim._cur_buf
+    if cur and cur.filetype and cur.filetype ~= "" then
+      vim.lsp._on_filetype(cur.bufnr, cur.filetype)
+    end
+  end
 end
 
 -- vim.lsp.start(config[, opts]): start (or reuse) the server for `config`

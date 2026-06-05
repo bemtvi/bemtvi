@@ -64,10 +64,21 @@ fn configure_mock() -> PathBuf {
         "severity": 1,
         "message": "lua_ls says hi",
     }]);
+    // Scripted feature replies so the `on_attach` keymaps below exercise go-to and
+    // hover end-to-end: definition jumps to `return M` (line 1), hover opens a panel.
+    let definition = serde_json::json!({
+        "uri": format!("file://{}", scratch("proj").join("src/init.lua").display()),
+        "range": { "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 8 } },
+    });
+    let hover = serde_json::json!({
+        "contents": { "kind": "markdown", "value": "local M: table\n" }
+    });
     let body = serde_json::json!({
         "record": record.to_str().unwrap(),
         "position_encoding": "utf-8",
         "diagnostics": diagnostics,
+        "definition": definition,
+        "hover": hover,
     });
     std::fs::write(&script, serde_json::to_string(&body).unwrap()).expect("write script");
 
@@ -87,12 +98,25 @@ fn configure_mock() -> PathBuf {
     record
 }
 
-/// A config dir whose `init.lua` enables `lua_ls` — nothing else. The base config
-/// (cmd/filetypes/root_markers) comes entirely from the vendored `lsp/lua_ls.lua`.
+/// A config dir whose `init.lua` is a user-style `lua_ls` setup: it merges an
+/// `on_attach` (wiring buffer-local LSP keymaps) over the vendored base config and
+/// enables the server. The base (cmd/filetypes/root_markers) still comes entirely
+/// from the vendored `lsp/lua_ls.lua`; this only adds the attach hook, exercising
+/// the Phase 7b Slice 3 `LspAttach`/`on_attach` path off the real config.
 fn enable_config_dir() -> PathBuf {
     let dir = scratch("config");
     std::fs::create_dir_all(&dir).expect("mkdir config");
-    std::fs::write(dir.join("init.lua"), "vim.lsp.enable('lua_ls')\n").expect("write init.lua");
+    std::fs::write(
+        dir.join("init.lua"),
+        "vim.lsp.config('lua_ls', {\n\
+         \x20 on_attach = function(client, bufnr)\n\
+         \x20   vim.keymap.set('n', '<Space>d', vim.lsp.buf.definition, { buffer = bufnr })\n\
+         \x20   vim.keymap.set('n', '<Space>k', vim.lsp.buf.hover, { buffer = bufnr })\n\
+         \x20 end,\n\
+         })\n\
+         vim.lsp.enable('lua_ls')\n",
+    )
+    .expect("write init.lua");
     dir
 }
 
@@ -133,6 +157,39 @@ async fn start(
     .await
     .expect("ui attach");
     (rpc, incoming)
+}
+
+/// Send key notation to the server (the `nvim_input` the UI client uses).
+fn feed(rpc: &Rpc, keys: &str) {
+    rpc.notify("nvim_input", vec![Value::from(keys)]);
+}
+
+/// The current window cursor as 0-based `(row, col)` (the `nvim_win_get_cursor`
+/// row is 1-based, so it is decremented here to match the rest of the asserts).
+async fn cursor(rpc: &Rpc) -> (u64, u64) {
+    let v = rpc
+        .request("nvim_win_get_cursor", vec![Value::from(0u64)])
+        .await
+        .expect("win_get_cursor");
+    let arr = v.as_array().expect("cursor array");
+    let row = arr[0].as_u64().expect("row").saturating_sub(1);
+    let col = arr[1].as_u64().expect("col");
+    (row, col)
+}
+
+/// Poll (bounded) until the cursor reaches `want`, driving redraws meanwhile.
+async fn wait_for_cursor(rpc: &Rpc, want: (u64, u64)) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        if cursor(rpc).await == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "cursor never reached {want:?}; last was {:?}",
+        cursor(rpc).await
+    );
 }
 
 /// Force a redraw (which drives LSP document sync) so the mock advances.
@@ -239,15 +296,72 @@ async fn vendored_lua_ls_config_drives_the_start() {
 
     // And diagnostics the (mock) server published flow through to a redraw —
     // the full path works end to end off the real config.
+    let mut saw_diagnostics = false;
     for _ in 0..100 {
         barrier(&rpc).await;
         tokio::task::yield_now().await;
         if let Some(params) = drain_latest_redraw(&mut incoming) {
             if has_diagnostics(&params) {
-                return;
+                saw_diagnostics = true;
+                break;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("diagnostics from the vendored-config server never reached a redraw");
+    assert!(
+        saw_diagnostics,
+        "diagnostics from the vendored-config server never reached a redraw"
+    );
+
+    // The user-style `on_attach` ran on attach (off the vendored config): its
+    // buffer-local `<Space>d` drives go-to-definition, jumping to the scripted
+    // target (line 1, `return M`). That the key works at all proves `LspAttach`
+    // fired and `on_attach` wired the map.
+    feed(&rpc, " d");
+    wait_for_cursor(&rpc, (1, 7)).await;
+    assert!(
+        find(&record_lines(&record), "textDocument/definition").is_some(),
+        "the on_attach <Space>d should send a textDocument/definition request"
+    );
+
+    // And the `on_attach`-set `<Space>k` drives hover, opening the panel with the
+    // markup rendered as plain lines.
+    feed(&rpc, " k");
+    let mut hovered = false;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if panel_has(&params, "LSP hover") {
+                hovered = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        hovered,
+        "the on_attach <Space>k should open the LSP hover panel"
+    );
+    assert!(
+        find(&record_lines(&record), "textDocument/hover").is_some(),
+        "the on_attach <Space>k should send a textDocument/hover request"
+    );
+}
+
+/// Whether a `redraw` carries a panel whose title is `title` (the `panel` redraw
+/// key projects `{ title, lines, … }`).
+fn panel_has(params: &[Value], title: &str) -> bool {
+    let Some(Value::Map(map)) = params.first() else {
+        return false;
+    };
+    let Some((_, panel)) = map.iter().find(|(k, _)| k.as_str() == Some("panel")) else {
+        return false;
+    };
+    let Some(fields) = panel.as_map() else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|(k, v)| k.as_str() == Some("title") && v.as_str() == Some(title))
 }

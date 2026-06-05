@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b Slices 1–2 complete** (the `vim.lsp.buf.*` Lua entry points route through the existing native paths; `vim.diagnostic.*` — `get`/`goto_next`/`goto_prev`/`setloclist`/`config` — plus a value-returning `nvim_exec_lua`). **7b** finishes with Slice 3 (`LspAttach`/`on_attach`, which closes the phase). 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`).
+**Status:** **Phases 1–7 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**; **7b — the `vim.*` Lua surface: Slice 1 `vim.lsp.buf.*` routes through the existing native paths; Slice 2 `vim.diagnostic.*` — `get`/`goto_next`/`goto_prev`/`setloclist`/`config` — plus a value-returning `nvim_exec_lua`; Slice 3 `LspAttach`/`on_attach`/`server_capabilities` — a per-server client mirrored into `vim.lsp._clients`, a default `LspAttach` autocmd running the config's `on_attach`, and `LspDetach` on `didClose`/server-exit, which closes the phase**). 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`), now including a user-style `on_attach` keymap setup driving go-to + hover off the real config.
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -1658,39 +1658,53 @@ diagnostics and wrap; `setloclist` opens the navigable panel.
 
 ---
 
-##### Slice 3 — `LspAttach` / `on_attach` / `server_capabilities`
+##### Slice 3 — `LspAttach` / `on_attach` / `server_capabilities` — ✅ DONE
 
 The slice that makes real nvim-lspconfig setups work and closes the gate.
 
-> **❓ Ask first (before coding Slice 3):**
-> - **`server_capabilities` shape** — start with the booleans common configs probe
->   (`definitionProvider`, `hoverProvider`, `renameProvider`, `completionProvider`,
->   `documentFormattingProvider`) and grow on demand, or mirror a fuller capabilities
->   table now? *(default: the minimal boolean set)*
-> - **`LspDetach`** — fire it this slice (on `didClose`/server-exit), or defer until a
->   plugin needs it? *(default: fire it now, symmetric with `LspAttach`)*
+> **Resolved (requester answers):**
+> - **`server_capabilities` shape** — the **full feature-mirroring set**: one bool per
+>   feature nxvim implements (`definitionProvider`, `declarationProvider`,
+>   `typeDefinitionProvider`, `implementationProvider`, `referencesProvider`,
+>   `hoverProvider`, `signatureHelpProvider`, `completionProvider`,
+>   `documentFormattingProvider`, `renameProvider`, `codeActionProvider`). Distilled
+>   in `ProviderCaps` (`manager.rs`) by serializing `ServerCapabilities` once and
+>   probing each camelCase `*Provider` (present and not an explicit `false`).
+> - **`LspDetach`** — **fired now**, on both `didClose` (`:bdelete`) and server exit,
+>   symmetric with `LspAttach`. A server exit drops the runtime + Lua client; a
+>   respawn re-`initialize`s into a fresh client id and re-attaches.
 
-**Rust — surface capabilities.** `manager.rs:78` already distills capabilities; carry
-them into `LspDocState` on attach and build a `client` Lua table
-`{ id, name, server_capabilities = {…} }` when firing the event.
+**Rust — surface capabilities (done).** `ServerCaps` carries a `ProviderCaps` (the 11
+feature bools), distilled in `provider_caps` by serializing the `initialize` reply's
+`ServerCapabilities` once and probing each camelCase `*Provider`. The negotiated
+`ServerRuntime` (`lsp.rs`) gained a `client_id`, assigned once per `(name, root)` on
+`Initialized` and reused across respawns.
 
-**Rust — fire the event.** On `initialized` + buffer bound (the attach moment), fire
-`LspAttach` through `fire_autocmd_buf` (`lib.rs:830`) with `data = { client_id, buf }`;
-mirror `LspDetach` on `didClose`/exit. Reuse the `announced` once-gate (`lib.rs:177`)
-so re-entry doesn't re-fire.
+**Rust — mirror the client + fire the events (done).** On `Initialized` the server
+pushes the client into Lua (`LuaRuntime::set_lsp_client` → `vim.lsp._clients[id] = {
+id, name, server_capabilities }`). `LspAttach` fires from `sync_lsp` right after the
+buffer's first `didOpen` (the attach moment, gated by `opened` so re-entry doesn't
+re-fire), through the new `fire_autocmd_data` which threads `data = { client_id }`.
+`LspDetach` fires on `didClose` (in `reap_closed_lsp_buffers`) and on `ServerExited`
+(which also drops the runtime and `remove_lsp_client`s it).
 
-**Lua — invoke `on_attach`.** Add a default `LspAttach` autocmd in the
-`nxvim.lsp.enable` augroup (`prelude.lua:1079`) that resolves the client by
-`args.data.client_id` and calls `cfg.on_attach(client, args.buf)` — this is what lets
-`on_attach` set buffer-local maps (`vim.keymap.set('n','gd',vim.lsp.buf.definition,{buffer=args.buf})`).
+**Lua — invoke `on_attach` (done).** A default `LspAttach` autocmd in the
+`nxvim.lsp.enable` augroup resolves the client via `vim.lsp.get_client_by_id(
+args.data.client_id)` and calls `cfg.on_attach(client, args.buf)` (where `cfg =
+vim.lsp.config[client.name]`) — the call site that lets `on_attach` set buffer-local
+maps (`vim.keymap.set('n','gd',vim.lsp.buf.definition,{buffer=args.buf})`).
 
-**Tests.**
-- An `on_attach` that sets a buffer-local `gd` runs on attach and fires
-  `vim.lsp.buf.definition`.
-- `client.server_capabilities.hoverProvider` is readable inside `on_attach`.
-- **Done-when gate (`lspconfig.rs`):** extend the real-nvim-lspconfig e2e so a
-  user-style config (`vim.lsp.enable` + `on_attach` keymaps) exercises diagnostics +
-  go-to + hover + completion + format end-to-end; gates green.
+**Tests (done).**
+- An `on_attach` that sets a buffer-local `<Space>d` runs on attach and drives
+  `vim.lsp.buf.definition` (`lsp.rs`).
+- `client.server_capabilities.{hoverProvider,definitionProvider}` and the client's
+  `name`/`id` are readable inside `on_attach`; a server that withholds `hoverProvider`
+  surfaces it falsy, so a config can gate a mapping on it (`lsp.rs`).
+- **Done-when gate (`lspconfig.rs`):** the real-nvim-lspconfig e2e now runs a
+  user-style config (`vim.lsp.config('lua_ls', { on_attach = … })` + `vim.lsp.enable`)
+  whose `on_attach` keymaps drive go-to + hover off the real vendored config, on top
+  of the existing diagnostics check; gates green. (Completion/format share the
+  identical attach→keymap path and keep their dedicated mock coverage in `lsp.rs`.)
 
 **Conventions reminder (CLAUDE.md).** No unit tests — all coverage is black-box in
 `crates/nxvim/tests/lsp.rs` / `lspconfig.rs` against the mock (or real lspconfig for

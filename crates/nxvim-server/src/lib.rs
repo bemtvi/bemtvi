@@ -151,6 +151,10 @@ struct Server {
     /// Server keys already handed to `ensure_server`, so a server is requested
     /// once rather than on every redraw (the `SyntaxClient::ensure_started` guard).
     lsp_ensured: HashSet<ServerKey>,
+    /// The next LSP client id to assign. Each `(name, root)` server gets one,
+    /// stable across respawns (reused when its runtime is replaced), and it is
+    /// the handle `LspAttach`'s `data.client_id` carries to Lua (Slice 3).
+    next_lsp_client_id: u64,
     /// Set when an LSP event changed something the client should see (e.g. a fresh
     /// `Initialized` that should trigger a `didOpen`). Coalesced like `syntax_dirty`.
     lsp_dirty: bool,
@@ -220,6 +224,7 @@ where
         lsp_states: HashMap::new(),
         lsp_servers: HashMap::new(),
         lsp_ensured: HashSet::new(),
+        next_lsp_client_id: 1,
         lsp_dirty: false,
         lsp_req_gen: 0,
         lsp_requests: HashMap::new(),

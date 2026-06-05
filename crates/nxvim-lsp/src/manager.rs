@@ -75,11 +75,33 @@ pub enum PositionEncoding {
     Utf32,
 }
 
-/// The distilled server capabilities the editor needs. Grows as later phases add
-/// features; Phase 1 needs only the document-sync kind (full vs incremental).
+/// The distilled server capabilities the editor needs: the document-sync kind
+/// (full vs incremental) that drives `didChange`, and the per-feature provider
+/// bools surfaced to Lua as `client.server_capabilities` (Phase 7b Slice 3).
 #[derive(Clone, Debug)]
 pub struct ServerCaps {
     pub sync_kind: TextDocumentSyncKind,
+    pub providers: ProviderCaps,
+}
+
+/// The language-feature providers a server advertised at `initialize`, one bool
+/// per feature nxvim implements. Surfaced to Lua as `client.server_capabilities`
+/// so an `on_attach` can branch on what the server supports (e.g. only map `K`
+/// when `hover`). Each field is the matching protocol `*Provider` reduced to
+/// "advertised and not an explicit `false`".
+#[derive(Clone, Debug, Default)]
+pub struct ProviderCaps {
+    pub definition: bool,
+    pub declaration: bool,
+    pub type_definition: bool,
+    pub implementation: bool,
+    pub references: bool,
+    pub hover: bool,
+    pub signature_help: bool,
+    pub completion: bool,
+    pub document_formatting: bool,
+    pub rename: bool,
+    pub code_action: bool,
 }
 
 /// A fire-and-forget document-sync notification, already in LSP coordinates. The
@@ -618,6 +640,7 @@ async fn run_server_once(
     let _ = socket.initialized(InitializedParams {});
     let encoding = encoding_of(&init_result.capabilities);
     let sync_kind = sync_kind_of(&init_result.capabilities);
+    let providers = provider_caps(&init_result.capabilities);
     log.log(
         LogLevel::Info,
         name,
@@ -625,7 +648,10 @@ async fn run_server_once(
     );
     let _ = event_tx.send(LspEvent::Initialized {
         key: key.clone(),
-        caps: ServerCaps { sync_kind },
+        caps: ServerCaps {
+            sync_kind,
+            providers,
+        },
         encoding,
     });
 
@@ -1365,6 +1391,34 @@ fn encoding_of(caps: &ServerCapabilities) -> PositionEncoding {
         Some("utf-8") => PositionEncoding::Utf8,
         Some("utf-32") => PositionEncoding::Utf32,
         _ => PositionEncoding::Utf16,
+    }
+}
+
+/// Reduce the protocol [`ServerCapabilities`] to the per-feature provider bools
+/// the editor surfaces as `client.server_capabilities`. Serializing once and
+/// probing the camelCase `*Provider` fields keeps all eleven uniform across the
+/// protocol's mix of `bool`/`OneOf`/options shapes: a provider counts as
+/// advertised when its field is present and not an explicit `false` (an options
+/// object — the common case — counts as supported).
+fn provider_caps(caps: &ServerCapabilities) -> ProviderCaps {
+    let json = serde_json::to_value(caps).unwrap_or(serde_json::Value::Null);
+    let present = |key: &str| match json.get(key) {
+        Some(serde_json::Value::Bool(b)) => *b,
+        None | Some(serde_json::Value::Null) => false,
+        Some(_) => true,
+    };
+    ProviderCaps {
+        definition: present("definitionProvider"),
+        declaration: present("declarationProvider"),
+        type_definition: present("typeDefinitionProvider"),
+        implementation: present("implementationProvider"),
+        references: present("referencesProvider"),
+        hover: present("hoverProvider"),
+        signature_help: present("signatureHelpProvider"),
+        completion: present("completionProvider"),
+        document_formatting: present("documentFormattingProvider"),
+        rename: present("renameProvider"),
+        code_action: present("codeActionProvider"),
     }
 }
 

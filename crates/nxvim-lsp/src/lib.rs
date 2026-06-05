@@ -26,5 +26,6 @@ pub mod mock;
 pub use lsp_types;
 pub use manager::{
     CodeActionData, CompletionItemData, LspEvent, LspManager, LspNotify, LspReply, LspRequest,
-    PositionEncoding, ReqToken, ServerCaps, ServerKey, ServerSpawn, WorkspaceEditData,
+    PositionEncoding, ProviderCaps, ReqToken, ServerCaps, ServerKey, ServerSpawn,
+    WorkspaceEditData,
 };

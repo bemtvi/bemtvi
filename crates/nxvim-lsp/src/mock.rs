@@ -175,11 +175,34 @@ fn initialize_result(script: &Value) -> Value {
         "full" => 1,
         _ => 2,
     };
+    // Advertise every feature provider nxvim implements, so a config's `on_attach`
+    // can read `client.server_capabilities.*Provider` (Phase 7b Slice 3). A script
+    // may override the whole `capabilities` object to test a server that withholds
+    // some providers.
+    let mut capabilities = json!({
+        "positionEncoding": encoding,
+        "textDocumentSync": sync_kind,
+        "definitionProvider": true,
+        "declarationProvider": true,
+        "typeDefinitionProvider": true,
+        "implementationProvider": true,
+        "referencesProvider": true,
+        "hoverProvider": true,
+        "signatureHelpProvider": {},
+        "completionProvider": {},
+        "documentFormattingProvider": true,
+        "renameProvider": true,
+        "codeActionProvider": true,
+    });
+    if let Some(Value::Object(overrides)) = script.get("capabilities") {
+        if let Value::Object(base) = &mut capabilities {
+            for (k, v) in overrides {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+    }
     json!({
-        "capabilities": {
-            "positionEncoding": encoding,
-            "textDocumentSync": sync_kind,
-        },
+        "capabilities": capabilities,
         "serverInfo": { "name": "nxvim-lsp-mock" }
     })
 }

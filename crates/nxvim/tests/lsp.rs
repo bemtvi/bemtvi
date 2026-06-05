@@ -2471,3 +2471,139 @@ async fn vim_diagnostic_config_underline_false_hides_the_squiggles() {
     exec_lua(&rpc, "vim.diagnostic.config({ underline = true })").await;
     wait_for_diagnostics(&rpc, &mut incoming).await;
 }
+
+// ----- Phase 7b Slice 3: LspAttach / on_attach / server_capabilities --------
+//
+// When a buffer's first `didOpen` goes out under an initialized server, the
+// server fires `LspAttach` with `data.client_id`; the default autocmd in the
+// `nxvim.lsp.enable` augroup resolves the client and runs the config's
+// `on_attach(client, bufnr)` — the call site that wires buffer-local LSP keymaps
+// and reads `client.server_capabilities`.
+
+/// A fresh config dir whose `init.lua` defines + enables the `mock` server with
+/// the given `on_attach` body (a Lua chunk with `client`/`bufnr` in scope).
+fn attach_config_dir(tag: &str, on_attach_body: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nxvim-lsp-cfg-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    std::fs::write(
+        dir.join("init.lua"),
+        format!(
+            "vim.lsp.config('mock', {{ cmd = {{ 'mock' }}, filetypes = {{ 'rust' }}, \
+             on_attach = function(client, bufnr)\n{on_attach_body}\nend }})\n\
+             vim.lsp.enable('mock')\n"
+        ),
+    )
+    .expect("write init.lua");
+    dir
+}
+
+#[tokio::test]
+async fn on_attach_sets_a_buffer_local_keymap_that_drives_definition() {
+    let _guard = test_lock().lock().await;
+    // The config's `on_attach` maps a non-default key (`<Space>d`) to
+    // `vim.lsp.buf.definition`, buffer-local. That the key works proves the server
+    // fired `LspAttach` on attach and the default autocmd ran `on_attach`.
+    let file = temp_file(
+        "attach-def",
+        "rs",
+        "fn target() {}\nfn main() { target() }\n",
+    );
+    let record = configure_mock(
+        "attach-def",
+        serde_json::json!({ "definition": location(&file, 0, 3) }),
+    );
+    let cfg = attach_config_dir(
+        "attach-def",
+        "vim.keymap.set('n', '<Space>d', vim.lsp.buf.definition, { buffer = bufnr })",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // From the call site (line 1), the `on_attach`-set key jumps to the definition
+    // (the space in the feed string is the `<Space>` half of the `<Space>d` map).
+    feed(&rpc, "j d");
+    wait_for_cursor(&rpc, (1, 3)).await;
+    assert!(
+        has_method(&record_lines(&record), "textDocument/definition"),
+        "the on_attach keymap should drive a textDocument/definition request"
+    );
+}
+
+#[tokio::test]
+async fn on_attach_reads_the_server_capabilities() {
+    let _guard = test_lock().lock().await;
+    // `client.server_capabilities` is readable inside `on_attach`: the mock
+    // advertises the provider booleans, and the client carries its name/id. The
+    // body stashes them in a global the test reads back over `nvim_exec_lua`.
+    let file = temp_file("attach-caps", "rs", "fn main() {}\n");
+    let record = configure_mock("attach-caps", serde_json::json!({}));
+    let cfg = attach_config_dir(
+        "attach-caps",
+        "_G.nxvim_seen = { \
+           hover = client.server_capabilities.hoverProvider, \
+           definition = client.server_capabilities.definitionProvider, \
+           name = client.name, \
+           has_id = client.id ~= nil, \
+         }",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    let seen = exec_lua(&rpc, "return _G.nxvim_seen").await;
+    assert_eq!(
+        map_get(&seen, "hover").and_then(Value::as_bool),
+        Some(true),
+        "server_capabilities.hoverProvider is readable in on_attach: {seen:?}"
+    );
+    assert_eq!(
+        map_get(&seen, "definition").and_then(Value::as_bool),
+        Some(true),
+        "server_capabilities.definitionProvider is readable in on_attach: {seen:?}"
+    );
+    assert_eq!(
+        map_get(&seen, "name").and_then(Value::as_str),
+        Some("mock"),
+        "the client carries its config name: {seen:?}"
+    );
+    assert_eq!(
+        map_get(&seen, "has_id").and_then(Value::as_bool),
+        Some(true),
+        "the client carries a numeric id: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_withheld_capability_reads_as_falsy_in_on_attach() {
+    let _guard = test_lock().lock().await;
+    // A server that doesn't advertise `hoverProvider` surfaces it as nil/false, so
+    // an `on_attach` can gate a mapping on the capability. The script overrides the
+    // mock's advertised `hoverProvider` to `false` (other providers stay on).
+    let file = temp_file("attach-nohover", "rs", "fn main() {}\n");
+    let record = configure_mock(
+        "attach-nohover",
+        serde_json::json!({
+            "capabilities": {
+                "definitionProvider": true,
+                "hoverProvider": false,
+            }
+        }),
+    );
+    let cfg = attach_config_dir(
+        "attach-nohover",
+        "_G.nxvim_hover = client.server_capabilities.hoverProvider or false\n\
+         _G.nxvim_def = client.server_capabilities.definitionProvider or false",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nxvim_hover").await.as_bool(),
+        Some(false),
+        "a withheld hoverProvider reads falsy in on_attach"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nxvim_def").await.as_bool(),
+        Some(true),
+        "an advertised definitionProvider still reads true"
+    );
+}

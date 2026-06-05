@@ -26,9 +26,9 @@ use nxvim_lsp::lsp_types::{
 };
 use nxvim_lsp::{
     CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
-    PositionEncoding, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
+    PositionEncoding, ProviderCaps, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
 };
-use nxvim_lua::{DiagnosticData, LspOp};
+use nxvim_lua::{DiagnosticData, LspClientData, LspOp, LspServerCapabilities};
 use rmpv::Value;
 
 use crate::{Server, StyleTable};
@@ -172,10 +172,13 @@ pub(crate) struct PendingLspReq {
 }
 
 /// The negotiated runtime state of one server, learned from its `initialize`
-/// reply: the position encoding and document-sync kind every buffer it owns uses.
+/// reply: the position encoding and document-sync kind every buffer it owns uses,
+/// plus the LSP client id assigned to this server (carried to Lua on
+/// `LspAttach`/`LspDetach` as `data.client_id`).
 pub(crate) struct ServerRuntime {
     encoding: PositionEncoding,
     sync_kind: TextDocumentSyncKind,
+    client_id: u64,
 }
 
 /// The live insert-mode completion popup (Phase 5), server-owned like the
@@ -336,6 +339,7 @@ impl Server {
         let Some(&ServerRuntime {
             encoding,
             sync_kind,
+            client_id,
         }) = self.lsp_servers.get(&key)
         else {
             let state = self.lsp_states.entry(buffer).or_default();
@@ -352,6 +356,10 @@ impl Server {
 
         // A text change since the last sync (only meaningful once opened).
         let tick_changed = state.opened && cur_tick != state.last_tick;
+
+        // Set when this sync is the buffer's first `didOpen` under the server: the
+        // attach moment, so `LspAttach` fires once the state is re-inserted below.
+        let mut just_attached = false;
 
         if !state.opened {
             // First open (or re-open after a respawn): full text supersedes any
@@ -375,6 +383,7 @@ impl Server {
             // The freshly-opened content is the on-disk state, so don't fire a
             // spurious `didSave` for saves that predate the open.
             state.last_save_tick = cur_save_tick;
+            just_attached = true;
         } else if tick_changed && sync_kind != TextDocumentSyncKind::NONE {
             let batch = self.editor.buffer_mut().take_lsp_edits();
             state.version += 1;
@@ -408,6 +417,54 @@ impl Server {
         }
 
         self.lsp_states.insert(buffer, state);
+
+        // The attach hook fires after the state is back in the map (so an
+        // `on_attach` that re-enters the LSP paths sees a consistent state): the
+        // buffer just sent its first `didOpen` under an initialized server — the
+        // attach moment. `sync_lsp` only ever syncs the current buffer, so the
+        // snapshot the autocmd reads is this buffer.
+        if just_attached {
+            let file = path.to_string_lossy().into_owned();
+            self.fire_lsp_attach(buffer, &file, client_id);
+        }
+    }
+
+    /// Fire `LspAttach` for the just-attached current buffer with the server's
+    /// `client_id` as `args.data.client_id`. Pushes the buffer snapshot first (so
+    /// the callback resolves the buffer), then folds in the Lua effects the
+    /// `on_attach` left — buffer-local keymaps it set bump the keymap version and
+    /// are picked up on the next input. Mirrors [`Server::fire_lifecycle`].
+    fn fire_lsp_attach(&mut self, buf: BufferId, file: &str, client_id: u64) {
+        let ft = self
+            .lsp_states
+            .get(&buf)
+            .map(|s| s.language_id.clone())
+            .unwrap_or_default();
+        let _ = self.lua.set_buf_snapshot(buf.0, file, &ft);
+        if let Err(e) = self
+            .lua
+            .fire_autocmd_data("LspAttach", file, buf.0, file, client_id)
+        {
+            self.editor
+                .echo(format!("E5108: Error in LspAttach autocmd: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Fire `LspDetach` for `buf` with `client_id` as `args.data.client_id` — the
+    /// detach counterpart to [`Server::fire_lsp_attach`]. Unlike attach it does
+    /// not push a buffer snapshot: detach fires for a buffer being closed
+    /// (`didClose`) or a server that exited, neither of which is necessarily the
+    /// current buffer. User `LspDetach` callbacks still get `args.buf`/`data`.
+    fn fire_lsp_detach(&mut self, buf: BufferId, file: &str, client_id: u64) {
+        if let Err(e) = self
+            .lua
+            .fire_autocmd_data("LspDetach", file, buf.0, file, client_id)
+        {
+            self.editor
+                .echo(format!("E5108: Error in LspDetach autocmd: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// Send `didClose` for, and forget the state of, every buffer the editor has
@@ -423,6 +480,15 @@ impl Server {
         for id in dead {
             if let Some(state) = self.lsp_states.remove(&id) {
                 if let (true, Some(key), Some(uri)) = (state.opened, state.server, state.uri) {
+                    // Fire `LspDetach` (symmetric with attach-on-`didOpen`) before
+                    // the close goes out, while the runtime — and so the client id —
+                    // is still around.
+                    if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
+                        let file = uri_to_path(&uri)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.fire_lsp_detach(id, &file, client_id);
+                    }
                     self.lsp.notify(key, LspNotify::DidClose { uri });
                 }
             }
@@ -440,13 +506,34 @@ impl Server {
                 caps,
                 encoding,
             } => {
+                // Assign a client id once per server, reused across respawns so the
+                // `client_id` Lua sees stays stable (and `vim.lsp._clients` isn't
+                // leaked one entry per restart).
+                let client_id = self
+                    .lsp_servers
+                    .get(&key)
+                    .map(|r| r.client_id)
+                    .unwrap_or_else(|| {
+                        let id = self.next_lsp_client_id;
+                        self.next_lsp_client_id += 1;
+                        id
+                    });
                 self.lsp_servers.insert(
                     key.clone(),
                     ServerRuntime {
                         encoding,
                         sync_kind: caps.sync_kind,
+                        client_id,
                     },
                 );
+                // Mirror the client into `vim.lsp._clients[id]` so `on_attach` can
+                // read `client.server_capabilities` once `LspAttach` resolves it.
+                let client = LspClientData {
+                    id: client_id,
+                    name: key.name.clone(),
+                    capabilities: provider_caps_to_lua(&caps.providers),
+                };
+                let _ = self.lua.set_lsp_client(&client);
                 // A fresh (or respawned) server holds no documents: re-open every
                 // buffer bound to it on the next sync. This doubles as the restart
                 // handler, like `SyntaxEvent::Restarted`.
@@ -482,9 +569,38 @@ impl Server {
                 }
             }
             LspEvent::Reply { token, reply, .. } => self.on_lsp_reply(token, reply),
-            LspEvent::ServerExited { .. } => {
-                // The manager respawns per its breaker (or gives up cleanly). The
-                // editor stays fully responsive throughout; nothing to surface yet.
+            LspEvent::ServerExited { key, .. } => {
+                // The manager respawns per its breaker (or gives up cleanly); the
+                // editor stays fully responsive throughout. Detach every buffer the
+                // dead server held — symmetric with attach-on-`didOpen` — and drop
+                // its runtime + Lua client. A respawn re-`initialize`s into a fresh
+                // client id and re-attaches (neovim treats a restart as a new
+                // client), so this is also the restart's detach half.
+                if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
+                    // Buffers attached to this server, with a display name for the
+                    // event's `args.file`. Clear `opened` so a later `:bdelete`
+                    // doesn't re-fire `LspDetach`, and so a respawn re-`didOpen`s.
+                    let detaching: Vec<(BufferId, String)> = self
+                        .lsp_states
+                        .iter_mut()
+                        .filter(|(_, s)| s.opened && s.server.as_ref() == Some(&key))
+                        .map(|(id, s)| {
+                            s.opened = false;
+                            s.version = 0;
+                            let file = s
+                                .uri
+                                .as_ref()
+                                .and_then(uri_to_path)
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            (*id, file)
+                        })
+                        .collect();
+                    for (id, file) in detaching {
+                        self.fire_lsp_detach(id, &file, client_id);
+                    }
+                    let _ = self.lua.remove_lsp_client(client_id);
+                }
             }
             LspEvent::Log { message, .. } => {
                 // Record to `:messages` without disturbing the message line.
@@ -1586,6 +1702,7 @@ impl Server {
         let Some(&ServerRuntime {
             encoding,
             sync_kind,
+            ..
         }) = self.lsp_servers.get(&key)
         else {
             return;
@@ -1871,6 +1988,26 @@ fn severity_code(severity: Option<DiagnosticSeverity>) -> u8 {
         Some(s) if s == DiagnosticSeverity::INFORMATION => 3,
         Some(s) if s == DiagnosticSeverity::HINT => 4,
         _ => 1,
+    }
+}
+
+/// Translate the LSP crate's [`ProviderCaps`] into the Lua-runtime
+/// [`LspServerCapabilities`], the boundary that keeps `nxvim-lua` free of the LSP
+/// crate. The two have the same per-feature fields; this is the one place they
+/// are mapped across.
+fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
+    LspServerCapabilities {
+        definition: p.definition,
+        declaration: p.declaration,
+        type_definition: p.type_definition,
+        implementation: p.implementation,
+        references: p.references,
+        hover: p.hover,
+        signature_help: p.signature_help,
+        completion: p.completion,
+        document_formatting: p.document_formatting,
+        rename: p.rename,
+        code_action: p.code_action,
     }
 }
 

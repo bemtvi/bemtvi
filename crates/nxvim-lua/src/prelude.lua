@@ -343,8 +343,9 @@ end
 -- in) the registered event; pattern is nil/"*", equals `pattern`, or is in the
 -- registered pattern list; a buffer-local autocmd only fires for its `buffer`.
 -- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
--- case `file` falls back to `pattern` (the old behavior).
-function vim._fire(event, pattern, buf, file)
+-- case `file` falls back to `pattern` (the old behavior). `data` is the optional
+-- `args.data` payload (LspAttach/LspDetach carry `{ client_id = … }`); nil otherwise.
+function vim._fire(event, pattern, buf, file, data)
   for _, au in ipairs(vim._autocmds) do
     local ev = au.event
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
@@ -356,7 +357,7 @@ function vim._fire(event, pattern, buf, file)
       if pat_ok and buf_ok then
         local cb = au.opts.callback
         if type(cb) == "function" then
-          cb({ id = au.id, event = event, match = pattern, buf = buf, file = file or pattern })
+          cb({ id = au.id, event = event, match = pattern, buf = buf, file = file or pattern, data = data })
         elseif type(au.opts.command) == "string" then
           vim.cmd(au.opts.command)
         end
@@ -980,6 +981,19 @@ vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
 vim._lsp_base_cache = vim._lsp_base_cache or {}   -- name -> lsp/<name>.lua result (false = none)
 vim._lsp_enabled = vim._lsp_enabled or {}         -- name -> enabled?
 
+-- The client registry: id -> { id, name, server_capabilities }, mirrored from
+-- Rust (`LuaRuntime::set_lsp_client`) when a server finishes `initialize`. The
+-- handle `LspAttach`'s `args.data.client_id` resolves through `get_client_by_id`.
+vim.lsp._clients = vim.lsp._clients or {}
+function vim.lsp._set_client(id, name, server_capabilities)
+  vim.lsp._clients[id] = { id = id, name = name, server_capabilities = server_capabilities or {} }
+end
+function vim.lsp._remove_client(id) vim.lsp._clients[id] = nil end
+
+-- vim.lsp.get_client_by_id(id): the registered client table (with `name` and
+-- `server_capabilities`), or nil once its server has exited.
+function vim.lsp.get_client_by_id(id) return vim.lsp._clients[id] end
+
 -- Load and cache `lsp/<name>.lua` off the runtimepath (the base config layer).
 -- Returns its returned table, or nil when absent / not a table.
 local function lsp_base_config(name)
@@ -1080,6 +1094,22 @@ local function lsp_ensure_dispatcher()
   vim.api.nvim_create_autocmd("FileType", {
     group = group,
     callback = function(args) vim.lsp._on_filetype(args.buf, args.match) end,
+  })
+  -- The attach hook: when the server bound to a buffer finishes its first
+  -- `didOpen`, the server fires `LspAttach` with `data.client_id`; resolve the
+  -- client and run its config's `on_attach(client, bufnr)` — the call site that
+  -- lets a config set buffer-local LSP keymaps (`vim.keymap.set('n','gd',
+  -- vim.lsp.buf.definition, {buffer=args.buf})`).
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = group,
+    callback = function(args)
+      local client = vim.lsp.get_client_by_id(args.data and args.data.client_id)
+      if not client then return end
+      local cfg = vim.lsp.config[client.name]
+      if cfg and type(cfg.on_attach) == "function" then
+        cfg.on_attach(client, args.buf)
+      end
+    end,
   })
 end
 

@@ -155,6 +155,40 @@ pub struct DiagnosticData {
     pub source: Option<String>,
 }
 
+/// One LSP client mirrored into `vim.lsp._clients[id]` so `on_attach` (and any
+/// Lua) can read `client.server_capabilities` (Phase 7b Slice 3). Pushed once per
+/// server when it finishes `initialize`; the server translates its `ProviderCaps`
+/// into these booleans so nxvim-lua stays free of the LSP crate.
+#[derive(Clone, Debug)]
+pub struct LspClientData {
+    /// The numeric client id, stable per server instance — the handle
+    /// `LspAttach`'s `args.data.client_id` resolves through `get_client_by_id`.
+    pub id: u64,
+    /// The config name (`vim.lsp.config('<name>', …)`), which the default
+    /// `LspAttach` autocmd uses to find the config's `on_attach`.
+    pub name: String,
+    /// Per-feature provider flags, surfaced as the camelCase
+    /// `server_capabilities.*Provider` keys neovim configs probe.
+    pub capabilities: LspServerCapabilities,
+}
+
+/// The per-feature provider flags of an [`LspClientData`], one bool per feature
+/// nxvim implements. The server fills these from `nxvim_lsp::ProviderCaps`.
+#[derive(Clone, Debug, Default)]
+pub struct LspServerCapabilities {
+    pub definition: bool,
+    pub declaration: bool,
+    pub type_definition: bool,
+    pub implementation: bool,
+    pub references: bool,
+    pub hover: bool,
+    pub signature_help: bool,
+    pub completion: bool,
+    pub document_formatting: bool,
+    pub rename: bool,
+    pub code_action: bool,
+}
+
 /// Lua registry key under which the panel's `on_select` callback is stored.
 const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
 
@@ -306,6 +340,40 @@ impl LuaRuntime {
             list.set(i + 1, t)?;
         }
         set.call((bufnr, list))
+    }
+
+    /// Mirror one LSP client into `vim.lsp._clients[id]` (the Rust→Lua client
+    /// registry) so `get_client_by_id` — and the `LspAttach` `on_attach` it feeds
+    /// — can read `client.server_capabilities`. Pushed once per server when it
+    /// finishes `initialize`. The provider flags become the camelCase
+    /// `*Provider` keys neovim configs probe.
+    pub fn set_lsp_client(&self, client: &LspClientData) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let lsp: Table = vim.get("lsp")?;
+        let set: mlua::Function = lsp.get("_set_client")?;
+        let caps = self.lua.create_table()?;
+        let c = &client.capabilities;
+        caps.set("definitionProvider", c.definition)?;
+        caps.set("declarationProvider", c.declaration)?;
+        caps.set("typeDefinitionProvider", c.type_definition)?;
+        caps.set("implementationProvider", c.implementation)?;
+        caps.set("referencesProvider", c.references)?;
+        caps.set("hoverProvider", c.hover)?;
+        caps.set("signatureHelpProvider", c.signature_help)?;
+        caps.set("completionProvider", c.completion)?;
+        caps.set("documentFormattingProvider", c.document_formatting)?;
+        caps.set("renameProvider", c.rename)?;
+        caps.set("codeActionProvider", c.code_action)?;
+        set.call((client.id, client.name.clone(), caps))
+    }
+
+    /// Forget an LSP client (`vim.lsp._clients[id] = nil`) when its server exits,
+    /// so a stale `get_client_by_id` after a `LspDetach` returns `nil`.
+    pub fn remove_lsp_client(&self, id: u64) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let lsp: Table = vim.get("lsp")?;
+        let remove: mlua::Function = lsp.get("_remove_client")?;
+        remove.call(id)
     }
 
     /// Take ex-commands queued by `vim.cmd` since the last drain.
@@ -464,6 +532,26 @@ impl LuaRuntime {
         let vim: Table = self.lua.globals().get("vim")?;
         let fire: mlua::Function = vim.get("_fire")?;
         fire.call((event, pattern, buf, file))
+    }
+
+    /// Fire an autocmd with buffer context *and* an `args.data` payload — the
+    /// `{ client_id = … }` table neovim's `LspAttach`/`LspDetach` carry. The
+    /// server fires these at the attach (didOpen) and detach (didClose / server
+    /// exit) moments; the default `nxvim.lsp.enable` autocmd reads `client_id` to
+    /// resolve the client and run the config's `on_attach`.
+    pub fn fire_autocmd_data(
+        &self,
+        event: &str,
+        pattern: &str,
+        buf: u64,
+        file: &str,
+        client_id: u64,
+    ) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let fire: mlua::Function = vim.get("_fire")?;
+        let data = self.lua.create_table()?;
+        data.set("client_id", client_id)?;
+        fire.call((event, pattern, buf, file, data))
     }
 
     /// Refresh the `vim._cur_buf` snapshot the prelude reads back through

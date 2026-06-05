@@ -514,15 +514,17 @@ screen," and that is exactly the shape of these tests.
   (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
   built-ins fire instantly even under a colliding user prefix, via the shared
   command grammar `nxvim_core::command_status` the matcher consults) are in place
-  — enough to run the real catppuccin colorscheme unmodified (see [*Lua*](#lua))
-  — but the surface grows only as plugins demand it. Known gaps for richer
-  plugins: `vim.treesitter` is a stub (nxvim highlights out-of-process),
-  `vim.loop`/`vim.uv`, the per-window API, and the `vim.lsp`/`vim.diagnostic` API
-  (the LSP client itself is implemented natively — diagnostics, go-to, hover,
-  signature help, behind a built-in config; see the
-  [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md) — but
-  it is not yet exposed to Lua). Legacy Vimscript (`eval.c`) is **not** on the
-  roadmap — see guiding principle 2.
+  — enough to run the real catppuccin colorscheme unmodified (see [*Lua*](#lua)).
+  So is the **`vim.lsp`/`vim.diagnostic` surface**: a server is configured and
+  started entirely from user Lua (`vim.lsp.config`/`vim.lsp.enable`, with the
+  built-in server table removed), `vim.lsp.buf.*` and `vim.diagnostic.*` drive the
+  native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
+  `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
+  the [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md)).
+  The surface still grows only as plugins demand it; known gaps for richer plugins:
+  `vim.treesitter` is a stub (nxvim highlights out-of-process), `vim.loop`/`vim.uv`,
+  and the per-window API. Legacy Vimscript (`eval.c`) is **not** on the roadmap —
+  see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far, and options are still global —
   **buffer-local options** are the next gap. Also mappings (`:map`), registers

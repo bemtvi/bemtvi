@@ -1459,36 +1459,160 @@ Phase 1–6 features pass; `nxvim-core` still carries no LSP/async/JSON deps; ga
 
 #### Phase 7b — Lua entry points to the features
 
-**Goal.** Let user keymaps and configs invoke the Phase 3–6 features and the
-diagnostics cache from Lua.
+**Goal.** Expose the native Phase 3–6 features and the Phase-2 diagnostics cache
+to Lua, so user configs/plugins (and `on_attach`-set keymaps) drive LSP — not
+just the built-in keymap defaults.
 
-**Prerequisites.** Phase 7a.
-
-**Scope (in).**
-- `vim.lsp.buf.*` (`definition`, `declaration`, `type_definition`, `implementation`,
-  `references`, `hover`, `signature_help`, `rename`, `format`, `code_action`,
-  `completion`) — route to the existing feature paths.
-- `vim.diagnostic.*` (`get`, `setloclist`/panel, `goto_next`/`goto_prev`, `config`)
-  over the Phase-2 diagnostics cache.
-- `vim.keymap.set` — provided by the separate **keymap design**
-  ([2026-06-04-keymap-design.md](2026-06-04-keymap-design.md)); 7b's go-to-via-keymap
-  and `on_attach` buffer-local maps depend on that doc's **Phase 1** (and Phase 3 for
-  buffer-local).
-- Fire `LspAttach`/`LspDetach`; surface `client.server_capabilities` and invoke the
-  config's `on_attach` (the firing hook may land in 7a; its body needs this surface).
+**Prerequisites.** Phase 7a ✅; keymap design Phase 1 (`vim.keymap.set`) ✅ and
+Phase 3 (buffer-local maps) ✅ — both landed on `feature/lsp-integration`.
 
 **Scope (out).** The *entire* `vim.lsp` surface (it's vast) — implement what common
 configs require and grow it as plugins demand, per architecture.md's "surface grows
 only as plugins demand it." Legacy Vimscript configs are a non-goal.
 
-**Tests.**
-- `vim.diagnostic.get`/`goto_next` behave against canned diagnostics.
-- A Lua keymap (`vim.keymap.set('n', 'gd', vim.lsp.buf.definition)`) jumps the cursor.
-- An `on_attach` that sets buffer-local keymaps runs on attach.
+> **How to execute this phase.** It is split into three slices — **1 `vim.lsp.buf.*`
+> → 2 `vim.diagnostic.*` → 3 `LspAttach`/`on_attach`** — each independently green.
+> Build them in order. **Each slice opens with an `❓ Ask first` block: before
+> writing any code for that slice, put those questions to the requester and build
+> to their answers.** Do not silently take the listed default — the default is only
+> the fallback if they defer. Slice 3 is the one that flips this phase to complete.
 
-**Done when.** A realistic Lua-driven setup (real nvim-lspconfig + user keymaps via
-`on_attach`) exercises diagnostics + go-to + hover + completion + format end-to-end;
-gates green.
+##### The two bridges (every slice reuses these — no new transport)
+
+1. **Action queue (Lua → Rust)** for anything that mutates editor state.
+   `vim.lsp.start` pushes an `LspOp` onto `shared.lsp_ops`; the server drains it in
+   `apply_lua_effects()` via `take_lsp_ops()` (`nxvim-server/src/lib.rs:888`), which
+   runs right after `run_keymap(id)` (`lib.rs:735,739`). A Lua keymap RHS that calls
+   `vim.lsp.buf.definition()` therefore enqueues an op the server applies on the same
+   input tick. **Extend the `LspOp` enum** (`nxvim-lua/src/lib.rs`, currently just
+   `Start`) — do not invent a new channel.
+2. **State mirror (Rust → Lua)** for the one synchronous getter (`vim.diagnostic.get`).
+   Lua closures can't reach the live `Server`, so mirror the cache into a Lua table
+   the way `vim._set_cur_buf` mirrors the current buffer (`prelude.lua:289`): on every
+   `publishDiagnostics` the server calls a new `vim._set_diagnostics(bufnr, list)`,
+   and `vim.diagnostic.get` reads that table in pure Lua.
+
+The native entry points already exist and are what the ops route into:
+`request_lsp(kind)` (`lsp.rs:678`), `request_lsp_format` (`:741`),
+`request_lsp_rename` (`:754`), `request_lsp_code_action` (`:783`),
+`diagnostics_location_list` (`:644`), `jump_to_lsp_location` (`:990`).
+
+---
+
+##### Slice 1 — `vim.lsp.buf.*`
+
+The thin-routing slice: each function enqueues an op; the server calls the existing
+`request_lsp*`.
+
+> **❓ Ask first (before coding Slice 1):**
+> - **`vim.lsp.buf.rename()` with no argument.** Neovim prompts for the new name;
+>   nxvim has no prompt UI. Require the arg (`rename(name)`) and echo `E471` when nil
+>   (same as `:LspRename`), deferring a prompt to a later phase? *(default: yes,
+>   require the arg)*
+> - **Keep the native `gd`/`gD`/`gr`/`K` defaults** (`lib.rs:243`) now that Lua can
+>   set them? They are `default=true` lowest-precedence, so an `on_attach` user map
+>   shadows them; real neovim ships no defaults, but nxvim's "native-first" principle
+>   wants a working no-config baseline. *(default: keep them)*
+
+**Rust — `nxvim-lua/src/lib.rs`:** extend `LspOp` with
+`BufRequest { kind: u16 }`, `Format`, `Rename { new_name: String }`, `CodeAction`
+(`kind` reuses `LspReqKind::as_u16`/`from_u16`, `lsp.rs:88`, so the wire stays one
+int). Register a `vim._lsp_buf(kind_u16)` / `vim._lsp_buf_rename(name)` Rust closure
+next to `_lsp_start` (`lib.rs:701`) that pushes the matching op.
+
+**Rust — `apply_lsp_op` (`lsp.rs:216`):** add arms routing `BufRequest`→`request_lsp`,
+`Format`→`request_lsp_format`, `Rename`→`request_lsp_rename`,
+`CodeAction`→`request_lsp_code_action`. No cursor threading — `request_lsp` reads
+`self.editor.cursor` at apply time, on the same tick the key fired.
+
+**Lua — `prelude.lua` (new `vim.lsp.buf` table near `:972`):** one bare function per
+feature (so `vim.keymap.set('n','gd',vim.lsp.buf.definition)` works), each calling
+`vim._lsp_buf(<kind>)`; `rename` → `vim._lsp_buf_rename`.
+
+**Tests (`crates/nxvim/tests/lsp.rs`).** Cover the distinct reply shapes through the
+Lua path: definition (jump via a Lua-set `gd`), references (panel), hover (panel
+text), rename (cross-buffer edit). One-per-kind is overkill.
+
+---
+
+##### Slice 2 — `vim.diagnostic.*`
+
+`get` uses the mirror; `goto_next`/`goto_prev`/`setloclist` use the action queue plus
+the existing jump/panel logic.
+
+> **❓ Ask first (before coding Slice 2):**
+> - **`vim.diagnostic.config(opts)` and `vim.lsp.buf.format({async=…})` option
+>   tables** — honor any of them now, or stub-and-store? Virt-text, signs, and
+>   async-format are listed follow-ups with no surface yet. *(default: stub-and-store
+>   — store the table, no behavior)*
+> - **Field indexing for `vim.diagnostic.get`** — confirm 0-indexed `lnum`/`col` and
+>   `severity` numbered ERROR=1…HINT=4 to match neovim. *(default: yes, match neovim)*
+
+**Rust — mirror push.** In the `publishDiagnostics` handler (`lsp.rs:416–428`, where
+`state.diagnostics` is set) *and* on buffer switch, call a new
+`Lua::set_diagnostics(bufnr, &[Diagnostic])` writing `vim._diagnostics[bufnr]` as
+`{lnum,col,end_lnum,end_col,severity,message,source}`. Push on **every**
+`publishDiagnostics` and on buffer switch or the getter goes stale (the `vim._cur_buf`
+refresh is the model).
+
+**Rust — actions.** Add `LspOp::DiagnosticGoto { forward, severity }` and
+`LspOp::DiagnosticSetloclist`. In `apply_lsp_op`: `DiagnosticGoto` sorts the cached
+`Vec<Diagnostic>` by `(line,col)`, picks the first strictly after/before
+`editor.cursor`, wraps, and moves the cursor — reuse the position math in
+`jump_to_lsp_location` (`lsp.rs:990`) minus the file-open (same buffer); don't
+duplicate the byte↔char conversion (reuse the encoding on `LspDocState`).
+`DiagnosticSetloclist` calls `diagnostics_location_list()` (`:644`) and opens the
+panel like `:LspDiagnostics` (`lib.rs:980`).
+
+**Lua — `prelude.lua` (new `vim.diagnostic` table):** `severity` constants;
+`vim._diagnostics` table; `get(bufnr,opts)` reading the mirror (0/`nil` bufnr →
+current, `opts.severity` filter, deepcopy out); `goto_next`/`goto_prev` →
+`vim._diagnostic_goto`; `setloclist` → `vim._diagnostic_setloclist`; `config` per the
+answer above.
+
+**Tests.** Seed canned diagnostics via the mock; assert `get(0)` returns them with
+correct fields + severity filter; `goto_next`/`goto_prev` move the cursor across two
+diagnostics and wrap; `setloclist` opens the navigable panel.
+
+---
+
+##### Slice 3 — `LspAttach` / `on_attach` / `server_capabilities`
+
+The slice that makes real nvim-lspconfig setups work and closes the gate.
+
+> **❓ Ask first (before coding Slice 3):**
+> - **`server_capabilities` shape** — start with the booleans common configs probe
+>   (`definitionProvider`, `hoverProvider`, `renameProvider`, `completionProvider`,
+>   `documentFormattingProvider`) and grow on demand, or mirror a fuller capabilities
+>   table now? *(default: the minimal boolean set)*
+> - **`LspDetach`** — fire it this slice (on `didClose`/server-exit), or defer until a
+>   plugin needs it? *(default: fire it now, symmetric with `LspAttach`)*
+
+**Rust — surface capabilities.** `manager.rs:78` already distills capabilities; carry
+them into `LspDocState` on attach and build a `client` Lua table
+`{ id, name, server_capabilities = {…} }` when firing the event.
+
+**Rust — fire the event.** On `initialized` + buffer bound (the attach moment), fire
+`LspAttach` through `fire_autocmd_buf` (`lib.rs:830`) with `data = { client_id, buf }`;
+mirror `LspDetach` on `didClose`/exit. Reuse the `announced` once-gate (`lib.rs:177`)
+so re-entry doesn't re-fire.
+
+**Lua — invoke `on_attach`.** Add a default `LspAttach` autocmd in the
+`nxvim.lsp.enable` augroup (`prelude.lua:1079`) that resolves the client by
+`args.data.client_id` and calls `cfg.on_attach(client, args.buf)` — this is what lets
+`on_attach` set buffer-local maps (`vim.keymap.set('n','gd',vim.lsp.buf.definition,{buffer=args.buf})`).
+
+**Tests.**
+- An `on_attach` that sets a buffer-local `gd` runs on attach and fires
+  `vim.lsp.buf.definition`.
+- `client.server_capabilities.hoverProvider` is readable inside `on_attach`.
+- **Done-when gate (`lspconfig.rs`):** extend the real-nvim-lspconfig e2e so a
+  user-style config (`vim.lsp.enable` + `on_attach` keymaps) exercises diagnostics +
+  go-to + hover + completion + format end-to-end; gates green.
+
+**Conventions reminder (CLAUDE.md).** No unit tests — all coverage is black-box in
+`crates/nxvim/tests/lsp.rs` / `lspconfig.rs` against the mock (or real lspconfig for
+the gate). `nxvim-core` stays LSP-free.
 
 ---
 

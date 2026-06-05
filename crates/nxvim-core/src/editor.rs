@@ -349,6 +349,491 @@ impl MotionResult {
     }
 }
 
+// ===== Normal / visual command grammar =====================================
+//
+// The normal/visual key sequence is parsed in two clean halves. [`parse_step`]
+// (pure: no buffer, no `&mut`) is the *grammar* — it decides whether a key
+// extends, completes, or aborts a command, and emits a typed [`ResolvedCommand`]
+// describing what to do. [`Editor::execute`] is the *effect* — it applies that
+// command to the buffer through the existing helpers. The typed motion / object
+// / find enums below are the contract between the two: a new built-in is a new
+// variant the compiler forces into both the parse arm and the effect arm, so the
+// two can never silently drift (this is what lets the keymap matcher reuse
+// `parse_step` as a read-only command oracle without mirroring the executor).
+
+/// A normal/visual cursor motion. The motion *alphabet* (which keys are motions)
+/// lives in [`classify_motion`]; where each motion *lands* lives in
+/// [`Editor::resolve_motion`]. Note `w`/`W`, `b`/`B`, `e`/`E` collapse to one
+/// variant each — nxvim does not yet implement `WORD` motions, so the big-word
+/// keys behave identically to their small-word counterparts (preserved here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    Left,                         // h, <Left>, <BS>
+    Right,                        // l, <Right>, <Space>
+    LineStart,                    // 0, <Home>
+    FirstNonBlank,                // ^
+    LineEnd,                      // $, <End>
+    Down,                         // j, <Down>
+    Up,                           // k, <Up>
+    GotoLine,                     // G  (count = target line, default last)
+    GotoTop,                      // gg (count = target line, default first)
+    Word,                         // w / W
+    BackWord,                     // b / B
+    EndWord,                      // e / E
+    Find(FindKind, char),         // f/t/F/T {char}
+    FindRepeat { reverse: bool }, // ; (same) / , (reversed)
+}
+
+/// The four find-char motions. `f`/`t` search forward, `F`/`T` backward; `t`/`T`
+/// stop one grapheme short of the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindKind {
+    Find,     // f
+    Till,     // t
+    FindBack, // F
+    TillBack, // T
+}
+
+impl FindKind {
+    fn from_key(c: char) -> Option<FindKind> {
+        Some(match c {
+            'f' => FindKind::Find,
+            't' => FindKind::Till,
+            'F' => FindKind::FindBack,
+            'T' => FindKind::TillBack,
+            _ => return None,
+        })
+    }
+
+    /// `f`/`t` go forward (and feed an operator inclusively); `F`/`T` go backward.
+    fn forward(self) -> bool {
+        matches!(self, FindKind::Find | FindKind::Till)
+    }
+
+    /// `t`/`T` stop short of the target ("till"); `f`/`F` land on it.
+    fn till(self) -> bool {
+        matches!(self, FindKind::Till | FindKind::TillBack)
+    }
+
+    /// The direction-flipped kind used by `,` (and by `;` after a `,`): f↔F, t↔T.
+    fn reversed(self) -> FindKind {
+        match self {
+            FindKind::Find => FindKind::FindBack,
+            FindKind::FindBack => FindKind::Find,
+            FindKind::Till => FindKind::TillBack,
+            FindKind::TillBack => FindKind::Till,
+        }
+    }
+}
+
+/// A text-object kind (`iw`, `a(`, `i"`, `ap`, …). The object *alphabet* lives
+/// in [`ObjectKind::from_key`]; the range search lives in
+/// [`Editor::text_object_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectKind {
+    Word(bool),       // w (false) / W (true)
+    Pair(char, char), // (), {}, [], <>  (incl. b/B aliases)
+    Quote(char),      // " ' `
+    Sentence,         // s
+    Paragraph,        // p
+}
+
+impl ObjectKind {
+    fn from_key(c: char) -> Option<ObjectKind> {
+        Some(match c {
+            'w' => ObjectKind::Word(false),
+            'W' => ObjectKind::Word(true),
+            '(' | ')' | 'b' => ObjectKind::Pair('(', ')'),
+            '{' | '}' | 'B' => ObjectKind::Pair('{', '}'),
+            '[' | ']' => ObjectKind::Pair('[', ']'),
+            '<' | '>' => ObjectKind::Pair('<', '>'),
+            '"' | '\'' | '`' => ObjectKind::Quote(c),
+            's' => ObjectKind::Sentence,
+            'p' => ObjectKind::Paragraph,
+            _ => return None,
+        })
+    }
+}
+
+/// A terminal single-key normal/visual command (everything that is neither a
+/// motion, an operator, a text object, nor `r{char}`). Classified in
+/// [`parse_command`], applied in [`Editor::execute_normal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalCmd {
+    InsertBefore,                                    // i
+    InsertLineStart,                                 // I
+    InsertAfter,                                     // a
+    InsertLineEnd,                                   // A
+    OpenBelow,                                       // o
+    OpenAbove,                                       // O
+    DeleteUnder,                                     // x
+    DeleteBefore,                                    // X
+    DeleteToEol,                                     // D
+    ChangeToEol,                                     // C
+    SubstituteChar,                                  // s
+    EnterReplace,                                    // R
+    PasteAfter,                                      // p
+    PasteBefore,                                     // P
+    Undo,                                            // u
+    Redo,                                            // <C-r>
+    Join,                                            // J
+    ToggleCase,                                      // ~
+    EnterVisual,                                     // v
+    EnterVisualLine,                                 // V
+    EnterCommand,                                    // :
+    EnterSearch(SearchDir),                          // / ?
+    SearchNext,                                      // n
+    SearchPrev,                                      // N
+    SearchWord { dir: SearchDir, whole_word: bool }, // * # (g* g# drop boundaries)
+    ScrollHalf(bool),                                // <C-d> (true) / <C-u> (false)
+    ScrollPage(bool),                                // <C-f> (true) / <C-b> (false)
+    AltBuffer,                                       // <C-^> / <C-6>
+}
+
+/// The stage of a partially-typed command — what the *next* key means. The
+/// `g`-prefix, find-char, replace, and text-object sub-states were eight
+/// scattered `Editor` booleans/options; they are one enum now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Stage {
+    /// Accumulating a count and/or awaiting a command, operator, or motion.
+    #[default]
+    Start,
+    /// Saw a lone `g`; the next key may complete `gg`/`g*`/`g#`.
+    GPending,
+    /// Saw `f`/`t`/`F`/`T`; the next key is the target char.
+    FindPending(FindKind),
+    /// Saw `r`; the next key is the replacement char.
+    ReplacePending,
+    /// Saw `i`/`a` (operator-pending or visual); the next key is the object kind.
+    TextObjectPending(char),
+}
+
+/// The accumulated, not-yet-complete normal/visual command — one value in place
+/// of the old scattered `count`/`op_count`/`operator`/`gpending`/… fields.
+#[derive(Debug, Clone, Default)]
+struct PendingCommand {
+    /// Count typed after any operator (`d`**2**`w`), or the sole count (`3j`).
+    count: Option<usize>,
+    /// Count typed before an operator (`2`d`w`), stashed when the operator armed.
+    op_count: Option<usize>,
+    /// Pending operator (`d`/`c`/`y`) awaiting its motion / text object.
+    operator: Option<char>,
+    /// What the next key continues; see [`Stage`].
+    stage: Stage,
+}
+
+/// A fully-resolved normal/visual command, ready for [`Editor::execute`].
+enum ResolvedCommand {
+    /// A motion — plain movement, or (when `pending.operator` is set) its range.
+    Motion(Motion),
+    /// A doubled operator over `count` lines (`dd`/`cc`/`yy`).
+    DoubledOperator(char),
+    /// An operator awaiting a search motion (`d/`, `c?`): open the search prompt.
+    OperatorSearch { op: char, dir: SearchDir },
+    /// A text object in operator-pending or visual mode (`diw`, `va(`).
+    TextObject { ia: char, kind: ObjectKind },
+    /// `r{char}`.
+    Replace(char),
+    /// A visual-mode operator on the current selection (`d`/`y`/`c`).
+    VisualOperate(char),
+    /// A terminal single-key command (insert, paste, scroll, …).
+    Normal(NormalCmd),
+}
+
+/// What [`parse_step`] decides for `(pending, key)`. Pure: no buffer, no
+/// mutation — the matcher's command oracle folds over this same function.
+enum ParseStep {
+    /// Incomplete: keep accumulating with this updated pending state.
+    Prefix(PendingCommand),
+    /// A whole command, ready to execute.
+    Complete(ResolvedCommand),
+    /// `<Esc>`: reset all pending state, and leave visual mode.
+    Cancel,
+    /// Reset all pending state (a dead-end key / `r`-cancel); mode unchanged.
+    Reset,
+    /// An object/find key with no match: in visual keep the selection (and any
+    /// count), else reset — mirroring the old find / text-object abort paths.
+    AbortObject,
+}
+
+/// Map a key to its [`Motion`], or `None` if it is not a (g-free) motion key.
+/// This is the motion alphabet; [`Editor::resolve_motion`] is its counterpart
+/// that computes where each lands. `f`/`t`/`F`/`T` are not here — they open a
+/// [`Stage::FindPending`] first — and `gg` is handled by the g-prefix stage.
+fn classify_motion(key: Key) -> Option<Motion> {
+    let ch = key.as_char();
+    Some(match (key.code, ch) {
+        (KeyCode::Left, _) | (_, Some('h')) | (KeyCode::Backspace, _) => Motion::Left,
+        (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => Motion::Right,
+        (_, Some('0')) | (KeyCode::Home, _) => Motion::LineStart,
+        (_, Some('^')) => Motion::FirstNonBlank,
+        (_, Some('$')) | (KeyCode::End, _) => Motion::LineEnd,
+        (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => Motion::Down,
+        (KeyCode::Up, _) | (_, Some('k')) => Motion::Up,
+        (_, Some('G')) => Motion::GotoLine,
+        (_, Some('w')) | (_, Some('W')) => Motion::Word,
+        (_, Some('b')) | (_, Some('B')) => Motion::BackWord,
+        (_, Some('e')) | (_, Some('E')) => Motion::EndWord,
+        (_, Some(';')) => Motion::FindRepeat { reverse: false },
+        (_, Some(',')) => Motion::FindRepeat { reverse: true },
+        _ => return None,
+    })
+}
+
+/// THE normal/visual grammar — the single source of truth shared by the editor's
+/// executor and (in a later phase) the keymap matcher's oracle. Pure: it reads
+/// only `mode`, the accumulated `pending`, and `key`, and never touches the
+/// buffer. Mirrors, arm for arm, the dispatch the old `handle_normal` /
+/// `handle_normal_command` performed inline.
+fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
+    use ParseStep::*;
+
+    // `r{char}` is checked before `<Esc>` (as in `handle_normal`): `r<Esc>` (or a
+    // non-char key) cancels with no replacement and no mode change.
+    if let Stage::ReplacePending = pending.stage {
+        return match key.as_char() {
+            Some(c) => Complete(ResolvedCommand::Replace(c)),
+            None => Reset,
+        };
+    }
+
+    // `<Esc>` cancels pending state and leaves visual mode — ahead of the find /
+    // text-object argument stages, exactly as the old top-level branch was.
+    if key.code == KeyCode::Esc {
+        return Cancel;
+    }
+
+    // Argument stages: the next key is consumed as data, not re-parsed.
+    match pending.stage {
+        Stage::FindPending(kind) => {
+            return match key.as_char() {
+                Some(target) => Complete(ResolvedCommand::Motion(Motion::Find(kind, target))),
+                None => AbortObject,
+            };
+        }
+        Stage::TextObjectPending(ia) => {
+            return match key.as_char().and_then(ObjectKind::from_key) {
+                Some(kind) => Complete(ResolvedCommand::TextObject { ia, kind }),
+                None => AbortObject,
+            };
+        }
+        Stage::Start | Stage::GPending => {}
+        Stage::ReplacePending => unreachable!("handled above"),
+    }
+
+    // Count accumulation (Start and GPending only). `0` is a motion unless a
+    // count is already building.
+    if let Some(c) = key.as_char() {
+        if c.is_ascii_digit() && !(c == '0' && pending.count.is_none()) {
+            let d = c as usize - '0' as usize;
+            let mut next = pending.clone();
+            next.count = Some(pending.count.unwrap_or(0) * 10 + d);
+            return Prefix(next);
+        }
+    }
+
+    let gpending = pending.stage == Stage::GPending;
+
+    // `g` prefix: a lone `g` arms it; a second `g` is `gg`.
+    if gpending {
+        if key.as_char() == Some('g') {
+            return Complete(ResolvedCommand::Motion(Motion::GotoTop));
+        }
+    } else if key.as_char() == Some('g') {
+        let mut next = pending.clone();
+        next.stage = Stage::GPending;
+        return Prefix(next);
+    }
+
+    // `i`/`a` introduce a text object when an operator is pending or in visual.
+    if pending.operator.is_some() || mode.is_visual() {
+        if let Some(c @ ('i' | 'a')) = key.as_char() {
+            let mut next = pending.clone();
+            next.stage = Stage::TextObjectPending(c);
+            return Prefix(next);
+        }
+    }
+
+    // `f`/`t`/`F`/`T` begin a find-char motion (the target follows).
+    if let Some(kind) = key.as_char().and_then(FindKind::from_key) {
+        let mut next = pending.clone();
+        next.stage = Stage::FindPending(kind);
+        return Prefix(next);
+    }
+
+    // Direct motions — but while g-pending only `gg` (handled above) is a motion,
+    // matching `resolve_motion`'s old `if self.gpending { … }` short-circuit.
+    if !gpending {
+        if let Some(m) = classify_motion(key) {
+            return Complete(ResolvedCommand::Motion(m));
+        }
+    }
+
+    parse_command(mode, pending, key, gpending)
+}
+
+/// The terminal / operator-continuation half of [`parse_step`]: everything that
+/// is not a count, g-prefix, text-object intro, find intro, or direct motion.
+/// `gpending` only affects whether `*`/`#` keep word boundaries.
+fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool) -> ParseStep {
+    use NormalCmd as N;
+    use ParseStep::*;
+    use ResolvedCommand as RC;
+
+    // With an operator pending only a doubled operator, a search-motion hand-off,
+    // or a cancel reaches here (motions were resolved just above).
+    if let Some(op) = pending.operator {
+        return match key.as_char() {
+            Some(c) if c == op => Complete(RC::DoubledOperator(op)),
+            Some('/') => Complete(RC::OperatorSearch {
+                op,
+                dir: SearchDir::Forward,
+            }),
+            Some('?') => Complete(RC::OperatorSearch {
+                op,
+                dir: SearchDir::Backward,
+            }),
+            _ => Reset,
+        };
+    }
+
+    // Ctrl-keyed scrolling, redo, and the alternate-buffer toggle.
+    if key.ctrl {
+        return match key.code {
+            KeyCode::Char('d') => Complete(RC::Normal(N::ScrollHalf(true))),
+            KeyCode::Char('u') => Complete(RC::Normal(N::ScrollHalf(false))),
+            KeyCode::Char('f') => Complete(RC::Normal(N::ScrollPage(true))),
+            KeyCode::Char('b') => Complete(RC::Normal(N::ScrollPage(false))),
+            KeyCode::Char('r') => Complete(RC::Normal(N::Redo)),
+            KeyCode::Char('^') | KeyCode::Char('6') => Complete(RC::Normal(N::AltBuffer)),
+            _ => Reset,
+        };
+    }
+
+    let c = match key.as_char() {
+        Some(c) => c,
+        None => return Reset,
+    };
+
+    // Visual-mode operators act on the selection immediately.
+    if mode.is_visual() {
+        match c {
+            'd' | 'x' => return Complete(RC::VisualOperate('d')),
+            'y' => return Complete(RC::VisualOperate('y')),
+            'c' | 's' => return Complete(RC::VisualOperate('c')),
+            'v' => return Complete(RC::Normal(N::EnterVisual)),
+            'V' => return Complete(RC::Normal(N::EnterVisualLine)),
+            ':' => return Complete(RC::Normal(N::EnterCommand)),
+            _ => {}
+        }
+    }
+
+    match c {
+        'i' => Complete(RC::Normal(N::InsertBefore)),
+        'I' => Complete(RC::Normal(N::InsertLineStart)),
+        'a' => Complete(RC::Normal(N::InsertAfter)),
+        'A' => Complete(RC::Normal(N::InsertLineEnd)),
+        'o' => Complete(RC::Normal(N::OpenBelow)),
+        'O' => Complete(RC::Normal(N::OpenAbove)),
+        'x' => Complete(RC::Normal(N::DeleteUnder)),
+        'X' => Complete(RC::Normal(N::DeleteBefore)),
+        'D' => Complete(RC::Normal(N::DeleteToEol)),
+        'C' => Complete(RC::Normal(N::ChangeToEol)),
+        's' => Complete(RC::Normal(N::SubstituteChar)),
+        'R' => Complete(RC::Normal(N::EnterReplace)),
+        'd' | 'c' | 'y' => {
+            // Begin an operator (prefix): move count → op_count, drop g-pending.
+            let mut next = pending.clone();
+            next.operator = Some(c);
+            next.op_count = pending.count;
+            next.count = None;
+            next.stage = Stage::Start;
+            Prefix(next)
+        }
+        'r' => {
+            let mut next = pending.clone();
+            next.stage = Stage::ReplacePending;
+            Prefix(next)
+        }
+        'p' => Complete(RC::Normal(N::PasteAfter)),
+        'P' => Complete(RC::Normal(N::PasteBefore)),
+        'u' => Complete(RC::Normal(N::Undo)),
+        'J' => Complete(RC::Normal(N::Join)),
+        '~' => Complete(RC::Normal(N::ToggleCase)),
+        'v' => Complete(RC::Normal(N::EnterVisual)),
+        'V' => Complete(RC::Normal(N::EnterVisualLine)),
+        ':' => Complete(RC::Normal(N::EnterCommand)),
+        '/' => Complete(RC::Normal(N::EnterSearch(SearchDir::Forward))),
+        '?' => Complete(RC::Normal(N::EnterSearch(SearchDir::Backward))),
+        'n' => Complete(RC::Normal(N::SearchNext)),
+        'N' => Complete(RC::Normal(N::SearchPrev)),
+        '*' => Complete(RC::Normal(N::SearchWord {
+            dir: SearchDir::Forward,
+            whole_word: !gpending,
+        })),
+        '#' => Complete(RC::Normal(N::SearchWord {
+            dir: SearchDir::Backward,
+            whole_word: !gpending,
+        })),
+        _ => Reset,
+    }
+}
+
+/// How a key run relates to the normal/visual command grammar, as seen by the
+/// keymap matcher's disambiguation oracle ([`command_status`]). Because it is a
+/// fold over the very same [`parse_step`] the executor runs, "is this a complete
+/// built-in?" can never drift from what actually executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStatus {
+    /// The run is a whole number of finished commands — it ends exactly on a
+    /// command boundary (e.g. `gg`, `dd`, `fx`).
+    Complete,
+    /// The run ends mid-command; more keys could still complete it (e.g. a lone
+    /// `g`, or `f` awaiting its target char).
+    Prefix,
+    /// No command runs this way — a dead-end key, a cancel, or an aborted
+    /// find/text-object argument.
+    Invalid,
+}
+
+/// Classify a key run against the normal/visual command grammar for `mode` by
+/// folding [`parse_step`] from a clean command boundary. This is the keymap
+/// matcher's **read-only** oracle: it consults the exact grammar the executor
+/// runs (never a mirror), so a built-in can never silently lag behind a colliding
+/// user mapping for want of being recognized.
+///
+/// Fold rule: start from a default [`PendingCommand`]; for each key call
+/// `parse_step`. On `Prefix(p)` carry `p` forward; on `Complete(_)` **reset to a
+/// fresh default** and keep folding the remainder (so a run of *several* finished
+/// commands still ends clean); on any cancel/reset/abort short-circuit to
+/// `Invalid`. The run is [`Complete`](CommandStatus::Complete) iff it ends on a
+/// boundary (nothing carried) and [`Prefix`](CommandStatus::Prefix) iff it ends
+/// mid-command.
+pub fn command_status(mode: Mode, keys: &[Key]) -> CommandStatus {
+    let mut pending = PendingCommand::default();
+    let mut at_boundary = true;
+    for &key in keys {
+        match parse_step(mode, &pending, key) {
+            ParseStep::Prefix(p) => {
+                pending = p;
+                at_boundary = false;
+            }
+            ParseStep::Complete(_) => {
+                pending = PendingCommand::default();
+                at_boundary = true;
+            }
+            ParseStep::Cancel | ParseStep::Reset | ParseStep::AbortObject => {
+                return CommandStatus::Invalid;
+            }
+        }
+    }
+    if at_boundary {
+        CommandStatus::Complete
+    } else {
+        CommandStatus::Prefix
+    }
+}
+
 /// A recorded scroll gesture (`<C-d>` / `<C-u>` / `<C-f>` / `<C-b>`) that moved
 /// the viewport, handed to the client so it can animate the slide. Lines/columns
 /// are absolute buffer lines; `duration_ms` is a suggested pacing the client may
@@ -529,22 +1014,14 @@ pub struct Editor {
     eol_request: bool,
     register: Register,
 
-    // pending normal-mode state
-    count: Option<usize>,
-    op_count: Option<usize>,
-    operator: Option<char>,
-    gpending: bool,
-    pending_replace: bool,
-    /// Set to `'i'` or `'a'` after a text-object introducer is seen while an
-    /// operator is pending or in visual mode; the next key is the object kind
-    /// (`w`, `(`, `{`, …). See `resolve` of the text object in `handle_normal`.
-    pending_textobject: Option<char>,
-    /// Set to `'f'`/`'t'`/`'F'`/`'T'` while waiting for the find-char target;
-    /// the next key is the character to find.
-    pending_find: Option<char>,
+    /// The accumulated, not-yet-complete normal/visual command — the count, the
+    /// pending operator, and the [`Stage`] of the in-progress sequence. Decided
+    /// by the pure [`parse_step`]; reset on every completed command.
+    pending: PendingCommand,
     /// The last find-char motion as `(kind, target)`, replayed by `;` (same
-    /// direction) and `,` (opposite). Persists across commands like vim.
-    last_find: Option<(char, char)>,
+    /// direction) and `,` (opposite). Cross-command memory, not pending state, so
+    /// it lives outside [`PendingCommand`] and survives `reset_pending`.
+    last_find: Option<(FindKind, char)>,
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
@@ -638,13 +1115,7 @@ impl Editor {
             preserve_desired: false,
             eol_request: false,
             register: Register::default(),
-            count: None,
-            op_count: None,
-            operator: None,
-            gpending: false,
-            pending_replace: false,
-            pending_textobject: None,
-            pending_find: None,
+            pending: PendingCommand::default(),
             last_find: None,
             snapshot_taken: false,
             visual_anchor: Cursor::default(),
@@ -1127,7 +1598,7 @@ impl Editor {
     /// one-shot replace that stays in normal mode). Clients use it to show the
     /// replace cursor shape, matching vim's operator-pending feedback.
     pub(crate) fn pending_replace(&self) -> bool {
-        self.pending_replace
+        self.pending.stage == Stage::ReplacePending
     }
 
     /// The fixed end of the visual selection (the other end is [`Self::cursor`]).
@@ -1143,290 +1614,174 @@ impl Editor {
 
     // ----- normal / visual mode --------------------------------------------
 
+    /// Drive one key through the normal/visual grammar. A thin loop: the pure
+    /// [`parse_step`] decides; [`Editor::execute`] (and the cancel arms here)
+    /// apply. All the old inline pending-state bookkeeping now lives in
+    /// `parse_step`, so this is the *only* place a normal-mode key enters and the
+    /// grammar has exactly one home.
     fn handle_normal(&mut self, key: Key) {
         self.message.clear();
-
-        // `r{char}` waits for one key, then overwrites; `r<Esc>` cancels.
-        if self.pending_replace {
-            self.pending_replace = false;
-            if key.code != KeyCode::Esc {
-                if let Some(c) = key.as_char() {
-                    let count = self.effective_count();
-                    self.replace_char(c, count);
-                }
-            }
-            self.reset_pending();
-            return;
-        }
-
-        // Escape cancels pending state / leaves visual mode.
-        if key.code == KeyCode::Esc {
-            self.operator = None;
-            self.count = None;
-            self.op_count = None;
-            self.gpending = false;
-            self.pending_textobject = None;
-            self.pending_find = None;
-            if self.mode.is_visual() {
-                self.mode = Mode::Normal;
-                self.clamp_cursor();
-            }
-            return;
-        }
-
-        // Second key of a text object (`iw`, `aw`, `i(`, `a{`, …). The first
-        // key armed `pending_textobject`; this key names the object kind.
-        if let Some(ia) = self.pending_textobject.take() {
-            let count = self.effective_count();
-            if let Some(obj) = key.as_char() {
-                if let Some((lo, hi, linewise)) = self.text_object_range(ia, obj, count) {
-                    self.apply_text_object(lo, hi, linewise);
-                    return;
-                }
-            }
-            // Unknown object char cancels, like vim. In visual mode the
-            // selection survives; in operator-pending the operator is dropped.
-            if self.mode.is_visual() {
-                self.gpending = false;
-            } else {
+        match parse_step(self.mode, &self.pending, key) {
+            ParseStep::Prefix(p) => self.pending = p,
+            ParseStep::Complete(cmd) => self.execute(cmd),
+            ParseStep::Cancel => {
                 self.reset_pending();
-            }
-            return;
-        }
-
-        // Target char of a pending find-char motion (`f`/`t`/`F`/`T`).
-        if let Some(kind) = self.pending_find.take() {
-            let count = self.effective_count();
-            if let Some(target) = key.as_char() {
-                self.last_find = Some((kind, target));
-                if let Some(m) = self.find_motion(kind, target, count, false) {
-                    self.gpending = false;
-                    self.apply_resolved_motion(m);
-                    return;
+                if self.mode.is_visual() {
+                    self.mode = Mode::Normal;
+                    self.clamp_cursor();
                 }
             }
-            // No match (or a non-char key): cancel like a failed motion.
-            if self.mode.is_visual() {
-                self.gpending = false;
-            } else {
-                self.reset_pending();
-            }
-            return;
-        }
-
-        // Count accumulation. `0` is a motion unless a count is already started.
-        if let Some(c) = key.as_char() {
-            if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) {
-                let d = c as usize - '0' as usize;
-                self.count = Some(self.count.unwrap_or(0) * 10 + d);
-                return;
+            ParseStep::Reset => self.reset_pending(),
+            ParseStep::AbortObject => {
+                // A find/text-object miss: in visual the selection (and count)
+                // survive — only the half-typed object is dropped; otherwise the
+                // whole pending command, operator included, is cancelled.
+                if self.mode.is_visual() {
+                    self.pending.stage = Stage::Start;
+                } else {
+                    self.reset_pending();
+                }
             }
         }
-
-        // `g` prefix (gg, etc.).
-        if !self.gpending {
-            if let Some('g') = key.as_char() {
-                self.gpending = true;
-                return;
-            }
-        }
-
-        // `i`/`a` introduce a text object when an operator is pending or we're
-        // in visual mode. (In plain normal mode they stay insert/append, so
-        // this only fires in those two contexts.) The object kind follows on
-        // the next key, handled by the `pending_textobject` block above.
-        if self.operator.is_some() || self.mode.is_visual() {
-            if let Some(c @ ('i' | 'a')) = key.as_char() {
-                self.pending_textobject = Some(c);
-                return;
-            }
-        }
-
-        // `f`/`t`/`F`/`T` begin a find-char motion; the target follows on the
-        // next key (handled by the `pending_find` block above).
-        if let Some(c @ ('f' | 't' | 'F' | 'T')) = key.as_char() {
-            self.gpending = false;
-            self.pending_find = Some(c);
-            return;
-        }
-
-        // Operator + motion resolution.
-        let raw = if self.operator.is_some() {
-            self.op_count.or(self.count)
-        } else {
-            self.count
-        };
-        let count = self.effective_count();
-
-        if let Some(m) = self.resolve_motion(key, count, raw) {
-            self.gpending = false;
-            self.apply_resolved_motion(m);
-            return;
-        }
-
-        let gstar = self.gpending;
-        self.gpending = false;
-        self.handle_normal_command(key, count, gstar);
     }
 
-    fn handle_normal_command(&mut self, key: Key, count: usize, gstar: bool) {
-        // With an operator pending, the only thing that lands here is a doubled
-        // operator (dd/cc/yy) or a search motion (`d/`,`y?`); anything else
-        // cancels the pending operator.
-        if let Some(op) = self.operator {
-            match key.as_char() {
-                Some(c) if c == op => self.begin_operator(op),
-                // Open a search prompt as an operator motion; the committed <CR>
-                // applies `op` over the match (see `submit_search`).
-                Some('/') => {
-                    self.search_operator = Some(op);
-                    self.enter_search(SearchDir::Forward, count);
+    /// Apply a fully-resolved command to the buffer, delegating to the existing
+    /// effect helpers. The grammar is gone from here — `execute` only dispatches
+    /// on the typed [`ResolvedCommand`] `parse_step` produced, so the parse and
+    /// the effect cannot drift.
+    fn execute(&mut self, cmd: ResolvedCommand) {
+        match cmd {
+            ResolvedCommand::Motion(m) => {
+                // `f`/`t`/`F`/`T` and `;`/`,` set the find memory even on a miss,
+                // matching the old `pending_find` block.
+                if let Motion::Find(kind, target) = m {
+                    self.last_find = Some((kind, target));
                 }
-                Some('?') => {
-                    self.search_operator = Some(op);
-                    self.enter_search(SearchDir::Backward, count);
+                match self.resolve_motion(m) {
+                    Some(mr) => self.apply_resolved_motion(mr),
+                    // A find/`;`/`,` that doesn't match (or `;`/`,` with no prior
+                    // find): an *execution* miss, not a grammar one. Cancel as the
+                    // old failed-motion paths did — visual `f`-miss keeps the
+                    // count, every other miss resets.
+                    None => match m {
+                        Motion::Find(..) if self.mode.is_visual() => {
+                            self.pending.stage = Stage::Start;
+                        }
+                        _ => self.reset_pending(),
+                    },
                 }
-                _ => self.reset_pending(),
             }
-            return;
-        }
-
-        // Ctrl-keyed scrolling, redo, and the alternate-buffer toggle.
-        if key.ctrl {
-            match key.code {
-                KeyCode::Char('d') => self.scroll_half(true),
-                KeyCode::Char('u') => self.scroll_half(false),
-                KeyCode::Char('f') => self.scroll_page(true),
-                KeyCode::Char('b') => self.scroll_page(false),
-                KeyCode::Char('r') => self.redo(),
-                // `<C-^>` / `<C-6>`: jump to the alternate buffer (`#`).
-                KeyCode::Char('^') | KeyCode::Char('6') => self.goto_alternate(),
-                _ => {}
+            ResolvedCommand::DoubledOperator(op) => self.begin_operator(op),
+            ResolvedCommand::OperatorSearch { op, dir } => {
+                let count = self.effective_count();
+                self.search_operator = Some(op);
+                self.enter_search(dir, count);
             }
-            self.reset_pending();
-            return;
-        }
-
-        let c = match key.as_char() {
-            Some(c) => c,
-            None => {
+            ResolvedCommand::TextObject { ia, kind } => {
+                let count = self.effective_count();
+                if let Some((lo, hi, linewise)) = self.text_object_range(ia, kind, count) {
+                    self.apply_text_object(lo, hi, linewise);
+                } else if self.mode.is_visual() {
+                    // No object at the cursor: keep the selection (and count).
+                    self.pending.stage = Stage::Start;
+                } else {
+                    self.reset_pending();
+                }
+            }
+            ResolvedCommand::Replace(c) => {
+                let count = self.effective_count();
+                self.replace_char(c, count);
                 self.reset_pending();
-                return;
             }
-        };
-
-        // Visual-mode operators act on the selection immediately.
-        if self.mode.is_visual() {
-            match c {
-                'd' | 'x' => {
-                    self.visual_operate('d');
-                    return;
-                }
-                'y' => {
-                    self.visual_operate('y');
-                    return;
-                }
-                'c' | 's' => {
-                    self.visual_operate('c');
-                    return;
-                }
-                'v' => {
-                    self.mode = Mode::Visual;
-                    return;
-                }
-                'V' => {
-                    self.mode = Mode::VisualLine;
-                    return;
-                }
-                ':' => {
-                    self.enter_command();
-                    return;
-                }
-                _ => {}
-            }
+            ResolvedCommand::VisualOperate(op) => self.visual_operate(op),
+            ResolvedCommand::Normal(cmd) => self.execute_normal(cmd),
         }
+    }
 
-        match c {
-            'i' => self.enter_insert_at(self.cursor.col),
-            'I' => {
+    /// Apply a terminal single-key command. Each arm is the old `handle_normal_
+    /// command` body verbatim; the dispatch is now on the typed [`NormalCmd`]
+    /// rather than a re-matched raw key.
+    fn execute_normal(&mut self, cmd: NormalCmd) {
+        let count = self.effective_count();
+        match cmd {
+            NormalCmd::InsertBefore => self.enter_insert_at(self.cursor.col),
+            NormalCmd::InsertLineStart => {
                 let col = self.first_non_blank(self.cursor.line);
                 self.enter_insert_at(col);
             }
-            'a' => {
+            NormalCmd::InsertAfter => {
                 let col = (self.cursor.col + 1).min(self.line_len());
                 self.enter_insert_at(col);
             }
-            'A' => self.enter_insert_at(self.line_len()),
-            'o' => self.open_line(true),
-            'O' => self.open_line(false),
-            'x' => self.delete_under_cursor(count),
-            'X' => self.delete_before_cursor(count),
-            'D' => self.delete_to_eol(),
-            'C' => {
+            NormalCmd::InsertLineEnd => self.enter_insert_at(self.line_len()),
+            NormalCmd::OpenBelow => self.open_line(true),
+            NormalCmd::OpenAbove => self.open_line(false),
+            NormalCmd::DeleteUnder => self.delete_under_cursor(count),
+            NormalCmd::DeleteBefore => self.delete_before_cursor(count),
+            NormalCmd::DeleteToEol => self.delete_to_eol(),
+            NormalCmd::ChangeToEol => {
                 self.delete_to_eol();
                 self.mode = Mode::Insert;
                 self.snapshot_taken = true;
             }
-            's' => {
+            NormalCmd::SubstituteChar => {
                 self.delete_under_cursor(count);
                 self.mode = Mode::Insert;
                 self.snapshot_taken = true;
             }
-            'd' | 'c' | 'y' => {
-                self.begin_operator(c);
-                return;
-            }
-            'r' => {
-                self.pending_replace = true;
-                return;
-            }
-            'R' => {
+            NormalCmd::PasteAfter => self.paste(true, count),
+            NormalCmd::PasteBefore => self.paste(false, count),
+            NormalCmd::Undo => self.undo(),
+            NormalCmd::Redo => self.redo(),
+            NormalCmd::Join => self.join_lines(count.max(2)),
+            NormalCmd::ToggleCase => self.toggle_case(count),
+            // `R` enters Replace mode: snapshot for undo, then overtype until
+            // `<Esc>` (the insert handler honors `Mode::Replace`).
+            NormalCmd::EnterReplace => {
                 self.push_undo();
                 self.snapshot_taken = true;
                 self.mode = Mode::Replace;
             }
-            'p' => self.paste(true, count),
-            'P' => self.paste(false, count),
-            'u' => self.undo(),
-            'J' => self.join_lines(count.max(2)),
-            '~' => self.toggle_case(count),
-            'v' => {
+            // From normal mode entering visual anchors the selection; from visual
+            // mode `v`/`V` only switch the selection's shape, leaving the anchor.
+            NormalCmd::EnterVisual => {
+                if !self.mode.is_visual() {
+                    self.visual_anchor = self.cursor;
+                }
                 self.mode = Mode::Visual;
-                self.visual_anchor = self.cursor;
             }
-            'V' => {
+            NormalCmd::EnterVisualLine => {
+                if !self.mode.is_visual() {
+                    self.visual_anchor = self.cursor;
+                }
                 self.mode = Mode::VisualLine;
-                self.visual_anchor = self.cursor;
             }
-            ':' => self.enter_command(),
-            '/' => self.enter_search(SearchDir::Forward, count),
-            '?' => self.enter_search(SearchDir::Backward, count),
-            'n' => self.search_repeat(true, count),
-            'N' => self.search_repeat(false, count),
-            // `*`/`#` search the word under the cursor (whole-word); `g*`/`g#`
-            // drop the word boundaries.
-            '*' => self.search_word_under_cursor(SearchDir::Forward, !gstar, count),
-            '#' => self.search_word_under_cursor(SearchDir::Backward, !gstar, count),
-            _ => {}
+            NormalCmd::EnterCommand => self.enter_command(),
+            NormalCmd::EnterSearch(dir) => self.enter_search(dir, count),
+            NormalCmd::SearchNext => self.search_repeat(true, count),
+            NormalCmd::SearchPrev => self.search_repeat(false, count),
+            NormalCmd::SearchWord { dir, whole_word } => {
+                self.search_word_under_cursor(dir, whole_word, count)
+            }
+            NormalCmd::ScrollHalf(down) => self.scroll_half(down),
+            NormalCmd::ScrollPage(down) => self.scroll_page(down),
+            NormalCmd::AltBuffer => self.goto_alternate(),
         }
         self.reset_pending();
     }
 
+    /// Apply a doubled operator (`dd`/`cc`/`yy`): linewise over `count` lines.
+    /// Only reached once the operator is already pending (the first `d`/`c`/`y`
+    /// armed it in [`parse_command`]), so this is purely the doubled path.
     fn begin_operator(&mut self, op: char) {
-        if self.operator == Some(op) {
-            // Doubled operator: linewise over `count` lines.
-            let count = self.effective_count();
-            let last = self.cursor.line + count - 1;
-            let target = self.buffer().line_start(last.min(self.last_line()));
-            // axis is unused for the operator path, but the field is required.
-            let m = MotionResult::linewise(target, MoveAxis::LineAnchor);
-            self.operator = None;
-            self.apply_operator(op, m);
-            self.reset_pending();
-        } else {
-            self.operator = Some(op);
-            self.op_count = self.count.take();
-        }
+        let count = self.effective_count();
+        let last = self.cursor.line + count - 1;
+        let target = self.buffer().line_start(last.min(self.last_line()));
+        // axis is unused for the operator path, but the field is required.
+        let m = MotionResult::linewise(target, MoveAxis::LineAnchor);
+        self.pending.operator = None;
+        self.apply_operator(op, m);
+        self.reset_pending();
     }
 
     // ----- motions ----------------------------------------------------------
@@ -1435,27 +1790,30 @@ impl Editor {
     /// otherwise as plain cursor movement (recording the pre-move position so
     /// an off-screen jump animates its scroll, like the explicit scrolls).
     fn apply_resolved_motion(&mut self, m: MotionResult) {
-        if let Some(op) = self.operator.take() {
+        if let Some(op) = self.pending.operator.take() {
             self.apply_operator(op, m);
-            self.reset_pending();
         } else {
             self.scroll_from = Some((self.top, self.cursor.line));
             self.apply_movement(m);
-            self.count = None;
         }
+        // A completed motion clears the whole pending command. (The old movement
+        // path only cleared `count`, but operator/g-prefix/find were already
+        // cleared before it ran, so a full reset is equivalent — and now correct,
+        // since `parse_step` leaves the stage set until the command finishes.)
+        self.reset_pending();
     }
 
     /// Build a find-char motion. Forward (`f`/`t`) is inclusive, backward
     /// (`F`/`T`) is exclusive, matching how vim feeds these to an operator.
     fn find_motion(
         &self,
-        kind: char,
+        kind: FindKind,
         target: char,
         count: usize,
         repeat: bool,
     ) -> Option<MotionResult> {
         let pos = self.find_char_target(kind, target, count, repeat)?;
-        if matches!(kind, 'f' | 't') {
+        if kind.forward() {
             Some(MotionResult::inclusive(pos))
         } else {
             Some(MotionResult::exclusive(pos))
@@ -1468,7 +1826,7 @@ impl Editor {
     /// adjacent match for `t`/`T`, so repeats make progress instead of sticking.
     fn find_char_target(
         &self,
-        kind: char,
+        kind: FindKind,
         target: char,
         count: usize,
         repeat: bool,
@@ -1477,10 +1835,10 @@ impl Editor {
         let s = self.buffer().line(line);
         let base = self.buffer().line_start(line);
         let cur = self.cursor.col;
-        let till = matches!(kind, 't' | 'T');
+        let till = kind.till();
         let char_at = |col: usize| s[col..].chars().next();
 
-        let hit = if matches!(kind, 'f' | 't') {
+        let hit = if kind.forward() {
             let mut col = unicode::next_grapheme(&s, cur);
             if till && repeat && col < s.len() && char_at(col) == Some(target) {
                 col = unicode::next_grapheme(&s, col);
@@ -1538,41 +1896,37 @@ impl Editor {
         hit.map(|col| base + col)
     }
 
-    fn resolve_motion(&self, key: Key, count: usize, raw: Option<usize>) -> Option<MotionResult> {
+    /// Where a [`Motion`] lands, as a [`MotionResult`]. The motion *alphabet*
+    /// lives in [`classify_motion`]; this is its effect counterpart — it `match`es
+    /// the typed enum exhaustively, so a new motion variant must be handled here
+    /// too (the compiler enforces it). Returns `None` only for *execution* misses
+    /// (a find/`;`/`,` with no match, or `;`/`,` before any find), never for a
+    /// classification disagreement. The count and the un-defaulted `raw` count are
+    /// derived from the pending command, exactly as the old caller computed them.
+    fn resolve_motion(&self, motion: Motion) -> Option<MotionResult> {
         let line = self.cursor.line;
         let last_line = self.last_line();
+        let count = self.effective_count();
+        let raw = if self.pending.operator.is_some() {
+            self.pending.op_count.or(self.pending.count)
+        } else {
+            self.pending.count
+        };
 
-        let kc = key.code;
-        let ch = key.as_char();
-
-        if self.gpending {
-            if ch == Some('g') {
+        let result = match motion {
+            Motion::GotoTop => {
                 let target_line = raw.map(|n| n - 1).unwrap_or(0).min(last_line);
                 let target = self.buffer().line_start(target_line);
-                return Some(MotionResult::linewise(target, MoveAxis::LineAnchor));
+                MotionResult::linewise(target, MoveAxis::LineAnchor)
             }
-            return None;
-        }
-
-        // `;` repeats the last find-char motion; `,` repeats it reversed.
-        if ch == Some(';') || ch == Some(',') {
-            let (kind, target) = self.last_find?;
-            let kind = if ch == Some(',') {
-                match kind {
-                    'f' => 'F',
-                    'F' => 'f',
-                    't' => 'T',
-                    'T' => 't',
-                    other => other,
-                }
-            } else {
-                kind
-            };
-            return self.find_motion(kind, target, count, true);
-        }
-
-        let motion = match (kc, ch) {
-            (KeyCode::Left, _) | (_, Some('h')) | (KeyCode::Backspace, _) => {
+            // `;` repeats the last find-char motion; `,` repeats it reversed.
+            Motion::FindRepeat { reverse } => {
+                let (kind, target) = self.last_find?;
+                let kind = if reverse { kind.reversed() } else { kind };
+                return self.find_motion(kind, target, count, true);
+            }
+            Motion::Find(kind, target) => return self.find_motion(kind, target, count, false),
+            Motion::Left => {
                 let s = self.buffer().line(line);
                 let mut col = self.cursor.col;
                 for _ in 0..count {
@@ -1580,7 +1934,7 @@ impl Editor {
                 }
                 MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
-            (KeyCode::Right, _) | (_, Some('l')) | (_, Some(' ')) => {
+            Motion::Right => {
                 let s = self.buffer().line(line);
                 let mut col = self.cursor.col;
                 for _ in 0..count {
@@ -1588,14 +1942,12 @@ impl Editor {
                 }
                 MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
-            (_, Some('0')) | (KeyCode::Home, _) => {
-                MotionResult::exclusive(self.buffer().byte_at(line, 0))
-            }
-            (_, Some('^')) => {
+            Motion::LineStart => MotionResult::exclusive(self.buffer().byte_at(line, 0)),
+            Motion::FirstNonBlank => {
                 let col = self.first_non_blank(line);
                 MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
-            (_, Some('$')) | (KeyCode::End, _) => {
+            Motion::LineEnd => {
                 let l = (line + count - 1).min(last_line);
                 let s = self.buffer().line(l);
                 let col = unicode::prev_grapheme(&s, s.len());
@@ -1605,36 +1957,35 @@ impl Editor {
                     axis: MoveAxis::EndOfLine,
                 }
             }
-            (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => {
+            Motion::Down => {
                 let l = (line + count).min(last_line);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
-            (KeyCode::Up, _) | (_, Some('k')) => {
+            Motion::Up => {
                 let l = line.saturating_sub(count);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
-            (_, Some('G')) => {
+            Motion::GotoLine => {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
             }
-            (_, Some('w')) | (_, Some('W')) => self.word_motion(count),
-            (_, Some('b')) | (_, Some('B')) => {
+            Motion::Word => self.word_motion(count),
+            Motion::BackWord => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
                     idx = self.word_backward(idx);
                 }
                 MotionResult::exclusive(idx)
             }
-            (_, Some('e')) | (_, Some('E')) => {
+            Motion::EndWord => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
                     idx = self.word_end(idx);
                 }
                 MotionResult::inclusive(idx)
             }
-            _ => return None,
         };
-        Some(motion)
+        Some(result)
     }
 
     /// Resolve a `w`/`W` word motion. Special case: `cw` on a non-blank acts like
@@ -1642,7 +1993,7 @@ impl Editor {
     /// space — so it returns an inclusive end-of-word target instead.
     fn word_motion(&self, count: usize) -> MotionResult {
         let mut idx = self.cursor_char();
-        if self.operator == Some('c')
+        if self.pending.operator == Some('c')
             && idx <= self.last_char_idx()
             && char_class(self.char_at(idx)) != CharClass::Blank
         {
@@ -1754,20 +2105,20 @@ impl Editor {
     /// object. `ia` is `'i'` (inner) or `'a'` (a/around); `obj` is the object
     /// key. Returns `None` for an unknown object key or when no object exists
     /// at the cursor.
-    fn text_object_range(&self, ia: char, obj: char, count: usize) -> Option<(usize, usize, bool)> {
+    fn text_object_range(
+        &self,
+        ia: char,
+        kind: ObjectKind,
+        count: usize,
+    ) -> Option<(usize, usize, bool)> {
         // Charwise objects return `(lo, hi)`; tag them `false` here.
         let charwise = |r: Option<(usize, usize)>| r.map(|(lo, hi)| (lo, hi, false));
-        match obj {
-            'w' => charwise(self.word_object(ia, count, false)),
-            'W' => charwise(self.word_object(ia, count, true)),
-            '(' | ')' | 'b' => self.pair_object(ia, '(', ')'),
-            '{' | '}' | 'B' => self.pair_object(ia, '{', '}'),
-            '[' | ']' => self.pair_object(ia, '[', ']'),
-            '<' | '>' => self.pair_object(ia, '<', '>'),
-            '"' | '\'' | '`' => charwise(self.quote_object(ia, obj)),
-            's' => charwise(self.sentence_object(ia, count)),
-            'p' => self.paragraph_object(ia, count), // linewise
-            _ => None,
+        match kind {
+            ObjectKind::Word(big) => charwise(self.word_object(ia, count, big)),
+            ObjectKind::Pair(open, close) => self.pair_object(ia, open, close),
+            ObjectKind::Quote(q) => charwise(self.quote_object(ia, q)),
+            ObjectKind::Sentence => charwise(self.sentence_object(ia, count)),
+            ObjectKind::Paragraph => self.paragraph_object(ia, count), // linewise
         }
     }
 
@@ -1787,10 +2138,10 @@ impl Editor {
                 }
                 self.set_visual_span(lo, hi);
             }
-            self.gpending = false;
+            self.pending.stage = Stage::Start;
             return;
         }
-        if let Some(op) = self.operator.take() {
+        if let Some(op) = self.pending.operator.take() {
             if linewise {
                 let first_line = self.buffer().byte_to_line(lo);
                 self.apply_operator_to_range(op, lo, hi, true, first_line);
@@ -4417,17 +4768,11 @@ impl Editor {
     // ----- pending-state bookkeeping ---------------------------------------
 
     fn effective_count(&self) -> usize {
-        self.op_count.unwrap_or(1) * self.count.unwrap_or(1)
+        self.pending.op_count.unwrap_or(1) * self.pending.count.unwrap_or(1)
     }
 
     fn reset_pending(&mut self) {
-        self.count = None;
-        self.op_count = None;
-        self.operator = None;
-        self.gpending = false;
-        self.pending_replace = false;
-        self.pending_textobject = None;
-        self.pending_find = None;
+        self.pending = PendingCommand::default();
     }
 }
 

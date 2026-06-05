@@ -20,10 +20,24 @@
 //! ([`Keymaps::flush`], the `nxvim_input_flush` RPC) after `timeoutlen` of no
 //! input, which resolves the buffer exactly as the next-key break path would —
 //! keeping the server itself timer-free (design D4, Phase 4).
+//!
+//! **Built-in disambiguation (the colliding-prefix fix).** To avoid lagging a
+//! built-in behind a user map that merely shares its prefix (`gg` under a `gh`
+//! map), the break path consults the editor's *own* command grammar as a
+//! read-only oracle — [`nxvim_core::command_status`], a pure fold over the same
+//! `parse_step` the executor runs. When a withheld run has just replayed raw and
+//! re-feeding the next key would only re-withhold it, but that run plus the key
+//! already forms a *complete* built-in, the key is released to the editor at once
+//! (see [`Keymaps::feed_key`]). This keeps D1's spirit — the engine reads the
+//! grammar but mutates no editor state — while making every multi-key built-in
+//! instant under a colliding prefix. The idle flush above is now reached only for
+//! genuinely-ambiguous *mapped* prefixes and lone-prefix release; user maps still
+//! win (the oracle fires only where a run breaks every live mapping prefix). Full
+//! rationale: `docs/superpowers/specs/2026-06-05-keymap-builtin-disambiguation-design.md`.
 
 use std::collections::HashMap;
 
-use nxvim_core::{parse_keys, Key, Mode};
+use nxvim_core::{command_status, parse_keys, CommandStatus, Key, Mode};
 use nxvim_lua::{RawKeymap, RawRhs};
 
 use crate::lsp::LspReqKind;
@@ -365,7 +379,11 @@ impl Keymaps {
             let before = self.pending.len();
             let buffered: Vec<Key> = self.pending.drain(..).collect();
             if self.tries.contains_key(&mode_key) {
-                self.resolve_buffered(mode, &buffered, &mut steps);
+                // No next key on the flush path, so the break-path oracle does not
+                // apply here: a trailing live-prefix replays raw and the editor
+                // completes any built-in itself (the re-feeds inside `resolve_
+                // buffered` still route through `feed_key`, where the oracle runs).
+                let _ = self.resolve_buffered(mode, &buffered, &mut steps);
             } else {
                 // No trie for the current mode (the prefix was withheld in another
                 // mode, then the mode changed): the keys can't be a mapping here.
@@ -405,7 +423,31 @@ impl Keymaps {
                     // The key on its own starts no mapping: straight to the editor.
                     steps.push(Step::Editor(key));
                 } else {
-                    self.resolve_buffered(mode, &buffered, steps);
+                    let raw = self.resolve_buffered(mode, &buffered, steps);
+                    // Disambiguation oracle (design §"Matcher integration"). The
+                    // buffered prefix just replayed *raw* to the editor (no shorter
+                    // mapping fired — the raw-replay gate is `raw.is_some()`). If
+                    // re-feeding `key` would only re-withhold it as a fresh mapping
+                    // prefix, but that raw run *plus* `key` already forms a complete
+                    // built-in command, release `key` to the editor instead — so a
+                    // built-in like `gg` (under a colliding `gh` map) reaches the
+                    // editor whole and fires instantly, with no flush or next key.
+                    // The `would_hold` guard keeps user maps winning: a `key` that
+                    // completes or breaks a mapping takes the normal path untouched.
+                    if let Some(raw_run) = raw {
+                        let would_hold = matches!(
+                            self.tries[&mode_key].classify(std::slice::from_ref(&key)),
+                            Classify::Prefix
+                        );
+                        if would_hold {
+                            let mut run = raw_run;
+                            run.push(key);
+                            if command_status(mode, &run) == CommandStatus::Complete {
+                                steps.push(Step::Editor(key));
+                                return;
+                            }
+                        }
+                    }
                     self.feed_key(mode, key, steps);
                 }
             }
@@ -448,15 +490,30 @@ impl Keymaps {
     /// this terminates). With no complete prefix the withheld keys were not a
     /// mapping at all: replay them to the editor raw (re-feeding them would just
     /// re-withhold the same live prefix and loop).
-    fn resolve_buffered(&mut self, mode: Mode, buffered: &[Key], steps: &mut Vec<Step>) {
+    ///
+    /// Returns `Some(raw)` with the keys replayed raw when no shorter mapping
+    /// fired — the "released run" the break-path oracle splices the next key onto
+    /// — and `None` when a mapping fired (the raw-replay gate: a fired-then-
+    /// leftover run is not a clean built-in command sequence, so it never reaches
+    /// the oracle).
+    fn resolve_buffered(
+        &mut self,
+        mode: Mode,
+        buffered: &[Key],
+        steps: &mut Vec<Step>,
+    ) -> Option<Vec<Key>> {
         match self.tries[&mode_key(mode)].longest_complete(buffered) {
             Some((mapping, used)) => {
                 self.fire(mode, mapping, steps);
                 for &key in &buffered[used..] {
                     self.feed_key(mode, key, steps);
                 }
+                None
             }
-            None => steps.extend(buffered.iter().copied().map(Step::Editor)),
+            None => {
+                steps.extend(buffered.iter().copied().map(Step::Editor));
+                Some(buffered.to_vec())
+            }
         }
     }
 }

@@ -17,17 +17,20 @@
 vim.g.mapleader = " "
 
 --------------------------------------------------------------------------------
--- 1. PREFIX-vs-BUILTIN: with `gh` mapped, `g` becomes a live prefix.
+-- 1. AMBIGUOUS MAPPED PREFIX: `gg` is a real prefix of the `ggx` MAPPING.
 --    TYPE:  G            (jump to the last line, so the move is visible)
 --    TYPE:  gg           then STOP — don't press anything else.
---    SEE :  after ~1s the cursor jumps to the FIRST line. The second `g` was
---           withheld (it could have continued to `gh`); the idle flush replayed
---           it, so core saw `gg` (go-to-top) and moved on its own.
---    Before Phase 4 the cursor would sit still until you pressed another key.
---    (Pressing `gh` instead still fires the map below — type it to compare.)
+--    SEE :  after ~1s the cursor jumps to the FIRST line. `gg` is a live prefix
+--           of `ggx`, so it is genuinely held (a following `x` would take the
+--           map); the idle flush resolves it to the `gg` built-in because no `x`
+--           followed. TYPE `ggx` quickly instead and the MAPPING fires.
+--    NOTE:  a `gg` that does NOT prefix a mapping (e.g. with only `gh` mapped) is
+--           now INSTANT — no wait — via the built-in disambiguation. See the
+--           examples/keymap-builtin playground. The flush below is for the
+--           genuinely-ambiguous *mapped* case only.
 --------------------------------------------------------------------------------
-vim.keymap.set("n", "gh", function()
-  print("gh fired (the mapping, not the gg motion)")
+vim.keymap.set("n", "ggx", function()
+  print("ggx fired (the mapping; the held gg prefix completed it)")
 end)
 
 --------------------------------------------------------------------------------

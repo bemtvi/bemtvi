@@ -510,10 +510,13 @@ screen," and that is exactly the shape of these tests.
   *buffers* are implemented — see [*Buffers*](#buffers) — but there is still
   exactly one window onto one buffer.)
 - A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
-  `nvim_set_hl`, and `:colorscheme` are in place — enough to run the real
-  catppuccin colorscheme unmodified (see [*Lua*](#lua)) — but the surface grows
-  only as plugins demand it. Known gaps for richer plugins: `vim.treesitter` is a
-  stub (nxvim highlights out-of-process), `vim.keymap`/`vim.api.nvim_set_keymap`,
+  `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
+  (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
+  built-ins fire instantly even under a colliding user prefix, via the shared
+  command grammar `nxvim_core::command_status` the matcher consults) are in place
+  — enough to run the real catppuccin colorscheme unmodified (see [*Lua*](#lua))
+  — but the surface grows only as plugins demand it. Known gaps for richer
+  plugins: `vim.treesitter` is a stub (nxvim highlights out-of-process),
   `vim.loop`/`vim.uv`, the per-window API, and the `vim.lsp`/`vim.diagnostic` API
   (the LSP client itself is implemented natively — diagnostics, go-to, hover,
   signature help, behind a built-in config; see the

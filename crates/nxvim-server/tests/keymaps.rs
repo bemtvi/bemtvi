@@ -243,11 +243,12 @@ async fn multikey_map_fires_on_full_sequence() {
     assert_eq!(lines(&rpc).await, vec!["hello"], "g/h did not reach editor");
 }
 
-/// The withhold/replay engine: with `gh` mapped, an unmapped `g`-sequence still
-/// reaches the editor intact — the withheld `g` is replayed, so core's `gg`
-/// (go-to-top) still happens. (This is the exact behavior the LSP backport reuses
-/// for `gd` vs `gg`.) With no input timer a trailing live-prefix stays buffered
-/// until the next key flushes it, so a final motion (`0`) is sent to flush it.
+/// The withhold/replay engine plus the disambiguation oracle: with `gh` mapped,
+/// the unmapped built-in `gg` still reaches the editor intact — the withheld `g`
+/// is replayed and the second `g` released as a complete built-in, so go-to-top
+/// fires on the keystroke alone. (This is the exact behavior the LSP backport
+/// reuses for `gd` vs `gg`.) Before the unified disambiguation this needed a
+/// trailing flush key (`"gg0"`); the oracle now resolves it with no following key.
 #[tokio::test]
 async fn unmapped_prefix_sequence_reaches_the_editor() {
     let dir = temp_dir("keymap_replay");
@@ -262,13 +263,13 @@ async fn unmapped_prefix_sequence_reaches_the_editor() {
     assert_eq!(lines(&rpc).await, vec!["line1", "line2", "line3"]);
     assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
 
-    // `gg` → go to the first line. The trailing `g` is a live prefix of `gh`;
-    // the `0` both proves the replay and flushes that buffered `g`.
-    feed(&rpc, "gg0");
+    // `gg` → go to the first line, instantly: the second `g` completes a built-in
+    // (the oracle releases it) instead of re-withholding as a live prefix of `gh`.
+    feed(&rpc, "gg");
     assert_eq!(
         cursor(&rpc).await,
         (1, 0),
-        "the replayed g's executed gg (go-to-top), then 0 to column 0"
+        "gg reached the editor whole and went to the top — no flush key needed"
     );
     assert_eq!(
         lines(&rpc).await,
@@ -617,34 +618,37 @@ async fn nvim_set_keymap_defaults_to_remappable() {
 
 // ----- Phase 4: the `timeoutlen` idle flush (design D4) ----------------------
 
-/// The blessed fix for the timer-less divergence: with `gh` mapped, pressing `gg`
-/// withholds the second `g` as a live prefix of `gh`, so go-to-top doesn't fire on
-/// the keystroke alone. The TUI's idle flush (`nxvim_input_flush`) resolves it —
-/// the withheld `g` replays to the editor and `gg` jumps to the top — *without*
-/// the user pressing another key, which is what the pre-Phase-4 engine required.
+/// The idle flush still resolves a *genuinely* withheld prefix — one that is a
+/// live prefix of a longer **mapping**, not a broken one. With `ggh` mapped, `gg`
+/// is a real prefix of the `ggh` map (the disambiguation oracle never fires — no
+/// mapping prefix is broken), so it is held with no movement, matching neovim's
+/// `timeoutlen` wait. The TUI's idle flush (`nxvim_input_flush`) then replays the
+/// withheld `gg` raw — the shorter map having no completion — and the built-in
+/// go-to-top fires, *without* the user pressing another key.
 #[tokio::test]
 async fn idle_flush_completes_a_withheld_prefix() {
     let dir = temp_dir("keymap_flush_gg");
     let (rpc, _incoming) = start_with_config(
         &dir,
-        "vim.keymap.set('n', 'gh', function() print('GH') end)\n",
+        "vim.keymap.set('n', 'ggh', function() print('GGH') end)\n",
     )
     .await;
 
     feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
     assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
 
-    // `gg` alone leaves the second `g` withheld (a live prefix of `gh`), so the
-    // cursor hasn't moved yet — exactly the trailing-prefix lag.
+    // `gg` is a live prefix of the `ggh` mapping, so it is held — go-to-top must
+    // not fire yet (a following `h` would take the map). This is the one case the
+    // oracle leaves alone: nothing is broken, so it waits like neovim's timeoutlen.
     feed(&rpc, "gg");
     assert_eq!(
         cursor(&rpc).await.0,
         3,
-        "the second g is still withheld; go-to-top hasn't fired"
+        "gg is still withheld as a live prefix of ggh; go-to-top hasn't fired"
     );
 
-    // The idle flush replays the withheld g; core sees `gg` and jumps to line 1 —
-    // no following keystroke needed.
+    // The idle flush replays the withheld gg raw (no `ggh` completion arrived);
+    // core sees `gg` and jumps to line 1 — no following keystroke needed.
     flush(&rpc).await;
     assert_eq!(
         cursor(&rpc).await.0,
@@ -740,6 +744,188 @@ async fn nowait_map_fires_immediately_despite_a_longer_map() {
         message(&redraw),
         "JNOW",
         "nowait fired j immediately, without waiting for a possible jk"
+    );
+}
+
+// ----- Phase 5: unified built-in disambiguation (the colliding-prefix fix) ----
+//
+// With a user map sharing a built-in's prefix, the matcher consults core's
+// `command_status` oracle: a withheld run that already forms a complete built-in
+// is released to the editor instead of re-held as a speculative mapping prefix.
+// So every multi-key built-in fires *instantly* under a colliding user prefix —
+// no idle flush, no following key. Each test below is red on pre-Phase-5 `main`
+// (the built-in would lag until a flush). See the design doc, Phase 2.
+
+/// `ggh` with `gh` mapped: the second `g` releases as a built-in (go-to-top)
+/// before the `h` arrives, so `gg` then `h` (move left) runs and the `gh` map
+/// does **not** fire. (Pre-fix this sent a lone `g` arming a dangling `gpending`,
+/// then fired `gh` on `[g,h]` — visibly wrong; the `A!` RHS would append a `!`.)
+#[tokio::test]
+async fn ggh_resolves_gg_then_h_without_firing_the_gh_map() {
+    let dir = temp_dir("keymap_ggh");
+    let (rpc, _incoming) = start_with_config(&dir, "vim.keymap.set('n', 'gh', 'A!<Esc>')\n").await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    // `gg` → top (line 1, col 0); `h` → left (no-op at col 0). The `gh` map never
+    // fires, so no `!` is appended anywhere.
+    feed(&rpc, "ggh");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "gg jumped to the top, then h moved left — instantly, no flush"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line1", "line2", "line3"],
+        "the gh map did not fire — the buffer is untouched (no appended !)"
+    );
+}
+
+/// Operators are instant under a colliding operator-prefix map: with `dh` mapped,
+/// the doubled `dd` and the operator+motion `dw` both fire on the keystroke alone.
+#[tokio::test]
+async fn operator_dd_and_dw_fire_instantly_under_a_colliding_d_map() {
+    let dir = temp_dir("keymap_dop");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'dh', function() print('DH') end)\n",
+    )
+    .await;
+
+    // `dd` deletes the current line, with no following key to flush a held `d`.
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>gg");
+    assert_eq!(cursor(&rpc).await.0, 1, "back at the top");
+    feed(&rpc, "dd");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line2", "line3"],
+        "dd deleted line 1 instantly under the colliding dh map"
+    );
+
+    // `dw` deletes to the next word — the `w` is not a map prefix, so `d` replays
+    // and `w` reaches the editor in the same feed. (`o` opens a clean line for it.)
+    feed(&rpc, "ohello world<Esc>0");
+    feed(&rpc, "dw");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line2", "world", "line3"],
+        "dw deleted the first word instantly"
+    );
+}
+
+/// Find-char and its repeat are instant under colliding `f`-maps: with `fh` and
+/// `ff` mapped, `f{char}` jumps and `;` repeats, no flush — even though `f` is a
+/// live prefix of both maps.
+#[tokio::test]
+async fn find_and_repeat_fire_instantly_under_colliding_f_maps() {
+    let dir = temp_dir("keymap_find");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'fh', function() print('FH') end)\n\
+         vim.keymap.set('n', 'ff', function() print('FF') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello world<Esc>0");
+    // `fo` → first `o` (col 4). The target char is delivered with no flush.
+    feed(&rpc, "fo");
+    assert_eq!(cursor(&rpc).await, (1, 4), "fo found the first o instantly");
+    // `;` repeats the find → next `o` (col 7), instantly (`;` is no map prefix).
+    feed(&rpc, ";");
+    assert_eq!(cursor(&rpc).await, (1, 7), "; repeated the find instantly");
+}
+
+/// `r{char}` is instant under a colliding `rx` map: the replacement char is
+/// delivered straight to the editor though `r` is a live prefix of `rx`.
+#[tokio::test]
+async fn replace_fires_instantly_under_a_colliding_r_map() {
+    let dir = temp_dir("keymap_replace");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'rx', function() print('RX') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    // `ra` replaces the `h` under the cursor with `a` — no flush needed.
+    feed(&rpc, "ra");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["aello"],
+        "ra replaced the first char instantly under the colliding rx map"
+    );
+}
+
+/// A text object is instant under a colliding object-prefix map: with `diz`
+/// mapped (so `d` then `i` is a live mapping prefix), `diw` still deletes the
+/// inner word on the keystroke alone.
+#[tokio::test]
+async fn text_object_diw_fires_instantly_under_a_colliding_object_map() {
+    let dir = temp_dir("keymap_textobj");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'diz', function() print('DIZ') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello world<Esc>0");
+    // `diw` deletes the inner word "hello" → " world", no flush.
+    feed(&rpc, "diw");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![" world"],
+        "diw deleted the inner word instantly under the colliding diz map"
+    );
+}
+
+/// Mode-awareness: the same `gh` map collides in **both** normal and visual, and
+/// the oracle uses the mode-conditioned grammar. In visual, `gg` extends the
+/// selection to the top instantly (motions are identical across modes).
+#[tokio::test]
+async fn visual_gg_extends_to_top_instantly_under_a_colliding_g_map() {
+    let dir = temp_dir("keymap_visual_gg");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    // `v` enters visual, then `gg` extends to the top instantly — the second `g`
+    // releases as a built-in under the visual `gh` collision.
+    feed(&rpc, "vgg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "visual gg extended the selection to the top, instantly"
+    );
+    assert_eq!(mode(&rpc).await, "v", "still in visual mode");
+}
+
+/// Mode-awareness for text objects: in visual `i`/`a` start an object, and with
+/// a colliding visual object map (`iz`), `viwd` selects then deletes the inner
+/// word instantly — the object resolves with no flush.
+#[tokio::test]
+async fn visual_text_object_fires_instantly_under_a_colliding_object_map() {
+    let dir = temp_dir("keymap_visual_obj");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('v', 'iz', function() print('IZ') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello world<Esc>0");
+    // `v` enters visual; `iw` selects the inner word instantly (despite the `iz`
+    // collision making `i` a live prefix); `d` deletes the selection.
+    feed(&rpc, "viwd");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![" world"],
+        "visual iw selected the inner word instantly, then d deleted it"
     );
 }
 
@@ -911,5 +1097,142 @@ async fn expr_map_sandbox_blocks_editor_mutation() {
         message(&redraw).contains("E5555") || message(&redraw).contains("Error"),
         "the textlock violation surfaced an error, got {:?}",
         message(&redraw)
+    );
+}
+
+// ----- Disambiguation edge audits (Phase 3) ---------------------------------
+//
+// Phase 2 proved the oracle on direct input across the built-in families and both
+// visual modes. Phase 3 audits the remaining release paths and mode corners: a
+// remap RHS that resolves to a built-in, visual-line `V`, count + selection, the
+// search-operator hand-off, and the inverse — a genuinely-ambiguous *mapped*
+// prefix still defers to the idle flush (user maps keep winning).
+
+/// The oracle is consulted on the **remap re-feed** path too: a remap RHS that
+/// expands to a built-in fires it instantly. `Q` → `gg` (remap) is re-fed key by
+/// key through the matcher, where `gh` makes the first `g` a live prefix; the
+/// second `g` then releases as a complete built-in, so `Q` jumps to the top with
+/// no flush — the same disambiguation as typing `gg` directly.
+#[tokio::test]
+async fn remap_to_a_builtin_is_instant() {
+    let dir = temp_dir("keymap_remap_builtin");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'gh', function() print('GH') end)\n\
+         vim.keymap.set('n', 'Q', 'gg', { remap = true })\n",
+    )
+    .await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    feed(&rpc, "Q");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "Q remapped to gg, which resolved to the built-in go-to-top instantly"
+    );
+}
+
+/// Visual-**line** mode is covered too: with `gh` mapped in visual, `V` then `gg`
+/// extends the line selection to the top instantly. The oracle is mode-aware —
+/// it classifies against the `VisualLine` grammar (motions are identical there).
+#[tokio::test]
+async fn visual_line_gg_extends_to_top_instantly_under_a_colliding_g_map() {
+    let dir = temp_dir("keymap_vline_gg");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    // `V` enters visual-line; `gg` extends the selection to the top, instantly.
+    feed(&rpc, "Vgg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "visual-line gg extended the selection to the top, instantly"
+    );
+    assert_eq!(mode(&rpc).await, "V", "still in visual-line mode");
+}
+
+/// Count + selection: a count typed before the colliding built-in still lands.
+/// The count is not a map prefix, so it reaches the editor immediately; the `gg`
+/// then resolves via the oracle, and the editor's own pending count makes `3gg`
+/// go to line 3 while extending the visual selection.
+#[tokio::test]
+async fn visual_count_gg_under_a_colliding_g_map() {
+    let dir = temp_dir("keymap_vcount_gg");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<Esc>"); // five lines; cursor on line 5
+    assert_eq!(cursor(&rpc).await.0, 5, "cursor starts on the last line");
+
+    // `v` selects; `3gg` jumps to line 3 (count carried by the editor), instantly.
+    feed(&rpc, "v3gg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "count + gg landed on line 3 under the colliding gh map, no flush"
+    );
+    assert_eq!(mode(&rpc).await, "v", "still in visual mode");
+}
+
+/// The search-operator hand-off (`d/{pattern}`) is instant under a colliding `d`
+/// map: with `dh` mapped, `d` is a live prefix, but `/` breaks it — the operator
+/// `d` replays and `/` opens the search prompt, so `d/world<CR>` deletes up to the
+/// match with no flush. (The `/` is not a map prefix, so it reaches the editor in
+/// the same feed — the operator + search-motion grammar resolves immediately.)
+#[tokio::test]
+async fn search_operator_handoff_is_instant_under_a_colliding_d_map() {
+    let dir = temp_dir("keymap_dsearch");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'dh', function() print('DH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello world<Esc>gg");
+    feed(&rpc, "d/world<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["world"],
+        "d/world deleted up to the match instantly under the colliding dh map"
+    );
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
+/// The inverse, confirming user maps still win: with `ggh` *mapped*, `gg` is a
+/// genuine live prefix of the mapping (not a broken one), so the oracle never
+/// fires. Typing the full `ggh` fires the **map** — not the `gg` built-in then
+/// `h`. (Compare `idle_flush_completes_a_withheld_prefix`, where the partial `gg`
+/// waits for the flush and *then* resolves to the built-in.)
+#[tokio::test]
+async fn typing_a_full_mapped_prefix_fires_the_map_not_the_builtin() {
+    let dir = temp_dir("keymap_ggh_mapped");
+    let (rpc, _incoming) = start_with_config(&dir, "vim.keymap.set('n', 'ggh', 'A!<Esc>')\n").await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    // `ggh` is the complete mapping: it fires (appending `!` at the end of the
+    // current line) instead of running `gg` (go-to-top) then `h`.
+    feed(&rpc, "ggh");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line1", "line2", "line3!"],
+        "the ggh map fired (appended !); the gg built-in did not run"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "the cursor stayed on line 3 — go-to-top never fired"
     );
 }

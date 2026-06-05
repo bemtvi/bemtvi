@@ -21,7 +21,7 @@ pub mod unicode;
 pub mod view;
 
 pub use buffer::{Buffer, BufferEdit, EditBatch};
-pub use editor::{BufferId, Cursor, Editor};
+pub use editor::{command_status, BufferId, CommandStatus, Cursor, Editor};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;

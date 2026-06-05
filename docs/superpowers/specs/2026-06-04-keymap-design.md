@@ -303,10 +303,13 @@ one focused context window.
 > `vim._run_keymap`) with the snapshot reader / `run_keymap` in `nxvim-lua`'s
 > `lib.rs`; the one core change (`#[derive(Hash)]` on `Key`/`KeyCode`) is in
 > `input.rs`. Covered by `crates/nxvim-server/tests/keymaps.rs`. **One realized
-> divergence:** with no input timer, a trailing live-prefix stays buffered until
-> the next key flushes it (rather than firing at a `timeoutlen` boundary), so the
-> `gg`-replay test sends a final motion to flush — exactly the D4 gap Phase 4's
-> idle-flush closes.
+> divergence (since fixed):** with no input timer, a trailing live-prefix stayed
+> buffered until the next key flushed it (rather than firing at a `timeoutlen`
+> boundary), so the `gg`-replay test originally sent a final motion to flush — the
+> D4 gap Phase 4's idle-flush closed for the general case, and the
+> [built-in disambiguation](2026-06-05-keymap-builtin-disambiguation-design.md)
+> then made `gg`-class *built-ins* instant outright (the test now feeds plain
+> `gg`, no flush key).
 
 **Goal / value.** Stand up the whole engine and the headline surface on `main`: a
 user (or a config) can map a normal-mode key/sequence to a **Lua function** or a
@@ -492,18 +495,31 @@ with the completion popup is **backport** work, not this phase.
 
 ### Phase 4 — fidelity & the long tail
 
-> **Idle-flush landed (the `timeoutlen` item).** The TUI now arms a `TIMEOUT_LEN`
+> **Idle-flush landed (the `timeoutlen` item).** The TUI arms a `TIMEOUT_LEN`
 > (1000ms, vim's default) timer after each keystroke and, on idle, notifies
 > `nxvim_input_flush`; the server turns that into `Keymaps::flush(mode)`, which
 > resolves a trailing live-prefix exactly as the next-key break path would —
 > firing the longest complete (ambiguous *shorter*) map, else replaying the
-> withheld keys raw. This closes the D4 gap: `gg` (with `gh` mapped) jumps to the
-> top on idle without a following key, and an ambiguous `j`/`jk` resolves to `j`.
-> The server stays timer-free (the timer lives in the client's existing
-> `select!` render loop), so tests stay deterministic — they call the flush RPC
-> directly rather than waiting on wall-clock. Covered by the Phase 4 block in
-> `tests/keymaps.rs`. The remaining Phase 4 items (`expr`, `<Plug>`/`<nowait>`/
-> `<silent>`, `:map` ex-commands) remain pick-per-demand.
+> withheld keys raw. The server stays timer-free (the timer lives in the client's
+> existing `select!` render loop), so tests stay deterministic — they call the
+> flush RPC directly rather than waiting on wall-clock. Covered by the Phase 4
+> block in `tests/keymaps.rs`. The remaining Phase 4 items (`<Plug>`, `:map`
+> ex-commands) remain pick-per-demand; `expr`/`<nowait>`/`<silent>` have since
+> landed.
+>
+> **Update — built-in disambiguation made `gg`-class sequences *instant*.** The
+> original flush story claimed it "closes the D4 gap: `gg` (with `gh` mapped) jumps
+> to the top *on idle* without a following key." That is now stronger: `gg` and
+> every other multi-key **built-in** under a colliding user prefix fire on the
+> keystroke alone, with **no flush and no next key**, via the unified command
+> grammar the matcher consults as a read-only oracle (`nxvim_core::command_status`,
+> a fold over the shared `parse_step`). See
+> [2026-06-05-keymap-builtin-disambiguation-design.md](2026-06-05-keymap-builtin-disambiguation-design.md).
+> The idle flush is now relegated to the two cases where holding is genuinely
+> correct: a truly-ambiguous *mapped* prefix (`j` when both `j` and `jk` are
+> mapped, or `gg` when `ggh` is mapped — both wait `timeoutlen` and take the
+> shorter map / built-in on the flush, matching neovim) and releasing a lone
+> prefix (a solitary `g`) to the editor after the idle gap.
 
 **Goal / value.** The harder corners, added as real configs demand them: an
 ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowait`,

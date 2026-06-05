@@ -521,24 +521,34 @@ screen," and that is exactly the shape of these tests.
   native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
   `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
   the [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md)).
-  **All ~400 vendored `lsp/<server>.lua` configs load and resolve unmodified**
-  (regression-tested by `crates/nxvim-lua/tests/lspconfig_configs.rs`, which loads
-  every one and resolves its `root_dir` + `cmd`). The host-utility surface they
-  reach for is in place: `vim.system`/`vim.json`/`vim.uv` (`fs_stat`, `os_homedir`,
-  `cwd`, `fs_realpath`, `os_uname`), the `vim.fn` filesystem/process helpers
-  (`executable`, `exepath`, `glob`, `resolve`, `getpid`, …), `vim.fs.root` with
-  neovim 0.11 priority-tier markers, `vim.iter` over iterators, `vim.version`,
-  `vim.bo`, `vim.tbl_get`/`tbl_flatten`, and stubs for the deferred-callback
-  surface (`vim.lsp.util.*`, `vim.ui`, `vim.api` buffer getters). The many configs
+  **All ~400 vendored `lsp/<server>.lua` configs LOAD and START unmodified — but
+  starting a server is not the same as it *working*** (the distinction this
+  paragraph is careful about). The config-resolution surface is real and
+  regression-tested (`crates/nxvim-lua/tests/lspconfig_configs.rs` loads every
+  config and resolves its `root_dir` + `cmd`): `vim.system`/`vim.json`/`vim.uv`
+  (`fs_stat`, `os_homedir`, `cwd`, `fs_realpath`, `os_uname`), the `vim.fn`
+  filesystem/process helpers (`executable`, `exepath`, `glob`, `resolve`,
+  `getpid`, …), `vim.fs.root` with neovim 0.11 priority-tier markers, `vim.iter`
+  over iterators, `vim.version`, `vim.tbl_get`/`tbl_flatten`, and the real
+  `lspconfig.util` framework module (required by ~33 configs). The many configs
   whose `cmd` is a `function(dispatchers, config)` builder returning
   `vim.lsp.rpc.start({argv}, …)` (ts_ls, eslint, jsonls, biome, tailwindcss, … —
-  20-plus) work because nxvim does its own stdio spawning: `vim.lsp.rpc.start`
-  returns the argv, and the start path invokes the builder with the resolved
-  config. The real `lspconfig.util` framework module (required by ~33 configs)
-  loads and runs too. Two classes are intentionally skipped (gracefully, never
-  crashing `enable`): a non-stdio transport — gdscript's `vim.lsp.rpc.connect`
-  TCP handle — and a server whose `cmd` builder needs user-only config with no
-  default (powershell_es's `bundle_path`). **Caveat:** with no event loop yet,
+  20-plus) resolve to a real argv because nxvim does its own stdio spawning. Once
+  a server is up, the editing loop — `vim.lsp.buf.*`, `vim.diagnostic.*`, and
+  capability-gated `on_attach` keymaps — genuinely works.
+
+  **What does *not* work yet** (the server starts but may not behave as its config
+  intends): the config's `settings` / `init_options` / `capabilities` are
+  **dropped at `initialize`**, so the server runs on defaults regardless of how it
+  was configured; the lifecycle hooks (`before_init` / `on_init` / `on_exit`) are
+  **never called**; and a swathe of the deferred-callback surface
+  (`vim.lsp.util.*`, `client:request`, `vim.ui.*`, the buffer/window getters) is
+  **stubbed**. Per the project's no-silent-stubs rule those stubs are being
+  converted to *raise* (named "not implemented" errors) so each gap is loud and
+  trackable rather than a silent no-op. Two whole configs are skipped: gdscript (a
+  non-stdio TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a
+  user-only `bundle_path`). The route from "starts" to "works", phase by phase, is
+  [the LSP completion plan](lsp-completion-plan.md). **Caveat:** with no event loop yet,
   `vim.system` runs the child process *synchronously* on the current tick —
   `:wait()` and the `on_exit` callback both see an already-complete result, and a
   slow command blocks the server thread (`vim.schedule`/`vim.defer_fn` likewise

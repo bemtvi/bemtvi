@@ -1070,7 +1070,250 @@ fn install_runtime_api(
         })?,
     )?;
 
+    // ----- vim.uv: the libuv-style host primitives configs reach for ----------
+    // The `lsp/<server>.lua` configs probe the filesystem/home/cwd through
+    // `vim.uv` (and its legacy alias `vim.loop`) while building defaults and
+    // resolving roots. Only the handful actually used are provided.
+    let uv = lua.create_table()?;
+    // `vim.uv.fs_stat(path)`: a stat table (at least `type`/`size`), or nil when
+    // `path` can't be stat'd. Follows symlinks (the `fs_stat`, not `fs_lstat`,
+    // semantics); configs read `.type == 'file'`/`'directory'`.
+    uv.set(
+        "fs_stat",
+        lua.create_function(|lua, path: String| match std::fs::metadata(&path) {
+            Ok(md) => {
+                let t = lua.create_table()?;
+                t.set("type", if md.is_dir() { "directory" } else { "file" })?;
+                t.set("size", md.len())?;
+                Ok(mlua::Value::Table(t))
+            }
+            Err(_) => Ok(mlua::Value::Nil),
+        })?,
+    )?;
+    // `vim.uv.os_homedir()`: the user's home directory.
+    uv.set(
+        "os_homedir",
+        lua.create_function(|_, ()| {
+            Ok(std::env::var("HOME")
+                .ok()
+                .or_else(|| std::env::var("USERPROFILE").ok()))
+        })?,
+    )?;
+    // `vim.uv.cwd()`: the process working directory.
+    uv.set(
+        "cwd",
+        lua.create_function(|_, ()| {
+            Ok(std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()))
+        })?,
+    )?;
+    // `vim.uv.fs_realpath(path)`: the canonical path (symlinks resolved), or nil.
+    uv.set(
+        "fs_realpath",
+        lua.create_function(|_, path: String| {
+            Ok(std::fs::canonicalize(&path)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()))
+        })?,
+    )?;
+    // `vim.uv.os_uname()`: a uname table. `lspconfig.util` reads `.version` and
+    // matches it against "Windows" to detect the platform, so `version` carries a
+    // Windows marker only on Windows.
+    uv.set(
+        "os_uname",
+        lua.create_function(|lua, ()| {
+            let t = lua.create_table()?;
+            t.set("sysname", std::env::consts::OS)?;
+            t.set("machine", std::env::consts::ARCH)?;
+            t.set("release", "")?;
+            t.set(
+                "version",
+                if cfg!(windows) {
+                    "Windows"
+                } else {
+                    std::env::consts::OS
+                },
+            )?;
+            Ok(t)
+        })?,
+    )?;
+    vim.set("uv", uv.clone())?;
+    vim.set("loop", uv)?; // `vim.loop` is the pre-0.10 name for `vim.uv`.
+
+    // ----- additional vim.fn (filesystem / process / PATH) --------------------
+    // `vim.fn.executable(name)`: 1 if `name` is an executable on $PATH (or an
+    // executable file path), else 0. Configs use it to prefer a project-local
+    // `node_modules/.bin/<server>` over the global one.
+    func.set(
+        "executable",
+        lua.create_function(|_, name: String| Ok(i64::from(find_executable(&name).is_some())))?,
+    )?;
+    // `vim.fn.exepath(name)`: the resolved path to `name` on $PATH, or "".
+    func.set(
+        "exepath",
+        lua.create_function(|_, name: String| Ok(find_executable(&name).unwrap_or_default()))?,
+    )?;
+    // `vim.fn.getpid()`: this (editor) process's id.
+    func.set(
+        "getpid",
+        lua.create_function(|_, ()| Ok(std::process::id() as i64))?,
+    )?;
+    // `vim.fn.resolve(path)`: `path` with symlinks resolved, or unchanged if it
+    // can't be canonicalized.
+    func.set(
+        "resolve",
+        lua.create_function(|_, path: String| {
+            Ok(std::fs::canonicalize(&path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(path))
+        })?,
+    )?;
+    // `vim.fn.filereadable(path)`: 1 if `path` is a readable regular file, else 0.
+    func.set(
+        "filereadable",
+        lua.create_function(|_, path: String| {
+            Ok(i64::from(std::path::Path::new(&path).is_file()))
+        })?,
+    )?;
+    // `vim.fn.readblob(path)`: the file's raw bytes as a string; errors if
+    // unreadable (callers `pcall` it).
+    func.set(
+        "readblob",
+        lua.create_function(|lua, path: String| {
+            lua.create_string(std::fs::read(&path).map_err(mlua::Error::external)?)
+        })?,
+    )?;
+    // `vim.fn.glob(pattern[, nosuf, list])`: existing paths matching a shell-style
+    // glob (`*`/`?` wildcards, per path component). Returns a list when `list` is
+    // truthy (the form `lspconfig.util.root_pattern` uses), else the default
+    // newline-joined string. `nosuf` is accepted and ignored.
+    func.set(
+        "glob",
+        lua.create_function(
+            |lua, (pattern, _nosuf, list): (String, Option<bool>, Option<bool>)| {
+                let paths = glob_paths(&pattern);
+                if list.unwrap_or(false) {
+                    Ok(mlua::Value::Table(lua.create_sequence_from(paths)?))
+                } else {
+                    Ok(mlua::Value::String(lua.create_string(paths.join("\n"))?))
+                }
+            },
+        )?,
+    )?;
+
     Ok(())
+}
+
+/// Resolve `name` to an executable path: an explicit path is accepted when it is
+/// an executable file; a bare name is searched across `$PATH`. Backs
+/// `vim.fn.executable`/`vim.fn.exepath`.
+fn find_executable(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    if name.contains('/') {
+        let p = std::path::Path::new(name);
+        return is_executable_file(p).then(|| name.to_string());
+    }
+    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+        let cand = dir.join(name);
+        if is_executable_file(&cand) {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
+/// Expand a shell-style glob (only `*` and `?`, matched per path component) into
+/// the existing paths it matches. Enough for the `lib/python*/site-packages`-
+/// style patterns the config files build; a relative pattern resolves against the
+/// cwd. Backs `vim.fn.glob`.
+fn glob_paths(pattern: &str) -> Vec<String> {
+    let absolute = pattern.starts_with('/');
+    let mut frontier = vec![if absolute {
+        String::from("/")
+    } else {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into())
+    }];
+    for seg in pattern.split('/').filter(|s| !s.is_empty()) {
+        let mut next = Vec::new();
+        if seg.contains('*') || seg.contains('?') {
+            for base in &frontier {
+                if let Ok(rd) = std::fs::read_dir(base) {
+                    for entry in rd.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if wildcard_match(seg, &name) {
+                            next.push(join_path(base, &name));
+                        }
+                    }
+                }
+            }
+        } else {
+            for base in &frontier {
+                let cand = join_path(base, seg);
+                if std::path::Path::new(&cand).exists() {
+                    next.push(cand);
+                }
+            }
+        }
+        frontier = next;
+    }
+    frontier.sort();
+    frontier
+}
+
+fn join_path(base: &str, name: &str) -> String {
+    if base == "/" {
+        format!("/{name}")
+    } else if base.ends_with('/') {
+        format!("{base}{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+/// Glob match for one path component: `*` matches any run of non-`/` chars, `?`
+/// any single char. A small backtracking matcher over bytes.
+fn wildcard_match(pat: &str, s: &str) -> bool {
+    let (pat, s) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while si < s.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 /// Full paths of the files matching `name` across `runtimepath`, the engine of

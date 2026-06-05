@@ -1361,6 +1361,84 @@ async fn lspconfig_style_root_dir_resolves_through_the_new_surface() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn host_primitives_for_lspconfig_are_available() {
+    // The libuv/process/version surface the configs build defaults from. Bundled
+    // into one assertion: cwd is resolvable, getpid is positive, a ubiquitous
+    // binary (`sh`) is executable, vim.version() stringifies, vim.trim trims,
+    // vim.empty_dict is empty, and the vim.lsp.rpc.start shim hands a cmd builder
+    // back its argv (the mechanism behind the 20-plus rpc.start configs).
+    let dir = temp_dir("hostprim");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local parts = {\n\
+         \x20 tostring(vim.uv.cwd() ~= nil),\n\
+         \x20 tostring(vim.fn.getpid() > 0),\n\
+         \x20 tostring(vim.fn.executable('sh') == 1),\n\
+         \x20 tostring(vim.version()),\n\
+         \x20 vim.trim('  hi  '),\n\
+         \x20 tostring(next(vim.empty_dict()) == nil),\n\
+         \x20 table.concat(vim.lsp.rpc.start({ 'mybin', '--stdio' }, {}), ','),\n\
+         }\n\
+         print(table.concat(parts, ' '))\n",
+    )
+    .await;
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "true true true 0.11.0 hi true mybin,--stdio"
+    );
+}
+
+#[tokio::test]
+async fn vim_iter_handles_iterators_and_find_any() {
+    // vim.iter must accept a stateless iterator triple (what vim.fs.parents
+    // returns) — the fennel_ls/vala_ls root_dir pattern — and expose :find/:any.
+    let dir = temp_dir("vimiter");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local p = vim.iter(vim.fs.parents('/a/b/c')):totable()\n\
+         print(p[1] .. ' ' .. p[2] .. ' '\n\
+           .. tostring(vim.iter({ 10, 20, 30 }):find(function(x) return x == 20 end)) .. ' '\n\
+           .. tostring(vim.iter({ 1, 2, 3 }):any(function(x) return x > 2 end)))\n",
+    )
+    .await;
+    // Ancestors of /a/b/c are /a/b, /a, … (the walk stops at /, not the cwd).
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "/a/b /a 20 true"
+    );
+}
+
+#[tokio::test]
+async fn vim_fs_root_resolves_priority_tiers() {
+    // vim.fs.root treats a list marker as an ordered priority chain (neovim 0.11):
+    // the highest-priority tier with a match anywhere up the tree wins regardless
+    // of depth, and a nested list is an equal-priority tier. Lay out a tree and
+    // check both the ordered-beats-proximity rule and nested-tier matching.
+    let dir = temp_dir("fsroot");
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(proj.join("sub").join("deep")).expect("mkdir tree");
+    std::fs::write(proj.join("low"), "").expect("low marker"); // high up
+    std::fs::write(proj.join("sub").join("g1"), "").expect("g1 marker"); // closer
+    let src = proj.join("sub").join("deep").join("src.txt");
+    let p = proj.to_string_lossy();
+
+    // marker1: prefer 'top' (absent), then the equal-priority {g1,g2} tier (g1 is
+    // at proj/sub) -> proj/sub. marker2: 'low' tier first (at proj) beats the
+    // closer 'g1' (at proj/sub) -> proj.
+    let init = format!(
+        "print(vim.fs.root('{src}', {{ 'top', {{ 'g1', 'g2' }}, 'low' }}) .. ' | '\n\
+         \x20 .. vim.fs.root('{src}', {{ 'low', 'g1' }}))\n",
+        src = src.to_string_lossy()
+    );
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        format!("{p}/sub | {p}")
+    );
+}
+
 // ----- highlight registry (Phase 3): nvim_set_hl, links, captures, colorscheme
 
 /// `#rrggbb` as the `0xRRGGBB` integer the highlight RPCs report colors as.

@@ -135,6 +135,19 @@ function vim.tbl_map(f, t)
   return out
 end
 
+-- vim.tbl_flatten(t): a single list with every nested list flattened into it
+-- (depth-first). Deprecated in neovim but still called by `lspconfig.util`.
+function vim.tbl_flatten(t)
+  local out = {}
+  local function flatten(list)
+    for _, v in ipairs(list) do
+      if type(v) == "table" then flatten(v) else out[#out + 1] = v end
+    end
+  end
+  flatten(t)
+  return out
+end
+
 function vim.deepcopy(orig)
   if type(orig) ~= "table" then return orig end
   local copy = {}
@@ -211,12 +224,59 @@ end
 local Iter = {}
 Iter.__index = Iter
 
-function vim.iter(src)
+-- vim.iter(src[, state, ctrl]): wrap a list-like table OR a Lua iterator triple
+-- in a chainable iterator. The triple form is what `vim.iter(vim.fs.parents(p))`
+-- passes — `vim.fs.parents` returns `(fn, state, start)`, which Lua spreads as
+-- three args here — so the ancestors are drained eagerly into the item list.
+function vim.iter(src, state, ctrl)
   local items = {}
-  if type(src) == "table" then
+  if type(src) == "function" then
+    local var = ctrl
+    while true do
+      local v = src(state, var)
+      if v == nil then break end
+      var = v
+      items[#items + 1] = v
+    end
+  elseif type(src) == "table" then
     for _, v in ipairs(src) do items[#items + 1] = v end
   end
   return setmetatable({ _items = items }, Iter)
+end
+
+-- Iter:find(pred): the first item for which `pred(item)` is truthy (or, when
+-- `pred` is a plain value, the first item equal to it), else nil.
+function Iter:find(pred)
+  for _, v in ipairs(self._items) do
+    if type(pred) == "function" then
+      if pred(v) then return v end
+    elseif v == pred then
+      return v
+    end
+  end
+  return nil
+end
+
+-- Iter:any(pred): true iff `pred(item)` is truthy for some item.
+function Iter:any(pred)
+  for _, v in ipairs(self._items) do
+    if pred(v) then return true end
+  end
+  return false
+end
+
+-- Iter:flatten(): flatten one level of list-valued items into the stream.
+function Iter:flatten()
+  local out = {}
+  for _, v in ipairs(self._items) do
+    if type(v) == "table" then
+      for _, inner in ipairs(v) do out[#out + 1] = inner end
+    else
+      out[#out + 1] = v
+    end
+  end
+  self._items = out
+  return self
 end
 
 function Iter:map(f)
@@ -461,6 +521,21 @@ function vim.api.nvim_buf_get_name(bufnr)
   if bufnr == nil or bufnr == 0 or bufnr == cur.bufnr then return cur.name end
   return ""
 end
+
+-- A few more vim.api the configs touch. `nvim_get_current_buf`/`_win` and
+-- `nvim_win_get_cursor` resolve against the single-buffer snapshot (nxvim has one
+-- window today); the option/line setters are no-ops or empties since nxvim has no
+-- Lua-side per-buffer store yet. Most are used only in on_attach/handler bodies —
+-- present so those don't nil-crash. (`nvim_create_augroup`/`nvim_create_autocmd`/
+-- `nvim_buf_get_name`/`nvim_echo` are the real, behavior-carrying ones, defined
+-- elsewhere; these are the snapshot/stub remainder.)
+function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
+function vim.api.nvim_get_current_win() return 1000 end -- neovim win-ids start at 1000
+function vim.api.nvim_win_get_cursor(_win) return { 1, 0 } end
+function vim.api.nvim_buf_is_loaded(_bufnr) return true end
+function vim.api.nvim_buf_get_lines(_bufnr, _start, _end, _strict) return {} end
+function vim.api.nvim_buf_set_lines(_bufnr, _start, _end, _strict, _lines) end
+function vim.api.nvim_set_option_value(_name, _value, _opts) end
 
 -- vim.fn.expand: the `%` (current file) forms autocmd callbacks use to resolve
 -- paths, backed by the snapshot. Supports `%`, `%:p` (absolute — for the first
@@ -805,6 +880,10 @@ end
 function vim.fs.dirname(path)
   if not path or path == "" then return "." end
   path = path:gsub("/+$", "")
+  -- All slashes (the root "/") stripped to "": root's parent is itself, so the
+  -- upward walks in vim.fs.root / vim.fs.parents terminate at "/" instead of
+  -- escaping to "." (the cwd).
+  if path == "" then return "/" end
   local dir = path:match("^(.*)/[^/]*$")
   if dir == nil then return "." end
   if dir == "" then return "/" end
@@ -883,10 +962,14 @@ end
 
 -- vim.fs.root(source, marker): the nearest ancestor of `source` (a path, or a
 -- bufnr — 0/snapshot resolves to the current buffer's name, else cwd) that holds
--- `marker`. `marker` is a filename, a `function(name, path)` predicate, a list
--- (equal priority — any present matches), or a list of such groups tried in
--- order ("a then b" priority). Returns nil if none match. This is what the
--- vendored `lsp/<server>.lua` files call to compute their `root_dir`.
+-- `marker`. `marker` is a filename, a `function(name, path)` predicate, or a
+-- list. A LIST is an ordered priority chain (neovim 0.11): each element is a
+-- *tier* tried in turn — the highest-priority tier with a match anywhere up the
+-- tree wins, regardless of depth. A tier that is itself a list groups names of
+-- EQUAL priority (closest ancestor with any of them wins). So
+-- `{ 'a', { 'b', 'c' }, 'd' }` means: prefer 'a'; else 'b'-or-'c'; else 'd'.
+-- Returns nil if none match. This is what the vendored `lsp/<server>.lua` files
+-- call to compute their `root_dir`.
 function vim.fs.root(source, marker)
   local path
   if type(source) == "number" then
@@ -899,15 +982,20 @@ function vim.fs.root(source, marker)
   -- Start at the path's directory when it is a file.
   local start = path
   if vim.fn.isdirectory(path) == 0 then start = vim.fs.dirname(path) end
-  -- Normalize `marker` to an ordered list of equal-priority groups.
-  local groups
-  if type(marker) == "table" and type(marker[1]) == "table" then
-    groups = marker
+  -- Normalize `marker` into the ordered list of tiers; each tier is a list of
+  -- equal-priority names (or predicates). A bare string/function is one tier; a
+  -- list marker is one tier per element (an element that is itself a list is a
+  -- single equal-priority tier).
+  local tiers
+  if type(marker) == "table" then
+    tiers = {}
+    for _, m in ipairs(marker) do
+      tiers[#tiers + 1] = type(m) == "table" and m or { m }
+    end
   else
-    groups = { marker }
+    tiers = { { marker } }
   end
-  for _, group in ipairs(groups) do
-    local names = type(group) == "table" and group or { group }
+  for _, names in ipairs(tiers) do
     local dir = start
     while dir do
       for _, m in ipairs(names) do
@@ -995,6 +1083,26 @@ function vim.fn.fnamemodify(fname, mods)
   return result
 end
 
+-- A few more vim.fn used only inside deferred callbacks (handlers / user
+-- commands) nxvim doesn't drive yet — present so those bodies don't nil-crash if
+-- a user does trigger them. `finddir` reuses the Rust-backed directory search via
+-- vim.fs; the register/quickfix/prompt ones are no-ops (nxvim has no such UI yet).
+function vim.fn.finddir(name, path)
+  local hit = vim.fs.find(name, { path = path or vim.fn.getcwd(), upward = true, type = "directory" })[1]
+  return hit or ""
+end
+function vim.fn.bufnr(_expr) return (vim._cur_buf or {}).bufnr or 0 end
+
+-- vim.fn.substitute(str, pat, sub, flags): vim-regex substitution. nxvim has no
+-- vim-regex engine; the only caller is `lspconfig.util.strip_archive_subpath`,
+-- which transforms `zipfile:`/`tarfile:` virtual paths and leaves ordinary paths
+-- untouched. Returning `str` unchanged is therefore correct for every real file
+-- path (archive-buffer paths, which nxvim doesn't produce, pass through as-is).
+function vim.fn.substitute(str, _pat, _sub, _flags) return str end
+function vim.fn.setreg(_name, _value, _opts) return 0 end
+function vim.fn.setqflist(_list, _action, _what) return 0 end
+function vim.fn.confirm(_msg, _choices, _default, _type) return 0 end
+
 -- ----- vim.system / vim.json -------------------------------------------------
 
 -- vim.system(cmd, opts, on_exit): run `cmd` (an argv list) to completion and
@@ -1032,6 +1140,106 @@ vim.json = vim.json or {}
 function vim.json.encode(value) return vim._json_encode(value) end
 function vim.json.decode(str, _opts) return vim._json_decode(str) end
 
+-- ----- misc vim.* the configs reach for --------------------------------------
+
+-- vim.NIL: the sentinel for JSON null (a value that survives table storage where
+-- a literal nil would simply drop the key). Configs store it in init_options /
+-- capabilities; nxvim doesn't yet forward those to a server, so it only needs to
+-- be a distinct, stringifiable value. `vim.json.encode` maps it to JSON null.
+vim.NIL = setmetatable({}, { __tostring = function() return "vim.NIL" end })
+
+-- vim.empty_dict(): a fresh table that JSON-encodes as `{}` (an object), never
+-- `[]`. nxvim's encoder already emits `{}` for an empty table, so a plain table
+-- suffices.
+function vim.empty_dict() return {} end
+
+-- vim.trim(s): `s` with leading/trailing whitespace removed.
+function vim.trim(s) return (tostring(s):gsub("^%s+", ""):gsub("%s+$", "")) end
+
+-- vim.islist(t): true iff `t` is a list (a table whose keys are exactly 1..#t).
+function vim.islist(t)
+  if type(t) ~= "table" then return false end
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  return n == #t
+end
+vim.tbl_islist = vim.islist -- the pre-0.10 name
+
+-- vim.version: callable (returns nxvim's emulated neovim version, stringifiable
+-- as "0.11.0" — configs report it to the server) and a table of semver helpers.
+-- nxvim targets the neovim 0.11 Lua surface, so that is what it reports.
+local NVIM_VERSION = { major = 0, minor = 11, patch = 0 }
+local function version_tbl(t)
+  return setmetatable(t, {
+    __tostring = function(v) return v.major .. "." .. v.minor .. "." .. v.patch end,
+  })
+end
+vim.version = setmetatable({
+  -- vim.version.parse("1.2.3"): a {major,minor,patch} table, or nil.
+  parse = function(s)
+    local a, b, c = tostring(s):match("v?(%d+)%.(%d+)%.?(%d*)")
+    if not a then return nil end
+    return version_tbl({ major = tonumber(a), minor = tonumber(b), patch = tonumber(c) or 0 })
+  end,
+  -- vim.version.cmp(a,b): -1 / 0 / 1. Accepts version tables or "x.y.z" strings.
+  cmp = function(a, b)
+    if type(a) == "string" then a = vim.version.parse(a) end
+    if type(b) == "string" then b = vim.version.parse(b) end
+    for _, k in ipairs({ "major", "minor", "patch" }) do
+      if (a[k] or 0) ~= (b[k] or 0) then return (a[k] or 0) < (b[k] or 0) and -1 or 1 end
+    end
+    return 0
+  end,
+}, {
+  __call = function() return version_tbl({ major = NVIM_VERSION.major, minor = NVIM_VERSION.minor, patch = NVIM_VERSION.patch }) end,
+})
+vim.version.lt = function(a, b) return vim.version.cmp(a, b) < 0 end
+vim.version.gt = function(a, b) return vim.version.cmp(a, b) > 0 end
+vim.version.eq = function(a, b) return vim.version.cmp(a, b) == 0 end
+vim.version.ge = function(a, b) return vim.version.cmp(a, b) >= 0 end
+vim.version.le = function(a, b) return vim.version.cmp(a, b) <= 0 end
+
+-- vim.defer_fn(fn, timeout): neovim runs `fn` after `timeout` ms on the event
+-- loop. nxvim has no loop yet (see vim.schedule), so it runs `fn` immediately;
+-- enough for the deferred-retry patterns configs use, minus the actual delay.
+function vim.defer_fn(fn, _timeout) return vim.schedule(fn) end
+
+-- vim.ui: the selection/input/open hooks. With no UI layer wired, select/input
+-- report a cancellation (on_choice/on_confirm called with nil) and open is a
+-- no-op — so a config that offers an interactive choice degrades cleanly.
+vim.ui = vim.ui or {}
+function vim.ui.select(_items, _opts, on_choice) if on_choice then on_choice(nil) end end
+function vim.ui.input(_opts, on_confirm) if on_confirm then on_confirm(nil) end end
+function vim.ui.open(_path) end
+
+-- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`). nxvim
+-- has no per-buffer option store yet, so reads resolve against the current-buffer
+-- snapshot (`filetype` is the one configs read in root_dir) and writes are
+-- dropped. A bare `vim.bo.<opt>` (no bufnr) targets the current buffer too.
+local function bo_proxy(_bufnr)
+  return setmetatable({}, {
+    __index = function(_, opt)
+      if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end
+      return nil
+    end,
+    __newindex = function() end,
+  })
+end
+vim.bo = setmetatable({}, {
+  __index = function(_, k)
+    -- numeric key -> per-buffer proxy; option name -> current-buffer value.
+    if type(k) == "number" then return bo_proxy(k) end
+    if k == "filetype" or k == "ft" then return (vim._cur_buf or {}).filetype end
+    return nil
+  end,
+  __newindex = function() end,
+})
+
+-- vim.uri_to_bufnr(uri): in neovim, the (creating) buffer number for `uri`.
+-- nxvim has no Lua-side buffer registry, so this returns 0 (used only in a
+-- deferred handler today).
+function vim.uri_to_bufnr(_uri) return 0 end
+
 -- vim.validate / vim.deprecate: argument validation and deprecation notices in
 -- neovim. Config files call them defensively; nxvim makes them no-ops (never
 -- erroring) so a config that validates its opts loads unimpeded.
@@ -1060,6 +1268,58 @@ vim.lsp.commands = vim.lsp.commands or {}
 -- Client capabilities are owned and advertised by the Rust client at
 -- `initialize`; this stub lets a config that merges into them run without error.
 function vim.lsp.protocol.make_client_capabilities() return {} end
+
+-- vim.lsp.protocol.MessageType: the window/logMessage severity enum. A config
+-- may name it as a literal value (smithy_ls sets `message_level =
+-- vim.lsp.protocol.MessageType.Log`), so the table must exist at load time.
+vim.lsp.protocol.MessageType = {
+  Error = 1, Warning = 2, Info = 3, Log = 4, Debug = 5,
+  [1] = "Error", [2] = "Warning", [3] = "Info", [4] = "Log", [5] = "Debug",
+}
+
+-- vim.lsp.protocol.Methods: the request/notification method-name table. Real
+-- neovim maps e.g. `textDocument_diagnostic` -> "textDocument/diagnostic"; the
+-- metatable reproduces that (first underscore -> slash) for any key, so a config
+-- that names a method (in a deferred handler) gets the wire string, not nil.
+vim.lsp.protocol.Methods = setmetatable({}, {
+  __index = function(_, k) return (tostring(k):gsub("_", "/", 1)) end,
+})
+
+-- vim.lsp.rpc: the transport entry points a config's `cmd` builder calls.
+-- nxvim does its own (stdio) process spawning in Rust, so it does not need
+-- neovim's RPC client — it only needs the argv. `start(cmd, dispatchers, extra)`
+-- therefore returns `cmd` unchanged: a `cmd = function(d, c) … return
+-- vim.lsp.rpc.start({argv}, d) end` builder (ts_ls, eslint, jsonls, html, biome,
+-- tailwindcss, … — 20-plus servers) resolves straight to its argv. `connect`
+-- (a TCP transport, e.g. gdscript) can't be driven by the stdio spawner; it
+-- returns a sentinel that `lsp_is_argv` rejects, so such a server is skipped
+-- rather than crashing `enable`.
+vim.lsp.rpc = vim.lsp.rpc or {}
+function vim.lsp.rpc.start(cmd, _dispatchers, _extra) return cmd end
+function vim.lsp.rpc.connect(_host, _port) return { _nxvim_unsupported_transport = "tcp" } end
+
+-- vim.lsp.util: helpers a config reaches for inside on_attach / command / handler
+-- callbacks. nxvim drives its LSP features natively (vim.lsp.buf.*), so these are
+-- compatibility stubs that return neovim-shaped empties rather than nil-crashing a
+-- callback. They do not issue real requests.
+vim.lsp.util = vim.lsp.util or {}
+function vim.lsp.util.make_position_params(_win, _enc)
+  return { textDocument = { uri = "" }, position = { line = 0, character = 0 } }
+end
+function vim.lsp.util.make_text_document_params(_bufnr) return { uri = "" } end
+function vim.lsp.util.make_given_range_params(_start, _end, _bufnr, _enc)
+  return { textDocument = { uri = "" }, range = {} }
+end
+function vim.lsp.util.locations_to_items(_locations, _enc) return {} end
+function vim.lsp.util.get_effective_tabstop(_bufnr) return 8 end
+function vim.lsp.util.open_floating_preview(_contents, _syntax, _opts) end
+function vim.lsp.util.apply_workspace_edit(_edit, _enc) end
+function vim.lsp.util.show_document(_location, _enc, _opts) end
+
+-- vim.lsp.omnifunc: the i_CTRL-X_CTRL-O completion entry point. nxvim has no
+-- omni-completion path yet; the stub keeps `vim.bo.omnifunc = 'v:lua...'` setups
+-- and any direct call from erroring.
+function vim.lsp.omnifunc(_findstart, _base) return -1 end
 
 vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
 vim._lsp_base_cache = vim._lsp_base_cache or {}   -- name -> lsp/<name>.lua result (false = none)
@@ -1156,12 +1416,49 @@ vim.lsp.config = setmetatable({}, {
   end,
 })
 
--- Queue a start for `bufnr` from a fully-resolved config (root already computed).
-local function lsp_start_resolved(name, cfg, bufnr, ft, root)
+-- Is `cmd` a usable argv — a non-empty list of strings? Guards the start queue
+-- against the config shapes nxvim can't spawn: an empty/nil cmd, a builder that
+-- failed, or a non-stdio transport (e.g. gdscript's `vim.lsp.rpc.connect` TCP
+-- handle). Those skip the start rather than erroring at the Rust boundary.
+local function lsp_is_argv(cmd)
+  if type(cmd) ~= "table" or #cmd == 0 then return false end
+  for _, a in ipairs(cmd) do
+    if type(a) ~= "string" then return false end
+  end
+  return true
+end
+
+-- Resolve a config's `cmd` to an argv list. A function `cmd` is neovim's
+-- `cmd(dispatchers, config)` builder: nxvim does its own (stdio) spawning, so the
+-- dispatchers are a stub and `vim.lsp.rpc.start` returns the argv it was given
+-- (see its shim) — letting the many `node_modules/.bin` resolvers run unchanged.
+-- The builder gets the resolved config with `root_dir` filled in (the field those
+-- resolvers read). A throwing/needs-unset-config builder yields nil (skip start).
+local function lsp_resolve_cmd(cfg, root)
   local cmd = cfg.cmd
-  if type(cmd) == "function" then cmd = cmd() end
+  if type(cmd) == "function" then
+    -- Shallow-copy and set root_dir to the *resolved* root. A direct assignment
+    -- (not tbl_extend) so a nil root CLEARS the field rather than leaving cfg's
+    -- root_dir function in place — otherwise a builder that does
+    -- `joinpath(config.root_dir, …)` would join against a function. With it nil,
+    -- those builders fall back to the global binary, which is correct.
+    local config = {}
+    for k, v in pairs(cfg) do config[k] = v end
+    config.root_dir = root
+    local ok, result = pcall(cmd, {}, config)
+    cmd = ok and result or nil
+  end
+  return cmd
+end
+
+-- Queue a start for `bufnr` from a fully-resolved config (root already computed).
+-- Silently skips when the cmd doesn't resolve to a spawnable argv (so enabling a
+-- server whose binary/transport nxvim can't drive never errors the whole enable).
+local function lsp_start_resolved(name, cfg, bufnr, ft, root)
+  local cmd = lsp_resolve_cmd(cfg, root)
+  if not lsp_is_argv(cmd) then return end
   vim.lsp.start(
-    { name = name, cmd = cmd or {}, root_dir = root, filetypes = cfg.filetypes },
+    { name = name, cmd = cmd, root_dir = root, filetypes = cfg.filetypes },
     { bufnr = bufnr, filetype = ft }
   )
 end
@@ -1258,7 +1555,10 @@ function vim.lsp.start(config, opts)
   opts = opts or {}
   local bufnr = opts.bufnr or (vim._cur_buf and vim._cur_buf.bufnr) or 0
   local cmd = config.cmd or {}
-  if type(cmd) == "function" then cmd = cmd() end
+  if type(cmd) == "function" then cmd = lsp_resolve_cmd(config, config.root_dir) end
+  -- Only queue a spawnable argv (see lsp_is_argv): a non-stdio/empty cmd would
+  -- otherwise fail at the Rust `vim._lsp_start` boundary.
+  if not lsp_is_argv(cmd) then return end
   vim._lsp_start(config.name, cmd, config.root_dir, opts.filetype or "", bufnr)
 end
 

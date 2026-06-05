@@ -521,14 +521,28 @@ screen," and that is exactly the shape of these tests.
   native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
   `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
   the [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md)).
-  The `lsp/<server>.lua` configs run unmodified: the host-utility helpers they
-  reach for — `vim.system`, `vim.json`, `vim.tbl_get`, `vim.fs.relpath`,
-  `vim.lsp.get_clients` — are in place, so e.g. rust_analyzer resolves its
-  workspace root via `cargo metadata` out of the box. **Caveat:** with no event
-  loop yet, `vim.system` runs the child process *synchronously* on the current
-  tick — `:wait()` and the `on_exit` callback both see an already-complete
-  result, and a slow command blocks the server thread (`vim.schedule` likewise
-  runs its callback immediately). This is enough for the short shell-outs a
+  **All ~400 vendored `lsp/<server>.lua` configs load and resolve unmodified**
+  (regression-tested by `crates/nxvim-lua/tests/lspconfig_configs.rs`, which loads
+  every one and resolves its `root_dir` + `cmd`). The host-utility surface they
+  reach for is in place: `vim.system`/`vim.json`/`vim.uv` (`fs_stat`, `os_homedir`,
+  `cwd`, `fs_realpath`, `os_uname`), the `vim.fn` filesystem/process helpers
+  (`executable`, `exepath`, `glob`, `resolve`, `getpid`, …), `vim.fs.root` with
+  neovim 0.11 priority-tier markers, `vim.iter` over iterators, `vim.version`,
+  `vim.bo`, `vim.tbl_get`/`tbl_flatten`, and stubs for the deferred-callback
+  surface (`vim.lsp.util.*`, `vim.ui`, `vim.api` buffer getters). The many configs
+  whose `cmd` is a `function(dispatchers, config)` builder returning
+  `vim.lsp.rpc.start({argv}, …)` (ts_ls, eslint, jsonls, biome, tailwindcss, … —
+  20-plus) work because nxvim does its own stdio spawning: `vim.lsp.rpc.start`
+  returns the argv, and the start path invokes the builder with the resolved
+  config. The real `lspconfig.util` framework module (required by ~33 configs)
+  loads and runs too. Two classes are intentionally skipped (gracefully, never
+  crashing `enable`): a non-stdio transport — gdscript's `vim.lsp.rpc.connect`
+  TCP handle — and a server whose `cmd` builder needs user-only config with no
+  default (powershell_es's `bundle_path`). **Caveat:** with no event loop yet,
+  `vim.system` runs the child process *synchronously* on the current tick —
+  `:wait()` and the `on_exit` callback both see an already-complete result, and a
+  slow command blocks the server thread (`vim.schedule`/`vim.defer_fn` likewise
+  run their callback immediately). This is enough for the short shell-outs a
   `root_dir` performs; making it truly async is gated on the event loop below.
   The surface still grows only as plugins demand it; known gaps for richer plugins:
   `vim.treesitter` is a stub (nxvim highlights out-of-process), `vim.loop`/`vim.uv`,

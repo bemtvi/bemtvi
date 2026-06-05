@@ -591,13 +591,14 @@ LSP branch and **subsumes** its hand-rolled recognizers. Because of D1/D2/D6/D7 
 backport is mostly **deletion plus a one-variant addition**, not an engine change.
 Cross-referenced against the actual code on that branch (`lib.rs` / `lsp.rs`).
 
-> **As-built note (the backport landed; this section is updated to match the
-> code).** The plan below originally proposed making **all four** normal-mode LSP
-> keys (`gd`/`gD`/`gr`/`K`) native default maps. That turned out to be wrong for the
-> `g`-prefixed three — see **B4** for the failure it caused and the fix. `K` and the
-> insert triggers *did* become native defaults as planned. The `g`-prefix keys stay
-> on a small in-batch recognizer (`lsp_g_prefix`), so `lsp_pending_g` was **kept**,
-> not deleted.
+> **As-built note (updated again after merging `main`'s built-in-disambiguation
+> oracle).** The plan below proposed making **all four** normal-mode LSP keys
+> (`gd`/`gD`/`gr`/`K`) native default maps. An interim step kept the `g`-prefixed
+> three on a small in-batch recognizer (`lsp_g_prefix`/`lsp_pending_g`) because the
+> matcher couldn't see core's `g`-motions. Once the `command_status` oracle landed
+> (commit `b23735f`) the matcher *can* see them, so the original all-four plan was
+> restored: `gd`/`gD`/`gr` are native defaults too and `lsp_pending_g`/`lsp_g_prefix`
+> are **deleted**. See **B4** for the full arc.
 
 **B1 — One call-site, then nearly identical.** On the branch, `Server::input`'s loop
 body was `if self.lsp_keymap(key) { continue; } self.editor.input(key);
@@ -611,7 +612,7 @@ defaults through the registry with `default = true` (D6): `K`→`Hover` (normal)
 insert-mode completion triggers `<C-Space>`→`Completion`, `<C-x><C-o>`→`Completion`,
 `<C-k>`→`SignatureHelp`. A user `vim.keymap.set('n','K',…)` shadows them via the *user
 > default* rung — the rung's first real use; `main` shipped it unpopulated. The
-`g`-prefixed go-to keys are **not** here — see B4.
+`g`-prefixed go-to keys (`gd`/`gD`/`gr`) **now live here too** — see B4.
 
 **B3 — `request_lsp` rides a native RHS.** Add the `MappingRhs::Native(BuiltinAction)`
 variant (D7) with `BuiltinAction::Lsp(LspReqKind)`, and the one *fire* arm:
@@ -622,28 +623,33 @@ already exist on the branch (`lsp.rs`); the B2 defaults carry
 applies to them. The matcher gains a `set_native_defaults` install path and a
 lowest-precedence insert in `build_for` so user maps overwrite the defaults.
 
-**B4 — `gd`/`gD`/`gr` stay on an in-batch recognizer; `lsp_pending_g` is *kept*.** The
-original plan (make them native defaults, delete `lsp_pending_g`, "core's `gg` reached
-via replay = same observable behavior") **does not hold**, and the merge does not do
-it. The reason: nxvim's core `g`-motions (`gg`/`ge`/`gj`/`g_`/`gv`/…) live in
-`nxvim-core`, **not in the server's trie**. If `g` were a matcher prefix (via a `gd`
-default), the matcher could not tell that a second `g` *completes* `gg` versus
-*continuing* toward `gd`; with no mid-batch timer it withholds the `g` and then — on
-the next key — folds it into `gd`. That breaks `gg`, `ggdG`, `ggdap`, `dgg`, and (since
-`pending` persists across batches) even `gg` followed by a later `d`. Observed: the
-`gd`/`gr`/`gg`/operator editing tests and `the_editor_survives_a_server_that_exits…`
-all failed under the native-default approach.
+**B4 — `gd`/`gD`/`gr` are native defaults; `lsp_pending_g` is *removed*.**
+**(Superseded.** This decision originally *kept* an in-batch `g`-prefix recognizer; it
+was reversed once `main`'s built-in-disambiguation oracle landed —
+[2026-06-05-keymap-builtin-disambiguation-design.md](2026-06-05-keymap-builtin-disambiguation-design.md),
+commit `b23735f` — and was merged into this branch. The history below is kept for the
+rationale.)
 
-So the `g`-prefix keys are resolved **in-batch**, ahead of the matcher, by
-`Server::lsp_g_prefix` (the old `lsp_keymap` `g`-arm, kept): `g` is withheld; `d`/`D`/`r`
-fire the request; **anything else** hands the withheld `g` *to the matcher*
-(`feed_matcher`) and falls through, so a user `g`-map that isn't `gd`/`gD`/`gr` (e.g.
-`gh`) still matches and an unmapped `g`-sequence reaches core's motions unchanged.
-`lsp_pending_g` is therefore retained (its `lsp_keymap` host is gone, but the field and
-its `g`-handling live on in `lsp_g_prefix`). **Consequence:** `gd`/`gD`/`gr` are *not*
-user-overridable (the recognizer claims `g`+`d`/`D`/`r` before the matcher sees them) —
-a deliberate, documented gap, the price of keeping core's `g`-motions intact. `K` and
-the triggers remain fully overridable.
+The original objection: nxvim's core `g`-motions (`gg`/`ge`/`gj`/`g_`/`gv`/…) live in
+`nxvim-core`, **not in the server's trie**. With `gd` a trie default, a matcher that
+only knew user/native mappings could not tell that a second `g` *completes* `gg` versus
+*continuing* toward `gd`; timer-less, it withheld the `g` and on the next key folded it
+into `gd`, breaking `gg`, `ggdG`, `ggdap`, `dgg`, and even `gg` followed by a later `d`.
+So `gd`/`gD`/`gr` were first resolved by a bespoke in-batch `Server::lsp_g_prefix`
+recognizer, at the cost of being **un-overridable**.
+
+That objection no longer holds. The merged disambiguation oracle teaches the matcher the
+*built-in* command grammar via the read-only `nxvim_core::command_status`: on the break
+path, when a withheld run replays raw and re-feeding the next key would only re-withhold
+it, but `raw_run + key` already forms a complete built-in, the key is **released to the
+editor** — so `gg` (under the `g`-prefix collision with `gd`) fires whole, instantly, no
+flush. With that in place, `gd`/`gD`/`gr` become ordinary `Native(Lsp(…))` defaults
+installed by `set_native_defaults` alongside `K` (B2/B3), and `lsp_pending_g` /
+`lsp_g_prefix` are deleted. **Consequence:** `gd`/`gD`/`gr` are now fully
+user-overridable like `K` and the triggers (a `vim.keymap.set('n','gd',…)` shadows the
+default), and the `gg`/`ggdG`/`dgg` motions stay intact — covered by
+`lsp_goto_keys_are_overridable`, `core_gg_is_instant_under_the_lsp_goto_defaults`, and
+`gg_operator_sequences_survive_the_lsp_goto_defaults` in `tests/keymaps.rs`.
 
 **B5 — Insert mode: popup routing stays bespoke; triggers are native maps.** The
 completion popup is **modal, stateful UI routing** (`completion: Option<CompletionMenu>`;
@@ -661,18 +667,19 @@ The triggers `<C-Space>`/`<C-x><C-o>`/`<C-k>` are native default maps (B2);
 before the matcher, so a trigger never fires while the menu is already steering keys.
 
 **B6 — Tests on the branch.** `main`'s `keymaps.rs` is ported as-is (no LSP deps) and
-passes, including `multikey_map_fires_on_full_sequence` (a user `gh` map — which only
-works because `lsp_g_prefix` routes the withheld `g` back through the matcher). The
-existing `lsp.rs` suite covers `gd`/`gD`/`gr`/`K`/`<C-Space>`/`<C-x><C-o>`/`<C-k>` and
-all pass unchanged. A `K`-override test (user > default) would pass; a `gd`-override
-test would *not* (B4 gap) and is deliberately not added.
+passes, including `multikey_map_fires_on_full_sequence` (a user `gh` map). The existing
+`lsp.rs` suite covers `gd`/`gD`/`gr`/`K`/`<C-Space>`/`<C-x><C-o>`/`<C-k>` and all pass
+unchanged. Post-B4-reversal, `tests/keymaps.rs` also adds `lsp_goto_keys_are_overridable`
+(the `gd`-override test the original B4 gap forbade), `unmapped_lsp_goto_fires_the_default`,
+and the `gg`/`ggdG`/`dgg`-survival tests.
 
 **Net diff on the branch:** the `Server::input` body swap (matcher drive via
-`feed_matcher`) with the popup guard + `lsp_g_prefix` kept ahead of it; one enum variant
-(`Native`) + one fire arm; a `set_native_defaults` install of `K` + three triggers; the
-matcher's lowest-precedence default insert in `build_for`; deletion of `lsp_keymap`'s
-*body* (its `g`-arm folded into `lsp_g_prefix`, its insert arm into the popup guard) and
-of `lsp_pending_ctrl_x`. `lsp_pending_g` is **kept**. No change to the matcher's core
+`feed_matcher`) with the popup guard ahead of it; one enum variant (`Native`) + one fire
+arm; a `set_native_defaults` install of the `gd`/`gD`/`gr` go-to trio + `K` + the three
+triggers; the matcher's lowest-precedence default insert in `build_for`; deletion of
+`lsp_keymap` (its insert arm folded into the popup guard) and of `lsp_pending_ctrl_x` /
+`lsp_pending_g` / `lsp_g_prefix` (the `g`-prefix keys now ride the matcher, with the
+`command_status` oracle keeping core's `g`-motions whole). No change to the matcher's core
 algorithm, the trie shape, the registry, or the Lua surface.
 
 ---

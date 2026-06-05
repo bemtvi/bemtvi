@@ -13,8 +13,10 @@
 //! that forms a *live prefix* of some mapping is **withheld** in `pending`; the
 //! next key either extends the prefix, completes a mapping, or breaks it — in
 //! which case the buffered keys are **replayed** to the editor and the current key
-//! re-processed (this is the generalization the LSP branch's hand-rolled
-//! `lsp_pending_g` recognizer becomes on the backport). The one divergence from
+//! re-processed. This generalization subsumes the LSP branch's old hand-rolled
+//! `lsp_pending_g` recognizer: `gd`/`gD`/`gr` are now ordinary native-default maps
+//! in the trie, and the [`command_status`] oracle releases a withheld `g`-run the
+//! moment it completes a core motion, so `gg` stays whole. The one divergence from
 //! neovim: a trailing live-prefix with no following key has no wall-clock
 //! `timeoutlen` to resolve it on; instead the client sends a synthetic idle flush
 //! ([`Keymaps::flush`], the `nxvim_input_flush` RPC) after `timeoutlen` of no

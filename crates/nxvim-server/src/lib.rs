@@ -161,12 +161,6 @@ struct Server {
     /// The in-flight language-feature request per kind (definition, references,
     /// …), used to match a reply to its intent and drop stale ones.
     lsp_requests: HashMap<LspReqKind, PendingLspReq>,
-    /// Whether the previous input key was a `g` armed as the prefix of a built-in
-    /// LSP go-to keymap (`gd`/`gD`/`gr`). Resolved in-batch by [`Server::lsp_g_prefix`]:
-    /// the next key either completes the request or replays the withheld `g` so
-    /// core's `gg`/`ge`/`dgg`/… motions stay intact. Kept off the general matcher
-    /// because the matcher can't see core's `g`-motions as complete (design caveat).
-    lsp_pending_g: bool,
     /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
     /// like the diagnostics cache; projected into the `pmenu` redraw key and
     /// driven by the popup-open key routing in [`Server::completion_menu_key`].
@@ -225,7 +219,6 @@ where
         lsp_dirty: false,
         lsp_req_gen: 0,
         lsp_requests: HashMap::new(),
-        lsp_pending_g: false,
         completion: None,
         lsp_code_actions: Vec::new(),
         last_buffer_id: None,
@@ -236,15 +229,29 @@ where
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
     // so a user `vim.keymap.set` for the same `(mode, lhs)` shadows them via the
-    // user > default precedence rung. Only the keys that don't collide with a
-    // multi-key *core* motion live here: `K` (single key) and the insert-mode
-    // completion triggers (`<C-x><C-o>` rides the matcher as a two-key sequence,
-    // retiring the bespoke `lsp_pending_ctrl_x`). The four-letter go-to keys are
-    // `g`-prefixed; the matcher can't own the `g` prefix without breaking core's
-    // `gg`/`ge`/… motions (which live in core, not the trie, so the matcher would
-    // greedily fold a withheld `g` into `gd`). Those stay on the in-batch
-    // [`Server::lsp_g_prefix`] recognizer instead — see its doc comment.
+    // user > default precedence rung. *All* the LSP keys ride the matcher now,
+    // including the `g`-prefixed go-to trio (`gd`/`gD`/`gr`): the matcher can own
+    // the `g` prefix without breaking core's `gg`/`ge`/`dgg`/… motions because the
+    // `command_status` oracle (merged from main) releases a withheld `g`-run to the
+    // editor the moment it completes a built-in, so `gg` fires whole instead of
+    // being folded into `gd`. This retires the bespoke `lsp_pending_g` recognizer
+    // (and, earlier, `lsp_pending_ctrl_x` — `<C-x><C-o>` is just a two-key map).
     server.keymaps.set_native_defaults(vec![
+        NativeDefault {
+            mode: "n",
+            lhs: "gd",
+            action: BuiltinAction::Lsp(LspReqKind::Definition),
+        },
+        NativeDefault {
+            mode: "n",
+            lhs: "gD",
+            action: BuiltinAction::Lsp(LspReqKind::Declaration),
+        },
+        NativeDefault {
+            mode: "n",
+            lhs: "gr",
+            action: BuiltinAction::Lsp(LspReqKind::References),
+        },
         NativeDefault {
             mode: "n",
             lhs: "K",
@@ -517,91 +524,26 @@ impl Server {
             {
                 continue;
             }
-            // Built-in `gd`/`gD`/`gr` go-to keys: an in-batch `g`-prefix recognizer
-            // that resolves *before* the matcher, so core's `gg`/`ge`/`dgg`/… motions
-            // are never broken by a speculatively-withheld `g`. A consumed key never
-            // reaches the matcher or the editor.
-            if self.lsp_g_prefix(key) {
-                continue;
-            }
             // The mapping layer interposes here, ahead of `editor.input`: each key
             // is run through the withhold/replay matcher, which hands back the steps
-            // to apply (raw editor keys and/or a fired mapping). The built-in `K`
-            // hover key and the insert-mode completion triggers ride it as
-            // overridable native default mappings (design B2/B3).
+            // to apply (raw editor keys and/or a fired mapping). The built-in LSP
+            // keys — the `gd`/`gD`/`gr` go-to trio, `K` hover, and the insert-mode
+            // completion triggers — all ride it as overridable native default
+            // mappings (design B2/B3); the `command_status` oracle keeps core's
+            // `g`-motions (`gg`/`dgg`/…) intact under the `g`-prefix collision.
             self.feed_matcher(key);
         }
         self.run_pending();
     }
 
     /// Run one key through the general mapping matcher and apply the steps it
-    /// produces. The single path into [`Keymaps::feed`] — used both by the per-key
-    /// [`input`](Self::input) loop and by [`lsp_g_prefix`](Self::lsp_g_prefix) when
-    /// it hands a withheld `g` back to the matcher.
+    /// produces. The single path into [`Keymaps::feed`], driving the per-key
+    /// [`input`](Self::input) loop.
     fn feed_matcher(&mut self, key: Key) {
         let mode = self.editor.mode;
         for step in self.keymaps.feed(mode, key) {
             self.apply_step(step);
         }
-    }
-
-    /// The built-in `g`-prefix go-to keys: `gd` definition, `gD` declaration, `gr`
-    /// references. Returns `true` when the key was consumed as (part of) an LSP
-    /// sequence and must reach neither the matcher nor the editor.
-    ///
-    /// Why these are here and not native default maps (unlike `K` / the insert
-    /// triggers): the general matcher withholds a live prefix and resolves the
-    /// ambiguity only on the *next* key or an idle flush, but core's `gg`/`ge`/`gj`/…
-    /// motions are **not in the trie** — they live in `nxvim-core`. So if `g` were a
-    /// matcher prefix, it couldn't tell that a second `g` *completes* `gg` rather than
-    /// *continuing* toward `gd`, and would fold the withheld `g` into `gd` — breaking
-    /// `gg`/`ggdG`/`dgg` (and, because `pending` persists across batches, even `gg`
-    /// then a later `d`). This recognizer resolves the LSP combos in-batch instead.
-    ///
-    /// `g` is withheld; the next key decides:
-    /// - `d`/`D`/`r` → fire the request (consumed; never reaches the editor).
-    /// - anything else → the withheld `g` is handed **to the matcher**
-    ///   ([`feed_matcher`](Self::feed_matcher)), then we fall through so the caller
-    ///   feeds the current key too. Routing through the matcher (rather than straight
-    ///   to the editor) is what lets a *user* `g`-map that isn't `gd`/`gD`/`gr` (say
-    ///   `gh`) still match, while an unmapped `g`-sequence passes through to core's
-    ///   motions unchanged.
-    ///
-    /// `g` is only armed in a `Normal`-mode context (which includes operator-pending,
-    /// so `dgg` takes the fall-through path and still deletes to the top). A user
-    /// `vim.keymap.set('n','gd',…)` does *not* override the three LSP combos (this
-    /// recognizer claims `g`+`d`/`D`/`r` before the matcher sees them) — a deliberate
-    /// gap versus `K`/the triggers, the price of keeping core's `g`-motions intact.
-    fn lsp_g_prefix(&mut self, key: Key) -> bool {
-        if self.lsp_pending_g {
-            self.lsp_pending_g = false;
-            match key.as_char() {
-                Some('d') => {
-                    self.request_lsp(LspReqKind::Definition);
-                    return true;
-                }
-                Some('D') => {
-                    self.request_lsp(LspReqKind::Declaration);
-                    return true;
-                }
-                Some('r') => {
-                    self.request_lsp(LspReqKind::References);
-                    return true;
-                }
-                // Not an LSP combo: hand the withheld `g` back to the matcher (so a
-                // user `g`-map can match and core's `gg`/`ge`/… still work), then let
-                // the caller feed this key through the matcher as well.
-                _ => {
-                    self.feed_matcher(Key::char('g'));
-                    return false;
-                }
-            }
-        }
-        if self.editor.mode == Mode::Normal && key.as_char() == Some('g') {
-            self.lsp_pending_g = true;
-            return true;
-        }
-        false
     }
 
     /// Handle one key while the completion popup is open. Returns `true` when the

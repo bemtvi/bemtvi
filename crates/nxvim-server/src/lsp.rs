@@ -214,13 +214,40 @@ impl Server {
     /// it; the next [`Server::sync_lsp`] sends `didOpen`. Phase 7a's replacement
     /// for the built-in auto-spawn: a server starts *only* via this path.
     pub(crate) fn apply_lsp_op(&mut self, op: LspOp) {
+        let start = match op {
+            LspOp::Start { .. } => op,
+            // `vim.lsp.buf.*` routes into the existing native request paths. No
+            // cursor threading: `request_lsp` reads `self.editor.cursor` here, on
+            // the same input tick the Lua keymap RHS fired.
+            LspOp::BufRequest { kind } => {
+                if let Some(kind) = LspReqKind::from_u16(kind) {
+                    self.request_lsp(kind);
+                }
+                return;
+            }
+            LspOp::Format => {
+                self.request_lsp_format();
+                return;
+            }
+            LspOp::Rename { new_name } => {
+                self.request_lsp_rename(&new_name);
+                return;
+            }
+            LspOp::CodeAction => {
+                self.request_lsp_code_action();
+                return;
+            }
+        };
         let LspOp::Start {
             name,
             cmd,
             root,
             filetype,
             bufnr,
-        } = op;
+        } = start
+        else {
+            unreachable!("non-Start ops returned above");
+        };
         let buffer = BufferId(bufnr);
         // The buffer must be open and file-backed to host an LSP document.
         let Some(name_str) = self.editor.buffer_name(buffer).filter(|n| !n.is_empty()) else {

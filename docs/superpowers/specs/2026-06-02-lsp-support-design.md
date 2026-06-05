@@ -1,7 +1,7 @@
 # LSP support — design & phased implementation plan
 
 **Date:** 2026-06-02
-**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b** (the `vim.lsp.buf.*` / `vim.diagnostic.*` Lua entry points) is next. 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`).
+**Status:** In progress — **Phases 1–6 + 7a complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**); **7b Slice 1 complete** (the `vim.lsp.buf.*` Lua entry points — definition/references/hover/rename/format/code_action route through the existing native paths). **7b** continues with Slice 2 (`vim.diagnostic.*`) then Slice 3 (`LspAttach`/`on_attach`, which closes the phase). 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`).
 
 This document is both the design for LSP support in nxvim **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
@@ -1499,10 +1499,41 @@ The native entry points already exist and are what the ops route into:
 
 ---
 
-##### Slice 1 — `vim.lsp.buf.*`
+##### Slice 1 — `vim.lsp.buf.*` — ✅ DONE
 
 The thin-routing slice: each function enqueues an op; the server calls the existing
 `request_lsp*`.
+
+> **Implementation notes (as built).** Faithful to the plan; the two `Ask first`
+> questions were settled with the listed defaults (require the `rename` arg;
+> **keep** the native `gd`/`gD`/`gr`/`K` defaults).
+> - **`LspOp` gained four variants** (`nxvim-lua/src/lib.rs`): `BufRequest { kind:
+>   u16 }` (the position family — definition/declaration/typeDefinition/
+>   implementation/references/hover/signatureHelp, `kind` = `LspReqKind::as_u16`),
+>   `Format`, `Rename { new_name }`, `CodeAction`. Four Rust closures
+>   (`vim._lsp_buf`, `vim._lsp_buf_format`, `vim._lsp_buf_code_action`,
+>   `vim._lsp_buf_rename`) sit next to `_lsp_start` and just push the op — no new
+>   channel.
+> - **`apply_lsp_op` routes them** (`nxvim-server/src/lsp.rs`): it now matches the
+>   op, sending `BufRequest`→`request_lsp(from_u16(kind))`, `Format`→
+>   `request_lsp_format`, `Rename`→`request_lsp_rename`, `CodeAction`→
+>   `request_lsp_code_action`, and falls through to the existing `Start` body
+>   otherwise. No cursor threading: the request reads `self.editor.cursor` at apply
+>   time, on the same input tick the keymap RHS fired (the op drains right after
+>   `run_keymap` in `apply_lua_effects`).
+> - **`vim.lsp.buf` is bare functions** (`prelude.lua`): `definition`/`declaration`/
+>   `type_definition`/`implementation`/`references`/`hover`/`signature_help` each
+>   call `vim._lsp_buf(<kind>)`; `format`/`code_action` accept and ignore their
+>   neovim options table (no behavior yet); `rename(name)` requires a non-empty
+>   string and echoes `E471` otherwise (no prompt UI). Being bare means
+>   `vim.keymap.set('n','gd',vim.lsp.buf.definition)` works — the RHS is the
+>   function itself. Completion stays out of `vim.lsp.buf` (it is `vim.lsp.completion`
+>   in neovim; not needed here).
+> - **Tests** (`crates/nxvim/tests/lsp.rs`, +4): definition (jump), references
+>   (panel + `<CR>`), hover (panel text), and rename (cross-buffer edit) each driven
+>   through a *Lua-set* keymap on a non-default key (`<Space>d/r/h`) or `:lua`, so
+>   the trigger is unambiguously `vim.lsp.buf.*` rather than the native default. Each
+>   asserts the request actually went out.
 
 > **❓ Ask first (before coding Slice 1):**
 > - **`vim.lsp.buf.rename()` with no argument.** Neovim prompts for the new name;

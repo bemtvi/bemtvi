@@ -91,6 +91,24 @@ pub enum LspOp {
         /// `vim._cur_buf` before firing `FileType` (so it round-trips exactly).
         bufnr: u64,
     },
+    /// A `vim.lsp.buf.*` language-feature request (definition, references,
+    /// hover, …) on the current buffer. `kind` is `LspReqKind::as_u16` — the same
+    /// int that rides the request token — so the wire stays one number; the server
+    /// reads `self.editor.cursor` at apply time (the tick the key fired).
+    BufRequest {
+        /// `LspReqKind::as_u16` of the position-family feature to request.
+        kind: u16,
+    },
+    /// `vim.lsp.buf.format()` — request `textDocument/formatting`.
+    Format,
+    /// `vim.lsp.buf.rename(name)` — request `textDocument/rename` with `new_name`.
+    Rename {
+        /// The new identifier (the required argument; `vim.lsp.buf.rename()` with
+        /// no name is rejected in Lua, never reaching this op).
+        new_name: String,
+    },
+    /// `vim.lsp.buf.code_action()` — request `textDocument/codeAction` at the cursor.
+    CodeAction,
 }
 
 /// Lua registry key under which the panel's `on_select` callback is stored.
@@ -718,6 +736,53 @@ fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `vim._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request
+    // ([`LspOp::BufRequest`]) or one of the edit ops (`Format`/`CodeAction`),
+    // selected by the `LspReqKind::as_u16` the prelude passes. The single Rust
+    // entry the bare `vim.lsp.buf` functions route through (rename has its own,
+    // below, since it carries an argument).
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_buf",
+        lua.create_function(move |_, kind: u16| {
+            sh.borrow_mut().lsp_ops.push(LspOp::BufRequest { kind });
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._lsp_buf_format()`: queue [`LspOp::Format`]. Kept distinct from
+    // `_lsp_buf` because formatting has no `{uri, position}` shape (it routes to
+    // `request_lsp_format`, not `request_lsp`).
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_buf_format",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().lsp_ops.push(LspOp::Format);
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._lsp_buf_code_action()`: queue [`LspOp::CodeAction`].
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_buf_code_action",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().lsp_ops.push(LspOp::CodeAction);
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._lsp_buf_rename(name)`: queue [`LspOp::Rename`]. The prelude requires
+    // the argument (echoing `E471` on nil), so a name always arrives here.
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_buf_rename",
+        lua.create_function(move |_, new_name: String| {
+            sh.borrow_mut().lsp_ops.push(LspOp::Rename { new_name });
+            Ok(())
+        })?,
     )?;
 
     Ok(())

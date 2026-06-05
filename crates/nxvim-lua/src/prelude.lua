@@ -1119,3 +1119,38 @@ function vim.lsp.start(config, opts)
   if type(cmd) == "function" then cmd = cmd() end
   vim._lsp_start(config.name, cmd, config.root_dir, opts.filetype or "", bufnr)
 end
+
+-- ----- vim.lsp.buf: Lua entry points to the native features -------------------
+-- Each function enqueues an `LspOp` (Rust `vim._lsp_buf*`) that the server drains
+-- on the same input tick and routes into the existing `request_lsp*` paths — so
+-- the request reads the cursor where the key fired. The functions are *bare*
+-- (no implicit args) so `vim.keymap.set('n', 'gd', vim.lsp.buf.definition)` works:
+-- the keymap RHS is called with no arguments and just queues the op.
+--
+-- `kind` ints mirror `LspReqKind::as_u16` (Rust); keep the two in lockstep.
+vim.lsp.buf = vim.lsp.buf or {}
+
+function vim.lsp.buf.definition() vim._lsp_buf(0) end
+function vim.lsp.buf.declaration() vim._lsp_buf(1) end
+function vim.lsp.buf.type_definition() vim._lsp_buf(2) end
+function vim.lsp.buf.implementation() vim._lsp_buf(3) end
+function vim.lsp.buf.references() vim._lsp_buf(4) end
+function vim.lsp.buf.hover() vim._lsp_buf(5) end
+function vim.lsp.buf.signature_help() vim._lsp_buf(6) end
+
+-- format()/code_action() take an options table in neovim (async, range, filter,
+-- …); none have behavior in nxvim yet (the request is synchronous-issue,
+-- async-reply), so the argument is accepted and ignored for call-site
+-- compatibility — see the Phase 7b follow-ups.
+function vim.lsp.buf.format(_opts) vim._lsp_buf_format() end
+function vim.lsp.buf.code_action(_opts) vim._lsp_buf_code_action() end
+
+-- rename(new_name): the name is required (nxvim has no prompt UI yet). A nil/empty
+-- name echoes E471 rather than prompting, matching `:LspRename`.
+function vim.lsp.buf.rename(new_name)
+  if type(new_name) ~= "string" or new_name == "" then
+    vim.api.nvim_echo("E471: Argument required: vim.lsp.buf.rename(name)")
+    return
+  end
+  vim._lsp_buf_rename(new_name)
+end

@@ -35,7 +35,7 @@ list their dependencies; later phases assume earlier ones landed.
 
 ---
 
-## Phase 0 — Fail loud: stubs raise `not implemented` 🚧
+## Phase 0 — Fail loud: stubs raise `not implemented` ✅
 
 **Goal.** Replace every *hollow* stub (returns fake/empty data or silently
 no-ops) with a raise that names the function, and record each hit so the gaps
@@ -79,8 +79,23 @@ list of what to build (the later phases).
   (top-level `vim.lsp.rpc.connect` now raises → TCP transport is a known gap).
 - Add a prelude test asserting a representative stub raises with its name.
 
-**Done when.** Every hollow stub raises a named error; the sweep is green with
-the documented allowlist; `vim._notimpl_hits` accumulates hit names.
+**Known approximations (kept — real or faithful for every input nxvim produces,
+NOT gaps).**
+- `vim.schedule(fn)` — runs `fn` inline (a safe "soon" in the synchronous model).
+- `vim.api.nvim_get_current_buf` — returns the real current-buffer snapshot.
+- `vim.fn.finddir` — real `vim.fs` upward directory search.
+- `vim.fn.substitute` — identity; its only caller
+  (`lspconfig.util.strip_archive_subpath`) is correct for every non-archive path,
+  and nxvim never produces archive buffers.
+- `vim.bo[buf].filetype` / `vim.bo.filetype` — the one faithful `vim.bo` read
+  (snapshot-backed); it backs the `root_dir` filetype checks. Every other `vim.bo`
+  read and all writes raise.
+
+**Done when.** ✅ Every hollow stub raises a named error via `vim._notimpl`; the
+config sweep (`lspconfig_configs.rs`) is green with the documented allowlist
+(`powershell_es`, `gdscript`); `vim._notimpl_hits` accumulates hit names; a
+prelude test (`prelude_notimpl.rs`) asserts a representative stub raises with its
+name and records the hit while the faithful neighbours stay real.
 
 **Depends on.** Nothing.
 

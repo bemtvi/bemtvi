@@ -91,9 +91,12 @@ return 'TOTAL=' .. #files .. ' ERRORS=' .. nerr .. '\n' .. table.concat(out, '\n
 
     // Configs allowed to fail to RESOLVE (they need user-supplied config that has
     // no sensible default): powershell_es needs `bundle_path` to the
-    // PowerShellEditorServices bundle (neovim errors here too). At the real
-    // `vim.lsp.enable` path these are pcall-skipped, never crashing enable.
-    const ALLOWED: &[&str] = &["powershell_es"];
+    // PowerShellEditorServices bundle (neovim errors here too). gdscript builds
+    // its `cmd` at load via `vim.lsp.rpc.connect` (a TCP transport), which now
+    // raises `not implemented` (Phase 0) — TCP is a known gap nxvim's stdio
+    // spawner can't drive. At the real `vim.lsp.enable` path these are
+    // pcall-skipped, never crashing enable.
+    const ALLOWED: &[&str] = &["powershell_es", "gdscript"];
 
     let failures: Vec<&str> = lines
         .iter()

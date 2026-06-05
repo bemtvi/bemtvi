@@ -311,8 +311,24 @@ function Iter:totable() return self._items end
 
 -- ----- misc ------------------------------------------------------------------
 
+-- vim._notimpl(name): the loud-failure funnel for not-yet-implemented surface.
+-- Records `name` into vim._notimpl_hits (a set, so a future `:checkhealth` /
+-- `vim.lsp._report` can enumerate which gaps a real config actually hit) and
+-- raises a named error. A stub that quietly returns a fake/empty value makes a
+-- broken server look configured; routing every hollow stub through here turns
+-- "we think it works" into a concrete, trackable list of what to build (the
+-- guiding principle of docs/lsp-completion-plan.md). `level` (default 2) blames
+-- the stub's call site in the error position; the message names the function.
+vim._notimpl_hits = vim._notimpl_hits or {}
+function vim._notimpl(name, level)
+  vim._notimpl_hits[name] = true
+  error("nxvim: not implemented: " .. name, level or 2)
+end
+
 -- No real event loop yet: run scheduled work immediately. Sufficient for the
--- colorscheme setup/apply path, which only defers to avoid reentrancy.
+-- colorscheme setup/apply path, which only defers to avoid reentrancy. A safe
+-- "soon" in the synchronous model — a known approximation, not a hollow stub
+-- (it really runs the work), so it stays rather than raising via vim._notimpl.
 function vim.schedule(fn) fn() end
 
 function vim.notify(msg, _level, _opts)
@@ -522,20 +538,28 @@ function vim.api.nvim_buf_get_name(bufnr)
   return ""
 end
 
--- A few more vim.api the configs touch. `nvim_get_current_buf`/`_win` and
--- `nvim_win_get_cursor` resolve against the single-buffer snapshot (nxvim has one
--- window today); the option/line setters are no-ops or empties since nxvim has no
--- Lua-side per-buffer store yet. Most are used only in on_attach/handler bodies —
--- present so those don't nil-crash. (`nvim_create_augroup`/`nvim_create_autocmd`/
+-- A few more vim.api the configs touch. `nvim_get_current_buf` resolves against
+-- the single-buffer snapshot (faithful: it returns the real current buffer), so
+-- it stays. The rest — window id/cursor, buffer-loaded/line access, the option
+-- setter — would have to fake window/cursor/text state nxvim's Lua side can't
+-- reach yet, so they raise via vim._notimpl (Phase 6 backs them for real) rather
+-- than returning a fabricated `{1,0}` cursor or empty line list that makes a
+-- handler look like it read the buffer. (`nvim_create_augroup`/`_autocmd`/
 -- `nvim_buf_get_name`/`nvim_echo` are the real, behavior-carrying ones, defined
--- elsewhere; these are the snapshot/stub remainder.)
+-- elsewhere.)
 function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
-function vim.api.nvim_get_current_win() return 1000 end -- neovim win-ids start at 1000
-function vim.api.nvim_win_get_cursor(_win) return { 1, 0 } end
-function vim.api.nvim_buf_is_loaded(_bufnr) return true end
-function vim.api.nvim_buf_get_lines(_bufnr, _start, _end, _strict) return {} end
-function vim.api.nvim_buf_set_lines(_bufnr, _start, _end, _strict, _lines) end
-function vim.api.nvim_set_option_value(_name, _value, _opts) end
+function vim.api.nvim_get_current_win() vim._notimpl("vim.api.nvim_get_current_win") end
+function vim.api.nvim_win_get_cursor(_win) vim._notimpl("vim.api.nvim_win_get_cursor") end
+function vim.api.nvim_buf_is_loaded(_bufnr) vim._notimpl("vim.api.nvim_buf_is_loaded") end
+function vim.api.nvim_buf_get_lines(_bufnr, _start, _end, _strict)
+  vim._notimpl("vim.api.nvim_buf_get_lines")
+end
+function vim.api.nvim_buf_set_lines(_bufnr, _start, _end, _strict, _lines)
+  vim._notimpl("vim.api.nvim_buf_set_lines")
+end
+function vim.api.nvim_set_option_value(_name, _value, _opts)
+  vim._notimpl("vim.api.nvim_set_option_value")
+end
 
 -- vim.fn.expand: the `%` (current file) forms autocmd callbacks use to resolve
 -- paths, backed by the snapshot. Supports `%`, `%:p` (absolute — for the first
@@ -1084,14 +1108,16 @@ function vim.fn.fnamemodify(fname, mods)
 end
 
 -- A few more vim.fn used only inside deferred callbacks (handlers / user
--- commands) nxvim doesn't drive yet — present so those bodies don't nil-crash if
--- a user does trigger them. `finddir` reuses the Rust-backed directory search via
--- vim.fs; the register/quickfix/prompt ones are no-ops (nxvim has no such UI yet).
+-- commands) nxvim doesn't drive yet. `finddir` faithfully reuses the Rust-backed
+-- directory search via vim.fs, so it stays. `bufnr` (resolving an arbitrary
+-- `expr` to a buffer number) and the register/quickfix/prompt ones can't be
+-- honored without a buffer registry / those UIs, so they raise via vim._notimpl
+-- rather than returning a fake number or silently dropping the write.
 function vim.fn.finddir(name, path)
   local hit = vim.fs.find(name, { path = path or vim.fn.getcwd(), upward = true, type = "directory" })[1]
   return hit or ""
 end
-function vim.fn.bufnr(_expr) return (vim._cur_buf or {}).bufnr or 0 end
+function vim.fn.bufnr(_expr) vim._notimpl("vim.fn.bufnr") end
 
 -- vim.fn.substitute(str, pat, sub, flags): vim-regex substitution. nxvim has no
 -- vim-regex engine; the only caller is `lspconfig.util.strip_archive_subpath`,
@@ -1099,9 +1125,9 @@ function vim.fn.bufnr(_expr) return (vim._cur_buf or {}).bufnr or 0 end
 -- untouched. Returning `str` unchanged is therefore correct for every real file
 -- path (archive-buffer paths, which nxvim doesn't produce, pass through as-is).
 function vim.fn.substitute(str, _pat, _sub, _flags) return str end
-function vim.fn.setreg(_name, _value, _opts) return 0 end
-function vim.fn.setqflist(_list, _action, _what) return 0 end
-function vim.fn.confirm(_msg, _choices, _default, _type) return 0 end
+function vim.fn.setreg(_name, _value, _opts) vim._notimpl("vim.fn.setreg") end
+function vim.fn.setqflist(_list, _action, _what) vim._notimpl("vim.fn.setqflist") end
+function vim.fn.confirm(_msg, _choices, _default, _type) vim._notimpl("vim.fn.confirm") end
 
 -- ----- vim.system / vim.json -------------------------------------------------
 
@@ -1200,29 +1226,34 @@ vim.version.ge = function(a, b) return vim.version.cmp(a, b) >= 0 end
 vim.version.le = function(a, b) return vim.version.cmp(a, b) <= 0 end
 
 -- vim.defer_fn(fn, timeout): neovim runs `fn` after `timeout` ms on the event
--- loop. nxvim has no loop yet (see vim.schedule), so it runs `fn` immediately;
--- enough for the deferred-retry patterns configs use, minus the actual delay.
-function vim.defer_fn(fn, _timeout) return vim.schedule(fn) end
+-- loop. Unlike vim.schedule (a faithful "soon"), defer_fn carries a *delay*
+-- semantic nxvim can't honor without an event loop (Phase 4) — running it inline
+-- would silently misfire the deferred-retry patterns configs use — so it raises.
+function vim.defer_fn(_fn, _timeout) vim._notimpl("vim.defer_fn") end
 
--- vim.ui: the selection/input/open hooks. With no UI layer wired, select/input
--- report a cancellation (on_choice/on_confirm called with nil) and open is a
--- no-op — so a config that offers an interactive choice degrades cleanly.
+-- vim.ui: the selection/input/open hooks. With no UI layer wired (Phase 8),
+-- calling `select`/`input` with a fake cancellation (on_choice(nil)) would make a
+-- code-action picker look like the user dismissed it; `open` silently doing
+-- nothing hides the gap. All three raise via vim._notimpl instead.
 vim.ui = vim.ui or {}
-function vim.ui.select(_items, _opts, on_choice) if on_choice then on_choice(nil) end end
-function vim.ui.input(_opts, on_confirm) if on_confirm then on_confirm(nil) end end
-function vim.ui.open(_path) end
+function vim.ui.select(_items, _opts, _on_choice) vim._notimpl("vim.ui.select") end
+function vim.ui.input(_opts, _on_confirm) vim._notimpl("vim.ui.input") end
+function vim.ui.open(_path) vim._notimpl("vim.ui.open") end
 
 -- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`). nxvim
--- has no per-buffer option store yet, so reads resolve against the current-buffer
--- snapshot (`filetype` is the one configs read in root_dir) and writes are
--- dropped. A bare `vim.bo.<opt>` (no bufnr) targets the current buffer too.
+-- has no per-buffer option store yet (Phase 6). The ONE faithful read is
+-- `filetype`/`ft` — it resolves against the current-buffer snapshot and backs the
+-- `root_dir` filetype checks configs do at load — so it stays. Any other read
+-- would fabricate an option value, and a write would silently vanish, so both
+-- raise via vim._notimpl. A bare `vim.bo.<opt>` (no bufnr) targets the current
+-- buffer too.
 local function bo_proxy(_bufnr)
   return setmetatable({}, {
     __index = function(_, opt)
       if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end
-      return nil
+      vim._notimpl("vim.bo[].".. tostring(opt))
     end,
-    __newindex = function() end,
+    __newindex = function(_, opt) vim._notimpl("vim.bo[]." .. tostring(opt) .. " (write)") end,
   })
 end
 vim.bo = setmetatable({}, {
@@ -1230,15 +1261,15 @@ vim.bo = setmetatable({}, {
     -- numeric key -> per-buffer proxy; option name -> current-buffer value.
     if type(k) == "number" then return bo_proxy(k) end
     if k == "filetype" or k == "ft" then return (vim._cur_buf or {}).filetype end
-    return nil
+    vim._notimpl("vim.bo." .. tostring(k))
   end,
-  __newindex = function() end,
+  __newindex = function(_, k) vim._notimpl("vim.bo." .. tostring(k) .. " (write)") end,
 })
 
 -- vim.uri_to_bufnr(uri): in neovim, the (creating) buffer number for `uri`.
--- nxvim has no Lua-side buffer registry, so this returns 0 (used only in a
--- deferred handler today).
-function vim.uri_to_bufnr(_uri) return 0 end
+-- nxvim has no Lua-side buffer registry yet (Phase 6), so returning 0 would hand
+-- a handler a wrong buffer; it raises via vim._notimpl instead.
+function vim.uri_to_bufnr(_uri) vim._notimpl("vim.uri_to_bufnr") end
 
 -- vim.validate / vim.deprecate: argument validation and deprecation notices in
 -- neovim. Config files call them defensively; nxvim makes them no-ops (never
@@ -1296,30 +1327,48 @@ vim.lsp.protocol.Methods = setmetatable({}, {
 -- rather than crashing `enable`.
 vim.lsp.rpc = vim.lsp.rpc or {}
 function vim.lsp.rpc.start(cmd, _dispatchers, _extra) return cmd end
-function vim.lsp.rpc.connect(_host, _port) return { _nxvim_unsupported_transport = "tcp" } end
+-- `connect` is a TCP transport (e.g. gdscript). nxvim's spawner is stdio-only,
+-- so there is no argv to hand back — returning a sentinel let the gap pass
+-- silently. It raises via vim._notimpl: a config that calls it at load (gdscript)
+-- surfaces as a real, allowlisted gap (TCP transport) rather than a "skip".
+function vim.lsp.rpc.connect(_host, _port) vim._notimpl("vim.lsp.rpc.connect") end
 
 -- vim.lsp.util: helpers a config reaches for inside on_attach / command / handler
--- callbacks. nxvim drives its LSP features natively (vim.lsp.buf.*), so these are
--- compatibility stubs that return neovim-shaped empties rather than nil-crashing a
--- callback. They do not issue real requests.
+-- callbacks. nxvim drives its LSP features natively (vim.lsp.buf.*); these helpers
+-- (cursor/range params, loclist conversion, floating preview, workspace-edit
+-- application, jump) need real cursor/buffer/window state and the panel surface
+-- that don't exist yet (Phases 6-7). Returning neovim-shaped empties made a
+-- command look like it computed params; they raise via vim._notimpl instead.
 vim.lsp.util = vim.lsp.util or {}
 function vim.lsp.util.make_position_params(_win, _enc)
-  return { textDocument = { uri = "" }, position = { line = 0, character = 0 } }
+  vim._notimpl("vim.lsp.util.make_position_params")
 end
-function vim.lsp.util.make_text_document_params(_bufnr) return { uri = "" } end
+function vim.lsp.util.make_text_document_params(_bufnr)
+  vim._notimpl("vim.lsp.util.make_text_document_params")
+end
 function vim.lsp.util.make_given_range_params(_start, _end, _bufnr, _enc)
-  return { textDocument = { uri = "" }, range = {} }
+  vim._notimpl("vim.lsp.util.make_given_range_params")
 end
-function vim.lsp.util.locations_to_items(_locations, _enc) return {} end
-function vim.lsp.util.get_effective_tabstop(_bufnr) return 8 end
-function vim.lsp.util.open_floating_preview(_contents, _syntax, _opts) end
-function vim.lsp.util.apply_workspace_edit(_edit, _enc) end
-function vim.lsp.util.show_document(_location, _enc, _opts) end
+function vim.lsp.util.locations_to_items(_locations, _enc)
+  vim._notimpl("vim.lsp.util.locations_to_items")
+end
+function vim.lsp.util.get_effective_tabstop(_bufnr)
+  vim._notimpl("vim.lsp.util.get_effective_tabstop")
+end
+function vim.lsp.util.open_floating_preview(_contents, _syntax, _opts)
+  vim._notimpl("vim.lsp.util.open_floating_preview")
+end
+function vim.lsp.util.apply_workspace_edit(_edit, _enc)
+  vim._notimpl("vim.lsp.util.apply_workspace_edit")
+end
+function vim.lsp.util.show_document(_location, _enc, _opts)
+  vim._notimpl("vim.lsp.util.show_document")
+end
 
 -- vim.lsp.omnifunc: the i_CTRL-X_CTRL-O completion entry point. nxvim has no
--- omni-completion path yet; the stub keeps `vim.bo.omnifunc = 'v:lua...'` setups
--- and any direct call from erroring.
-function vim.lsp.omnifunc(_findstart, _base) return -1 end
+-- omni-completion path yet; returning -1 ("no completion") masked the gap, so it
+-- raises via vim._notimpl.
+function vim.lsp.omnifunc(_findstart, _base) vim._notimpl("vim.lsp.omnifunc") end
 
 vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
 vim._lsp_base_cache = vim._lsp_base_cache or {}   -- name -> lsp/<name>.lua result (false = none)
@@ -1342,11 +1391,12 @@ function vim.lsp.get_client_by_id(id) return vim.lsp._clients[id] end
 -- `{ id, name, server_capabilities, config, request }` table. `filter` narrows by
 -- `id` and/or `name`; a `bufnr` filter is accepted but not honored — nxvim has no
 -- Lua-side buffer->client map yet, so it returns the name/id matches across all
--- buffers. `config` is the resolved `vim.lsp.config[name]`. `request` is a stub
--- (synchronous client requests aren't wired yet) so a config that calls
--- `client:request(...)` — e.g. rust_analyzer's `:LspCargoReload` — loads and runs
--- without erroring (the request is a no-op). `get_active_clients` is the
--- deprecated neovim alias, kept for configs that still call it.
+-- buffers. `config` is the resolved `vim.lsp.config[name]`. `request` raises via
+-- vim._notimpl: real client requests need the async request bridge (Phase 5), and
+-- a stub that returned `false` made a config command (e.g. rust_analyzer's
+-- `:LspCargoReload`) look like it issued a request when nothing happened.
+-- `get_active_clients` is the deprecated neovim alias, kept for configs that still
+-- call it.
 function vim.lsp.get_clients(filter)
   filter = filter or {}
   local out = {}
@@ -1357,7 +1407,7 @@ function vim.lsp.get_clients(filter)
         name = c.name,
         server_capabilities = c.server_capabilities,
         config = vim.lsp.config[c.name],
-        request = function() return false end,
+        request = function() vim._notimpl("vim.lsp.Client:request") end,
       }
     end
   end

@@ -8,9 +8,11 @@
 //! native GUI later) attach over the same RPC channel and are never blocked by
 //! the server's bookkeeping.
 
+mod keymap;
 mod lsp;
 mod syntax;
 
+use keymap::{BuiltinAction, Keymaps, MappingRhs, NativeDefault, Step};
 use lsp::{
     CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime, CODE_ACTION_PANEL_TITLE,
 };
@@ -160,21 +162,19 @@ struct Server {
     /// …), used to match a reply to its intent and drop stale ones.
     lsp_requests: HashMap<LspReqKind, PendingLspReq>,
     /// Whether the previous input key was a `g` armed as the prefix of a built-in
-    /// LSP normal-mode keymap (`gd`/`gD`/`gr`). The next key resolves it; a
-    /// non-LSP key replays the withheld `g` so `gg`/`ge`/… still work.
+    /// LSP go-to keymap (`gd`/`gD`/`gr`). Resolved in-batch by [`Server::lsp_g_prefix`]:
+    /// the next key either completes the request or replays the withheld `g` so
+    /// core's `gg`/`ge`/`dgg`/… motions stay intact. Kept off the general matcher
+    /// because the matcher can't see core's `g`-motions as complete (design caveat).
     lsp_pending_g: bool,
     /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
     /// like the diagnostics cache; projected into the `pmenu` redraw key and
-    /// driven by the insert-mode key interception in [`Server::lsp_keymap`].
+    /// driven by the popup-open key routing in [`Server::completion_menu_key`].
     completion: Option<CompletionMenu>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
     lsp_code_actions: Vec<CodeActionData>,
-    /// Whether the previous insert-mode key was a `<C-x>` armed as the prefix of
-    /// the `<C-x><C-o>` omni-completion trigger. The next key resolves it (a
-    /// `<C-o>` fires completion; anything else is handled normally).
-    lsp_pending_ctrl_x: bool,
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
     /// every entry).
@@ -186,6 +186,10 @@ struct Server {
     /// (from a non-insert mode) fires `InsertEnter`; tracked here so the per-key
     /// diff can spot the edge without touching the core's insert chokepoints.
     last_mode: Mode,
+    /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
+    /// `Server::input` runs every key through before `editor.input`. Rebuilt from
+    /// `vim._keymaps` when its version advances (checked once per input batch).
+    keymaps: Keymaps,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -223,12 +227,56 @@ where
         lsp_requests: HashMap::new(),
         lsp_pending_g: false,
         completion: None,
-        lsp_pending_ctrl_x: false,
         lsp_code_actions: Vec::new(),
         last_buffer_id: None,
         announced: HashSet::new(),
         last_mode: Mode::Normal,
+        keymaps: Keymaps::default(),
     };
+
+    // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
+    // so a user `vim.keymap.set` for the same `(mode, lhs)` shadows them via the
+    // user > default precedence rung. Only the keys that don't collide with a
+    // multi-key *core* motion live here: `K` (single key) and the insert-mode
+    // completion triggers (`<C-x><C-o>` rides the matcher as a two-key sequence,
+    // retiring the bespoke `lsp_pending_ctrl_x`). The four-letter go-to keys are
+    // `g`-prefixed; the matcher can't own the `g` prefix without breaking core's
+    // `gg`/`ge`/… motions (which live in core, not the trie, so the matcher would
+    // greedily fold a withheld `g` into `gd`). Those stay on the in-batch
+    // [`Server::lsp_g_prefix`] recognizer instead — see its doc comment.
+    server.keymaps.set_native_defaults(vec![
+        NativeDefault {
+            mode: "n",
+            lhs: "K",
+            action: BuiltinAction::Lsp(LspReqKind::Hover),
+        },
+        NativeDefault {
+            mode: "i",
+            lhs: "<C-Space>",
+            action: BuiltinAction::Lsp(LspReqKind::Completion),
+        },
+        NativeDefault {
+            mode: "i",
+            lhs: "<C-x><C-o>",
+            action: BuiltinAction::Lsp(LspReqKind::Completion),
+        },
+        NativeDefault {
+            mode: "i",
+            lhs: "<C-k>",
+            action: BuiltinAction::Lsp(LspReqKind::SignatureHelp),
+        },
+    ]);
+
+    // Seed the current-buffer snapshot before sourcing config, so a buffer-local
+    // map declared with `buffer = 0` (or `nvim_create_autocmd`'s `buffer = 0`)
+    // resolves to the real startup buffer rather than the default `0` — the buffer
+    // already exists at config time, matching neovim. Lifecycle emission refreshes
+    // it again before each autocmd fires; this just makes it valid earlier.
+    {
+        let buf = server.editor.current_buffer_id();
+        let name = server.editor.buffer_name(buf).unwrap_or_default();
+        let _ = server.lua.set_buf_snapshot(buf.0, &name);
+    }
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
@@ -332,6 +380,13 @@ impl Server {
                 let keys = text(params.first());
                 self.input(&keys);
                 Ok(Value::from(keys.len() as u64))
+            }
+            "nxvim_input_flush" => {
+                // The TUI's synthetic `timeoutlen` idle flush (design D4): resolve a
+                // trailing live-prefix withheld in the matcher without waiting for
+                // the next keystroke. A no-op when nothing is pending.
+                self.input_flush();
+                Ok(Value::Nil)
             }
             "nvim_command" => {
                 let cmd = text(params.first());
@@ -444,38 +499,80 @@ impl Server {
     }
 
     fn input(&mut self, keys: &str) {
+        // Rebuild the keymap tries if the registry changed since the last batch —
+        // once per `nvim_input`, not per key, so each keystroke only walks the
+        // cached trie (design §6). A map a callback sets mid-batch takes effect on
+        // the next batch, an accepted ordering.
+        self.refresh_keymaps();
         for key in parse_keys(keys) {
-            // Built-in LSP normal-mode keymaps (Phase 3) are owned here, not in
-            // core, so the pure editor stays free of LSP concepts. A consumed key
-            // never reaches the editor.
-            if self.lsp_keymap(key) {
+            // Insert-mode completion popup is modal, stateful UI routing: while it
+            // is open it owns every key (navigate / accept / dismiss / live-refresh)
+            // ahead of the mapping engine (design B5). A key the popup *doesn't*
+            // claim dismisses it and returns `false`, so we fall through to the
+            // matcher below — `<C-k>` then fires signature help, `<Esc>` then leaves
+            // insert, etc. (`completion_menu_key` is only reached while open.)
+            if self.editor.mode == Mode::Insert
+                && self.completion_menu_open()
+                && self.completion_menu_key(key)
+            {
                 continue;
             }
-            self.editor.input(key);
-            // Per *key*, not per message: a batched `o…<Esc>` must still see the
-            // transition into insert on the `o`, which a once-per-input diff would
-            // miss (it'd see only the settled Normal end-state).
-            self.emit_lifecycle_events();
+            // Built-in `gd`/`gD`/`gr` go-to keys: an in-batch `g`-prefix recognizer
+            // that resolves *before* the matcher, so core's `gg`/`ge`/`dgg`/… motions
+            // are never broken by a speculatively-withheld `g`. A consumed key never
+            // reaches the matcher or the editor.
+            if self.lsp_g_prefix(key) {
+                continue;
+            }
+            // The mapping layer interposes here, ahead of `editor.input`: each key
+            // is run through the withhold/replay matcher, which hands back the steps
+            // to apply (raw editor keys and/or a fired mapping). The built-in `K`
+            // hover key and the insert-mode completion triggers ride it as
+            // overridable native default mappings (design B2/B3).
+            self.feed_matcher(key);
         }
         self.run_pending();
     }
 
-    /// The built-in LSP keymaps: `gd` go-to-definition, `gD` go-to-declaration,
-    /// `gr` references, `K` hover (all normal mode); the completion popup and its
-    /// `<C-x><C-o>` / `<C-Space>` triggers, plus `<C-k>` signature help (insert
-    /// mode). Returns `true` when the key was consumed as (part of) a mapping and
-    /// must not reach the editor.
+    /// Run one key through the general mapping matcher and apply the steps it
+    /// produces. The single path into [`Keymaps::feed`] — used both by the per-key
+    /// [`input`](Self::input) loop and by [`lsp_g_prefix`](Self::lsp_g_prefix) when
+    /// it hands a withheld `g` back to the matcher.
+    fn feed_matcher(&mut self, key: Key) {
+        let mode = self.editor.mode;
+        for step in self.keymaps.feed(mode, key) {
+            self.apply_step(step);
+        }
+    }
+
+    /// The built-in `g`-prefix go-to keys: `gd` definition, `gD` declaration, `gr`
+    /// references. Returns `true` when the key was consumed as (part of) an LSP
+    /// sequence and must reach neither the matcher nor the editor.
     ///
-    /// `g` is a two-key prefix, so it is withheld and the next key decides: an
-    /// LSP letter fires the request; anything else replays the withheld `g`
-    /// (then the caller feeds the current key), so `gg`/`ge`/… are untouched.
-    /// `g`/`K` are only armed in plain normal mode, leaving insert-mode text and
-    /// visual-mode `g`/`K` alone; operator-pending also reports `Normal`, but its
-    /// non-LSP second key takes the replay path, preserving `dgg` & co. The
-    /// insert-mode arm ([`Server::completion_insert_key`]) owns the popup; `<C-k>`
-    /// fires signature help (where it would otherwise insert a literal `k`).
-    /// (Revisited once `vim.keymap` lands in Phase 7.)
-    fn lsp_keymap(&mut self, key: Key) -> bool {
+    /// Why these are here and not native default maps (unlike `K` / the insert
+    /// triggers): the general matcher withholds a live prefix and resolves the
+    /// ambiguity only on the *next* key or an idle flush, but core's `gg`/`ge`/`gj`/…
+    /// motions are **not in the trie** — they live in `nxvim-core`. So if `g` were a
+    /// matcher prefix, it couldn't tell that a second `g` *completes* `gg` rather than
+    /// *continuing* toward `gd`, and would fold the withheld `g` into `gd` — breaking
+    /// `gg`/`ggdG`/`dgg` (and, because `pending` persists across batches, even `gg`
+    /// then a later `d`). This recognizer resolves the LSP combos in-batch instead.
+    ///
+    /// `g` is withheld; the next key decides:
+    /// - `d`/`D`/`r` → fire the request (consumed; never reaches the editor).
+    /// - anything else → the withheld `g` is handed **to the matcher**
+    ///   ([`feed_matcher`](Self::feed_matcher)), then we fall through so the caller
+    ///   feeds the current key too. Routing through the matcher (rather than straight
+    ///   to the editor) is what lets a *user* `g`-map that isn't `gd`/`gD`/`gr` (say
+    ///   `gh`) still match, while an unmapped `g`-sequence passes through to core's
+    ///   motions unchanged.
+    ///
+    /// `g` is only armed in a `Normal`-mode context (which includes operator-pending,
+    /// so `dgg` takes the fall-through path and still deletes to the top). A user
+    /// `vim.keymap.set('n','gd',…)` does *not* override the three LSP combos (this
+    /// recognizer claims `g`+`d`/`D`/`r` before the matcher sees them) — a deliberate
+    /// gap versus `K`/the triggers, the price of keeping core's `g`-motions intact.
+    fn lsp_g_prefix(&mut self, key: Key) -> bool {
         if self.lsp_pending_g {
             self.lsp_pending_g = false;
             match key.as_char() {
@@ -491,73 +588,18 @@ impl Server {
                     self.request_lsp(LspReqKind::References);
                     return true;
                 }
-                // Not an LSP sequence: replay the `g` we withheld, then let the
-                // caller feed this key, so the editor sees the original pair.
+                // Not an LSP combo: hand the withheld `g` back to the matcher (so a
+                // user `g`-map can match and core's `gg`/`ge`/… still work), then let
+                // the caller feed this key through the matcher as well.
                 _ => {
-                    self.editor.input(Key::char('g'));
+                    self.feed_matcher(Key::char('g'));
                     return false;
                 }
             }
         }
-        // Insert-mode completion: the triggers and, while the popup is open, its
-        // navigation / accept / dismiss / live-refresh keys (Phase 5). A "passes
-        // through" key (e.g. `<C-k>`, a non-word char) closes the menu here and
-        // falls through to take its normal effect below.
-        if self.editor.mode == Mode::Insert && self.completion_insert_key(key) {
+        if self.editor.mode == Mode::Normal && key.as_char() == Some('g') {
+            self.lsp_pending_g = true;
             return true;
-        }
-        if self.editor.mode == Mode::Normal {
-            match key.as_char() {
-                Some('g') => {
-                    self.lsp_pending_g = true;
-                    return true;
-                }
-                Some('K') => {
-                    self.request_lsp(LspReqKind::Hover);
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        // `<C-k>` in insert mode requests signature help (consumed here so it
-        // never reaches the editor as a literal `k` insertion).
-        if self.editor.mode == Mode::Insert && key.ctrl && key.code == KeyCode::Char('k') {
-            self.request_lsp(LspReqKind::SignatureHelp);
-            return true;
-        }
-        false
-    }
-
-    /// Insert-mode completion key handling (Phase 5): the omni triggers
-    /// (`<C-x><C-o>` / `<C-Space>`) and, while the popup is open, its keys.
-    /// Returns `true` when the key is consumed; `false` lets it fall through to
-    /// the rest of [`Server::lsp_keymap`] and the editor (e.g. `<C-k>`, or a plain
-    /// character typed with no menu open).
-    fn completion_insert_key(&mut self, key: Key) -> bool {
-        // `<C-x>` arms the omni-completion prefix; a following `<C-o>` triggers.
-        if self.lsp_pending_ctrl_x {
-            self.lsp_pending_ctrl_x = false;
-            if key.ctrl && key.code == KeyCode::Char('o') {
-                self.request_lsp(LspReqKind::Completion);
-                return true;
-            }
-            // Not `<C-o>`: the `<C-x>` is dropped; handle `key` normally below.
-        }
-        // While the popup is open, route its keys. A key it doesn't claim closes
-        // the menu and returns `false`, so it falls through to act normally.
-        if self.completion_menu_open() && self.completion_menu_key(key) {
-            return true;
-        }
-        // Triggers — only with no menu open (a passthrough above just closed one).
-        if !self.completion_menu_open() {
-            if key.ctrl && key.code == KeyCode::Char(' ') {
-                self.request_lsp(LspReqKind::Completion);
-                return true;
-            }
-            if key.ctrl && key.code == KeyCode::Char('x') {
-                self.lsp_pending_ctrl_x = true;
-                return true;
-            }
         }
         false
     }
@@ -624,6 +666,150 @@ impl Server {
                 self.lsp_menu_close();
                 false
             }
+        }
+    }
+
+    /// Resolve a withheld key-prefix on input idle — the matcher's `timeoutlen`
+    /// flush (design D4). Mirrors [`input`](Self::input)'s drive, but the steps come
+    /// from [`Keymaps::flush`] (no incoming key) instead of `feed`. Refreshing the
+    /// tries first keeps the flush consistent with a registry/buffer change since the
+    /// last batch; with nothing pending the whole call is a no-op.
+    fn input_flush(&mut self) {
+        self.refresh_keymaps();
+        let mode = self.editor.mode;
+        for step in self.keymaps.flush(mode) {
+            self.apply_step(step);
+        }
+        self.run_pending();
+    }
+
+    /// Bring the keymap tries up to date for the current buffer. Re-reads the
+    /// registry only when `vim._keymaps_version` advanced (one integer read across
+    /// the bridge on the common path), and rebuilds the per-mode tries when either
+    /// the snapshot or the current buffer changed — the latter so a buffer-local
+    /// map (design D6) is in force exactly in its own buffer. Both checks are
+    /// cheap; a mapping set or a buffer switched *mid-batch* takes effect on the
+    /// next batch, the same accepted ordering the version check already implies.
+    fn refresh_keymaps(&mut self) {
+        let version = self.lua.keymaps_version();
+        if version != self.keymaps.version {
+            let snapshot = self.lua.keymaps_snapshot();
+            self.keymaps.set_snapshot(version, snapshot);
+        }
+        let buffer = self.editor.current_buffer_id().0;
+        if self.keymaps.needs_build(buffer) {
+            self.keymaps.build_for(buffer);
+        }
+    }
+
+    /// Apply one matcher [`Step`]: a raw key goes to the editor (with the per-key
+    /// lifecycle diff, exactly as the old bare loop did); a fired mapping runs its
+    /// RHS.
+    fn apply_step(&mut self, step: Step) {
+        match step {
+            Step::Editor(key) => {
+                self.editor.input(key);
+                // Per *key*, not per message: a batched `o…<Esc>` must still see
+                // the transition into insert on the `o`, which a once-per-input
+                // diff would miss (it'd see only the settled Normal end-state).
+                self.emit_lifecycle_events();
+            }
+            Step::Fire { rhs, silent, expr } => self.fire_mapping(rhs, silent, expr),
+        }
+    }
+
+    /// Execute a fired mapping's RHS (design D7 — a `match` over the enum from day
+    /// one, so the LSP backport adds its native action as one more arm). A Lua
+    /// function is invoked and its effects folded in (any deferred ex-commands
+    /// converge in the batch's trailing `run_pending`, like the autocmd path); a
+    /// `noremap` string RHS is fed key-by-key straight to the editor.
+    ///
+    /// `<silent>` (`silent`) suppresses the message line the mapping leaves: the
+    /// line is snapshotted before the fire and restored after, so a `:cmd` echo or
+    /// `print` the mapping triggers doesn't linger on the command line. The
+    /// `:messages` history (appended by `echo`) is deliberately *not* rewound — the
+    /// output is still logged, only its transient display is hidden, matching vim's
+    /// "no messages on the command line while executing this mapping." (Effects a
+    /// Lua RHS *defers* to the trailing `run_pending` fall outside this window — an
+    /// accepted corner, the same ordering caveat the rest of the fire path carries.)
+    ///
+    /// `<expr>` (`expr`) routes a Lua RHS through [`fire_expr`](Self::fire_expr): the
+    /// function is run for its *return value* (the keys to feed), under a textlock
+    /// that stops it mutating the editor. (A non-Lua `expr` RHS falls through to the
+    /// normal path — nxvim has no expression evaluator for a string RHS.)
+    fn fire_mapping(&mut self, rhs: MappingRhs, silent: bool, expr: bool) {
+        let restore = silent.then(|| self.editor.message.clone());
+        match (expr, rhs) {
+            (true, MappingRhs::Lua(id)) => self.fire_expr(id),
+            (_, rhs) => self.fire_mapping_inner(rhs),
+        }
+        if let Some(message) = restore {
+            self.editor.message = message;
+        }
+    }
+
+    /// Run an `<expr>` Lua RHS and feed the keys it returns. The function computes
+    /// keys rather than acting (vim's `<expr>`): it runs under the prelude's textlock
+    /// (`vim._expr_lock`, which makes `vim.cmd` raise), and whatever effects it
+    /// queued anyway are **discarded** here — only the returned keys take effect, fed
+    /// straight to the editor (noremap; the computed keys are not themselves
+    /// remapped, the common case for `<expr>`, which is noremap by default). An error
+    /// (a throwing handler, or a textlock violation) is surfaced and nothing is fed.
+    fn fire_expr(&mut self, id: u64) {
+        match self.lua.run_keymap_expr(id) {
+            Ok(keys) => {
+                self.discard_lua_effects();
+                for key in parse_keys(&keys) {
+                    self.editor.input(key);
+                    self.emit_lifecycle_events();
+                }
+            }
+            Err(e) => {
+                self.discard_lua_effects();
+                self.editor
+                    .echo(format!("E5108: Error executing keymap: {e}"));
+            }
+        }
+    }
+
+    /// Drop every side effect the last Lua chunk queued without applying any of them
+    /// — the `<expr>` sandbox's safety net: an `<expr>` RHS that printed, set a
+    /// highlight, or queued a panel op despite the textlock has those effects thrown
+    /// away here, so only its returned keys ever reach the editor. Mirrors the drains
+    /// in [`apply_lua_effects`](Self::apply_lua_effects), but discards each.
+    fn discard_lua_effects(&mut self) {
+        let _ = self.lua.take_highlights();
+        let _ = self.lua.take_commands();
+        let _ = self.lua.take_output();
+        let _ = self.lua.take_panel_ops();
+    }
+
+    fn fire_mapping_inner(&mut self, rhs: MappingRhs) {
+        match rhs {
+            MappingRhs::Lua(id) => {
+                if let Err(e) = self.lua.run_keymap(id) {
+                    self.editor
+                        .echo(format!("E5108: Error executing keymap: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            MappingRhs::Keys(keys, _noremap) => {
+                // A string RHS that reaches the server is fed straight to the
+                // editor, bypassing the trie. The matcher only hands these over
+                // for the non-remapping cases: a `noremap` RHS, or a `remap` RHS
+                // that exhausted its re-feed budget (recursive remap expansion
+                // happens inside the matcher's `feed`, never here).
+                for key in keys {
+                    self.editor.input(key);
+                    self.emit_lifecycle_events();
+                }
+            }
+            // A built-in default (the LSP keys) runs natively — no key-feeding, so
+            // the `<cmd>`/remap caveats never touch it (design B3). `request_lsp`
+            // and `LspReqKind` already exist on this branch; the matcher only ever
+            // hands us a `Native` RHS for the four normal-mode LSP defaults and the
+            // insert-mode completion triggers installed at startup.
+            MappingRhs::Native(BuiltinAction::Lsp(kind)) => self.request_lsp(kind),
         }
     }
 

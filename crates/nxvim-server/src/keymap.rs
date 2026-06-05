@@ -1,0 +1,489 @@
+//! The server-side key-mapping engine: a per-mode prefix trie plus an N-key
+//! withhold/replay buffer that sits *in front of* `Editor::input`, so the core
+//! key state machine never learns about user mappings (design D1).
+//!
+//! The whole engine is a pure function of *(mode, incoming key)*: [`Keymaps::feed`]
+//! returns an owned list of [`Step`]s the server then executes against the editor
+//! / Lua — it never touches the editor itself, which both keeps the core mapping-
+//! unaware and sidesteps borrow conflicts between the matcher state and the editor.
+//!
+//! **Matching without a timer.** nxvim processes keys synchronously, in
+//! `nvim_input` batches, with no idle timer — so vim's `timeoutlen` ambiguity
+//! ("wait T ms, then take the shorter map") can't be reproduced. Instead a key
+//! that forms a *live prefix* of some mapping is **withheld** in `pending`; the
+//! next key either extends the prefix, completes a mapping, or breaks it — in
+//! which case the buffered keys are **replayed** to the editor and the current key
+//! re-processed (this is the generalization the LSP branch's hand-rolled
+//! `lsp_pending_g` recognizer becomes on the backport). The one divergence from
+//! neovim: a trailing live-prefix with no following key has no wall-clock
+//! `timeoutlen` to resolve it on; instead the client sends a synthetic idle flush
+//! ([`Keymaps::flush`], the `nxvim_input_flush` RPC) after `timeoutlen` of no
+//! input, which resolves the buffer exactly as the next-key break path would —
+//! keeping the server itself timer-free (design D4, Phase 4).
+
+use std::collections::HashMap;
+
+use nxvim_core::{parse_keys, Key, Mode};
+use nxvim_lua::{RawKeymap, RawRhs};
+
+use crate::lsp::LspReqKind;
+
+/// A built-in editor action a default mapping fires natively, rather than by
+/// running Lua or feeding keys (design D7 — the LSP backport's variant). It is the
+/// only RHS the server *acts on directly*: the four normal-mode LSP keys
+/// (`gd`/`gD`/`gr`/`K`) and the insert-mode completion triggers
+/// (`<C-Space>`/`<C-x><C-o>`/`<C-k>`) all resolve to a [`LspReqKind`] the server
+/// issues via `request_lsp`. No key-feeding, so the `<cmd>` / remap caveats never
+/// apply to these.
+#[derive(Clone, Copy, Debug)]
+pub enum BuiltinAction {
+    /// Issue an LSP request of this kind (the only native action kind today).
+    Lsp(LspReqKind),
+}
+
+/// What a matched mapping does when it fires (design D7). The fire dispatch is a
+/// `match` over this enum, so the LSP backport adds its native action as one more
+/// variant + one more arm — not an engine change.
+#[derive(Clone, Debug)]
+pub enum MappingRhs {
+    /// A Lua function RHS, keyed by id in `vim._keymap_fns`; the server runs it
+    /// via `LuaRuntime::run_keymap` and folds in the effects.
+    Lua(u64),
+    /// A string RHS already parsed to keys, with its `noremap` flag. A `noremap`
+    /// RHS is fed straight to the editor (bypassing the trie); a remap RHS is
+    /// re-fed *through the matcher* so its keys can themselves trigger mappings
+    /// (see [`Keymaps::fire`], bounded by the `remap_budget`).
+    Keys(Vec<Key>, bool),
+    /// A built-in editor action (the LSP keys) the server runs natively. Carried
+    /// only by the [`native defaults`](Keymaps::set_native_defaults), never by a
+    /// user map (the Lua registry has no way to produce one), so it always sits at
+    /// the lowest precedence rung and a user `vim.keymap.set` shadows it.
+    Native(BuiltinAction),
+}
+
+/// A compiled mapping at a trie node: its RHS plus the option flags that change
+/// how it matches (`nowait`) or how its effects surface (`silent`).
+#[derive(Clone, Debug)]
+pub struct Mapping {
+    /// What fires when this mapping matches.
+    pub rhs: MappingRhs,
+    /// `<nowait>`: fire the moment this mapping completes, even if it is also a
+    /// prefix of a longer one — don't hold it waiting for the longer map (which,
+    /// timer-less, would otherwise need the idle flush or the next key to resolve).
+    pub nowait: bool,
+    /// `<silent>`: the message line this mapping's execution produces is suppressed
+    /// (the server snapshots/restores it around the fire); `:messages` is unaffected.
+    pub silent: bool,
+    /// `<expr>`: a function RHS computes the keys to feed rather than acting; the
+    /// server runs it via `run_keymap_expr` and feeds the returned keys. Only a Lua
+    /// RHS is affected — a string RHS ignores it (nxvim has no expression evaluator).
+    pub expr: bool,
+}
+
+/// A built-in default mapping the server installs at startup (design D6/B2): the
+/// LSP keys, given as the raw map-mode code (`"n"`, `"i"`, …), the LHS notation,
+/// and the native action they fire. Compiled into every buffer's tries at the
+/// lowest precedence so a user `vim.keymap.set` for the same `(mode, lhs)` wins.
+#[derive(Clone, Copy)]
+pub struct NativeDefault {
+    /// The declared map-mode code, expanded through [`mode_buckets`] like a user
+    /// map's mode (so a future `""` default would fan out the same way).
+    pub mode: &'static str,
+    /// The LHS notation, run through `parse_keys` into the trie path.
+    pub lhs: &'static str,
+    /// What fires when the LHS matches.
+    pub action: BuiltinAction,
+}
+
+/// A unit of work [`Keymaps::feed`] hands back for the server to apply, in order.
+pub enum Step {
+    /// Send this key to `editor.input` (then `emit_lifecycle_events`).
+    Editor(Key),
+    /// Fire this mapping's RHS; `silent` carries the `<silent>` flag the server
+    /// honors by restoring the message line after the fire, and `expr` the
+    /// `<expr>` flag (run the Lua RHS for its returned keys, then feed them).
+    Fire {
+        rhs: MappingRhs,
+        silent: bool,
+        expr: bool,
+    },
+}
+
+/// A node in a per-mode prefix trie: the mapping that ends here (if any) and the
+/// continuations that extend it.
+#[derive(Default)]
+struct Node {
+    children: HashMap<Key, Node>,
+    mapping: Option<Mapping>,
+}
+
+/// A prefix trie of LHS key-paths → mapping, one per mode.
+#[derive(Default)]
+struct Trie {
+    root: Node,
+}
+
+/// How a buffered key sequence relates to the mappings in a trie.
+enum Classify {
+    /// A live prefix of at least one mapping (possibly itself complete): hold.
+    Prefix,
+    /// A complete mapping to fire now — either nothing longer extends it, or it is
+    /// `<nowait>` so it fires without waiting for a longer continuation.
+    Complete(Mapping),
+    /// Not a prefix of anything: the sequence broke every live mapping.
+    None,
+}
+
+impl Trie {
+    /// Insert `keys` → `mapping`. A later insert at the same path overwrites an
+    /// earlier one, which is how the precedence ladder resolves to last-wins
+    /// (callers insert lowest-precedence first; see [`Keymaps::build_for`]).
+    fn insert(&mut self, keys: &[Key], mapping: Mapping) {
+        let mut node = &mut self.root;
+        for k in keys {
+            node = node.children.entry(*k).or_default();
+        }
+        node.mapping = Some(mapping);
+    }
+
+    /// Classify `keys` against the trie. A mapping that is *also* a prefix of a
+    /// longer one (ambiguous, e.g. `j` & `jk`) is normally held as `Prefix` and
+    /// resolved when a later key breaks it (via [`Trie::longest_complete`]) — unless
+    /// it is `<nowait>`, in which case it fires the moment it completes, ignoring
+    /// the longer continuation (vim's `<nowait>` semantics).
+    fn classify(&self, keys: &[Key]) -> Classify {
+        let mut node = &self.root;
+        for k in keys {
+            match node.children.get(k) {
+                Some(n) => node = n,
+                None => return Classify::None,
+            }
+        }
+        match (&node.mapping, node.children.is_empty()) {
+            (Some(m), true) => Classify::Complete(m.clone()), // complete, nothing longer
+            (Some(m), false) if m.nowait => Classify::Complete(m.clone()), // nowait: fire now
+            (Some(_), false) => Classify::Prefix,             // complete but also a prefix: hold
+            (None, false) => Classify::Prefix,                // live prefix, not yet complete
+            (None, true) => Classify::None,                   // unreachable in a well-formed trie
+        }
+    }
+
+    /// The longest prefix of `keys` that is a complete mapping, with its length —
+    /// used to fire the shorter map when an ambiguous sequence finally breaks.
+    fn longest_complete(&self, keys: &[Key]) -> Option<(Mapping, usize)> {
+        let mut node = &self.root;
+        let mut best = None;
+        for (i, k) in keys.iter().enumerate() {
+            match node.children.get(k) {
+                Some(n) => {
+                    node = n;
+                    if let Some(m) = &node.mapping {
+                        best = Some((m.clone(), i + 1));
+                    }
+                }
+                None => break,
+            }
+        }
+        best
+    }
+}
+
+/// The mapping engine: cached per-mode tries, the registry version they were
+/// built from, and the withhold/replay buffer. One of these lives on the server.
+#[derive(Default)]
+pub struct Keymaps {
+    /// `vim._keymaps_version` the cached [`snapshot`](Self::snapshot) was last
+    /// pulled at. The server re-reads the registry only when the live version
+    /// advances (checked once per batch).
+    pub version: u64,
+    /// The registry snapshot, pre-sorted into precedence order (lowest first), so
+    /// [`build_for`](Self::build_for) can compile a buffer's tries by a single
+    /// linear insert without re-sorting. Kept across buffer switches: a switch
+    /// rebuilds the tries from this same snapshot, filtered to the new buffer.
+    snapshot: Vec<RawKeymap>,
+    /// The buffer the cached `tries` were built for, or `None` when they need a
+    /// (re)build — set on a version bump or after a buffer switch. Buffer-local
+    /// maps for *other* buffers are filtered out of the tries (design D6's
+    /// buffer-local > global rung), so this gates a rebuild when the current
+    /// buffer changes even though the registry version did not.
+    built_buffer: Option<u64>,
+    /// Per-mode tries, keyed by the editor-mode code the matcher selects them by
+    /// (`mode_key`: `'n'`, `'i'`, `'v'`, `'V'`, …). A map's declared mode expands
+    /// to one or more of these buckets at build time (see [`mode_buckets`]).
+    tries: HashMap<char, Trie>,
+    /// Keys withheld as a live prefix, awaiting the key that extends, completes,
+    /// or breaks them. Persists across batches (no auto-flush — design D4).
+    pending: Vec<Key>,
+    /// The built-in default mappings (the LSP keys) installed once at startup,
+    /// inserted into every buffer's tries *before* the snapshot so any user (or
+    /// Lua-default) map at the same LHS overwrites them — the lowest rung of the
+    /// precedence ladder (design D6/B2).
+    native_defaults: Vec<NativeDefault>,
+    /// Remaining recursive-`remap` re-feeds for the current keystroke (vim's
+    /// `maxmapdepth`). Reset at the top of every [`feed`](Keymaps::feed) and
+    /// decremented on each remap expansion, so a self-referential map (`a`→`a`,
+    /// or `a`↔`b`) runs out of budget and falls through to a literal key instead
+    /// of looping. It is a *shared* budget across the whole expansion tree, not a
+    /// per-branch depth, so a fan-out remap (`a`→`bb`, `b`→`a`) stays linear.
+    remap_budget: usize,
+}
+
+/// The recursive-remap re-feed cap (vim's `maxmapdepth` is 1000; a smaller cap is
+/// plenty — it only has to break self-referential maps cleanly).
+const MAX_MAP_DEPTH: usize = 100;
+
+impl Keymaps {
+    /// Cache a fresh registry snapshot (read when `vim._keymaps_version`
+    /// advanced) and remember its version. Entries are sorted once into
+    /// precedence order — **buffer-local > global**, within a scope **user
+    /// (non-default) > default**, and among equals **last-set wins** — so
+    /// [`build_for`](Self::build_for) can replay them lowest-first and let
+    /// higher-precedence entries overwrite at the same LHS path (D6). Marks the
+    /// tries stale (via [`needs_build`](Self::needs_build)) so the server rebuilds
+    /// them before the next match.
+    pub fn set_snapshot(&mut self, version: u64, mut snapshot: Vec<RawKeymap>) {
+        self.version = version;
+        snapshot.sort_by_key(|e| (e.buffer.is_some(), !e.default, e.seq));
+        self.snapshot = snapshot;
+        self.built_buffer = None;
+    }
+
+    /// Install the built-in default mappings (the LSP keys) once at startup. They
+    /// are kept separately from the registry snapshot and inserted at the lowest
+    /// precedence on every [`build_for`](Self::build_for), so a user
+    /// `vim.keymap.set` for the same `(mode, lhs)` shadows them (design D6/B2).
+    /// Marks the tries stale so the next match rebuilds with the defaults in place.
+    pub fn set_native_defaults(&mut self, defaults: Vec<NativeDefault>) {
+        self.native_defaults = defaults;
+        self.built_buffer = None;
+    }
+
+    /// Whether the cached tries need a (re)build for `buffer` — true after a
+    /// version bump (which clears [`built_buffer`](Self::built_buffer)) or when the
+    /// current buffer differs from the one the tries were built for.
+    pub fn needs_build(&self, buffer: u64) -> bool {
+        self.built_buffer != Some(buffer)
+    }
+
+    /// (Re)compile the per-mode tries for `buffer` from the cached snapshot,
+    /// keeping global maps and the buffer-local maps scoped to `buffer` while
+    /// dropping buffer-local maps for *other* buffers. Because the snapshot is
+    /// pre-sorted (buffer-local last within a scope), the surviving buffer-local
+    /// entries overwrite the globals at the same LHS — the buffer-local > global
+    /// rung of D6. Phase 1 exercised only last-set-wins (all global); this is
+    /// where the buffer rung first does real work.
+    pub fn build_for(&mut self, buffer: u64) {
+        self.built_buffer = Some(buffer);
+        self.tries.clear();
+        // Built-in defaults go in first, at the bottom of the precedence ladder:
+        // every snapshot entry below (all user maps, plus any Lua-registered
+        // default) is inserted afterward and overwrites at the same LHS path (D6).
+        for d in &self.native_defaults {
+            let lhs = parse_keys(d.lhs);
+            if lhs.is_empty() {
+                continue;
+            }
+            let mapping = Mapping {
+                rhs: MappingRhs::Native(d.action),
+                nowait: false,
+                silent: false,
+                expr: false,
+            };
+            for &bucket in mode_buckets(d.mode) {
+                self.tries
+                    .entry(bucket)
+                    .or_default()
+                    .insert(&lhs, mapping.clone());
+            }
+        }
+        for entry in &self.snapshot {
+            // Skip buffer-local maps that belong to a different buffer.
+            if matches!(entry.buffer, Some(b) if b != buffer) {
+                continue;
+            }
+            let lhs = parse_keys(&entry.lhs);
+            if lhs.is_empty() {
+                continue;
+            }
+            let rhs = match &entry.rhs {
+                RawRhs::Lua(id) => MappingRhs::Lua(*id),
+                RawRhs::Str(s) => MappingRhs::Keys(parse_keys(s), entry.noremap),
+            };
+            let mapping = Mapping {
+                rhs,
+                nowait: entry.nowait,
+                silent: entry.silent,
+                expr: entry.expr,
+            };
+            for mode in &entry.modes {
+                // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out
+                // to the editor-mode tries it covers — `'v'` lands in both the
+                // Visual and Visual-Line tries, `''` in normal+visual, etc.
+                for &bucket in mode_buckets(mode) {
+                    self.tries
+                        .entry(bucket)
+                        .or_default()
+                        .insert(&lhs, mapping.clone());
+                }
+            }
+        }
+    }
+
+    /// Feed one input key in `mode` and return the steps it produced. The server
+    /// calls this for every parsed key, executing the steps in order.
+    pub fn feed(&mut self, mode: Mode, key: Key) -> Vec<Step> {
+        // Fresh remap budget per real keystroke (vim resets `maxmapdepth` once a
+        // typed char is consumed; a keystroke is exactly that boundary).
+        self.remap_budget = MAX_MAP_DEPTH;
+        let mut steps = Vec::new();
+        self.feed_key(mode, key, &mut steps);
+        steps
+    }
+
+    /// Resolve whatever is withheld in `pending` *as if a `timeoutlen` boundary
+    /// had passed* — the synthetic idle flush that closes the D4 gap (design §3 /
+    /// D4). The TUI sends this after an idle gap with no following key; the server
+    /// turns it into a [`flush`](Keymaps::flush) so a trailing live-prefix fires
+    /// without waiting for the *next* keystroke.
+    ///
+    /// Semantics are the next-key break path with no next key: fire the longest
+    /// complete mapping that prefixes the buffer (the ambiguous *shorter* map —
+    /// e.g. `j` when both `j` and `jk` are mapped), then re-feed the remainder; with
+    /// no complete prefix the withheld keys were not a mapping, so replay them raw
+    /// (e.g. the second `g` of `gg` reaches the editor, completing go-to-top). Empty
+    /// `pending` makes this a no-op, so the client can flush unconditionally on idle.
+    ///
+    /// The loop drains any remainder a re-feed re-withholds (overlapping maps can
+    /// leave a deeper prefix buffered); it terminates because each pass consumes at
+    /// least one key, so `pending` strictly shrinks. The defensive break guards the
+    /// invariant in case that ever fails to hold.
+    pub fn flush(&mut self, mode: Mode) -> Vec<Step> {
+        self.remap_budget = MAX_MAP_DEPTH;
+        let mut steps = Vec::new();
+        let mode_key = mode_key(mode);
+        while !self.pending.is_empty() {
+            let before = self.pending.len();
+            let buffered: Vec<Key> = self.pending.drain(..).collect();
+            if self.tries.contains_key(&mode_key) {
+                self.resolve_buffered(mode, &buffered, &mut steps);
+            } else {
+                // No trie for the current mode (the prefix was withheld in another
+                // mode, then the mode changed): the keys can't be a mapping here.
+                steps.extend(buffered.into_iter().map(Step::Editor));
+            }
+            if self.pending.len() >= before {
+                steps.extend(self.pending.drain(..).map(Step::Editor));
+                break;
+            }
+        }
+        steps
+    }
+
+    fn feed_key(&mut self, mode: Mode, key: Key, steps: &mut Vec<Step>) {
+        let mode_key = mode_key(mode);
+        // No mappings for this mode: flush any prefix buffered in another mode and
+        // pass the key straight through. (In practice `pending` is empty here.)
+        if !self.tries.contains_key(&mode_key) {
+            steps.extend(self.pending.drain(..).map(Step::Editor));
+            steps.push(Step::Editor(key));
+            return;
+        }
+        self.pending.push(key);
+        let classify = self.tries[&mode_key].classify(&self.pending);
+        match classify {
+            Classify::Prefix => {} // hold: wait for the next key
+            Classify::Complete(mapping) => {
+                self.pending.clear();
+                self.fire(mode, mapping, steps);
+            }
+            Classify::None => {
+                // This key broke every live prefix. Resolve the previously
+                // buffered keys (without this key), then re-process this key fresh.
+                self.pending.pop();
+                let buffered: Vec<Key> = self.pending.drain(..).collect();
+                if buffered.is_empty() {
+                    // The key on its own starts no mapping: straight to the editor.
+                    steps.push(Step::Editor(key));
+                } else {
+                    self.resolve_buffered(mode, &buffered, steps);
+                    self.feed_key(mode, key, steps);
+                }
+            }
+        }
+    }
+
+    /// Execute a fired mapping. A `remap` string RHS is re-fed key-by-key *through
+    /// the matcher* so its keys can themselves trigger further mappings, bounded by
+    /// the shared `remap_budget` so a self-referential map terminates (at the cap
+    /// the remaining keys fall through as a literal feed). Everything else — a
+    /// `noremap` string RHS, a Lua function, a future native action — is handed to
+    /// the server as a [`Step::Fire`] (a `noremap` RHS the server feeds straight to
+    /// the editor; a Lua/native RHS it invokes), carrying the `<silent>`/`<expr>`
+    /// flags the server honors.
+    ///
+    /// `<silent>` on a *remap* RHS is not threaded onto the re-fed keys: the inner
+    /// maps they trigger surface with their own flags, matching the fact that the
+    /// outer map's effect is just to type those keys. The flag bites on the terminal
+    /// fire (Lua / `noremap` string), which is where a message would be produced.
+    fn fire(&mut self, mode: Mode, mapping: Mapping, steps: &mut Vec<Step>) {
+        match mapping.rhs {
+            MappingRhs::Keys(keys, false) if self.remap_budget > 0 => {
+                self.remap_budget -= 1;
+                for key in keys {
+                    self.feed_key(mode, key, steps);
+                }
+            }
+            rhs => steps.push(Step::Fire {
+                rhs,
+                silent: mapping.silent,
+                expr: mapping.expr,
+            }),
+        }
+    }
+
+    /// Resolve a run of buffered keys that no longer extends any mapping: fire the
+    /// longest complete mapping that prefixes them (the ambiguous shorter map),
+    /// then re-process the remainder through the matcher (it follows a completed
+    /// map and may itself begin a new one — strictly shorter than `buffered`, so
+    /// this terminates). With no complete prefix the withheld keys were not a
+    /// mapping at all: replay them to the editor raw (re-feeding them would just
+    /// re-withhold the same live prefix and loop).
+    fn resolve_buffered(&mut self, mode: Mode, buffered: &[Key], steps: &mut Vec<Step>) {
+        match self.tries[&mode_key(mode)].longest_complete(buffered) {
+            Some((mapping, used)) => {
+                self.fire(mode, mapping, steps);
+                for &key in &buffered[used..] {
+                    self.feed_key(mode, key, steps);
+                }
+            }
+            None => steps.extend(buffered.iter().copied().map(Step::Editor)),
+        }
+    }
+}
+
+/// The trie key the matcher selects for the *current editor mode* — the first
+/// char of its `mode()` short code (`Normal` → `'n'`, `Insert` → `'i'`,
+/// `Visual` → `'v'`, `VisualLine` → `'V'`, `Command` → `'c'`). Paired with
+/// [`mode_buckets`], which decides which of these tries a declared map lands in.
+fn mode_key(mode: Mode) -> char {
+    mode.short_code().chars().next().unwrap_or('n')
+}
+
+/// The editor-mode trie buckets a declared map-mode code lands in — the build-time
+/// counterpart of [`mode_key`]. A `'v'`/`'x'` map covers both Visual and
+/// Visual-Line (nxvim has no Select mode, so they coincide); `''` (vim's `:map`)
+/// covers normal + visual. Operator-pending (`'o'`) is **deferred**: nxvim has no
+/// operator-pending *mode* (a pending operator lives in private core state while
+/// `editor.mode == Normal`), so there is no trie to select it by — the normal-trie
+/// replay path already preserves `d{motion}`/`dgg`, and a true `omap` trie awaits a
+/// core accessor for the pending operator. An unknown code maps to nothing.
+fn mode_buckets(code: &str) -> &'static [char] {
+    match code {
+        "n" => &['n'],
+        "i" => &['i'],
+        "c" => &['c'],
+        "v" | "x" => &['v', 'V'],
+        "" => &['n', 'v', 'V'],
+        _ => &[],
+    }
+}

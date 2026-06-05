@@ -22,15 +22,15 @@ mod parse;
 mod render;
 mod view;
 
-pub use keys::encode_key;
+pub use keys::{encode_key, encode_paste};
 pub use render::{close_button, cursor_style, paint, ScrollHarness};
 pub use view::View;
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseButton,
-    MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
@@ -46,6 +46,16 @@ use render::render;
 
 /// Rows reserved at the bottom for the status line and command line.
 const CHROME_ROWS: u16 = 2;
+
+/// How long the client waits after a keystroke, with no further input, before
+/// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`
+/// (default 1000ms). The server has no input timer (it processes `nvim_input`
+/// batches synchronously), so a trailing key that is a *live prefix* of a mapping
+/// stays withheld in the matcher until something flushes it. This idle flush is
+/// that something: it lets an ambiguous shorter map (`j` with `jk` mapped) or a
+/// replayed prefix (the second `g` of `gg` with `gh` mapped) resolve without the
+/// user pressing another key — the timer-less divergence's blessed fix (design D4).
+const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
 
 /// RAII guard for terminal mouse capture: enables mouse reporting on creation
 /// and **disables it on drop**, including when the event loop unwinds on a
@@ -98,6 +108,33 @@ impl<W: Write> Drop for CursorStyleGuard<W> {
     }
 }
 
+/// RAII guard for terminal bracketed paste: turns the mode on at creation and
+/// **off on drop**, including on a panic unwind. With it on, the terminal hands
+/// a paste to the client as a single [`Event::Paste`] carrying the whole text,
+/// so the client forwards one `nvim_input` and the server does one redraw —
+/// instead of the per-character storm an unbracketed paste produces, which
+/// makes pasted text trickle in one char at a time. Drops cleanly on the panic
+/// path too, so a crash never leaves the terminal in bracketed-paste mode.
+/// Generic over the writer for the same in-memory testability as
+/// [`MouseCapture`]; production uses `std::io::stdout()`.
+pub struct BracketedPaste<W: Write> {
+    out: W,
+}
+
+impl<W: Write> BracketedPaste<W> {
+    /// Enable bracketed paste on `out`; the returned guard disables it on drop.
+    pub fn enable(mut out: W) -> Self {
+        let _ = crossterm::execute!(out, EnableBracketedPaste);
+        Self { out }
+    }
+}
+
+impl<W: Write> Drop for BracketedPaste<W> {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(self.out, DisableBracketedPaste);
+    }
+}
+
 /// Run the client over a connected stream until the server exits or disconnects.
 ///
 /// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic
@@ -114,9 +151,13 @@ where
     // Restore the user's cursor shape on the way out — the loop switches it to a
     // bar in insert mode and must not leak that into their shell.
     let cursor = CursorStyleGuard::new(std::io::stdout());
+    // Receive a paste as one event instead of one keystroke per character.
+    let paste = BracketedPaste::enable(std::io::stdout());
     let result = event_loop(stream, &mut terminal).await;
-    drop(cursor); // reset cursor shape before leaving the alternate screen
-    drop(mouse); // disable mouse capture before leaving the alternate screen
+    // Restore terminal modes before leaving the alternate screen.
+    drop(cursor); // reset cursor shape
+    drop(paste); // disable bracketed paste
+    drop(mouse); // disable mouse capture
     ratatui::restore();
     result
 }
@@ -146,6 +187,11 @@ where
     // The cursor shape last sent to the terminal, so we re-emit the escape only
     // when the mode actually changes the shape rather than on every redraw.
     let mut cursor_shape: Option<SetCursorStyle> = None;
+    // Armed by each keystroke; when the `TIMEOUT_LEN` branch wins (no further input
+    // arrived), we send one `nxvim_input_flush` and disarm. The `sleep` is recreated
+    // each loop pass, so any event — including the next key — restarts the countdown,
+    // which is exactly `timeoutlen`'s reset-on-input semantics.
+    let mut flush_armed = false;
 
     loop {
         tokio::select! {
@@ -154,7 +200,18 @@ where
                     if key.kind != KeyEventKind::Release {
                         if let Some(notation) = encode_key(key) {
                             rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
+                            flush_armed = true;
                         }
+                    }
+                }
+                Some(Ok(Event::Paste(text))) => {
+                    // Bracketed paste: the whole clipboard arrives as one event,
+                    // so forward it as a single `nvim_input` (one redraw) rather
+                    // than the per-character trickle of an unbracketed paste.
+                    let notation = encode_paste(&text);
+                    if !notation.is_empty() {
+                        rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
+                        flush_armed = true;
                     }
                 }
                 Some(Ok(Event::Resize(w, h))) => {
@@ -211,6 +268,14 @@ where
                     anim = None; // settle: render the destination view below
                 }
                 terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
+            },
+            // `timeoutlen` idle flush: a keystroke armed the timer and nothing
+            // followed within `TIMEOUT_LEN`, so nudge the server to resolve any key
+            // it withheld as a live prefix (design D4). Harmless when nothing is
+            // pending. Disarmed so it fires at most once per idle gap.
+            _ = sleep(TIMEOUT_LEN), if flush_armed => {
+                rpc.notify("nxvim_input_flush", vec![]);
+                flush_armed = false;
             },
         }
     }

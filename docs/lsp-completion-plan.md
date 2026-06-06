@@ -101,7 +101,7 @@ name and records the hit while the faithful neighbours stay real.
 
 ---
 
-## Phase 1 — Stop swallowing config-load & start failures ⬜
+## Phase 1 — Stop swallowing config-load & start failures ✅
 
 **Goal.** Make a config that errors at load (now possible after Phase 0) or a
 server that fails to start **visible**, not degraded-to-`{}`.
@@ -126,7 +126,14 @@ surface. Optionally a `vim.lsp` health/report function.
 **Tests.** A config that references a not-implemented symbol at load surfaces in
 `vim._lsp_load_errors`; a non-argv cmd surfaces in `vim._lsp_skipped`.
 
-**Done when.** No config failure is silent; `vim.lsp._report()` enumerates them.
+**Done when.** ✅ `lsp_base_config` records a present-but-failing config (unreadable
+/ parse error / runtime error / non-table return) into `vim._lsp_load_errors` and
+echoes a one-line warning instead of degrading to `{}`; `lsp_resolve_cmd` returns
+`nil, reason` on a throwing builder, and `lsp_start_resolved` / `vim.lsp.start`
+record a skip into `vim._lsp_skipped` (deduped, with a reason) instead of a bare
+`return`. `vim.lsp._report()` enumerates `enabled` / `started` / `load_errors` /
+`skipped` / `notimpl_hits`. Covered by `lsp_report.rs`. (A `:LspInfo`-style command
+that renders `_report()` is left as a later follow-up — the data surface is here.)
 
 **Depends on.** Phase 0.
 

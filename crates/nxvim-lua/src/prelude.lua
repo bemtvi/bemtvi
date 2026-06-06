@@ -1323,8 +1323,8 @@ vim.lsp.protocol.Methods = setmetatable({}, {
 -- vim.lsp.rpc.start({argv}, d) end` builder (ts_ls, eslint, jsonls, html, biome,
 -- tailwindcss, … — 20-plus servers) resolves straight to its argv. `connect`
 -- (a TCP transport, e.g. gdscript) can't be driven by the stdio spawner; it
--- returns a sentinel that `lsp_is_argv` rejects, so such a server is skipped
--- rather than crashing `enable`.
+-- raises (see below), so a config that builds its cmd through it surfaces as a
+-- load error (vim._lsp_load_errors) rather than crashing `enable`.
 vim.lsp.rpc = vim.lsp.rpc or {}
 function vim.lsp.rpc.start(cmd, _dispatchers, _extra) return cmd end
 -- `connect` is a TCP transport (e.g. gdscript). nxvim's spawner is stdio-only,
@@ -1374,6 +1374,31 @@ vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
 vim._lsp_base_cache = vim._lsp_base_cache or {}   -- name -> lsp/<name>.lua result (false = none)
 vim._lsp_enabled = vim._lsp_enabled or {}         -- name -> enabled?
 
+-- Phase 1 visibility surfaces: a config that errors at load, and a server skipped
+-- at start, are recorded here (keyed by name, so a re-resolve never duplicates)
+-- instead of silently degrading to `{}` / a bare `return`. `vim.lsp._report`
+-- reads them back. See docs/lsp-completion-plan.md (Phase 1).
+vim._lsp_load_errors = vim._lsp_load_errors or {} -- name -> load error message
+vim._lsp_skipped = vim._lsp_skipped or {}         -- name -> skip reason
+
+-- Record that `name`'s lsp/<name>.lua failed to load, and echo a one-line
+-- warning. One broken config must not wedge startup — the editor keeps running
+-- and the other servers still start — but the failure is loud, not swallowed into
+-- an empty config. Idempotent (lsp_base_config caches, so it records once).
+local function lsp_record_load_error(name, err)
+  vim._lsp_load_errors[name] = err
+  vim.api.nvim_echo("nxvim LSP: config '" .. name .. "' failed to load: " .. err)
+end
+
+-- Record that `name` was skipped at start with `reason` (its cmd didn't resolve
+-- to a spawnable stdio argv), and echo a one-line warning. Deduped on the reason
+-- so a server that skips on every buffer open doesn't spam the panel.
+local function lsp_record_skip(name, reason)
+  if vim._lsp_skipped[name] == reason then return end
+  vim._lsp_skipped[name] = reason
+  vim.api.nvim_echo("nxvim LSP: server '" .. name .. "' skipped: " .. reason)
+end
+
 -- The client registry: id -> { id, name, server_capabilities }, mirrored from
 -- Rust (`LuaRuntime::set_lsp_client`) when a server finishes `initialize`. The
 -- handle `LspAttach`'s `args.data.client_id` resolves through `get_client_by_id`.
@@ -1416,20 +1441,65 @@ end
 
 vim.lsp.get_active_clients = vim.lsp.get_clients
 
+-- vim.lsp._report(): the Phase-1 scoreboard — a snapshot of what the LSP layer is
+-- doing and where it fell short, so no failure stays silent. `enabled` lists the
+-- configs marked for auto-activation; `started` the servers that reached
+-- `initialize` (the live clients); `load_errors` the configs that failed to load
+-- (name -> message); `skipped` the servers whose cmd didn't resolve to a
+-- spawnable argv (name -> reason); `notimpl_hits` the not-implemented functions a
+-- real config actually called (the Phase-0 set). A `:LspInfo`-style command can
+-- render this later; for now it backs `:lua print(vim.inspect(vim.lsp._report()))`
+-- and the tests.
+function vim.lsp._report()
+  local enabled = {}
+  for name, on in pairs(vim._lsp_enabled) do
+    if on then enabled[#enabled + 1] = name end
+  end
+  table.sort(enabled)
+  local started = {}
+  for _, c in pairs(vim.lsp._clients) do started[#started + 1] = c.name end
+  table.sort(started)
+  local notimpl = vim.tbl_keys(vim._notimpl_hits)
+  table.sort(notimpl)
+  return {
+    enabled = enabled,
+    started = started,
+    load_errors = vim._lsp_load_errors,
+    skipped = vim._lsp_skipped,
+    notimpl_hits = notimpl,
+  }
+end
+
 -- Load and cache `lsp/<name>.lua` off the runtimepath (the base config layer).
--- Returns its returned table, or nil when absent / not a table.
+-- Returns its returned table, or nil when the file is simply absent. A file that
+-- IS present but fails — unreadable, a parse error, a runtime error (now possible
+-- since Phase 0 made gaps raise), or one that doesn't return a table — is no
+-- longer swallowed into an empty config: it is recorded in vim._lsp_load_errors
+-- and echoed (lsp_record_load_error). The result is still cached (`false`) so the
+-- load is attempted — and reported — only once.
 local function lsp_base_config(name)
   local cached = vim._lsp_base_cache[name]
   if cached ~= nil then return cached or nil end
   local cfg = false
   local files = vim.api.nvim_get_runtime_file("lsp/" .. name .. ".lua", false)
   if files and files[1] then
-    local src = vim._read_file(files[1])
-    if src then
-      local chunk = loadstring(src, "@" .. files[1])
-      if chunk then
+    local file = files[1]
+    local src = vim._read_file(file)
+    if src == nil then
+      lsp_record_load_error(name, "could not read " .. file)
+    else
+      local chunk, perr = loadstring(src, "@" .. file)
+      if not chunk then
+        lsp_record_load_error(name, "parse: " .. tostring(perr))
+      else
         local ok, ret = pcall(chunk)
-        if ok and type(ret) == "table" then cfg = ret end
+        if not ok then
+          lsp_record_load_error(name, tostring(ret))
+        elseif type(ret) ~= "table" then
+          lsp_record_load_error(name, "config did not return a table (got " .. type(ret) .. ")")
+        else
+          cfg = ret
+        end
       end
     end
   end
@@ -1467,9 +1537,8 @@ vim.lsp.config = setmetatable({}, {
 })
 
 -- Is `cmd` a usable argv — a non-empty list of strings? Guards the start queue
--- against the config shapes nxvim can't spawn: an empty/nil cmd, a builder that
--- failed, or a non-stdio transport (e.g. gdscript's `vim.lsp.rpc.connect` TCP
--- handle). Those skip the start rather than erroring at the Rust boundary.
+-- against the config shapes nxvim can't spawn: an empty/nil cmd or a builder that
+-- failed. Those skip the start rather than erroring at the Rust boundary.
 local function lsp_is_argv(cmd)
   if type(cmd) ~= "table" or #cmd == 0 then return false end
   for _, a in ipairs(cmd) do
@@ -1478,12 +1547,23 @@ local function lsp_is_argv(cmd)
   return true
 end
 
+-- Why `cmd` is not a spawnable argv — the human-readable reason recorded in
+-- vim._lsp_skipped so a skipped server isn't a silent mystery.
+local function lsp_argv_reason(cmd)
+  if cmd == nil then return "cmd did not resolve (nil)" end
+  if type(cmd) ~= "table" then return "cmd is not an argv list (got " .. type(cmd) .. ")" end
+  if #cmd == 0 then return "cmd is an empty argv list" end
+  return "cmd has a non-string element"
+end
+
 -- Resolve a config's `cmd` to an argv list. A function `cmd` is neovim's
 -- `cmd(dispatchers, config)` builder: nxvim does its own (stdio) spawning, so the
 -- dispatchers are a stub and `vim.lsp.rpc.start` returns the argv it was given
 -- (see its shim) — letting the many `node_modules/.bin` resolvers run unchanged.
 -- The builder gets the resolved config with `root_dir` filled in (the field those
--- resolvers read). A throwing/needs-unset-config builder yields nil (skip start).
+-- resolvers read). A throwing builder yields `nil, reason` so the caller can
+-- record exactly why the server was skipped (instead of a bare nil that looks the
+-- same as "no cmd").
 local function lsp_resolve_cmd(cfg, root)
   local cmd = cfg.cmd
   if type(cmd) == "function" then
@@ -1496,17 +1576,23 @@ local function lsp_resolve_cmd(cfg, root)
     for k, v in pairs(cfg) do config[k] = v end
     config.root_dir = root
     local ok, result = pcall(cmd, {}, config)
-    cmd = ok and result or nil
+    if not ok then return nil, "cmd builder errored: " .. tostring(result) end
+    cmd = result
   end
   return cmd
 end
 
 -- Queue a start for `bufnr` from a fully-resolved config (root already computed).
--- Silently skips when the cmd doesn't resolve to a spawnable argv (so enabling a
--- server whose binary/transport nxvim can't drive never errors the whole enable).
+-- When the cmd doesn't resolve to a spawnable argv, the server is recorded in
+-- vim._lsp_skipped with the reason (and a warning echoed) rather than vanishing —
+-- so enabling a server whose binary/transport nxvim can't drive is visible, not a
+-- silent no-op, and still never errors the whole enable.
 local function lsp_start_resolved(name, cfg, bufnr, ft, root)
-  local cmd = lsp_resolve_cmd(cfg, root)
-  if not lsp_is_argv(cmd) then return end
+  local cmd, reason = lsp_resolve_cmd(cfg, root)
+  if not lsp_is_argv(cmd) then
+    lsp_record_skip(name, reason or lsp_argv_reason(cmd))
+    return
+  end
   vim.lsp.start(
     { name = name, cmd = cmd, root_dir = root, filetypes = cfg.filetypes },
     { bufnr = bufnr, filetype = ft }
@@ -1604,11 +1690,15 @@ end
 function vim.lsp.start(config, opts)
   opts = opts or {}
   local bufnr = opts.bufnr or (vim._cur_buf and vim._cur_buf.bufnr) or 0
-  local cmd = config.cmd or {}
-  if type(cmd) == "function" then cmd = lsp_resolve_cmd(config, config.root_dir) end
+  local cmd, reason = config.cmd or {}, nil
+  if type(cmd) == "function" then cmd, reason = lsp_resolve_cmd(config, config.root_dir) end
   -- Only queue a spawnable argv (see lsp_is_argv): a non-stdio/empty cmd would
-  -- otherwise fail at the Rust `vim._lsp_start` boundary.
-  if not lsp_is_argv(cmd) then return end
+  -- otherwise fail at the Rust `vim._lsp_start` boundary. A skip is recorded
+  -- (vim._lsp_skipped) rather than returning silently.
+  if not lsp_is_argv(cmd) then
+    lsp_record_skip(config.name or "?", reason or lsp_argv_reason(cmd))
+    return
+  end
   vim._lsp_start(config.name, cmd, config.root_dir, opts.filetype or "", bufnr)
 end
 

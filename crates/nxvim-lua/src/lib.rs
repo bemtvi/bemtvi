@@ -406,6 +406,23 @@ struct Shared {
     /// Buffer mutations from `vim.api.nvim_buf_set_lines`, drained by the server
     /// into the live editor after the chunk (Phase 6).
     buf_ops: Vec<BufOp>,
+    /// `vim.ui.input` prompt requests, drained by the server into the editor's
+    /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
+    ui_inputs: Vec<UiInputReq>,
+}
+
+/// A `vim.ui.input(opts, on_confirm)` request: open a one-line prompt labelled
+/// `prompt`, prefilled with `default`, and fire callback `cb_id` (a `vim._cb_fns`
+/// entry wrapping `on_confirm`) with the typed text — or `nil` on cancel — when
+/// the user submits. Queued in [`Shared::ui_inputs`], drained by the server.
+#[derive(Clone, Debug)]
+pub struct UiInputReq {
+    /// The prompt label shown ahead of the editable line (`opts.prompt`).
+    pub prompt: String,
+    /// The text the line is prefilled with (`opts.default`; empty when unset).
+    pub default: String,
+    /// The `vim._cb_fns` id whose `on_confirm` wrapper receives the result.
+    pub cb_id: u64,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -598,6 +615,40 @@ impl LuaRuntime {
     /// drain, for the server to apply to the live editor (Phase 6).
     pub fn take_buf_ops(&self) -> Vec<BufOp> {
         std::mem::take(&mut self.shared.borrow_mut().buf_ops)
+    }
+
+    /// Take the `vim.ui.input` prompt requests queued since the last drain, for
+    /// the server to open as command-line prompts (Phase 8).
+    pub fn take_ui_inputs(&self) -> Vec<UiInputReq> {
+        std::mem::take(&mut self.shared.borrow_mut().ui_inputs)
+    }
+
+    /// Deliver a `vim.ui.input` result to its callback `id`: the typed line
+    /// (`Some`) on `<CR>`, or `nil` (`None`) on cancel. Runs `vim._run_cb(id,
+    /// false, text)` — a one-shot, so the callback registry entry is dropped after
+    /// firing (Phase 8). Effects it queues drain through `apply_lua_effects`.
+    pub fn run_ui_input(&self, id: u64, result: Option<String>) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let run: mlua::Function = vim.get("_run_cb")?;
+        let arg = match result {
+            Some(s) => mlua::Value::String(self.lua.create_string(&s)?),
+            None => mlua::Value::Nil,
+        };
+        run.call::<()>((id, false, arg))
+    }
+
+    /// Dispatch an LSP code-action `command` (Phase 8): runs
+    /// `vim.lsp._dispatch_command(client_id, command)`, which routes to a
+    /// client-side `vim.lsp.commands[name]` handler when registered, else issues a
+    /// `workspace/executeCommand` to the client's server. `command` is the LSP
+    /// `Command` (`{ title, command, arguments }`) as JSON. Errors are returned for
+    /// the server to surface.
+    pub fn run_lsp_command(&self, client_id: u64, command: &serde_json::Value) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let lsp: Table = vim.get("lsp")?;
+        let dispatch: mlua::Function = lsp.get("_dispatch_command")?;
+        let cmd = json_to_lua(&self.lua, command)?;
+        dispatch.call((client_id, cmd))
     }
 
     /// Run the deferred callback registered under `id` (the `run_keymap` analogue
@@ -1451,6 +1502,37 @@ fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `vim._ui_input(prompt, default, cb_id)`: queue a `vim.ui.input` prompt
+    // ([`UiInputReq`]). The server opens the editor's command line labelled
+    // `prompt` (prefilled with `default`) and fires `vim._cb_fns[cb_id]` with the
+    // typed text — or `nil` on cancel — when the user submits (Phase 8).
+    let sh = shared.clone();
+    vim.set(
+        "_ui_input",
+        lua.create_function(move |_, (prompt, default, cb_id): (String, String, u64)| {
+            sh.borrow_mut().ui_inputs.push(UiInputReq {
+                prompt,
+                default,
+                cb_id,
+            });
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._ui_opener()`: the OS file/URL opener argv prefix `vim.ui.open` spawns
+    // (via the async `vim.system`), chosen by platform — `open` on macOS,
+    // `xdg-open` elsewhere (Phase 8). The path is appended by the Lua wrapper.
+    vim.set(
+        "_ui_opener",
+        lua.create_function(|_, ()| {
+            Ok(match std::env::consts::OS {
+                "macos" => vec!["open".to_string()],
+                "windows" => vec!["explorer".to_string()],
+                _ => vec!["xdg-open".to_string()],
+            })
+        })?,
     )?;
 
     // `vim._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),

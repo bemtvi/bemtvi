@@ -429,7 +429,7 @@ Lua-side buffer-creating registry yet).
 
 ---
 
-## Phase 8 — `vim.ui.*` + server command dispatch ⬜
+## Phase 8 — `vim.ui.*` + server command dispatch ✅
 
 **Goal.** `vim.ui.select`/`input` via nxvim's panel/prompt, and dispatch of
 server `workspace/executeCommand` + config `commands` (so `:Format`-style and
@@ -441,10 +441,45 @@ server commands) the remaining configs use.
 **Scope.** `prelude.lua` (`vim.ui.*` → panel/prompt), command registry +
 `executeCommand` request, `vim.lsp.commands` dispatch.
 
-**Tests.** A code action that needs a `vim.ui.select` choice completes; an
-`executeCommand` reaches the server.
+**Tests.** ✅ In `crates/nxvim-server/tests/editing.rs` (driven through
+`nvim_command`/`nvim_input`): `vim_ui_select_routes_the_pick_to_on_choice`,
+`vim_ui_select_format_item_renders_the_rows` (the panel shows `format_item`'s
+text while `on_choice` gets the original item),
+`vim_ui_input_hands_the_typed_line_to_on_confirm` (the label is projected into the
+redraw; `<CR>` delivers the text), `vim_ui_input_default_prefills_and_is_editable`,
+`vim_ui_input_cancel_hands_nil` (`<Esc>` → `on_confirm(nil)`). In
+`crates/nxvim/tests/lsp.rs`: `execute_command_relays_to_the_server` (no client-side
+handler → `workspace/executeCommand` reaches the mock with its params),
+`execute_command_runs_a_client_side_command` (a `vim.lsp.commands` handler runs and
+the command is *not* relayed), `a_code_action_command_runs_via_execute_command` (a
+bare-`Command` action dispatches `workspace/executeCommand` instead of the old
+"command unsupported" echo).
 
-**Done when.** The `vim.ui.*` raises are gone; server/config commands dispatch.
+**Done when.** ✅ The `vim.ui.*` raises are gone, replaced by real surfaces:
+`vim.ui.select` lists choices in nxvim's panel and routes the `<CR>` pick to
+`on_choice(item, index)` (`opts.format_item` renders rows, the original item is
+handed back); `vim.ui.input` opens a command-line prompt — a new
+`CmdlineKind::Prompt` in `nxvim-core` (the label rides the `View` as
+`cmdline_prompt`, the typed line / `nil`-on-cancel flow back through
+`Editor::prompt_results` → `Server::pending_ui_input` → `LuaRuntime::run_ui_input`
+→ the `on_confirm` callback off-tick); `vim.ui.open` spawns the platform opener
+(`open` / `xdg-open`, via `vim._ui_opener`) through the async `vim.system`. Command
+dispatch goes through `vim.lsp._dispatch_command(client_id, command)` (shared by
+`vim.lsp.buf.execute_command` and the native code-action path): a registered
+`vim.lsp.commands[name]` handler wins client-side, else the command is relayed as a
+`workspace/executeCommand` `client:request` (Phase 5). The native
+`Server::apply_code_action` now applies an action's `edit` *and* dispatches its
+`command` (via the new `CodeActionData.command` + `LuaRuntime::run_lsp_command`
+Rust→Lua bridge), instead of echoing "command unsupported".
+
+*Known approximations:* `vim.ui.select` does not deliver `on_choice(nil)` when the
+panel is dismissed without a pick (`q`) — the panel has no cancel event; a real
+pick is faithful. Only one `vim.ui.input` prompt is open at a time (a single
+command line); if several are queued in one tick the last wins (loud single-prompt
+limitation, not a silent drop). `vim.ui.open` is unauthenticated platform spawn
+(no per-call success check beyond `vim.system`'s). A code action's `command` that
+*resolves* lazily (a command only on the resolved action) is dispatched on the
+eager/bare path only; a resolve-then-command chain is a follow-up.
 
 **Depends on.** Phases 5 (requests) and 7 (util).
 

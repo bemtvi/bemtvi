@@ -1502,14 +1502,60 @@ function vim.fn.timer_stop(id)
   vim._cb_fns[id] = nil
 end
 
--- vim.ui: the selection/input/open hooks. With no UI layer wired (Phase 8),
--- calling `select`/`input` with a fake cancellation (on_choice(nil)) would make a
--- code-action picker look like the user dismissed it; `open` silently doing
--- nothing hides the gap. All three raise via vim._notimpl instead.
+-- vim.ui: the selection / input / open surface, driven through nxvim's own panel
+-- and command line (Phase 8). `select` lists the choices in the panel and routes
+-- the `<CR>` pick to `on_choice`; `input` opens a one-line command-line prompt and
+-- hands the typed text (or nil on cancel) to `on_confirm`; `open` spawns the OS
+-- file/URL opener via the async `vim.system`.
 vim.ui = vim.ui or {}
-function vim.ui.select(_items, _opts, _on_choice) vim._notimpl("vim.ui.select") end
-function vim.ui.input(_opts, _on_confirm) vim._notimpl("vim.ui.input") end
-function vim.ui.open(_path) vim._notimpl("vim.ui.open") end
+
+-- vim.ui.select(items, opts, on_choice): present `items` for the user to pick one.
+-- `opts.format_item(item)` renders each row (default `tostring`); `opts.prompt` is
+-- the panel title. The chosen item and its 1-based index go to
+-- `on_choice(item, index)` on `<CR>`. The panel's `on_select` callback drives it.
+--
+-- Approximation: dismissing the panel without a pick (`q`) does not deliver the
+-- neovim `on_choice(nil)` cancel — the panel has no cancel event — so a caller
+-- that must react to cancellation won't. A real pick is faithful.
+function vim.ui.select(items, opts, on_choice)
+  opts = opts or {}
+  items = items or {}
+  local format_item = opts.format_item or tostring
+  local lines = {}
+  for i, item in ipairs(items) do lines[i] = tostring(format_item(item)) end
+  vim.panel.open(opts.prompt or "Select one of:", lines, function(_line, idx)
+    vim.panel.close()
+    if on_choice then on_choice(items[idx], idx) end
+  end)
+end
+
+-- vim.ui.input(opts, on_confirm): prompt for a line of text. `opts.prompt` is the
+-- label shown ahead of the line, `opts.default` prefills it. The typed text reaches
+-- `on_confirm(text)` on `<CR>`; cancelling (`<Esc>`) calls `on_confirm(nil)`,
+-- matching neovim. Backed by nxvim's command line (a `CmdlineKind::Prompt`), so the
+-- usual within-line editing (motion / backspace) applies. The callback fires
+-- off-tick, when the server drains the prompt result.
+function vim.ui.input(opts, on_confirm)
+  opts = opts or {}
+  local cb = vim._next_cb_id()
+  vim._cb_fns[cb] = function(text)
+    if on_confirm then on_confirm(text) end
+  end
+  vim._ui_input(tostring(opts.prompt or "Input: "), tostring(opts.default or ""), cb)
+end
+
+-- vim.ui.open(path): open `path` (a file or URL) in the OS handler, asynchronously
+-- via `vim.system` (Phase 8). The opener is `open` on macOS, `xdg-open` elsewhere
+-- (`vim._ui_opener`). Returns the `vim.system` handle, matching neovim's
+-- `(SystemObj, nil)` shape.
+function vim.ui.open(path)
+  if type(path) ~= "string" or path == "" then
+    error("vim.ui.open: path must be a non-empty string", 2)
+  end
+  local cmd = vim._ui_opener()
+  cmd[#cmd + 1] = path
+  return vim.system(cmd)
+end
 
 -- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`), backed
 -- by a per-buffer store (Phase 6). Writes record; reads return the stored value
@@ -1570,10 +1616,11 @@ function vim.deprecate(...) end
 vim.lsp = vim.lsp or {}
 vim.lsp.protocol = vim.lsp.protocol or {}
 
--- vim.lsp.commands: the registry a server's workspace/executeCommand handlers map
--- into (a config's `before_init` may populate it, e.g. rust_analyzer's
--- `rust-analyzer.runSingle`). nxvim doesn't dispatch through it yet, but it must
--- exist so assigning into it doesn't index nil.
+-- vim.lsp.commands: the client-side command registry (a config's `before_init`
+-- may populate it, e.g. rust_analyzer's `rust-analyzer.runSingle`). A code action's
+-- `command` (or an explicit `vim.lsp.buf.execute_command`) checks here first: a
+-- registered `vim.lsp.commands[name]` handler `(command, ctx)` runs locally, else
+-- the command is relayed to the server as `workspace/executeCommand` (Phase 8).
 vim.lsp.commands = vim.lsp.commands or {}
 
 -- vim.lsp.handlers: the default response-handler registry, keyed by LSP method
@@ -1892,6 +1939,32 @@ function vim.lsp._client_notify(self, method, params)
   if type(method) ~= "string" then error("client:notify: method must be a string", 2) end
   vim._lsp_client_notify(self.id, method, params)
   return true
+end
+
+-- vim.lsp._dispatch_command(client_id, command): run an LSP command (Phase 8),
+-- the shared path for a code-action `command` (called from Rust when an applied
+-- action carries one) and `vim.lsp.buf.execute_command`. `command` is the LSP
+-- `Command` table (`{ command = name, arguments = {...}, title = ... }`). A
+-- registered `vim.lsp.commands[name]` handler `(command, ctx)` wins (client-side,
+-- e.g. a config-provided runner); otherwise the command is relayed to the client's
+-- server as `workspace/executeCommand`. A missing command name or client is loud.
+function vim.lsp._dispatch_command(client_id, command)
+  local name = type(command) == "table" and command.command
+  if type(name) ~= "string" then
+    error("vim.lsp: execute_command needs a command string", 2)
+  end
+  local ctx = { client_id = client_id, bufnr = vim.api.nvim_get_current_buf() }
+  local handler = vim.lsp.commands[name]
+  if handler then
+    handler(command, ctx)
+    return
+  end
+  local client = vim.lsp.get_client_by_id(client_id)
+  if not client then
+    error("vim.lsp: no client " .. tostring(client_id) .. " for command " .. name, 2)
+  end
+  client:request("workspace/executeCommand",
+    { command = name, arguments = command.arguments }, nil, ctx.bufnr)
 end
 
 -- Build a client table carrying the real request/notify methods. Shared by
@@ -2314,6 +2387,27 @@ function vim.lsp.buf.signature_help() vim._lsp_buf(6) end
 -- compatibility — see the Phase 7b follow-ups.
 function vim.lsp.buf.format(_opts) vim._lsp_buf_format() end
 function vim.lsp.buf.code_action(_opts) vim._lsp_buf_code_action() end
+
+-- execute_command(command, opts): run an LSP command (`{ command = name,
+-- arguments = {...} }`) — the entry a config's `:Format`-style command or a code
+-- action's `command` calls (Phase 8). `opts.client_id` targets a specific client;
+-- otherwise the first attached client is used. Dispatch goes through
+-- `vim.lsp._dispatch_command`: a registered `vim.lsp.commands[name]` handler runs
+-- client-side, else the command is relayed to the server as
+-- `workspace/executeCommand`.
+function vim.lsp.buf.execute_command(command, opts)
+  opts = opts or {}
+  local client_id = opts.client_id
+  if not client_id then
+    local client = vim.lsp.get_clients()[1]
+    if not client then
+      vim.api.nvim_echo("No active LSP client for execute_command")
+      return
+    end
+    client_id = client.id
+  end
+  vim.lsp._dispatch_command(client_id, command)
+end
 
 -- rename(new_name): the name is required (nxvim has no prompt UI yet). A nil/empty
 -- name echoes E471 rather than prompting, matching `:LspRename`.

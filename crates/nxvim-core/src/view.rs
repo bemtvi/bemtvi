@@ -93,6 +93,10 @@ pub struct View {
     /// The command-line prompt character: `:` for an ex command, `/` / `?` for a
     /// forward / backward search. Only meaningful while `command_mode`.
     pub cmdline_prefix: char,
+    /// The multi-char prompt label for a `vim.ui.input` prompt (Phase 8), shown
+    /// ahead of the editable line in place of `cmdline_prefix`. Empty for
+    /// `:`/`/`/`?`. Only meaningful while `command_mode`.
+    pub cmdline_prompt: String,
     /// Cursor position within `cmdline` as a character count from its start, so
     /// the client can place the command cursor mid-line after `<Left>`/`<Right>`
     /// edits. Only meaningful while `command_mode`.
@@ -194,6 +198,7 @@ impl View {
             pending_replace: ed.pending_replace(),
             cmdline: ed.cmdline.clone(),
             cmdline_prefix: ed.cmdline_prefix(),
+            cmdline_prompt: ed.cmdline_prompt().to_string(),
             cmdline_cursor: ed.cmdline_cursor(),
             message: ed.message.clone(),
             file_name,

@@ -190,13 +190,18 @@ fn parse_signed(s: &str) -> Option<isize> {
     digits.parse::<isize>().ok().map(|n| sign * n)
 }
 
-/// What the command line is editing: an `:` ex command, or a `/`,`?` search.
-/// One [`Mode::Command`] serves both; the kind decides the prompt char and what
-/// `<CR>` does. Set on entry, read on submit.
+/// What the command line is editing: an `:` ex command, a `/`,`?` search, or a
+/// scripted text prompt (`vim.ui.input`). One [`Mode::Command`] serves all three;
+/// the kind decides the prompt label and what `<CR>` does. Set on entry, read on
+/// submit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CmdlineKind {
     Ex,
     Search(SearchDir),
+    /// A `vim.ui.input` prompt: `<CR>` hands the typed line to the waiting Lua
+    /// callback (and `<Esc>` hands it `nil`), via [`Editor::prompt_results`]. The
+    /// label is held in [`Editor::cmdline_prompt`].
+    Prompt,
 }
 
 #[derive(Clone)]
@@ -945,9 +950,19 @@ pub struct Editor {
     /// command cursor are all relative to it, so `<Left>`/`<Right>` edit mid-line
     /// rather than only at the end. Reset to 0 each time a command line opens.
     cmdline_col: usize,
-    /// What the command line is editing (`:` ex vs `/`,`?` search). Decides the
-    /// prompt char and what `<CR>` submits. Only meaningful in [`Mode::Command`].
+    /// What the command line is editing (`:` ex vs `/`,`?` search vs a scripted
+    /// `vim.ui.input` prompt). Decides the prompt label and what `<CR>` submits.
+    /// Only meaningful in [`Mode::Command`].
     cmdline_kind: CmdlineKind,
+    /// The label shown ahead of the command line for a [`CmdlineKind::Prompt`]
+    /// (`vim.ui.input`'s `opts.prompt`); empty for `:`/`/`/`?` (those use the
+    /// single-char [`Editor::cmdline_prefix`]). Cleared when the prompt closes.
+    cmdline_prompt: String,
+    /// Resolved `vim.ui.input` prompts awaiting delivery to their Lua callback:
+    /// `Some(text)` on `<CR>`, `None` on `<Esc>`/cancel. The server drains this
+    /// each tick (like [`Editor::panel_selects`]) and fires the registered
+    /// callback. nxvim-native; not a neovim concept.
+    pub prompt_results: Vec<Option<String>>,
     /// The last search pattern, its direction, and its trailing offset, for
     /// `n`/`N` repeat and an empty-pattern re-search. `None` until the first
     /// search.
@@ -1092,6 +1107,8 @@ impl Editor {
             cmdline: String::new(),
             cmdline_col: 0,
             cmdline_kind: CmdlineKind::Ex,
+            cmdline_prompt: String::new(),
+            prompt_results: Vec::new(),
             last_search: None,
             search_operator: None,
             pending_search_count: 1,
@@ -3116,6 +3133,12 @@ impl Editor {
                         self.cursor = self.search_origin;
                         self.submit_search(&text, dir);
                     }
+                    CmdlineKind::Prompt => {
+                        // Hand the typed line to the waiting `vim.ui.input` callback
+                        // (the server drains `prompt_results` and fires it).
+                        self.cmdline_prompt.clear();
+                        self.prompt_results.push(Some(text));
+                    }
                 }
                 return;
             }
@@ -3162,9 +3185,39 @@ impl Editor {
             // Cancelling a `d/`-style search also abandons the pending operator.
             self.search_operator = None;
         }
+        if matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+            // A cancelled `vim.ui.input` delivers `nil` to its callback (neovim's
+            // `on_confirm(nil)` on `<Esc>`).
+            self.cmdline_prompt.clear();
+            self.prompt_results.push(None);
+        }
         self.mode = Mode::Normal;
         self.cmdline.clear();
         self.cmdline_col = 0;
+    }
+
+    /// Open the command line as a scripted `vim.ui.input` prompt (Phase 8): a
+    /// [`CmdlineKind::Prompt`] showing `label`, prefilled with `default` and the
+    /// cursor at its end. `<CR>` / `<Esc>` deliver the result through
+    /// [`Editor::prompt_results`]. The server calls this when it drains a queued
+    /// `vim.ui.input` request, then fires the registered Lua callback on submit.
+    pub fn open_prompt(&mut self, label: String, default: String) {
+        self.mode = Mode::Command;
+        self.cmdline = default;
+        self.cmdline_col = self.cmdline.len();
+        self.cmdline_kind = CmdlineKind::Prompt;
+        self.cmdline_prompt = label;
+    }
+
+    /// The `vim.ui.input` prompt label (empty unless a [`CmdlineKind::Prompt`] is
+    /// open), projected into the [`View`] so the client renders it ahead of the
+    /// editable line in place of the single-char [`Editor::cmdline_prefix`].
+    pub(crate) fn cmdline_prompt(&self) -> &str {
+        if matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+            &self.cmdline_prompt
+        } else {
+            ""
+        }
     }
 
     // ----- command-line editing ---------------------------------------------
@@ -3616,7 +3669,7 @@ impl Editor {
 
         let search_dir = match self.cmdline_kind {
             CmdlineKind::Search(dir) => Some(dir),
-            CmdlineKind::Ex => None,
+            CmdlineKind::Ex | CmdlineKind::Prompt => None,
         };
         let incsearch = self.mode == Mode::Command
             && search_dir.is_some()
@@ -3663,11 +3716,12 @@ impl Editor {
     }
 
     /// The history list for the open command line's kind: ex commands for `:`,
-    /// search patterns for `/`,`?`.
+    /// search patterns for `/`,`?`. A `vim.ui.input` prompt has no history.
     fn active_history(&self) -> &[String] {
         match self.cmdline_kind {
             CmdlineKind::Ex => &self.ex_history,
             CmdlineKind::Search(_) => &self.search_history,
+            CmdlineKind::Prompt => &[],
         }
     }
 
@@ -3714,6 +3768,10 @@ impl Editor {
         match self.cmdline_kind {
             CmdlineKind::Ex => ':',
             CmdlineKind::Search(dir) => dir.prefix(),
+            // A `vim.ui.input` prompt renders its multi-char label via
+            // `cmdline_prompt()` instead; the single-char prefix is unused (a
+            // space keeps the projection well-formed).
+            CmdlineKind::Prompt => ' ',
         }
     }
 

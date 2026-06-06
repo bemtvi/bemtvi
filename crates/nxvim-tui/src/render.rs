@@ -245,9 +245,11 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     }
 
     if view.command_mode {
-        // +1 for the leading prompt char; the cursor follows `cmdline_cursor`
-        // (a char offset) so it sits mid-line after `<Left>`/`<Right>` edits.
-        let col = cmd_area.x + 1 + view.cmdline_cursor as u16;
+        // Offset past the leading prompt — a single prefix char (`:`/`/`/`?`) or
+        // the multi-char `vim.ui.input` label; the cursor then follows
+        // `cmdline_cursor` (a char offset) so it sits mid-line after edits.
+        let prompt_width = cmdline_prompt_width(view);
+        let col = cmd_area.x + prompt_width + view.cmdline_cursor as u16;
         frame.set_cursor_position((col, cmd_area.y));
     } else {
         // The cursor row is interpolated during a slide, but the column comes
@@ -605,11 +607,27 @@ fn render_status(frame: &mut Frame, area: Rect, view: &View) {
 
 fn render_command(frame: &mut Frame, area: Rect, view: &View) {
     let content = if view.command_mode {
-        format!("{}{}", view.cmdline_prefix, view.cmdline)
+        format!("{}{}", cmdline_prompt_str(view), view.cmdline)
     } else {
         view.message.clone()
     };
     frame.render_widget(Paragraph::new(content), area);
+}
+
+/// The leading prompt shown ahead of the editable command line: the multi-char
+/// `vim.ui.input` label when set, else the single prefix char (`:`/`/`/`?`).
+fn cmdline_prompt_str(view: &View) -> String {
+    if view.cmdline_prompt.is_empty() {
+        view.cmdline_prefix.to_string()
+    } else {
+        view.cmdline_prompt.clone()
+    }
+}
+
+/// Display width (in cells, approximated as char count) of the leading prompt,
+/// used to place the command cursor past it.
+fn cmdline_prompt_width(view: &View) -> u16 {
+    cmdline_prompt_str(view).chars().count() as u16
 }
 
 /// Render the bottom panel: a `─ Title ───────[X]─` top-border bar, then the

@@ -27,6 +27,9 @@ pub struct View {
     pub(crate) cmdline: String,
     /// The command-line prompt char (`:` ex, `/` / `?` search). Defaults to `:`.
     pub(crate) cmdline_prefix: char,
+    /// The multi-char `vim.ui.input` prompt label, rendered ahead of the editable
+    /// line in place of `cmdline_prefix`. Empty for `:`/`/`/`?`.
+    pub(crate) cmdline_prompt: String,
     /// Command cursor position as a character offset into `cmdline`, for placing
     /// the terminal cursor mid-line after `<Left>`/`<Right>` edits.
     pub(crate) cmdline_cursor: usize,
@@ -130,6 +133,7 @@ impl View {
             .unwrap_or(false);
         self.cmdline = map_str(map, "cmdline");
         self.cmdline_prefix = map_str(map, "cmdline_prefix").chars().next().unwrap_or(':');
+        self.cmdline_prompt = map_str(map, "cmdline_prompt");
         self.cmdline_cursor = map_u64(map, "cmdline_cursor") as usize;
         self.message = map_str(map, "message");
         self.file_name = map_str(map, "file_name");

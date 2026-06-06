@@ -212,6 +212,10 @@ struct Server {
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
     /// refresh each time (Phase 6).
     buf_mirror_ticks: HashMap<BufferId, u64>,
+    /// The `vim._cb_fns` id of the `vim.ui.input` callback awaiting the open
+    /// command-line prompt's result, or `None` when no scripted prompt is open
+    /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
+    pending_ui_input: Option<u64>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -259,6 +263,7 @@ where
         evloop,
         scheduled: VecDeque::new(),
         buf_mirror_ticks: HashMap::new(),
+        pending_ui_input: None,
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -984,6 +989,15 @@ impl Server {
         for op in self.lua.take_buf_ops() {
             self.apply_buf_op(op);
         }
+        // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
+        // labelled text prompt and remember which callback awaits the result. Only
+        // one prompt can be open at a time (a single command line); if several were
+        // queued, the last wins (its label/default is what shows) — a documented
+        // single-prompt limitation, not a silent drop.
+        for req in self.lua.take_ui_inputs() {
+            self.editor.open_prompt(req.prompt, req.default);
+            self.pending_ui_input = Some(req.cb_id);
+        }
     }
 
     /// Apply one [`BufOp`] to the live editor (Phase 6). Converts the neovim line
@@ -1215,6 +1229,19 @@ impl Server {
                 }
                 self.apply_lua_effects();
             }
+            // `vim.ui.input` results (Phase 8): a submitted (`Some`) or cancelled
+            // (`None`) prompt fires the waiting callback off the same tick. The
+            // callback may itself open another prompt / queue lua, so this is
+            // inside the fixpoint. The pending id is taken (one prompt at a time).
+            for result in std::mem::take(&mut self.editor.prompt_results) {
+                if let Some(id) = self.pending_ui_input.take() {
+                    if let Err(e) = self.lua.run_ui_input(id, result) {
+                        self.editor
+                            .echo(format!("E5108: Error in vim.ui.input callback: {e}"));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
             // Scheduled callbacks (`vim.schedule`) run after the work that queued
             // them converges, but still within this fixpoint — a scheduled fn may
             // itself `vim.schedule` / `vim.cmd`, which re-enters the loop. One
@@ -1230,6 +1257,7 @@ impl Server {
             if self.editor.lua_queue.is_empty()
                 && self.editor.deferred_commands.is_empty()
                 && self.editor.panel_selects.is_empty()
+                && self.editor.prompt_results.is_empty()
                 && self.scheduled.is_empty()
             {
                 break;
@@ -1241,6 +1269,7 @@ impl Server {
                 self.editor.lua_queue.clear();
                 self.editor.deferred_commands.clear();
                 self.editor.panel_selects.clear();
+                self.editor.prompt_results.clear();
                 self.scheduled.clear();
                 self.editor
                     .echo("E132: command recursion limit exceeded".to_string());
@@ -1454,6 +1483,10 @@ impl Server {
             (
                 Value::from("cmdline_prefix"),
                 Value::from(view.cmdline_prefix.to_string().as_str()),
+            ),
+            (
+                Value::from("cmdline_prompt"),
+                Value::from(view.cmdline_prompt.as_str()),
             ),
             (
                 Value::from("cmdline_cursor"),

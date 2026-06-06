@@ -303,15 +303,17 @@ pub type WorkspaceEditData = Vec<(Url, Vec<TextEdit>)>;
 
 /// One code action distilled for the editor: its `title` for the panel list, its
 /// eager `edit` (a normalized [`WorkspaceEditData`]) when the server returned one,
-/// and `resolve` — the original [`CodeAction`] to round-trip through
-/// `codeAction/resolve` when there is no eager edit (a lazy action). Exactly one
-/// of `edit`/`resolve` is set for an applicable `CodeAction`; a bare `Command`
-/// has neither (its `command` would need `workspace/executeCommand`, scoped out).
+/// `resolve` — the original [`CodeAction`] to round-trip through
+/// `codeAction/resolve` when there is neither an eager edit nor a command (a lazy
+/// action) — and `command`, a `workspace/executeCommand` payload to dispatch
+/// after the edit (Phase 8). A bare `Command` action lands as `command`-only; a
+/// `CodeAction` may carry both an `edit` and a `command`.
 #[derive(Clone, Debug)]
 pub struct CodeActionData {
     pub title: String,
     pub edit: Option<WorkspaceEditData>,
     pub resolve: Option<Box<CodeAction>>,
+    pub command: Option<lsp_types::Command>,
 }
 
 /// One completion candidate, distilled from a protocol [`CompletionItem`] to the
@@ -1180,29 +1182,33 @@ fn formatting_options() -> FormattingOptions {
 
 /// Distill a `textDocument/codeAction` response (a mixed `(Command | CodeAction)[]`)
 /// into the editor-facing list: a `CodeAction`'s `title` + normalized eager
-/// `edit`; a bare `Command` keeps its title with no edit (its `command` would
-/// need `workspace/executeCommand`, scoped out).
+/// `edit` + optional `command` (run via `workspace/executeCommand` after the
+/// edit); a bare `Command` lands as a `command`-only entry (Phase 8).
 fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
     resp.into_iter()
         .map(|item| match item {
             CodeActionOrCommand::CodeAction(ca) => {
                 let title = ca.title.clone();
+                let command = ca.command.clone();
                 let edit = ca
                     .edit
                     .as_ref()
                     .map(|e| normalize_workspace_edit(e.clone()));
-                // With no eager edit, keep the original action to resolve lazily.
-                let resolve = edit.is_none().then(|| Box::new(ca));
+                // With neither an eager edit nor a command, keep the original
+                // action to resolve lazily; a command makes it directly applicable.
+                let resolve = (edit.is_none() && command.is_none()).then(|| Box::new(ca));
                 CodeActionData {
                     title,
                     edit,
                     resolve,
+                    command,
                 }
             }
             CodeActionOrCommand::Command(cmd) => CodeActionData {
-                title: cmd.title,
+                title: cmd.title.clone(),
                 edit: None,
                 resolve: None,
+                command: Some(cmd),
             },
         })
         .collect()

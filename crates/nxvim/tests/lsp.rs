@@ -1974,6 +1974,38 @@ async fn a_lazy_code_action_is_resolved_before_applying() {
 }
 
 #[tokio::test]
+async fn a_code_action_command_runs_via_execute_command() {
+    let _guard = test_lock().lock().await;
+    // A bare-`Command` code action carries no edit; applying it dispatches a
+    // `workspace/executeCommand` to the server (Phase 8) rather than the old
+    // "command unsupported" echo.
+    let file = temp_file("ca-cmd", "rs", "fn main() {}\n");
+    let record = configure_mock(
+        "ca-cmd",
+        serde_json::json!({
+            "code_action": [{ "title": "Run it", "command": "mock.run", "arguments": ["a"] }],
+            "custom_replies": { "workspace/executeCommand": { "ok": true } }
+        }),
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspCodeAction").await;
+    let (_title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
+    assert_eq!(panel_lines, vec!["Run it".to_string()]);
+
+    // `<CR>` applies the command action: it goes out as workspace/executeCommand.
+    feed(&rpc, "<CR>");
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "workspace/executeCommand")).await;
+    let req = find(&recs, "workspace/executeCommand").expect("the command reached the server");
+    assert_eq!(
+        req["params"]["command"].as_str(),
+        Some("mock.run"),
+        "the code-action command is dispatched: {req:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_formatting_edit_lands_at_the_right_byte_with_utf16() {
     let _guard = test_lock().lock().await;
     // The edit analogue of the cross-file `é` test: a leading 2-byte `é` and a
@@ -2929,6 +2961,83 @@ async fn client_notify_reaches_the_server() {
         note["params"]["value"].as_str(),
         Some("verbose"),
         "client:notify forwards the params verbatim: {note:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[tokio::test]
+async fn execute_command_relays_to_the_server() {
+    let _guard = test_lock().lock().await;
+    // With no client-side `vim.lsp.commands` handler registered,
+    // `vim.lsp.buf.execute_command` relays the command to the server as a
+    // `workspace/executeCommand` request — the mock records it with its params.
+    let file = temp_file("xc-relay", "rs", "fn main() {}\n");
+    let record = configure_mock(
+        "xc-relay",
+        serde_json::json!({
+            "custom_replies": { "workspace/executeCommand": { "applied": true } }
+        }),
+    );
+    let cfg = attach_config_dir(
+        "xc-relay",
+        "vim.lsp.buf.execute_command({ command = 'mock.organizeImports', \
+           arguments = { 'a', 2 } }, { client_id = client.id })",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg.clone()).await;
+
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "workspace/executeCommand")).await;
+    let req = find(&recs, "workspace/executeCommand").expect("the command reached the server");
+    assert_eq!(
+        req["params"]["command"].as_str(),
+        Some("mock.organizeImports"),
+        "execute_command relays the command name: {req:?}"
+    );
+    assert_eq!(
+        req["params"]["arguments"][0].as_str(),
+        Some("a"),
+        "execute_command forwards the arguments: {req:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[tokio::test]
+async fn execute_command_runs_a_client_side_command() {
+    let _guard = test_lock().lock().await;
+    // A command registered in `vim.lsp.commands` runs client-side: the handler
+    // fires (stashing its args in a global) and the command is NOT relayed to the
+    // server (config `commands` dispatch, Phase 8).
+    let file = temp_file("xc-local", "rs", "fn main() {}\n");
+    let record = configure_mock("xc-local", serde_json::json!({}));
+    let cfg = attach_config_dir(
+        "xc-local",
+        "vim.lsp.commands['mock.local'] = function(cmd, ctx) \
+           _G.nxvim_local_cmd = cmd.command \
+           _G.nxvim_local_arg = cmd.arguments and cmd.arguments[1] \
+           _G.nxvim_local_done = true \
+         end\n\
+         vim.lsp.buf.execute_command({ command = 'mock.local', arguments = { 'hi' } }, \
+           { client_id = client.id })",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg.clone()).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    wait_for_global_flag(&rpc, "_G.nxvim_local_done").await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nxvim_local_cmd").await.as_str(),
+        Some("mock.local"),
+        "the client-side handler runs with the command"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nxvim_local_arg").await.as_str(),
+        Some("hi"),
+        "the handler receives the command's arguments"
+    );
+    // The client-side handler short-circuits the server relay.
+    assert!(
+        !has_method(&record_lines(&record), "workspace/executeCommand"),
+        "a client-side command must not be relayed to the server"
     );
 
     let _ = std::fs::remove_dir_all(&cfg);

@@ -1971,20 +1971,61 @@ impl Server {
         let Some(action) = action else {
             return;
         };
+        let has_edit = action.edit.is_some();
         if let Some(changes) = action.edit {
             self.apply_workspace_edit(changes);
             self.lsp_dirty = true;
-        } else if let Some(raw) = action.resolve {
-            // A lazy action: ask the server to fill in its edit, then apply when
-            // the reply lands (reply-as-event, like format/rename).
-            self.resolve_code_action(raw);
-        } else {
-            // A bare `Command` — running it needs `workspace/executeCommand`,
-            // which is a scoped-out follow-up.
-            self.editor
-                .echo("Code action has no edit (command unsupported)");
-            self.lsp_dirty = true;
         }
+        // An action may carry a `command` alongside (or instead of) its edit:
+        // neovim applies the edit first, then runs the command. Dispatch it through
+        // Lua so a client-side `vim.lsp.commands` handler wins over the server's
+        // `workspace/executeCommand` (Phase 8).
+        if let Some(command) = action.command {
+            self.dispatch_lsp_command(command);
+        } else if !has_edit {
+            if let Some(raw) = action.resolve {
+                // A lazy action: ask the server to fill in its edit, then apply
+                // when the reply lands (reply-as-event, like format/rename).
+                self.resolve_code_action(raw);
+            } else {
+                self.editor.echo("Code action has no edit");
+                self.lsp_dirty = true;
+            }
+        }
+    }
+
+    /// Dispatch an LSP code-action `command` (Phase 8): route it through Lua's
+    /// `vim.lsp._dispatch_command`, which runs a registered client-side
+    /// `vim.lsp.commands[name]` handler, else issues a `workspace/executeCommand`
+    /// to the current buffer's server (via the Phase-5 `client:request` path). The
+    /// queued request drains immediately so it leaves on this tick.
+    fn dispatch_lsp_command(&mut self, command: nxvim_lsp::lsp_types::Command) {
+        let Some(client_id) = self.current_lsp_client_id() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let cmd_json = match serde_json::to_value(&command) {
+            Ok(v) => v,
+            Err(e) => {
+                self.editor
+                    .echo(format!("Code action command malformed: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = self.lua.run_lsp_command(client_id, &cmd_json) {
+            self.editor
+                .echo(format!("E5108: Error dispatching command: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// The Lua `client_id` of the current buffer's language server (the reverse of
+    /// the [`ServerKey`] resolved by [`Self::current_lsp_target`]), or `None` when
+    /// no server is attached / initialized. Used to route a code-action command to
+    /// the right client.
+    fn current_lsp_client_id(&self) -> Option<u64> {
+        let (key, _, _) = self.current_lsp_target()?;
+        self.lsp_servers.get(&key).map(|r| r.client_id)
     }
 
     /// Fire a `codeAction/resolve` for a lazy action, recording it as a pending

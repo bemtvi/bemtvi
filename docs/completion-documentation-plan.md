@@ -1,5 +1,11 @@
 # Completion documentation — completion plan
 
+> **Status: complete (all three phases ✅).** The menu now carries per-item
+> `documentation`, fetches it lazily for the selected item via
+> `completionItem/resolve`, and renders it in a preview box beside the popup. The
+> sections below are kept as the design record; each phase's "Done when" notes
+> what landed and which tests pin it.
+
 ## Why this document exists
 
 nxvim **already has a working insert-mode completion menu.** `<C-Space>` in
@@ -12,23 +18,24 @@ accepts the selected item — honoring its `textEdit` range and
 against real servers. Each row shows the item's **label** plus its right-aligned
 **`detail`** (the type/signature) — see `pmenu_value` / `pmenu_item_width`.
 
-The one thing the menu does **not** show is the per-item **documentation** —
-the prose/markdown block a server attaches to a candidate (function docs,
-parameter help). Two concrete reasons:
+The piece this plan added was the per-item **documentation** — the prose/markdown
+block a server attaches to a candidate (function docs, parameter help). When the
+plan was written it was missing for two concrete reasons, both now resolved:
 
-1. **`documentation` is dropped at distillation.** `completion_item()`
+1. **`documentation` was dropped at distillation.** `completion_item()`
    (`crates/nxvim-lsp/src/manager.rs`) reduces the protocol `CompletionItem` to
-   `CompletionItemData`, keeping `label / kind / detail / filter_text /
+   `CompletionItemData`; it previously kept `label / kind / detail / filter_text /
    sort_text / insert_text / text_edit / additional_text_edits` — but **not**
    `documentation`, and not the opaque `data` blob a server needs to resolve it.
+   Phase 1 added both (`documentation` + `resolve_data`).
 2. **No `completionItem/resolve`, and no completion client capability at all.**
-   nxvim advertises no `completion` block under `text_document` in
-   `client_capabilities()`, so it never declares `documentationFormat` or
+   nxvim advertised no `completion` block under `text_document` in
+   `client_capabilities()`, so it never declared `documentationFormat` or
    `resolveSupport`. This matters because most servers — **notably
    rust_analyzer** — send completion lists *without* documentation (often
    without full `detail` either) and expect the client to fetch it lazily per
-   selected item via `completionItem/resolve`. Without that round-trip, the docs
-   simply never arrive.
+   selected item via `completionItem/resolve`. Phase 1 advertised the capability;
+   Phase 2 wired the round-trip.
 
 So "show the docs" is three pieces: carry `documentation` end to end (and keep
 enough of the original item to resolve), add the `completionItem/resolve`
@@ -163,7 +170,7 @@ in `manager.rs`; `LspReqKind::CompletionResolve` fired from `lsp_menu_move` via
 
 ---
 
-## Phase 3 — The documentation preview surface ⬜
+## Phase 3 — The documentation preview surface ✅
 
 **Goal.** Render the selected item's `documentation` in a preview box beside the
 completion popup (vim's "preview window"/`completeopt=popup` shape).
@@ -188,8 +195,14 @@ mock-fed case): after opening the menu and selecting a documented item, the
 `pmenu` redraw value carries the doc lines — asserted on the redraw view
 (take-latest helper), the project's standard surface for UI state.
 
-**Done when.** ⬜ The selected item's documentation renders in a preview box
-beside the popup; navigating updates it; an item with no docs shows no box.
+**Done when.** ✅ The selected item's documentation renders in a preview box
+beside the popup; navigating updates it; an item with no docs (or no selection)
+shows no box. `pmenu_value` projects the selected item's `documentation` as a
+`doc` lines array on the `pmenu` redraw key; the client's `render_pmenu_doc`
+floats a second bordered box to the right of the popup (falling back to its
+left), wrapping the lines and clipping to the text area. Verified by
+`selecting_a_documented_item_shows_a_doc_preview` in `crates/nxvim/tests/lsp.rs`
+(asserts both the `doc` lines on the redraw and the painted preview text).
 
 **Depends on.** Phases 1 and 2 (the data); the existing pmenu surface.
 

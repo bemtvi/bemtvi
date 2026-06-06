@@ -100,6 +100,9 @@ pub(crate) struct PmenuData {
     pub(crate) col: u16,
     pub(crate) width: u16,
     pub(crate) height: u16,
+    /// The selected item's documentation lines, drawn in a preview box beside the
+    /// popup. Empty ⇒ no preview (nothing selected, or the item has no docs).
+    pub(crate) doc: Vec<String>,
 }
 
 /// The bottom panel mirrored from the server's redraw: a title, the visible
@@ -189,6 +192,7 @@ impl View {
                 col: map_u16(p, "col"),
                 width: map_u16(p, "width"),
                 height: map_u16(p, "height"),
+                doc: map_str_array(p, "doc"),
             }),
             _ => None,
         };

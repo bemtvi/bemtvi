@@ -5,7 +5,7 @@ use crossterm::cursor::SetCursorStyle;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rmpv::Value;
 use unicode_width::UnicodeWidthChar;
@@ -728,6 +728,70 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData) {
         })
         .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+
+    // The documentation preview floats beside the popup (its own bordered box).
+    render_pmenu_doc(frame, text_area, area, &pmenu.doc);
+}
+
+/// Draw the selected item's documentation in a bordered preview box beside the
+/// `popup` box: to its right when there's room, else to its left (vim's
+/// `completeopt=popup` shape). Top-aligned with the popup, content wrapped to the
+/// box width and clipped to the text area; nothing is drawn when there are no docs
+/// or no room beside the popup. Markdown is shown as plain lines (the server's
+/// markup distiller yields lines, not styled spans).
+fn render_pmenu_doc(frame: &mut Frame, text_area: Rect, popup: Rect, doc: &[String]) {
+    if doc.is_empty() {
+        return;
+    }
+    // Cap the preview so a long doc block doesn't swallow the screen.
+    const MAX_W: u16 = 50;
+    const MAX_H: u16 = 12;
+    let natural_w = doc.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let want_box_w = natural_w.clamp(1, MAX_W).saturating_add(2);
+
+    // Prefer the right of the popup; fall back to its left. Each side needs the
+    // border plus at least one content cell (3 cells) to be worth drawing.
+    let room_right = text_area.right().saturating_sub(popup.right());
+    let room_left = popup.x.saturating_sub(text_area.x);
+    let (x, box_w) = if room_right >= 3 {
+        (popup.right(), want_box_w.min(room_right))
+    } else if room_left >= 3 {
+        let w = want_box_w.min(room_left);
+        (popup.x.saturating_sub(w), w)
+    } else {
+        return; // no room either side
+    };
+
+    // Height from the wrapped line count, clamped to the cap and the room below.
+    let content_w = box_w.saturating_sub(2).max(1);
+    let wrapped: usize = doc
+        .iter()
+        .map(|l| (l.chars().count() as u16).max(1).div_ceil(content_w) as usize)
+        .sum();
+    let content_h = (wrapped as u16).clamp(1, MAX_H);
+    let box_h = content_h
+        .saturating_add(2)
+        .min(text_area.bottom().saturating_sub(popup.y));
+    if box_w < 3 || box_h < 3 {
+        return;
+    }
+
+    let area = Rect {
+        x,
+        y: popup.y,
+        width: box_w,
+        height: box_h,
+    };
+    let block = Block::new().borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let text = Text::from(
+        doc.iter()
+            .map(|l| Line::from(l.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 /// One popup row padded to `width` cells: the `label` left-aligned, and the

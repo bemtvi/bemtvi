@@ -196,12 +196,13 @@ pub(crate) struct ServerRuntime {
 /// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
 /// re-ranks (or re-requests) in place rather than closing and reopening.
 //
-// INCOMPLETE: each `raw` item carries `documentation`/`resolve_data` (Phase 1) and
-// the selected item's lazy docs/detail are now fetched via `completionItem/resolve`
-// and merged in place (Phase 2). What's left: project the selected item's
-// documentation into a preview surface beside the popup (`pmenu_value`, Phase 3) —
-// today the resolved docs land in `raw` but only the resolved `detail` is shown
-// (it rides the existing pmenu item projection). Plan: docs/completion-documentation-plan.md.
+// Per-item documentation is fully wired (docs/completion-documentation-plan.md):
+// each `raw` item carries `documentation`/`resolve_data` (Phase 1); the selected
+// item's lazy docs/detail are fetched via `completionItem/resolve` and merged in
+// place (Phase 2); and the selected item's documentation is projected as the
+// `doc` lines `pmenu_value` emits, which the client floats in a preview box beside
+// the popup (Phase 3). Markdown is rendered as plain lines (the markup distiller
+// yields lines, not styled spans), per the known-approximations registry.
 pub(crate) struct CompletionMenu {
     /// The buffer the menu belongs to; a reply for any other buffer is dropped.
     buffer: BufferId,
@@ -1827,6 +1828,17 @@ impl Server {
             (cursor_row.saturating_sub(h + 2), h)
         };
 
+        // The selected item's documentation, split into display lines, for the
+        // preview box the client floats beside the popup (Phase 3). Empty ⇒ no
+        // preview: nothing selected, or the selected item carries no docs (yet —
+        // a `completionItem/resolve` may fill it in, repainting on the merge).
+        let doc: Vec<Value> = menu
+            .selected
+            .and_then(|s| menu.visible.get(s))
+            .and_then(|&i| menu.raw[i].documentation.as_deref())
+            .map(|d| d.lines().map(Value::from).collect())
+            .unwrap_or_default();
+
         Value::Map(vec![
             (Value::from("items"), Value::Array(items)),
             (
@@ -1840,6 +1852,7 @@ impl Server {
             (Value::from("col"), Value::from(anchor_col as u64)),
             (Value::from("width"), Value::from(width as u64)),
             (Value::from("height"), Value::from(height as u64)),
+            (Value::from("doc"), Value::Array(doc)),
         ])
     }
 

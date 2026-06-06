@@ -80,7 +80,7 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 
 | Root cause | Approximations it clears |
 |---|---|
-| Single-window model | `nvim_win_get_cursor(win)`, `make_position_params(window)`, `open_floating_preview` handles, per-window placement |
+| Single-window model | `nvim_win_get_cursor(win)`, `make_position_params(window)`, `open_floating_preview` handles, per-window placement, the single completion-doc preview box (no separate preview-window handle / `completeopt` matrix) |
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
 | Core doesn't honor buffer-local options | every `vim.bo` write but `filetype`, `nvim_set_option_value` |
 | No per-buffer command registry | `nvim_buf_create_user_command` registers globally |

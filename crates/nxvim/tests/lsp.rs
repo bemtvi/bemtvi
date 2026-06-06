@@ -1285,6 +1285,26 @@ fn pmenu_details(params: &[Value]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The popup's `doc` lines — the selected item's documentation projected for the
+/// preview box. Empty when nothing is selected or the item has no docs.
+fn pmenu_doc(params: &[Value]) -> Vec<String> {
+    let Some(Value::Map(map)) = params.first() else {
+        return Vec::new();
+    };
+    let Some((_, Value::Map(pm))) = map.iter().find(|(k, _)| k.as_str() == Some("pmenu")) else {
+        return Vec::new();
+    };
+    pm.iter()
+        .find(|(k, _)| k.as_str() == Some("doc"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Drain every buffered `redraw` (oldest first), returning their params — so a
 /// test can assert the popup never closed *between* keystrokes, not just at the
 /// end.
@@ -1562,6 +1582,57 @@ async fn a_completion_resolve_failure_leaves_the_item_docless() {
     assert!(
         pmenu_details(&params).iter().all(|d| d.is_empty()),
         "a failed resolve leaves the item with no detail (and no faked docs)"
+    );
+}
+
+#[tokio::test]
+async fn selecting_a_documented_item_shows_a_doc_preview() {
+    let _guard = test_lock().lock().await;
+    // Phase 3: the selected item's documentation is projected as `pmenu.doc`, and
+    // the client floats it in a preview box beside the popup. No selection ⇒ no
+    // preview; selecting the documented item fills it (and the box paints).
+    let record = configure_mock(
+        "compl-preview",
+        serde_json::json!({
+            "completion": [{
+                "label": "connect",
+                "detail": "fn() -> Conn",
+                "documentation": {
+                    "kind": "markdown",
+                    "value": "Opens a connection.\nReturns a handle."
+                }
+            }]
+        }),
+    );
+    let file = temp_file("compl-preview", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "o<C-x><C-o>");
+    let params = wait_for_pmenu(&rpc, &mut incoming).await;
+    assert!(
+        pmenu_doc(&params).is_empty(),
+        "nothing selected ⇒ no documentation preview"
+    );
+
+    feed(&rpc, "<C-n>");
+    let params = wait_for_pmenu_where(&rpc, &mut incoming, |(_, sel)| *sel == 0).await;
+    assert_eq!(
+        pmenu_doc(&params),
+        vec!["Opens a connection.", "Returns a handle."],
+        "the selected item's documentation rides the pmenu redraw as `doc` lines"
+    );
+
+    // The real client paints the docs in a bordered preview box beside the popup.
+    let buf = paint(&View::from_redraw(&params), COLS, ROWS);
+    let row_text = |y: u16| {
+        (0..COLS)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect::<String>()
+    };
+    assert!(
+        (0..ROWS).any(|y| row_text(y).contains("Opens a connection.")),
+        "the preview box paints the documentation text beside the popup"
     );
 }
 

@@ -1547,6 +1547,15 @@ local function lsp_is_argv(cmd)
   return true
 end
 
+-- `t` if it is a non-empty table, else nil. Guards the config payloads
+-- (`settings` / `init_options` / `capabilities`) threaded to `vim._lsp_start`: an
+-- absent or empty table becomes nil → the server forwards nothing, rather than an
+-- empty `{}` that the lua_to_json bridge would emit as `[]`.
+local function lsp_nonempty(t)
+  if type(t) == "table" and next(t) ~= nil then return t end
+  return nil
+end
+
 -- Why `cmd` is not a spawnable argv — the human-readable reason recorded in
 -- vim._lsp_skipped so a skipped server isn't a silent mystery.
 local function lsp_argv_reason(cmd)
@@ -1594,7 +1603,17 @@ local function lsp_start_resolved(name, cfg, bufnr, ft, root)
     return
   end
   vim.lsp.start(
-    { name = name, cmd = cmd, root_dir = root, filetypes = cfg.filetypes },
+    {
+      name = name,
+      cmd = cmd,
+      root_dir = root,
+      filetypes = cfg.filetypes,
+      -- Carry what the config configures so the server runs configured, not on
+      -- defaults (Phase 2): vim.lsp.start reads these and forwards them to Rust.
+      settings = cfg.settings,
+      init_options = cfg.init_options,
+      capabilities = cfg.capabilities,
+    },
     { bufnr = bufnr, filetype = ft }
   )
 end
@@ -1699,7 +1718,12 @@ function vim.lsp.start(config, opts)
     lsp_record_skip(config.name or "?", reason or lsp_argv_reason(cmd))
     return
   end
-  vim._lsp_start(config.name, cmd, config.root_dir, opts.filetype or "", bufnr)
+  vim._lsp_start(
+    config.name, cmd, config.root_dir, opts.filetype or "", bufnr,
+    lsp_nonempty(config.init_options),
+    lsp_nonempty(config.settings),
+    lsp_nonempty(config.capabilities)
+  )
 end
 
 -- ----- vim.lsp.buf: Lua entry points to the native features -------------------

@@ -139,7 +139,7 @@ that renders `_report()` is left as a later follow-up — the data surface is he
 
 ---
 
-## Phase 2 — Forward `settings` / `init_options` / `capabilities` ⬜
+## Phase 2 — Forward `settings` / `init_options` / `capabilities` ✅
 
 **Goal.** Send the config's `settings`, `init_options`, and merged
 `capabilities` to the server, so it runs *configured*, not on defaults.
@@ -162,12 +162,19 @@ that renders `_report()` is left as a later follow-up — the data surface is he
   `capabilities` over `client_capabilities()`.
 - After `initialized`, send `workspace/didChangeConfiguration { settings }`.
 
-**Tests.** Start a real server with a sentinel setting and assert the
-`initialize`/`didChangeConfiguration` payload carries it (a mock LSP server over
-the existing `$NXVIM_LSP_CMD` hook can echo what it received).
+**Tests.** ✅ `the_config_settings_init_options_and_capabilities_reach_the_server`
+(`crates/nxvim/tests/lsp.rs`): a config sets a sentinel in each of `settings` /
+`init_options` / `capabilities`; the mock records the handshake and we assert
+`init_options` → `initializationOptions`, the config's `capabilities` deep-merged
+over the base (sentinel present *and* base `positionEncodings` survive), and
+`settings` → `workspace/didChangeConfiguration`.
 
-**Done when.** A configured `settings`/`init_options` demonstrably reaches the
-server.
+**Done when.** ✅ The resolved config's `settings` / `init_options` /
+`capabilities` ride `vim._lsp_start` → `LspOp::Start` (as `serde_json::Value` via
+the `lua_to_json` bridge, empties dropped) → `ServerSpawn` → `run_server_once`:
+`initialization_options = init_options or settings`, `capabilities` = base
+deep-merged with the config's (malformed → logged, base used — loud, not silent),
+and `workspace/didChangeConfiguration { settings }` after `initialized`.
 
 **Depends on.** Phase 0 (clean baseline). Independent of the event loop.
 

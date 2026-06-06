@@ -2607,3 +2607,67 @@ async fn a_withheld_capability_reads_as_falsy_in_on_attach() {
         "an advertised definitionProvider still reads true"
     );
 }
+
+#[tokio::test]
+async fn the_config_settings_init_options_and_capabilities_reach_the_server() {
+    let _guard = test_lock().lock().await;
+    // Phase 2: a config's `settings` / `init_options` / `capabilities` must reach
+    // the server, not be dropped. The config sets a sentinel in each; the mock
+    // records the handshake, so we can assert each sentinel arrived where it should.
+    let record = configure_mock("cfgfwd", serde_json::json!({}));
+    let content = "fn main() {}\n";
+    let file = temp_file("cfgfwd", "rs", content);
+
+    let dir = std::env::temp_dir().join(format!("nxvim-lsp-cfgfwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    std::fs::write(
+        dir.join("init.lua"),
+        "vim.lsp.config('mock', { cmd = { 'mock' }, filetypes = { 'rust' }, \
+         settings = { ['mock-ls'] = { sentinel = 'SETTING' } }, \
+         init_options = { initSentinel = 'INIT' }, \
+         capabilities = { experimental = { nxvimSentinel = true } } })\n\
+         vim.lsp.enable('mock')\n",
+    )
+    .expect("write init.lua");
+
+    let (rpc, _incoming) = start_with_config_dir(Some(file), dir.clone()).await;
+
+    // Wait until both the handshake and the post-`initialized` configuration push
+    // are recorded.
+    let recs = wait_for_record(&rpc, &record, |r| {
+        has_method(r, "workspace/didChangeConfiguration")
+    })
+    .await;
+
+    let init = find(&recs, "initialize").expect("an initialize request");
+    // init_options is forwarded verbatim as initializationOptions.
+    assert_eq!(
+        init["params"]["initializationOptions"]["initSentinel"].as_str(),
+        Some("INIT"),
+        "init_options should reach initialize as initializationOptions, got {:?}",
+        init["params"]["initializationOptions"]
+    );
+    // The config's capabilities are deep-merged OVER nxvim's base ones: the
+    // sentinel is present AND the base positionEncodings survive.
+    assert_eq!(
+        init["params"]["capabilities"]["experimental"]["nxvimSentinel"].as_bool(),
+        Some(true),
+        "config capabilities should merge into initialize, got {:?}",
+        init["params"]["capabilities"]["experimental"]
+    );
+    assert_eq!(
+        init["params"]["capabilities"]["general"]["positionEncodings"][0].as_str(),
+        Some("utf-8"),
+        "the base capabilities must survive the merge"
+    );
+    // settings arrive via workspace/didChangeConfiguration after `initialized`.
+    let cfg = find(&recs, "workspace/didChangeConfiguration").unwrap();
+    assert_eq!(
+        cfg["params"]["settings"]["mock-ls"]["sentinel"].as_str(),
+        Some("SETTING"),
+        "settings should reach didChangeConfiguration, got {:?}",
+        cfg["params"]["settings"]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

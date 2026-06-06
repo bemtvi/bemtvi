@@ -25,15 +25,16 @@ use lsp_types::{
     CodeActionClientCapabilities, CodeActionContext, CodeActionKindLiteralSupport,
     CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
-    Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
-    DocumentFormattingClientCapabilities, DocumentFormattingParams, FormattingOptions,
-    GeneralClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
-    MessageType, OneOf, ParameterLabel, Position, PositionEncodingKind, Range, ReferenceContext,
-    ReferenceParams, RenameClientCapabilities, RenameParams, ServerCapabilities, SignatureHelp,
-    SignatureHelpParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentEdit, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    Diagnostic, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentChangeOperation, DocumentChanges, DocumentFormattingClientCapabilities,
+    DocumentFormattingParams, FormattingOptions, GeneralClientCapabilities, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
+    InitializedParams, Location, MarkedString, MessageType, OneOf, ParameterLabel, Position,
+    PositionEncodingKind, Range, ReferenceContext, ReferenceParams, RenameClientCapabilities,
+    RenameParams, ServerCapabilities, SignatureHelp, SignatureHelpParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentEdit,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind, TextEdit,
     Url, VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceEdit,
     WorkspaceEditClientCapabilities,
@@ -55,13 +56,24 @@ pub struct ServerKey {
     pub root: PathBuf,
 }
 
-/// How to launch a server: the program and its arguments. The working directory
-/// is the key's `root`. Derived from the resolved Lua config's `cmd` (or the
-/// `NXVIM_LSP_CMD` test override) by the server.
-#[derive(Clone, Debug)]
+/// How to launch a server and how to configure it. The working directory is the
+/// key's `root`; `program`/`args` are derived from the resolved Lua config's `cmd`
+/// (or the `NXVIM_LSP_CMD` test override). The three JSON payloads are the
+/// config's `init_options` / `settings` / `capabilities`, forwarded at the
+/// handshake so the server runs *configured*, not on defaults (Phase 2).
+#[derive(Clone, Debug, Default)]
 pub struct ServerSpawn {
     pub program: String,
     pub args: Vec<String>,
+    /// Sent verbatim as `initialization_options` at `initialize` (falling back to
+    /// `settings` when absent). `None` when the config sets neither.
+    pub init_options: Option<serde_json::Value>,
+    /// The `workspace/didChangeConfiguration` payload sent after `initialized`,
+    /// and the `initialization_options` fallback. `None` when the config sets none.
+    pub settings: Option<serde_json::Value>,
+    /// Deep-merged OVER nxvim's base [`client_capabilities`] at `initialize`.
+    /// `None` when the config adds none.
+    pub capabilities: Option<serde_json::Value>,
 }
 
 /// The position encoding negotiated at `initialize` (Decision 4). nxvim columns
@@ -607,7 +619,17 @@ async fn run_server_once(
     let init = InitializeParams {
         process_id: Some(std::process::id()),
         root_uri: Url::from_file_path(&key.root).ok(),
-        capabilities: client_capabilities(),
+        // The config's `init_options`, or `settings` as the fallback (neovim's
+        // behavior): a server that reads only `initialization_options` still sees
+        // what a `settings`-only config configured.
+        initialization_options: spawn
+            .init_options
+            .clone()
+            .or_else(|| spawn.settings.clone()),
+        // nxvim's base capabilities with the config's `capabilities` deep-merged
+        // over them (config wins) — so a config that advertises extra capabilities
+        // (snippet support, extra code-action kinds, …) is honored.
+        capabilities: merged_client_capabilities(spawn.capabilities.as_ref(), log, name),
         ..Default::default()
     };
     let init_result = tokio::select! {
@@ -638,6 +660,12 @@ async fn run_server_once(
         }
     };
     let _ = socket.initialized(InitializedParams {});
+    // Push the config's `settings` once the server is ready to accept them. Many
+    // servers (re)read their configuration only on `didChangeConfiguration`, so
+    // this is what makes a `settings`-configured server actually run configured.
+    if let Some(settings) = spawn.settings.clone() {
+        let _ = socket.did_change_configuration(DidChangeConfigurationParams { settings });
+    }
     let encoding = encoding_of(&init_result.capabilities);
     let sync_kind = sync_kind_of(&init_result.capabilities);
     let providers = provider_caps(&init_result.capabilities);
@@ -1321,6 +1349,65 @@ fn level_of(typ: MessageType) -> LogLevel {
 /// `Command[]` rather than a `CodeAction` carrying an `edit`**, and "apply the
 /// edit" becomes impossible; we also declare `formatting`/`rename` and
 /// `workspaceEdit.documentChanges` so servers offer those features.
+/// nxvim's base [`client_capabilities`] with the config's `extra` capabilities
+/// (a raw JSON value) deep-merged over them — the config wins on any conflict, so
+/// it can both extend (add a capability nxvim doesn't advertise) and override
+/// (flip a flag). A malformed `extra` that won't round-trip back into
+/// [`ClientCapabilities`] is logged and the base is used — loud, not silent, so a
+/// bad `capabilities` table is visible rather than mysteriously ignored.
+fn merged_client_capabilities(
+    extra: Option<&serde_json::Value>,
+    log: &LspLog,
+    name: &str,
+) -> ClientCapabilities {
+    let base = client_capabilities();
+    let Some(extra) = extra else {
+        return base;
+    };
+    let mut merged = match serde_json::to_value(&base) {
+        Ok(v) => v,
+        Err(e) => {
+            log.log(
+                LogLevel::Warn,
+                name,
+                &format!(
+                    "could not serialize base capabilities: {e}; ignoring config capabilities"
+                ),
+            );
+            return base;
+        }
+    };
+    json_merge(&mut merged, extra);
+    match serde_json::from_value(merged) {
+        Ok(caps) => caps,
+        Err(e) => {
+            log.log(
+                LogLevel::Warn,
+                name,
+                &format!(
+                    "config `capabilities` are not valid client capabilities: {e}; using base"
+                ),
+            );
+            client_capabilities()
+        }
+    }
+}
+
+/// Recursively merge `src` into `dst`: objects merge key-by-key (recursing on
+/// shared keys), and any non-object pair replaces `dst` with `src`. The deep-merge
+/// `merged_client_capabilities` uses so a nested config capability (e.g. one field
+/// under `textDocument.completion`) doesn't clobber its siblings.
+fn json_merge(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    match (dst, src) {
+        (serde_json::Value::Object(d), serde_json::Value::Object(s)) => {
+            for (k, v) in s {
+                json_merge(d.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (d, s) => *d = s.clone(),
+    }
+}
+
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         general: Some(GeneralClientCapabilities {

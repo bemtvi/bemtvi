@@ -266,6 +266,9 @@ impl Server {
             root,
             filetype,
             bufnr,
+            init_options,
+            settings,
+            capabilities,
         } = start
         else {
             unreachable!("non-Start ops returned above");
@@ -291,10 +294,15 @@ impl Server {
         let key = ServerKey { name, root };
         // Spawn command: `$NXVIM_LSP_CMD` overrides the whole argv (the mock hook,
         // the LSP analogue of `NXVIM_TS_WORKER`), else the config's `cmd`. An
-        // empty command can't start a server.
-        let Some(spawn) = lsp_spawn(&cmd) else {
+        // empty command can't start a server. The resolved config's
+        // settings/init_options/capabilities ride along so the manager forwards
+        // them at `initialize` (Phase 2).
+        let Some(mut spawn) = lsp_spawn(&cmd) else {
             return;
         };
+        spawn.init_options = init_options;
+        spawn.settings = settings;
+        spawn.capabilities = capabilities;
         if !self.lsp_ensured.contains(&key) {
             self.lsp.ensure_server(key.clone(), spawn);
             self.lsp_ensured.insert(key.clone());
@@ -2083,12 +2091,14 @@ fn lsp_spawn(cmd: &[String]) -> Option<ServerSpawn> {
         return Some(ServerSpawn {
             program,
             args: parts.collect(),
+            ..Default::default()
         });
     }
     let (program, args) = cmd.split_first()?;
     Some(ServerSpawn {
         program: program.clone(),
         args: args.to_vec(),
+        ..Default::default()
     })
 }
 

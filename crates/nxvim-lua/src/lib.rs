@@ -90,6 +90,16 @@ pub enum LspOp {
         /// The buffer to attach, as the `BufferId` the server snapshotted into
         /// `vim._cur_buf` before firing `FileType` (so it round-trips exactly).
         bufnr: u64,
+        /// The config's `init_options`, sent verbatim as `initialization_options`
+        /// at `initialize` (Phase 2). `None` when the config sets none.
+        init_options: Option<serde_json::Value>,
+        /// The config's `settings`: the fallback `initialization_options` when
+        /// `init_options` is absent, and the payload of the post-`initialized`
+        /// `workspace/didChangeConfiguration` (Phase 2). `None` when unset.
+        settings: Option<serde_json::Value>,
+        /// The config's `capabilities`, deep-merged OVER nxvim's base client
+        /// capabilities at `initialize` (Phase 2). `None` when the config adds none.
+        capabilities: Option<serde_json::Value>,
     },
     /// A `vim.lsp.buf.*` language-feature request (definition, references,
     /// hover, …) on the current buffer. `kind` is `LspReqKind::as_u16` — the same
@@ -817,6 +827,20 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     Ok(())
 }
 
+/// The argument tuple of `vim._lsp_start`: the original five
+/// (`name`, `cmd`, `root`, `filetype`, `bufnr`) plus the Phase-2 config payloads
+/// (`init_options`, `settings`, `capabilities`, each a table or `nil`).
+type LspStartArgs = (
+    String,
+    Vec<String>,
+    Option<String>,
+    String,
+    u64,
+    Option<Table>,
+    Option<Table>,
+    Option<Table>,
+);
+
 /// Install the `vim.*` functions that need the host filesystem / environment /
 /// runtimepath and feed the LSP framework (Phase 7a): `nvim_get_runtime_file`
 /// (runtimepath `lsp/` discovery), `vim.fn.getcwd`, the `vim._read_file` /
@@ -879,31 +903,30 @@ fn install_runtime_api(
         })?,
     )?;
 
-    // `vim._lsp_start(name, cmd, root, filetype, bufnr)`: queue an [`LspOp::Start`]
-    // for the server to drain. The Lua-facing `vim.lsp.start` wrapper (prelude)
-    // resolves the config and root, then calls this.
+    // `vim._lsp_start(name, cmd, root, filetype, bufnr, init_options, settings,
+    // capabilities)`: queue an [`LspOp::Start`] for the server to drain. The
+    // Lua-facing `vim.lsp.start` wrapper (prelude) resolves the config and root,
+    // then calls this. The trailing three are the config's `init_options` /
+    // `settings` / `capabilities` tables (each `nil` when unset); they convert
+    // through the same `lua_to_json` bridge `vim.json.encode` uses, so the server
+    // forwards them at `initialize` exactly as the config wrote them (Phase 2).
     let sh = shared.clone();
     vim.set(
         "_lsp_start",
-        lua.create_function(
-            move |_,
-                  (name, cmd, root, filetype, bufnr): (
-                String,
-                Vec<String>,
-                Option<String>,
-                String,
-                u64,
-            )| {
-                sh.borrow_mut().lsp_ops.push(LspOp::Start {
-                    name,
-                    cmd,
-                    root,
-                    filetype,
-                    bufnr,
-                });
-                Ok(())
-            },
-        )?,
+        lua.create_function(move |_, args: LspStartArgs| {
+            let (name, cmd, root, filetype, bufnr, init_options, settings, capabilities) = args;
+            sh.borrow_mut().lsp_ops.push(LspOp::Start {
+                name,
+                cmd,
+                root,
+                filetype,
+                bufnr,
+                init_options: opt_table_to_json(init_options)?,
+                settings: opt_table_to_json(settings)?,
+                capabilities: opt_table_to_json(capabilities)?,
+            });
+            Ok(())
+        })?,
     )?;
 
     // `vim._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request
@@ -1587,6 +1610,17 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value
             mlua::Value::Table(t)
         }
     })
+}
+
+/// Convert an optional Lua config table (`init_options` / `settings` /
+/// `capabilities` from `vim._lsp_start`) to JSON for [`LspOp::Start`]. `None`
+/// passes through; a present table goes through [`lua_to_json`] (the same bridge
+/// `vim.json.encode` uses), so what the config wrote reaches the server verbatim.
+fn opt_table_to_json(t: Option<Table>) -> mlua::Result<Option<serde_json::Value>> {
+    match t {
+        Some(t) => Ok(Some(lua_to_json(&mlua::Value::Table(t))?)),
+        None => Ok(None),
+    }
 }
 
 /// Convert an `mlua::Value` to a [`serde_json::Value`] for `vim.json.encode`,

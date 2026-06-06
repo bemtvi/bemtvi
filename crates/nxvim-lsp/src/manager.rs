@@ -1212,7 +1212,11 @@ fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
 /// [`WorkspaceEditData`]). `documentChanges` (versioned) is preferred when present
 /// — collapsing the `OneOf<TextEdit, AnnotatedTextEdit>` and dropping file
 /// resource operations — else the plain `changes` map is used.
-fn normalize_workspace_edit(edit: WorkspaceEdit) -> WorkspaceEditData {
+///
+/// `pub` so `nxvim-server` can reuse it for `vim.lsp.util.apply_workspace_edit`
+/// (Phase 7): a WorkspaceEdit handed up from Lua normalizes through the exact same
+/// path the native rename / code-action replies use.
+pub fn normalize_workspace_edit(edit: WorkspaceEdit) -> WorkspaceEditData {
     if let Some(changes) = edit.document_changes {
         return match changes {
             DocumentChanges::Edits(edits) => edits.into_iter().map(text_document_edit).collect(),

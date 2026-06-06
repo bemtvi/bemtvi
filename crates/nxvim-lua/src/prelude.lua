@@ -1620,35 +1620,186 @@ function vim.lsp.rpc.start(cmd, _dispatchers, _extra) return cmd end
 function vim.lsp.rpc.connect(_host, _port) vim._notimpl("vim.lsp.rpc.connect") end
 
 -- vim.lsp.util: helpers a config reaches for inside on_attach / command / handler
--- callbacks. nxvim drives its LSP features natively (vim.lsp.buf.*); these helpers
--- (cursor/range params, loclist conversion, floating preview, workspace-edit
--- application, jump) need real cursor/buffer/window state and the panel surface
--- that don't exist yet (Phases 6-7). Returning neovim-shaped empties made a
--- command look like it computed params; they raise via vim._notimpl instead.
+-- callbacks (Phase 7). nxvim drives its core LSP features natively (vim.lsp.buf.*);
+-- these compute LSP params from the real cursor/buffer state (the Phase-6 mirror)
+-- and drive nxvim's own surfaces — the panel for previews, and the native
+-- workspace-edit / single-location goto paths (queued as LspOps) for edits and
+-- navigation. The Phase-0 vim._notimpl raises are gone.
 vim.lsp.util = vim.lsp.util or {}
-function vim.lsp.util.make_position_params(_win, _enc)
-  vim._notimpl("vim.lsp.util.make_position_params")
+
+-- Convert a 0-based *byte* column on `line` to a position character in the LSP
+-- `encoding` (utf-16 default; utf-8 → the byte index unchanged; utf-32 →
+-- codepoints). nxvim stores text as UTF-8 bytes, so this walks the prefix
+-- [0, byte_col) one UTF-8 lead byte at a time, counting code units (a 4-byte
+-- char is a surrogate pair — 2 units — under utf-16, 1 under utf-32).
+function vim._byte_to_position_char(line, byte_col, encoding)
+  if encoding == nil or encoding == "utf-8" then return byte_col end
+  local utf16 = encoding ~= "utf-32"
+  local count, i = 0, 1
+  local limit = math.min(byte_col, #line)
+  while i <= limit do
+    local b = string.byte(line, i)
+    local size, units
+    if b < 0x80 then size, units = 1, 1
+    elseif b < 0xE0 then size, units = 2, 1
+    elseif b < 0xF0 then size, units = 3, 1
+    else size, units = 4, utf16 and 2 or 1 end
+    count = count + units
+    i = i + size
+  end
+  return count
 end
-function vim.lsp.util.make_text_document_params(_bufnr)
-  vim._notimpl("vim.lsp.util.make_text_document_params")
+
+-- The inverse: a position `character` in `encoding` back to a 0-based byte column
+-- on `line` (used to address loclist columns by byte). Clamps at end-of-line.
+function vim._position_char_to_byte(line, character, encoding)
+  if encoding == nil or encoding == "utf-8" then return math.min(character, #line) end
+  local utf16 = encoding ~= "utf-32"
+  local count, i = 0, 1
+  while i <= #line and count < character do
+    local b = string.byte(line, i)
+    local size, units
+    if b < 0x80 then size, units = 1, 1
+    elseif b < 0xE0 then size, units = 2, 1
+    elseif b < 0xF0 then size, units = 3, 1
+    else size, units = 4, utf16 and 2 or 1 end
+    count = count + units
+    i = i + size
+  end
+  return i - 1
 end
-function vim.lsp.util.make_given_range_params(_start, _end, _bufnr, _enc)
-  vim._notimpl("vim.lsp.util.make_given_range_params")
+
+-- The text of 0-based `row` in the loaded buffer whose name maps to `uri`, or nil
+-- when no open buffer backs it. Scans the Phase-6 mirror (`vim._bufs`, which
+-- carries each buffer's name and line array) — the loclist `text` field for a
+-- location in an unopened file is left empty rather than read off disk.
+function vim._line_text_for_uri(uri, row)
+  local fname = vim.uri_to_fname(uri)
+  for _, buf in pairs(vim._bufs) do
+    if buf.lines and buf.name == fname then
+      return buf.lines[row + 1]
+    end
+  end
+  return nil
 end
-function vim.lsp.util.locations_to_items(_locations, _enc)
-  vim._notimpl("vim.lsp.util.locations_to_items")
+
+-- make_text_document_params(bufnr): the `{ uri }` a request's `textDocument` field
+-- carries, from the buffer's file path.
+function vim.lsp.util.make_text_document_params(bufnr)
+  return { uri = vim.uri_from_bufnr(bufnr or 0) }
 end
-function vim.lsp.util.get_effective_tabstop(_bufnr)
-  vim._notimpl("vim.lsp.util.get_effective_tabstop")
+
+-- make_position_params(window, encoding): the `{ textDocument, position }` a
+-- cursor-relative request (definition, hover, …) carries. The cursor comes from
+-- the real editor (Phase-6 mirror); its byte column is converted to `encoding`
+-- (utf-16 default). `window` is ignored — single-window nxvim.
+function vim.lsp.util.make_position_params(_window, encoding)
+  encoding = encoding or "utf-16"
+  local bufnr = vim.api.nvim_get_current_buf()
+  local c = vim.api.nvim_win_get_cursor(0) -- { row (1-based), col (0-based byte) }
+  local line = vim.api.nvim_buf_get_lines(bufnr, c[1] - 1, c[1], false)[1] or ""
+  return {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+    position = { line = c[1] - 1, character = vim._byte_to_position_char(line, c[2], encoding) },
+  }
 end
-function vim.lsp.util.open_floating_preview(_contents, _syntax, _opts)
-  vim._notimpl("vim.lsp.util.open_floating_preview")
+
+-- make_given_range_params(start_pos, end_pos, bufnr, encoding): the
+-- `{ textDocument, range }` a range request (range formatting, range code action)
+-- carries. `start_pos`/`end_pos` are `{ row (1-based), col (0-based byte) }` (the
+-- neovim mark shape); the columns convert to `encoding` and the end is made
+-- exclusive (marks are inclusive), matching neovim.
+function vim.lsp.util.make_given_range_params(start_pos, end_pos, bufnr, encoding)
+  encoding = encoding or "utf-16"
+  bufnr = vim._resolve_bufnr(bufnr or 0)
+  local function pos_at(p)
+    local row = p[1] - 1
+    local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
+    return { line = row, character = vim._byte_to_position_char(line, p[2], encoding) }
+  end
+  local s = pos_at(start_pos)
+  local e = pos_at(end_pos)
+  e.character = e.character + 1 -- inclusive mark → exclusive LSP range end
+  return {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+    range = { start = s, ["end"] = e },
+  }
 end
-function vim.lsp.util.apply_workspace_edit(_edit, _enc)
-  vim._notimpl("vim.lsp.util.apply_workspace_edit")
+
+-- locations_to_items(locations, encoding): turn LSP `Location` / `LocationLink`s
+-- into loclist items (`{ filename, lnum, col, text }`), sorted by file then
+-- position. The byte `col` and the `text` come from the open buffer backing each
+-- location (empty `text` for an unopened file). `user_data` keeps the raw location.
+function vim.lsp.util.locations_to_items(locations, encoding)
+  encoding = encoding or "utf-16"
+  local items = {}
+  for _, loc in ipairs(locations or {}) do
+    local uri = loc.uri or loc.targetUri
+    local range = loc.range or loc.targetRange
+    if uri and range then
+      local row = range.start.line
+      local text = vim._line_text_for_uri(uri, row) or ""
+      items[#items + 1] = {
+        filename = vim.uri_to_fname(uri),
+        lnum = row + 1,
+        col = vim._position_char_to_byte(text, range.start.character, encoding) + 1,
+        text = text,
+        user_data = loc,
+      }
+    end
+  end
+  table.sort(items, function(a, b)
+    if a.filename ~= b.filename then return a.filename < b.filename end
+    if a.lnum ~= b.lnum then return a.lnum < b.lnum end
+    return a.col < b.col
+  end)
+  return items
 end
-function vim.lsp.util.show_document(_location, _enc, _opts)
-  vim._notimpl("vim.lsp.util.show_document")
+
+-- get_effective_tabstop(bufnr): the indent width for the buffer — `shiftwidth`
+-- when set (> 0), else `tabstop` (default 8), read from the vim.bo store (Phase 6).
+function vim.lsp.util.get_effective_tabstop(bufnr)
+  bufnr = vim._resolve_bufnr(bufnr or 0)
+  local store = vim._bo_store[bufnr] or {}
+  local sw = store.shiftwidth or 0
+  if sw > 0 then return sw end
+  return store.tabstop or 8
+end
+
+-- open_floating_preview(contents, syntax, opts): show `contents` (a list of lines)
+-- in nxvim's panel — the surface that stands in for neovim's floating window.
+-- neovim returns `(float_bufnr, win_id)`; nxvim has one panel and no per-float
+-- handle, so it returns `0` and the current window handle for call-site shape.
+function vim.lsp.util.open_floating_preview(contents, _syntax, opts)
+  opts = opts or {}
+  local lines = type(contents) == "table" and contents or { tostring(contents) }
+  vim.panel.open(opts.title or "Preview", lines)
+  return 0, vim.api.nvim_get_current_win()
+end
+
+-- apply_workspace_edit(workspace_edit, encoding): apply a `WorkspaceEdit` across
+-- the open buffers it names, reusing the native rename / code-action path (queued
+-- as an LspOp the server normalizes and applies). Edits to unopened files are a
+-- follow-up (the native path edits open buffers only); `encoding` is carried by
+-- the edit's positions and resolved server-side, so the arg is accepted here.
+function vim.lsp.util.apply_workspace_edit(workspace_edit, _encoding)
+  vim._lsp_apply_workspace_edit(workspace_edit or {})
+end
+
+-- show_document(location, encoding, opts): jump the cursor to an LSP location
+-- (`Location` or `LocationLink`), opening the file if needed — the native
+-- single-location goto, queued as an LspOp. An `external = true` location (open in
+-- a browser/program) has no nxvim surface, so it raises rather than no-op.
+function vim.lsp.util.show_document(location, encoding, _opts)
+  if type(location) ~= "table" then return false end
+  if location.external then vim._notimpl("vim.lsp.util.show_document (external)") end
+  local uri = location.uri or location.targetUri
+  local range = location.range or location.targetRange
+  if not uri then return false end
+  local line = range and range.start.line or 0
+  local character = range and range.start.character or 0
+  vim._lsp_show_document(uri, line, character, encoding or "utf-16")
+  return true
 end
 
 -- vim.lsp.omnifunc: the i_CTRL-X_CTRL-O completion entry point. nxvim has no

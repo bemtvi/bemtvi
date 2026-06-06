@@ -12,14 +12,16 @@ fn notimpl_stub_raises_with_its_name_and_records_the_hit() {
     let report = rt
         .eval_to_value(
             r#"
--- A representative hollow stub: it used to return a fabricated zero-cursor
--- position params table; now it raises naming itself.
-local ok, err = pcall(vim.lsp.util.make_position_params)
-assert(not ok, "expected vim.lsp.util.make_position_params to raise")
-assert(err:find("nxvim: not implemented: vim.lsp.util.make_position_params", 1, true),
+-- A representative hollow stub: returning 0 here would hand a handler the wrong
+-- buffer, so it raises naming itself instead. (The `vim.lsp.util.*` neighbours
+-- became real in Phase 7; uri_to_bufnr stays a gap — no Lua buffer-creating
+-- registry yet — so it is the standing representative.)
+local ok, err = pcall(vim.uri_to_bufnr, "file:///tmp/x")
+assert(not ok, "expected vim.uri_to_bufnr to raise")
+assert(err:find("nxvim: not implemented: vim.uri_to_bufnr", 1, true),
   "error should name the function, got: " .. tostring(err))
 -- The hit is recorded so the gaps a real config triggers stay trackable.
-assert(vim._notimpl_hits["vim.lsp.util.make_position_params"] == true,
+assert(vim._notimpl_hits["vim.uri_to_bufnr"] == true,
   "the hit should be recorded in vim._notimpl_hits")
 
 -- The faithful neighbours are NOT routed through the raise. vim.schedule no

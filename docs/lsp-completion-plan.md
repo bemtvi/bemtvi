@@ -375,7 +375,7 @@ step (no `undojoin` coalescing), matching `apply_workspace_edit`.
 
 ---
 
-## Phase 7 — `vim.lsp.util.*` real implementations ⬜
+## Phase 7 — `vim.lsp.util.*` real implementations ✅
 
 **Goal.** Implement the LSP utility helpers configs call in on_attach/handlers:
 `make_position_params` (cursor + `offset_encoding`), `make_text_document_params`,
@@ -390,10 +390,40 @@ config-shipped commands depend on.
 surface; `apply_workspace_edit` reuses the rename/workspace-edit path in
 `manager.rs`.
 
-**Tests.** `make_position_params` reflects the real cursor; `apply_workspace_edit`
-edits multiple buffers; `open_floating_preview` shows content in the panel.
+**Tests.** ✅ In `crates/nxvim-server/tests/editing.rs` (driven through
+`nvim_exec_lua`): `make_position_params_reflects_the_cursor_and_encoding` (real
+cursor, byte→UTF-16 vs UTF-8 distinguished), `byte_to_position_char_handles_surrogate_pairs`
+(4-byte char → 2 UTF-16 units / 1 UTF-32 codepoint),
+`make_given_range_params_converts_marks_to_an_exclusive_range`,
+`locations_to_items_builds_sorted_loclist_items` (sorted, `text` from the open
+buffer), `get_effective_tabstop_prefers_shiftwidth_then_tabstop`,
+`open_floating_preview_shows_content_in_the_panel`,
+`apply_workspace_edit_edits_the_open_buffer` (native RPC `lines` confirms the
+rope), `show_document_jumps_the_cursor_to_the_location`,
+`show_document_external_location_raises`.
 
-**Done when.** The `vim.lsp.util.*` raises are gone and back the real features.
+**Done when.** ✅ The `vim.lsp.util.*` raises are gone, replaced by real
+implementations: the param builders (`make_position_params` /
+`make_text_document_params` / `make_given_range_params`) read the Phase-6 cursor /
+buffer mirror and convert byte columns to the offset encoding via the shared
+`vim._byte_to_position_char` / `vim._position_char_to_byte` UTF-8 walkers (utf-16
+default, surrogate-aware); `locations_to_items` emits sorted loclist items with the
+byte `col` and `text` from the open buffer backing each URI; `get_effective_tabstop`
+reads the `vim.bo` store (shiftwidth → tabstop → 8); `open_floating_preview` shows
+its lines in nxvim's panel; `apply_workspace_edit` queues `LspOp::ApplyWorkspaceEdit`
+→ `serde_json::from_value::<WorkspaceEdit>` → the exported `normalize_workspace_edit`
+→ the native `Server::apply_workspace_edit`; `show_document` queues
+`LspOp::ShowDocument` → `Server::jump_to_lsp_location` (open + cursor jump).
+
+*Known approximations:* `make_position_params`/`open_floating_preview` ignore the
+`window` arg and per-float handles (single-window nxvim, one panel — `(0, win)` is
+returned for call-site shape); `make_text_document_params` for a *non-current*
+bufnr yields an empty URI (Phase-6 `nvim_buf_get_name` is snapshot-backed);
+`apply_workspace_edit` edits only *open* buffers (an unopened-file edit is a
+follow-up, inherited from the native path) and `locations_to_items` leaves `text`
+empty for a location in an unopened buffer; an `external = true` `show_document`
+raises (no external-open surface); `vim.uri_to_bufnr` stays a Phase-0 raise (no
+Lua-side buffer-creating registry yet).
 
 **Depends on.** Phase 6 (buffer/window), the panel surface.
 

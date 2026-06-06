@@ -22,12 +22,13 @@ use nxvim_core::view::View;
 use nxvim_core::{Buffer, BufferEdit, BufferId, Mode};
 use nxvim_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, TextDocumentContentChangeEvent,
-    TextDocumentSyncKind, TextEdit, Url,
+    TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit,
 };
 use nxvim_lsp::serde_json;
 use nxvim_lsp::{
-    CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
-    PositionEncoding, ProviderCaps, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
+    normalize_workspace_edit, CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply,
+    LspRequest, PositionEncoding, ProviderCaps, ReqToken, ServerKey, ServerSpawn,
+    WorkspaceEditData,
 };
 use nxvim_lua::{CallbackArgs, DiagnosticData, LspClientData, LspOp, LspServerCapabilities};
 use rmpv::Value;
@@ -275,6 +276,19 @@ impl Server {
                 params,
             } => {
                 self.client_notify(client_id, method, params);
+                return;
+            }
+            LspOp::ApplyWorkspaceEdit { edit } => {
+                self.apply_lua_workspace_edit(edit);
+                return;
+            }
+            LspOp::ShowDocument {
+                uri,
+                line,
+                character,
+                encoding,
+            } => {
+                self.show_lua_document(&uri, line, character, &encoding);
                 return;
             }
         };
@@ -1746,6 +1760,50 @@ impl Server {
             .collect();
         self.editor.apply_edits_to(id, byte_edits);
         self.sync_lsp_buffer(id);
+    }
+
+    /// Apply a `WorkspaceEdit` handed up from Lua (`vim.lsp.util.apply_workspace_edit`,
+    /// Phase 7). Deserializes the LSP-shape JSON and normalizes it through the same
+    /// path the native rename / code-action replies use, then applies the
+    /// per-document edits across the open buffers it names. A malformed edit is
+    /// echoed (loud, per the no-silent-stubs rule), never silently dropped.
+    fn apply_lua_workspace_edit(&mut self, edit: serde_json::Value) {
+        match serde_json::from_value::<WorkspaceEdit>(edit) {
+            Ok(edit) => {
+                self.apply_workspace_edit(normalize_workspace_edit(edit));
+                self.lsp_dirty = true;
+            }
+            Err(e) => self
+                .editor
+                .echo(format!("apply_workspace_edit: malformed edit: {e}")),
+        }
+    }
+
+    /// Jump to an LSP location handed up from Lua (`vim.lsp.util.show_document`,
+    /// Phase 7). Builds a [`Location`] from the URI / position and reuses the native
+    /// single-location goto (open the file if needed, then refine the byte column on
+    /// the landed line). An invalid URI is echoed rather than silently ignored.
+    fn show_lua_document(&mut self, uri: &str, line: u32, character: u32, encoding: &str) {
+        let Ok(url) = Url::parse(uri) else {
+            self.editor
+                .echo(format!("show_document: invalid uri: {uri}"));
+            return;
+        };
+        let encoding = match encoding {
+            "utf-8" => PositionEncoding::Utf8,
+            "utf-32" => PositionEncoding::Utf32,
+            _ => PositionEncoding::Utf16,
+        };
+        let position = Position { line, character };
+        let location = Location {
+            uri: url,
+            range: Range {
+                start: position,
+                end: position,
+            },
+        };
+        self.jump_to_lsp_location(&location, encoding);
+        self.lsp_dirty = true;
     }
 
     /// Apply a normalized workspace edit (from rename or a code action) across the

@@ -164,6 +164,28 @@ pub enum LspOp {
         /// The notification params as JSON (`Null` when the caller passed none).
         params: serde_json::Value,
     },
+    /// `vim.lsp.util.apply_workspace_edit(edit)` (Phase 7) — apply a `WorkspaceEdit`
+    /// across the open buffers it names, reusing the native rename / code-action
+    /// application path. The server deserializes the JSON into `lsp_types`,
+    /// normalizes it, and applies the per-document edits.
+    ApplyWorkspaceEdit {
+        /// The `WorkspaceEdit` as JSON (`changes` / `documentChanges`), converted
+        /// through the same `lua_to_json` bridge `vim.json.encode` uses.
+        edit: serde_json::Value,
+    },
+    /// `vim.lsp.util.show_document(location)` (Phase 7) — jump the cursor to an LSP
+    /// location (opening the file if needed), reusing the native single-location
+    /// goto path.
+    ShowDocument {
+        /// The target document URI (`file://…`).
+        uri: String,
+        /// 0-based line within the document.
+        line: u32,
+        /// The start position's character, in `encoding`.
+        character: u32,
+        /// The position offset encoding (`utf-8` / `utf-16` / `utf-32`).
+        encoding: String,
+    },
 }
 
 /// A request to the async runtime (the "event loop"), queued by the `vim.schedule`
@@ -1391,6 +1413,40 @@ fn install_runtime_api(
                     client_id,
                     method,
                     params: lua_to_json(&params)?,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `vim._lsp_apply_workspace_edit(edit)`: queue [`LspOp::ApplyWorkspaceEdit`]
+    // (Phase 7). `edit` is the LSP-shape WorkspaceEdit table, converted to JSON
+    // through the same `lua_to_json` bridge `client:request` params use; the server
+    // deserializes, normalizes, and applies it across the open buffers it names.
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_apply_workspace_edit",
+        lua.create_function(move |_, edit: mlua::Value| {
+            sh.borrow_mut().lsp_ops.push(LspOp::ApplyWorkspaceEdit {
+                edit: lua_to_json(&edit)?,
+            });
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._lsp_show_document(uri, line, character, encoding)`: queue
+    // [`LspOp::ShowDocument`] (Phase 7) — the server builds an LSP location and
+    // reuses the native single-location goto (open + cursor jump).
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_show_document",
+        lua.create_function(
+            move |_, (uri, line, character, encoding): (String, u32, u32, String)| {
+                sh.borrow_mut().lsp_ops.push(LspOp::ShowDocument {
+                    uri,
+                    line,
+                    character,
+                    encoding,
                 });
                 Ok(())
             },

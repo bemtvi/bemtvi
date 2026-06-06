@@ -1399,6 +1399,17 @@ local function lsp_record_skip(name, reason)
   vim.api.nvim_echo("nxvim LSP: server '" .. name .. "' skipped: " .. reason)
 end
 
+-- Errors raised inside a config's lifecycle hook (`before_init` / `on_init` /
+-- `on_exit`), keyed by "name:hook" → message. A hook that throws (e.g. one that
+-- reaches a Phase-0 gap like `vim.uv`) must not wedge the start/exit path, but the
+-- failure is recorded and echoed, never swallowed. Surfaced by vim.lsp._report.
+vim._lsp_hook_errors = vim._lsp_hook_errors or {}
+local function lsp_record_hook_error(name, hook, err)
+  local key = (name or "?") .. ":" .. hook
+  vim._lsp_hook_errors[key] = tostring(err)
+  vim.api.nvim_echo("nxvim LSP: " .. hook .. " for '" .. (name or "?") .. "' errored: " .. tostring(err))
+end
+
 -- The client registry: id -> { id, name, server_capabilities }, mirrored from
 -- Rust (`LuaRuntime::set_lsp_client`) when a server finishes `initialize`. The
 -- handle `LspAttach`'s `args.data.client_id` resolves through `get_client_by_id`.
@@ -1411,6 +1422,34 @@ function vim.lsp._remove_client(id) vim.lsp._clients[id] = nil end
 -- vim.lsp.get_client_by_id(id): the registered client table (with `name` and
 -- `server_capabilities`), or nil once its server has exited.
 function vim.lsp.get_client_by_id(id) return vim.lsp._clients[id] end
+
+-- vim.lsp._run_on_init(id, result): call the config's `on_init(client, result)`
+-- hook (Phase 3), invoked from Rust (`LuaRuntime::run_lsp_on_init`) right after the
+-- client is mirrored on `initialize`. `result` is the raw `initialize` result. A
+-- throwing hook is recorded, never fatal. No-op if the client/hook is absent.
+function vim.lsp._run_on_init(id, result)
+  local client = vim.lsp._clients[id]
+  if not client then return end
+  local cfg = vim.lsp.config[client.name]
+  if cfg and type(cfg.on_init) == "function" then
+    local ok, err = pcall(cfg.on_init, client, result)
+    if not ok then lsp_record_hook_error(client.name, "on_init", err) end
+  end
+end
+
+-- vim.lsp._run_on_exit(id, code, signal): call the config's
+-- `on_exit(code, signal, client)` hook (Phase 3), invoked from Rust
+-- (`LuaRuntime::run_lsp_on_exit`) when the server exits, while the client is still
+-- registered (before it is removed). A throwing hook is recorded, never fatal.
+function vim.lsp._run_on_exit(id, code, signal)
+  local client = vim.lsp._clients[id]
+  if not client then return end
+  local cfg = vim.lsp.config[client.name]
+  if cfg and type(cfg.on_exit) == "function" then
+    local ok, err = pcall(cfg.on_exit, code, signal, client)
+    if not ok then lsp_record_hook_error(client.name, "on_exit", err) end
+  end
+end
 
 -- vim.lsp.get_clients(filter): the list of active clients, each a
 -- `{ id, name, server_capabilities, config, request }` table. `filter` narrows by
@@ -1466,6 +1505,7 @@ function vim.lsp._report()
     started = started,
     load_errors = vim._lsp_load_errors,
     skipped = vim._lsp_skipped,
+    hook_errors = vim._lsp_hook_errors,
     notimpl_hits = notimpl,
   }
 end
@@ -1569,6 +1609,37 @@ end
 -- `cmd(dispatchers, config)` builder: nxvim does its own (stdio) spawning, so the
 -- dispatchers are a stub and `vim.lsp.rpc.start` returns the argv it was given
 -- (see its shim) — letting the many `node_modules/.bin` resolvers run unchanged.
+-- Run the config's `before_init(init_params, config)` hook (Phase 3) if present,
+-- and return the `(init_options, settings, capabilities)` to forward — honoring
+-- whatever the hook left in `init_params.initializationOptions` / `.capabilities`
+-- and any mutation of `config.settings` (rust_analyzer copies
+-- `settings['rust-analyzer'] → init_params.initializationOptions`; eslint mutates
+-- `config.settings`). nxvim runs this synchronously on the editor thread just
+-- before the start is queued (no event loop needed), so the mutations are baked
+-- into the `initialize` Phase 2 forwards. A throwing hook is recorded (not fatal)
+-- and the pre-hook values are forwarded unchanged. `init_params` is the minimal
+-- shape the common hooks touch; a `config.cmd` mutation here is too late (the cmd
+-- is already resolved) and is not honored — a documented approximation.
+local function lsp_before_init(config)
+  local init_options, settings, capabilities =
+    config.init_options, config.settings, config.capabilities
+  if type(config.before_init) == "function" then
+    local init_params = {
+      initializationOptions = init_options or settings,
+      capabilities = capabilities or {},
+    }
+    local ok, err = pcall(config.before_init, init_params, config)
+    if ok then
+      init_options = init_params.initializationOptions
+      capabilities = init_params.capabilities
+      settings = config.settings -- the hook may have mutated it in place
+    else
+      lsp_record_hook_error(config.name, "before_init", err)
+    end
+  end
+  return init_options, settings, capabilities
+end
+
 -- The builder gets the resolved config with `root_dir` filled in (the field those
 -- resolvers read). A throwing builder yields `nil, reason` so the caller can
 -- record exactly why the server was skipped (instead of a bare nil that looks the
@@ -1613,6 +1684,8 @@ local function lsp_start_resolved(name, cfg, bufnr, ft, root)
       settings = cfg.settings,
       init_options = cfg.init_options,
       capabilities = cfg.capabilities,
+      -- The lifecycle hook run just before initialize (Phase 3).
+      before_init = cfg.before_init,
     },
     { bufnr = bufnr, filetype = ft }
   )
@@ -1718,11 +1791,14 @@ function vim.lsp.start(config, opts)
     lsp_record_skip(config.name or "?", reason or lsp_argv_reason(cmd))
     return
   end
+  -- Run before_init (Phase 3) and forward the (possibly hook-mutated)
+  -- init_options / settings / capabilities the server applies at initialize.
+  local init_options, settings, capabilities = lsp_before_init(config)
   vim._lsp_start(
     config.name, cmd, config.root_dir, opts.filetype or "", bufnr,
-    lsp_nonempty(config.init_options),
-    lsp_nonempty(config.settings),
-    lsp_nonempty(config.capabilities)
+    lsp_nonempty(init_options),
+    lsp_nonempty(settings),
+    lsp_nonempty(capabilities)
   )
 end
 

@@ -386,6 +386,34 @@ impl LuaRuntime {
         remove.call(id)
     }
 
+    /// Run the config's `on_init(client, result)` hook for client `id` (Phase 3),
+    /// passing the raw `initialize` result as a Lua table. Called when the server
+    /// finishes `initialize`, right after the client is mirrored — so the hook can
+    /// read `result.capabilities` / `result.offsetEncoding` and tweak the client.
+    pub fn run_lsp_on_init(&self, id: u64, result: &serde_json::Value) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let lsp: Table = vim.get("lsp")?;
+        let run: mlua::Function = lsp.get("_run_on_init")?;
+        let result = json_to_lua(&self.lua, result)?;
+        run.call((id, result))
+    }
+
+    /// Run the config's `on_exit(code, signal, client)` hook for client `id`
+    /// (Phase 3), when its server exits. Called while the client is still in
+    /// `vim.lsp._clients` (before [`Self::remove_lsp_client`]). `code`/`signal`
+    /// are the child's exit status (`signal` is unix-only).
+    pub fn run_lsp_on_exit(
+        &self,
+        id: u64,
+        code: Option<i32>,
+        signal: Option<i32>,
+    ) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let lsp: Table = vim.get("lsp")?;
+        let run: mlua::Function = lsp.get("_run_on_exit")?;
+        run.call((id, code, signal))
+    }
+
     /// Take ex-commands queued by `vim.cmd` since the last drain.
     pub fn take_commands(&self) -> Vec<String> {
         std::mem::take(&mut self.shared.borrow_mut().commands)

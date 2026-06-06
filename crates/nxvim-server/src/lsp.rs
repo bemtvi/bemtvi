@@ -513,6 +513,7 @@ impl Server {
                 key,
                 caps,
                 encoding,
+                init_result,
             } => {
                 // Assign a client id once per server, reused across respawns so the
                 // `client_id` Lua sees stays stable (and `vim.lsp._clients` isn't
@@ -542,6 +543,12 @@ impl Server {
                     capabilities: provider_caps_to_lua(&caps.providers),
                 };
                 let _ = self.lua.set_lsp_client(&client);
+                // Run the config's on_init(client, result) hook (Phase 3) now that
+                // the client is mirrored — it can read what the server advertised.
+                if let Err(e) = self.lua.run_lsp_on_init(client_id, &init_result) {
+                    self.editor
+                        .echo(format!("E5108: Error in LSP on_init: {e}"));
+                }
                 // A fresh (or respawned) server holds no documents: re-open every
                 // buffer bound to it on the next sync. This doubles as the restart
                 // handler, like `SyntaxEvent::Restarted`.
@@ -577,7 +584,9 @@ impl Server {
                 }
             }
             LspEvent::Reply { token, reply, .. } => self.on_lsp_reply(token, reply),
-            LspEvent::ServerExited { key, .. } => {
+            LspEvent::ServerExited {
+                key, code, signal, ..
+            } => {
                 // The manager respawns per its breaker (or gives up cleanly); the
                 // editor stays fully responsive throughout. Detach every buffer the
                 // dead server held — symmetric with attach-on-`didOpen` — and drop
@@ -606,6 +615,12 @@ impl Server {
                         .collect();
                     for (id, file) in detaching {
                         self.fire_lsp_detach(id, &file, client_id);
+                    }
+                    // Run the config's on_exit(code, signal, client) hook (Phase 3)
+                    // while the client is still registered, then forget it.
+                    if let Err(e) = self.lua.run_lsp_on_exit(client_id, code, signal) {
+                        self.editor
+                            .echo(format!("E5108: Error in LSP on_exit: {e}"));
                     }
                     let _ = self.lua.remove_lsp_client(client_id);
                 }

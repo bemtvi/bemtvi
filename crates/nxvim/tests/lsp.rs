@@ -2671,3 +2671,120 @@ async fn the_config_settings_init_options_and_capabilities_reach_the_server() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Write an `init.lua` that registers the mock with an extra config fragment
+/// (lifecycle hooks, etc.) spliced into the `vim.lsp.config('mock', { … })` table.
+fn hook_config_dir(tag: &str, config_fragment: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nxvim-lsp-hook-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    std::fs::write(
+        dir.join("init.lua"),
+        format!(
+            "vim.lsp.config('mock', {{ cmd = {{ 'mock' }}, filetypes = {{ 'rust' }}, \
+             {config_fragment} }})\nvim.lsp.enable('mock')\n"
+        ),
+    )
+    .expect("write init.lua");
+    dir
+}
+
+#[tokio::test]
+async fn before_init_shapes_the_initialize_params() {
+    let _guard = test_lock().lock().await;
+    // Phase 3: `before_init(init_params, config)` runs just before the handshake
+    // and can set `init_params.initializationOptions` — the rust_analyzer pattern
+    // (copy settings → initializationOptions). The mock records what arrived.
+    let record = configure_mock("beforeinit", serde_json::json!({}));
+    let file = temp_file("beforeinit", "rs", "fn main() {}\n");
+    let cfg = hook_config_dir(
+        "beforeinit",
+        "settings = { ['rust-analyzer'] = { cargo = { sentinel = 'BI' } } }, \
+         before_init = function(init_params, config) \
+           init_params.initializationOptions = config.settings['rust-analyzer'] \
+         end",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg.clone()).await;
+
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "initialize")).await;
+    let init = find(&recs, "initialize").expect("an initialize request");
+    assert_eq!(
+        init["params"]["initializationOptions"]["cargo"]["sentinel"].as_str(),
+        Some("BI"),
+        "before_init's initializationOptions should reach initialize, got {:?}",
+        init["params"]["initializationOptions"]
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[tokio::test]
+async fn on_init_runs_with_the_real_initialize_result() {
+    let _guard = test_lock().lock().await;
+    // Phase 3: `on_init(client, result)` fires after `initialize`, with the raw
+    // result. The hook stashes a value derived from `result` so we can prove it ran
+    // and saw real data, not a faked empty.
+    let record = configure_mock("oninit", serde_json::json!({}));
+    let file = temp_file("oninit", "rs", "fn main() {}\n");
+    let cfg = hook_config_dir(
+        "oninit",
+        "on_init = function(client, result) \
+           _G.nxvim_on_init = (result.capabilities ~= nil) and client.name or 'NO_RESULT' \
+         end",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg.clone()).await;
+
+    // didOpen is sent after `initialized`, so once it's recorded on_init has run.
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nxvim_on_init").await.as_str(),
+        Some("mock"),
+        "on_init should run with the real initialize result and the client"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[tokio::test]
+async fn on_exit_runs_with_the_exit_code() {
+    let _guard = test_lock().lock().await;
+    // Phase 3: `on_exit(code, signal, client)` fires when the server exits. The mock
+    // exits cleanly right after `initialize`; the hook records the code/name.
+    configure_mock(
+        "onexit",
+        serde_json::json!({ "exit_after_initialize": true }),
+    );
+    let file = temp_file("onexit", "rs", "fn main() {}\n");
+    let cfg = hook_config_dir(
+        "onexit",
+        "on_exit = function(code, signal, client) \
+           _G.nxvim_on_exit_code = code; _G.nxvim_on_exit_name = client.name \
+         end",
+    );
+    let (rpc, _incoming) = start_with_config_dir(Some(file), cfg.clone()).await;
+
+    // Drive the loop until the exit has been processed and the hook ran.
+    let mut code = Value::Nil;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        code = exec_lua(&rpc, "return _G.nxvim_on_exit_code").await;
+        if !code.is_nil() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        code.as_i64(),
+        Some(0),
+        "on_exit should run with the child's exit code (0)"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nxvim_on_exit_name")
+            .await
+            .as_str(),
+        Some("mock"),
+        "on_exit should receive the exiting client"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}

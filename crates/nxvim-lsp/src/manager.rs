@@ -315,6 +315,10 @@ pub enum LspEvent {
         key: ServerKey,
         caps: ServerCaps,
         encoding: PositionEncoding,
+        /// The raw `InitializeResult` as JSON, passed to the config's `on_init`
+        /// hook (Phase 3) so it can read what the server advertised. `Null` if the
+        /// result couldn't be serialized.
+        init_result: serde_json::Value,
     },
     /// `textDocument/publishDiagnostics` for a document.
     Diagnostics {
@@ -326,7 +330,17 @@ pub enum LspEvent {
     /// The child exited or its pipe closed (it will be respawned per the breaker,
     /// or stay down once the breaker gives up). Surfaced so the editor can tell
     /// the user instead of leaving buffers silently un-serviced.
-    ServerExited { key: ServerKey, message: String },
+    ServerExited {
+        key: ServerKey,
+        message: String,
+        /// The child's exit code, if it exited normally (the first arg of the
+        /// config's `on_exit(code, signal, client)` hook, Phase 3). `None` for the
+        /// pre-serve handshake failures, where no client was ever registered.
+        code: Option<i32>,
+        /// The terminating signal on unix, if the child was killed by one; `None`
+        /// otherwise (and always on non-unix).
+        signal: Option<i32>,
+    },
     /// The reply to an [`LspRequest`], tagged with the [`ReqToken`] the editor
     /// issued so it can match the reply to its intent and drop stale ones.
     Reply {
@@ -569,6 +583,8 @@ async fn run_server_once(
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message,
+                code: None,
+                signal: None,
             });
             return ServerOutcome::Failed;
         }
@@ -584,6 +600,8 @@ async fn run_server_once(
         let _ = event_tx.send(LspEvent::ServerExited {
             key: key.clone(),
             message: "server stdio pipes unexpectedly missing".to_string(),
+            code: None,
+            signal: None,
         });
         return ServerOutcome::Failed;
     };
@@ -641,6 +659,8 @@ async fn run_server_once(
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message: "server exited during initialize".to_string(),
+                code: None,
+                signal: None,
             });
             return ServerOutcome::Failed;
         }
@@ -655,6 +675,8 @@ async fn run_server_once(
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message: format!("initialize failed: {e}"),
+                code: None,
+                signal: None,
             });
             return ServerOutcome::Failed;
         }
@@ -681,6 +703,9 @@ async fn run_server_once(
             providers,
         },
         encoding,
+        // The raw result for the config's `on_init` hook (Phase 3); `Null` if it
+        // somehow won't serialize (it always should).
+        init_result: serde_json::to_value(&init_result).unwrap_or(serde_json::Value::Null),
     });
 
     // Serve: ferry document-sync notifications to the socket until told to stop
@@ -717,13 +742,17 @@ async fn run_server_once(
                 }
             },
             _ = &mut mainloop_fut => {
-                // The loop ended: the child closed its pipe or exited.
+                // The loop ended: the child closed its pipe or exited. Capture the
+                // exit status for the config's `on_exit(code, signal, client)` hook
+                // (Phase 3) — this is the one exit path with a registered client.
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let (code, signal) = exit_code_signal(child.wait().await.ok());
                 log.log(LogLevel::Warn, name, "language server exited");
                 let _ = event_tx.send(LspEvent::ServerExited {
                     key: key.clone(),
                     message: "language server exited".to_string(),
+                    code,
+                    signal,
                 });
                 return ServerOutcome::Failed;
             }
@@ -1349,6 +1378,25 @@ fn level_of(typ: MessageType) -> LogLevel {
 /// `Command[]` rather than a `CodeAction` carrying an `edit`**, and "apply the
 /// edit" becomes impossible; we also declare `formatting`/`rename` and
 /// `workspaceEdit.documentChanges` so servers offer those features.
+/// Split a child's [`std::process::ExitStatus`] into `(code, signal)` for the
+/// config's `on_exit(code, signal, client)` hook (Phase 3). `code` is the normal
+/// exit code; `signal` is the terminating signal (unix only — always `None`
+/// elsewhere). `None`/`None` when the status couldn't be collected.
+fn exit_code_signal(status: Option<std::process::ExitStatus>) -> (Option<i32>, Option<i32>) {
+    let Some(status) = status else {
+        return (None, None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        (status.code(), None)
+    }
+}
+
 /// nxvim's base [`client_capabilities`] with the config's `extra` capabilities
 /// (a raw JSON value) deep-merged over them — the config wins on any conflict, so
 /// it can both extend (add a capability nxvim doesn't advertise) and override

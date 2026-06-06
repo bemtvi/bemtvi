@@ -180,7 +180,7 @@ and `workspace/didChangeConfiguration { settings }` after `initialized`.
 
 ---
 
-## Phase 3 — Lifecycle hooks: `before_init` / `on_init` / `on_exit` ⬜
+## Phase 3 — Lifecycle hooks: `before_init` / `on_init` / `on_exit` ✅
 
 **Goal.** Call the config's lifecycle hooks at the right moments so configs that
 shape init params or react to the server (e.g. rust_analyzer's
@@ -199,11 +199,24 @@ handshake), `prelude.lua` (store hooks per client), `manager.rs` (call points).
 - On exit, call `on_exit(code, signal, client)`.
 - Requires a synchronous Rust→Lua call with a params round-trip (msgpack/JSON).
 
-**Tests.** A config whose `before_init` sets an init option is honored at
-`initialize`.
+**Tests.** ✅ `before_init_shapes_the_initialize_params` (rust_analyzer-style
+`settings → initializationOptions`), `on_init_runs_with_the_real_initialize_result`
+(hook sees the raw result + client), `on_exit_runs_with_the_exit_code` (clean
+exit → `code == 0`), all in `crates/nxvim/tests/lsp.rs`.
 
-**Done when.** The three hooks fire with correct arguments and their mutations
-take effect.
+**Done when.** ✅ `before_init(init_params, config)` runs *synchronously on the
+editor thread* just before the start is queued (no event loop needed) and its
+mutations to `init_params.initializationOptions` / `.capabilities` / `config.settings`
+feed the Phase-2 forwarding. `on_init(client, result)` fires when the `Initialized`
+event lands, carrying the raw `InitializeResult` (now threaded as JSON on the
+event). `on_exit(code, signal, client)` fires on `ServerExited` with the child's
+exit status (captured in the manager; `signal` is unix-only), while the client is
+still registered. A throwing hook is recorded in `vim._lsp_hook_errors` (surfaced
+by `vim.lsp._report`) and echoed, never fatal.
+
+*Approximations:* a `config.cmd` mutation inside `before_init` is not honored (the
+cmd is already resolved by then); `on_exit` does not fire on an intentional
+shutdown (only on a server exit / crash), since that path registers no client.
 
 **Depends on.** Phase 2 (params plumbing).
 

@@ -1290,6 +1290,14 @@ end
 function vim.fn.substitute(str, _pat, _sub, _flags) return str end
 function vim.fn.setreg(_name, _value, _opts) vim._notimpl("vim.fn.setreg") end
 function vim.fn.setqflist(_list, _action, _what) vim._notimpl("vim.fn.setqflist") end
+
+-- vim.fn.input(opts) / vim.fn.confirm(msg, choices, …): SYNCHRONOUS prompts —
+-- they block and RETURN the user's answer inline (a string / a 1-based index).
+-- nxvim has a prompt surface (vim.ui.input / the panel), but only in its async
+-- callback shape; the inline-return contract here needs a re-entrant input pump
+-- that doesn't yet exist, so both fail loud rather than fake a value. See
+-- docs/architecture.md → "Not yet implemented (roadmap)" for the target.
+function vim.fn.input(_opts, _default, _completion) vim._notimpl("vim.fn.input") end
 function vim.fn.confirm(_msg, _choices, _default, _type) vim._notimpl("vim.fn.confirm") end
 
 -- ----- vim.system / vim.json -------------------------------------------------

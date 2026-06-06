@@ -613,8 +613,15 @@ screen," and that is exactly the shape of these tests.
   branch (no `on_exit`) is retained for the short `root_dir` shell-outs that want a
   blocking result. The surface still grows only as plugins demand it; known gaps
   for richer plugins: `vim.treesitter` is a stub (nxvim highlights out-of-process)
-  and the per-window API. Legacy Vimscript (`eval.c`) is **not** on the roadmap —
-  see guiding principle 2.
+  and the per-window API. The **synchronous prompt** functions `vim.fn.input(opts)`
+  and `vim.fn.confirm(msg, choices, …)` are also still open: they must return the
+  user's answer *inline* (a string / a 1-based index), and nxvim now has a prompt
+  surface (`CmdlineKind::Prompt` driving `vim.ui.input`, and the message panel for
+  pickers) but only in its **asynchronous, callback** shape — the inline-return
+  contract needs a re-entrant input pump (a nested input loop, or a Lua coroutine
+  the bridge resumes when the result lands) that preserves the one-message-at-a-time
+  invariant. Until then both fail loud via `vim._notimpl` rather than fake a value.
+  Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far, and options are still global —
   **buffer-local options** are the next gap. Also mappings (`:map`), registers

@@ -23,7 +23,9 @@ mod render;
 mod view;
 
 pub use keys::{encode_key, encode_paste};
-pub use render::{close_button, cursor_style, paint, ScrollHarness};
+pub use render::{
+    close_button, cursor_style, paint, paint_doc_scrolled, pmenu_doc_geometry, ScrollHarness,
+};
 pub use view::View;
 
 use anyhow::Result;
@@ -183,6 +185,10 @@ where
 
     let mut view = View::default();
     let mut anim: Option<Animation> = None;
+    // Client-side scroll offset for the completion doc preview (a pure UI gesture —
+    // the server owns no notion of the box's pixel height). Reset to 0 whenever the
+    // previewed docs change (a new selection, or the menu closing).
+    let mut doc_scroll: u16 = 0;
     let mut term_events = EventStream::new();
     // The cursor shape last sent to the terminal, so we re-emit the escape only
     // when the mode actually changes the shape rather than on every redraw.
@@ -220,12 +226,12 @@ where
                         vec![Value::from(w as u64), Value::from(text_height(h) as u64)],
                     );
                 }
-                Some(Ok(Event::Mouse(m))) => {
+                Some(Ok(Event::Mouse(m))) => match m.kind {
                     // A left-click on the focused panel's `[X]` closes it — the
                     // same effect as pressing `q`, which the focused panel maps
                     // to close. Guarded on a panel being open so a stray click
                     // never injects a `q` into the buffer.
-                    if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(panel) = view.panel.as_ref() {
                             let size = terminal.size().unwrap_or_default();
                             if let Some((row, cols)) =
@@ -237,16 +243,48 @@ where
                             }
                         }
                     }
-                }
+                    // The mouse wheel over the completion doc preview scrolls it —
+                    // a purely client-side gesture (the box height is the client's
+                    // to know), so it never touches the buffer or the server. Three
+                    // lines per notch, clamped so it can't overscroll the docs.
+                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                        let size = terminal.size().unwrap_or_default();
+                        if let Some((bx, by, bw, bh, max_scroll)) =
+                            pmenu_doc_geometry(size.width, size.height, &view)
+                        {
+                            let over_box = m.column >= bx
+                                && m.column < bx + bw
+                                && m.row >= by
+                                && m.row < by + bh;
+                            if over_box {
+                                const STEP: u16 = 3;
+                                doc_scroll = if m.kind == MouseEventKind::ScrollDown {
+                                    (doc_scroll + STEP).min(max_scroll)
+                                } else {
+                                    doc_scroll.saturating_sub(STEP)
+                                };
+                                terminal
+                                    .draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },
             message = incoming.recv() => match message {
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "redraw" => {
+                        let prev_doc = view.pmenu.as_ref().map(|p| p.doc.clone());
                         view.update(&params);
+                        // The previewed docs changed (new selection / menu gone):
+                        // start the new doc from the top.
+                        if view.pmenu.as_ref().map(|p| &p.doc) != prev_doc.as_ref() {
+                            doc_scroll = 0;
+                        }
                         anim = arm_animation(&view, anim.take());
-                        terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
+                        terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
                         // Match the cursor shape to the mode (a thin bar in insert
                         // mode). Emitted only on change so it doesn't flicker.
                         let want = cursor_style(&view);
@@ -267,7 +305,7 @@ where
                 if anim.as_ref().is_some_and(|a| a.start.elapsed() >= a.duration) {
                     anim = None; // settle: render the destination view below
                 }
-                terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
+                terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
             },
             // `timeoutlen` idle flush: a keystroke armed the timer and nothing
             // followed within `TIMEOUT_LEN`, so nudge the server to resolve any key

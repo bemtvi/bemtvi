@@ -22,11 +22,24 @@ const TABSTOP: usize = 8;
 /// and return the painted buffer. This drives the *same* `render` the live
 /// client uses, so tests assert on exactly what a user would see.
 pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    paint_doc_scrolled(view, width, height, 0)
+}
+
+/// Like [`paint`], but with the completion doc preview scrolled down `doc_scroll`
+/// lines — the hook a test uses to assert the mouse-wheel scroll offset actually
+/// shifts the rendered docs. Not part of the client's runtime API.
+#[doc(hidden)]
+pub fn paint_doc_scrolled(
+    view: &View,
+    width: u16,
+    height: u16,
+    doc_scroll: u16,
+) -> ratatui::buffer::Buffer {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
-        .draw(|frame| render(frame, view, None))
+        .draw(|frame| render(frame, view, None, doc_scroll))
         .expect("draw");
     terminal.backend().buffer().clone()
 }
@@ -84,7 +97,7 @@ impl ScrollHarness {
         use ratatui::Terminal;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal
-            .draw(|frame| render(frame, &self.view, self.anim.as_ref()))
+            .draw(|frame| render(frame, &self.view, self.anim.as_ref(), 0))
             .expect("draw");
         terminal.backend().buffer().clone()
     }
@@ -93,7 +106,7 @@ impl ScrollHarness {
 /// Lay out the three regions and render each with its own widget. When `anim`
 /// is present and unfinished, the text area shows an interpolated slice of the
 /// scroll band instead of the static viewport.
-pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
+pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, doc_scroll: u16) {
     // The panel docks below the status line, claiming `height + 1` rows (content
     // plus its title bar); `0` rows — an empty region — when no panel is open.
     // The server already shrank the text `lines` to match, so the text area
@@ -230,7 +243,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>) {
     // insert-mode; a focused panel grabs every key), so this never fights the
     // panel cursor handled next.
     if let Some(pmenu) = &view.pmenu {
-        render_pmenu(frame, text_inner, pmenu);
+        render_pmenu(frame, text_inner, pmenu, doc_scroll);
     }
 
     // A focused panel owns the cursor: draw it on the panel's current line and
@@ -678,28 +691,10 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelData) -> Rect {
 /// first so the text beneath doesn't bleed through; the list scrolls to keep the
 /// selected item visible when there are more items than rows. The box is clamped
 /// to `text_area` so it never paints outside the editable region.
-fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData) {
-    let x = text_area.x.saturating_add(pmenu.col);
-    let y = text_area.y.saturating_add(pmenu.row);
-    // Content size plus a one-cell border all round, clamped to the text area.
-    let width = pmenu
-        .width
-        .saturating_add(2)
-        .min(text_area.right().saturating_sub(x));
-    let height = pmenu
-        .height
-        .saturating_add(2)
-        .min(text_area.bottom().saturating_sub(y));
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    // Need room for the border plus at least one content cell each way.
-    if area.width < 3 || area.height < 3 {
+fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scroll: u16) {
+    let Some(area) = popup_rect(text_area, pmenu) else {
         return;
-    }
+    };
     let block = Block::new().borders(Borders::ALL);
     let inner = block.inner(area);
     // Clear the cells first so the overlay is opaque, then the border, then rows.
@@ -730,18 +725,42 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData) {
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
     // The documentation preview floats beside the popup (its own bordered box).
-    render_pmenu_doc(frame, text_area, area, &pmenu.doc);
+    render_pmenu_doc(frame, text_area, area, &pmenu.doc, doc_scroll);
 }
 
-/// Draw the selected item's documentation in a bordered preview box beside the
-/// `popup` box: to its right when there's room, else to its left (vim's
-/// `completeopt=popup` shape). Top-aligned with the popup, content wrapped to the
-/// box width and clipped to the text area; nothing is drawn when there are no docs
-/// or no room beside the popup. Markdown is shown as plain lines (the server's
-/// markup distiller yields lines, not styled spans).
-fn render_pmenu_doc(frame: &mut Frame, text_area: Rect, popup: Rect, doc: &[String]) {
+/// The popup box rect (border included), anchored under the completion word and
+/// clamped to `text_area`. `None` when it can't fit a border plus one content
+/// cell each way. Shared by the renderer and the doc-box geometry.
+fn popup_rect(text_area: Rect, pmenu: &PmenuData) -> Option<Rect> {
+    let x = text_area.x.saturating_add(pmenu.col);
+    let y = text_area.y.saturating_add(pmenu.row);
+    // Content size plus a one-cell border all round, clamped to the text area.
+    let width = pmenu
+        .width
+        .saturating_add(2)
+        .min(text_area.right().saturating_sub(x));
+    let height = pmenu
+        .height
+        .saturating_add(2)
+        .min(text_area.bottom().saturating_sub(y));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    (area.width >= 3 && area.height >= 3).then_some(area)
+}
+
+/// The documentation preview box's rect (border included) and its maximum scroll
+/// offset (wrapped content height minus the visible inner rows, `0` when it all
+/// fits) — laid out beside the `popup` within `text_area`: to its right when
+/// there's room, else to its left (vim's `completeopt=popup` shape), top-aligned
+/// with the popup. `None` when there are no docs or no room either side. Pure, so
+/// the renderer and the wheel hit-test share one layout.
+fn doc_rect(text_area: Rect, popup: Rect, doc: &[String]) -> Option<(Rect, u16)> {
     if doc.is_empty() {
-        return;
+        return None;
     }
     // Cap the preview so a long doc block doesn't swallow the screen.
     const MAX_W: u16 = 50;
@@ -759,29 +778,50 @@ fn render_pmenu_doc(frame: &mut Frame, text_area: Rect, popup: Rect, doc: &[Stri
         let w = want_box_w.min(room_left);
         (popup.x.saturating_sub(w), w)
     } else {
-        return; // no room either side
+        return None; // no room either side
     };
 
     // Height from the wrapped line count, clamped to the cap and the room below.
     let content_w = box_w.saturating_sub(2).max(1);
-    let wrapped: usize = doc
+    let wrapped = doc
         .iter()
-        .map(|l| (l.chars().count() as u16).max(1).div_ceil(content_w) as usize)
-        .sum();
-    let content_h = (wrapped as u16).clamp(1, MAX_H);
+        .map(|l| (l.chars().count() as u16).max(1).div_ceil(content_w))
+        .sum::<u16>();
+    let content_h = wrapped.clamp(1, MAX_H);
     let box_h = content_h
         .saturating_add(2)
         .min(text_area.bottom().saturating_sub(popup.y));
     if box_w < 3 || box_h < 3 {
-        return;
+        return None;
     }
-
     let area = Rect {
         x,
         y: popup.y,
         width: box_w,
         height: box_h,
     };
+    // Visible content rows = inner height; anything past that is reachable only by
+    // scrolling.
+    let max_scroll = wrapped.saturating_sub(area.height.saturating_sub(2));
+    Some((area, max_scroll))
+}
+
+/// Draw the selected item's documentation in a bordered preview box beside the
+/// popup, scrolled down `doc_scroll` lines (clamped so it can't scroll past the
+/// end). Content is wrapped to the box width and clipped to the box; nothing is
+/// drawn when there are no docs or no room beside the popup. Markdown is shown as
+/// plain lines (the server's markup distiller yields lines, not styled spans).
+fn render_pmenu_doc(
+    frame: &mut Frame,
+    text_area: Rect,
+    popup: Rect,
+    doc: &[String],
+    doc_scroll: u16,
+) {
+    let Some((area, max_scroll)) = doc_rect(text_area, popup, doc) else {
+        return;
+    };
+    let scroll = doc_scroll.min(max_scroll);
     let block = Block::new().borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
@@ -791,7 +831,46 @@ fn render_pmenu_doc(frame: &mut Frame, text_area: Rect, popup: Rect, doc: &[Stri
             .map(|l| Line::from(l.as_str()))
             .collect::<Vec<_>>(),
     );
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+}
+
+/// Headless geometry of the completion doc preview box for a `width`x`height`
+/// terminal showing `view`: `(x, y, width, height, max_scroll)` in screen cells,
+/// or `None` when no preview is drawn. `max_scroll` is the largest `doc_scroll`
+/// that still reveals new content. The event loop uses it to hit-test the mouse
+/// wheel and clamp the scroll; a test uses it to find the box. Mirrors the layout
+/// in [`render`] (same reason as [`close_button`]).
+#[doc(hidden)]
+pub fn pmenu_doc_geometry(
+    width: u16,
+    height: u16,
+    view: &View,
+) -> Option<(u16, u16, u16, u16, u16)> {
+    let pmenu = view.pmenu.as_ref()?;
+    // Recompute the same regions `render` lays out, so the box lands identically.
+    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    let regions = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(panel_rows),
+        Constraint::Length(1),
+    ])
+    .split(Rect::new(0, 0, width, height));
+    let text_area = regions[0];
+    let text_inner = if view.number_width > 0 {
+        Layout::horizontal([Constraint::Length(view.number_width), Constraint::Min(0)])
+            .split(text_area)[1]
+    } else {
+        text_area
+    };
+    let popup = popup_rect(text_inner, pmenu)?;
+    let (area, max_scroll) = doc_rect(text_inner, popup, &pmenu.doc)?;
+    Some((area.x, area.y, area.width, area.height, max_scroll))
 }
 
 /// One popup row padded to `width` cells: the `label` left-aligned, and the

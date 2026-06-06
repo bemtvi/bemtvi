@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, View};
+use nxvim_tui::{paint, paint_doc_scrolled, pmenu_doc_geometry, View};
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use serde_json::Value as Json;
@@ -1633,6 +1633,69 @@ async fn selecting_a_documented_item_shows_a_doc_preview() {
     assert!(
         (0..ROWS).any(|y| row_text(y).contains("Opens a connection.")),
         "the preview box paints the documentation text beside the popup"
+    );
+}
+
+#[tokio::test]
+async fn the_doc_preview_scrolls_with_the_mouse_wheel() {
+    let _guard = test_lock().lock().await;
+    // A documentation block taller than the capped preview box can be scrolled
+    // (the client owns the box height, so this is a pure client-side offset). The
+    // box shows the top by default and a later slice once scrolled to the bottom.
+    let doc_value = (1..=20)
+        .map(|i| format!("line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let record = configure_mock(
+        "compl-scroll",
+        serde_json::json!({
+            "completion": [{
+                "label": "connect",
+                "documentation": { "kind": "markdown", "value": doc_value }
+            }]
+        }),
+    );
+    let file = temp_file("compl-scroll", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "o<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-n>");
+    let params = wait_for_pmenu_where(&rpc, &mut incoming, |(_, sel)| *sel == 0).await;
+    let view = View::from_redraw(&params);
+
+    // The 20-line doc overflows the capped box, so there's content to scroll to.
+    let (bx, by, bw, _bh, max_scroll) =
+        pmenu_doc_geometry(COLS, ROWS, &view).expect("the doc preview box has geometry");
+    assert!(
+        max_scroll > 0,
+        "a doc taller than the box can scroll (max_scroll={max_scroll})"
+    );
+
+    // The text on the box's first inner row (between its borders).
+    let box_top_line = |buf: &ratatui::buffer::Buffer| {
+        (bx + 1..bx + bw - 1)
+            .map(|x| buf.cell((x, by + 1)).unwrap().symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+
+    // Unscrolled, the docs start at line 1…
+    let top = paint(&view, COLS, ROWS);
+    assert_eq!(
+        box_top_line(&top),
+        "line 01",
+        "unscrolled, the preview starts at the first doc line"
+    );
+
+    // …and scrolling to the bottom brings the corresponding later line to the top.
+    let bottom = paint_doc_scrolled(&view, COLS, ROWS, max_scroll);
+    assert_eq!(
+        box_top_line(&bottom),
+        format!("line {:02}", 1 + max_scroll),
+        "scrolled by max_scroll, the box top shows the matching later doc line"
     );
 }
 

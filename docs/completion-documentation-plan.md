@@ -200,9 +200,14 @@ beside the popup; navigating updates it; an item with no docs (or no selection)
 shows no box. `pmenu_value` projects the selected item's `documentation` as a
 `doc` lines array on the `pmenu` redraw key; the client's `render_pmenu_doc`
 floats a second bordered box to the right of the popup (falling back to its
-left), wrapping the lines and clipping to the text area. Verified by
-`selecting_a_documented_item_shows_a_doc_preview` in `crates/nxvim/tests/lsp.rs`
-(asserts both the `doc` lines on the redraw and the painted preview text).
+left), wrapping the lines. A doc taller than the box's cap is **mouse-wheel
+scrollable**: the client tracks a `doc_scroll` offset (a pure UI gesture — only
+the client knows the box height), the wheel hit-tests the box via the shared
+`pmenu_doc_geometry` and clamps to its `max_scroll`, and the offset resets when
+the previewed docs change. Verified by `selecting_a_documented_item_shows_a_doc_preview`
+and `the_doc_preview_scrolls_with_the_mouse_wheel` in `crates/nxvim/tests/lsp.rs`
+(the latter asserts the box shows the top unscrolled and the matching later line
+scrolled to the bottom).
 
 **Depends on.** Phases 1 and 2 (the data); the existing pmenu surface.
 

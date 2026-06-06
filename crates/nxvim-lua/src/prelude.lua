@@ -1282,12 +1282,15 @@ function vim.fn.bufnr(expr)
   return -1
 end
 
--- vim.fn.substitute(str, pat, sub, flags): vim-regex substitution. nxvim has no
--- vim-regex engine; the only caller is `lspconfig.util.strip_archive_subpath`,
--- which transforms `zipfile:`/`tarfile:` virtual paths and leaves ordinary paths
--- untouched. Returning `str` unchanged is therefore correct for every real file
--- path (archive-buffer paths, which nxvim doesn't produce, pass through as-is).
-function vim.fn.substitute(str, _pat, _sub, _flags) return str end
+-- vim.fn.substitute(str, pat, sub, flags): a real vim-regex substitution, backed
+-- by the Rust engine (`vim._substitute`) so plugins that rely on vim's magic
+-- dialect + replacement syntax (`\(\)`, `\{-}`, `&`, `\1`, `\U…\E`, …) get the
+-- same result neovim gives. This is a DIFFERENT dialect from nxvim's `/` search
+-- (canonical regex); the divergence is intentional and lives in the `vim.fn.*`
+-- compatibility layer. An invalid / unsupported pattern raises (fail loud).
+function vim.fn.substitute(str, pat, sub, flags)
+  return vim._substitute(tostring(str), tostring(pat), tostring(sub or ""), tostring(flags or ""))
+end
 function vim.fn.setreg(_name, _value, _opts) vim._notimpl("vim.fn.setreg") end
 function vim.fn.setqflist(_list, _action, _what) vim._notimpl("vim.fn.setqflist") end
 

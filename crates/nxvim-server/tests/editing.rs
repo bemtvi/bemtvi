@@ -2307,6 +2307,116 @@ async fn enter_does_nothing_without_a_select_handler() {
     );
 }
 
+// ----- vim.fn.substitute (vim-regex compatibility) --------------------------
+
+/// `vim.fn.substitute(input, pat, sub, flags)` via the live VM. `pat`/`sub` ride
+/// Lua long-bracket literals so vim backslashes pass through unescaped.
+async fn substitute(rpc: &Rpc, input: &str, pat: &str, sub: &str, flags: &str) -> String {
+    let code =
+        format!("return vim.fn.substitute({input:?}, [==[{pat}]==], [==[{sub}]==], {flags:?})");
+    exec_lua(rpc, &code)
+        .await
+        .as_str()
+        .unwrap_or("<not a string>")
+        .to_string()
+}
+
+#[tokio::test]
+async fn substitute_matches_vim_magic_semantics() {
+    let (rpc, _incoming) = start(None).await;
+
+    // Literal `\.` (magic: bare `.` is the wildcard, `\.` the literal), global.
+    assert_eq!(substitute(&rpc, "a.b.c", r"\.", "/", "g").await, "a/b/c");
+    // Bare `.` IS the wildcard in magic — first match only without `g`.
+    assert_eq!(substitute(&rpc, "abc", ".", "X", "").await, "Xbc");
+    // Escaped backslash → a literal backslash (Windows-path normalisation).
+    assert_eq!(substitute(&rpc, r"a\b\c", r"\\", "/", "g").await, "a/b/c");
+    // `\(\)` groups + `\+` one-or-more; `\1` in the replacement.
+    assert_eq!(
+        substitute(&rpc, "hello", r"\(l\+\)", r"[\1]", "").await,
+        "he[ll]o"
+    );
+    // `&` is the whole match.
+    assert_eq!(substitute(&rpc, "cat", "a", "[&]", "").await, "c[a]t");
+    // `[^=]\+=` — a magic char class with `\+`.
+    assert_eq!(substitute(&rpc, "VAR=val", r"[^=]\+=", "", "").await, "val");
+    // POSIX class inside `[]`.
+    assert_eq!(
+        substitute(&rpc, "  hi  ", r"^[[:space:]]*", "", "").await,
+        "hi  "
+    );
+}
+
+#[tokio::test]
+async fn substitute_handles_non_greedy_groups_and_anchors() {
+    let (rpc, _incoming) = start(None).await;
+
+    // The lspconfig `strip_archive_subpath` shape: `.\{-}` is non-greedy, so the
+    // group stops at the FIRST `::`, not the last.
+    assert_eq!(
+        substitute(
+            &rpc,
+            "zipfile:///path/to/a::b::c",
+            r"zipfile://\(.\{-}\)::.*$",
+            r"\1",
+            ""
+        )
+        .await,
+        "/path/to/a"
+    );
+    // `$` anchors to the end; `^` to the start.
+    assert_eq!(
+        substitute(&rpc, "foobar", r"bar$", "BAZ", "").await,
+        "fooBAZ"
+    );
+    assert_eq!(substitute(&rpc, "foofoo", r"^foo", "X", "g").await, "Xfoo");
+}
+
+#[tokio::test]
+async fn substitute_very_magic_and_case_modifiers() {
+    let (rpc, _incoming) = start(None).await;
+
+    // `\v` very magic: bare `\d` class, `+`/`(` operators without backslashes.
+    assert_eq!(
+        substitute(&rpc, "a1b22c", r"\v\d+", "#", "g").await,
+        "a#b#c"
+    );
+    assert_eq!(
+        substitute(&rpc, "key: val", r"\v(\w+): (\w+)", r"\2=\1", "").await,
+        "val=key"
+    );
+    // `\u&` upper-cases the first letter of each match (Title Case).
+    assert_eq!(
+        substitute(&rpc, "hello world", r"\w\+", r"\u&", "g").await,
+        "Hello World"
+    );
+    // `\U…\E` upper-cases a span.
+    assert_eq!(
+        substitute(&rpc, "abc", r"\(b\)", r"\U\1\E", "").await,
+        "aBc"
+    );
+    // The `i` flag folds case for matching.
+    assert_eq!(substitute(&rpc, "FoO", "o", "0", "gi").await, "F00");
+}
+
+#[tokio::test]
+async fn substitute_fails_loud_on_unsupported_constructs() {
+    let (rpc, _incoming) = start(None).await;
+    // `\zs` has no RE2 equivalent — it must raise (named), not silently mis-match.
+    // pcall captures the error so we can assert on its message.
+    let err = exec_lua(
+        &rpc,
+        r"local ok, e = pcall(vim.fn.substitute, 'xy', [==[x\zsy]==], 'z', '')
+          return tostring(e)",
+    )
+    .await;
+    let err = err.as_str().expect("a string error from the raise");
+    assert!(
+        err.contains("substitute") && err.contains(r"\zs"),
+        "the error names the unsupported construct (fail loud): {err:?}"
+    );
+}
+
 // ----- vim.ui.select / vim.ui.input (Phase 8) -------------------------------
 
 #[tokio::test]

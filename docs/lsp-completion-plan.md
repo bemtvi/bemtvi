@@ -67,11 +67,10 @@ list of what to build (the later phases).
     read stays real — it backs `root_dir` filetype checks)
 - **Keep (real or faithful for every input nxvim produces):**
   `vim.api.nvim_get_current_buf` (snapshot = the real current buffer),
-  `vim.fn.finddir` (real `vim.fs` search), `vim.fn.substitute` (identity — only
-  used by `lspconfig.util.strip_archive_subpath`, correct for every non-archive
-  path, and nxvim never produces archive buffers), `vim.schedule` (runs
+  `vim.fn.finddir` (real `vim.fs` search), `vim.schedule` (runs
   immediately — a safe "soon" in the synchronous model). List these in the doc as
-  known approximations, not gaps.
+  known approximations, not gaps. (`vim.fn.substitute` was an identity stub here at
+  Phase 0; it is now a **real vim-regex engine** — see `nxvim-lua/src/vimregex.rs`.)
 
 **Tests.**
 - The config sweep (`lspconfig_configs.rs`) still passes: the raising stubs are
@@ -84,9 +83,9 @@ NOT gaps).**
 - `vim.schedule(fn)` — runs `fn` inline (a safe "soon" in the synchronous model).
 - `vim.api.nvim_get_current_buf` — returns the real current-buffer snapshot.
 - `vim.fn.finddir` — real `vim.fs` upward directory search.
-- `vim.fn.substitute` — identity; its only caller
-  (`lspconfig.util.strip_archive_subpath`) is correct for every non-archive path,
-  and nxvim never produces archive buffers.
+- `vim.fn.substitute` — was an identity stub at Phase 0; **since reimplemented** as
+  a real vim-regex substitution (vim magic dialect + replacement syntax →
+  `regex`-crate, `nxvim-lua/src/vimregex.rs`), no longer an approximation.
 - `vim.bo[buf].filetype` / `vim.bo.filetype` — the one faithful `vim.bo` read
   (snapshot-backed); it backs the `root_dir` filetype checks. Every other `vim.bo`
   read and all writes raise.

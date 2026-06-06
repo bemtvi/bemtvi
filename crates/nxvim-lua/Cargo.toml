@@ -21,5 +21,6 @@ luajit = ["mlua/luajit"]
 [dependencies]
 anyhow.workspace = true
 mlua.workspace = true
+regex.workspace = true
 rmpv.workspace = true
 serde_json.workspace = true

@@ -20,6 +20,8 @@ use std::rc::Rc;
 
 use mlua::{Lua, LuaOptions, StdLib, Table, Variadic};
 
+mod vimregex;
+
 /// A highlight-group definition produced by `nvim_set_hl(0, name, opts)`, in
 /// the wire-ish form the server translates into `nxvim_core`'s `HlDef`. Colors
 /// are kept as the strings the opts table carried (`"#rrggbb"` / `"NONE"` /
@@ -1533,6 +1535,19 @@ fn install_runtime_api(
                 _ => vec!["xdg-open".to_string()],
             })
         })?,
+    )?;
+
+    // `vim._substitute(input, pat, sub, flags)`: the engine behind
+    // `vim.fn.substitute` — a real vim-regex substitution (vim's magic dialect +
+    // replacement syntax, NOT nxvim's standard-regex `/` search). An invalid or
+    // unsupported pattern raises (fail loud), never a fake identity result.
+    vim.set(
+        "_substitute",
+        lua.create_function(
+            |_, (input, pat, sub, flags): (String, String, String, String)| {
+                vimregex::substitute(&input, &pat, &sub, &flags).map_err(mlua::Error::RuntimeError)
+            },
+        )?,
     )?;
 
     // `vim._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),

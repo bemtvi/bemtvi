@@ -188,6 +188,13 @@ pub(crate) struct ServerRuntime {
 /// open. It keeps the server's last candidate list verbatim plus the live
 /// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
 /// re-ranks (or re-requests) in place rather than closing and reopening.
+//
+// INCOMPLETE: each `raw` item now carries `documentation`/`resolve_data` (the
+// completion-documentation plan, Phase 1), but the menu doesn't yet *use* them —
+// it neither issues `completionItem/resolve` for the selected item (Phase 2, the
+// only way docs arrive from rust_analyzer & most servers) nor projects the docs
+// into a preview surface (`pmenu_value`, Phase 3). So per-item documentation is
+// carried but not shown. Plan: docs/completion-documentation-plan.md.
 pub(crate) struct CompletionMenu {
     /// The buffer the menu belongs to; a reply for any other buffer is dropped.
     buffer: BufferId,

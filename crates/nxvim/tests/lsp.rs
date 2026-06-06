@@ -1363,6 +1363,84 @@ fn completion_list(incomplete: bool, labels: &[&str]) -> Json {
 }
 
 #[tokio::test]
+async fn completion_capability_advertises_documentation_and_resolve() {
+    let _guard = test_lock().lock().await;
+    // Phase 1: nxvim must declare `completion.completionItem` at `initialize` so
+    // servers that gate per-item docs on the capability send them, and so the
+    // lazy `completionItem/resolve` round-trip (Phase 2) is on the table. The mock
+    // records the `initialize` request verbatim, so the advertised capability is
+    // observable end to end.
+    let record = configure_mock(
+        "compl-cap",
+        serde_json::json!({ "completion": completion_items(&["alpha"]) }),
+    );
+    let file = temp_file("compl-cap", "rs", "fn main() {}\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    // didOpen is sent only after `initialize`/`initialized`, so waiting on it
+    // guarantees the handshake — and the recorded `initialize` — is present.
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    let init = find(&recs, "initialize").expect("the initialize request was recorded");
+    let completion_item =
+        &init["params"]["capabilities"]["textDocument"]["completion"]["completionItem"];
+    assert!(
+        !completion_item.is_null(),
+        "initialize advertises completion.completionItem; got {init:#}"
+    );
+
+    let formats = completion_item["documentationFormat"]
+        .as_array()
+        .expect("documentationFormat is advertised");
+    assert!(
+        formats.iter().any(|f| f == "markdown") && formats.iter().any(|f| f == "plaintext"),
+        "documentationFormat accepts markdown and plaintext; got {formats:?}"
+    );
+
+    let resolvable = completion_item["resolveSupport"]["properties"]
+        .as_array()
+        .expect("resolveSupport.properties is advertised");
+    assert!(
+        resolvable.iter().any(|p| p == "documentation") && resolvable.iter().any(|p| p == "detail"),
+        "resolveSupport lists documentation and detail; got {resolvable:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_documented_completion_item_opens_the_menu() {
+    let _guard = test_lock().lock().await;
+    // Phase 1: an item carrying inline `documentation` (a MarkupContent block) and
+    // a `data` blob distills cleanly and rides the reply into the menu — the new
+    // fields don't perturb the candidate path. The doc *text* gets its own preview
+    // surface in Phase 3; here we prove the documented item reaches the menu like
+    // any other (it opens, with the item's label).
+    let record = configure_mock(
+        "compl-doc",
+        serde_json::json!({
+            "completion": [{
+                "label": "connect",
+                "detail": "fn() -> Conn",
+                "data": { "id": 42 },
+                "documentation": {
+                    "kind": "markdown",
+                    "value": "Opens a connection.\n\n# Errors\nFails when unreachable.\n"
+                }
+            }]
+        }),
+    );
+    let file = temp_file("compl-doc", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "ocon<C-x><C-o>");
+    let params = wait_for_pmenu(&rpc, &mut incoming).await;
+    assert_eq!(
+        pmenu_of(&params).unwrap().0,
+        vec!["connect"],
+        "the documented item opens the menu like any other candidate"
+    );
+}
+
+#[tokio::test]
 async fn completion_orders_by_importance_and_filters_the_prefix() {
     let _guard = test_lock().lock().await;
     // The headline: with `use nv` typed, the menu shows the items matching `nv`

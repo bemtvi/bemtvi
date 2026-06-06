@@ -24,13 +24,15 @@ use lsp_types::{
     AnnotatedTextEdit, ClientCapabilities, CodeAction, CodeActionCapabilityResolveSupport,
     CodeActionClientCapabilities, CodeActionContext, CodeActionKindLiteralSupport,
     CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
-    Diagnostic, DidChangeConfigurationParams, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentChangeOperation, DocumentChanges, DocumentFormattingClientCapabilities,
-    DocumentFormattingParams, FormattingOptions, GeneralClientCapabilities, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
-    InitializedParams, Location, MarkedString, MessageType, OneOf, ParameterLabel, Position,
+    CompletionClientCapabilities, CompletionItem, CompletionItemCapability,
+    CompletionItemCapabilityResolveSupport, CompletionItemKind, CompletionParams,
+    CompletionResponse, CompletionTextEdit, Diagnostic, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
+    DocumentFormattingClientCapabilities, DocumentFormattingParams, Documentation,
+    FormattingOptions, GeneralClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, InitializeParams, InitializeResult, InitializedParams,
+    Location, MarkedString, MarkupKind, MessageType, OneOf, ParameterLabel, Position,
     PositionEncodingKind, PublishDiagnosticsClientCapabilities, Range, ReferenceContext,
     ReferenceParams, RenameClientCapabilities, RenameParams, ServerCapabilities, SignatureHelp,
     SignatureHelpParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
@@ -333,6 +335,20 @@ pub struct CompletionItemData {
     pub insert_text: Option<String>,
     pub text_edit: Option<TextEdit>,
     pub additional_text_edits: Vec<TextEdit>,
+    /// The item's `documentation` (a plain string or `MarkupContent`) reduced to
+    /// plain display lines joined by `\n` (markdown is not styled — same as hover),
+    /// with trailing blank lines trimmed. `None` ⇒ the item carried no
+    /// documentation *inline*; many servers (rust_analyzer especially) send it only
+    /// on `completionItem/resolve` (Phase 2), keyed by [`Self::resolve_data`].
+    pub documentation: Option<String>,
+    /// The original protocol [`CompletionItem`] serialized verbatim, round-tripped
+    /// to `completionItem/resolve` in Phase 2 to fetch the lazy
+    /// `documentation`/`detail`. The whole item (not just its `data` blob) is kept
+    /// because a server matches the resolve against the exact item it issued —
+    /// rust_analyzer rejects a resolve whose `data` it didn't send. `None` only if
+    /// the item somehow failed to serialize (it always should). Mirrors
+    /// [`CodeActionData::resolve`] round-tripping the original [`CodeAction`].
+    pub resolve_data: Option<serde_json::Value>,
 }
 
 /// Server → editor, delivered to the main loop's `select!`. The distilled events
@@ -1282,17 +1298,18 @@ fn completion_reply(
 }
 
 /// Reduce a protocol [`CompletionItem`] to the editor-facing [`CompletionItemData`]:
-/// keep the label/kind/detail/sort+filter text and insert text, and normalize the
+/// keep the label/kind/detail/sort+filter text and insert text, normalize the
 /// `CompletionTextEdit` (an `Edit`, or an `InsertAndReplace` collapsed to its
 /// `replace` range) plus the `additionalTextEdits` to plain [`TextEdit`]s whose
-/// ranges stay in the negotiated encoding.
-// INCOMPLETE: `item.documentation` and `item.data` are dropped, so the menu can
-// never show per-item documentation, and there is no way to `completionItem/resolve`
-// it (most servers — rust_analyzer especially — send docs only on resolve, keyed
-// by the `data` blob). Faithful needs: carry `documentation` (markup → lines) and
-// `data`, advertise the completion client capability, and wire a resolve round-trip.
-// Plan: docs/completion-documentation-plan.md.
+/// ranges stay in the negotiated encoding, carry any inline `documentation`
+/// (markup → plain lines), and preserve the original item for a later
+/// `completionItem/resolve` ([`CompletionItemData::resolve_data`], Phase 2).
 fn completion_item(item: CompletionItem) -> CompletionItemData {
+    // Serialize the whole item up front (before its fields are moved out) for the
+    // resolve round-trip; a server matches the resolve against the exact item it
+    // issued, so the original is preserved verbatim, not rebuilt from our distill.
+    let resolve_data = serde_json::to_value(&item).ok();
+    let documentation = item.documentation.and_then(documentation_lines);
     let text_edit = item.text_edit.map(|edit| match edit {
         CompletionTextEdit::Edit(e) => e,
         CompletionTextEdit::InsertAndReplace(ir) => TextEdit {
@@ -1309,7 +1326,23 @@ fn completion_item(item: CompletionItem) -> CompletionItemData {
         insert_text: item.insert_text,
         text_edit,
         additional_text_edits: item.additional_text_edits.unwrap_or_default(),
+        documentation,
+        resolve_data,
     }
+}
+
+/// Reduce a completion item's `documentation` (a plain string, or a
+/// `MarkupContent` whose markdown is rendered as plain lines — same as hover) to
+/// its display text, trailing blank lines trimmed. `None` when the result is
+/// empty, so a blank documentation block reads as "no docs" rather than an empty
+/// preview (it is never *faked* into one — an absent field is simply `None`).
+fn documentation_lines(doc: Documentation) -> Option<String> {
+    let text = match doc {
+        Documentation::String(s) => s,
+        Documentation::MarkupContent(mc) => mc.value,
+    };
+    let lines = markup_lines(text);
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The numeric `CompletionItemKind` (`1`=Text … `25`=TypeParameter), via serde so
@@ -1348,11 +1381,20 @@ fn hover_reply(
             .join("\n\n"),
         HoverContents::Markup(markup) => markup.value,
     };
+    LspReply::Hover(markup_lines(text))
+}
+
+/// Split a markup/prose block (hover contents, completion `documentation`) into
+/// display lines, dropping trailing blank lines so a panel isn't padded. The
+/// shared distiller for every markup-to-lines reduction — nxvim renders markdown
+/// as plain lines today, so this is a plain `lines()` split (styling is a
+/// follow-up, tracked with hover).
+fn markup_lines(text: String) -> Vec<String> {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    LspReply::Hover(lines)
+    lines
 }
 
 /// The text of a `MarkedString` (a plain markdown string, or the code of a
@@ -1609,7 +1651,9 @@ fn level_of(typ: MessageType) -> LogLevel {
 /// `codeAction.codeActionLiteralSupport` — **without it a server returns legacy
 /// `Command[]` rather than a `CodeAction` carrying an `edit`**, and "apply the
 /// edit" becomes impossible; we also declare `formatting`/`rename` and
-/// `workspaceEdit.documentChanges` so servers offer those features.
+/// `workspaceEdit.documentChanges` so servers offer those features, and
+/// `completion.completionItem` (`documentationFormat` + `resolveSupport`) so
+/// servers send per-item docs / let us resolve them lazily.
 /// Split a child's [`std::process::ExitStatus`] into `(code, signal)` for the
 /// config's `on_exit(code, signal, client)` hook (Phase 3). `code` is the normal
 /// exit code; `signal` is the terminating signal (unix only — always `None`
@@ -1736,6 +1780,24 @@ fn client_capabilities() -> ClientCapabilities {
                     properties: vec!["edit".to_string()],
                 }),
                 data_support: Some(true),
+                ..Default::default()
+            }),
+            // Declare completion-item documentation + resolve support. Most servers
+            // — notably rust_analyzer — send completion lists *without* per-item
+            // `documentation`/`detail` and expect the client to fetch them lazily
+            // per selected item via `completionItem/resolve`; advertising
+            // `resolveSupport` for those properties is what unlocks that round-trip
+            // (Phase 2), and `documentationFormat` declares we accept markdown (and
+            // plaintext) for the docs that do arrive (the markup distiller renders
+            // either as plain lines).
+            completion: Some(CompletionClientCapabilities {
+                completion_item: Some(CompletionItemCapability {
+                    documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                    resolve_support: Some(CompletionItemCapabilityResolveSupport {
+                        properties: vec!["documentation".to_string(), "detail".to_string()],
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             // We *do* consume `textDocument/publishDiagnostics` (see the client

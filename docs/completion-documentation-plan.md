@@ -54,7 +54,7 @@ looks like "no documentation."
 
 ---
 
-## Phase 1 — Carry `documentation` + `data` end to end; advertise the capability ⬜
+## Phase 1 — Carry `documentation` + `data` end to end; advertise the capability ✅
 
 **Goal.** Make a completion item's `documentation` (and `data`) survive
 distillation and reach the menu, and advertise the client capability so servers
@@ -92,10 +92,17 @@ whose item carries inline `documentation` surfaces on the menu item — assert i
 rides the reply into `CompletionMenu.raw` (a new redraw assertion or a Lua-side
 probe, consistent with how the menu is otherwise observed).
 
-**Done when.** ⬜ `CompletionItemData` carries `documentation` (markup →
-lines) and the item's `data`; `client_capabilities()` advertises
-`completion.completionItem` with `documentationFormat` + `resolveSupport`; an
-eagerly-documented item's docs reach the menu state.
+**Done when.** ✅ `CompletionItemData` carries `documentation` (markup →
+lines, via the shared `markup_lines` distiller hover now also uses) and the
+original item as `resolve_data` (whole serialized item, for the Phase 2 resolve
+round-trip); `client_capabilities()` advertises `completion.completionItem` with
+`documentationFormat: [markdown, plaintext]` + `resolveSupport: [documentation,
+detail]`; an eagerly-documented item's docs ride into `CompletionMenu.raw` by
+construction. Verified by `completion_capability_advertises_documentation_and_resolve`
+(asserts the advertised capability on the recorded `initialize`) and
+`a_documented_completion_item_opens_the_menu` (a `MarkupContent`-documented,
+`data`-bearing item distills cleanly and reaches the menu) in
+`crates/nxvim/tests/lsp.rs`.
 
 **Depends on.** Nothing (the menu already exists).
 

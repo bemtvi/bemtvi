@@ -496,6 +496,9 @@ end
 -- yet, so it registers globally (the buffer scope is ignored). Enough for an
 -- `on_attach` that defines a convenience command (e.g. rust_analyzer's
 -- `:LspCargoReload`) to load without error.
+-- INCOMPLETE: `buffer` is ignored — the command exists everywhere, not only in
+-- its buffer. A per-buffer command registry (the analogue of the buffer-local
+-- keymap scoping `vim._keymaps` already does) is the fix.
 function vim.api.nvim_buf_create_user_command(_buffer, name, command, _opts)
   vim._user_commands[name] = command
 end
@@ -654,6 +657,9 @@ end
 function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
 
 -- Single-window nxvim: one window handle, and the cursor is the editor cursor.
+-- INCOMPLETE: `win` is ignored (handle 1000 is the only window). Faithful once
+-- nxvim grows a window layout tree; until then a config that targets a specific
+-- window gets the current cursor regardless of which handle it passed.
 function vim.api.nvim_get_current_win() return vim._cur_win or 1000 end
 function vim.api.nvim_win_get_cursor(_win)
   local c = vim._cur_cursor or { row = 1, col = 0 }
@@ -682,6 +688,10 @@ function vim.api.nvim_buf_get_lines(bufnr, start, end_, strict)
   return out
 end
 
+-- INCOMPLETE: can't produce a buffer without a final newline — `normalize()`
+-- always re-adds the trailing phantom `\n` (no `nofixeol`). Each call is also its
+-- own undo step (no `undojoin` coalescing), so a plugin issuing many small edits
+-- leaves many undo entries. Faithful once the core models `nofixeol`/`undojoin`.
 function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
   local id = vim._resolve_bufnr(bufnr)
   local buf = vim._bufs[id]
@@ -1535,9 +1545,10 @@ vim.ui = vim.ui or {}
 -- the panel title. The chosen item and its 1-based index go to
 -- `on_choice(item, index)` on `<CR>`. The panel's `on_select` callback drives it.
 --
--- Approximation: dismissing the panel without a pick (`q`) does not deliver the
+-- INCOMPLETE: dismissing the panel without a pick (`q`) does not deliver the
 -- neovim `on_choice(nil)` cancel — the panel has no cancel event — so a caller
--- that must react to cancellation won't. A real pick is faithful.
+-- that must react to cancellation won't. A real pick is faithful. Faithful once
+-- the panel emits a dismiss/cancel event.
 function vim.ui.select(items, opts, on_choice)
   opts = opts or {}
   items = items or {}
@@ -1556,6 +1567,9 @@ end
 -- matching neovim. Backed by nxvim's command line (a `CmdlineKind::Prompt`), so the
 -- usual within-line editing (motion / backspace) applies. The callback fires
 -- off-tick, when the server drains the prompt result.
+-- INCOMPLETE: only one prompt is open at a time (a single command line) — if
+-- several vim.ui.input calls are queued in one tick the last wins (a loud
+-- single-prompt limitation, not a silent drop). Faithful once prompts can stack.
 function vim.ui.input(opts, on_confirm)
   opts = opts or {}
   local cb = vim._next_cb_id()
@@ -1587,6 +1601,11 @@ end
 -- known-approximations list. A bare `vim.bo.<opt>` (no bufnr) targets the current
 -- buffer. The `vim._bo_store` table is initialized with the other Phase-6 mirror
 -- state above.
+-- INCOMPLETE: the store records and reads back, but only `filetype` actually
+-- *drives* anything — writing `vim.bo[buf].shiftwidth`/`expandtab`/… stores the
+-- value without changing how the editor indents, formats, or renders. Reads also
+-- return nil for an unset option rather than neovim's real default. Faithful once
+-- the core honors buffer-local options.
 local function bo_get(bufnr, opt)
   local store = vim._bo_store[bufnr]
   if store ~= nil and store[opt] ~= nil then return store[opt] end
@@ -1765,6 +1784,9 @@ end
 
 -- make_text_document_params(bufnr): the `{ uri }` a request's `textDocument` field
 -- carries, from the buffer's file path.
+-- INCOMPLETE: a *non-current* bufnr yields an empty URI — `nvim_buf_get_name` is
+-- backed by the current-buffer snapshot only, so it can't name another buffer's
+-- file. Faithful once buffer names come from a real multi-buffer registry.
 function vim.lsp.util.make_text_document_params(bufnr)
   return { uri = vim.uri_from_bufnr(bufnr or 0) }
 end
@@ -1773,6 +1795,9 @@ end
 -- cursor-relative request (definition, hover, …) carries. The cursor comes from
 -- the real editor (Phase-6 mirror); its byte column is converted to `encoding`
 -- (utf-16 default). `window` is ignored — single-window nxvim.
+-- INCOMPLETE: `window` is ignored (always the current cursor) — faithful only
+-- while nxvim is single-window. A config passing a specific window gets the
+-- current one's position.
 function vim.lsp.util.make_position_params(_window, encoding)
   encoding = encoding or "utf-16"
   local bufnr = vim.api.nvim_get_current_buf()
@@ -1810,6 +1835,10 @@ end
 -- into loclist items (`{ filename, lnum, col, text }`), sorted by file then
 -- position. The byte `col` and the `text` come from the open buffer backing each
 -- location (empty `text` for an unopened file). `user_data` keeps the raw location.
+-- INCOMPLETE: a location in an *unopened* file gets an empty `text` (and a `col`
+-- computed against ""), because the line text is read from open buffers only — a
+-- result list spanning files you haven't visited shows blank previews. Faithful
+-- once line text can be read from disk for unopened files.
 function vim.lsp.util.locations_to_items(locations, encoding)
   encoding = encoding or "utf-16"
   local items = {}
@@ -1850,6 +1879,10 @@ end
 -- in nxvim's panel — the surface that stands in for neovim's floating window.
 -- neovim returns `(float_bufnr, win_id)`; nxvim has one panel and no per-float
 -- handle, so it returns `0` and the current window handle for call-site shape.
+-- INCOMPLETE: returns `(0, curwin)` placeholders, not a real float buffer/window
+-- pair — a config that closes/relocates/styles the returned float by its handles
+-- can't (there's one shared panel, no per-float identity). `syntax` is ignored
+-- (the panel has no per-preview filetype). Faithful once floats are real windows.
 function vim.lsp.util.open_floating_preview(contents, _syntax, opts)
   opts = opts or {}
   local lines = type(contents) == "table" and contents or { tostring(contents) }
@@ -1862,6 +1895,10 @@ end
 -- as an LspOp the server normalizes and applies). Edits to unopened files are a
 -- follow-up (the native path edits open buffers only); `encoding` is carried by
 -- the edit's positions and resolved server-side, so the arg is accepted here.
+-- INCOMPLETE: edits land only in *open* buffers — a workspace edit that touches
+-- files you haven't opened (a project-wide rename) silently skips them. Each call
+-- is also its own undo step (no `undojoin` coalescing). Faithful once edits can
+-- be applied to files on disk without opening them.
 function vim.lsp.util.apply_workspace_edit(workspace_edit, _encoding)
   vim._lsp_apply_workspace_edit(workspace_edit or {})
 end
@@ -2214,6 +2251,12 @@ end
 -- and the pre-hook values are forwarded unchanged. `init_params` is the minimal
 -- shape the common hooks touch; a `config.cmd` mutation here is too late (the cmd
 -- is already resolved) and is not honored — a documented approximation.
+-- INCOMPLETE: a `config.cmd` mutation inside `before_init` is ignored (cmd is
+-- already resolved by the time the hook runs). `init_params` is also a minimal
+-- shape, not neovim's full initialize params. Relatedly, `on_exit` does not fire
+-- on an *intentional* shutdown — only on a server exit/crash — since the clean
+-- path registers no client to notify. Faithful once cmd resolution moves after
+-- before_init and shutdown routes through the client registry.
 local function lsp_before_init(config)
   local init_options, settings, capabilities =
     config.init_options, config.settings, config.capabilities
@@ -2543,6 +2586,11 @@ end
 -- underline spans — so the `underline` key is honored (false hides the
 -- squiggles); virt-text/signs and the rest are stored without behavior until a
 -- surface exists.
+-- INCOMPLETE: only `underline` drives anything. `virtual_text`, `signs`,
+-- `virtual_lines`, `float`, `severity_sort`, … are recorded and echoed back but
+-- have no rendering surface, so a config enabling inline virtual-text diagnostics
+-- sees no change. `_namespace` is ignored (one global config). Faithful once
+-- those diagnostic surfaces exist.
 vim.diagnostic._config = { underline = true }
 function vim.diagnostic.config(opts, _namespace)
   if opts == nil then return vim.diagnostic._config end

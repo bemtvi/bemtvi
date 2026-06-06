@@ -560,7 +560,9 @@ screen," and that is exactly the shape of these tests.
   [*Syntax highlighting*](#syntax-highlighting-treesitter)) — neovim parses
   in-process on the main loop.
 
-**Not yet implemented (roadmap):**
+**Not yet implemented (roadmap).** The big-ticket items below; the granular
+`vim.*` gaps and the silent approximations live in
+[*Known approximations & missing features*](known-approximations.md).
 
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up), treesitter
@@ -596,32 +598,28 @@ screen," and that is exactly the shape of these tests.
   a server is up, the editing loop — `vim.lsp.buf.*`, `vim.diagnostic.*`, and
   capability-gated `on_attach` keymaps — genuinely works.
 
-  **What does *not* work yet** (the server starts but may not behave as its config
-  intends): the config's `settings` / `init_options` / `capabilities` are
-  **dropped at `initialize`**, so the server runs on defaults regardless of how it
-  was configured; the lifecycle hooks (`before_init` / `on_init` / `on_exit`) are
-  **never called**; and a swathe of the deferred-callback surface
-  (`vim.lsp.util.*`, `client:request`, `vim.ui.*`, the buffer/window getters) is
-  **stubbed**. Per the project's no-silent-stubs rule those stubs are being
-  converted to *raise* (named "not implemented" errors) so each gap is loud and
-  trackable rather than a silent no-op. Two whole configs are skipped: gdscript (a
-  non-stdio TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a
-  user-only `bundle_path`). The route from "starts" to "works", phase by phase, is
-  [the LSP completion plan](lsp-completion-plan.md). The async-runtime work below
-  has since landed, so `vim.system(cmd, opts, on_exit)` now runs the child *off the
-  server thread* and fires `on_exit` on a later tick; the synchronous `:wait()`
-  branch (no `on_exit`) is retained for the short `root_dir` shell-outs that want a
-  blocking result. The surface still grows only as plugins demand it; known gaps
-  for richer plugins: `vim.treesitter` is a stub (nxvim highlights out-of-process)
-  and the per-window API. The **synchronous prompt** functions `vim.fn.input(opts)`
-  and `vim.fn.confirm(msg, choices, …)` are also still open: they must return the
-  user's answer *inline* (a string / a 1-based index), and nxvim now has a prompt
-  surface (`CmdlineKind::Prompt` driving `vim.ui.input`, and the message panel for
-  pickers) but only in its **asynchronous, callback** shape — the inline-return
-  contract needs a re-entrant input pump (a nested input loop, or a Lua coroutine
-  the bridge resumes when the result lands) that preserves the one-message-at-a-time
-  invariant. Until then both fail loud via `vim._notimpl` rather than fake a value.
-  Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
+  Through Phase 8 the config's `settings` / `init_options` / `capabilities` are
+  forwarded at `initialize`, the lifecycle hooks (`before_init` / `on_init` /
+  `on_exit`) fire, and the deferred-callback surface (`vim.lsp.util.*`,
+  `client:request`, `vim.ui.*`, the buffer/window getters) is real — see
+  [the LSP completion plan](lsp-completion-plan.md) for the phase-by-phase route
+  from "starts" to "works". Two whole configs are skipped: gdscript (a non-stdio
+  TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a user-only
+  `bundle_path`).
+
+  **What does *not* work yet** is tracked canonically — both the *silent
+  approximations* (a feature that looks whole but isn't) and the *loud gaps*
+  (functions that raise `not implemented` rather than fake a value, per the
+  no-silent-stubs rule) — in
+  [**Known approximations & missing features**](known-approximations.md). That
+  doc explains how to enumerate them straight from the code (`grep -rn
+  'INCOMPLETE:'` for approximations, the `vim._notimpl` raises / runtime
+  `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
+  that have no call site to tag — multiple windows, the `vim.treesitter` Lua API,
+  buffer-local options not yet honored by the core, a per-buffer command registry,
+  richer diagnostic surfaces, and the **synchronous prompts** `vim.fn.input` /
+  `vim.fn.confirm` (which need an inline-return input pump). Legacy Vimscript
+  (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far, and options are still global —
   **buffer-local options** are the next gap. Also mappings (`:map`), registers

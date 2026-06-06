@@ -796,6 +796,36 @@ async fn ctrl_d_emits_half_page_scroll() {
 }
 
 #[tokio::test]
+async fn page_down_acts_like_ctrl_d() {
+    let path = write_n_lines("pgdn", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let map = scroll_after(&rpc, &mut incoming, "<PageDown>").await;
+
+    // Identical to <C-d>: viewport height 24 → half page = 12.
+    assert_eq!(scroll_u64(&map, "from_top"), 0);
+    assert_eq!(scroll_u64(&map, "to_top"), 12);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 0);
+    assert_eq!(scroll_u64(&map, "to_cursor"), 12);
+}
+
+#[tokio::test]
+async fn page_up_acts_like_ctrl_u() {
+    let path = write_n_lines("pgup", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Scroll down a full page first so there's room to scroll back up.
+    let _ = redraw_after(&rpc, &mut incoming, "<C-f>").await; // top 0 -> 22
+    let map = scroll_after(&rpc, &mut incoming, "<PageUp>").await; // top 22 -> 10
+
+    // Identical to <C-u>: half page = 12.
+    assert_eq!(scroll_u64(&map, "from_top"), 22);
+    assert_eq!(scroll_u64(&map, "to_top"), 10);
+    assert_eq!(scroll_u64(&map, "from_cursor"), 22);
+    assert_eq!(scroll_u64(&map, "to_cursor"), 10);
+}
+
+#[tokio::test]
 async fn ctrl_f_emits_full_page_scroll() {
     let path = write_n_lines("cf", 100);
     let (rpc, mut incoming) = start(Some(path)).await;

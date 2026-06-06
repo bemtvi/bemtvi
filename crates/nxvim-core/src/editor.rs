@@ -715,6 +715,13 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         };
     }
 
+    // PageDown / PageUp default to a half-page scroll, like <C-d> / <C-u>.
+    match key.code {
+        KeyCode::PageDown => return Complete(RC::Normal(N::ScrollHalf(true))),
+        KeyCode::PageUp => return Complete(RC::Normal(N::ScrollHalf(false))),
+        _ => {}
+    }
+
     let c = match key.as_char() {
         Some(c) => c,
         None => return Reset,

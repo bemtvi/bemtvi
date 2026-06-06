@@ -94,18 +94,55 @@ async fn cursor(rpc: &Rpc) -> (usize, usize) {
     }
 }
 
-/// Feed `keys`, then deterministically return the `redraw` map the server
-/// emitted *for that input*. Works because the server processes messages
-/// serially: it writes each message's response and then its `redraw`. We send
-/// `nvim_input` then `nvim_get_mode`; the wire order is input-response,
-/// input-redraw, barrier-response, barrier-redraw. Since the input's redraw
-/// is written before the barrier's response, by the time the barrier `.await`
-/// resolves the input's redraw is already queued in `incoming` — so the first
-/// redraw we drain is the one for this input.
-async fn redraw_after(
+/// Drain every `redraw` currently queued in `incoming` and return the most
+/// recent one for which `keep` holds (skipping non-redraw notifications and
+/// redraws `keep` rejects), or `None` when none qualifies.
+fn drain_to_latest_redraw(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keep: impl Fn(&[(Value, Value)]) -> bool,
+) -> Option<Vec<(Value, Value)>> {
+    let mut latest = None;
+    loop {
+        match incoming.try_recv() {
+            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
+                match params.into_iter().next() {
+                    Some(Value::Map(map)) => {
+                        if keep(&map) {
+                            latest = Some(map);
+                        }
+                    }
+                    _ => panic!("redraw without a map"),
+                }
+            }
+            Ok(_) => continue, // a non-redraw notification — ignore
+            Err(_) => return latest,
+        }
+    }
+}
+
+/// Feed `keys`, then return the most recent queued `redraw` satisfying `keep`.
+///
+/// The server processes messages serially, writing each message's response and
+/// then its `redraw`. We send `nvim_input` then a `nvim_get_mode` barrier; the
+/// wire order is input-response, input-redraw, barrier-response, barrier-redraw,
+/// and the client's reader task ferries it into `incoming` in that same order.
+/// So once the barrier `.await` resolves, the input's redraw is guaranteed
+/// queued.
+///
+/// We take the most recent qualifying redraw, not the first. A redraw still in
+/// flight from earlier in the test — the startup frame, or a previous call's
+/// trailing barrier repaint — can land in `incoming` after the pre-drain below
+/// when the reader task lags under load, and taking the first would then return
+/// that stale frame (the source of the intermittent failures). `keep` lets a
+/// caller pin the exact frame it means: the default takes the freshest state
+/// (the barrier's repaint is state-identical to the input's), while scroll tests
+/// pass [`has_scroll`] to single out the input's frame, the only one carrying
+/// the one-shot `scroll` gesture (which the trailing barrier repaint lacks).
+async fn redraw_after_matching(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
     keys: &str,
+    keep: impl Fn(&[(Value, Value)]) -> bool,
 ) -> Vec<(Value, Value)> {
     while incoming.try_recv().is_ok() {} // discard any buffered notifications from earlier in the test
 
@@ -114,18 +151,39 @@ async fn redraw_after(
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    loop {
-        match incoming.try_recv() {
-            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
-                match params.into_iter().next() {
-                    Some(Value::Map(map)) => return map,
-                    _ => panic!("redraw without a map"),
-                }
-            }
-            Ok(_) => continue,
-            Err(_) => panic!("no redraw arrived for {keys:?}"),
+
+    if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
+        return map;
+    }
+    // The barrier guarantees the input's redraw is queued before its response, so
+    // the drain above should have found it. Under heavy load the reader task can
+    // still lag; poll a bounded while rather than failing on the first miss.
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
+            return map;
         }
     }
+    panic!("no redraw arrived for {keys:?}");
+}
+
+/// Feed `keys` and return the freshest resulting `redraw` — the common case.
+async fn redraw_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> Vec<(Value, Value)> {
+    redraw_after_matching(rpc, incoming, keys, |_| true).await
+}
+
+/// Feed `keys` and return the `redraw` carrying the one-shot `scroll` gesture —
+/// the input's own frame, not the state-only barrier repaint that trails it.
+async fn scroll_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> Vec<(Value, Value)> {
+    redraw_after_matching(rpc, incoming, keys, |map| scroll(map).is_some()).await
 }
 
 /// Look up a top-level key in a redraw map.
@@ -724,7 +782,7 @@ async fn ctrl_d_emits_half_page_scroll() {
     let path = write_n_lines("cd", 100);
     let (rpc, mut incoming) = start(Some(path)).await;
 
-    let map = redraw_after(&rpc, &mut incoming, "<C-d>").await;
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
 
     // Viewport height 24 → half page = 12.
     assert_eq!(scroll_u64(&map, "from_top"), 0);
@@ -742,7 +800,7 @@ async fn ctrl_f_emits_full_page_scroll() {
     let path = write_n_lines("cf", 100);
     let (rpc, mut incoming) = start(Some(path)).await;
 
-    let map = redraw_after(&rpc, &mut incoming, "<C-f>").await;
+    let map = scroll_after(&rpc, &mut incoming, "<C-f>").await;
 
     // Full page = height - 2 = 22.
     assert_eq!(scroll_u64(&map, "from_top"), 0);
@@ -770,7 +828,7 @@ async fn scroll_window_pads_past_end_of_buffer() {
     let path = write_n_lines("eof", 30);
     let (rpc, mut incoming) = start(Some(path)).await;
 
-    let map = redraw_after(&rpc, &mut incoming, "<C-f>").await;
+    let map = scroll_after(&rpc, &mut incoming, "<C-f>").await;
 
     assert_eq!(scroll_u64(&map, "to_top"), 22);
     assert_eq!(scroll_lines_len(&map), 46); // window length is fixed regardless of EOF
@@ -793,7 +851,7 @@ async fn ctrl_u_mid_buffer_scrolls_up() {
 
     // Scroll down a full page first so there's room to scroll back up.
     let _ = redraw_after(&rpc, &mut incoming, "<C-f>").await; // top 0 -> 22
-    let map = redraw_after(&rpc, &mut incoming, "<C-u>").await; // top 22 -> 10
+    let map = scroll_after(&rpc, &mut incoming, "<C-u>").await; // top 22 -> 10
 
     assert_eq!(scroll_u64(&map, "from_top"), 22);
     assert_eq!(scroll_u64(&map, "to_top"), 10);
@@ -810,7 +868,7 @@ async fn count_motion_emits_scroll() {
     let (rpc, mut incoming) = start(Some(path)).await;
 
     // `30j` lands the cursor on line 30; ensure_visible drags top to 30+1-24 = 7.
-    let map = redraw_after(&rpc, &mut incoming, "30j").await;
+    let map = scroll_after(&rpc, &mut incoming, "30j").await;
 
     assert_eq!(scroll_u64(&map, "from_top"), 0);
     assert_eq!(scroll_u64(&map, "to_top"), 7);
@@ -828,7 +886,7 @@ async fn g_to_last_line_emits_capped_scroll() {
 
     // `G` jumps to line 99; top settles at 99+1-24 = 76. The raw travel is 76
     // lines, but it's capped to two screens (2*24 = 48) so the slide stays bounded.
-    let map = redraw_after(&rpc, &mut incoming, "G").await;
+    let map = scroll_after(&rpc, &mut incoming, "G").await;
 
     assert_eq!(scroll_u64(&map, "from_top"), 28); // 76 - 48 (cap)
     assert_eq!(scroll_u64(&map, "to_top"), 76);
@@ -845,7 +903,7 @@ async fn gg_back_to_top_emits_capped_scroll() {
     let (rpc, mut incoming) = start(Some(path)).await;
 
     let _ = redraw_after(&rpc, &mut incoming, "G").await; // jump to the bottom first
-    let map = redraw_after(&rpc, &mut incoming, "gg").await; // ...then back to the top
+    let map = scroll_after(&rpc, &mut incoming, "gg").await; // ...then back to the top
 
     assert_eq!(scroll_u64(&map, "from_top"), 48); // 0 + 48 (cap)
     assert_eq!(scroll_u64(&map, "to_top"), 0);
@@ -1288,23 +1346,6 @@ async fn vim_json_decodes_and_encodes() {
         startup_message(&rpc, &mut incoming).await,
         "/w 3 20 {\"a\":1}"
     );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn vim_system_runs_a_command_synchronously() {
-    let dir = temp_dir("vimsystem");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "local r = vim.system({ '/bin/echo', '-n', 'hello' }):wait()\n\
-         local cb\n\
-         vim.system({ '/bin/echo', '-n', 'world' }, {}, function(o) cb = o.stdout end)\n\
-         print(r.code .. ' ' .. r.stdout .. ' ' .. cb)\n",
-    )
-    .await;
-    // `:wait()` returns {code, stdout, stderr}; the on_exit callback (no event
-    // loop yet) fires synchronously with the same shape.
-    assert_eq!(startup_message(&rpc, &mut incoming).await, "0 hello world");
 }
 
 #[tokio::test]

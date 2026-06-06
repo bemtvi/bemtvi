@@ -79,8 +79,39 @@ async fn start_with_file_and_config(
     (rpc, incoming)
 }
 
-/// Feed `keys`, then deterministically return the `redraw` map the server emitted
-/// for that input (same serial-ordering trick as `editing.rs::redraw_after`).
+/// Drain every `redraw` currently queued in `incoming` and return the *most
+/// recent* one (skipping non-redraw notifications), or `None` when none is
+/// buffered. Redraws are full-state projections, so the latest reflects the
+/// freshest editor state.
+fn drain_to_latest_redraw(
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<(Value, Value)>> {
+    let mut latest = None;
+    loop {
+        match incoming.try_recv() {
+            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
+                match params.into_iter().next() {
+                    Some(Value::Map(map)) => latest = Some(map),
+                    _ => panic!("redraw without a map"),
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => return latest,
+        }
+    }
+}
+
+/// Feed `keys`, then return the `redraw` map the server emitted for that input.
+///
+/// The server processes messages serially, writing each message's response then
+/// its `redraw`; we send `nvim_input` then a `nvim_get_mode` barrier, so once the
+/// barrier `.await` resolves the input's redraw is already queued. We take the
+/// *most recent* queued redraw, not the first: a frame still in flight from
+/// earlier in the test (the startup frame, or a previous call's trailing barrier
+/// repaint) can land in `incoming` after the pre-drain below when the reader task
+/// lags under load, and taking the first would then return that stale frame. The
+/// input's redraw is the newest one present (the barrier changes no state and its
+/// repaint trails), so draining to the latest skips the stragglers.
 async fn redraw_after(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
@@ -91,18 +122,19 @@ async fn redraw_after(
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    loop {
-        match incoming.try_recv() {
-            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
-                match params.into_iter().next() {
-                    Some(Value::Map(map)) => return map,
-                    _ => panic!("redraw without a map"),
-                }
-            }
-            Ok(_) => continue,
-            Err(_) => panic!("no redraw arrived for {keys:?}"),
+    if let Some(map) = drain_to_latest_redraw(incoming) {
+        return map;
+    }
+    // The barrier guarantees the input's redraw is queued before its response, so
+    // the drain above should have found it. Under heavy load the reader task can
+    // lag; poll a bounded while rather than failing on the first miss.
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(map) = drain_to_latest_redraw(incoming) {
+            return map;
         }
     }
+    panic!("no redraw arrived for {keys:?}");
 }
 
 fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {

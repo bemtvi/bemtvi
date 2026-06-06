@@ -465,6 +465,19 @@ async fn ls_lists_open_buffers_with_flags() {
     command(&rpc, &format!("e {}", name(&a))).await; // buffer 1, becomes alternate
     command(&rpc, &format!("e {}", name(&b))).await; // buffer 2, current
 
+    // Widen the viewport so each buffer's listing — a line that embeds the long
+    // absolute temp path — fits on a single display row. At the default 80
+    // columns those paths word-wrap, splitting one buffer's entry across several
+    // rows; that breaks the one-row-per-buffer correspondence this test asserts
+    // (row count, per-row flags, selected row) without saying anything about the
+    // `:ls` behavior under test.
+    rpc.request(
+        "nvim_ui_try_resize",
+        vec![Value::from(400u64), Value::from(24u64)],
+    )
+    .await
+    .expect("resize");
+
     command(&rpc, "ls").await;
     let (title, rows, selected) = panel(&rpc, &mut incoming)
         .await

@@ -1016,7 +1016,7 @@ async fn panelopen_reopens_the_references_panel_and_still_jumps() {
     wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
 
     feed(&rpc, "gr");
-    let (title, _lines) = wait_for_panel(&rpc, &mut incoming).await;
+    let (title, original_lines) = wait_for_panel(&rpc, &mut incoming).await;
     assert_eq!(title, "LSP references");
 
     // First navigation: `<CR>` on row 0 jumps to reference 1 (line 2, col 8) and
@@ -1031,7 +1031,13 @@ async fn panelopen_reopens_the_references_panel_and_still_jumps() {
         .expect("panelopen");
     let (title, panel_lines) = wait_for_panel(&rpc, &mut incoming).await;
     assert_eq!(title, "LSP references", "the references panel came back");
-    assert_eq!(panel_lines.len(), 2, "with its content: {panel_lines:?}");
+    // The reopened list carries the exact content it had before — comparing to the
+    // original render rather than a fixed row count keeps this robust to how long
+    // temp paths word-wrap to the panel width.
+    assert_eq!(
+        panel_lines, original_lines,
+        "reopened with its content intact"
+    );
 
     feed(&rpc, "j<CR>");
     wait_for_cursor(&rpc, (3, 8)).await;

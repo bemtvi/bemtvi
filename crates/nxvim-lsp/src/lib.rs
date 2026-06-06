@@ -24,8 +24,12 @@ mod manager;
 pub mod mock;
 
 pub use lsp_types;
+// Re-exported because the manager's public API (`LspRequest::Raw` / `LspReply::Raw`
+// — Phase 5) carries raw `serde_json::Value`s, so downstream crates can name the
+// type without taking a direct dependency on the protocol JSON layer.
 pub use manager::{
     CodeActionData, CompletionItemData, LspEvent, LspManager, LspNotify, LspReply, LspRequest,
     PositionEncoding, ProviderCaps, ReqToken, ServerCaps, ServerKey, ServerSpawn,
     WorkspaceEditData,
 };
+pub use serde_json;

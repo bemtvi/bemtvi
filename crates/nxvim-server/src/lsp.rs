@@ -24,11 +24,12 @@ use nxvim_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, TextDocumentContentChangeEvent,
     TextDocumentSyncKind, TextEdit, Url,
 };
+use nxvim_lsp::serde_json;
 use nxvim_lsp::{
     CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
     PositionEncoding, ProviderCaps, ReqToken, ServerKey, ServerSpawn, WorkspaceEditData,
 };
-use nxvim_lua::{DiagnosticData, LspClientData, LspOp, LspServerCapabilities};
+use nxvim_lua::{CallbackArgs, DiagnosticData, LspClientData, LspOp, LspServerCapabilities};
 use rmpv::Value;
 
 use crate::{Server, StyleTable};
@@ -257,6 +258,23 @@ impl Server {
             LspOp::DiagnosticConfig { underline } => {
                 self.diagnostics_underline = underline;
                 self.lsp_dirty = true;
+                return;
+            }
+            LspOp::ClientRequest {
+                client_id,
+                method,
+                params,
+                cb_id,
+            } => {
+                self.client_request(client_id, method, params, cb_id);
+                return;
+            }
+            LspOp::ClientNotify {
+                client_id,
+                method,
+                params,
+            } => {
+                self.client_notify(client_id, method, params);
                 return;
             }
         };
@@ -583,6 +601,14 @@ impl Server {
                     let _ = self.lua.set_diagnostics(bufnr, &data);
                 }
             }
+            // A generic `client:request` reply (Phase 5) routes to its Lua handler
+            // by the callback id the token carries, bypassing the editor-feature
+            // staleness machinery the typed replies go through.
+            LspEvent::Reply {
+                token,
+                reply: LspReply::Raw(res),
+                ..
+            } => self.on_client_request_reply(token.cb_id, res),
             LspEvent::Reply { token, reply, .. } => self.on_lsp_reply(token, reply),
             LspEvent::ServerExited {
                 key, code, signal, ..
@@ -983,7 +1009,62 @@ impl Server {
         ReqToken {
             kind: kind.as_u16(),
             generation,
+            // Native typed requests dispatch by kind/generation, never by callback.
+            cb_id: 0,
         }
+    }
+
+    // ----- Phase 5: generic client:request / client:notify -----------------
+
+    /// Resolve a Lua `client_id` to its server [`ServerKey`] — the reverse of the
+    /// id assigned at `Initialized`. `None` once that server has exited.
+    fn client_id_to_key(&self, client_id: u64) -> Option<ServerKey> {
+        self.lsp_servers
+            .iter()
+            .find(|(_, rt)| rt.client_id == client_id)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// `client:request(method, params, handler)` (Phase 5): forward a generic LSP
+    /// request to `client_id`'s server, tagging the reply with `cb_id` so it
+    /// routes to the Lua handler when it lands ([`Server::on_client_request_reply`]).
+    /// If the client has no running server, fail loud — run the handler now with an
+    /// error rather than dropping it, so the caller learns the request didn't go.
+    fn client_request(
+        &mut self,
+        client_id: u64,
+        method: String,
+        params: serde_json::Value,
+        cb_id: u64,
+    ) {
+        let Some(key) = self.client_id_to_key(client_id) else {
+            self.on_client_request_reply(
+                cb_id,
+                Err(format!("LSP client {client_id} is not running")),
+            );
+            return;
+        };
+        let token = ReqToken {
+            // No native kind/generation: a raw reply routes purely by `cb_id`.
+            kind: u16::MAX,
+            generation: 0,
+            cb_id,
+        };
+        self.lsp
+            .request(key, token, LspRequest::Raw { method, params });
+    }
+
+    /// `client:notify(method, params)` (Phase 5): fire-and-forget a generic LSP
+    /// notification to `client_id`'s server. A notification carries no reply, so a
+    /// missing server is echoed loudly rather than routed to a handler.
+    fn client_notify(&mut self, client_id: u64, method: String, params: serde_json::Value) {
+        let Some(key) = self.client_id_to_key(client_id) else {
+            self.editor.echo(format!(
+                "nxvim: client:notify: LSP client {client_id} is not running"
+            ));
+            return;
+        };
+        self.lsp.notify(key, LspNotify::Raw { method, params });
     }
 
     // ----- Phase 6: formatting / rename / code action ----------------------
@@ -1184,7 +1265,32 @@ impl Server {
                 }
                 self.lsp_dirty = true;
             }
+            // Generic `client:request` replies are routed to their Lua handler in
+            // `on_lsp_event` before reaching here, never through the typed path.
+            LspReply::Raw(_) => unreachable!("raw replies are routed in on_lsp_event"),
         }
+    }
+
+    /// Run the Lua handler a generic `client:request` (Phase 5) registered under
+    /// `cb_id`, handing it `(err, result)` — `Err(message)` becomes the error arg
+    /// (result nil), `Ok(value)` the result arg (err nil). The reply always fires
+    /// the handler: unlike the typed editor features, a config command's reply is
+    /// not subject to cursor/buffer staleness dropping. Called from the
+    /// `lsp_events` arm, whose `settle_events` tail drives any deferred work (a
+    /// handler that `vim.cmd`s / `vim.schedule`s) to convergence and repaints.
+    fn on_client_request_reply(&mut self, cb_id: u64, res: Result<serde_json::Value, String>) {
+        let args = match res {
+            Ok(result) => CallbackArgs::LspReply { err: None, result },
+            Err(message) => CallbackArgs::LspReply {
+                err: Some(message),
+                result: serde_json::Value::Null,
+            },
+        };
+        if let Err(e) = self.lua.run_callback(cb_id, false, args) {
+            self.editor
+                .echo(format!("E5108: Error in client:request handler: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// Render a hover reply: open the bottom panel with the markup's plain lines

@@ -139,6 +139,31 @@ pub enum LspOp {
         /// default on; `false` disables the squiggles).
         underline: bool,
     },
+    /// `client:request(method, params, handler)` (Phase 5) — issue a generic LSP
+    /// request to the client `client_id`'s server and route its reply to the Lua
+    /// callback `cb_id` (a `vim._cb_fns` entry holding the resolved handler). The
+    /// server resolves the client's [`ServerKey`] and forwards a raw request; the
+    /// reply comes back off-tick as a [`CallbackArgs::LspReply`].
+    ClientRequest {
+        /// The target client id (`client.id`, the handle `LspAttach` resolves).
+        client_id: u64,
+        /// The LSP method (e.g. `workspace/executeCommand`).
+        method: String,
+        /// The request params as JSON (`Null` when the caller passed none).
+        params: serde_json::Value,
+        /// The `vim._cb_fns` id the reply's handler is registered under.
+        cb_id: u64,
+    },
+    /// `client:notify(method, params)` (Phase 5) — fire-and-forget a generic LSP
+    /// notification to the client `client_id`'s server.
+    ClientNotify {
+        /// The target client id.
+        client_id: u64,
+        /// The LSP notification method (e.g. `$/setTrace`).
+        method: String,
+        /// The notification params as JSON (`Null` when the caller passed none).
+        params: serde_json::Value,
+    },
 }
 
 /// A request to the async runtime (the "event loop"), queued by the `vim.schedule`
@@ -196,6 +221,17 @@ pub enum CallbackArgs {
         code: i32,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+    },
+    /// The reply to a `client:request` (Phase 5): the handler is called as
+    /// `handler(err, result)` — `err` a message string (the request failed) with
+    /// `result` nil, or `err` nil with `result` the server's JSON value. Exactly
+    /// one is set, mirroring neovim's `(err, result, ctx)` handler signature.
+    LspReply {
+        /// `Some(message)` when the request failed (unsupported method, transport
+        /// error, or the server replied an error); `None` on success.
+        err: Option<String>,
+        /// The server's JSON result on success; `Null` when `err` is set.
+        result: serde_json::Value,
     },
 }
 
@@ -535,6 +571,16 @@ impl LuaRuntime {
                 result.set("stdout", self.lua.create_string(&stdout)?)?;
                 result.set("stderr", self.lua.create_string(&stderr)?)?;
                 run.call::<()>((id, keep, result))
+            }
+            CallbackArgs::LspReply { err, result } => {
+                // `handler(err, result)`: a string-or-nil error and the JSON
+                // result (nil when `err` is set), matching neovim's handler shape.
+                let err = match err {
+                    Some(msg) => mlua::Value::String(self.lua.create_string(&msg)?),
+                    None => mlua::Value::Nil,
+                };
+                let result = json_to_lua(&self.lua, &result)?;
+                run.call::<()>((id, keep, err, result))
             }
         }
     }
@@ -1220,6 +1266,45 @@ fn install_runtime_api(
                 .push(LspOp::DiagnosticConfig { underline });
             Ok(())
         })?,
+    )?;
+
+    // `vim._lsp_client_request(client_id, method, params, cb_id)`: queue a generic
+    // `client:request` ([`LspOp::ClientRequest`]). The handler is already stored in
+    // `vim._cb_fns[cb_id]` by the Lua wrapper; the server forwards the request and
+    // runs the callback with `(err, result)` when the reply lands (Phase 5).
+    // `params` is any Lua value (a table / nil), converted through the same
+    // `lua_to_json` bridge `vim.json.encode` uses.
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_client_request",
+        lua.create_function(
+            move |_, (client_id, method, params, cb_id): (u64, String, mlua::Value, u64)| {
+                sh.borrow_mut().lsp_ops.push(LspOp::ClientRequest {
+                    client_id,
+                    method,
+                    params: lua_to_json(&params)?,
+                    cb_id,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `vim._lsp_client_notify(client_id, method, params)`: queue a generic
+    // fire-and-forget `client:notify` ([`LspOp::ClientNotify`]).
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_client_notify",
+        lua.create_function(
+            move |_, (client_id, method, params): (u64, String, mlua::Value)| {
+                sh.borrow_mut().lsp_ops.push(LspOp::ClientNotify {
+                    client_id,
+                    method,
+                    params: lua_to_json(&params)?,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `vim._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),

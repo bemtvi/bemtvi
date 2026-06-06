@@ -1453,6 +1453,12 @@ vim.lsp.protocol = vim.lsp.protocol or {}
 -- exist so assigning into it doesn't index nil.
 vim.lsp.commands = vim.lsp.commands or {}
 
+-- vim.lsp.handlers: the default response-handler registry, keyed by LSP method
+-- (`handler(err, result, ctx)`). A `client:request` with no explicit handler falls
+-- back to the config's `handlers[method]`, then this global table (Phase 5). A
+-- config may register a global default handler here; the per-config layer wins.
+vim.lsp.handlers = vim.lsp.handlers or {}
+
 -- Client capabilities are owned and advertised by the Rust client at
 -- `initialize`; this stub lets a config that merges into them run without error.
 function vim.lsp.protocol.make_client_capabilities() return {} end
@@ -1571,8 +1577,64 @@ end
 -- Rust (`LuaRuntime::set_lsp_client`) when a server finishes `initialize`. The
 -- handle `LspAttach`'s `args.data.client_id` resolves through `get_client_by_id`.
 vim.lsp._clients = vim.lsp._clients or {}
+
+-- The handler for a `client:request` reply on `method`: the config's
+-- `handlers[method]`, else the global `vim.lsp.handlers[method]`, else nil (the
+-- reply is discarded after firing). The per-config layer wins (Phase 5).
+function vim.lsp._resolve_handler(name, method)
+  local cfg = name and vim.lsp.config[name]
+  if cfg and type(cfg.handlers) == "table" and cfg.handlers[method] ~= nil then
+    return cfg.handlers[method]
+  end
+  return vim.lsp.handlers[method]
+end
+
+-- client:request(method, params, handler, bufnr): issue a generic LSP request to
+-- this client's server and route the reply to `handler(err, result, ctx)` when it
+-- lands off-tick (Phase 5). With no handler, falls back to the config's
+-- `handlers[method]` then `vim.lsp.handlers[method]`. The handler is registered in
+-- the deferred-callback registry (`vim._cb_fns`), dropped after one fire (no leak).
+-- Returns `true, request_id`; the reply won't arrive if the server exits first
+-- (the same liveness caveat neovim has).
+function vim.lsp._client_request(self, method, params, handler, bufnr)
+  if type(method) ~= "string" then error("client:request: method must be a string", 2) end
+  handler = handler or vim.lsp._resolve_handler(self.name, method)
+  local cb = vim._next_cb_id()
+  local client_id, client_name = self.id, self.name
+  vim._cb_fns[cb] = function(err, result)
+    if handler then
+      handler(err, result, {
+        method = method, client_id = client_id, client_name = client_name, bufnr = bufnr,
+      })
+    end
+  end
+  vim._lsp_client_request(self.id, method, params, cb)
+  return true, cb
+end
+
+-- client:notify(method, params): fire-and-forget a generic LSP notification to
+-- this client's server (Phase 5). Returns true (queued).
+function vim.lsp._client_notify(self, method, params)
+  if type(method) ~= "string" then error("client:notify: method must be a string", 2) end
+  vim._lsp_client_notify(self.id, method, params)
+  return true
+end
+
+-- Build a client table carrying the real request/notify methods. Shared by
+-- `_set_client` (the entry `get_client_by_id`/`on_attach` resolve) and
+-- `get_clients`, so `client:request`/`client:notify` work from every call site.
+function vim.lsp._make_client(id, name, server_capabilities)
+  return {
+    id = id,
+    name = name,
+    server_capabilities = server_capabilities or {},
+    request = vim.lsp._client_request,
+    notify = vim.lsp._client_notify,
+  }
+end
+
 function vim.lsp._set_client(id, name, server_capabilities)
-  vim.lsp._clients[id] = { id = id, name = name, server_capabilities = server_capabilities or {} }
+  vim.lsp._clients[id] = vim.lsp._make_client(id, name, server_capabilities)
 end
 function vim.lsp._remove_client(id) vim.lsp._clients[id] = nil end
 
@@ -1609,13 +1671,12 @@ function vim.lsp._run_on_exit(id, code, signal)
 end
 
 -- vim.lsp.get_clients(filter): the list of active clients, each a
--- `{ id, name, server_capabilities, config, request }` table. `filter` narrows by
--- `id` and/or `name`; a `bufnr` filter is accepted but not honored — nxvim has no
--- Lua-side buffer->client map yet, so it returns the name/id matches across all
--- buffers. `config` is the resolved `vim.lsp.config[name]`. `request` raises via
--- vim._notimpl: real client requests need the async request bridge (Phase 5), and
--- a stub that returned `false` made a config command (e.g. rust_analyzer's
--- `:LspCargoReload`) look like it issued a request when nothing happened.
+-- `{ id, name, server_capabilities, config, request, notify }` table. `filter`
+-- narrows by `id` and/or `name`; a `bufnr` filter is accepted but not honored —
+-- nxvim has no Lua-side buffer->client map yet, so it returns the name/id matches
+-- across all buffers. `config` is the resolved `vim.lsp.config[name]`; `request` /
+-- `notify` are the real Phase-5 client methods (a server-specific command like
+-- rust_analyzer's `:LspCargoReload` issues `client:request` through them).
 -- `get_active_clients` is the deprecated neovim alias, kept for configs that still
 -- call it.
 function vim.lsp.get_clients(filter)
@@ -1623,13 +1684,9 @@ function vim.lsp.get_clients(filter)
   local out = {}
   for id, c in pairs(vim.lsp._clients) do
     if (filter.id == nil or filter.id == id) and (filter.name == nil or filter.name == c.name) then
-      out[#out + 1] = {
-        id = c.id,
-        name = c.name,
-        server_capabilities = c.server_capabilities,
-        config = vim.lsp.config[c.name],
-        request = function() vim._notimpl("vim.lsp.Client:request") end,
-      }
+      local client = vim.lsp._make_client(c.id, c.name, c.server_capabilities)
+      client.config = vim.lsp.config[c.name]
+      out[#out + 1] = client
     end
   end
   return out

@@ -139,6 +139,14 @@ pub enum LspNotify {
     DidClose {
         uri: Url,
     },
+    /// A **generic** notification issued by Lua `client:notify(method, params)`
+    /// (Phase 5): an arbitrary `method` with raw JSON `params`, fire-and-forget
+    /// like the document-sync notes. The `method` must be in the dispatch table
+    /// ([`apply_dyn_notify`]); an unknown one is logged and dropped.
+    Raw {
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 /// A language-feature request the editor fires; its reply returns later as an
@@ -206,6 +214,17 @@ pub enum LspRequest {
     ResolveCodeAction {
         action: Box<CodeAction>,
     },
+    /// A **generic** request issued by Lua `client:request(method, params, …)`
+    /// (Phase 5): an arbitrary `method` with raw JSON `params`, whose raw JSON
+    /// result routes back to a Lua handler ([`LspReply::Raw`]). This is the seam
+    /// the config `handlers` and server-specific commands (`:LspCargoReload`,
+    /// `switchSourceHeader`, organize-imports) build on, distinct from the typed
+    /// native features above. The `method` must be in the dispatch table
+    /// ([`issue_dyn_request`]); an unknown one fails loud rather than no-op.
+    Raw {
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 /// The opaque correlation token the editor issues with a request and the manager
@@ -218,6 +237,11 @@ pub enum LspRequest {
 pub struct ReqToken {
     pub kind: u16,
     pub generation: u64,
+    /// The Lua deferred-callback id ([`vim._cb_fns`]) a generic
+    /// [`LspRequest::Raw`] (Phase 5 `client:request`) routes its reply to; `0` for
+    /// the typed native requests, which dispatch by `kind`/`generation` instead.
+    /// The manager only ferries it, exactly as it does `kind`/`generation`.
+    pub cb_id: u64,
 }
 
 /// The distilled result of an [`LspRequest`]. Each variant is already reduced to
@@ -260,6 +284,12 @@ pub enum LspReply {
     /// The edit a `codeAction/resolve` produced for a lazy action (`None` ⇒ the
     /// resolved action still carried no edit, or the request failed).
     ResolvedCodeAction(Option<WorkspaceEditData>),
+    /// The reply to an [`LspRequest::Raw`] (Phase 5): the server's raw JSON result
+    /// (`Ok`) or an error message (`Err`) — an unsupported method, a transport
+    /// failure, or the server replying an error. Routed back to the Lua handler as
+    /// `(err, result)`, bypassing the editor-feature staleness machinery the typed
+    /// replies use (a config command's reply always fires its handler).
+    Raw(Result<serde_json::Value, String>),
 }
 
 /// A [`WorkspaceEdit`] normalized to per-document text edits: the protocol's
@@ -795,6 +825,13 @@ fn apply_notify(socket: &mut ServerSocket, note: LspNotify, log: &LspLog, name: 
         LspNotify::DidClose { uri } => socket.did_close(DidCloseTextDocumentParams {
             text_document: TextDocumentIdentifier { uri },
         }),
+        // A generic `client:notify` (Phase 5): dispatched by runtime method name
+        // through the notification table. An unknown method is logged and dropped
+        // (a notification has no reply to carry an error back on).
+        LspNotify::Raw { method, params } => {
+            apply_dyn_notify(socket, &method, params, log, name);
+            return;
+        }
     };
 }
 
@@ -949,7 +986,184 @@ async fn issue_request(
                 LspReply::ResolvedCodeAction(None)
             }
         },
+        // A generic `client:request` (Phase 5): dispatched by runtime method name
+        // through the request table, raw JSON in and out. Unlike the typed
+        // requests above, a failure is surfaced to the Lua handler as an `Err`
+        // string (not degraded to an empty result) — the config command that
+        // issued it decides what to do.
+        LspRequest::Raw { method, params } => {
+            LspReply::Raw(issue_dyn_request(sock, &method, params, log, name).await)
+        }
     }
+}
+
+/// Issue a generic, runtime-method request and return its raw JSON result (`Ok`)
+/// or an error message (`Err`) for the Lua handler.
+///
+/// async-lsp's [`ServerSocket::request`] is generic over a compile-time
+/// [`lsp_types::request::Request`] whose `METHOD` is a `const &'static str`, so a
+/// truly arbitrary runtime method can't be sent through it directly. The
+/// [`dyn_requests!`] macro bridges that gap: it generates one zero-sized
+/// `Request` type per supported method (all uniform `serde_json::Value` in and
+/// out, since the editor only relays the JSON to/from Lua) and a runtime `match`
+/// on the method string. An **unknown** method fails loud — it returns an `Err`
+/// the handler receives rather than silently no-op'ing — and is a one-line table
+/// addition away from being supported.
+async fn issue_dyn_request(
+    sock: &mut ServerSocket,
+    method: &str,
+    params: serde_json::Value,
+    log: &LspLog,
+    name: &str,
+) -> Result<serde_json::Value, String> {
+    let result = issue_dyn_request_inner(sock, method, params).await;
+    if let Err(e) = &result {
+        log.log(
+            LogLevel::Warn,
+            name,
+            &format!("client:request {method}: {e}"),
+        );
+    }
+    result
+}
+
+/// Generate the request dispatch table: one `Request` impl per `method => Type`
+/// row (raw JSON params/result) and the runtime `match` that issues it. Standard
+/// LSP methods and server-specific ones (`rust-analyzer/*`, clangd's
+/// `switchSourceHeader`, …) live side by side — they only differ by the method
+/// string. Add a method by adding a row.
+macro_rules! dyn_requests {
+    ($($method:literal => $ty:ident),* $(,)?) => {
+        $(
+            #[allow(non_camel_case_types)]
+            enum $ty {}
+            impl lsp_types::request::Request for $ty {
+                type Params = serde_json::Value;
+                type Result = serde_json::Value;
+                const METHOD: &'static str = $method;
+            }
+        )*
+        async fn issue_dyn_request_inner(
+            sock: &mut ServerSocket,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            match method {
+                $( $method => sock.request::<$ty>(params).await.map_err(|e| e.to_string()), )*
+                other => Err(format!(
+                    "nxvim: client:request: unsupported method '{other}' \
+                     (add it to dyn_requests! in nxvim-lsp/src/manager.rs)"
+                )),
+            }
+        }
+    };
+}
+
+/// Generate the notification dispatch table — the fire-and-forget twin of
+/// [`dyn_requests!`].
+macro_rules! dyn_notifications {
+    ($($method:literal => $ty:ident),* $(,)?) => {
+        $(
+            #[allow(non_camel_case_types)]
+            enum $ty {}
+            impl lsp_types::notification::Notification for $ty {
+                type Params = serde_json::Value;
+                const METHOD: &'static str = $method;
+            }
+        )*
+        /// Send a generic `client:notify` by runtime method name. An unknown
+        /// method is logged and dropped (a notification carries no reply).
+        fn apply_dyn_notify(
+            sock: &mut ServerSocket,
+            method: &str,
+            params: serde_json::Value,
+            log: &LspLog,
+            name: &str,
+        ) {
+            match method {
+                $( $method => { let _ = sock.notify::<$ty>(params); } )*
+                other => log.log(
+                    LogLevel::Warn,
+                    name,
+                    &format!("client:notify: unsupported method '{other}'"),
+                ),
+            }
+        }
+    };
+}
+
+// The supported generic-request methods. Every standard LSP request the editor
+// doesn't already drive through a typed [`LspRequest`], plus the server-specific
+// methods the headline configs reach for via `client:request`. All are relayed
+// as raw JSON, so a row is just `"<method>" => <unique-type-name>`.
+dyn_requests! {
+    "workspace/executeCommand" => req_workspace_executeCommand,
+    "workspace/symbol" => req_workspace_symbol,
+    "workspaceSymbol/resolve" => req_workspaceSymbol_resolve,
+    "workspace/willCreateFiles" => req_workspace_willCreateFiles,
+    "workspace/willRenameFiles" => req_workspace_willRenameFiles,
+    "workspace/willDeleteFiles" => req_workspace_willDeleteFiles,
+    "textDocument/documentSymbol" => req_textDocument_documentSymbol,
+    "textDocument/documentHighlight" => req_textDocument_documentHighlight,
+    "textDocument/documentLink" => req_textDocument_documentLink,
+    "documentLink/resolve" => req_documentLink_resolve,
+    "textDocument/foldingRange" => req_textDocument_foldingRange,
+    "textDocument/selectionRange" => req_textDocument_selectionRange,
+    "textDocument/prepareCallHierarchy" => req_textDocument_prepareCallHierarchy,
+    "callHierarchy/incomingCalls" => req_callHierarchy_incomingCalls,
+    "callHierarchy/outgoingCalls" => req_callHierarchy_outgoingCalls,
+    "textDocument/prepareTypeHierarchy" => req_textDocument_prepareTypeHierarchy,
+    "typeHierarchy/supertypes" => req_typeHierarchy_supertypes,
+    "typeHierarchy/subtypes" => req_typeHierarchy_subtypes,
+    "textDocument/semanticTokens/full" => req_textDocument_semanticTokens_full,
+    "textDocument/semanticTokens/full/delta" => req_textDocument_semanticTokens_full_delta,
+    "textDocument/semanticTokens/range" => req_textDocument_semanticTokens_range,
+    "textDocument/inlayHint" => req_textDocument_inlayHint,
+    "inlayHint/resolve" => req_inlayHint_resolve,
+    "textDocument/codeLens" => req_textDocument_codeLens,
+    "codeLens/resolve" => req_codeLens_resolve,
+    "textDocument/documentColor" => req_textDocument_documentColor,
+    "textDocument/colorPresentation" => req_textDocument_colorPresentation,
+    "textDocument/linkedEditingRange" => req_textDocument_linkedEditingRange,
+    "textDocument/moniker" => req_textDocument_moniker,
+    "textDocument/prepareRename" => req_textDocument_prepareRename,
+    "textDocument/rangeFormatting" => req_textDocument_rangeFormatting,
+    "textDocument/onTypeFormatting" => req_textDocument_onTypeFormatting,
+    "completionItem/resolve" => req_completionItem_resolve,
+    // The typed native features are also reachable generically, for a config that
+    // routes them through `client:request` (e.g. a custom `handlers` entry).
+    "textDocument/definition" => req_textDocument_definition,
+    "textDocument/declaration" => req_textDocument_declaration,
+    "textDocument/typeDefinition" => req_textDocument_typeDefinition,
+    "textDocument/implementation" => req_textDocument_implementation,
+    "textDocument/references" => req_textDocument_references,
+    "textDocument/hover" => req_textDocument_hover,
+    "textDocument/signatureHelp" => req_textDocument_signatureHelp,
+    "textDocument/completion" => req_textDocument_completion,
+    "textDocument/formatting" => req_textDocument_formatting,
+    "textDocument/rename" => req_textDocument_rename,
+    "textDocument/codeAction" => req_textDocument_codeAction,
+    "codeAction/resolve" => req_codeAction_resolve,
+    // Server-specific methods the headline configs drive via `client:request`.
+    "rust-analyzer/reloadWorkspace" => req_rustAnalyzer_reloadWorkspace,
+    "rust-analyzer/expandMacro" => req_rustAnalyzer_expandMacro,
+    "rust-analyzer/analyzerStatus" => req_rustAnalyzer_analyzerStatus,
+    "rust-analyzer/viewSyntaxTree" => req_rustAnalyzer_viewSyntaxTree,
+    "rust-analyzer/openCargoToml" => req_rustAnalyzer_openCargoToml,
+    "experimental/externalDocs" => req_experimental_externalDocs,
+    "textDocument/switchSourceHeader" => req_textDocument_switchSourceHeader,
+}
+
+// The supported generic-notification methods.
+dyn_notifications! {
+    "$/setTrace" => notif_setTrace,
+    "$/cancelRequest" => notif_cancelRequest,
+    "window/workDoneProgress/cancel" => notif_window_workDoneProgress_cancel,
+    "workspace/didChangeWatchedFiles" => notif_workspace_didChangeWatchedFiles,
+    "workspace/didChangeWorkspaceFolders" => notif_workspace_didChangeWorkspaceFolders,
+    "workspace/didCreateFiles" => notif_workspace_didCreateFiles,
+    "workspace/didRenameFiles" => notif_workspace_didRenameFiles,
+    "workspace/didDeleteFiles" => notif_workspace_didDeleteFiles,
 }
 
 /// The `FormattingOptions` for `textDocument/formatting`. nxvim has no
@@ -1278,6 +1492,7 @@ fn describe_request(req: &LspRequest) -> String {
         LspRequest::ResolveCodeAction { action } => {
             return format!("→ codeAction/resolve '{}'", action.title)
         }
+        LspRequest::Raw { method, .. } => return format!("→ {method} (client:request)"),
     };
     format!("→ {label} @ {}:{}", pos.line, pos.character)
 }
@@ -1293,6 +1508,7 @@ fn describe_notify(note: &LspNotify) -> String {
         } => format!("→ didChange v{version} ({} change(s))", changes.len()),
         LspNotify::DidSave { .. } => "→ didSave".to_string(),
         LspNotify::DidClose { .. } => "→ didClose".to_string(),
+        LspNotify::Raw { method, .. } => format!("→ {method} (client:notify)"),
     }
 }
 

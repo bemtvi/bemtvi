@@ -257,7 +257,7 @@ one-message-at-a-time invariant.
 
 ---
 
-## Phase 5 — Real `client:request` + response handlers ⬜
+## Phase 5 — Real `client:request` + response handlers ✅
 
 **Goal.** `client:request(method, params, handler, bufnr)` issues a real LSP
 request and routes the response back to the Lua `handler` — enabling
@@ -287,10 +287,37 @@ callback queue. Wire config `handlers[method]` into the response path.
 > so a handler that defers via `vim.cmd`/`vim.schedule` is driven to convergence
 > off-tick — the gap this plan closed.
 
-**Tests.** A round-trip request to a mock server returns a result to the Lua
-handler; a config command that issues a request works end-to-end.
+**Tests.** ✅ `client_request_round_trips_a_custom_method` (request reaches the
+server with its params; the JSON result reaches the Lua handler off-tick),
+`client_request_unsupported_method_fails_loud` (an unknown method sets the
+handler's `err` and never reaches the server),
+`client_notify_reaches_the_server` (a generic notification arrives with its
+params) — all in `crates/nxvim/tests/lsp.rs`, driven through the scripted mock's
+new `custom_replies` field.
 
-**Done when.** `client:request` and `handlers` work against a real/mock server.
+**Done when.** ✅ `client:request(method, params, handler, bufnr)` and
+`client:notify(method, params)` are real on every client table (`get_client_by_id`
+/ `on_attach`'s client and `get_clients`), routing through
+`LspOp::ClientRequest`/`ClientNotify` → `LspRequest::Raw`/`LspNotify::Raw` →
+`LspReply::Raw` → `CallbackArgs::LspReply` → the handler `(err, result, ctx)`. A
+no-explicit-handler request falls back to the config's `handlers[method]` then
+`vim.lsp.handlers[method]`. The reply's `cb_id` rides on `ReqToken` (0 for the
+typed native requests); raw replies bypass the cursor/buffer staleness machinery.
+The `:request` `_notimpl` stub in `get_clients` is gone.
+
+*The async-lsp dynamic-method constraint.* async-lsp 0.2.4's `ServerSocket::request`
+is generic over a compile-time `lsp_types::request::Request` whose `METHOD` is a
+`const &'static str`, so a truly arbitrary runtime method can't be sent through
+its public API (the outgoing-request channel is private; no raw/dyn entry exists,
+and the pinned offline dep can't be bumped). The `dyn_requests!` / `dyn_notifications!`
+macros in `crates/nxvim-lsp/src/manager.rs` bridge it: one zero-sized `Request`/
+`Notification` type per supported method (all uniform `serde_json::Value` in and
+out, since the editor only relays JSON to/from Lua) plus a runtime `match` on the
+method string. The table covers every standard LSP method plus the named
+server-specific ones (`rust-analyzer/*`, clangd `switchSourceHeader`, …); an
+**unknown** method fails loud (the handler's `err` names it) and is a one-line
+table addition away from support. This is the one deliberate approximation versus
+"any arbitrary method," consistent with the no-silent-stubs rule.
 
 **Depends on.** Phase 4 (callback queue).
 

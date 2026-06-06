@@ -49,6 +49,9 @@
 //!   ⇒ `null` (no actions).
 //! - `code_action_resolve`: the resolved `CodeAction` (with its `edit` filled in)
 //!   returned for `codeAction/resolve`. Absent ⇒ `null`.
+//! - `custom_replies`: a `{ method: result }` map scripting the reply to an
+//!   otherwise-unhandled request — the generic `client:request` path (Phase 5).
+//!   A method not in the map falls back to a `null` result.
 //! - `reply_delay_ms`: milliseconds the mock sleeps before sending each scripted
 //!   request *reply* (definition/hover/formatting/…), so a test can edit the
 //!   buffer before the reply lands and prove the editor's stale-drop (e.g. the
@@ -147,10 +150,17 @@ pub fn run(script_path: &str) {
                 }
             }
             // Any other request must be answered or the client would wait forever;
-            // notifications need no reply.
+            // notifications need no reply. A `custom_replies` map (method ->
+            // result) scripts the answer to a generic `client:request` (Phase 5);
+            // an unscripted method falls back to `null`.
             _ => {
                 if let Some(id) = id {
-                    write_response(&stdout, id, Value::Null);
+                    let result = script
+                        .get("custom_replies")
+                        .and_then(|m| m.get(method))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    write_response(&stdout, id, result);
                 }
             }
         }

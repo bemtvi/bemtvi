@@ -1,0 +1,372 @@
+-- nxvim Lua prelude — Lua-side API registries.
+-- User-command and autocmd registration kept purely in Lua (the vim._fire dispatcher the server reads back), plus the callable-and-indexable vim.cmd.
+-- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
+-- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
+
+local vim = vim
+
+-- ----- API surface stored purely in Lua --------------------------------------
+-- Registration that needn't touch the editor lives in Lua tables; the server
+-- reads them when it must (e.g. dispatching a user command typed as `:Foo`).
+
+vim._user_commands = vim._user_commands or {}
+vim._autocmds = vim._autocmds or {}
+vim._augroups = vim._augroups or {}
+local augroup_seq, autocmd_seq = 0, 0
+
+-- vim._cur_buf: the current-buffer snapshot the server refreshes (via
+-- vim._set_cur_buf) immediately before firing a buffer/mode autocmd, so a
+-- callback can resolve "the buffer that fired" — nvim_buf_get_name(0) and
+-- expand('%') read it. An interim until a real per-bufnr registry exists; with
+-- the core single-message-at-a-time it can't go stale mid-dispatch.
+vim._cur_buf = vim._cur_buf or { bufnr = 0, name = "", filetype = "" }
+
+function vim._set_cur_buf(bufnr, name, filetype)
+  vim._cur_buf = { bufnr = bufnr or 0, name = name or "", filetype = filetype or "" }
+end
+
+-- vim._bufs / vim._cur_cursor / vim._cur_win: the Rust→Lua buffer mirror the
+-- buffer-read API (Phase 6) resolves against. The server refreshes it via
+-- vim._set_buf_mirror before running any Lua that can read buffer or cursor
+-- state, so nvim_buf_get_lines / nvim_win_get_cursor / nvim_buf_is_loaded read
+-- live data without reaching the Server. vim._bufs[bufnr] = { lines, name,
+-- loaded }; nvim_buf_set_lines write-through mutates `lines` here directly so a
+-- read-after-write within one chunk stays consistent (the real buffer catches up
+-- when the server drains the queued BufOp).
+vim._bufs = vim._bufs or {}
+vim._cur_cursor = vim._cur_cursor or { row = 1, col = 0 }
+vim._cur_win = vim._cur_win or 1000
+-- Per-buffer option store backing vim.bo / nvim_set_option_value (Phase 6); the
+-- table is created here so the earlier-defined setter can index it safely.
+vim._bo_store = vim._bo_store or {}
+
+function vim._set_buf_mirror(entries, row, col, win)
+  -- The server omits `lines` for a buffer whose changedtick is unchanged (the
+  -- cheap cursor-moved-no-edit path); keep the prior `lines` in that case.
+  for bufnr, entry in pairs(entries) do
+    if entry.lines == nil then
+      local prev = vim._bufs[bufnr]
+      if prev then entry.lines = prev.lines end
+    end
+    entry.loaded = true
+  end
+  vim._bufs = entries
+  vim._cur_cursor = { row = row or 1, col = col or 0 }
+  vim._cur_win = win or 1000
+end
+
+-- Resolve a buffer handle to a concrete bufnr (0 / nil -> current buffer), the
+-- one place the buffer-read API maps neovim's "0 means current" convention.
+function vim._resolve_bufnr(bufnr)
+  if bufnr == nil or bufnr == 0 then return (vim._cur_buf or {}).bufnr or 0 end
+  return bufnr
+end
+
+-- Normalize a neovim line index against a buffer of `n` real lines, shared by
+-- nvim_buf_get_lines and nvim_buf_set_lines (and mirrored on the Rust side so the
+-- write-through and the real apply can't disagree): negatives count from the end
+-- (`-1` == one past the last line), then clamp into [0, n]. `strict` raises on an
+-- out-of-range index instead of clamping (neovim's strict_indexing).
+function vim._norm_line_index(i, n, strict)
+  local orig = i
+  if i < 0 then i = n + i + 1 end
+  if strict and (orig > n or i < 0) then
+    error("Index out of bounds", 3)
+  end
+  if i < 0 then i = 0 elseif i > n then i = n end
+  return i
+end
+
+function vim.api.nvim_create_user_command(name, command, _opts)
+  vim._user_commands[name] = command
+end
+
+-- nvim_buf_create_user_command(buffer, name, command, opts): in neovim this
+-- registers a *buffer-local* command; nxvim has no per-buffer command registry
+-- yet, so it registers globally (the buffer scope is ignored). Enough for an
+-- `on_attach` that defines a convenience command (e.g. rust_analyzer's
+-- `:LspCargoReload`) to load without error.
+-- INCOMPLETE: `buffer` is ignored — the command exists everywhere, not only in
+-- its buffer. A per-buffer command registry (the analogue of the buffer-local
+-- keymap scoping `vim._keymaps` already does) is the fix.
+function vim.api.nvim_buf_create_user_command(_buffer, name, command, _opts)
+  vim._user_commands[name] = command
+end
+
+-- nvim_create_augroup(name[, {clear=…}]): define (or look up) an augroup. When
+-- the group already exists and `clear` is set (the default), its autocmds are
+-- removed first — so re-sourcing a config that recreates its groups doesn't
+-- double-register. The group id is stable across recreation (callers store it
+-- and pass it as `opts.group` to nvim_create_autocmd).
+function vim.api.nvim_create_augroup(name, opts)
+  opts = opts or {}
+  local clear = opts.clear ~= false -- absent → clear, matching neovim's default
+  local id = vim._augroups[name]
+  if id and clear then
+    vim._autocmds = vim.tbl_filter(function(au) return au.group ~= id end, vim._autocmds)
+  end
+  if not id then
+    augroup_seq = augroup_seq + 1
+    id = augroup_seq
+    vim._augroups[name] = id
+  end
+  return id
+end
+
+-- nvim_create_autocmd(event, opts): register a callback/command for `event`.
+-- `opts.group` (numeric id or augroup name) ties it to a group so a later
+-- `clear` can drop it; `opts.buffer` makes it buffer-local (only fires for that
+-- buffer; 0 resolves to the current snapshot buffer at registration time).
+function vim.api.nvim_create_autocmd(event, opts)
+  opts = opts or {}
+  autocmd_seq = autocmd_seq + 1
+  local group = opts.group
+  if type(group) == "string" then group = vim._augroups[group] end
+  local buffer = opts.buffer
+  if buffer == 0 then buffer = vim._cur_buf and vim._cur_buf.bufnr or 0 end
+  vim._autocmds[#vim._autocmds + 1] =
+    { id = autocmd_seq, event = event, opts = opts, group = group, buffer = buffer }
+  return autocmd_seq
+end
+
+-- nvim_del_autocmd(id): remove the autocmd with this id, so it stops firing.
+function vim.api.nvim_del_autocmd(id)
+  vim._autocmds = vim.tbl_filter(function(au) return au.id ~= id end, vim._autocmds)
+end
+
+-- Fire the registered autocmds for `event` whose pattern matches `pattern`,
+-- with optional buffer context. Called from Rust (LuaRuntime::fire_autocmd*)
+-- when the editor triggers an event, and from nvim_exec_autocmds. A function
+-- handler runs with the callback args table `{id, event, match, buf, file}`; a
+-- string `command` is queued as an ex-command. Match rules: event equals (or is
+-- in) the registered event; pattern is nil/"*", equals `pattern`, or is in the
+-- registered pattern list; a buffer-local autocmd only fires for its `buffer`.
+-- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
+-- case `file` falls back to `pattern` (the old behavior). `data` is the optional
+-- `args.data` payload (LspAttach/LspDetach carry `{ client_id = … }`); nil otherwise.
+function vim._fire(event, pattern, buf, file, data)
+  for _, au in ipairs(vim._autocmds) do
+    local ev = au.event
+    local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
+    if ev_ok then
+      local pat = au.opts.pattern
+      local pat_ok = pat == nil or pat == "*" or pat == pattern
+        or (type(pat) == "table" and vim.tbl_contains(pat, pattern))
+      local buf_ok = au.buffer == nil or au.buffer == buf
+      if pat_ok and buf_ok then
+        local cb = au.opts.callback
+        if type(cb) == "function" then
+          cb({ id = au.id, event = event, match = pattern, buf = buf, file = file or pattern, data = data })
+        elseif type(au.opts.command) == "string" then
+          vim.cmd(au.opts.command)
+        end
+      end
+    end
+  end
+end
+
+-- nvim_exec_autocmds(event, opts): fire `event` (or a list of events) manually.
+-- `opts.pattern` (string or list) is matched as in registration; `opts.buffer`
+-- supplies the buffer context (defaulting to the current snapshot buffer), and
+-- the callback's `args.file` is the snapshot name when firing for it.
+function vim.api.nvim_exec_autocmds(event, opts)
+  opts = opts or {}
+  local events = type(event) == "table" and event or { event }
+  local buf = opts.buffer
+  if buf == nil then buf = vim._cur_buf and vim._cur_buf.bufnr or nil end
+  local file
+  if vim._cur_buf and buf == vim._cur_buf.bufnr then file = vim._cur_buf.name end
+  local patterns = opts.pattern
+  for _, ev in ipairs(events) do
+    if type(patterns) == "table" then
+      for _, p in ipairs(patterns) do vim._fire(ev, p, buf, file) end
+    else
+      vim._fire(ev, patterns, buf, file)
+    end
+  end
+end
+
+-- nvim_get_autocmds(opts): introspect the registered autocmds — a debugging
+-- affordance for confirming what `clear`/`del` left behind. Returns a list of
+-- `{id, event, group, group_name, pattern, buffer, command}` entries, optionally
+-- filtered by `opts.event` (string or list) and `opts.group` (id or name). Run
+-- it interactively as `:lua print(vim.inspect(vim.api.nvim_get_autocmds({})))`.
+function vim.api.nvim_get_autocmds(opts)
+  opts = opts or {}
+  local want_events = opts.event and (type(opts.event) == "table" and opts.event or { opts.event })
+  local want_group = opts.group
+  if type(want_group) == "string" then want_group = vim._augroups[want_group] end
+  -- reverse map: group id → its registered name, for human-readable output
+  local group_name = {}
+  for nm, id in pairs(vim._augroups) do group_name[id] = nm end
+  local out = {}
+  for _, au in ipairs(vim._autocmds) do
+    -- match if any requested event is among the autocmd's events
+    local ev_ok = true
+    if want_events then
+      ev_ok = false
+      local evs = type(au.event) == "table" and au.event or { au.event }
+      for _, w in ipairs(want_events) do
+        if vim.tbl_contains(evs, w) then ev_ok = true break end
+      end
+    end
+    local group_ok = want_group == nil or au.group == want_group
+    if ev_ok and group_ok then
+      out[#out + 1] = {
+        id = au.id,
+        event = au.event,
+        group = au.group,
+        group_name = au.group and group_name[au.group] or nil,
+        pattern = au.opts.pattern,
+        buffer = au.buffer,
+        command = type(au.opts.command) == "string" and au.opts.command or nil,
+      }
+    end
+  end
+  return out
+end
+
+-- nvim_buf_get_name(bufnr): the snapshot buffer's name when `bufnr` is 0/nil or
+-- matches the snapshot, else "". Snapshot-backed (vim._cur_buf) as an interim
+-- until a real per-bufnr registry exists. (A separate, core-backed
+-- nvim_buf_get_name *RPC* method serves remote clients; this is the in-VM Lua
+-- binding autocmd callbacks reach for.)
+function vim.api.nvim_buf_get_name(bufnr)
+  local cur = vim._cur_buf or { bufnr = 0, name = "" }
+  if bufnr == nil or bufnr == 0 or bufnr == cur.bufnr then return cur.name end
+  return ""
+end
+
+-- A few more vim.api the configs touch. `nvim_get_current_buf` resolves against
+-- the single-buffer snapshot (faithful: it returns the real current buffer). The
+-- window/cursor/line-access getters (Phase 6) read the `vim._bufs` / `vim._cur_*`
+-- mirror the server refreshes before running Lua, so they return live state, and
+-- `nvim_buf_set_lines` write-through updates the mirror then queues the real edit.
+-- (`nvim_create_augroup`/`_autocmd`/`nvim_buf_get_name`/`nvim_echo` are the real,
+-- behavior-carrying ones, defined elsewhere.)
+function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
+
+-- Single-window nxvim: one window handle, and the cursor is the editor cursor.
+-- INCOMPLETE: `win` is ignored (handle 1000 is the only window). Faithful once
+-- nxvim grows a window layout tree; until then a config that targets a specific
+-- window gets the current cursor regardless of which handle it passed.
+function vim.api.nvim_get_current_win() return vim._cur_win or 1000 end
+function vim.api.nvim_win_get_cursor(_win)
+  local c = vim._cur_cursor or { row = 1, col = 0 }
+  return { c.row, c.col }
+end
+
+function vim.api.nvim_buf_is_loaded(bufnr)
+  return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil
+end
+
+function vim.api.nvim_buf_get_lines(bufnr, start, end_, strict)
+  local buf = vim._bufs[vim._resolve_bufnr(bufnr)]
+  if not buf or not buf.lines then
+    if strict then error("Invalid buffer id", 2) end
+    return {}
+  end
+  local lines = buf.lines
+  local n = #lines
+  local s = vim._norm_line_index(start, n, strict)
+  local e = vim._norm_line_index(end_, n, strict)
+  if e < s then e = s end
+  local out = {}
+  for i = s + 1, e do
+    out[#out + 1] = lines[i]
+  end
+  return out
+end
+
+-- INCOMPLETE: can't produce a buffer without a final newline — `normalize()`
+-- always re-adds the trailing phantom `\n` (no `nofixeol`). Each call is also its
+-- own undo step (no `undojoin` coalescing), so a plugin issuing many small edits
+-- leaves many undo entries. Faithful once the core models `nofixeol`/`undojoin`.
+function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
+  local id = vim._resolve_bufnr(bufnr)
+  local buf = vim._bufs[id]
+  if not buf or not buf.lines then
+    if strict then error("Invalid buffer id", 2) end
+    return
+  end
+  local lines = buf.lines
+  local n = #lines
+  local s = vim._norm_line_index(start, n, strict)
+  local e = vim._norm_line_index(end_, n, strict)
+  if e < s then e = s end
+  -- Write-through: splice the mirror so a read-after-write within this chunk is
+  -- consistent, then queue the real edit (the server re-derives the byte range).
+  local updated = {}
+  for i = 1, s do updated[#updated + 1] = lines[i] end
+  for i = 1, #repl do updated[#updated + 1] = repl[i] end
+  for i = e + 1, n do updated[#updated + 1] = lines[i] end
+  buf.lines = updated
+  vim._buf_set_lines(id, start, end_, repl)
+end
+
+-- nvim_set_option_value(name, value, opts): set a (buffer-local) option. opts.buf
+-- targets a specific buffer; otherwise the current buffer. Backed by the same
+-- per-buffer store as vim.bo (observable, see the note there).
+function vim.api.nvim_set_option_value(name, value, opts)
+  opts = opts or {}
+  local buf = opts.buf and vim._resolve_bufnr(opts.buf) or vim._resolve_bufnr(0)
+  vim._bo_store[buf] = vim._bo_store[buf] or {}
+  vim._bo_store[buf][name] = value
+end
+
+-- vim.fn.expand: the `%` (current file) forms autocmd callbacks use to resolve
+-- paths, backed by the snapshot. Supports `%`, `%:p` (absolute — for the first
+-- cut the stored path is taken as-is), `%:h` (head/dir), `%:t` (tail/basename),
+-- and `%:p:h`. Unknown expressions return the stored name unchanged.
+function vim.fn.expand(expr)
+  local cur = vim._cur_buf or { bufnr = 0, name = "" }
+  local name = cur.name or ""
+  if expr == "%" or expr == "%:p" then
+    return name
+  elseif expr == "%:h" or expr == "%:p:h" then
+    return name:match("^(.*)/[^/]*$") or ""
+  elseif expr == "%:t" then
+    return name:match("[^/]*$") or name
+  end
+  return name
+end
+
+-- vim.api.nvim_set_hl is installed from Rust (it captures the group definition
+-- for the server to fold into the core highlight registry), so it is not
+-- (re)defined here — doing so would shadow the Rust-backed version.
+
+-- ----- vim.cmd: callable AND indexable ---------------------------------------
+-- vim.cmd("…") queues a raw ex-command (the Rust function installed earlier);
+-- vim.cmd.colorscheme("x") / vim.cmd.set("number") build "<name> <args…>".
+do
+  local raw_cmd = vim.cmd
+  -- An <expr> mapping RHS must not change editor state (textlock): while
+  -- vim._expr_lock is set, running an ex-command raises instead of mutating.
+  local function raw(c)
+    if vim._expr_lock then
+      error("E5555: <expr> mapping must not change the editor (vim.cmd is blocked)", 0)
+    end
+    return raw_cmd(c)
+  end
+  local function build(name, ...)
+    local first = ...
+    if type(first) == "table" then
+      local s = name
+      if first.bang then s = s .. "!" end
+      if first.args then s = s .. " " .. table.concat(first.args, " ") end
+      return raw(s)
+    end
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    local s = name
+    if #parts > 0 then s = s .. " " .. table.concat(parts, " ") end
+    return raw(s)
+  end
+  vim.cmd = setmetatable({}, {
+    __call = function(_, c) return raw(c) end,
+    __index = function(_, name)
+      return function(...) return build(name, ...) end
+    end,
+  })
+end
+

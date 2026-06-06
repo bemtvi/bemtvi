@@ -30,7 +30,7 @@ The per-function list is **generated from the code, not maintained here**:
 grep -rn 'INCOMPLETE:' crates/
 
 # Loud "not implemented" gaps — the call sites:
-grep -rn 'vim\._notimpl(' crates/nxvim-lua/src/prelude.lua
+grep -rn 'vim\._notimpl(' crates/nxvim-lua/src/prelude/
 ```
 
 At runtime, every loud gap a real config trips is recorded in the

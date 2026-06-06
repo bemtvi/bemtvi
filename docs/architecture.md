@@ -431,7 +431,7 @@ the very same API functions remote clients invoke (`Lua → API → core`).
 for tests), seeds `package.path` from it so `require` resolves plugin modules,
 and sources `<config>/init.lua` at startup — before the first frame. The `vim.*`
 surface real plugins reach for is provided as a bundled **Lua prelude**
-(`nxvim-lua/src/prelude.lua`, the analogue of neovim's `runtime/lua/vim/`):
+(the `nxvim-lua/src/prelude/` modules, the analogue of neovim's `runtime/lua/vim/`):
 `vim.tbl_*`, `vim.split`, `vim.inspect`, `vim.g`/`vim.o`/`vim.opt`/`vim.env`,
 `vim.notify`, `vim.log`, user commands, and autocmds; FS/env-touching helpers
 (`vim.fn.stdpath`/`getftime`/`mkdir`, …) are Rust-backed. `:colorscheme <name>`

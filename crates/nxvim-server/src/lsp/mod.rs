@@ -1,0 +1,547 @@
+//! Server-side LSP integration: the `treesitter.rs` analogue for language
+//! servers.
+//!
+//! Where `nxvim-lsp` owns the client machinery (spawning/supervising servers and
+//! the JSON-RPC bridge), this module owns the *editor* half. It is split by
+//! concern across submodules: [`sync`] (document sync + server lifecycle),
+//! [`diagnostics`], [`request`] (language-feature requests/replies),
+//! [`completion`] (the insert-mode popup), and [`edit`] (buffer-mutating
+//! features). This file holds the shared types, the request-kind enum, and the
+//! pure conversion/formatting helpers the submodules draw on.
+//!
+//! All [`Server`] methods here run on the single editor thread and only ever
+//! hand the manager fire-and-forget notifications, so a slow or hung server can
+//! never stall keystroke->buffer->redraw.
+
+use std::path::{Path, PathBuf};
+
+use nxvim_core::unicode;
+use nxvim_core::{Buffer, BufferEdit, BufferId};
+use nxvim_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent,
+    TextDocumentSyncKind, Url,
+};
+use nxvim_lsp::{CompletionItemData, PositionEncoding, ProviderCaps, ServerKey, ServerSpawn};
+use nxvim_lua::{DiagnosticData, LspServerCapabilities};
+
+mod completion;
+mod diagnostics;
+mod edit;
+mod request;
+mod sync;
+
+/// One per-line jump target for a navigable LSP panel (diagnostics, references,
+/// …), handed to [`nxvim_core::Editor::set_panel_targets`]: `Some((path, 0-based
+/// line, 0-based **byte** column))` — the LSP character already converted through
+/// the negotiated encoding — or `None` for a non-navigable line. Indexed in
+/// lockstep with the panel's lines, and retained in the `:panelopen` snapshot.
+pub(crate) type PanelTarget = Option<(PathBuf, usize, usize)>;
+
+/// Per-buffer LSP document-sync bookkeeping, mirroring `SyntaxState`. One per
+/// open buffer that mapped to a configured server, keyed by [`BufferId`] in
+/// [`Server::lsp_states`].
+#[derive(Default)]
+pub(crate) struct LspDocState {
+    /// Which server owns this buffer (`None` until a `vim.lsp.start` binds one).
+    server: Option<ServerKey>,
+    /// The LSP `languageId` for `didOpen` — the buffer's filetype, set when the
+    /// `vim.lsp.enable` dispatcher binds the buffer (no longer re-derived in sync).
+    language_id: String,
+    /// The document URI, kept so `didClose` can be sent after the buffer is gone.
+    uri: Option<Url>,
+    /// Has `didOpen` been sent for the current server instance?
+    opened: bool,
+    /// LSP document version (monotonic, bumped per `didChange`).
+    version: i32,
+    /// `changedtick` of the last sync we sent (drives `didChange`).
+    last_tick: u64,
+    /// `save_tick` of the last sync, mirrored to fire `didSave` exactly when the
+    /// buffer is written (`save_tick` bumps only on a successful `:w`).
+    last_save_tick: u64,
+    /// Latest `publishDiagnostics` for this buffer, projected into the redraw
+    /// (`diagnostics_for`) and the under-cursor message line.
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Which language-feature request a [`ReqToken`] / [`PendingLspReq`] belongs to.
+/// The numeric mapping is what rides in the token's `kind` field across the
+/// manager and back; the editor owns its meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LspReqKind {
+    Definition,
+    Declaration,
+    TypeDefinition,
+    Implementation,
+    References,
+    Hover,
+    SignatureHelp,
+    Completion,
+    Formatting,
+    Rename,
+    CodeAction,
+    ResolveCodeAction,
+    CompletionResolve,
+}
+
+impl LspReqKind {
+    pub(crate) fn as_u16(self) -> u16 {
+        match self {
+            LspReqKind::Definition => 0,
+            LspReqKind::Declaration => 1,
+            LspReqKind::TypeDefinition => 2,
+            LspReqKind::Implementation => 3,
+            LspReqKind::References => 4,
+            LspReqKind::Hover => 5,
+            LspReqKind::SignatureHelp => 6,
+            LspReqKind::Completion => 7,
+            LspReqKind::Formatting => 8,
+            LspReqKind::Rename => 9,
+            LspReqKind::CodeAction => 10,
+            LspReqKind::ResolveCodeAction => 11,
+            LspReqKind::CompletionResolve => 12,
+        }
+    }
+
+    pub(crate) fn from_u16(value: u16) -> Option<Self> {
+        Some(match value {
+            0 => LspReqKind::Definition,
+            1 => LspReqKind::Declaration,
+            2 => LspReqKind::TypeDefinition,
+            3 => LspReqKind::Implementation,
+            4 => LspReqKind::References,
+            5 => LspReqKind::Hover,
+            6 => LspReqKind::SignatureHelp,
+            7 => LspReqKind::Completion,
+            8 => LspReqKind::Formatting,
+            9 => LspReqKind::Rename,
+            10 => LspReqKind::CodeAction,
+            11 => LspReqKind::ResolveCodeAction,
+            12 => LspReqKind::CompletionResolve,
+            _ => return None,
+        })
+    }
+
+    /// Whether results always go to a panel location list (references) rather
+    /// than jumping a lone result directly (the goto family).
+    pub(crate) fn is_list(self) -> bool {
+        matches!(self, LspReqKind::References)
+    }
+
+    /// The message shown when the server returns no result. The location-list
+    /// kinds phrase it as "found"; hover/signatureHelp have their own wording but
+    /// are handled off the location path, so these are their fallbacks too.
+    pub(crate) fn empty_message(self) -> &'static str {
+        match self {
+            LspReqKind::Definition => "No definition found",
+            LspReqKind::Declaration => "No declaration found",
+            LspReqKind::TypeDefinition => "No type definition found",
+            LspReqKind::Implementation => "No implementation found",
+            LspReqKind::References => "No references found",
+            LspReqKind::Hover => "No hover information",
+            LspReqKind::SignatureHelp => "No signature help",
+            LspReqKind::Completion => "No completions",
+            LspReqKind::Formatting => "No formatting changes",
+            LspReqKind::Rename => "No rename changes",
+            LspReqKind::CodeAction => "No code actions available",
+            LspReqKind::ResolveCodeAction => "Code action returned no edit",
+            // Resolve is a silent background fetch for the selected item's docs;
+            // it never surfaces an empty-result message (an unresolved item just
+            // shows no preview), so this is only a formal fallback.
+            LspReqKind::CompletionResolve => "No completion documentation",
+        }
+    }
+
+    /// The panel title for a multi-result location list.
+    pub(crate) fn panel_title(self) -> &'static str {
+        match self {
+            LspReqKind::References => "LSP references",
+            _ => "LSP locations",
+        }
+    }
+}
+
+/// A request in flight, kept per [`LspReqKind`] so a reply can be matched to it
+/// and stale ones dropped (Decision 3): the `generation` it was issued under,
+/// and the `buffer`/`cursor` it was issued at (a later reply whose generation
+/// differs, or that arrives after the cursor moved, is discarded).
+pub(crate) struct PendingLspReq {
+    pub(crate) generation: u64,
+    pub(crate) buffer: BufferId,
+    pub(crate) cursor: (usize, usize),
+    /// The buffer's `changedtick` when the request was issued, for the
+    /// content-version stale-drop of an *apply* reply (formatting/rename/code
+    /// action return edits computed against this text; applying them after any
+    /// edit would corrupt the buffer). Unused by the cursor-based kinds.
+    pub(crate) tick: u64,
+}
+
+/// The negotiated runtime state of one server, learned from its `initialize`
+/// reply: the position encoding and document-sync kind every buffer it owns uses,
+/// plus the LSP client id assigned to this server (carried to Lua on
+/// `LspAttach`/`LspDetach` as `data.client_id`).
+pub(crate) struct ServerRuntime {
+    encoding: PositionEncoding,
+    sync_kind: TextDocumentSyncKind,
+    client_id: u64,
+}
+
+/// The live insert-mode completion popup (Phase 5), server-owned like the
+/// diagnostics cache. Held in [`Server::completion`]; `None` when no menu is
+/// open. It keeps the server's last candidate list verbatim plus the live
+/// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
+/// re-ranks (or re-requests) in place rather than closing and reopening.
+//
+// Per-item documentation is fully wired (docs/plans/2026-06-06-completion-documentation.md):
+// each `raw` item carries `documentation`/`resolve_data` (Phase 1); the selected
+// item's lazy docs/detail are fetched via `completionItem/resolve` and merged in
+// place (Phase 2); and the selected item's documentation is projected as the
+// `doc` lines `pmenu_value` emits, which the client floats in a preview box beside
+// the popup (Phase 3). Markdown is rendered as plain lines (the markup distiller
+// yields lines, not styled spans), per the known-approximations registry.
+pub(crate) struct CompletionMenu {
+    /// The buffer the menu belongs to; a reply for any other buffer is dropped.
+    buffer: BufferId,
+    /// `(row, word-start byte column)` the completion word begins at — the menu's
+    /// screen anchor and the default replace range's start. Fixed while the menu
+    /// is open (typing only extends the word to the right).
+    anchor: (usize, usize),
+    /// The identifier run typed since `anchor` (`line[anchor.col..cursor.col]`):
+    /// both the filter string and, for an item without an explicit `textEdit`, the
+    /// text the accept replaces.
+    prefix: String,
+    /// The server's `isIncomplete` for the current list: when set, a narrowing
+    /// keystroke re-requests instead of filtering the cache client-side.
+    is_incomplete: bool,
+    /// The server's last candidate list, verbatim (ranking is recomputed from it).
+    raw: Vec<CompletionItemData>,
+    /// Indices into `raw`, filtered to those matching `prefix` and ordered by
+    /// importance (match tier, then `sortText`, then label). The projected menu.
+    visible: Vec<usize>,
+    /// The selected entry as an index into `visible`, or `None` until the user
+    /// navigates (accept then falls back to the first visible item).
+    selected: Option<usize>,
+    /// Parallel to `raw`: whether a `completionItem/resolve` has already settled
+    /// for that item, so its lazy docs/detail are fetched at most once per item.
+    /// Reset whenever `raw` is replaced (a refresh re-requests the world).
+    resolved: Vec<bool>,
+    /// The `raw` index of the resolve currently in flight (`None` when none). A
+    /// reply merges only into this index, and only the newest resolve survives the
+    /// generation gate — a navigation that supersedes an in-flight resolve drops
+    /// its (now stale) reply.
+    resolving: Option<usize>,
+}
+
+/// Human label for a negotiated position encoding (matches the LSP wire names).
+pub(crate) fn encoding_label(encoding: PositionEncoding) -> &'static str {
+    match encoding {
+        PositionEncoding::Utf8 => "utf-8",
+        PositionEncoding::Utf16 => "utf-16",
+        PositionEncoding::Utf32 => "utf-32",
+    }
+}
+
+/// The panel title for the `:LspCodeAction` list. The server recognizes a panel
+/// select by this title to route it to [`Server::apply_code_action`] instead of
+/// the generic scripting `on_select` path.
+pub(crate) const CODE_ACTION_PANEL_TITLE: &str = "LSP code actions";
+
+/// Convert an LSP [`Range`] (in `encoding`) to an absolute byte range in
+/// `buffer`, resolving each endpoint against its line — the buffer-addressed form
+/// of [`Server::lsp_range_to_bytes`], for a workspace edit that touches a
+/// non-current buffer.
+pub(crate) fn lsp_range_to_bytes_in(
+    buffer: &Buffer,
+    range: &Range,
+    encoding: PositionEncoding,
+) -> std::ops::Range<usize> {
+    lsp_pos_to_byte_in(buffer, range.start, encoding)
+        ..lsp_pos_to_byte_in(buffer, range.end, encoding)
+}
+
+/// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:
+/// the character offset converted against its line, the row added as a line start.
+pub(crate) fn lsp_pos_to_byte_in(
+    buffer: &Buffer,
+    pos: Position,
+    encoding: PositionEncoding,
+) -> usize {
+    let row = pos.line as usize;
+    let line = buffer.line(row);
+    buffer.line_start(row) + byte_col(encoding, &line, pos.character as usize)
+}
+
+/// A `(row, byte-column)` point in `buffer` as an LSP [`Position`] in `encoding`
+/// (Decision 4): UTF-8 is the identity (an LSP UTF-8 character *is* a byte
+/// offset), UTF-16/UTF-32 need column math over the line text. The buffer-
+/// addressed form of [`Server::lsp_position`].
+pub(crate) fn lsp_position_in(
+    buffer: &Buffer,
+    encoding: PositionEncoding,
+    row: usize,
+    byte_col: usize,
+) -> Position {
+    let character = match encoding {
+        PositionEncoding::Utf8 => byte_col,
+        PositionEncoding::Utf16 => {
+            let line = buffer.line(row);
+            unicode::byte_to_utf16(&line, byte_col)
+        }
+        PositionEncoding::Utf32 => {
+            let line = buffer.line(row);
+            line[..byte_col.min(line.len())].chars().count()
+        }
+    };
+    Position {
+        line: row as u32,
+        character: character as u32,
+    }
+}
+
+/// Convert a batch of journaled byte-delta edits in `buffer` into LSP incremental
+/// content changes (each replacing the edit's old `(start..old_end)` range with
+/// its inserted text, in `encoding`) — the buffer-addressed form of the
+/// current-buffer conversion `sync_lsp` does inline.
+pub(crate) fn incremental_changes_in(
+    buffer: &Buffer,
+    edits: &[BufferEdit],
+    encoding: PositionEncoding,
+) -> Vec<TextDocumentContentChangeEvent> {
+    edits
+        .iter()
+        .map(|e| TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: lsp_position_in(buffer, encoding, e.start_point.0, e.start_point.1),
+                end: lsp_position_in(buffer, encoding, e.old_end_point.0, e.old_end_point.1),
+            }),
+            range_length: None,
+            text: e.text.clone(),
+        })
+        .collect()
+}
+
+/// Byte offset of LSP `character` on `line`, the inverse of [`Server::lsp_position`]
+/// (Decision 4): UTF-8 is the identity (a character *is* a byte offset, clamped
+/// to the line), UTF-16/UTF-32 need column math. Clamped to the line length so a
+/// past-end character (a diagnostic whose range runs to EOL) lands at the end.
+pub(crate) fn byte_col(encoding: PositionEncoding, line: &str, character: usize) -> usize {
+    match encoding {
+        PositionEncoding::Utf8 => character.min(line.len()),
+        PositionEncoding::Utf16 => unicode::utf16_to_byte(line, character),
+        PositionEncoding::Utf32 => line
+            .char_indices()
+            .nth(character)
+            .map_or(line.len(), |(i, _)| i),
+    }
+}
+
+/// Whether `c` belongs to a completion word — an identifier run: ASCII
+/// alphanumeric or `_` (the default `iskeyword`, locale specifics aside).
+pub(crate) fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The completion word: the run of identifier characters immediately left of the
+/// byte `cursor` on `line`, as `(word_start_byte, prefix)`. An empty prefix when
+/// the cursor isn't preceded by an identifier char (a just-triggered menu with
+/// nothing typed). Both the menu's filter string and its default replace range.
+pub(crate) fn completion_word(line: &str, cursor: usize) -> (usize, String) {
+    let cursor = cursor.min(line.len());
+    let mut start = cursor;
+    for (i, c) in line[..cursor].char_indices().rev() {
+        if is_word_char(c) {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    (start, line[start..cursor].to_string())
+}
+
+/// The match tier of an item's `filter` string against the typed `prefix`, lower
+/// = better: `0` exact, `1` case-sensitive prefix, `2` case-insensitive prefix,
+/// `3` case-insensitive subsequence; `None` ⇒ no match (the item is dropped). An
+/// empty prefix matches everything at tier ≤ 1, so a just-triggered menu shows
+/// the whole list in the server's `sortText` order.
+pub(crate) fn match_tier(filter: &str, prefix: &str) -> Option<u8> {
+    if prefix.is_empty() {
+        return Some(if filter.is_empty() { 0 } else { 1 });
+    }
+    if filter == prefix {
+        return Some(0);
+    }
+    if filter.starts_with(prefix) {
+        return Some(1);
+    }
+    let (filter, prefix) = (filter.to_lowercase(), prefix.to_lowercase());
+    if filter.starts_with(&prefix) {
+        return Some(2);
+    }
+    if is_subsequence(&prefix, &filter) {
+        return Some(3);
+    }
+    None
+}
+
+/// Whether every character of `needle` appears in `haystack` in order (a
+/// subsequence). Callers lowercase both for a case-insensitive match.
+pub(crate) fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut hay = haystack.chars();
+    needle.chars().all(|nc| hay.by_ref().any(|hc| hc == nc))
+}
+
+/// Display width (cells) of a completion item's menu row: the label plus, when
+/// present, a gap and the right-aligned detail. Sizes the popup box.
+pub(crate) fn pmenu_item_width(item: &CompletionItemData) -> usize {
+    let label = item.label.chars().count();
+    let detail = match item.detail.as_deref() {
+        Some(d) if !d.is_empty() => 1 + d.chars().count(),
+        _ => 0,
+    };
+    label + detail
+}
+
+/// Map an LSP [`DiagnosticSeverity`] to nxvim's severity code (`1`=error,
+/// `2`=warning, `3`=info, `4`=hint). An absent severity is treated as an error,
+/// matching how most servers and neovim render an unspecified diagnostic. The
+/// constants aren't enum variants (lsp-types models them as a newtype), so this
+/// compares rather than pattern-matches.
+pub(crate) fn severity_code(severity: Option<DiagnosticSeverity>) -> u8 {
+    match severity {
+        Some(s) if s == DiagnosticSeverity::WARNING => 2,
+        Some(s) if s == DiagnosticSeverity::INFORMATION => 3,
+        Some(s) if s == DiagnosticSeverity::HINT => 4,
+        _ => 1,
+    }
+}
+
+/// Translate the LSP crate's [`ProviderCaps`] into the Lua-runtime
+/// [`LspServerCapabilities`], the boundary that keeps `nxvim-lua` free of the LSP
+/// crate. The two have the same per-feature fields; this is the one place they
+/// are mapped across.
+pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
+    LspServerCapabilities {
+        definition: p.definition,
+        declaration: p.declaration,
+        type_definition: p.type_definition,
+        implementation: p.implementation,
+        references: p.references,
+        hover: p.hover,
+        signature_help: p.signature_help,
+        completion: p.completion,
+        document_formatting: p.document_formatting,
+        rename: p.rename,
+        code_action: p.code_action,
+    }
+}
+
+/// Project a buffer's cached diagnostics into the plain [`DiagnosticData`] the
+/// Lua mirror (`vim._diagnostics`) holds for `vim.diagnostic.get`. Positions are
+/// the raw 0-based LSP coordinates; `col`/`end_col` are byte offsets under the
+/// UTF-8 encoding nxvim advertises first (the negotiated default), matching
+/// neovim's byte-column `get` shape for the common case.
+pub(crate) fn diagnostic_mirror_data(diags: &[Diagnostic]) -> Vec<DiagnosticData> {
+    diags
+        .iter()
+        .map(|d| DiagnosticData {
+            lnum: d.range.start.line as i64,
+            col: d.range.start.character as i64,
+            end_lnum: d.range.end.line as i64,
+            end_col: d.range.end.character as i64,
+            severity: severity_code(d.severity),
+            message: d.message.clone(),
+            source: d.source.clone(),
+        })
+        .collect()
+}
+
+/// The highlight group whose `sp`/underline style paints a diagnostic of this
+/// severity code, resolved through the registry like the chrome groups.
+pub(crate) fn severity_group(severity: u8) -> &'static str {
+    match severity {
+        2 => "DiagnosticUnderlineWarn",
+        3 => "DiagnosticUnderlineInfo",
+        4 => "DiagnosticUnderlineHint",
+        _ => "DiagnosticUnderlineError",
+    }
+}
+
+/// One-letter severity tag for the location-list column (`E`/`W`/`I`/`H`).
+pub(crate) fn severity_short(severity: u8) -> char {
+    match severity {
+        2 => 'W',
+        3 => 'I',
+        4 => 'H',
+        _ => 'E',
+    }
+}
+
+/// The first non-empty line of a (possibly multi-line, markdown) diagnostic
+/// message, for the single-line message line and location-list rows.
+pub(crate) fn first_line(message: &str) -> String {
+    message
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Human label for a document-sync kind.
+pub(crate) fn sync_label(kind: TextDocumentSyncKind) -> &'static str {
+    match kind {
+        TextDocumentSyncKind::FULL => "full",
+        TextDocumentSyncKind::INCREMENTAL => "incremental",
+        _ => "none",
+    }
+}
+
+/// Resolve the argv for a `vim.lsp.start`'s `cmd` into a [`ServerSpawn`]:
+/// `$NXVIM_LSP_CMD` overrides the whole command (the mock hook, the LSP analogue
+/// of `NXVIM_TS_WORKER`), else the config's `cmd` is used verbatim. `None` when no
+/// program can be determined (an empty `cmd` and no override).
+pub(crate) fn lsp_spawn(cmd: &[String]) -> Option<ServerSpawn> {
+    if let Ok(override_cmd) = std::env::var("NXVIM_LSP_CMD") {
+        let mut parts = override_cmd.split_whitespace().map(str::to_string);
+        let program = parts.next()?;
+        return Some(ServerSpawn {
+            program,
+            args: parts.collect(),
+            ..Default::default()
+        });
+    }
+    let (program, args) = cmd.split_first()?;
+    Some(ServerSpawn {
+        program: program.clone(),
+        args: args.to_vec(),
+        ..Default::default()
+    })
+}
+
+/// `$NXVIM_LSP_ROOT`, absolutized, if set — an explicit workspace-root override
+/// that supersedes the root Lua resolved (handy for tests, and for pinning a root
+/// against an unusual layout). Relative values resolve against the cwd.
+pub(crate) fn lsp_root_override() -> Option<PathBuf> {
+    std::env::var_os("NXVIM_LSP_ROOT").map(|root| absolutize(Path::new(&root)))
+}
+
+/// A `file://` URI for an absolute-ized path, or `None` if it can't be formed.
+pub(crate) fn path_to_uri(path: &Path) -> Option<Url> {
+    Url::from_file_path(absolutize(path)).ok()
+}
+
+/// The filesystem path behind a `file://` URI (the inverse of [`path_to_uri`]),
+/// or `None` for a non-file URI — the target of a go-to jump or a panel location.
+pub(crate) fn uri_to_path(uri: &Url) -> Option<PathBuf> {
+    uri.to_file_path().ok()
+}
+
+/// Resolve `path` against the current directory if it is relative.
+pub(crate) fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}

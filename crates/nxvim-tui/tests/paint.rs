@@ -449,6 +449,28 @@ fn close_button_geometry_matches_the_painted_x() {
 }
 
 #[test]
+fn panel_content_rect_geometry_matches_the_painted_content() {
+    // Same 20x8 layout as the close-button test: a panel of content height 2 sits
+    // on the border row 4, so its content area is rows 5..7.
+    let (x, y, w, h) = nxvim_tui::panel_content_rect(20, 8, 2).expect("a panel content rect");
+    assert_eq!(
+        (x, y, w, h),
+        (0, 5, 20, 2),
+        "content sits below the [X] bar"
+    );
+
+    let v = view(vec![
+        ("lines", lines(&["text"])),
+        ("panel", panel("Messages", &["alpha", "beta"], 0, 2)),
+    ]);
+    let buf = paint(&v, 20, 8);
+    // The rect's top row is exactly where the first content line paints, and its
+    // bottom row holds the second — so a click hit-test lands on the right rows.
+    assert_eq!(row_text(&buf, y).trim_end(), "alpha");
+    assert_eq!(row_text(&buf, y + h - 1).trim_end(), "beta");
+}
+
+#[test]
 fn a_zero_duration_scroll_gesture_does_not_arm_an_animation() {
     // R11: a scroll gesture with `duration_ms == 0` has no slide to play. Arming
     // a degenerate animation would later divide elapsed time by a zero duration

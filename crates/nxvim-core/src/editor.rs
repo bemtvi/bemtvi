@@ -4262,6 +4262,34 @@ impl Editor {
         self.scroll_panel_into_view();
     }
 
+    /// Move the panel selection to the logical entry occupying display `row`
+    /// (0-based, within the visible content) — the mouse-click counterpart to the
+    /// keyboard motions (`nxvim_panel_click`). The panel word-wraps, so a display
+    /// row maps back to its logical entry by replaying the same wrap walk as
+    /// [`Editor::panel_view`], starting from `top`. A row past the last visible
+    /// entry selects that last entry. A no-op when no panel is open.
+    pub fn set_panel_cursor_by_row(&mut self, row: usize) {
+        let height = self.panel_content_height();
+        let width = self.panel_width();
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        let mut display = 0;
+        let mut logical = panel.top;
+        let mut target = logical.min(panel.lines.len().saturating_sub(1));
+        while display < height && logical < panel.lines.len() {
+            let span = wrap_to_width(&panel.lines[logical], width).len().max(1);
+            target = logical;
+            if row < display + span {
+                break;
+            }
+            display += span;
+            logical += 1;
+        }
+        panel.cursor = target;
+        self.scroll_panel_into_view();
+    }
+
     /// Replace the open panel's content (`vim.panel.set_lines` /
     /// `nxvim_panel_set_lines`), keeping its title and re-clamping the cursor and
     /// scroll to the new content. A no-op when no panel is open.

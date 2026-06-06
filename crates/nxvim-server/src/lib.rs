@@ -583,6 +583,14 @@ impl Server {
                 Ok(Value::Nil)
             }
             "nxvim_panel_is_open" => Ok(Value::from(self.editor.panel_is_open())),
+            "nxvim_panel_click" => {
+                // (row): move the panel selection to the logical entry at visible
+                // display `row` — the mouse-click counterpart to j/k. The client
+                // sends <CR> itself to activate an already-selected row.
+                let row = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.editor.set_panel_cursor_by_row(row);
+                Ok(Value::Nil)
+            }
             // ----- the insert-mode completion popup (mouse routing) ---------
             "nxvim_complete_select" => {
                 // (index): highlight a visible completion item by absolute index

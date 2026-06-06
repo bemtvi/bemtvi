@@ -24,8 +24,8 @@ mod view;
 
 pub use keys::{encode_key, encode_paste};
 pub use render::{
-    close_button, cursor_style, paint, paint_doc_scrolled, pmenu_doc_geometry, pmenu_geometry,
-    ScrollHarness,
+    close_button, cursor_style, paint, paint_doc_scrolled, panel_content_rect, pmenu_doc_geometry,
+    pmenu_geometry, ScrollHarness,
 };
 pub use view::View;
 
@@ -235,11 +235,37 @@ where
                     MouseEventKind::Down(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
                         if let Some(panel) = view.panel.as_ref() {
-                            if let Some((row, cols)) =
-                                close_button(size.width, size.height, panel.height)
+                            let close = close_button(size.width, size.height, panel.height);
+                            let on_close = close
+                                .as_ref()
+                                .is_some_and(|(row, cols)| m.row == *row && cols.contains(&m.column));
+                            if on_close {
+                                // The `[X]` on the border bar closes the panel.
+                                rpc.notify("nvim_input", vec![Value::from("q")]);
+                            } else if let Some((cx, cy, cw, ch)) =
+                                panel_content_rect(size.width, size.height, panel.height)
                             {
-                                if m.row == row && cols.contains(&m.column) {
-                                    rpc.notify("nvim_input", vec![Value::from("q")]);
+                                // A click on a content row selects that entry; a
+                                // click on the already-selected entry activates it
+                                // (`<CR>`) — the panel's select-then-confirm, like
+                                // the completion popup. Blank rows past the content
+                                // are ignored.
+                                if within(m.column, m.row, cx, cy, cw, ch) {
+                                    let row = (m.row - cy) as usize;
+                                    if row < panel.lines.len() {
+                                        let sel_end =
+                                            panel.cursor_row + panel.cursor_span.max(1);
+                                        let on_selected = (m.row - cy) >= panel.cursor_row
+                                            && (m.row - cy) < sel_end;
+                                        if on_selected {
+                                            rpc.notify("nvim_input", vec![Value::from("<CR>")]);
+                                        } else {
+                                            rpc.notify(
+                                                "nxvim_panel_click",
+                                                vec![Value::from(row as u64)],
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         } else if let Some((px, py, pw, ph, start)) =
@@ -303,6 +329,19 @@ where
                                             vec![Value::from(next as u64)],
                                         );
                                     }
+                                }
+                            }
+                        } else if let Some(panel) = view.panel.as_ref() {
+                            // Over the panel, the wheel moves its selection one entry
+                            // per notch — the panel scrolls to follow, like j/k. The
+                            // server owns the (logical, word-wrapped) cursor, so this
+                            // just feeds the same keys the panel already handles.
+                            if let Some((cx, cy, cw, ch)) =
+                                panel_content_rect(size.width, size.height, panel.height)
+                            {
+                                if within(m.column, m.row, cx, cy, cw, ch) {
+                                    let key = if down { "<Down>" } else { "<Up>" };
+                                    rpc.notify("nvim_input", vec![Value::from(key)]);
                                 }
                             }
                         }

@@ -943,3 +943,19 @@ pub fn close_button(
     let start = width.checked_sub(3)?;
     Some((row, start..width))
 }
+
+/// Screen rect of the panel's content area — the rows below its top-border bar —
+/// on a `width`×`height` terminal showing a panel of content height
+/// `panel_height`: `(x, y, width, height)` in cells, or `None` when there's no
+/// room. The content sits one row below the border ([`close_button`]'s row), so
+/// `y = border_row + 1`. Pure (no rendering), so the event loop can hit-test the
+/// mouse against the same rows [`render_panel`] draws.
+#[doc(hidden)]
+pub fn panel_content_rect(
+    width: u16,
+    height: u16,
+    panel_height: u16,
+) -> Option<(u16, u16, u16, u16)> {
+    let border_row = height.checked_sub(panel_height + 2)?;
+    Some((0, border_row + 1, width, panel_height))
+}

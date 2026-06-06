@@ -2037,6 +2037,104 @@ async fn panel_grabs_focus_so_the_buffer_is_not_edited() {
 }
 
 #[tokio::test]
+async fn clicking_a_panel_row_selects_the_wrapped_entry() {
+    // The mouse path: the client maps a click to a content display row and sends
+    // `nxvim_panel_click(row)`. The panel word-wraps (width 80), so a display row
+    // must map back to its logical entry — the second half of a wrapped entry
+    // selects that whole entry, not the next one.
+    let (rpc, mut incoming) = start(None).await;
+    let long = "x".repeat(100); // wraps to two display rows at width 80
+    let content = Value::Array(vec![
+        Value::from("aaa"),
+        Value::from(long.as_str()),
+        Value::from("ccc"),
+    ]);
+    rpc.notify(
+        "nxvim_panel_open",
+        vec![
+            Value::from("Picks"),
+            content,
+            Value::from(false),
+            Value::from(0u64),
+        ],
+    );
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 0, "opens on the first entry");
+
+    // Display rows: 0="aaa", 1..2=wrapped long entry, 3="ccc". Clicking row 2 (the
+    // second half of the wrapped entry) selects that entry: its first row is 1 and
+    // it spans 2 rows.
+    rpc.notify("nxvim_panel_click", vec![Value::from(2u64)]);
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(
+        panel_u64(&map, "cursor_row"),
+        1,
+        "the wrapped entry is selected"
+    );
+    assert_eq!(
+        panel_u64(&map, "cursor_span"),
+        2,
+        "its whole span is focused"
+    );
+
+    // Clicking row 3 lands on the entry past the wrap (a single-row entry).
+    rpc.notify("nxvim_panel_click", vec![Value::from(3u64)]);
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 3);
+    assert_eq!(panel_u64(&map, "cursor_span"), 1);
+
+    // A row past the content clamps to the last entry, never wrapping around.
+    rpc.notify("nxvim_panel_click", vec![Value::from(99u64)]);
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 3, "clamps to the last entry");
+}
+
+#[tokio::test]
+async fn clicking_the_selected_panel_row_activates_it() {
+    // Select-then-confirm: the first click selects a row (`nxvim_panel_click`),
+    // and a click on the already-selected row activates it — which the client
+    // sends as `<CR>`. On a select-enabled panel that emits `nxvim_panel_select`.
+    let (rpc, mut incoming) = start(None).await;
+    let content = Value::Array(vec![
+        Value::from("one"),
+        Value::from("two"),
+        Value::from("three"),
+    ]);
+    rpc.notify(
+        "nxvim_panel_open",
+        vec![
+            Value::from("Picks"),
+            content,
+            Value::from(true), // wants_select
+            Value::from(0u64),
+        ],
+    );
+    drain_latest(&rpc, &mut incoming).await;
+
+    // Click row 2 to select "three".
+    rpc.notify("nxvim_panel_click", vec![Value::from(2u64)]);
+    let map = drain_latest(&rpc, &mut incoming).await;
+    assert_eq!(panel_u64(&map, "cursor_row"), 2);
+
+    // The client sends <CR> for a click on the already-selected row; the server
+    // emits a select event for that entry (1-based index, line text).
+    rpc.notify("nvim_input", vec![Value::from("<CR>")]);
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    tokio::task::yield_now().await;
+    let mut selected = None;
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "nxvim_panel_select" {
+            selected = params.into_iter().next();
+        }
+    }
+    let Some(Value::Map(sel)) = selected else {
+        panic!("no nxvim_panel_select notification arrived");
+    };
+    assert_eq!(field(&sel, "index").and_then(Value::as_u64), Some(3));
+    assert_eq!(field(&sel, "line").and_then(Value::as_str), Some("three"));
+}
+
+#[tokio::test]
 async fn panel_shrinks_the_text_window() {
     let (rpc, mut incoming) = start(None).await;
     // No panel: the text window fills the attached height.

@@ -209,6 +209,16 @@ and `the_doc_preview_scrolls_with_the_mouse_wheel` in `crates/nxvim/tests/lsp.rs
 (the latter asserts the box shows the top unscrolled and the matching later line
 scrolled to the bottom).
 
+The **popup list itself is mouse-driven** too: the shared `pmenu_geometry`
+hit-test lets the wheel over the popup move the selection one item per notch
+(non-wrapping, so the list scrolls to the ends like a scrollbar) and a left-click
+on a row select it — clicking the already-selected row accepts it, the
+`<C-n>`/`<C-y>` equivalents. Unlike the doc-box offset, selection is server
+state, so the client just sends `nxvim_complete_select(index)` /
+`nxvim_complete_accept` (the index clamped server-side) and the menu repaints on
+the reply. Verified by `a_click_selects_then_accepts_a_completion_item` and
+`the_completion_popup_scrolls_with_the_mouse_wheel`.
+
 **Depends on.** Phases 1 and 2 (the data); the existing pmenu surface.
 
 ---

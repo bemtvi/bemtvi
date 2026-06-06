@@ -1578,6 +1578,28 @@ impl Server {
         self.maybe_resolve_selected();
     }
 
+    /// Select a visible item by absolute index (clamped to the visible range) —
+    /// the mouse counterpart to [`lsp_menu_move`]'s relative `<C-n>`/`<C-p>`. A
+    /// click lands on a specific row, and the wheel moves one step without
+    /// wrapping, so this clamps rather than wraps. No-op when the index already
+    /// holds, so an idempotent re-select fires no stray resolve.
+    pub(crate) fn lsp_menu_select(&mut self, index: usize) {
+        let Some(menu) = self.completion.as_mut() else {
+            return;
+        };
+        let n = menu.visible.len();
+        if n == 0 {
+            return;
+        }
+        let idx = index.min(n - 1);
+        if menu.selected == Some(idx) {
+            return;
+        }
+        menu.selected = Some(idx);
+        self.lsp_dirty = true;
+        self.maybe_resolve_selected();
+    }
+
     /// Fire a `completionItem/resolve` for the just-selected item when it still
     /// lacks `documentation`/`detail` — the only way per-item docs arrive from
     /// rust_analyzer and most servers. Debounced by selection (it fires on settle,

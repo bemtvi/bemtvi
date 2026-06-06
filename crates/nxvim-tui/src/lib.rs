@@ -24,7 +24,8 @@ mod view;
 
 pub use keys::{encode_key, encode_paste};
 pub use render::{
-    close_button, cursor_style, paint, paint_doc_scrolled, pmenu_doc_geometry, ScrollHarness,
+    close_button, cursor_style, paint, paint_doc_scrolled, pmenu_doc_geometry, pmenu_geometry,
+    ScrollHarness,
 };
 pub use view::View;
 
@@ -232,8 +233,8 @@ where
                     // to close. Guarded on a panel being open so a stray click
                     // never injects a `q` into the buffer.
                     MouseEventKind::Down(MouseButton::Left) => {
+                        let size = terminal.size().unwrap_or_default();
                         if let Some(panel) = view.panel.as_ref() {
-                            let size = terminal.size().unwrap_or_default();
                             if let Some((row, cols)) =
                                 close_button(size.width, size.height, panel.height)
                             {
@@ -241,30 +242,68 @@ where
                                     rpc.notify("nvim_input", vec![Value::from("q")]);
                                 }
                             }
+                        } else if let Some((px, py, pw, ph, start)) =
+                            pmenu_geometry(size.width, size.height, &view)
+                        {
+                            // A click on a completion row chooses that item: the
+                            // first click on a row selects it (highlight + docs),
+                            // and clicking the already-selected row accepts it —
+                            // the same select-then-confirm as <C-n> then <C-y>.
+                            if within(m.column, m.row, px, py, pw, ph) {
+                                if let Some(pmenu) = view.pmenu.as_ref() {
+                                    let idx = start + (m.row - py) as usize;
+                                    if idx < pmenu.items.len() {
+                                        if pmenu.selected == Some(idx) {
+                                            rpc.notify("nxvim_complete_accept", vec![]);
+                                        } else {
+                                            rpc.notify(
+                                                "nxvim_complete_select",
+                                                vec![Value::from(idx as u64)],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                    // The mouse wheel over the completion doc preview scrolls it —
-                    // a purely client-side gesture (the box height is the client's
-                    // to know), so it never touches the buffer or the server. Three
-                    // lines per notch, clamped so it can't overscroll the docs.
+                    // The mouse wheel drives the completion UI. Over the doc preview
+                    // box it scrolls the docs — a purely client-side gesture (the box
+                    // height is the client's to know), three lines per notch, clamped
+                    // so it can't overscroll. Over the popup list itself it moves the
+                    // selection one item per notch (server state; the list scrolls to
+                    // follow), non-wrapping so it stops at the ends like a scrollbar.
                     MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                         let size = terminal.size().unwrap_or_default();
-                        if let Some((bx, by, bw, bh, max_scroll)) =
-                            pmenu_doc_geometry(size.width, size.height, &view)
+                        let down = m.kind == MouseEventKind::ScrollDown;
+                        let doc = pmenu_doc_geometry(size.width, size.height, &view);
+                        let over_doc = doc
+                            .is_some_and(|(bx, by, bw, bh, _)| within(m.column, m.row, bx, by, bw, bh));
+                        if let Some((.., max_scroll)) = doc.filter(|_| over_doc) {
+                            const STEP: u16 = 3;
+                            doc_scroll = if down {
+                                (doc_scroll + STEP).min(max_scroll)
+                            } else {
+                                doc_scroll.saturating_sub(STEP)
+                            };
+                            terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                        } else if let Some((px, py, pw, ph, _)) =
+                            pmenu_geometry(size.width, size.height, &view)
                         {
-                            let over_box = m.column >= bx
-                                && m.column < bx + bw
-                                && m.row >= by
-                                && m.row < by + bh;
-                            if over_box {
-                                const STEP: u16 = 3;
-                                doc_scroll = if m.kind == MouseEventKind::ScrollDown {
-                                    (doc_scroll + STEP).min(max_scroll)
-                                } else {
-                                    doc_scroll.saturating_sub(STEP)
-                                };
-                                terminal
-                                    .draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                            if within(m.column, m.row, px, py, pw, ph) {
+                                if let Some(pmenu) = view.pmenu.as_ref() {
+                                    let n = pmenu.items.len();
+                                    if n > 0 {
+                                        let next = match pmenu.selected {
+                                            Some(i) if down => (i + 1).min(n - 1),
+                                            Some(i) => i.saturating_sub(1),
+                                            None => 0,
+                                        };
+                                        rpc.notify(
+                                            "nxvim_complete_select",
+                                            vec![Value::from(next as u64)],
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -324,4 +363,10 @@ where
 /// Text-area height = terminal height minus the chrome rows we render ourselves.
 fn text_height(terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(CHROME_ROWS).max(1)
+}
+
+/// Whether `(col, row)` falls inside the `w`×`h` rect anchored at `(x, y)` —
+/// the mouse hit-test shared by the completion popup and its doc preview box.
+fn within(col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
+    col >= x && col < x + w && row >= y && row < y + h
 }

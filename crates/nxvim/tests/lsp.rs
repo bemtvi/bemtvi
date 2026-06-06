@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, paint_doc_scrolled, pmenu_doc_geometry, View};
+use nxvim_tui::{paint, paint_doc_scrolled, pmenu_doc_geometry, pmenu_geometry, View};
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use serde_json::Value as Json;
@@ -1696,6 +1696,119 @@ async fn the_doc_preview_scrolls_with_the_mouse_wheel() {
         box_top_line(&bottom),
         format!("line {:02}", 1 + max_scroll),
         "scrolled by max_scroll, the box top shows the matching later doc line"
+    );
+}
+
+#[tokio::test]
+async fn a_click_selects_then_accepts_a_completion_item() {
+    let _guard = test_lock().lock().await;
+    // The mouse path: the client maps a click row to an item index via
+    // `pmenu_geometry`, then drives the server with `nxvim_complete_select`
+    // (highlight) and, on a click of the already-selected row,
+    // `nxvim_complete_accept` (insert) — the <C-n>/<C-y> equivalents.
+    let record = configure_mock(
+        "compl-click",
+        serde_json::json!({ "completion": completion_items(&["alpha", "beta", "gamma"]) }),
+    );
+    let file = temp_file("compl-click", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "o<C-x><C-o>");
+    let params = wait_for_pmenu(&rpc, &mut incoming).await;
+    let (labels, selected) = pmenu_of(&params).unwrap();
+    assert_eq!(selected, -1, "nothing is selected until the user acts");
+
+    // The geometry the client hit-tests: pick the box row for visible item 2 and
+    // confirm the click math (`start + (row - y)`) round-trips to that index.
+    let view = View::from_redraw(&params);
+    let (_px, py, _pw, _ph, start) =
+        pmenu_geometry(COLS, ROWS, &view).expect("the popup has geometry");
+    let target = 2usize;
+    let click_row = py + (target - start) as u16;
+    assert_eq!(
+        start + (click_row - py) as usize,
+        target,
+        "the click row maps back to the intended item index"
+    );
+
+    // First click on that row selects it (highlight only, no insert yet).
+    rpc.notify("nxvim_complete_select", vec![Value::from(target as u64)]);
+    let params = wait_for_pmenu_where(&rpc, &mut incoming, |(_, sel)| *sel == target as i64).await;
+    assert_eq!(pmenu_of(&params).unwrap().1, target as i64);
+
+    // A second click on the already-selected row accepts it.
+    rpc.notify("nxvim_complete_accept", vec![]);
+    wait_for_pmenu_closed(&rpc, &mut incoming).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string(), labels[target].clone()],
+        "accepting the clicked item inserts its label on the new line"
+    );
+}
+
+#[tokio::test]
+async fn the_completion_popup_scrolls_with_the_mouse_wheel() {
+    let _guard = test_lock().lock().await;
+    // A list taller than the popup's capped height scrolls as the wheel moves the
+    // selection. Each notch is the client computing the next index from the current
+    // selection (non-wrapping) and sending `nxvim_complete_select`; once the
+    // selection passes the bottom of the box, the visible window (pmenu_geometry's
+    // `start`) advances to keep it on screen.
+    let labels: Vec<String> = (0..15).map(|i| format!("item{i:02}")).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let record = configure_mock(
+        "compl-wheel",
+        serde_json::json!({ "completion": completion_items(&label_refs) }),
+    );
+    let file = temp_file("compl-wheel", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "o<C-x><C-o>");
+    let mut params = wait_for_pmenu(&rpc, &mut incoming).await;
+    let n = pmenu_of(&params).unwrap().0.len();
+    assert!(n >= 12, "enough items to overflow the capped box (got {n})");
+
+    // The list starts at the top.
+    let (.., start0) =
+        pmenu_geometry(COLS, ROWS, &View::from_redraw(&params)).expect("the popup has geometry");
+    assert_eq!(start0, 0, "the list starts unscrolled");
+
+    // Wheel down twelve notches: each reads the live selection and steps one item,
+    // exactly as the event loop computes `next`.
+    for _ in 0..12 {
+        let sel = pmenu_of(&params).unwrap().1;
+        let next = if sel < 0 {
+            0
+        } else {
+            ((sel + 1) as usize).min(n - 1)
+        };
+        rpc.notify("nxvim_complete_select", vec![Value::from(next as u64)]);
+        params = wait_for_pmenu_where(&rpc, &mut incoming, move |(_, s)| *s == next as i64).await;
+    }
+
+    let sel = pmenu_of(&params).unwrap().1 as usize;
+    let view = View::from_redraw(&params);
+    let (_x, _py, _w, ph, start) =
+        pmenu_geometry(COLS, ROWS, &view).expect("the popup has geometry");
+    assert!(
+        start > 0,
+        "the list scrolled to follow the selection (start={start})"
+    );
+    assert!(
+        sel - start < ph as usize,
+        "the selected item stays within the visible box rows"
+    );
+
+    // Clamp: a wheel/click past the end lands on the last item, never wrapping.
+    rpc.notify("nxvim_complete_select", vec![Value::from(999u64)]);
+    let params =
+        wait_for_pmenu_where(&rpc, &mut incoming, move |(_, s)| *s == (n - 1) as i64).await;
+    assert_eq!(
+        pmenu_of(&params).unwrap().1,
+        (n - 1) as i64,
+        "selecting past the end clamps to the last item"
     );
 }
 

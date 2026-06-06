@@ -704,10 +704,7 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
     let rows = inner.height as usize;
     let width = inner.width as usize;
     // Scroll so the selected item stays in view; show from the top otherwise.
-    let start = match pmenu.selected {
-        Some(s) if s >= rows => s + 1 - rows,
-        _ => 0,
-    };
+    let start = pmenu_start(pmenu.selected, rows);
     let lines: Vec<Line> = (0..inner.height)
         .map(|r| {
             let idx = start + r as usize;
@@ -726,6 +723,39 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 
     // The documentation preview floats beside the popup (its own bordered box).
     render_pmenu_doc(frame, text_area, area, &pmenu.doc, doc_scroll);
+}
+
+/// First visible item index for a popup whose inner content area is `rows` tall
+/// with `selected` highlighted: scroll the list to keep the selection in view,
+/// else start at the top. The single source of truth shared by [`render_pmenu`]
+/// and [`pmenu_geometry`] so a click maps to the same row the renderer drew.
+fn pmenu_start(selected: Option<usize>, rows: usize) -> usize {
+    match selected {
+        Some(s) if s >= rows => s + 1 - rows,
+        _ => 0,
+    }
+}
+
+/// The text-area inner rect (past the number gutter) for a `width`×`height`
+/// terminal showing `view` — the cell space the popup and its doc box anchor in.
+/// Mirrors the region split in [`render`]; shared by the popup and doc-box
+/// geometry so hit-tests land on exactly the cells the renderer draws.
+fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
+    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    let regions = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(panel_rows),
+        Constraint::Length(1),
+    ])
+    .split(Rect::new(0, 0, width, height));
+    let text_area = regions[0];
+    if view.number_width > 0 {
+        Layout::horizontal([Constraint::Length(view.number_width), Constraint::Min(0)])
+            .split(text_area)[1]
+    } else {
+        text_area
+    }
 }
 
 /// The popup box rect (border included), anchored under the completion word and
@@ -852,25 +882,27 @@ pub fn pmenu_doc_geometry(
     view: &View,
 ) -> Option<(u16, u16, u16, u16, u16)> {
     let pmenu = view.pmenu.as_ref()?;
-    // Recompute the same regions `render` lays out, so the box lands identically.
-    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
-    let regions = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(panel_rows),
-        Constraint::Length(1),
-    ])
-    .split(Rect::new(0, 0, width, height));
-    let text_area = regions[0];
-    let text_inner = if view.number_width > 0 {
-        Layout::horizontal([Constraint::Length(view.number_width), Constraint::Min(0)])
-            .split(text_area)[1]
-    } else {
-        text_area
-    };
+    let text_inner = text_inner_rect(width, height, view);
     let popup = popup_rect(text_inner, pmenu)?;
     let (area, max_scroll) = doc_rect(text_inner, popup, &pmenu.doc)?;
     Some((area.x, area.y, area.width, area.height, max_scroll))
+}
+
+/// Headless geometry of the completion popup's inner item area for a
+/// `width`×`height` terminal showing `view`: `(x, y, width, height, start)` in
+/// screen cells, where `start` is the first visible item index — or `None` when
+/// no popup is drawn. The event loop uses it to hit-test the mouse: the wheel
+/// moves the selection while it is over the box, and a left-click on row `r`
+/// chooses item `start + (r - y)`. Mirrors the layout in [`render_pmenu`] (same
+/// reason as [`pmenu_doc_geometry`]).
+#[doc(hidden)]
+pub fn pmenu_geometry(width: u16, height: u16, view: &View) -> Option<(u16, u16, u16, u16, usize)> {
+    let pmenu = view.pmenu.as_ref()?;
+    let text_inner = text_inner_rect(width, height, view);
+    let area = popup_rect(text_inner, pmenu)?;
+    let inner = Block::new().borders(Borders::ALL).inner(area);
+    let start = pmenu_start(pmenu.selected, inner.height as usize);
+    Some((inner.x, inner.y, inner.width, inner.height, start))
 }
 
 /// One popup row padded to `width` cells: the `label` left-aligned, and the

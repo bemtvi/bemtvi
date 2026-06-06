@@ -583,6 +583,22 @@ impl Server {
                 Ok(Value::Nil)
             }
             "nxvim_panel_is_open" => Ok(Value::from(self.editor.panel_is_open())),
+            // ----- the insert-mode completion popup (mouse routing) ---------
+            "nxvim_complete_select" => {
+                // (index): highlight a visible completion item by absolute index
+                // (clamped) — the mouse click / wheel counterpart to <C-n>/<C-p>.
+                let idx = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.lsp_menu_select(idx);
+                Ok(Value::Nil)
+            }
+            "nxvim_complete_accept" => {
+                // Accept the highlighted item — a click on the selected row, the
+                // <C-y> equivalent. `run_pending` drains the edit's effects, as the
+                // keyboard accept path does via `input`'s trailing drain.
+                self.lsp_menu_accept();
+                self.run_pending();
+                Ok(Value::Nil)
+            }
             other => Err(format!("Unknown method: {other}")),
         }
     }

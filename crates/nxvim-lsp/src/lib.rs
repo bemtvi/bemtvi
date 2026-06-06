@@ -19,17 +19,25 @@
 //! `lsp_types` re-export below is the exact version `async-lsp` builds against,
 //! so the types the server constructs match the client API with no version skew.
 
+mod client;
+mod convert;
+mod dispatch;
 mod log;
 mod manager;
 pub mod mock;
+mod protocol;
 
 pub use lsp_types;
-// Re-exported because the manager's public API (`LspRequest::Raw` / `LspReply::Raw`
-// — Phase 5) carries raw `serde_json::Value`s, so downstream crates can name the
-// type without taking a direct dependency on the protocol JSON layer.
-pub use manager::{
-    normalize_workspace_edit, CodeActionData, CompletionItemData, LspEvent, LspManager, LspNotify,
-    LspReply, LspRequest, PositionEncoding, ProviderCaps, ReqToken, ServerCaps, ServerKey,
-    ServerSpawn, WorkspaceEditData,
+// The editor↔manager data types (`crate::protocol`), the manager handle
+// (`crate::manager`), and the one normalization helper `nxvim-server` reuses
+// directly (`crate::convert`). `LspRequest::Raw`/`LspReply::Raw` (Phase 5) carry
+// raw `serde_json::Value`s, so the `serde_json` re-export below lets downstream
+// crates name the type without a direct dependency on the protocol JSON layer.
+pub use convert::normalize_workspace_edit;
+pub use manager::LspManager;
+pub use protocol::{
+    CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
+    PositionEncoding, ProviderCaps, ReqToken, ServerCaps, ServerKey, ServerSpawn,
+    WorkspaceEditData,
 };
 pub use serde_json;

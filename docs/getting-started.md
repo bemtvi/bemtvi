@@ -76,7 +76,7 @@ client is a truecolor renderer with a small built-in fallback theme for when no
 colorscheme is loaded. See [*Lua*](architecture.md#lua) and
 [*View protocol*](architecture.md#view-protocol-ui) in the architecture doc, and
 the full design in
-[`superpowers/specs/2026-06-01-catppuccin-colorscheme-design.md`](superpowers/specs/2026-06-01-catppuccin-colorscheme-design.md).
+[`specs/2026-06-01-catppuccin-colorscheme-design.md`](specs/2026-06-01-catppuccin-colorscheme-design.md).
 
 ## Caveats
 

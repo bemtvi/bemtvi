@@ -317,7 +317,7 @@ function Iter:totable() return self._items end
 -- raises a named error. A stub that quietly returns a fake/empty value makes a
 -- broken server look configured; routing every hollow stub through here turns
 -- "we think it works" into a concrete, trackable list of what to build (the
--- guiding principle of docs/lsp-completion-plan.md). `level` (default 2) blames
+-- guiding principle of docs/plans/2026-06-05-lsp-completion.md). `level` (default 2) blames
 -- the stub's call site in the error position; the message names the function.
 vim._notimpl_hits = vim._notimpl_hits or {}
 function vim._notimpl(name, level)
@@ -1326,7 +1326,7 @@ function vim.fn.confirm(_msg, _choices, _default, _type) vim._notimpl("vim.fn.co
 --
 -- Two modes, split on whether an `on_exit` is given (the pragmatic
 -- approximation of neovim's loop-pumping `:wait()`, which a single thread can't
--- replicate; see docs/async-lua-runtime-plan.md):
+-- replicate; see docs/plans/2026-06-06-async-lua-runtime.md):
 --   * `on_exit` given  → ASYNC. The child runs in the event-loop actor (off the
 --     server thread); `on_exit` fires on a later tick with { code, stdout, stderr }.
 --     The handle exposes a real `pid` (filled once the spawn lands) and a working
@@ -1929,7 +1929,7 @@ end
 -- (crates/nxvim-server/src/lsp.rs). This raise only covers the legacy omnifunc
 -- integration point — do not read it as "completion is missing." The one real
 -- completion-menu gap is per-item documentation; see
--- docs/completion-documentation-plan.md.
+-- docs/plans/2026-06-06-completion-documentation.md.
 function vim.lsp.omnifunc(_findstart, _base) vim._notimpl("vim.lsp.omnifunc") end
 
 vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
@@ -1939,7 +1939,7 @@ vim._lsp_enabled = vim._lsp_enabled or {}         -- name -> enabled?
 -- Phase 1 visibility surfaces: a config that errors at load, and a server skipped
 -- at start, are recorded here (keyed by name, so a re-resolve never duplicates)
 -- instead of silently degrading to `{}` / a bare `return`. `vim.lsp._report`
--- reads them back. See docs/lsp-completion-plan.md (Phase 1).
+-- reads them back. See docs/plans/2026-06-05-lsp-completion.md (Phase 1).
 vim._lsp_load_errors = vim._lsp_load_errors or {} -- name -> load error message
 vim._lsp_skipped = vim._lsp_skipped or {}         -- name -> skip reason
 

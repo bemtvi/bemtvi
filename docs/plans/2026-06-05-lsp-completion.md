@@ -224,7 +224,7 @@ shutdown (only on a server exit / crash), since that path registers no client.
 ## Phase 4 — Async runtime / event loop ✅ (foundational)
 
 **Landed.** Implemented in full as its own four-phase effort —
-[`docs/async-lua-runtime-plan.md`](async-lua-runtime-plan.md). The event-loop
+[`docs/plans/2026-06-06-async-lua-runtime.md`](2026-06-06-async-lua-runtime.md). The event-loop
 actor is `crates/nxvim-server/src/evloop.rs`; the deferred-callback registry is
 `vim._cb_fns` (Lua) driven by `LuaRuntime::run_callback(id, keep, args)` (Rust);
 the queue is `Shared.loop_ops` / `take_loop_ops`. Phase 5 below plugs into that

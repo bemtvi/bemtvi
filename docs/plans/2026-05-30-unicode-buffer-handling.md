@@ -1,7 +1,5 @@
 # Unicode-aware Buffer Navigation and Display — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make cursor movement step by grapheme cluster and make cursor display/`j`/`k` honor wide characters and tabs, so non-ASCII text in the buffer behaves correctly.
 
 **Architecture:** `cursor.col` stays a byte offset within its line (the rope's metric and what `nvim_win_get_cursor` returns). A new pure `nxvim-core::unicode` module converts between byte offset, grapheme boundary, and virtual (screen) column over a line `&str`. Motions step by grapheme; vertical motion and `$` remember a virtual column; the `View` gains `cursor_screen_col` (cells) for terminal placement while `cursor_col` stays the byte column for the ruler/API. The TUI expands tabs when painting so its widths match core's.

@@ -1,14 +1,12 @@
 # Smooth (animated) scrolling — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make the scroll commands `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>` *slide* the viewport over ~80–160ms (neoscroll.nvim style) instead of teleporting, with the animation driven entirely by the client.
 
 **Architecture:** The server stays authoritative and applies each scroll instantly, but attaches a self-contained `scroll` descriptor to the `redraw` (the from/to viewport+cursor lines, a duration hint, and the band of buffer lines spanning the slide). The client animates against its *local* clock by interpolating `top`/cursor and slicing the band per frame. The steady-state render path is unchanged; only animation reads the new payload. This keeps `nxvim-core` pure/synchronous, keeps the client the only place that knows about *time*, and lets a future GUI render the same descriptor at pixel resolution.
 
 **Tech Stack:** Rust, tokio (single-threaded runtimes), ratatui/crossterm (TUI client), msgpack-RPC (`rmpv`). Black-box integration tests in `crates/nxvim-server/tests/editing.rs`.
 
-**Design source:** `docs/superpowers/specs/2026-05-31-smooth-scrolling-design.md`. Two intentional deviations from the spec, both noted below: (1) the over-scan window lives *inside* the `scroll` payload rather than widening the main `View`, lowering regression risk; (2) the scroll commands are made to move `top` directly (vim-faithful) because today they don't, which would leave the animation with nothing to slide.
+**Design source:** `docs/specs/2026-05-31-smooth-scrolling-design.md`. Two intentional deviations from the spec, both noted below: (1) the over-scan window lives *inside* the `scroll` payload rather than widening the main `View`, lowering regression risk; (2) the scroll commands are made to move `top` directly (vim-faithful) because today they don't, which would leave the animation with nothing to slide.
 
 ---
 

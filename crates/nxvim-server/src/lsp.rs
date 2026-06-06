@@ -196,7 +196,7 @@ pub(crate) struct ServerRuntime {
 /// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
 /// re-ranks (or re-requests) in place rather than closing and reopening.
 //
-// Per-item documentation is fully wired (docs/completion-documentation-plan.md):
+// Per-item documentation is fully wired (docs/plans/2026-06-06-completion-documentation.md):
 // each `raw` item carries `documentation`/`resolve_data` (Phase 1); the selected
 // item's lazy docs/detail are fetched via `completionItem/resolve` and merged in
 // place (Phase 2); and the selected item's documentation is projected as the

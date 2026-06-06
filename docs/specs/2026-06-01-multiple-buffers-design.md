@@ -3,7 +3,7 @@
 Status: **Phases 1–4 implemented** (Phase 5 is optional UI, deferred). This is
 the implementation plan for the next major feature: supporting **multiple open
 buffers** (the editor holding several files at once and switching between them),
-the prerequisite for windows/splits/tabs later. See [*Buffers*](../../architecture.md#buffers)
+the prerequisite for windows/splits/tabs later. See [*Buffers*](../architecture.md#buffers)
 in the architecture doc for the shipped design.
 
 Scope is deliberately **buffers only**, not windows. There is still exactly one
@@ -13,7 +13,7 @@ modified state, and last cursor position), and the vim ex-command + RPC surface
 to manage that list. Splits, the window layout tree, and a tabline remain future
 work.
 
-Read [`docs/architecture.md`](../../architecture.md) first. The relevant code is
+Read [`docs/architecture.md`](../architecture.md) first. The relevant code is
 `crates/nxvim-core/src/editor.rs` (the state machine and the single embedded
 `Buffer`), `crates/nxvim-core/src/buffer.rs` (the rope text type + edit
 journal), `crates/nxvim-core/src/view.rs` (the renderable `View`), and

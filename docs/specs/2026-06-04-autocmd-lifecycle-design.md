@@ -243,7 +243,7 @@ exactly once; gates green.
 
 ## Downstream (not in this doc)
 
-- **LSP Phase 7** (`docs/superpowers/specs/2026-06-02-lsp-support-design.md`) —
+- **LSP Phase 7** (`docs/specs/2026-06-02-lsp-support-design.md`) —
   `vim.lsp.enable` installs a `FileType` autocmd; depends on Phase 2.
 - **`BufWritePre` write seam + format-on-save**
   ([`2026-06-04-bufwritepre-write-seam-design.md`](2026-06-04-bufwritepre-write-seam-design.md))

@@ -1,14 +1,12 @@
 # GitHub Release Pipeline Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Stand up a hand-rolled GitHub Actions release pipeline that builds `nxvim` for five native targets, publishes a review-gated stable release and a rolling `edge` prerelease, with rust-cache for light incremental builds, SLSA provenance attestation, and git-cliff changelogs.
 
 **Architecture:** One reusable build workflow (`build.yml`) defines the five-target matrix and uploads archives as artifacts. `edge.yml` (on `main` push) and a two-workflow stable flow — `release-prep.yml` (manual PR) + `release.yml` (on merged release PR) — reuse it to publish. CI never pushes to `main`; the stable changelog/version bump lands via a reviewed PR, and merging it auto-tags `v<version>` and publishes in one run.
 
 **Tech Stack:** GitHub Actions, Rust (cargo, musl-static Linux), `Swatinem/rust-cache`, `actions/attest-build-provenance`, `git-cliff`, `peter-evans/create-pull-request`, `gh` CLI.
 
-**Reference spec:** `docs/superpowers/specs/2026-05-31-release-pipeline-design.md`
+**Reference spec:** `docs/specs/2026-05-31-release-pipeline-design.md`
 
 **Local validation tools:** `actionlint` (already installed) validates workflow YAML. Install `git-cliff` once to validate `cliff.toml` locally: `brew install git-cliff`.
 

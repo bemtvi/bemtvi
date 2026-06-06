@@ -1,4 +1,4 @@
-//! Phase 1 of docs/lsp-completion-plan.md: a config that errors at load, or a
+//! Phase 1 of docs/plans/2026-06-05-lsp-completion.md: a config that errors at load, or a
 //! server whose cmd can't be spawned, is no longer swallowed (degraded to `{}` /
 //! a bare `return`). It is recorded — `vim._lsp_load_errors` / `vim._lsp_skipped`
 //! — and enumerated by `vim.lsp._report()`, so no LSP failure stays silent.

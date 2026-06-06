@@ -1,7 +1,5 @@
 # User-experience fidelity tests Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Add three tiers of tests that exercise what a user actually experiences — the painted terminal grid, real key translation, the real binary through a PTY, and the editor/UI non-blocking guarantee — on top of the existing RPC/`View`-level suite.
 
 **Architecture:** Tier 1 promotes a tiny public surface on `nxvim-tui` (`encode_key`, `View::from_redraw`, `paint`) and tests key translation + cell-grid painting from synthetic views. Tier 2 (`crates/nxvim/tests/screen.rs`) runs the real server in-process, captures the real `redraw`, paints it via `nxvim_tui::paint`, and asserts on cells — plus a deterministic "stalled UI never blocks the editor" test. Tier 3 (`crates/nxvim/tests/e2e.rs`) drives the real `nxvim` binary in a PTY with `portable-pty` + `vt100`. A real `:sleep {N}[m]` ex-command serves as the slow-op hook for the responsiveness tests.
@@ -688,7 +686,7 @@ async fn editor_keeps_processing_when_the_ui_never_drains_redraws() {
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `cargo test -p nxvim --test screen`
-Expected: first run fails to compile until the dev-deps from Step 1 are in place; once compiling, all four tests should pass (this task is mostly test-only — the production code it exercises already exists after Tasks 1–3). If any assertion fails, treat it as a real defect surfaced by the new tier and debug with superpowers:systematic-debugging.
+Expected: first run fails to compile until the dev-deps from Step 1 are in place; once compiling, all four tests should pass (this task is mostly test-only — the production code it exercises already exists after Tasks 1–3). If any assertion fails, treat it as a real defect surfaced by the new tier and debug it systematically.
 
 - [ ] **Step 4: Run test to verify it passes**
 

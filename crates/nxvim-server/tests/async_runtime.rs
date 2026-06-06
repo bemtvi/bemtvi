@@ -3,7 +3,7 @@
 //! `vim.system`. Black-box per the project conventions — a real server over RPC,
 //! driven with `nvim_exec_lua`, asserting on observable Lua state.
 //!
-//! Two observation patterns (see docs/async-lua-runtime-plan.md → testing
+//! Two observation patterns (see docs/plans/2026-06-06-async-lua-runtime.md → testing
 //! appendix):
 //!   * deferred-within-a-tick (`vim.schedule`) — assert on *ordering*, since the
 //!     effect lands at convergence in the same handler;

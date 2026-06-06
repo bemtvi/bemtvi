@@ -1,4 +1,4 @@
-//! Phase 0 of docs/lsp-completion-plan.md: every hollow `vim.*` stub now fails
+//! Phase 0 of docs/plans/2026-06-05-lsp-completion.md: every hollow `vim.*` stub now fails
 //! loud. Instead of returning a fake/empty value that makes a broken server look
 //! configured, a not-yet-implemented function raises `nxvim: not implemented:
 //! <name>` and records `<name>` in `vim._notimpl_hits` (the running scoreboard a

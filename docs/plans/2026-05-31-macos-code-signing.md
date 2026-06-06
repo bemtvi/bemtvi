@@ -1,14 +1,12 @@
 # macOS Code Signing & Notarization Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Developer ID sign (hardened runtime) + notarize the two macOS `nxvim` binaries in the reusable build workflow, so every macOS binary on both the `edge` and stable channels runs on any Mac.
 
 **Architecture:** Three macOS-only steps (`if: matrix.os == 'macos'`) are inserted into `.github/workflows/build.yml` between the `Build` and `Package (Unix)` steps — import cert into a throwaway keychain, `codesign`, then `xcrun notarytool submit --wait`. Because `build.yml` is a reusable (`workflow_call`) workflow, the five signing secrets are declared in its `workflow_call.secrets` block and the two callers (`edge.yml`, `release.yml`) pass them with `secrets: inherit` — otherwise `${{ secrets.* }}` is empty inside `build.yml`. Signing mutates the binary before `tar`, so the existing checksums + provenance attestation (computed in the publish jobs over the archives) already cover the signed binary.
 
 **Tech Stack:** Apple first-party CLIs — `security`, `codesign`, `xcrun notarytool` — with App Store Connect API-key auth. No third-party actions touch the signing material.
 
-**Reference spec:** `docs/superpowers/specs/2026-05-31-macos-code-signing-design.md`
+**Reference spec:** `docs/specs/2026-05-31-macos-code-signing-design.md`
 
 **Local validation tool:** `actionlint` (already installed) validates the workflow YAML and runs shellcheck on the `run:` scripts.
 

@@ -21,7 +21,7 @@ only what has *no* call site to tag.
    `nxvim: not implemented: <name>` through `vim._notimpl(name)` rather than
    returning a fake value. Self-documenting at the call site (the name is in the
    raise) and at runtime (see below). This is the project's no-silent-stubs rule
-   (`CLAUDE.md`, and `docs/lsp-completion-plan.md` Phase 0).
+   (`CLAUDE.md`, and `docs/plans/2026-06-05-lsp-completion.md` Phase 0).
 
 The per-function list is **generated from the code, not maintained here**:
 
@@ -89,7 +89,7 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 
 ## Relationship to the LSP completion plan
 
-[`docs/lsp-completion-plan.md`](lsp-completion-plan.md) is the **phased route**
+[`docs/plans/2026-06-05-lsp-completion.md`](plans/2026-06-05-lsp-completion.md) is the **phased route**
 that drove the LSP surface from "every hollow stub raises" (Phase 0) to today;
 each phase notes the approximations it deliberately left behind. That document is
 *history + plan*, not a live registry. The live registry is the `INCOMPLETE:` /

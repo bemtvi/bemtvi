@@ -35,7 +35,7 @@
 //! instant under a colliding prefix. The idle flush above is now reached only for
 //! genuinely-ambiguous *mapped* prefixes and lone-prefix release; user maps still
 //! win (the oracle fires only where a run breaks every live mapping prefix). Full
-//! rationale: `docs/superpowers/specs/2026-06-05-keymap-builtin-disambiguation-design.md`.
+//! rationale: `docs/specs/2026-06-05-keymap-builtin-disambiguation-design.md`.
 
 use std::collections::HashMap;
 

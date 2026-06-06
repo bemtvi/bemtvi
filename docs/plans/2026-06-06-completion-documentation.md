@@ -43,7 +43,7 @@ round-trip for the selected item, and render the result in a preview surface
 beside the popup.
 
 This follows the same fail-loud, no-silent-stubs rule as
-[`docs/lsp-completion-plan.md`](lsp-completion-plan.md): a server that can't
+[`docs/plans/2026-06-05-lsp-completion.md`](2026-06-05-lsp-completion.md): a server that can't
 resolve, or a malformed reply, is logged — never faked into an empty doc that
 looks like "no documentation."
 
@@ -228,7 +228,7 @@ the reply. Verified by `a_click_selects_then_accepts_a_completion_item` and
 - **Single preview, single window.** Like the popup itself, the preview is one
   box in the single-window model — no separate preview-window handle, no
   `completeopt` matrix. (Inherits the single-window root cause in
-  [`docs/known-approximations.md`](known-approximations.md).)
+  [`docs/known-approximations.md`](../known-approximations.md).)
 - **Markdown is rendered as plain lines**, not styled — same as hover today
   (the markup distiller yields lines, not highlights).
 - **Resolve is best-effort per selection.** A very fast scroll through the menu

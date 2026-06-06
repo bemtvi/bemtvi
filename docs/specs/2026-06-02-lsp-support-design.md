@@ -33,7 +33,7 @@ formatting, code actions** — while preserving nxvim's two non-negotiables:
    no I/O leak into core. LSP lives in a new crate and in `nxvim-server`; core
    gains only small, pure helpers (position-encoding math) and a cursor-jump API.
 
-Compatibility target, per [architecture.md](../../architecture.md) guiding
+Compatibility target, per [architecture.md](../architecture.md) guiding
 principle 2, is the **Lua `vim.lsp.*` / `vim.diagnostic.*` API surface** that
 modern plugins drive — but that is the *last* phase. Earlier phases stand up the
 machinery behind a small **built-in config** (a filetype→server-command table,
@@ -226,7 +226,7 @@ what they need:
 
 Floating windows, a real sign column, and inline virtual text are **follow-ups**,
 noted where they would improve a feature. The panel ([architecture.md → *The
-message panel*](../../architecture.md)) is the workhorse: it is already
+message panel*](../architecture.md)) is the workhorse: it is already
 bottom-docked, scrollable, and `<CR>`-selectable with a Lua/RPC callback — ideal
 for location lists and hover text without inventing float layout.
 

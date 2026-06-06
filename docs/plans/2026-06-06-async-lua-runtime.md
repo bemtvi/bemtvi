@@ -14,7 +14,7 @@ config) reaches for are faked:
 | `vim.uv`/`vim.loop` timers | libuv timer handles | **absent** (only `fs_stat`/`os_homedir`/`cwd`/`fs_realpath`/`os_uname` exist, all synchronous) | `nxvim-lua/src/lib.rs` `uv` table |
 
 This is **foundational work**: it is Phase 4 of
-[`docs/lsp-completion-plan.md`](lsp-completion-plan.md) and the pivot the back
+[`docs/plans/2026-06-05-lsp-completion.md`](2026-06-05-lsp-completion.md) and the pivot the back
 half of LSP (real `client:request`, `vim.lsp.util.*`, `vim.ui.*`) builds on, and
 it unblocks the general `vim.loop`/`vim.uv` surface every async plugin assumes.
 The architecture doc already lists it as the next roadmap gap (*"An async Lua
@@ -474,7 +474,7 @@ under concurrency.
 **Scope (files).** `crates/nxvim-lua/src/lib.rs` (the seam API + `run_callback`
 variants), `crates/nxvim-server/src/lib.rs` (the central `settle()` helper),
 `crates/nxvim-lua/src/prelude.lua` (`vim.schedule_wrap`, any now-implementable
-stubs), plus a short note in `docs/lsp-completion-plan.md` Phase 5 pointing at
+stubs), plus a short note in `docs/plans/2026-06-05-lsp-completion.md` Phase 5 pointing at
 the seam.
 
 **Approach.**
@@ -533,7 +533,7 @@ leak/ordering/re-entrancy tests pass; `Server::settle()` is the one tail every
 Lua-running entry point shares; and the LSP plan's Phase 5 can reference this
 seam instead of inventing its own.
 
-**Depends on.** Phases 1–3. Hands off to `lsp-completion-plan.md` Phase 5.
+**Depends on.** Phases 1–3. Hands off to `2026-06-05-lsp-completion.md` Phase 5.
 
 ---
 

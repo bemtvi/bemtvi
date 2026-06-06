@@ -62,7 +62,7 @@ core  rpc  lua       rpc        /   \
 The syntax worker is a *process* edge, not a crate dependency: `nxvim-server`
 spawns and supervises it but never links tree-sitter. See
 [*Syntax highlighting*](#syntax-highlighting-treesitter) below and the design at
-[`docs/superpowers/specs/2026-06-01-syntax-highlighting-design.md`](superpowers/specs/2026-06-01-syntax-highlighting-design.md).
+[`docs/specs/2026-06-01-syntax-highlighting-design.md`](specs/2026-06-01-syntax-highlighting-design.md).
 
 `nxvim-core` has no async, no I/O beyond file read/write, and no transport
 dependencies. That keeps the hard part — vim semantics — testable and portable,
@@ -477,9 +477,9 @@ resolves group → concrete style (a colorscheme's `nvim_set_hl` table, or the
 capture-fallback chain); the client paints the truecolor it is handed, falling
 back to a small built-in theme only when no colorscheme resolved a span. Full
 designs:
-[syntax highlighting](superpowers/specs/2026-06-01-syntax-highlighting-design.md)
+[syntax highlighting](specs/2026-06-01-syntax-highlighting-design.md)
 and
-[the catppuccin colorscheme](superpowers/specs/2026-06-01-catppuccin-colorscheme-design.md).
+[the catppuccin colorscheme](specs/2026-06-01-catppuccin-colorscheme-design.md).
 
 ---
 
@@ -581,7 +581,7 @@ screen," and that is exactly the shape of these tests.
   built-in server table removed), `vim.lsp.buf.*` and `vim.diagnostic.*` drive the
   native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
   `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
-  the [LSP support design](superpowers/specs/2026-06-02-lsp-support-design.md)).
+  the [LSP support design](specs/2026-06-02-lsp-support-design.md)).
   **All ~400 vendored `lsp/<server>.lua` configs LOAD and START unmodified — but
   starting a server is not the same as it *working*** (the distinction this
   paragraph is careful about). The config-resolution surface is real and
@@ -602,7 +602,7 @@ screen," and that is exactly the shape of these tests.
   forwarded at `initialize`, the lifecycle hooks (`before_init` / `on_init` /
   `on_exit`) fire, and the deferred-callback surface (`vim.lsp.util.*`,
   `client:request`, `vim.ui.*`, the buffer/window getters) is real — see
-  [the LSP completion plan](lsp-completion-plan.md) for the phase-by-phase route
+  [the LSP completion plan](plans/2026-06-05-lsp-completion.md) for the phase-by-phase route
   from "starts" to "works". Two whole configs are skipped: gdscript (a non-stdio
   TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a user-only
   `bundle_path`).
@@ -632,7 +632,7 @@ screen," and that is exactly the shape of these tests.
   A per-buffer command registry (the command analogue of buffer-local options /
   buffer-local keymaps, which `vim._keymaps` already scopes) is the fix.
 - **An async Lua runtime (event loop).** *Landed* (see
-  [the async-runtime plan](async-lua-runtime-plan.md)). A `Send` background actor
+  [the async-runtime plan](plans/2026-06-06-async-lua-runtime.md)). A `Send` background actor
   (`crates/nxvim-server/src/evloop.rs`, modeled on `LspManager`) owns timers and
   child processes; on completion it sends a typed `LoopEvent` back to the single
   server thread, which runs the matching Lua callback by id (the `vim._cb_fns`

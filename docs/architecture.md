@@ -114,6 +114,65 @@ The editor and Lua state are intentionally `!Send` and live on a single thread,
 which is why the server gets its own thread/runtime rather than being spawned
 onto a shared pool.
 
+#### Multi-source scheduling & event ordering
+
+The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **four**
+event sources against the single-threaded editor: RPC input from the UI, the
+treesitter syntax worker, the LSP manager, and the async-runtime actor
+(`evloop.rs` — timers and child processes). Each source is an mpsc channel; the
+matching async actor (a `Send` background task) only ever ferries ids / bytes /
+durations back, never the `!Send` editor or Lua state. This is nxvim's analog of
+neovim's main-thread + worker-thread model, where workers hand results to the one
+editor thread by enqueuing events — see
+[neovim's threading model](neovim-threading-model.md) for the reference design.
+
+Two ordering properties hold, and one is a deliberate divergence worth recording:
+
+- **Serialization (preserved).** Every `select!` arm body runs to completion
+  before the next loop iteration — the off-tick arms are fully synchronous, and
+  each ends in the *settle contract* (`apply_lua_effects` → `run_pending` →
+  `redraw`) so a callback's deferred work converges and repaints at a
+  redraw-followed point, never "too early". Two events can never interleave their
+  mutations: neovim's "editor logic never runs concurrently with itself"
+  guarantee, enforced here by the crate boundary (`nxvim-core` is pure/sync) and
+  the `!Send` VM rather than by neovim's runtime `recursive`-abort.
+- **Per-source order (FIFO).** Each channel delivers in arrival order, and the
+  per-arm coalescing (`while try_recv()`) drains a burst in order before one
+  repaint.
+- **Cross-source order (divergence).** When events from *different* sources are
+  ready in the same poll, plain `tokio::select!` picks a ready branch
+  **pseudo-randomly**. Neovim's parent/child `MultiQueue` instead imposes a
+  deterministic relative order by enqueue time. We accept the weaker guarantee:
+  the random pick buys anti-starvation fairness, and because every arm fully
+  settles, the nondeterminism is limited to *which independent source lands
+  first* — never to interleaving or corruption. A timer-vs-keystroke wall-clock
+  race is inherently timing-dependent in neovim too.
+
+**The `biased;` option (possible future change).** `tokio::select!` accepts a
+leading `biased;` that switches branch selection from random to **top-to-bottom
+in declaration order**. Adding it would make cross-source scheduling
+*deterministic* — the closest analog to neovim's multiqueue ordering — and turn
+the arm declaration order into an explicit **priority** (e.g. input first, so
+keystrokes are never delayed behind background timers/LSP/syntax; the cosmetic
+syntax arm last). It is intentionally **not** enabled today because:
+
+- the current random selection is the simpler default and provides fairness for
+  free, and no observed workload depends on cross-source ordering (each arm
+  settles independently, so the relative order of background sources carries no
+  correctness dependency);
+- `biased;` makes the developer responsible for starvation — a branch that is
+  *perpetually* ready (e.g. a sustained input flood, or a tight self-re-arming
+  timer) would starve every lower-priority branch, whereas random selection
+  cannot. Our per-arm burst-coalescing bounds this in practice, but it is a real
+  footgun the default avoids.
+
+Adopt `biased;` if a future need arises: a reproducibility requirement (a test or
+behavior that must see input drained before a same-tick timer), or a responsiveness
+bug where background work visibly preempts input. The change is one line plus a
+deliberate arm ordering — recommended order **input → LSP → loop (timers/processes)
+→ syntax** (user-facing first, purely-cosmetic last) — and must be paired with a
+starvation review of the now-highest-priority arm.
+
 ---
 
 ## Protocols

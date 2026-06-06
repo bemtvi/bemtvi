@@ -393,6 +393,11 @@ function vim.notify_once(msg, level, opts) return vim.notify(msg, level, opts) e
 -- neovim's in-VM one, so this namespace is otherwise absent. catppuccin probes
 -- `vim.treesitter.highlighter.hl_map` purely to detect ancient neovim 0.7; an
 -- empty `highlighter` makes that field nil, so the modern path is taken.
+-- INCOMPLETE: the namespace is a near-empty shell — only the version-probe shape
+-- exists. Every real API (vim.treesitter.get_parser, .query.*, .start, language
+-- registration, etc.) is absent, so a config calling one hits a nil-index rather
+-- than a named failure. A real impl would either bridge to nxvim's out-of-process
+-- highlighter or route the unimplemented entry points through vim._notimpl.
 vim.treesitter = vim.treesitter or { highlighter = {} }
 
 function vim.inspect(value)
@@ -1456,8 +1461,13 @@ function uv_timer:close(cb)
   vim._proc_pids[self._id] = nil
   if cb then cb() end
 end
-function uv_timer:is_closing() return false end
-function uv_timer:is_active() return true end
+-- :is_active() / :is_closing() can't be answered faithfully from Lua: a one-shot
+-- timer auto-expires inside the event-loop actor (Rust) with no callback back to
+-- Lua, so the handle has no way to know it has fired. Any constant we return (the
+-- old `true` / `false`) is a lie about real state that would make a "is this timer
+-- still running?" check silently wrong, so they raise via vim._notimpl instead.
+function uv_timer:is_closing() vim._notimpl("vim.uv.timer:is_closing") end
+function uv_timer:is_active() vim._notimpl("vim.uv.timer:is_active") end
 
 -- vim.uv.new_timer_handle(id): wrap an existing callback id in a handle (used by
 -- defer_fn, whose fn is already registered). vim.uv.new_timer(): a fresh handle.
@@ -1611,6 +1621,11 @@ function vim.uri_to_bufnr(_uri) vim._notimpl("vim.uri_to_bufnr") end
 -- vim.validate / vim.deprecate: argument validation and deprecation notices in
 -- neovim. Config files call them defensively; nxvim makes them no-ops (never
 -- erroring) so a config that validates its opts loads unimpeded.
+-- INCOMPLETE: vim.validate never actually validates — a config passing the wrong
+-- arg type sails through instead of getting neovim's "expected X, got Y" error,
+-- so bad opts surface later (or never) rather than at the validate call. A real
+-- impl would parse the {name = {value, type/pred, optional}} spec and raise on
+-- mismatch. vim.deprecate likewise swallows every deprecation notice silently.
 function vim.validate(...) end
 
 function vim.deprecate(...) end
@@ -1642,6 +1657,13 @@ vim.lsp.handlers = vim.lsp.handlers or {}
 
 -- Client capabilities are owned and advertised by the Rust client at
 -- `initialize`; this stub lets a config that merges into them run without error.
+-- INCOMPLETE: returns an EMPTY table, not nxvim's real default capabilities. A
+-- config that *replaces* whole subtrees (caps = tbl_deep_extend("force", caps,
+-- cmp_caps)) works — its deltas flow through to the server (lib.rs `capabilities`
+-- is deep-merged over the Rust base). But a config that *indexes* a nested field
+-- (caps.textDocument.completion.completionItem.snippetSupport = true) crashes on
+-- nil, because the tree isn't populated. A real impl would mirror the Rust base
+-- client capabilities here so reads and writes both see the true advertised tree.
 function vim.lsp.protocol.make_client_capabilities() return {} end
 
 -- vim.lsp.protocol.MessageType: the window/logMessage severity enum. A config

@@ -982,6 +982,10 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     // to fold into the core registry. `ns` is accepted but ignored (namespace 0
     // only); the full opts shape — colors, the boolean attrs, and `link` — is
     // read here so a colorscheme's hundreds of calls all land.
+    // INCOMPLETE: a non-zero `ns` is silently folded into the global namespace
+    // instead of a separate one, so `nvim_win_set_hl_ns` / per-window highlight
+    // namespaces can't be honored — a config that sets group X in two namespaces
+    // gets last-write-wins on the global table. A real impl would key HlSet by ns.
     let sh = shared.clone();
     api.set(
         "nvim_set_hl",
@@ -1199,6 +1203,12 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
         lua.create_function(|_, feature: String| {
             // Claim a modern neovim so version-gated code takes its full path;
             // unknown features report absent. Refined as needs surface.
+            // INCOMPLETE: a coarse heuristic, not a real feature table. EVERY
+            // `nvim-X.Y` returns 1 — including future/bogus versions
+            // (`has('nvim-0.99')` → 1, wrong) — and every non-`nvim-` feature
+            // returns 0, including real ones nxvim could answer (`unix`, `mac`,
+            // `win32`, `gui_running`, …). A real impl would consult an actual
+            // feature/version table instead of pattern-matching the prefix.
             Ok(if feature.starts_with("nvim-") {
                 1i64
             } else {
@@ -1705,6 +1715,12 @@ fn install_runtime_api(
             let t = lua.create_table()?;
             t.set("sysname", std::env::consts::OS)?;
             t.set("machine", std::env::consts::ARCH)?;
+            // INCOMPLETE: `release` is hardcoded empty (no real kernel release).
+            // Only `version`/`sysname` are consulted by lspconfig today, so the
+            // gap is dormant; a config that reads os_uname().release for an OS
+            // version check gets "". A real impl would call the libc `uname(2)` /
+            // platform API and fill release (and sysname's true value — `sysname`
+            // here is Rust's "macos"/"linux" const, not uname's "Darwin"/"Linux").
             t.set("release", "")?;
             t.set(
                 "version",

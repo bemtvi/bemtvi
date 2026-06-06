@@ -472,6 +472,15 @@ dispatch goes through `vim.lsp._dispatch_command(client_id, command)` (shared by
 `command` (via the new `CodeActionData.command` + `LuaRuntime::run_lsp_command`
 Rust→Lua bridge), instead of echoing "command unsupported".
 
+With the prompt machinery now in place, the surfaces that previously *required* a
+name because no input existed prompt for it: `vim.lsp.buf.rename()` with no name
+(the bare-RHS `vim.keymap.set('n','<leader>rn',vim.lsp.buf.rename)` case) and
+`:LspRename` with no argument both open a `vim.ui.input` prompt prefilled with the
+symbol under the cursor (`vim.lsp._cursor_word`, neovim's `<cword>`) and rename on
+confirm, instead of echoing E471. Covered by
+`lsp_rename_with_no_name_prompts_prefilled_with_the_cword` and
+`vim_lsp_buf_rename_no_arg_prompts_via_lua`.
+
 *Known approximations:* `vim.ui.select` does not deliver `on_choice(nil)` when the
 panel is dismissed without a pick (`q`) — the panel has no cancel event; a real
 pick is faithful. Only one `vim.ui.input` prompt is open at a time (a single

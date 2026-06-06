@@ -1905,6 +1905,72 @@ async fn rename_applies_a_workspace_edit_across_open_buffers() {
 }
 
 #[tokio::test]
+async fn lsp_rename_with_no_name_prompts_prefilled_with_the_cword() {
+    let _guard = test_lock().lock().await;
+    // `:LspRename` with no argument now prompts (vim.ui.input) instead of erroring,
+    // prefilled with the symbol under the cursor — so the prompt is editable and
+    // the typed name reaches `textDocument/rename`.
+    let file = temp_file("rename-prompt", "rs", "foo = foo\n");
+    let record = configure_mock(
+        "rename-prompt",
+        serde_json::json!({
+            "rename": ws_changes(&[(
+                &file,
+                vec![text_edit(0, 0, 0, 3, "X"), text_edit(0, 6, 0, 9, "X")],
+            )])
+        }),
+    );
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Cursor on the `foo` symbol; `:LspRename` (no arg) opens the prompt prefilled
+    // with the cword "foo". Append "bar" and submit.
+    feed(&rpc, "gg0");
+    cmd(&rpc, "LspRename").await;
+    feed(&rpc, "bar<CR>");
+
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/rename")).await;
+    let req = find(&recs, "textDocument/rename").expect("the rename request went out");
+    assert_eq!(
+        req["params"]["newName"].as_str(),
+        Some("foobar"),
+        "the prompt prefilled the cword (foo) and the appended text rode along: {req:?}"
+    );
+    // The server's WorkspaceEdit reply still applies.
+    wait_for_lines(&rpc, &["X = X"]).await;
+}
+
+#[tokio::test]
+async fn vim_lsp_buf_rename_no_arg_prompts_via_lua() {
+    let _guard = test_lock().lock().await;
+    // The bare-RHS form `vim.lsp.buf.rename()` (no name) prompts too — the path a
+    // `vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename)` mapping takes.
+    let file = temp_file("rename-lua-prompt", "rs", "foo = foo\n");
+    let record = configure_mock(
+        "rename-lua-prompt",
+        serde_json::json!({
+            "rename": ws_changes(&[(&file, vec![text_edit(0, 0, 0, 3, "Y"), text_edit(0, 6, 0, 9, "Y")])])
+        }),
+    );
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "gg0");
+    cmd(&rpc, "lua vim.lsp.buf.rename()").await;
+    // Accept the prefilled cword default unchanged.
+    feed(&rpc, "<CR>");
+
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/rename")).await;
+    let req = find(&recs, "textDocument/rename").expect("the rename request went out");
+    assert_eq!(
+        req["params"]["newName"].as_str(),
+        Some("foo"),
+        "the prompt defaulted to the cword: {req:?}"
+    );
+    wait_for_lines(&rpc, &["Y = Y"]).await;
+}
+
+#[tokio::test]
 async fn a_code_action_lists_in_the_panel_and_applies_on_enter() {
     let _guard = test_lock().lock().await;
     // The code-action list opens in the panel; `<CR>` on a row applies that

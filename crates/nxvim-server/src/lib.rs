@@ -1312,8 +1312,17 @@ impl Server {
             "LspHover" => self.request_lsp(LspReqKind::Hover),
             "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp),
             // Phase-6: buffer-mutating features. Format/code-action take no
-            // argument; rename reads the new name the dispatcher split off.
+            // argument; rename reads the new name the dispatcher split off — or,
+            // with no name, prompts for it through `vim.lsp.buf.rename()`
+            // (`vim.ui.input`, Phase 8) instead of erroring.
             "LspFormat" => self.request_lsp_format(),
+            "LspRename" if args.trim().is_empty() => {
+                if let Err(e) = self.lua.exec("vim.lsp.buf.rename()") {
+                    self.editor
+                        .echo(format!("E5108: Error in :LspRename prompt: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             "LspRename" => self.request_lsp_rename(args),
             "LspCodeAction" => self.request_lsp_code_action(),
             _ if self.lua.has_user_command(name) => {

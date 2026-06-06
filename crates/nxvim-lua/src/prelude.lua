@@ -2409,14 +2409,37 @@ function vim.lsp.buf.execute_command(command, opts)
   vim.lsp._dispatch_command(client_id, command)
 end
 
--- rename(new_name): the name is required (nxvim has no prompt UI yet). A nil/empty
--- name echoes E471 rather than prompting, matching `:LspRename`.
-function vim.lsp.buf.rename(new_name)
-  if type(new_name) ~= "string" or new_name == "" then
-    vim.api.nvim_echo("E471: Argument required: vim.lsp.buf.rename(name)")
+-- vim.lsp._cursor_word(): the keyword run (`[%w_]`) under the cursor, read from
+-- the Phase-6 cursor / buffer mirror — neovim's `<cword>`, used to prefill the
+-- rename prompt. Empty when the cursor isn't on a word char (ASCII-keyword
+-- approximation; multibyte identifiers aren't expanded).
+function vim.lsp._cursor_word()
+  local pos = vim.api.nvim_win_get_cursor(0)
+  local row, col = pos[1], pos[2]
+  local line = (vim.api.nvim_buf_get_lines(0, row - 1, row, false))[1] or ""
+  local b = col + 1 -- 1-based byte index of the char under the cursor
+  if not line:sub(b, b):match("[%w_]") then return "" end
+  local s, e = b, b
+  while s > 1 and line:sub(s - 1, s - 1):match("[%w_]") do s = s - 1 end
+  while e < #line and line:sub(e + 1, e + 1):match("[%w_]") do e = e + 1 end
+  return line:sub(s, e)
+end
+
+-- rename(new_name): rename the symbol under the cursor. With a name, request it
+-- straight away; with none (the common `vim.keymap.set('n', '<leader>rn',
+-- vim.lsp.buf.rename)` bare-RHS case), prompt for it via `vim.ui.input` (Phase 8),
+-- prefilled with the symbol under the cursor, and rename on confirm — matching
+-- neovim. An empty / cancelled prompt does nothing.
+function vim.lsp.buf.rename(new_name, _opts)
+  if type(new_name) == "string" and new_name ~= "" then
+    vim._lsp_buf_rename(new_name)
     return
   end
-  vim._lsp_buf_rename(new_name)
+  vim.ui.input({ prompt = "New Name: ", default = vim.lsp._cursor_word() }, function(name)
+    if type(name) == "string" and name ~= "" then
+      vim._lsp_buf_rename(name)
+    end
+  end)
 end
 
 -- ----- vim.diagnostic: the Lua diagnostics surface ---------------------------

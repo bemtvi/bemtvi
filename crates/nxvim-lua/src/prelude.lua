@@ -1919,9 +1919,17 @@ function vim.lsp.util.show_document(location, encoding, _opts)
   return true
 end
 
--- vim.lsp.omnifunc: the i_CTRL-X_CTRL-O completion entry point. nxvim has no
--- omni-completion path yet; returning -1 ("no completion") masked the gap, so it
--- raises via vim._notimpl.
+-- vim.lsp.omnifunc: the legacy `i_CTRL-X_CTRL-O` (Vimscript-era omni-completion)
+-- entry point. nxvim has no omnifunc path yet; returning -1 ("no completion")
+-- masked the gap, so it raises via vim._notimpl.
+--
+-- NOTE: this is NOT nxvim's completion menu. The native insert-mode menu is real
+-- and works against live servers: <C-Space> fires `textDocument/completion` via
+-- LspReqKind::Completion, opening the server-owned `CompletionMenu`
+-- (crates/nxvim-server/src/lsp.rs). This raise only covers the legacy omnifunc
+-- integration point — do not read it as "completion is missing." The one real
+-- completion-menu gap is per-item documentation; see
+-- docs/completion-documentation-plan.md.
 function vim.lsp.omnifunc(_findstart, _base) vim._notimpl("vim.lsp.omnifunc") end
 
 vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer

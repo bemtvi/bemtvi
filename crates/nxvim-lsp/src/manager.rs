@@ -1286,6 +1286,12 @@ fn completion_reply(
 /// `CompletionTextEdit` (an `Edit`, or an `InsertAndReplace` collapsed to its
 /// `replace` range) plus the `additionalTextEdits` to plain [`TextEdit`]s whose
 /// ranges stay in the negotiated encoding.
+// INCOMPLETE: `item.documentation` and `item.data` are dropped, so the menu can
+// never show per-item documentation, and there is no way to `completionItem/resolve`
+// it (most servers — rust_analyzer especially — send docs only on resolve, keyed
+// by the `data` blob). Faithful needs: carry `documentation` (markup → lines) and
+// `data`, advertise the completion client capability, and wire a resolve round-trip.
+// Plan: docs/completion-documentation-plan.md.
 fn completion_item(item: CompletionItem) -> CompletionItemData {
     let text_edit = item.text_edit.map(|edit| match edit {
         CompletionTextEdit::Edit(e) => e,

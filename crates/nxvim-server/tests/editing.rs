@@ -3480,3 +3480,225 @@ async fn v_f_then_delete_includes_the_target() {
     feed(&rpc, "0vfod");
     assert_eq!(lines(&rpc).await, vec![" world"]);
 }
+
+// ----- Phase 6: buffer / window Lua API ----------------------------------
+//
+// These drive the *Lua* buffer API (`vim.api.nvim_buf_*` / `nvim_win_get_cursor`
+// / `vim.bo`) through `nvim_exec_lua`, which reads the Rust→Lua mirror the server
+// refreshes before the eval. The native RPC `nvim_buf_get_lines` (`lines`) reads
+// the real editor directly, so it independently confirms the queued mutation
+// reached the rope, not just the Lua-side write-through.
+
+/// Run a Lua chunk and return its value (the Phase-6 getters surface here).
+async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(code), Value::Array(vec![])],
+    )
+    .await
+    .expect("nvim_exec_lua")
+}
+
+#[tokio::test]
+async fn buf_set_lines_then_get_lines_round_trips_within_one_chunk() {
+    let (rpc, _incoming) = start(None).await;
+    // Write-through must agree with the eventual real apply: set then get in one
+    // chunk reads the Lua mirror; `lines` then proves the rope caught up.
+    let got = exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, {"alpha", "beta", "gamma"})
+        return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+        "#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("alpha\nbeta\ngamma"));
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beta", "gamma"]);
+}
+
+#[tokio::test]
+async fn buf_get_lines_honors_negative_and_ranged_indices() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"a", "b", "c", "d", "e"})"#,
+    )
+    .await;
+    let last = exec_lua(
+        &rpc,
+        r#"return table.concat(vim.api.nvim_buf_get_lines(0, -2, -1, false), ",")"#,
+    )
+    .await;
+    assert_eq!(last.as_str(), Some("e"), "(-2,-1) is the last line");
+    let mid = exec_lua(
+        &rpc,
+        r#"return table.concat(vim.api.nvim_buf_get_lines(0, 1, 3, false), ",")"#,
+    )
+    .await;
+    assert_eq!(mid.as_str(), Some("b,c"), "(1,3) is end-exclusive");
+}
+
+#[tokio::test]
+async fn buf_set_lines_append_replace_all_and_delete() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"one", "two", "three"})"#,
+    )
+    .await;
+    // Append after the last line.
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, -1, -1, false, {"four"})"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two", "three", "four"]);
+    // Delete the first line (empty replacement).
+    exec_lua(&rpc, r#"vim.api.nvim_buf_set_lines(0, 0, 1, false, {})"#).await;
+    assert_eq!(lines(&rpc).await, vec!["two", "three", "four"]);
+    // Replace everything.
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"only"})"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["only"]);
+}
+
+#[tokio::test]
+async fn buf_set_lines_on_a_fresh_empty_buffer() {
+    let (rpc, _incoming) = start(None).await;
+    // A fresh [No Name] buffer is [""]. Inserting at (0,0) keeps the empty line…
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, 0, false, {"first"})"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["first", ""]);
+    // …while (0,-1) replaces through the last real line (the phantom-newline guard).
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"first"})"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["first"]);
+}
+
+#[tokio::test]
+async fn buf_set_lines_reflected_in_the_rendered_buffer() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iuntouched<Esc>");
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"scripted edit"})"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["scripted edit"]);
+}
+
+#[tokio::test]
+async fn win_get_cursor_reflects_the_real_cursor() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar baz<Esc>");
+    // Land somewhere unambiguous: line 2, a few columns in.
+    feed(&rpc, "gg0jll");
+    let pos = exec_lua(
+        &rpc,
+        r#"local c = vim.api.nvim_win_get_cursor(0); return c[1] * 1000 + c[2]"#,
+    )
+    .await;
+    // Row 2 (1-based), column 2 (0-based).
+    assert_eq!(pos.as_u64(), Some(2 * 1000 + 2));
+}
+
+#[tokio::test]
+async fn get_current_win_is_the_single_window_handle() {
+    let (rpc, _incoming) = start(None).await;
+    let win = exec_lua(&rpc, r#"return vim.api.nvim_get_current_win()"#).await;
+    assert_eq!(win.as_u64(), Some(1000));
+}
+
+#[tokio::test]
+async fn buf_is_loaded_is_true_for_open_and_false_for_unknown() {
+    let (rpc, _incoming) = start(None).await;
+    let open = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_buf_is_loaded(vim.api.nvim_get_current_buf())"#,
+    )
+    .await;
+    assert_eq!(open.as_bool(), Some(true));
+    let unknown = exec_lua(&rpc, r#"return vim.api.nvim_buf_is_loaded(9999)"#).await;
+    assert_eq!(unknown.as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn bo_option_write_is_observable_and_filetype_still_resolves() {
+    let (rpc, _incoming) = start(None).await;
+    // A write to the per-buffer option store reads back.
+    let stored = exec_lua(&rpc, r#"vim.bo.shiftwidth = 2; return vim.bo.shiftwidth"#).await;
+    assert_eq!(stored.as_u64(), Some(2));
+    // nvim_set_option_value lands in the same store.
+    let via_api = exec_lua(
+        &rpc,
+        r#"vim.api.nvim_set_option_value("tabstop", 8, { buf = 0 }); return vim.bo.tabstop"#,
+    )
+    .await;
+    assert_eq!(via_api.as_u64(), Some(8));
+}
+
+#[tokio::test]
+async fn buf_set_lines_targets_a_non_current_buffer() {
+    let (rpc, _incoming) = start(None).await;
+    // Create a second buffer (stays non-current) and edit it by id from Lua.
+    let other = rpc
+        .request(
+            "nvim_create_buf",
+            vec![Value::Boolean(true), Value::Boolean(false)],
+        )
+        .await
+        .expect("create_buf")
+        .as_u64()
+        .expect("buffer id");
+    exec_lua(
+        &rpc,
+        &format!(r#"vim.api.nvim_buf_set_lines({other}, 0, -1, false, {{"in the background"}})"#),
+    )
+    .await;
+    // The current buffer is untouched…
+    assert_eq!(lines(&rpc).await, vec![""]);
+    // …and the background buffer got the edit (native RPC read, by id).
+    let got = rpc
+        .request(
+            "nvim_buf_get_lines",
+            vec![
+                Value::from(other),
+                Value::from(0i64),
+                Value::from(-1i64),
+                Value::Boolean(false),
+            ],
+        )
+        .await
+        .expect("get_lines");
+    let got: Vec<String> = match got {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(got, vec!["in the background"]);
+}
+
+#[tokio::test]
+async fn buf_set_lines_strict_indexing_raises_out_of_range() {
+    let (rpc, _incoming) = start(None).await;
+    // pcall captures the strict-indexing error; a clamped (non-strict) call would
+    // silently succeed, so this guards the fail-loud contract.
+    let ok = exec_lua(
+        &rpc,
+        r#"return pcall(vim.api.nvim_buf_set_lines, 0, 50, 50, true, {"x"})"#,
+    )
+    .await;
+    assert_eq!(ok.as_bool(), Some(false), "strict out-of-range must error");
+}

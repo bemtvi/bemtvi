@@ -430,6 +430,58 @@ function vim._set_cur_buf(bufnr, name, filetype)
   vim._cur_buf = { bufnr = bufnr or 0, name = name or "", filetype = filetype or "" }
 end
 
+-- vim._bufs / vim._cur_cursor / vim._cur_win: the Rust→Lua buffer mirror the
+-- buffer-read API (Phase 6) resolves against. The server refreshes it via
+-- vim._set_buf_mirror before running any Lua that can read buffer or cursor
+-- state, so nvim_buf_get_lines / nvim_win_get_cursor / nvim_buf_is_loaded read
+-- live data without reaching the Server. vim._bufs[bufnr] = { lines, name,
+-- loaded }; nvim_buf_set_lines write-through mutates `lines` here directly so a
+-- read-after-write within one chunk stays consistent (the real buffer catches up
+-- when the server drains the queued BufOp).
+vim._bufs = vim._bufs or {}
+vim._cur_cursor = vim._cur_cursor or { row = 1, col = 0 }
+vim._cur_win = vim._cur_win or 1000
+-- Per-buffer option store backing vim.bo / nvim_set_option_value (Phase 6); the
+-- table is created here so the earlier-defined setter can index it safely.
+vim._bo_store = vim._bo_store or {}
+
+function vim._set_buf_mirror(entries, row, col, win)
+  -- The server omits `lines` for a buffer whose changedtick is unchanged (the
+  -- cheap cursor-moved-no-edit path); keep the prior `lines` in that case.
+  for bufnr, entry in pairs(entries) do
+    if entry.lines == nil then
+      local prev = vim._bufs[bufnr]
+      if prev then entry.lines = prev.lines end
+    end
+    entry.loaded = true
+  end
+  vim._bufs = entries
+  vim._cur_cursor = { row = row or 1, col = col or 0 }
+  vim._cur_win = win or 1000
+end
+
+-- Resolve a buffer handle to a concrete bufnr (0 / nil -> current buffer), the
+-- one place the buffer-read API maps neovim's "0 means current" convention.
+function vim._resolve_bufnr(bufnr)
+  if bufnr == nil or bufnr == 0 then return (vim._cur_buf or {}).bufnr or 0 end
+  return bufnr
+end
+
+-- Normalize a neovim line index against a buffer of `n` real lines, shared by
+-- nvim_buf_get_lines and nvim_buf_set_lines (and mirrored on the Rust side so the
+-- write-through and the real apply can't disagree): negatives count from the end
+-- (`-1` == one past the last line), then clamp into [0, n]. `strict` raises on an
+-- out-of-range index instead of clamping (neovim's strict_indexing).
+function vim._norm_line_index(i, n, strict)
+  local orig = i
+  if i < 0 then i = n + i + 1 end
+  if strict and (orig > n or i < 0) then
+    error("Index out of bounds", 3)
+  end
+  if i < 0 then i = 0 elseif i > n then i = n end
+  return i
+end
+
 function vim.api.nvim_create_user_command(name, command, _opts)
   vim._user_commands[name] = command
 end
@@ -588,26 +640,73 @@ function vim.api.nvim_buf_get_name(bufnr)
 end
 
 -- A few more vim.api the configs touch. `nvim_get_current_buf` resolves against
--- the single-buffer snapshot (faithful: it returns the real current buffer), so
--- it stays. The rest — window id/cursor, buffer-loaded/line access, the option
--- setter — would have to fake window/cursor/text state nxvim's Lua side can't
--- reach yet, so they raise via vim._notimpl (Phase 6 backs them for real) rather
--- than returning a fabricated `{1,0}` cursor or empty line list that makes a
--- handler look like it read the buffer. (`nvim_create_augroup`/`_autocmd`/
--- `nvim_buf_get_name`/`nvim_echo` are the real, behavior-carrying ones, defined
--- elsewhere.)
+-- the single-buffer snapshot (faithful: it returns the real current buffer). The
+-- window/cursor/line-access getters (Phase 6) read the `vim._bufs` / `vim._cur_*`
+-- mirror the server refreshes before running Lua, so they return live state, and
+-- `nvim_buf_set_lines` write-through updates the mirror then queues the real edit.
+-- (`nvim_create_augroup`/`_autocmd`/`nvim_buf_get_name`/`nvim_echo` are the real,
+-- behavior-carrying ones, defined elsewhere.)
 function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
-function vim.api.nvim_get_current_win() vim._notimpl("vim.api.nvim_get_current_win") end
-function vim.api.nvim_win_get_cursor(_win) vim._notimpl("vim.api.nvim_win_get_cursor") end
-function vim.api.nvim_buf_is_loaded(_bufnr) vim._notimpl("vim.api.nvim_buf_is_loaded") end
-function vim.api.nvim_buf_get_lines(_bufnr, _start, _end, _strict)
-  vim._notimpl("vim.api.nvim_buf_get_lines")
+
+-- Single-window nxvim: one window handle, and the cursor is the editor cursor.
+function vim.api.nvim_get_current_win() return vim._cur_win or 1000 end
+function vim.api.nvim_win_get_cursor(_win)
+  local c = vim._cur_cursor or { row = 1, col = 0 }
+  return { c.row, c.col }
 end
-function vim.api.nvim_buf_set_lines(_bufnr, _start, _end, _strict, _lines)
-  vim._notimpl("vim.api.nvim_buf_set_lines")
+
+function vim.api.nvim_buf_is_loaded(bufnr)
+  return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil
 end
-function vim.api.nvim_set_option_value(_name, _value, _opts)
-  vim._notimpl("vim.api.nvim_set_option_value")
+
+function vim.api.nvim_buf_get_lines(bufnr, start, end_, strict)
+  local buf = vim._bufs[vim._resolve_bufnr(bufnr)]
+  if not buf or not buf.lines then
+    if strict then error("Invalid buffer id", 2) end
+    return {}
+  end
+  local lines = buf.lines
+  local n = #lines
+  local s = vim._norm_line_index(start, n, strict)
+  local e = vim._norm_line_index(end_, n, strict)
+  if e < s then e = s end
+  local out = {}
+  for i = s + 1, e do
+    out[#out + 1] = lines[i]
+  end
+  return out
+end
+
+function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
+  local id = vim._resolve_bufnr(bufnr)
+  local buf = vim._bufs[id]
+  if not buf or not buf.lines then
+    if strict then error("Invalid buffer id", 2) end
+    return
+  end
+  local lines = buf.lines
+  local n = #lines
+  local s = vim._norm_line_index(start, n, strict)
+  local e = vim._norm_line_index(end_, n, strict)
+  if e < s then e = s end
+  -- Write-through: splice the mirror so a read-after-write within this chunk is
+  -- consistent, then queue the real edit (the server re-derives the byte range).
+  local updated = {}
+  for i = 1, s do updated[#updated + 1] = lines[i] end
+  for i = 1, #repl do updated[#updated + 1] = repl[i] end
+  for i = e + 1, n do updated[#updated + 1] = lines[i] end
+  buf.lines = updated
+  vim._buf_set_lines(id, start, end_, repl)
+end
+
+-- nvim_set_option_value(name, value, opts): set a (buffer-local) option. opts.buf
+-- targets a specific buffer; otherwise the current buffer. Backed by the same
+-- per-buffer store as vim.bo (observable, see the note there).
+function vim.api.nvim_set_option_value(name, value, opts)
+  opts = opts or {}
+  local buf = opts.buf and vim._resolve_bufnr(opts.buf) or vim._resolve_bufnr(0)
+  vim._bo_store[buf] = vim._bo_store[buf] or {}
+  vim._bo_store[buf][name] = value
 end
 
 -- vim.fn.expand: the `%` (current file) forms autocmd callbacks use to resolve
@@ -1158,15 +1257,30 @@ end
 
 -- A few more vim.fn used only inside deferred callbacks (handlers / user
 -- commands) nxvim doesn't drive yet. `finddir` faithfully reuses the Rust-backed
--- directory search via vim.fs, so it stays. `bufnr` (resolving an arbitrary
--- `expr` to a buffer number) and the register/quickfix/prompt ones can't be
--- honored without a buffer registry / those UIs, so they raise via vim._notimpl
--- rather than returning a fake number or silently dropping the write.
+-- directory search via vim.fs, so it stays. `bufnr` resolves against the Phase-6
+-- buffer mirror; the register/quickfix/prompt ones can't be honored without those
+-- UIs, so they raise via vim._notimpl rather than silently dropping the write.
 function vim.fn.finddir(name, path)
   local hit = vim.fs.find(name, { path = path or vim.fn.getcwd(), upward = true, type = "directory" })[1]
   return hit or ""
 end
-function vim.fn.bufnr(_expr) vim._notimpl("vim.fn.bufnr") end
+
+-- vim.fn.bufnr(expr): the buffer number for `expr`. "" / "%" / nil / 0 -> current
+-- buffer; a string -> the loaded buffer whose name matches (exact, else suffix),
+-- -1 when none. Backed by the Phase-6 `vim._bufs` mirror.
+function vim.fn.bufnr(expr)
+  if expr == nil or expr == 0 or expr == "" or expr == "%" then
+    return (vim._cur_buf or {}).bufnr or 0
+  end
+  if type(expr) == "number" then
+    return vim._bufs[expr] and expr or -1
+  end
+  for bufnr, buf in pairs(vim._bufs) do
+    local name = buf.name or ""
+    if name == expr or name:sub(-#expr) == expr then return bufnr end
+  end
+  return -1
+end
 
 -- vim.fn.substitute(str, pat, sub, flags): vim-regex substitution. nxvim has no
 -- vim-regex engine; the only caller is `lspconfig.util.strip_archive_subpath`,
@@ -1397,30 +1511,39 @@ function vim.ui.select(_items, _opts, _on_choice) vim._notimpl("vim.ui.select") 
 function vim.ui.input(_opts, _on_confirm) vim._notimpl("vim.ui.input") end
 function vim.ui.open(_path) vim._notimpl("vim.ui.open") end
 
--- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`). nxvim
--- has no per-buffer option store yet (Phase 6). The ONE faithful read is
--- `filetype`/`ft` — it resolves against the current-buffer snapshot and backs the
--- `root_dir` filetype checks configs do at load — so it stays. Any other read
--- would fabricate an option value, and a write would silently vanish, so both
--- raise via vim._notimpl. A bare `vim.bo.<opt>` (no bufnr) targets the current
--- buffer too.
-local function bo_proxy(_bufnr)
+-- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`), backed
+-- by a per-buffer store (Phase 6). Writes record; reads return the stored value
+-- (else nil — neovim's option default isn't modeled). `filetype`/`ft` stays
+-- authoritative from the current-buffer snapshot (it backs the `root_dir`
+-- filetype checks configs do at load) unless a write explicitly overrode it. The
+-- store is *observable* but not yet wired to editor behavior — see the doc's
+-- known-approximations list. A bare `vim.bo.<opt>` (no bufnr) targets the current
+-- buffer. The `vim._bo_store` table is initialized with the other Phase-6 mirror
+-- state above.
+local function bo_get(bufnr, opt)
+  local store = vim._bo_store[bufnr]
+  if store ~= nil and store[opt] ~= nil then return store[opt] end
+  if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end
+  return nil
+end
+local function bo_set(bufnr, opt, value)
+  vim._bo_store[bufnr] = vim._bo_store[bufnr] or {}
+  vim._bo_store[bufnr][opt] = value
+end
+local function bo_proxy(bufnr)
+  bufnr = vim._resolve_bufnr(bufnr)
   return setmetatable({}, {
-    __index = function(_, opt)
-      if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end
-      vim._notimpl("vim.bo[].".. tostring(opt))
-    end,
-    __newindex = function(_, opt) vim._notimpl("vim.bo[]." .. tostring(opt) .. " (write)") end,
+    __index = function(_, opt) return bo_get(bufnr, opt) end,
+    __newindex = function(_, opt, value) bo_set(bufnr, opt, value) end,
   })
 end
 vim.bo = setmetatable({}, {
   __index = function(_, k)
     -- numeric key -> per-buffer proxy; option name -> current-buffer value.
     if type(k) == "number" then return bo_proxy(k) end
-    if k == "filetype" or k == "ft" then return (vim._cur_buf or {}).filetype end
-    vim._notimpl("vim.bo." .. tostring(k))
+    return bo_get(vim._resolve_bufnr(0), k)
   end,
-  __newindex = function(_, k) vim._notimpl("vim.bo." .. tostring(k) .. " (write)") end,
+  __newindex = function(_, k, value) bo_set(vim._resolve_bufnr(0), k, value) end,
 })
 
 -- vim.uri_to_bufnr(uri): in neovim, the (creating) buffer number for `uri`.

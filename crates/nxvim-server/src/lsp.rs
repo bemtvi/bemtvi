@@ -467,6 +467,9 @@ impl Server {
             .map(|s| s.language_id.clone())
             .unwrap_or_default();
         let _ = self.lua.set_buf_snapshot(buf.0, file, &ft);
+        // Keep the buffer mirror fresh: an `on_attach` body commonly reads buffer
+        // lines / the cursor and runs before the trailing `run_pending` (Phase 6).
+        self.push_buf_mirror();
         if let Err(e) = self
             .lua
             .fire_autocmd_data("LspAttach", file, buf.0, file, client_id)
@@ -1814,7 +1817,7 @@ impl Server {
     /// `didChange`); a non-current, attached buffer drains its own journal and
     /// sends the deltas (or full text) here. A no-op for an unopened / unattached
     /// / sync-none buffer (its journal is still drained so it can't replay later).
-    fn sync_lsp_buffer(&mut self, id: BufferId) {
+    pub(crate) fn sync_lsp_buffer(&mut self, id: BufferId) {
         if id == self.editor.current_buffer_id() {
             self.sync_lsp();
             return;

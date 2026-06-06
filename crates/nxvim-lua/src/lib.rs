@@ -207,6 +207,28 @@ pub enum LoopOp {
     Kill { id: u64 },
 }
 
+/// A buffer mutation queued by the buffer Lua API (`vim.api.nvim_buf_set_lines`),
+/// drained by the server in `apply_lua_effects` and applied to the live editor —
+/// the buffer-text analogue of [`LspOp`]/[`LoopOp`]. Reads (`nvim_buf_get_lines`,
+/// the cursor) need no op: they read the Rust→Lua *mirror* the server pushes via
+/// [`LuaRuntime::set_buf_mirror`] before running Lua. `set_lines` write-through
+/// updates that mirror in Lua first (so read-after-write within a chunk is
+/// consistent) and queues this op so the real buffer catches up after the chunk.
+#[derive(Clone, Debug)]
+pub enum BufOp {
+    /// `nvim_buf_set_lines(bufnr, start, end, strict, repl)` — replace lines
+    /// `[start, end)` of buffer `bufnr` with `repl`. Indices are neovim's: 0-based,
+    /// `end` exclusive, negatives count from the end, `end == -1` is the last line.
+    /// The server normalizes them against the real line count and converts the line
+    /// range to a byte range before calling `Editor::apply_edits_to`.
+    SetLines {
+        bufnr: u64,
+        start: i64,
+        end: i64,
+        repl: Vec<String>,
+    },
+}
+
 /// The arguments handed to a deferred callback when the server runs it via
 /// [`LuaRuntime::run_callback`]. A `vim.schedule` / timer callback takes none; an
 /// async `vim.system` `on_exit` takes the finished child's result, built into the
@@ -359,6 +381,9 @@ struct Shared {
     /// timers / async `vim.system`, drained by the server into its scheduled-work
     /// queue and event-loop actor after the chunk.
     loop_ops: Vec<LoopOp>,
+    /// Buffer mutations from `vim.api.nvim_buf_set_lines`, drained by the server
+    /// into the live editor after the chunk (Phase 6).
+    buf_ops: Vec<BufOp>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -545,6 +570,12 @@ impl LuaRuntime {
     /// service directly (`Schedule`) or forward to the event-loop actor.
     pub fn take_loop_ops(&self) -> Vec<LoopOp> {
         std::mem::take(&mut self.shared.borrow_mut().loop_ops)
+    }
+
+    /// Take the buffer mutations queued by `nvim_buf_set_lines` since the last
+    /// drain, for the server to apply to the live editor (Phase 6).
+    pub fn take_buf_ops(&self) -> Vec<BufOp> {
+        std::mem::take(&mut self.shared.borrow_mut().buf_ops)
     }
 
     /// Run the deferred callback registered under `id` (the `run_keymap` analogue
@@ -755,6 +786,44 @@ impl LuaRuntime {
         let vim: Table = self.lua.globals().get("vim")?;
         let set: mlua::Function = vim.get("_set_cur_buf")?;
         set.call((bufnr, name, filetype))
+    }
+
+    /// Refresh the Rust→Lua buffer mirror the buffer-read API resolves against
+    /// (Phase 6): `vim._bufs[bufnr] = { lines, name, loaded = true }` for every
+    /// open buffer, plus `vim._cur_cursor = { row, col }` (row 1-based, col 0-based,
+    /// neovim convention) and the current-window handle. The server pushes this
+    /// before running any Lua that can read buffer/cursor state, so synchronous
+    /// getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read live data
+    /// without reaching the `Server`. `set_lines` write-through mutates this same
+    /// mirror in Lua so a read-after-write within one chunk stays consistent.
+    ///
+    /// `bufs` is `(bufnr, lines, name)` per open buffer; `lines` may be empty when
+    /// the caller is only refreshing the cheap cursor/window fields (the server
+    /// gates the line arrays on `changedtick`), in which case the existing mirror
+    /// `lines` are kept.
+    pub fn set_buf_mirror(
+        &self,
+        bufs: &[(u64, Option<Vec<String>>, String)],
+        cursor: (u64, u64),
+        win: u64,
+    ) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let entries = self.lua.create_table()?;
+        for (bufnr, lines, name) in bufs {
+            let entry = self.lua.create_table()?;
+            if let Some(lines) = lines {
+                let arr = self.lua.create_table()?;
+                for (i, line) in lines.iter().enumerate() {
+                    arr.set(i + 1, self.lua.create_string(line)?)?;
+                }
+                entry.set("lines", arr)?;
+            }
+            entry.set("name", self.lua.create_string(name)?)?;
+            entry.set("bufnr", *bufnr)?;
+            entries.set(*bufnr, entry)?;
+        }
+        let set: mlua::Function = vim.get("_set_buf_mirror")?;
+        set.call((entries, cursor.0, cursor.1, win))
     }
 
     /// Whether `name` was registered via `nvim_create_user_command` (so the
@@ -1180,6 +1249,27 @@ fn install_runtime_api(
             });
             Ok(())
         })?,
+    )?;
+
+    // `vim._buf_set_lines(bufnr, start, end, repl)`: queue a [`BufOp::SetLines`]
+    // for the server to apply to the live editor (Phase 6). The Lua-facing
+    // `vim.api.nvim_buf_set_lines` wrapper (prelude) has already updated the
+    // `vim._bufs` mirror (write-through) and resolved `bufnr` to a concrete id; the
+    // server normalizes the indices and converts the line range to a byte range.
+    let sh = shared.clone();
+    vim.set(
+        "_buf_set_lines",
+        lua.create_function(
+            move |_, (bufnr, start, end, repl): (u64, i64, i64, Vec<String>)| {
+                sh.borrow_mut().buf_ops.push(BufOp::SetLines {
+                    bufnr,
+                    start,
+                    end,
+                    repl,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `vim._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request

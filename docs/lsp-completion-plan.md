@@ -323,7 +323,7 @@ table addition away from support. This is the one deliberate approximation versu
 
 ---
 
-## Phase 6 — Buffer / window Lua API ⬜
+## Phase 6 — Buffer / window Lua API ✅
 
 **Goal.** Real `nvim_buf_get_lines`/`set_lines`/`is_loaded`, buffer-local options
 (`vim.bo` backed by a store), `nvim_win_*`, and cursor access — the surface
@@ -339,10 +339,37 @@ queue + synchronous getters), `nxvim-core`/`nxvim-server` (the backing ops),
 **Approach.** Extend the Lua↔core bridge with read getters (lines, cursor, win)
 and queued mutations (set_lines), plus a per-buffer option store for `vim.bo`.
 
-**Tests.** `nvim_buf_get_lines`/`set_lines` round-trip on a real buffer; a
-`vim.bo[buf].x = v` write is observable.
+**Tests.** ✅ In `crates/nxvim-server/tests/editing.rs`, driven through
+`nvim_exec_lua`: `set_lines`→`get_lines` round-trips within one chunk (write-through
+agrees with the real apply, confirmed by the native RPC read of the rope); negative
+/ ranged `get_lines`; append / replace-all / delete; the fresh-empty-buffer
+phantom-newline guard; a non-current buffer edited by id; `nvim_win_get_cursor`
+tracks the real cursor; `nvim_get_current_win` is the stable handle;
+`nvim_buf_is_loaded` true/false; a `vim.bo[buf].x = v` (and `nvim_set_option_value`)
+write reads back while `filetype` still resolves; strict-indexing raises loud.
 
-**Done when.** The Phase-0 buffer/window raises become real implementations.
+**Done when.** ✅ The synchronous getters (`nvim_buf_get_lines`/`is_loaded`,
+`nvim_win_get_cursor`, `nvim_get_current_win`, `vim.fn.bufnr`) read the Rust→Lua
+buffer mirror (`vim._bufs` / `vim._cur_cursor` / current-window handle) the server
+refreshes via `LuaRuntime::set_buf_mirror` ← `Server::push_buf_mirror` before every
+Lua entry that can read buffer/cursor state (top of `run_pending`, before
+`eval_to_value`, before `run_keymap`/`run_keymap_expr`, and folded into the autocmd
+`set_buf_snapshot` sites); the per-buffer line arrays are `changedtick`-gated so the
+cursor-moved-no-edit path stays cheap. `nvim_buf_set_lines` writes through to the
+`vim._bufs` mirror (so read-after-write within a chunk is consistent) and queues
+`BufOp::SetLines` → `Server::apply_buf_op`, which normalizes the neovim line range,
+converts it to a byte range against the real rope, applies it via
+`Editor::apply_edits_to`, then flushes the buffer's LSP `didChange` via
+`sync_lsp_buffer` (the must-not-omit step for a non-current buffer). `vim.bo` /
+`nvim_set_option_value` are backed by a per-buffer store (`vim._bo_store`). The
+Phase-0 `vim._notimpl` raises for all of the above are gone.
+
+*Known approximations:* `nvim_win_get_cursor(win)` ignores `win` (single-window
+nxvim, handle `1000`); the `vim.bo` store is *observable* but not yet wired to
+editor behavior (only `filetype` is behavior-backing, read from the snapshot);
+`set_lines` can't produce a buffer without a final newline (`normalize()` always
+re-adds the phantom `\n` — no `nofixeol`); each `nvim_buf_set_lines` is its own undo
+step (no `undojoin` coalescing), matching `apply_workspace_edit`.
 
 **Depends on.** Phase 0; benefits from Phase 4.
 

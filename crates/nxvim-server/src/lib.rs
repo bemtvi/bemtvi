@@ -24,7 +24,7 @@ use nxvim_core::{
     parse_color, parse_keys, unicode, BufferId, Editor, Key, KeyCode, Mode, PanelView,
 };
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
-use nxvim_lua::{CallbackArgs, HlSet, LoopOp, LuaRuntime, PanelOp};
+use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
@@ -127,6 +127,11 @@ struct SyntaxState {
     spans: HashMap<usize, Vec<ByteSpan>>,
 }
 
+/// The single window handle nxvim reports to Lua (`nvim_get_current_win`). nxvim
+/// is single-window; neovim's first window id is 1000, so configs that key state
+/// by window id see a stable, conventional handle (Phase 6).
+const CURRENT_WIN: u64 = 1000;
+
 struct Server {
     editor: Editor,
     lua: LuaRuntime,
@@ -202,6 +207,11 @@ struct Server {
     /// scheduled fn runs at the end of the current convergence (not nested in its
     /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
     scheduled: VecDeque<u64>,
+    /// Per-buffer `changedtick` last copied into the `vim._bufs` Lua mirror
+    /// ([`Server::push_buf_mirror`]), so an unchanged buffer's line array isn't
+    /// re-serialized on every Lua entry — only the cheap cursor/window fields
+    /// refresh each time (Phase 6).
+    buf_mirror_ticks: HashMap<BufferId, u64>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -248,6 +258,7 @@ where
         keymaps: Keymaps::default(),
         evloop,
         scheduled: VecDeque::new(),
+        buf_mirror_ticks: HashMap::new(),
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -310,6 +321,8 @@ where
         let ft = filetype_of(server.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = server.lua.set_buf_snapshot(buf.0, &name, ft);
     }
+    // Seed the buffer mirror too, so `init.lua` can read buffer lines / the cursor.
+    server.push_buf_mirror();
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
@@ -448,6 +461,11 @@ impl Server {
             // accepted for call-compatibility but not yet threaded into the chunk.
             "nvim_exec_lua" => {
                 let code = text(params.first());
+                // Refresh the buffer mirror before the eval: this is the one
+                // synchronous-getter entry that reads buffer state *before* its
+                // trailing `run_pending`, so a `nvim_buf_get_lines` in the chunk
+                // must see fresh lines (Phase 6).
+                self.push_buf_mirror();
                 let value = match self.lua.eval_to_value(&code) {
                     Ok(value) => value,
                     Err(e) => {
@@ -757,6 +775,7 @@ impl Server {
     /// remapped, the common case for `<expr>`, which is noremap by default). An error
     /// (a throwing handler, or a textlock violation) is surfaced and nothing is fed.
     fn fire_expr(&mut self, id: u64) {
+        self.push_buf_mirror(); // an `<expr>` RHS may read the cursor / buffer lines
         match self.lua.run_keymap_expr(id) {
             Ok(keys) => {
                 self.discard_lua_effects();
@@ -788,6 +807,10 @@ impl Server {
     fn fire_mapping_inner(&mut self, rhs: MappingRhs) {
         match rhs {
             MappingRhs::Lua(id) => {
+                // A keymap function commonly reads the cursor / buffer lines; this
+                // is a synchronous Lua entry that runs before the trailing
+                // `run_pending`, so refresh the mirror first (Phase 6).
+                self.push_buf_mirror();
                 if let Err(e) = self.lua.run_keymap(id) {
                     self.editor
                         .echo(format!("E5108: Error executing keymap: {e}"));
@@ -883,6 +906,9 @@ impl Server {
     fn fire_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId, file: &str) {
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, file, ft);
+        // Keep the buffer mirror in lockstep: an autocmd callback runs here before
+        // the caller's `run_pending`, so refresh `vim._bufs` / the cursor too.
+        self.push_buf_mirror();
         if let Err(e) = self.lua.fire_autocmd_buf(event, pattern, buf.0, file) {
             self.editor
                 .echo(format!("E5108: Error in {event} autocmd: {e}"));
@@ -952,6 +978,102 @@ impl Server {
         for op in self.lua.take_loop_ops() {
             self.apply_loop_op(op);
         }
+        // Buffer mutations from `nvim_buf_set_lines` (Phase 6): applied to the live
+        // editor after the chunk, so the rope catches up with the write-through the
+        // Lua side already did against the `vim._bufs` mirror.
+        for op in self.lua.take_buf_ops() {
+            self.apply_buf_op(op);
+        }
+    }
+
+    /// Apply one [`BufOp`] to the live editor (Phase 6). Converts the neovim line
+    /// range (0-based, `end`-exclusive, negatives from the end) to a byte range
+    /// against the real buffer and replaces it as one undo step via
+    /// [`Editor::apply_edits_to`], then flushes the buffer's pending LSP edits with
+    /// [`Self::sync_lsp_buffer`] so a server attached to it sees the `didChange`
+    /// (the must-not-omit step for a non-current buffer, which `sync_lsp` skips).
+    fn apply_buf_op(&mut self, op: BufOp) {
+        let BufOp::SetLines {
+            bufnr,
+            start,
+            end,
+            repl,
+        } = op;
+        let id = BufferId(bufnr);
+        let Some(n) = self.editor.line_count_of(id) else {
+            return; // unknown buffer — the Lua mirror guards this, but stay safe.
+        };
+        // Same normalization the Lua getter applies (kept in lockstep): negatives
+        // count from the end, then clamp into [0, n]; `end` not below `start`.
+        let norm = |i: i64| -> usize {
+            let i = if i < 0 { n as i64 + i + 1 } else { i };
+            i.clamp(0, n as i64) as usize
+        };
+        let start = norm(start);
+        let end = norm(end).max(start);
+
+        let buf = self
+            .editor
+            .buffer_of(id)
+            .expect("line_count_of(id) was Some");
+        let start_byte = buf.line_start(start);
+        // Replacing through the last real line reaches the trailing phantom `\n`.
+        // `line_start(n)` already equals `len_bytes()` for a real buffer (`n >= 1`),
+        // but spell out the intent and guard the degenerate `n == 0` so the phantom
+        // newline is never consumed.
+        let end_byte = if end >= n && n > 0 {
+            buf.len_bytes()
+        } else {
+            buf.line_start(end)
+        };
+        // Each replacement line needs its terminating `\n` (the removed span always
+        // ends at a line boundary); `normalize()` re-adds the phantom trailing one.
+        let repl_text = if repl.is_empty() {
+            String::new()
+        } else {
+            let mut s = repl.join("\n");
+            s.push('\n');
+            s
+        };
+        self.editor
+            .apply_edits_to(id, vec![(start_byte..end_byte, repl_text)]);
+        self.sync_lsp_buffer(id);
+    }
+
+    /// Refresh the Rust→Lua buffer mirror (`vim._bufs` + `vim._cur_cursor` +
+    /// current window) the buffer-read API resolves against (Phase 6). Pushed
+    /// before any Lua entry that can read buffer/cursor state. The per-buffer line
+    /// arrays are gated on `changedtick` — only a buffer that changed since its last
+    /// mirror is re-serialized — so the common cursor-moved-no-edit path only
+    /// refreshes the O(1) cursor/window fields.
+    fn push_buf_mirror(&mut self) {
+        let mut bufs: Vec<(u64, Option<Vec<String>>, String)> = Vec::new();
+        for id in self.editor.buffer_ids() {
+            let tick = self
+                .editor
+                .buffer_of(id)
+                .map(|b| b.changedtick)
+                .unwrap_or(0);
+            let fresh = self.buf_mirror_ticks.get(&id) != Some(&tick);
+            let lines = if fresh {
+                self.buf_mirror_ticks.insert(id, tick);
+                Some(self.editor.lines_of(id).unwrap_or_default())
+            } else {
+                None
+            };
+            let name = self.editor.buffer_name(id).unwrap_or_default();
+            bufs.push((id.0, lines, name));
+        }
+        // Drop tick entries for buffers that no longer exist, so the map can't grow
+        // unboundedly across a long session of opening and closing buffers.
+        let live: HashSet<BufferId> = self.editor.buffer_ids().into_iter().collect();
+        self.buf_mirror_ticks.retain(|id, _| live.contains(id));
+
+        let cursor = (
+            (self.editor.cursor.line + 1) as u64, // 1-based row, neovim convention
+            self.editor.cursor.col as u64,        // 0-based column
+        );
+        let _ = self.lua.set_buf_mirror(&bufs, cursor, CURRENT_WIN);
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
@@ -1049,6 +1171,12 @@ impl Server {
         // chain converges first; mirrors neovim's `maxfuncdepth` recursion guard.
         const MAX_ROUNDS: usize = 100;
         let mut rounds = 0;
+        // Refresh the buffer mirror before draining: everything that flows through
+        // `run_pending` (user commands, scheduled / select callbacks, queued `:lua`)
+        // can read buffer/cursor state. Intra-batch read-after-write stays
+        // consistent via the `nvim_buf_set_lines` write-through, so once-at-entry is
+        // enough (Phase 6).
+        self.push_buf_mirror();
         loop {
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 if let Err(e) = self.lua.exec(&chunk) {

@@ -2,3 +2,9 @@
 **/*.rs.bk
 *.pdb
 .claude
+
+# LSP end-to-end suite (scripts/lsp-e2e): downloaded/hash-verified servers and the
+# node_modules the npm-based servers + eslint fixture install into. All regenerated
+# by `scripts/lsp-e2e/lsp-e2e.sh install`; never committed.
+/.lsp-e2e
+/scripts/lsp-e2e/npm/node_modules

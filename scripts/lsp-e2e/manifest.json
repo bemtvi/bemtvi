@@ -1,0 +1,87 @@
+{
+  "//": "Pinned versions + hashes for the LSP end-to-end suite (crates/nxvim/tests/lsp_e2e.rs).",
+  "//versions": "Bump a version here, then re-run `scripts/lsp-e2e/lsp-e2e.sh lock` to refresh the hashes below.",
+  "//platforms": "Hashes are pinned for the two host arches the suite supports: darwin-arm64 and linux-x86_64.",
+
+  "binaries": {
+    "rust-analyzer": {
+      "version": "2026-06-01",
+      "bin": "rust-analyzer",
+      "url": "https://github.com/rust-lang/rust-analyzer/releases/download/{version}/rust-analyzer-{rust_triple}.gz",
+      "format": "gz",
+      "rust_triple": {
+        "darwin-arm64": "aarch64-apple-darwin",
+        "linux-x86_64": "x86_64-unknown-linux-gnu"
+      },
+      "sha256": {
+        "darwin-arm64": "e3f859bc11c7b54035c9dc3612c3353f8599f39845412b737e6423fd4f51deaa",
+        "linux-x86_64": "1f243cefae24b9e7a0392f2369810d1d82b31d4fa7e07eb95a3465528cc2e1cb"
+      }
+    },
+    "lua-language-server": {
+      "version": "3.18.2",
+      "bin": "lua-language-server",
+      "url": "https://github.com/LuaLS/lua-language-server/releases/download/{version}/lua-language-server-{version}-{lua_plat}.tar.gz",
+      "format": "tar.gz",
+      "bin_in_archive": "bin/lua-language-server",
+      "lua_plat": {
+        "darwin-arm64": "darwin-arm64",
+        "linux-x86_64": "linux-x64"
+      },
+      "sha256": {
+        "darwin-arm64": "cec99d70b1f612acec4a10a79a03664e3aa0c229d4d8a586cb3f928ec37d509e",
+        "linux-x86_64": "ca71415dd19f19e30aaa35a4915aefca9fdb5fec31b98331cc3d77f778d539c5"
+      }
+    },
+    "clangd": {
+      "version": "22.1.0",
+      "bin": "clangd",
+      "url": "https://github.com/clangd/clangd/releases/download/{version}/clangd-{clangd_plat}-{version}.zip",
+      "format": "zip",
+      "bin_in_archive": "clangd_{version}/bin/clangd",
+      "clangd_plat": {
+        "darwin-arm64": "mac",
+        "linux-x86_64": "linux"
+      },
+      "sha256": {
+        "darwin-arm64": "71eddc5303da9a5bc5e8b509488b5b2c5acf45f20e33b8394e71a12a56d67198",
+        "linux-x86_64": "c54e57dbff3ccc9e8352367ddb7030ad3f624073ec58c7477424e7919f578572"
+      }
+    },
+    "zls": {
+      "version": "0.16.0",
+      "bin": "zls",
+      "url": "https://github.com/zigtools/zls/releases/download/{version}/zls-{zls_plat}.tar.xz",
+      "format": "tar.xz",
+      "bin_in_archive": "zls",
+      "zls_plat": {
+        "darwin-arm64": "aarch64-macos",
+        "linux-x86_64": "x86_64-linux"
+      },
+      "sha256": {
+        "darwin-arm64": "b93ec549f8558a7e85984a840e9276d274f1059b54ade4254296ef4982958359",
+        "linux-x86_64": "ded6d562a0b86ee878b1ddf70ffab2797ce3cdca3b02d6077548f9d56dff96b6"
+      }
+    }
+  },
+
+  "go": {
+    "gopls": {
+      "module": "golang.org/x/tools/gopls",
+      "version": "v0.22.0",
+      "bin": "gopls",
+      "sum": "h1:9aON2mTxKrZ1y71RbQVnlPTTNfKZ9y5cv3x/f6XpsZw="
+    }
+  },
+
+  "npm": {
+    "//": "Exact versions live in scripts/lsp-e2e/npm/package.json; integrity hashes live in the committed package-lock.json and are verified by `npm ci`.",
+    "servers": {
+      "pyright": { "package": "pyright", "bin": "pyright-langserver" },
+      "typescript-language-server": { "package": "typescript-language-server", "bin": "typescript-language-server" },
+      "bash-language-server": { "package": "bash-language-server", "bin": "bash-language-server" },
+      "vscode-json-language-server": { "package": "vscode-langservers-extracted", "bin": "vscode-json-language-server" },
+      "yaml-language-server": { "package": "yaml-language-server", "bin": "yaml-language-server" }
+    }
+  }
+}

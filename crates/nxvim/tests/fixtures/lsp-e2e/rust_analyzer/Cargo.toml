@@ -1,0 +1,10 @@
+[package]
+name = "nxvim-ra-e2e"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "nxvim-ra-e2e"
+path = "src/main.rs"
+
+[workspace]

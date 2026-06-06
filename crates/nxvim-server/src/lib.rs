@@ -1847,6 +1847,8 @@ pub(crate) fn filetype_of(path: Option<&std::path::Path>) -> Option<&'static str
         "lua" => "lua",
         "html" => "html",
         "css" => "css",
+        "yaml" | "yml" => "yaml",
+        "zig" => "zig",
         "sh" | "bash" => "bash",
         _ => return None,
     })

@@ -31,10 +31,10 @@ use lsp_types::{
     DocumentFormattingParams, FormattingOptions, GeneralClientCapabilities, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
     InitializedParams, Location, MarkedString, MessageType, OneOf, ParameterLabel, Position,
-    PositionEncodingKind, Range, ReferenceContext, ReferenceParams, RenameClientCapabilities,
-    RenameParams, ServerCapabilities, SignatureHelp, SignatureHelpParams,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentEdit,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    PositionEncodingKind, PublishDiagnosticsClientCapabilities, Range, ReferenceContext,
+    ReferenceParams, RenameClientCapabilities, RenameParams, ServerCapabilities, SignatureHelp,
+    SignatureHelpParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentEdit, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind, TextEdit,
     Url, VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceEdit,
     WorkspaceEditClientCapabilities,
@@ -1730,6 +1730,15 @@ fn client_capabilities() -> ClientCapabilities {
                     properties: vec!["edit".to_string()],
                 }),
                 data_support: Some(true),
+                ..Default::default()
+            }),
+            // We *do* consume `textDocument/publishDiagnostics` (see the client
+            // router), but some servers — notably typescript-language-server —
+            // withhold push diagnostics entirely unless the client advertises
+            // support here. Declaring it is what turns those servers' diagnostics
+            // on; `relatedInformation` lets them attach cross-reference notes.
+            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
+                related_information: Some(true),
                 ..Default::default()
             }),
             ..Default::default()

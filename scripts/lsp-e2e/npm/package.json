@@ -1,0 +1,14 @@
+{
+  "name": "nxvim-lsp-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned node-based language servers for the nxvim LSP end-to-end suite. Run `npm ci` (not `npm install`) to install exactly these versions with integrity verification against package-lock.json.",
+  "dependencies": {
+    "pyright": "1.1.410",
+    "typescript": "5.9.3",
+    "typescript-language-server": "5.3.0",
+    "bash-language-server": "5.6.0",
+    "vscode-langservers-extracted": "4.10.0",
+    "yaml-language-server": "1.23.0"
+  }
+}

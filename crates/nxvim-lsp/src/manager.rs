@@ -216,6 +216,15 @@ pub enum LspRequest {
     ResolveCodeAction {
         action: Box<CodeAction>,
     },
+    /// `completionItem/resolve` — fetch a selected completion item's lazy
+    /// `documentation`/`detail`. The original item is round-tripped verbatim as
+    /// JSON (the editor holds it as [`CompletionItemData::resolve_data`]); the
+    /// manager deserializes it back to a [`CompletionItem`] to send, because a
+    /// server matches the resolve against the exact item it issued (rust_analyzer
+    /// keys on the `data` blob). Mirrors [`LspRequest::ResolveCodeAction`].
+    ResolveCompletion {
+        item: serde_json::Value,
+    },
     /// A **generic** request issued by Lua `client:request(method, params, …)`
     /// (Phase 5): an arbitrary `method` with raw JSON `params`, whose raw JSON
     /// result routes back to a Lua handler ([`LspReply::Raw`]). This is the seam
@@ -286,6 +295,16 @@ pub enum LspReply {
     /// The edit a `codeAction/resolve` produced for a lazy action (`None` ⇒ the
     /// resolved action still carried no edit, or the request failed).
     ResolvedCodeAction(Option<WorkspaceEditData>),
+    /// The `documentation`/`detail` a `completionItem/resolve` produced for the
+    /// selected menu item — `documentation` distilled to plain lines like the
+    /// inline field (Phase 1). Either is `None` when the resolved item still
+    /// carried nothing there, the item was malformed, or the request failed (the
+    /// editor then leaves that field as-is — a docless item stays docless, never
+    /// faked).
+    ResolvedCompletion {
+        documentation: Option<String>,
+        detail: Option<String>,
+    },
     /// The reply to an [`LspRequest::Raw`] (Phase 5): the server's raw JSON result
     /// (`Ok`) or an error message (`Err`) — an unsupported method, a transport
     /// failure, or the server replying an error. Routed back to the Lua handler as
@@ -1004,6 +1023,9 @@ async fn issue_request(
                 LspReply::ResolvedCodeAction(None)
             }
         },
+        LspRequest::ResolveCompletion { item } => {
+            resolve_completion_reply(sock, item, log, name).await
+        }
         // A generic `client:request` (Phase 5): dispatched by runtime method name
         // through the request table, raw JSON in and out. Unlike the typed
         // requests above, a failure is surfaced to the Lua handler as an `Err`
@@ -1331,6 +1353,49 @@ fn completion_item(item: CompletionItem) -> CompletionItemData {
     }
 }
 
+/// Issue a `completionItem/resolve` for the selected menu item and distill the
+/// reply to its `documentation`/`detail` ([`LspReply::ResolvedCompletion`]). The
+/// `item` is the original completion item as JSON ([`CompletionItemData::resolve_data`]);
+/// it is deserialized back to a [`CompletionItem`] to send verbatim. A malformed
+/// item, an unsupported method, or a server error degrades to both-`None` (logged),
+/// so the editor leaves a docless item docless rather than hang — never a fake doc.
+async fn resolve_completion_reply(
+    sock: &mut ServerSocket,
+    item: serde_json::Value,
+    log: &LspLog,
+    name: &str,
+) -> LspReply {
+    let none = LspReply::ResolvedCompletion {
+        documentation: None,
+        detail: None,
+    };
+    let item: CompletionItem = match serde_json::from_value(item) {
+        Ok(item) => item,
+        Err(e) => {
+            log.log(
+                LogLevel::Warn,
+                name,
+                &format!("completionItem/resolve: malformed item: {e}"),
+            );
+            return none;
+        }
+    };
+    match sock.completion_item_resolve(item).await {
+        Ok(resolved) => LspReply::ResolvedCompletion {
+            documentation: resolved.documentation.and_then(documentation_lines),
+            detail: resolved.detail,
+        },
+        Err(e) => {
+            log.log(
+                LogLevel::Warn,
+                name,
+                &format!("completionItem/resolve failed: {e}"),
+            );
+            none
+        }
+    }
+}
+
 /// Reduce a completion item's `documentation` (a plain string, or a
 /// `MarkupContent` whose markdown is rendered as plain lines — same as hover) to
 /// its display text, trailing blank lines trimmed. `None` when the result is
@@ -1549,6 +1614,12 @@ fn describe_request(req: &LspRequest) -> String {
         }
         LspRequest::ResolveCodeAction { action } => {
             return format!("→ codeAction/resolve '{}'", action.title)
+        }
+        LspRequest::ResolveCompletion { item } => {
+            return format!(
+                "→ completionItem/resolve '{}'",
+                item.get("label").and_then(|l| l.as_str()).unwrap_or("?")
+            )
         }
         LspRequest::Raw { method, .. } => return format!("→ {method} (client:request)"),
     };

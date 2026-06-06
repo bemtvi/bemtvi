@@ -1263,6 +1263,28 @@ fn pmenu_of(params: &[Value]) -> Option<(Vec<String>, i64)> {
     Some((labels, selected))
 }
 
+/// The popup items' `detail` column (the 3rd element of each `[label, kind,
+/// detail]` item), in visible order. The surface a `completionItem/resolve`-filled
+/// `detail` becomes observable on, since `pmenu_value` already projects it.
+fn pmenu_details(params: &[Value]) -> Vec<String> {
+    let Some(Value::Map(map)) = params.first() else {
+        return Vec::new();
+    };
+    let Some((_, Value::Map(pm))) = map.iter().find(|(k, _)| k.as_str() == Some("pmenu")) else {
+        return Vec::new();
+    };
+    pm.iter()
+        .find(|(k, _)| k.as_str() == Some("items"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| it.as_array()?.get(2)?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Drain every buffered `redraw` (oldest first), returning their params — so a
 /// test can assert the popup never closed *between* keystrokes, not just at the
 /// end.
@@ -1437,6 +1459,109 @@ async fn a_documented_completion_item_opens_the_menu() {
         pmenu_of(&params).unwrap().0,
         vec!["connect"],
         "the documented item opens the menu like any other candidate"
+    );
+}
+
+#[tokio::test]
+async fn selecting_a_docless_item_resolves_it_and_merges_the_result() {
+    let _guard = test_lock().lock().await;
+    // Phase 2: the list item carries no `documentation`/`detail` (only `data`) —
+    // the rust_analyzer shape. Selecting it must fire `completionItem/resolve`
+    // round-tripping the *original* item (so the server recognizes its `data`),
+    // and the resolved `detail` must merge into the open menu off-tick (the
+    // resolved `documentation` lands in `raw` too, surfaced by the Phase 3 preview).
+    let record = configure_mock(
+        "compl-resolve",
+        serde_json::json!({
+            "completion": [{ "label": "connect", "data": { "id": 7 } }],
+            "completion_resolve": {
+                "label": "connect",
+                "data": { "id": 7 },
+                "detail": "fn() -> Conn",
+                "documentation": { "kind": "markdown", "value": "Opens a connection." }
+            }
+        }),
+    );
+    let file = temp_file("compl-resolve", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    // Open the menu (empty prefix → the single item) and select it.
+    feed(&rpc, "o<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-n>");
+
+    // The resolved detail merges into the menu off-tick (a tick after selection).
+    let mut merged = false;
+    for _ in 0..60 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if pmenu_details(&params).iter().any(|d| d == "fn() -> Conn") {
+                merged = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        merged,
+        "the resolved `detail` merged into the open menu after selection"
+    );
+
+    // The resolve round-tripped the original item verbatim — crucially its `data`,
+    // which rust_analyzer matches the resolve against.
+    let recs = record_lines(&record);
+    let resolve = find(&recs, "completionItem/resolve").expect("completionItem/resolve was issued");
+    assert_eq!(
+        resolve["params"]["label"], "connect",
+        "resolve carries the original item"
+    );
+    assert_eq!(
+        resolve["params"]["data"],
+        serde_json::json!({ "id": 7 }),
+        "resolve round-trips the original item's data blob"
+    );
+}
+
+#[tokio::test]
+async fn a_completion_resolve_failure_leaves_the_item_docless() {
+    let _guard = test_lock().lock().await;
+    // Phase 2 fail-loud: with no `completion_resolve` scripted the mock replies
+    // `null`, which can't deserialize into a `CompletionItem` — a resolve failure.
+    // It must be logged (not faked) and leave the item exactly as it was: still in
+    // the menu, still with no `detail`/docs. The menu doesn't break.
+    let record = configure_mock(
+        "compl-resolve-fail",
+        serde_json::json!({
+            "completion": [{ "label": "connect", "data": { "id": 7 } }],
+        }),
+    );
+    let file = temp_file("compl-resolve-fail", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    feed(&rpc, "o<C-x><C-o>");
+    wait_for_pmenu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-n>");
+
+    // Selecting the docless item still issues the resolve.
+    wait_for_record(&rpc, &record, |r| has_method(r, "completionItem/resolve")).await;
+    // Let the failed reply land and be dropped.
+    for _ in 0..5 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    // The menu is still open and the item still carries no detail (no fake doc).
+    let params = wait_for_pmenu(&rpc, &mut incoming).await;
+    assert_eq!(
+        pmenu_of(&params).unwrap().0,
+        vec!["connect"],
+        "the item stays in the menu after a failed resolve"
+    );
+    assert!(
+        pmenu_details(&params).iter().all(|d| d.is_empty()),
+        "a failed resolve leaves the item with no detail (and no faked docs)"
     );
 }
 

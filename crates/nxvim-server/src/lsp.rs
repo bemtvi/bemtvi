@@ -85,6 +85,7 @@ pub(crate) enum LspReqKind {
     Rename,
     CodeAction,
     ResolveCodeAction,
+    CompletionResolve,
 }
 
 impl LspReqKind {
@@ -102,6 +103,7 @@ impl LspReqKind {
             LspReqKind::Rename => 9,
             LspReqKind::CodeAction => 10,
             LspReqKind::ResolveCodeAction => 11,
+            LspReqKind::CompletionResolve => 12,
         }
     }
 
@@ -119,6 +121,7 @@ impl LspReqKind {
             9 => LspReqKind::Rename,
             10 => LspReqKind::CodeAction,
             11 => LspReqKind::ResolveCodeAction,
+            12 => LspReqKind::CompletionResolve,
             _ => return None,
         })
     }
@@ -146,6 +149,10 @@ impl LspReqKind {
             LspReqKind::Rename => "No rename changes",
             LspReqKind::CodeAction => "No code actions available",
             LspReqKind::ResolveCodeAction => "Code action returned no edit",
+            // Resolve is a silent background fetch for the selected item's docs;
+            // it never surfaces an empty-result message (an unresolved item just
+            // shows no preview), so this is only a formal fallback.
+            LspReqKind::CompletionResolve => "No completion documentation",
         }
     }
 
@@ -189,12 +196,12 @@ pub(crate) struct ServerRuntime {
 /// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
 /// re-ranks (or re-requests) in place rather than closing and reopening.
 //
-// INCOMPLETE: each `raw` item now carries `documentation`/`resolve_data` (the
-// completion-documentation plan, Phase 1), but the menu doesn't yet *use* them —
-// it neither issues `completionItem/resolve` for the selected item (Phase 2, the
-// only way docs arrive from rust_analyzer & most servers) nor projects the docs
-// into a preview surface (`pmenu_value`, Phase 3). So per-item documentation is
-// carried but not shown. Plan: docs/completion-documentation-plan.md.
+// INCOMPLETE: each `raw` item carries `documentation`/`resolve_data` (Phase 1) and
+// the selected item's lazy docs/detail are now fetched via `completionItem/resolve`
+// and merged in place (Phase 2). What's left: project the selected item's
+// documentation into a preview surface beside the popup (`pmenu_value`, Phase 3) —
+// today the resolved docs land in `raw` but only the resolved `detail` is shown
+// (it rides the existing pmenu item projection). Plan: docs/completion-documentation-plan.md.
 pub(crate) struct CompletionMenu {
     /// The buffer the menu belongs to; a reply for any other buffer is dropped.
     buffer: BufferId,
@@ -217,6 +224,15 @@ pub(crate) struct CompletionMenu {
     /// The selected entry as an index into `visible`, or `None` until the user
     /// navigates (accept then falls back to the first visible item).
     selected: Option<usize>,
+    /// Parallel to `raw`: whether a `completionItem/resolve` has already settled
+    /// for that item, so its lazy docs/detail are fetched at most once per item.
+    /// Reset whenever `raw` is replaced (a refresh re-requests the world).
+    resolved: Vec<bool>,
+    /// The `raw` index of the resolve currently in flight (`None` when none). A
+    /// reply merges only into this index, and only the newest resolve survives the
+    /// generation gate — a navigation that supersedes an in-flight resolve drops
+    /// its (now stale) reply.
+    resolving: Option<usize>,
 }
 
 impl Server {
@@ -1005,12 +1021,14 @@ impl Server {
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
             LspReqKind::Completion => LspRequest::Completion { uri, position },
-            // Formatting/rename/codeAction(+resolve) don't share the uniform
-            // {uri, position} shape and have their own issue functions below.
+            // Formatting/rename/codeAction(+resolve) and completion-resolve don't
+            // share the uniform {uri, position} shape and have their own issue
+            // functions below (resolve is fired from the menu, not the cursor).
             LspReqKind::Formatting
             | LspReqKind::Rename
             | LspReqKind::CodeAction
-            | LspReqKind::ResolveCodeAction => return,
+            | LspReqKind::ResolveCodeAction
+            | LspReqKind::CompletionResolve => return,
         };
         self.lsp.request(key, token, req);
     }
@@ -1289,6 +1307,18 @@ impl Server {
                 }
                 self.lsp_dirty = true;
             }
+            LspReply::ResolvedCompletion {
+                documentation,
+                detail,
+            } => {
+                // The menu follows the cursor while open (like a completion reply),
+                // so only a buffer change drops it; the merge itself is a no-op if
+                // the menu closed or the selection moved on.
+                if buffer_changed {
+                    return;
+                }
+                self.merge_resolved_completion(documentation, detail);
+            }
             // Generic `client:request` replies are routed to their Lua handler in
             // `on_lsp_event` before reaching here, never through the typed path.
             LspReply::Raw(_) => unreachable!("raw replies are routed in on_lsp_event"),
@@ -1450,7 +1480,10 @@ impl Server {
         let (word_start, prefix) = completion_word(&line, col);
         match self.completion.as_mut() {
             // A refresh for the open menu: swap in the new list, re-rank in place.
+            // The list is new, so every item's resolve state resets.
             Some(menu) => {
+                menu.resolved = vec![false; items.len()];
+                menu.resolving = None;
                 menu.raw = items;
                 menu.is_incomplete = is_incomplete;
                 menu.anchor = (row, word_start);
@@ -1461,6 +1494,7 @@ impl Server {
                 if items.is_empty() {
                     return;
                 }
+                let resolved = vec![false; items.len()];
                 self.completion = Some(CompletionMenu {
                     buffer,
                     anchor: (row, word_start),
@@ -1469,6 +1503,8 @@ impl Server {
                     raw: items,
                     visible: Vec::new(),
                     selected: None,
+                    resolved,
+                    resolving: None,
                 });
             }
         }
@@ -1537,6 +1573,84 @@ impl Server {
             Some(i) => (i as isize + delta).rem_euclid(n as isize) as usize,
         });
         self.lsp_dirty = true;
+        // The selection settled on an item; fetch its lazy docs/detail if needed.
+        self.maybe_resolve_selected();
+    }
+
+    /// Fire a `completionItem/resolve` for the just-selected item when it still
+    /// lacks `documentation`/`detail` — the only way per-item docs arrive from
+    /// rust_analyzer and most servers. Debounced by selection (it fires on settle,
+    /// not per keystroke) and at-most-once per item (the `resolved` flag); a resolve
+    /// already in flight for this same item is not re-issued. The reply merges back
+    /// in [`Server::merge_resolved_completion`], gated by the request generation so
+    /// a navigation that supersedes it drops the stale reply.
+    fn maybe_resolve_selected(&mut self) {
+        // Decide and capture what's needed *before* taking the mutable borrows the
+        // request bookkeeping wants.
+        let (raw_idx, item) = {
+            let Some(menu) = self.completion.as_ref() else {
+                return;
+            };
+            let Some(sel) = menu.selected else {
+                return;
+            };
+            let Some(&raw_idx) = menu.visible.get(sel) else {
+                return;
+            };
+            let entry = &menu.raw[raw_idx];
+            // Already fully populated ⇒ nothing to fetch.
+            if entry.documentation.is_some() && entry.detail.is_some() {
+                return;
+            }
+            // Already resolved once, or a resolve for this item is in flight.
+            if menu.resolved.get(raw_idx).copied().unwrap_or(true) {
+                return;
+            }
+            if menu.resolving == Some(raw_idx) {
+                return;
+            }
+            // Without the original item there is nothing the server can resolve.
+            let Some(item) = entry.resolve_data.clone() else {
+                return;
+            };
+            (raw_idx, item)
+        };
+        let Some((key, _uri, _encoding)) = self.current_lsp_target() else {
+            return;
+        };
+        let token = self.register_lsp_request(LspReqKind::CompletionResolve);
+        if let Some(menu) = self.completion.as_mut() {
+            menu.resolving = Some(raw_idx);
+        }
+        self.lsp
+            .request(key, token, LspRequest::ResolveCompletion { item });
+    }
+
+    /// Merge a `completionItem/resolve` reply into the in-flight target item and
+    /// mark it resolved, so the menu shows the freshly-fetched `detail` (and, in
+    /// Phase 3, documentation). A resolve that returned nothing for a field leaves
+    /// that field as-is — the list's value wins over a resolve that omitted it, and
+    /// a docless item stays docless. No-op if the menu closed or the selection
+    /// superseded this resolve (its index is no longer the one in flight).
+    fn merge_resolved_completion(&mut self, documentation: Option<String>, detail: Option<String>) {
+        let Some(menu) = self.completion.as_mut() else {
+            return;
+        };
+        let Some(idx) = menu.resolving.take() else {
+            return;
+        };
+        if let Some(flag) = menu.resolved.get_mut(idx) {
+            *flag = true;
+        }
+        if let Some(item) = menu.raw.get_mut(idx) {
+            if documentation.is_some() {
+                item.documentation = documentation;
+            }
+            if detail.is_some() {
+                item.detail = detail;
+            }
+        }
+        self.lsp_dirty = true;
     }
 
     /// Close the menu without inserting, dropping any in-flight completion request
@@ -1544,6 +1658,7 @@ impl Server {
     pub(crate) fn lsp_menu_close(&mut self) {
         if self.completion.take().is_some() {
             self.lsp_requests.remove(&LspReqKind::Completion);
+            self.lsp_requests.remove(&LspReqKind::CompletionResolve);
             self.lsp_dirty = true;
         }
     }
@@ -1556,8 +1671,9 @@ impl Server {
         let Some(menu) = self.completion.take() else {
             return;
         };
-        // No refresh should land after an accept.
+        // No refresh or stray resolve should land after an accept.
         self.lsp_requests.remove(&LspReqKind::Completion);
+        self.lsp_requests.remove(&LspReqKind::CompletionResolve);
         self.lsp_dirty = true;
         let Some(&raw_idx) = menu.visible.get(menu.selected.unwrap_or(0)) else {
             return;

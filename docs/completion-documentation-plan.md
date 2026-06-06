@@ -108,7 +108,7 @@ construction. Verified by `completion_capability_advertises_documentation_and_re
 
 ---
 
-## Phase 2 — `completionItem/resolve` for the selected item ⬜
+## Phase 2 — `completionItem/resolve` for the selected item ✅
 
 **Goal.** When the selection settles on an item missing `documentation` (and/or
 `detail`), fetch it via `completionItem/resolve` and merge the result back into
@@ -144,9 +144,20 @@ issues `completionItem/resolve` with the original item's `data`, and the
 resolved documentation lands on the menu item off-tick. A resolve failure logs
 and leaves the item docless (loud, not a fake empty doc).
 
-**Done when.** ⬜ Selecting a docless item issues `completionItem/resolve`
-(round-tripping `data`), the resolved `documentation`/`detail` merge into the
-open menu, stale/closed-menu replies are dropped, and failures are logged.
+**Done when.** ✅ Selecting a docless item issues `completionItem/resolve`
+(round-tripping the original item incl. its `data`), the resolved
+`documentation`/`detail` merge into the open menu in place (the resolved
+`detail` is already visible in the pmenu projection; `documentation` lands in
+`raw` for the Phase 3 preview), stale/closed-menu replies are dropped (the
+request-generation gate + a per-item `resolved` flag / single-slot `resolving`
+target on the menu), and a failed/malformed resolve is logged and leaves the
+item docless. Typed `LspRequest::ResolveCompletion` / `LspReply::ResolvedCompletion`
+in `manager.rs`; `LspReqKind::CompletionResolve` fired from `lsp_menu_move` via
+`maybe_resolve_selected`, merged by `merge_resolved_completion`, in
+`nxvim-server/src/lsp.rs`. Verified by
+`selecting_a_docless_item_resolves_it_and_merges_the_result` and
+`a_completion_resolve_failure_leaves_the_item_docless` in `crates/nxvim/tests/lsp.rs`
+(the mock gained a `completion_resolve` script field).
 
 **Depends on.** Phase 1 (the field + `data` + advertised capability).
 

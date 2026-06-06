@@ -49,6 +49,10 @@
 //!   ⇒ `null` (no actions).
 //! - `code_action_resolve`: the resolved `CodeAction` (with its `edit` filled in)
 //!   returned for `codeAction/resolve`. Absent ⇒ `null`.
+//! - `completion_resolve`: the resolved `CompletionItem` (its lazy
+//!   `documentation`/`detail` filled in) returned for `completionItem/resolve`.
+//!   Absent ⇒ `null` (which fails to deserialize, exercising the resolve-failure
+//!   path: logged, the item stays docless).
 //! - `custom_replies`: a `{ method: result }` map scripting the reply to an
 //!   otherwise-unhandled request — the generic `client:request` path (Phase 5).
 //!   A method not in the map falls back to a `null` result.
@@ -149,6 +153,11 @@ pub fn run(script_path: &str) {
                     write_response(&stdout, id, result);
                 }
             }
+            // The resolved `CompletionItem` (its lazy `documentation`/`detail`
+            // filled in) for the item the editor selected. Absent ⇒ `null`, which
+            // can't deserialize into a `CompletionItem` — exercising the editor's
+            // resolve-failure path (logged, item left docless).
+            "completionItem/resolve" => reply_scripted(&stdout, id, &script, "completion_resolve"),
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply. A `custom_replies` map (method ->
             // result) scripts the answer to a generic `client:request` (Phase 5);

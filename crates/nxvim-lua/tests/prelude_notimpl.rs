@@ -22,12 +22,16 @@ assert(err:find("nxvim: not implemented: vim.lsp.util.make_position_params", 1, 
 assert(vim._notimpl_hits["vim.lsp.util.make_position_params"] == true,
   "the hit should be recorded in vim._notimpl_hits")
 
--- The faithful neighbours are NOT routed through the raise: vim.schedule runs
--- its callback (a safe "soon"), and nvim_get_current_buf returns the real
--- snapshot buffer rather than raising.
+-- The faithful neighbours are NOT routed through the raise. vim.schedule no
+-- longer runs inline either: with the async runtime it *defers* the callback to
+-- the server's convergence (registered in vim._cb_fns, run later by id) rather
+-- than nesting it in the caller. In this bare runtime — no server draining the
+-- queue — that means the callback is registered but has NOT run, which is exactly
+-- the proof it deferred.
 local ran = false
 vim.schedule(function() ran = true end)
-assert(ran, "vim.schedule should still run its callback inline")
+assert(not ran, "vim.schedule should defer its callback, not run it inline")
+assert(next(vim._cb_fns) ~= nil, "the scheduled callback should be registered for later")
 assert(type(vim.api.nvim_get_current_buf()) == "number",
   "nvim_get_current_buf should stay real, not raise")
 return "ok"

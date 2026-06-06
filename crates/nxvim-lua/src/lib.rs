@@ -141,6 +141,64 @@ pub enum LspOp {
     },
 }
 
+/// A request to the async runtime (the "event loop"), queued by the `vim.schedule`
+/// / `vim.defer_fn` / `vim.uv` timer / `vim.system` family and drained by the
+/// server in `apply_lua_effects`. Each op carries a `cb_id` into `vim._cb_fns`
+/// (the deferred-callback registry); the server either services it directly
+/// ([`LoopOp::Schedule`], same-convergence deferral) or forwards it to the
+/// background event-loop actor (timers and processes, which take wall-clock time).
+/// The async analogue of [`PanelOp`]/[`LspOp`] — Lua queues, the server drives.
+#[derive(Clone, Debug)]
+pub enum LoopOp {
+    /// `vim.schedule(fn)` — run callback `id` once, at the end of the current
+    /// convergence (no wall-clock wait, no actor; serviced inside `run_pending`).
+    Schedule { id: u64 },
+    /// `vim.defer_fn` / `vim.uv` timer `:start` — arm a timer that fires callback
+    /// `id` after `delay_ms`, then every `repeat_ms` while `repeat_ms > 0` (a
+    /// one-shot when `repeat_ms == 0`). Forwarded to the event-loop actor.
+    TimerStart {
+        id: u64,
+        delay_ms: u64,
+        repeat_ms: u64,
+    },
+    /// `vim.uv` timer `:stop`/`:close` (or a `defer_fn` handle's `:stop`) — cancel
+    /// the timer armed under `id`. A no-op if it already fired or was never armed.
+    TimerStop { id: u64 },
+    /// `vim.system(cmd, opts, on_exit)` with an `on_exit` — spawn `cmd` in the
+    /// actor (off the server thread) and run callback `id` with the result when it
+    /// exits. The pid is returned synchronously by the bridge; only the *wait* is
+    /// async.
+    Spawn {
+        id: u64,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+    },
+    /// `handle:kill(signal)` on a `vim.system` handle spawned async — terminate the
+    /// child running under `id`. A no-op if it already exited. The `signal`
+    /// argument is accepted at the Lua surface for call-compatibility but not
+    /// carried here: the actor terminates the child unconditionally (it has no
+    /// libc binding to deliver an arbitrary signal), a documented approximation.
+    Kill { id: u64 },
+}
+
+/// The arguments handed to a deferred callback when the server runs it via
+/// [`LuaRuntime::run_callback`]. A `vim.schedule` / timer callback takes none; an
+/// async `vim.system` `on_exit` takes the finished child's result, built into the
+/// `{ code, stdout, stderr }` table neovim's `on_exit` receives. Keeping the
+/// payload typed here (rather than passing `mlua::Value`s) lets the actor — which
+/// produced the bytes off-thread — stay free of any Lua types.
+pub enum CallbackArgs {
+    /// No arguments (`vim.schedule`, `vim.defer_fn`, `vim.uv` timers).
+    None,
+    /// An async `vim.system` exit: the result table its `on_exit` is called with.
+    Process {
+        code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+}
+
 /// One diagnostic mirrored into the Lua `vim._diagnostics[bufnr]` table so the
 /// synchronous getter `vim.diagnostic.get` can read it without reaching the live
 /// `Server` (the Rust→Lua mirror, the analogue of `vim._set_cur_buf`). Fields
@@ -261,6 +319,10 @@ struct Shared {
     /// Server-start requests from `vim.lsp.start` (driven by `vim.lsp.enable`),
     /// drained by the server into its `LspManager` after the chunk.
     lsp_ops: Vec<LspOp>,
+    /// Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `vim.uv`
+    /// timers / async `vim.system`, drained by the server into its scheduled-work
+    /// queue and event-loop actor after the chunk.
+    loop_ops: Vec<LoopOp>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -440,6 +502,51 @@ impl LuaRuntime {
     /// drain, for the server to apply to its `LspManager`.
     pub fn take_lsp_ops(&self) -> Vec<LspOp> {
         std::mem::take(&mut self.shared.borrow_mut().lsp_ops)
+    }
+
+    /// Take the async-runtime requests queued by `vim.schedule` / `vim.defer_fn` /
+    /// `vim.uv` timers / `vim.system` since the last drain, for the server to
+    /// service directly (`Schedule`) or forward to the event-loop actor.
+    pub fn take_loop_ops(&self) -> Vec<LoopOp> {
+        std::mem::take(&mut self.shared.borrow_mut().loop_ops)
+    }
+
+    /// Run the deferred callback registered under `id` (the `run_keymap` analogue
+    /// for the async runtime). Invokes `vim._run_cb(id, keep, …)`; with `keep ==
+    /// false` the registry entry is dropped after firing (one-shot), so
+    /// `vim.schedule` / `vim.defer_fn` / `vim.system` `on_exit` never leak. A
+    /// repeating timer passes `keep == true` to retain its function across fires.
+    /// `args` are forwarded to the Lua callback as its arguments. Effects the
+    /// callback queues land in [`Shared`] and drain through the server's
+    /// `apply_lua_effects`; a throwing callback returns its error for the server to
+    /// surface (it isolates one callback, never aborting the drain).
+    pub fn run_callback(&self, id: u64, keep: bool, args: CallbackArgs) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let run: mlua::Function = vim.get("_run_cb")?;
+        match args {
+            CallbackArgs::None => run.call::<()>((id, keep)),
+            CallbackArgs::Process {
+                code,
+                stdout,
+                stderr,
+            } => {
+                let result = self.lua.create_table()?;
+                result.set("code", code)?;
+                result.set("stdout", self.lua.create_string(&stdout)?)?;
+                result.set("stderr", self.lua.create_string(&stderr)?)?;
+                run.call::<()>((id, keep, result))
+            }
+        }
+    }
+
+    /// Record the OS pid of an async `vim.system` child (keyed by its callback
+    /// `id`) so the handle's `.pid` field resolves it. Delivered by the event-loop
+    /// actor shortly after the spawn — the pid can't be known synchronously on the
+    /// single-threaded runtime, so the handle reads `nil` until this lands.
+    pub fn set_process_pid(&self, id: u64, pid: Option<u32>) -> mlua::Result<()> {
+        let vim: Table = self.lua.globals().get("vim")?;
+        let set: mlua::Function = vim.get("_set_proc_pid")?;
+        set.call((id, pid))
     }
 
     /// Fire the panel's `on_select` callback for the line at `index` (0-based,
@@ -786,6 +893,78 @@ fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     )?;
     vim.set("panel", panel)?;
 
+    // ----- the async runtime bridge (the "event loop") -----------------------
+    // Lua queues a [`LoopOp`] carrying a callback id; the server drains it in
+    // `apply_lua_effects` and either services it directly (`Schedule`) or forwards
+    // it to the background event-loop actor (timers, processes). Same "Lua queues,
+    // the server drives" flow as `vim.cmd` / panel / lsp ops — the callback itself
+    // stays in the Lua registry (`vim._cb_fns[id]`) and runs on the server thread.
+
+    // `vim._schedule(id)`: defer callback `id` to the end of the current
+    // convergence (the strict, non-nested `vim.schedule`).
+    let sh = shared.clone();
+    vim.set(
+        "_schedule",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::Schedule { id });
+            Ok(())
+        })?,
+    )?;
+    // `vim._timer_start(id, delay_ms, repeat_ms)`: arm a timer firing callback
+    // `id` after `delay_ms`, then every `repeat_ms` (`0` ⇒ one-shot).
+    let sh = shared.clone();
+    vim.set(
+        "_timer_start",
+        lua.create_function(move |_, (id, delay_ms, repeat_ms): (u64, u64, u64)| {
+            sh.borrow_mut().loop_ops.push(LoopOp::TimerStart {
+                id,
+                delay_ms,
+                repeat_ms,
+            });
+            Ok(())
+        })?,
+    )?;
+    // `vim._timer_stop(id)`: cancel the timer armed under `id`.
+    let sh = shared.clone();
+    vim.set(
+        "_timer_stop",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::TimerStop { id });
+            Ok(())
+        })?,
+    )?;
+    // `vim._system_async(id, cmd, cwd, env)`: spawn `cmd` (an argv list) in the
+    // event-loop actor and run callback `id` with `{ code, stdout, stderr }` when
+    // it exits — the off-tick `vim.system`. Returns the child's OS pid immediately
+    // (the actor sends it back over a oneshot the bridge blocks on *briefly* — only
+    // until the spawn itself completes, not the run), so the `vim.system` handle
+    // carries a real pid while the wait stays async. A spawn failure surfaces as a
+    // `nil` pid (the `on_exit` still fires later with `code = -1`).
+    let sh = shared.clone();
+    vim.set(
+        "_system_async",
+        lua.create_function(
+            move |_, (id, cmd, cwd, env): (u64, Vec<String>, Option<String>, Option<Table>)| {
+                let env = env_pairs(env)?;
+                sh.borrow_mut()
+                    .loop_ops
+                    .push(LoopOp::Spawn { id, cmd, cwd, env });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `vim._system_kill(id, signal)`: terminate the async child running under
+    // `id`. `signal` is accepted (neovim's `handle:kill(signal)`) but ignored —
+    // the actor terminates the child unconditionally (see [`LoopOp::Kill`]).
+    let sh = shared.clone();
+    vim.set(
+        "_system_kill",
+        lua.create_function(move |_, (id, _signal): (u64, Option<i32>)| {
+            sh.borrow_mut().loop_ops.push(LoopOp::Kill { id });
+            Ok(())
+        })?,
+    )?;
+
     // `vim.fn`: the Vimscript builtins the load path calls. Only the ones that
     // need real filesystem / environment access are Rust-backed; the rest of
     // `vim.*` is pure Lua in the prelude.
@@ -1081,11 +1260,32 @@ fn install_runtime_api(
                     }
                 }
                 let result = lua.create_table()?;
-                match command.output() {
-                    Ok(output) => {
-                        result.set("code", output.status.code().unwrap_or(-1))?;
-                        result.set("stdout", lua.create_string(&output.stdout)?)?;
-                        result.set("stderr", lua.create_string(&output.stderr)?)?;
+                // Spawn (capturing the real pid) then wait, rather than `output()`,
+                // so the synchronous handle's `result.pid` is a real pid — parity
+                // with the async path. The wait is short by construction (a
+                // `root_dir` shell-out), so blocking here is acceptable.
+                match command
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        result.set("pid", child.id())?;
+                        match child.wait_with_output() {
+                            Ok(output) => {
+                                result.set("code", output.status.code().unwrap_or(-1))?;
+                                result.set("stdout", lua.create_string(&output.stdout)?)?;
+                                result.set("stderr", lua.create_string(&output.stderr)?)?;
+                            }
+                            Err(e) => {
+                                result.set("code", -1)?;
+                                result.set("stdout", "")?;
+                                result.set(
+                                    "stderr",
+                                    format!("vim.system: wait failed for {program}: {e}"),
+                                )?;
+                            }
+                        }
                     }
                     Err(e) => {
                         result.set("code", -1)?;
@@ -1649,6 +1849,21 @@ fn opt_table_to_json(t: Option<Table>) -> mlua::Result<Option<serde_json::Value>
         Some(t) => Ok(Some(lua_to_json(&mlua::Value::Table(t))?)),
         None => Ok(None),
     }
+}
+
+/// Flatten a `vim.system` `opts.env` table (`{ VAR = value }`) into the
+/// `(key, value)` pairs the event-loop actor layers onto the child's inherited
+/// environment — the async `vim._system_async` analogue of the inline loop in the
+/// blocking `vim._system`. An absent table yields no pairs.
+fn env_pairs(env: Option<Table>) -> mlua::Result<Vec<(String, String)>> {
+    let Some(env) = env else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = Vec::new();
+    for kv in env.pairs::<String, String>() {
+        pairs.push(kv?);
+    }
+    Ok(pairs)
 }
 
 /// Convert an `mlua::Value` to a [`serde_json::Value`] for `vim.json.encode`,

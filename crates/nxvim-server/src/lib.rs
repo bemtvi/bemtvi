@@ -8,10 +8,12 @@
 //! native GUI later) attach over the same RPC channel and are never blocked by
 //! the server's bookkeeping.
 
+mod evloop;
 mod keymap;
 mod lsp;
 mod syntax;
 
+use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::{BuiltinAction, Keymaps, MappingRhs, NativeDefault, Step};
 use lsp::{
     CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime, CODE_ACTION_PANEL_TITLE,
@@ -22,11 +24,11 @@ use nxvim_core::{
     parse_color, parse_keys, unicode, BufferId, Editor, Key, KeyCode, Mode, PanelView,
 };
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
-use nxvim_lua::{HlSet, LuaRuntime, PanelOp};
+use nxvim_lua::{CallbackArgs, HlSet, LoopOp, LuaRuntime, PanelOp};
 use nxvim_rpc::syntax::{encode_edits, EditWire, SpanWire};
 use nxvim_rpc::{connect, Incoming, Rpc};
 use rmpv::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use syntax::{SyntaxClient, SyntaxEvent};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -192,6 +194,14 @@ struct Server {
     /// `Server::input` runs every key through before `editor.input`. Rebuilt from
     /// `vim._keymaps` when its version advances (checked once per input batch).
     keymaps: Keymaps,
+    /// The async Lua runtime's background actor (timers + child processes). Cheap
+    /// to hold; its task spawns lazily on the first timer/`vim.system`. Commands go
+    /// out fire-and-forget; completions return as [`LoopEvent`]s on a `select!` arm.
+    evloop: EventLoop,
+    /// Callback ids queued by `vim.schedule`, drained inside `run_pending` so a
+    /// scheduled fn runs at the end of the current convergence (not nested in its
+    /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
+    scheduled: VecDeque<u64>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -211,6 +221,7 @@ where
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     let (syntax, mut syntax_events) = SyntaxClient::new();
     let (lsp, mut lsp_events) = LspManager::new();
+    let (evloop, mut loop_events) = EventLoop::new();
 
     let mut server = Server {
         editor,
@@ -235,6 +246,8 @@ where
         announced: HashSet::new(),
         last_mode: Mode::Normal,
         keymaps: Keymaps::default(),
+        evloop,
+        scheduled: VecDeque::new(),
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -346,9 +359,24 @@ where
                 while let Ok(event) = lsp_events.try_recv() {
                     server.on_lsp_event(event);
                 }
-                if std::mem::take(&mut server.lsp_dirty) {
-                    server.redraw();
+                // A reply handled by a Lua callback (Phase 4 seam) may defer work
+                // via `vim.cmd` / `vim.schedule`; drive it to convergence and
+                // repaint. Closes the latent gap where an `on_init`/`LspAttach`
+                // callback's deferred work wasn't driven off-tick.
+                let dirty = std::mem::take(&mut server.lsp_dirty);
+                server.settle_events(dirty);
+            }
+            // Timers and child-process completions from the event-loop actor — the
+            // first thing that wakes the server on wall-clock time rather than RPC.
+            // The matching Lua callback runs here, on the one server thread.
+            Some(event) = loop_events.recv() => {
+                server.on_loop_event(event);
+                // Coalesce a burst (a flurry of timers, several processes exiting)
+                // into one settle + repaint, like the syntax/LSP arms.
+                while let Ok(event) = loop_events.try_recv() {
+                    server.on_loop_event(event);
                 }
+                server.settle_events(true);
             }
         }
     }
@@ -916,6 +944,95 @@ impl Server {
         for op in self.lua.take_lsp_ops() {
             self.apply_lsp_op(op);
         }
+        // Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `vim.uv`
+        // timers / async `vim.system`: a `Schedule` is serviced directly (queued
+        // for the trailing `run_pending` drain); everything else is forwarded to
+        // the background event-loop actor, whose completions arrive on the
+        // `loop_events` `select!` arm.
+        for op in self.lua.take_loop_ops() {
+            self.apply_loop_op(op);
+        }
+    }
+
+    /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
+    /// forward a timer / process op to the event-loop actor (a fire-and-forget
+    /// [`LoopCommand`], never awaited).
+    fn apply_loop_op(&mut self, op: LoopOp) {
+        match op {
+            LoopOp::Schedule { id } => self.scheduled.push_back(id),
+            LoopOp::TimerStart {
+                id,
+                delay_ms,
+                repeat_ms,
+            } => self.evloop.send(LoopCommand::TimerStart {
+                id,
+                delay: std::time::Duration::from_millis(delay_ms),
+                repeat: std::time::Duration::from_millis(repeat_ms),
+            }),
+            LoopOp::TimerStop { id } => self.evloop.send(LoopCommand::TimerStop { id }),
+            LoopOp::Spawn { id, cmd, cwd, env } => self.evloop.send(LoopCommand::Spawn {
+                id,
+                argv: cmd,
+                cwd,
+                env,
+            }),
+            LoopOp::Kill { id } => self.evloop.send(LoopCommand::Kill { id }),
+        }
+    }
+
+    /// Handle one completion from the event-loop actor (a timer fired, a child
+    /// reported its pid, or a child exited) by running its Lua callback on the
+    /// server thread, then draining the effects it queued. The caller's
+    /// `settle_events` drives the rest to convergence and repaints once per burst.
+    fn on_loop_event(&mut self, event: LoopEvent) {
+        match event {
+            LoopEvent::Timer { id, keep } => {
+                if let Err(e) = self.lua.run_callback(id, keep, CallbackArgs::None) {
+                    self.editor
+                        .echo(format!("E5108: Error in timer callback: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::ProcessSpawned { id, pid } => {
+                // Record the real pid so the `vim.system` handle's `.pid` resolves
+                // it (it can't be known synchronously on a single-threaded runtime).
+                if let Err(e) = self.lua.set_process_pid(id, pid) {
+                    self.editor
+                        .echo(format!("E5108: Error recording process pid: {e}"));
+                }
+            }
+            LoopEvent::ProcessExit {
+                id,
+                code,
+                stdout,
+                stderr,
+            } => {
+                let args = CallbackArgs::Process {
+                    code,
+                    stdout,
+                    stderr,
+                };
+                if let Err(e) = self.lua.run_callback(id, false, args) {
+                    self.editor
+                        .echo(format!("E5108: Error in vim.system on_exit: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+        }
+    }
+
+    /// The settle contract for an off-tick event arm: drive every queued effect to
+    /// convergence (`run_pending`, which also drains `self.scheduled`) and repaint
+    /// once. `dirty` forces a repaint even when no Lua callback ran (e.g. an LSP
+    /// event that only updated cached state); a callback that queued work always
+    /// repaints. Factored out so the syntax/LSP/loop arms share one tail and no
+    /// off-tick callback's deferred `vim.cmd` is left undriven.
+    fn settle_events(&mut self, dirty: bool) {
+        let had_scheduled = !self.scheduled.is_empty();
+        self.run_pending();
+        if dirty || had_scheduled {
+            self.redraw();
+        }
     }
 
     /// Drive queued work to convergence: run the `:lua` chunks the editor
@@ -970,9 +1087,22 @@ impl Server {
                 }
                 self.apply_lua_effects();
             }
+            // Scheduled callbacks (`vim.schedule`) run after the work that queued
+            // them converges, but still within this fixpoint — a scheduled fn may
+            // itself `vim.schedule` / `vim.cmd`, which re-enters the loop. One
+            // throwing callback is isolated (echoed as E5108) and never aborts the
+            // drain or stops a later scheduled callback from running.
+            for id in std::mem::take(&mut self.scheduled) {
+                if let Err(e) = self.lua.run_callback(id, false, CallbackArgs::None) {
+                    self.editor
+                        .echo(format!("E5108: Error in scheduled callback: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             if self.editor.lua_queue.is_empty()
                 && self.editor.deferred_commands.is_empty()
                 && self.editor.panel_selects.is_empty()
+                && self.scheduled.is_empty()
             {
                 break;
             }
@@ -983,6 +1113,7 @@ impl Server {
                 self.editor.lua_queue.clear();
                 self.editor.deferred_commands.clear();
                 self.editor.panel_selects.clear();
+                self.scheduled.clear();
                 self.editor
                     .echo("E132: command recursion limit exceeded".to_string());
                 break;

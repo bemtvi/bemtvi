@@ -548,14 +548,12 @@ screen," and that is exactly the shape of these tests.
   trackable rather than a silent no-op. Two whole configs are skipped: gdscript (a
   non-stdio TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a
   user-only `bundle_path`). The route from "starts" to "works", phase by phase, is
-  [the LSP completion plan](lsp-completion-plan.md). **Caveat:** with no event loop yet,
-  `vim.system` runs the child process *synchronously* on the current tick —
-  `:wait()` and the `on_exit` callback both see an already-complete result, and a
-  slow command blocks the server thread (`vim.schedule`/`vim.defer_fn` likewise
-  run their callback immediately). This is enough for the short shell-outs a
-  `root_dir` performs; making it truly async is gated on the event loop below.
-  The surface still grows only as plugins demand it; known gaps for richer plugins:
-  `vim.treesitter` is a stub (nxvim highlights out-of-process), `vim.loop`/`vim.uv`,
+  [the LSP completion plan](lsp-completion-plan.md). The async-runtime work below
+  has since landed, so `vim.system(cmd, opts, on_exit)` now runs the child *off the
+  server thread* and fires `on_exit` on a later tick; the synchronous `:wait()`
+  branch (no `on_exit`) is retained for the short `root_dir` shell-outs that want a
+  blocking result. The surface still grows only as plugins demand it; known gaps
+  for richer plugins: `vim.treesitter` is a stub (nxvim highlights out-of-process)
   and the per-window API. Legacy Vimscript (`eval.c`) is **not** on the roadmap —
   see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
@@ -569,12 +567,16 @@ screen," and that is exactly the shape of these tests.
   error, but the command then exists everywhere rather than only in its buffer.
   A per-buffer command registry (the command analogue of buffer-local options /
   buffer-local keymaps, which `vim._keymaps` already scopes) is the fix.
-- **An async Lua runtime (event loop).** Today all Lua runs synchronously on the
-  input tick: `vim.schedule(fn)` invokes `fn` immediately and `vim.system` blocks
-  until the child exits (see the LSP caveat above). The target is a real loop so
-  deferred work, timers (`vim.defer_fn`/`vim.uv` timers), and `vim.system`'s
-  `on_exit` fire off-tick — letting `root_dir` shell-outs and other slow work run
-  without stalling the server, and unblocking the `vim.loop`/`vim.uv` surface.
+- **An async Lua runtime (event loop).** *Landed* (see
+  [the async-runtime plan](async-lua-runtime-plan.md)). A `Send` background actor
+  (`crates/nxvim-server/src/evloop.rs`, modeled on `LspManager`) owns timers and
+  child processes; on completion it sends a typed `LoopEvent` back to the single
+  server thread, which runs the matching Lua callback by id (the `vim._cb_fns`
+  registry, the keymap-callback shape applied to async work). `vim.schedule`
+  defers to convergence, `vim.defer_fn`/`vim.uv` timers fire on wall-clock time,
+  and `vim.system`'s `on_exit` fires off-tick. The `vim.uv`/`vim.loop` surface
+  beyond timers (`new_pipe`, TCP, event-based `fs_*`) still grows as plugins demand
+  it — e.g. `vim.lsp.rpc.connect`'s TCP transport (the skipped gdscript config).
 - LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
 - A native, non-terminal GUI client (e.g. for Windows).
 

@@ -1,0 +1,241 @@
+//! Behavior tests for nxvim's async Lua runtime (the event loop):
+//! `vim.schedule`, `vim.defer_fn`, `vim.uv`/`vim.fn` timers, and async
+//! `vim.system`. Black-box per the project conventions — a real server over RPC,
+//! driven with `nvim_exec_lua`, asserting on observable Lua state.
+//!
+//! Two observation patterns (see docs/async-lua-runtime-plan.md → testing
+//! appendix):
+//!   * deferred-within-a-tick (`vim.schedule`) — assert on *ordering*, since the
+//!     effect lands at convergence in the same handler;
+//!   * off-tick (timers / async `vim.system`) — the *two-barrier* pattern: a
+//!     barrier right after the trigger sees the effect ABSENT (it didn't run
+//!     inline), then after a real sleep a second barrier sees it PRESENT (the
+//!     actor fired it off-tick and the server settled).
+
+use std::time::Duration;
+
+use nxvim_rpc::{connect, Incoming, Rpc};
+use nxvim_server::{run as run_server, ServerInit};
+use rmpv::Value;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+/// Start a server on its own thread (its runtime has timers enabled, so the
+/// event-loop actor can sleep) and return a connected, UI-attached client.
+async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("server runtime");
+        let _ = runtime.block_on(run_server(server_end, ServerInit::default()));
+    });
+    let (reader, writer) = tokio::io::split(client_end);
+    let (rpc, incoming) = connect(reader, writer);
+    rpc.request(
+        "nvim_ui_attach",
+        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
+    )
+    .await
+    .expect("ui attach");
+    (rpc, incoming)
+}
+
+/// Run a Lua chunk and return its value (the `nvim_exec_lua` entry point). Doubles
+/// as a barrier: awaiting the response means the server has processed every prior
+/// message and settled this one.
+async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(code), Value::Array(vec![])],
+    )
+    .await
+    .expect("exec_lua")
+}
+
+async fn lua_bool(rpc: &Rpc, code: &str) -> Option<bool> {
+    exec_lua(rpc, code).await.as_bool()
+}
+
+async fn lua_u64(rpc: &Rpc, code: &str) -> Option<u64> {
+    exec_lua(rpc, code).await.as_u64()
+}
+
+// ----- Phase 1: vim.schedule (deferred within the tick) ----------------------
+
+#[tokio::test]
+async fn schedule_runs_after_direct_work_not_inline() {
+    let (rpc, _incoming) = start().await;
+    // The scheduled callback must run AFTER the direct work that follows it in the
+    // chunk — proof it deferred to convergence rather than running nested inline.
+    exec_lua(
+        &rpc,
+        "_G.order = {}\n\
+         vim.schedule(function() table.insert(_G.order, 'scheduled') end)\n\
+         table.insert(_G.order, 'direct')",
+    )
+    .await;
+    let order = exec_lua(&rpc, "return table.concat(_G.order, ',')").await;
+    assert_eq!(order.as_str(), Some("direct,scheduled"));
+}
+
+#[tokio::test]
+async fn a_scheduled_callback_can_schedule_more_work() {
+    let (rpc, _incoming) = start().await;
+    // A callback that schedules another must see both run — proof the fixpoint
+    // picks up work queued mid-drain.
+    exec_lua(
+        &rpc,
+        "_G.n = 0\n\
+         vim.schedule(function()\n\
+           vim.schedule(function() _G.n = _G.n + 1 end)\n\
+           _G.n = _G.n + 1\n\
+         end)",
+    )
+    .await;
+    assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(2));
+}
+
+#[tokio::test]
+async fn a_throwing_scheduled_callback_does_not_stop_the_next() {
+    let (rpc, _incoming) = start().await;
+    // The first scheduled callback throws; the second must still run (error
+    // isolation — the drain catches and echoes E5108, never aborts).
+    exec_lua(
+        &rpc,
+        "_G.ran = false\n\
+         vim.schedule(function() error('boom') end)\n\
+         vim.schedule(function() _G.ran = true end)",
+    )
+    .await;
+    assert_eq!(lua_bool(&rpc, "return _G.ran").await, Some(true));
+}
+
+// ----- Phase 2: timers (off the input tick) ----------------------------------
+
+#[tokio::test]
+async fn defer_fn_fires_after_the_delay_not_before() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.fired = false\n\
+         vim.defer_fn(function() _G.fired = true end, 40)",
+    )
+    .await;
+    // Barrier #1, immediate: the deferred fn has NOT run (it didn't run inline).
+    assert_eq!(lua_bool(&rpc, "return _G.fired").await, Some(false));
+    // Past the delay: the actor fired it off-tick and the server settled.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(lua_bool(&rpc, "return _G.fired").await, Some(true));
+}
+
+#[tokio::test]
+async fn a_repeating_uv_timer_fires_repeatedly_and_stops() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.count = 0\n\
+         _G.t = vim.uv.new_timer()\n\
+         _G.t:start(20, 20, function() _G.count = _G.count + 1 end)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    let fired = lua_u64(&rpc, "return _G.count").await.unwrap();
+    assert!(
+        fired >= 2,
+        "repeating timer should fire repeatedly, got {fired}"
+    );
+
+    // Stop it; the count must stop growing.
+    exec_lua(&rpc, "_G.t:stop()").await;
+    let at_stop = lua_u64(&rpc, "return _G.count").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let after = lua_u64(&rpc, "return _G.count").await.unwrap();
+    assert_eq!(after, at_stop, "a stopped timer must not fire again");
+}
+
+#[tokio::test]
+async fn a_throwing_timer_callback_does_not_wedge_the_loop() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.ok = false\n\
+         vim.defer_fn(function() error('boom') end, 20)\n\
+         vim.defer_fn(function() _G.ok = true end, 50)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert_eq!(lua_bool(&rpc, "return _G.ok").await, Some(true));
+}
+
+// ----- Phase 3: async vim.system ---------------------------------------------
+
+#[tokio::test]
+async fn vim_system_with_on_exit_runs_async() {
+    let (rpc, _incoming) = start().await;
+    // A child that sleeps briefly, so barrier #1 reliably observes "not done yet".
+    exec_lua(
+        &rpc,
+        "_G.code = nil\n\
+         vim.system({ 'sh', '-c', 'sleep 0.1' }, {}, function(r) _G.code = r.code end)",
+    )
+    .await;
+    // Barrier #1: on_exit has not fired (it didn't run synchronously inline).
+    assert_eq!(lua_bool(&rpc, "return _G.code ~= nil").await, Some(false));
+    // Past the child's lifetime: on_exit fired off-tick with the result.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(lua_u64(&rpc, "return _G.code").await, Some(0));
+}
+
+#[tokio::test]
+async fn vim_system_wait_without_on_exit_is_synchronous() {
+    let (rpc, _incoming) = start().await;
+    // The blocking `:wait()` branch the config `root_dir` path relies on: a
+    // complete result returned synchronously, no event loop involved.
+    let out = exec_lua(
+        &rpc,
+        "local r = vim.system({ 'sh', '-c', 'printf hello' }):wait()\n\
+         return r.stdout",
+    )
+    .await;
+    assert_eq!(out.as_str(), Some("hello"));
+    let code = lua_u64(
+        &rpc,
+        "return vim.system({ 'sh', '-c', 'exit 3' }):wait().code",
+    )
+    .await;
+    assert_eq!(code, Some(3));
+}
+
+// ----- Phase 4: robustness (leaks, schedule_wrap) ----------------------------
+
+#[tokio::test]
+async fn one_shot_callbacks_do_not_leak_the_registry() {
+    let (rpc, _incoming) = start().await;
+    // A long run of one-shot schedules must leave vim._cb_fns empty (each is
+    // dropped after firing).
+    exec_lua(&rpc, "for _ = 1, 64 do vim.schedule(function() end) end").await;
+    let remaining = lua_u64(
+        &rpc,
+        "local n = 0; for _ in pairs(vim._cb_fns) do n = n + 1 end; return n",
+    )
+    .await;
+    assert_eq!(remaining, Some(0), "scheduled one-shots must not leak");
+}
+
+#[tokio::test]
+async fn schedule_wrap_defers_its_call() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.got = nil\n\
+         local w = vim.schedule_wrap(function(x) _G.got = x end)\n\
+         w(42)\n\
+         _G.during = _G.got",
+    )
+    .await;
+    // During the chunk the wrapped call had not run yet (it scheduled); by the
+    // time we read back it has (at convergence).
+    assert_eq!(lua_bool(&rpc, "return _G.during == nil").await, Some(true));
+    assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(42));
+}

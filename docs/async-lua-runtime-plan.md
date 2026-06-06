@@ -34,10 +34,23 @@ running scoreboard (the same one the LSP plan uses).
 
 | phase | title | status |
 | --- | --- | --- |
-| 1 | The callback registry + deferred `vim.schedule` (no threads) | ⬜ |
-| 2 | The event-loop actor + timers (`vim.defer_fn`, `vim.uv`/`vim.loop`) | ⬜ |
-| 3 | Async `vim.system` (off-tick `on_exit`, real `pid`, `kill`) | ⬜ |
-| 4 | The async-request seam + robustness + scoreboard cleanup | ⬜ |
+| 1 | The callback registry + deferred `vim.schedule` (no threads) | ✅ |
+| 2 | The event-loop actor + timers (`vim.defer_fn`, `vim.uv`/`vim.loop`) | ✅ |
+| 3 | Async `vim.system` (off-tick `on_exit`, real `pid`, `kill`) | ✅ |
+| 4 | The async-request seam + robustness + scoreboard cleanup | ✅ |
+
+**Implementation note.** Phases 1–4 landed together (`crates/nxvim-server/src/evloop.rs`
+is the actor; `nxvim-lua`'s `LoopOp`/`CallbackArgs`/`run_callback`/`take_loop_ops`
+the bridge; the `vim._cb_fns` registry + `vim.schedule`/`defer_fn`/`vim.uv` timers
++ async `vim.system` live in `prelude.lua`). The pid plumbing diverges from the
+plan's literal text: a synchronous blocking wait for the pid would **deadlock**
+the single-threaded (`new_current_thread`) runtime — the actor shares the server's
+thread — so the actor instead delivers the pid via `LoopEvent::ProcessSpawned`,
+which the server records into `vim._proc_pids[id]`; the `vim.system` handle's
+`.pid` reads through that (nil until the spawn lands, microseconds later). The
+`:wait()`-on-an-async-handle case raises a clear error pointing at the synchronous
+(no-`on_exit`) form rather than double-spawning. Coverage:
+`crates/nxvim-server/tests/async_runtime.rs`.
 
 ---
 

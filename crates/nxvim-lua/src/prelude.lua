@@ -325,11 +325,60 @@ function vim._notimpl(name, level)
   error("nxvim: not implemented: " .. name, level or 2)
 end
 
--- No real event loop yet: run scheduled work immediately. Sufficient for the
--- colorscheme setup/apply path, which only defers to avoid reentrancy. A safe
--- "soon" in the synchronous model — a known approximation, not a hollow stub
--- (it really runs the work), so it stays rather than raising via vim._notimpl.
-function vim.schedule(fn) fn() end
+-- ----- the async runtime: the deferred-callback registry ---------------------
+-- The spine of nxvim's event loop. A deferred function (vim.schedule, defer_fn,
+-- a vim.uv timer, a vim.system on_exit) is stored by integer id in vim._cb_fns
+-- and run *later*, by id, from Rust — the vim._keymap_fns / vim._run_keymap shape
+-- applied to async work. vim._next_cb_id() allocates a fresh id; vim._run_cb runs
+-- one and (unless `keep`) drops it so the registry can't grow unbounded.
+vim._cb_fns = vim._cb_fns or {}
+vim._cb_seq = vim._cb_seq or 0
+function vim._next_cb_id()
+  vim._cb_seq = vim._cb_seq + 1
+  return vim._cb_seq
+end
+
+-- Run the callback registered under `id`, forwarding any extra args. `keep` is
+-- false for one-shots (vim.schedule, defer_fn, a system on_exit) — the entry is
+-- dropped *before* the call so a throwing or re-scheduling callback still leaves
+-- the registry clean — and true for a repeating timer, whose fn is retained
+-- across fires (its :stop()/:close() drops it). A nil id (already stopped) is a
+-- silent no-op. The return value is forwarded so an <expr>-like caller could read
+-- it; current callers ignore it.
+function vim._run_cb(id, keep, ...)
+  local fn = vim._cb_fns[id]
+  if not keep then vim._cb_fns[id] = nil end
+  if fn then return fn(...) end
+end
+
+-- vim.schedule(fn): defer `fn` to the end of the current convergence — it runs
+-- after the work that scheduled it settles, no longer nested in the caller's
+-- stack frame (the strict improvement over the old inline `fn()`), but still
+-- within the same input tick (not a later wall-clock turn; that is defer_fn).
+-- This is exactly what the colorscheme's "defer to avoid reentrancy" wants.
+function vim.schedule(fn)
+  local id = vim._next_cb_id()
+  vim._cb_fns[id] = fn
+  vim._schedule(id) -- Rust bridge: push LoopOp::Schedule{id} onto Shared.loop_ops
+end
+
+-- vim.schedule_wrap(fn): return a function that, when called, schedules `fn` with
+-- whatever arguments it was given — a common plugin idiom for "run this callback
+-- safely on the loop". The captured args ride into the deferred call via a closure.
+function vim.schedule_wrap(fn)
+  return function(...)
+    local args = { ... }
+    local n = select("#", ...)
+    vim.schedule(function() fn(table.unpack and table.unpack(args, 1, n) or unpack(args, 1, n)) end)
+  end
+end
+
+-- pid registry for async vim.system handles. The event-loop actor reports a
+-- spawned child's OS pid back to the server, which records it here keyed by the
+-- handle's callback id; the handle's `.pid` reads through this table (nil until
+-- the spawn lands, since it can't be known synchronously on a single thread).
+vim._proc_pids = vim._proc_pids or {}
+function vim._set_proc_pid(id, pid) vim._proc_pids[id] = pid end
 
 function vim.notify(msg, _level, _opts)
   if type(msg) == "table" then msg = table.concat(msg, "\n") end
@@ -1131,25 +1180,49 @@ function vim.fn.confirm(_msg, _choices, _default, _type) vim._notimpl("vim.fn.co
 
 -- ----- vim.system / vim.json -------------------------------------------------
 
--- vim.system(cmd, opts, on_exit): run `cmd` (an argv list) to completion and
--- return a handle. `opts` may carry `cwd`, `env` (a {VAR=value} dict layered on
--- the inherited environment), and `text` (accepted; output is always returned as
--- a string). `on_exit`, if given (or passed in `opts`'s place), is called with
--- the result. The handle's `:wait()` returns `{ code, stdout, stderr }`.
+-- vim.system(cmd, opts, on_exit): run `cmd` (an argv list) and return a handle.
+-- `opts` may carry `cwd`, `env` (a {VAR=value} dict layered on the inherited
+-- environment), and `text` (accepted; output is always returned as a string).
 --
--- Caveat vs neovim: there is no event loop yet (see vim.schedule), so the process
--- is run *synchronously* on the current tick — `:wait()` and `on_exit` both see a
--- result that is already complete, and a long command blocks the server. This is
--- exactly what lets an `lsp/<server>.lua` `root_dir` that shells out (rust_analyzer
--- runs `cargo metadata` / `rustc --print sysroot`) resolve inline during
--- `vim.lsp.enable`. The Rust `vim._system` does the blocking spawn.
+-- Two modes, split on whether an `on_exit` is given (the pragmatic
+-- approximation of neovim's loop-pumping `:wait()`, which a single thread can't
+-- replicate; see docs/async-lua-runtime-plan.md):
+--   * `on_exit` given  → ASYNC. The child runs in the event-loop actor (off the
+--     server thread); `on_exit` fires on a later tick with { code, stdout, stderr }.
+--     The handle exposes a real `pid` (filled once the spawn lands) and a working
+--     `kill`. `:wait()` is unavailable on this handle (it would need to pump the
+--     loop) and raises, pointing the caller at the synchronous form.
+--   * no `on_exit`     → SYNCHRONOUS. The child runs to completion inline and
+--     `:wait()` returns the already-complete result. This is what an
+--     `lsp/<server>.lua` `root_dir` that shells out (rust_analyzer's `cargo
+--     metadata` / `rustc --print sysroot`) needs — short, blocking, resolved
+--     during `vim.lsp.enable`.
 function vim.system(cmd, opts, on_exit)
   if type(opts) == "function" then
     on_exit, opts = opts, nil
   end
   opts = opts or {}
+  if on_exit then
+    local id = vim._next_cb_id()
+    vim._cb_fns[id] = on_exit
+    vim._system_async(id, cmd, opts.cwd, opts.env)
+    return setmetatable({}, {
+      __index = function(_, key)
+        if key == "pid" then
+          return vim._proc_pids[id]
+        elseif key == "kill" then
+          return function(_, signal) vim._system_kill(id, signal) end
+        elseif key == "wait" then
+          return function()
+            error("nxvim: vim.system():wait() is unavailable on a handle spawned "
+              .. "with on_exit; call vim.system without on_exit for a synchronous result", 2)
+          end
+        end
+        return nil
+      end,
+    })
+  end
   local result = vim._system(cmd, opts.cwd, opts.env, opts.text ~= false)
-  if on_exit then on_exit(result) end
   return setmetatable({ pid = result.pid }, {
     __index = {
       wait = function() return result end,
@@ -1225,11 +1298,95 @@ vim.version.eq = function(a, b) return vim.version.cmp(a, b) == 0 end
 vim.version.ge = function(a, b) return vim.version.cmp(a, b) >= 0 end
 vim.version.le = function(a, b) return vim.version.cmp(a, b) <= 0 end
 
--- vim.defer_fn(fn, timeout): neovim runs `fn` after `timeout` ms on the event
--- loop. Unlike vim.schedule (a faithful "soon"), defer_fn carries a *delay*
--- semantic nxvim can't honor without an event loop (Phase 4) — running it inline
--- would silently misfire the deferred-retry patterns configs use — so it raises.
-function vim.defer_fn(_fn, _timeout) vim._notimpl("vim.defer_fn") end
+-- ----- timers: vim.defer_fn / vim.uv timers / vim.fn.timer_* -----------------
+-- All wall-clock timers ride the event-loop actor through the vim._timer_start /
+-- vim._timer_stop bridge: a callback id is registered in vim._cb_fns, the actor
+-- sleeps and fires LoopEvent::Timer, and the server runs the callback by id on its
+-- thread. A repeating timer (repeat > 0) keeps its callback across fires; a
+-- one-shot drops it. This is the same registry the keymap/schedule paths use.
+
+-- A libuv-style timer handle: a table carrying its callback id, with the
+-- start/stop/close/again methods plugins call. :start arms the actor timer;
+-- :stop / :close cancel it (and :close drops the callback, freeing the registry).
+local uv_timer = {}
+uv_timer.__index = uv_timer
+function uv_timer:start(timeout, rep, cb)
+  if cb ~= nil then vim._cb_fns[self._id] = cb end
+  self._repeat = rep or 0
+  vim._timer_start(self._id, timeout or 0, self._repeat)
+  return 0
+end
+function uv_timer:stop()
+  vim._timer_stop(self._id)
+  return 0
+end
+function uv_timer:again()
+  -- libuv: restart a repeating timer, using its stored repeat as the new delay.
+  vim._timer_start(self._id, self._repeat, self._repeat)
+  return 0
+end
+function uv_timer:close(cb)
+  vim._timer_stop(self._id)
+  vim._cb_fns[self._id] = nil -- drop the callback so the registry can't leak
+  vim._proc_pids[self._id] = nil
+  if cb then cb() end
+end
+function uv_timer:is_closing() return false end
+function uv_timer:is_active() return true end
+
+-- vim.uv.new_timer_handle(id): wrap an existing callback id in a handle (used by
+-- defer_fn, whose fn is already registered). vim.uv.new_timer(): a fresh handle.
+-- vim.uv and vim.loop are the same table, so this lands on both.
+function vim.uv.new_timer_handle(id)
+  return setmetatable({ _id = id, _repeat = 0 }, uv_timer)
+end
+function vim.uv.new_timer()
+  return vim.uv.new_timer_handle(vim._next_cb_id())
+end
+
+-- vim.defer_fn(fn, timeout): run `fn` once, `timeout` ms from now, on the loop —
+-- the off-tick deferral configs use for retry patterns. Returns a timer handle so
+-- the caller can :stop() it before it fires (neovim returns a uv timer).
+function vim.defer_fn(fn, timeout)
+  local id = vim._next_cb_id()
+  vim._cb_fns[id] = fn
+  vim._timer_start(id, timeout or 0, 0) -- one-shot
+  return vim.uv.new_timer_handle(id)
+end
+
+-- vim.fn.timer_start(timeout, callback, opts): the vimscript timer. Returns a
+-- timer id for timer_stop. `opts.repeat` is a *count* (-1 = forever, N = fire N
+-- times, absent/0 = once); since the actor speaks intervals not counts, a finite
+-- N>1 is honored by a wrapper that decrements and stops itself, so the count is
+-- real rather than approximated. `callback` is called with the timer id (vim
+-- passes the timer id as its argument).
+function vim.fn.timer_start(timeout, callback, opts)
+  opts = opts or {}
+  local count = opts["repeat"] or 0
+  local id = vim._next_cb_id()
+  if count == 0 then
+    vim._cb_fns[id] = function() callback(id) end
+    vim._timer_start(id, timeout, 0)
+  elseif count < 0 then
+    vim._cb_fns[id] = function() callback(id) end
+    vim._timer_start(id, timeout, timeout) -- forever, interval == timeout
+  else
+    local remaining = count
+    vim._cb_fns[id] = function()
+      callback(id)
+      remaining = remaining - 1
+      if remaining <= 0 then vim._timer_stop(id); vim._cb_fns[id] = nil end
+    end
+    vim._timer_start(id, timeout, timeout)
+  end
+  return id
+end
+
+-- vim.fn.timer_stop(id): cancel a timer started by timer_start and drop its fn.
+function vim.fn.timer_stop(id)
+  vim._timer_stop(id)
+  vim._cb_fns[id] = nil
+end
 
 -- vim.ui: the selection/input/open hooks. With no UI layer wired (Phase 8),
 -- calling `select`/`input` with a fake cancellation (on_choice(nil)) would make a

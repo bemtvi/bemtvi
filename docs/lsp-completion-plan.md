@@ -222,7 +222,14 @@ shutdown (only on a server exit / crash), since that path registers no client.
 
 ---
 
-## Phase 4 — Async runtime / event loop ⬜ (foundational)
+## Phase 4 — Async runtime / event loop ✅ (foundational)
+
+**Landed.** Implemented in full as its own four-phase effort —
+[`docs/async-lua-runtime-plan.md`](async-lua-runtime-plan.md). The event-loop
+actor is `crates/nxvim-server/src/evloop.rs`; the deferred-callback registry is
+`vim._cb_fns` (Lua) driven by `LuaRuntime::run_callback(id, keep, args)` (Rust);
+the queue is `Shared.loop_ops` / `take_loop_ops`. Phase 5 below plugs into that
+**callback-dispatch primitive** rather than inventing its own — see its note.
 
 **Goal.** A real scheduler so deferred work runs off-tick: `vim.schedule`
 genuinely defers, `vim.defer_fn(fn, ms)` honors the delay, `vim.system` runs the
@@ -267,6 +274,18 @@ value-add lives here.
 **Approach.** Generic request bridge: Lua queues `{method, params, handler_id}`;
 the manager sends it; the response enqueues `handler(err, result)` on the
 callback queue. Wire config `handlers[method]` into the response path.
+
+> **Seam (from the async-runtime plan).** The callback-dispatch primitive already
+> exists: register the handler with `vim._next_cb_id()` (Lua) — the same registry
+> `vim.schedule`/timers/`vim.system` use — and thread the id through the `LspOp`
+> alongside the existing `ReqToken` (`crates/nxvim-lsp/src/manager.rs` already
+> correlates replies by token). On `LspEvent::Reply`, `on_lsp_event` runs the
+> handler via the callback dispatcher. **This plan owns only the
+> LSP-reply *payload*:** add a `CallbackArgs::LspReply { err, result }` variant in
+> `nxvim-lua` (next to `None`/`Process`) so `run_callback` can hand the handler its
+> `(err, result)`. The `loop_events`/`lsp_events` arms already call `settle_events`,
+> so a handler that defers via `vim.cmd`/`vim.schedule` is driven to convergence
+> off-tick — the gap this plan closed.
 
 **Tests.** A round-trip request to a mock server returns a result to the Lua
 handler; a config command that issues a request works end-to-end.

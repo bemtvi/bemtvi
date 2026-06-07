@@ -15,8 +15,8 @@ use crate::convert::{json_to_lua, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp, PanelOp,
-    RawKeymap, RawRhs, UiInputReq, WindowOp,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, GlobalOptionOp, HlSet, LoopOp, LspClientData,
+    LspOp, PanelOp, RawKeymap, RawRhs, UiInputReq, WindowOp,
 };
 
 /// One window's row in the Rust→Lua window mirror, in layout order:
@@ -72,6 +72,9 @@ pub(crate) struct Shared {
     /// `nvim_set_current_win` API, drained by the server into the live editor
     /// after the chunk (Phase 5).
     pub(crate) window_ops: Vec<WindowOp>,
+    /// Global-option writes from `vim.o` for a wired search option, drained by
+    /// the server into the editor's global options after the chunk.
+    pub(crate) global_ops: Vec<GlobalOptionOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
@@ -326,6 +329,12 @@ impl LuaRuntime {
     /// the last drain, for the server to apply to the live editor (Phase 5).
     pub fn take_window_ops(&self) -> Vec<WindowOp> {
         std::mem::take(&mut self.shared.borrow_mut().window_ops)
+    }
+
+    /// Take the global-option writes queued by `vim.o` since the last drain, for
+    /// the server to apply to the editor's global options.
+    pub fn take_global_ops(&self) -> Vec<GlobalOptionOp> {
+        std::mem::take(&mut self.shared.borrow_mut().global_ops)
     }
 
     /// Take the `vim.ui.input` prompt requests queued since the last drain, for
@@ -652,6 +661,25 @@ impl LuaRuntime {
         }
         let set: mlua::Function = vim.get("_set_bo_mirror")?;
         set.call(entries)
+    }
+
+    /// Refresh the Rust→Lua global-option mirror (`vim._go_mirror = { ignorecase,
+    /// smartcase, wrapscan, hlsearch, incsearch }`) that `vim.o` reads for the
+    /// wired global search options. Pushed alongside the buffer mirror before any
+    /// Lua that can read options, so a read reflects the core's current value —
+    /// the default until set, and a value set through the `:set` ex path, not just
+    /// one written from Lua.
+    pub fn set_go_mirror(&self, opts: (bool, bool, bool, bool, bool)) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let (ignorecase, smartcase, wrapscan, hlsearch, incsearch) = opts;
+        let entry = self.lua.create_table()?;
+        entry.set("ignorecase", ignorecase)?;
+        entry.set("smartcase", smartcase)?;
+        entry.set("wrapscan", wrapscan)?;
+        entry.set("hlsearch", hlsearch)?;
+        entry.set("incsearch", incsearch)?;
+        let set: mlua::Function = vim.get("_set_go_mirror")?;
+        set.call(entry)
     }
 
     /// Whether `name` was registered via `nvim_create_user_command` (so the

@@ -255,6 +255,21 @@ pub enum OptionValue {
     Bool(bool),
 }
 
+/// A global (editor-wide) option mutation queued by `vim.o` for a search option
+/// (`ignorecase` / `smartcase` / `wrapscan` / `hlsearch` / `incsearch`), the
+/// global analogue of [`BufOp::SetOption`] / [`WindowOp::SetOption`]. The Lua
+/// side has canonicalized `name` and written through its `vim._go_mirror`; the
+/// server applies the value to the editor's global options after the chunk.
+/// These are all boolean today, but the value rides as an [`OptionValue`] for
+/// symmetry with the buffer/window bridges (and so a numeric global can land here
+/// later without changing the wire shape).
+#[derive(Clone, Debug)]
+pub struct GlobalOptionOp {
+    /// Canonical option name (`ignorecase` / `smartcase` / …).
+    pub name: String,
+    pub value: OptionValue,
+}
+
 /// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,
 /// `nvim_win_set_buf`/`set_cursor`/`set_width`/`set_height`/`close`, `nvim_open_win`),
 /// drained by the server in `apply_lua_effects` and applied to the live editor —

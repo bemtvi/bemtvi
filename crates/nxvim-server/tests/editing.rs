@@ -4451,6 +4451,69 @@ async fn bo_option_write_is_observable_and_filetype_still_resolves() {
 }
 
 #[tokio::test]
+async fn vim_o_global_option_reaches_core_search() {
+    let (rpc, _incoming) = start(None).await;
+    // A global search option set through vim.o must reach the core, not just a
+    // Lua table: with ignorecase on, a lowercase pattern matches uppercase text.
+    feed(&rpc, "iaXYZb<Esc>0");
+    exec_lua(&rpc, r#"vim.o.ignorecase = true"#).await;
+    feed(&rpc, "/xyz<CR>");
+    // The match "XYZ" sits at byte column 1; the cursor jumps there only because
+    // ignorecase reached the editor (off, "xyz" never matches and it stays at 0).
+    assert_eq!(cursor(&rpc).await, (1, 1));
+}
+
+#[tokio::test]
+async fn vim_o_global_read_reflects_set_ex_command() {
+    let (rpc, _incoming) = start(None).await;
+    // Reading vim.o reflects the core's value, including one set via the `:set`
+    // ex path (the server-pushed mirror, not just a Lua write-through).
+    feed(&rpc, ":set ignorecase<CR>");
+    let via_o = exec_lua(&rpc, r#"return vim.o.ignorecase"#).await;
+    assert_eq!(via_o.as_bool(), Some(true));
+    // The abbreviation resolves to the same canonical option.
+    let via_abbrev = exec_lua(&rpc, r#"return vim.o.ic"#).await;
+    assert_eq!(via_abbrev.as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn vim_o_window_option_routes_to_current_window() {
+    let (rpc, _incoming) = start(None).await;
+    // vim.o forwards a window-local option to the current window: the write must
+    // reach the core, observed by reading it back through vim.wo in a fresh chunk
+    // (which reads the server-refreshed window mirror).
+    exec_lua(&rpc, r#"vim.o.number = false"#).await;
+    let via_wo = exec_lua(&rpc, r#"return vim.wo.number"#).await;
+    assert_eq!(via_wo.as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn vim_o_buffer_option_reaches_core_indent() {
+    let (rpc, _incoming) = start(None).await;
+    // vim.o forwards a buffer-local option to the current buffer: tabstop set
+    // through vim.o drives the width expandtab fills to.
+    exec_lua(&rpc, r#"vim.o.tabstop = 2"#).await;
+    feed(&rpc, ":set expandtab<CR>");
+    feed(&rpc, "i<Tab>x<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["  x"]);
+}
+
+#[tokio::test]
+async fn vim_o_unwired_option_round_trips_observably() {
+    let (rpc, _incoming) = start(None).await;
+    // An option the core does not yet honor stays observable: it round-trips
+    // through the plain store, and the seeded defaults read back.
+    let tgc = exec_lua(
+        &rpc,
+        r#"vim.o.termguicolors = true; return vim.o.termguicolors"#,
+    )
+    .await;
+    assert_eq!(tgc.as_bool(), Some(true));
+    let bg = exec_lua(&rpc, r#"return vim.o.background"#).await;
+    assert_eq!(bg.as_str(), Some("dark"));
+}
+
+#[tokio::test]
 async fn expandtab_inserts_spaces_to_the_next_tabstop() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, ":set expandtab tabstop=4<CR>");

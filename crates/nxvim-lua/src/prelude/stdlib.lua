@@ -57,17 +57,96 @@ end
 -- vim.g: global variables. Plain storage; reading an unset key yields nil.
 vim.g = vim.g or {}
 
--- vim.o: editor options. Only a few are meaningful today (background,
--- termguicolors); the rest are stored so plugins can set/read them freely.
-vim.o = vim.o or {
+-- vim.o: editor options with neovim's set-semantics — a write reaches the
+-- option's real home and a read returns the core's current value (the default
+-- until set, and a value set through the `:set` ex path, not just one written
+-- from Lua). The wired options route to the scope their name implies:
+--   * number / relativenumber       -> window-local (delegated to vim.wo)
+--   * tabstop / shiftwidth /
+--     softtabstop / expandtab       -> buffer-local (delegated to vim.bo)
+--   * ignorecase / smartcase /
+--     wrapscan / hlsearch /
+--     incsearch                     -> global (vim._go_mirror + the
+--                                      vim._set_global_option Rust bridge)
+-- Any other option (termguicolors, background, winblend, pumblend, …) lands in
+-- the plain Lua store `vim._o_store`: observable read/write, not yet honored.
+--
+-- vim.wo / vim.bo are defined in later prelude chunks; vim.o only touches them
+-- from inside its metamethods, which run at config time once every chunk has
+-- loaded, so the forward reference is fine.
+
+-- Window- and buffer-local options vim.o forwards to vim.wo / vim.bo. Keyed by
+-- both the full name and its abbreviation (the delegate canonicalizes again).
+local O_WIN = { number = true, nu = true, relativenumber = true, rnu = true }
+local O_BUF = {
+  tabstop = true, ts = true, shiftwidth = true, sw = true,
+  softtabstop = true, sts = true, expandtab = true, et = true,
+}
+-- Global (editor-wide) options: canonical name keyed by name and abbreviation.
+local O_GLOBAL = {
+  ignorecase = "ignorecase", ic = "ignorecase",
+  smartcase = "smartcase", scs = "smartcase",
+  wrapscan = "wrapscan", ws = "wrapscan",
+  hlsearch = "hlsearch", hls = "hlsearch",
+  incsearch = "incsearch", is = "incsearch",
+}
+-- Core defaults, the safety net before the server has pushed the mirror.
+local O_GLOBAL_DEFAULT = {
+  ignorecase = false, smartcase = false, wrapscan = true,
+  hlsearch = true, incsearch = true,
+}
+
+-- Rust→Lua mirror of the core's global option values, refreshed by the server
+-- (vim._set_go_mirror) before any Lua that can read options. Authoritative for
+-- the wired global options, so a read reflects the core default until set and a
+-- value set through the `:set` ex path, not just one written from Lua.
+vim._go_mirror = vim._go_mirror or {}
+function vim._set_go_mirror(t) vim._go_mirror = t or {} end
+
+-- Arbitrary (Lua-only) global options plugins set via vim.o; the wired options
+-- live in their scope (vim.wo / vim.bo / vim._go_mirror) instead. Seeded with
+-- the few defaults colorschemes read (termguicolors / background / *blend).
+vim._o_store = vim._o_store or {
   background = "dark",
   termguicolors = false,
   winblend = 0,
   pumblend = 0,
 }
 
+local function o_get(k)
+  if O_WIN[k] then return vim.wo[k] end
+  if O_BUF[k] then return vim.bo[k] end
+  local canon = O_GLOBAL[k]
+  if canon then
+    local v = vim._go_mirror[canon]
+    if v ~= nil then return v end
+    return O_GLOBAL_DEFAULT[canon]
+  end
+  return vim._o_store[k]
+end
+local function o_set(k, v)
+  if O_WIN[k] then vim.wo[k] = v; return end
+  if O_BUF[k] then vim.bo[k] = v; return end
+  local canon = O_GLOBAL[k]
+  if canon then
+    -- Queue the change for the core and write through the mirror so a
+    -- read-after-write within this chunk is consistent (the server overwrites it
+    -- on the next push).
+    vim._set_global_option(canon, v)
+    vim._go_mirror[canon] = v
+    return
+  end
+  vim._o_store[k] = v
+end
+
+vim.o = setmetatable({}, {
+  __index = function(_, k) return o_get(k) end,
+  __newindex = function(_, k, v) o_set(k, v) end,
+})
+
 -- vim.opt: in neovim each field is a rich Option object, but the colorscheme
--- load path only uses scalar get/set, so a thin proxy over vim.o suffices.
+-- load path only uses scalar get/set, so a thin proxy over vim.o suffices — and
+-- it inherits vim.o's scope routing for free.
 vim.opt = setmetatable({}, {
   __index = function(_, k) return vim.o[k] end,
   __newindex = function(_, k, v) vim.o[k] = v end,

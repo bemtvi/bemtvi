@@ -71,6 +71,17 @@ impl Server {
         for op in self.lua.take_window_ops() {
             self.apply_window_op(op);
         }
+        // Global-option writes from `vim.o` (a wired search option): applied to the
+        // editor's global options after the chunk — the same state the `:set` ex
+        // path writes. All boolean today (the wired global set is the search flags).
+        for op in self.lua.take_global_ops() {
+            match op.value {
+                OptionValue::Bool(b) => self.editor.set_global_option_bool(&op.name, b),
+                // No numeric global option is wired yet; ignore rather than guess a
+                // target (the Lua side only forwards the boolean search options).
+                OptionValue::Number(_) => {}
+            }
+        }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
         // labelled text prompt and remember which callback awaits the result. Only
         // one prompt can be open at a time (a single command line); if several were
@@ -292,6 +303,17 @@ impl Server {
             .lua
             .set_buf_mirror(&bufs, cursor, cur_win, &wins, next_win);
         let _ = self.lua.set_bo_mirror(&bo);
+        // Global search options, mirrored so `vim.o` reads the core's current value
+        // (the default until set, and values set via the `:set` ex path). Cheap
+        // (five flags), so it isn't gated.
+        let go = self.editor.global_options();
+        let _ = self.lua.set_go_mirror((
+            go.ignorecase,
+            go.smartcase,
+            go.wrapscan,
+            go.hlsearch,
+            go.incsearch,
+        ));
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

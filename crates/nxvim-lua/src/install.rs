@@ -21,7 +21,8 @@ use crate::host::{
     stdpath,
 };
 use crate::ops::{
-    BufOp, ConfirmReq, HlSet, LoopOp, LspOp, OptionValue, PanelOp, UiInputReq, WindowOp,
+    BufOp, ConfirmReq, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, UiInputReq,
+    WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -460,6 +461,30 @@ pub(crate) fn install_runtime_api(
                 sh.borrow_mut()
                     .buf_ops
                     .push(BufOp::SetOption { bufnr, name, value });
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._set_global_option(name, value)`: queue a [`GlobalOptionOp`] for the
+    // server to apply to the editor's global options. The prelude (`vim.o`) has
+    // canonicalized `name` and written through its `vim._go_mirror`; the wired
+    // global options are all boolean, but a number rides as `Number` for symmetry
+    // with the buffer/window bridges. Other Lua types are ignored.
+    let sh = shared.clone();
+    vim.set(
+        "_set_global_option",
+        lua.create_function(move |_, (name, value): (String, mlua::Value)| {
+            let value = match value {
+                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
+                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                _ => None,
+            };
+            if let Some(value) = value {
+                sh.borrow_mut()
+                    .global_ops
+                    .push(GlobalOptionOp { name, value });
             }
             Ok(())
         })?,

@@ -2052,6 +2052,27 @@ impl Editor {
         }
     }
 
+    /// Set a boolean global option from outside the editor (the Lua `vim.o`
+    /// bridge), the global analogue of [`Editor::set_window_option_bool`]. The
+    /// wired global options are all the search booleans; an unknown name is a
+    /// no-op (the Lua side only forwards the canonical wired set). This is the same
+    /// state the `:set` ex path writes — the two routes share one home.
+    pub fn set_global_option_bool(&mut self, name: &str, value: bool) {
+        match name {
+            "ignorecase" => self.options.ignorecase = value,
+            "smartcase" => self.options.smartcase = value,
+            "wrapscan" => self.options.wrapscan = value,
+            "hlsearch" => self.options.hlsearch = value,
+            "incsearch" => self.options.incsearch = value,
+            _ => {}
+        }
+    }
+
+    /// The editor's global options, for the server to mirror to Lua (`vim.o`).
+    pub fn global_options(&self) -> Options {
+        self.options
+    }
+
     /// Window `id`'s cursor as `(0-based line, byte col)` — the live cursor for
     /// the focused window, the stashed one otherwise (`nvim_win_get_cursor`).
     /// `None` if there is no such window.

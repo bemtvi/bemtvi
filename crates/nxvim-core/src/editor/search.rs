@@ -405,6 +405,12 @@ impl Editor {
             return;
         };
 
+        // A search is a jump: stash the pre-search cursor in the previous-context
+        // mark (`` `` ``/`''`) before landing — but only a *movement* search, not
+        // an operator's search-motion range (`d/pat`).
+        if op.is_none() {
+            self.record_jump_context();
+        }
         self.place_with_offset(ms, me, offset);
         if let Some(op) = op {
             // The cursor now rests on the (offset-adjusted) match; the operator

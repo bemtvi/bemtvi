@@ -210,6 +210,8 @@ impl Editor {
         let rest = rest.trim_start();
         if rest.is_empty() {
             if range.explicit {
+                // A `:line` move is a jump: stash the previous-context mark first.
+                self.record_jump_context();
                 self.cursor.line = range.hi;
                 self.cursor.col = self.first_non_blank(range.hi);
             }
@@ -286,6 +288,7 @@ impl Editor {
             },
             "mes" | "messages" | "message" => self.ex_messages(),
             "reg" | "registers" | "di" | "dis" | "display" => self.ex_registers(args),
+            "marks" => self.ex_marks(args),
             "panelopen" | "panelo" => {
                 if !self.reopen_last_panel() {
                     self.echo("No panel to reopen");
@@ -404,11 +407,22 @@ impl Editor {
                 *i += 1;
                 have_base = true;
             }
-            // A `'{mark}` range address. Buffer-local marks exist in the normal
-            // grammar (`m`/`` ` ``/`'`), but resolving one *here* (`:'a,'bd`) is
-            // not wired yet, so a mark address fails loud rather than resolving to
-            // a bogus line. (See docs/plans/2026-06-07-marks.md.)
-            Some(b'\'') => return Err("E20: Mark not set".to_string()),
+            // A `'{mark}` range address (`:'a,'bd`, the `:'<,'>` of a visual
+            // selection). The next byte names the mark; resolve it to its line via
+            // the same store the `` `{x} `` jump reads (buffer-local marks and the
+            // automatic `'<`/`'>`/`'.`/… specials). An unset or unknown mark fails
+            // loud (*E20*) rather than resolving to a bogus line.
+            Some(b'\'') => {
+                let name = bytes.get(*i + 1).map(|&b| b as char);
+                match name.and_then(|n| self.mark_position(n)) {
+                    Some(cursor) => {
+                        line = cursor.line as i64;
+                        *i += 2;
+                        have_base = true;
+                    }
+                    None => return Err("E20: Mark not set".to_string()),
+                }
+            }
             Some(c) if c.is_ascii_digit() => {
                 let mut n = 0i64;
                 while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {

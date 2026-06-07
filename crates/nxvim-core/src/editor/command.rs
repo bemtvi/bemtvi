@@ -372,6 +372,18 @@ fn is_register_name(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':' | '+' | '*')
 }
 
+/// Whether `m` is a **jump** in vim's sense — a motion that records the
+/// previous-context mark (`` `` `` / `''`) before it moves: `gg`/`G` and the mark
+/// jumps themselves. Ordinary `h`/`j`/`k`/`l`/word/find motions are *not* jumps,
+/// so they don't stash the context (search and `:line` record it on their own
+/// paths). Used by [`Editor::execute`].
+fn is_jump_motion(m: Motion) -> bool {
+    matches!(
+        m,
+        Motion::GotoTop | Motion::GotoLine | Motion::MarkJumpExact(_) | Motion::MarkJumpLine(_)
+    )
+}
+
 /// The registers vim refuses to *write* (yank/delete into): the last-search
 /// `/`, last-insert `.`, filename `%`, last-command `:`, expression `=`, and
 /// alternate-file `#`. They are readable (paste, `:registers`) but a yank/delete
@@ -471,16 +483,21 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             };
         }
         Stage::MarkSetPending => {
-            // The next key names the mark. An unsupported name is a loud dead-end
-            // (`Reset`), exactly like a missed find/register arg.
+            // The next key names the mark. Any printable name resolves to `SetMark`,
+            // which `execute` validates: a settable `a`–`z`/`A`–`Z` is set, a
+            // read-only special (or other junk) errors loudly (vim's *E191*) rather
+            // than the old silent dead-end. A non-char key is still a `Reset`.
             return match key.as_char() {
-                Some(name) if marks::is_mark_name(name) => Complete(ResolvedCommand::SetMark(name)),
-                _ => Reset,
+                Some(name) => Complete(ResolvedCommand::SetMark(name)),
+                None => Reset,
             };
         }
         Stage::MarkJumpPending(kind) => {
+            // The next key names the mark to jump to: a settable name or a read-only
+            // automatic special (`` ` ``/`'`/`.`/`^`/`[`/`]`/`<`/`>`). An unsupported
+            // name (a digit, untracked punctuation) is a loud dead-end (`Reset`).
             return match key.as_char() {
-                Some(name) if marks::is_mark_name(name) => {
+                Some(name) if marks::is_jumpable_mark(name) => {
                     Complete(ResolvedCommand::Motion(match kind {
                         MarkJumpKind::Exact => Motion::MarkJumpExact(name),
                         MarkJumpKind::Line => Motion::MarkJumpLine(name),
@@ -780,6 +797,10 @@ impl Editor {
             ParseStep::Cancel => {
                 self.reset_pending();
                 if self.mode.is_visual() {
+                    // Leaving Visual mode stamps the `` `< `` / `` `> `` selection
+                    // marks (what `gv` and the angle-mark jumps read) before we drop
+                    // back to Normal.
+                    self.record_visual_marks();
                     self.mode = Mode::Normal;
                     self.clamp_cursor();
                 }
@@ -821,6 +842,9 @@ impl Editor {
                 if let Motion::MarkJumpExact(name) | Motion::MarkJumpLine(name) = m {
                     if let Some(loc) = self.mark_location(name) {
                         if loc.buf != self.cur_buffer() {
+                            // A jump still records the pre-jump context in the source
+                            // buffer (so `` `` `` returns), then crosses over.
+                            self.record_jump_context();
                             self.jump_to_mark_buffer(loc, matches!(m, Motion::MarkJumpLine(_)));
                             self.reset_pending();
                             return;
@@ -828,7 +852,16 @@ impl Editor {
                     }
                 }
                 match self.resolve_motion(m) {
-                    Some(mr) => self.apply_resolved_motion(mr),
+                    Some(mr) => {
+                        // A jump-class motion (not an operator's range) stashes the
+                        // pre-jump cursor in the previous-context mark (`` `` ``/`''`)
+                        // *after* the target is resolved — so `` `` `` itself reads the
+                        // old context before overwriting it — and before the move.
+                        if is_jump_motion(m) && self.pending.operator.is_none() {
+                            self.record_jump_context();
+                        }
+                        self.apply_resolved_motion(mr);
+                    }
                     // A find/`;`/`,` that doesn't match (or `;`/`,` with no prior
                     // find): an *execution* miss, not a grammar one. Cancel as the
                     // old failed-motion paths did — visual `f`-miss keeps the
@@ -871,7 +904,13 @@ impl Editor {
                 self.reset_pending();
             }
             ResolvedCommand::SetMark(name) => {
-                self.set_mark(name);
+                // Only the named marks are settable; the automatic specials (and any
+                // other name) are read-only and error loudly, never a silent no-op.
+                if marks::is_settable_mark(name) {
+                    self.set_mark(name);
+                } else {
+                    self.echo("E191: Argument must be a letter or forward/backward quote");
+                }
                 self.reset_pending();
             }
             ResolvedCommand::VisualOperate(op) => self.visual_operate(op),

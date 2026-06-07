@@ -1,27 +1,53 @@
 //! Marks — positions the user names with `m{x}` and returns to with `` `{x} ``
 //! (exact byte position) or `'{x}` (first non-blank of the mark's line).
 //!
-//! Phase 1–3: the buffer-local lowercase marks `a`–`z`, stored as `(line, col)`
+//! Phase 1–4: the buffer-local lowercase marks `a`–`z`, stored as `(line, col)`
 //! on the text [`Buffer`](crate::buffer::Buffer) so they follow the buffer across
 //! switches *and* ride the single edit choke point ([`crate::buffer::Buffer`]'s
 //! `record`) that keeps them correct as text is inserted/deleted — exactly the
-//! arrangement `extmarks` use; plus the global file marks `A`–`Z`, each naming a
-//! `(buffer, cursor)` on the [`Editor`] so a jump can cross buffers. The automatic
-//! specials (`` ` `` / `'` / `.` / `[` / …) land in later phases — see
-//! `docs/plans/2026-06-07-marks.md`. The grammar ([`crate::editor::command`])
-//! rejects any name this module doesn't yet accept as a loud dead-end, never a
-//! silent no-op, matching the register surface.
+//! arrangement `extmarks` use; the global file marks `A`–`Z`, each naming a
+//! `(buffer, cursor)` on the [`Editor`] so a jump can cross buffers; and the
+//! automatic *special* marks (`` `` `` / `''` previous-context, `` `. `` last
+//! change, `` `^ `` last insert, `` `[ `` / `` `] `` last yank/change bounds,
+//! `` `< `` / `` `> `` last visual selection). The specials are **read-only**
+//! (jump-only): they ride the *same* buffer `marks` store under their punctuation
+//! key, so they shift with edits and restore on undo like the named marks, but
+//! `m{special}` is rejected loudly. See `docs/plans/2026-06-07-marks.md`.
 
 use super::*;
 
-/// Whether `c` names a mark nxvim can set and jump to today. Phases 1–3 support
-/// the buffer-local lowercase marks `a`–`z` and the global file marks `A`–`Z`;
-/// every other name (the automatic `` ` `` / `.` / `[` / `<` … specials) is
-/// rejected at the grammar level — `m{X}` / `` `{X} `` is a dead-end that runs
-/// nothing — until its phase lands.
-pub(crate) fn is_mark_name(c: char) -> bool {
+/// Whether `m{c}` may *set* mark `c`. Only the named marks are settable: the
+/// buffer-local lowercase `a`–`z` and the global file `A`–`Z`. The automatic
+/// specials are read-only — `m.` / `m<` error loudly (vim's *E191*) rather than
+/// silently doing nothing.
+pub(crate) fn is_settable_mark(c: char) -> bool {
     c.is_ascii_alphabetic()
 }
+
+/// Whether `` `{c} `` / `'{c}` may *jump* to mark `c`: the settable named marks
+/// plus the read-only automatic specials. `` ` `` and `'` both name the
+/// previous-context mark; `.` `^` `[` `]` `<` `>` name the change/insert/visual
+/// automatics. Any other name (a digit `'0`–`'9`, punctuation we don't track) is
+/// a grammar dead-end until its phase lands.
+pub(crate) fn is_jumpable_mark(c: char) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, '\'' | '`' | '.' | '^' | '[' | ']' | '<' | '>')
+}
+
+/// The buffer-local store key a jump name reads. `` ` `` and `'` are two spellings
+/// of the one previous-context mark, so both fold to `'`; every other name keys
+/// itself. (Uppercase global names never reach here — they key
+/// [`Editor::global_marks`] instead.)
+fn buffer_mark_key(name: char) -> char {
+    match name {
+        '`' => '\'',
+        other => other,
+    }
+}
+
+/// The automatic special marks in vim's `:marks` display order. Each lives in the
+/// buffer `marks` store under this key, written at its capture point (a jump, an
+/// edit, an insert-exit, a yank/change, a visual selection) — never by `m`.
+const SPECIAL_MARKS: [char; 7] = ['\'', '.', '^', '[', ']', '<', '>'];
 
 /// Where a mark points: which buffer and the cursor within it. A buffer-local
 /// lowercase mark resolves into the *current* buffer; a global `A`–`Z` mark
@@ -39,7 +65,8 @@ impl Editor {
     /// when its line is deleted (see [`crate::buffer`]'s `shift_marks`). An
     /// uppercase mark is a *global* file mark: it records `(current buffer,
     /// cursor)` on the editor, so jumping to it later can cross back to that
-    /// buffer.
+    /// buffer. Only called for a settable name; the read-only specials are
+    /// rejected at the grammar boundary.
     pub(crate) fn set_mark(&mut self, name: char) {
         let cursor = self.cursor;
         if name.is_ascii_uppercase() {
@@ -51,11 +78,68 @@ impl Editor {
         }
     }
 
+    /// Record the pre-jump cursor into the previous-context mark (`` `` `` / `''`)
+    /// so a jump can be undone with `` `` ``. Stored in the buffer `marks` under
+    /// `'`, so it shifts with later edits and restores on undo. Called by the
+    /// jump-class motions (`gg`/`G`/`` `x ``/`'x`), search, and `:line` — *before*
+    /// they move — and never for an operator's range or an ordinary `h`/`j`/word
+    /// motion, matching vim's definition of a jump.
+    pub(crate) fn record_jump_context(&mut self) {
+        let Cursor { line, col } = self.cursor;
+        self.buffer_mut().marks.insert('\'', (line, col));
+    }
+
+    /// Record the cursor as the last-insert mark (`` `^ ``) — where Insert mode was
+    /// last left. Called from the insert-mode `<Esc>` handler at the insert-stop
+    /// column (before the normal-mode backstep), so `` `^ `` returns there.
+    pub(crate) fn record_last_insert(&mut self) {
+        let Cursor { line, col } = self.cursor;
+        self.buffer_mut().marks.insert('^', (line, col));
+    }
+
+    /// Record the bounds of the just yanked/changed byte range `[lo, hi)` into the
+    /// `` `[ `` / `` `] `` marks: `` `[ `` on the first affected character, `` `] ``
+    /// on the last. Called from the operator path *before* the text is mutated, so
+    /// for a delete/change the edit's `shift_marks` then collapses both onto the
+    /// edit start (vim's behavior); for a yank, which mutates nothing, they bracket
+    /// the yanked text.
+    pub(crate) fn record_change_bounds(&mut self, lo: usize, hi: usize) {
+        let buf = self.buffer();
+        let len = buf.len_bytes();
+        let lo = lo.min(len);
+        let last = hi.clamp(lo + 1, len.max(lo + 1)).saturating_sub(1).min(len);
+        let start_line = buf.byte_to_line(lo);
+        let end_line = buf.byte_to_line(last);
+        let start = (start_line, lo - buf.line_start(start_line));
+        let end = (end_line, last - buf.line_start(end_line));
+        let marks = &mut self.buffer_mut().marks;
+        marks.insert('[', start);
+        marks.insert(']', end);
+    }
+
+    /// Record the bounds of the selection just left in Visual mode into the
+    /// `` `< `` / `` `> `` marks (vim's selection marks, also what `gv` reads):
+    /// `` `< `` on the earlier of anchor/cursor, `` `> `` on the later. Called as
+    /// Visual mode is left (a `<Esc>` cancel or a completed visual operator).
+    pub(crate) fn record_visual_marks(&mut self) {
+        let a = self.visual_anchor;
+        let b = self.cursor;
+        let (lo, hi) = if (a.line, a.col) <= (b.line, b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let marks = &mut self.buffer_mut().marks;
+        marks.insert('<', (lo.line, lo.col));
+        marks.insert('>', (hi.line, hi.col));
+    }
+
     /// The full location of mark `name` — its buffer and cursor — or `None` when
     /// the mark was never set, was dropped (its line deleted), or, for a global
     /// mark, the buffer it pointed at is no longer open. `None` makes the jump
     /// fail loudly (vim's *E20: Mark not set*) rather than silently leaving the
-    /// cursor put or diving into a phantom buffer.
+    /// cursor put or diving into a phantom buffer. The read-only specials resolve
+    /// here too, reading the buffer `marks` store under their canonical key.
     pub(crate) fn mark_location(&self, name: char) -> Option<MarkLocation> {
         if name.is_ascii_uppercase() {
             let &(buf, cursor) = self.global_marks.get(&name)?;
@@ -64,7 +148,7 @@ impl Editor {
                 .contains_key(&buf)
                 .then_some(MarkLocation { buf, cursor })
         } else {
-            let &(line, col) = self.buffer().marks.get(&name)?;
+            let &(line, col) = self.buffer().marks.get(&buffer_mark_key(name))?;
             Some(MarkLocation {
                 buf: self.cur_buffer(),
                 cursor: Cursor { line, col },
@@ -102,4 +186,53 @@ impl Editor {
         self.desired_eol = false;
         self.ensure_visible();
     }
+
+    /// `:marks [names]` — list the set marks into the bottom panel, mirroring vim's
+    /// `mark line col file/text` table. Order: the automatic specials, then the
+    /// buffer-local `a`–`z`, then the global `A`–`Z`. An argument filters to the
+    /// named marks (`:marks aB`). A buffer-local row shows its line's text; a global
+    /// row shows the file (or its text when it points into the current buffer).
+    pub(crate) fn ex_marks(&mut self, args: &str) {
+        let filter: Vec<char> = args.chars().filter(|c| !c.is_whitespace()).collect();
+        let wanted = |name: char| filter.is_empty() || filter.contains(&name);
+
+        let mut lines = vec!["mark line  col file/text".to_string()];
+        // Buffer-local marks (specials first, then a–z): line/col + the line text.
+        let local = SPECIAL_MARKS.iter().copied().chain('a'..='z');
+        for name in local {
+            if !wanted(name) {
+                continue;
+            }
+            if let Some(&(line, col)) = self.buffer().marks.get(&name) {
+                let text = self.buffer().line(line.min(self.last_line()));
+                lines.push(format_mark_line(name, line, col, text.trim_end()));
+            }
+        }
+        // Global marks: their stored line/col, and the file they point into (its
+        // text when that buffer is current, else its path).
+        let globals: Vec<(char, BufferId, Cursor)> = ('A'..='Z')
+            .filter(|&n| wanted(n))
+            .filter_map(|n| self.global_marks.get(&n).map(|&(b, c)| (n, b, c)))
+            .collect();
+        for (name, buf, cur) in globals {
+            let detail = if buf == self.cur_buffer() {
+                self.buffer()
+                    .line(cur.line.min(self.last_line()))
+                    .trim_end()
+                    .to_string()
+            } else {
+                self.buffer_name(buf)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "[No Name]".to_string())
+            };
+            lines.push(format_mark_line(name, cur.line, cur.col, &detail));
+        }
+        self.open_panel("Marks", lines, false, 0);
+    }
+}
+
+/// One `:marks` row in vim's layout: the mark name, its 1-based line, 0-based
+/// column, then the line text or file name.
+fn format_mark_line(name: char, line: usize, col: usize, detail: &str) -> String {
+    format!("{name:>4} {:>4} {col:>4} {detail}", line + 1)
 }

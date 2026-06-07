@@ -7,6 +7,13 @@ use crate::mode::Mode;
 
 impl Editor {
     pub(crate) fn enter_command(&mut self) {
+        // `:` pressed in Visual mode operates on the selection: vim stamps the
+        // `'<` / `'>` selection marks and prefills the line with `'<,'>` so the
+        // typed command (`:'<,'>d`, `:'<,'>s/…`) addresses exactly those lines.
+        let from_visual = self.mode.is_visual();
+        if from_visual {
+            self.record_visual_marks();
+        }
         self.mode = Mode::Command;
         self.cmdline.clear();
         self.cmdline_col = 0;
@@ -14,6 +21,10 @@ impl Editor {
         self.hist_idx = None;
         self.message.clear();
         self.reset_pending();
+        if from_visual {
+            self.cmdline.push_str("'<,'>");
+            self.cmdline_col = self.cmdline.len();
+        }
     }
 
     /// Open the command line as a `/` (forward) or `?` (backward) search prompt.

@@ -22,6 +22,9 @@ impl Editor {
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
+                // `` `^ `` — where Insert mode was last left — is the insert-stop
+                // column, captured before the normal-mode backstep below.
+                self.record_last_insert();
                 if self.cursor.col > 0 {
                     let s = self.buffer().line(self.cursor.line);
                     self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);

@@ -330,6 +330,13 @@ impl Buffer {
             edit.old_end_point,
             edit.new_end_point,
         );
+        // The automatic `'.'` mark — vim's "position of the last change" — rides
+        // this same store as the named marks, so it shifts with later edits and is
+        // restored on undo for free. It lands where the edit began, which is the
+        // last inserted/changed character for a per-keystroke insert. The phantom
+        // trailing-newline maintenance `insert` is *not* a user change, so
+        // `normalize` saves and restores `'.'` around it (see there).
+        self.marks.insert('.', edit.start_point);
         self.edits.push(edit.clone());
         self.lsp_edits.push(edit);
         self.changedtick += 1;
@@ -348,11 +355,22 @@ impl Buffer {
     /// `\n` is journaled like any edit, so a shadow buffer stays byte-identical.
     pub fn normalize(&mut self) {
         let n = self.text.len();
+        // The maintenance insert below is bookkeeping, not a user edit, so it must
+        // not claim the `'.'` last-change mark `record` sets. Save it and restore it
+        // across the insert; the phantom newline is always at the buffer's end,
+        // after every real mark, so it never needs to *shift* one.
+        let saved_dot = self.marks.get(&'.').copied();
         if n == 0 {
             self.insert(0, "\n");
         } else if self.text.get_char(n - 1).map(|c| c != '\n').unwrap_or(true) {
             self.insert(n, "\n");
+        } else {
+            return;
         }
+        match saved_dot {
+            Some(p) => self.marks.insert('.', p),
+            None => self.marks.remove(&'.'),
+        };
     }
 
     /// Write the buffer to `path` (or its bound path). Returns `(bytes, lines)`.

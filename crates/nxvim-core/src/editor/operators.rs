@@ -61,6 +61,11 @@ impl Editor {
                 self.echo(CLIPBOARD_UNAVAILABLE);
                 return;
             }
+            // The `` `[ `` / `` `] `` change-bound marks bracket the affected text.
+            // Recorded before the mutation: a yank leaves them around the yanked
+            // span, a delete/change lets the edit's `shift_marks` collapse them onto
+            // the edit start (vim's behavior).
+            self.record_change_bounds(lo, hi);
         }
         match op {
             'y' => {
@@ -165,6 +170,11 @@ impl Editor {
             self.reset_pending();
             return;
         }
+        // Leaving Visual mode (by operating on the selection) sets the `` `< `` /
+        // `` `> `` selection marks and the `` `[ `` / `` `] `` change bounds, both
+        // from the pre-edit selection.
+        self.record_visual_marks();
+        self.record_change_bounds(lo, hi);
         self.push_undo();
         // `y` records a yank; `d`/`c` record a delete (ring / small-delete).
         if op == 'y' {

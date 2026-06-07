@@ -1012,6 +1012,127 @@ async fn global_mark_into_a_closed_buffer_errors_loudly() {
     assert_eq!(lines(&rpc).await, vec!["fresh"]);
 }
 
+// ----- marks (Phase 4: :marks display + automatic / special marks) ----------
+
+#[tokio::test]
+async fn marks_command_lists_set_marks() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    // A buffer-local `a` and a global `B`.
+    feed(&rpc, "ggj0lma");
+    feed(&rpc, "mB");
+    let map = latest_after(&rpc, &mut incoming, ":marks<CR>").await;
+    assert_eq!(panel_title(&map), "Marks");
+    let rows = panel_lines(&map);
+    // A header plus one row per set mark; the names `a` and `B` both appear.
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("mark") && r.contains("line")),
+        "expected a header row, got: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.split_whitespace().next() == Some("a")),
+        "the buffer-local mark `a` should be listed, got: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.split_whitespace().next() == Some("B")),
+        "the global mark `B` should be listed, got: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn previous_context_mark_returns_after_a_jump() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // Park on line 1, column 2, then jump to the last line with `G`.
+    feed(&rpc, "gg0ll");
+    assert_eq!(cursor(&rpc).await, (1, 2));
+    feed(&rpc, "G");
+    assert_eq!(cursor(&rpc).await, (4, 0));
+    // `` `` `` returns to the exact pre-jump spot the jump stashed.
+    feed(&rpc, "``");
+    assert_eq!(cursor(&rpc).await, (1, 2));
+    // `''` is the linewise form — first non-blank of that line (still column 0).
+    feed(&rpc, "G");
+    feed(&rpc, "''");
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
+#[tokio::test]
+async fn last_change_mark_after_an_edit() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>");
+    // Replace a character on line 2, column 2 — the last change happens there.
+    feed(&rpc, "ggj0llrX");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beXa", "gamma"]);
+    // Move far away, then `` `. `` returns to the just-changed position.
+    feed(&rpc, "gg");
+    feed(&rpc, "`.");
+    assert_eq!(cursor(&rpc).await, (2, 2));
+}
+
+#[tokio::test]
+async fn last_insert_mark_after_insert() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabcdef<Esc>");
+    // Insert "XY" at column 2; insert mode stops with the cursor past the "Y".
+    feed(&rpc, "0lliXY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["abXYcdef"]);
+    // From elsewhere, `` `^ `` returns to where insert mode last stopped (the cell
+    // after the inserted "XY", i.e. on the now-shifted "c" at column 4).
+    feed(&rpc, "0");
+    feed(&rpc, "`^");
+    assert_eq!(cursor(&rpc).await, (1, 4));
+}
+
+#[tokio::test]
+async fn visual_selection_sets_the_angle_marks() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha beta gamma<Esc>");
+    // Select "beta" charwise: from column 6 to column 9, then leave visual mode.
+    feed(&rpc, "0");
+    feed(&rpc, "6l");
+    feed(&rpc, "v3l<Esc>");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+    // `` `< `` jumps to the selection start, `` `> `` to its last char.
+    feed(&rpc, "0");
+    feed(&rpc, "`<");
+    assert_eq!(cursor(&rpc).await, (1, 6));
+    feed(&rpc, "`>");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+}
+
+#[tokio::test]
+async fn change_bracket_marks_around_a_yank() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Yank "world" (columns 6..=10) with a charwise text-object yank.
+    feed(&rpc, "06l");
+    assert_eq!(cursor(&rpc).await, (1, 6));
+    feed(&rpc, "yiw");
+    // `` `[ `` lands on the first yanked char, `` `] `` on the last.
+    feed(&rpc, "0");
+    feed(&rpc, "`[");
+    assert_eq!(cursor(&rpc).await, (1, 6));
+    feed(&rpc, "`]");
+    assert_eq!(cursor(&rpc).await, (1, 10));
+}
+
+#[tokio::test]
+async fn setting_a_read_only_mark_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // The automatic marks are read-only: `m.` is rejected loudly, not silently.
+    let map = latest_after(&rpc, &mut incoming, "m.").await;
+    assert!(
+        view_str(&map, "message").contains("E191"),
+        "setting a read-only mark must error loudly, got: {:?}",
+        view_str(&map, "message")
+    );
+}
+
 /// The shipped `examples/registers/` config sources cleanly and its Lua
 /// register surface actually drives core: the seeded `"h` / `"t` registers
 /// paste, and the `:Stash` user command round-trips a line through `setreg` →
@@ -5949,8 +6070,7 @@ async fn ex_range_reversed_errors_loudly() {
 #[tokio::test]
 async fn ex_range_unknown_mark_errors_loudly() {
     let (rpc, mut incoming) = range_fixture().await;
-    // Marks aren't implemented; a mark address must fail loud, not resolve to
-    // a bogus line.
+    // An *unset* mark address must fail loud, not resolve to a bogus line.
     let map = redraw_after(&rpc, &mut incoming, ":'a<CR>").await;
     let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
     assert!(
@@ -5962,6 +6082,46 @@ async fn ex_range_unknown_mark_errors_loudly() {
         (1, 0),
         "cursor stays put on a bad range"
     );
+}
+
+#[tokio::test]
+async fn ex_range_visual_marks_delete_selection() {
+    let (rpc, _incoming) = range_fixture().await;
+    // Select lines 2–3 linewise, leave visual (stamping `'<` / `'>`), then the
+    // canonical `:'<,'>d` deletes exactly those lines.
+    feed(&rpc, "ggj");
+    feed(&rpc, "Vj");
+    feed(&rpc, "<Esc>");
+    feed(&rpc, ":'<,'>d<CR>");
+    assert_eq!(lines(&rpc).await, vec!["one", "    four", "five"]);
+}
+
+#[tokio::test]
+async fn ex_range_buffer_local_marks_address_lines() {
+    let (rpc, _incoming) = range_fixture().await;
+    // Mark `a` on line 2 and `b` on line 4; `:'a,'bd` deletes that inclusive span.
+    feed(&rpc, "ggjma");
+    feed(&rpc, "jjmb");
+    feed(&rpc, ":'a,'bd<CR>");
+    assert_eq!(lines(&rpc).await, vec!["one", "five"]);
+}
+
+#[tokio::test]
+async fn colon_in_visual_prefills_the_selection_range() {
+    let (rpc, mut incoming) = range_fixture().await;
+    // Select lines 2–3, then `:` — vim stamps `'<`/`'>` and prefills `'<,'>` so the
+    // command line already reads ":'<,'>" with the cursor at the end.
+    feed(&rpc, "ggj");
+    feed(&rpc, "Vj");
+    let map = redraw_after(&rpc, &mut incoming, ":").await;
+    assert_eq!(
+        field(&map, "cmdline").and_then(Value::as_str),
+        Some("'<,'>"),
+        "`:` in visual mode should prefill the selection range"
+    );
+    // Typing just `d` then <CR> deletes the selected lines — the real user flow.
+    feed(&rpc, "d<CR>");
+    assert_eq!(lines(&rpc).await, vec!["one", "    four", "five"]);
 }
 
 // ---- Phase 1: the :substitute command -----------------------------------

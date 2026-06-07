@@ -643,3 +643,116 @@ async fn q_on_the_last_window_of_a_tab_closes_the_tab_not_the_editor() {
     let mode = req(&rpc, "nvim_get_mode", vec![]).await;
     assert!(matches!(mode, Value::Map(_)), "the editor is still alive");
 }
+
+// ----- Phase 4: reorder & positional close ----------------------------------
+
+/// Open two extra tabs so the order is [1, 2, 3], leaving focus on the last
+/// (tab 3) — the state the reorder/close tests start from.
+async fn three_tabs(rpc: &Rpc) {
+    feed_sync(rpc, ":tabnew<CR>").await; // [1, 2], on 2
+    feed_sync(rpc, ":tabnew<CR>").await; // [1, 2, 3], on 3
+}
+
+/// The current tabline order (tab ids, in tabline order).
+async fn tab_order(rpc: &Rpc) -> Vec<u64> {
+    handles(&req(rpc, "nvim_list_tabpages", vec![]).await)
+}
+
+/// The current tab's id.
+async fn cur_tab(rpc: &Rpc) -> u64 {
+    handle(&req(rpc, "nvim_get_current_tabpage", vec![]).await)
+}
+
+#[tokio::test]
+async fn tabmove_to_first_and_last() {
+    let (rpc, _incoming) = start().await;
+    three_tabs(&rpc).await; // [1, 2, 3], current = 3
+
+    // `:tabmove 0` sends the current tab to the front; it stays current.
+    feed_sync(&rpc, ":tabmove 0<CR>").await;
+    assert_eq!(tab_order(&rpc).await, vec![3, 1, 2]);
+    assert_eq!(cur_tab(&rpc).await, 3, "the moved tab is still current");
+    let num = handle(&req(&rpc, "nvim_tabpage_get_number", vec![Value::from(3u64)]).await);
+    assert_eq!(num, 1, "tab 3 is now the first tab");
+
+    // `:tabmove $` sends it back to the end.
+    feed_sync(&rpc, ":tabmove $<CR>").await;
+    assert_eq!(tab_order(&rpc).await, vec![1, 2, 3]);
+    assert_eq!(cur_tab(&rpc).await, 3);
+}
+
+#[tokio::test]
+async fn tabmove_relative_shifts_one_each_way() {
+    let (rpc, _incoming) = start().await;
+    three_tabs(&rpc).await;
+    feed_sync(&rpc, ":tabfirst<CR>").await; // on tab 1
+
+    feed_sync(&rpc, ":tabmove +1<CR>").await; // one place right
+    assert_eq!(tab_order(&rpc).await, vec![2, 1, 3]);
+    assert_eq!(cur_tab(&rpc).await, 1, "still on the moved tab");
+
+    feed_sync(&rpc, ":tabmove -1<CR>").await; // back left
+    assert_eq!(tab_order(&rpc).await, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn tabmove_after_tab_n() {
+    let (rpc, _incoming) = start().await;
+    three_tabs(&rpc).await;
+    feed_sync(&rpc, ":tabfirst<CR>").await; // on tab 1, [1, 2, 3]
+
+    // `:tabmove 2` moves the current tab to after tab 2 -> [2, 1, 3].
+    feed_sync(&rpc, ":tabmove 2<CR>").await;
+    assert_eq!(tab_order(&rpc).await, vec![2, 1, 3]);
+    assert_eq!(cur_tab(&rpc).await, 1);
+}
+
+#[tokio::test]
+async fn tabmove_rejects_a_bad_arg_and_leaves_order() {
+    let (rpc, mut incoming) = start().await;
+    three_tabs(&rpc).await;
+    let msg = message_after(&rpc, &mut incoming, ":tabmove xyz<CR>").await;
+    assert_eq!(msg, "E474: Invalid argument: xyz");
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1, 2, 3],
+        "a rejected move is a no-op"
+    );
+}
+
+#[tokio::test]
+async fn tabclose_n_closes_an_inactive_tab_keeping_focus() {
+    let (rpc, _incoming) = start().await;
+    three_tabs(&rpc).await; // [1, 2, 3], on tab 3
+
+    // Closing tab 1 (not current) drops its stash; the live tab 3 is untouched.
+    feed_sync(&rpc, ":tabclose 1<CR>").await;
+    assert_eq!(tab_order(&rpc).await, vec![2, 3]);
+    assert_eq!(cur_tab(&rpc).await, 3, "focus stays on tab 3");
+}
+
+#[tokio::test]
+async fn tabclose_dollar_closes_the_last_tab() {
+    let (rpc, _incoming) = start().await;
+    three_tabs(&rpc).await;
+    feed_sync(&rpc, ":tabfirst<CR>").await; // on tab 1
+
+    feed_sync(&rpc, ":tabclose $<CR>").await; // close the last tab (3)
+    assert_eq!(tab_order(&rpc).await, vec![1, 2]);
+    assert_eq!(cur_tab(&rpc).await, 1, "focus stays on tab 1");
+}
+
+#[tokio::test]
+async fn tabclose_refuses_last_tab_and_rejects_out_of_range() {
+    let (rpc, mut incoming) = start().await;
+
+    // With one tab, any close refuses (E784) before parsing the argument.
+    let last = message_after(&rpc, &mut incoming, ":tabclose<CR>").await;
+    assert_eq!(last, "E784: Cannot close last tab page");
+
+    // With several tabs, an out-of-range number is E474 and closes nothing.
+    three_tabs(&rpc).await;
+    let bad = message_after(&rpc, &mut incoming, ":tabclose 9<CR>").await;
+    assert_eq!(bad, "E474: Invalid argument: 9");
+    assert_eq!(tab_order(&rpc).await, vec![1, 2, 3]);
+}

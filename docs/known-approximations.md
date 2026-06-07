@@ -47,10 +47,6 @@ These have **no single call site to tag** because the subsystem itself is
 absent — a config touching them hits a nil index or a generic error, not a named
 gap. Recorded here so the sweep doesn't lose them.
 
-- **Multiple windows / splits / tabs.** There is one window onto one buffer.
-  Everything window-keyed collapses to the single handle `1000`. This is the root
-  cause behind the window-related `INCOMPLETE:` tags (`nvim_win_get_cursor`,
-  `make_position_params`, `open_floating_preview` handles).
 - **Treesitter Lua API.** nxvim highlights in a separate process, so
   `vim.treesitter.*` (parsers, queries, `get_node`, language registration,
   injections) is a near-empty shell — only the version-probe shape exists

@@ -2718,32 +2718,140 @@ impl Editor {
         self.switch_tab(target);
     }
 
-    /// `:tabclose[!]` — close the current tab page (its whole layout; the buffers
-    /// stay loaded in the store). The tab to the right becomes active, or the last
-    /// tab if the closed one was last. Refuses to close the only tab (vim's
-    /// `E784`).
+    /// `:tabclose[!]` / the last-window `:q` close: close the **current** tab page
+    /// (its whole layout; the buffers stay loaded in the store). Refuses the only
+    /// tab (vim's `E784`). The argument form lives in [`Editor::close_tab_cmd`].
     fn close_tab(&mut self) {
         if self.tabs.len() <= 1 {
             self.echo("E784: Cannot close last tab page");
             return;
         }
-        let closing = self.current_tab;
-        // The closing tab's tree is live on `self.windows`; its slot is empty.
-        // Drop the slot, then replace the live tree with a surviving tab's stash.
-        self.tabs.remove(closing);
-        let target = closing.min(self.tabs.len() - 1);
-        let incoming = self.tabs[target]
-            .tree
-            .take()
-            .expect("a surviving tab is inactive, so holds its stashed layout");
-        self.windows = incoming;
-        self.current_tab = target;
-        self.relayout();
-        let cur = self.windows.current;
-        self.enter_window(cur);
-        if !self.windows.floats.is_empty() {
-            self.relayout();
+        self.close_tab_at(self.current_tab);
+    }
+
+    /// `:tabclose[!] [N]` — close tab page `arg` (`N` 1-based, `+N`/`-N` relative,
+    /// `$` last, empty = current), refusing the only tab (`E784`) and a malformed
+    /// or out-of-range target (`E474`).
+    fn close_tab_cmd(&mut self, arg: &str) {
+        if self.tabs.len() <= 1 {
+            self.echo("E784: Cannot close last tab page");
+            return;
         }
+        match self.resolve_tab_arg(arg) {
+            Some(target) => self.close_tab_at(target),
+            None => self.echo(format!("E474: Invalid argument: {arg}")),
+        }
+    }
+
+    /// Close the tab page at index `target` (assumed valid, with `tabs.len() > 1`).
+    /// Closing the **active** tab promotes a neighbor's stashed tree to live (the
+    /// tab to the right, or the last tab); closing an **inactive** tab just drops
+    /// its stashed slot, leaving the live layout untouched. Buffers stay loaded.
+    fn close_tab_at(&mut self, target: usize) {
+        if target == self.current_tab {
+            // The closing tab's tree is live on `self.windows`; its slot is empty.
+            // Drop the slot, then replace the live tree with a surviving tab's stash.
+            self.tabs.remove(target);
+            let next = target.min(self.tabs.len() - 1);
+            let incoming = self.tabs[next]
+                .tree
+                .take()
+                .expect("a surviving tab is inactive, so holds its stashed layout");
+            self.windows = incoming;
+            self.current_tab = next;
+            self.relayout();
+            let cur = self.windows.current;
+            self.enter_window(cur);
+            if !self.windows.floats.is_empty() {
+                self.relayout();
+            }
+        } else {
+            // An inactive tab: its stashed tree is dropped with the slot; the live
+            // layout is unaffected. `current_tab` shifts left if the closed tab was
+            // before it. Re-lay since the tabline row may vanish (down to one tab).
+            self.tabs.remove(target);
+            if target < self.current_tab {
+                self.current_tab -= 1;
+            }
+            self.relayout();
+            self.ensure_visible();
+        }
+    }
+
+    /// `:tabmove [N]` — move the **current** tab page within the tabline. No arg or
+    /// `$` makes it last; `0` makes it first; a bare `N` (1-based, counted *before*
+    /// the move, per vim) moves it to just after tab `N`; `+N` / `-N` shift it `N`
+    /// places right / left (clamped, not wrapped). The active layout stays live —
+    /// only its [`TabSlot`]'s position in `tabs` changes, so there is no
+    /// stash/restore and the windows area is untouched.
+    fn move_tab(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let n = self.tabs.len();
+        if n <= 1 {
+            return;
+        }
+        let c = self.current_tab;
+        // Destination 0-based index, computed against the pre-move array.
+        let dest = if arg.is_empty() || arg == "$" {
+            n - 1
+        } else if let Some(rest) = arg.strip_prefix('+') {
+            match parse_rel_count(rest) {
+                Some(k) => (c + k).min(n - 1),
+                None => return self.echo(format!("E474: Invalid argument: {arg}")),
+            }
+        } else if let Some(rest) = arg.strip_prefix('-') {
+            match parse_rel_count(rest) {
+                Some(k) => c.saturating_sub(k),
+                None => return self.echo(format!("E474: Invalid argument: {arg}")),
+            }
+        } else {
+            match arg.parse::<usize>() {
+                // `0` → first; `N` → after tab N. With N counted before the move,
+                // a pivot at or past the current tab lands the tab *at* the pivot's
+                // old index (everything after it shifts left on removal), else just
+                // after it.
+                Ok(0) => 0,
+                Ok(num) if num <= n => {
+                    let pivot = num - 1;
+                    if c <= pivot {
+                        pivot
+                    } else {
+                        pivot + 1
+                    }
+                }
+                _ => return self.echo(format!("E474: Invalid argument: {arg}")),
+            }
+        };
+        if dest == c {
+            return;
+        }
+        let slot = self.tabs.remove(c);
+        self.tabs.insert(dest, slot);
+        self.current_tab = dest;
+    }
+
+    /// Resolve a tab-selecting ex argument to a 0-based index into `tabs`: empty →
+    /// current, `$` → last, `+N`/`-N` → relative to the current tab (clamped), a
+    /// bare `N` → the 1-based tab number. `None` for a malformed or out-of-range
+    /// argument. (Shared by the argument forms of `:tabclose`; `:tabmove` has its
+    /// own "after tab N" placement rule and parses inline.)
+    fn resolve_tab_arg(&self, arg: &str) -> Option<usize> {
+        let arg = arg.trim();
+        let n = self.tabs.len();
+        if arg.is_empty() {
+            return Some(self.current_tab);
+        }
+        if arg == "$" {
+            return Some(n - 1);
+        }
+        if let Some(rest) = arg.strip_prefix('+') {
+            return Some((self.current_tab + parse_rel_count(rest)?).min(n - 1));
+        }
+        if let Some(rest) = arg.strip_prefix('-') {
+            return Some(self.current_tab.saturating_sub(parse_rel_count(rest)?));
+        }
+        let num: usize = arg.parse().ok()?;
+        (1..=n).contains(&num).then_some(num - 1)
     }
 
     /// `:tabonly` — close every tab page but the current one (their buffers stay
@@ -6434,8 +6542,9 @@ impl Editor {
             "hid" | "hide" => self.close_window(),
             "on" | "only" => self.only_window(),
             "tabnew" | "tabe" | "tabed" | "tabedit" => self.ex_tabnew(args),
-            "tabc" | "tabclo" | "tabclose" => self.close_tab(),
+            "tabc" | "tabclo" | "tabclose" => self.close_tab_cmd(args),
             "tabo" | "tabonly" => self.tab_only(),
+            "tabm" | "tabmo" | "tabmove" => self.move_tab(args),
             "tabn" | "tabnext" => self.goto_tab_next(parse_opt_count_arg(args)),
             "tabp" | "tabN" | "tabprevious" | "tabNext" => {
                 self.goto_tab_prev(parse_opt_count_arg(args))
@@ -8208,6 +8317,18 @@ fn parse_count_arg(args: &str) -> usize {
 /// tab) needs the absent case distinguished from `1` (no count → tab 1).
 fn parse_opt_count_arg(args: &str) -> Option<usize> {
     args.trim().parse::<usize>().ok().filter(|n| *n > 0)
+}
+
+/// The count after a `+`/`-` in a relative tab argument (`:tabmove +2`,
+/// `:tabclose -`): an empty string means `1` (a bare `+`/`-`), a positive integer
+/// is itself, anything else is `None`. The sign is the caller's (it stripped the
+/// prefix and picks the direction).
+fn parse_rel_count(rest: &str) -> Option<usize> {
+    if rest.is_empty() {
+        Some(1)
+    } else {
+        rest.parse::<usize>().ok()
+    }
 }
 
 /// Map a file path's extension to a treesitter language / filetype name, or

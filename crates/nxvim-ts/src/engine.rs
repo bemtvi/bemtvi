@@ -6,7 +6,7 @@
 //! — not the file. Highlights are extracted by running the grammar's query over
 //! just the requested line range.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use nxvim_core::{BufferEdit, BufferId, IndentParams, OpenOutcome, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, QueryCursor, Tree};
+use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::loader::{Grammar, LoadError};
 
@@ -208,12 +208,250 @@ impl Engine {
         };
         extract_spans(grammar, tree, &state.shadow, first_line, last_line)
     }
+
+    /// Target indent **width in columns** for the 0-indexed `line`, by running the
+    /// grammar's `indents.scm` over the tree — a faithful port of
+    /// nvim-treesitter's `indent.lua` `get_indent`. Returns `None` when there is
+    /// no grammar, no indent query, or the query is inconclusive (an `@indent.auto`
+    /// node or an unselectable node), so the editor falls back. Column 0 is a real
+    /// verdict (`@indent.zero` / inside an `@indent.ignore` block), returned as
+    /// `Some(0)`.
+    pub fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {
+        let state = self.buffers.get(&buffer)?;
+        let tree = state.tree.as_ref()?;
+        let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
+            return None;
+        };
+        let query = grammar.indents.as_ref()?;
+        let rope = &state.shadow;
+        let root = tree.root_node();
+        let maps = build_indent_maps(query, &root, rope);
+        let indent_size = p.shiftwidth as i64;
+
+        let line_count = rope.len_lines(LINE_TYPE).saturating_sub(1);
+
+        // --- pick the node whose ancestry decides this line's indent ----------
+        // For an empty line (the o/O/Enter case) we reason from the *previous*
+        // non-blank line's last node; for a non-empty line, from its first node.
+        let is_empty = line >= line_count || line_text(rope, line).trim().is_empty();
+        let node = if is_empty {
+            let prev = prevnonblank(rope, line.min(line_count.saturating_sub(1)))?;
+            let indentcols = leading_ws(rope, prev);
+            let prevline = line_text(rope, prev);
+            let prevline = prevline.trim();
+            let col = indentcols + prevline.len().saturating_sub(1);
+            let mut n = node_at(&root, prev, col)?;
+            // A trailing comment on the previous line must not drive the indent —
+            // re-pick the last node of the code that precedes it.
+            if n.kind().contains("comment") {
+                let first = node_at(&root, prev, indentcols)?;
+                if first.id() != n.id() {
+                    let scol = n.start_position().column;
+                    let cut = scol.saturating_sub(indentcols).min(prevline.len());
+                    if prevline.is_char_boundary(cut) {
+                        let pre = prevline[..cut].trim_end();
+                        let col = indentcols + pre.len().saturating_sub(1);
+                        n = node_at(&root, prev, col)?;
+                    }
+                }
+            }
+            // If that last node *closes* a block (`@indent.end`), the new line sits
+            // outside it, so decide from the new line's own (first) node instead.
+            if maps.end.contains(&n.id()) {
+                node_at(&root, line, leading_ws(rope, line))?
+            } else {
+                n
+            }
+        } else {
+            node_at(&root, line, leading_ws(rope, line))?
+        };
+
+        if maps.zero.contains(&node.id()) {
+            return Some(0);
+        }
+
+        // --- accumulate indent by walking ancestors ---------------------------
+        // `processed` holds start-rows already credited a level, so a line with
+        // several openers nested on it only indents once (nvim-treesitter's
+        // `is_processed_by_row`).
+        let mut indent: i64 = 0;
+        let mut processed: HashSet<usize> = HashSet::new();
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            let nid = n.id();
+            let srow = n.start_position().row;
+            let erow = n.end_position().row;
+
+            // `@indent.auto` (e.g. inside a raw string): defer to the editor's
+            // fallback rather than guess. Lua returns -1; we return None.
+            if !maps.begin.contains_key(&nid)
+                && !maps.align.contains(&nid)
+                && maps.auto.contains(&nid)
+                && srow < line
+                && line <= erow
+            {
+                return None;
+            }
+            // `@indent.ignore` block (e.g. inside a block comment): force column 0.
+            if !maps.begin.contains_key(&nid)
+                && maps.ignore.contains(&nid)
+                && srow < line
+                && line <= erow
+            {
+                return Some(0);
+            }
+
+            let row_done = processed.contains(&srow);
+            let mut is_processed = false;
+
+            // Branch (`else`/`}` opening row) and dedent close a level.
+            if !row_done
+                && ((maps.branch.contains(&nid) && srow == line)
+                    || (maps.dedent.contains(&nid) && srow != line))
+            {
+                indent -= indent_size;
+                is_processed = true;
+            }
+
+            // A node in an ERROR parent is treated as if it spanned multiple lines,
+            // so a half-typed opener still indents (matches nvim-treesitter).
+            let is_in_err = !row_done && n.parent().is_some_and(|pr| pr.has_error());
+
+            if !row_done {
+                if let Some(meta) = maps.begin.get(&nid) {
+                    if (srow != erow || is_in_err || meta.immediate)
+                        && (srow != line || meta.start_at_same_line)
+                    {
+                        indent += indent_size;
+                        is_processed = true;
+                    }
+                }
+            }
+
+            // `@indent.align` (delimiter alignment) is a documented v2 follow-up;
+            // its nodes are still collected above so the auto/ignore guards stay
+            // correct, but the alignment math is not applied. The rust query (and
+            // the core captures this v1 targets) does not use it.
+
+            if is_processed {
+                processed.insert(srow);
+            }
+            cur = n.parent();
+        }
+
+        Some(indent.max(0) as usize)
+    }
+}
+
+/// One indent capture's `#set!` directives that the algorithm consults.
+#[derive(Default, Clone, Copy)]
+struct BeginMeta {
+    /// `(#set! indent.immediate)` — indent even for a node that opens and closes
+    /// on the same line.
+    immediate: bool,
+    /// `(#set! indent.start_at_same_line)` — indent even when the node starts on
+    /// the target line.
+    start_at_same_line: bool,
+}
+
+/// Captured node ids by indent role, built once per `indent()` call by running the
+/// `indents.scm` query over the whole tree (ancestors anywhere can carry a
+/// capture, so the query is not range-limited). Mirrors nvim-treesitter's `q`.
+#[derive(Default)]
+struct IndentMaps {
+    begin: HashMap<usize, BeginMeta>,
+    end: HashSet<usize>,
+    dedent: HashSet<usize>,
+    branch: HashSet<usize>,
+    ignore: HashSet<usize>,
+    align: HashSet<usize>,
+    auto: HashSet<usize>,
+    zero: HashSet<usize>,
+}
+
+fn build_indent_maps(query: &Query, root: &Node, rope: &Rope) -> IndentMaps {
+    let mut maps = IndentMaps::default();
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let provider =
+        |node: Node| std::iter::once(node_bytes(rope, node.start_byte()..node.end_byte()));
+    let mut caps = cursor.captures(query, *root, provider);
+    while let Some((m, idx)) = caps.next() {
+        let cap = m.captures[*idx];
+        let name = names[cap.index as usize];
+        if name.starts_with('_') {
+            continue; // internal/predicate capture, not an indent role
+        }
+        let id = cap.node.id();
+        match name {
+            "indent.begin" => {
+                let mut meta = BeginMeta::default();
+                for prop in query.property_settings(m.pattern_index) {
+                    match &*prop.key {
+                        "indent.immediate" => meta.immediate = true,
+                        "indent.start_at_same_line" => meta.start_at_same_line = true,
+                        _ => {}
+                    }
+                }
+                maps.begin.insert(id, meta);
+            }
+            "indent.end" => {
+                maps.end.insert(id);
+            }
+            "indent.dedent" => {
+                maps.dedent.insert(id);
+            }
+            "indent.branch" => {
+                maps.branch.insert(id);
+            }
+            "indent.ignore" => {
+                maps.ignore.insert(id);
+            }
+            "indent.align" => {
+                maps.align.insert(id);
+            }
+            "indent.auto" => {
+                maps.auto.insert(id);
+            }
+            "indent.zero" => {
+                maps.zero.insert(id);
+            }
+            _ => {}
+        }
+    }
+    maps
+}
+
+/// The smallest node covering one byte column on a line — nvim-treesitter's
+/// `descendant_for_range(row, col, row, col+1)`.
+fn node_at<'t>(root: &Node<'t>, row: usize, col: usize) -> Option<Node<'t>> {
+    root.descendant_for_point_range(Point::new(row, col), Point::new(row, col + 1))
+}
+
+/// The 0-indexed row of the nearest non-blank line at or above `start`.
+fn prevnonblank(rope: &Rope, start: usize) -> Option<usize> {
+    (0..=start)
+        .rev()
+        .find(|&r| !line_text(rope, r).trim().is_empty())
+}
+
+/// Line `row`'s text (with its trailing newline, which callers `trim`).
+fn line_text(rope: &Rope, row: usize) -> String {
+    rope.line(row, LINE_TYPE).to_string()
+}
+
+/// Leading-whitespace byte count of line `row` (its indent in bytes).
+fn leading_ws(rope: &Rope, row: usize) -> usize {
+    line_text(rope, row)
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count()
 }
 
 /// The synchronous backend the editor owns (`nxvim-core`'s [`SyntaxEngine`]).
-/// Highlighting delegates to the inherent methods; `indent` is not implemented
-/// yet (a later phase ports nvim-treesitter's `indent.lua`), so it returns
-/// `None` — an **honest fallback**, not a fake success: the caller then uses
+/// Every method delegates to the inherent ones; `indent` runs the ported
+/// nvim-treesitter algorithm and returns `None` for the honest fallback cases
+/// (no grammar / no `indents.scm` / `@indent.auto`), where the editor uses
 /// copy-previous-line autoindent, then column 0.
 impl SyntaxEngine for Engine {
     fn open(&mut self, buffer: BufferId, language: &str, text: &str) -> OpenOutcome {
@@ -232,8 +470,18 @@ impl SyntaxEngine for Engine {
         Engine::highlights(self, buffer, first, last)
     }
 
-    fn indent(&mut self, _buffer: BufferId, _line: usize, _p: &IndentParams) -> Option<usize> {
-        None
+    fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {
+        Engine::indent(self, buffer, line, p)
+    }
+
+    fn indents_available(&self, buffer: BufferId) -> bool {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return false;
+        };
+        matches!(
+            self.grammars.get(&state.language),
+            Some(Slot::Loaded(g)) if g.indents.is_some()
+        )
     }
 }
 

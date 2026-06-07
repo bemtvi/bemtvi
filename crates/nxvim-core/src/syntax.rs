@@ -74,4 +74,11 @@ pub trait SyntaxEngine {
     /// grammar / no `indents.scm` / the query is inconclusive — in which case the
     /// caller falls back (copy-previous-line autoindent, then column 0).
     fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize>;
+
+    /// Whether treesitter indentation is *available* for `buffer` — a grammar with
+    /// an `indents.scm` is loaded. Lets the editor read a `None` from [`indent`] as
+    /// an *inconclusive query* (fall back to copy-previous-line autoindent) when
+    /// indentation is active, versus *no ts-indent at all* (keep vim's
+    /// autoindent-off default of column 0) when it isn't.
+    fn indents_available(&self, buffer: BufferId) -> bool;
 }

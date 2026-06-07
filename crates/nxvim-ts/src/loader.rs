@@ -7,6 +7,7 @@
 //! ```text
 //! <data>/parser/<lang>.{so,dylib,dll}    # exports tree_sitter_<lang>()
 //! <data>/queries/<lang>/highlights.scm
+//! <data>/queries/<lang>/indents.scm      # optional — treesitter indentation
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -28,12 +29,15 @@ pub enum LoadError {
 }
 
 /// A loaded grammar: the dynamic library (kept alive because `language` borrows
-/// code inside it), the `Language`, and the compiled highlights `Query`.
+/// code inside it), the `Language`, the compiled highlights `Query`, and an
+/// optional compiled indents `Query` (treesitter indentation; absent when the
+/// language ships no `indents.scm`).
 pub struct Grammar {
-    // Field order matters: `language`/`query` drop before `_lib`, so the loaded
-    // code outlives anything pointing into it.
+    // Field order matters: `language`/`query`/`indents` drop before `_lib`, so the
+    // loaded code outlives anything pointing into it.
     pub language: Language,
     pub query: Query,
+    pub indents: Option<Query>,
     _lib: libloading::Library,
 }
 
@@ -89,9 +93,28 @@ impl Grammar {
             .with_context(|| format!("compiling {lang} highlights"))
             .map_err(LoadError::Failed)?;
 
+        // `indents.scm` is optional: a language with no indent query simply has no
+        // treesitter indentation (the editor falls back). A *present* file that
+        // fails to compile is a real error, surfaced like a broken highlights query.
+        let indents_path = query_path(data_dir, lang, "indents.scm");
+        let indents = match std::fs::read_to_string(&indents_path) {
+            Ok(src) => Some(
+                Query::new(&language, &src)
+                    .with_context(|| format!("compiling {lang} indents"))
+                    .map_err(LoadError::Failed)?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(LoadError::Failed(
+                    anyhow::Error::new(e).context(format!("reading {}", indents_path.display())),
+                ))
+            }
+        };
+
         Ok(Grammar {
             language,
             query,
+            indents,
             _lib: lib,
         })
     }

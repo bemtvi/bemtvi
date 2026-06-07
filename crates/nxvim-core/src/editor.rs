@@ -15,7 +15,7 @@ use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::{resolve_set, NumOp, Options, SetCmd, SetOp, WindowOptions};
 use crate::search::SearchRegex;
-use crate::syntax::{OpenOutcome, Span, SyntaxEngine};
+use crate::syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
 use crate::unicode;
 use crate::view::{PanelView, Separator, View};
 
@@ -1634,6 +1634,7 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             'd' | 'x' => return Complete(RC::VisualOperate('d')),
             'y' => return Complete(RC::VisualOperate('y')),
             'c' | 's' => return Complete(RC::VisualOperate('c')),
+            '=' => return Complete(RC::VisualOperate('=')),
             'v' => return Complete(RC::Normal(N::EnterVisual)),
             'V' => return Complete(RC::Normal(N::EnterVisualLine)),
             ':' => return Complete(RC::Normal(N::EnterCommand)),
@@ -1654,8 +1655,9 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         'C' => Complete(RC::Normal(N::ChangeToEol)),
         's' => Complete(RC::Normal(N::SubstituteChar)),
         'R' => Complete(RC::Normal(N::EnterReplace)),
-        'd' | 'c' | 'y' => {
+        'd' | 'c' | 'y' | '=' => {
             // Begin an operator (prefix): move count → op_count, drop g-pending.
+            // `=` is the reindent operator (`==`, `=motion`, `gg=G`).
             let mut next = pending.clone();
             next.operator = Some(c);
             next.op_count = pending.count;
@@ -1817,6 +1819,21 @@ fn fill_indent(start: usize, target: usize, tabstop: usize, expandtab: bool) -> 
     }
     s.push_str(&" ".repeat(target - col));
     s
+}
+
+/// Visual-column width of `line`'s leading whitespace: spaces count one cell, a
+/// tab advances to the next `tabstop` boundary. The inverse of [`fill_indent`],
+/// used to read a line's existing indent depth for copy-previous autoindent.
+fn indent_width(line: &str, tabstop: usize) -> usize {
+    let mut col = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => col += 1,
+            b'\t' => col = col - (col % tabstop) + tabstop,
+            _ => break,
+        }
+    }
+    col
 }
 
 /// Word-wrap `text` into rows no wider than `width` screen cells, for the bottom
@@ -2323,6 +2340,70 @@ impl Editor {
             engine.close(id);
         }
         self.syntax_opened.remove(&id);
+    }
+
+    /// Target indent **width in columns** for `line` of the current buffer, the
+    /// single policy + fallback chain behind every auto-indent site (`o`/`O`,
+    /// insert-mode `Enter`, the `=` operators). Treesitter first; then, only when
+    /// ts-indent is *active* for the buffer but inconclusive for this line,
+    /// copy-the-previous-non-blank-line's indent; then column 0.
+    ///
+    /// Syncs the engine first so the query sees the just-inserted `\n` (and any
+    /// edits since the last redraw) — currency is required for a correct verdict.
+    fn indent_for(&mut self, line: usize) -> usize {
+        let buf = self.current_buffer_id();
+        self.sync_syntax_engine(buf);
+        let opts = self.buffer().options;
+        let p = IndentParams {
+            shiftwidth: opts.effective_shiftwidth(),
+            tabstop: opts.effective_tabstop(),
+        };
+        // Resolve the treesitter verdict and whether ts-indent is even available,
+        // both before releasing the engine borrow so the fallback can re-borrow self.
+        let (ts, available) = match self.syntax.as_mut() {
+            Some(s) => (s.indent(buf, line, &p), s.indents_available(buf)),
+            None => (None, false),
+        };
+        ts.or_else(|| available.then(|| self.autoindent_copy_prev(line)).flatten())
+            .unwrap_or(0)
+    }
+
+    /// Copy the indent **width in columns** of the nearest non-blank line above
+    /// `line`, or `None` if there is none — the grammar-free autoindent the
+    /// engine falls back to when its query is inconclusive.
+    fn autoindent_copy_prev(&self, line: usize) -> Option<usize> {
+        let tabstop = self.buffer().options.effective_tabstop();
+        let mut r = line.checked_sub(1)?;
+        loop {
+            let s = self.buffer().line(r);
+            if !s.trim().is_empty() {
+                return Some(indent_width(&s, tabstop));
+            }
+            r = r.checked_sub(1)?;
+        }
+    }
+
+    /// Replace line `line`'s leading whitespace with indentation of visual width
+    /// `width` (tabs/spaces per the buffer's `expandtab`/`tabstop`), returning the
+    /// new leading-whitespace **byte length** — i.e. the column the first
+    /// non-blank now begins at, where an auto-indent caller parks the cursor.
+    fn set_line_indent(&mut self, line: usize, width: usize) -> usize {
+        let opts = self.buffer().options;
+        let s = self.buffer().line(line);
+        let old_ws = s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        let fill = fill_indent(0, width, opts.effective_tabstop(), opts.expandtab);
+        if old_ws == fill.len() && s.starts_with(&fill) {
+            return fill.len(); // already correct — no edit (keeps `=` idempotent)
+        }
+        let start = self.buffer().line_start(line);
+        if old_ws > 0 {
+            self.buffer_mut().remove(start..start + old_ws);
+        }
+        if !fill.is_empty() {
+            self.buffer_mut().insert(start, &fill);
+        }
+        self.buffer_mut().normalize();
+        fill.len()
     }
 
     /// All open buffer ids, ascending (the `nvim_list_bufs` order).
@@ -4953,8 +5034,32 @@ impl Editor {
                 self.mode = Mode::Insert;
                 self.snapshot_taken = true;
             }
+            // `=` reindents whole lines (always linewise, even from a charwise
+            // motion / text object), then settles on the first line's first non-blank.
+            '=' => {
+                let first = self.buffer().byte_to_line(lo);
+                let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+                self.reindent_lines(first, last);
+            }
             _ => {}
         }
+    }
+
+    /// Reindent lines `[first, last]` to their treesitter (else copy-previous,
+    /// else 0) indent — the body shared by `==`, `=motion`, `gg=G`, and visual `=`.
+    /// One undo step covers the whole run; the cursor settles on `first`'s first
+    /// non-blank, as vim does after `=`.
+    fn reindent_lines(&mut self, first: usize, last: usize) {
+        self.push_undo();
+        let last = last.min(self.last_line());
+        for line in first..=last {
+            let width = self.indent_for(line);
+            self.set_line_indent(line, width);
+        }
+        self.buffer_mut().modified = true;
+        self.cursor.line = first.min(self.last_line());
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+        self.clamp_cursor();
     }
 
     /// Settle the cursor after a linewise delete: first non-blank of the line that
@@ -4979,6 +5084,16 @@ impl Editor {
 
     fn visual_operate(&mut self, op: char) {
         let (lo, hi, linewise, first_line) = self.visual_range();
+        // `=` reindents the selected lines; unlike d/y/c it neither yanks nor needs
+        // the shared snapshot (`reindent_lines` takes its own), so handle it first.
+        if op == '=' {
+            let first = self.buffer().byte_to_line(lo);
+            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            self.reindent_lines(first, last);
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            return;
+        }
         self.push_undo();
         self.yank_range(lo, hi, linewise);
         match op {
@@ -5193,8 +5308,12 @@ impl Editor {
             self.buffer_mut().insert_char(at, '\n');
         }
         self.buffer_mut().normalize();
-        self.cursor.col = 0;
         self.buffer_mut().modified = true;
+        // Auto-indent the fresh line: treesitter, else copy-previous-line, else 0.
+        // The `\n` is synced to the engine inside `indent_for` before it queries,
+        // so the tree reflects the line being opened.
+        let width = self.indent_for(self.cursor.line);
+        self.cursor.col = self.set_line_indent(self.cursor.line, width);
         self.mode = Mode::Insert;
         self.snapshot_taken = true;
     }
@@ -5273,8 +5392,12 @@ impl Editor {
                 let at = self.cursor_char();
                 self.buffer_mut().insert_char(at, '\n');
                 self.cursor.line += 1;
-                self.cursor.col = 0;
                 self.buffer_mut().modified = true;
+                self.buffer_mut().normalize();
+                // Auto-indent the new line (treesitter, else copy-previous, else 0)
+                // and park the cursor past the indent — vim's `Enter` behavior.
+                let width = self.indent_for(self.cursor.line);
+                self.cursor.col = self.set_line_indent(self.cursor.line, width);
             }
             KeyCode::Backspace => self.insert_backspace(soft_tab),
             KeyCode::Tab => self.insert_tab(soft_tab),

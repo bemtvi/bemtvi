@@ -1,7 +1,14 @@
 # In-process treesitter + treesitter indentation — design
 
-**Status:** accepted; phases 1–3 implemented (worker deleted, highlighting now
-in-process and synchronous), phases 4–5 (treesitter indentation) pending.
+**Status:** accepted; phases 1–5 implemented. Phases 1–3 made highlighting
+in-process and synchronous (worker deleted); phases 4–5 added treesitter
+indentation — `indents.scm` loading, a port of nvim-treesitter's `indent.lua`
+core captures (`@indent.begin`/`.end`/`.dedent`/`.branch`/`.zero`/`.ignore`/
+`.auto`, plus the `indent.immediate` / `indent.start_at_same_line` directives),
+and the editor hooks (`o`/`O`, insert-mode `Enter`, the `=` operator family:
+`==`, `=motion`, `gg=G`, visual `=`). `@indent.align` (delimiter alignment) and
+injected-tree indent are the documented phase-6 follow-up; phase 6's other items
+(`indentkeys` retriggers, `vim.treesitter` Lua API, folds) remain pending.
 **Supersedes** the process-isolation architecture in
 [`2026-06-01-syntax-highlighting-design.md`](2026-06-01-syntax-highlighting-design.md)
 (highlighting *behavior* is unchanged for the user; only where the parser runs
@@ -350,13 +357,20 @@ deadline.
    `syntax.rs`, the worker mode, the RPC wire, and the async half of
    `treesitter.rs`; add the per-buffer span memo. Wire the parse deadline. Update
    `syntax.rs` tests to synchronous. **Highlighting parity reached, worker gone.**
-4. **`indents.scm` loading + the indent algorithm.** Extend `Grammar`; port
-   `indent.lua`'s core captures to `Engine::indent`.
-5. **Editor indent hooks.** `indent_for` + fallback; wire `open_line`, insert-mode
-   `Enter`, and the `=` family. Add indent tests with the rust `indents.scm`
-   fixture.
-6. **(Later, now unblocked)** copy-previous-line nuances, `indentkeys` retriggers,
-   `vim.treesitter` Lua API, treesitter folds.
+4. **`indents.scm` loading + the indent algorithm.** ✅ Done — `Grammar.indents`
+   is an optional compiled query; `Engine::indent` ports `indent.lua`'s core
+   captures (the `begin/end/dedent/branch/zero/ignore/auto` walk + the
+   `is_processed_by_row` dedupe + the empty-line / trailing-comment node
+   selection), with `@indent.align` collected-but-not-applied (phase 6).
+5. **Editor indent hooks.** ✅ Done — `indent_for` (treesitter → copy-previous →
+   0, the copy-previous step gated on `SyntaxEngine::indents_available` so a
+   grammar-less buffer keeps vim's autoindent-off default of column 0),
+   `set_line_indent`, and the wiring of `open_line`, insert-mode `Enter`, and the
+   `=` family. Black-box indent tests live in `crates/nxvim/tests/indent.rs` with
+   a vendored rust `indents.scm` fixture.
+6. **(Later, now unblocked)** `@indent.align` (delimiter alignment) + injected
+   trees, copy-previous-line nuances, `indentkeys` retriggers, `vim.treesitter`
+   Lua API, treesitter folds.
 
 Phases 1–3 are a behavior-preserving refactor (highlighting identical, worker
 deleted); 4–5 deliver the actual feature the user asked for. Each phase is

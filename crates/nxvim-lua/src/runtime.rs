@@ -740,7 +740,10 @@ impl LuaRuntime {
     /// `wins` is one [`WindowMirror`] per open window in layout order. `cur_win`
     /// is the focused id and `next_win` the id the next `nvim_open_win` will mint
     /// (so the Lua side can return the new handle synchronously while the real
-    /// window is created when the queued op drains).
+    /// window is created when the queued op drains). `mode` is the editor's
+    /// current `mode()` short code (`"n"`/`"i"`/`"v"`/…), stored as
+    /// `vim._cur_mode` so a `%{}` statusline expression reading `vim.fn.mode()`
+    /// reflects this frame.
     #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,
@@ -749,6 +752,7 @@ impl LuaRuntime {
         win: u64,
         wins: &[WindowMirror],
         next_win: u64,
+        mode: &str,
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
@@ -801,7 +805,7 @@ impl LuaRuntime {
             win_arr.set(i + 1, w)?;
         }
         let set: mlua::Function = vim.get("_set_buf_mirror")?;
-        set.call((entries, cursor.0, cursor.1, win, win_arr, next_win))
+        set.call((entries, cursor.0, cursor.1, win, win_arr, next_win, mode))
     }
 
     /// Refresh the Rust→Lua buffer-option mirror (`vim._bo_mirror[bufnr] =

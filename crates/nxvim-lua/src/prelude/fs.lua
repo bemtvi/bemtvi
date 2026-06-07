@@ -209,31 +209,75 @@ end
 -- vim.fn.bufname(bufnr): the buffer's name, snapshot-backed via nvim_buf_get_name.
 function vim.fn.bufname(bufnr) return vim.api.nvim_buf_get_name(bufnr or 0) end
 
--- vim.fn.fnamemodify(fname, mods): apply the `:p`/`:h`/`:t`/`:r`/`:e` filename
--- modifiers (left to right) configs use. `:p` absolutizes against cwd.
+-- vim.fn.fnamemodify(fname, mods): apply vim's filename modifiers left to right.
+-- Supported: `:p` (make absolute against cwd), `:~` (relative to $HOME with `~`),
+-- `:.` (relative to cwd when under it), `:h` (head/dir), `:t` (tail), `:r` (root,
+-- strip one extension — a leading dot isn't one), `:e` (extension; consecutive
+-- `:e` widen it to the last k dot-components, vim's quirk). An unsupported
+-- modifier (`:s///`, `:gs`, `:8`, …) errors loud rather than silently passing
+-- the name through. Cases match real neovim's vim.fn.fnamemodify.
 function vim.fn.fnamemodify(fname, mods)
-  local result = fname or ""
-  local i = 1
-  while i <= #(mods or "") do
-    if mods:sub(i, i) == ":" then
-      local m = mods:sub(i + 1, i + 1)
-      if m == "p" then
-        if result:sub(1, 1) ~= "/" then result = vim.fs.joinpath(vim.fn.getcwd(), result) end
-      elseif m == "h" then
-        result = vim.fs.dirname(result)
-      elseif m == "t" then
-        result = vim.fs.basename(result)
-      elseif m == "r" then
-        result = (result:gsub("%.[^./]*$", ""))
-      elseif m == "e" then
-        result = result:match("%.([^./]*)$") or ""
+  fname = fname or ""
+  mods = mods or ""
+  local i, n = 1, #mods
+  while i <= n do
+    local m = mods:sub(i, i + 1)
+    if m == ":p" then
+      if fname == "" then fname = vim.fn.getcwd()
+      elseif fname:sub(1, 1) ~= "/" then fname = vim.fn.getcwd() .. "/" .. fname end
+      i = i + 2
+    elseif m == ":~" then
+      local home = os.getenv("HOME") or ""
+      if home ~= "" and (fname == home or fname:sub(1, #home + 1) == home .. "/") then
+        fname = "~" .. fname:sub(#home + 1)
       end
       i = i + 2
+    elseif m == ":." then
+      local cwd = vim.fn.getcwd()
+      if cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then
+        fname = fname:sub(#cwd + 2)
+      end
+      i = i + 2
+    elseif m == ":h" then
+      local head = fname:match("^(.*)/[^/]*$")
+      if head == nil then fname = "."
+      elseif head == "" then fname = "/"
+      else fname = head end
+      i = i + 2
+    elseif m == ":t" then
+      fname = fname:match("[^/]*$") or ""
+      i = i + 2
+    elseif m == ":r" then
+      -- Strip the last extension of the tail component (a leading dot isn't one).
+      local dir, tail = fname:match("^(.*/)([^/]*)$")
+      if not tail then dir, tail = "", fname end
+      for p = #tail, 2, -1 do
+        if tail:sub(p, p) == "." then tail = tail:sub(1, p - 1); break end
+      end
+      fname = dir .. tail
+      i = i + 2
+    elseif m == ":e" then
+      -- Count the run of consecutive `:e`; k of them widen the extension to its
+      -- last k dot-separated components (capped at the count of extensions).
+      local k = 0
+      while mods:sub(i, i + 1) == ":e" do k = k + 1; i = i + 2 end
+      local tail = fname:match("[^/]*$") or ""
+      local dots = {}
+      for p = 2, #tail do
+        if tail:sub(p, p) == "." then dots[#dots + 1] = p end
+      end
+      if #dots == 0 then
+        fname = ""
+      else
+        local idx = #dots - k + 1
+        if idx < 1 then idx = 1 end
+        fname = tail:sub(dots[idx] + 1)
+      end
     else
-      i = i + 1
+      error("fnamemodify(): unsupported modifier '" .. mods:sub(i) .. "'", 2)
     end
   end
-  return result
+  return fname
 end
 
 -- A few more vim.fn used only inside deferred callbacks (handlers / user
@@ -247,11 +291,19 @@ function vim.fn.finddir(name, path)
 end
 
 -- vim.fn.bufnr(expr): the buffer number for `expr`. "" / "%" / nil / 0 -> current
--- buffer; a string -> the loaded buffer whose name matches (exact, else suffix),
--- -1 when none. Backed by the Phase-6 `vim._bufs` mirror.
+-- buffer; "$" -> the last (largest) buffer number; a string -> the loaded buffer
+-- whose name matches (exact, else suffix), -1 when none. Backed by the Phase-6
+-- `vim._bufs` mirror.
 function vim.fn.bufnr(expr)
   if expr == nil or expr == 0 or expr == "" or expr == "%" then
     return (vim._cur_buf or {}).bufnr or 0
+  end
+  if expr == "$" then
+    local max = 0
+    for id in pairs(vim._bufs or {}) do
+      if id > max then max = id end
+    end
+    return max
   end
   if type(expr) == "number" then
     return vim._bufs[expr] and expr or -1

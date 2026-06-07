@@ -36,6 +36,10 @@ end
 vim._bufs = vim._bufs or {}
 vim._cur_cursor = vim._cur_cursor or { row = 1, col = 0 }
 vim._cur_win = vim._cur_win or 1000
+-- The editor's current mode() short code ("n"/"i"/"v"/…), refreshed alongside
+-- the buffer mirror so vim.fn.mode() (and a %{} statusline expression calling it)
+-- reflects the live mode.
+vim._cur_mode = vim._cur_mode or "n"
 -- Per-buffer option store backing vim.bo / nvim_set_option_value (Phase 6); the
 -- table is created here so the earlier-defined setter can index it safely. This
 -- holds *arbitrary* (Lua-only) buffer options plugins set; the wired indentation
@@ -67,7 +71,8 @@ vim._cur_tab = vim._cur_tab or 1
 -- options (number/relativenumber) live on the `vim._wins` mirror instead.
 vim._wo_store = vim._wo_store or {}
 
-function vim._set_buf_mirror(entries, row, col, win, wins, next_win)
+function vim._set_buf_mirror(entries, row, col, win, wins, next_win, mode)
+  vim._cur_mode = mode or "n"
   -- The server omits `lines` for a buffer whose changedtick is unchanged (the
   -- cheap cursor-moved-no-edit path); keep the prior `lines` in that case.
   for bufnr, entry in pairs(entries) do
@@ -795,21 +800,96 @@ function vim.api.nvim_get_option_value(name, opts)
   return vim.bo[buf][name]
 end
 
--- vim.fn.expand: the `%` (current file) forms autocmd callbacks use to resolve
--- paths, backed by the snapshot. Supports `%`, `%:p` (absolute — for the first
--- cut the stored path is taken as-is), `%:h` (head/dir), `%:t` (tail/basename),
--- and `%:p:h`. Unknown expressions return the stored name unchanged.
-function vim.fn.expand(expr)
-  local cur = vim._cur_buf or { bufnr = 0, name = "" }
-  local name = cur.name or ""
-  if expr == "%" or expr == "%:p" then
-    return name
-  elseif expr == "%:h" or expr == "%:p:h" then
-    return name:match("^(.*)/[^/]*$") or ""
-  elseif expr == "%:t" then
-    return name:match("[^/]*$") or name
+-- ----- vim.fn editor-state builtins (statusline / lualine, Phase 5) ----------
+-- The Vimscript builtins a real `'statusline'` (and lualine) call from inside a
+-- `%{}`/`%!` expression. Each reads the Rust→Lua mirror the server refreshes
+-- before evaluating the statusline (vim._cur_mode / vim._cur_cursor / vim._bufs /
+-- vim._cur_buf / vim._wins), so a live redraw reflects the current frame. An
+-- unsupported argument fails loud (the no-silent-stub rule) rather than guessing.
+
+-- vim.fn.mode([expanded]): the single-letter mode code ("n"/"i"/"v"/"V"/"R"/"c").
+-- INCOMPLETE: `expanded` is ignored — the core has a flat Mode (no operator-pending
+-- / sub-state), so mode(1)'s multi-char forms ("no", "niI", …) don't exist here;
+-- the short code is returned for both. Faithful for the modes nxvim has.
+function vim.fn.mode(_expanded)
+  return vim._cur_mode or "n"
+end
+
+-- vim.fn.line(expr): a buffer line number. "." is the cursor line (1-based), "$"
+-- the last line (the line count). The window-relative forms ("w0"/"w$") need the
+-- scroll position, which the mirror doesn't carry yet, so they error loud.
+function vim.fn.line(expr)
+  if expr == "." then
+    return (vim._cur_cursor or {}).row or 1
+  elseif expr == "$" then
+    local buf = vim._bufs[vim._resolve_bufnr(0)]
+    return (buf and buf.lines) and #buf.lines or 1
   end
-  return name
+  error("line(): unsupported expression '" .. tostring(expr) .. "'", 2)
+end
+
+-- vim.fn.col(expr): a byte column (1-based). "." is the cursor column, "$" one
+-- past the end of the cursor line (its byte length + 1), matching vim.
+function vim.fn.col(expr)
+  if expr == "." then
+    return ((vim._cur_cursor or {}).col or 0) + 1
+  elseif expr == "$" then
+    local buf = vim._bufs[vim._resolve_bufnr(0)]
+    local row = (vim._cur_cursor or {}).row or 1
+    local ln = (buf and buf.lines) and buf.lines[row] or ""
+    return #ln + 1
+  end
+  error("col(): unsupported expression '" .. tostring(expr) .. "'", 2)
+end
+
+-- vim.fn.winnr([arg]): the current window's 1-based number (its index in the
+-- layout order), or with "$" the number of windows. (vim's "#" previous-window
+-- form needs window history the mirror doesn't keep, so it errors loud.)
+function vim.fn.winnr(arg)
+  if arg == nil or arg == "." then
+    local cur = vim._cur_win or 1000
+    for i, id in ipairs(vim._win_order or {}) do
+      if id == cur then return i end
+    end
+    return 0
+  elseif arg == "$" then
+    return #(vim._win_order or {})
+  end
+  error("winnr(): unsupported argument '" .. tostring(arg) .. "'", 2)
+end
+
+-- (vim.fn.bufnr / bufname live in prelude/fs.lua, which loads after this chunk —
+-- the canonical "additional vim.fn" home — so they aren't (re)defined here.)
+
+-- vim.fn.winwidth(nr) / winheight(nr): a window's text dimensions. 0 is the
+-- current window; a positive `nr` is a window *number* (1-based layout index),
+-- resolved through the layout order to the mirror entry.
+local function win_by_number(nr)
+  if nr == nil or nr == 0 then return vim._cur_win or 1000 end
+  return (vim._win_order or {})[nr]
+end
+function vim.fn.winwidth(nr)
+  local w = (vim._wins or {})[win_by_number(nr)]
+  return w and w.width or 0
+end
+function vim.fn.winheight(nr)
+  local w = (vim._wins or {})[win_by_number(nr)]
+  return w and w.height or 0
+end
+
+-- (vim.fn.fnamemodify lives in prelude/fs.lua, alongside the other path vim.fn;
+-- this chunk's expand routes through it at call time.)
+
+-- vim.fn.expand: the `%` (current file) forms autocmd callbacks and statuslines
+-- use to resolve paths, backed by the current-buffer snapshot. `%` is the stored
+-- name; `%:<mods>` routes through fnamemodify (so `%:t`, `%:p`, `%:h`, `%:r`,
+-- `%:~:.`, … all work). A non-`%` expression errors loud.
+function vim.fn.expand(expr)
+  local name = (vim._cur_buf or {}).name or ""
+  if expr == "%" then return name end
+  local mods = expr:match("^%%(:.*)$")
+  if mods then return vim.fn.fnamemodify(name, mods) end
+  error("expand(): unsupported expression '" .. tostring(expr) .. "'", 2)
 end
 
 -- vim.api.nvim_set_hl is installed from Rust (it captures the group definition

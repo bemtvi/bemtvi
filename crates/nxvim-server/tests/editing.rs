@@ -6334,3 +6334,167 @@ async fn statusline_non_vlua_expression_errors_loudly() {
     assert!(text.contains("E:statusline:"), "loud, not empty: {text:?}");
     assert!(text.contains("somevar"), "names the expression: {text:?}");
 }
+
+// ----- vim.fn editor-state builtins (statusline / lualine, Phase 5) -----
+//
+// The `vim.fn.*` surface a real `'statusline'` calls from inside `%{}`/`%!`:
+// mode(), line(), col(), winnr(), bufnr(), bufname(), winwidth/height(),
+// fnamemodify(), expand(). They read the Rust→Lua mirror the server refreshes
+// before evaluating the statusline, so a live redraw reflects the current frame.
+// Filename-modifier cases are derived from real neovim's vim.fn.fnamemodify.
+
+#[tokio::test]
+async fn statusline_mode_expression_refreshes_live_across_redraws() {
+    let (rpc, mut incoming) = start(None).await;
+    // A `%{v:lua.vim.fn.mode()}` expression re-evaluates every frame, so the
+    // statusline tracks the mode as it changes (the live-refresh guarantee).
+    feed(&rpc, ":set statusline=[%{v:lua.vim.fn.mode()}]<CR>");
+    let normal = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(status_text(&normal), "[n]", "normal mode short code");
+    let insert = redraw_after(&rpc, &mut incoming, "i").await;
+    assert_eq!(status_text(&insert), "[i]", "insert mode after entering it");
+}
+
+#[tokio::test]
+async fn vim_fn_cursor_window_buffer_builtins_read_live_state() {
+    let (rpc, _incoming) = start(None).await;
+    // Two lines ("abc" / "defgh"); park the cursor on line 1, column 1.
+    feed(&rpc, "iabc<CR>defgh<Esc>gg0");
+    let out = exec_lua(
+        &rpc,
+        r#"return table.concat({
+            vim.fn.line("."), vim.fn.col("."),   -- cursor row / column (1-based)
+            vim.fn.line("$"), vim.fn.col("$"),   -- last line / one past line end
+            vim.fn.winnr(), vim.fn.winnr("$"),   -- current window nr / window count
+            tostring(vim.fn.bufnr("%") == vim.fn.bufnr("$")), -- the only buffer
+          }, "/")"#,
+    )
+    .await;
+    // line 1, col 1; 2 lines; col('$') = #"abc" + 1 = 4; one window; one buffer.
+    assert_eq!(out.as_str().unwrap(), "1/1/2/4/1/1/true");
+}
+
+#[tokio::test]
+async fn vim_fn_fnamemodify_applies_filename_modifiers() {
+    let (rpc, _incoming) = start(None).await;
+    // Ground truth captured from neovim's vim.fn.fnamemodify (the oracle); each
+    // line is one (fname, mods) case.
+    let out = exec_lua(
+        &rpc,
+        r#"local f = vim.fn.fnamemodify
+           return table.concat({
+             f("/a/b/file.txt", ":h"),       -- /a/b
+             f("/a/b/file.txt", ":t"),       -- file.txt
+             f("/a/b/file.txt", ":r"),       -- /a/b/file
+             f("/a/b/file.txt", ":e"),       -- txt
+             f("file.txt", ":h"),            -- .
+             f("file.txt", ":t:r"),          -- file
+             f("/a/b/c/", ":h"),             -- /a/b/c
+             f("dir/file.tar.gz", ":r"),     -- dir/file.tar
+             f("dir/file.tar.gz", ":e"),     -- gz
+             f("a.b.c.d", ":e:e"),           -- c.d  (consecutive :e widen)
+             f("/a/b", ":h:h"),              -- /
+           }, "\n")"#,
+    )
+    .await;
+    assert_eq!(
+        out.as_str().unwrap(),
+        "/a/b\nfile.txt\n/a/b/file\ntxt\n.\nfile\n/a/b/c\ndir/file.tar\ngz\nc.d\n/"
+    );
+}
+
+#[tokio::test]
+async fn vim_fn_fnamemodify_resolves_against_cwd() {
+    let (rpc, _incoming) = start(None).await;
+    // The cwd-relative modifiers (:p make absolute, :. make relative) are checked
+    // against the live getcwd() so the test doesn't bake in a path.
+    let out = exec_lua(
+        &rpc,
+        r#"local cwd = vim.fn.getcwd()
+           return table.concat({
+             vim.fn.fnamemodify("a/b.txt", ":p") == cwd .. "/a/b.txt" and "p-ok" or "p-bad",
+             vim.fn.fnamemodify(cwd .. "/a/b.txt", ":.") == "a/b.txt" and "dot-ok" or "dot-bad",
+             vim.fn.fnamemodify("/elsewhere/x", ":.") == "/elsewhere/x" and "abs-ok" or "abs-bad",
+           }, "\n")"#,
+    )
+    .await;
+    assert_eq!(out.as_str().unwrap(), "p-ok\ndot-ok\nabs-ok");
+}
+
+#[tokio::test]
+async fn vim_fn_fnamemodify_unsupported_modifier_errors_loud() {
+    let (rpc, _incoming) = start(None).await;
+    // A modifier with no implementation (`:s///`) raises (named), per the
+    // no-silent-stub rule, rather than silently returning the name unchanged.
+    let err = exec_lua(
+        &rpc,
+        r"local ok, e = pcall(vim.fn.fnamemodify, 'x', ':s/a/b/')
+          return tostring(e)",
+    )
+    .await;
+    let err = err.as_str().expect("a string error from the raise");
+    assert!(
+        err.contains("fnamemodify") && err.contains(":s"),
+        "the error names the unsupported modifier (fail loud): {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn vim_fn_expand_resolves_current_file_modifiers() {
+    let path = temp_path("expand_sl");
+    std::fs::write(&path, "x\n").unwrap();
+    let name = path.to_string_lossy().into_owned();
+    let (rpc, _incoming) = start(Some(name.clone())).await;
+    // `expand('%')` is the current file; `%:t`/`%:h`/`%:r`/`%:e` route through
+    // fnamemodify, so they agree with the path's components.
+    let out = exec_lua(
+        &rpc,
+        r#"return table.concat({
+            vim.fn.expand("%"), vim.fn.expand("%:t"),
+            vim.fn.expand("%:h"), vim.fn.expand("%:e"),
+          }, "\n")"#,
+    )
+    .await;
+    let p = std::path::Path::new(&name);
+    let tail = p.file_name().unwrap().to_string_lossy();
+    let head = p.parent().unwrap().to_string_lossy();
+    assert_eq!(
+        out.as_str().unwrap(),
+        format!("{name}\n{tail}\n{head}\ntxt")
+    );
+}
+
+/// The shipped `examples/statusline/` config sources cleanly and actually drives
+/// the status line (not just "loads"): its `%!v:lua.statusline()` builder runs
+/// through the engine and assembles the line from the Phase 5 `vim.fn` surface —
+/// the mode block, the file label, and a live cursor ruler all render.
+#[tokio::test]
+async fn statusline_example_config_runs() {
+    let dir = temp_dir("statusline-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/statusline/init.lua"
+    ))
+    .expect("read example init.lua");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
+
+    // On the startup No Name buffer: NORMAL mode block (vim.fn.mode), the file
+    // label (vim.fn.expand), and the cursor ruler "1:1" (vim.fn.line/col).
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let text = status_text(&map);
+    assert!(
+        text.contains("NORMAL"),
+        "mode block from vim.fn.mode(): {text:?}"
+    );
+    assert!(
+        text.contains("[No Name]"),
+        "file label from expand(): {text:?}"
+    );
+    assert!(
+        text.contains("1:1"),
+        "live ruler from vim.fn.line/col: {text:?}"
+    );
+}

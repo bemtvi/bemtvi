@@ -514,9 +514,14 @@ impl Server {
             .collect();
         let cur_win = self.editor.current_window_id().0;
         let next_win = self.editor.next_window_id().0;
-        let _ = self
-            .lua
-            .set_buf_mirror(&bufs, cursor, cur_win, &wins, next_win);
+        let _ = self.lua.set_buf_mirror(
+            &bufs,
+            cursor,
+            cur_win,
+            &wins,
+            next_win,
+            self.editor.mode.short_code(),
+        );
         let _ = self.lua.set_bo_mirror(&bo);
         // The tab snapshot (Phase 3): one entry per tab page in tabline order, each
         // carrying its window ids and focused window, so `nvim_tabpage_*` reads from

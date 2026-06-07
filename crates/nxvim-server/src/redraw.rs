@@ -57,6 +57,15 @@ impl Server {
         // read once and shared across every window's status projection.
         let statusline_fmt = self.editor.global_options().statusline;
 
+        // A `%{}`/`%!` statusline expression evaluates Lua that reads live editor
+        // state through the `vim.fn.*` surface (mode/cursor/buffer/window). Refresh
+        // the Rust→Lua mirror so those reads reflect this frame; skip the cost when
+        // the format has no expressions (the default look and pure-field formats
+        // compute entirely in Rust and never reach Lua).
+        if statusline_fmt.contains("%{") || statusline_fmt.contains("%!") {
+            self.push_buf_mirror();
+        }
+
         // Project each window: its rect, per-window text/gutter/status data, and
         // its own buffer's syntax/diagnostic slice.
         let windows: Vec<Value> = view

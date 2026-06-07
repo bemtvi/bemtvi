@@ -1,0 +1,28 @@
+Move around this buffer and watch the status line at the bottom.
+
+The status line is assembled in init.lua by _G.statusline(), which the
+'statusline' option calls on every redraw via:
+
+    vim.o.statusline = "%!v:lua.statusline()"
+
+Left side  — a coloured mode block (NORMAL / INSERT / VISUAL / …) followed by
+             the file name and a [+] flag once you make an edit.
+Right side — a live ruler:  line:col  and a percent-through-file figure.
+
+Everything dynamic comes from the Phase 5 vim.fn surface:
+
+    vim.fn.mode()                   the mode block's label + colour
+    vim.fn.expand("%:t")            the file name (tail)
+    vim.fn.fnamemodify(p, ":~:.:h") the directory, relative to cwd / $HOME
+    vim.fn.line(".") / col(".")     the cursor position
+    vim.fn.line("$")                the line count, for the percent figure
+
+Try it:
+  - press i, type something, then <Esc>      (mode recolours; [+] appears)
+  - press V to select lines                  (mode block turns purple)
+  - jump with G and gg                       (the ruler and percent move)
+  - :set statusline=                         (back to the built-in default look)
+
+Line four. Line five. Line six. Line seven so there is something to scroll
+through and watch the percent figure climb from 0%% toward 100%% as you move
+the cursor down the file with j or <C-d>.

@@ -164,13 +164,25 @@ correctness is asserted through Phase 3's redraw tests.
 - **Tests** (`crates/nxvim/tests/screen.rs`): end-to-end paint of a custom
   statusline.
 
-### Phase 5 — `vim.fn` / `vim.api` surface for real configs
+### Phase 5 — `vim.fn` / `vim.api` surface for real configs ✅ done
 
 Add the functions a real statusline (and lualine) call from inside `%{}`/`%!`:
 `mode()`, `line('.')`, `col('.')`, `winnr()`, `bufnr()`, `fnamemodify()`,
 `expand('%:…')`, `getbufvar`, `nvim_get_current_line` width helpers, etc. Each
 added only when exercised by a test (no speculative stubs). Confirm live refresh:
 a `%{}` reading editor state updates as the state changes across redraws.
+
+**Shipped:** the editor mode is now threaded into the Rust→Lua mirror
+(`vim._cur_mode`, via `set_buf_mirror`), and `redraw` refreshes that mirror
+before evaluating a statusline that contains a `%{}`/`%!` expression — so a
+`%{v:lua.vim.fn.mode()}` tracks the mode live across frames. New / enhanced
+`vim.fn`: `mode`, `line('.'/'$')`, `col('.'/'$')`, `winnr('.'/'$')`,
+`winwidth`/`winheight` (api.lua), plus a vim-faithful `fnamemodify`
+(`:p :~ :. :h :t :r :e`, consecutive-`:e` widening, loud error on unsupported
+modifiers — replacing fs.lua's coarser version) and `bufnr('$')`. `expand`
+routes `%:<mods>` through `fnamemodify`. fnamemodify cases are derived from real
+neovim. `getbufvar` deferred (no test demands it yet). The window-relative
+`line('w0'/'w$')` forms error loud (the mirror has no scroll position yet).
 
 ### Phase 6 (later) — `laststatus=3`, then tabline reuse
 

@@ -117,6 +117,31 @@ fn split_substitute(body: &str, delim: char) -> (String, String, String) {
     (pat, rep, flags)
 }
 
+/// Split a `:global` body (everything after the leading delimiter) into
+/// `(pattern, command)` on the first unescaped `delim`. `\delim` is a literal
+/// delimiter in the pattern; everything past the delimiter is the command, taken
+/// verbatim (it may itself contain delimiters). No closing delimiter → an empty
+/// command (the caller defaults it to `:print`).
+fn split_global(body: &str, delim: char) -> (String, String) {
+    let mut pat = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(n) if n == delim => pat.push(delim),
+                Some(n) => {
+                    pat.push('\\');
+                    pat.push(n);
+                }
+                None => pat.push('\\'),
+            },
+            _ if c == delim => return (pat, chars.collect()),
+            _ => pat.push(c),
+        }
+    }
+    (pat, String::new())
+}
+
 /// Split an ex-command into `(name, bang, args)`.
 fn split_ex(cmd: &str) -> (&str, bool, &str) {
     let bytes = cmd.as_bytes();
@@ -272,6 +297,14 @@ impl Editor {
             "noh" | "nohlsearch" => self.search_active = false,
             "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu"
             | "substitut" | "substitute" => self.ex_substitute(range, args),
+            // `:[range]g[!]/pat/cmd` runs `cmd` on every line matching `pat`
+            // (default range = whole file); `:g!` and `:v` invert to non-matching.
+            "g" | "gl" | "glo" | "glob" | "globa" | "global" => self.ex_global(range, bang, args),
+            "v" | "vg" | "vgl" | "vglo" | "vglob" | "vgloba" | "vglobal" => {
+                self.ex_global(range, true, args)
+            }
+            "d" | "de" | "del" | "dele" | "delet" | "delete" => self.ex_delete(range),
+            "p" | "pr" | "pri" | "prin" | "print" => self.ex_print(range),
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
             // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
             "hi" | "highlight" => {
@@ -615,6 +648,131 @@ impl Editor {
     fn set_substitute_search(&mut self, pattern: String) {
         self.last_search = Some((pattern, SearchDir::Forward, SearchOffset::None));
         self.search_active = true;
+    }
+
+    /// `:[range]g[!]/{pat}/{cmd}` — run `cmd` (an ex command) on every line of the
+    /// range matching `pat`; `invert` (`:g!` / `:v`) targets the *non*-matching
+    /// lines. The range defaults to the whole file. The whole `:g` is one undo
+    /// step, and a nested `:g`/`:v` in `cmd` fails loud (`E147`).
+    fn ex_global(&mut self, range: ExRange, invert: bool, args: &str) {
+        if self.in_global {
+            self.echo("E147: Cannot do :global recursive");
+            return;
+        }
+        let spec = args.trim();
+        let delim = match spec.chars().next() {
+            Some(d) if !d.is_alphanumeric() && d != '\\' && d != '"' => d,
+            Some(_) => {
+                self.echo("E146: Regular expressions can't be delimited by letters");
+                return;
+            }
+            None => {
+                self.echo("E471: Argument required");
+                return;
+            }
+        };
+        let (pat, cmd) = split_global(&spec[delim.len_utf8()..], delim);
+
+        // An empty pattern reuses the last search/substitute pattern (like `:s`).
+        let pattern = if pat.is_empty() {
+            match self.last_search.as_ref() {
+                Some((p, _, _)) => p.clone(),
+                None => {
+                    self.echo("E35: No previous regular expression");
+                    return;
+                }
+            }
+        } else {
+            pat
+        };
+        let re = match SearchRegex::compile(&pattern, self.search_ignorecase(&pattern)) {
+            Ok(re) => re,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+        let (lo, hi) = if range.explicit {
+            (range.lo, range.hi)
+        } else {
+            (0, self.last_line())
+        };
+
+        // First pass: mark the target lines. Doing this up front means edits in
+        // the command pass can't disturb which lines were selected (vim's
+        // mark-then-execute). `:g` keeps the matching lines, `:g!`/`:v` the rest.
+        let targets: Vec<usize> = (lo..=hi)
+            .filter(|&l| re.find_from(&self.buffer().line(l), 0).is_some() != invert)
+            .collect();
+        self.set_substitute_search(pattern.clone());
+        if targets.is_empty() {
+            // `:g` with no match is a not-found, reported like `:s` (fail-loud).
+            // `:v` finding "no non-matching lines" isn't a miss, so it's silent.
+            if !invert {
+                self.echo(format!("E486: Pattern not found: {pattern}"));
+            }
+            return;
+        }
+        let cmd = if cmd.trim().is_empty() {
+            "p".to_string() // vim's default command is `:print`
+        } else {
+            cmd
+        };
+
+        // One undo step for the whole `:g`: force a fresh snapshot, then suppress
+        // the per-command snapshots while the batch runs; leave `snapshot_taken`
+        // cleared so the next edit snapshots on its own.
+        self.snapshot_taken = false;
+        self.push_undo();
+        self.snapshot_taken = true;
+        self.in_global = true;
+        // Second pass: run `cmd` on each target. A running `offset` keeps the
+        // remaining (later) targets aligned as the command adds or removes lines.
+        let mut offset: i64 = 0;
+        for t in targets {
+            let line = t as i64 + offset;
+            if line < 0 || line > self.last_line() as i64 {
+                continue;
+            }
+            let before = self.buffer().line_count() as i64;
+            self.cursor.line = line as usize;
+            self.cursor.col = 0;
+            self.execute_ex(&cmd);
+            offset += self.buffer().line_count() as i64 - before;
+        }
+        self.in_global = false;
+        self.snapshot_taken = false;
+        self.buffer_mut().normalize();
+        self.clamp_cursor();
+    }
+
+    /// `:[range]d[elete]` — delete the range's lines (default: the current line),
+    /// landing the cursor on the line that takes their place (first non-blank).
+    fn ex_delete(&mut self, range: ExRange) {
+        self.push_undo();
+        let start = self.buffer().line_start(range.lo);
+        // Up to the start of the line after the range — or the buffer end when the
+        // range runs to the last line, so the deleted block's newlines go too.
+        let end = if range.hi < self.last_line() {
+            self.buffer().line_start(range.hi + 1)
+        } else {
+            self.buffer().len_bytes()
+        };
+        self.buffer_mut().remove(start..end);
+        self.buffer_mut().normalize();
+        self.cursor.line = range.lo.min(self.last_line());
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+        self.clamp_cursor();
+    }
+
+    /// `:[range]p[rint]` — echo the range's lines (default: the current line). The
+    /// message line shows the last; each is recorded in `:messages`. Also the
+    /// default command for a bare `:g/pat/`.
+    fn ex_print(&mut self, range: ExRange) {
+        for l in range.lo..=range.hi.min(self.last_line()) {
+            let line = self.buffer().line(l);
+            self.echo(line);
+        }
     }
 
     /// Open a `:s///c` confirm substitute over `[lo, hi]`: light up the pattern

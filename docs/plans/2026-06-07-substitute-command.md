@@ -1,13 +1,14 @@
 # Implementing `:substitute` (`:s`)
 
-> **Status: Phases 0–3 DONE — the command is complete.** The ex-range parser
+> **Status: Phases 0–4 DONE.** The ex-range parser
 > (Phase 0), the core substitute command (Phase 1: `g`/`i`/`I`/`n` flags, count,
 > `\r` line-split, capture refs, count reporting, single-undo), pattern/replacement
 > reuse (Phase 2: empty-pattern reuse, bare `:s` / `:&` / `:&&` repeat with the
 > flag-reset-vs-keep distinction, `~` replacement recall, trailing count,
-> alternate delimiters), and the interactive `c` confirm flag (Phase 3:
-> `y`/`n`/`a`/`l`/`q`/`<Esc>` per-match prompting) are all implemented and tested.
-> Phased and TDD-driven per the project workflow.
+> alternate delimiters), the interactive `c` confirm flag (Phase 3:
+> `y`/`n`/`a`/`l`/`q`/`<Esc>` per-match prompting), and `:global` / `:vglobal`
+> (Phase 4, with the `:delete` / `:print` it drives) are all implemented and
+> tested. Phased and TDD-driven per the project workflow.
 >
 > **Note on file paths below.** This plan was written against the pre-refactor
 > single-file `crates/nxvim-core/src/editor.rs`. That file has since been split
@@ -272,13 +273,50 @@ the rest of the original line on its new (pushed-down) row. The cursor lands on
 the first non-blank of the last line produced by the last substitution. A
 zero-width match is force-stepped one grapheme so the walk can't spin.
 
+## Phase 4 — `:global` / `:vglobal` (and the `:delete` / `:print` it drives) — DONE
+
+`:[range]g[!]/{pat}/{cmd}` runs an ex command on every line of the range matching
+`{pat}`; `:g!` and `:v` / `:vglobal` invert to the non-matching lines. The
+**range defaults to the whole file** (not the current line), an empty pattern
+reuses the last search, and an empty command defaults to `:print` (vim).
+
+The engine (`ex_global` in `editor/ex.rs`) is vim's two-pass **mark then execute**:
+
+1. **First pass** collects the target line indices (matching, or non-matching for
+   the inverted forms) up front, so edits in pass two can't disturb the selection.
+2. **Second pass** runs `{cmd}` on each target via the normal `execute_ex`
+   dispatch (so `:g/re/s/…/…/`, `:g/re/d`, `:g/re/p` all just work), with the
+   cursor pre-positioned on the line. A running `offset` tracks the buffer's
+   line-count change after each command and shifts the remaining targets, so a
+   command that deletes or splits lines keeps the rest aligned. This handles the
+   line-wise commands (`:d`, `:s`, `:p`) that cover the overwhelming majority of
+   `:g` use; a command that non-locally restructures many lines at once is a known
+   edge the simple offset model doesn't perfectly track.
+
+The whole `:g` is **one undo step**: force a fresh `push_undo`, set `snapshot_taken`
+to suppress the per-command snapshots through the batch, then clear it so the next
+edit snapshots on its own. A nested `:g`/`:v` in `{cmd}` fails loud (`E147`) via an
+`in_global` re-entrancy flag. `:g` with no match reports `E486` (like `:s`); `:v`
+with no non-matching lines is a silent no-op (the pattern was found, so it's not a
+miss). `:g` sets the last-search pattern, like `:s`.
+
+Two range commands were added as the per-line targets (independently useful):
+`:[range]d[elete]` removes the range's lines (default current line; lands the
+cursor on the line that replaces them), and `:[range]p[rint]` echoes them (the
+default `:g` command). Both go through `push_undo`, so they coalesce under `:g`.
+
 ## Out of scope / known gaps (state them, don't hide them)
 
 - vim-magic patterns (`\(`, `\+`, `\zs`, …) in `:s` — intentionally unsupported;
   `:s` is canonical regex like `/`.
-- `:g`/`:v`, `:s` with the `e` (no-error) flag — later. (Note: `e` would
-  *suppress* the no-match error; until it exists, no-match always reports
-  `E486`, consistent with fail-loud.)
+- `:s` with the `e` (no-error) flag — later. (Note: `e` would *suppress* the
+  no-match error; until it exists, no-match always reports `E486`, consistent
+  with fail-loud.)
+- `:g` driving `:normal`, `:m`/`:t` (move/copy), or `:>`/`:<` — those ex commands
+  don't exist yet, so `:g/re/normal …` defers and reports unknown-command per
+  line. `:d` takes no register/count argument yet (`:d x`, `:d 3`).
+- Normal-mode `&` / `g&` (repeat the last `:s`) — the ex `:&` / `:&&` exist; the
+  normal-mode keys don't.
 
 ## Touch list (as built)
 
@@ -291,11 +329,14 @@ zero-width match is force-stepped one grapheme so the walk can't spin.
 - `crates/nxvim-core/src/editor/cursor.rs` + `editor/command.rs` — the normal-mode
   one-line scroll `<C-e>`/`<C-y>` (`scroll_line` / `scroll_view_line`,
   `NormalCmd::ScrollLine`), which the confirm `^E`/`^Y` peek reuses.
+- `crates/nxvim-core/src/editor/ex.rs` (Phase 4) — `ex_global` / `split_global`,
+  the `:g`/`:v`/`:d`/`:p` `execute_ex` arms, and `ex_delete` / `ex_print`; the
+  `in_global` re-entrancy flag lives on `Editor` in `editor/mod.rs`.
 - `crates/nxvim-core/src/search.rs` — `SearchRegex::substitute_line` and
   `match_replacement` (the Phase-3 single-match primitive) + the replacement-dialect
   module note.
-- `crates/nxvim-server/tests/editing.rs` — the `substitute_*` and
-  `substitute_confirm_*` tests (Phases 0–3).
+- `crates/nxvim-server/tests/editing.rs` — the `substitute_*` /
+  `substitute_confirm_*` (Phases 0–3) and `global_*` / `ex_delete_*` (Phase 4) tests.
 - `docs/architecture.md` / `docs/known-approximations.md` — `:s` is implemented;
   the replacement dialect shares `/` search's canonical regex.
 

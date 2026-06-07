@@ -366,6 +366,10 @@ pub struct Editor {
     /// the buffer is otherwise in normal mode with the cursor on the pending
     /// match. `None` outside a confirm substitute.
     subst_confirm: Option<ex::SubstConfirm>,
+    /// True while a `:global` / `:vglobal` is running its per-line command pass,
+    /// so a nested `:g` / `:v` in that command fails loud (`E147`) instead of
+    /// recursing. Set around the second pass in [`Editor::ex_global`].
+    in_global: bool,
     /// Operator (`d`/`c`/`y`) waiting on a search motion: set when `d/`,`y?`, …
     /// open a search prompt, applied over the match when the search commits, and
     /// cleared on commit or `<Esc>`. `None` for a plain (movement) search.
@@ -545,6 +549,7 @@ impl Editor {
             last_search: None,
             last_substitute: None,
             subst_confirm: None,
+            in_global: false,
             search_operator: None,
             pending_search_count: 1,
             search_history: Vec::new(),

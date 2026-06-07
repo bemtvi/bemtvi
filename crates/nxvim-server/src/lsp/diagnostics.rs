@@ -63,6 +63,12 @@ impl Server {
             // stays aligned with `highlights`/`numbers`.
             return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
         };
+        // Tab width is the rendered window's buffer's `tabstop` (it may differ
+        // from the current buffer's), so the underline columns line up with the
+        // text the client paints for that window.
+        let tabstop = buf
+            .map(|b| b.options.effective_tabstop())
+            .unwrap_or(unicode::TABSTOP);
         let rows = numbers
             .iter()
             .map(|num| {
@@ -78,8 +84,8 @@ impl Server {
                     .filter_map(|d| {
                         let (start_byte, end_byte) =
                             self.diag_row_span(d, encoding, line_idx, &text)?;
-                        let start_col = unicode::virtcol(&text, start_byte, unicode::TABSTOP);
-                        let mut end_col = unicode::virtcol(&text, end_byte, unicode::TABSTOP);
+                        let start_col = unicode::virtcol(&text, start_byte, tabstop);
+                        let mut end_col = unicode::virtcol(&text, end_byte, tabstop);
                         // A zero-width range (e.g. an empty span at end-of-line)
                         // still needs one underlined cell to be visible.
                         if end_col <= start_col {

@@ -13,7 +13,7 @@ use crate::buffer::{Buffer, EditBatch};
 use crate::highlight::Highlights;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
-use crate::options::{resolve_set, Options, SetOp};
+use crate::options::{resolve_set, NumOp, Options, SetCmd, SetOp, WindowOptions};
 use crate::search::SearchRegex;
 use crate::unicode;
 use crate::view::{PanelView, Separator, View};
@@ -337,6 +337,9 @@ struct Window {
     saved_cursor: Cursor,
     saved_top: usize,
     rect: Rect,
+    /// Window-local options (the number gutter). A split inherits these from the
+    /// window it was split off, mirroring vim.
+    options: WindowOptions,
 }
 
 /// The orientation of a split: `Horizontal` stacks children top-to-bottom
@@ -403,6 +406,7 @@ impl WindowTree {
                 saved_cursor: Cursor::default(),
                 saved_top: 0,
                 rect: Rect::default(),
+                options: WindowOptions::default(),
             },
         );
         WindowTree {
@@ -779,6 +783,9 @@ pub(crate) struct WindowLayout {
     pub(crate) top: usize,
     pub(crate) rect: Rect,
     pub(crate) focused: bool,
+    /// This window's window-local options (the number gutter), so the projection
+    /// renders each window's own gutter rather than a single global one.
+    pub(crate) options: WindowOptions,
 }
 
 /// A directional window-focus move (`<C-w>h/j/k/l`).
@@ -1471,6 +1478,29 @@ struct Panel {
     targets: Vec<Option<(PathBuf, usize, usize)>>,
 }
 
+/// Whitespace that advances the virtual column from `start` to `target`
+/// (`target >= start`), the fill an inserted `<Tab>` lays down. With `expandtab`
+/// it is all spaces; otherwise real tabs that jump to each `tabstop` boundary,
+/// then spaces for any remainder past the last boundary — vim's tab/space mix.
+fn fill_indent(start: usize, target: usize, tabstop: usize, expandtab: bool) -> String {
+    if expandtab {
+        return " ".repeat(target - start);
+    }
+    let mut s = String::new();
+    let mut col = start;
+    loop {
+        let next_tab = col - (col % tabstop) + tabstop;
+        if next_tab <= target {
+            s.push('\t');
+            col = next_tab;
+        } else {
+            break;
+        }
+    }
+    s.push_str(&" ".repeat(target - col));
+    s
+}
+
 /// Word-wrap `text` into rows no wider than `width` screen cells, for the bottom
 /// [`Panel`] (nxvim's only multi-line, wrap-able surface — long hover docs,
 /// messages, and location-list rows). Breaks after the last space that fits so
@@ -1633,6 +1663,13 @@ pub struct Editor {
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
+    /// Provenance for soft-tab `<BS>`: `(line, anchor_col)` of the whitespace run
+    /// the *immediately preceding* `<Tab>` keypress inserted as spaces (its
+    /// `anchor_col` is where the whole run began, preserved across consecutive
+    /// tabs). [`handle_insert`](Self::handle_insert) clears it before every other
+    /// key, so only Tab-inserted spaces collapse a whole unit on backspace —
+    /// hand-typed spaces always delete one at a time. `None` outside that window.
+    soft_tab: Option<(usize, usize)>,
     visual_anchor: Cursor,
 
     /// Set by a scroll command or a cursor motion at the moment it fires:
@@ -1731,6 +1768,7 @@ impl Editor {
             pending: PendingCommand::default(),
             last_find: None,
             snapshot_taken: false,
+            soft_tab: None,
             visual_anchor: Cursor::default(),
             scroll_from: None,
             pending_scroll: None,
@@ -1780,6 +1818,36 @@ impl Editor {
     /// through [`Editor::apply_edits_to`], so this stays read-only.
     pub fn buffer_of(&self, id: BufferId) -> Option<&Buffer> {
         self.buffers.map.get(&id).map(|ob| &ob.buffer)
+    }
+
+    /// Set a buffer-local option on buffer `id` from outside the editor (the Lua
+    /// `vim.bo` / `nvim_set_option_value` bridge). `value` is the option's scalar:
+    /// a number for `tabstop`/`shiftwidth`/`softtabstop` (booleans arrive through
+    /// [`Editor::set_buffer_option_bool`]). It is clamped to each option's valid
+    /// range (`tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`). Unknown options
+    /// and unknown buffers are ignored (the Lua side only forwards the wired set,
+    /// and the buffer is mirror-guarded).
+    pub fn set_buffer_option_num(&mut self, id: BufferId, name: &str, value: i64) {
+        let Some(ob) = self.buffers.map.get_mut(&id) else {
+            return;
+        };
+        match name {
+            "tabstop" => ob.buffer.options.tabstop = value.max(1) as usize,
+            "shiftwidth" => ob.buffer.options.shiftwidth = value.max(0) as usize,
+            "softtabstop" => ob.buffer.options.softtabstop = value.max(-1) as isize,
+            _ => {}
+        }
+    }
+
+    /// Set a boolean buffer-local option (currently `expandtab`) on buffer `id`.
+    /// The boolean companion to [`Editor::set_buffer_option_num`].
+    pub fn set_buffer_option_bool(&mut self, id: BufferId, name: &str, value: bool) {
+        let Some(ob) = self.buffers.map.get_mut(&id) else {
+            return;
+        };
+        if name == "expandtab" {
+            ob.buffer.options.expandtab = value;
+        }
     }
 
     /// Drain buffer `id`'s LSP edit journal — the buffer-addressed form of the
@@ -1963,6 +2031,27 @@ impl Editor {
         }
     }
 
+    /// Window `id`'s window-local options (the number gutter), or `None` for an
+    /// unknown id. The server snapshots these into the `vim.wo` mirror.
+    pub fn window_options(&self, id: WindowId) -> Option<WindowOptions> {
+        self.windows.windows.get(&id).map(|w| w.options)
+    }
+
+    /// Set a boolean window-local option on window `id` (`vim.wo` /
+    /// `nvim_win_set_option`). Recognizes `number` / `relativenumber`; a no-op for
+    /// any other name or an unknown id. `0` is resolved to the focused window by
+    /// the caller.
+    pub fn set_window_option_bool(&mut self, id: WindowId, name: &str, value: bool) {
+        let Some(w) = self.windows.windows.get_mut(&id) else {
+            return;
+        };
+        match name {
+            "number" => w.options.number = value,
+            "relativenumber" => w.options.relativenumber = value,
+            _ => {}
+        }
+    }
+
     /// Window `id`'s cursor as `(0-based line, byte col)` — the live cursor for
     /// the focused window, the stashed one otherwise (`nvim_win_get_cursor`).
     /// `None` if there is no such window.
@@ -2069,6 +2158,7 @@ impl Editor {
                     top: if focused { self.top } else { w.saved_top },
                     rect: w.rect,
                     focused,
+                    options: w.options,
                 }
             })
             .collect()
@@ -2095,6 +2185,8 @@ impl Editor {
             w.saved_top = top;
         }
         let buffer = self.windows.get(cur).buffer;
+        // A split inherits the source window's window-local options, as vim does.
+        let options = self.windows.get(cur).options;
         let new_id = self.windows.alloc_id();
         self.windows.windows.insert(
             new_id,
@@ -2103,6 +2195,7 @@ impl Editor {
                 saved_cursor: cursor,
                 saved_top: top,
                 rect: Rect::default(),
+                options,
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -4061,6 +4154,10 @@ impl Editor {
     }
 
     fn handle_insert(&mut self, key: Key) {
+        // The soft-tab marker is valid only for the keystroke immediately after a
+        // `<Tab>` (or a chained soft-tab `<BS>`). Take it here so every key clears
+        // it; only the Tab/Backspace arms thread it through and may re-arm it.
+        let soft_tab = self.soft_tab.take();
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -4078,13 +4175,8 @@ impl Editor {
                 self.cursor.col = 0;
                 self.buffer_mut().modified = true;
             }
-            KeyCode::Backspace => self.insert_backspace(),
-            KeyCode::Tab => {
-                let at = self.cursor_char();
-                self.buffer_mut().insert_char(at, '\t');
-                self.cursor.col += 1;
-                self.buffer_mut().modified = true;
-            }
+            KeyCode::Backspace => self.insert_backspace(soft_tab),
+            KeyCode::Tab => self.insert_tab(soft_tab),
             KeyCode::Left => {
                 let s = self.buffer().line(self.cursor.line);
                 self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
@@ -4122,8 +4214,57 @@ impl Editor {
         }
     }
 
-    fn insert_backspace(&mut self) {
+    /// Insert a tab at the cursor. The width it advances by is the buffer's
+    /// resolved [`softtabstop`](crate::options::BufferOptions::effective_softtabstop)
+    /// (the `softtabstop → shiftwidth → tabstop` chain), measured from the
+    /// cursor's current virtual column so a partial tab only fills the remaining
+    /// cells. With `expandtab` the fill is spaces; otherwise it's real tabs (each
+    /// jumping a `tabstop` boundary) plus any trailing spaces.
+    ///
+    /// `prev` is the soft-tab marker carried from the previous keystroke; a fill
+    /// of pure spaces re-arms the marker (chaining onto a contiguous prior run) so
+    /// the next `<BS>` can undo this tab as a unit.
+    fn insert_tab(&mut self, prev: Option<(usize, usize)>) {
+        let opts = self.buffer().options;
+        let unit = opts.effective_softtabstop();
+        let start = self.cursor_virtcol();
+        let target = start - (start % unit) + unit; // next multiple of the unit
+        let ws = fill_indent(start, target, opts.effective_tabstop(), opts.expandtab);
+        let begin = self.cursor.col;
+        let at = self.cursor_char();
+        // `ws` is ASCII (tabs/spaces), so its byte length is its column advance.
+        let n = ws.len();
+        self.buffer_mut().insert(at, &ws);
+        self.cursor.col += n;
+        self.buffer_mut().modified = true;
+        // Only a pure-spaces fill is unit-deletable (a literal `\t` is one
+        // grapheme the normal backspace already removes wholesale). Anchor at the
+        // start of a contiguous prior soft-tab run, else where this tab began.
+        self.soft_tab = if n > 0 && ws.bytes().all(|b| b == b' ') {
+            let line = self.cursor.line;
+            let anchor = match prev {
+                Some((l, a)) if l == line && a <= begin && self.is_spaces(line, a, begin) => a,
+                _ => begin,
+            };
+            Some((line, anchor))
+        } else {
+            None
+        };
+    }
+
+    /// Whether `line[start..end]` (byte columns) is entirely ASCII spaces.
+    fn is_spaces(&self, line: usize, start: usize, end: usize) -> bool {
+        let s = self.buffer().line(line);
+        s.as_bytes()
+            .get(start..end)
+            .is_some_and(|run| run.iter().all(|&b| b == b' '))
+    }
+
+    fn insert_backspace(&mut self, soft_tab: Option<(usize, usize)>) {
         if self.cursor.col > 0 {
+            if self.softtab_backspace(soft_tab) {
+                return;
+            }
             let at = self.cursor_char();
             let start = self.buffer().line_start(self.cursor.line);
             let s = self.buffer().line(self.cursor.line);
@@ -4139,6 +4280,59 @@ impl Editor {
             self.cursor.col = prev_len;
             self.buffer_mut().modified = true;
         }
+    }
+
+    /// `<BS>` over a soft tab: delete a whole [`softtabstop`] unit of spaces back
+    /// to the previous tab boundary, rather than one space at a time — but *only*
+    /// for whitespace a `<Tab>` inserted, tracked by `soft_tab` (the marker from
+    /// the immediately preceding keystroke). Hand-typed spaces carry no marker, so
+    /// they fall through to the normal one-character delete. The delete never
+    /// crosses the run's anchor, and re-arms the marker while soft-tab spaces
+    /// remain so a second `<BS>` peels off the next unit. Returns `true` when it
+    /// handled the delete.
+    ///
+    /// [`softtabstop`]: crate::options::BufferOptions::effective_softtabstop
+    fn softtab_backspace(&mut self, soft_tab: Option<(usize, usize)>) -> bool {
+        let Some((line, anchor)) = soft_tab else {
+            return false;
+        };
+        if line != self.cursor.line || anchor >= self.cursor.col {
+            return false;
+        }
+        let opts = self.buffer().options;
+        let unit = opts.effective_softtabstop();
+        if unit <= 1 {
+            return false;
+        }
+        let s = self.buffer().line(self.cursor.line);
+        // The marked run must still be spaces from the anchor up to the cursor.
+        if !self.is_spaces(line, anchor, self.cursor.col) {
+            return false;
+        }
+        // Delete back one unit by virtual column, but never past the anchor.
+        let ts = opts.effective_tabstop();
+        let vcol = unicode::virtcol(&s, self.cursor.col, ts);
+        let anchor_vcol = unicode::virtcol(&s, anchor, ts);
+        let target_vcol = (((vcol - 1) / unit) * unit).max(anchor_vcol);
+        let mut col = self.cursor.col;
+        let mut vc = vcol;
+        while vc > target_vcol && col > anchor {
+            col -= 1;
+            vc -= 1;
+        }
+        if col == self.cursor.col {
+            return false;
+        }
+        let line_start = self.buffer().line_start(self.cursor.line);
+        let range = line_start + col..line_start + self.cursor.col;
+        self.buffer_mut().remove(range);
+        self.cursor.col = col;
+        self.buffer_mut().modified = true;
+        // Keep peeling on the next <BS> while soft-tab spaces remain before us.
+        if col > anchor {
+            self.soft_tab = Some((line, anchor));
+        }
+        true
     }
 
     // ----- command-line mode ------------------------------------------------
@@ -4823,10 +5017,11 @@ impl Editor {
                 break;
             }
             let text = buf.line(buf_line);
+            let ts = buf.options.effective_tabstop();
             for (s, e) in re.find_all(&text) {
                 let span = (
-                    unicode::virtcol(&text, s, unicode::TABSTOP),
-                    unicode::virtcol(&text, e, unicode::TABSTOP),
+                    unicode::virtcol(&text, s, ts),
+                    unicode::virtcol(&text, e, ts),
                 );
                 row_spans.push(span);
                 // The preview cursor sits on the start of its match, so an exact
@@ -4968,7 +5163,10 @@ impl Editor {
                     self.echo("No panel to reopen");
                 }
             }
-            "set" | "se" => self.ex_set(args),
+            // `:setlocal`/`:setl` shares the handler: buffer-local options
+            // (tabstop/shiftwidth/expandtab) live on the current buffer, which is
+            // exactly what `:set` already targets for them.
+            "set" | "se" | "setlocal" | "setl" => self.ex_set(args),
             "noh" | "nohlsearch" => self.search_active = false,
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
             // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
@@ -5744,28 +5942,35 @@ impl Editor {
 
     // ----- options ----------------------------------------------------------
 
-    /// Handle `:set {options}`. Each whitespace-separated token is a boolean
-    /// option with the usual `no`/`inv` prefixes and `!`/`?` suffixes (e.g.
-    /// `:set number relativenumber`, `:set nonu`, `:set rnu!`).
+    /// Handle `:set {options}` (and `:setlocal`, which is identical here — the
+    /// buffer-local options apply to the current buffer either way). Each
+    /// whitespace-separated token is a boolean option with the usual `no`/`inv`
+    /// prefixes and `!`/`?` suffixes (`:set number`, `:set nonu`, `:set rnu!`) or
+    /// a number option with `=value` / `?` (`:set tabstop=4`, `:set ts?`).
     fn ex_set(&mut self, args: &str) {
         for tok in args.split_whitespace() {
             match resolve_set(tok) {
-                Some((name, op)) => self.apply_set(name, op),
+                Some(SetCmd::Bool { name, op }) => self.apply_set_bool(name, op),
+                Some(SetCmd::Num { name, op }) => self.apply_set_num(name, op),
                 None => self.echo(format!("E518: Unknown option: {tok}")),
             }
         }
     }
 
-    /// Apply one resolved `:set` operation to the named (canonical) option.
-    fn apply_set(&mut self, name: &str, op: SetOp) {
+    /// Apply one resolved boolean `:set` operation. `number` / `relativenumber`
+    /// are window-local (they live on the focused window); `expandtab` is
+    /// buffer-local (on the current buffer); the rest are global search options on
+    /// the editor.
+    fn apply_set_bool(&mut self, name: &str, op: SetOp) {
         let slot = match name {
-            "number" => &mut self.options.number,
-            "relativenumber" => &mut self.options.relativenumber,
+            "number" => &mut self.windows.cur_mut().options.number,
+            "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
             "ignorecase" => &mut self.options.ignorecase,
             "smartcase" => &mut self.options.smartcase,
             "wrapscan" => &mut self.options.wrapscan,
             "hlsearch" => &mut self.options.hlsearch,
             "incsearch" => &mut self.options.incsearch,
+            "expandtab" => &mut self.buffer_mut().options.expandtab,
             _ => return,
         };
         match op {
@@ -5773,8 +5978,7 @@ impl Editor {
             SetOp::Off => *slot = false,
             SetOp::Toggle => *slot = !*slot,
             SetOp::Query => {
-                let on = *slot;
-                let label = if on {
+                let label = if *slot {
                     name.to_string()
                 } else {
                     format!("no{name}")
@@ -5784,12 +5988,50 @@ impl Editor {
         }
     }
 
-    /// The number-gutter width for a window showing a buffer with `line_count`
-    /// lines: `0` when both number options are off, else at least 4 cells,
-    /// widening to fit the largest line number plus one trailing space. Sized
-    /// per window so each gutter fits its own buffer.
-    pub(crate) fn number_width_for(&self, line_count: usize) -> usize {
-        if !self.options.number && !self.options.relativenumber {
+    /// Apply one resolved number `:set` operation to a buffer-local option
+    /// (`tabstop` / `shiftwidth` / `softtabstop`), which lives on the current
+    /// buffer. The assigned value is range-checked per option (vim's `E487`):
+    /// `tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`.
+    fn apply_set_num(&mut self, name: &str, op: NumOp) {
+        match op {
+            NumOp::Set(v) => {
+                let min = match name {
+                    "tabstop" => 1,
+                    "shiftwidth" => 0,
+                    "softtabstop" => -1,
+                    _ => return,
+                };
+                if v < min {
+                    self.echo(format!("E487: Argument must be positive: {name}={v}"));
+                    return;
+                }
+                let opts = &mut self.buffer_mut().options;
+                match name {
+                    "tabstop" => opts.tabstop = v as usize,
+                    "shiftwidth" => opts.shiftwidth = v as usize,
+                    "softtabstop" => opts.softtabstop = v as isize,
+                    _ => {}
+                }
+            }
+            NumOp::Query => {
+                let opts = &self.buffer().options;
+                let v: i64 = match name {
+                    "tabstop" => opts.tabstop as i64,
+                    "shiftwidth" => opts.shiftwidth as i64,
+                    "softtabstop" => opts.softtabstop as i64,
+                    _ => return,
+                };
+                self.echo(format!("{name}={v}"));
+            }
+        }
+    }
+
+    /// The number-gutter width for a window with window-local `opts` showing a
+    /// buffer with `line_count` lines: `0` when both number options are off, else
+    /// at least 4 cells, widening to fit the largest line number plus one trailing
+    /// space. Sized per window so each gutter fits its own buffer and options.
+    pub(crate) fn number_width_for(&self, opts: WindowOptions, line_count: usize) -> usize {
+        if !opts.number && !opts.relativenumber {
             return 0;
         }
         (digit_count(line_count) + 1).max(4)
@@ -5932,10 +6174,17 @@ impl Editor {
         }
     }
 
+    /// The current buffer's `tabstop`: cells a tab expands to, the grid tabs
+    /// render on and the cursor snaps to. Floored at 1 so a degenerate `0`
+    /// (set via `:set tabstop=0`) never divides by zero.
+    pub fn tabstop(&self) -> usize {
+        self.buffer().options.effective_tabstop()
+    }
+
     /// Virtual (screen) column of the cursor on its current line.
     fn cursor_virtcol(&self) -> usize {
         let s = self.buffer().line(self.cursor.line);
-        unicode::virtcol(&s, self.cursor.col, unicode::TABSTOP)
+        unicode::virtcol(&s, self.cursor.col, self.tabstop())
     }
 
     /// Advance `count` grapheme clusters forward from byte offset `from`, never
@@ -6018,7 +6267,7 @@ impl Editor {
         let target = if self.desired_eol {
             max_byte
         } else {
-            unicode::byte_at_virtcol(&s, self.desired_col, unicode::TABSTOP).min(max_byte)
+            unicode::byte_at_virtcol(&s, self.desired_col, self.tabstop()).min(max_byte)
         };
         self.cursor.col = unicode::floor_grapheme(&s, target);
     }

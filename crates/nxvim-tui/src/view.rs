@@ -54,6 +54,10 @@ pub(crate) struct WindowView {
     pub(crate) number: bool,
     pub(crate) relativenumber: bool,
     pub(crate) number_width: u16,
+    /// This window's buffer `tabstop`: how many cells to expand a `\t` to when
+    /// painting, mirrored from the server so the text lines up with the server's
+    /// `cursor_screen_col` (computed with the same value). Defaults to 8.
+    pub(crate) tabstop: u16,
 }
 
 /// A window's rect in windows-area cells (mirrors `nxvim_core::ViewRect`).
@@ -317,6 +321,12 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         number_width: map_u16(m, "number_width"),
+        // The server always sends a tabstop ≥ 1; treat a missing/0 value as the
+        // historical default of 8 so an older server still renders sanely.
+        tabstop: match map_u16(m, "tabstop") {
+            0 => 8,
+            ts => ts,
+        },
     }
 }
 

@@ -152,10 +152,14 @@ pub(crate) async fn issue_request(
             };
             completion_reply(sock.completion(params).await, log, name)
         }
-        LspRequest::Formatting { uri } => {
+        LspRequest::Formatting {
+            uri,
+            tab_size,
+            insert_spaces,
+        } => {
             let params = DocumentFormattingParams {
                 text_document: TextDocumentIdentifier { uri },
-                options: formatting_options(),
+                options: formatting_options(tab_size, insert_spaces),
                 work_done_progress_params: Default::default(),
             };
             match sock.formatting(params).await {
@@ -448,14 +452,13 @@ dyn_notifications! {
     "workspace/didDeleteFiles" => notif_workspace_didDeleteFiles,
 }
 
-/// The `FormattingOptions` for `textDocument/formatting`. nxvim has no
-/// `:set shiftwidth`/`expandtab` yet, so these are fixed: `tab_size: 8` to match
-/// the editor's `TABSTOP`, and spaces. Real, option-driven values are a follow-up
-/// for when `:set` grows them.
-fn formatting_options() -> FormattingOptions {
+/// The `FormattingOptions` for `textDocument/formatting`, built from the
+/// requesting buffer's `tabstop` (`tab_size`) and `expandtab` (`insert_spaces`)
+/// so the language server formats to the buffer's indentation.
+fn formatting_options(tab_size: u32, insert_spaces: bool) -> FormattingOptions {
     FormattingOptions {
-        tab_size: 8,
-        insert_spaces: true,
+        tab_size,
+        insert_spaces,
         ..Default::default()
     }
 }

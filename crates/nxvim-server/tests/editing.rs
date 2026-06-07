@@ -550,9 +550,10 @@ async fn screen_column_expands_tabs_to_the_next_tabstop() {
     feed(&rpc, "i<Tab>x<Esc>");
     let _ = lines(&rpc).await;
     let view = latest_view(&mut incoming).expect("a redraw view");
-    // Cursor on 'x' at byte column 1; the leading tab puts it at screen col 8.
+    // Cursor on 'x' at byte column 1; the leading tab puts it at the next tabstop
+    // (the default tabstop is 4), screen col 4.
     assert_eq!(view_u64(&view, "cursor_col"), 1);
-    assert_eq!(view_u64(&view, "cursor_screen_col"), 8);
+    assert_eq!(view_u64(&view, "cursor_screen_col"), 4);
 }
 
 #[tokio::test]
@@ -762,17 +763,17 @@ async fn vertical_motion_keeps_screen_column_across_wide_chars() {
 
 #[tokio::test]
 async fn vertical_motion_keeps_screen_column_across_a_tab() {
-    // A leading tab expands to 8 cells, so 'x' sits at screen column 8 even
-    // though it is byte 1. Vertical motion must map that screen column onto the
-    // ASCII line below (where byte == screen column).
+    // A leading tab expands to the default tabstop (4), so 'x' sits at screen
+    // column 4 even though it is byte 1. Vertical motion must map that screen
+    // column onto the ASCII line below (where byte == screen column).
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "i<Tab>x<Esc>"); // line 1: "\tx"
     feed(&rpc, "oabcdefghij<Esc>"); // line 2: ASCII
-    feed(&rpc, "ggl"); // line 1, onto 'x' at byte 1 / screen col 8
+    feed(&rpc, "ggl"); // line 1, onto 'x' at byte 1 / screen col 4
     assert_eq!(cursor(&rpc).await, (1, 1));
-    feed(&rpc, "j"); // down: screen col 8 → byte 8 ('i')
-    assert_eq!(cursor(&rpc).await, (2, 8));
-    feed(&rpc, "k"); // back up: screen col 8 → byte 1 ('x')
+    feed(&rpc, "j"); // down: screen col 4 → byte 4 ('e')
+    assert_eq!(cursor(&rpc).await, (2, 4));
+    feed(&rpc, "k"); // back up: screen col 4 → byte 1 ('x')
     assert_eq!(cursor(&rpc).await, (1, 1));
 }
 
@@ -4450,6 +4451,215 @@ async fn bo_option_write_is_observable_and_filetype_still_resolves() {
 }
 
 #[tokio::test]
+async fn expandtab_inserts_spaces_to_the_next_tabstop() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab tabstop=4<CR>");
+    feed(&rpc, "i<Tab>x<Esc>");
+    // expandtab turns the Tab into spaces up to the next tabstop (4).
+    assert_eq!(lines(&rpc).await, vec!["    x"]);
+}
+
+#[tokio::test]
+async fn expandtab_aligns_a_partial_tab_to_the_next_stop() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab tabstop=4<CR>");
+    // From virtual column 2 ("ab"), a Tab fills only to column 4: two spaces.
+    feed(&rpc, "iab<Tab>c<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["ab  c"]);
+}
+
+#[tokio::test]
+async fn noexpandtab_inserts_a_literal_tab() {
+    let (rpc, _incoming) = start(None).await;
+    // The default (noexpandtab) keeps a real tab character.
+    feed(&rpc, "i<Tab>x<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["\tx"]);
+}
+
+#[tokio::test]
+async fn tabstop_drives_the_screen_column_of_a_tab() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set tabstop=2<CR>");
+    feed(&rpc, "i<Tab>x<Esc>");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+    // The literal tab now expands to 2 cells (not the default 4), so 'x' sits at
+    // screen column 2 while still at byte column 1.
+    assert_eq!(view_u64(&view, "cursor_col"), 1);
+    assert_eq!(view_u64(&view, "cursor_screen_col"), 2);
+}
+
+#[tokio::test]
+async fn default_indent_chain_resolves_to_four() {
+    let (rpc, _incoming) = start(None).await;
+    // Defaults: tabstop=4, shiftwidth=0 (follow tabstop), softtabstop=-1 (follow
+    // shiftwidth). So a Tab's width resolves down the chain to 4 with no explicit
+    // tabstop/softtabstop set — here observed through expandtab's spaces.
+    feed(&rpc, ":set expandtab<CR>");
+    feed(&rpc, "i<Tab>z<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    z"]);
+}
+
+#[tokio::test]
+async fn softtabstop_drives_tab_independent_of_tabstop() {
+    let (rpc, _incoming) = start(None).await;
+    // softtabstop is the width a <Tab> keypress moves, distinct from tabstop (the
+    // display width of a real tab). With sts=4 the Tab fills 4 columns even though
+    // a literal tab would be 8 wide.
+    feed(&rpc, ":set expandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "i<Tab>q<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    q"]);
+}
+
+#[tokio::test]
+async fn softtabstop_backspace_removes_a_whole_unit() {
+    let (rpc, _incoming) = start(None).await;
+    // With softtabstop, <BS> right after a <Tab> deletes the whole soft-tab of
+    // spaces it inserted, not one space.
+    feed(&rpc, ":set expandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "i<Tab><BS>x<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["x"]);
+}
+
+#[tokio::test]
+async fn typed_spaces_backspace_one_at_a_time() {
+    let (rpc, _incoming) = start(None).await;
+    // Spaces the user typed (not a <Tab>) are deleted one at a time, even though
+    // softtabstop is on — only Tab-inserted whitespace collapses as a unit.
+    feed(&rpc, ":set expandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "i    <BS>x<Esc>"); // four typed spaces, then one <BS>
+    assert_eq!(lines(&rpc).await, vec!["   x"]);
+}
+
+#[tokio::test]
+async fn typing_after_a_tab_breaks_the_soft_tab() {
+    let (rpc, _incoming) = start(None).await;
+    // A keystroke between the <Tab> and the <BS> ends the soft-tab window, so the
+    // backspace removes just that character, leaving the tab's spaces intact.
+    feed(&rpc, ":set expandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "i<Tab>a<BS>b<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    b"]);
+}
+
+#[tokio::test]
+async fn consecutive_tabs_backspace_unit_by_unit() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab tabstop=8 softtabstop=4<CR>");
+    // Two <Tab>s build two soft-tab units (8 spaces); one <BS> peels one unit,
+    // leaving four spaces.
+    feed(&rpc, "i<Tab><Tab><BS>z<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    z"]);
+    // On a fresh line, two <BS>s peel both units back to nothing.
+    feed(&rpc, "o<Tab><Tab><BS><BS>w<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    z", "w"]);
+}
+
+#[tokio::test]
+async fn set_parses_a_numeric_option_assignment() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set shiftwidth=3<CR>");
+    let sw = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("shiftwidth", {})"#,
+    )
+    .await;
+    assert_eq!(sw.as_u64(), Some(3));
+}
+
+#[tokio::test]
+async fn buffer_local_options_are_independent_per_buffer() {
+    let (rpc, _incoming) = start(None).await;
+    // A second, non-current buffer.
+    let other = rpc
+        .request(
+            "nvim_create_buf",
+            vec![Value::Boolean(true), Value::Boolean(false)],
+        )
+        .await
+        .expect("create_buf")
+        .as_u64()
+        .expect("buffer id");
+    // Set tabstop on the background buffer only.
+    exec_lua(
+        &rpc,
+        &format!(r#"vim.api.nvim_set_option_value("tabstop", 2, {{ buf = {other} }})"#),
+    )
+    .await;
+    let other_ts = exec_lua(
+        &rpc,
+        &format!(r#"return vim.api.nvim_get_option_value("tabstop", {{ buf = {other} }})"#),
+    )
+    .await;
+    let cur_ts = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("tabstop", {})"#,
+    )
+    .await;
+    assert_eq!(
+        other_ts.as_u64(),
+        Some(2),
+        "background buffer took the value"
+    );
+    assert_eq!(cur_ts.as_u64(), Some(4), "current buffer kept the default");
+}
+
+#[tokio::test]
+async fn get_option_value_reads_the_core_default() {
+    let (rpc, _incoming) = start(None).await;
+    // Never set, so the read reflects the core default, not nil.
+    let ts = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("tabstop", {})"#,
+    )
+    .await;
+    assert_eq!(ts.as_u64(), Some(4));
+    let et = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("expandtab", {})"#,
+    )
+    .await;
+    assert_eq!(et.as_bool(), Some(false));
+    // shiftwidth defaults to 0 ("follow tabstop") and softtabstop to -1 ("follow
+    // shiftwidth"), the modern follow-chain.
+    let sw = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("shiftwidth", {})"#,
+    )
+    .await;
+    assert_eq!(sw.as_i64(), Some(0));
+    let sts = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("softtabstop", {})"#,
+    )
+    .await;
+    assert_eq!(sts.as_i64(), Some(-1));
+}
+
+#[tokio::test]
+async fn bo_write_drives_tab_insertion() {
+    let (rpc, _incoming) = start(None).await;
+    // Writing vim.bo must reach the core and change how Tab indents.
+    exec_lua(&rpc, r#"vim.bo.expandtab = true; vim.bo.tabstop = 4"#).await;
+    feed(&rpc, "i<Tab>x<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    x"]);
+}
+
+#[tokio::test]
+async fn set_ex_command_is_visible_through_get_option_value() {
+    let (rpc, _incoming) = start(None).await;
+    // A value set via the :set ex-command path is readable back through the Lua
+    // option surface (the Rust->Lua option mirror), not just the value last
+    // written from Lua.
+    feed(&rpc, ":set tabstop=4<CR>");
+    let ts = exec_lua(
+        &rpc,
+        r#"return vim.api.nvim_get_option_value("tabstop", {})"#,
+    )
+    .await;
+    assert_eq!(ts.as_u64(), Some(4));
+}
+
+#[tokio::test]
 async fn buf_set_lines_targets_a_non_current_buffer() {
     let (rpc, _incoming) = start(None).await;
     // Create a second buffer (stays non-current) and edit it by id from Lua.
@@ -4602,23 +4812,23 @@ async fn locations_to_items_builds_sorted_loclist_items() {
 #[tokio::test]
 async fn get_effective_tabstop_prefers_shiftwidth_then_tabstop() {
     let (rpc, _incoming) = start(None).await;
-    // No options set -> the tabstop default (8).
+    // Defaults: shiftwidth=0 ("follow tabstop") + tabstop=4 -> 4.
     let dflt = exec_lua(&rpc, r#"return vim.lsp.util.get_effective_tabstop(0)"#).await;
-    assert_eq!(dflt.as_u64(), Some(8));
-    // tabstop is used while shiftwidth is unset/0.
-    let ts = exec_lua(
-        &rpc,
-        r#"vim.bo.tabstop = 4; return vim.lsp.util.get_effective_tabstop(0)"#,
-    )
-    .await;
-    assert_eq!(ts.as_u64(), Some(4));
-    // A non-zero shiftwidth wins.
+    assert_eq!(dflt.as_u64(), Some(4));
+    // A non-zero shiftwidth is preferred, even when tabstop differs.
     let sw = exec_lua(
         &rpc,
-        r#"vim.bo.shiftwidth = 2; return vim.lsp.util.get_effective_tabstop(0)"#,
+        r#"vim.bo.tabstop = 8; vim.bo.shiftwidth = 2; return vim.lsp.util.get_effective_tabstop(0)"#,
     )
     .await;
     assert_eq!(sw.as_u64(), Some(2));
+    // shiftwidth=0 is the "follow tabstop" sentinel -> fall through to tabstop.
+    let ts = exec_lua(
+        &rpc,
+        r#"vim.bo.shiftwidth = 0; return vim.lsp.util.get_effective_tabstop(0)"#,
+    )
+    .await;
+    assert_eq!(ts.as_u64(), Some(8));
 }
 
 #[tokio::test]

@@ -30,6 +30,6 @@ mod vimregex;
 
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp,
-    LspServerCapabilities, PanelOp, RawKeymap, RawRhs, UiInputReq, WindowOp,
+    LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs, UiInputReq, WindowOp,
 };
-pub use runtime::LuaRuntime;
+pub use runtime::{LuaRuntime, WindowMirror};

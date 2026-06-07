@@ -19,6 +19,12 @@ use crate::ops::{
     RawKeymap, RawRhs, UiInputReq, WindowOp,
 };
 
+/// One window's row in the Rust→Lua window mirror, in layout order:
+/// `(id, buffer, row (1-based), col, width, height (text rows), number,
+/// relativenumber)`. The number/relativenumber flags back `vim.wo`'s wired
+/// window-local options.
+pub type WindowMirror = (u64, u64, u64, u64, u64, u64, bool, bool);
+
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
 /// and loaded in this order at VM init — the order is significant (a later module
 /// reads `vim.*` an earlier one installed), so it mirrors the original single
@@ -579,18 +585,17 @@ impl LuaRuntime {
     /// the caller is only refreshing the cheap cursor/window fields (the server
     /// gates the line arrays on `changedtick`), in which case the existing mirror
     /// `lines` are kept.
-    /// `wins` is one entry per open window in layout order: `(id, buffer, row
-    /// (1-based), col, width, height (text rows))`. `cur_win` is the focused id
-    /// and `next_win` the id the next `nvim_open_win` will mint (so the Lua side
-    /// can return the new handle synchronously while the real window is created
-    /// when the queued op drains).
+    /// `wins` is one [`WindowMirror`] per open window in layout order. `cur_win`
+    /// is the focused id and `next_win` the id the next `nvim_open_win` will mint
+    /// (so the Lua side can return the new handle synchronously while the real
+    /// window is created when the queued op drains).
     #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,
         bufs: &[(u64, Option<Vec<String>>, String)],
         cursor: (u64, u64),
         win: u64,
-        wins: &[(u64, u64, u64, u64, u64, u64)],
+        wins: &[WindowMirror],
         next_win: u64,
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
@@ -609,7 +614,9 @@ impl LuaRuntime {
             entries.set(*bufnr, entry)?;
         }
         let win_arr = self.lua.create_table()?;
-        for (i, (id, buffer, row, col, width, height)) in wins.iter().enumerate() {
+        for (i, (id, buffer, row, col, width, height, number, relativenumber)) in
+            wins.iter().enumerate()
+        {
             let w = self.lua.create_table()?;
             w.set("id", *id)?;
             w.set("buffer", *buffer)?;
@@ -617,10 +624,34 @@ impl LuaRuntime {
             w.set("col", *col)?;
             w.set("width", *width)?;
             w.set("height", *height)?;
+            w.set("number", *number)?;
+            w.set("relativenumber", *relativenumber)?;
             win_arr.set(i + 1, w)?;
         }
         let set: mlua::Function = vim.get("_set_buf_mirror")?;
         set.call((entries, cursor.0, cursor.1, win, win_arr, next_win))
+    }
+
+    /// Refresh the Rust→Lua buffer-option mirror (`vim._bo_mirror[bufnr] =
+    /// { tabstop, shiftwidth, expandtab }`) that `vim.bo` / `nvim_get_option_value`
+    /// read for the wired buffer-local options. Pushed alongside the buffer mirror
+    /// before any Lua that can read options, so a read reflects the core's current
+    /// value — the option's default until set, and a value set through the `:set`
+    /// ex-command path (not just one written from Lua). `bufs` is
+    /// `(bufnr, tabstop, shiftwidth, softtabstop, expandtab)` per open buffer.
+    pub fn set_bo_mirror(&self, bufs: &[(u64, usize, usize, isize, bool)]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let entries = self.lua.create_table()?;
+        for (bufnr, tabstop, shiftwidth, softtabstop, expandtab) in bufs {
+            let entry = self.lua.create_table()?;
+            entry.set("tabstop", *tabstop)?;
+            entry.set("shiftwidth", *shiftwidth)?;
+            entry.set("softtabstop", *softtabstop)?;
+            entry.set("expandtab", *expandtab)?;
+            entries.set(*bufnr, entry)?;
+        }
+        let set: mlua::Function = vim.get("_set_bo_mirror")?;
+        set.call(entries)
     }
 
     /// Whether `name` was registered via `nvim_create_user_command` (so the

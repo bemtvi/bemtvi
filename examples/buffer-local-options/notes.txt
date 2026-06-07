@@ -1,0 +1,2 @@
+plain notes file (no filetype) — keeps the defaults: real tabs, tabstop 8.
+put the cursor here and press i, then <Tab> to see a real tab.

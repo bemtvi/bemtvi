@@ -773,10 +773,11 @@ async fn lsp_info_reports_the_running_server() {
 
 #[tokio::test]
 async fn diagnostics_are_projected_with_screen_columns() {
-    // The headline conversion guard: a leading tab (expands to 8 cells) then a
-    // 2-byte `é` (1 cell), with a diagnostic over "diag" — utf-8 chars/bytes
-    // 3..7. It must surface on *screen* columns 9..13, proving both byte->screen
-    // (`virtcol` over the tab- and wide-aware line) and the LSP char->byte step.
+    // The headline conversion guard: a leading tab (expands to the default
+    // tabstop, 4 cells) then a 2-byte `é` (1 cell), with a diagnostic over "diag"
+    // — utf-8 bytes 3..7. It must surface on *screen* columns 5..9, proving both
+    // byte->screen (`virtcol` over the tab- and wide-aware line) and the LSP
+    // char->byte step.
     let _guard = test_lock().lock().await;
     let record = configure_mock(
         "diag-cols",
@@ -793,8 +794,8 @@ async fn diagnostics_are_projected_with_screen_columns() {
     let rows = diagnostics_of(&params);
     assert_eq!(
         rows[0],
-        vec![(9, 13, 1)],
-        "the diagnostic spans screen columns 9..13 at severity 1 (error)"
+        vec![(5, 9, 1)],
+        "the diagnostic spans screen columns 5..9 at severity 1 (error)"
     );
 }
 

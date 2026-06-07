@@ -222,13 +222,13 @@ function vim.lsp.util.locations_to_items(locations, encoding)
 end
 
 -- get_effective_tabstop(bufnr): the indent width for the buffer — `shiftwidth`
--- when set (> 0), else `tabstop` (default 8), read from the vim.bo store (Phase 6).
+-- when set (> 0), else `tabstop`, read through vim.bo (so it reflects the core's
+-- buffer-local values, defaulting to 8).
 function vim.lsp.util.get_effective_tabstop(bufnr)
-  bufnr = vim._resolve_bufnr(bufnr or 0)
-  local store = vim._bo_store[bufnr] or {}
-  local sw = store.shiftwidth or 0
+  local bo = vim.bo[vim._resolve_bufnr(bufnr or 0)]
+  local sw = bo.shiftwidth or 0
   if sw > 0 then return sw end
-  return store.tabstop or 8
+  return bo.tabstop or 8
 end
 
 -- open_floating_preview(contents, syntax, opts): show `contents` (a list of lines)

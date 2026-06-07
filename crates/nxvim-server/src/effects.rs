@@ -7,7 +7,7 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::Server;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{parse_color, BufferId, WindowId};
-use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, PanelOp, WindowOp};
+use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, OptionValue, PanelOp, WindowMirror, WindowOp};
 use rmpv::Value;
 use std::collections::HashSet;
 
@@ -99,12 +99,22 @@ impl Server {
     /// [`Self::sync_lsp_buffer`] so a server attached to it sees the `didChange`
     /// (the must-not-omit step for a non-current buffer, which `sync_lsp` skips).
     pub(crate) fn apply_buf_op(&mut self, op: BufOp) {
-        let BufOp::SetLines {
-            bufnr,
-            start,
-            end,
-            repl,
-        } = op;
+        let (bufnr, start, end, repl) = match op {
+            BufOp::SetLines {
+                bufnr,
+                start,
+                end,
+                repl,
+            } => (bufnr, start, end, repl),
+            BufOp::SetOption { bufnr, name, value } => {
+                let id = BufferId(bufnr);
+                match value {
+                    OptionValue::Number(n) => self.editor.set_buffer_option_num(id, &name, n),
+                    OptionValue::Bool(b) => self.editor.set_buffer_option_bool(id, &name, b),
+                }
+                return;
+            }
+        };
         let id = BufferId(bufnr);
         let Some(n) = self.editor.line_count_of(id) else {
             return; // unknown buffer — the Lua mirror guards this, but stay safe.
@@ -179,6 +189,15 @@ impl Server {
                 let id = resolve_win(self, win);
                 self.editor.set_window_height(id, height);
             }
+            WindowOp::SetOption { win, name, value } => {
+                let id = resolve_win(self, win);
+                // The window options nxvim honors (number / relativenumber) are
+                // booleans; a numeric value for one of them is meaningless, so it
+                // is ignored rather than silently coerced.
+                if let OptionValue::Bool(b) = value {
+                    self.editor.set_window_option_bool(id, &name, b);
+                }
+            }
             WindowOp::Close { win, force } => {
                 let id = resolve_win(self, win);
                 self.editor.close_window_by_id(id, force);
@@ -210,6 +229,10 @@ impl Server {
     /// refreshes the O(1) cursor/window fields.
     pub(crate) fn push_buf_mirror(&mut self) {
         let mut bufs: Vec<(u64, Option<Vec<String>>, String)> = Vec::new();
+        // Buffer-local option values, mirrored so `vim.bo` / `nvim_get_option_value`
+        // read the core's current value (the default until set, and values set via
+        // the `:set` ex path). Cheap (three scalars per buffer), so it isn't gated.
+        let mut bo: Vec<(u64, usize, usize, isize, bool)> = Vec::new();
         for id in self.editor.buffer_ids() {
             let tick = self
                 .editor
@@ -224,6 +247,10 @@ impl Server {
                 None
             };
             let name = self.editor.buffer_name(id).unwrap_or_default();
+            if let Some(b) = self.editor.buffer_of(id) {
+                let o = b.options;
+                bo.push((id.0, o.tabstop, o.shiftwidth, o.softtabstop, o.expandtab));
+            }
             bufs.push((id.0, lines, name));
         }
         // Drop tick entries for buffers that no longer exist, so the map can't grow
@@ -238,7 +265,7 @@ impl Server {
         // The window snapshot (Phase 5): one entry per window in layout order,
         // each carrying its buffer, cursor (1-based row / 0-based col), and text
         // dimensions, so the `nvim_win_*` getters read live state from Lua.
-        let wins: Vec<(u64, u64, u64, u64, u64, u64)> = self
+        let wins: Vec<WindowMirror> = self
             .editor
             .window_ids()
             .into_iter()
@@ -246,6 +273,7 @@ impl Server {
                 let buffer = self.editor.window_buffer(id).map(|b| b.0).unwrap_or(0);
                 let (line, col) = self.editor.window_cursor(id).unwrap_or((0, 0));
                 let (_, _, w, h) = self.editor.window_rect(id).unwrap_or((0, 0, 0, 0));
+                let opts = self.editor.window_options(id).unwrap_or_default();
                 (
                     id.0,
                     buffer,
@@ -253,6 +281,8 @@ impl Server {
                     col as u64,
                     w as u64,
                     h.saturating_sub(1) as u64, // text rows (minus the status line)
+                    opts.number,
+                    opts.relativenumber,
                 )
             })
             .collect();
@@ -261,6 +291,7 @@ impl Server {
         let _ = self
             .lua
             .set_buf_mirror(&bufs, cursor, cur_win, &wins, next_win);
+        let _ = self.lua.set_bo_mirror(&bo);
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

@@ -86,6 +86,28 @@ fn text_is_painted_on_the_top_rows() {
 }
 
 #[test]
+fn tabs_expand_to_the_buffer_tabstop() {
+    // Regression: a leading tab must render to the buffer's tabstop (mirrored
+    // from the server), not a hard-coded width. With tabstop=4 the tab fills 4
+    // cells, so the painted text matches the server's cursor_screen_col=4 and the
+    // cursor sits on 'x' rather than in the middle of the tab.
+    let v = view(vec![
+        ("lines", lines(&["\tx"])),
+        ("tabstop", Value::from(4u64)),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(row_text(&buf, 0).trim_end(), "    x");
+
+    // A different tabstop changes the width: 2 cells.
+    let v2 = view(vec![
+        ("lines", lines(&["\tx"])),
+        ("tabstop", Value::from(2u64)),
+    ]);
+    let buf2 = paint(&v2, 20, 5);
+    assert_eq!(row_text(&buf2, 0).trim_end(), "  x");
+}
+
+#[test]
 fn bottom_two_rows_are_status_and_command_chrome() {
     let v = view(vec![
         ("lines", lines(&["abc"])),

@@ -232,6 +232,27 @@ pub enum BufOp {
         end: i64,
         repl: Vec<String>,
     },
+    /// `vim.bo[bufnr].<opt> = value` / `nvim_set_option_value(name, value, {buf})`
+    /// — set a buffer-local option (`tabstop`/`shiftwidth`/`expandtab`) on the
+    /// live editor's buffer `bufnr`. The Lua side has already canonicalized the
+    /// name and updated its option mirror (write-through); the server applies the
+    /// value to the core buffer after the chunk.
+    SetOption {
+        bufnr: u64,
+        /// Canonical option name (`tabstop` / `shiftwidth` / `expandtab`).
+        name: String,
+        value: OptionValue,
+    },
+}
+
+/// A scalar buffer-option value carried by [`BufOp::SetOption`]: a number for
+/// `tabstop`/`shiftwidth`, a boolean for `expandtab`. Kept free of `mlua` types
+/// (the bridge converts the Lua value into this) so the server can match on it
+/// directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionValue {
+    Number(i64),
+    Bool(bool),
 }
 
 /// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,
@@ -254,6 +275,14 @@ pub enum WindowOp {
     SetWidth { win: u64, width: usize },
     /// `nvim_win_set_height(win, height)` — set window `win`'s text-row height.
     SetHeight { win: u64, height: usize },
+    /// `vim.wo[win].<opt> = value` / `nvim_win_set_option(win, name, value)` — set a
+    /// window-local option (the number gutter) on window `win`. The prelude has
+    /// canonicalized `name`; a boolean rides as [`OptionValue::Bool`].
+    SetOption {
+        win: u64,
+        name: String,
+        value: OptionValue,
+    },
     /// `nvim_win_close(win, force)` — close window `win`.
     Close { win: u64, force: bool },
     /// `nvim_open_win(buf, enter, config)` (split form) — split the focused window

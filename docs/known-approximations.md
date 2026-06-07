@@ -58,9 +58,15 @@ gap. Recorded here so the sweep doesn't lose them.
 - **`vim.uv` / `vim.loop` beyond timers.** `new_pipe`, TCP (`new_tcp` — the
   TCP transport behind the skipped gdscript `vim.lsp.rpc.connect`), and
   event-based `fs_*` watchers are absent.
-- **Broad options surface.** `:set` honors only `number` / `relativenumber`, and
-  options are global. Buffer-local options are *recorded* by `vim.bo` but do not
-  drive behavior (tagged). Also: marks, folds, macros, registers beyond the
+- **Broad options surface.** `:set` honors the search/number booleans plus the
+  buffer-local indentation options `tabstop` / `shiftwidth` / `softtabstop` /
+  `expandtab` (also via `:setlocal`, `vim.bo`, and `nvim_{set,get}_option_value`).
+  nxvim breaks with vim's defaults here: `tabstop` defaults to **4**, with
+  `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow shiftwidth") so
+  the one `tabstop` knob drives the whole indent width. `tabstop`, `softtabstop`,
+  and `expandtab` drive rendering and `<Tab>`; `shiftwidth` only feeds the LSP
+  indent width until the `>>`/`<<` operators land. The rest of vim's hundreds of
+  options are still missing. Also: marks, folds, macros, registers beyond the
   unnamed register, and most `:s` flags.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written compatibility shim, not an
@@ -82,7 +88,7 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 |---|---|
 | Single-window model | `nvim_win_get_cursor(win)`, `make_position_params(window)`, `open_floating_preview` handles, per-window placement, the single completion-doc preview box (no separate preview-window handle / `completeopt` matrix) |
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
-| Core doesn't honor buffer-local options | every `vim.bo` write but `filetype`, `nvim_set_option_value` |
+| Core honors only the indentation buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `expandtab` are recorded but inert |
 | No per-buffer command registry | `nvim_buf_create_user_command` registers globally |
 | No virtual-text / signs / float surfaces | `vim.diagnostic.config` keys other than `underline` |
 | No per-namespace highlight tables | `nvim_set_hl` non-zero namespace folded into global |

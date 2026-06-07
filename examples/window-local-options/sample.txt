@@ -1,0 +1,17 @@
+Window-local options demo
+=========================
+
+`number` and `relativenumber` are *window-local*: two splits onto this
+very buffer can show different line-number gutters at the same time.
+
+Split this window (<C-w>v or <C-w>s) and run :GutterDemo, or toggle the
+gutter by hand with :setlocal number! / :setlocal relativenumber! — only
+the focused split changes; its sibling keeps whatever gutter it had.
+
+line six
+line seven
+line eight
+line nine
+line ten
+line eleven
+line twelve

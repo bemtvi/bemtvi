@@ -158,6 +158,7 @@ impl Server {
                 Value::from("number_width"),
                 Value::from(win.number_width as u64),
             ),
+            (Value::from("tabstop"), Value::from(win.tabstop as u64)),
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("scroll"), scroll),

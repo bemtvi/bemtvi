@@ -359,7 +359,7 @@ impl Server {
         }
         let (arow, acol) = menu.anchor;
         let line = self.editor.buffer().line(arow);
-        let anchor_col = unicode::virtcol(&line, acol, unicode::TABSTOP);
+        let anchor_col = unicode::virtcol(&line, acol, self.editor.tabstop());
         // The popup anchors in the focused window's text body.
         let focused = view.focused();
         let cursor_row = focused.cursor_row;

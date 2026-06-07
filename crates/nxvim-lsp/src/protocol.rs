@@ -159,8 +159,12 @@ pub enum LspRequest {
     },
     /// `textDocument/formatting` — whole-document formatting; the reply is a
     /// `TextEdit[]` (in the negotiated encoding) the editor applies to the buffer.
+    /// `tab_size` / `insert_spaces` carry the requesting buffer's `tabstop` /
+    /// `expandtab` so the server formats to the buffer's indentation.
     Formatting {
         uri: Url,
+        tab_size: u32,
+        insert_spaces: bool,
     },
     /// `textDocument/rename` — the reply is a `WorkspaceEdit` the editor applies
     /// across the open buffers it touches.

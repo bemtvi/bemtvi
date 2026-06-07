@@ -147,6 +147,13 @@ pub struct WindowView {
     pub relativenumber: bool,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
+    /// This window's buffer `tabstop`: the width the client must expand a `\t`
+    /// to, so its tab rendering matches the server's [`cursor_screen_col`] (which
+    /// is computed with this same value). A client that hard-codes a different
+    /// width would misplace the cursor over tabbed lines.
+    ///
+    /// [`cursor_screen_col`]: WindowView::cursor_screen_col
+    pub tabstop: usize,
 }
 
 /// A snapshot of everything a client needs to draw a frame: the **global** chrome
@@ -233,7 +240,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .buffer_of(w.buffer)
         .expect("a live window's buffer is always open");
     let line_count = buf.line_count();
-    let number_width = ed.number_width_for(line_count);
+    let number_width = ed.number_width_for(w.options, line_count);
     // The window's own rows minus its status line; selections fill to the text
     // width (the area past the number gutter).
     let height = w.rect.height.saturating_sub(1).max(1);
@@ -281,7 +288,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
 
     let cursor_screen_col = {
         let line = buf.line(cur_line);
-        unicode::virtcol(&line, w.cursor.col, unicode::TABSTOP)
+        unicode::virtcol(&line, w.cursor.col, buf.options.effective_tabstop())
     };
 
     WindowView {
@@ -305,9 +312,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         incsearch,
         scroll,
         numbers,
-        number: ed.options.number,
-        relativenumber: ed.options.relativenumber,
+        number: w.options.number,
+        relativenumber: w.options.relativenumber,
         number_width,
+        tabstop: buf.options.effective_tabstop(),
     }
 }
 
@@ -378,16 +386,17 @@ fn selection_spans(
         }
 
         // Charwise: clip the inclusive [start, end] region to this row.
+        let ts = ed.tabstop();
         let lo = if buf_line == start.line { start.col } else { 0 };
-        let start_col = unicode::virtcol(&text, lo, unicode::TABSTOP);
+        let start_col = unicode::virtcol(&text, lo, ts);
         let end_col = if buf_line == end.line {
             // Include the grapheme under the trailing cursor.
             let hi = unicode::next_grapheme(&text, end.col.min(text.len()));
-            unicode::virtcol(&text, hi, unicode::TABSTOP)
+            unicode::virtcol(&text, hi, ts)
         } else {
             // The selection continues onto the next line: highlight the text and
             // one extra cell standing in for the selected newline.
-            unicode::virtcol(&text, text.len(), unicode::TABSTOP) + 1
+            unicode::virtcol(&text, text.len(), ts) + 1
         };
         *span = Some((start_col, end_col));
     }

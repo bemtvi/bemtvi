@@ -14,10 +14,6 @@ use crate::anim::{arm_animation, lerp, Animation};
 use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans};
 use crate::view::{PanelData, PmenuData, Separator, View, WindowView};
 
-/// Tab stop width in cells. Must match `nxvim_core::unicode::TABSTOP` so the
-/// painted text lines up with the server's reported screen columns.
-const TABSTOP: usize = 8;
-
 /// Render `view` into a `width`x`height` cell grid using ratatui's test backend
 /// and return the painted buffer. This drives the *same* `render` the live
 /// client uses, so tests assert on exactly what a user would see.
@@ -317,6 +313,7 @@ fn render_window(
         &frame_hl,
         frame_diag,
         &frame_numbers,
+        win.tabstop.max(1) as usize,
         &theme,
     );
     render_status(frame, status_area, win, view);
@@ -448,6 +445,7 @@ fn render_text(
     highlights: &[Vec<HlSpan>],
     diagnostics: &[Vec<DiagSpan>],
     numbers: &[Option<usize>],
+    tabstop: usize,
     theme: &LineTheme,
 ) {
     let width = area.width as usize;
@@ -466,7 +464,9 @@ fn render_text(
                 let diag = diagnostics.get(row).unwrap_or(&empty_diag);
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
-                highlight_line(l, sel, matches, cur, hl, diag, width, is_filler, theme)
+                highlight_line(
+                    l, sel, matches, cur, hl, diag, width, is_filler, tabstop, theme,
+                )
             })
             .collect::<Vec<_>>(),
     );
@@ -495,9 +495,10 @@ fn highlight_line(
     diag: &[DiagSpan],
     max_width: usize,
     is_filler: bool,
+    tabstop: usize,
     theme: &LineTheme,
 ) -> Line<'static> {
-    let expanded = expand_tabs(line);
+    let expanded = expand_tabs(line, tabstop);
 
     // `~` rows carry no tokens or selection: paint the marker with the theme's
     // EndOfBuffer style (default — terminal foreground — with no colorscheme).
@@ -658,23 +659,24 @@ pub(crate) fn group_style(group: &str) -> Style {
     }
 }
 
-/// Expand tabs to spaces at `TABSTOP`, tracking display width so wide characters
-/// before a tab advance the column correctly. No-op for tab-free lines; the
-/// result never contains a `\t`.
+/// Expand tabs to spaces at `tabstop` (the buffer's, mirrored from the server),
+/// tracking display width so wide characters before a tab advance the column
+/// correctly. No-op for tab-free lines; the result never contains a `\t`.
 ///
 /// Per-`char` `UnicodeWidthChar` width matches the server's per-grapheme
 /// `unicode::virtcol` (`UnicodeWidthStr`) because str width is just the sum of
 /// its chars' widths — so the cursor's `cursor_screen_col` lines up with the
 /// glyphs painted here.
-fn expand_tabs(line: &str) -> String {
+fn expand_tabs(line: &str, tabstop: usize) -> String {
     if !line.contains('\t') {
         return line.to_string();
     }
-    let mut out = String::with_capacity(line.len() + TABSTOP);
+    let tabstop = tabstop.max(1);
+    let mut out = String::with_capacity(line.len() + tabstop);
     let mut col = 0;
     for ch in line.chars() {
         if ch == '\t' {
-            let spaces = TABSTOP - (col % TABSTOP);
+            let spaces = tabstop - (col % tabstop);
             out.push_str(&" ".repeat(spaces));
             col += spaces;
         } else {

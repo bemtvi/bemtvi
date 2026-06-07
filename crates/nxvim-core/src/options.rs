@@ -3,15 +3,11 @@
 //! actually honors live here, and they grow alongside the features that read
 //! them.
 
-/// Window/buffer options that affect rendering and editing.
+/// Global editor options that affect editing and search. Window-local rendering
+/// options (the number gutter) live on [`WindowOptions`]; per-buffer ones on
+/// [`BufferOptions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
-    /// Show the absolute line number in the number column.
-    pub number: bool,
-    /// Show line numbers relative to the cursor line. Combined with
-    /// [`Options::number`] this gives vim's "hybrid" gutter: the absolute
-    /// number on the cursor line, relative numbers elsewhere.
-    pub relativenumber: bool,
     /// Ignore case when searching (`/`, `?`, `n`, `N`).
     pub ignorecase: bool,
     /// Override [`Options::ignorecase`] for a pattern that contains an uppercase
@@ -32,12 +28,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        // nxvim ships with the hybrid number column on: the cursor line shows
-        // its document line number, every other line shows its distance from
-        // the cursor.
         Options {
-            number: true,
-            relativenumber: true,
             // Search defaults match modern neovim: case-sensitive unless asked
             // otherwise, but wrapping, highlighting, and incremental preview on.
             ignorecase: false,
@@ -45,6 +36,120 @@ impl Default for Options {
             wrapscan: true,
             hlsearch: true,
             incsearch: true,
+        }
+    }
+}
+
+/// Window-local options, the rust-native analogue of neovim's per-window scope.
+/// Unlike [`Options`] (one global copy on the editor), a [`WindowOptions`] lives
+/// on each window, so two windows onto the *same* buffer can show different
+/// line-number gutters. A split inherits these from the window it splits off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowOptions {
+    /// Show the absolute line number in the number column.
+    pub number: bool,
+    /// Show line numbers relative to the cursor line. Combined with
+    /// [`WindowOptions::number`] this gives vim's "hybrid" gutter: the absolute
+    /// number on the cursor line, relative numbers elsewhere.
+    pub relativenumber: bool,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        // nxvim ships with the hybrid number column on: the cursor line shows its
+        // document line number, every other line shows its distance from the
+        // cursor.
+        WindowOptions {
+            number: true,
+            relativenumber: true,
+        }
+    }
+}
+
+/// Buffer-local options, the rust-native analogue of neovim's per-buffer scope.
+/// Unlike [`Options`] (one global copy on the editor), a [`BufferOptions`] lives
+/// on each [`crate::Buffer`], so two buffers can indent differently. These are
+/// the indentation options nxvim honors today; they grow alongside the features
+/// that read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferOptions {
+    /// Number of screen cells a `\t` occupies, and the grid the cursor snaps to
+    /// over tabs (vim's `tabstop`). Drives how the buffer renders and how
+    /// horizontal motion crosses a tab. nxvim defaults to **4** (not vim's 8):
+    /// it's the lone knob the other indent options follow.
+    pub tabstop: usize,
+    /// Indent width for shift commands and autoindent (vim's `shiftwidth`). `0`
+    /// means "follow [`tabstop`]" (vim's documented sentinel), which is nxvim's
+    /// default — so indent width tracks `tabstop` until set. Accepted by
+    /// `:set`/`vim.bo` now; the shift operators (`>>`/`<<`) that consume it
+    /// directly are a later phase, but it already feeds [`effective_softtabstop`]
+    /// and the LSP indent width (`get_effective_tabstop`).
+    ///
+    /// [`tabstop`]: BufferOptions::tabstop
+    /// [`effective_softtabstop`]: BufferOptions::effective_softtabstop
+    pub shiftwidth: usize,
+    /// Columns a `<Tab>` keypress moves while editing (vim's `softtabstop`),
+    /// distinct from [`tabstop`] (the *display* width of a real tab). `0` turns
+    /// the feature off (a Tab uses `tabstop`); `-1` means "follow
+    /// [`shiftwidth`]", which is nxvim's default — so it chains
+    /// `softtabstop → shiftwidth → tabstop`. Resolve it with
+    /// [`effective_softtabstop`].
+    ///
+    /// [`tabstop`]: BufferOptions::tabstop
+    /// [`shiftwidth`]: BufferOptions::shiftwidth
+    /// [`effective_softtabstop`]: BufferOptions::effective_softtabstop
+    pub softtabstop: isize,
+    /// Insert spaces instead of a `\t` when <Tab> is pressed in insert mode
+    /// (vim's `expandtab`). The inserted run reaches the next tab boundary
+    /// ([`effective_softtabstop`]).
+    ///
+    /// [`effective_softtabstop`]: BufferOptions::effective_softtabstop
+    pub expandtab: bool,
+}
+
+impl Default for BufferOptions {
+    fn default() -> Self {
+        // nxvim's modern defaults: a 4-cell tab, with shiftwidth and softtabstop
+        // following it via their sentinels (0 = follow tabstop, -1 = follow
+        // shiftwidth), so the single `tabstop` knob sets the whole indent width.
+        BufferOptions {
+            tabstop: 4,
+            shiftwidth: 0,
+            softtabstop: -1,
+            expandtab: false,
+        }
+    }
+}
+
+impl BufferOptions {
+    /// `tabstop`, floored at 1 so a degenerate `0` never divides by zero.
+    pub fn effective_tabstop(&self) -> usize {
+        self.tabstop.max(1)
+    }
+
+    /// Resolve `shiftwidth`'s "follow tabstop" sentinel: `0` → [`effective_tabstop`].
+    ///
+    /// [`effective_tabstop`]: BufferOptions::effective_tabstop
+    pub fn effective_shiftwidth(&self) -> usize {
+        if self.shiftwidth == 0 {
+            self.effective_tabstop()
+        } else {
+            self.shiftwidth
+        }
+    }
+
+    /// The width a `<Tab>` keypress advances by, resolving the
+    /// `softtabstop → shiftwidth → tabstop` chain: `softtabstop < 0` follows
+    /// [`effective_shiftwidth`]; `softtabstop == 0` (feature off) uses
+    /// [`effective_tabstop`]; a positive `softtabstop` is used as-is.
+    ///
+    /// [`effective_shiftwidth`]: BufferOptions::effective_shiftwidth
+    /// [`effective_tabstop`]: BufferOptions::effective_tabstop
+    pub fn effective_softtabstop(&self) -> usize {
+        match self.softtabstop.cmp(&0) {
+            std::cmp::Ordering::Less => self.effective_shiftwidth(),
+            std::cmp::Ordering::Equal => self.effective_tabstop(),
+            std::cmp::Ordering::Greater => self.softtabstop as usize,
         }
     }
 }
@@ -58,42 +163,122 @@ pub enum SetOp {
     Query,
 }
 
+/// What a `:set` token does to a number-valued option (e.g. `tabstop=4`,
+/// `tabstop?`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumOp {
+    /// `name=value` — assign the parsed value. Signed so `softtabstop`'s `-1`
+    /// "follow shiftwidth" sentinel parses; the editor validates per option.
+    Set(i64),
+    /// `name` / `name?` — echo the current value.
+    Query,
+}
+
+/// A single resolved `:set` token: which canonical option, and the operation —
+/// boolean toggles ([`SetOp`]) or numeric assignments ([`NumOp`]) — depending on
+/// the option's kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetCmd {
+    Bool { name: &'static str, op: SetOp },
+    Num { name: &'static str, op: NumOp },
+}
+
+/// Whether a canonical option carries a boolean or a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptKind {
+    Bool,
+    Num,
+}
+
 /// Resolve a single `:set` token (e.g. `number`, `nonu`, `rnu!`, `invnumber`,
-/// `number?`) into the canonical option name and the operation it requests.
-/// Returns `None` for unknown options.
+/// `number?`, `tabstop=4`, `ts?`) into the canonical option name and the
+/// operation it requests. Returns `None` for an unknown option, a malformed
+/// value, or a prefix/suffix used on the wrong kind (e.g. `notabstop`,
+/// `noexpandtab=2`).
 ///
 /// The canonical name is resolved *before* the `no`/`inv` prefixes are tried,
 /// so a real option name that happens to start with `no` (none yet, but vim has
 /// them) is never mis-parsed as a negation.
-pub fn resolve_set(tok: &str) -> Option<(&'static str, SetOp)> {
+pub fn resolve_set(tok: &str) -> Option<SetCmd> {
+    // `name=value`: only valid for a number option.
+    if let Some((name, value)) = tok.split_once('=') {
+        let (name, kind) = canonical(name)?;
+        if kind != OptKind::Num {
+            return None;
+        }
+        let value = value.trim().parse().ok()?;
+        return Some(SetCmd::Num {
+            name,
+            op: NumOp::Set(value),
+        });
+    }
     if let Some(name) = tok.strip_suffix('?') {
-        return canonical(name).map(|c| (c, SetOp::Query));
+        let (name, kind) = canonical(name)?;
+        return Some(match kind {
+            OptKind::Bool => SetCmd::Bool {
+                name,
+                op: SetOp::Query,
+            },
+            OptKind::Num => SetCmd::Num {
+                name,
+                op: NumOp::Query,
+            },
+        });
     }
     if let Some(name) = tok.strip_suffix('!') {
-        return canonical(name).map(|c| (c, SetOp::Toggle));
+        // `!` toggles, which only makes sense for a boolean.
+        let (name, kind) = canonical(name)?;
+        return (kind == OptKind::Bool).then_some(SetCmd::Bool {
+            name,
+            op: SetOp::Toggle,
+        });
     }
-    if let Some(c) = canonical(tok) {
-        return Some((c, SetOp::On));
+    if let Some((name, kind)) = canonical(tok) {
+        return Some(match kind {
+            // A bare boolean turns on; a bare number queries (vim shows its value).
+            OptKind::Bool => SetCmd::Bool {
+                name,
+                op: SetOp::On,
+            },
+            OptKind::Num => SetCmd::Num {
+                name,
+                op: NumOp::Query,
+            },
+        });
     }
     if let Some(name) = tok.strip_prefix("no") {
-        return canonical(name).map(|c| (c, SetOp::Off));
+        let (name, kind) = canonical(name)?;
+        return (kind == OptKind::Bool).then_some(SetCmd::Bool {
+            name,
+            op: SetOp::Off,
+        });
     }
     if let Some(name) = tok.strip_prefix("inv") {
-        return canonical(name).map(|c| (c, SetOp::Toggle));
+        let (name, kind) = canonical(name)?;
+        return (kind == OptKind::Bool).then_some(SetCmd::Bool {
+            name,
+            op: SetOp::Toggle,
+        });
     }
     None
 }
 
-/// Map an option name or its standard abbreviation to its canonical spelling.
-fn canonical(name: &str) -> Option<&'static str> {
+/// Map an option name or its standard abbreviation to its canonical spelling and
+/// kind.
+fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
+    use OptKind::{Bool, Num};
     match name {
-        "number" | "nu" => Some("number"),
-        "relativenumber" | "rnu" => Some("relativenumber"),
-        "ignorecase" | "ic" => Some("ignorecase"),
-        "smartcase" | "scs" => Some("smartcase"),
-        "wrapscan" | "ws" => Some("wrapscan"),
-        "hlsearch" | "hls" => Some("hlsearch"),
-        "incsearch" | "is" => Some("incsearch"),
+        "number" | "nu" => Some(("number", Bool)),
+        "relativenumber" | "rnu" => Some(("relativenumber", Bool)),
+        "ignorecase" | "ic" => Some(("ignorecase", Bool)),
+        "smartcase" | "scs" => Some(("smartcase", Bool)),
+        "wrapscan" | "ws" => Some(("wrapscan", Bool)),
+        "hlsearch" | "hls" => Some(("hlsearch", Bool)),
+        "incsearch" | "is" => Some(("incsearch", Bool)),
+        "tabstop" | "ts" => Some(("tabstop", Num)),
+        "shiftwidth" | "sw" => Some(("shiftwidth", Num)),
+        "softtabstop" | "sts" => Some(("softtabstop", Num)),
+        "expandtab" | "et" => Some(("expandtab", Bool)),
         _ => None,
     }
 }

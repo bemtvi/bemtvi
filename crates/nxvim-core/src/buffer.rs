@@ -66,6 +66,11 @@ pub struct Buffer {
     pub text: Rope,
     pub path: Option<PathBuf>,
     pub modified: bool,
+    /// Buffer-local options (indentation: `tabstop`/`shiftwidth`/`expandtab`),
+    /// independent per buffer so two files can indent differently. Set through
+    /// `:set`/`:setlocal` or `vim.bo`, read by the editor when it renders tabs
+    /// and inserts indentation.
+    pub options: crate::options::BufferOptions,
     /// Monotonic change counter (neovim's `b:changedtick`), bumped on every
     /// mutation. Lets a consumer cheaply tell whether the buffer changed.
     pub changedtick: u64,
@@ -104,6 +109,7 @@ impl Buffer {
             text: Rope::from_str("\n"),
             path: None,
             modified: false,
+            options: crate::options::BufferOptions::default(),
             changedtick: 0,
             save_tick: 0,
             edits: Vec::new(),
@@ -143,6 +149,7 @@ impl Buffer {
             text,
             path: Some(path.to_path_buf()),
             modified: false,
+            options: crate::options::BufferOptions::default(),
             changedtick: 0,
             save_tick: 0,
             edits: Vec::new(),

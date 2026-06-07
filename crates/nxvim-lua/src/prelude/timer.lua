@@ -159,27 +159,55 @@ function vim.ui.open(path)
   return vim.system(cmd)
 end
 
--- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`), backed
--- by a per-buffer store (Phase 6). Writes record; reads return the stored value
--- (else nil — neovim's option default isn't modeled). `filetype`/`ft` stays
--- authoritative from the current-buffer snapshot (it backs the `root_dir`
--- filetype checks configs do at load) unless a write explicitly overrode it. The
--- store is *observable* but not yet wired to editor behavior — see the doc's
--- known-approximations list. A bare `vim.bo.<opt>` (no bufnr) targets the current
--- buffer. The `vim._bo_store` table is initialized with the other Phase-6 mirror
--- state above.
--- INCOMPLETE: the store records and reads back, but only `filetype` actually
--- *drives* anything — writing `vim.bo[buf].shiftwidth`/`expandtab`/… stores the
--- value without changing how the editor indents, formats, or renders. Reads also
--- return nil for an unset option rather than neovim's real default. Faithful once
--- the core honors buffer-local options.
+-- vim.bo: buffer-local options, indexed by bufnr (`vim.bo[buf].filetype`).
+--
+-- The indentation options nxvim's core honors — tabstop/shiftwidth/expandtab and
+-- their `ts`/`sw`/`et` abbreviations — are *wired*: a write reaches the live
+-- editor (it changes how the buffer renders tabs and indents on <Tab>), and a
+-- read returns the core's current value (`vim._bo_mirror`, refreshed by the
+-- server) — the option default until set, and a value set through the `:set`
+-- ex-command path, not just one written from Lua.
+--
+-- `filetype`/`ft` stays authoritative from the current-buffer snapshot (it backs
+-- the `root_dir` filetype checks configs do at load) unless a write overrode it.
+-- Any other option falls back to the plain Lua store `vim._bo_store` (observable
+-- read/write, but not yet driving editor behavior). A bare `vim.bo.<opt>` (no
+-- bufnr) targets the current buffer.
+
+-- Canonical name of a *wired* (core-honored) buffer option, or nil for the rest.
+local BUF_OPT_CANON = {
+  tabstop = "tabstop", ts = "tabstop",
+  shiftwidth = "shiftwidth", sw = "shiftwidth",
+  softtabstop = "softtabstop", sts = "softtabstop",
+  expandtab = "expandtab", et = "expandtab",
+}
+-- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
+-- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
+-- their sentinels (0 = follow tabstop, -1 = follow shiftwidth).
+local BUF_OPT_DEFAULT = { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false }
+
 local function bo_get(bufnr, opt)
+  local canon = BUF_OPT_CANON[opt]
+  if canon then
+    local mirror = vim._bo_mirror[bufnr]
+    if mirror ~= nil and mirror[canon] ~= nil then return mirror[canon] end
+    return BUF_OPT_DEFAULT[canon]
+  end
   local store = vim._bo_store[bufnr]
   if store ~= nil and store[opt] ~= nil then return store[opt] end
   if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end
   return nil
 end
 local function bo_set(bufnr, opt, value)
+  local canon = BUF_OPT_CANON[opt]
+  if canon then
+    -- Queue the change for the core and update the mirror so a read-after-write
+    -- within this chunk is consistent (the server overwrites it on the next push).
+    vim._buf_set_option(bufnr, canon, value)
+    vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
+    vim._bo_mirror[bufnr][canon] = value
+    return
+  end
   vim._bo_store[bufnr] = vim._bo_store[bufnr] or {}
   vim._bo_store[bufnr][opt] = value
 end

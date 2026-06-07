@@ -18,6 +18,15 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// Start a server on its own thread and return a connected client, with a
 /// `file` opened in the first window when given.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_with_config(file, None).await
+}
+
+/// As [`start`], but also source `config_dir`'s `init.lua` at startup (the real
+/// production path), so a test can drive an actual `examples/<feature>/` config.
+async fn start_with_config(
+    file: Option<String>,
+    config_dir: Option<PathBuf>,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -26,6 +35,7 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
             .expect("server runtime");
         let init = ServerInit {
             file,
+            config_dir,
             ..Default::default()
         };
         let _ = runtime.block_on(run_server(server_end, init));
@@ -79,6 +89,18 @@ struct Win {
     file_name: String,
     lines: Vec<String>,
     rect: Rect,
+    /// This window's buffer `tabstop` (cells a `\t` expands to) and the cursor's
+    /// resulting screen column — both computed per-window from the window's own
+    /// buffer, so two windows onto differently-tabbed buffers report different
+    /// values.
+    tabstop: u64,
+    cursor_screen_col: u64,
+    /// This window's window-local number-gutter options and the resulting gutter
+    /// width — per-window, so two windows onto the same buffer can show different
+    /// line-number columns.
+    number: bool,
+    relativenumber: bool,
+    number_width: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +182,15 @@ fn parse_window(value: &Value) -> Win {
             .to_string(),
         lines,
         rect: parse_rect(map_get(m, "rect")),
+        tabstop: u64_at(m, "tabstop"),
+        cursor_screen_col: u64_at(m, "cursor_screen_col"),
+        number: map_get(m, "number")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        relativenumber: map_get(m, "relativenumber")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        number_width: u64_at(m, "number_width"),
     }
 }
 
@@ -455,6 +486,223 @@ async fn vsplit_file_opens_a_different_buffer_in_the_new_window() {
     assert!(frame.focused().file_name.contains("other"));
     // The original file is still the one the *other* window reads.
     let _ = lines(&rpc).await;
+}
+
+// ----- buffer-local options across windows ----------------------------------
+
+#[tokio::test]
+async fn two_windows_render_their_own_buffers_tabstop() {
+    // The cross-feature seam: `tabstop` is buffer-local, windows are many. A
+    // window must expand tabs and place its cursor with *its own* buffer's
+    // tabstop — including a non-focused window onto a differently-tabbed buffer.
+    // Each file is a single tab-led line so the cursor's screen column past the
+    // tab equals the buffer's tabstop exactly.
+    let wide = temp_file("wide", "\tA\n");
+    let narrow = temp_file("narrow", "\tB\n");
+    let (rpc, mut incoming) = start(Some(wide.clone())).await;
+
+    // Buffer `wide`: tabstop 8, cursor moved onto the 'A' (one tab = 8 cells).
+    feed(&rpc, ":set tabstop=8<CR>");
+    feed(&rpc, "l");
+    // `:vsplit narrow` opens the other buffer in a new (focused) window; the
+    // `wide` window stays open with its cursor stashed at screen column 8.
+    let _ = windows_after(&rpc, &mut incoming, &format!(":vsplit {narrow}<CR>")).await;
+    // Buffer `narrow`: tabstop 2 (set only here — buffer-local), cursor onto 'B'.
+    feed(&rpc, ":set tabstop=2<CR>");
+    let frame = windows_after(&rpc, &mut incoming, "l").await;
+
+    assert_eq!(frame.windows.len(), 2, "vsplit makes a second window");
+    let wide_win = frame
+        .windows
+        .iter()
+        .find(|w| w.file_name.contains("wide"))
+        .expect("a window shows the wide-tab buffer");
+    let narrow_win = frame
+        .windows
+        .iter()
+        .find(|w| w.file_name.contains("narrow"))
+        .expect("a window shows the narrow-tab buffer");
+
+    // Each window reports its own buffer's tabstop, not a single global one.
+    assert_eq!(wide_win.tabstop, 8, "wide window keeps tabstop=8");
+    assert_eq!(
+        narrow_win.tabstop, 2,
+        "narrow window honors its own tabstop=2"
+    );
+
+    // And that per-buffer tabstop actually drives the cursor's screen column:
+    // one leading tab places the cursor at column == tabstop in each window. The
+    // wide window is *not* focused here, proving stashed cursors use their own
+    // buffer's tabstop too.
+    assert!(
+        !wide_win.focused,
+        "focus is in the freshly-split narrow window"
+    );
+    assert!(narrow_win.focused);
+    assert_eq!(
+        wide_win.cursor_screen_col, 8,
+        "wide window's cursor sits one tabstop=8 in"
+    );
+    assert_eq!(
+        narrow_win.cursor_screen_col, 2,
+        "narrow window's cursor sits one tabstop=2 in"
+    );
+}
+
+#[tokio::test]
+async fn number_and_relativenumber_are_window_local() {
+    // `number` / `relativenumber` are window-local in vim: two splits onto the
+    // *same* buffer can show different number gutters. `:set` targets the focused
+    // window only, leaving the other window's gutter untouched.
+    let file = temp_file("nu", "alpha\nbeta\ngamma\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // `<C-w>v` splits the window; both halves start with the default hybrid
+    // gutter (number + relativenumber on).
+    let split = windows_after(&rpc, &mut incoming, "<C-w>v").await;
+    assert_eq!(split.windows.len(), 2);
+    assert!(
+        split.windows.iter().all(|w| w.number && w.relativenumber),
+        "both windows start with the default number gutter"
+    );
+
+    // Turn the gutter off in the focused (new, left) window only.
+    let frame = windows_after(&rpc, &mut incoming, ":set nonumber norelativenumber<CR>").await;
+    assert_eq!(frame.windows.len(), 2, "still two windows");
+
+    let off = frame.focused();
+    let on = frame
+        .windows
+        .iter()
+        .find(|w| !w.focused)
+        .expect("the other window");
+
+    // The focused window dropped its gutter; the other window kept it. A single
+    // global option would have flipped both — this is the window-local seam.
+    assert!(!off.number, "focused window's `number` is off");
+    assert!(
+        !off.relativenumber,
+        "focused window's `relativenumber` is off"
+    );
+    assert_eq!(
+        off.number_width, 0,
+        "focused window's gutter collapsed to width 0"
+    );
+    assert!(on.number, "the other window kept `number`");
+    assert!(on.relativenumber, "the other window kept `relativenumber`");
+    assert!(
+        on.number_width > 0,
+        "the other window kept a non-empty gutter"
+    );
+}
+
+#[tokio::test]
+async fn vim_wo_sets_the_focused_windows_gutter() {
+    // The Lua surface for window-local options: `vim.wo.number = false` reaches
+    // the live editor through a queued WindowOp, changing only the focused window.
+    let file = temp_file("wo", "one\ntwo\nthree\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    let split = windows_after(&rpc, &mut incoming, "<C-w>v").await;
+    assert_eq!(split.windows.len(), 2);
+    assert!(split.windows.iter().all(|w| w.number));
+
+    // Turn `number` off in the focused window from Lua.
+    let frame = windows_after(&rpc, &mut incoming, ":lua vim.wo.number = false<CR>").await;
+    let off = frame.focused();
+    let on = frame
+        .windows
+        .iter()
+        .find(|w| !w.focused)
+        .expect("the other window");
+    assert!(
+        !off.number,
+        "vim.wo.number=false turned off the focused gutter"
+    );
+    assert!(on.number, "the other window is untouched by vim.wo");
+}
+
+#[tokio::test]
+async fn vim_wo_by_window_id_targets_a_specific_window() {
+    // `vim.wo[win].number = false` must target the *named* window, even when it
+    // isn't focused — the per-id path the `:GutterDemo` example leans on.
+    let file = temp_file("woid", "one\ntwo\nthree\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    let split = windows_after(&rpc, &mut incoming, "<C-w>v").await;
+    assert_eq!(split.windows.len(), 2);
+
+    // `nvim_list_wins()` is layout order (left→right), matching the redraw's
+    // `windows` array; [2] is the right window, which the `<C-w>v` left unfocused.
+    let frame = windows_after(
+        &rpc,
+        &mut incoming,
+        ":lua vim.wo[vim.api.nvim_list_wins()[2]].number = false<CR>",
+    )
+    .await;
+    assert!(
+        frame.focused().number,
+        "the focused (left) window is untouched"
+    );
+    let other = frame.windows.iter().find(|w| !w.focused).unwrap();
+    assert!(
+        !other.number,
+        "the targeted-by-id (right) window lost its number gutter"
+    );
+}
+
+#[tokio::test]
+async fn nvim_open_win_then_vim_wo_on_the_new_window() {
+    // The `:GutterDemo` flow: open a split and immediately set its gutter via the
+    // *predicted* window id `nvim_open_win` returns — the SetOption op must resolve
+    // to the very window the Open op creates.
+    let file = temp_file("openwo", "one\ntwo\nthree\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    let frame = windows_after(
+        &rpc,
+        &mut incoming,
+        ":lua local f = vim.api.nvim_open_win(0, true, { vertical = true }); \
+         vim.wo[f].number = false; vim.wo[f].relativenumber = false<CR>",
+    )
+    .await;
+    assert_eq!(frame.windows.len(), 2, "nvim_open_win made a second window");
+    let fresh = frame.focused();
+    assert!(
+        !fresh.number,
+        "the new window's gutter was turned off by id"
+    );
+    assert!(!fresh.relativenumber);
+    let other = frame.windows.iter().find(|w| !w.focused).unwrap();
+    assert!(other.number, "the original window kept its gutter");
+}
+
+#[tokio::test]
+async fn window_local_options_example_runs() {
+    // End-to-end check that the shipped `examples/window-local-options/` config
+    // sources without error and its `:GutterDemo` gives the two windows different
+    // gutters from Lua — the example, exercised exactly as a user would run it.
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/window-local-options")
+        .canonicalize()
+        .expect("example dir exists");
+    let sample = example.join("sample.txt").display().to_string();
+    let (rpc, mut incoming) = start_with_config(Some(sample), Some(example)).await;
+
+    let frame = windows_after(&rpc, &mut incoming, ":GutterDemo<CR>").await;
+    assert_eq!(frame.windows.len(), 2, ":GutterDemo opened a split");
+    assert!(
+        !frame.message.contains("rror") && !frame.message.contains("E5113"),
+        "no error sourcing/running the example: {:?}",
+        frame.message
+    );
+    // The new (focused) window has no gutter; the original keeps the hybrid one.
+    let fresh = frame.focused();
+    assert!(!fresh.number && !fresh.relativenumber, "new window bare");
+    let other = frame.windows.iter().find(|w| !w.focused).unwrap();
+    assert!(
+        other.number && other.relativenumber,
+        "original window keeps hybrid numbers"
+    );
 }
 
 // ----- resizing -------------------------------------------------------------

@@ -237,10 +237,13 @@ resolved style (no colorscheme loaded), the client falls back to a small built-i
 theme, so default startup looks exactly as before. (See
 [*Syntax highlighting*](#syntax-highlighting-treesitter).)
 
-The same split governs the **number column**: the `View` carries the per-row
-1-based buffer line numbers (`numbers`, `None` for `~` filler rows), the
+The same split governs the **number column**: each `WindowView` carries the
+per-row 1-based buffer line numbers (`numbers`, `None` for `~` filler rows), the
 `number`/`relativenumber` option flags, and the gutter width (`number_width`,
-sized like vim's `numberwidth`). The core owns *what* each line's number is; the
+sized like vim's `numberwidth`). `number`/`relativenumber` are **window-local** —
+a `WindowOptions` lives on each window, set via `:set`/`:setlocal`/`vim.wo`, and a
+split inherits them from the window it splits off — so two windows onto the *same*
+buffer can show different gutters. The core owns *what* each line's number is; the
 client renders the gutter as its own ratatui widget — a horizontal split off the
 left of the text area — and decides *how* it looks, computing the relative
 offsets and the hybrid absolute-on-cursor-line formatting from that data. Text,
@@ -272,8 +275,8 @@ invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is
 The phantom final line is never displayed or edited.
 
 Motion steps by **grapheme cluster** and the cursor's display column is computed
-as a **virtual column** (wide characters via `unicode-width`, tabs expanded to a
-fixed `tabstop` of 8), carried in the `View` as `cursor_screen_col`. `cursor.col`
+as a **virtual column** (wide characters via `unicode-width`, tabs expanded to
+the buffer's `tabstop`), carried in the `View` as `cursor_screen_col`. `cursor.col`
 remains a byte offset (what `nvim_win_get_cursor` returns); the TUI expands tabs
 when painting so glyphs line up with that virtual column.
 
@@ -294,8 +297,19 @@ them. `nxvim-core`'s `Editor` separates the two concerns vim keeps apart:
   `BufferStore` keyed by a monotonic, 1-based `BufferId` that is never reused.
 - **Window state** (the "view"): the live cursor, scroll `top`, mode, and
   pending-input state stay on `Editor`, alongside `current` (the shown buffer)
-  and `alternate` (vim's `#`). The register and options are still **global** —
-  buffer-local options are a follow-up.
+  and `alternate` (vim's `#`). The register and the search options are still
+  **global**, but options come in three scopes, mirroring vim:
+  - The indentation options (`tabstop` / `shiftwidth` / `softtabstop` /
+    `expandtab`) are **buffer-local** — a `BufferOptions` lives on each `Buffer`,
+    set via `:set`/`:setlocal`/`vim.bo`, so two buffers can indent differently.
+    nxvim's defaults differ from vim's: `tabstop` is 4, and
+    `shiftwidth`/`softtabstop` follow it via their `0`/`-1` sentinels
+    (`softtabstop → shiftwidth → tabstop`), so one knob sets the indent width.
+  - The number-gutter options (`number` / `relativenumber`) are **window-local** —
+    a `WindowOptions` lives on each window, set via `:set`/`:setlocal`/`vim.wo`
+    (and `nvim_win_{get,set}_option` / scoped `nvim_{get,set}_option_value`), and
+    a split inherits them from the window it splits off, so two windows onto the
+    same buffer can show different gutters.
 
 `Editor::buffer()` / `buffer_mut()` resolve the current buffer through the
 store, so the editing code is oblivious to how many buffers are open. There is
@@ -361,13 +375,15 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.
 - **Shared per buffer.** Two windows onto one buffer share its `SyntaxState`,
   diagnostics, and undo — each just projects a different `(top, height)` slice.
-  The register, options, command line, message line, and panel stay **global**.
+  The register, command line, message line, and panel stay **global**; the
+  number-gutter options (`number` / `relativenumber`) are **window-local** (a
+  `WindowOptions` per window, set via `:set`/`:setlocal`/`vim.wo`).
 
 Still pending: **tab pages**, **floating windows** (`nvim_open_win` with
-`relative` — the seams are built to carry them), and **window-local options**
-(`wrap`, `cursorline`, …), the window analogue of the pending buffer-local
-options. The per-window status line is `laststatus=2`; the global/conditional
-`laststatus` modes are a small follow-up.
+`relative` — the seams are built to carry them), and **more window-local options**
+(`wrap`, `cursorline`, …) beyond the number gutter that already rides
+`WindowOptions`. The per-window status line is `laststatus=2`; the
+global/conditional `laststatus` modes are a small follow-up.
 
 ---
 
@@ -672,24 +688,32 @@ screen," and that is exactly the shape of these tests.
   'INCOMPLETE:'` for approximations, the `vim._notimpl` raises / runtime
   `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — tab pages and floating windows, the
-  `vim.treesitter` Lua API, buffer-local and window-local options not yet honored
-  by the core, a per-buffer command registry, and richer diagnostic surfaces. (The **synchronous prompts** `vim.fn.input` /
+  `vim.treesitter` Lua API, the bulk of vim's options beyond the handful nxvim
+  honors (window-local `number`/`relativenumber` and the buffer-local indentation
+  options are wired; `wrap`/`cursorline`/… are not), a per-buffer command
+  registry, and richer diagnostic surfaces. (The **synchronous prompts**
+  `vim.fn.input` /
   `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,
   or user command — runs its Lua inside a coroutine via `vim._pump`, so the prompt
   `coroutine.yield`s to park the chunk on the command line and the result resumes
   it inline. See `examples/sync-prompts/`.) Legacy Vimscript (`eval.c`) is **not**
   on the roadmap — see guiding principle 2.
-- A broad options surface. `:set` exists, but only `number`/`relativenumber`
-  (the line-number column) are honored so far, and options are still global —
-  **buffer-local options** are the next gap. Also mappings (`:map`), registers
-  beyond the unnamed register, search (`/`, `?`, `:s`), marks, folds, and macros.
+- A broad options surface. `:set` exists and honors the search booleans, the
+  **window-local** number-gutter options `number` / `relativenumber` (also via
+  `:setlocal` / `vim.wo` / `nvim_win_{get,set}_option`), and the **buffer-local**
+  indentation options `tabstop` / `shiftwidth` / `softtabstop` / `expandtab` (also
+  via `:setlocal` / `vim.bo`); scoped `nvim_{set,get}_option_value` routes to the
+  right scope. The bulk of vim's options are still missing.
+  Also mappings (`:map`), registers beyond the unnamed register, search (`/`, `?`,
+  `:s`), marks, folds, and macros.
 - **Per-buffer user commands.** User commands live in one global registry, so
   `nvim_buf_create_user_command(buffer, …)` currently registers *globally*
   (the buffer argument is ignored) — enough for an `on_attach` that defines a
   convenience command (e.g. rust_analyzer's `:LspCargoReload`) to load without
   error, but the command then exists everywhere rather than only in its buffer.
-  A per-buffer command registry (the command analogue of buffer-local options /
-  buffer-local keymaps, which `vim._keymaps` already scopes) is the fix.
+  A per-buffer command registry (the command analogue of the buffer-local
+  options on `Buffer` / buffer-local keymaps, which `vim._keymaps` already
+  scopes) is the fix.
 - **An async Lua runtime (event loop).** *Landed* (see
   [the async-runtime plan](plans/2026-06-06-async-lua-runtime.md)). A `Send` background actor
   (`crates/nxvim-server/src/evloop.rs`, modeled on `LspManager`) owns timers and

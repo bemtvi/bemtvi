@@ -146,7 +146,15 @@ impl Server {
             return;
         };
         let token = self.register_lsp_request(LspReqKind::Formatting);
-        self.lsp.request(key, token, LspRequest::Formatting { uri });
+        self.lsp.request(
+            key,
+            token,
+            LspRequest::Formatting {
+                uri,
+                tab_size: self.editor.tabstop() as u32,
+                insert_spaces: self.editor.buffer().options.expandtab,
+            },
+        );
     }
 
     /// `:LspRename {newname}` — request `textDocument/rename` at the cursor with

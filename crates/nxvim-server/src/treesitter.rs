@@ -222,14 +222,16 @@ impl Server {
                     let Some(spans) = spans_by_line.and_then(|m| m.get(&line_idx)) else {
                         return Value::Array(Vec::new());
                     };
-                    let Some(text) = buf.map(|b| b.line(line_idx)) else {
+                    let Some(b) = buf else {
                         return Value::Array(Vec::new());
                     };
+                    let text = b.line(line_idx);
+                    let ts = b.options.effective_tabstop();
                     let row = spans
                         .iter()
                         .map(|s| {
-                            let start = unicode::virtcol(&text, s.start, unicode::TABSTOP);
-                            let end = unicode::virtcol(&text, s.end, unicode::TABSTOP);
+                            let start = unicode::virtcol(&text, s.start, ts);
+                            let end = unicode::virtcol(&text, s.end, ts);
                             let style_id = match self.editor.highlights.resolve_capture(&s.group) {
                                 Some(style) => Value::from(styles.intern(style) as u64),
                                 None => Value::Nil,

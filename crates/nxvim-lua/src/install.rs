@@ -20,7 +20,9 @@ use crate::host::{
     create_dir_all_mode, find_executable, get_runtime_file, getftime, glob_paths, parse_mode,
     stdpath,
 };
-use crate::ops::{BufOp, ConfirmReq, HlSet, LoopOp, LspOp, PanelOp, UiInputReq, WindowOp};
+use crate::ops::{
+    BufOp, ConfirmReq, HlSet, LoopOp, LspOp, OptionValue, PanelOp, UiInputReq, WindowOp,
+};
 use crate::runtime::Shared;
 use crate::vimregex;
 
@@ -438,6 +440,31 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `vim._buf_set_option(bufnr, name, value)`: queue a [`BufOp::SetOption`] for
+    // the server to apply to the live editor's buffer (Phase 6). The prelude
+    // (`vim.bo` / `nvim_set_option_value`) has canonicalized `name` and updated
+    // its option mirror (write-through); a number value rides as `Number`, a
+    // boolean as `Bool`. Other Lua types are ignored (the option set is typed:
+    // tabstop/shiftwidth are numbers, expandtab a boolean).
+    let sh = shared.clone();
+    vim.set(
+        "_buf_set_option",
+        lua.create_function(move |_, (bufnr, name, value): (u64, String, mlua::Value)| {
+            let value = match value {
+                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
+                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                _ => None,
+            };
+            if let Some(value) = value {
+                sh.borrow_mut()
+                    .buf_ops
+                    .push(BufOp::SetOption { bufnr, name, value });
+            }
+            Ok(())
+        })?,
+    )?;
+
     // `vim._win_op(...)`: the window-mutation bridges (Phase 5). Each queues a
     // [`WindowOp`] the server drains into the live editor after the chunk; the
     // Lua-facing `vim.api.nvim_win_*` wrappers (prelude) have already updated the
@@ -489,6 +516,24 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut()
                 .window_ops
                 .push(WindowOp::SetHeight { win, height });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_win_set_option",
+        lua.create_function(move |_, (win, name, value): (u64, String, mlua::Value)| {
+            let value = match value {
+                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
+                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                _ => None,
+            };
+            if let Some(value) = value {
+                sh.borrow_mut()
+                    .window_ops
+                    .push(WindowOp::SetOption { win, name, value });
+            }
             Ok(())
         })?,
     )?;

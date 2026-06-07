@@ -384,6 +384,43 @@ impl Editor {
         self.open_panel("Messages", lines, false, last);
     }
 
+    /// `:registers` / `:reg` / `:display` — list the non-empty registers in the
+    /// bottom panel, mirroring vim's `Type Name Content` layout (a `c`/`l` type
+    /// column, `^J` for embedded newlines). An argument filters to the named
+    /// registers (`:reg ab0`). The read-only specials `"%` / `"/` / `":` are
+    /// projected from live editor state.
+    pub(crate) fn ex_registers(&mut self, args: &str) {
+        let filter: Vec<char> = args.chars().filter(|c| !c.is_whitespace()).collect();
+        let wanted = |name: char| filter.is_empty() || filter.contains(&name);
+
+        let mut lines = vec!["Type Name Content".to_string()];
+        // Stored registers in vim's order: unnamed, numbered, small-delete, named.
+        let order = std::iter::once('"')
+            .chain('0'..='9')
+            .chain(std::iter::once('-'))
+            .chain('a'..='z');
+        for name in order {
+            if !wanted(name) {
+                continue;
+            }
+            if let Some(cell) = self.registers.peek(name) {
+                lines.push(format_register_line(name, &cell.text, cell.kind));
+            }
+        }
+        // Read-only specials, resolved against live editor state.
+        for name in ['%', '/', ':'] {
+            if !wanted(name) {
+                continue;
+            }
+            if let Some((text, kind)) = self.register_text(Some(name)) {
+                if !text.is_empty() {
+                    lines.push(format_register_line(name, &text, kind));
+                }
+            }
+        }
+        self.open_panel("Registers", lines, false, 0);
+    }
+
     /// Resolve a `:buffer` / `:bdelete` argument to a buffer id: empty = current,
     /// `#` = alternate, a number = that buffer id, otherwise a file-name
     /// substring. Sets the appropriate `E86`/`E94`/`E93` message and returns
@@ -532,4 +569,13 @@ impl Editor {
                 .map(|(k, _)| *k)
         })
     }
+}
+
+/// One `:registers` row in vim's layout: a `c`/`l` type column, the `"name`,
+/// then the content with embedded newlines shown as `^J` (a trailing one for a
+/// linewise register, which keeps its closing `\n`).
+fn format_register_line(name: char, text: &str, kind: RegKind) -> String {
+    let ty = if kind == RegKind::Line { 'l' } else { 'c' };
+    let shown = text.replace('\n', "^J");
+    format!("  {ty}  \"{name}   {shown}")
 }

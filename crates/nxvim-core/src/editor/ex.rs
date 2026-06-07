@@ -285,6 +285,7 @@ impl Editor {
                 Err(e) => self.echo(e),
             },
             "mes" | "messages" | "message" => self.ex_messages(),
+            "reg" | "registers" | "di" | "dis" | "display" => self.ex_registers(args),
             "panelopen" | "panelo" => {
                 if !self.reopen_last_panel() {
                     self.echo("No panel to reopen");

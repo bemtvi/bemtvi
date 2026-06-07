@@ -26,6 +26,7 @@ mod motions;
 mod operators;
 mod options;
 mod panel;
+mod registers;
 mod search;
 mod syntax;
 mod tabs;
@@ -114,11 +115,7 @@ struct TabSlot {
     tree: Option<WindowTree>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct Register {
-    text: String,
-    linewise: bool,
-}
+pub(crate) use registers::{RegKind, Registers};
 
 /// What the command line is editing: an `:` ex command, a `/`,`?` search, or a
 /// scripted text prompt (`vim.ui.input`). One [`Mode::Command`] serves all three;
@@ -430,7 +427,7 @@ pub struct Editor {
     preserve_desired: bool,
     /// Per-key: the action just handled requests end-of-line stickiness (`$`).
     eol_request: bool,
-    register: Register,
+    registers: Registers,
 
     /// The accumulated, not-yet-complete normal/visual command — the count, the
     /// pending operator, and the [`Stage`] of the in-progress sequence. Decided
@@ -571,7 +568,7 @@ impl Editor {
             desired_eol: false,
             preserve_desired: false,
             eol_request: false,
-            register: Register::default(),
+            registers: Registers::default(),
             pending: PendingCommand::default(),
             last_find: None,
             snapshot_taken: false,

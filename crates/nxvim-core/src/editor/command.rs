@@ -288,6 +288,8 @@ pub(crate) enum Stage {
     TextObjectPending(char),
     /// Saw the `<C-w>` window prefix; the next key is the window command.
     WindowPending,
+    /// Saw `"`; the next key names the register for the coming yank/delete/paste.
+    RegisterPending,
 }
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
@@ -300,6 +302,10 @@ pub(crate) struct PendingCommand {
     pub(crate) op_count: Option<usize>,
     /// Pending operator (`d`/`c`/`y`) awaiting its motion / text object.
     pub(crate) operator: Option<char>,
+    /// Register selected by a leading `"x` for the next yank/delete/paste
+    /// (`"ayy`, `"_dd`, `"0p`). `None` ⇒ the unnamed register. Carried through
+    /// count/operator accumulation, cleared by [`Editor::reset_pending`].
+    pub(crate) register: Option<char>,
     /// What the next key continues; see [`Stage`].
     pub(crate) stage: Stage,
 }
@@ -338,6 +344,26 @@ enum ParseStep {
     /// An object/find key with no match: in visual keep the selection (and any
     /// count), else reset — mirroring the old find / text-object abort paths.
     AbortObject,
+}
+
+/// Valid `"x` register names so far: the named `a`–`z`/`A`–`Z`, the numbered
+/// `0`–`9`, the small-delete `-`, the black hole `_`, the unnamed `"`, and the
+/// read-only specials `%` (filename), `/` (last search), `:` (last command).
+/// The remaining specials — `.` (last insert), `=`, clipboard `+` `*`, and the
+/// alternate-file `#` — are rejected until their phases land, so selecting one
+/// is a loud dead-end, never a silent no-op.
+fn is_register_name(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':')
+}
+
+/// The registers vim refuses to *write* (yank/delete into): the last-search
+/// `/`, last-insert `.`, filename `%`, last-command `:`, expression `=`, and
+/// alternate-file `#`. They are readable (paste, `:registers`) but a yank/delete
+/// targeting one is aborted — vim beeps and does nothing (`register.c`
+/// `valid_yank_reg(.., writing=true)` → `beep_flush`). nxvim has no bell, so the
+/// abort is the whole of the signal.
+pub(crate) fn is_readonly_register(c: char) -> bool {
+    matches!(c, '/' | '.' | '%' | ':' | '=' | '#')
 }
 
 /// Map a key to its [`Motion`], or `None` if it is not a (g-free) motion key.
@@ -407,6 +433,19 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
                 None => Reset,
             };
         }
+        Stage::RegisterPending => {
+            // The next key names the register. An unsupported name is a loud
+            // dead-end (`Reset`), exactly like a missed find/text-object arg.
+            return match key.as_char() {
+                Some(name) if is_register_name(name) => {
+                    let mut next = pending.clone();
+                    next.register = Some(name);
+                    next.stage = Stage::Start;
+                    Prefix(next)
+                }
+                _ => Reset,
+            };
+        }
         Stage::Start | Stage::GPending => {}
         Stage::ReplacePending => unreachable!("handled above"),
     }
@@ -423,6 +462,15 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
     }
 
     let gpending = pending.stage == Stage::GPending;
+
+    // `"` selects the register for the next yank/delete/paste. It precedes the
+    // operator (vim: `"add`, never `d"a`), so only at a command boundary with no
+    // operator pending — and not mid-`g`.
+    if !gpending && pending.operator.is_none() && key.as_char() == Some('"') {
+        let mut next = pending.clone();
+        next.stage = Stage::RegisterPending;
+        return Prefix(next);
+    }
 
     // `g` prefix: a lone `g` arms it; a second `g` is `gg`; `gt`/`gT` cycle tabs.
     if gpending {
@@ -768,6 +816,20 @@ impl Editor {
     /// rather than a re-matched raw key.
     fn execute_normal(&mut self, cmd: NormalCmd) {
         let count = self.effective_count();
+        // The delete/change family writes a register; a read-only target aborts
+        // the whole command (including `C`/`s`'s insert) — vim beeps, no change.
+        if matches!(
+            cmd,
+            NormalCmd::DeleteUnder
+                | NormalCmd::DeleteBefore
+                | NormalCmd::DeleteToEol
+                | NormalCmd::ChangeToEol
+                | NormalCmd::SubstituteChar
+        ) && self.pending.register.is_some_and(is_readonly_register)
+        {
+            self.reset_pending();
+            return;
+        }
         match cmd {
             NormalCmd::InsertBefore => self.enter_insert_at(self.cursor.col),
             NormalCmd::InsertLineStart => {

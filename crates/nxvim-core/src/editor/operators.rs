@@ -1,6 +1,7 @@
 //! Operators (`d`/`c`/`y`/`>`/…) and the editing primitives they drive
 //! (delete/yank/paste/join/replace/case).
 
+use super::command::is_readonly_register;
 use super::*;
 use crate::mode::Mode;
 use crate::unicode;
@@ -43,6 +44,11 @@ impl Editor {
         if lo >= hi {
             return;
         }
+        // `d`/`y`/`c` write a register; a read-only target aborts the whole
+        // operator before any text is touched (vim beeps and does nothing).
+        if matches!(op, 'd' | 'y' | 'c') && self.register_write_blocked() {
+            return;
+        }
         match op {
             'y' => {
                 self.yank_range(lo, hi, linewise);
@@ -54,7 +60,7 @@ impl Editor {
                 self.clamp_cursor();
             }
             'd' => {
-                self.yank_range(lo, hi, linewise);
+                self.delete_yank_range(lo, hi, linewise);
                 self.delete_range(lo, hi);
                 if linewise {
                     self.settle_after_linewise_delete(first_line);
@@ -64,7 +70,7 @@ impl Editor {
                 self.clamp_cursor();
             }
             'c' => {
-                self.yank_range(lo, hi, linewise);
+                self.delete_yank_range(lo, hi, linewise);
                 if linewise {
                     self.linewise_change(lo, hi, first_line);
                 } else {
@@ -134,8 +140,19 @@ impl Editor {
             self.reset_pending();
             return;
         }
+        // A read-only register target aborts the operation; vim beeps and stays
+        // in visual mode with the selection intact.
+        if self.register_write_blocked() {
+            self.reset_pending();
+            return;
+        }
         self.push_undo();
-        self.yank_range(lo, hi, linewise);
+        // `y` records a yank; `d`/`c` record a delete (ring / small-delete).
+        if op == 'y' {
+            self.yank_range(lo, hi, linewise);
+        } else {
+            self.delete_yank_range(lo, hi, linewise);
+        }
         match op {
             'd' => {
                 self.delete_range(lo, hi);
@@ -190,15 +207,44 @@ impl Editor {
         }
     }
 
-    fn yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
+    /// Snap `[lo, hi)` and extract it as register-bound text + its kind, or
+    /// `None` when the range is empty.
+    fn slice_for_register(
+        &self,
+        lo: usize,
+        hi: usize,
+        linewise: bool,
+    ) -> Option<(String, RegKind)> {
         let (lo, hi) = self.snap_range(lo, hi);
         if lo >= hi {
-            return;
+            return None;
         }
-        self.register = Register {
-            text: self.buffer().text.slice(lo..hi).to_string(),
-            linewise,
+        let text = self.buffer().text.slice(lo..hi).to_string();
+        let kind = if linewise {
+            RegKind::Line
+        } else {
+            RegKind::Char
         };
+        Some((text, kind))
+    }
+
+    /// Yank `[lo, hi)` into the active register (the `"x` selection, or the
+    /// unnamed register when none is selected), routing through vim's yank rules.
+    fn yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
+        if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
+            let reg = self.pending.register;
+            self.registers.record_yank(reg, text, kind);
+        }
+    }
+
+    /// Capture `[lo, hi)` for a *delete* (or change): like `yank_range` but
+    /// routed through the delete rules (numbered ring / small-delete register).
+    /// Call this — never `yank_range` — before any operator that removes text.
+    fn delete_yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
+        if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
+            let reg = self.pending.register;
+            self.registers.record_delete(reg, text, kind);
+        }
     }
 
     /// Remove `[lo, hi)` bytes, recording undo and keeping the buffer invariant.
@@ -230,7 +276,7 @@ impl Editor {
         let lo = self.cursor_char();
         let line_end = self.buffer().byte_at(self.cursor.line, len);
         let (hi, _) = self.advance_graphemes(lo, count, line_end);
-        self.yank_range(lo, hi, false);
+        self.delete_yank_range(lo, hi, false);
         self.delete_range(lo, hi);
         self.clamp_cursor();
     }
@@ -242,7 +288,7 @@ impl Editor {
         let new_col = self.cursor.col.saturating_sub(count);
         let lo = self.buffer().byte_at(self.cursor.line, new_col);
         let hi = self.cursor_char();
-        self.yank_range(lo, hi, false);
+        self.delete_yank_range(lo, hi, false);
         self.delete_range(lo, hi);
         self.cursor.col = new_col;
         self.clamp_cursor();
@@ -253,7 +299,7 @@ impl Editor {
         let lo = self.cursor_char();
         let hi = self.buffer().byte_at(self.cursor.line, len);
         if lo < hi {
-            self.yank_range(lo, hi, false);
+            self.delete_yank_range(lo, hi, false);
             self.delete_range(lo, hi);
         }
         self.clamp_cursor();
@@ -356,19 +402,50 @@ impl Editor {
         self.snapshot_taken = true;
     }
 
-    pub(crate) fn paste(&mut self, after: bool, count: usize) {
-        if self.register.text.is_empty() {
-            return;
+    /// Resolve the active register's contents for a paste. Read-only specials
+    /// project from live editor state — `"%` the file name, `"/` the last search
+    /// pattern, `":` the last ex command — and every other name reads the stored
+    /// register file. `None` for an empty / absent register (paste does nothing).
+    pub(crate) fn register_text(&self, reg: Option<char>) -> Option<(String, RegKind)> {
+        match reg {
+            Some('%') => {
+                let name = self.buffer_name(self.cur_buffer())?;
+                (!name.is_empty()).then_some((name, RegKind::Char))
+            }
+            Some('/') => self
+                .last_search
+                .as_ref()
+                .map(|(pat, _, _)| (pat.clone(), RegKind::Char)),
+            Some(':') => self
+                .ex_history
+                .last()
+                .map(|cmd| (cmd.clone(), RegKind::Char)),
+            _ => self.registers.get(reg).map(|c| (c.text.clone(), c.kind)),
         }
+    }
+
+    /// Whether the active register refuses writes (a read-only special). A
+    /// yank/delete targeting one is aborted — vim beeps and changes nothing; with
+    /// no bell, the abort is the whole signal. See [`is_readonly_register`].
+    fn register_write_blocked(&self) -> bool {
+        self.pending.register.is_some_and(is_readonly_register)
+    }
+
+    pub(crate) fn paste(&mut self, after: bool, count: usize) {
+        let reg = self.pending.register;
+        let (text, linewise) = match self.register_text(reg) {
+            Some((text, kind)) if !text.is_empty() => (text, kind == RegKind::Line),
+            _ => return,
+        };
         self.push_undo();
-        if self.register.linewise {
+        if linewise {
             let at = if after {
                 self.buffer()
                     .line_start((self.cursor.line + 1).min(self.buffer().line_count()))
             } else {
                 self.buffer().line_start(self.cursor.line)
             };
-            let chunk = self.register.text.repeat(count);
+            let chunk = text.repeat(count);
             self.buffer_mut().insert(at, &chunk);
             self.buffer_mut().normalize();
             self.cursor.line = if after {
@@ -388,7 +465,7 @@ impl Editor {
             } else {
                 cur
             };
-            let chunk = self.register.text.repeat(count);
+            let chunk = text.repeat(count);
             // Byte length of the chunk's final grapheme, so the cursor lands on
             // it (not on a trailing combining mark) — vim leaves it on the last
             // pasted character.

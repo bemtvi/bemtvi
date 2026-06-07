@@ -556,6 +556,94 @@ async fn screen_column_expands_tabs_to_the_next_tabstop() {
     assert_eq!(view_u64(&view, "cursor_screen_col"), 4);
 }
 
+/// With `nowrap` (nxvim's only text-window mode today), a cursor driven past the
+/// window's text width scrolls the viewport horizontally (`leftcol`) to keep the
+/// cursor on screen, and scrolls all the way back at column 0 — vim's `w_leftcol`.
+#[tokio::test]
+async fn nowrap_scrolls_horizontally_to_keep_cursor_visible() {
+    let (rpc, mut incoming) = start(None).await;
+    // A line far wider than the 80-column window.
+    feed(&rpc, "i");
+    feed(&rpc, &"abcdefghij".repeat(20)); // 200 columns
+
+    // At column 0 the window is not horizontally scrolled.
+    let at_start = redraw_after(&rpc, &mut incoming, "<Esc>0").await;
+    assert_eq!(view_u64(&at_start, "leftcol"), 0);
+    let text_width = 80 - view_u64(&at_start, "number_width");
+
+    // Jumping to end-of-line scrolls the viewport right to keep the cursor visible.
+    let at_end = redraw_after(&rpc, &mut incoming, "$").await;
+    let leftcol = view_u64(&at_end, "leftcol");
+    let csc = view_u64(&at_end, "cursor_screen_col");
+    assert!(leftcol > 0, "leftcol must advance for an off-screen cursor");
+    assert!(
+        csc >= leftcol && csc - leftcol < text_width,
+        "cursor (screen col {csc}) must be visible within [{leftcol}, {leftcol}+{text_width})"
+    );
+
+    // Returning to column 0 scrolls the viewport all the way back.
+    let back = redraw_after(&rpc, &mut incoming, "0").await;
+    assert_eq!(view_u64(&back, "leftcol"), 0);
+}
+
+/// `sidescrolloff` keeps a margin of columns between the cursor and the window
+/// edge while horizontally scrolling, mirroring vim's option.
+#[tokio::test]
+async fn sidescrolloff_keeps_a_margin_to_the_right_of_the_cursor() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "i");
+    feed(&rpc, &"abcdefghij".repeat(20)); // 200 columns
+    feed(&rpc, "<Esc>:set sidescrolloff=8<CR>0");
+
+    // Land the cursor mid-line, well past the right edge, scrolling right.
+    let map = redraw_after(&rpc, &mut incoming, "120l").await;
+    let leftcol = view_u64(&map, "leftcol");
+    let csc = view_u64(&map, "cursor_screen_col");
+    let text_width = 80 - view_u64(&map, "number_width");
+    assert!(
+        csc >= leftcol && csc - leftcol < text_width,
+        "cursor must be visible"
+    );
+    // There is text beyond the cursor, so the 8-column right margin is preserved.
+    let right_margin = text_width - (csc - leftcol) - 1;
+    assert_eq!(
+        right_margin, 8,
+        "sidescrolloff keeps 8 columns right of the cursor"
+    );
+}
+
+/// The horizontal-scroll options are queryable via `:set ss?` and settable via
+/// `:set ss=N`, like any number option.
+#[tokio::test]
+async fn set_sidescroll_query_echoes_the_value() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":set sidescroll?<CR>").await;
+    assert_eq!(view_str(&map, "message"), "sidescroll=1");
+    let map = redraw_after(&rpc, &mut incoming, ":set sidescroll=5<CR>:set ss?<CR>").await;
+    assert_eq!(view_str(&map, "message"), "sidescroll=5");
+}
+
+/// The shipped `examples/horizontal-scroll/` config sources cleanly and actually
+/// configures the editor (not just "loads"): its `:set sidescrolloff=8` takes
+/// effect, observable through `:set siso?`.
+#[tokio::test]
+async fn horizontal_scroll_example_config_runs() {
+    let dir = temp_dir("hscroll-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/horizontal-scroll/init.lua"
+    ))
+    .expect("read example init.lua");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
+
+    // The example's `vim.cmd("set sidescrolloff=8")` reached the core.
+    let map = redraw_after(&rpc, &mut incoming, ":set siso?<CR>").await;
+    assert_eq!(view_str(&map, "message"), "sidescrolloff=8");
+}
+
 #[tokio::test]
 async fn charwise_visual_highlights_the_selected_columns() {
     let (rpc, mut incoming) = start(None).await;

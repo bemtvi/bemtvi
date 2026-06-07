@@ -407,11 +407,21 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   number-gutter options (`number` / `relativenumber`) are **window-local** (a
   `WindowOptions` per window, set via `:set`/`:setlocal`/`vim.wo`).
 
+**Horizontal scrolling** rides `WindowOptions` too: each window tracks a
+`leftcol` (the first visible screen column, the horizontal analog of the vertical
+`top`) and, under `nowrap`, scrolls sideways to keep the cursor visible — governed
+by the window-local `sidescroll` / `sidescrolloff`. The core decides `leftcol`
+(`ensure_visible_horizontal`, called on the same beat as the vertical
+`ensure_visible`); the client paints from that offset, leaving the number gutter
+fixed. (Design: [`docs/plans/2026-06-07-horizontal-scrolling-and-wrap.md`](plans/2026-06-07-horizontal-scrolling-and-wrap.md).)
+
 Still pending: **tab pages**, the rest of the **floating-windows** surface
 (`nvim_win_set_config` and the float edge semantics — see the floats bullet
-above), and **more window-local options** (`wrap`, `cursorline`, …) beyond the
-number gutter that already rides `WindowOptions`. The per-window status line is
-`laststatus=2`; the global/conditional `laststatus` modes are a small follow-up.
+above), **line wrapping** (`wrap` — the display-row projection; Phase 2 of the
+horizontal-scroll plan), and **more window-local options** (`cursorline`, …)
+beyond the number gutter and the scroll options that already ride `WindowOptions`.
+The per-window status line is `laststatus=2`; the global/conditional `laststatus`
+modes are a small follow-up.
 
 ---
 
@@ -717,8 +727,9 @@ screen," and that is exactly the shape of these tests.
   `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — tab pages and floating windows, the
   `vim.treesitter` Lua API, the bulk of vim's options beyond the handful nxvim
-  honors (window-local `number`/`relativenumber` and the buffer-local indentation
-  options are wired; `wrap`/`cursorline`/… are not), a per-buffer command
+  honors (window-local `number`/`relativenumber` + the horizontal-scroll
+  `sidescroll`/`sidescrolloff` and the buffer-local indentation options are wired;
+  `wrap`/`cursorline`/… are not), a per-buffer command
   registry, and richer diagnostic surfaces. (The **synchronous prompts**
   `vim.fn.input` /
   `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,
@@ -728,10 +739,12 @@ screen," and that is exactly the shape of these tests.
   on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
   **window-local** number-gutter options `number` / `relativenumber` (also via
-  `:setlocal` / `vim.wo` / `nvim_win_{get,set}_option`), and the **buffer-local**
-  indentation options `tabstop` / `shiftwidth` / `softtabstop` / `expandtab` (also
-  via `:setlocal` / `vim.bo`); scoped `nvim_{set,get}_option_value` routes to the
-  right scope. The bulk of vim's options are still missing.
+  `:setlocal` / `vim.wo` / `nvim_win_{get,set}_option`) and the window-local
+  horizontal-scroll options `sidescroll` / `sidescrolloff` (via `:set`), and the
+  **buffer-local** indentation options `tabstop` / `shiftwidth` / `softtabstop` /
+  `expandtab` (also via `:setlocal` / `vim.bo`); scoped
+  `nvim_{set,get}_option_value` routes to the right scope. The bulk of vim's
+  options are still missing.
   Also mappings (`:map`), registers beyond the unnamed register, search (`/`, `?`,
   `:s`), marks, folds, and macros.
 - **Per-buffer user commands.** User commands live in one global registry, so

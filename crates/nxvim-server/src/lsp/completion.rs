@@ -359,9 +359,12 @@ impl Server {
         }
         let (arow, acol) = menu.anchor;
         let line = self.editor.buffer().line(arow);
-        let anchor_col = unicode::virtcol(&line, acol, self.editor.tabstop());
-        // The popup anchors in the focused window's text body.
+        // The popup anchors in the focused window's text body. Under a horizontal
+        // scroll the client paints text at `screen_col - leftcol`, so the anchor
+        // shifts left by `leftcol` to stay under the (scrolled) completion word.
         let focused = view.focused();
+        let anchor_col =
+            unicode::virtcol(&line, acol, self.editor.tabstop()).saturating_sub(focused.leftcol);
         let cursor_row = focused.cursor_row;
         let text_height = focused.lines.len();
 

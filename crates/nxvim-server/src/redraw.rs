@@ -136,6 +136,7 @@ impl Server {
                 Value::from("cursor_screen_col"),
                 Value::from(win.cursor_screen_col as u64),
             ),
+            (Value::from("leftcol"), Value::from(win.leftcol as u64)),
             (
                 Value::from("file_name"),
                 Value::from(win.file_name.as_str()),

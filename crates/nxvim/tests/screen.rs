@@ -202,6 +202,33 @@ async fn wide_chars_align_on_screen() {
 }
 
 #[tokio::test]
+async fn long_line_scrolls_horizontally_on_screen() {
+    let (rpc, mut incoming) = start(None).await;
+    // A line wider than the 80-column window: a unique 'Z' at the far left, a
+    // unique 'Q' at the far right, filler between.
+    let line = format!("Z{}Q", "abcdefgh".repeat(12)); // 1 + 96 + 1 = 98 columns
+    feed(&rpc, "i");
+    feed(&rpc, &line);
+    feed(&rpc, "<Esc>$"); // cursor on the trailing 'Q', off the right edge
+    let buf = screen(&rpc, &mut incoming).await;
+
+    let row = row_text(&buf, 0);
+    // The viewport scrolled right to keep the cursor visible: the leading 'Z' is
+    // no longer painted, while the trailing 'Q' (under the cursor) is. (`leftcol`
+    // is sticky, vim-style — it was set while typing past the edge and isn't
+    // re-minimized when the cursor stays on screen — so 'Q' need not sit on the
+    // very last cell.)
+    assert!(!row.contains('Z'), "leading column scrolled off: {row:?}");
+    assert!(
+        row.contains('Q'),
+        "trailing cursor char stays visible: {row:?}"
+    );
+    // The number gutter is untouched by horizontal scroll: the cursor line still
+    // shows its absolute line number at the far left.
+    assert!(row.starts_with("1 "), "gutter intact: {row:?}");
+}
+
+#[tokio::test]
 async fn editor_keeps_processing_when_the_ui_never_drains_redraws() {
     // Never drain `incoming` — the client-side application never consumes the
     // delivered redraws. The server's writer runs as its own task on an

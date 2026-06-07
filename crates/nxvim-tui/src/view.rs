@@ -29,6 +29,10 @@ pub(crate) struct WindowView {
     pub(crate) cursor_row: u16,
     pub(crate) cursor_col: u16,
     pub(crate) cursor_screen_col: u16,
+    /// First visible screen column (horizontal scroll offset) under `nowrap`. The
+    /// renderer drops this many leading screen cells from each text row and shifts
+    /// the cursor and every span left by it; the number gutter is not offset.
+    pub(crate) leftcol: u16,
     pub(crate) file_name: String,
     pub(crate) modified: bool,
     pub(crate) cursor_line: usize,
@@ -313,6 +317,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         cursor_row: map_u16(m, "cursor_row"),
         cursor_col: map_u16(m, "cursor_col"),
         cursor_screen_col: map_u16(m, "cursor_screen_col"),
+        leftcol: map_u16(m, "leftcol"),
         file_name: map_str(m, "file_name"),
         modified: map_get(m, "modified")
             .and_then(Value::as_bool)

@@ -95,6 +95,9 @@ struct Win {
     /// values.
     tabstop: u64,
     cursor_screen_col: u64,
+    /// This window's horizontal scroll offset (screen columns), per-window like the
+    /// vertical scroll — a focused float scrolls within its own content width.
+    leftcol: u64,
     /// This window's window-local number-gutter options and the resulting gutter
     /// width — per-window, so two windows onto the same buffer can show different
     /// line-number columns.
@@ -184,6 +187,7 @@ fn parse_window(value: &Value) -> Win {
         rect: parse_rect(map_get(m, "rect")),
         tabstop: u64_at(m, "tabstop"),
         cursor_screen_col: u64_at(m, "cursor_screen_col"),
+        leftcol: u64_at(m, "leftcol"),
         number: map_get(m, "number")
             .and_then(Value::as_bool)
             .unwrap_or(false),
@@ -1526,5 +1530,49 @@ async fn lua_nvim_open_win_rejects_unsupported_border() {
         frame.message.contains("border") && frame.message.contains("not supported"),
         "the unsupported border is reported loudly: {:?}",
         frame.message
+    );
+}
+
+/// A focused floating window scrolls horizontally within its own content width,
+/// just like a tiled window — the per-window `leftcol` and the bordered float's
+/// inset both feed the cursor-visibility math.
+#[tokio::test]
+async fn focused_bordered_float_scrolls_within_its_inset_width() {
+    let (rpc, mut incoming) = start(None).await;
+    // A line far wider than any float, in the buffer the float will show.
+    feed(&rpc, "i");
+    feed(&rpc, &"abcdefghij".repeat(20)); // 200 columns
+    feed(&rpc, "<Esc>");
+
+    // A focused, bordered float onto the same buffer (0).
+    let _float = open_float(
+        &rpc,
+        true, // take focus
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(24u64)),
+            ("height", Value::from(6u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await;
+
+    // Jump to end-of-line inside the float; it scrolls horizontally within its
+    // bordered content width to keep the cursor visible.
+    let frame = windows_after(&rpc, &mut incoming, "$").await;
+    let win = frame.focused();
+    assert!(
+        win.rect.width <= 30,
+        "the focused window is the float, not the full-width tiled window"
+    );
+    // A single border spends one cell on each side; the gutter takes the rest.
+    let text_width = win.rect.width - 2 - win.number_width;
+    assert!(win.leftcol > 0, "the float scrolled horizontally");
+    assert!(
+        win.cursor_screen_col >= win.leftcol && win.cursor_screen_col - win.leftcol < text_width,
+        "cursor (screen col {}) visible within the float's content width {text_width}",
+        win.cursor_screen_col
     );
 }

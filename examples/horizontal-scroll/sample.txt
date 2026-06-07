@@ -1,0 +1,13 @@
+Horizontal scrolling demo — the lines below are deliberately wider than your window.
+
+Move the cursor right along this very long line with l, w, e, or f<char>, and jump to the far end with $; the viewport slides left to keep the cursor visible while the number gutter on the left stays put, then press 0 to scroll all the way back home.
+
+01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890 <- a column ruler: each digit marks a screen column, so you can watch leftcol advance as you move along it toward the 9...
+
+Short line — nothing to scroll here.
+
+This second long line is here so you can scroll one line, move down with j to a line at a different length, and watch leftcol follow the cursor independently per motion rather than snapping back: aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggggggggg hhhhhhhhhh iiiiiiiiii jjjjjjjjjj END
+
+Try :set sidescrolloff=10 then move around — the cursor now keeps a 10-column margin from each edge so you always see context ahead of it. Then :set ss=0 to recenter the cursor whenever it falls off an edge instead of nudging it to the border.
+
+Another short line.

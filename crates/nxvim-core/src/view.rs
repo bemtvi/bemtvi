@@ -112,6 +112,11 @@ pub struct WindowView {
     pub lines: Vec<String>,
     /// Cursor row relative to the top of this window's text body.
     pub cursor_row: usize,
+    /// First visible screen column (horizontal scroll offset) under `nowrap`. `0`
+    /// unless a long line scrolled the viewport right. The client drops this many
+    /// leading screen cells from each row and shifts the cursor and every span
+    /// left by it; the number gutter is *not* offset.
+    pub leftcol: usize,
     /// Cursor byte/column offset within its line (for the ruler and
     /// `nvim_win_get_cursor`).
     pub cursor_col: usize,
@@ -324,6 +329,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         focused: w.focused,
         lines,
         cursor_row: cur_line.saturating_sub(top).min(height.saturating_sub(1)),
+        leftcol: w.leftcol,
         cursor_col: w.cursor.col,
         cursor_screen_col,
         file_name,

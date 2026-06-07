@@ -52,6 +52,14 @@ pub struct WindowOptions {
     /// [`WindowOptions::number`] this gives vim's "hybrid" gutter: the absolute
     /// number on the cursor line, relative numbers elsewhere.
     pub relativenumber: bool,
+    /// Minimum number of columns to scroll horizontally when the cursor moves off
+    /// a `nowrap` window's edge (vim's `sidescroll`). `0` recenters the cursor;
+    /// `1` (the default) scrolls just enough to keep it at the edge.
+    pub sidescroll: usize,
+    /// Minimum number of columns to keep between the cursor and the left/right
+    /// edge while horizontally scrolling (vim's `sidescrolloff`). `0` by default —
+    /// the cursor may sit on the very edge.
+    pub sidescrolloff: usize,
 }
 
 impl Default for WindowOptions {
@@ -62,6 +70,9 @@ impl Default for WindowOptions {
         WindowOptions {
             number: true,
             relativenumber: true,
+            // neovim's horizontal-scroll defaults: scroll a minimal step, no margin.
+            sidescroll: 1,
+            sidescrolloff: 0,
         }
     }
 }
@@ -279,6 +290,8 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "shiftwidth" | "sw" => Some(("shiftwidth", Num)),
         "softtabstop" | "sts" => Some(("softtabstop", Num)),
         "expandtab" | "et" => Some(("expandtab", Bool)),
+        "sidescroll" | "ss" => Some(("sidescroll", Num)),
+        "sidescrolloff" | "siso" => Some(("sidescrolloff", Num)),
         _ => None,
     }
 }

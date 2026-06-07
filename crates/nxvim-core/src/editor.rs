@@ -248,9 +248,10 @@ struct OpenBuffer {
     next_seq: u64,
     /// Window position saved when this buffer stops being current; restored on
     /// switch-back. Meaningless while the buffer *is* current — the live position
-    /// is then [`Editor::cursor`] / `Editor::top`.
+    /// is then [`Editor::cursor`] / `Editor::top` / `Editor::leftcol`.
     saved_cursor: Cursor,
     saved_top: usize,
+    saved_leftcol: usize,
 }
 
 impl OpenBuffer {
@@ -265,6 +266,7 @@ impl OpenBuffer {
             next_seq: 1,
             saved_cursor: Cursor::default(),
             saved_top: 0,
+            saved_leftcol: 0,
         }
     }
 }
@@ -429,6 +431,7 @@ struct Window {
     buffer: BufferId,
     saved_cursor: Cursor,
     saved_top: usize,
+    saved_leftcol: usize,
     rect: Rect,
     /// Window-local options (the number gutter). A split inherits these from the
     /// window it was split off, mirroring vim.
@@ -505,6 +508,7 @@ impl WindowTree {
                 buffer,
                 saved_cursor: Cursor::default(),
                 saved_top: 0,
+                saved_leftcol: 0,
                 rect: Rect::default(),
                 options: WindowOptions::default(),
                 float: None,
@@ -982,6 +986,9 @@ pub(crate) struct WindowLayout {
     pub(crate) buffer: BufferId,
     pub(crate) cursor: Cursor,
     pub(crate) top: usize,
+    /// First visible screen column (horizontal scroll offset). `0` unless a long
+    /// line under `nowrap` has scrolled the viewport right.
+    pub(crate) leftcol: usize,
     pub(crate) rect: Rect,
     pub(crate) focused: bool,
     /// This window's window-local options (the number gutter), so the projection
@@ -1768,6 +1775,11 @@ pub struct Editor {
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
     pub top: usize,
+    /// First visible screen column (horizontal scroll offset) of the focused
+    /// window, under `nowrap`. `0` until a long line scrolls the viewport right;
+    /// non-focused windows stash theirs in [`Window::saved_leftcol`]. Mirrors
+    /// [`Editor::top`].
+    pub leftcol: usize,
     /// Command-line contents (text after the leading `:` / `/` / `?`).
     pub cmdline: String,
     /// Cursor position within [`Editor::cmdline`], as a byte offset in `0..=len`
@@ -1944,6 +1956,7 @@ impl Editor {
             mode: Mode::Normal,
             cursor: Cursor::default(),
             top: 0,
+            leftcol: 0,
             cmdline: String::new(),
             cmdline_col: 0,
             cmdline_kind: CmdlineKind::Ex,
@@ -2143,11 +2156,12 @@ impl Editor {
             return;
         }
         // Stash the outgoing position with its buffer; it becomes the alternate.
-        let (cursor, top) = (self.cursor, self.top);
+        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
         let outgoing = self.cur_buffer();
         let out = self.buffers.get_mut(outgoing);
         out.saved_cursor = cursor;
         out.saved_top = top;
+        out.saved_leftcol = leftcol;
         self.alternate = Some(outgoing);
 
         self.enter_buffer(id);
@@ -2160,10 +2174,15 @@ impl Editor {
     /// when `:bdelete` removes the current one).
     fn enter_buffer(&mut self, id: BufferId) {
         let incoming = self.buffers.get(id);
-        let (saved_cursor, saved_top) = (incoming.saved_cursor, incoming.saved_top);
+        let (saved_cursor, saved_top, saved_leftcol) = (
+            incoming.saved_cursor,
+            incoming.saved_top,
+            incoming.saved_leftcol,
+        );
         self.set_cur_buffer(id);
         self.cursor = saved_cursor;
         self.top = saved_top;
+        self.leftcol = saved_leftcol;
         self.mode = Mode::Normal;
         self.reset_pending();
         self.scroll_from = None;
@@ -2394,6 +2413,7 @@ impl Editor {
                 buffer: buf,
                 saved_cursor: Cursor::default(),
                 saved_top: 0,
+                saved_leftcol: 0,
                 rect: Rect::default(),
                 options,
                 float: Some(config),
@@ -2437,6 +2457,11 @@ impl Editor {
                 buffer: w.buffer,
                 cursor: if focused { self.cursor } else { w.saved_cursor },
                 top: if focused { self.top } else { w.saved_top },
+                leftcol: if focused {
+                    self.leftcol
+                } else {
+                    w.saved_leftcol
+                },
                 rect: w.rect,
                 focused,
                 options: w.options,
@@ -2468,6 +2493,7 @@ impl Editor {
     fn split(&mut self, dir: SplitDir) {
         let cursor = self.cursor;
         let top = self.top;
+        let leftcol = self.leftcol;
         let cur = self.windows.current;
         // Stash the live position into the outgoing window so the old (bottom /
         // right) sibling keeps its view; seed the new window from the same spot.
@@ -2475,6 +2501,7 @@ impl Editor {
             let w = self.windows.get_mut(cur);
             w.saved_cursor = cursor;
             w.saved_top = top;
+            w.saved_leftcol = leftcol;
         }
         let buffer = self.windows.get(cur).buffer;
         // A split inherits the source window's window-local options, as vim does.
@@ -2486,6 +2513,7 @@ impl Editor {
                 buffer,
                 saved_cursor: cursor,
                 saved_top: top,
+                saved_leftcol: leftcol,
                 rect: Rect::default(),
                 options,
                 float: None,
@@ -2678,11 +2706,13 @@ impl Editor {
         }
         let cursor = self.cursor;
         let top = self.top;
+        let leftcol = self.leftcol;
         let out = self.windows.current;
         {
             let w = self.windows.get_mut(out);
             w.saved_cursor = cursor;
             w.saved_top = top;
+            w.saved_leftcol = leftcol;
         }
         self.enter_window(id);
     }
@@ -2696,10 +2726,12 @@ impl Editor {
     fn enter_window(&mut self, id: WindowId) {
         self.windows.current = id;
         let w = self.windows.get(id);
-        let (buffer, cursor, top) = (w.buffer, w.saved_cursor, w.saved_top);
+        let (buffer, cursor, top, leftcol) =
+            (w.buffer, w.saved_cursor, w.saved_top, w.saved_leftcol);
         self.set_cur_buffer(buffer);
         self.cursor = cursor;
         self.top = top;
+        self.leftcol = leftcol;
         self.mode = Mode::Normal;
         self.reset_pending();
         self.scroll_from = None;
@@ -2740,6 +2772,7 @@ impl Editor {
             Ok(buf) => {
                 self.cursor = Cursor::default();
                 self.top = 0;
+                self.leftcol = 0;
                 let ob = self.cur_mut();
                 ob.buffer = buf;
                 ob.undo_stack.clear();
@@ -3074,6 +3107,23 @@ impl Editor {
         // excluded from the window rect by `relayout`, so it is not subtracted
         // again here.
         self.windows.cur().rect.height.saturating_sub(1).max(1)
+    }
+
+    /// The focused window's text-area width in screen cells: its rect width minus
+    /// a bordered float's one-cell inset (on each side) and the number gutter. The
+    /// horizontal analog of [`text_height`], feeding the `leftcol` scroll math.
+    /// Matches the `width` `view::window_view` projects, so on-screen and policy
+    /// agree.
+    pub(crate) fn text_width(&self) -> usize {
+        let w = self.windows.cur();
+        let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
+        let options = w.options;
+        let rect_width = w.rect.width;
+        let line_count = self.buffer().line_count();
+        let number_width = self.number_width_for(options, line_count);
+        rect_width
+            .saturating_sub(2 * inset)
+            .saturating_sub(number_width)
     }
 
     // ----- normal / visual mode --------------------------------------------
@@ -5890,6 +5940,7 @@ impl Editor {
             self.alternate = None;
             self.cursor = Cursor::default();
             self.top = 0;
+            self.leftcol = 0;
             self.mode = Mode::Normal;
             self.reset_pending();
             self.scroll_from = None;
@@ -6309,16 +6360,18 @@ impl Editor {
         }
     }
 
-    /// Apply one resolved number `:set` operation to a buffer-local option
-    /// (`tabstop` / `shiftwidth` / `softtabstop`), which lives on the current
-    /// buffer. The assigned value is range-checked per option (vim's `E487`):
-    /// `tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`.
+    /// Apply one resolved number `:set` operation. The indentation options
+    /// (`tabstop` / `shiftwidth` / `softtabstop`) are buffer-local; the horizontal-
+    /// scroll governors (`sidescroll` / `sidescrolloff`) are window-local (they live
+    /// on the focused window). The assigned value is range-checked per option (vim's
+    /// `E487`): `tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`, the scroll
+    /// options `≥ 0`.
     fn apply_set_num(&mut self, name: &str, op: NumOp) {
         match op {
             NumOp::Set(v) => {
                 let min = match name {
                     "tabstop" => 1,
-                    "shiftwidth" => 0,
+                    "shiftwidth" | "sidescroll" | "sidescrolloff" => 0,
                     "softtabstop" => -1,
                     _ => return,
                 };
@@ -6326,21 +6379,33 @@ impl Editor {
                     self.echo(format!("E487: Argument must be positive: {name}={v}"));
                     return;
                 }
-                let opts = &mut self.buffer_mut().options;
                 match name {
-                    "tabstop" => opts.tabstop = v as usize,
-                    "shiftwidth" => opts.shiftwidth = v as usize,
-                    "softtabstop" => opts.softtabstop = v as isize,
-                    _ => {}
+                    "sidescroll" => self.windows.cur_mut().options.sidescroll = v as usize,
+                    "sidescrolloff" => self.windows.cur_mut().options.sidescrolloff = v as usize,
+                    _ => {
+                        let opts = &mut self.buffer_mut().options;
+                        match name {
+                            "tabstop" => opts.tabstop = v as usize,
+                            "shiftwidth" => opts.shiftwidth = v as usize,
+                            "softtabstop" => opts.softtabstop = v as isize,
+                            _ => {}
+                        }
+                    }
                 }
             }
             NumOp::Query => {
-                let opts = &self.buffer().options;
                 let v: i64 = match name {
-                    "tabstop" => opts.tabstop as i64,
-                    "shiftwidth" => opts.shiftwidth as i64,
-                    "softtabstop" => opts.softtabstop as i64,
-                    _ => return,
+                    "sidescroll" => self.windows.cur().options.sidescroll as i64,
+                    "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
+                    _ => {
+                        let opts = &self.buffer().options;
+                        match name {
+                            "tabstop" => opts.tabstop as i64,
+                            "shiftwidth" => opts.shiftwidth as i64,
+                            "softtabstop" => opts.softtabstop as i64,
+                            _ => return,
+                        }
+                    }
                 };
                 self.echo(format!("{name}={v}"));
             }
@@ -6638,6 +6703,46 @@ impl Editor {
             self.top = self.cursor.line;
         } else if self.cursor.line >= self.top + th {
             self.top = self.cursor.line + 1 - th;
+        }
+        // Horizontal scroll follows the cursor on the same beat as the vertical
+        // one, so every motion that calls `ensure_visible` also keeps the cursor's
+        // column on screen under `nowrap`.
+        self.ensure_visible_horizontal();
+    }
+
+    /// Keep the cursor's screen column within the focused window's text area by
+    /// adjusting [`Editor::leftcol`] — the horizontal analog of [`ensure_visible`]
+    /// (vim's `nowrap` `w_leftcol`). Honors `sidescroll` (the scroll step: `0`
+    /// recenters the cursor, `> 0` scrolls just enough to bring it to the edge) and
+    /// `sidescrolloff` (the margin kept between the cursor and the edge). A no-op
+    /// for a degenerate (zero-width) text area.
+    fn ensure_visible_horizontal(&mut self) {
+        let tw = self.text_width();
+        if tw == 0 {
+            return;
+        }
+        let opts = self.windows.cur().options;
+        // The margin can't claim more than half the window, or the left and right
+        // bounds would cross.
+        let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);
+        let recenter = opts.sidescroll == 0;
+        let vc = self.cursor_virtcol();
+        let left = self.leftcol;
+
+        if vc < left + so {
+            // Cursor at/past the left margin: scroll left.
+            self.leftcol = if recenter {
+                vc.saturating_sub(tw / 2)
+            } else {
+                vc.saturating_sub(so)
+            };
+        } else if vc + so + 1 > left + tw {
+            // Cursor at/past the right margin: scroll right.
+            self.leftcol = if recenter {
+                vc.saturating_sub(tw / 2)
+            } else {
+                (vc + so + 1).saturating_sub(tw)
+            };
         }
     }
 

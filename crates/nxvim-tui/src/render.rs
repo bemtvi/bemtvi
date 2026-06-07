@@ -205,13 +205,18 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     } else if let (Some((inner, cursor_row)), Some(win)) = (focused_inner, view.focused()) {
         // The cursor row is interpolated during a slide, but the column comes
         // straight from the focused window — correct because the scroll commands
-        // move only vertically. Clamp both to the window's text area: nxvim has no
-        // horizontal scroll yet, so a cursor on a line wider than the window would
-        // otherwise be drawn past its right edge — escaping a narrow float (or
-        // vsplit) onto whatever sits beside it. The logical cursor column is
-        // unchanged; only the painted terminal cursor is pinned to the last
-        // visible cell. (Rows are already bounded by the window's text height.)
-        let col = inner.x + win.cursor_screen_col.min(inner.width.saturating_sub(1));
+        // move only vertically. The horizontal scroll offset (`leftcol`) shifts the
+        // painted text left, so the cursor follows by the same amount; the core
+        // keeps the cursor on screen, so this normally lands inside the text area.
+        // The `.min` is a safety clamp (a stale frame, a degenerate width) so a
+        // cursor can never be drawn past a window's right edge — escaping a narrow
+        // float or vsplit onto whatever sits beside it. (Rows are already bounded
+        // by the window's text height.)
+        let col = inner.x
+            + win
+                .cursor_screen_col
+                .saturating_sub(win.leftcol)
+                .min(inner.width.saturating_sub(1));
         let row = inner.y + cursor_row.min(inner.height.saturating_sub(1));
         frame.set_cursor_position((col, row));
     }
@@ -386,6 +391,7 @@ fn render_window(
         frame_diag,
         &frame_numbers,
         win.tabstop.max(1) as usize,
+        win.leftcol as usize,
         &theme,
     );
     render_status(frame, status_area, win, view);
@@ -518,6 +524,7 @@ fn render_text(
     diagnostics: &[Vec<DiagSpan>],
     numbers: &[Option<usize>],
     tabstop: usize,
+    leftcol: usize,
     theme: &LineTheme,
 ) {
     let width = area.width as usize;
@@ -537,7 +544,7 @@ fn render_text(
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
-                    l, sel, matches, cur, hl, diag, width, is_filler, tabstop, theme,
+                    l, sel, matches, cur, hl, diag, width, is_filler, tabstop, leftcol, theme,
                 )
             })
             .collect::<Vec<_>>(),
@@ -557,6 +564,12 @@ fn render_text(
 /// offsets through the same tab/wide-char `virtcol` the gutter-less text area
 /// uses), so they line up with the glyphs painted here. Token foregrounds patch
 /// onto the `Normal` background already painted across the text area.
+///
+/// `leftcol` is the horizontal scroll offset: the first `leftcol` screen columns
+/// are not painted, so the row begins at the cell whose absolute screen column is
+/// `leftcol`. Styles are still keyed on the **absolute** column, so every span
+/// lines up; a wide char or tab straddling the `leftcol` boundary is dropped (its
+/// start column is hidden), leaving the boundary cell blank.
 #[allow(clippy::too_many_arguments)]
 fn highlight_line(
     line: &str,
@@ -568,12 +581,14 @@ fn highlight_line(
     max_width: usize,
     is_filler: bool,
     tabstop: usize,
+    leftcol: usize,
     theme: &LineTheme,
 ) -> Line<'static> {
     let expanded = expand_tabs(line, tabstop);
 
     // `~` rows carry no tokens or selection: paint the marker with the theme's
-    // EndOfBuffer style (default — terminal foreground — with no colorscheme).
+    // EndOfBuffer style (default — terminal foreground — with no colorscheme). The
+    // `~` sits at column 0, so the horizontal scroll never moves it.
     if is_filler {
         return Line::from(Span::styled(
             expanded,
@@ -584,28 +599,35 @@ fn highlight_line(
     let sel = sel.filter(|(s, e)| e > s);
 
     // Walk cells left to right, coalescing runs of identical style into spans.
+    // Cells left of `leftcol` are skipped (scrolled off); the rest paint starting
+    // at the left edge, keyed on their absolute column so spans still align.
     let mut spans: Vec<Span> = Vec::new();
     let mut run = String::new();
     let mut run_style = Style::default();
     let mut col = 0usize;
     for ch in expanded.chars() {
-        let style = cell_style(col, sel, search, incsearch, hl, diag, theme);
-        if style != run_style && !run.is_empty() {
-            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        if col >= leftcol {
+            let style = cell_style(col, sel, search, incsearch, hl, diag, theme);
+            if style != run_style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            }
+            run_style = style;
+            run.push(ch);
         }
-        run_style = style;
-        run.push(ch);
         col += UnicodeWidthChar::width(ch).unwrap_or(0);
     }
     if !run.is_empty() {
         spans.push(Span::styled(run, run_style));
     }
 
-    // Extend the selection past end-of-text (selected newline / linewise fill).
+    // Extend the selection past end-of-text (selected newline / linewise fill),
+    // within the scrolled viewport `[leftcol, leftcol + max_width)`. The pad count
+    // is a difference of absolute columns, which equals the painted-cell count.
     if let Some((_, e)) = sel {
-        let e = (e as usize).min(max_width);
-        if col < e {
-            let pad = " ".repeat(e - col);
+        let start = col.max(leftcol);
+        let e = (e as usize).min(leftcol + max_width);
+        if start < e {
+            let pad = " ".repeat(e - start);
             spans.push(Span::styled(pad, selection_style(Style::default(), theme)));
         }
     }

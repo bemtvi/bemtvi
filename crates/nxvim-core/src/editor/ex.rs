@@ -1,0 +1,825 @@
+//! Ex-command dispatch (`execute_ex`), range/address parsing, `:substitute`, and
+//! the file/window/tab ex-commands.
+
+use super::*;
+use crate::buffer::Buffer;
+use crate::search::SearchRegex;
+use std::path::PathBuf;
+
+/// A resolved, 0-based, inclusive line range parsed from the head of an
+/// ex-command. `explicit` is false when no address was present and the range
+/// defaulted to the current line (so a bare range can be told from none).
+#[derive(Clone, Copy)]
+struct ExRange {
+    lo: usize,
+    hi: usize,
+    explicit: bool,
+}
+
+/// Split a substitute body (everything after the leading delimiter) into
+/// `(pattern, replacement, flags)` on unescaped `delim`. A `\` before the
+/// delimiter makes it literal (dropped from the field); any other `\x` is kept
+/// verbatim so the regex / replacement expander sees it. Everything past the
+/// second delimiter — the flags and trailing count — is taken verbatim.
+/// Expand an unescaped `~` in a substitute replacement to `prev` (the previous
+/// replacement string); `\~` stays a literal tilde. All other backslash escapes
+/// pass through verbatim for [`SearchRegex::substitute_line`]'s expansion pass to
+/// handle. Errors (`Err(())`) on a bare `~` when there is no previous
+/// replacement, so the caller can fail loud rather than insert nothing.
+fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
+    let mut out = String::new();
+    let mut chars = rep.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Copy a backslash escape (e.g. `\~`, `\r`) through untouched.
+            '\\' => {
+                out.push('\\');
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '~' => match prev {
+                Some(p) => out.push_str(p),
+                None => return Err(()),
+            },
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+fn split_substitute(body: &str, delim: char) -> (String, String, String) {
+    let mut parts: Vec<String> = vec![String::new()];
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        // Once pat and rep are captured, flags + count are taken verbatim.
+        if parts.len() >= 3 {
+            parts[2].push(c);
+        } else if c == '\\' {
+            let cur = parts.last_mut().expect("at least one part");
+            match chars.next() {
+                Some(n) if n == delim => cur.push(delim),
+                Some(n) => {
+                    cur.push('\\');
+                    cur.push(n);
+                }
+                None => cur.push('\\'),
+            }
+        } else if c == delim {
+            parts.push(String::new());
+        } else {
+            parts.last_mut().expect("at least one part").push(c);
+        }
+    }
+    let pat = parts.first().cloned().unwrap_or_default();
+    let rep = parts.get(1).cloned().unwrap_or_default();
+    let flags = parts.get(2).cloned().unwrap_or_default();
+    (pat, rep, flags)
+}
+
+/// Split an ex-command into `(name, bang, args)`.
+fn split_ex(cmd: &str) -> (&str, bool, &str) {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let name = &cmd[..i];
+    let mut bang = false;
+    if i < bytes.len() && bytes[i] == b'!' {
+        bang = true;
+        i += 1;
+    }
+    let args = cmd[i..].trim();
+    (name, bang, args)
+}
+
+/// Parse a `:sleep` argument: `{n}` = seconds, `{n}m` = milliseconds, empty =
+/// 1 second (matching vim). Returns a vim-style `E475` error string for
+/// non-integer input.
+/// Parse a buffer-navigation count argument (`:bnext 2`). Empty / invalid / zero
+/// all mean 1, matching vim's default repeat count.
+fn parse_count_arg(args: &str) -> usize {
+    parse_opt_count_arg(args).unwrap_or(1)
+}
+
+/// A positive numeric command argument, or `None` when absent / non-numeric. The
+/// `Option`-preserving form of [`parse_count_arg`] — `:tabnext` (no count → next
+/// tab) needs the absent case distinguished from `1` (no count → tab 1).
+fn parse_opt_count_arg(args: &str) -> Option<usize> {
+    args.trim().parse::<usize>().ok().filter(|n| *n > 0)
+}
+
+fn parse_sleep(args: &str) -> Result<u64, String> {
+    let a = args.trim();
+    if a.is_empty() {
+        return Ok(1000);
+    }
+    let invalid = || format!("E475: Invalid argument: {a}");
+    match a.strip_suffix('m') {
+        Some(ms) => ms.trim().parse::<u64>().map_err(|_| invalid()),
+        None => a
+            .parse::<u64>()
+            .map(|secs| secs.saturating_mul(1000))
+            .map_err(|_| invalid()),
+    }
+}
+
+impl Editor {
+    pub(crate) fn execute_ex(&mut self, raw: &str) {
+        let cmd = raw.trim();
+        if cmd.is_empty() {
+            return;
+        }
+
+        // Strip and resolve any leading range (`.`, `$`, `%`, `N`, `+N`, `lo,hi`)
+        // before the command name. A range with no command moves the cursor to
+        // the last address; a malformed range fails loud rather than guessing.
+        let (range, rest) = match self.parse_ex_range(cmd) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            if range.explicit {
+                self.cursor.line = range.hi;
+                self.cursor.col = self.first_non_blank(range.hi);
+            }
+            return;
+        }
+
+        // `:&` and `:&&` repeat the last substitute (a bare `&` resets its flags;
+        // `&&` keeps them). These have no alphabetic name, so they're matched on
+        // the raw remainder before `split_ex` would strip an empty name.
+        if let Some(after) = rest.strip_prefix("&&") {
+            self.repeat_substitute(range, after.trim(), true);
+            return;
+        }
+        if let Some(after) = rest.strip_prefix('&') {
+            self.repeat_substitute(range, after.trim(), false);
+            return;
+        }
+
+        let (name, bang, args) = split_ex(rest);
+        match name {
+            "w" | "write" => self.ex_write(args),
+            "q" | "quit" => self.ex_quit(bang),
+            "wq" | "x" | "xit" | "exit" => {
+                // Write the current buffer, then `:q` it (close the window, or
+                // quit on the last window). A failed write leaves the buffer
+                // modified, so a last-window quit then reports it.
+                self.ex_write(args);
+                self.ex_quit(bang);
+            }
+            "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
+            "wa" | "wall" => self.ex_write_all(),
+            "wqa" | "xa" | "xall" => {
+                self.ex_write_all();
+                self.ex_quit_all(bang);
+            }
+            "e" | "edit" => self.ex_edit(args, bang),
+            "ene" | "enew" => self.ex_enew(),
+            "sp" | "spl" | "split" => self.ex_split(SplitDir::Horizontal, args),
+            "vs" | "vsp" | "vsplit" | "vspl" => self.ex_split(SplitDir::Vertical, args),
+            "new" => self.ex_new(SplitDir::Horizontal),
+            "vne" | "vnew" => self.ex_new(SplitDir::Vertical),
+            "clo" | "close" => self.close_window(),
+            "hid" | "hide" => self.close_window(),
+            "on" | "only" => self.only_window(),
+            "tabnew" | "tabe" | "tabed" | "tabedit" => self.ex_tabnew(args),
+            "tabc" | "tabclo" | "tabclose" => self.close_tab_cmd(args),
+            "tabo" | "tabonly" => self.tab_only(),
+            "tabm" | "tabmo" | "tabmove" => self.move_tab(args),
+            "tabn" | "tabnext" => self.goto_tab_next(parse_opt_count_arg(args)),
+            "tabp" | "tabN" | "tabprevious" | "tabNext" => {
+                self.goto_tab_prev(parse_opt_count_arg(args))
+            }
+            "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
+            "tabl" | "tablast" => self.goto_tab_next(Some(self.tabs.len())),
+            "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
+            "vert" | "vertical" | "ver" => self.ex_vertical(args),
+            "ls" | "buffers" | "files" => self.ex_buffers(),
+            "b" | "bu" | "buf" | "buffer" => {
+                if let Some(id) = self.resolve_buffer(args) {
+                    self.switch_buffer(id);
+                }
+            }
+            "bn" | "bnext" => self.ex_bnext(parse_count_arg(args)),
+            "bp" | "bN" | "bprev" | "bprevious" | "bNext" => self.ex_bprev(parse_count_arg(args)),
+            "bf" | "bfirst" | "br" | "brewind" => self.ex_bfirst(),
+            "bl" | "blast" => self.ex_blast(),
+            "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => self.ex_bdelete(args, bang),
+            "lua" => self.lua_queue.push(args.to_string()),
+            "sleep" | "sl" => match parse_sleep(args) {
+                Ok(ms) => self.pending_sleep = Some(ms),
+                Err(e) => self.echo(e),
+            },
+            "mes" | "messages" | "message" => self.ex_messages(),
+            "panelopen" | "panelo" => {
+                if !self.reopen_last_panel() {
+                    self.echo("No panel to reopen");
+                }
+            }
+            // `:setlocal`/`:setl` shares the handler: buffer-local options
+            // (tabstop/shiftwidth/expandtab) live on the current buffer, which is
+            // exactly what `:set` already targets for them.
+            "set" | "se" | "setlocal" | "setl" => self.ex_set(args),
+            "noh" | "nohlsearch" => self.search_active = false,
+            "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu"
+            | "substitut" | "substitute" => self.ex_substitute(range, args),
+            // `:hi clear` resets the registry to defaults (empty); other `:hi`
+            // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
+            "hi" | "highlight" => {
+                if args.trim() == "clear" {
+                    self.highlights.clear();
+                }
+            }
+            // Unknown to the core: defer to the server, which resolves it
+            // against Lua user commands (or reports the unknown-command error).
+            _ => self.deferred_commands.push(rest.to_string()),
+        }
+    }
+
+    /// Consume any leading range from `cmd`, resolving addresses against the
+    /// cursor and buffer. Returns the resolved 0-based inclusive range
+    /// (defaulting to the current line when no address is present) and the
+    /// remaining command text. Fails loud on a backwards range, an unset mark,
+    /// or a malformed address — never silently swaps or guesses.
+    fn parse_ex_range<'a>(&self, cmd: &'a str) -> Result<(ExRange, &'a str), String> {
+        let bytes = cmd.as_bytes();
+        let cur = self.cursor.line;
+
+        // `%` is the whole file (`1,$`) and stands alone.
+        if bytes.first() == Some(&b'%') {
+            let range = ExRange {
+                lo: 0,
+                hi: self.last_line(),
+                explicit: true,
+            };
+            return Ok((range, &cmd[1..]));
+        }
+
+        let mut i = 0;
+        let first = self.parse_ex_address(cmd, &mut i, cur)?;
+        let has_sep = matches!(bytes.get(i), Some(b',') | Some(b';'));
+        if first.is_none() && !has_sep {
+            // No address at all — the range defaults to the current line.
+            let range = ExRange {
+                lo: cur,
+                hi: cur,
+                explicit: false,
+            };
+            return Ok((range, cmd));
+        }
+
+        let lo = first.unwrap_or(cur);
+        let hi = if has_sep {
+            // `;` moves the cursor to the first address before resolving the
+            // second; `,` resolves the second against the original cursor.
+            let base = if bytes[i] == b';' { lo } else { cur };
+            i += 1;
+            self.parse_ex_address(cmd, &mut i, base)?.unwrap_or(cur)
+        } else {
+            lo
+        };
+
+        if lo > hi {
+            return Err("E493: Backwards range given".to_string());
+        }
+        let range = ExRange {
+            lo,
+            hi,
+            explicit: true,
+        };
+        Ok((range, &cmd[i..]))
+    }
+
+    /// Parse one ex address at `*i`: an optional base (`.`, `$`, `N`, `'m`)
+    /// followed by any number of `+N` / `-N` offsets (a bare `+`/`-` counts as
+    /// 1). `base` is the line a relative address (one with no explicit base, or
+    /// a `.`) is measured from. Advances `*i` past what it consumes and returns
+    /// the resolved 0-based line clamped to the buffer, or `None` when no
+    /// address token is present.
+    fn parse_ex_address(
+        &self,
+        cmd: &str,
+        i: &mut usize,
+        base: usize,
+    ) -> Result<Option<usize>, String> {
+        let bytes = cmd.as_bytes();
+        let start = *i;
+        let mut line = base as i64;
+        let mut have_base = false;
+
+        match bytes.get(*i) {
+            Some(b'.') => {
+                *i += 1;
+                have_base = true;
+            }
+            Some(b'$') => {
+                line = self.last_line() as i64;
+                *i += 1;
+                have_base = true;
+            }
+            // Marks aren't implemented yet; a mark address fails loud rather
+            // than resolving to a bogus line.
+            Some(b'\'') => return Err("E20: Mark not set".to_string()),
+            Some(c) if c.is_ascii_digit() => {
+                let mut n = 0i64;
+                while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
+                    n = n * 10 + i64::from(d - b'0');
+                    *i += 1;
+                }
+                line = n - 1; // 1-based source line -> 0-based index
+                have_base = true;
+            }
+            _ => {}
+        }
+
+        let mut have_offset = false;
+        while let Some(&sign) = bytes.get(*i).filter(|b| matches!(b, b'+' | b'-')) {
+            *i += 1;
+            let mut n = 0i64;
+            let mut digits = false;
+            while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
+                n = n * 10 + i64::from(d - b'0');
+                *i += 1;
+                digits = true;
+            }
+            if !digits {
+                n = 1;
+            }
+            line += if sign == b'+' { n } else { -n };
+            have_offset = true;
+        }
+
+        if !have_base && !have_offset {
+            *i = start;
+            return Ok(None);
+        }
+        Ok(Some(line.clamp(0, self.last_line() as i64) as usize))
+    }
+
+    /// `:[range]s/{pat}/{rep}/[flags] [count]` — substitute matches of `pat`
+    /// with `rep` over the range (canonical regex, the `/`-search dialect).
+    /// Flags: `g` (every match on a line), `i`/`I` (force ignore/match case),
+    /// `n` (count only, no edit). Fails loud on a bad delimiter, an unknown
+    /// flag, the not-yet-built `c` flag, an invalid pattern, or no match.
+    fn ex_substitute(&mut self, range: ExRange, args: &str) {
+        let spec = args.trim();
+        match spec.chars().next() {
+            // No delimiter: a bare `:s` (or `:s {flags} [count]`) repeats the last
+            // substitute with its flags reset — only freshly given flags apply.
+            // An alphanumeric first char is a flag/count, not a delimiter.
+            None => self.repeat_substitute(range, "", false),
+            Some(c) if c.is_alphanumeric() => self.repeat_substitute(range, spec, false),
+            Some('\\') | Some('"') => {
+                self.echo("E146: Regular expressions can't be delimited by letters");
+            }
+            Some(delim) => {
+                let (pat, rep, flags) = split_substitute(&spec[delim.len_utf8()..], delim);
+                self.run_substitute(range, pat, rep, &flags);
+            }
+        }
+    }
+
+    /// Repeat the last `:substitute` — bare `:s`, `:&` (`keep_flags` false), or
+    /// `:&&` (`keep_flags` true). `extra` carries any freshly typed flags/count;
+    /// `&&` keeps the previous flags (prepended), the others reset them.
+    fn repeat_substitute(&mut self, range: ExRange, extra: &str, keep_flags: bool) {
+        let Some((pat, rep, prev_flags)) = self.last_substitute.clone() else {
+            self.echo("E33: No previous substitute regular expression");
+            return;
+        };
+        let flag_spec = if keep_flags {
+            format!("{prev_flags}{extra}")
+        } else {
+            extra.to_string()
+        };
+        self.run_substitute(range, pat, rep, &flag_spec);
+    }
+
+    /// The substitute engine shared by `:s/pat/rep/flags` and the repeat forms.
+    /// `pat` empty reuses the last search/substitute pattern; a `~` in `rep`
+    /// expands to the previous replacement. Records the (resolved) substitute for
+    /// later repeats — even on a no-match, matching vim.
+    fn run_substitute(&mut self, range: ExRange, pat: String, rep: String, flag_spec: &str) {
+        // Parse flag letters, then an optional trailing count.
+        let mut global = false;
+        let mut nflag = false;
+        let mut icase: Option<bool> = None;
+        let tail = flag_spec.trim();
+        let tb = tail.as_bytes();
+        let mut k = 0;
+        while k < tb.len() {
+            match tb[k] {
+                b'g' => global = true,
+                b'i' => icase = Some(true),
+                b'I' => icase = Some(false),
+                b'n' => nflag = true,
+                b'c' => {
+                    self.echo("substitute: the 'c' (confirm) flag is not implemented yet");
+                    return;
+                }
+                b' ' | b'\t' | b'0'..=b'9' => break,
+                _ => {
+                    self.echo(format!("E488: Trailing characters: {}", &tail[k..]));
+                    return;
+                }
+            }
+            k += 1;
+        }
+        let flag_letters = tail[..k].to_string();
+        let rest = tail[k..].trim();
+        let count = if rest.is_empty() {
+            None
+        } else {
+            match rest.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    self.echo(format!("E488: Trailing characters: {rest}"));
+                    return;
+                }
+            }
+        };
+
+        // An empty pattern reuses the last search/substitute pattern.
+        let pattern = if pat.is_empty() {
+            match self.last_search.as_ref() {
+                Some((p, _, _)) => p.clone(),
+                None => {
+                    self.echo("E35: No previous regular expression");
+                    return;
+                }
+            }
+        } else {
+            pat
+        };
+        // A `~` in the replacement recalls the previous replacement — resolved
+        // before this substitute overwrites the remembered state.
+        let prev_rep = self.last_substitute.as_ref().map(|(_, r, _)| r.clone());
+        let rep = match expand_tilde(&rep, prev_rep.as_deref()) {
+            Ok(r) => r,
+            Err(()) => {
+                self.echo("E33: No previous substitute regular expression");
+                return;
+            }
+        };
+        let ignorecase = icase.unwrap_or_else(|| self.search_ignorecase(&pattern));
+        let re = match SearchRegex::compile(&pattern, ignorecase) {
+            Ok(re) => re,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+        // Remember this substitute (resolved pattern, expanded replacement, flag
+        // letters) for bare `:s` / `:&` / `:&&` and `~`. vim repeats even a
+        // substitute that matched nothing, so record before the match pass.
+        self.last_substitute = Some((pattern.clone(), rep.clone(), flag_letters));
+
+        // A trailing count restricts the edit to `count` lines from the range's
+        // last line (vim semantics), overriding the range's start.
+        let (lo, hi) = match count {
+            Some(c) => (range.hi, (range.hi + c - 1).min(self.last_line())),
+            None => (range.lo, range.hi),
+        };
+
+        // `n` reports the match count and edits nothing.
+        if nflag {
+            let (mut matches, mut nlines) = (0usize, 0usize);
+            for l in lo..=hi {
+                let m = re.find_all(&self.buffer().line(l)).len();
+                if m > 0 {
+                    matches += m;
+                    nlines += 1;
+                }
+            }
+            if matches == 0 {
+                self.echo(format!("E486: Pattern not found: {pattern}"));
+            } else {
+                self.echo(format!(
+                    "{matches} {} on {nlines} {}",
+                    if matches == 1 { "match" } else { "matches" },
+                    if nlines == 1 { "line" } else { "lines" },
+                ));
+                self.set_substitute_search(pattern);
+            }
+            return;
+        }
+
+        // Edit pass. A `\r` in the replacement splits a line into several, so a
+        // running `added` offset keeps later original lines pointing at the
+        // right (shifted) index.
+        let (mut subs, mut nlines) = (0usize, 0usize);
+        let mut added = 0i64;
+        let mut last_changed: Option<usize> = None;
+        let mut pushed = false;
+        for orig in lo..=hi {
+            let idx = (orig as i64 + added) as usize;
+            let old = self.buffer().line(idx);
+            let (new_text, n) = re.substitute_line(&old, &rep, global);
+            if n == 0 {
+                continue;
+            }
+            if !pushed {
+                self.push_undo();
+                pushed = true;
+            }
+            let start = self.buffer().line_start(idx);
+            self.buffer_mut().remove(start..start + old.len());
+            self.buffer_mut().insert(start, &new_text);
+            let extra = new_text.matches('\n').count();
+            added += extra as i64;
+            subs += n;
+            nlines += 1;
+            last_changed = Some(idx + extra);
+        }
+
+        let Some(last) = last_changed else {
+            self.echo(format!("E486: Pattern not found: {pattern}"));
+            return;
+        };
+        self.buffer_mut().normalize();
+        self.cursor.line = last;
+        self.cursor.col = self.first_non_blank(last);
+        self.clamp_cursor();
+        self.set_substitute_search(pattern);
+
+        // vim stays silent for a single substitution on a single line.
+        if subs != 1 || nlines != 1 {
+            self.echo(format!(
+                "{subs} {} on {nlines} {}",
+                if subs == 1 {
+                    "substitution"
+                } else {
+                    "substitutions"
+                },
+                if nlines == 1 { "line" } else { "lines" },
+            ));
+        }
+    }
+
+    /// Record `pattern` as the last-used search pattern (so `n` and `hlsearch`
+    /// pick it up after a `:s`, matching vim) and light up the highlight.
+    fn set_substitute_search(&mut self, pattern: String) {
+        self.last_search = Some((pattern, SearchDir::Forward, SearchOffset::None));
+        self.search_active = true;
+    }
+
+    fn ex_write(&mut self, args: &str) {
+        let path = if args.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(args))
+        };
+        match self.buffer_mut().write(path) {
+            Ok((bytes, lines)) => {
+                // The current state is now what's on disk — undoing/redoing back
+                // to it should read as clean.
+                let ob = self.cur_mut();
+                ob.saved_seq = Some(ob.cur_seq);
+                let name = self
+                    .buffer()
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
+            }
+            Err(e) => self.echo(e.to_string()),
+        }
+    }
+
+    /// `:q` / `<C-w>q` — close the focused window. Closing a float, or an ordinary
+    /// window while other ordinary windows remain, is exactly `<C-w>c`: the window
+    /// goes away and its buffer stays in the store (other windows may still show
+    /// it, or it's reachable via `:b`), so there is nothing to lose and no modified
+    /// guard — closing a non-last window onto a modified buffer is fine. Only the
+    /// **last ordinary** window is a real editor quit, which defers to
+    /// [`Self::ex_quit_all`] (and its `E37` guard); a leftover float never keeps
+    /// the editor alive (and gating on the *total* window count would wrongly try
+    /// to close that last ordinary window, stranding focus on a deleted id).
+    pub(crate) fn ex_quit(&mut self, bang: bool) {
+        // `:q` on a focused float closes just the float and never quits the
+        // editor. For a tiled window, only the *last tiled* one is a real quit —
+        // floats don't keep the editor alive, nor do they count toward "more
+        // than one window" (the last-tiled rule lives in `remove_window`).
+        let on_float = self.windows.cur().float.is_some();
+        if on_float || self.windows.tiled_count() > 1 {
+            self.close_window();
+            return;
+        }
+        // Last tiled window of *this* tab, but other tabs are open: `:q` closes the
+        // tab page (like `:tabclose`), not the editor — its buffers stay loaded, so
+        // there's nothing to lose and no modified guard, same as a non-last window.
+        if self.tabs.len() > 1 {
+            self.close_tab();
+            return;
+        }
+        self.ex_quit_all(bang);
+    }
+
+    /// `:qa` (and last-window `:q`) — quit the *editor*, but only if nothing
+    /// would be lost. With `!`, exit unconditionally (discarding every buffer).
+    /// Otherwise, if any buffer has unsaved changes, *don't* quit: switch the
+    /// window to that buffer (the current one if it's the one modified, else the
+    /// lowest-numbered modified buffer) and report `E37`, so the user sees what's
+    /// blocking the quit. With no modified buffers, exit.
+    fn ex_quit_all(&mut self, bang: bool) {
+        if bang {
+            self.should_quit = true;
+            return;
+        }
+        if self.buffer().modified {
+            // Already showing the offending buffer.
+            self.echo("E37: No write since last change (add ! to override)");
+            return;
+        }
+        match self.first_modified_buffer() {
+            Some(id) => {
+                // Surface the blocking buffer, then warn (the switch clears the
+                // message, so set it afterwards).
+                self.switch_buffer(id);
+                self.echo(format!(
+                    "E37: No write since last change for buffer {} (add ! to override)",
+                    id.0
+                ));
+            }
+            None => self.should_quit = true,
+        }
+    }
+
+    /// The lowest-numbered buffer with unsaved changes, if any.
+    fn first_modified_buffer(&self) -> Option<BufferId> {
+        self.buffers
+            .map
+            .iter()
+            .find(|(_, ob)| ob.buffer.modified)
+            .map(|(id, _)| *id)
+    }
+
+    fn ex_edit(&mut self, args: &str, bang: bool) {
+        if args.is_empty() {
+            self.echo("E32: No file name");
+            return;
+        }
+        let path = PathBuf::from(args);
+
+        // Re-editing the current file reloads it in place (`:e` / `:e!`),
+        // discarding unsaved changes — so the modified guard applies here.
+        if self.buffer().path.as_deref() == Some(path.as_path()) {
+            if self.buffer().modified && !bang {
+                self.echo("E37: No write since last change (add ! to override)");
+                return;
+            }
+            self.load_into_current(&path);
+            return;
+        }
+
+        // The file is already open in another buffer: just switch to it. The
+        // current buffer stays in the list (vim's `hidden` behavior), so there is
+        // nothing to lose and no modified guard.
+        if let Some(id) = self.find_buffer_by_path(&path) {
+            self.switch_buffer(id);
+            return;
+        }
+
+        // A new file. Reuse a throwaway `[No Name]` buffer if that's all we have
+        // (so the first `:e` doesn't strand an empty buffer 1); otherwise open it
+        // in a fresh buffer and switch, keeping the current one open.
+        if self.current_is_throwaway() {
+            self.load_into_current(&path);
+        } else {
+            match Buffer::from_file(&path) {
+                Ok(buf) => {
+                    let id = self.add_buffer(buf);
+                    self.switch_buffer(id);
+                }
+                Err(e) => self.echo(e.to_string()),
+            }
+        }
+    }
+
+    /// `:split [file]` / `:vsplit [file]` — split the focused window, then (with a
+    /// file argument) `:edit` it in the new window. With no argument both windows
+    /// show the same buffer.
+    fn ex_split(&mut self, dir: SplitDir, args: &str) {
+        self.split(dir);
+        let file = args.trim();
+        if !file.is_empty() {
+            self.ex_edit(file, false);
+        }
+    }
+
+    /// `:new` / `:vnew` — split the focused window and open a fresh `[No Name]`
+    /// buffer in the new window.
+    fn ex_new(&mut self, dir: SplitDir) {
+        self.split(dir);
+        self.ex_enew();
+    }
+
+    /// `:tabnew` / `:tabedit [file]` — open a new tab page after the current one.
+    /// With a file argument the new tab edits it; with none it opens a fresh
+    /// `[No Name]` buffer (vim's behavior for both names). The new tab inherits the
+    /// source window's local options (the number gutter), like a split does.
+    ///
+    /// The buffer is resolved *before* the tab is created — a fresh empty one, the
+    /// named file reused if already open, or a new buffer loaded from disk — so the
+    /// new tab never reuses (and clobbers) the current tab's buffer the way an
+    /// in-place `:edit` of a throwaway buffer would.
+    fn ex_tabnew(&mut self, args: &str) {
+        let options = self.windows.cur().options;
+        let file = args.trim();
+        let buf = if file.is_empty() {
+            self.add_buffer(Buffer::empty())
+        } else {
+            let path = PathBuf::from(file);
+            match self.find_buffer_by_path(&path) {
+                Some(id) => id,
+                None => match Buffer::from_file(&path) {
+                    Ok(b) => self.add_buffer(b),
+                    Err(e) => {
+                        self.echo(e.to_string());
+                        self.add_buffer(Buffer::empty())
+                    }
+                },
+            }
+        };
+        self.new_tab(buf, options);
+    }
+
+    /// `:res[ize] {n}` — set the focused window's height; `:vertical resize {n}`
+    /// routes here with `axis = Vertical` for its width. `{n}` is absolute; `+n`
+    /// / `-n` are relative. A bare `:resize` maximizes along the axis (vim). The
+    /// extent is text rows for height (the status line is excluded, as in vim) and
+    /// columns for width.
+    fn ex_resize(&mut self, axis: SplitDir, args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            self.maximize_window(axis);
+            return;
+        }
+        let delta = if let Some(rest) = arg.strip_prefix('+') {
+            rest.trim().parse::<isize>().ok()
+        } else if let Some(rest) = arg.strip_prefix('-') {
+            rest.trim().parse::<isize>().ok().map(|n| -n)
+        } else {
+            // Absolute: aim for `target` and resize by the difference from the
+            // current extent.
+            match arg.parse::<usize>() {
+                Ok(target) => {
+                    let rect = self.windows.cur().rect;
+                    let current = match axis {
+                        SplitDir::Horizontal => rect.height.saturating_sub(1),
+                        SplitDir::Vertical => rect.width,
+                    };
+                    Some(target as isize - current as isize)
+                }
+                Err(_) => None,
+            }
+        };
+        match delta {
+            Some(d) => self.resize_window(axis, d),
+            None => self.echo("E487: Argument must be a number"),
+        }
+    }
+
+    /// `:vertical {cmd}` — the `vertical` modifier. Re-routes the split / resize
+    /// commands to their vertical (width-dividing) form.
+    fn ex_vertical(&mut self, args: &str) {
+        let (name, _bang, rest) = split_ex(args.trim());
+        match name {
+            "res" | "resize" => self.ex_resize(SplitDir::Vertical, rest),
+            "sp" | "spl" | "split" => self.ex_split(SplitDir::Vertical, rest),
+            "new" => self.ex_new(SplitDir::Vertical),
+            "" => self.echo("E471: Argument required"),
+            _ => self.deferred_commands.push(format!("vertical {args}")),
+        }
+    }
+
+    /// `:enew` — open a new, empty `[No Name]` buffer in the window. Reuses a
+    /// throwaway current buffer rather than stacking another empty one.
+    fn ex_enew(&mut self) {
+        if self.current_is_throwaway() {
+            return;
+        }
+        let id = self.add_buffer(Buffer::empty());
+        self.switch_buffer(id);
+    }
+
+    /// `:wall` — write every modified buffer that has a file name.
+    fn ex_write_all(&mut self) {
+        let mut written = 0;
+        for ob in self.buffers.map.values_mut() {
+            if ob.buffer.modified && ob.buffer.path.is_some() && ob.buffer.write(None).is_ok() {
+                ob.saved_seq = Some(ob.cur_seq);
+                written += 1;
+            }
+        }
+        self.echo(format!("{written} buffer(s) written"));
+    }
+}

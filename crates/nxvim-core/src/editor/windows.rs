@@ -1,4 +1,6 @@
-//! (auto-extracted from editor/mod.rs; see refactor plan)
+//! The window layout subsystem: the split tree (`Node`/`WindowTree`), the layout
+//! algebra, floating windows, and the `<C-w>`/`:split` window-management methods.
+//! `Node` and the layout free functions are private to this module.
 
 use super::*;
 use crate::mode::Mode;

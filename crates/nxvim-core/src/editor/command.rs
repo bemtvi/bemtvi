@@ -1,4 +1,13 @@
-//! (auto-extracted from editor/mod.rs; see refactor plan)
+//! The normal/visual command grammar **and** its executor.
+//!
+//! The key sequence is parsed in two clean halves. [`parse_step`] (pure: no
+//! buffer, no `&mut`) is the *grammar* — it decides whether a key extends,
+//! completes, or aborts a command, and emits a typed [`ResolvedCommand`].
+//! [`Editor::execute`] is the *effect* — it applies that command through the
+//! editing helpers. The typed motion / object / find enums are the contract
+//! between the two: a new built-in is a new variant the compiler forces into
+//! both arms, so they can never silently drift (this is what lets the keymap
+//! matcher reuse `parse_step` as a read-only command oracle).
 
 use super::*;
 use crate::input::{Key, KeyCode};

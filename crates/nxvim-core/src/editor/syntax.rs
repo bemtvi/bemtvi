@@ -1,0 +1,195 @@
+//! The treesitter engine bridge (synchronous highlights) and the indentation
+//! helpers (`autoindent`, `:set` shiftwidth).
+
+use super::*;
+use crate::syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
+
+/// Whitespace that advances the virtual column from `start` to `target`
+/// (`target >= start`), the fill an inserted `<Tab>` lays down. With `expandtab`
+/// it is all spaces; otherwise real tabs that jump to each `tabstop` boundary,
+/// then spaces for any remainder past the last boundary — vim's tab/space mix.
+pub(crate) fn fill_indent(start: usize, target: usize, tabstop: usize, expandtab: bool) -> String {
+    if expandtab {
+        return " ".repeat(target - start);
+    }
+    let mut s = String::new();
+    let mut col = start;
+    loop {
+        let next_tab = col - (col % tabstop) + tabstop;
+        if next_tab <= target {
+            s.push('\t');
+            col = next_tab;
+        } else {
+            break;
+        }
+    }
+    s.push_str(&" ".repeat(target - col));
+    s
+}
+
+/// Visual-column width of `line`'s leading whitespace: spaces count one cell, a
+/// tab advances to the next `tabstop` boundary. The inverse of [`fill_indent`],
+/// used to read a line's existing indent depth for copy-previous autoindent.
+fn indent_width(line: &str, tabstop: usize) -> usize {
+    let mut col = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => col += 1,
+            b'\t' => col = col - (col % tabstop) + tabstop,
+            _ => break,
+        }
+    }
+    col
+}
+
+impl Editor {
+    /// Install the in-process syntax backend. The server constructs the concrete
+    /// `nxvim-ts` engine at startup and hands it over; a bare-core test leaves it
+    /// `None` and simply has no highlighting / treesitter indentation.
+    pub fn set_syntax_engine(&mut self, engine: Box<dyn SyntaxEngine>) {
+        self.syntax = Some(engine);
+    }
+
+    /// Bring the engine's parse state for `buf` up to date before a query: open
+    /// it (first sync, or the path's language changed) from full text, otherwise
+    /// drain the buffer's edit journal and reparse incrementally. A buffer whose
+    /// path has no known grammar is left alone (the query returns nothing).
+    ///
+    /// Accesses `syntax` / `buffers` / `syntax_opened` as disjoint fields so the
+    /// engine's `&mut` never collides with the buffer borrow it reads text from.
+    fn sync_syntax_engine(&mut self, buf: BufferId) {
+        let Some(engine) = self.syntax.as_mut() else {
+            return;
+        };
+        let Some(open_buf) = self.buffers.map.get_mut(&buf) else {
+            return;
+        };
+        let buffer = &mut open_buf.buffer;
+        let Some(language) = language_of_path(buffer.path.as_deref()) else {
+            return; // no grammar for this path: nothing to parse
+        };
+
+        // Capture a load failure to echo *after* the engine/buffer field borrows
+        // end (so the `&mut self` echo doesn't collide with them).
+        let mut load_failure: Option<String> = None;
+
+        // A fresh buffer, or one whose language changed (`:saveas` to another
+        // extension), needs a full open; its stale journal is superseded.
+        if self.syntax_opened.get(&buf).copied() != Some(language) {
+            let _ = buffer.take_edits();
+            if let OpenOutcome::LoadFailed(reason) =
+                engine.open(buf, language, &buffer.text.to_string())
+            {
+                load_failure = Some(reason);
+            }
+            self.syntax_opened.insert(buf, language);
+        } else {
+            // Already open in this language: feed it just what changed. A
+            // whole-rope replacement (undo/redo, reload) re-opens; ordinary deltas
+            // reparse incrementally.
+            let batch = buffer.take_edits();
+            if !batch.is_empty() {
+                if batch.resync {
+                    engine.open(buf, language, &buffer.text.to_string());
+                } else {
+                    engine.edit(buf, &batch.edits);
+                }
+            }
+        }
+
+        // A grammar that is *installed but broken* (bad ABI, unparseable query) is
+        // worth surfacing — once per language, so opening many files of it doesn't
+        // spam. A *missing* grammar yields `OpenOutcome::Ok` and stays silent:
+        // highlighting is best-effort, not a missing feature.
+        if let Some(reason) = load_failure {
+            if self.syntax_failed.insert(language) {
+                self.echo(format!(
+                    "treesitter: grammar '{language}' failed to load: {reason}"
+                ));
+            }
+        }
+    }
+
+    /// Highlight spans for the line range `[first, last)` of buffer `buf`,
+    /// synced to the buffer's current content. Empty when there is no engine or
+    /// no grammar for the buffer.
+    pub fn highlights(&mut self, buf: BufferId, first: usize, last: usize) -> Vec<Span> {
+        self.sync_syntax_engine(buf);
+        match self.syntax.as_mut() {
+            Some(engine) => engine.highlights(buf, first, last),
+            None => Vec::new(),
+        }
+    }
+
+    /// Forget a deleted buffer's engine state (called from `:bdelete`).
+    pub(crate) fn syntax_close(&mut self, id: BufferId) {
+        if let Some(engine) = self.syntax.as_mut() {
+            engine.close(id);
+        }
+        self.syntax_opened.remove(&id);
+    }
+
+    /// Target indent **width in columns** for `line` of the current buffer, the
+    /// single policy + fallback chain behind every auto-indent site (`o`/`O`,
+    /// insert-mode `Enter`, the `=` operators). Treesitter first; then, only when
+    /// ts-indent is *active* for the buffer but inconclusive for this line,
+    /// copy-the-previous-non-blank-line's indent; then column 0.
+    ///
+    /// Syncs the engine first so the query sees the just-inserted `\n` (and any
+    /// edits since the last redraw) — currency is required for a correct verdict.
+    pub(crate) fn indent_for(&mut self, line: usize) -> usize {
+        let buf = self.current_buffer_id();
+        self.sync_syntax_engine(buf);
+        let opts = self.buffer().options;
+        let p = IndentParams {
+            shiftwidth: opts.effective_shiftwidth(),
+            tabstop: opts.effective_tabstop(),
+        };
+        // Resolve the treesitter verdict and whether ts-indent is even available,
+        // both before releasing the engine borrow so the fallback can re-borrow self.
+        let (ts, available) = match self.syntax.as_mut() {
+            Some(s) => (s.indent(buf, line, &p), s.indents_available(buf)),
+            None => (None, false),
+        };
+        ts.or_else(|| available.then(|| self.autoindent_copy_prev(line)).flatten())
+            .unwrap_or(0)
+    }
+
+    /// Copy the indent **width in columns** of the nearest non-blank line above
+    /// `line`, or `None` if there is none — the grammar-free autoindent the
+    /// engine falls back to when its query is inconclusive.
+    fn autoindent_copy_prev(&self, line: usize) -> Option<usize> {
+        let tabstop = self.buffer().options.effective_tabstop();
+        let mut r = line.checked_sub(1)?;
+        loop {
+            let s = self.buffer().line(r);
+            if !s.trim().is_empty() {
+                return Some(indent_width(&s, tabstop));
+            }
+            r = r.checked_sub(1)?;
+        }
+    }
+
+    /// Replace line `line`'s leading whitespace with indentation of visual width
+    /// `width` (tabs/spaces per the buffer's `expandtab`/`tabstop`), returning the
+    /// new leading-whitespace **byte length** — i.e. the column the first
+    /// non-blank now begins at, where an auto-indent caller parks the cursor.
+    pub(crate) fn set_line_indent(&mut self, line: usize, width: usize) -> usize {
+        let opts = self.buffer().options;
+        let s = self.buffer().line(line);
+        let old_ws = s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        let fill = fill_indent(0, width, opts.effective_tabstop(), opts.expandtab);
+        if old_ws == fill.len() && s.starts_with(&fill) {
+            return fill.len(); // already correct — no edit (keeps `=` idempotent)
+        }
+        let start = self.buffer().line_start(line);
+        if old_ws > 0 {
+            self.buffer_mut().remove(start..start + old_ws);
+        }
+        if !fill.is_empty() {
+            self.buffer_mut().insert(start, &fill);
+        }
+        self.buffer_mut().normalize();
+        fill.len()
+    }
+}

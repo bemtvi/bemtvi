@@ -199,6 +199,8 @@ impl Editor {
             }
             "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
             "tabl" | "tablast" => self.goto_tab_next(Some(self.tabs.len())),
+            "tab" => self.ex_tab(args),
+            "dr" | "dro" | "drop" => self.ex_drop(args, false),
             "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
             "vert" | "vertical" | "ver" => self.ex_vertical(args),
             "ls" | "buffers" | "files" => self.ex_buffers(),
@@ -785,6 +787,51 @@ impl Editor {
         match delta {
             Some(d) => self.resize_window(axis, d),
             None => self.echo("E487: Argument must be a number"),
+        }
+    }
+
+    /// `:tab {cmd}` — the `tab` modifier. Makes the next window-opening command
+    /// target a **new tab page** (after the current one) instead of a split or
+    /// the current window. Mirrors [`Editor::ex_vertical`]: the window-opening
+    /// commands are re-routed here; `:tab drop` defers to [`Editor::ex_drop`];
+    /// anything else falls through to the user-command resolver.
+    ///
+    /// `:tab split` is special — it clones the *current* buffer + view into the
+    /// new tab (a split made into its own tab). `:tab edit`/`:tab new`/`:tab
+    /// enew` open a named or fresh buffer there, exactly like `:tabedit`.
+    fn ex_tab(&mut self, args: &str) {
+        let (name, _bang, rest) = split_ex(args.trim());
+        match name {
+            "sp" | "spl" | "split" => self.tab_split(),
+            "e" | "edit" | "new" | "ene" | "enew" => self.ex_tabnew(rest),
+            "dr" | "dro" | "drop" => self.ex_drop(rest, true),
+            "" => self.echo("E471: Argument required"),
+            _ => self.deferred_commands.push(format!("tab {args}")),
+        }
+    }
+
+    /// `:drop {file}` / `:tab drop {file}` — focus a window that already shows
+    /// `{file}` (in any tab), else open it. With the file already on screen the
+    /// `tab` / split distinction is moot: both forms just jump to that window.
+    /// Otherwise `:drop` edits it in the current window (`:edit`) and `:tab drop`
+    /// opens it in a new tab (`:tabedit`). An empty argument is `E471`.
+    fn ex_drop(&mut self, args: &str, in_new_tab: bool) {
+        let file = args.trim();
+        if file.is_empty() {
+            self.echo("E471: Argument required");
+            return;
+        }
+        let path = PathBuf::from(file);
+        if let Some(buf) = self.find_buffer_by_path(&path) {
+            if let Some((tab_idx, win)) = self.window_showing(buf) {
+                self.goto_tab_window(tab_idx, win);
+                return;
+            }
+        }
+        if in_new_tab {
+            self.ex_tabnew(file);
+        } else {
+            self.ex_edit(file, false);
         }
     }
 

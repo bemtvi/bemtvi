@@ -827,6 +827,29 @@ impl Editor {
         self.windows.windows.get(&id).map(|w| w.buffer)
     }
 
+    /// The first `(tab index, window id)` whose tiled window shows `buf`,
+    /// scanning tabs in tabline order and windows in layout order. The active
+    /// tab reads its live tree; inactive tabs read their stashed one. Backs
+    /// `:drop` / `:tab drop`'s "already open somewhere?" check. Floats are
+    /// excluded — `:drop` targets editable windows, as in vim.
+    pub(crate) fn window_showing(&self, buf: BufferId) -> Option<(usize, WindowId)> {
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            let tree = if idx == self.current_tab {
+                &self.windows
+            } else {
+                tab.tree
+                    .as_ref()
+                    .expect("an inactive tab always holds its stashed layout")
+            };
+            for win in tree.leaves() {
+                if tree.windows.get(&win).map(|w| w.buffer) == Some(buf) {
+                    return Some((idx, win));
+                }
+            }
+        }
+        None
+    }
+
     /// Rebind window `id` to show buffer `buf` *without* changing focus
     /// (`nvim_win_set_buf`). The focused window swaps its live buffer (like `:b`);
     /// an inactive window updates its binding and clamps its stashed cursor to the

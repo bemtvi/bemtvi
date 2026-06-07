@@ -810,6 +810,23 @@ impl Editor {
                 if let Motion::Find(kind, target) = m {
                     self.last_find = Some((kind, target));
                 }
+                // A global mark `A`–`Z` may point into another buffer. That jump
+                // can't be a within-buffer motion offset (and operating across
+                // files is meaningless), so it's handled here: switch to the mark's
+                // buffer, then land. Marks resolving into the current buffer (every
+                // lowercase mark, and a global whose buffer is current) fall through
+                // to the ordinary motion path, so `` d`a `` still operates. An unset
+                // or closed-buffer mark resolves to `None` here and falls through to
+                // the loud *E20* miss below.
+                if let Motion::MarkJumpExact(name) | Motion::MarkJumpLine(name) = m {
+                    if let Some(loc) = self.mark_location(name) {
+                        if loc.buf != self.cur_buffer() {
+                            self.jump_to_mark_buffer(loc, matches!(m, Motion::MarkJumpLine(_)));
+                            self.reset_pending();
+                            return;
+                        }
+                    }
+                }
                 match self.resolve_motion(m) {
                     Some(mr) => self.apply_resolved_motion(mr),
                     // A find/`;`/`,` that doesn't match (or `;`/`,` with no prior

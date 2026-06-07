@@ -323,6 +323,13 @@ pub struct Editor {
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
+    /// The global file marks `A`–`Z`: each names a `(buffer, cursor)`, so a jump
+    /// can cross buffers — unlike the buffer-local lowercase marks that live on the
+    /// [`Buffer`] and ride its edit choke point. Set by `m{A-Z}`; jumping to one
+    /// switches to its buffer first. A mark whose buffer has been closed is treated
+    /// as unset on lookup (the jump then errors *E20*) — see
+    /// [`Editor::mark_location`].
+    global_marks: HashMap<char, (BufferId, Cursor)>,
     pub mode: Mode,
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
@@ -548,6 +555,7 @@ impl Editor {
             next_win_id: 2,
             next_tab_id: 2,
             alternate: None,
+            global_marks: HashMap::new(),
             mode: Mode::Normal,
             cursor: Cursor::default(),
             top: 0,

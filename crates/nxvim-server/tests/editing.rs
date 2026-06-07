@@ -930,6 +930,88 @@ async fn mark_rides_back_to_its_position_on_undo() {
     assert_eq!(cursor(&rpc).await, (2, 1));
 }
 
+// ----- marks (Phase 3: global file marks A–Z, cross-buffer) -----------------
+
+#[tokio::test]
+async fn global_mark_jumps_back_to_its_buffer() {
+    let (rpc, _incoming) = start(None).await;
+    // Buffer 1 gets three lines; set the global mark `A` on line 2, column 4.
+    feed(&rpc, "ialpha<Esc>o  beta<Esc>ogamma<Esc>");
+    feed(&rpc, "ggj04l");
+    assert_eq!(cursor(&rpc).await, (2, 4));
+    feed(&rpc, "mA");
+    // Switch to a fresh second buffer and put the cursor somewhere else.
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, "ione<Esc>otwo<Esc>");
+    // `` `A `` crosses back to buffer 1 (its content reappears) at the exact spot.
+    feed(&rpc, "`A");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "  beta", "gamma"]);
+    assert_eq!(cursor(&rpc).await, (2, 4));
+}
+
+#[tokio::test]
+async fn global_mark_line_jump_lands_on_first_non_blank() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>o  beta<Esc>ogamma<Esc>");
+    // Mark `A` sits at column 4 of the indented line 2.
+    feed(&rpc, "ggj04l");
+    feed(&rpc, "mA");
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, "ione<Esc>");
+    // `'A` is linewise: it crosses to buffer 1 and lands on the first non-blank
+    // (the `b` at column 2), not the exact mark column.
+    feed(&rpc, "'A");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "  beta", "gamma"]);
+    assert_eq!(cursor(&rpc).await, (2, 2));
+}
+
+#[tokio::test]
+async fn uppercase_mark_survives_a_buffer_switch_where_lowercase_does_not() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    // On line 2: set both a buffer-local `a` and a global `A` at the same spot.
+    feed(&rpc, "ggj0l");
+    assert_eq!(cursor(&rpc).await, (2, 1));
+    feed(&rpc, "ma"); // buffer-local mark `a`
+    feed(&rpc, "mA"); // global mark `A`, same spot
+                      // Move to a second buffer.
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, "ifresh<Esc>");
+    // The lowercase mark is buffer-local: it does not exist in buffer 2, so the
+    // jump errors loudly and the cursor stays put.
+    let map = latest_after(&rpc, &mut incoming, "`a").await;
+    assert!(
+        view_str(&map, "message").contains("E20"),
+        "lowercase mark must not leak across buffers, got: {:?}",
+        view_str(&map, "message")
+    );
+    assert_eq!(lines(&rpc).await, vec!["fresh"]);
+    // The uppercase global mark *does* cross back to buffer 1.
+    feed(&rpc, "`A");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
+    assert_eq!(cursor(&rpc).await, (2, 1));
+}
+
+#[tokio::test]
+async fn global_mark_into_a_closed_buffer_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    feed(&rpc, "ggjmA");
+    // Open a second buffer, then delete the buffer the mark points into.
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, "ifresh<Esc>");
+    feed(&rpc, ":bdelete! 1<CR>"); // `!` to discard buffer 1's unsaved edits
+                                   // The mark now dangles at a closed buffer: jumping reports it loudly rather
+                                   // than silently doing nothing or jumping into a phantom buffer.
+    let map = latest_after(&rpc, &mut incoming, "`A").await;
+    assert!(
+        view_str(&map, "message").contains("E20"),
+        "a global mark into a closed buffer must error loudly, got: {:?}",
+        view_str(&map, "message")
+    );
+    assert_eq!(lines(&rpc).await, vec!["fresh"]);
+}
+
 /// The shipped `examples/registers/` config sources cleanly and its Lua
 /// register surface actually drives core: the seeded `"h` / `"t` registers
 /// paste, and the `:Stash` user command round-trips a line through `setreg` →

@@ -229,6 +229,17 @@ fn lines_len(map: &[(Value, Value)]) -> usize {
         .unwrap_or(0)
 }
 
+/// The first visible buffer line of the focused window (`lines[0]`) — reveals the
+/// viewport `top` for a content-numbered buffer (e.g. `write_n_lines`).
+fn first_visible_line(map: &[(Value, Value)]) -> String {
+    field(map, "lines")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 /// The `scroll` sub-map, or `None` when the redraw carries no scroll gesture.
 fn scroll(map: &[(Value, Value)]) -> Option<&Vec<(Value, Value)>> {
     match field(map, "scroll") {
@@ -1008,6 +1019,64 @@ async fn ctrl_u_mid_buffer_scrolls_up() {
     assert_eq!(scroll_u64(&map, "base_line"), 10); // min(from, to)
     assert_eq!(scroll_u64(&map, "duration_ms"), 96); // 12 * 8
     assert_eq!(scroll_lines_len(&map), 36); // |22 - 10| + 24
+}
+
+#[tokio::test]
+async fn ctrl_e_scrolls_one_line_keeping_the_cursor_line() {
+    let path = write_n_lines("ce", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    feed(&rpc, "10G"); // cursor mid-screen (line 10), top still 0
+    let map = redraw_after(&rpc, &mut incoming, "<C-e>").await;
+
+    // The window scrolled down one line, but the cursor held its buffer line —
+    // the defining difference from <C-d>, which drags the cursor with the view.
+    assert_eq!(first_visible_line(&map), "line2", "top moved down one line");
+    assert_eq!(cursor(&rpc).await, (10, 0), "cursor stayed on its line");
+}
+
+#[tokio::test]
+async fn ctrl_e_pulls_the_cursor_when_it_would_scroll_off_top() {
+    let path = write_n_lines("ce_pull", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    feed(&rpc, "gg"); // cursor on line 1 — the top visible row
+    let map = redraw_after(&rpc, &mut incoming, "<C-e>").await;
+
+    // Scrolling down one line would push line 1 off the top, so the cursor is
+    // pulled to the new top line (scrolloff is 0).
+    assert_eq!(first_visible_line(&map), "line2");
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 0),
+        "cursor pulled to the new top line"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_y_scrolls_one_line_up_keeping_the_cursor_line() {
+    let path = write_n_lines("cy", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    feed(&rpc, "<C-f>"); // top 0 -> 22, cursor lands on line 23 (top row)
+    let map = redraw_after(&rpc, &mut incoming, "<C-y>").await;
+
+    // View scrolls back up one line; the cursor (now one row down) holds line 23.
+    assert_eq!(first_visible_line(&map), "line22", "top moved up one line");
+    assert_eq!(cursor(&rpc).await, (23, 0), "cursor stayed on its line");
+}
+
+#[tokio::test]
+async fn ctrl_y_at_the_top_does_nothing() {
+    let path = write_n_lines("cy_top", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    feed(&rpc, "gg");
+    let map = redraw_after(&rpc, &mut incoming, "<C-y>").await;
+
+    assert!(scroll(&map).is_none(), "no viewport movement at the top");
+    assert_eq!(first_visible_line(&map), "line1");
+    assert_eq!(cursor(&rpc).await, (1, 0));
 }
 
 #[tokio::test]
@@ -5427,4 +5496,394 @@ async fn substitute_tilde_without_previous_errors() {
     assert_eq!(lines(&rpc).await, vec!["foo"], "no previous replacement");
     let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
     assert!(msg.contains("E33"), "expected E33, got {msg:?}");
+}
+
+// ----- Phase 3: the `c` (confirm) flag -----
+
+#[tokio::test]
+async fn substitute_confirm_prompts_then_y_replaces_n_skips() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    feed(&rpc, ":s/foo/bar/gc<CR>"); // opens a confirm prompt on the 1st match
+    feed(&rpc, "y"); // replace #1
+    feed(&rpc, "n"); // skip    #2
+    feed(&rpc, "y"); // replace #3
+    assert_eq!(lines(&rpc).await, vec!["bar foo bar"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_shows_the_replace_prompt() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":s/foo/bar/c<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo"],
+        "nothing changes until the prompt is answered"
+    );
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("replace with bar (y/n/a/l/q/^E/^Y)?")
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_a_replaces_all_remaining() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    feed(&rpc, ":s/foo/bar/gc<CR>");
+    feed(&rpc, "a"); // this match and every remaining one, no more prompts
+    assert_eq!(lines(&rpc).await, vec!["bar bar bar"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_q_quits_without_touching_the_rest() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    feed(&rpc, ":s/foo/bar/gc<CR>");
+    feed(&rpc, "y"); // replace #1
+    feed(&rpc, "q"); // quit before #2
+    assert_eq!(lines(&rpc).await, vec!["bar foo foo"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_esc_quits_like_q() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    feed(&rpc, ":s/foo/bar/gc<CR>");
+    feed(&rpc, "y"); // replace #1
+    feed(&rpc, "<Esc>"); // quit before #2
+    assert_eq!(lines(&rpc).await, vec!["bar foo foo"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_l_replaces_current_then_stops() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    feed(&rpc, ":s/foo/bar/gc<CR>");
+    feed(&rpc, "n"); // skip #1
+    feed(&rpc, "l"); // replace #2 and stop (last)
+    assert_eq!(lines(&rpc).await, vec!["foo bar foo"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_spans_a_range_with_y_and_n() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>");
+    feed(&rpc, ":%s/foo/bar/c<CR>"); // one match per line (no g)
+    feed(&rpc, "y"); // line 1
+    feed(&rpc, "n"); // line 2
+    feed(&rpc, "y"); // line 3
+    assert_eq!(lines(&rpc).await, vec!["bar", "foo", "bar"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_reports_count_when_done() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>");
+    feed(&rpc, ":%s/foo/bar/c<CR>");
+    feed(&rpc, "y");
+    feed(&rpc, "y");
+    let map = redraw_after(&rpc, &mut incoming, "y").await;
+    assert_eq!(lines(&rpc).await, vec!["bar", "bar", "bar"]);
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("3 substitutions on 3 lines")
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_is_a_single_undo() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    feed(&rpc, ":s/foo/bar/gc<CR>");
+    feed(&rpc, "y");
+    feed(&rpc, "y");
+    feed(&rpc, "y");
+    assert_eq!(lines(&rpc).await, vec!["bar bar bar"]);
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo foo foo"],
+        "one u undoes it all"
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_carriage_return_split_then_continue() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ia, b, c<Esc>");
+    feed(&rpc, ":s/, /\\r/gc<CR>"); // each ", " can split the line in two
+    feed(&rpc, "y"); // split after "a" -> "a" / "b, c"
+    feed(&rpc, "y"); // the walk continues onto the pushed-down tail
+    assert_eq!(lines(&rpc).await, vec!["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_n_flag_overrides_c_and_only_counts() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo foo<Esc>");
+    // `n` wins over `c`: a counting pass, no prompt, no edit.
+    let map = redraw_after(&rpc, &mut incoming, ":s/foo/bar/gnc<CR>").await;
+    assert_eq!(lines(&rpc).await, vec!["foo foo"], "n makes no edits");
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("2 matches on 1 line")
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_ctrl_e_scrolls_without_consuming_the_match() {
+    let path = write_n_lines("conf_ce", 100); // lines "line1".."line100"
+    let (rpc, mut incoming) = start(Some(path)).await;
+    feed(&rpc, "gg");
+    feed(&rpc, ":%s/line/LINE/c<CR>"); // prompt opens on line 1's match
+    let map = redraw_after(&rpc, &mut incoming, "<C-e>").await;
+
+    // The peek scrolled the window down a line but kept the prompt up and made
+    // no edit — `^E` is not an answer. (nxvim keeps the cursor on screen every
+    // frame, so the view-cursor rides along; the pending match lives in the
+    // confirm state, not the cursor, so the answer still lands on it.)
+    assert_eq!(first_visible_line(&map), "line2", "view scrolled one line");
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("replace with LINE (y/n/a/l/q/^E/^Y)?"),
+        "prompt still up after the scroll"
+    );
+    assert_eq!(
+        lines(&rpc).await[0],
+        "line1",
+        "no substitution happened on the scroll key"
+    );
+
+    // The still-pending match answers to `y` as if the scroll never happened.
+    feed(&rpc, "y");
+    feed(&rpc, "q"); // stop after the first
+    let after = lines(&rpc).await;
+    assert_eq!(
+        after[0], "LINE1",
+        "y substituted the originally-prompted match"
+    );
+    assert_eq!(after[1], "line2", "and only that one");
+}
+
+#[tokio::test]
+async fn substitute_confirm_cursor_lands_on_last_changed_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>gg0");
+    feed(&rpc, ":%s/foo/bar/c<CR>");
+    feed(&rpc, "y"); // line 1
+    feed(&rpc, "n"); // skip line 2
+    feed(&rpc, "y"); // line 3 — the last change
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 0),
+        "cursor on the last changed line"
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_all_skipped_pushes_no_undo() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ofoo foo<Esc>"); // line 2 is "foo foo"; line 1 stays ""
+    feed(&rpc, ":s/foo/bar/gc<CR>");
+    feed(&rpc, "n"); // skip #1
+    feed(&rpc, "n"); // skip #2 -> prompt ends, nothing changed
+    assert_eq!(lines(&rpc).await, vec!["", "foo foo"], "buffer untouched");
+    // The skipped substitute pushed no undo entry, so `u` reverts the prior edit
+    // (the `o` insert) — not a phantom no-op snapshot.
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "u undoes the insert, not the :s"
+    );
+}
+
+// ----- statusline option plumbing (string-valued global option, Phase 1) -----
+
+#[tokio::test]
+async fn vim_opt_statusline_round_trips_through_core() {
+    let (rpc, _incoming) = start(None).await;
+    // The `statusline` string global written through vim.opt reaches the core and
+    // reads back the same value via vim.o / vim.opt and the `stl` abbreviation —
+    // proving the String OptionValue threads through the Lua bridge and mirror,
+    // not just a Lua-side table.
+    exec_lua(&rpc, r#"vim.opt.statusline = "%f %l,%c""#).await;
+    let via_o = exec_lua(&rpc, r#"return vim.o.statusline"#).await;
+    assert_eq!(via_o.as_str(), Some("%f %l,%c"));
+    let via_opt = exec_lua(&rpc, r#"return vim.opt.statusline"#).await;
+    assert_eq!(via_opt.as_str(), Some("%f %l,%c"));
+    let via_abbrev = exec_lua(&rpc, r#"return vim.o.stl"#).await;
+    assert_eq!(via_abbrev.as_str(), Some("%f %l,%c"));
+}
+
+#[tokio::test]
+async fn vim_o_statusline_read_reflects_set_ex_command() {
+    let (rpc, _incoming) = start(None).await;
+    // Reading vim.o.statusline reflects a value set via the `:set` ex path (the
+    // server-pushed mirror), the same home the Lua write reaches.
+    feed(&rpc, ":set statusline=%f<CR>");
+    let via_o = exec_lua(&rpc, r#"return vim.o.statusline"#).await;
+    assert_eq!(via_o.as_str(), Some("%f"));
+}
+
+#[tokio::test]
+async fn set_statusline_query_echoes_value_with_escaped_spaces() {
+    let (rpc, mut incoming) = start(None).await;
+    // `:set statusline=…` carries spaces via vim's `\ ` escaping (the value would
+    // otherwise split into separate `:set` tokens). The escaped space survives as
+    // a real space, and `:set statusline?` echoes the stored value back.
+    feed(&rpc, r":set statusline=%f\ %l,%c<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline?<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(msg, "statusline=%f %l,%c");
+}
+
+#[tokio::test]
+async fn set_statusline_reset_clears_to_default() {
+    let (rpc, _incoming) = start(None).await;
+    // `:set statusline&` resets the option to its default (empty).
+    feed(&rpc, ":set statusline=%f<CR>");
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.o.statusline"#).await.as_str(),
+        Some("%f")
+    );
+    feed(&rpc, ":set statusline&<CR>");
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.o.statusline"#).await.as_str(),
+        Some("")
+    );
+}
+
+// ----- :global / :vglobal (and the :delete / :print they drive) -----
+
+#[tokio::test]
+async fn ex_delete_removes_the_range_lines() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<CR>ddd<Esc>");
+    feed(&rpc, ":2,3d<CR>");
+    assert_eq!(lines(&rpc).await, vec!["aaa", "ddd"]);
+}
+
+#[tokio::test]
+async fn ex_delete_bare_removes_the_current_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<Esc>gg");
+    feed(&rpc, ":d<CR>"); // current line (1) only
+    assert_eq!(lines(&rpc).await, vec!["bbb", "ccc"]);
+}
+
+#[tokio::test]
+async fn global_deletes_every_matching_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ikeep<CR>drop me<CR>keep<CR>drop<CR>keep<Esc>");
+    feed(&rpc, ":g/drop/d<CR>");
+    assert_eq!(lines(&rpc).await, vec!["keep", "keep", "keep"]);
+}
+
+#[tokio::test]
+async fn vglobal_deletes_every_non_matching_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ikeep<CR>drop me<CR>keep<CR>drop<CR>x<Esc>");
+    feed(&rpc, ":v/drop/d<CR>"); // delete lines NOT matching "drop"
+    assert_eq!(lines(&rpc).await, vec!["drop me", "drop"]);
+}
+
+#[tokio::test]
+async fn global_bang_is_vglobal() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ikeep<CR>drop<CR>keep<Esc>");
+    feed(&rpc, ":g!/drop/d<CR>"); // == :v/drop/d
+    assert_eq!(lines(&rpc).await, vec!["drop"]);
+}
+
+#[tokio::test]
+async fn global_runs_substitute_on_matching_lines_only() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo 1<CR>bar 1<CR>foo 1<Esc>");
+    feed(&rpc, ":g/foo/s/1/X/<CR>"); // substitute only on the "foo" lines
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo X", "bar 1", "foo X"],
+        "the bar line is skipped even though it also contains 1"
+    );
+}
+
+#[tokio::test]
+async fn global_default_range_is_the_whole_file() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "idrop<CR>a<CR>drop<Esc>G"); // cursor on the last line
+    feed(&rpc, ":g/drop/d<CR>"); // no range → whole file, not the current line
+    assert_eq!(lines(&rpc).await, vec!["a"]);
+}
+
+#[tokio::test]
+async fn global_range_limits_the_scan() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ix<CR>x<CR>x<CR>x<Esc>");
+    feed(&rpc, ":2,3g/x/d<CR>"); // only lines 2..3 are eligible
+    assert_eq!(lines(&rpc).await, vec!["x", "x"]);
+}
+
+#[tokio::test]
+async fn global_is_a_single_undo() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ix<CR>y<CR>x<CR>y<CR>x<Esc>");
+    feed(&rpc, ":g/x/d<CR>");
+    assert_eq!(lines(&rpc).await, vec!["y", "y"]);
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["x", "y", "x", "y", "x"],
+        "one u restores every :g/x/d deletion"
+    );
+}
+
+#[tokio::test]
+async fn global_empty_pattern_reuses_last_search() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<CR>foo<Esc>");
+    feed(&rpc, "/foo<CR>"); // sets the last search pattern
+    feed(&rpc, ":g//d<CR>"); // empty pattern → reuse "foo"
+    assert_eq!(lines(&rpc).await, vec!["bar"]);
+}
+
+#[tokio::test]
+async fn global_prints_matching_lines_when_no_command() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<CR>beta<CR>also alpha<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":g/alpha/<CR>").await; // default cmd = print
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta", "also alpha"],
+        "print changes nothing"
+    );
+    // The last printed line shows on the message line.
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("also alpha")
+    );
+}
+
+#[tokio::test]
+async fn global_nested_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ix<CR>y<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":g/x/g/y/d<CR>").await;
+    assert_eq!(lines(&rpc).await, vec!["x", "y"], "nothing deleted");
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E147"), "expected E147, got {msg:?}");
+}
+
+#[tokio::test]
+async fn global_no_match_reports_e486() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":g/zzz/d<CR>").await;
+    assert_eq!(lines(&rpc).await, vec!["foo", "bar"], "buffer untouched");
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E486: Pattern not found: zzz")
+    );
 }

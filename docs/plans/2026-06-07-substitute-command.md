@@ -1,12 +1,21 @@
 # Implementing `:substitute` (`:s`)
 
-> **Status: Phases 0–2 DONE.** The ex-range parser (Phase 0), the core
-> substitute command (Phase 1: `g`/`i`/`I`/`n` flags, count, `\r` line-split,
-> capture refs, count reporting, single-undo), and pattern/replacement reuse
-> (Phase 2: empty-pattern reuse, bare `:s` / `:&` / `:&&` repeat with the
+> **Status: Phases 0–4 DONE.** The ex-range parser
+> (Phase 0), the core substitute command (Phase 1: `g`/`i`/`I`/`n` flags, count,
+> `\r` line-split, capture refs, count reporting, single-undo), pattern/replacement
+> reuse (Phase 2: empty-pattern reuse, bare `:s` / `:&` / `:&&` repeat with the
 > flag-reset-vs-keep distinction, `~` replacement recall, trailing count,
-> alternate delimiters) are implemented and tested. Phase 3 (the `c` confirm
-> flag) remains. Phased and TDD-driven per the project workflow.
+> alternate delimiters), the interactive `c` confirm flag (Phase 3:
+> `y`/`n`/`a`/`l`/`q`/`<Esc>` per-match prompting), and `:global` / `:vglobal`
+> (Phase 4, with the `:delete` / `:print` it drives) are all implemented and
+> tested. Phased and TDD-driven per the project workflow.
+>
+> **Note on file paths below.** This plan was written against the pre-refactor
+> single-file `crates/nxvim-core/src/editor.rs`. That file has since been split
+> into per-concern modules under `crates/nxvim-core/src/editor/`; the substitute
+> code now lives in `editor/ex.rs` (range parsing, `ex_substitute`,
+> `run_substitute`, and the `SubstConfirm` confirm walk) with the confirm-key
+> intercept in `editor/mod.rs`. Line numbers in the prose are historical.
 
 ## Why this document exists
 
@@ -96,7 +105,7 @@ calls; the treesitter/LSP edit journal is fed automatically.
   (Phase 2, optional).
 - **flags**: `g` (every match on the line, not just first), `i`/`I` (force ignore /
   match case for this command), `n` (report match count, make no changes),
-  `c` (confirm — Phase 3, optional), `&` (keep previous flags — optional).
+  `c` (confirm — prompt per match, Phase 3), `&` (keep previous flags — optional).
 - **count**: trailing number → apply to `count` lines starting at the range's
   *last* line (vim semantics).
 - **bare `:s`** with no pattern → repeat the last substitute on the current line.
@@ -217,37 +226,119 @@ literal `/pat/rep/flags` spec, a bare/flag-only repeat, or (via `execute_ex`) th
 `&`/`&&` forms; `repeat_substitute` rebuilds the spec from `last_substitute`; and
 `run_substitute` is the shared engine both call.
 
-## Phase 3 — Confirm flag `c` (optional, larger)
+## Phase 3 — Confirm flag `c` — DONE
 
-The `c` flag prompts per match (`replace with X (y/n/a/l/q/^E/^Y)?`). This needs
-a modal prompt state in the editor + a way for the client to feed the answer
-key — closer to the search/command-line input machinery than to a pure edit.
-Scope it as its own follow-up; land Phases 0–2 first and note `c` as a
-known gap (fail loud: `echo` that `c` is unimplemented rather than silently
-ignoring it, per the no-silent-stubs rule).
+The `c` flag walks the matches one at a time, prompting `replace with {rep}
+(y/n/a/l/q/^E/^Y)?` before each. Rather than reuse `Mode::Command` (the cursor
+stays *in the buffer*, on the match, not on a command line), it adds a small
+paused-walk state to the editor:
 
-**Cursor with a line-splitting replacement.** When `\r` splits lines, the range's
-line indices shift as edits land. Iterate the range carefully (track a running
-line offset, or rebuild from match positions), and leave the cursor on the first
-non-blank of the *last line produced by the last substitution*.
+- **`SubstConfirm`** (in `editor/ex.rs`) holds the compiled regex, the expanded
+  replacement, the `g` flag, the live `[.., hi]` bounds, the current scan
+  position (`line`/`byte`), the match awaiting an answer (`cur`), the running
+  `subs`/`nlines` tallies, `last_changed`, and a lazy `pushed` (the single undo
+  snapshot is taken on the *first* applied match — an all-skipped confirm pushes
+  no undo, so a later `u` reverts the prior edit, matching vim).
+- **`Editor::subst_confirm: Option<SubstConfirm>`** (in `editor/mod.rs`). While
+  `Some`, `Editor::input` routes every key to `subst_confirm_key` *ahead of* the
+  mode dispatch (the same pattern the focused panel uses), so the answer never
+  reaches normal-mode handling and the prompt message survives between keys.
+- The prompt is set straight onto `Editor::message` (not via `echo`), keeping the
+  transient question off the `:messages` history, like vim.
+
+Answer keys: `y` substitute + advance, `n` skip + advance, `a` substitute this
+and all remaining with no further prompts, `l` substitute this one then stop,
+`q`/`<Esc>` stop without it, and `^E`/`^Y` scroll the window one line to peek
+around the match (leaving the prompt up, the match unconsumed). `n` (count-only)
+still takes precedence over `c` (a counting pass never prompts); any other key
+leaves the prompt up (vim beeps).
+
+The `^E`/`^Y` peek reuses the normal-mode one-line scroll (`<C-e>`/`<C-y>`, added
+alongside this — `Editor::scroll_line` in `editor/cursor.rs`). One nxvim-specific
+wrinkle: nxvim re-runs `ensure_visible` on every redraw, so it can't let the
+cursor scroll off the match the way vim does. Instead the cursor rides the view
+to stay on screen during the peek — harmless, because the pending match lives in
+the confirm state (`cur`), not in the cursor, so the eventual `y`/`n` still lands
+on the right match.
+
+`SearchRegex::match_replacement(line, from, rep)` (in `search.rs`) is the single
+primitive the walk steps on: the next non-overlapping match at-or-after `from`
+plus its expanded replacement.
+
+**Cursor with a line-splitting replacement.** When `\r` splits a line, later
+lines shift down. Applying a match bumps `hi` and the continuation `line` by the
+number of newlines the replacement introduced, and sets the continuation `byte`
+to just past the replacement's final segment — so a global confirm keeps matching
+the rest of the original line on its new (pushed-down) row. The cursor lands on
+the first non-blank of the last line produced by the last substitution. A
+zero-width match is force-stepped one grapheme so the walk can't spin.
+
+## Phase 4 — `:global` / `:vglobal` (and the `:delete` / `:print` it drives) — DONE
+
+`:[range]g[!]/{pat}/{cmd}` runs an ex command on every line of the range matching
+`{pat}`; `:g!` and `:v` / `:vglobal` invert to the non-matching lines. The
+**range defaults to the whole file** (not the current line), an empty pattern
+reuses the last search, and an empty command defaults to `:print` (vim).
+
+The engine (`ex_global` in `editor/ex.rs`) is vim's two-pass **mark then execute**:
+
+1. **First pass** collects the target line indices (matching, or non-matching for
+   the inverted forms) up front, so edits in pass two can't disturb the selection.
+2. **Second pass** runs `{cmd}` on each target via the normal `execute_ex`
+   dispatch (so `:g/re/s/…/…/`, `:g/re/d`, `:g/re/p` all just work), with the
+   cursor pre-positioned on the line. A running `offset` tracks the buffer's
+   line-count change after each command and shifts the remaining targets, so a
+   command that deletes or splits lines keeps the rest aligned. This handles the
+   line-wise commands (`:d`, `:s`, `:p`) that cover the overwhelming majority of
+   `:g` use; a command that non-locally restructures many lines at once is a known
+   edge the simple offset model doesn't perfectly track.
+
+The whole `:g` is **one undo step**: force a fresh `push_undo`, set `snapshot_taken`
+to suppress the per-command snapshots through the batch, then clear it so the next
+edit snapshots on its own. A nested `:g`/`:v` in `{cmd}` fails loud (`E147`) via an
+`in_global` re-entrancy flag. `:g` with no match reports `E486` (like `:s`); `:v`
+with no non-matching lines is a silent no-op (the pattern was found, so it's not a
+miss). `:g` sets the last-search pattern, like `:s`.
+
+Two range commands were added as the per-line targets (independently useful):
+`:[range]d[elete]` removes the range's lines (default current line; lands the
+cursor on the line that replaces them), and `:[range]p[rint]` echoes them (the
+default `:g` command). Both go through `push_undo`, so they coalesce under `:g`.
 
 ## Out of scope / known gaps (state them, don't hide them)
 
 - vim-magic patterns (`\(`, `\+`, `\zs`, …) in `:s` — intentionally unsupported;
   `:s` is canonical regex like `/`.
-- `:g`/`:v`, `:s` with the `e` (no-error) flag — later. (Note: `e` would
-  *suppress* the no-match error; until it exists, no-match always reports
-  `E486`, consistent with fail-loud.)
+- `:s` with the `e` (no-error) flag — later. (Note: `e` would *suppress* the
+  no-match error; until it exists, no-match always reports `E486`, consistent
+  with fail-loud.)
+- `:g` driving `:normal`, `:m`/`:t` (move/copy), or `:>`/`:<` — those ex commands
+  don't exist yet, so `:g/re/normal …` defers and reports unknown-command per
+  line. `:d` takes no register/count argument yet (`:d x`, `:d 3`).
+- Normal-mode `&` / `g&` (repeat the last `:s`) — the ex `:&` / `:&&` exist; the
+  normal-mode keys don't.
 
-## Touch list
+## Touch list (as built)
 
-- `crates/nxvim-core/src/editor.rs` — `parse_ex_range` (new), `execute_ex` wiring,
-  `ex_substitute` (new), last-substitute state fields on `OpenBuffer`/`Editor`.
-- `crates/nxvim-core/src/search.rs` — `SearchRegex::substitute_line` (new) +
-  module doc note on the replacement dialect.
-- `crates/nxvim-server/tests/editing.rs` — new `substitute_*` tests (Phases 0–2).
-- `docs/architecture.md` / `docs/known-approximations.md` — note the `:s`
-  replacement dialect and the deferred `c`/newline gaps once landed.
+- `crates/nxvim-core/src/editor/ex.rs` — `parse_ex_range`, `execute_ex` wiring,
+  `ex_substitute` / `repeat_substitute` / `run_substitute`, and the Phase-3
+  confirm walk (`SubstConfirm`, `begin_subst_confirm`, `subst_confirm_seek` /
+  `_key` / `_apply` / `_skip` / `_finish`, `next_char_boundary`).
+- `crates/nxvim-core/src/editor/mod.rs` — the `last_substitute` / `subst_confirm`
+  state fields and the `subst_confirm_key` input intercept in `Editor::input`.
+- `crates/nxvim-core/src/editor/cursor.rs` + `editor/command.rs` — the normal-mode
+  one-line scroll `<C-e>`/`<C-y>` (`scroll_line` / `scroll_view_line`,
+  `NormalCmd::ScrollLine`), which the confirm `^E`/`^Y` peek reuses.
+- `crates/nxvim-core/src/editor/ex.rs` (Phase 4) — `ex_global` / `split_global`,
+  the `:g`/`:v`/`:d`/`:p` `execute_ex` arms, and `ex_delete` / `ex_print`; the
+  `in_global` re-entrancy flag lives on `Editor` in `editor/mod.rs`.
+- `crates/nxvim-core/src/search.rs` — `SearchRegex::substitute_line` and
+  `match_replacement` (the Phase-3 single-match primitive) + the replacement-dialect
+  module note.
+- `crates/nxvim-server/tests/editing.rs` — the `substitute_*` /
+  `substitute_confirm_*` (Phases 0–3) and `global_*` / `ex_delete_*` (Phase 4) tests.
+- `docs/architecture.md` / `docs/known-approximations.md` — `:s` is implemented;
+  the replacement dialect shares `/` search's canonical regex.
 
 ## Resolved decisions
 
@@ -255,7 +346,8 @@ non-blank of the *last line produced by the last substitution*.
   captures, plus a `\r`/`\n`→newline, `\t`→tab, `\\`→backslash escape pass.
   `\r` (line split) was specifically requested as useful.
 - **`lo > hi` range** — error loudly (no silent swap), per the fail-loud rule.
-- **Unknown flags / unsupported `c`** — error, never ignore.
+- **Unknown flags** — error, never ignore. The `c` confirm flag is implemented
+  (Phase 3); `n` (count-only) takes precedence over it.
 
 ## To verify before Phase 0
 

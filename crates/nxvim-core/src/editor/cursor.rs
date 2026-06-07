@@ -233,6 +233,45 @@ impl Editor {
         self.scroll_by(if down { page } else { -page });
     }
 
+    /// Move the viewport one line — `<C-e>` (down) / `<C-y>` (up) — *without*
+    /// touching the cursor, returning whether `top` actually moved. `<C-e>` can
+    /// scroll until the last buffer line reaches the top row; `<C-y>` stops at the
+    /// first. The pure-viewport primitive behind [`Self::scroll_line`].
+    fn scroll_view_line(&mut self, down: bool) -> bool {
+        let new_top = if down {
+            (self.top + 1).min(self.last_line())
+        } else {
+            self.top.saturating_sub(1)
+        };
+        if new_top == self.top {
+            return false;
+        }
+        self.scroll_from = Some((self.top, self.cursor.line));
+        self.top = new_top;
+        true
+    }
+
+    /// `<C-e>` / `<C-y>`: scroll the viewport one line, keeping the cursor on its
+    /// buffer line unless the scroll pushes it off-screen — then pull it to the
+    /// nearest visible edge (scrolloff is 0), at its remembered desired column.
+    /// Unlike [`Self::scroll_by`] (`<C-d>`/`<C-f>`), the cursor does *not* travel
+    /// with the view while it stays visible.
+    pub(crate) fn scroll_line(&mut self, down: bool) {
+        if !self.scroll_view_line(down) {
+            return;
+        }
+        let bottom = self.top + self.text_height() - 1;
+        if self.cursor.line < self.top {
+            self.cursor.line = self.top;
+        } else if self.cursor.line > bottom {
+            self.cursor.line = bottom.min(self.last_line());
+        } else {
+            return; // cursor still on screen — leave it (and its curswant) put
+        }
+        self.settle_desired_col(false);
+        self.preserve_desired = true;
+    }
+
     /// Scroll the viewport by `delta` lines, vim-style: move both `top` and the
     /// cursor together so the cursor keeps its screen row. Records the pre-move
     /// `(top, cursor.line)` in `scroll_from`; `input` turns that into a

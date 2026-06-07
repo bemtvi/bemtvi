@@ -90,6 +90,28 @@ impl SearchRegex {
         out.push_str(&line[last..]);
         (out, count)
     }
+
+    /// The next match in the non-overlapping sequence whose start is at byte
+    /// offset `from` or later, as `(start, end, replacement)` where `replacement`
+    /// is `rep` expanded against that match's captures (same `$`-captures and
+    /// backslash escapes as [`Self::substitute_line`]). `None` past the last
+    /// match. The single-match primitive the interactive `:s///c` confirm walk
+    /// uses to step one match at a time.
+    pub(crate) fn match_replacement(
+        &self,
+        line: &str,
+        from: usize,
+        rep: &str,
+    ) -> Option<(usize, usize, String)> {
+        let caps = self
+            .re
+            .captures_iter(line)
+            .find(|c| c.get(0).expect("group 0 always present").start() >= from)?;
+        let m = caps.get(0).expect("group 0 always present");
+        let mut out = String::new();
+        expand_replacement(rep, &caps, &mut out);
+        Some((m.start(), m.end(), out))
+    }
 }
 
 /// Expand a substitute replacement against a match's captures, appending to

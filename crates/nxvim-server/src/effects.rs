@@ -117,6 +117,9 @@ impl Server {
                 // `showtabline` is the one wired numeric global (the Lua side
                 // forwards the search booleans and `showtabline`).
                 OptionValue::Number(n) => self.editor.set_global_option_num(&op.name, n),
+                // `statusline` (the one wired string global) — same home the
+                // `:set statusline=…` ex path writes.
+                OptionValue::String(s) => self.editor.set_global_option_str(&op.name, &s),
             }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
@@ -159,6 +162,10 @@ impl Server {
                 match value {
                     OptionValue::Number(n) => self.editor.set_buffer_option_num(id, &name, n),
                     OptionValue::Bool(b) => self.editor.set_buffer_option_bool(id, &name, b),
+                    // No buffer-local string option is wired (only the global
+                    // `statusline` is). The `_buf_set_option` bridge never emits
+                    // a `String`, so this is unreachable in practice.
+                    OptionValue::String(_) => {}
                 }
                 return;
             }
@@ -539,6 +546,7 @@ impl Server {
                 go.incsearch,
             ),
             go.showtabline,
+            &go.statusline,
         );
     }
 

@@ -934,9 +934,20 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// Set a string global option from outside the editor (the Lua `vim.o`
+    /// bridge), the string analogue of [`Editor::set_global_option_bool`]. The one
+    /// wired string global is `statusline`; an unknown name is a no-op (the Lua
+    /// side forwards only the canonical wired set). This is the same state the
+    /// `:set statusline=…` ex path writes — the two routes share one home.
+    pub fn set_global_option_str(&mut self, name: &str, value: &str) {
+        if name == "statusline" {
+            self.options.statusline = value.to_string();
+        }
+    }
+
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).
     pub fn global_options(&self) -> Options {
-        self.options
+        self.options.clone()
     }
 
     /// Window `id`'s cursor as `(0-based line, byte col)` — the live cursor for

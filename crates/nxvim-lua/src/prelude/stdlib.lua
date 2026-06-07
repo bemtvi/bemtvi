@@ -90,11 +90,13 @@ local O_GLOBAL = {
   hlsearch = "hlsearch", hls = "hlsearch",
   incsearch = "incsearch", is = "incsearch",
   showtabline = "showtabline", stal = "showtabline",
+  statusline = "statusline", stl = "statusline",
 }
 -- Core defaults, the safety net before the server has pushed the mirror.
 local O_GLOBAL_DEFAULT = {
   ignorecase = false, smartcase = false, wrapscan = true,
   hlsearch = true, incsearch = true, showtabline = 1,
+  statusline = "",
 }
 
 -- Rust→Lua mirror of the core's global option values, refreshed by the server

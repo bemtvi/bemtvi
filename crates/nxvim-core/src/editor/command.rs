@@ -264,6 +264,7 @@ enum NormalCmd {
     SearchWord { dir: SearchDir, whole_word: bool }, // * # (g* g# drop boundaries)
     ScrollHalf(bool),                                // <C-d> (true) / <C-u> (false)
     ScrollPage(bool),                                // <C-f> (true) / <C-b> (false)
+    ScrollLine(bool),                                // <C-e> (true) / <C-y> (false)
     AltBuffer,                                       // <C-^> / <C-6>
     TabNext(Option<usize>),                          // gt  ({count}gt → tab number)
     TabPrev(Option<usize>),                          // gT  ({count}gT → count back)
@@ -508,6 +509,8 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             KeyCode::Char('u') => Complete(RC::Normal(N::ScrollHalf(false))),
             KeyCode::Char('f') => Complete(RC::Normal(N::ScrollPage(true))),
             KeyCode::Char('b') => Complete(RC::Normal(N::ScrollPage(false))),
+            KeyCode::Char('e') => Complete(RC::Normal(N::ScrollLine(true))),
+            KeyCode::Char('y') => Complete(RC::Normal(N::ScrollLine(false))),
             KeyCode::Char('r') => Complete(RC::Normal(N::Redo)),
             KeyCode::Char('^') | KeyCode::Char('6') => Complete(RC::Normal(N::AltBuffer)),
             _ => Reset,
@@ -827,6 +830,7 @@ impl Editor {
             }
             NormalCmd::ScrollHalf(down) => self.scroll_half(down),
             NormalCmd::ScrollPage(down) => self.scroll_page(down),
+            NormalCmd::ScrollLine(down) => self.scroll_line(down),
             NormalCmd::AltBuffer => self.goto_alternate(),
             NormalCmd::TabNext(n) => self.goto_tab_next(n),
             NormalCmd::TabPrev(n) => self.goto_tab_prev(n),

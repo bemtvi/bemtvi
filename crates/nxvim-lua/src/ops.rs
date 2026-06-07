@@ -245,14 +245,18 @@ pub enum BufOp {
     },
 }
 
-/// A scalar buffer-option value carried by [`BufOp::SetOption`]: a number for
-/// `tabstop`/`shiftwidth`, a boolean for `expandtab`. Kept free of `mlua` types
-/// (the bridge converts the Lua value into this) so the server can match on it
-/// directly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A scalar option value carried by [`BufOp::SetOption`] / [`GlobalOptionOp`] /
+/// [`WindowOp::SetOption`]: a number for `tabstop`/`shiftwidth`, a boolean for
+/// `expandtab`, a string for `statusline`. Kept free of `mlua` types (the bridge
+/// converts the Lua value into this) so the server can match on it directly. Not
+/// `Copy` since [`OptionValue::String`] owns its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OptionValue {
     Number(i64),
     Bool(bool),
+    /// A string option (`statusline`, …). Only the global scope wires one today;
+    /// the buffer/window bridges never produce this variant.
+    String(String),
 }
 
 /// A global (editor-wide) option mutation queued by `vim.o` for a search option

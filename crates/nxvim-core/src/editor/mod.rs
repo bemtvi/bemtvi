@@ -360,6 +360,12 @@ pub struct Editor {
     /// bare `:s` / `:&` / `:&&` repeats and the `~` replacement recall. The flag
     /// letters exclude any trailing count. `None` until the first substitute.
     last_substitute: Option<(String, String, String)>,
+    /// An in-flight `:s///c` confirm substitute: the match-by-match walk paused
+    /// on a `replace with … (y/n/a/l/q)?` prompt. While `Some`, every key is the
+    /// answer to that prompt (routed ahead of mode handling in [`Editor::input`]);
+    /// the buffer is otherwise in normal mode with the cursor on the pending
+    /// match. `None` outside a confirm substitute.
+    subst_confirm: Option<ex::SubstConfirm>,
     /// Operator (`d`/`c`/`y`) waiting on a search motion: set when `d/`,`y?`, …
     /// open a search prompt, applied over the match when the search commits, and
     /// cleared on commit or `<Esc>`. `None` for a plain (movement) search.
@@ -538,6 +544,7 @@ impl Editor {
             confirm_default: 0,
             last_search: None,
             last_substitute: None,
+            subst_confirm: None,
             search_operator: None,
             pending_search_count: 1,
             search_history: Vec::new(),
@@ -643,6 +650,13 @@ impl Editor {
         // buffer's mode handling and the `curswant`/scroll bookkeeping below.
         if self.panel.is_some() {
             self.handle_panel(key);
+            return;
+        }
+
+        // A `:s///c` confirm substitute owns every key as the answer to its
+        // `replace with … ?` prompt, ahead of mode handling, until it resolves.
+        if self.subst_confirm.is_some() {
+            self.subst_confirm_key(key);
             return;
         }
 

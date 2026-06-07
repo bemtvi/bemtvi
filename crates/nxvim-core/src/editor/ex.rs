@@ -3,8 +3,18 @@
 
 use super::*;
 use crate::buffer::Buffer;
+use crate::input::{Key, KeyCode};
 use crate::search::SearchRegex;
 use std::path::PathBuf;
+
+/// Byte offset of the char boundary just past `byte` in `line`, or `line.len()`
+/// at the end. Used to force the confirm walk past a zero-width match.
+fn next_char_boundary(line: &str, byte: usize) -> usize {
+    line[byte..]
+        .chars()
+        .next()
+        .map_or(line.len(), |c| byte + c.len_utf8())
+}
 
 /// A resolved, 0-based, inclusive line range parsed from the head of an
 /// ex-command. `explicit` is false when no address was present and the range
@@ -14,6 +24,36 @@ struct ExRange {
     lo: usize,
     hi: usize,
     explicit: bool,
+}
+
+/// An in-flight `:s///c` confirm substitute (see [`Editor::subst_confirm`]). The
+/// match-by-match walk over `[.., hi]`, paused on each match's `replace with …?`
+/// prompt; the answer key ([`Editor::subst_confirm_key`]) drives it forward.
+///
+/// Positions track *live* (post-edit) rope coordinates: a `\r`-splitting
+/// replacement pushes later lines down, so applying a match bumps `hi` and the
+/// continuation line by the number of newlines it introduced. `cur` is the match
+/// currently being prompted (`Some` while a prompt is showing).
+pub(crate) struct SubstConfirm {
+    re: SearchRegex,
+    rep: String,
+    /// Replace every match on a line (`g`), not just the first.
+    global: bool,
+    /// Last line to scan, in live coordinates (grows as `\r` splits add lines).
+    hi: usize,
+    /// Line currently being scanned, in live coordinates.
+    line: usize,
+    /// Next byte offset to search from within `line`.
+    byte: usize,
+    /// The match awaiting an answer: `(start, end, expanded replacement)`.
+    cur: Option<(usize, usize, String)>,
+    /// `y`/`a`/`l` to one match already happened on the current line.
+    line_dirty: bool,
+    subs: usize,
+    nlines: usize,
+    last_changed: Option<usize>,
+    /// The single undo snapshot is pushed lazily, on the first applied match.
+    pushed: bool,
 }
 
 /// Split a substitute body (everything after the leading delimiter) into
@@ -412,6 +452,7 @@ impl Editor {
         // Parse flag letters, then an optional trailing count.
         let mut global = false;
         let mut nflag = false;
+        let mut confirm = false;
         let mut icase: Option<bool> = None;
         let tail = flag_spec.trim();
         let tb = tail.as_bytes();
@@ -422,10 +463,7 @@ impl Editor {
                 b'i' => icase = Some(true),
                 b'I' => icase = Some(false),
                 b'n' => nflag = true,
-                b'c' => {
-                    self.echo("substitute: the 'c' (confirm) flag is not implemented yet");
-                    return;
-                }
+                b'c' => confirm = true,
                 b' ' | b'\t' | b'0'..=b'9' => break,
                 _ => {
                     self.echo(format!("E488: Trailing characters: {}", &tail[k..]));
@@ -513,6 +551,13 @@ impl Editor {
             return;
         }
 
+        // `c` runs the same range interactively, prompting before each match.
+        // `n` takes precedence above (vim: a counting pass never prompts).
+        if confirm {
+            self.begin_subst_confirm(re, rep, global, pattern, lo, hi);
+            return;
+        }
+
         // Edit pass. A `\r` in the replacement splits a line into several, so a
         // running `added` offset keeps later original lines pointing at the
         // right (shifted) index.
@@ -570,6 +615,240 @@ impl Editor {
     fn set_substitute_search(&mut self, pattern: String) {
         self.last_search = Some((pattern, SearchDir::Forward, SearchOffset::None));
         self.search_active = true;
+    }
+
+    /// Open a `:s///c` confirm substitute over `[lo, hi]`: light up the pattern
+    /// highlight (matches show while prompting), seed the walk, and prompt on the
+    /// first match — or finish straight away if the range holds none. The
+    /// substitute is *not* recorded for repeats here; the caller in
+    /// [`Self::run_substitute`] already did that before this point.
+    fn begin_subst_confirm(
+        &mut self,
+        re: SearchRegex,
+        rep: String,
+        global: bool,
+        pattern: String,
+        lo: usize,
+        hi: usize,
+    ) {
+        self.set_substitute_search(pattern);
+        self.subst_confirm = Some(SubstConfirm {
+            re,
+            rep,
+            global,
+            hi,
+            line: lo,
+            byte: 0,
+            cur: None,
+            line_dirty: false,
+            subs: 0,
+            nlines: 0,
+            last_changed: None,
+            pushed: false,
+        });
+        self.subst_confirm_seek();
+    }
+
+    /// Find the next match from the walk's current position and prompt for it,
+    /// putting the cursor on the match and the `replace with …?` question on the
+    /// message line. Skips lines with no match; finishes when the range is spent.
+    fn subst_confirm_seek(&mut self) {
+        loop {
+            let (line, byte, hi) = {
+                let sc = self.subst_confirm.as_ref().expect("confirm active");
+                (sc.line, sc.byte, sc.hi)
+            };
+            if line > hi {
+                self.subst_confirm_finish();
+                return;
+            }
+            let text = self.buffer().line(line);
+            let found = {
+                let sc = self.subst_confirm.as_ref().expect("confirm active");
+                sc.re.match_replacement(&text, byte, &sc.rep)
+            };
+            match found {
+                Some((s, e, repl)) => {
+                    self.subst_confirm.as_mut().expect("confirm active").cur =
+                        Some((s, e, repl.clone()));
+                    self.cursor.line = line;
+                    self.cursor.col = s;
+                    self.clamp_cursor();
+                    self.ensure_visible();
+                    // Set the prompt directly, not via `echo`: it's a transient
+                    // question, kept off the `:messages` history (like vim).
+                    self.message = format!("replace with {repl} (y/n/a/l/q/^E/^Y)?");
+                    return;
+                }
+                None => {
+                    // No (more) matches on this line — drop to the next.
+                    let sc = self.subst_confirm.as_mut().expect("confirm active");
+                    sc.line += 1;
+                    sc.byte = 0;
+                    sc.line_dirty = false;
+                }
+            }
+        }
+    }
+
+    /// Answer the open confirm prompt. `y` substitutes and advances, `n` skips,
+    /// `a` substitutes this match and every remaining one without prompting, `l`
+    /// substitutes this one then stops, `q`/`<Esc>` stop without it. Any other
+    /// key leaves the prompt up (vim beeps).
+    pub(crate) fn subst_confirm_key(&mut self, key: Key) {
+        let Some((s, e, repl)) = self.subst_confirm.as_ref().and_then(|sc| sc.cur.clone()) else {
+            // No pending match (defensive) — close the walk out.
+            self.subst_confirm_finish();
+            return;
+        };
+        // `^E`/`^Y` scroll the window one line to peek around the match, leaving
+        // the prompt up and the match unconsumed (vim). The pending match lives in
+        // `cur`, not the cursor, so a peek that rides the cursor along is harmless —
+        // and required here, because nxvim re-runs `ensure_visible` every redraw
+        // and would otherwise snap the view straight back to the on-match cursor.
+        // So use the full cursor-pulling [`scroll_line`], and clear `scroll_from`
+        // so the early return doesn't leak a stale scroll gesture.
+        if key.ctrl && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('y')) {
+            self.scroll_line(key.code == KeyCode::Char('e'));
+            self.scroll_from = None;
+            return;
+        }
+        let answer = match key.code {
+            KeyCode::Esc => 'q',
+            KeyCode::Char(c) if !key.ctrl => c,
+            _ => return, // ignore; keep the prompt up
+        };
+        match answer {
+            'y' => {
+                self.subst_confirm_apply(s, e, &repl);
+                self.subst_confirm_seek();
+            }
+            'n' => {
+                self.subst_confirm_skip(e);
+                self.subst_confirm_seek();
+            }
+            'l' => {
+                self.subst_confirm_apply(s, e, &repl);
+                self.subst_confirm_finish();
+            }
+            'a' => {
+                // This match and all the rest, no further prompts.
+                self.subst_confirm_apply(s, e, &repl);
+                while let Some((s, e, repl)) = {
+                    self.subst_confirm_seek();
+                    self.subst_confirm.as_ref().and_then(|sc| sc.cur.clone())
+                } {
+                    self.subst_confirm_apply(s, e, &repl);
+                }
+            }
+            'q' => self.subst_confirm_finish(),
+            _ => {} // unknown answer: leave the prompt up
+        }
+    }
+
+    /// Substitute the match at `[s, e)` on the walk's current line with `repl`,
+    /// tallying it and setting the continuation point. A `\r`-splitting `repl`
+    /// pushes later lines down, so `hi` and the continuation line shift by the
+    /// number of newlines introduced.
+    fn subst_confirm_apply(&mut self, s: usize, e: usize, repl: &str) {
+        let (line, global) = {
+            let sc = self.subst_confirm.as_ref().expect("confirm active");
+            (sc.line, sc.global)
+        };
+        if !self.subst_confirm.as_ref().expect("confirm active").pushed {
+            self.push_undo();
+            self.subst_confirm.as_mut().expect("confirm active").pushed = true;
+        }
+        let start = self.buffer().line_start(line);
+        self.buffer_mut().remove(start + s..start + e);
+        self.buffer_mut().insert(start + s, repl);
+
+        let extra = repl.matches('\n').count();
+        // Where the rest of the original line now begins: just past `repl`, on a
+        // later rope line when `repl` split it.
+        let tail_byte = match repl.rfind('\n') {
+            Some(nl) => repl.len() - (nl + 1),
+            None => s + repl.len(),
+        };
+        let cont_line = line + extra;
+        // An empty match (`s == e`) with an empty/zero-width replacement would
+        // re-fire at the same spot forever; step one grapheme on so the walk
+        // progresses (mirrors the regex crate's empty-match handling).
+        let cont_byte = if global && e == s && extra == 0 {
+            next_char_boundary(&self.buffer().line(cont_line), tail_byte)
+        } else {
+            tail_byte
+        };
+
+        let sc = self.subst_confirm.as_mut().expect("confirm active");
+        sc.subs += 1;
+        if !sc.line_dirty {
+            sc.nlines += 1;
+            sc.line_dirty = true;
+        }
+        sc.hi += extra;
+        sc.last_changed = Some(cont_line);
+        if global {
+            sc.line = cont_line;
+            sc.byte = cont_byte;
+        } else {
+            // One substitution per line without `g`: move to the next line.
+            sc.line = cont_line + 1;
+            sc.byte = 0;
+            sc.line_dirty = false;
+        }
+    }
+
+    /// Decline the match ending at `e` and advance the walk past it (to the next
+    /// line without `g`, else just past this match on the same line).
+    fn subst_confirm_skip(&mut self, e: usize) {
+        let (line, byte, global) = {
+            let sc = self.subst_confirm.as_ref().expect("confirm active");
+            (sc.line, sc.byte, sc.global)
+        };
+        if global {
+            // Past the match; force a step for an empty one so we make progress.
+            let next = if e > byte {
+                e
+            } else {
+                next_char_boundary(&self.buffer().line(line), byte)
+            };
+            self.subst_confirm.as_mut().expect("confirm active").byte = next;
+        } else {
+            let sc = self.subst_confirm.as_mut().expect("confirm active");
+            sc.line += 1;
+            sc.byte = 0;
+            sc.line_dirty = false;
+        }
+    }
+
+    /// Close out the confirm walk: normalize and land the cursor on the last
+    /// changed line (vim's resting place), then report the count — silent for a
+    /// lone single substitution, just like the non-confirm path.
+    fn subst_confirm_finish(&mut self) {
+        let sc = self.subst_confirm.take().expect("confirm active");
+        if let Some(last) = sc.last_changed {
+            self.buffer_mut().normalize();
+            self.cursor.line = last;
+            self.cursor.col = self.first_non_blank(last);
+            self.clamp_cursor();
+        }
+        // Clear the now-stale prompt; report a count only when there's more than
+        // one substitution or more than one line (vim stays silent otherwise).
+        self.message.clear();
+        if sc.subs != 0 && (sc.subs != 1 || sc.nlines != 1) {
+            self.echo(format!(
+                "{} {} on {} {}",
+                sc.subs,
+                if sc.subs == 1 {
+                    "substitution"
+                } else {
+                    "substitutions"
+                },
+                sc.nlines,
+                if sc.nlines == 1 { "line" } else { "lines" },
+            ));
+        }
     }
 
     fn ex_write(&mut self, args: &str) {

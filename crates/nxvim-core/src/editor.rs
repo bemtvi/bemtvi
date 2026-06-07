@@ -629,6 +629,14 @@ impl WindowTree {
         self.windows.len()
     }
 
+    /// How many *ordinary* (tiled, layout-tree) windows are open — floats
+    /// excluded. Always ≥ 1: the editor can never be left holding only floating
+    /// windows, so this is the count that gates closing the "last" window and
+    /// quitting the editor.
+    fn tiled_count(&self) -> usize {
+        self.leaves().len()
+    }
+
     /// Mint a fresh, never-reused window id.
     fn alloc_id(&mut self) -> WindowId {
         let id = WindowId(self.next_id);
@@ -2779,8 +2787,9 @@ impl Editor {
     }
 
     /// `<C-w>c` / `:close` — close the focused window and expand a neighbor to
-    /// fill the freed area. Refuses to close the last window (vim's `E444`); the
-    /// quit-when-last semantics belong to `:q`.
+    /// fill the freed area. On the last *tiled* window it closes any open floats
+    /// instead (the editor can't be left showing only floats); with none open it
+    /// refuses (vim's `E444`). The quit-when-last semantics belong to `:q`.
     fn close_window(&mut self) {
         let cur = self.windows.current;
         if !self.remove_window(cur) {
@@ -2788,23 +2797,47 @@ impl Editor {
         }
     }
 
+    /// Close every floating window, dropping each from the window map *and* the
+    /// float list. Used where the editor would otherwise be left holding only
+    /// floats — which can't stand alone — so neovim closes the floats instead of
+    /// the ordinary window: `:only`, and `:close` / `<C-w>c` on the last tiled
+    /// window. Clearing the list (not just the map) is essential: a leftover id
+    /// there panics the next redraw, which looks every float up by id.
+    fn close_all_floats(&mut self) {
+        for id in std::mem::take(&mut self.windows.floats) {
+            self.windows.windows.remove(&id);
+        }
+    }
+
     /// Remove window `id` (focused or not) and collapse its parent split. When
     /// the closed window held focus, the spatially nearest survivor takes it (and
     /// its view position is restored); otherwise focus is untouched. Floats
-    /// anchored to the closing window (`relative="win"`) close with it. Returns
-    /// `false` — without touching the layout — if `id` is the last *tiled* window
-    /// (it can't be closed; a float never substitutes for it) or not open. Shared
-    /// by `<C-w>c`/`:close` and the `nvim_win_close` API.
+    /// anchored to the closing window (`relative="win"`) close with it. Closing
+    /// the *last tiled* window instead closes any open floats and keeps this
+    /// window (neovim's behavior — the editor can't be left showing only floats).
+    /// Returns `false` — without touching the layout — only when `id` is the
+    /// genuine last window (the last tiled one with no floats to close) or not
+    /// open. Shared by `<C-w>c`/`:close` and the `nvim_win_close` API.
     fn remove_window(&mut self, id: WindowId) -> bool {
         if !self.windows.windows.contains_key(&id) {
             return false;
         }
-        // The last *tiled* window can't be closed — a float never substitutes
-        // for it (the tiled layout must always have a normal window to fill).
-        // Floats themselves are always closable (one is never the only window).
+        // The last tiled window can't be closed — a float never substitutes for it
+        // (the tiled layout must always have a normal window to fill). But the
+        // editor also can't be left showing only floats, so vim closes the floats
+        // instead (keeping this window); with none open it is the genuine last
+        // window. Gating on the *total* count instead would let an unfocused float
+        // fool this into closing the last tiled window, stranding focus on a
+        // deleted id.
         let is_float = self.windows.get(id).float.is_some();
-        if !is_float && self.windows.leaves().len() <= 1 {
-            return false;
+        if !is_float && self.windows.tiled_count() <= 1 {
+            if self.windows.floats.is_empty() {
+                return false;
+            }
+            self.close_all_floats();
+            self.relayout();
+            self.ensure_visible();
+            return true;
         }
         let closing_rect = self.windows.get(id).rect;
         // `id` plus every float transitively anchored to it (`relative="win"`):
@@ -2873,8 +2906,10 @@ impl Editor {
             return;
         }
         let keep = self.windows.current;
+        // Close the floats (clearing the list, not just the map — a stale id there
+        // panics the next redraw), then drop the other tiled windows.
+        self.close_all_floats();
         self.windows.windows.retain(|id, _| *id == keep);
-        self.windows.floats.clear();
         self.windows.root = Node::Leaf(keep);
         self.relayout();
         self.ensure_visible();
@@ -3403,10 +3438,19 @@ impl Editor {
     }
 
     pub(crate) fn text_height(&self) -> usize {
-        // The window's own rows minus its status line. The panel is already
-        // excluded from the window rect by `relayout`, so it is not subtracted
-        // again here.
-        self.windows.cur().rect.height.saturating_sub(1).max(1)
+        // The window's own rows minus a bordered float's one-cell inset (top and
+        // bottom) and its status line. The vertical analog of `text_width`: it
+        // must match the `height` `view::window_view` projects so the
+        // cursor-visibility math scrolls at the real bottom of the text area, not
+        // two phantom rows past it. The panel is already excluded from the window
+        // rect by `relayout`, so it is not subtracted again here.
+        let w = self.windows.cur();
+        let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
+        w.rect
+            .height
+            .saturating_sub(2 * inset)
+            .saturating_sub(1)
+            .max(1)
     }
 
     /// The focused window's text-area width in screen cells: its rect width minus
@@ -5876,19 +5920,22 @@ impl Editor {
         }
     }
 
-    /// `:q` / `<C-w>q` — close the focused window. With more than one window open
-    /// this is exactly `<C-w>c`: the window goes away and its buffer stays in the
-    /// store (other windows may still show it, or it's reachable via `:b`), so
-    /// there is nothing to lose and no modified guard — closing a non-last window
-    /// onto a modified buffer is fine. Only the **last** window is a real editor
-    /// quit, which defers to [`Self::ex_quit_all`] (and its `E37` guard).
+    /// `:q` / `<C-w>q` — close the focused window. Closing a float, or an ordinary
+    /// window while other ordinary windows remain, is exactly `<C-w>c`: the window
+    /// goes away and its buffer stays in the store (other windows may still show
+    /// it, or it's reachable via `:b`), so there is nothing to lose and no modified
+    /// guard — closing a non-last window onto a modified buffer is fine. Only the
+    /// **last ordinary** window is a real editor quit, which defers to
+    /// [`Self::ex_quit_all`] (and its `E37` guard); a leftover float never keeps
+    /// the editor alive (and gating on the *total* window count would wrongly try
+    /// to close that last ordinary window, stranding focus on a deleted id).
     fn ex_quit(&mut self, bang: bool) {
         // `:q` on a focused float closes just the float and never quits the
         // editor. For a tiled window, only the *last tiled* one is a real quit —
         // floats don't keep the editor alive, nor do they count toward "more
         // than one window" (the last-tiled rule lives in `remove_window`).
-        let on_float = self.windows.get(self.windows.current).float.is_some();
-        if on_float || self.windows.leaves().len() > 1 {
+        let on_float = self.windows.cur().float.is_some();
+        if on_float || self.windows.tiled_count() > 1 {
             self.close_window();
             return;
         }

@@ -930,6 +930,169 @@ async fn ctrl_w_q_closes_a_window_then_quits_on_the_last() {
     );
 }
 
+/// Open a small, unfocused, bordered float onto the current buffer, leaving focus
+/// on the ordinary window — the setup that used to make `:q` / `<C-w>c` strand
+/// focus on a deleted window id.
+async fn open_unfocused_float(rpc: &Rpc) -> u64 {
+    open_float(
+        rpc,
+        false, // don't take focus
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(12u64)),
+            ("height", Value::from(4u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn q_on_the_last_ordinary_window_with_an_unfocused_float_does_not_close_it() {
+    let (rpc, mut incoming) = start(None).await;
+    // Make the ordinary window's buffer modified so a genuine editor quit is
+    // refused (E37) — keeping the editor alive and observable. A float can't keep
+    // the editor alive, so the ordinary window is the *last ordinary* window and
+    // `:q` is an editor quit, not a window close. The bug: `:q` counted the float
+    // as a second window, tried to close the ordinary one, and stranded focus on a
+    // deleted id ("current window id is always valid" panic).
+    feed(&rpc, "iunsaved<Esc>");
+    let _float = open_unfocused_float(&rpc).await;
+
+    let frame = windows_after(&rpc, &mut incoming, ":q<CR>").await;
+    assert!(
+        frame.message.starts_with("E37"),
+        "`:q` on the last ordinary window (modified) warns E37 instead of panicking: {:?}",
+        frame.message
+    );
+    // The ordinary window and the float both survive — nothing was closed.
+    assert_eq!(list_wins(&rpc).await.len(), 2, "both windows still open");
+}
+
+#[tokio::test]
+async fn ctrl_w_c_on_the_last_ordinary_window_closes_the_floats_instead() {
+    let (rpc, mut incoming) = start(None).await;
+    // `<C-w>c` can't close the sole ordinary window (the editor can't be left with
+    // only a float). Neovim closes the *floats* instead and keeps the ordinary
+    // window — it must not panic by closing the ordinary one and stranding focus.
+    let _float = open_unfocused_float(&rpc).await;
+    let ordinary = current_win(&rpc).await;
+
+    let frame = windows_after(&rpc, &mut incoming, "<C-w>c").await;
+    assert!(
+        !frame.message.starts_with("E4") && !frame.message.starts_with("E5"),
+        "no error closing the float via `<C-w>c`: {:?}",
+        frame.message
+    );
+    assert_eq!(
+        list_wins(&rpc).await,
+        vec![ordinary],
+        "the float was closed; the ordinary window remains"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        ordinary,
+        "focus stayed on the ordinary window"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_w_c_on_the_genuine_last_window_still_refuses_with_e444() {
+    let (rpc, mut incoming) = start(None).await;
+    // With no floats open, the sole window is the genuine last window: `<C-w>c`
+    // refuses with E444 (closing-the-floats only applies when floats are open).
+    let frame = windows_after(&rpc, &mut incoming, "<C-w>c").await;
+    assert!(
+        frame.message.starts_with("E444"),
+        "`<C-w>c` on the genuine last window warns E444: {:?}",
+        frame.message
+    );
+    assert_eq!(list_wins(&rpc).await.len(), 1, "still one window");
+}
+
+#[tokio::test]
+async fn only_from_an_ordinary_window_closes_other_windows_including_floats() {
+    let (rpc, mut incoming) = start(None).await;
+    // Two ordinary windows plus an unfocused float.
+    feed(&rpc, "<C-w>s");
+    let _float = open_unfocused_float(&rpc).await;
+    let keep = current_win(&rpc).await;
+    assert_eq!(list_wins(&rpc).await.len(), 3, "two splits + a float");
+
+    // `:only` keeps the focused ordinary window and closes *everything* else, the
+    // float included — the float must also be dropped from the float list, or the
+    // next redraw panics on its stale id.
+    let _ = windows_after(&rpc, &mut incoming, ":only<CR>").await;
+    assert_eq!(
+        list_wins(&rpc).await,
+        vec![keep],
+        "`:only` leaves just the focused window, float closed"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        keep,
+        "the focused window stayed focused"
+    );
+}
+
+#[tokio::test]
+async fn only_from_a_floating_window_warns_e5601() {
+    let (rpc, mut incoming) = start(None).await;
+    // Focus a float, then `<C-w>o`: vim refuses (`:only` from a float would leave
+    // only a float), so it warns E5601 and closes nothing.
+    let float = open_float(
+        &rpc,
+        true, // take focus
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(12u64)),
+            ("height", Value::from(4u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await;
+    assert_eq!(current_win(&rpc).await, float, "the float holds focus");
+
+    let frame = windows_after(&rpc, &mut incoming, "<C-w>o").await;
+    assert!(
+        frame.message.starts_with("E5601"),
+        "`:only` from a float warns E5601: {:?}",
+        frame.message
+    );
+    assert_eq!(list_wins(&rpc).await.len(), 2, "nothing was closed");
+}
+
+#[tokio::test]
+async fn closing_an_unfocused_float_leaves_the_ordinary_window_focused() {
+    let (rpc, mut incoming) = start(None).await;
+    let float = open_unfocused_float(&rpc).await;
+    let ordinary = current_win(&rpc).await;
+
+    // Closing the float itself is always fine and must not disturb the ordinary
+    // window's focus.
+    rpc.request(
+        "nvim_win_close",
+        vec![Value::from(float), Value::from(false)],
+    )
+    .await
+    .expect("win_close float");
+    let _ = windows_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        list_wins(&rpc).await,
+        vec![ordinary],
+        "only the ordinary window remains"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        ordinary,
+        "focus stayed on the ordinary window"
+    );
+}
+
 // ----- nvim_win_* RPC surface (phase 5) -------------------------------------
 
 /// `nvim_list_wins` -> window ids in layout order.
@@ -1923,13 +2086,14 @@ async fn ctrl_w_w_skips_a_non_focusable_float_but_set_current_win_does_not() {
     );
 }
 
-/// `nvim_win_close` refuses the last *tiled* window even while a float is open
-/// (a float never substitutes for the tiled layout).
+/// `nvim_win_close` on the last *tiled* window while a float is open closes the
+/// *float* instead and keeps the tiled window — the editor can't be left showing
+/// only a float, so neovim closes the floats rather than the ordinary window.
 #[tokio::test]
-async fn closing_the_last_tiled_window_is_refused_while_a_float_is_open() {
+async fn closing_the_last_tiled_window_closes_the_float_instead() {
     let (rpc, _incoming) = start(None).await;
     let tiled = list_wins(&rpc).await[0];
-    let float = open_float(
+    let _float = open_float(
         &rpc,
         false,
         vec![
@@ -1951,8 +2115,8 @@ async fn closing_the_last_tiled_window_is_refused_while_a_float_is_open() {
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
     assert_eq!(
         list_wins(&rpc).await,
-        vec![tiled, float],
-        "the last tiled window stays; the float can't replace it"
+        vec![tiled],
+        "the float was closed; the tiled window stays"
     );
 }
 
@@ -2031,5 +2195,65 @@ async fn focused_bordered_float_scrolls_within_its_inset_width() {
         win.cursor_screen_col >= win.leftcol && win.cursor_screen_col - win.leftcol < text_width,
         "cursor (screen col {}) visible within the float's content width {text_width}",
         win.cursor_screen_col
+    );
+}
+
+/// A focused, bordered float scrolls *vertically* within its bordered, status-line
+/// inset content height — not its raw rect height. A `height = 8` single-bordered
+/// float spends one row per border (top + bottom) and one on its status line, so
+/// exactly 5 text rows show. Moving the cursor onto the 6th line must scroll the
+/// float by one line; the bottom-of-window math has to subtract the border inset
+/// just like the width math does, or the float thinks it has two phantom rows (the
+/// borders) and the cursor sits pinned at the bottom for two presses before
+/// scrolling resumes.
+#[tokio::test]
+async fn focused_bordered_float_scrolls_within_its_inset_height() {
+    let (rpc, mut incoming) = start(None).await;
+    // Twenty short, distinct lines so a scroll is unambiguous from the visible set.
+    let body: Vec<String> = (1..=20).map(|n| format!("line{n:02}")).collect();
+    feed(&rpc, "i");
+    feed(&rpc, &body.join("<CR>"));
+    feed(&rpc, "<Esc>");
+
+    // A focused, single-bordered float onto the same buffer (0), 8 rows tall.
+    let _float = open_float(
+        &rpc,
+        true, // take focus
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(24u64)),
+            ("height", Value::from(8u64)),
+            ("border", Value::from("single")),
+            ("title", Value::from("T")),
+        ],
+    )
+    .await;
+
+    // Start at the top of the buffer inside the float: 5 text rows show line01..line05.
+    let frame = windows_after(&rpc, &mut incoming, "gg").await;
+    let win = frame.focused();
+    assert_eq!(
+        win.lines.first().map(String::as_str),
+        Some("line01"),
+        "float opens scrolled to the top"
+    );
+    assert_eq!(
+        win.lines.len(),
+        5,
+        "a height-8 single-bordered float shows 5 text rows"
+    );
+
+    // Move the cursor onto the 6th line. With only 5 text rows visible, that is one
+    // past the bottom, so the float must scroll down by one line — line02 becomes
+    // the first visible row. (Buggy behavior: top stays at line01 because the
+    // bottom-of-window math counted the two border rows as text.)
+    let frame = windows_after(&rpc, &mut incoming, "5j").await;
+    let win = frame.focused();
+    assert_eq!(
+        win.lines.first().map(String::as_str),
+        Some("line02"),
+        "moving onto the 6th line scrolls the bordered float by one line"
     );
 }

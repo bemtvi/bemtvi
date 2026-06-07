@@ -110,6 +110,21 @@ fn bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
     buf.cell((x, y)).and_then(|c| c.style().bg)
 }
 
+/// The foreground color of a painted cell — used to spot a `%#Group#` status
+/// segment painting its resolved truecolor foreground.
+fn fg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).and_then(|c| c.style().fg)
+}
+
+async fn exec_lua(rpc: &Rpc, code: &str) {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(code), Value::Array(vec![])],
+    )
+    .await
+    .expect("nvim_exec_lua");
+}
+
 #[tokio::test]
 async fn typed_text_is_painted_with_the_mode_in_the_status_line() {
     let (rpc, mut incoming) = start(None).await;
@@ -123,6 +138,48 @@ async fn typed_text_is_painted_with_the_mode_in_the_status_line() {
         row_text(&buf, ROWS - 2).contains("NORMAL"),
         "status: {:?}",
         row_text(&buf, ROWS - 2)
+    );
+}
+
+#[tokio::test]
+async fn a_custom_statusline_is_painted_end_to_end() {
+    // A custom `'statusline'` runs the server's %-format engine, and the client
+    // paints the projected segments verbatim. A field format (`%l,%c`) expands
+    // from window state; the literal text around it shows as-is.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>gg"); // line 1, col 1
+    feed(&rpc, r":set statusline=L%lC%c<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    assert_eq!(
+        row_text(&buf, ROWS - 2).trim_end(),
+        "L1C1",
+        "status: {:?}",
+        row_text(&buf, ROWS - 2)
+    );
+}
+
+#[tokio::test]
+async fn a_statusline_highlight_group_paints_its_color_end_to_end() {
+    // `%#Group#` switches the highlight mid-statusline; the server resolves the
+    // group to a palette style and the client paints that segment's truecolor
+    // foreground (patched onto the reverse-video base, which has no colorscheme).
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(&rpc, "vim.api.nvim_set_hl(0, 'MyStl', { fg = '#ff0000' })").await;
+    feed(&rpc, r":set statusline=ab%#MyStl#X<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    let y = ROWS - 2;
+    assert_eq!(row_text(&buf, y).trim_end(), "abX");
+    // The `ab` prefix has no group of its own (the base look)...
+    assert_ne!(
+        fg(&buf, 0, y),
+        Some(Color::Rgb(255, 0, 0)),
+        "prefix is base"
+    );
+    // ...while the `%#MyStl#X` run paints the group's red foreground.
+    assert_eq!(fg(&buf, 2, y), Some(Color::Rgb(255, 0, 0)), "X is red");
+    assert!(
+        reversed(&buf, 2, y),
+        "the styled run keeps the base REVERSED"
     );
 }
 

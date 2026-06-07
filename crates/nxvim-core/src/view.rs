@@ -11,8 +11,9 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{BorderStyle, BufferId, Editor, TabLabel, WindowLayout};
+use crate::editor::{language_of_path, BorderStyle, BufferId, Editor, TabLabel, WindowLayout};
 use crate::mode::Mode;
+use crate::statusline::StatuslineCtx;
 use crate::unicode;
 
 /// A scroll gesture for the client to animate. Self-contained: it carries its
@@ -170,6 +171,11 @@ pub struct WindowView {
     pub border: BorderStyle,
     /// The float's title, drawn on its top border. `None` when untitled.
     pub title: Option<String>,
+    /// Pre-computed facts the `'statusline'` `%`-format engine reads to expand its
+    /// built-in fields (`%f`, `%l`, `%y`, …). Built here in core — where the
+    /// buffer and viewport live — so the server only has to run the (Lua-aware)
+    /// engine over it. See [`crate::statusline`].
+    pub status_ctx: StatuslineCtx,
 }
 
 /// One tab page's cell in the tabline. `label` is the tab's focused window's
@@ -347,6 +353,17 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         unicode::virtcol(&line, w.cursor.col, buf.options.effective_tabstop())
     };
 
+    let status_ctx = window_status_ctx(StatusCtxInputs {
+        buf,
+        w,
+        file_name: &file_name,
+        cur_line,
+        line_count,
+        cursor_screen_col,
+        top,
+        text_height: height,
+    });
+
     WindowView {
         rect: ViewRect {
             x: w.rect.x,
@@ -376,6 +393,56 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         floating: w.floating,
         border: w.border,
         title: w.title.clone(),
+        status_ctx,
+    }
+}
+
+/// The window facts [`window_status_ctx`] reads — grouped into a struct so the
+/// builder doesn't take a long positional argument list (and `clippy` stays
+/// happy).
+struct StatusCtxInputs<'a> {
+    buf: &'a Buffer,
+    w: &'a WindowLayout,
+    file_name: &'a str,
+    /// Clamped cursor line (0-based) — the rendered line, matching the ruler.
+    cur_line: usize,
+    line_count: usize,
+    /// Cursor screen-cell column (0-based, tab/wide aware) for `%v`.
+    cursor_screen_col: usize,
+    /// 0-based first visible buffer line, and visible text rows, for `%P`.
+    top: usize,
+    text_height: usize,
+}
+
+/// Build the [`StatuslineCtx`] the `%`-format engine expands its built-in fields
+/// from. The facts come straight off the buffer and the window's viewport; the
+/// flags nxvim does not model yet (`'modifiable'`, `'readonly'`, help buffers)
+/// take their always-true / always-false defaults, so `%m`/`%r`/`%h` render
+/// faithfully for what nxvim supports rather than faking a state it lacks.
+fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
+    let path = inp.buf.path.as_deref();
+    let file_tail = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "[No Name]".to_string());
+    StatuslineCtx {
+        // `%f`/`%F`: nxvim keeps the path as opened; v1 uses it verbatim for both
+        // (no `canonicalize`, which would be I/O — forbidden in core).
+        file_rel: inp.file_name.to_string(),
+        file_full: inp.file_name.to_string(),
+        file_tail,
+        modified: inp.buf.modified,
+        modifiable: true,
+        readonly: false,
+        help: false,
+        filetype: language_of_path(path).unwrap_or("").to_string(),
+        bufnr: inp.w.buffer.0 as usize,
+        line: inp.cur_line + 1,
+        line_count: inp.line_count,
+        col: inp.w.cursor.col + 1,
+        virtcol: inp.cursor_screen_col + 1,
+        top_line: inp.top + 1,
+        text_height: inp.text_height,
     }
 }
 

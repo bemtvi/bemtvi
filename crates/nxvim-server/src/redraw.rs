@@ -4,6 +4,7 @@
 
 use crate::Server;
 use nxvim_core::highlight::Style;
+use nxvim_core::statusline::{self, ExprKind};
 use nxvim_core::view::{ScrollAnim, Separator, TabView, ViewRect, WindowView};
 use nxvim_core::{BorderStyle, PanelView};
 use rmpv::Value;
@@ -52,12 +53,16 @@ impl Server {
             self.diagnostic_under_cursor().unwrap_or_default()
         };
 
+        // The global `'statusline'` format (empty ⇒ the built-in default look),
+        // read once and shared across every window's status projection.
+        let statusline_fmt = self.editor.global_options().statusline;
+
         // Project each window: its rect, per-window text/gutter/status data, and
         // its own buffer's syntax/diagnostic slice.
         let windows: Vec<Value> = view
             .windows
             .iter()
-            .map(|win| self.window_value(win, &mut styles))
+            .map(|win| self.window_value(win, &view.mode_label, &statusline_fmt, &mut styles))
             .collect();
 
         // The split borders between windows.
@@ -128,8 +133,15 @@ impl Server {
     /// per-window text/cursor/gutter/status fields, and the window's own syntax
     /// highlights, diagnostic underlines, and scroll band (each resolving styles
     /// into the shared per-frame `styles` palette).
-    fn window_value(&self, win: &WindowView, styles: &mut StyleTable) -> Value {
+    fn window_value(
+        &self,
+        win: &WindowView,
+        mode_label: &str,
+        statusline_fmt: &str,
+        styles: &mut StyleTable,
+    ) -> Value {
         let highlights = self.highlights_for(win.buffer, &win.numbers, styles);
+        let status = self.status_value(win, mode_label, statusline_fmt, styles);
         let diagnostics = self.diagnostics_for(win.buffer, &win.numbers, styles);
         let scroll = match &win.scroll {
             Some(s) => self.project_band(win.buffer, s, styles),
@@ -177,6 +189,7 @@ impl Server {
             (Value::from("tabstop"), Value::from(win.tabstop as u64)),
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
+            (Value::from("status"), status),
             (Value::from("scroll"), scroll),
             // Float overlay chrome. A tiled window is `floating: false` with no
             // border/title, so the client paints it exactly as before.
@@ -190,6 +203,87 @@ impl Server {
                 },
             ),
         ])
+    }
+
+    /// Project a window's status line as the `status` array — one `{ text, style }`
+    /// segment per highlighted run. Runs the [`statusline`] `%`-format engine over
+    /// the global `'statusline'` (or the built-in default when empty) against the
+    /// window's pre-computed `status_ctx`, evaluating `%{}`/`%!` expressions via
+    /// the (Lua-aware) [`Server::eval_statusline_expr`] callback, then resolves
+    /// each segment's highlight group to a palette style id.
+    ///
+    /// `style` is `Nil` for a segment with no group, or one whose group the
+    /// colorscheme leaves undefined — the client then paints it in the base
+    /// `StatusLine` look (the `status_line` chrome style, or reverse-video out of
+    /// the box), exactly as it did before per-segment styling existed.
+    fn status_value(
+        &self,
+        win: &WindowView,
+        mode_label: &str,
+        statusline_fmt: &str,
+        styles: &mut StyleTable,
+    ) -> Value {
+        let default;
+        let fmt = if statusline_fmt.is_empty() {
+            default = default_statusline(mode_label);
+            &default
+        } else {
+            statusline_fmt
+        };
+
+        let items = match statusline::parse(fmt) {
+            Ok(items) => items,
+            // A malformed 'statusline' shows its own error text rather than a
+            // blank line — loud, not silent (per CLAUDE.md).
+            Err(err) => return Value::Array(vec![segment_value(&err, Value::Nil)]),
+        };
+
+        let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw);
+        let pieces = statusline::expand(&items, &win.status_ctx, &mut eval);
+        // The status line spans the window's content width — its rect inset by the
+        // float border, matching where the client paints it (and what `%=`/`%<`
+        // resolve against).
+        let inset = if win.floating && win.border != BorderStyle::None {
+            1
+        } else {
+            0
+        };
+        let width = win.rect.width.saturating_sub(2 * inset);
+        let segments = statusline::layout(&pieces, width);
+
+        Value::Array(
+            segments
+                .iter()
+                .map(|seg| {
+                    let style = seg
+                        .group
+                        .as_deref()
+                        .and_then(|g| self.editor.highlights.resolve(g))
+                        .map(|s| Value::from(styles.intern(s) as u64))
+                        .unwrap_or(Value::Nil);
+                    segment_value(&seg.text, style)
+                })
+                .collect(),
+        )
+    }
+
+    /// Evaluate one `%{}`/`%!` statusline expression. nxvim has no Vimscript, so
+    /// **only `v:lua.…` expressions are supported** — anything else returns a loud
+    /// `E:…` marker naming the offending expression (rendered on the status line)
+    /// rather than silently expanding to nothing. A `v:lua.` prefix is stripped to
+    /// the bare Lua expression (`v:lua.require('m').f()` → `require('m').f()`),
+    /// which the synchronous, prompt-pumping evaluator runs inline during redraw.
+    fn eval_statusline_expr(&self, raw: &str) -> String {
+        let expr = raw.trim();
+        let Some(lua) = expr.strip_prefix("v:lua.") else {
+            return format!(
+                "E:statusline: unsupported expression {{{expr}}} (only v:lua.* is supported)"
+            );
+        };
+        match self.lua.eval_to_value_pumped(lua) {
+            Ok(value) => stringify_eval(&value),
+            Err(err) => format!("E:{err}"),
+        }
     }
 
     /// Project a scroll-animation band into the `scroll` sub-map a client animates
@@ -273,6 +367,38 @@ impl StyleTable {
     /// each entry the same `{ fg, bg, sp, <attrs> }` map `nvim_get_hl` returns.
     fn into_value(self) -> Value {
         Value::Array(self.list.iter().map(style_value).collect())
+    }
+}
+
+/// Encode one status-line segment as `{ text, style }` for the `status` array.
+/// `style` is a `u64` index into the frame's style palette, or `Nil` for the
+/// base `StatusLine` look.
+fn segment_value(text: &str, style: Value) -> Value {
+    Value::Map(vec![
+        (Value::from("text"), Value::from(text)),
+        (Value::from("style"), style),
+    ])
+}
+
+/// The built-in `'statusline'` look, expressed as a format string so the one
+/// engine renders it too: ` MODE  file[+]  …  line,col `. The mode label is an
+/// nxvim addition (neovim shows the mode elsewhere), spliced in as a literal —
+/// escaped, though mode names never contain `%` — since it is not a `%`-item.
+fn default_statusline(mode_label: &str) -> String {
+    format!(" {}  %f%m%=%l,%c ", mode_label.replace('%', "%%"))
+}
+
+/// Coerce a `%{}`/`%!` Lua result to the text that goes on the status line.
+/// Strings pass through; numbers stringify; `nil`/`false` (lualine's "nothing
+/// here") and anything more exotic render empty — matching neovim's lenient
+/// expression-to-text coercion for the cases a status line actually produces.
+fn stringify_eval(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.as_str().unwrap_or_default().to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::F64(n) => n.to_string(),
+        Value::F32(n) => n.to_string(),
+        _ => String::new(),
     }
 }
 

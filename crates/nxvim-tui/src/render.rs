@@ -793,20 +793,28 @@ fn expand_tabs(line: &str, tabstop: usize) -> String {
     out
 }
 
+/// Paint a window's status line from the segments the server's `%`-format engine
+/// projected (text + resolved style). The base look is the theme's `StatusLine`
+/// when loaded, else reverse-video; each segment's own style patches onto that
+/// base (so a `%#Group#` that sets only a foreground keeps the status background).
+/// Segments span the window's content width — the engine's `%=`/`%<` pass already
+/// padded or truncated them to fit — and the base style fills any remainder.
+/// An empty `status` (an older server) leaves the bare base look across the row.
 fn render_status(frame: &mut Frame, area: Rect, win: &WindowView, view: &View) {
-    let modified = if win.modified { " [+]" } else { "" };
-    let left = format!(" {}  {}{}", view.mode_label, win.file_name, modified);
-    let right = format!("{},{} ", win.cursor_line, win.cursor_col + 1);
-
-    let width = area.width as usize;
-    let pad = width.saturating_sub(left.chars().count() + right.chars().count());
-    let line = format!("{left}{}{right}", " ".repeat(pad));
-
-    // The theme's StatusLine when loaded; reverse-video out of the box.
-    let style = view
+    let base = view
         .status_line
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_widget(Paragraph::new(line).style(style), area);
+
+    let spans: Vec<Span> = win
+        .status
+        .iter()
+        .map(|(text, style)| {
+            let style = style.map_or(base, |s| base.patch(s));
+            Span::styled(text.clone(), style)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
 }
 
 fn render_command(frame: &mut Frame, area: Rect, view: &View) {

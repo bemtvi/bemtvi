@@ -10,7 +10,8 @@ use crate::anim::ScrollData;
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_diagnostics,
     parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items, parse_spans,
-    parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem, SearchSpans,
+    parse_status, parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem, SearchSpans,
+    StatusSegment,
 };
 
 /// One window's content mirrored from a redraw `windows[i]` sub-map: its screen
@@ -27,14 +28,16 @@ pub(crate) struct WindowView {
     pub(crate) focused: bool,
     pub(crate) lines: Vec<String>,
     pub(crate) cursor_row: u16,
-    pub(crate) cursor_col: u16,
     pub(crate) cursor_screen_col: u16,
     /// First visible screen column (horizontal scroll offset) under `nowrap`. The
     /// renderer drops this many leading screen cells from each text row and shifts
     /// the cursor and every span left by it; the number gutter is not offset.
     pub(crate) leftcol: u16,
-    pub(crate) file_name: String,
-    pub(crate) modified: bool,
+    /// This window's status line as rendered segments (`text` + resolved
+    /// `style`), projected by the server's `%`-format engine. The client paints
+    /// them left-to-right; an empty vec (an older server) falls back to a bare
+    /// reverse-video status row.
+    pub(crate) status: Vec<StatusSegment>,
     pub(crate) cursor_line: usize,
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`.
@@ -333,13 +336,9 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .unwrap_or(true),
         lines: map_str_array(m, "lines"),
         cursor_row: map_u16(m, "cursor_row"),
-        cursor_col: map_u16(m, "cursor_col"),
         cursor_screen_col: map_u16(m, "cursor_screen_col"),
         leftcol: map_u16(m, "leftcol"),
-        file_name: map_str(m, "file_name"),
-        modified: map_get(m, "modified")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        status: parse_status(map_get(m, "status"), styles),
         cursor_line: map_u64(m, "cursor_line") as usize,
         selection: parse_spans(map_get(m, "selection")),
         search: parse_multi_spans(map_get(m, "search")),

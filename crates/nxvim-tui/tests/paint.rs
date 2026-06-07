@@ -54,6 +54,23 @@ fn lines(strs: &[&str]) -> Value {
     Value::Array(strs.iter().map(|s| Value::from(*s)).collect())
 }
 
+/// A window's `status` array: one `{ text, style }` segment per `(text, style)`,
+/// where `style` is an index into the frame's `styles` palette (`None` ⇒ the wire
+/// `Nil`, the base `StatusLine` look). Mirrors the server's `segment_value`.
+fn status(segments: &[(&str, Option<u64>)]) -> Value {
+    Value::Array(
+        segments
+            .iter()
+            .map(|(text, style)| {
+                Value::Map(vec![
+                    (Value::from("text"), Value::from(*text)),
+                    (Value::from("style"), style.map_or(Value::Nil, Value::from)),
+                ])
+            })
+            .collect(),
+    )
+}
+
 #[test]
 fn cursor_shape_follows_the_mode() {
     // Insert shows the thin "edit cursor" bar, replace an underline, and every
@@ -111,7 +128,7 @@ fn tabs_expand_to_the_buffer_tabstop() {
 fn bottom_two_rows_are_status_and_command_chrome() {
     let v = view(vec![
         ("lines", lines(&["abc"])),
-        ("file_name", Value::from("f.txt")),
+        ("status", status(&[(" NORMAL  f.txt", None)])),
     ]);
     let buf = paint(&v, 20, 5);
     assert!(
@@ -134,6 +151,36 @@ fn status_row_is_reversed() {
     assert!(reversed(&buf, 0, 3), "status row should be reverse-video");
 }
 
+#[test]
+fn status_segments_paint_their_own_styles_over_the_base() {
+    // Two segments: a plain prefix in the base look, then `RED` carrying palette
+    // entry 0 (a red foreground). The client paints each segment with its own
+    // style, patched onto the reverse-video base — so the styled run keeps the
+    // base's REVERSED while overriding the foreground.
+    let v = view(vec![
+        ("lines", lines(&["abc"])),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("fg", rgb(0xff, 0, 0))])]),
+        ),
+        ("status", status(&[("ab", None), ("RED", Some(0))])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(row_text(&buf, 3).trim_end(), "abRED");
+    // The prefix has no foreground of its own (base reverse-video only)...
+    assert!(reversed(&buf, 0, 3), "the prefix keeps the base look");
+    // ...while the styled `RED` segment (cols 2..5) paints its red fg, still
+    // reverse-video from the patched base.
+    assert_eq!(
+        buf.cell((2, 3)).unwrap().style().fg,
+        Some(Color::Rgb(255, 0, 0))
+    );
+    assert!(
+        reversed(&buf, 2, 3),
+        "the styled segment keeps the base REVERSED"
+    );
+}
+
 /// A `{ x, y, width, height }` rect sub-map.
 fn rect(x: u64, y: u64, w: u64, h: u64) -> Value {
     Value::Map(vec![
@@ -144,13 +191,15 @@ fn rect(x: u64, y: u64, w: u64, h: u64) -> Value {
     ])
 }
 
-/// One window sub-map for the `windows` redraw array.
+/// One window sub-map for the `windows` redraw array. Its status line is the
+/// single projected segment ` NORMAL  {file}`, matching the server's projection.
 fn window(r: Value, focused: bool, file: &str, text: &[&str]) -> Value {
+    let label = format!(" NORMAL  {file}");
     Value::Map(vec![
         (Value::from("rect"), r),
         (Value::from("focused"), Value::from(focused)),
         (Value::from("lines"), lines(text)),
-        (Value::from("file_name"), Value::from(file)),
+        (Value::from("status"), status(&[(&label, None)])),
         (Value::from("cursor_line"), Value::from(1u64)),
     ])
 }

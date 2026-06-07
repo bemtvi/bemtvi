@@ -6035,3 +6035,136 @@ async fn global_no_match_reports_e486() {
         Some("E486: Pattern not found: zzz")
     );
 }
+
+// ----- statusline rendering (the %-format engine, Phase 3) -----
+//
+// These assert on the per-window `status` segment array the server now projects
+// (text + a style-palette id per highlighted run), driven by the `'statusline'`
+// option through the core engine. The default UI is 80 cols, so the short
+// formats below never hit `%<` truncation.
+
+/// The first window's `status` segments from a redraw, as `(text, style_id)` —
+/// `style_id` is `None` for a segment painted in the base `StatusLine` look.
+fn status_segments(map: &[(Value, Value)]) -> Vec<(String, Option<usize>)> {
+    field(map, "status")
+        .and_then(Value::as_array)
+        .expect("a status segment array")
+        .iter()
+        .map(|seg| {
+            let Value::Map(m) = seg else {
+                panic!("status segment is not a map")
+            };
+            let get = |key: &str| {
+                m.iter()
+                    .find(|(k, _)| k.as_str() == Some(key))
+                    .map(|(_, v)| v)
+            };
+            let text = get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let style = get("style").and_then(Value::as_u64).map(|n| n as usize);
+            (text, style)
+        })
+        .collect()
+}
+
+/// The whole status line as one string — the analogue of nvim's
+/// `nvim_eval_statusline(...).str`.
+fn status_text(map: &[(Value, Value)]) -> String {
+    status_segments(map).into_iter().map(|(t, _)| t).collect()
+}
+
+#[tokio::test]
+async fn statusline_literal_renders_verbatim() {
+    let (rpc, mut incoming) = start(None).await;
+    // A literal format (no %-items) paints exactly its text — no fill without a
+    // `%=`, so it isn't padded to the window width.
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=hello<CR>").await;
+    assert_eq!(status_text(&map), "hello");
+    assert_eq!(status_segments(&map), vec![("hello".to_string(), None)]);
+}
+
+#[tokio::test]
+async fn statusline_fields_expand_from_window_state() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iabc<CR>defgh<Esc>gg"); // 2 lines; gg -> line 1, col 1
+    let map = redraw_after(&rpc, &mut incoming, r":set statusline=%f\ %l,%c<CR>").await;
+    assert_eq!(status_text(&map), "[No Name] 1,1");
+}
+
+#[tokio::test]
+async fn statusline_highlight_group_resolves_to_palette_style() {
+    let (rpc, mut incoming) = start(None).await;
+    // `%#Group#` switches the highlight for the text that follows; the server
+    // resolves it to a style-palette id (the base segment before it has none).
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_hl(0, 'MyStl', { fg = '#ff0000', bg = '#00ff00' })",
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=a%#MyStl#b<CR>").await;
+    let segs = status_segments(&map);
+    assert_eq!(segs[0], ("a".to_string(), None));
+    assert_eq!(segs[1].0, "b");
+    let id = segs[1]
+        .1
+        .expect("the %#MyStl# run carries a resolved style");
+
+    let styles = field(&map, "styles")
+        .and_then(Value::as_array)
+        .expect("style palette");
+    let Value::Map(style) = &styles[id] else {
+        panic!("style entry is not a map")
+    };
+    assert_eq!(hl_color(style, "fg"), Some(hex("ff0000")));
+    assert_eq!(hl_color(style, "bg"), Some(hex("00ff00")));
+}
+
+#[tokio::test]
+async fn statusline_whole_vlua_expression_renders_result() {
+    let (rpc, mut incoming) = start(None).await;
+    // `%!expr` — the whole statusline is the eval result. Only v:lua.* is
+    // supported; the prefix is stripped to the bare Lua call.
+    exec_lua(&rpc, "_G.my_stl = function() return 'HELLO' end").await;
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=%!v:lua.my_stl()<CR>").await;
+    assert_eq!(status_text(&map), "HELLO");
+}
+
+#[tokio::test]
+async fn statusline_embedded_vlua_expression_renders_result() {
+    let (rpc, mut incoming) = start(None).await;
+    // `%{expr}` — the result is literal text spliced into the surrounding format.
+    exec_lua(&rpc, "_G.tag = function() return 'OK' end").await;
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=[%{v:lua.tag()}]<CR>").await;
+    assert_eq!(status_text(&map), "[OK]");
+}
+
+#[tokio::test]
+async fn statusline_default_shows_mode_file_and_ruler() {
+    let (rpc, mut incoming) = start(None).await;
+    // Empty 'statusline' renders the built-in default through the same engine:
+    // ` MODE  file %= line,col `.
+    let map = redraw_after(&rpc, &mut incoming, "i<Esc>").await;
+    let text = status_text(&map);
+    assert!(text.contains("NORMAL"), "default shows the mode: {text:?}");
+    assert!(
+        text.contains("[No Name]"),
+        "default shows the file: {text:?}"
+    );
+    assert!(
+        text.trim_end().ends_with("1,1"),
+        "default ends with the line,col ruler: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn statusline_non_vlua_expression_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    // A non-`v:lua` expression is unsupported (no Vimscript); it renders a loud
+    // error naming the expression rather than silently expanding to nothing.
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=%{somevar}<CR>").await;
+    let text = status_text(&map);
+    assert!(text.contains("E:statusline:"), "loud, not empty: {text:?}");
+    assert!(text.contains("somevar"), "names the expression: {text:?}");
+}

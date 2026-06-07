@@ -22,6 +22,12 @@ pub(crate) type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
 pub(crate) type IncSearchSpans = Vec<Option<(u16, u16)>>;
 
+/// One rendered status-line segment: its literal text and the resolved style.
+/// `style` is `None` for a segment with no highlight group (or one the
+/// colorscheme left undefined) — the client then paints it in the base
+/// `StatusLine` look.
+pub(crate) type StatusSegment = (String, Option<Style>);
+
 /// One completion-popup row: `(label, kind, detail)`. `kind` is the
 /// `CompletionItemKind` as a small int (`0` = unspecified) the client could map
 /// to an icon; `detail` is `""` when the server provided none.
@@ -45,6 +51,30 @@ pub(crate) fn parse_pmenu_items(value: Option<&Value>) -> Vec<PmenuItem> {
                         t[1].as_u64()? as u8,
                         t[2].as_str().unwrap_or("").to_string(),
                     ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a window's `status` array into rendered segments: each entry a
+/// `{ text, style }` map, where `style` is an index into the frame's `styles`
+/// palette (`Nil` for the base `StatusLine` look). An absent/empty array yields
+/// no segments, and the client falls back to the bare reverse-video status row
+/// (an older server that doesn't project styled segments).
+pub(crate) fn parse_status(value: Option<&Value>, styles: &[Style]) -> Vec<StatusSegment> {
+    value
+        .and_then(Value::as_array)
+        .map(|segs| {
+            segs.iter()
+                .filter_map(|seg| {
+                    let Value::Map(m) = seg else {
+                        return None;
+                    };
+                    let style = map_get(m, "style")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| styles.get(id as usize).copied());
+                    Some((map_str(m, "text"), style))
                 })
                 .collect()
         })

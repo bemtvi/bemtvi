@@ -578,6 +578,79 @@ async fn the_floats_example_opens_a_visible_float_on_startup() {
 }
 
 #[tokio::test]
+async fn the_floats_example_move_command_repositions_the_float() {
+    let (rpc, mut incoming) = start_floats_example().await;
+    // `:FloatMove` calls nvim_win_set_config on the startup hint float with only
+    // row/col — it should slide from (col 20, row 0) to the top-left corner while
+    // keeping its border and title. The Phase 3 set_config path, driven through
+    // the shipped config in the real client.
+    feed(&rpc, ":FloatMove<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().symbol(),
+        "┌",
+        "the float's border moved to the top-left corner"
+    );
+    assert!(
+        row_text(&buf, 0).starts_with("┌") && row_text(&buf, 0).contains("nxvim floats"),
+        "the moved float keeps its title (size/border unchanged by the partial config): {:?}",
+        row_text(&buf, 0)
+    );
+}
+
+#[tokio::test]
+async fn the_floats_example_grow_and_to_split_commands_work() {
+    let (rpc, mut incoming) = start_floats_example().await;
+    let float = rpc
+        .request("nvim_list_wins", vec![])
+        .await
+        .expect("list_wins")
+        .as_array()
+        .and_then(|a| a.get(1).and_then(Value::as_u64))
+        .expect("the startup float id");
+
+    // `:FloatGrow` reads the float's config and resizes it (+8 wide). The startup
+    // float is 40x3, so it becomes 48 wide — exercises get_config + set_config in
+    // the shipped command body.
+    feed(&rpc, ":FloatGrow<CR>");
+    barrier(&rpc).await;
+    let cfg = rpc
+        .request("nvim_win_get_config", vec![Value::from(float)])
+        .await
+        .expect("get_config");
+    let width = cfg
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("width")))
+        .and_then(|(_, v)| v.as_u64());
+    assert_eq!(width, Some(48), "FloatGrow widened the float by 8");
+
+    // `:FloatToSplit` converts it into a tiled split (`relative = ""`): it leaves
+    // the float layer, so the view now has a separator between two tiled windows.
+    feed(&rpc, ":FloatToSplit<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    let relative = rpc
+        .request("nvim_win_get_config", vec![Value::from(float)])
+        .await
+        .expect("get_config")
+        .as_map()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("relative"))
+                .and_then(|(_, v)| v.as_str().map(str::to_string))
+        });
+    assert_eq!(
+        relative.as_deref(),
+        Some(""),
+        "the float re-tiled into a split"
+    );
+    // A horizontal separator row now divides the two tiled windows.
+    assert!(
+        (0..ROWS).any(|y| row_text(&buf, y).contains("─")),
+        "a split separator appears after the float converts to a tiled window"
+    );
+}
+
+#[tokio::test]
 async fn a_focused_float_owns_the_terminal_cursor() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ibackground<Esc>");

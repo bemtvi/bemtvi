@@ -19,11 +19,47 @@ use crate::ops::{
     LspOp, PanelOp, RawKeymap, RawRhs, UiInputReq, WindowOp,
 };
 
-/// One window's row in the Rust→Lua window mirror, in layout order:
-/// `(id, buffer, row (1-based), col, width, height (text rows), number,
-/// relativenumber)`. The number/relativenumber flags back `vim.wo`'s wired
-/// window-local options.
-pub type WindowMirror = (u64, u64, u64, u64, u64, u64, bool, bool);
+/// One window's row in the Rust→Lua window mirror, in layout order. The
+/// number/relativenumber flags back `vim.wo`'s wired window-local options;
+/// `float` carries a floating window's placement so `nvim_win_get_config` reads
+/// it from Lua (`None` for a tiled window).
+#[derive(Clone, Debug, Default)]
+pub struct WindowMirror {
+    pub id: u64,
+    pub buffer: u64,
+    /// 1-based cursor row, neovim convention.
+    pub row: u64,
+    /// 0-based cursor column.
+    pub col: u64,
+    pub width: u64,
+    /// Text rows (the rect height minus the status line).
+    pub height: u64,
+    pub number: bool,
+    pub relativenumber: bool,
+    pub float: Option<FloatMirror>,
+}
+
+/// A floating window's placement for the [`WindowMirror`], pre-formatted into the
+/// strings `nvim_win_get_config` returns (the server translates the core's
+/// `FloatConfig` enums into these so nxvim-lua stays free of the core's types).
+#[derive(Clone, Debug)]
+pub struct FloatMirror {
+    /// `"editor"` / `"win"` / `"cursor"`.
+    pub relative: String,
+    /// The parent window for `relative == "win"`, else `0`.
+    pub win: u64,
+    /// `"NW"` / `"NE"` / `"SW"` / `"SE"`.
+    pub anchor: String,
+    pub row: i64,
+    pub col: i64,
+    pub width: u64,
+    pub height: u64,
+    pub zindex: u64,
+    pub focusable: bool,
+    /// `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"`.
+    pub border: String,
+    pub title: Option<String>,
+}
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
 /// and loaded in this order at VM init — the order is significant (a later module
@@ -623,18 +659,38 @@ impl LuaRuntime {
             entries.set(*bufnr, entry)?;
         }
         let win_arr = self.lua.create_table()?;
-        for (i, (id, buffer, row, col, width, height, number, relativenumber)) in
-            wins.iter().enumerate()
-        {
+        for (i, m) in wins.iter().enumerate() {
             let w = self.lua.create_table()?;
-            w.set("id", *id)?;
-            w.set("buffer", *buffer)?;
-            w.set("row", *row)?;
-            w.set("col", *col)?;
-            w.set("width", *width)?;
-            w.set("height", *height)?;
-            w.set("number", *number)?;
-            w.set("relativenumber", *relativenumber)?;
+            w.set("id", m.id)?;
+            w.set("buffer", m.buffer)?;
+            w.set("row", m.row)?;
+            w.set("col", m.col)?;
+            w.set("width", m.width)?;
+            w.set("height", m.height)?;
+            w.set("number", m.number)?;
+            w.set("relativenumber", m.relativenumber)?;
+            // A float carries its placement as a nested table, the shape
+            // `nvim_win_get_config` returns (and that `nvim_win_set_config`'s
+            // write-through merges into).
+            if let Some(f) = &m.float {
+                let ft = self.lua.create_table()?;
+                ft.set("relative", self.lua.create_string(&f.relative)?)?;
+                if f.win != 0 {
+                    ft.set("win", f.win)?;
+                }
+                ft.set("anchor", self.lua.create_string(&f.anchor)?)?;
+                ft.set("row", f.row)?;
+                ft.set("col", f.col)?;
+                ft.set("width", f.width)?;
+                ft.set("height", f.height)?;
+                ft.set("zindex", f.zindex)?;
+                ft.set("focusable", f.focusable)?;
+                ft.set("border", self.lua.create_string(&f.border)?)?;
+                if let Some(title) = &f.title {
+                    ft.set("title", self.lua.create_string(title)?)?;
+                }
+                w.set("float", ft)?;
+            }
             win_arr.set(i + 1, w)?;
         }
         let set: mlua::Function = vim.get("_set_buf_mirror")?;

@@ -551,6 +551,92 @@ async fn nvim_open_win_creates_a_window_and_fires_winnew() {
 }
 
 #[tokio::test]
+async fn opening_and_closing_a_float_fires_window_autocmds() {
+    // A float is a window, so the lifecycle diff spans it: opening+entering fires
+    // WinNew then WinEnter for the float; closing it fires WinClosed.
+    let dir = temp_dir("au_float_life");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
+         vim.api.nvim_create_autocmd('WinNew', { callback = rec('new') })\n\
+         vim.api.nvim_create_autocmd('WinEnter', { callback = rec('enter') })\n\
+         vim.api.nvim_create_autocmd('WinClosed', { callback = rec('closed') })\n",
+    )
+    .await;
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    // Open+enter the float (fires WinNew/WinEnter into _G.log). Read its id with a
+    // synchronous getter — `print(_G.f)` in the open chunk is wiped by the float's
+    // own WinEnter (which clears the message line).
+    lua_message(
+        &rpc,
+        &mut incoming,
+        "_G.f = vim.api.nvim_open_win(0, true, \
+         { relative='editor', row=1, col=1, width=10, height=4 })",
+    )
+    .await;
+    let id = exec_lua(&rpc, "return _G.f")
+        .await
+        .as_u64()
+        .expect("float id");
+    let opened = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(
+        opened,
+        format!("new{id},enter{id}"),
+        "opening+entering a float fired WinNew then WinEnter"
+    );
+
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    lua_message(&rpc, &mut incoming, "vim.api.nvim_win_close(_G.f, false)").await;
+    let closed = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    let want = format!("closed{id}");
+    assert!(
+        closed.contains(&want),
+        "closing the float fired WinClosed: {closed}"
+    );
+}
+
+#[tokio::test]
+async fn resizing_a_float_with_set_config_fires_winresized() {
+    // `nvim_win_set_config` that changes a float's size makes its rect change,
+    // which the lifecycle diff reports as WinResized.
+    let dir = temp_dir("au_float_resize");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.resized = {}\n\
+         vim.api.nvim_create_autocmd('WinResized', {\n\
+         \x20 callback = function(a) _G.resized[#_G.resized+1] = a.match end })\n",
+    )
+    .await;
+    lua_message(
+        &rpc,
+        &mut incoming,
+        "_G.f = vim.api.nvim_open_win(0, true, \
+         { relative='editor', row=1, col=1, width=10, height=4 })",
+    )
+    .await;
+    let id = exec_lua(&rpc, "return _G.f")
+        .await
+        .as_u64()
+        .expect("float id");
+    let id = id.to_string();
+    // Clear any layout churn from the open before measuring the resize.
+    lua_message(&rpc, &mut incoming, "_G.resized = {}").await;
+    lua_message(
+        &rpc,
+        &mut incoming,
+        "vim.api.nvim_win_set_config(_G.f, \
+         { relative='editor', row=1, col=1, width=20, height=8 })",
+    )
+    .await;
+    let fired = lua_message(&rpc, &mut incoming, "print(table.concat(_G.resized, ','))").await;
+    assert!(
+        fired.contains(id.as_str()),
+        "resizing the float fired WinResized for it: {fired}"
+    );
+}
+
+#[tokio::test]
 async fn examples_windows_config_loads_and_drives_the_window_api() {
     // End-to-end check of the shipped `examples/windows/` config: source its real
     // init.lua, then exercise the helper commands it defines. Proves the example

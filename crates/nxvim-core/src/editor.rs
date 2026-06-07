@@ -354,6 +354,20 @@ pub enum FloatAnchor {
     SE,
 }
 
+impl FloatAnchor {
+    /// The `nvim_open_win` `anchor` string for this corner — the inverse of the
+    /// RPC/Lua parse, used to format `nvim_win_get_config` and the `vim._wins`
+    /// mirror.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloatAnchor::NW => "NW",
+            FloatAnchor::NE => "NE",
+            FloatAnchor::SW => "SW",
+            FloatAnchor::SE => "SE",
+        }
+    }
+}
+
 /// A float's border style (`nvim_open_win`'s `border`). The *width* of the border
 /// (one cell on each side when present) is part of the geometry — a bordered
 /// float's inner text area is `width - 2 × height - 2` — so it is carried from
@@ -366,6 +380,21 @@ pub enum BorderStyle {
     Rounded,
     Double,
     Solid,
+}
+
+impl BorderStyle {
+    /// The `nvim_open_win` `border` string for this style — the inverse of the
+    /// RPC/Lua parse, used to format `nvim_win_get_config` and the `vim._wins`
+    /// mirror.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BorderStyle::None => "none",
+            BorderStyle::Single => "single",
+            BorderStyle::Rounded => "rounded",
+            BorderStyle::Double => "double",
+            BorderStyle::Solid => "solid",
+        }
+    }
 }
 
 /// A floating window's placement (`nvim_open_win`'s float `config`). Held on
@@ -413,6 +442,31 @@ impl Default for FloatConfig {
             title: None,
         }
     }
+}
+
+/// A partial `nvim_win_set_config` change ([`Editor::set_window_config`]). Each
+/// `Some` field overrides the target window's float placement; a `None` keeps the
+/// current value (neovim's "absent keys are unchanged" merge semantics). The
+/// merge happens **here** so both callers — the `nvim_win_set_config` RPC and the
+/// `WindowOp::SetConfig` drain — send only the keys the caller passed.
+///
+/// `make_tiled` is the `relative = ""` form: convert a float back into a tiled
+/// window (a split of the focused window), ignoring the placement fields. `title`
+/// nests an `Option` so the caller can distinguish *unchanged* (`None`) from
+/// *clear* (`Some(None)`) from *set* (`Some(Some(_))`).
+#[derive(Debug, Clone, Default)]
+pub struct WindowConfigSpec {
+    pub make_tiled: bool,
+    pub relative: Option<FloatRelative>,
+    pub anchor: Option<FloatAnchor>,
+    pub row: Option<isize>,
+    pub col: Option<isize>,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub zindex: Option<u32>,
+    pub focusable: Option<bool>,
+    pub border: Option<BorderStyle>,
+    pub title: Option<Option<String>>,
 }
 
 /// A window: one viewport onto a buffer. Mirrors the way [`OpenBuffer`] splits
@@ -2440,6 +2494,122 @@ impl Editor {
         self.windows.windows.get(&id).and_then(|w| w.float.clone())
     }
 
+    /// `nvim_win_set_config(win, config)` — reconfigure window `id` from a partial
+    /// [`WindowConfigSpec`]. Three behaviors, selected by the spec and the
+    /// window's current kind:
+    ///
+    /// - **move / resize / restyle a float:** merge the `Some` fields over the
+    ///   window's current [`FloatConfig`] and re-lay; absent fields are unchanged.
+    /// - **tiled → float** (`spec.relative` is `Some`, window is currently tiled):
+    ///   the window leaves the layout tree (its split collapses, a neighbor fills
+    ///   the freed area) and joins the float list with the merged config. Refused
+    ///   for the **last** tiled window (neovim won't float the only normal window).
+    /// - **float → tiled** (`spec.make_tiled`, the `relative = ""` form): the float
+    ///   re-tiles as a horizontal split of the focused window.
+    ///
+    /// A no-op for an unknown id, or `make_tiled` on an already-tiled window.
+    pub fn set_window_config(&mut self, id: WindowId, spec: WindowConfigSpec) {
+        if !self.windows.windows.contains_key(&id) {
+            return;
+        }
+        // `relative = ""` re-tiles a float; on a tiled window it is a no-op.
+        if spec.make_tiled {
+            self.convert_float_to_tiled(id);
+            return;
+        }
+        let was_tiled = self.windows.get(id).float.is_none();
+        if was_tiled && self.windows.leaves().len() <= 1 {
+            // The only tiled window can't become a float — there must always be a
+            // normal window left for the tiled layout to fill.
+            self.echo("nvim_win_set_config: cannot make the last window floating");
+            return;
+        }
+        // Base config: the window's live placement, or a default seeded from its
+        // current tiled rect (so a tiled → float conversion that omits width/height
+        // keeps its on-screen size).
+        let mut cfg = match self.windows.get(id).float.clone() {
+            Some(c) => c,
+            None => {
+                let (_, _, w, h) = self.window_rect(id).unwrap_or((0, 0, 1, 1));
+                FloatConfig {
+                    width: w.max(1),
+                    height: h.max(1),
+                    ..FloatConfig::default()
+                }
+            }
+        };
+        if let Some(v) = spec.relative {
+            cfg.relative = v;
+        }
+        if let Some(v) = spec.anchor {
+            cfg.anchor = v;
+        }
+        if let Some(v) = spec.row {
+            cfg.row = v;
+        }
+        if let Some(v) = spec.col {
+            cfg.col = v;
+        }
+        if let Some(v) = spec.width {
+            cfg.width = v.max(1);
+        }
+        if let Some(v) = spec.height {
+            cfg.height = v.max(1);
+        }
+        if let Some(v) = spec.zindex {
+            cfg.zindex = v;
+        }
+        if let Some(v) = spec.focusable {
+            cfg.focusable = v;
+        }
+        if let Some(v) = spec.border {
+            cfg.border = v;
+        }
+        if let Some(v) = spec.title {
+            cfg.title = v;
+        }
+        if was_tiled {
+            // Detach the window from the tiled tree (a sibling expands) but keep
+            // the window itself; it becomes a float.
+            remove_leaf(&mut self.windows.root, id);
+            self.windows.floats.push(id);
+        }
+        self.windows.get_mut(id).float = Some(cfg);
+        self.windows.sort_floats();
+        self.relayout();
+        if self.windows.current == id {
+            self.ensure_visible();
+        }
+    }
+
+    /// Convert float `id` back into a tiled window (the `relative = ""` form of
+    /// `nvim_win_set_config`): drop it from the float list, clear its
+    /// [`FloatConfig`], and re-insert it into the layout tree as a horizontal
+    /// split of the focused window (neovim's "make it a normal window" lands it in
+    /// the current layout). A no-op if `id` is already tiled.
+    fn convert_float_to_tiled(&mut self, id: WindowId) {
+        if self.windows.get(id).float.is_none() {
+            return;
+        }
+        self.windows.floats.retain(|f| *f != id);
+        self.windows.get_mut(id).float = None;
+        // Split a tiled neighbor to make room. When the float itself is focused,
+        // split the first tiled leaf (there is always at least one, since a float
+        // is never the only window); otherwise split the focused window.
+        let target = if self.windows.current == id {
+            self.windows
+                .leaves()
+                .into_iter()
+                .next()
+                .expect("a tiled window always exists alongside a float")
+        } else {
+            self.windows.current
+        };
+        split_leaf(&mut self.windows.root, target, SplitDir::Horizontal, id);
+        self.relayout();
+        self.ensure_visible();
+    }
+
     /// Per-window data the [`View`] projection needs: each window's buffer, its
     /// view position (the *live* `cursor`/`top` for the focused window, the
     /// stashed `saved_*` for the rest), its computed rect, and whether it holds
@@ -2539,24 +2709,56 @@ impl Editor {
 
     /// Remove window `id` (focused or not) and collapse its parent split. When
     /// the closed window held focus, the spatially nearest survivor takes it (and
-    /// its view position is restored); otherwise focus is untouched. Returns
-    /// `false` — without touching the layout — if `id` is the last window (it
-    /// can't be closed) or not open. Shared by `<C-w>c`/`:close` and the
-    /// `nvim_win_close` API.
+    /// its view position is restored); otherwise focus is untouched. Floats
+    /// anchored to the closing window (`relative="win"`) close with it. Returns
+    /// `false` — without touching the layout — if `id` is the last *tiled* window
+    /// (it can't be closed; a float never substitutes for it) or not open. Shared
+    /// by `<C-w>c`/`:close` and the `nvim_win_close` API.
     fn remove_window(&mut self, id: WindowId) -> bool {
-        if self.windows.count() <= 1 || !self.windows.windows.contains_key(&id) {
+        if !self.windows.windows.contains_key(&id) {
+            return false;
+        }
+        // The last *tiled* window can't be closed — a float never substitutes
+        // for it (the tiled layout must always have a normal window to fill).
+        // Floats themselves are always closable (one is never the only window).
+        let is_float = self.windows.get(id).float.is_some();
+        if !is_float && self.windows.leaves().len() <= 1 {
             return false;
         }
         let closing_rect = self.windows.get(id).rect;
-        let was_focused = id == self.windows.current;
-        // A float is not in the layout tree — drop it from the float list; a tiled
-        // window collapses its parent split.
-        if self.windows.get(id).float.is_some() {
-            self.windows.floats.retain(|f| *f != id);
-        } else {
-            remove_leaf(&mut self.windows.root, id);
+        // `id` plus every float transitively anchored to it (`relative="win"`):
+        // neovim closes a float when its parent window goes away.
+        let mut victims = vec![id];
+        let mut i = 0;
+        while i < victims.len() {
+            let parent = victims[i];
+            let children: Vec<WindowId> = self
+                .windows
+                .floats
+                .iter()
+                .copied()
+                .filter(|f| !victims.contains(f))
+                .filter(|f| {
+                    matches!(
+                        self.windows.get(*f).float.as_ref().map(|c| c.relative),
+                        Some(FloatRelative::Win(p)) if p == parent
+                    )
+                })
+                .collect();
+            victims.extend(children);
+            i += 1;
         }
-        self.windows.windows.remove(&id);
+        let was_focused = victims.contains(&self.windows.current);
+        // A float is not in the layout tree — drop it from the float list; a
+        // tiled window collapses its parent split.
+        for &v in &victims {
+            if self.windows.get(v).float.is_some() {
+                self.windows.floats.retain(|f| *f != v);
+            } else {
+                remove_leaf(&mut self.windows.root, v);
+            }
+            self.windows.windows.remove(&v);
+        }
         if was_focused {
             // Pick the spatially nearest survivor (using the pre-relayout rects)
             // as the new focus, then re-lay and restore its view.
@@ -2576,15 +2778,22 @@ impl Editor {
         true
     }
 
-    /// `<C-w>o` / `:only` — drop every window but the focused one, which expands
-    /// to the whole area. A no-op with a single window. The kept window stays
-    /// focused, so the live view position is untouched.
+    /// `<C-w>o` / `:only` — drop every other tiled window *and every float*
+    /// (neovim's `:only` closes floats too); the focused window expands to the
+    /// whole area. A no-op when it is already the only window. The kept window
+    /// stays focused, so the live view position is untouched. Refused from a
+    /// focused float (only a float would remain — neovim's E5601).
     fn only_window(&mut self) {
-        if self.windows.count() <= 1 {
+        if self.windows.get(self.windows.current).float.is_some() {
+            self.echo("E5601: Cannot close window, only floating window would remain");
+            return;
+        }
+        if self.windows.leaves().len() <= 1 && self.windows.floats.is_empty() {
             return;
         }
         let keep = self.windows.current;
         self.windows.windows.retain(|id, _| *id == keep);
+        self.windows.floats.clear();
         self.windows.root = Node::Leaf(keep);
         self.relayout();
         self.ensure_visible();
@@ -2680,9 +2889,19 @@ impl Editor {
     }
 
     /// Cyclic window focus (vim's `<C-w>w` forward / `<C-w>W` backward), wrapping
-    /// around the layout order.
+    /// around the layout order. The cycle spans the tiled windows (in tree order)
+    /// and any *focusable* floats (in z-order, appended after); non-focusable
+    /// floats are skipped, as neovim does. (`nvim_set_current_win` can still focus
+    /// a non-focusable float explicitly — only the `<C-w>` cycle excludes it.)
     fn focus_cycle(&mut self, forward: bool) {
-        let order = self.windows.leaves();
+        let mut order = self.windows.leaves();
+        order.extend(self.windows.floats.iter().copied().filter(|f| {
+            self.windows
+                .get(*f)
+                .float
+                .as_ref()
+                .is_some_and(|c| c.focusable)
+        }));
         let n = order.len();
         if n <= 1 {
             return;
@@ -5583,7 +5802,12 @@ impl Editor {
     /// onto a modified buffer is fine. Only the **last** window is a real editor
     /// quit, which defers to [`Self::ex_quit_all`] (and its `E37` guard).
     fn ex_quit(&mut self, bang: bool) {
-        if self.windows.count() > 1 {
+        // `:q` on a focused float closes just the float and never quits the
+        // editor. For a tiled window, only the *last tiled* one is a real quit —
+        // floats don't keep the editor alive, nor do they count toward "more
+        // than one window" (the last-tiled rule lives in `remove_window`).
+        let on_float = self.windows.get(self.windows.current).float.is_some();
+        if on_float || self.windows.leaves().len() > 1 {
             self.close_window();
             return;
         }

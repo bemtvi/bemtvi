@@ -328,6 +328,26 @@ pub enum WindowOp {
         border: String,
         title: Option<String>,
     },
+    /// `nvim_win_set_config(win, config)` — reconfigure window `win` from a
+    /// **partial** config: every field is `Option`, `None` meaning "key absent,
+    /// leave unchanged" (the merge happens in the core). `relative == Some("")` is
+    /// the re-tile form (convert a float back to a split). `parent` is the
+    /// `relative == "win"` anchor (`0` = current). The prelude validated the
+    /// enumerated strings before queuing, so the drain trusts them.
+    SetConfig {
+        win: u64,
+        relative: Option<String>,
+        parent: u64,
+        anchor: Option<String>,
+        row: Option<i64>,
+        col: Option<i64>,
+        width: Option<u64>,
+        height: Option<u64>,
+        zindex: Option<u32>,
+        focusable: Option<bool>,
+        border: Option<String>,
+        title: Option<String>,
+    },
 }
 
 /// The arguments handed to a deferred callback when the server runs it via

@@ -610,6 +610,32 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `vim._win_set_config(win, cfg)`: queue the partial reconfigure of
+    // `nvim_win_set_config`. `cfg` carries only the keys the caller passed (the
+    // prelude already validated the enumerated strings); a missing key stays
+    // `None` so the core leaves it unchanged. `relative = ""` rides through as the
+    // re-tile form.
+    let sh = shared.clone();
+    vim.set(
+        "_win_set_config",
+        lua.create_function(move |_, (win, cfg): (u64, Table)| {
+            sh.borrow_mut().window_ops.push(WindowOp::SetConfig {
+                win,
+                relative: cfg.get::<Option<String>>("relative")?,
+                parent: cfg.get::<Option<u64>>("win")?.unwrap_or(0),
+                anchor: cfg.get::<Option<String>>("anchor")?,
+                row: cfg.get::<Option<i64>>("row")?,
+                col: cfg.get::<Option<i64>>("col")?,
+                width: cfg.get::<Option<u64>>("width")?,
+                height: cfg.get::<Option<u64>>("height")?,
+                zindex: cfg.get::<Option<u32>>("zindex")?,
+                focusable: cfg.get::<Option<bool>>("focusable")?,
+                border: cfg.get::<Option<String>>("border")?,
+                title: cfg.get::<Option<String>>("title")?,
+            });
+            Ok(())
+        })?,
+    )?;
 
     // `vim._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request
     // ([`LspOp::BufRequest`]) or one of the edit ops (`Format`/`CodeAction`),

@@ -44,8 +44,8 @@ part of it.
 | --- | --- | --- |
 | 1 | The float in the core — model, positioning, lifecycle (queryable, not yet painted) | ✅ |
 | 2 | Painting floats — the `View` projection + the TUI overlay | ✅ |
-| 3 | The full config surface — `nvim_win_set_config`/`get_config`, split↔float, the Lua API + mirror | ⬜ |
-| 4 | Autocmds, edge semantics (`:q`/`:only`/focus), and hardening | ⬜ |
+| 3 | The full config surface — `nvim_win_set_config`/`get_config`, split↔float, the Lua API + mirror | ✅ |
+| 4 | Autocmds, edge semantics (`:q`/`:only`/focus), and hardening | ✅ |
 
 **Phase 1 implementation note.** Landed as designed. The float model lives on
 `WindowTree` (`Window.float: Option<FloatConfig>` + a z-sorted `floats: Vec<WindowId>`
@@ -410,7 +410,42 @@ and `examples/floats/` shows it working in the real TUI. `architecture.md`'s
 
 ---
 
-## Phase 3 — The full config surface: `set_config`/`get_config`, split↔float, the Lua API ⬜
+## Phase 3 — The full config surface: `set_config`/`get_config`, split↔float, the Lua API ✅
+
+**Phase 3 implementation note.** Landed as designed. The merge ("absent keys are
+unchanged") lives in **one place** — `Editor::set_window_config(id, spec)` in
+`editor.rs`, taking a partial `WindowConfigSpec` (all-`Option` fields plus a
+`make_tiled` flag for the `relative = ""` form) — so both callers send only the
+keys they were given: the `nvim_win_set_config` RPC (`dispatch.rs::parse_window_config`)
+and the `WindowOp::SetConfig` drain (`effects.rs`). `set_window_config` does three
+things by case: move/resize/restyle a float (merge over its live `FloatConfig`);
+**tiled → float** (`remove_leaf` detaches it from the tree, a sibling expands, the
+window joins `floats` — refused for the last tiled window via an `echo`); and
+**float → tiled** (`convert_float_to_tiled` clears `float` and `split_leaf`s it
+back into the tree as a horizontal split of the focused window). The `vim._wins`
+mirror gained the float fields: `WindowMirror` became a struct with an
+`Option<FloatMirror>` (the placement pre-formatted into the strings
+`nvim_win_get_config` returns, so nxvim-lua never sees the core's enums —
+`effects.rs::float_mirror` translates), serialized as a nested `float` table by
+`runtime.rs::set_buf_mirror`. `api.lua` gained `nvim_win_get_config` (reads
+`w.float` off the mirror) and `nvim_win_set_config` (loud-validates the enumerated
+fields, queues `_win_set_config`, and write-throughs `w.float` so a `get_config`
+later in the same chunk agrees); `nvim_open_win`'s write-through now seeds the
+float record too. **Deliberate divergences / limitations:** (1) a tiled → float
+conversion that omits `width`/`height` seeds them from the window's current tiled
+rect (its on-screen size), rather than erroring; (2) `set_config` cannot *clear* a
+title from Lua (a `nil` field is indistinguishable from absent — the RPC path can,
+via an empty `title` string); (3) `convert_float_to_tiled` always makes a
+*horizontal* split of the focused window (the simplest "make it a normal window"
+placement neovim's docs leave unspecified). Coverage: 5 RPC tests in `windows.rs`
+(move-keeps-absent-fields, resize, tiled↔float round-trip, same-chunk get_config
+write-through, Lua `nvim_win_set_config`) + 3 example-driven screen tests in
+`crates/nxvim/tests/screen.rs` (the shipped `examples/floats/` `:FloatMove` /
+`:FloatGrow` / `:FloatToSplit` commands, which exercise `set_config`/`get_config`
+and the split conversion through the real client). The `examples/floats/init.lua`
+config grew those three commands.
+
+## Phase 3 (original plan) — The full config surface: `set_config`/`get_config`, split↔float, the Lua API
 
 **Already landed in Phase 2 (don't redo):** `WindowOp::OpenFloat`, the
 `vim._open_float` bridge, `api.lua`'s `nvim_open_win` float branch (with loud
@@ -503,7 +538,38 @@ configure).
 
 ---
 
-## Phase 4 — Autocmds, edge semantics, and hardening ⬜
+## Phase 4 — Autocmds, edge semantics, and hardening ✅
+
+**Phase 4 implementation note.** Landed as designed, mostly as small edits to the
+existing `WindowTree`/`Editor` edge logic in `editor.rs` (no new types). (1)
+**Autocmds** needed *no* new code — the `lifecycle.rs` diff already keys off
+`window_ids()` (which spans floats) and a rect snapshot, so `WinNew`/`WinEnter`/
+`WinClosed` fire for floats and `WinResized` fires when `set_config` changes a
+float's rect; Phase 4 just adds the coverage. (2) **`:q` / last-window rule:**
+`ex_quit` now branches on whether the focused window is a float (close just the
+float, never quit) and otherwise counts **tiled** windows (`leaves().len()`) for
+the last-window test, and `remove_window`'s guard became "refuse the last *tiled*
+window" (`!is_float && leaves().len() <= 1`) so a tiled window can't be closed
+down to floats-only and a float is always closable. (3) **Parent-close:**
+`remove_window` collects the target plus every float transitively anchored to it
+(`relative="win"`) into a `victims` list and removes them together. (4)
+**`:only`:** `only_window` clears `floats` alongside the tiled retain, and refuses
+to run from a focused float (neovim's E5601). (5) **Focusable focus cycle:**
+`focus_cycle` (`<C-w>w`/`<C-w>W`) now appends focusable floats (z-order) after the
+tiled leaves; the spatial `focus_dir` (`<C-w>h/j/k/l`) stays tiled-only. (6)
+**Resize re-clamp** needed no code — `editor.resize` → `relayout` → the float pass
+already re-clamps every layout; Phase 4 adds the test. **Deliberate divergence
+from the literal plan:** the spatial `<C-w>h/j/k/l` does **not** descend into
+floats (only the `<C-w>w` cycle does), since a float overlapping the tiled grid
+has no well-defined direction — neovim's directional moves likewise stay in the
+tiled layout. Coverage: 8 edge tests in `crates/nxvim-server/tests/windows.rs`
+(float `:q`, last-tiled quit, `:only` closes floats, parent-close cascade, cycle
+includes/skips focusable, last-tiled-close refusal, resize re-clamp) + 2 autocmd
+tests in `autocmds.rs` (float WinNew/WinEnter/WinClosed, `set_config` WinResized)
++ a `:FloatNote` non-focusable demo command and an EDGE BEHAVIORS note in
+`examples/floats/init.lua`.
+
+## Phase 4 (original plan) — Autocmds, edge semantics, and hardening
 
 **Goal.** Floats behave correctly at the **boundaries**: the window autocmds fire
 for them, `:q`/`:qa`/`:only`/`<C-w>` do the right thing with floats present, focus

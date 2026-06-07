@@ -7,11 +7,39 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::Server;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
-    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowId,
+    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec,
+    WindowId,
 };
-use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, OptionValue, PanelOp, WindowMirror, WindowOp};
+use nxvim_lua::{
+    BufOp, CallbackArgs, FloatMirror, HlSet, LoopOp, OptionValue, PanelOp, WindowMirror, WindowOp,
+};
 use rmpv::Value;
 use std::collections::HashSet;
+
+/// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `vim._wins`
+/// mirror carries — the enums become the strings `nvim_win_get_config` returns,
+/// so nxvim-lua never sees the core's float types. The inverse of the
+/// `parse_float_config` / `WindowOp::OpenFloat` parse.
+fn float_mirror(cfg: FloatConfig) -> FloatMirror {
+    let (relative, win) = match cfg.relative {
+        FloatRelative::Editor => ("editor", 0),
+        FloatRelative::Cursor => ("cursor", 0),
+        FloatRelative::Win(id) => ("win", id.0),
+    };
+    FloatMirror {
+        relative: relative.to_string(),
+        win,
+        anchor: cfg.anchor.as_str().to_string(),
+        row: cfg.row as i64,
+        col: cfg.col as i64,
+        width: cfg.width as u64,
+        height: cfg.height as u64,
+        zindex: cfg.zindex as u64,
+        focusable: cfg.focusable,
+        border: cfg.border.as_str().to_string(),
+        title: cfg.title,
+    }
+}
 
 impl Server {
     /// Apply the side effects the last Lua chunk left in the runtime: highlight
@@ -307,6 +335,78 @@ impl Server {
                 };
                 self.editor.open_float_window(buffer, config, enter);
             }
+            WindowOp::SetConfig {
+                win,
+                relative,
+                parent,
+                anchor,
+                row,
+                col,
+                width,
+                height,
+                zindex,
+                focusable,
+                border,
+                title,
+            } => {
+                let id = resolve_win(self, win);
+                let mut spec = WindowConfigSpec::default();
+                match relative.as_deref() {
+                    None => {}
+                    Some("") => spec.make_tiled = true,
+                    Some("editor") => spec.relative = Some(FloatRelative::Editor),
+                    Some("cursor") => spec.relative = Some(FloatRelative::Cursor),
+                    Some("win") => {
+                        let p = if parent == 0 {
+                            self.editor.current_window_id()
+                        } else {
+                            WindowId(parent)
+                        };
+                        spec.relative = Some(FloatRelative::Win(p));
+                    }
+                    Some(other) => {
+                        self.editor.echo(format!(
+                            "nvim_win_set_config: invalid 'relative': '{other}'"
+                        ));
+                        return;
+                    }
+                }
+                if let Some(a) = anchor.as_deref() {
+                    spec.anchor = Some(match a {
+                        "NW" => FloatAnchor::NW,
+                        "NE" => FloatAnchor::NE,
+                        "SW" => FloatAnchor::SW,
+                        "SE" => FloatAnchor::SE,
+                        other => {
+                            self.editor
+                                .echo(format!("nvim_win_set_config: invalid 'anchor': '{other}'"));
+                            return;
+                        }
+                    });
+                }
+                if let Some(b) = border.as_deref() {
+                    spec.border = Some(match b {
+                        "none" => BorderStyle::None,
+                        "single" => BorderStyle::Single,
+                        "rounded" => BorderStyle::Rounded,
+                        "double" => BorderStyle::Double,
+                        "solid" => BorderStyle::Solid,
+                        other => {
+                            self.editor
+                                .echo(format!("nvim_win_set_config: invalid 'border': '{other}'"));
+                            return;
+                        }
+                    });
+                }
+                spec.row = row.map(|v| v as isize);
+                spec.col = col.map(|v| v as isize);
+                spec.width = width.map(|v| v as usize);
+                spec.height = height.map(|v| v as usize);
+                spec.zindex = zindex;
+                spec.focusable = focusable;
+                spec.title = title.map(Some);
+                self.editor.set_window_config(id, spec);
+            }
         }
     }
 
@@ -363,16 +463,17 @@ impl Server {
                 let (line, col) = self.editor.window_cursor(id).unwrap_or((0, 0));
                 let (_, _, w, h) = self.editor.window_rect(id).unwrap_or((0, 0, 0, 0));
                 let opts = self.editor.window_options(id).unwrap_or_default();
-                (
-                    id.0,
+                WindowMirror {
+                    id: id.0,
                     buffer,
-                    (line + 1) as u64,
-                    col as u64,
-                    w as u64,
-                    h.saturating_sub(1) as u64, // text rows (minus the status line)
-                    opts.number,
-                    opts.relativenumber,
-                )
+                    row: (line + 1) as u64,
+                    col: col as u64,
+                    width: w as u64,
+                    height: h.saturating_sub(1) as u64, // text rows (minus the status line)
+                    number: opts.number,
+                    relativenumber: opts.relativenumber,
+                    float: self.editor.window_float_config(id).map(float_mirror),
+                }
             })
             .collect();
         let cur_win = self.editor.current_window_id().0;

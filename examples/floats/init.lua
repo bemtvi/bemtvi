@@ -20,8 +20,20 @@
 --   :FloatHello     a centered, rounded, titled float          ("hello from a float")
 --   :FloatStack     two overlapping floats — higher zindex on top
 --   :FloatCursor    a float anchored to the cursor cell (move first, then run it)
+--   :FloatNote      a NON-focusable float — <C-w>w skips it; set focus skips too
+--   :FloatMove      slide the last float to the top-left corner (nvim_win_set_config)
+--   :FloatGrow      resize the last float bigger (nvim_win_set_config)
+--   :FloatToSplit   turn the last float into a real split (relative = "")
 --   :FloatClose     close the most-recently opened demo float
 --   <leader>x       (same as :FloatClose)  — <leader> is `\` by default
+--
+-- EDGE BEHAVIORS (they match neovim):
+--   * <C-w>w cycles focus through the tiled windows AND any *focusable* floats,
+--     in z-order; a non-focusable float (:FloatNote) is skipped by the cycle.
+--   * :q on a focused float closes just the float — it never quits the editor.
+--     :q on the last tiled window quits even with floats still open.
+--   * :only (or <C-w>o) closes every other window, floats included.
+--   * Closing a window closes any float anchored to it (relative = "win").
 --
 -- A small hint float opens on startup (top of the screen) so you see a float
 -- immediately, without stealing focus.
@@ -85,6 +97,64 @@ vim.api.nvim_create_user_command("FloatCursor", function()
     width = 26, height = 4,
     border = "single", title = "at the cursor",
   })
+end, {})
+
+--------------------------------------------------------------------------------
+-- :FloatNote — a NON-focusable float (focusable = false). The window cycle
+-- (<C-w>w / <C-w>W) walks right past it, so it never steals your place in the
+-- rotation — the way a hover or notification float behaves. You can still close
+-- it with :FloatClose. (nvim_set_current_win could focus it explicitly, but the
+-- <C-w> cycle won't.)
+--------------------------------------------------------------------------------
+vim.api.nvim_create_user_command("FloatNote", function()
+  open_float({
+    relative = "editor", row = 2, col = 40,
+    width = 30, height = 4,
+    border = "rounded", title = "note (skipped by <C-w>w)",
+    focusable = false, enter = false,
+  })
+  vim.notify("opened a non-focusable float — <C-w>w skips it")
+end, {})
+
+--------------------------------------------------------------------------------
+-- nvim_win_set_config — reconfigure a float after it is open. The config is a
+-- *partial*: only the keys you pass change, the rest are kept. This is how
+-- plugins reposition (hover following the cursor), resize (telescope on resize),
+-- or convert a float into a normal split. These act on the most-recent float.
+--------------------------------------------------------------------------------
+local function last_float()
+  local win = _G.float_wins[#_G.float_wins]
+  if not win then vim.notify("no demo floats open — open one first") end
+  return win
+end
+
+-- :FloatMove — slide the last float to the top-left corner. Only row/col are
+-- passed, so its size/border/title stay exactly as they were.
+vim.api.nvim_create_user_command("FloatMove", function()
+  local win = last_float()
+  if not win then return end
+  vim.api.nvim_win_set_config(win, { relative = "editor", row = 0, col = 0 })
+  vim.notify("moved float " .. win .. " to the top-left")
+end, {})
+
+-- :FloatGrow — make the last float bigger. Only width/height change.
+vim.api.nvim_create_user_command("FloatGrow", function()
+  local win = last_float()
+  if not win then return end
+  local cfg = vim.api.nvim_win_get_config(win)
+  vim.api.nvim_win_set_config(win, { width = cfg.width + 8, height = cfg.height + 2 })
+  vim.notify("grew float " .. win .. " to " .. (cfg.width + 8) .. "x" .. (cfg.height + 2))
+end, {})
+
+-- :FloatToSplit — convert the last float into a real tiled split (relative = "").
+-- It leaves the float layer and joins the window tree as a normal split; the
+-- other tiled windows make room. (It is no longer a "demo float", so drop it
+-- from the list — :FloatClose would refuse to close the last tiled window.)
+vim.api.nvim_create_user_command("FloatToSplit", function()
+  local win = table.remove(_G.float_wins)
+  if not win then vim.notify("no demo floats open") return end
+  vim.api.nvim_win_set_config(win, { relative = "" })
+  vim.notify("converted float " .. win .. " into a tiled split")
 end, {})
 
 --------------------------------------------------------------------------------

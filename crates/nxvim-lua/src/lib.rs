@@ -32,4 +32,4 @@ pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, GlobalOptionOp, HlSet, LoopOp, LspClientData,
     LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs, UiInputReq, WindowOp,
 };
-pub use runtime::{LuaRuntime, WindowMirror};
+pub use runtime::{FloatMirror, LuaRuntime, WindowMirror};

@@ -390,6 +390,9 @@ function vim.api.nvim_open_win(buffer, enter, config)
   vim._next_win = id + 1
   local enters = enter ~= false
   local buf = (buffer == nil or buffer == 0) and vim.api.nvim_get_current_buf() or buffer
+  -- The float placement to seed into the mirror so a `nvim_win_get_config` later
+  -- in this chunk sees it (set in the float branch below; nil for a split).
+  local float_record = nil
 
   if type(config.relative) == "string" and config.relative ~= "" then
     -- Float form. Validate the enumerated fields loudly before queuing.
@@ -408,11 +411,9 @@ function vim.api.nvim_open_win(buffer, enter, config)
         or config.width <= 0 or config.height <= 0 then
       error("nvim_open_win: 'width' and 'height' must be positive", 2)
     end
-    vim._open_float({
-      buf = buffer or 0,
-      enter = enters,
+    float_record = {
       relative = config.relative,
-      win = config.win or 0,
+      win = (config.win and config.win ~= 0) and config.win or nil,
       anchor = anchor,
       row = math.floor(config.row or 0),
       col = math.floor(config.col or 0),
@@ -422,6 +423,21 @@ function vim.api.nvim_open_win(buffer, enter, config)
       focusable = config.focusable ~= false,
       border = border,
       title = float_title(config.title),
+    }
+    vim._open_float({
+      buf = buffer or 0,
+      enter = enters,
+      relative = float_record.relative,
+      win = config.win or 0,
+      anchor = float_record.anchor,
+      row = float_record.row,
+      col = float_record.col,
+      width = float_record.width,
+      height = float_record.height,
+      zindex = float_record.zindex,
+      focusable = float_record.focusable,
+      border = float_record.border,
+      title = float_record.title,
     })
   else
     local vertical = config.vertical == true
@@ -443,11 +459,91 @@ function vim.api.nvim_open_win(buffer, enter, config)
   if relativenumber == nil then relativenumber = true end
   vim._wins[id] = {
     id = id, buffer = buf, row = 1, col = 0, width = 0, height = 0,
-    number = number, relativenumber = relativenumber,
+    number = number, relativenumber = relativenumber, float = float_record,
   }
   vim._win_order[#vim._win_order + 1] = id
   if enters then vim._cur_win = id end
   return id
+end
+
+-- nvim_win_get_config(win): the float placement of `win` as neovim's config map,
+-- or `{ relative = "" }` for a tiled window. Reads the `vim._wins` mirror (the
+-- server pushes each float's config into `w.float`; `nvim_open_win` /
+-- `nvim_win_set_config` write through it so a read within the same chunk agrees).
+function vim.api.nvim_win_get_config(win)
+  win = resolve_win(win)
+  local f = ((vim._wins or {})[win] or {}).float
+  if not f then return { relative = "" } end
+  -- Return a fresh table so a caller mutating the result can't corrupt the mirror.
+  local cfg = {
+    relative = f.relative, anchor = f.anchor, row = f.row, col = f.col,
+    width = f.width, height = f.height, zindex = f.zindex,
+    focusable = f.focusable, border = f.border,
+  }
+  if f.win then cfg.win = f.win end
+  if f.title then cfg.title = f.title end
+  return cfg
+end
+
+-- nvim_win_set_config(win, config): move/resize/restyle a float, or convert a
+-- window between floating and tiled. `config` is a *partial* — only the keys
+-- given change (the core merges over the current placement); `relative = ""`
+-- re-tiles a float. Validates the enumerated fields loudly (the no-silent-stub
+-- rule), queues the op, and write-throughs the mirror so a `get_config` later in
+-- this chunk sees the change before the op drains.
+function vim.api.nvim_win_set_config(win, config)
+  win = resolve_win(win)
+  config = config or {}
+  local relative = config.relative
+  local make_tiled = relative == ""
+  if type(relative) == "string" and relative ~= "" and not FLOAT_RELATIVE[relative] then
+    error("nvim_win_set_config: 'relative' value '" .. relative .. "' is not supported yet", 2)
+  end
+  if config.anchor ~= nil and not FLOAT_ANCHOR[config.anchor] then
+    error("nvim_win_set_config: invalid 'anchor': '" .. tostring(config.anchor) .. "'", 2)
+  end
+  if config.border ~= nil
+      and (type(config.border) ~= "string" or not FLOAT_BORDER[config.border]) then
+    error("nvim_win_set_config: 'border' style '" .. tostring(config.border) .. "' is not supported yet", 2)
+  end
+  local floor = function(v) return v and math.floor(v) or nil end
+  vim._win_set_config(win, {
+    relative = type(relative) == "string" and relative or nil,
+    win = config.win,
+    anchor = config.anchor,
+    row = floor(config.row),
+    col = floor(config.col),
+    width = floor(config.width),
+    height = floor(config.height),
+    zindex = floor(config.zindex),
+    focusable = config.focusable,
+    border = config.border,
+    title = float_title(config.title),
+  })
+  -- Write-through the mirror: drop the float on a re-tile, else merge the present
+  -- fields over the window's current placement (creating it on a tiled → float).
+  local w = (vim._wins or {})[win]
+  if w then
+    if make_tiled then
+      w.float = nil
+    else
+      local f = w.float or { relative = "editor", anchor = "NW", row = 0, col = 0,
+        width = 1, height = 1, zindex = 50, focusable = true, border = "none" }
+      if type(relative) == "string" then f.relative = relative end
+      if config.win and config.win ~= 0 then f.win = config.win end
+      if config.anchor then f.anchor = config.anchor end
+      if config.row then f.row = math.floor(config.row) end
+      if config.col then f.col = math.floor(config.col) end
+      if config.width then f.width = math.floor(config.width) end
+      if config.height then f.height = math.floor(config.height) end
+      if config.zindex then f.zindex = math.floor(config.zindex) end
+      if config.focusable ~= nil then f.focusable = config.focusable end
+      if config.border then f.border = config.border end
+      local title = float_title(config.title)
+      if title then f.title = title end
+      w.float = f
+    end
+  end
 end
 
 -- vim.wo: window-local options, indexed by window id (`vim.wo[win].number`), the

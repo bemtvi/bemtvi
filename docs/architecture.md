@@ -393,11 +393,23 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   non-empty `relative` opens one (RPC and Lua, the latter via `WindowOp::OpenFloat`);
   the client draws it as an opaque, bordered, titled overlay above the tiled
   layout (see [*View protocol*](#view-protocol-ui)). Focus, the window list, and
-  close already span floats because they key off `WindowId`. Unsupported config
-  values (`relative="mouse"`, an unknown `border`) fail **loud** rather than
-  silently falling back to a tiled split. Still deferred: `nvim_win_set_config`
-  (move/resize/restyle, split↔float conversion) and the float edge semantics
-  (`:q`/`:only`/focus with floats present, `focusable`, parent-close).
+  close already span floats because they key off `WindowId`.
+  `nvim_win_set_config`/`get_config` move, resize, restyle, and convert a window
+  between float and split. Unsupported config values (`relative="mouse"`, an
+  unknown `border`) fail **loud** rather than silently falling back to a tiled
+  split.
+  **Edge semantics** (matching neovim): `:q` on a focused float closes only the
+  float and never quits — the "last window" quit rule counts **tiled** windows
+  only, so closing the last tiled window quits even with floats open, and a tiled
+  window can't be closed down to floats-only. `:only`/`<C-w>o` close every float
+  too. `<C-w>w`/`<C-w>W` cyclic focus includes **focusable** floats (in z-order,
+  after the tiled windows) and skips non-focusable ones, though
+  `nvim_set_current_win` can focus either explicitly; the spatial `<C-w>h/j/k/l`
+  moves stay within the tiled grid. Closing a window also closes every float
+  anchored to it (`relative="win"`, transitively). A terminal resize re-runs the
+  float pass, re-clamping `editor`-relative floats back on-screen. The lifecycle
+  diff fires `WinNew`/`WinEnter`/`WinClosed` for floats and `WinResized` when
+  `set_config` changes a float's size.
 - **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from
   the same server-side lifecycle diff as the buffer events, ordered
   `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.
@@ -415,13 +427,14 @@ by the window-local `sidescroll` / `sidescrolloff`. The core decides `leftcol`
 `ensure_visible`); the client paints from that offset, leaving the number gutter
 fixed. (Design: [`docs/plans/2026-06-07-horizontal-scrolling-and-wrap.md`](plans/2026-06-07-horizontal-scrolling-and-wrap.md).)
 
-Still pending: **tab pages**, the rest of the **floating-windows** surface
-(`nvim_win_set_config` and the float edge semantics — see the floats bullet
-above), **line wrapping** (`wrap` — the display-row projection; Phase 2 of the
-horizontal-scroll plan), and **more window-local options** (`cursorline`, …)
-beyond the number gutter and the scroll options that already ride `WindowOptions`.
-The per-window status line is `laststatus=2`; the global/conditional `laststatus`
-modes are a small follow-up.
+Still pending: **tab pages**, **line wrapping** (`wrap` — the display-row
+projection; Phase 2 of the horizontal-scroll plan), and **more window-local
+options** (`cursorline`, …) beyond the number gutter and the scroll options that
+already ride `WindowOptions`. Floating windows are otherwise complete (model,
+paint, dynamic config, edge semantics); the remaining float fidelity knobs
+(`style="minimal"`, `footer`, `bufpos`, `relative="mouse"`) grow as a consumer
+demands them. The per-window status line is `laststatus=2`; the
+global/conditional `laststatus` modes are a small follow-up.
 
 ---
 
@@ -674,12 +687,13 @@ screen," and that is exactly the shape of these tests.
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up), treesitter
   injections, and a `:set`-driven highlight toggle.
-- **Tab pages** and **floating windows.** Multiple **windows** (splits, the
-  layout tree, per-window view state, the `<C-w>` family, and the `nvim_win_*` /
-  Lua API) are implemented — see [*Windows*](#windows). What remains on this axis
-  is tab pages (a `Vec<WindowTree>` + a tabline), floating/anchored windows
-  (`nvim_open_win` with `relative`, a z-ordered overlay layer), and window-local
-  options (`wrap`, `cursorline`, …).
+- **Tab pages.** Multiple **windows** (splits, the layout tree, per-window view
+  state, the `<C-w>` family, and the `nvim_win_*` / Lua API) and **floating
+  windows** (`nvim_open_win` with `relative`, the z-ordered overlay layer,
+  `nvim_win_set_config`, and the `:q`/`:only`/focus/autocmd edge semantics) are
+  implemented — see [*Windows*](#windows). What remains on this axis is tab pages
+  (a `Vec<WindowTree>` + a tabline) and window-local options (`wrap`,
+  `cursorline`, …).
 - A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
   `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
   (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key

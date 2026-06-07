@@ -3,7 +3,9 @@
 
 use crate::redraw::{lines_value, style_value};
 use crate::Server;
-use nxvim_core::{BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowId};
+use nxvim_core::{
+    BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec, WindowId,
+};
 use nxvim_rpc::Incoming;
 use rmpv::Value;
 
@@ -232,6 +234,17 @@ impl Server {
                 let win = self.resolve_win(params.first());
                 Ok(self.win_config_value(win))
             }
+            "nvim_win_set_config" => {
+                // (win, config): move/resize/restyle a float, or convert between a
+                // float and a tiled split. `config` is a *partial* — absent keys
+                // are unchanged (neovim's merge); `relative = ""` re-tiles a float.
+                let win = self.resolve_win(params.first());
+                let spec = self.parse_window_config(params.get(1))?;
+                self.editor.set_window_config(win, spec);
+                self.emit_lifecycle_events();
+                self.run_pending();
+                Ok(Value::Nil)
+            }
             "nvim_win_get_position" => {
                 // [row, col] of the window's top-left in windows-area cells.
                 let win = self.resolve_win(params.first());
@@ -443,6 +456,69 @@ impl Server {
         })
     }
 
+    /// Parse a `nvim_win_set_config` `config` map into a partial
+    /// [`WindowConfigSpec`]: only the keys present become `Some`, so the core's
+    /// merge leaves the rest unchanged (neovim's behavior). `relative = ""` is the
+    /// re-tile form (`make_tiled`). Enumerated values (`relative`/`anchor`/
+    /// `border`) are validated loudly, like [`Self::parse_float_config`].
+    fn parse_window_config(&self, config: Option<&Value>) -> Result<WindowConfigSpec, String> {
+        let get = |k: &'static str| config.and_then(map_get(k));
+        let mut spec = WindowConfigSpec::default();
+        match get("relative").and_then(Value::as_str) {
+            None => {}
+            Some("") => spec.make_tiled = true,
+            Some("editor") => spec.relative = Some(FloatRelative::Editor),
+            Some("cursor") => spec.relative = Some(FloatRelative::Cursor),
+            Some("win") => {
+                let w = get("win").and_then(Value::as_u64).unwrap_or(0);
+                let id = if w == 0 {
+                    self.editor.current_window_id()
+                } else {
+                    WindowId(w)
+                };
+                spec.relative = Some(FloatRelative::Win(id));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "nvim_win_set_config: 'relative' value '{other}' is not supported yet"
+                ))
+            }
+        }
+        if let Some(a) = get("anchor").and_then(Value::as_str) {
+            spec.anchor = Some(match a {
+                "NW" => FloatAnchor::NW,
+                "NE" => FloatAnchor::NE,
+                "SW" => FloatAnchor::SW,
+                "SE" => FloatAnchor::SE,
+                other => return Err(format!("nvim_win_set_config: invalid 'anchor': '{other}'")),
+            });
+        }
+        if let Some(b) = get("border") {
+            spec.border = Some(match b.as_str() {
+                None | Some("none") => BorderStyle::None,
+                Some("single") => BorderStyle::Single,
+                Some("rounded") => BorderStyle::Rounded,
+                Some("double") => BorderStyle::Double,
+                Some("solid") => BorderStyle::Solid,
+                Some(other) => {
+                    return Err(format!(
+                        "nvim_win_set_config: 'border' style '{other}' is not supported yet"
+                    ))
+                }
+            });
+        }
+        spec.row = get("row").and_then(as_int);
+        spec.col = get("col").and_then(as_int);
+        spec.width = get("width").and_then(Value::as_u64).map(|n| n as usize);
+        spec.height = get("height").and_then(Value::as_u64).map(|n| n as usize);
+        spec.zindex = get("zindex").and_then(Value::as_u64).map(|z| z as u32);
+        spec.focusable = get("focusable").and_then(Value::as_bool);
+        // A present `title` key sets (or, with an empty value, clears) the title;
+        // an absent one leaves it unchanged.
+        spec.title = get("title").map(|t| parse_title(Some(t)));
+        Ok(spec)
+    }
+
     /// The `nvim_win_get_config` value for window `win`: neovim's config map for a
     /// float (`relative`/`anchor`/`row`/`col`/`width`/`height`/`zindex`/
     /// `focusable`/`border`), or `{ relative = "" }` for a tiled window.
@@ -455,29 +531,16 @@ impl Server {
             FloatRelative::Win(_) => "win",
             FloatRelative::Cursor => "cursor",
         };
-        let anchor = match cfg.anchor {
-            FloatAnchor::NW => "NW",
-            FloatAnchor::NE => "NE",
-            FloatAnchor::SW => "SW",
-            FloatAnchor::SE => "SE",
-        };
-        let border = match cfg.border {
-            BorderStyle::None => "none",
-            BorderStyle::Single => "single",
-            BorderStyle::Rounded => "rounded",
-            BorderStyle::Double => "double",
-            BorderStyle::Solid => "solid",
-        };
         let mut entries = vec![
             (Value::from("relative"), Value::from(relative)),
-            (Value::from("anchor"), Value::from(anchor)),
+            (Value::from("anchor"), Value::from(cfg.anchor.as_str())),
             (Value::from("row"), Value::from(cfg.row as i64)),
             (Value::from("col"), Value::from(cfg.col as i64)),
             (Value::from("width"), Value::from(cfg.width as u64)),
             (Value::from("height"), Value::from(cfg.height as u64)),
             (Value::from("zindex"), Value::from(cfg.zindex as u64)),
             (Value::from("focusable"), Value::from(cfg.focusable)),
-            (Value::from("border"), Value::from(border)),
+            (Value::from("border"), Value::from(cfg.border.as_str())),
         ];
         if let FloatRelative::Win(id) = cfg.relative {
             entries.push((Value::from("win"), Value::from(id.0)));

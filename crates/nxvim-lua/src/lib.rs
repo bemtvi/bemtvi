@@ -26,6 +26,7 @@ mod host;
 mod install;
 mod ops;
 mod runtime;
+mod uvfs;
 mod vimregex;
 
 pub use ops::{

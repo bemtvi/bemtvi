@@ -1104,21 +1104,12 @@ pub(crate) fn install_runtime_api(
     // `vim.uv` (and its legacy alias `vim.loop`) while building defaults and
     // resolving roots. Only the handful actually used are provided.
     let uv = lua.create_table()?;
-    // `vim.uv.fs_stat(path)`: a stat table (at least `type`/`size`), or nil when
-    // `path` can't be stat'd. Follows symlinks (the `fs_stat`, not `fs_lstat`,
-    // semantics); configs read `.type == 'file'`/`'directory'`.
-    uv.set(
-        "fs_stat",
-        lua.create_function(|lua, path: String| match std::fs::metadata(&path) {
-            Ok(md) => {
-                let t = lua.create_table()?;
-                t.set("type", if md.is_dir() { "directory" } else { "file" })?;
-                t.set("size", md.len())?;
-                Ok(mlua::Value::Table(t))
-            }
-            Err(_) => Ok(mlua::Value::Nil),
-        })?,
-    )?;
+    // The libuv **filesystem** family (`fs_open`/`fs_read`/`fs_write`/`fs_stat`/
+    // …) that plugins bind directly — `plenary.path` foremost. Kept in its own
+    // module since it carries an fd table and the `std::fs` plumbing; it also
+    // (re)defines `fs_stat` with the unix `st_mode` bits `plenary.path:is_dir()`
+    // needs, which the old inline stub omitted.
+    crate::uvfs::install(lua, &uv)?;
     // `vim.uv.os_homedir()`: the user's home directory.
     uv.set(
         "os_homedir",

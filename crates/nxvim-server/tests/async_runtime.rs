@@ -239,3 +239,132 @@ async fn schedule_wrap_defers_its_call() {
     assert_eq!(lua_bool(&rpc, "return _G.during == nil").await, Some(true));
     assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(42));
 }
+
+// ----- Phase 4: async vim.uv filesystem (the callback form) ------------------
+// `vim.uv.fs_*` is dual-mode: synchronous without a trailing callback, async
+// with one (returns immediately; `cb(err, value)` fires on a later loop
+// iteration). The async form rides `vim.schedule`, so the callback lands at
+// convergence — off the calling frame — and chained ops (open → write → close)
+// all settle within one fixpoint. (Wired in nxvim-lua's prelude/uv.lua over the
+// sync primitives in src/uvfs.rs.)
+
+/// A unique temp path per test, forward-slashed for pasting into Lua. Removed
+/// first so a prior run can't mask a write that didn't happen.
+fn tmp_path(name: &str) -> String {
+    let p = std::env::temp_dir().join(format!("nxvim-async-uvfs-{name}.txt"));
+    let _ = std::fs::remove_file(&p);
+    p.to_string_lossy().replace('\\', "/")
+}
+
+#[tokio::test]
+async fn async_fs_write_chain_defers_the_callback_and_persists() {
+    let (rpc, _incoming) = start().await;
+    let path = tmp_path("write-chain");
+    // Kick off open → write → close, all in the async (callback) form. Track
+    // ordering against a direct insert: the callback must run AFTER 'direct',
+    // proving it deferred rather than running nested inline.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.order = {{}}\n\
+             _G.done = false\n\
+             local uv = vim.uv\n\
+             uv.fs_open('{path}', 'w', tonumber('644', 8), function(oerr, fd)\n\
+               table.insert(_G.order, 'callback')\n\
+               assert(not oerr, tostring(oerr))\n\
+               uv.fs_write(fd, 'async bytes\\n', -1, function(werr)\n\
+                 assert(not werr, tostring(werr))\n\
+                 uv.fs_close(fd, function() _G.done = true end)\n\
+               end)\n\
+             end)\n\
+             table.insert(_G.order, 'direct')"
+        ),
+    )
+    .await;
+    // Deferred (not inline), and the whole chain settled within the fixpoint.
+    assert_eq!(
+        exec_lua(&rpc, "return table.concat(_G.order, ',')")
+            .await
+            .as_str(),
+        Some("direct,callback")
+    );
+    assert_eq!(lua_bool(&rpc, "return _G.done").await, Some(true));
+    // The bytes actually reached disk through the async path.
+    let written = std::fs::read_to_string(path.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .expect("file written by async chain");
+    assert_eq!(written, "async bytes\n");
+}
+
+#[tokio::test]
+async fn async_fs_read_chain_delivers_data_off_the_calling_frame() {
+    let (rpc, _incoming) = start().await;
+    let path = tmp_path("read-chain");
+    std::fs::write(
+        path.replace('/', std::path::MAIN_SEPARATOR_STR),
+        "from disk\n",
+    )
+    .expect("seed file");
+    // The plenary.path:_read_async shape: open → fstat → read → close, each step
+    // nested in the previous callback. The data must arrive in the callback, not
+    // inline.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.data = nil\n\
+             _G.inline = '<unset>'\n\
+             local uv = vim.uv\n\
+             uv.fs_open('{path}', 'r', tonumber('644', 8), function(oerr, fd)\n\
+               assert(not oerr, tostring(oerr))\n\
+               uv.fs_fstat(fd, function(serr, st)\n\
+                 assert(not serr, tostring(serr))\n\
+                 uv.fs_read(fd, st.size, 0, function(rerr, chunk)\n\
+                   assert(not rerr, tostring(rerr))\n\
+                   _G.data = chunk\n\
+                   uv.fs_close(fd, function() end)\n\
+                 end)\n\
+               end)\n\
+             end)\n\
+             _G.inline = _G.data"
+        ),
+    )
+    .await;
+    // It had NOT arrived inline (the open call returned before the callback ran)…
+    assert_eq!(
+        lua_bool(&rpc, "return _G.inline == nil").await,
+        Some(true),
+        "data must not be delivered inline"
+    );
+    // …and it DID arrive in the callback, with the right bytes.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.data").await.as_str(),
+        Some("from disk\n")
+    );
+}
+
+#[tokio::test]
+async fn async_fs_open_error_reaches_the_callback_not_a_raise() {
+    let (rpc, _incoming) = start().await;
+    // Opening a missing file for read fails. In the async form the failure must
+    // be delivered to the callback as `err` (a string), never raised — so the
+    // exec_lua settles cleanly and the callback observes (err, nil).
+    exec_lua(
+        &rpc,
+        "_G.err = nil\n\
+         _G.fd = '<unset>'\n\
+         vim.uv.fs_open('/no/such/nxvim/path.txt', 'r', tonumber('644', 8), function(err, fd)\n\
+           _G.err = err\n\
+           _G.fd = fd\n\
+         end)",
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return type(_G.err) == 'string'").await,
+        Some(true),
+        "the open error should reach the callback as a string"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.fd == nil").await,
+        Some(true),
+        "a failed open delivers no fd"
+    );
+}

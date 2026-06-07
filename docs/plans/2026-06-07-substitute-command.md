@@ -1,10 +1,12 @@
 # Implementing `:substitute` (`:s`)
 
-> **Status: Phases 0–1 DONE.** The ex-range parser (Phase 0) and the core
+> **Status: Phases 0–2 DONE.** The ex-range parser (Phase 0), the core
 > substitute command (Phase 1: `g`/`i`/`I`/`n` flags, count, `\r` line-split,
-> capture refs, count reporting, single-undo) are implemented and tested.
-> Phases 2–3 (pattern reuse / bare-`:s` repeat / `&` / `~`, and the `c` confirm
-> flag) remain. Phased and TDD-driven per the project workflow.
+> capture refs, count reporting, single-undo), and pattern/replacement reuse
+> (Phase 2: empty-pattern reuse, bare `:s` / `:&` / `:&&` repeat with the
+> flag-reset-vs-keep distinction, `~` replacement recall, trailing count,
+> alternate delimiters) are implemented and tested. Phase 3 (the `c` confirm
+> flag) remains. Phased and TDD-driven per the project workflow.
 
 ## Why this document exists
 
@@ -189,17 +191,31 @@ the parser without needing `:s` yet).
   field, using `drain_to_latest_redraw` per the harness race note);
 - one `u` undoes a whole `:%s`.
 
-## Phase 2 — Pattern reuse, repeat, count, delimiters
+## Phase 2 — Pattern reuse, repeat, count, delimiters — DONE
 
-- **Empty pattern** `:s//rep/` reuses the most recent pattern (last substitute or
-  last `/` search, whichever is newer — vim uses the shared "last used pattern").
-- **Bare `:s`** repeats the last substitute (same pat/rep/flags) on the current
-  line; `:s g` re-runs it with new flags. `&` repeats with previous flags reset;
-  `:&&` keeps flags. (Implement at least bare-`:s` and `&`.)
+- **Empty pattern** `:s//rep/` reuses the last search/substitute pattern
+  (`last_search`); `E35` when none exists.
+- **Bare `:s` / `:&` / `:&&`** repeat the last substitute on the range (default:
+  current line). `:s` and `:&` **reset** the flags (only freshly typed flags
+  apply); `:&&` **keeps** the previous flags (then layers on any new ones) — the
+  vim-faithful distinction, not the looser "same flags" this doc first sketched.
+  `:s g` / `:& g` / `:&& 3` all accept fresh flags/count. `E33` when there is no
+  previous substitute. Stored as `last_substitute = (pattern, replacement, flag
+  letters)`; the substitute is recorded even when it matched nothing, so a
+  following `:&` still repeats it (matches vim). `:&`/`:&&` are dispatched off the
+  raw command remainder (they have no alphabetic name for `split_ex`).
+- **`~` in replacement** = the previous replacement string (`\~` is a literal
+  tilde); `E33` when there is no previous replacement. Expanded by `expand_tilde`
+  in `editor.rs` *before* the new substitute overwrites `last_substitute`; other
+  backslash escapes pass through to `substitute_line`'s expansion pass untouched.
 - **Trailing count** `:s/a/b/ 3` → apply to 3 lines from the range's last line.
-- **Alternate delimiters** `:s#a#b#`, `:s,a,b,` — covered by the Phase-1 parser if
-  written delimiter-agnostic; add explicit tests here.
-- **`~` in replacement** = previous replacement string (optional).
+- **Alternate delimiters** `:s#a#b#`, `:s,a,b,` — handled by the delimiter-agnostic
+  Phase-1 parser; covered by explicit tests now.
+
+Implemented as a three-way split in `editor.rs`: `ex_substitute` dispatches a
+literal `/pat/rep/flags` spec, a bare/flag-only repeat, or (via `execute_ex`) the
+`&`/`&&` forms; `repeat_substitute` rebuilds the spec from `last_substitute`; and
+`run_substitute` is the shared engine both call.
 
 ## Phase 3 — Confirm flag `c` (optional, larger)
 

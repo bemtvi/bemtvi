@@ -5336,3 +5336,95 @@ async fn substitute_cursor_lands_on_last_changed_line() {
     // Cursor on the last line a substitution happened (line 3), first non-blank.
     assert_eq!(cursor(&rpc).await, (3, 0));
 }
+
+// ---- Phase 2: pattern reuse, repeat, count, delimiters ------------------
+//
+// Bare `:s` / `:&` / `:&&` repeat the last substitute; `~` recalls the last
+// replacement; alternate delimiters and a trailing count round out the parser.
+
+#[tokio::test]
+async fn substitute_bare_s_repeats_last_resetting_flags() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo<CR>foo foo<Esc>");
+    feed(&rpc, ":1s/foo/bar/g<CR>"); // line 1: both replaced
+    feed(&rpc, "2G");
+    feed(&rpc, ":s<CR>"); // repeat on line 2 — flags reset, so first match only
+    assert_eq!(lines(&rpc).await, vec!["bar bar", "bar foo"]);
+}
+
+#[tokio::test]
+async fn substitute_bare_s_accepts_new_flags() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo<CR>foo foo<Esc>");
+    feed(&rpc, ":1s/foo/bar<CR>"); // line 1: first match only (no g)
+    feed(&rpc, "2G");
+    feed(&rpc, ":s g<CR>"); // repeat with a fresh g flag -> every match
+    assert_eq!(lines(&rpc).await, vec!["bar foo", "bar bar"]);
+}
+
+#[tokio::test]
+async fn substitute_ampersand_repeats_resetting_flags() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo<CR>foo foo<Esc>");
+    feed(&rpc, ":1s/foo/bar/g<CR>");
+    feed(&rpc, "2G");
+    feed(&rpc, ":&<CR>"); // `:&` repeats with flags reset, like bare `:s`
+    assert_eq!(lines(&rpc).await, vec!["bar bar", "bar foo"]);
+}
+
+#[tokio::test]
+async fn substitute_double_ampersand_keeps_flags() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foo<CR>foo foo<Esc>");
+    feed(&rpc, ":1s/foo/bar/g<CR>");
+    feed(&rpc, "2G");
+    feed(&rpc, ":&&<CR>"); // `:&&` keeps the previous flags (g)
+    assert_eq!(lines(&rpc).await, vec!["bar bar", "bar bar"]);
+}
+
+#[tokio::test]
+async fn substitute_bare_s_without_previous_errors() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":s<CR>").await;
+    assert_eq!(lines(&rpc).await, vec!["foo"], "nothing to repeat");
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E33"), "expected E33, got {msg:?}");
+}
+
+#[tokio::test]
+async fn substitute_trailing_count_applies_to_n_lines() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>gg");
+    feed(&rpc, ":s/foo/bar/ 2<CR>"); // current line + 1 more
+    assert_eq!(lines(&rpc).await, vec!["bar", "bar", "foo"]);
+}
+
+#[tokio::test]
+async fn substitute_accepts_alternate_delimiters() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "i/usr/bin<Esc>");
+    feed(&rpc, ":s#/usr#/opt#<CR>"); // `#` delimiter so `/` is literal in the pattern
+    assert_eq!(lines(&rpc).await, vec!["/opt/bin"]);
+    feed(&rpc, ":s,/bin,/sbin,<CR>"); // `,` delimiter
+    assert_eq!(lines(&rpc).await, vec!["/opt/sbin"]);
+}
+
+#[tokio::test]
+async fn substitute_tilde_recalls_previous_replacement() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo baz<Esc>");
+    feed(&rpc, ":s/foo/bar/<CR>"); // -> "bar baz", remembers replacement "bar"
+    feed(&rpc, ":s/baz/~/<CR>"); // `~` expands to the previous replacement "bar"
+    assert_eq!(lines(&rpc).await, vec!["bar bar"]);
+}
+
+#[tokio::test]
+async fn substitute_tilde_without_previous_errors() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":s/foo/~/<CR>").await;
+    assert_eq!(lines(&rpc).await, vec!["foo"], "no previous replacement");
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E33"), "expected E33, got {msg:?}");
+}

@@ -1944,6 +1944,10 @@ pub struct Editor {
     /// `n`/`N` repeat and an empty-pattern re-search. `None` until the first
     /// search.
     last_search: Option<(String, SearchDir, SearchOffset)>,
+    /// The last `:substitute` as `(pattern, replacement, flag letters)`, for
+    /// bare `:s` / `:&` / `:&&` repeats and the `~` replacement recall. The flag
+    /// letters exclude any trailing count. `None` until the first substitute.
+    last_substitute: Option<(String, String, String)>,
     /// Operator (`d`/`c`/`y`) waiting on a search motion: set when `d/`,`y?`, …
     /// open a search prompt, applied over the match when the search commits, and
     /// cleared on commit or `<Esc>`. `None` for a plain (movement) search.
@@ -2121,6 +2125,7 @@ impl Editor {
             confirm_accelerators: Vec::new(),
             confirm_default: 0,
             last_search: None,
+            last_substitute: None,
             search_operator: None,
             pending_search_count: 1,
             search_history: Vec::new(),
@@ -6390,6 +6395,18 @@ impl Editor {
             return;
         }
 
+        // `:&` and `:&&` repeat the last substitute (a bare `&` resets its flags;
+        // `&&` keeps them). These have no alphabetic name, so they're matched on
+        // the raw remainder before `split_ex` would strip an empty name.
+        if let Some(after) = rest.strip_prefix("&&") {
+            self.repeat_substitute(range, after.trim(), true);
+            return;
+        }
+        if let Some(after) = rest.strip_prefix('&') {
+            self.repeat_substitute(range, after.trim(), false);
+            return;
+        }
+
         let (name, bang, args) = split_ex(rest);
         match name {
             "w" | "write" => self.ex_write(args),
@@ -6596,22 +6613,48 @@ impl Editor {
     /// flag, the not-yet-built `c` flag, an invalid pattern, or no match.
     fn ex_substitute(&mut self, range: ExRange, args: &str) {
         let spec = args.trim();
-        let Some(delim) = spec.chars().next() else {
-            // A bare `:s` repeats the last substitute (Phase 2); none stored yet.
+        match spec.chars().next() {
+            // No delimiter: a bare `:s` (or `:s {flags} [count]`) repeats the last
+            // substitute with its flags reset — only freshly given flags apply.
+            // An alphanumeric first char is a flag/count, not a delimiter.
+            None => self.repeat_substitute(range, "", false),
+            Some(c) if c.is_alphanumeric() => self.repeat_substitute(range, spec, false),
+            Some('\\') | Some('"') => {
+                self.echo("E146: Regular expressions can't be delimited by letters");
+            }
+            Some(delim) => {
+                let (pat, rep, flags) = split_substitute(&spec[delim.len_utf8()..], delim);
+                self.run_substitute(range, pat, rep, &flags);
+            }
+        }
+    }
+
+    /// Repeat the last `:substitute` — bare `:s`, `:&` (`keep_flags` false), or
+    /// `:&&` (`keep_flags` true). `extra` carries any freshly typed flags/count;
+    /// `&&` keeps the previous flags (prepended), the others reset them.
+    fn repeat_substitute(&mut self, range: ExRange, extra: &str, keep_flags: bool) {
+        let Some((pat, rep, prev_flags)) = self.last_substitute.clone() else {
             self.echo("E33: No previous substitute regular expression");
             return;
         };
-        if delim.is_alphanumeric() || delim == '\\' || delim == '"' {
-            self.echo("E146: Regular expressions can't be delimited by letters");
-            return;
-        }
-        let (pat, rep, flags) = split_substitute(&spec[delim.len_utf8()..], delim);
+        let flag_spec = if keep_flags {
+            format!("{prev_flags}{extra}")
+        } else {
+            extra.to_string()
+        };
+        self.run_substitute(range, pat, rep, &flag_spec);
+    }
 
+    /// The substitute engine shared by `:s/pat/rep/flags` and the repeat forms.
+    /// `pat` empty reuses the last search/substitute pattern; a `~` in `rep`
+    /// expands to the previous replacement. Records the (resolved) substitute for
+    /// later repeats — even on a no-match, matching vim.
+    fn run_substitute(&mut self, range: ExRange, pat: String, rep: String, flag_spec: &str) {
         // Parse flag letters, then an optional trailing count.
         let mut global = false;
         let mut nflag = false;
         let mut icase: Option<bool> = None;
-        let tail = flags.trim();
+        let tail = flag_spec.trim();
         let tb = tail.as_bytes();
         let mut k = 0;
         while k < tb.len() {
@@ -6632,6 +6675,7 @@ impl Editor {
             }
             k += 1;
         }
+        let flag_letters = tail[..k].to_string();
         let rest = tail[k..].trim();
         let count = if rest.is_empty() {
             None
@@ -6657,6 +6701,16 @@ impl Editor {
         } else {
             pat
         };
+        // A `~` in the replacement recalls the previous replacement — resolved
+        // before this substitute overwrites the remembered state.
+        let prev_rep = self.last_substitute.as_ref().map(|(_, r, _)| r.clone());
+        let rep = match expand_tilde(&rep, prev_rep.as_deref()) {
+            Ok(r) => r,
+            Err(()) => {
+                self.echo("E33: No previous substitute regular expression");
+                return;
+            }
+        };
         let ignorecase = icase.unwrap_or_else(|| self.search_ignorecase(&pattern));
         let re = match SearchRegex::compile(&pattern, ignorecase) {
             Ok(re) => re,
@@ -6665,6 +6719,10 @@ impl Editor {
                 return;
             }
         };
+        // Remember this substitute (resolved pattern, expanded replacement, flag
+        // letters) for bare `:s` / `:&` / `:&&` and `~`. vim repeats even a
+        // substitute that matched nothing, so record before the match pass.
+        self.last_substitute = Some((pattern.clone(), rep.clone(), flag_letters));
 
         // A trailing count restricts the edit to `count` lines from the range's
         // last line (vim semantics), overriding the range's start.
@@ -8063,6 +8121,33 @@ struct ExRange {
 /// delimiter makes it literal (dropped from the field); any other `\x` is kept
 /// verbatim so the regex / replacement expander sees it. Everything past the
 /// second delimiter — the flags and trailing count — is taken verbatim.
+/// Expand an unescaped `~` in a substitute replacement to `prev` (the previous
+/// replacement string); `\~` stays a literal tilde. All other backslash escapes
+/// pass through verbatim for [`SearchRegex::substitute_line`]'s expansion pass to
+/// handle. Errors (`Err(())`) on a bare `~` when there is no previous
+/// replacement, so the caller can fail loud rather than insert nothing.
+fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
+    let mut out = String::new();
+    let mut chars = rep.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Copy a backslash escape (e.g. `\~`, `\r`) through untouched.
+            '\\' => {
+                out.push('\\');
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '~' => match prev {
+                Some(p) => out.push_str(p),
+                None => return Err(()),
+            },
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 fn split_substitute(body: &str, delim: char) -> (String, String, String) {
     let mut parts: Vec<String> = vec![String::new()];
     let mut chars = body.chars();

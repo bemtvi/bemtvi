@@ -250,11 +250,11 @@ fn indent_for(&mut self, line: usize) -> usize {
 
 Wire it into the three sites that currently hardcode `cursor.col = 0`:
 
-1. **`open_line` (`editor.rs:4256`, the `o`/`O` path)** — after inserting `\n`
+1. **`open_line` (`editor/operators.rs`, the `o`/`O` path)** — after inserting `\n`
    and `normalize()`, forward the edit to the engine, compute `indent_for(new_line)`,
    insert that much leading whitespace (rendered via existing `<Tab>`/`expandtab`
    logic), set the cursor past it.
-2. **`Enter` in insert mode (`editor.rs:4339`)** — same: insert `\n`, sync engine,
+2. **`Enter` in insert mode (`editor/insert.rs`, the `KeyCode::Enter` arm)** — same: insert `\n`, sync engine,
    indent the new line, place the cursor.
 3. **The `=` family** — `==`, `=` over a motion/visual, `gg=G`: for each line in
    range call `indent_for(line)` and rewrite that line's leading whitespace. This

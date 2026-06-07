@@ -245,6 +245,40 @@ pub enum BufOp {
     },
 }
 
+/// An extmark mutation queued by the `nvim_buf_set_extmark` / `_del_extmark` /
+/// `_clear_namespace` Lua family, drained by the server into the target buffer's
+/// [`ExtmarkStore`](nxvim_core::ExtmarkStore). Positions ride as neovim's 0-based
+/// `(row, col)`; the server converts them to byte offsets against the live buffer
+/// (the conversion needs the rope, which the Lua side can't see). The Lua front
+/// has already updated its `vim._extmarks` mirror (read-after-write within the
+/// chunk); this op makes the core catch up after the chunk.
+#[derive(Clone, Debug)]
+pub enum ExtmarkOp {
+    /// Create-or-replace a mark `(bufnr, ns, id)`. `end_row`/`end_col` are absent
+    /// for a point mark; `hl_group` is absent when the mark carries no highlight.
+    Set {
+        bufnr: u64,
+        ns: u32,
+        id: u64,
+        row: i64,
+        col: i64,
+        end_row: Option<i64>,
+        end_col: Option<i64>,
+        hl_group: Option<String>,
+        priority: u32,
+    },
+    /// Delete mark `(bufnr, ns, id)`.
+    Del { bufnr: u64, ns: u32, id: u64 },
+    /// Clear namespace `ns` over lines `[line_start, line_end)` (neovim's range:
+    /// 0-based, `line_end == -1` ⇒ end of buffer).
+    Clear {
+        bufnr: u64,
+        ns: u32,
+        line_start: i64,
+        line_end: i64,
+    },
+}
+
 /// A scalar option value carried by [`BufOp::SetOption`] / [`GlobalOptionOp`] /
 /// [`WindowOp::SetOption`]: a number for `tabstop`/`shiftwidth`, a boolean for
 /// `expandtab`, a string for `statusline`. Kept free of `mlua` types (the bridge

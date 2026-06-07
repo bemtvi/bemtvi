@@ -15,8 +15,8 @@ use crate::convert::{json_to_lua, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, GlobalOptionOp, HlSet, LoopOp, LspClientData,
-    LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, UiInputReq, WindowOp,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, GlobalOptionOp, HlSet, LoopOp,
+    LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, UiInputReq, WindowOp,
 };
 
 /// One window's row in the Rust→Lua window mirror, in layout order. The
@@ -72,6 +72,21 @@ pub struct TabMirror {
     pub windows: Vec<u64>,
     /// The tab's focused window id (`nvim_tabpage_get_win`).
     pub current_window: u64,
+}
+
+/// One extmark's row in the Rust→Lua extmark mirror, pushed before each chunk so
+/// `nvim_buf_get_extmarks` reads positions current with the buffer. `(row, col)`
+/// are 0-based, the server having converted the byte anchors against the rope.
+#[derive(Clone, Debug, Default)]
+pub struct ExtmarkMirror {
+    pub ns: u32,
+    pub id: u64,
+    pub row: u64,
+    pub col: u64,
+    pub end_row: Option<u64>,
+    pub end_col: Option<u64>,
+    pub hl_group: Option<String>,
+    pub priority: u32,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -161,6 +176,10 @@ pub(crate) struct Shared {
     /// Buffer mutations from `vim.api.nvim_buf_set_lines`, drained by the server
     /// into the live editor after the chunk (Phase 6).
     pub(crate) buf_ops: Vec<BufOp>,
+    /// Extmark mutations from `nvim_buf_set_extmark` / `_del_extmark` /
+    /// `_clear_namespace`, drained by the server into the target buffer's
+    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) after the chunk.
+    pub(crate) extmark_ops: Vec<ExtmarkOp>,
     /// Window mutations from the `vim.api.nvim_win_*` / `nvim_open_win` /
     /// `nvim_set_current_win` API, drained by the server into the live editor
     /// after the chunk (Phase 5).
@@ -454,6 +473,13 @@ impl LuaRuntime {
     /// drain, for the server to apply to the live editor (Phase 6).
     pub fn take_buf_ops(&self) -> Vec<BufOp> {
         std::mem::take(&mut self.shared.borrow_mut().buf_ops)
+    }
+
+    /// Take the extmark mutations queued by the `nvim_buf_set_extmark` family
+    /// since the last drain, for the server to apply to the target buffers'
+    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore).
+    pub fn take_extmark_ops(&self) -> Vec<ExtmarkOp> {
+        std::mem::take(&mut self.shared.borrow_mut().extmark_ops)
     }
 
     /// Take the window mutations queued by the `vim.api.nvim_win_*` family since
@@ -806,6 +832,40 @@ impl LuaRuntime {
         }
         let set: mlua::Function = vim.get("_set_buf_mirror")?;
         set.call((entries, cursor.0, cursor.1, win, win_arr, next_win, mode))
+    }
+
+    /// Refresh the Rust→Lua extmark mirror (`vim._extmarks[bufnr][ns][id]`) that
+    /// `nvim_buf_get_extmarks` reads. `bufs` carries only buffers that hold marks;
+    /// each entry's marks come from the authoritative core
+    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) with positions already shifted
+    /// for any edits, so a read this chunk reflects the live buffer.
+    pub fn set_extmark_mirror(&self, bufs: &[(u64, Vec<ExtmarkMirror>)]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let entries = self.lua.create_table()?;
+        for (bufnr, marks) in bufs {
+            let arr = self.lua.create_table()?;
+            for (i, m) in marks.iter().enumerate() {
+                let t = self.lua.create_table()?;
+                t.set("ns", m.ns)?;
+                t.set("id", m.id)?;
+                t.set("row", m.row)?;
+                t.set("col", m.col)?;
+                if let Some(r) = m.end_row {
+                    t.set("end_row", r)?;
+                }
+                if let Some(c) = m.end_col {
+                    t.set("end_col", c)?;
+                }
+                if let Some(g) = &m.hl_group {
+                    t.set("hl_group", self.lua.create_string(g)?)?;
+                }
+                t.set("priority", m.priority)?;
+                arr.set(i + 1, t)?;
+            }
+            entries.set(*bufnr, arr)?;
+        }
+        let set: mlua::Function = vim.get("_set_extmark_mirror")?;
+        set.call(entries)
     }
 
     /// Refresh the Rust→Lua buffer-option mirror (`vim._bo_mirror[bufnr] =

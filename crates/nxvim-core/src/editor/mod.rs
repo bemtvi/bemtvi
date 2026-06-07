@@ -635,6 +635,15 @@ impl Editor {
         self.buffers.map.get(&id).map(|ob| &ob.buffer)
     }
 
+    /// Mutable access to buffer `id`'s text model, or `None` if no such buffer is
+    /// open. The buffer-addressed counterpart to [`Editor::buffer_mut`], used by
+    /// the extmark effect drain to mutate a (possibly non-current) buffer's
+    /// [`crate::extmark::ExtmarkStore`] directly. Text mutation still funnels
+    /// through [`Editor::apply_edits_to`]; this is for the side metadata.
+    pub fn buffer_of_mut(&mut self, id: BufferId) -> Option<&mut Buffer> {
+        self.buffers.map.get_mut(&id).map(|ob| &mut ob.buffer)
+    }
+
     /// The current buffer's full editor-side state (text + undo/redo + saved
     /// position). Internal helper for the undo path and switching.
     fn cur_mut(&mut self) -> &mut OpenBuffer {

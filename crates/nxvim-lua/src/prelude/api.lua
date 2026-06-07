@@ -71,6 +71,42 @@ vim._cur_tab = vim._cur_tab or 1
 -- options (number/relativenumber) live on the `vim._wins` mirror instead.
 vim._wo_store = vim._wo_store or {}
 
+-- Extmark / namespace state (the decoration layer). `vim._namespaces` maps a
+-- namespace name to its id and `vim._namespace_next` is the next id to mint, both
+-- allocated entirely Lua-side (the sole allocator) so `nvim_create_namespace`
+-- returns synchronously. `vim._extmarks[bufnr][ns][id]` mirrors each mark's
+-- position/attrs for `nvim_buf_get_extmarks`; the server rebuilds it from the
+-- authoritative core store before every chunk (so positions reflect edits), and
+-- the set/del/clear wrappers write through it for read-after-write within a
+-- chunk. `vim._extmark_next[bufnr][ns]` is the per-(buffer, namespace) id
+-- allocator — persistent (never reset by the mirror refresh), so ids are never
+-- reused, matching neovim.
+vim._namespaces = vim._namespaces or {}
+vim._namespace_next = vim._namespace_next or 1
+vim._extmarks = vim._extmarks or {}
+vim._extmark_next = vim._extmark_next or {}
+
+-- Receive the extmark mirror: `entries[bufnr]` is the array of that buffer's
+-- marks the server pushed from core (positions already shifted for any edits).
+-- Rebuilds `vim._extmarks` from the authoritative state; the persistent
+-- allocator (`vim._extmark_next`) is deliberately untouched.
+function vim._set_extmark_mirror(entries)
+  local marks = {}
+  for bufnr, list in pairs(entries or {}) do
+    local by_ns = {}
+    for _, m in ipairs(list) do
+      by_ns[m.ns] = by_ns[m.ns] or {}
+      by_ns[m.ns][m.id] = {
+        row = m.row, col = m.col,
+        end_row = m.end_row, end_col = m.end_col,
+        hl_group = m.hl_group, priority = m.priority,
+      }
+    end
+    marks[bufnr] = by_ns
+  end
+  vim._extmarks = marks
+end
+
 function vim._set_buf_mirror(entries, row, col, win, wins, next_win, mode)
   vim._cur_mode = mode or "n"
   -- The server omits `lines` for a buffer whose changedtick is unchanged (the
@@ -770,6 +806,157 @@ function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
   for i = e + 1, n do updated[#updated + 1] = lines[i] end
   buf.lines = updated
   vim._buf_set_lines(id, start, end_, repl)
+end
+
+-- ===== Extmarks / decoration layer =====================================
+-- See docs/specs/2026-06-07-extmark-decoration-layer-design.md. v1 carries the
+-- highlight-relevant attrs only; virtual text / signs / conceal / ephemeral are
+-- not modelled yet and are rejected loudly rather than silently ignored.
+
+-- nvim_create_namespace(name): create-or-get a namespace id by name (an empty /
+-- nil name mints a fresh anonymous one each call). Ids are allocated Lua-side, so
+-- the call returns synchronously; the server only ever sees the id on a mark.
+function vim.api.nvim_create_namespace(name)
+  name = name or ""
+  if name ~= "" and vim._namespaces[name] then
+    return vim._namespaces[name]
+  end
+  local id = vim._namespace_next
+  vim._namespace_next = id + 1
+  if name ~= "" then vim._namespaces[name] = id end
+  return id
+end
+
+-- The extmark options v1 understands; any other key is rejected (no silent drop).
+local EXTMARK_OPT_OK = {
+  id = true, end_row = true, end_col = true, hl_group = true, priority = true,
+}
+
+-- nvim_buf_set_extmark(buffer, ns, line, col, opts) -> id. `line`/`col` are
+-- 0-based (col a byte offset). Returns the (allocated or given) mark id. Queues
+-- the real mutation for the server, which converts positions to byte offsets.
+function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
+  local b = vim._resolve_bufnr(buffer)
+  opts = opts or {}
+  for k in pairs(opts) do
+    if not EXTMARK_OPT_OK[k] then
+      error("nvim_buf_set_extmark: option '" .. tostring(k) .. "' is not supported yet", 2)
+    end
+  end
+  local hl_group = opts.hl_group
+  if hl_group ~= nil and type(hl_group) ~= "string" then
+    error("nvim_buf_set_extmark: hl_group must be a string (group lists not supported yet)", 2)
+  end
+  if (opts.end_row == nil) ~= (opts.end_col == nil) then
+    error("nvim_buf_set_extmark: end_row and end_col must be given together", 2)
+  end
+  local priority = opts.priority or 4096
+
+  vim._extmark_next[b] = vim._extmark_next[b] or {}
+  local mark_id = opts.id or vim._extmark_next[b][ns] or 1
+  -- Advance the allocator past this id so a later auto-id can't collide.
+  vim._extmark_next[b][ns] = math.max(vim._extmark_next[b][ns] or 1, mark_id + 1)
+
+  -- Write-through the mirror (read-after-write within this chunk).
+  vim._extmarks[b] = vim._extmarks[b] or {}
+  vim._extmarks[b][ns] = vim._extmarks[b][ns] or {}
+  vim._extmarks[b][ns][mark_id] = {
+    row = line, col = col,
+    end_row = opts.end_row, end_col = opts.end_col,
+    hl_group = hl_group, priority = priority,
+  }
+  vim._extmark_set(b, ns, mark_id, line, col, opts.end_row, opts.end_col, hl_group, priority)
+  return mark_id
+end
+
+-- nvim_buf_del_extmark(buffer, ns, id) -> bool (whether it existed).
+function vim.api.nvim_buf_del_extmark(buffer, ns, id)
+  local b = vim._resolve_bufnr(buffer)
+  local marks = vim._extmarks[b] and vim._extmarks[b][ns]
+  local existed = marks ~= nil and marks[id] ~= nil
+  if existed then marks[id] = nil end
+  vim._extmark_del(b, ns, id)
+  return existed
+end
+
+-- nvim_buf_clear_namespace(buffer, ns, line_start, line_end): drop ns's marks in
+-- the line range (`line_end == -1` ⇒ to end of buffer). `ns == -1` clears every
+-- namespace, matching neovim.
+function vim.api.nvim_buf_clear_namespace(buffer, ns, line_start, line_end)
+  local b = vim._resolve_bufnr(buffer)
+  if ns == -1 then
+    for nsid in pairs(vim._extmarks[b] or {}) do
+      vim.api.nvim_buf_clear_namespace(b, nsid, line_start, line_end)
+    end
+    return
+  end
+  local marks = vim._extmarks[b] and vim._extmarks[b][ns]
+  if marks then
+    for id, m in pairs(marks) do
+      if line_end == -1 or (m.row >= line_start and m.row < line_end) then
+        marks[id] = nil
+      end
+    end
+  end
+  vim._extmark_clear(b, ns, line_start, line_end)
+end
+
+-- Normalize a `get_extmarks` position argument to an inclusive (row, col) bound.
+-- v1 supports the common `0` (buffer start), `-1` (buffer end), and `{row, col}`
+-- forms; a bare mark-id position is rejected rather than silently mishandled.
+local function extmark_pos_bound(p)
+  if p == 0 then return 0, 0 end
+  if p == -1 then return math.huge, math.huge end
+  if type(p) == "table" then return p[1] or 0, p[2] or 0 end
+  error("nvim_buf_get_extmarks: only 0, -1, and {row, col} positions are supported", 2)
+end
+
+-- nvim_buf_get_extmarks(buffer, ns, start, end_, opts) -> list of {id, row, col}
+-- (or {id, row, col, details} with opts.details), in (row, col, id) order. `ns ==
+-- -1` returns marks from every namespace. Reads the mirror, so it reflects marks
+-- set earlier in this chunk and positions current as of chunk start.
+function vim.api.nvim_buf_get_extmarks(buffer, ns, start, end_, opts)
+  local b = vim._resolve_bufnr(buffer)
+  opts = opts or {}
+  local sr, sc = extmark_pos_bound(start)
+  local er, ec = extmark_pos_bound(end_)
+  local out = {}
+  local function in_range(row, col)
+    if row < sr or (row == sr and col < sc) then return false end
+    if row > er or (row == er and col > ec) then return false end
+    return true
+  end
+  local function collect(nsid, marks)
+    for id, m in pairs(marks) do
+      if in_range(m.row, m.col) then
+        local e = { id, m.row, m.col }
+        if opts.details then
+          e[4] = {
+            ns_id = nsid, end_row = m.end_row, end_col = m.end_col,
+            hl_group = m.hl_group, priority = m.priority,
+          }
+        end
+        out[#out + 1] = e
+      end
+    end
+  end
+  local bufmarks = vim._extmarks[b] or {}
+  if ns == -1 then
+    for nsid, marks in pairs(bufmarks) do collect(nsid, marks) end
+  else
+    collect(ns, bufmarks[ns] or {})
+  end
+  table.sort(out, function(x, y)
+    if x[2] ~= y[2] then return x[2] < y[2] end
+    if x[3] ~= y[3] then return x[3] < y[3] end
+    return x[1] < y[1]
+  end)
+  if opts.limit and #out > opts.limit then
+    local trimmed = {}
+    for i = 1, opts.limit do trimmed[i] = out[i] end
+    out = trimmed
+  end
+  return out
 end
 
 -- nvim_set_option_value(name, value, opts): set an option in the scope its name

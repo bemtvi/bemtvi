@@ -21,8 +21,8 @@ use crate::host::{
     stdpath,
 };
 use crate::ops::{
-    BufOp, ConfirmReq, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, RegisterSetOp,
-    TabOp, UiInputReq, WindowOp,
+    BufOp, ConfirmReq, ExtmarkOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp,
+    RegisterSetOp, TabOp, UiInputReq, WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -454,6 +454,71 @@ pub(crate) fn install_runtime_api(
                     start,
                     end,
                     repl,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // The extmark funnels (`vim._extmark_set` / `_extmark_del` / `_extmark_clear`):
+    // queue an [`ExtmarkOp`] for the server to apply to the target buffer's
+    // `ExtmarkStore` after the chunk. The Lua-facing `nvim_buf_set_extmark` family
+    // (prelude) has resolved `bufnr`, allocated the id, and updated its
+    // `vim._extmarks` mirror (write-through); the server converts the 0-based
+    // `(row, col)` positions to byte offsets against the live rope.
+    // `(bufnr, ns, id, row, col, end_row, end_col, hl_group, priority)` — the
+    // positional payload the prelude's `nvim_buf_set_extmark` forwards.
+    type ExtmarkSetArgs = (
+        u64,
+        u32,
+        u64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        u32,
+    );
+    let sh = shared.clone();
+    vim.set(
+        "_extmark_set",
+        lua.create_function(
+            move |_, (bufnr, ns, id, row, col, end_row, end_col, hl_group, priority): ExtmarkSetArgs| {
+                sh.borrow_mut().extmark_ops.push(ExtmarkOp::Set {
+                    bufnr,
+                    ns,
+                    id,
+                    row,
+                    col,
+                    end_row,
+                    end_col,
+                    hl_group,
+                    priority,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_extmark_del",
+        lua.create_function(move |_, (bufnr, ns, id): (u64, u32, u64)| {
+            sh.borrow_mut()
+                .extmark_ops
+                .push(ExtmarkOp::Del { bufnr, ns, id });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_extmark_clear",
+        lua.create_function(
+            move |_, (bufnr, ns, line_start, line_end): (u64, u32, i64, i64)| {
+                sh.borrow_mut().extmark_ops.push(ExtmarkOp::Clear {
+                    bufnr,
+                    ns,
+                    line_start,
+                    line_end,
                 });
                 Ok(())
             },

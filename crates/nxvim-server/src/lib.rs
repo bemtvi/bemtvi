@@ -20,6 +20,7 @@ mod dispatch;
 mod effects;
 mod evloop;
 mod excmd;
+mod extmarks;
 mod input;
 mod keymap;
 mod lifecycle;

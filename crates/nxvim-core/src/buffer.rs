@@ -95,6 +95,11 @@ pub struct Buffer {
     lsp_edits: Vec<BufferEdit>,
     /// `resync` for the LSP journal (whole-rope replacement: undo/redo/reload).
     lsp_resync: bool,
+    /// Buffer-anchored extmarks (highlight-layering marks set via
+    /// `nvim_buf_set_extmark`), partitioned by namespace. Their byte anchors are
+    /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
+    /// [`Buffer::mark_resync`]. See [`crate::extmark`].
+    pub extmarks: crate::extmark::ExtmarkStore,
 }
 
 impl Default for Buffer {
@@ -116,6 +121,7 @@ impl Buffer {
             resync: false,
             lsp_edits: Vec::new(),
             lsp_resync: false,
+            extmarks: crate::extmark::ExtmarkStore::default(),
         }
     }
 
@@ -156,6 +162,7 @@ impl Buffer {
             resync: false,
             lsp_edits: Vec::new(),
             lsp_resync: false,
+            extmarks: crate::extmark::ExtmarkStore::default(),
         })
     }
 
@@ -266,6 +273,11 @@ impl Buffer {
         self.lsp_edits.clear();
         self.resync = true;
         self.lsp_resync = true;
+        // Byte anchors are meaningless against the wholesale-new rope, and an
+        // extmark has no source of truth to rebuild from (unlike the treesitter
+        // / LSP journals, which re-derive from the full text), so drop them all —
+        // matching neovim losing extmarks on a destructive reload.
+        self.extmarks.clear_all();
         self.changedtick += 1;
         self.modified = true;
     }
@@ -290,6 +302,8 @@ impl Buffer {
     }
 
     fn record(&mut self, edit: BufferEdit) {
+        self.extmarks
+            .shift(edit.start_byte, edit.old_end_byte, edit.new_end_byte);
         self.edits.push(edit.clone());
         self.lsp_edits.push(edit);
         self.changedtick += 1;

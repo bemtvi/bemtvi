@@ -13,6 +13,7 @@
 pub mod buffer;
 pub mod clipboard;
 pub mod editor;
+pub mod extmark;
 pub mod highlight;
 pub mod input;
 pub mod mode;
@@ -29,6 +30,7 @@ pub use editor::{
     command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,
     FloatAnchor, FloatConfig, FloatRelative, TabId, WindowConfigSpec, WindowId,
 };
+pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;

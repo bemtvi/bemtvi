@@ -1,0 +1,5 @@
+The decoration layer lets plugins paint highlights anywhere.
+An extmark anchors a highlight group to a byte range in the buffer.
+TODO: extmarks shift with edits, so this mark rides along as you type.
+NOTE: clearing a namespace removes every mark it owns at once.
+Try editing the lines above and watch the highlighted ranges follow.

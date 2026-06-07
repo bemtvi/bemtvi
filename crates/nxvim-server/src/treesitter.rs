@@ -105,22 +105,38 @@ impl Server {
         let buf = self.editor.buffer_of(buffer);
         let rows = numbers
             .iter()
-            .map(|num| match num {
-                Some(n) => {
-                    let line_idx = n - 1;
-                    let Some(spans) = spans_by_line.and_then(|m| m.get(&line_idx)) else {
+            .map(|num| {
+                let Some(n) = num else {
+                    return Value::Array(Vec::new());
+                };
+                let line_idx = n - 1;
+                let Some(b) = buf else {
+                    return Value::Array(Vec::new());
+                };
+                let ts_spans = spans_by_line.and_then(|m| m.get(&line_idx));
+                let text = b.line(line_idx);
+                let tab = b.options.effective_tabstop();
+
+                // Fast path: no extmarks on this line ⇒ emit the (already
+                // non-overlapping) treesitter spans verbatim, byte-identical to
+                // the pre-extmark projection.
+                let ext = self.extmark_intervals(
+                    buffer,
+                    line_idx,
+                    b.line_start(line_idx),
+                    text.len(),
+                    // treesitter spans take orders [0, n); extmarks sort above.
+                    ts_spans.map_or(0, |s| s.len()) as u32,
+                );
+                if ext.is_empty() {
+                    let Some(spans) = ts_spans else {
                         return Value::Array(Vec::new());
                     };
-                    let Some(b) = buf else {
-                        return Value::Array(Vec::new());
-                    };
-                    let text = b.line(line_idx);
-                    let ts = b.options.effective_tabstop();
                     let row = spans
                         .iter()
                         .map(|s| {
-                            let start = unicode::virtcol(&text, s.start, ts);
-                            let end = unicode::virtcol(&text, s.end, ts);
+                            let start = unicode::virtcol(&text, s.start, tab);
+                            let end = unicode::virtcol(&text, s.end, tab);
                             let style_id = match self.editor.highlights.resolve_capture(&s.group) {
                                 Some(style) => Value::from(styles.intern(style) as u64),
                                 None => Value::Nil,
@@ -133,9 +149,48 @@ impl Server {
                             ])
                         })
                         .collect();
-                    Value::Array(row)
+                    return Value::Array(row);
                 }
-                None => Value::Array(Vec::new()),
+
+                // Merge path: treesitter spans (priority TS_HL_PRIORITY) and the
+                // line's extmarks, resolved into non-overlapping winning segments.
+                let mut intervals = Vec::new();
+                if let Some(spans) = ts_spans {
+                    for (i, s) in spans.iter().enumerate() {
+                        intervals.push(crate::extmarks::HlInterval {
+                            start: s.start,
+                            end: s.end,
+                            group: s.group.as_str(),
+                            priority: nxvim_core::TS_HL_PRIORITY,
+                            order: i as u32,
+                            capture: true,
+                        });
+                    }
+                }
+                intervals.extend(ext);
+                let row = crate::extmarks::merge_intervals(&intervals)
+                    .into_iter()
+                    .map(|(sb, eb, group, capture)| {
+                        let start = unicode::virtcol(&text, sb, tab);
+                        let end = unicode::virtcol(&text, eb, tab);
+                        let resolved = if capture {
+                            self.editor.highlights.resolve_capture(group)
+                        } else {
+                            self.editor.highlights.resolve(group)
+                        };
+                        let style_id = match resolved {
+                            Some(style) => Value::from(styles.intern(style) as u64),
+                            None => Value::Nil,
+                        };
+                        Value::Array(vec![
+                            Value::from(start as u64),
+                            Value::from(end as u64),
+                            Value::from(group),
+                            style_id,
+                        ])
+                    })
+                    .collect();
+                Value::Array(row)
             })
             .collect();
         Value::Array(rows)

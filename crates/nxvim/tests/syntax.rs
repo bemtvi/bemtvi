@@ -146,6 +146,15 @@ fn feed(rpc: &Rpc, keys: &str) {
     rpc.notify("nvim_input", vec![Value::from(keys)]);
 }
 
+async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(code), Value::Array(vec![])],
+    )
+    .await
+    .expect("nvim_exec_lua")
+}
+
 async fn barrier(rpc: &Rpc) {
     rpc.request(
         "nvim_buf_get_lines",
@@ -575,6 +584,63 @@ async fn the_scroll_animation_band_is_highlighted() {
         band.iter().filter(|row| !row.is_empty()).count() >= 5,
         "the scroll band should be colored, not flashing white (rows colored: {})",
         band.iter().filter(|row| !row.is_empty()).count()
+    );
+}
+
+#[tokio::test]
+async fn an_extmark_wins_over_treesitter_by_priority() {
+    // An extmark highlight (default priority 4096) painted over a treesitter
+    // span (priority 100) replaces it for the overlapping cells: the merge
+    // resolves overlaps server-side into non-overlapping spans, so the `fn`
+    // keyword's cells carry the extmark's group, not `keyword`. Proves the
+    // priority layering of the decoration layer on top of the syntax engine.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("ext-prio", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Wait for the treesitter `keyword` span on `fn` (cols 0..2) first.
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| {
+            row.iter()
+                .any(|(s, e, g)| *s == 0 && *e == 2 && g.split('.').next() == Some("keyword"))
+        })
+    })
+    .await;
+
+    // Cover `fn` with an extmark in a custom group.
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('prio')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { end_row = 0, end_col = 2, hl_group = 'ExtMark' })
+        "#,
+    )
+    .await;
+
+    // Cols 0..2 now belong to the extmark group; `keyword` no longer covers them.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| {
+            row.iter()
+                .any(|(s, e, g)| *s == 0 && *e == 2 && g == "ExtMark")
+        })
+    })
+    .await;
+    let row0 = &hl[0];
+    let col0 = row0
+        .iter()
+        .find(|(s, _, _)| *s == 0)
+        .expect("a span at column 0");
+    assert_eq!(
+        (col0.1, col0.2.as_str()),
+        (2, "ExtMark"),
+        "the extmark outranks the treesitter keyword over cols 0..2"
+    );
+    assert!(
+        !row0
+            .iter()
+            .any(|(s, _, g)| *s == 0 && g.split('.').next() == Some("keyword")),
+        "the treesitter keyword span no longer covers column 0"
     );
 }
 

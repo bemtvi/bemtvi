@@ -11,11 +11,33 @@ use nxvim_core::{
     WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BufOp, CallbackArgs, FloatMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp,
-    WindowMirror, WindowOp,
+    BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, HlSet, LoopOp, OptionValue,
+    PanelOp, TabMirror, TabOp, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
+
+/// Byte offset of a neovim 0-based `(row, col)` position in `buf`, clamped into
+/// the buffer (row into `[0, line_count]`, col into the line's byte length) the
+/// way neovim tolerates out-of-range extmark positions. `col` is a byte offset
+/// within the line, matching the rest of nxvim's column model.
+fn byte_of(buf: &nxvim_core::Buffer, row: i64, col: i64) -> usize {
+    let n = buf.line_count();
+    let row = (row.max(0) as usize).min(n);
+    let line_len = if row < n { buf.line(row).len() } else { 0 };
+    let col = (col.max(0) as usize).min(line_len);
+    buf.line_start(row) + col
+}
+
+/// neovim 0-based `(row, col)` of byte offset `byte` in `buf` — the inverse of
+/// [`byte_of`], for projecting stored extmark anchors back into the Lua mirror.
+/// `col` is a byte offset within the line.
+fn byte_rowcol(buf: &nxvim_core::Buffer, byte: usize) -> (u64, u64) {
+    let byte = byte.min(buf.len_bytes());
+    let row = buf.byte_to_line(byte);
+    let col = byte - buf.line_start(row);
+    (row as u64, col as u64)
+}
 
 /// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `vim._wins`
 /// mirror carries — the enums become the strings `nvim_win_get_config` returns,
@@ -94,6 +116,13 @@ impl Server {
         // Lua side already did against the `vim._bufs` mirror.
         for op in self.lua.take_buf_ops() {
             self.apply_buf_op(op);
+        }
+        // Extmark mutations from the `nvim_buf_set_extmark` family (the decoration
+        // layer): applied to the target buffer's `ExtmarkStore` after the chunk,
+        // catching the core up with the write-through the Lua side did against its
+        // `vim._extmarks` mirror.
+        for op in self.lua.take_extmark_ops() {
+            self.apply_extmark_op(op);
         }
         // Window mutations from the `vim.api.nvim_win_*` family (Phase 5): applied
         // to the live editor after the chunk. Their `WinNew`/`WinEnter`/… autocmds
@@ -216,6 +245,75 @@ impl Server {
         self.editor
             .apply_edits_to(id, vec![(start_byte..end_byte, repl_text)]);
         self.sync_lsp_buffer(id);
+    }
+
+    /// Apply one [`ExtmarkOp`] to the target buffer's `ExtmarkStore`, converting
+    /// the neovim 0-based `(row, col)` positions to byte offsets against the live
+    /// rope (the conversion the Lua side can't do without the text). Positions are
+    /// clamped into the buffer, matching neovim's tolerance for out-of-range
+    /// marks. A missing buffer is a no-op (it was deleted between queue and drain).
+    pub(crate) fn apply_extmark_op(&mut self, op: ExtmarkOp) {
+        match op {
+            ExtmarkOp::Set {
+                bufnr,
+                ns,
+                id,
+                row,
+                col,
+                end_row,
+                end_col,
+                hl_group,
+                priority,
+            } => {
+                let bid = BufferId(bufnr);
+                let Some(buf) = self.editor.buffer_of(bid) else {
+                    return;
+                };
+                let start = byte_of(buf, row, col);
+                let end = match (end_row, end_col) {
+                    (Some(r), Some(c)) => Some(byte_of(buf, r, c).max(start)),
+                    _ => None,
+                };
+                if let Some(buf) = self.editor.buffer_of_mut(bid) {
+                    buf.extmarks
+                        .set(ns, Some(id), start, end, hl_group, priority);
+                }
+            }
+            ExtmarkOp::Del { bufnr, ns, id } => {
+                if let Some(buf) = self.editor.buffer_of_mut(BufferId(bufnr)) {
+                    buf.extmarks.del(ns, id);
+                }
+            }
+            ExtmarkOp::Clear {
+                bufnr,
+                ns,
+                line_start,
+                line_end,
+            } => {
+                let bid = BufferId(bufnr);
+                let Some(buf) = self.editor.buffer_of(bid) else {
+                    return;
+                };
+                // `(0, -1)` ⇒ the whole buffer (clear every mark in the namespace);
+                // any narrower range clips to the spanned bytes.
+                let range = if line_start <= 0 && line_end == -1 {
+                    None
+                } else {
+                    let n = buf.line_count();
+                    let ls = (line_start.max(0) as usize).min(n);
+                    let start = buf.line_start(ls);
+                    let end = if line_end < 0 {
+                        buf.len_bytes()
+                    } else {
+                        buf.line_start((line_end as usize).min(n))
+                    };
+                    Some(start..end.max(start))
+                };
+                if let Some(buf) = self.editor.buffer_of_mut(bid) {
+                    buf.extmarks.clear(ns, range);
+                }
+            }
+        }
     }
 
     /// Apply one [`WindowOp`] to the live editor (Phase 5) — the deferred form of
@@ -458,6 +556,9 @@ impl Server {
         // read the core's current value (the default until set, and values set via
         // the `:set` ex path). Cheap (three scalars per buffer), so it isn't gated.
         let mut bo: Vec<(u64, usize, usize, isize, bool)> = Vec::new();
+        // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
+        // marks contribute, so a session with no decoration plugin pays nothing.
+        let mut extmarks: Vec<(u64, Vec<ExtmarkMirror>)> = Vec::new();
         for id in self.editor.buffer_ids() {
             let tick = self
                 .editor
@@ -475,6 +576,33 @@ impl Server {
             if let Some(b) = self.editor.buffer_of(id) {
                 let o = b.options;
                 bo.push((id.0, o.tabstop, o.shiftwidth, o.softtabstop, o.expandtab));
+                if !b.extmarks.is_empty() {
+                    let marks = b
+                        .extmarks
+                        .iter_with_ns()
+                        .map(|(ns, m)| {
+                            let (row, col) = byte_rowcol(b, m.start);
+                            let (end_row, end_col) = match m.end {
+                                Some(e) => {
+                                    let (r, c) = byte_rowcol(b, e);
+                                    (Some(r), Some(c))
+                                }
+                                None => (None, None),
+                            };
+                            ExtmarkMirror {
+                                ns,
+                                id: m.id,
+                                row,
+                                col,
+                                end_row,
+                                end_col,
+                                hl_group: m.hl_group.clone(),
+                                priority: m.priority,
+                            }
+                        })
+                        .collect();
+                    extmarks.push((id.0, marks));
+                }
             }
             bufs.push((id.0, lines, name));
         }
@@ -523,6 +651,7 @@ impl Server {
             self.editor.mode.short_code(),
         );
         let _ = self.lua.set_bo_mirror(&bo);
+        let _ = self.lua.set_extmark_mirror(&extmarks);
         // The tab snapshot (Phase 3): one entry per tab page in tabline order, each
         // carrying its window ids and focused window, so `nvim_tabpage_*` reads from
         // Lua resolve against live state.

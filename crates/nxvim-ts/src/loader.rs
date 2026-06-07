@@ -1,4 +1,4 @@
-//! Dynamic grammar loading — the installable-grammar half of the worker.
+//! Dynamic grammar loading — the installable-grammar half of the engine.
 //!
 //! Grammars are **not** linked into nxvim. They are loaded at runtime from a
 //! data directory laid out exactly like neovim's `runtimepath`, so an existing
@@ -11,8 +11,21 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Context};
 use tree_sitter::{Language, Parser, Query};
+
+/// Why [`Grammar::load`] didn't return a grammar, so the engine (and the editor
+/// above it) can stay silent for an uninstalled language but surface a real load
+/// failure once.
+pub enum LoadError {
+    /// No parser library is installed for this language under the data dir. The
+    /// expected, silent case — the buffer is simply not highlighted.
+    NotInstalled,
+    /// A parser **is** installed but couldn't be loaded or used: an invalid
+    /// language name, a dlopen failure, a missing symbol, an ABI mismatch, or a
+    /// missing/unparseable highlights query. Worth telling the user about.
+    Failed(anyhow::Error),
+}
 
 /// A loaded grammar: the dynamic library (kept alive because `language` borrows
 /// code inside it), the `Language`, and the compiled highlights `Query`.
@@ -25,34 +38,39 @@ pub struct Grammar {
 }
 
 impl Grammar {
-    /// Load the grammar for `lang` from `data_dir`. Returns an error (rather than
-    /// panicking) for a missing parser, a missing symbol, an ABI mismatch, or an
-    /// unparseable query — the worker turns that into a `ts_error` and moves on.
-    pub fn load(data_dir: &Path, lang: &str) -> Result<Grammar> {
+    /// Load the grammar for `lang` from `data_dir`. Distinguishes a *missing*
+    /// parser ([`LoadError::NotInstalled`], silent) from a parser that is present
+    /// but broken ([`LoadError::Failed`], worth echoing).
+    pub fn load(data_dir: &Path, lang: &str) -> Result<Grammar, LoadError> {
         // Security boundary: `lang` flows into the parser `.so` path and the
         // query directory, and we then `dlopen` that path — i.e. execute native
         // code. A name containing `.`, `/`, `\`, or path components could escape
         // `data_dir` (traversal / absolute path) and load an arbitrary shared
         // object. Reject anything that isn't a plain grammar identifier before
-        // touching the filesystem. The worker only ever *should* see names from
-        // the server's fixed filetype table, but it must not assume that.
+        // touching the filesystem. The engine only ever *should* see names from
+        // the fixed filetype table, but it must not assume that.
         if !is_valid_language(lang) {
-            return Err(anyhow!("invalid language name '{lang}'"));
+            return Err(LoadError::Failed(anyhow!("invalid language name '{lang}'")));
         }
 
-        let lib_path = parser_path(data_dir, lang)
-            .ok_or_else(|| anyhow!("no parser for '{lang}' under {}", data_dir.display()))?;
+        // No parser file at all is the common, expected case — not a failure.
+        let Some(lib_path) = parser_path(data_dir, lang) else {
+            return Err(LoadError::NotInstalled);
+        };
 
-        // SAFETY: loading arbitrary native code is inherently unsafe; crash
-        // isolation is provided by running this in a separate process.
+        // SAFETY: loading arbitrary native code is inherently unsafe. A poison
+        // grammar can segfault the process (neovim's posture); the ABI probe
+        // below is the load-time mitigation.
         let lib = unsafe { libloading::Library::new(&lib_path) }
-            .with_context(|| format!("dlopen {}", lib_path.display()))?;
+            .with_context(|| format!("dlopen {}", lib_path.display()))
+            .map_err(LoadError::Failed)?;
 
         let symbol = format!("tree_sitter_{}", lang.replace('-', "_"));
         let language = unsafe {
             let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> = lib
                 .get(symbol.as_bytes())
-                .with_context(|| format!("symbol {symbol} in {}", lib_path.display()))?;
+                .with_context(|| format!("symbol {symbol} in {}", lib_path.display()))
+                .map_err(LoadError::Failed)?;
             Language::from_raw(func() as *const _)
         };
 
@@ -60,13 +78,16 @@ impl Grammar {
         let mut probe = Parser::new();
         probe
             .set_language(&language)
-            .with_context(|| format!("grammar '{lang}' ABI incompatible"))?;
+            .with_context(|| format!("grammar '{lang}' ABI incompatible"))
+            .map_err(LoadError::Failed)?;
 
         let hl_path = query_path(data_dir, lang, "highlights.scm");
         let hl_src = std::fs::read_to_string(&hl_path)
-            .with_context(|| format!("reading {}", hl_path.display()))?;
+            .with_context(|| format!("reading {}", hl_path.display()))
+            .map_err(LoadError::Failed)?;
         let query = Query::new(&language, &hl_src)
-            .with_context(|| format!("compiling {lang} highlights"))?;
+            .with_context(|| format!("compiling {lang} highlights"))
+            .map_err(LoadError::Failed)?;
 
         Ok(Grammar {
             language,

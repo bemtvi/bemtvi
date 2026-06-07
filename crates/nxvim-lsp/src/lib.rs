@@ -6,8 +6,8 @@
 //! `rust-analyzer` just closes a pipe; it cannot segfault nxvim, so the
 //! out-of-process guard the grammar worker needs buys nothing here).
 //!
-//! [`LspManager`] is the LSP analogue of `SyntaxClient`: a cheap handle the
-//! server holds plus background tasks. It manages **N** child processes (one per
+//! [`LspManager`] is a cheap handle the server holds plus background tasks. It
+//! manages **N** child processes (one per
 //! `(language, workspace-root)` [`ServerKey`]), each driven by its own
 //! [`async_lsp`] client `MainLoop` task that owns that server's framing and
 //! JSON-RPC id space. The manager bridges those per-server loops to the single

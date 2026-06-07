@@ -1,11 +1,10 @@
 //! [`LspManager`]: spawn, supervise, and route N language servers, bridging each
 //! to the editor's single `LspCommand`/[`LspEvent`] channel pair.
 //!
-//! Shape mirrors `nxvim-server`'s `SyntaxClient`/`supervise`/`run_worker_once`:
-//! a lazily-spawned supervisor task, per-child supervision with an
+//! Shape: a lazily-spawned supervisor task, per-child supervision with an
 //! escalating-backoff circuit breaker, and a fire-and-forget command path so the
-//! editor thread is never blocked. The differences are intrinsic to LSP: there
-//! are many children (one per [`ServerKey`]) rather than one worker, and each is
+//! editor thread is never blocked. There are many children (one per
+//! [`ServerKey`]), and each is
 //! driven by an [`async_lsp`] client `MainLoop` that owns its JSON-RPC framing
 //! and id correlation, so we ferry typed [`LspNotify`]/[`LspEvent`] values rather
 //! than raw msgpack notifications.

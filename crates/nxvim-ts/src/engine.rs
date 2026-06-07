@@ -7,17 +7,26 @@
 //! just the requested line range.
 
 use std::collections::HashMap;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use nxvim_core::{BufferEdit, BufferId, IndentParams, Span, SyntaxEngine};
+use nxvim_core::{BufferEdit, BufferId, IndentParams, OpenOutcome, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree};
+use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, QueryCursor, Tree};
 
-use crate::loader::Grammar;
+use crate::loader::{Grammar, LoadError};
 
 const LINE_TYPE: LineType = LineType::LF_CR;
+
+/// Wall-clock budget for a single (incremental) parse. In-process, a runaway or
+/// pathological grammar would otherwise stall the editor on the frame that
+/// triggered the reparse; the worker process used to bound this by being async.
+/// On expiry the parse is cancelled and the last good tree is kept (see
+/// [`BufferState::reparse`]), so the cost is one frame of stale highlights rather
+/// than a hang. Generous enough that a normal incremental reparse never trips it.
+const PARSE_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Per-buffer parse state.
 struct BufferState {
@@ -32,26 +41,46 @@ impl BufferState {
     fn reparse(&mut self) {
         let shadow = &self.shadow;
         let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
-        // Keep the last good tree if the parse yields `None` (a timeout/cancel):
+        // Cancel the parse once it has run longer than the deadline — the
+        // in-process replacement for the worker's "never stalls the UI" property.
+        let started = Instant::now();
+        let mut budget = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
+            if started.elapsed() >= PARSE_DEADLINE {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = ParseOptions::new().progress_callback(&mut budget);
+        // Keep the last good tree if the parse yields `None` (the deadline fired):
         // overwriting it with `None` would throw away all incremental reuse and
-        // leave the buffer un-highlightable until a full re-open. Today no
-        // timeout/cancellation is configured so `parse_with_options` always
-        // returns `Some`, but this stays correct if one is ever added.
-        if let Some(tree) = self
-            .parser
-            .parse_with_options(&mut callback, self.tree.as_ref(), None)
+        // leave the buffer un-highlightable until a full re-open. So a cancelled
+        // parse costs one frame of stale highlights, not a permanently dark buffer.
+        if let Some(tree) =
+            self.parser
+                .parse_with_options(&mut callback, self.tree.as_ref(), Some(options))
         {
             self.tree = Some(tree);
         }
     }
 }
 
+/// A cached grammar-load result for a language. Remembers *why* a grammar is
+/// absent so the editor can stay silent for an uninstalled one but echo a real
+/// load failure. Cached on first use, so the dlopen (and its outcome) happen
+/// once per language, not once per keystroke.
+enum Slot {
+    Loaded(Grammar),
+    /// No parser installed — silent.
+    NotInstalled,
+    /// Installed but broken; the reason to echo.
+    Failed(String),
+}
+
 /// Owns every buffer's parse state and a lazily-populated grammar cache.
 pub struct Engine {
     data_dir: PathBuf,
-    /// `None` means a previous load attempt for that language failed; we don't
-    /// retry it (so a missing grammar costs one failed `dlopen`, not one per key).
-    grammars: HashMap<String, Option<Grammar>>,
+    grammars: HashMap<String, Slot>,
     buffers: HashMap<BufferId, BufferState>,
 }
 
@@ -64,37 +93,36 @@ impl Engine {
         }
     }
 
-    /// Lazily load (and cache) the grammar for `lang`. `Ok(None)` means it has
-    /// failed to load before and shouldn't be retried.
-    fn grammar(&mut self, lang: &str) -> Result<Option<&Grammar>, String> {
+    /// Lazily load (and cache) the grammar for `lang`, returning its cache slot.
+    /// The load — and its outcome (loaded / not-installed / failed) — happens once
+    /// per language; later calls are a cache hit.
+    fn grammar(&mut self, lang: &str) -> &Slot {
         if !self.grammars.contains_key(lang) {
-            match Grammar::load(&self.data_dir, lang) {
-                Ok(g) => {
-                    self.grammars.insert(lang.to_string(), Some(g));
-                }
-                Err(e) => {
-                    self.grammars.insert(lang.to_string(), None);
-                    return Err(format!("{e:#}"));
-                }
-            }
+            let slot = match Grammar::load(&self.data_dir, lang) {
+                Ok(g) => Slot::Loaded(g),
+                Err(LoadError::NotInstalled) => Slot::NotInstalled,
+                Err(LoadError::Failed(e)) => Slot::Failed(format!("{e:#}")),
+            };
+            self.grammars.insert(lang.to_string(), slot);
         }
-        Ok(self.grammars.get(lang).and_then(Option::as_ref))
+        &self.grammars[lang]
     }
 
-    /// (Re)initialize a buffer from full text and do the initial parse. Returns
-    /// an error string if the language has no usable grammar. (The inherent form
-    /// surfaces the error so the worker can emit `ts_error`; the [`SyntaxEngine`]
-    /// trait method discards it — the editor reports load failures separately.)
-    pub fn open(&mut self, buffer: BufferId, lang: &str, text: &str) -> Result<(), String> {
-        // Touch the grammar cache so a missing grammar reports once.
-        let language = match self.grammar(lang)? {
-            Some(g) => g.language.clone(),
-            None => return Err(format!("no grammar for '{lang}'")),
+    /// (Re)initialize a buffer from full text and do the initial parse. The
+    /// [`OpenOutcome`] reports whether an *installed* grammar failed to load
+    /// (worth echoing) vs the silent no-grammar / parsed-fine cases.
+    pub fn open(&mut self, buffer: BufferId, lang: &str, text: &str) -> OpenOutcome {
+        let language = match self.grammar(lang) {
+            Slot::Loaded(g) => g.language.clone(),
+            Slot::NotInstalled => return OpenOutcome::Ok, // silent: best-effort
+            Slot::Failed(reason) => return OpenOutcome::LoadFailed(reason.clone()),
         };
         let mut parser = Parser::new();
-        parser
-            .set_language(&language)
-            .map_err(|e| format!("set_language: {e}"))?;
+        if let Err(e) = parser.set_language(&language) {
+            // Unreachable in practice (the ABI is probed at load), but report it
+            // honestly rather than silently dropping the buffer.
+            return OpenOutcome::LoadFailed(format!("set_language: {e}"));
+        }
         let mut state = BufferState {
             shadow: Rope::from_str(text),
             parser,
@@ -103,7 +131,7 @@ impl Engine {
         };
         state.reparse();
         self.buffers.insert(buffer, state);
-        Ok(())
+        OpenOutcome::Ok
     }
 
     /// Apply edit deltas to a buffer's shadow + tree, then reparse incrementally.
@@ -112,11 +140,11 @@ impl Engine {
             return; // never opened; the editor opens before editing
         };
         for e in edits {
-            // The byte offsets come off the wire; an out-of-range, mis-ordered,
-            // or mid-codepoint range would panic ropey and (under the worker's
-            // catch_unwind) leave the shadow and tree half-mutated, poisoning the
-            // buffer for every later edit. Validate against the live shadow and
-            // drop a delta that doesn't fit rather than trust it. `try_*` is a
+            // Defend the shadow against a bad delta: an out-of-range, mis-ordered,
+            // or mid-codepoint range would panic ropey and leave the shadow and
+            // tree half-mutated, poisoning the buffer for every later edit (and,
+            // in-process, taking the editor down). Validate against the live shadow
+            // and drop a delta that doesn't fit rather than trust it. `try_*` is a
             // second guard so a mutation can still never panic.
             let len = state.shadow.len();
             let valid = e.start_byte <= e.old_end_byte
@@ -175,7 +203,7 @@ impl Engine {
         let Some(tree) = state.tree.as_ref() else {
             return Vec::new();
         };
-        let Some(Some(grammar)) = self.grammars.get(&state.language) else {
+        let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
             return Vec::new();
         };
         extract_spans(grammar, tree, &state.shadow, first_line, last_line)
@@ -188,11 +216,8 @@ impl Engine {
 /// `None` — an **honest fallback**, not a fake success: the caller then uses
 /// copy-previous-line autoindent, then column 0.
 impl SyntaxEngine for Engine {
-    fn open(&mut self, buffer: BufferId, language: &str, text: &str) {
-        // The error (no/incompatible grammar) is the editor's to surface; the
-        // trait contract is best-effort, so we drop it here. The worker path uses
-        // the inherent `Engine::open`, which still returns it.
-        let _ = Engine::open(self, buffer, language, text);
+    fn open(&mut self, buffer: BufferId, language: &str, text: &str) -> OpenOutcome {
+        Engine::open(self, buffer, language, text)
     }
 
     fn edit(&mut self, buffer: BufferId, edits: &[BufferEdit]) {

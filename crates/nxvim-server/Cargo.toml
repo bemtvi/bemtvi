@@ -25,3 +25,6 @@ nxvim-core.workspace = true
 nxvim-rpc.workspace = true
 nxvim-lua.workspace = true
 nxvim-lsp.workspace = true
+# In-process treesitter: the server constructs the engine and installs it on the
+# editor, which owns and queries it synchronously (no worker process).
+nxvim-ts.workspace = true

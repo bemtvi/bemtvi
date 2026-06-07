@@ -1071,11 +1071,9 @@ name = "nxvim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "nxvim-core",
  "nxvim-lsp",
  "nxvim-rpc",
  "nxvim-server",
- "nxvim-ts",
  "nxvim-tui",
  "portable-pty",
  "ratatui",
@@ -1139,6 +1137,7 @@ dependencies = [
  "nxvim-lsp",
  "nxvim-lua",
  "nxvim-rpc",
+ "nxvim-ts",
  "rmpv",
  "tokio",
 ]

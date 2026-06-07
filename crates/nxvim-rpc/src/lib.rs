@@ -12,8 +12,6 @@
 //! is cheap to clone and `Send + Sync`, so the reader/writer run as independent
 //! tasks and never block the consumer.
 
-pub mod syntax;
-
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 use std::sync::atomic::{AtomicU64, Ordering};

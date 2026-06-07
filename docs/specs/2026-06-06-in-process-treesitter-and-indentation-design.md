@@ -1,6 +1,8 @@
 # In-process treesitter + treesitter indentation — design
 
-**Status:** proposed. **Supersedes** the process-isolation architecture in
+**Status:** accepted; phases 1–3 implemented (worker deleted, highlighting now
+in-process and synchronous), phases 4–5 (treesitter indentation) pending.
+**Supersedes** the process-isolation architecture in
 [`2026-06-01-syntax-highlighting-design.md`](2026-06-01-syntax-highlighting-design.md)
 (highlighting *behavior* is unchanged for the user; only where the parser runs
 changes). Folds and the `vim.treesitter` Lua API are explicitly **out of scope**

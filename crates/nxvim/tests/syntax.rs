@@ -1,12 +1,13 @@
-//! Treesitter syntax highlighting, end to end through the real stack: the
-//! in-process server spawns the **real** `nxvim` binary as the crash-isolated
-//! syntax worker (`NXVIM_TS_WORKER`), which loads a grammar we compile into a
-//! temp `NXVIM_DATA_DIR` fixture. Highlighting is asynchronous, so these tests
-//! poll redraws until the spans arrive (bounded wait) rather than using a single
-//! barrier.
+//! Treesitter syntax highlighting, end to end through the real stack: the server
+//! owns an **in-process** treesitter engine that loads a grammar we compile into
+//! a temp `NXVIM_DATA_DIR` fixture. Highlighting is now synchronous — the spans
+//! are correct in the same frame as the edit — but these tests still drain to the
+//! latest redraw with a bounded poll, since the client's reader task ferries
+//! redraws onto the channel asynchronously (the harness race documented in
+//! CLAUDE.md), not because the highlights themselves lag.
 //!
-//! These tests spawn subprocesses and share process-global env, so they
-//! serialize on a single lock.
+//! These tests share process-global env (`NXVIM_DATA_DIR`), so they serialize on
+//! a single lock.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, ScrollHarness, View};
+use nxvim_tui::{paint, View};
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
@@ -67,9 +68,7 @@ fn fixture_data_dir() -> &'static Path {
         )
         .unwrap();
 
-        // The worker is the real nxvim binary; point the server at it (the test
-        // binary, not nxvim, is this process's current_exe).
-        std::env::set_var("NXVIM_TS_WORKER", env!("CARGO_BIN_EXE_nxvim"));
+        // The engine loads grammars + queries from here, in-process.
         std::env::set_var("NXVIM_DATA_DIR", &dir);
         dir
     })
@@ -100,7 +99,7 @@ fn home_dir() -> PathBuf {
 
 // ----- server harness -------------------------------------------------------
 
-/// Start a server (worker spawning enabled) editing `file`, attach a UI.
+/// Start a server editing `file` (in-process treesitter engine), attach a UI.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
     start_with(file, Vec::new()).await
 }
@@ -274,6 +273,18 @@ async fn wait_for_highlights(
     highlights_of(&params)
 }
 
+/// Write `content` to a fresh temp `.rs` file and return its path as a string.
+fn temp_rs(name: &str, content: &str) -> String {
+    temp_file(name, "rs", content)
+}
+
+/// Write `content` to a fresh temp file with extension `ext`; return its path.
+fn temp_file(name: &str, ext: &str, content: &str) -> String {
+    let path = std::env::temp_dir().join(format!("nxvim-ts-{}-{}.{ext}", std::process::id(), name));
+    std::fs::write(&path, content).unwrap();
+    path.display().to_string()
+}
+
 /// The `message` line from a redraw map (empty if absent).
 fn message_of(params: &[Value]) -> String {
     let Some(Value::Map(map)) = params.first() else {
@@ -286,21 +297,14 @@ fn message_of(params: &[Value]) -> String {
         .to_string()
 }
 
-/// Write `content` to a fresh temp `.rs` file and return its path as a string.
-fn temp_rs(name: &str, content: &str) -> String {
-    let path = std::env::temp_dir().join(format!("nxvim-ts-{}-{}.rs", std::process::id(), name));
-    std::fs::write(&path, content).unwrap();
-    path.display().to_string()
-}
-
 // ----- tests ----------------------------------------------------------------
 
 #[tokio::test]
-async fn an_edit_proactively_repaints_coalesced_highlights() {
-    // R7: worker events are now coalesced — a burst of replies costs one redraw
-    // instead of one per reply. This guards that coalescing never *loses* the
-    // final proactive repaint: after an edit, the worker replies asynchronously
-    // and the new line must light up with no further client interaction.
+async fn an_edit_repaints_highlights_same_frame() {
+    // In-process highlighting is synchronous: the redraw the server emits in
+    // response to an edit already carries the spans for the edited text — no
+    // second, async catch-up frame. This guards that an edit's *own* redraw
+    // lights up a freshly-inserted line with no further client interaction.
     let _guard = test_lock().lock().await;
     fixture_data_dir();
     let file = temp_rs("burst", "fn a() {}\n");
@@ -312,16 +316,14 @@ async fn an_edit_proactively_repaints_coalesced_highlights() {
     })
     .await;
 
-    // Open a line above and type a fresh function in one rapid burst, then leave
-    // insert mode. The buffer is now two lines; crucially the *original* `fn a()`
-    // moves to row 1, which carried no highlight before — a post-edit-only
-    // discriminator. Each inserted char is its own edit → a flurry of worker
-    // replies that get coalesced into (ideally) one repaint.
+    // Open a line above and type a fresh function, then leave insert mode. The
+    // buffer is now two lines; crucially the *original* `fn a()` moves to row 1,
+    // which carried no highlight before — a post-edit-only discriminator.
     feed(&rpc, "ggOfn bbbbbbbb() {}<Esc>");
 
     // Wait for an *unsolicited* redraw — no `barrier`/poll requests, which would
     // themselves trigger a client-path redraw and mask a missing proactive
-    // syntax repaint — that carries the `fn` keyword on the new row 1.
+    // repaint — that carries the `fn` keyword on the new row 1.
     let mut painted = false;
     for _ in 0..150 {
         match tokio::time::timeout(Duration::from_millis(100), incoming.recv()).await {
@@ -338,12 +340,12 @@ async fn an_edit_proactively_repaints_coalesced_highlights() {
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
-            Err(_) => {} // idle tick: keep waiting for the async repaint
+            Err(_) => {} // idle tick
         }
     }
     assert!(
         painted,
-        "the async worker reply should proactively repaint row 1's `fn` keyword"
+        "the edit's own redraw should carry row 1's `fn` keyword (same-frame highlight)"
     );
 }
 
@@ -379,123 +381,6 @@ async fn a_rust_buffer_gets_treesitter_highlights() {
     assert!(
         hl.get(1).is_some_and(|row| !row.is_empty()),
         "row 1 (`let x = 42;`) should be highlighted"
-    );
-}
-
-#[tokio::test]
-async fn editing_a_huge_file_sends_only_a_tiny_delta() {
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    // Record what the worker receives, so we can assert delta sizes.
-    let record = std::env::temp_dir().join(format!("nxvim-ts-record-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&record);
-    std::env::set_var("NXVIM_TS_RECORD", &record);
-
-    // A genuinely large buffer.
-    let line = "fn f() { let value = 123; }\n";
-    let huge = line.repeat(40_000);
-    let file = temp_rs("huge", &huge);
-
-    let (rpc, mut incoming) = start(Some(file)).await;
-    // Initial open + highlights.
-    wait_for_highlights(&rpc, &mut incoming, |hl| {
-        hl.first().is_some_and(|row| !row.is_empty())
-    })
-    .await;
-
-    // Type one character, then wait for the follow-up highlight pass.
-    feed(&rpc, "ix");
-    feed(&rpc, "<Esc>");
-    for _ in 0..40 {
-        barrier(&rpc).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if record_has_edit(&record) {
-            break;
-        }
-    }
-    std::env::remove_var("NXVIM_TS_RECORD");
-
-    let log = std::fs::read_to_string(&record).unwrap_or_default();
-    // Exactly one full-text open, sized to the file...
-    let open = log
-        .lines()
-        .find(|l| l.starts_with("ts_open"))
-        .expect("an initial ts_open");
-    let open_len: usize = open
-        .split("text=")
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| s.parse().ok())
-        .unwrap();
-    assert!(
-        open_len > 1_000_000,
-        "ts_open should carry the whole huge file, got text={open_len}"
-    );
-
-    // ...and the edit after it carries a *tiny* delta, not the file.
-    let edit = log
-        .lines()
-        .find(|l| l.starts_with("ts_edit"))
-        .expect("a ts_edit after typing");
-    let delta: usize = edit
-        .split("delta=")
-        .nth(1)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap();
-    assert!(
-        delta <= 4,
-        "typing one char into a {open_len}-byte file must send a tiny delta, got delta={delta}"
-    );
-}
-
-fn record_has_edit(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|s| s.lines().any(|l| l.starts_with("ts_edit")))
-        .unwrap_or(false)
-}
-
-#[tokio::test]
-async fn the_editor_survives_a_crashing_worker() {
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    // A `.crash` file selects the reserved `__crash` language, whose worker
-    // aborts on every open — a stand-in for a segfaulting C grammar. The server
-    // respawns it (and the circuit breaker eventually throttles the loop), but
-    // crucially the editor must stay fully responsive throughout.
-    let path = std::env::temp_dir().join(format!("nxvim-ts-{}-crash.crash", std::process::id()));
-    std::fs::write(&path, "hello\n").unwrap();
-    let (rpc, _incoming) = start(Some(path.display().to_string())).await;
-
-    // Hammer the editor with edits while the worker is busy crash-looping.
-    feed(&rpc, "ggdGiline one<CR>line two<CR>line three<Esc>");
-    barrier(&rpc).await;
-    // ...and it applied every keystroke, unaffected by the dying worker.
-    let lines = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(0u64),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("editor still responds while the worker crashes");
-    let lines: Vec<String> = match lines {
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => vec![],
-    };
-    assert_eq!(
-        lines,
-        vec![
-            "line one".to_string(),
-            "line two".to_string(),
-            "line three".to_string()
-        ]
     );
 }
 
@@ -697,10 +582,10 @@ async fn the_scroll_animation_band_is_highlighted() {
 async fn a_plain_text_buffer_has_no_highlights() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    // No path / unknown filetype: no worker, no highlights, ever.
+    // No path / unknown filetype: no grammar, no highlights, ever.
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello world<Esc>");
-    // Give any (erroneous) worker time to respond, then assert nothing appeared.
+    // Settle a few frames, then assert nothing was ever highlighted.
     for _ in 0..6 {
         barrier(&rpc).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -710,133 +595,6 @@ async fn a_plain_text_buffer_has_no_highlights() {
     assert!(
         hl.iter().all(|row| row.is_empty()),
         "a no-name buffer must never be highlighted"
-    );
-}
-
-/// True if this redraw carries a (non-nil) scroll gesture.
-fn redraw_has_scroll(params: &[Value]) -> bool {
-    window0(params)
-        .and_then(|win| win.iter().find(|(k, _)| k.as_str() == Some("scroll")))
-        .map(|(_, v)| !matches!(v, Value::Nil))
-        .unwrap_or(false)
-}
-
-/// The scroll gesture's destination top line (`to_top`), if this redraw carries
-/// one.
-fn scroll_to_top(params: &[Value]) -> Option<usize> {
-    let Value::Map(s) = window0(params)?
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("scroll"))
-        .map(|(_, v)| v)?
-    else {
-        return None;
-    };
-    s.iter()
-        .find(|(k, _)| k.as_str() == Some("to_top"))
-        .and_then(|(_, v)| v.as_u64())
-        .map(|n| n as usize)
-}
-
-/// Wait (passively — *no* `barrier`, which would itself make the server redraw)
-/// for the next `redraw` notification whose params satisfy `pred`.
-async fn next_redraw(
-    incoming: &mut UnboundedReceiver<Incoming>,
-    pred: impl Fn(&[Value]) -> bool,
-) -> Option<Vec<Value>> {
-    for _ in 0..150 {
-        while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-            if method == "redraw" && pred(&params) {
-                return Some(params);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    None
-}
-
-/// The index `N` of the `fN(...)` function on the top text row of a painted
-/// frame — i.e. the buffer line the viewport currently starts at — or `None` if
-/// the row carries no such token. The fixture names line `i` `fn fi()`, so this
-/// reads back the scroll position straight off the screen.
-fn top_fn_index(buf: &Buffer) -> Option<usize> {
-    let row: String = (0..buf.area.width)
-        .map(|x| buf.cell((x, 0)).map(|c| c.symbol()).unwrap_or(""))
-        .collect();
-    let at = row.find("fn f")? + "fn f".len();
-    row[at..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()
-}
-
-/// Smooth scrolling must survive an incidental syntax-highlight repaint.
-///
-/// On `<C-d>` the server sends one redraw carrying the `scroll` gesture (the
-/// client arms a local slide), then — because the scrolled viewport drives the
-/// syntax worker — a second redraw with the worker's highlights for the *same*
-/// destination viewport and **no** scroll gesture. The client must treat that
-/// second redraw as a repaint, not as an interruption: the slide should keep
-/// playing. Today it clears the animation, snapping straight to the destination.
-///
-/// This drives the client's real render-state machine ([`ScrollHarness`], which
-/// shares the event loop's `arm_animation`) with the actual redraws the server
-/// emits, so it pins client behavior regardless of how the server schedules its
-/// repaints.
-#[tokio::test]
-async fn a_highlight_repaint_does_not_snap_an_in_flight_scroll() {
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    // A buffer much taller than the viewport, so <C-d> is a real scroll.
-    let content: String = (0..200)
-        .map(|i| format!("fn f{i}() {{ let x = {i}; }}\n"))
-        .collect();
-    let file = temp_rs("scroll-anim", &content);
-    let (rpc, mut incoming) = start(Some(file)).await;
-
-    // Warm the worker so spans are cached and no request is in flight — the
-    // state in which a scroll fires an *immediate* highlight repaint.
-    wait_for_highlights(&rpc, &mut incoming, |hl| {
-        hl.first().is_some_and(|row| !row.is_empty())
-    })
-    .await;
-    while incoming.try_recv().is_ok() {}
-
-    // Capture the two real redraws the client would receive, in order.
-    feed(&rpc, "<C-d>");
-    let scroll = next_redraw(&mut incoming, redraw_has_scroll)
-        .await
-        .expect("a redraw carrying the scroll gesture");
-    let repaint = next_redraw(&mut incoming, |p| !redraw_has_scroll(p))
-        .await
-        .expect("a follow-up highlight repaint with no scroll gesture");
-
-    // `<C-d>` half-pages down: the viewport slides from line 0 toward `dest`.
-    let dest = scroll_to_top(&scroll).expect("scroll redraw carries a destination top");
-    assert!(dest > 0, "the scroll should move the viewport down");
-
-    // Replay the two redraws through the client's render-state machine, back to
-    // back: the slide is still near its start when the repaint lands.
-    let mut client = ScrollHarness::new();
-    client.on_redraw(&scroll);
-    assert!(client.animating(), "the scroll redraw should arm the slide");
-    let started = top_fn_index(&client.paint(COLS, ROWS)).expect("a top line");
-    assert!(
-        started < dest,
-        "the freshly-armed slide should start near the origin, not at the destination",
-    );
-
-    client.on_redraw(&repaint);
-    let top = top_fn_index(&client.paint(COLS, ROWS));
-    assert!(
-        client.animating(),
-        "a highlight repaint cleared the in-flight scroll slide (it should keep playing)",
-    );
-    assert!(
-        top.is_some_and(|n| n < dest),
-        "after the highlight repaint the slide snapped to its destination line {dest} \
-         (top line is now {top:?}) instead of continuing the slide",
     );
 }
 
@@ -875,95 +633,79 @@ async fn switching_buffers_shows_each_buffers_own_highlights() {
     assert_eq!(back[0], a_row0, "switching back to A shows A's highlights");
 }
 
-#[tokio::test]
-async fn bdelete_sends_ts_close_to_the_worker() {
-    // Deleting a buffer frees its parse state in the worker via `ts_close`.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let record = std::env::temp_dir().join(format!("nxvim-ts-close-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&record);
-    std::env::set_var("NXVIM_TS_RECORD", &record);
-
-    let a = temp_rs("close-a", "fn a() {}\n");
-    let b = temp_rs("close-b", "fn b() {}\n");
-    let (rpc, mut incoming) = start(Some(a)).await;
-    wait_for_highlights(&rpc, &mut incoming, |hl| {
-        hl.first().is_some_and(|row| !row.is_empty())
-    })
-    .await;
-    rpc.request("nvim_command", vec![Value::from(format!("e {b}"))])
-        .await
-        .expect("edit b");
-    wait_for_highlights(&rpc, &mut incoming, |hl| {
-        hl.first().is_some_and(|row| !row.is_empty())
-    })
-    .await;
-
-    // Delete the current buffer (b); the server reaps it and sends `ts_close`.
-    rpc.request("nvim_command", vec![Value::from("bd")])
-        .await
-        .expect("bdelete");
-
-    let mut closed = false;
-    for _ in 0..100 {
-        barrier(&rpc).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if std::fs::read_to_string(&record)
-            .unwrap_or_default()
-            .lines()
-            .any(|l| l.starts_with("ts_close"))
-        {
-            closed = true;
-            break;
-        }
-    }
-    std::env::remove_var("NXVIM_TS_RECORD");
-    let _ = std::fs::remove_file(&record);
-    assert!(closed, "expected a ts_close for the deleted buffer");
+/// A data dir holding a parser file that is **present but not a valid grammar**
+/// (garbage bytes — `dlopen` rejects it), under `parser/python.so`. Stands in for
+/// a corrupt / wrong-arch / ABI-mismatched installed grammar.
+fn broken_data_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nxvim-ts-broken-{}", std::process::id()));
+    let parser_dir = dir.join("parser");
+    std::fs::create_dir_all(&parser_dir).unwrap();
+    std::fs::write(parser_dir.join("python.so"), b"not a real shared object").unwrap();
+    dir
 }
 
 #[tokio::test]
-async fn an_unspawnable_worker_disables_syntax_instead_of_looping_forever() {
-    // R5: a worker binary that can't be spawned (here, a path that doesn't exist)
-    // must not retry forever in silence. The supervisor's breaker gives up after
-    // a few failures and the server tells the user once. Before the fix, spawn
-    // failures had no breaker and emitted no event — the loop retried every 1s
-    // forever and the buffer stayed silently un-highlighted.
+async fn a_broken_grammar_echoes_a_load_failure() {
+    // A grammar that is *installed but fails to load* (bad ABI / corrupt .so) is
+    // worth telling the user about — unlike a missing one. The editor surfaces it
+    // synchronously (in-process) the first time the buffer is opened in the engine.
     let _guard = test_lock().lock().await;
+    fixture_data_dir(); // establish the baseline data dir so we can restore it
+    let saved = std::env::var_os("NXVIM_DATA_DIR");
+    let broken = broken_data_dir();
+    std::env::set_var("NXVIM_DATA_DIR", &broken);
 
-    // Point the worker env at a non-existent binary just for this test, restoring
-    // it after so the sibling tests (which expect the real nxvim worker) are
-    // unaffected. The lock guarantees no other test runs while it's swapped.
-    let saved = std::env::var_os("NXVIM_TS_WORKER");
-    let bogus = std::env::temp_dir().join("nxvim-no-such-worker-binary");
-    std::env::set_var("NXVIM_TS_WORKER", &bogus);
-
-    let file = temp_rs("nospawn", "fn main() {}\n");
+    let file = temp_file("broken", "py", "x = 1\n");
     let (rpc, mut incoming) = start(Some(file)).await;
 
-    // Poll redraws until the "syntax worker unavailable" message surfaces. The
-    // breaker gives up after ~5 escalating-backoff failures (~3s), so a generous
-    // bound here is plenty.
-    let mut disabled = false;
-    for _ in 0..200 {
+    let mut seen = false;
+    for _ in 0..100 {
         barrier(&rpc).await;
         tokio::task::yield_now().await;
         if let Some(params) = drain_latest_redraw(&mut incoming) {
-            if message_of(&params).contains("highlighting disabled") {
-                disabled = true;
+            if message_of(&params).contains("failed to load") {
+                seen = true;
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Restore the data dir for the sibling tests (they expect the rust fixture).
     match saved {
-        Some(v) => std::env::set_var("NXVIM_TS_WORKER", v),
-        None => std::env::remove_var("NXVIM_TS_WORKER"),
+        Some(v) => std::env::set_var("NXVIM_DATA_DIR", v),
+        None => std::env::remove_var("NXVIM_DATA_DIR"),
     }
 
     assert!(
-        disabled,
-        "an unspawnable worker should disable syntax and message the user, not retry forever"
+        seen,
+        "a present-but-broken grammar should echo a load failure"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_grammar_is_silent() {
+    // The common case: no parser installed for the language. Highlighting is
+    // best-effort, so the buffer is silently un-highlighted — *no* error message.
+    // (The rust fixture dir has a rust grammar but no python one.)
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_file("missing", "py", "x = 1\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Settle several frames so any (erroneous) message would have appeared.
+    for _ in 0..6 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let params = drain_latest_redraw(&mut incoming).expect("a redraw");
+    assert!(
+        !message_of(&params).contains("failed to load"),
+        "a missing grammar must not echo a load failure: {:?}",
+        message_of(&params)
+    );
+    assert!(
+        highlights_of(&params).iter().all(|row| row.is_empty()),
+        "a buffer with no installed grammar must not be highlighted"
     );
 }

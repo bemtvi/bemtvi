@@ -26,6 +26,19 @@ pub struct Span {
     pub group: String,
 }
 
+/// The outcome of [`SyntaxEngine::open`]. Lets the editor surface a *genuine*
+/// grammar load failure once, while staying silent for the common, expected case
+/// of no grammar being installed for a language (best-effort highlighting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// Parsed, **or** there is simply no grammar installed for this language —
+    /// both are silent (a buffer with no grammar just isn't highlighted).
+    Ok,
+    /// A grammar **is** installed but failed to load (bad ABI, missing symbol,
+    /// unparseable query, …). Carries a human-readable reason worth echoing.
+    LoadFailed(String),
+}
+
 /// The editor's effective indent settings, passed to [`SyntaxEngine::indent`] so
 /// the engine can turn an indent *level* into a target column width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +56,10 @@ pub struct IndentParams {
 /// `highlights`/`indent` query the engine's own shadow.
 pub trait SyntaxEngine {
     /// (Re)initialize `buffer` from full `text` in `language` and parse it. Used
-    /// on open and on a whole-rope replacement (undo/redo, reload).
-    fn open(&mut self, buffer: BufferId, language: &str, text: &str);
+    /// on open and on a whole-rope replacement (undo/redo, reload). The
+    /// [`OpenOutcome`] tells the editor whether an installed grammar failed to
+    /// load (worth echoing) versus the silent no-grammar / parsed-fine cases.
+    fn open(&mut self, buffer: BufferId, language: &str, text: &str) -> OpenOutcome;
 
     /// Apply edit deltas to `buffer` and reparse **incrementally**.
     fn edit(&mut self, buffer: BufferId, edits: &[BufferEdit]);

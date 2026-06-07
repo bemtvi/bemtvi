@@ -12,7 +12,7 @@
 //! split across focused sibling modules: [`dispatch`] (the RPC surface),
 //! [`input`] (keystrokes/mappings), [`excmd`] (ex-commands), [`lifecycle`]
 //! (autocmd emission), [`effects`] (draining queued Lua side effects),
-//! [`redraw`] (View→wire projection), [`treesitter`] (syntax sync), and
+//! [`redraw`] (View→wire projection), [`treesitter`] (highlight projection), and
 //! [`lsp`] (language-server integration).
 
 mod dispatch;
@@ -24,7 +24,6 @@ mod keymap;
 mod lifecycle;
 mod lsp;
 mod redraw;
-mod syntax;
 mod treesitter;
 
 use evloop::EventLoop;
@@ -36,7 +35,6 @@ use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use syntax::SyntaxClient;
 use tokio::io::{AsyncRead, AsyncWrite};
 use treesitter::SyntaxState;
 
@@ -116,14 +114,11 @@ struct Server {
     rpc: Rpc,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
-    syntax: SyntaxClient,
-    /// Per-buffer syntax sync state, keyed by buffer id (entries created lazily
-    /// on first sync, dropped when the buffer is deleted).
+    /// Per-buffer highlight memo, keyed by buffer id (created lazily on first
+    /// redraw of a buffer, dropped when the buffer is deleted). The parse tree
+    /// itself lives in the editor's [`nxvim_core::SyntaxEngine`]; this is only the
+    /// slim span cache the redraw projects.
     syntax_states: HashMap<BufferId, SyntaxState>,
-    /// Set when a syntax event changed something the client should see. Drained
-    /// once per loop turn so a burst of worker notifications costs one `redraw`,
-    /// not one per notification.
-    syntax_dirty: bool,
     /// The in-process LSP client: spawns/supervises N language servers and
     /// bridges them to the [`LspEvent`] channel the main loop selects on.
     lsp: LspManager,
@@ -134,14 +129,15 @@ struct Server {
     /// from each `initialize` reply.
     lsp_servers: HashMap<ServerKey, ServerRuntime>,
     /// Server keys already handed to `ensure_server`, so a server is requested
-    /// once rather than on every redraw (the `SyntaxClient::ensure_started` guard).
+    /// once rather than on every redraw (a lazy-start guard).
     lsp_ensured: HashSet<ServerKey>,
     /// The next LSP client id to assign. Each `(name, root)` server gets one,
     /// stable across respawns (reused when its runtime is replaced), and it is
     /// the handle `LspAttach`'s `data.client_id` carries to Lua (Slice 3).
     next_lsp_client_id: u64,
     /// Set when an LSP event changed something the client should see (e.g. a fresh
-    /// `Initialized` that should trigger a `didOpen`). Coalesced like `syntax_dirty`.
+    /// `Initialized` that should trigger a `didOpen`). Coalesced per loop turn so a
+    /// burst of replies costs one repaint.
     lsp_dirty: bool,
     /// Monotonic generation counter stamped onto each language-feature request,
     /// so a reply whose generation is behind the latest of its kind is dropped
@@ -216,13 +212,17 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let (rpc, mut incoming) = connect(reader, writer);
 
-    let editor = match init.file {
+    let mut editor = match init.file {
         Some(path) => Editor::open_or_named(path),
         None => Editor::new(),
     };
+    // The editor owns the in-process treesitter engine and queries it
+    // synchronously for highlights (and, later, indentation). It loads
+    // installable grammars from the data dir at runtime; a buffer with no grammar
+    // simply isn't highlighted.
+    editor.set_syntax_engine(Box::new(nxvim_ts::Engine::new(nxvim_ts::data_dir())));
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
-    let (syntax, mut syntax_events) = SyntaxClient::new();
     let (lsp, mut lsp_events) = LspManager::new();
     let (evloop, mut loop_events) = EventLoop::new();
 
@@ -231,9 +231,7 @@ where
         lua,
         rpc,
         ui: None,
-        syntax,
         syntax_states: HashMap::new(),
-        syntax_dirty: false,
         lsp,
         lsp_states: HashMap::new(),
         lsp_servers: HashMap::new(),
@@ -350,21 +348,6 @@ where
                     break;
                 }
             }
-            // Highlight spans / restarts from the syntax process. Selecting here
-            // (rather than blocking on it) is what keeps the editor responsive
-            // regardless of the worker's speed or health.
-            Some(event) = syntax_events.recv() => {
-                server.on_syntax_event(event);
-                // Coalesce a burst: drain everything queued right now, then redraw
-                // at most once — a fast/flooding worker would otherwise force a
-                // full view re-projection per notification.
-                while let Ok(event) = syntax_events.try_recv() {
-                    server.on_syntax_event(event);
-                }
-                if std::mem::take(&mut server.syntax_dirty) {
-                    server.redraw();
-                }
-            }
             // Replies from the language servers (initialize handshakes, published
             // diagnostics, server exits, log messages). Selecting here keeps the
             // editor responsive regardless of any server's speed or health.
@@ -398,35 +381,10 @@ where
     Ok(())
 }
 
-/// Map a buffer's file extension to a treesitter language name. Unknown
-/// extensions (and paths with none) yield `None` — no highlighting, and no
-/// worker is spawned. This table is the seam where more languages plug in.
+/// Map a buffer's file extension to a treesitter language / filetype name (the
+/// FileType autocmd and LSP server selection use this too). Delegates to
+/// [`nxvim_core::language_of_path`] so the table lives in exactly one place — the
+/// editor needs the same mapping to drive its in-process treesitter engine.
 pub(crate) fn filetype_of(path: Option<&std::path::Path>) -> Option<&'static str> {
-    let ext = path?.extension()?.to_str()?;
-    // Test hook (debug builds only): a `.crash` file selects the reserved
-    // `__crash` language, whose worker aborts on open — used to verify the editor
-    // survives and respawns a crashed worker. Absent from release binaries.
-    #[cfg(debug_assertions)]
-    if ext == "crash" {
-        return Some("__crash");
-    }
-    Some(match ext {
-        "rs" => "rust",
-        "py" => "python",
-        "js" | "mjs" | "cjs" => "javascript",
-        "ts" => "typescript",
-        "json" => "json",
-        "toml" => "toml",
-        "md" | "markdown" => "markdown",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
-        "go" => "go",
-        "lua" => "lua",
-        "html" => "html",
-        "css" => "css",
-        "yaml" | "yml" => "yaml",
-        "zig" => "zig",
-        "sh" | "bash" => "bash",
-        _ => return None,
-    })
+    nxvim_core::language_of_path(path)
 }

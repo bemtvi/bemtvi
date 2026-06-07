@@ -349,7 +349,7 @@ pub struct CompletionItemData {
 pub enum LspEvent {
     /// A server completed (or re-completed, after a respawn) its handshake. The
     /// editor records the encoding/caps and re-`didOpen`s its buffers — this
-    /// doubles as the restart signal, the way `SyntaxEvent::Restarted` does.
+    /// doubles as the restart signal (a respawned server re-handshakes).
     Initialized {
         key: ServerKey,
         caps: ServerCaps,

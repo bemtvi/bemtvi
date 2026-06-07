@@ -23,12 +23,12 @@ pub mod view;
 
 pub use buffer::{Buffer, BufferEdit, EditBatch};
 pub use editor::{
-    command_status, BorderStyle, BufferId, CommandStatus, Cursor, Editor, FloatAnchor, FloatConfig,
-    FloatRelative, TabId, WindowConfigSpec, WindowId,
+    command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,
+    FloatAnchor, FloatConfig, FloatRelative, TabId, WindowConfigSpec, WindowId,
 };
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};
-pub use syntax::{IndentParams, Span, SyntaxEngine};
+pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
 pub use view::{PanelView, View, ViewRect, WindowView};

@@ -24,10 +24,10 @@ impl Server {
         };
         let view = self.editor.view(w, h);
 
-        // Drive the syntax process from the freshly-settled viewport, then paint
-        // with whatever spans it has returned so far (this never blocks on it).
-        self.sync_syntax(h);
-        // Drive LSP document sync for the current buffer (also non-blocking).
+        // Refresh the current buffer's highlights from the in-process engine for
+        // the freshly-settled viewport (same-frame, memoized per content+view).
+        self.refresh_highlights(h);
+        // Drive LSP document sync for the current buffer (non-blocking).
         self.sync_lsp();
 
         // Resolve every highlight span and chrome region to a concrete style here
@@ -39,11 +39,17 @@ impl Server {
         // The message line shows the diagnostic under the cursor, but only when
         // nothing more important (an error, command output) already holds it —
         // and never via `echo`, so the under-cursor text doesn't flood
-        // `:messages` on every cursor move.
-        let message = if view.message.is_empty() {
-            self.diagnostic_under_cursor().unwrap_or_default()
-        } else {
+        // `:messages` on every cursor move. A message *echoed after* `view()` ran
+        // (which consumes and clears the transient line) — e.g. a grammar load
+        // failure surfaced lazily when `refresh_highlights` first opened the
+        // buffer in the engine — is read straight off the editor so it shows this
+        // frame rather than waiting for the next keypress.
+        let message = if !view.message.is_empty() {
             view.message.clone()
+        } else if !self.editor.message.is_empty() {
+            self.editor.message.clone()
+        } else {
+            self.diagnostic_under_cursor().unwrap_or_default()
         };
 
         // Project each window: its rect, per-window text/gutter/status data, and

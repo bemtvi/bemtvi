@@ -25,13 +25,7 @@ anyhow.workspace = true
 tokio.workspace = true
 nxvim-server.workspace = true
 nxvim-tui.workspace = true
-nxvim-ts.workspace = true
 nxvim-lsp.workspace = true
-# The binary hosts the treesitter worker loop (`--__ts-worker`), so it speaks the
-# msgpack-RPC syntax wire directly; the parse logic lives in `nxvim-ts`.
-nxvim-core.workspace = true
-nxvim-rpc.workspace = true
-rmpv.workspace = true
 
 [dev-dependencies]
 ratatui.workspace = true
@@ -39,3 +33,6 @@ portable-pty.workspace = true
 vt100.workspace = true
 tree-sitter-rust.workspace = true
 serde_json.workspace = true
+# The integration tests speak the msgpack-RPC wire directly to drive the server.
+nxvim-rpc.workspace = true
+rmpv.workspace = true

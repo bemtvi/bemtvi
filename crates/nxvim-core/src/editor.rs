@@ -6,7 +6,7 @@
 //! and reads back state; it never blocks.
 
 use std::cmp::{max, min};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::buffer::{Buffer, EditBatch};
@@ -15,6 +15,7 @@ use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::{resolve_set, NumOp, Options, SetCmd, SetOp, WindowOptions};
 use crate::search::SearchRegex;
+use crate::syntax::{OpenOutcome, Span, SyntaxEngine};
 use crate::unicode;
 use crate::view::{PanelView, Separator, View};
 
@@ -1999,6 +2000,22 @@ pub struct Editor {
     /// `:sleep` and drained via [`Editor::take_sleep`]. Models a slow editor
     /// operation; the server awaits it without freezing the UI.
     pending_sleep: Option<u64>,
+
+    /// The in-process treesitter backend, or `None` in a bare-core test (or a
+    /// front end that ships no grammars). The editor owns it so highlights — and,
+    /// later, treesitter indentation — are answered **synchronously, in the same
+    /// frame** as the edit. It keeps its own shadow text per buffer, so its
+    /// methods never borrow [`Editor::buffers`]. Installed by the server via
+    /// [`Editor::set_syntax_engine`].
+    syntax: Option<Box<dyn SyntaxEngine>>,
+    /// The language each buffer was last `open`ed in the engine with, so a query
+    /// knows whether to re-`open` (first sync, or the path's language changed) vs
+    /// apply incremental `edit` deltas. Dropped when the buffer is deleted.
+    syntax_opened: HashMap<BufferId, &'static str>,
+    /// Languages whose grammar was *installed but failed to load*, already echoed
+    /// once. Dedups the failure message so opening many files of a broken-grammar
+    /// language doesn't spam (a *missing* grammar is silent and never recorded).
+    syntax_failed: HashSet<&'static str>,
 }
 
 impl Editor {
@@ -2086,6 +2103,9 @@ impl Editor {
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
             pending_sleep: None,
+            syntax: None,
+            syntax_opened: HashMap::new(),
+            syntax_failed: HashSet::new(),
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.
@@ -2182,6 +2202,94 @@ impl Editor {
     /// The id of the buffer the window currently shows.
     pub fn current_buffer_id(&self) -> BufferId {
         self.cur_buffer()
+    }
+
+    // ----- treesitter engine -----------------------------------------------
+
+    /// Install the in-process syntax backend. The server constructs the concrete
+    /// `nxvim-ts` engine at startup and hands it over; a bare-core test leaves it
+    /// `None` and simply has no highlighting / treesitter indentation.
+    pub fn set_syntax_engine(&mut self, engine: Box<dyn SyntaxEngine>) {
+        self.syntax = Some(engine);
+    }
+
+    /// Bring the engine's parse state for `buf` up to date before a query: open
+    /// it (first sync, or the path's language changed) from full text, otherwise
+    /// drain the buffer's edit journal and reparse incrementally. A buffer whose
+    /// path has no known grammar is left alone (the query returns nothing).
+    ///
+    /// Accesses `syntax` / `buffers` / `syntax_opened` as disjoint fields so the
+    /// engine's `&mut` never collides with the buffer borrow it reads text from.
+    fn sync_syntax_engine(&mut self, buf: BufferId) {
+        let Some(engine) = self.syntax.as_mut() else {
+            return;
+        };
+        let Some(open_buf) = self.buffers.map.get_mut(&buf) else {
+            return;
+        };
+        let buffer = &mut open_buf.buffer;
+        let Some(language) = language_of_path(buffer.path.as_deref()) else {
+            return; // no grammar for this path: nothing to parse
+        };
+
+        // Capture a load failure to echo *after* the engine/buffer field borrows
+        // end (so the `&mut self` echo doesn't collide with them).
+        let mut load_failure: Option<String> = None;
+
+        // A fresh buffer, or one whose language changed (`:saveas` to another
+        // extension), needs a full open; its stale journal is superseded.
+        if self.syntax_opened.get(&buf).copied() != Some(language) {
+            let _ = buffer.take_edits();
+            if let OpenOutcome::LoadFailed(reason) =
+                engine.open(buf, language, &buffer.text.to_string())
+            {
+                load_failure = Some(reason);
+            }
+            self.syntax_opened.insert(buf, language);
+        } else {
+            // Already open in this language: feed it just what changed. A
+            // whole-rope replacement (undo/redo, reload) re-opens; ordinary deltas
+            // reparse incrementally.
+            let batch = buffer.take_edits();
+            if !batch.is_empty() {
+                if batch.resync {
+                    engine.open(buf, language, &buffer.text.to_string());
+                } else {
+                    engine.edit(buf, &batch.edits);
+                }
+            }
+        }
+
+        // A grammar that is *installed but broken* (bad ABI, unparseable query) is
+        // worth surfacing — once per language, so opening many files of it doesn't
+        // spam. A *missing* grammar yields `OpenOutcome::Ok` and stays silent:
+        // highlighting is best-effort, not a missing feature.
+        if let Some(reason) = load_failure {
+            if self.syntax_failed.insert(language) {
+                self.echo(format!(
+                    "treesitter: grammar '{language}' failed to load: {reason}"
+                ));
+            }
+        }
+    }
+
+    /// Highlight spans for the line range `[first, last)` of buffer `buf`,
+    /// synced to the buffer's current content. Empty when there is no engine or
+    /// no grammar for the buffer.
+    pub fn highlights(&mut self, buf: BufferId, first: usize, last: usize) -> Vec<Span> {
+        self.sync_syntax_engine(buf);
+        match self.syntax.as_mut() {
+            Some(engine) => engine.highlights(buf, first, last),
+            None => Vec::new(),
+        }
+    }
+
+    /// Forget a deleted buffer's engine state (called from `:bdelete`).
+    fn syntax_close(&mut self, id: BufferId) {
+        if let Some(engine) = self.syntax.as_mut() {
+            engine.close(id);
+        }
+        self.syntax_opened.remove(&id);
     }
 
     /// All open buffer ids, ascending (the `nvim_list_bufs` order).
@@ -6281,6 +6389,7 @@ impl Editor {
             None
         };
         self.buffers.map.remove(&target);
+        self.syntax_close(target);
         if self.alternate == Some(target) {
             self.alternate = None;
         }
@@ -7171,6 +7280,34 @@ fn parse_count_arg(args: &str) -> usize {
         .ok()
         .filter(|n| *n > 0)
         .unwrap_or(1)
+}
+
+/// Map a file path's extension to a treesitter language / filetype name, or
+/// `None` for an unknown (or absent) extension — in which case the buffer has no
+/// highlighting and no treesitter indentation. This is the single seam where
+/// more languages plug in; the server's `filetype_of` (FileType autocmd, LSP)
+/// delegates here so the table lives in exactly one place.
+pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
+    let ext = path?.extension()?.to_str()?;
+    Some(match ext {
+        "rs" => "rust",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" => "typescript",
+        "json" => "json",
+        "toml" => "toml",
+        "md" | "markdown" => "markdown",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "go" => "go",
+        "lua" => "lua",
+        "html" => "html",
+        "css" => "css",
+        "yaml" | "yml" => "yaml",
+        "zig" => "zig",
+        "sh" | "bash" => "bash",
+        _ => return None,
+    })
 }
 
 fn parse_sleep(args: &str) -> Result<u64, String> {

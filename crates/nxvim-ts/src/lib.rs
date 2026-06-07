@@ -2,11 +2,11 @@
 //!
 //! This crate is a plain **library**: it loads **installable** grammars from
 //! disk by language (see [`loader`]) and parses **incrementally** (see
-//! [`engine`]), exposing a synchronous [`Engine`] the editor process owns and
-//! queries directly. There is no transport and no process boundary here — a host
-//! that wants crash isolation runs the engine behind one (today the `nxvim`
-//! binary still hosts it in a `--__ts-worker` child; the in-process cutover is a
-//! later phase).
+//! [`engine`]), exposing a synchronous [`Engine`] the editor owns (via
+//! `nxvim-core`'s `SyntaxEngine` trait) and queries directly, in the same frame
+//! as the keypress. There is no transport and no process boundary: a poison
+//! grammar can crash the editor (neovim's posture), bounded only by the engine's
+//! parse deadline — the tradeoff that buys synchronous highlights and indent.
 //!
 //! Grammars are loaded at runtime from a data directory laid out like neovim's
 //! `runtimepath`, so an existing nvim-treesitter `parser/` + `queries/` tree is

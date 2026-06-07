@@ -155,8 +155,8 @@ impl Server {
     /// Drive LSP document sync for the *current* buffer this frame: for a buffer a
     /// `vim.lsp.start` already bound to a server, send `didOpen`/`didChange`/
     /// `didSave` as its state requires. Called from `redraw()` alongside
-    /// `sync_syntax`. Never spawns (that is [`Server::apply_lsp_op`]) and never
-    /// blocks: every send is a fire-and-forget [`LspNotify`].
+    /// `refresh_highlights`. Never spawns (that is [`Server::apply_lsp_op`]) and
+    /// never blocks: every send is a fire-and-forget [`LspNotify`].
     pub(crate) fn sync_lsp(&mut self) {
         self.reap_closed_lsp_buffers();
 
@@ -203,8 +203,8 @@ impl Server {
 
         if !state.opened {
             // First open (or re-open after a respawn): full text supersedes any
-            // journaled deltas, so drop the LSP journal (the syntax journal is
-            // drained independently by `sync_syntax`).
+            // journaled deltas, so drop the LSP journal (the treesitter journal is
+            // drained independently when the editor queries highlights).
             let _ = self.editor.buffer_mut().take_lsp_edits();
             let text = self.editor.buffer().text.to_string();
             state.version = 1;
@@ -455,7 +455,7 @@ impl Server {
                 }
                 // A fresh (or respawned) server holds no documents: re-open every
                 // buffer bound to it on the next sync. This doubles as the restart
-                // handler, like `SyntaxEvent::Restarted`.
+                // handler.
                 for state in self.lsp_states.values_mut() {
                     if state.server.as_ref() == Some(&key) {
                         state.opened = false;
@@ -469,8 +469,7 @@ impl Server {
             } => {
                 // Cache the latest publish for the matching buffer; the redraw
                 // projects whichever buffer is current (route by `uri`, dropping
-                // a publish for a buffer closed while it was in flight, as
-                // `store_spans` drops unknown-buffer syntax replies). Mark dirty
+                // a publish for a buffer closed while it was in flight). Mark dirty
                 // so the coalesced repaint paints the new squiggles.
                 let mirror = self
                     .lsp_states

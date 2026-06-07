@@ -45,24 +45,26 @@ subsystems:
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime and the `vim.*` standard library.           |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
-| `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **treesitter syntax worker**: a separate, crash-isolated process that loads installable grammars and parses incrementally. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
-| `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. Also re-invokes itself as the syntax worker (`--__ts-worker`). |
+| `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
+| `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
 
 Dependency direction is strictly one-way:
 
 ```
-        nxvim (bin) ───────────────┐
-        /         \                │ spawns (process, not a crate edge)
- nxvim-server   nxvim-tui          ▼
-   /   |   \         \         nxvim-ts (worker mode)
-core  rpc  lua       rpc        /   \
-       \____________/        tree-sitter  rpc
+        nxvim (bin)
+        /         \
+ nxvim-server   nxvim-tui
+  / | | \           \
+core rpc lua ts     rpc
+      \_______/    /
+       tree-sitter
 ```
 
-The syntax worker is a *process* edge, not a crate dependency: `nxvim-server`
-spawns and supervises it but never links tree-sitter. See
+The treesitter engine is a normal crate dependency now: `nxvim-server`
+constructs it and installs it on the editor (which owns a `Box<dyn SyntaxEngine>`
+defined in `nxvim-core`), then queries it **synchronously** at redraw. See
 [*Syntax highlighting*](#syntax-highlighting-treesitter) below and the design at
-[`docs/specs/2026-06-01-syntax-highlighting-design.md`](specs/2026-06-01-syntax-highlighting-design.md).
+[`docs/specs/2026-06-06-in-process-treesitter-and-indentation-design.md`](specs/2026-06-06-in-process-treesitter-and-indentation-design.md).
 
 `nxvim-core` has no async, no I/O beyond file read/write, and no transport
 dependencies. That keeps the hard part — vim semantics — testable and portable,
@@ -116,10 +118,12 @@ onto a shared pool.
 
 #### Multi-source scheduling & event ordering
 
-The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **four**
-event sources against the single-threaded editor: RPC input from the UI, the
-treesitter syntax worker, the LSP manager, and the async-runtime actor
-(`evloop.rs` — timers and child processes). Each source is an mpsc channel; the
+The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **three**
+event sources against the single-threaded editor: RPC input from the UI, the LSP
+manager, and the async-runtime actor (`evloop.rs` — timers and child processes).
+Treesitter is *not* one of them — it runs in-process and is queried synchronously
+during `redraw`, so highlighting needs no channel or arm. Each source is an mpsc
+channel; the
 matching async actor (a `Send` background task) only ever ferries ids / bytes /
 durations back, never the `!Send` editor or Lua state. This is nxvim's analog of
 neovim's main-thread + worker-thread model, where workers hand results to the one
@@ -153,8 +157,8 @@ leading `biased;` that switches branch selection from random to **top-to-bottom
 in declaration order**. Adding it would make cross-source scheduling
 *deterministic* — the closest analog to neovim's multiqueue ordering — and turn
 the arm declaration order into an explicit **priority** (e.g. input first, so
-keystrokes are never delayed behind background timers/LSP/syntax; the cosmetic
-syntax arm last). It is intentionally **not** enabled today because:
+keystrokes are never delayed behind background timers/LSP). It is intentionally
+**not** enabled today because:
 
 - the current random selection is the simpler default and provides fairness for
   free, and no observed workload depends on cross-source ordering (each arm
@@ -169,9 +173,9 @@ syntax arm last). It is intentionally **not** enabled today because:
 Adopt `biased;` if a future need arises: a reproducibility requirement (a test or
 behavior that must see input drained before a same-tick timer), or a responsiveness
 bug where background work visibly preempts input. The change is one line plus a
-deliberate arm ordering — recommended order **input → LSP → loop (timers/processes)
-→ syntax** (user-facing first, purely-cosmetic last) — and must be paired with a
-starvation review of the now-highest-priority arm.
+deliberate arm ordering — recommended order **input → LSP → loop
+(timers/processes)** (user-facing first) — and must be paired with a starvation
+review of the now-highest-priority arm.
 
 ---
 
@@ -342,11 +346,11 @@ switching the window to that buffer and reporting `E37` (so you see what's
 blocking), matching neovim's last-window behavior with `hidden` buffers. `:q!` /
 `:qa!` exit unconditionally.
 
-The treesitter worker tracks each buffer independently: the server keeps a
-`SyntaxState` per `BufferId`, routes `ts_highlights` replies by id, and sends
-`ts_close` when a buffer is deleted — so switching back to a buffer paints from
-its cached parse instead of re-opening. (See
-[*Syntax highlighting*](#syntax-highlighting-treesitter).)
+The treesitter engine tracks each buffer independently: it keeps a parse tree +
+shadow text per `BufferId` (the editor owns the engine), the server memoizes the
+projected spans per `(BufferId, changedtick, viewport)`, and a `:bdelete` forgets
+both — so switching back to a buffer paints from its live parse instead of
+re-opening. (See [*Syntax highlighting*](#syntax-highlighting-treesitter).)
 
 ---
 
@@ -569,26 +573,27 @@ runtimepath, its `setup()` compiles the highlight table to Lua bytecode under
 
 nxvim is **treesitter-native only** — there is no regex/`syntax.vim` highlighter.
 All highlighting comes from [tree-sitter](https://tree-sitter.github.io) grammars
-and their `highlights.scm` queries, and is built so it **can never crash, stall,
-or even slow the editor**:
+and their `highlights.scm` queries, parsed **in-process**:
 
-- **A separate, supervised process.** Tree-sitter grammars are compiled C; a
-  buggy one can *segfault*. So parsing runs in a child process — the `nxvim`
-  binary re-invoked as `nxvim --__ts-worker` (`nxvim-ts`). The server is its RPC
-  client (same `nxvim-rpc` framing) and **respawns it** if it dies, with a
-  circuit breaker against crash-loops. The editor never links tree-sitter and
-  never blocks on the worker: redraws go out immediately with whatever spans are
-  cached, and the worker's `ts_highlights` replies arrive asynchronously as their
-  own redraw.
+- **In-process, synchronous.** The editor owns the parser (a `Box<dyn
+  SyntaxEngine>` whose trait lives in `nxvim-core`, implemented by `nxvim-ts`) and
+  queries it during `redraw`, so spans are correct in the **same frame** as the
+  keypress — no worker process, no RPC, no async catch-up frame. This is neovim's
+  posture: a buggy grammar (compiled C) can segfault the editor, a risk accepted
+  because grammars are user-installed and stable, bounded by a **parse deadline**
+  (a per-parse wall-clock budget; on expiry the last good tree is kept, costing
+  one frame of stale highlights rather than a hang). It also unblocks treesitter
+  *indentation* and the future `vim.treesitter` Lua API, both of which need a
+  synchronously-queryable tree.
 - **Installable grammars.** Grammars are not bundled; they load dynamically by
   filetype from a data directory laid out exactly like neovim's
   (`<data>/parser/<lang>.so`, `<data>/queries/<lang>/highlights.scm`), so an
   existing nvim-treesitter tree is drop-in usable.
-- **Incremental parsing.** The worker keeps a shadow buffer and a persistent
-  parse tree per buffer; the editor sends only **edit deltas** (`InputEdit`), so
-  per-edit cost scales with the edit, not the file — huge files stay responsive.
-  This rides a `Buffer` edit journal in `nxvim-core` (`changedtick` +
-  `BufferEdit`s, drained by the server each frame).
+- **Incremental parsing.** The engine keeps a shadow buffer and a persistent
+  parse tree per buffer; it applies only **edit deltas** (`InputEdit`) drained
+  from the `Buffer` edit journal in `nxvim-core` (`changedtick` + `BufferEdit`s),
+  so per-edit cost scales with the edit, not the file — huge files stay
+  responsive.
 
 The `View`/`redraw` carries the result as a per-row `highlights` array (see the
 *View protocol* above): screen-column spans tagged with a capture-group name and
@@ -597,7 +602,8 @@ resolves group → concrete style (a colorscheme's `nvim_set_hl` table, or the
 capture-fallback chain); the client paints the truecolor it is handed, falling
 back to a small built-in theme only when no colorscheme resolved a span. Full
 designs:
-[syntax highlighting](specs/2026-06-01-syntax-highlighting-design.md)
+[in-process treesitter](specs/2026-06-06-in-process-treesitter-and-indentation-design.md)
+(superseding the original [worker-based design](specs/2026-06-01-syntax-highlighting-design.md))
 and
 [the catppuccin colorscheme](specs/2026-06-01-catppuccin-colorscheme-design.md).
 
@@ -675,10 +681,10 @@ screen," and that is exactly the shape of these tests.
 - Rope-backed (ropey 2.0), byte-indexed buffers with a strict trailing-newline
   invariant — closer to vim's own byte-column model.
 - Snapshot undo rather than a persistent undo tree — for now.
-- **Treesitter highlighting in a separate, crash-isolated process** with
-  installable grammars and incremental parsing (see
-  [*Syntax highlighting*](#syntax-highlighting-treesitter)) — neovim parses
-  in-process on the main loop.
+- **In-process treesitter** with installable grammars and incremental parsing —
+  like neovim, but kept off `nxvim-core` behind a `SyntaxEngine` trait (so the
+  pure core never links tree-sitter) and bounded by a parse deadline (see
+  [*Syntax highlighting*](#syntax-highlighting-treesitter)).
 
 **Not yet implemented (roadmap).** The big-ticket items below; the granular
 `vim.*` gaps and the silent approximations live in

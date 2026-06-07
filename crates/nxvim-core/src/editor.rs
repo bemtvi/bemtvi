@@ -71,6 +71,22 @@ pub struct BufferId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WindowId(pub u64);
 
+/// Stable identifier for a tab page — a named collection of windows with its own
+/// split layout. Like [`WindowId`] / [`BufferId`] it is monotonic, 1-based, and
+/// never reused, matching neovim's tabpage handles. The first tab is allocated at
+/// startup, holding the first window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TabId(pub u64);
+
+/// One tab page in tabline order: a stable id plus, *while not active*, its
+/// stashed window layout. The active tab's layout is live on [`Editor::windows`]
+/// (the analogue of the focused window's live cursor), so its `tree` here is
+/// `None`; every inactive tab stashes its whole [`WindowTree`].
+struct TabSlot {
+    id: TabId,
+    tree: Option<WindowTree>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Register {
     text: String,
@@ -1818,10 +1834,16 @@ pub struct Editor {
     /// focused window ([`Editor::cur_buffer`]); reach its text model through
     /// [`Editor::buffer`].
     buffers: BufferStore,
-    /// The window layout — the split tree, the focused window, and per-window
-    /// view state. Phase 1 holds exactly one window; the buffer it shows is the
-    /// current buffer.
+    /// The window layout of the **active** tab — the split tree, the focused
+    /// window, and per-window view state. The buffer it shows is the current
+    /// buffer. Inactive tabs stash their own layout in [`Editor::tabs`].
     windows: WindowTree,
+    /// Every tab page in tabline order. The active tab's slot holds `None` (its
+    /// layout is live on [`Editor::windows`]); inactive tabs stash theirs. Holds
+    /// exactly one tab until the creation surface lands.
+    tabs: Vec<TabSlot>,
+    /// Index into [`Editor::tabs`] of the active tab.
+    current_tab: usize,
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
@@ -2006,6 +2028,11 @@ impl Editor {
         let mut editor = Editor {
             buffers,
             windows,
+            tabs: vec![TabSlot {
+                id: TabId(1),
+                tree: None,
+            }],
+            current_tab: 0,
             alternate: None,
             mode: Mode::Normal,
             cursor: Cursor::default(),
@@ -2253,6 +2280,60 @@ impl Editor {
             Some(id) => self.switch_buffer(id),
             None => self.echo("E23: No alternate file"),
         }
+    }
+
+    // ----- tab pages --------------------------------------------------------
+
+    /// The active tab's id (the `nvim_get_current_tabpage` target).
+    pub fn current_tab_id(&self) -> TabId {
+        self.tabs[self.current_tab].id
+    }
+
+    /// Every tab id in tabline order (the `nvim_list_tabpages` order).
+    pub fn tab_ids(&self) -> Vec<TabId> {
+        self.tabs.iter().map(|t| t.id).collect()
+    }
+
+    /// Number of open tab pages (always ≥ 1).
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Whether `id` names an open tab (`nvim_tabpage_is_valid`).
+    pub fn tab_is_valid(&self, id: TabId) -> bool {
+        self.tabs.iter().any(|t| t.id == id)
+    }
+
+    /// A tab's 1-based position in the tabline (`nvim_tabpage_get_number`), or
+    /// `None` if `id` names no open tab.
+    pub fn tab_number(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id).map(|i| i + 1)
+    }
+
+    /// The window layout backing tab `id`: the live tree for the active tab, the
+    /// stashed tree otherwise. `None` if `id` names no open tab.
+    fn tab_tree(&self, id: TabId) -> Option<&WindowTree> {
+        let idx = self.tabs.iter().position(|t| t.id == id)?;
+        if idx == self.current_tab {
+            Some(&self.windows)
+        } else {
+            self.tabs[idx].tree.as_ref()
+        }
+    }
+
+    /// Every window id in tab `id`, in the same order [`Editor::window_ids`] uses
+    /// (`nvim_tabpage_list_wins`). `None` if `id` names no open tab.
+    pub fn tab_window_ids(&self, id: TabId) -> Option<Vec<WindowId>> {
+        let tree = self.tab_tree(id)?;
+        let mut ids = tree.leaves();
+        ids.extend(tree.floats.iter().copied());
+        Some(ids)
+    }
+
+    /// The focused window of tab `id` (`nvim_tabpage_get_win`). `None` if `id`
+    /// names no open tab.
+    pub fn tab_current_window(&self, id: TabId) -> Option<WindowId> {
+        Some(self.tab_tree(id)?.current)
     }
 
     // ----- window management ------------------------------------------------

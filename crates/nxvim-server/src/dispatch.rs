@@ -4,7 +4,8 @@
 use crate::redraw::{lines_value, style_value};
 use crate::Server;
 use nxvim_core::{
-    BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec, WindowId,
+    BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId, WindowConfigSpec,
+    WindowId,
 };
 use nxvim_rpc::Incoming;
 use rmpv::Value;
@@ -258,6 +259,44 @@ impl Server {
                     Value::from(x as u64),
                 ]))
             }
+            // ----- tab pages (read-only) -----------------------------------
+            "nvim_list_tabpages" => Ok(Value::Array(
+                self.editor
+                    .tab_ids()
+                    .into_iter()
+                    .map(|id| Value::from(id.0))
+                    .collect(),
+            )),
+            "nvim_get_current_tabpage" => Ok(Value::from(self.editor.current_tab_id().0)),
+            "nvim_tabpage_is_valid" => {
+                let tab = self.resolve_tabpage(params.first());
+                Ok(Value::from(self.editor.tab_is_valid(tab)))
+            }
+            "nvim_tabpage_get_number" => {
+                let tab = self.resolve_tabpage(params.first());
+                Ok(match self.editor.tab_number(tab) {
+                    Some(n) => Value::from(n as u64),
+                    None => Value::from(0u64),
+                })
+            }
+            "nvim_tabpage_list_wins" => {
+                let tab = self.resolve_tabpage(params.first());
+                Ok(Value::Array(
+                    self.editor
+                        .tab_window_ids(tab)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|id| Value::from(id.0))
+                        .collect(),
+                ))
+            }
+            "nvim_tabpage_get_win" => {
+                let tab = self.resolve_tabpage(params.first());
+                Ok(match self.editor.tab_current_window(tab) {
+                    Some(win) => Value::from(win.0),
+                    None => Value::from(0u64),
+                })
+            }
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
             "nvim_list_bufs" => Ok(Value::Array(
                 self.editor
@@ -384,6 +423,15 @@ impl Server {
         match v.and_then(Value::as_u64) {
             Some(0) | None => self.editor.current_window_id(),
             Some(n) => WindowId(n),
+        }
+    }
+
+    /// Resolve a tabpage handle the way neovim does: `0` (or absent) is the
+    /// current tab, anything else is that handle verbatim.
+    fn resolve_tabpage(&self, v: Option<&Value>) -> TabId {
+        match v.and_then(Value::as_u64) {
+            Some(0) | None => self.editor.current_tab_id(),
+            Some(n) => TabId(n),
         }
     }
 

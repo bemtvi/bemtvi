@@ -728,11 +728,18 @@ impl Server {
                 repeat: std::time::Duration::from_millis(repeat_ms),
             }),
             LoopOp::TimerStop { id } => self.evloop.send(LoopCommand::TimerStop { id }),
-            LoopOp::Spawn { id, cmd, cwd, env } => self.evloop.send(LoopCommand::Spawn {
+            LoopOp::Spawn {
+                id,
+                cmd,
+                cwd,
+                env,
+                stdin,
+            } => self.evloop.send(LoopCommand::Spawn {
                 id,
                 argv: cmd,
                 cwd,
                 env,
+                stdin,
             }),
             LoopOp::Kill { id } => self.evloop.send(LoopCommand::Kill { id }),
         }

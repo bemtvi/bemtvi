@@ -43,11 +43,14 @@ pub enum LoopCommand {
     /// Spawn `argv` (program + args, no shell) and run callback `id` with its
     /// result when it exits. The child's pid comes back first as
     /// [`LoopEvent::ProcessSpawned`]; its result later as [`LoopEvent::ProcessExit`].
+    /// `stdin` is written to the child's standard input then closed (empty when the
+    /// caller feeds no input).
     Spawn {
         id: u64,
         argv: Vec<String>,
         cwd: Option<String>,
         env: Vec<(String, String)>,
+        stdin: Vec<u8>,
     },
     /// Terminate the async child running under `id` (a no-op if it already
     /// exited). The child is terminated via `kill_on_drop`, and its `on_exit`
@@ -172,11 +175,17 @@ async fn run_evloop(
                     h.abort();
                 }
             }
-            LoopCommand::Spawn { id, argv, cwd, env } => {
+            LoopCommand::Spawn {
+                id,
+                argv,
+                cwd,
+                env,
+                stdin,
+            } => {
                 let (kill_tx, kill_rx) = oneshot::channel();
                 procs.insert(id, kill_tx);
                 let event_tx = event_tx.clone();
-                tokio::spawn(run_process(id, argv, cwd, env, kill_rx, event_tx));
+                tokio::spawn(run_process(id, argv, cwd, env, stdin, kill_rx, event_tx));
             }
             LoopCommand::Kill { id } => {
                 // Dropping the kill sender (or sending on it) wakes the process
@@ -205,6 +214,7 @@ async fn run_process(
     argv: Vec<String>,
     cwd: Option<String>,
     env: Vec<(String, String)>,
+    stdin: Vec<u8>,
     mut kill_rx: oneshot::Receiver<()>,
     event_tx: UnboundedSender<LoopEvent>,
 ) {
@@ -221,7 +231,14 @@ async fn run_process(
     let mut command = Command::new(program);
     command
         .args(args)
-        .stdin(Stdio::null())
+        // A child fed stdin gets a real pipe (closed after the bytes are written,
+        // so it sees EOF); one with no input keeps `/dev/null` so a process that
+        // reads stdin doesn't block waiting on a tty.
+        .stdin(if stdin.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -231,7 +248,7 @@ async fn run_process(
     for (k, v) in env {
         command.env(k, v);
     }
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             // Mirror the blocking `vim._system`: a missing tool degrades to
@@ -251,6 +268,18 @@ async fn run_process(
         id,
         pid: child.id(),
     });
+    // Feed stdin (if any) from a detached task and close it, so the write runs
+    // concurrently with reading stdout/stderr — a child that echoes a large input
+    // back would otherwise deadlock (both sides blocked on full pipes).
+    if !stdin.is_empty() {
+        if let Some(mut sink) = child.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = sink.write_all(&stdin).await;
+                let _ = sink.shutdown().await; // close → the child reads EOF
+            });
+        }
+    }
     let exit = tokio::select! {
         result = child.wait_with_output() => match result {
             Ok(out) => LoopEvent::ProcessExit {

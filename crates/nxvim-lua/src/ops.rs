@@ -197,12 +197,15 @@ pub enum LoopOp {
     /// `vim.system(cmd, opts, on_exit)` with an `on_exit` — spawn `cmd` in the
     /// actor (off the server thread) and run callback `id` with the result when it
     /// exits. The pid is returned synchronously by the bridge; only the *wait* is
-    /// async.
+    /// async. `stdin` is fed to the child's standard input then closed (empty for
+    /// `vim.system`, which takes no stdin; non-empty for a `uv.spawn` pipe written
+    /// by `plenary.job`).
     Spawn {
         id: u64,
         cmd: Vec<String>,
         cwd: Option<String>,
         env: Vec<(String, String)>,
+        stdin: Vec<u8>,
     },
     /// `handle:kill(signal)` on a `vim.system` handle spawned async — terminate the
     /// child running under `id`. A no-op if it already exited. The `signal`

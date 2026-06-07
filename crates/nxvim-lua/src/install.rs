@@ -241,11 +241,23 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     vim.set(
         "_system_async",
         lua.create_function(
-            move |_, (id, cmd, cwd, env): (u64, Vec<String>, Option<String>, Option<Table>)| {
+            move |_,
+                  (id, cmd, cwd, env, stdin): (
+                u64,
+                Vec<String>,
+                Option<String>,
+                Option<Table>,
+                Option<mlua::String>,
+            )| {
                 let env = env_pairs(env)?;
-                sh.borrow_mut()
-                    .loop_ops
-                    .push(LoopOp::Spawn { id, cmd, cwd, env });
+                let stdin = stdin.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+                sh.borrow_mut().loop_ops.push(LoopOp::Spawn {
+                    id,
+                    cmd,
+                    cwd,
+                    env,
+                    stdin,
+                });
                 Ok(())
             },
         )?,

@@ -107,6 +107,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
     ("nxvim:prelude/system", include_str!("prelude/system.lua")),
     ("nxvim:prelude/uv", include_str!("prelude/uv.lua")),
+    (
+        "nxvim:prelude/uv_process",
+        include_str!("prelude/uv_process.lua"),
+    ),
     ("nxvim:prelude/timer", include_str!("prelude/timer.lua")),
     ("nxvim:prelude/lsp", include_str!("prelude/lsp.lua")),
     (

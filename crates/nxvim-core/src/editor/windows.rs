@@ -941,13 +941,16 @@ impl Editor {
     }
 
     /// Set a string global option from outside the editor (the Lua `vim.o`
-    /// bridge), the string analogue of [`Editor::set_global_option_bool`]. The one
-    /// wired string global is `statusline`; an unknown name is a no-op (the Lua
-    /// side forwards only the canonical wired set). This is the same state the
-    /// `:set statusline=…` ex path writes — the two routes share one home.
+    /// bridge), the string analogue of [`Editor::set_global_option_bool`]. The
+    /// wired string globals are `statusline` and `tabline`; an unknown name is a
+    /// no-op (the Lua side forwards only the canonical wired set). This is the same
+    /// state the `:set statusline=…` / `:set tabline=…` ex path writes — the two
+    /// routes share one home.
     pub fn set_global_option_str(&mut self, name: &str, value: &str) {
-        if name == "statusline" {
-            self.options.statusline = value.to_string();
+        match name {
+            "statusline" => self.options.statusline = value.to_string(),
+            "tabline" => self.options.tabline = value.to_string(),
+            _ => {}
         }
     }
 

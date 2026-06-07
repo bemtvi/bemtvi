@@ -95,6 +95,13 @@ pub enum Item {
     Align,
     /// `%<` — the point at which the line is truncated when it is too wide.
     Truncate,
+    /// A tabline click-region marker: `%T` / `%X` (and the numbered `%nT` /
+    /// `%nX`). In neovim these delimit the mouse-click region for a tab label or
+    /// its close button; they render to **no visible text**. nxvim's tabline is
+    /// render-only (no mouse), so the region is not tracked — the marker is parsed
+    /// (rather than erroring, so a real `'tabline'` format renders) and expands to
+    /// nothing.
+    TabRegion,
     /// `%{…}` / `%!…` / `%{%…%}` — an expression evaluated by the injected
     /// callback. `raw` is the expression text between the delimiters.
     Expr { kind: ExprKind, raw: String },
@@ -165,10 +172,10 @@ pub struct StatusSegment {
 ///
 /// Recognised `%`-items: the [`Field`] letters, `%%` (a literal `%`), `%=`
 /// (align), `%<` (truncate), highlight switches `%#Group#` / `%*` / `%0*` /
-/// `%N*`, and the expression forms `%{…}`, `%{%…%}`, `%!…`. Any other `%X`
-/// sequence is an error (no silent passthrough — an unknown item would otherwise
-/// render as misleading text), returned as a human-readable message naming the
-/// offending item.
+/// `%N*`, the tabline click regions `%T` / `%X` / `%nT` / `%nX`, and the
+/// expression forms `%{…}`, `%{%…%}`, `%!…`. Any other `%X` sequence is an error
+/// (no silent passthrough — an unknown item would otherwise render as misleading
+/// text), returned as a human-readable message naming the offending item.
 pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
     let bytes = fmt.as_bytes();
     let mut items = Vec::new();
@@ -228,6 +235,12 @@ pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
                 items.push(Item::HlSwitch(None));
                 i += 2;
             }
+            Some(b'T') | Some(b'X') => {
+                // Bare `%T` / `%X` — a tabline click-region marker (no text).
+                flush_lit!();
+                items.push(Item::TabRegion);
+                i += 2;
+            }
             Some(b'!') => {
                 // `%!expr` — the whole statusline is the eval result. The
                 // expression runs to the end of the format string.
@@ -246,23 +259,41 @@ pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
                 i += consumed;
             }
             Some(d) if d.is_ascii_digit() => {
-                // `%N*` (highlight) — `%0*` resets, `%1*`..`%9*` select User{N}.
-                // (A digit not followed by `*` would be a width prefix, which v1
-                // does not support — flagged as an error below.)
-                if bytes.get(i + 2).copied() == Some(b'*') {
-                    flush_lit!();
-                    let group = if d == b'0' {
-                        None
-                    } else {
-                        Some(format!("User{}", (d - b'0')))
-                    };
-                    items.push(Item::HlSwitch(group));
-                    i += 3;
-                } else {
-                    return Err(format!(
-                        "statusline: width-prefixed items (%{}…) are not supported yet",
-                        d as char
-                    ));
+                // A `%`-item carrying a leading number: `%N*` (User highlight) or
+                // the numbered tabline regions `%nT` / `%nX`. Read the whole digit
+                // run, then dispatch on the letter that closes it.
+                let mut j = i + 1;
+                while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                    j += 1;
+                }
+                match bytes.get(j).copied() {
+                    // `%N*` (highlight) — `%0*` resets, `%1*`..`%9*` select
+                    // User{N}. Single digit only, as in neovim.
+                    Some(b'*') if j == i + 2 => {
+                        flush_lit!();
+                        let group = if d == b'0' {
+                            None
+                        } else {
+                            Some(format!("User{}", (d - b'0')))
+                        };
+                        items.push(Item::HlSwitch(group));
+                        i = j + 1;
+                    }
+                    // `%nT` / `%nX` — a numbered tabline click region (e.g. `%1T`
+                    // the tab-1 label, `%999X` the close button). No visible text.
+                    Some(b'T') | Some(b'X') => {
+                        flush_lit!();
+                        items.push(Item::TabRegion);
+                        i = j + 1;
+                    }
+                    // A digit prefix on any other item is a width field, which v1
+                    // does not support.
+                    _ => {
+                        return Err(format!(
+                            "statusline: width-prefixed items (%{}…) are not supported yet",
+                            d as char
+                        ));
+                    }
                 }
             }
             Some(f) => {
@@ -388,6 +419,9 @@ fn expand_into(
             Item::HlSwitch(g) => *group = g.clone(),
             Item::Align => out.push(Piece::Align),
             Item::Truncate => out.push(Piece::Truncate),
+            // A tabline click region is a no-op in render-only mode: it carries no
+            // text and no structural marker, so it contributes nothing.
+            Item::TabRegion => {}
             Item::Expr { kind, raw } => {
                 let result = eval(*kind, raw);
                 match kind {
@@ -1007,6 +1041,38 @@ mod tests {
         assert_eq!(render("abcdef%<gh", &c, 4), "abc>");
         assert_eq!(render("abcdef%<gh", &c, 5), "abcd>");
         assert_eq!(render("LONGPREFIX%<x", &c, 3), "LO>");
+    }
+
+    // --- Tabline click regions (`%T` / `%X` / `%nT` / `%nX`) ---
+
+    #[test]
+    fn tab_regions_render_nothing() {
+        let c = ctx();
+        // Bare and numbered tab/close regions carry no visible text; the literals
+        // around them survive.
+        assert_eq!(render("%1T one %T", &c, 0), " one ");
+        assert_eq!(render("%999Xclose", &c, 0), "close");
+        assert_eq!(render("%Tab%Xcd", &c, 0), "abcd"); // %T, then ab, then %X, then cd
+                                                       // Each region's highlight is set by the surrounding `%#…#`, not the marker.
+        assert_eq!(
+            segments("%#A#%1T x %#B#%2T y %T%#C#%999Xz", &c, 0),
+            vec![
+                (" x ".into(), Some("A".into())),
+                (" y ".into(), Some("B".into())),
+                ("z".into(), Some("C".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn width_prefix_still_errors_but_not_tab_regions() {
+        // A digit prefix on a real item is still the unsupported width field…
+        assert!(parse("%3l").is_err());
+        // …but a digit prefix on T / X is a tab region, not an error.
+        assert!(parse("%1T").is_ok());
+        assert!(parse("%999X").is_ok());
+        assert!(parse("%T").is_ok());
+        assert!(parse("%X").is_ok());
     }
 
     // --- Expressions (the injected eval callback) ---

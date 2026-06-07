@@ -63,6 +63,18 @@ impl Editor {
         Some(ids)
     }
 
+    /// The buffer shown in each window of tab `id`, parallel to
+    /// [`Editor::tab_window_ids`] (same order). Lets the server mirror an
+    /// **inactive** tab's window→buffer mapping — which the global window mirror
+    /// (current tab only) can't supply — so `vim.fn.tabpagebuflist` resolves every
+    /// tab, not just the focused one. `None` if `id` names no open tab.
+    pub fn tab_window_buffers(&self, id: TabId) -> Option<Vec<crate::BufferId>> {
+        let tree = self.tab_tree(id)?;
+        let mut ids = tree.leaves();
+        ids.extend(tree.floats.iter().copied());
+        Some(ids.into_iter().map(|w| tree.get(w).buffer).collect())
+    }
+
     /// The focused window of tab `id` (`nvim_tabpage_get_win`). `None` if `id`
     /// names no open tab.
     pub fn tab_current_window(&self, id: TabId) -> Option<WindowId> {

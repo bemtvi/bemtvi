@@ -134,6 +134,7 @@ impl Editor {
             StrOp::Query => {
                 let value = match name {
                     "statusline" => self.options.statusline.clone(),
+                    "tabline" => self.options.tabline.clone(),
                     _ => return,
                 };
                 self.echo(format!("{name}={value}"));

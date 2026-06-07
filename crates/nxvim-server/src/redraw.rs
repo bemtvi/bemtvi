@@ -53,16 +53,18 @@ impl Server {
             self.diagnostic_under_cursor().unwrap_or_default()
         };
 
-        // The global `'statusline'` format (empty ⇒ the built-in default look),
-        // read once and shared across every window's status projection.
+        // The global `'statusline'` / `'tabline'` formats (empty ⇒ the built-in
+        // look), read once and shared across the window status + tabline projection.
         let statusline_fmt = self.editor.global_options().statusline;
+        let tabline_fmt = self.editor.global_options().tabline;
 
-        // A `%{}`/`%!` statusline expression evaluates Lua that reads live editor
-        // state through the `vim.fn.*` surface (mode/cursor/buffer/window). Refresh
-        // the Rust→Lua mirror so those reads reflect this frame; skip the cost when
-        // the format has no expressions (the default look and pure-field formats
-        // compute entirely in Rust and never reach Lua).
-        if statusline_fmt.contains("%{") || statusline_fmt.contains("%!") {
+        // A `%{}`/`%!` statusline *or* tabline expression evaluates Lua that reads
+        // live editor state through the `vim.fn.*` surface (mode/cursor/buffer/
+        // window/tab). Refresh the Rust→Lua mirror so those reads reflect this
+        // frame; skip the cost when neither format has expressions (the default
+        // looks and pure-field formats compute entirely in Rust, never reaching Lua).
+        let has_expr = |f: &str| f.contains("%{") || f.contains("%!");
+        if has_expr(&statusline_fmt) || has_expr(&tabline_fmt) {
             self.push_buf_mirror();
         }
 
@@ -92,6 +94,25 @@ impl Server {
         // draws no tabline) and the active cell index.
         let tabline = Value::Array(view.tabline.iter().map(tab_value).collect());
 
+        // A custom `'tabline'` ('tabline' option non-empty), rendered through the
+        // same `%`-format engine as the statusline into one styled row spanning the
+        // full editor width — the focused window supplies the `%`-item context, as
+        // in neovim. `Nil` when the option is empty (the client formats the
+        // structured `tabline` cells itself) or the tabline isn't shown this frame
+        // (`view.tabline` empty ⇒ `showtabline` hides it). The mirror was already
+        // refreshed above when the format has expressions.
+        let tabline_segments = if tabline_fmt.is_empty() || view.tabline.is_empty() {
+            Value::Nil
+        } else {
+            self.render_statusline(
+                &view.focused().status_ctx,
+                w,
+                &view.mode_label,
+                &tabline_fmt,
+                &mut styles,
+            )
+        };
+
         // The insert-mode completion popup, `Nil` when none is open. The focused
         // window's text-area width (its width minus its number gutter) bounds the
         // overlay so it can't spill past the editable region.
@@ -114,6 +135,7 @@ impl Server {
             (Value::from("global_status"), global_status),
             (Value::from("separators"), separators),
             (Value::from("tabline"), tabline),
+            (Value::from("tabline_segments"), tabline_segments),
             (
                 Value::from("current_tab"),
                 Value::from(view.current_tab as u64),

@@ -92,6 +92,7 @@ local O_GLOBAL = {
   showtabline = "showtabline", stal = "showtabline",
   laststatus = "laststatus", ls = "laststatus",
   statusline = "statusline", stl = "statusline",
+  tabline = "tabline", tal = "tabline",
 }
 -- Core defaults, the safety net before the server has pushed the mirror.
 local O_GLOBAL_DEFAULT = {
@@ -99,6 +100,7 @@ local O_GLOBAL_DEFAULT = {
   hlsearch = true, incsearch = true, showtabline = 1,
   laststatus = 2,
   statusline = "",
+  tabline = "",
 }
 
 -- Rust→Lua mirror of the core's global option values, refreshed by the server
@@ -363,6 +365,34 @@ function vim.split(s, sep, opts)
     while #parts > 0 and parts[1] == "" do table.remove(parts, 1) end
   end
   return parts
+end
+
+-- vim.spairs(t): pairs() in sorted-key order. Neovim's stable-iteration helper —
+-- a custom `'tabline'`/`str_join` uses it so output order is deterministic.
+function vim.spairs(t)
+  local keys = {}
+  for k in pairs(t) do keys[#keys + 1] = k end
+  table.sort(keys)
+  local i = 0
+  return function()
+    i = i + 1
+    local k = keys[i]
+    if k ~= nil then return k, t[k] end
+  end
+end
+
+-- vim.print(...): pretty-print each argument (via vim.inspect) on the message
+-- line and return them unchanged, so it can wrap a value inline. Strings print
+-- verbatim; tables are inspected.
+function vim.print(...)
+  local n = select("#", ...)
+  local parts = {}
+  for i = 1, n do
+    local v = select(i, ...)
+    parts[i] = type(v) == "string" and v or vim.inspect(v)
+  end
+  print(table.concat(parts, "\n"))
+  return ...
 end
 
 -- ----- minimal vim.iter ------------------------------------------------------

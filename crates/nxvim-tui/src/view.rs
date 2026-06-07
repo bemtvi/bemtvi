@@ -115,6 +115,11 @@ pub struct View {
     /// The tab pages, in tabline order — empty when only one tab is open (no
     /// tabline is drawn). When non-empty, `current_tab` indexes the active cell.
     pub(crate) tabline: Vec<TabData>,
+    /// A custom `'tabline'` rendered by the server's `%`-format engine into styled
+    /// segments spanning the editor width. Empty when no `'tabline'` is set (the
+    /// client then formats the [`TabData`] cells itself); when non-empty it is
+    /// painted in place of those cells on the same reserved top row.
+    pub(crate) tabline_segments: Vec<StatusSegment>,
     /// Index into `tabline` of the active tab (meaningful only when `tabline` is
     /// non-empty).
     pub(crate) current_tab: usize,
@@ -245,6 +250,7 @@ impl View {
         // The global status line (`laststatus=3`); empty/absent for per-window modes.
         self.global_status = parse_status(map_get(map, "global_status"), &self.styles);
         self.tabline = parse_tabline(map_get(map, "tabline"));
+        self.tabline_segments = parse_status(map_get(map, "tabline_segments"), &self.styles);
         self.current_tab = map_u64(map, "current_tab") as usize;
         self.panel = match map_get(map, "panel") {
             Some(Value::Map(p)) => Some(PanelData {

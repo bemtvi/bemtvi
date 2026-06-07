@@ -845,11 +845,26 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
     frame.render_widget(Paragraph::new(content), area);
 }
 
-/// Render the tabline across the top row: one cell per tab, each ` {count} {name}{+} `
-/// (the window count only when >1, a `+` when the tab's buffer is modified, matching
-/// vim's default tabline). The active cell is reverse-video; the strip past the last
-/// cell is left blank (vim's `TabLineFill`). Drawn only with ≥2 tabs.
+/// Render the tabline across the top row. With a custom `'tabline'` set, the
+/// server has already rendered it into styled segments ([`View::tabline_segments`])
+/// — paint those verbatim. Otherwise fall back to the built-in cells: one per tab,
+/// each ` {count} {name}{+} ` (the window count only when >1, a `+` when the tab's
+/// buffer is modified, matching vim's default tabline), the active cell
+/// reverse-video and the strip past the last cell left blank (vim's `TabLineFill`).
 fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
+    if !view.tabline_segments.is_empty() {
+        let spans: Vec<Span> = view
+            .tabline_segments
+            .iter()
+            .map(|(text, style)| match style {
+                Some(s) => Span::styled(text.clone(), *s),
+                None => Span::raw(text.clone()),
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let mut spans: Vec<Span> = Vec::with_capacity(view.tabline.len());
     for (i, tab) in view.tabline.iter().enumerate() {
         let count = if tab.window_count > 1 {

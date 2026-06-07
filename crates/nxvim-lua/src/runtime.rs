@@ -70,6 +70,10 @@ pub struct TabMirror {
     pub id: u64,
     /// The tab's window ids, in its in-tab layout order.
     pub windows: Vec<u64>,
+    /// The buffer shown in each window, parallel to `windows`. Lets
+    /// `vim.fn.tabpagebuflist` resolve an inactive tab's buffers (the global
+    /// window mirror only carries the current tab's windows).
+    pub buffers: Vec<u64>,
     /// The tab's focused window id (`nvim_tabpage_get_win`).
     pub current_window: u64,
 }
@@ -874,16 +878,22 @@ impl LuaRuntime {
     /// before any Lua that can read options, so a read reflects the core's current
     /// value — the option's default until set, and a value set through the `:set`
     /// ex-command path (not just one written from Lua). `bufs` is
-    /// `(bufnr, tabstop, shiftwidth, softtabstop, expandtab)` per open buffer.
-    pub fn set_bo_mirror(&self, bufs: &[(u64, usize, usize, isize, bool)]) -> mlua::Result<()> {
+    /// `(bufnr, tabstop, shiftwidth, softtabstop, expandtab, modified)` per open
+    /// buffer (`modified` backs `vim.bo[n].modified`, which a `'tabline'` label
+    /// reads).
+    pub fn set_bo_mirror(
+        &self,
+        bufs: &[(u64, usize, usize, isize, bool, bool)],
+    ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
-        for (bufnr, tabstop, shiftwidth, softtabstop, expandtab) in bufs {
+        for (bufnr, tabstop, shiftwidth, softtabstop, expandtab, modified) in bufs {
             let entry = self.lua.create_table()?;
             entry.set("tabstop", *tabstop)?;
             entry.set("shiftwidth", *shiftwidth)?;
             entry.set("softtabstop", *softtabstop)?;
             entry.set("expandtab", *expandtab)?;
+            entry.set("modified", *modified)?;
             entries.set(*bufnr, entry)?;
         }
         let set: mlua::Function = vim.get("_set_bo_mirror")?;
@@ -892,16 +902,18 @@ impl LuaRuntime {
 
     /// Refresh the Rust→Lua global-option mirror (`vim._go_mirror = { ignorecase,
     /// smartcase, wrapscan, hlsearch, incsearch, showtabline, laststatus,
-    /// statusline }`) that `vim.o` reads for the wired global options. Pushed
-    /// alongside the buffer mirror before any Lua that can read options, so a read
-    /// reflects the core's current value — the default until set, and a value set
-    /// through the `:set` ex path, not just one written from Lua.
+    /// statusline, tabline }`) that `vim.o` reads for the wired global options.
+    /// Pushed alongside the buffer mirror before any Lua that can read options, so a
+    /// read reflects the core's current value — the default until set, and a value
+    /// set through the `:set` ex path, not just one written from Lua.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_go_mirror(
         &self,
         opts: (bool, bool, bool, bool, bool),
         showtabline: u8,
         laststatus: u8,
         statusline: &str,
+        tabline: &str,
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let (ignorecase, smartcase, wrapscan, hlsearch, incsearch) = opts;
@@ -914,6 +926,7 @@ impl LuaRuntime {
         entry.set("showtabline", showtabline)?;
         entry.set("laststatus", laststatus)?;
         entry.set("statusline", statusline)?;
+        entry.set("tabline", tabline)?;
         let set: mlua::Function = vim.get("_set_go_mirror")?;
         set.call(entry)
     }
@@ -953,6 +966,11 @@ impl LuaRuntime {
                 wins.set(j + 1, *w)?;
             }
             entry.set("windows", wins)?;
+            let bufs = self.lua.create_table()?;
+            for (j, b) in t.buffers.iter().enumerate() {
+                bufs.set(j + 1, *b)?;
+            }
+            entry.set("buffers", bufs)?;
             entry.set("current_window", t.current_window)?;
             tab_arr.set(i + 1, entry)?;
         }

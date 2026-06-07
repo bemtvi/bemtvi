@@ -39,6 +39,12 @@ pub struct Options {
     /// rendered by the statusline engine. Global-only for now (no per-window
     /// override). The one wired string-valued global option.
     pub statusline: String,
+    /// The `'tabline'` format string (the same `%`-format mini-language the
+    /// statusline uses, plus the `%T`/`%X` tab click-region items). Empty means
+    /// the built-in tab cells (`Vec<TabView>`); a non-empty value is parsed and
+    /// rendered by the same engine into a single styled row. A whole-line
+    /// `%!v:lua.…()` is the usual form. Global by nature (there is one tabline).
+    pub tabline: String,
 }
 
 impl Default for Options {
@@ -57,6 +63,8 @@ impl Default for Options {
             laststatus: 2,
             // No custom statusline by default — the built-in look is used.
             statusline: String::new(),
+            // No custom tabline by default — the built-in tab cells are used.
+            tabline: String::new(),
         }
     }
 }
@@ -398,6 +406,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "showtabline" | "stal" => Some(("showtabline", Num)),
         "laststatus" | "ls" => Some(("laststatus", Num)),
         "statusline" | "stl" => Some(("statusline", Str)),
+        "tabline" | "tal" => Some(("tabline", Str)),
         _ => None,
     }
 }

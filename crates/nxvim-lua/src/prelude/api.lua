@@ -327,7 +327,11 @@ end
 function vim.api.nvim_buf_get_name(bufnr)
   local cur = vim._cur_buf or { bufnr = 0, name = "" }
   if bufnr == nil or bufnr == 0 or bufnr == cur.bufnr then return cur.name end
-  return ""
+  -- A non-current buffer: resolve its name from the full buffer mirror (which
+  -- carries every open buffer), so e.g. a custom 'tabline' can name a buffer
+  -- shown in another tab. Empty for an unknown handle.
+  local b = (vim._bufs or {})[bufnr]
+  return (b and b.name) or ""
 end
 
 -- A few more vim.api the configs touch. `nvim_get_current_buf` resolves against
@@ -1043,6 +1047,40 @@ function vim.fn.winnr(arg)
     return #(vim._win_order or {})
   end
   error("winnr(): unsupported argument '" .. tostring(arg) .. "'", 2)
+end
+
+-- vim.fn.tabpagenr([arg]): the current tab page's 1-based number, or with "$" the
+-- number of tab pages — the tab analogue of winnr(). Backs the loop in a custom
+-- `'tabline'` (`for i = 1, tabpagenr('$')`). Resolves from the `vim._tabs` /
+-- vim._tab_order mirror the server pushes before evaluating the tabline.
+function vim.fn.tabpagenr(arg)
+  if arg == nil or arg == "." then
+    return vim.api.nvim_tabpage_get_number(0)
+  elseif arg == "$" then
+    return #(vim._tab_order or { vim._cur_tab or 1 })
+  end
+  error("tabpagenr(): unsupported argument '" .. tostring(arg) .. "'", 2)
+end
+
+-- vim.fn.tabpagebuflist(nr): the list of buffer numbers shown in tab page `nr`
+-- (1-based; nil/0 is the current tab), one per window in that tab — what a custom
+-- `'tabline'` label reads to find the tab's active file. Reads the tab mirror's
+-- per-window `buffers` (parallel to `windows`), which the server fills for EVERY
+-- tab — unlike the global window mirror, which only carries the current tab, so
+-- `nvim_win_get_buf` would resolve an inactive tab's window to the current buffer.
+function vim.fn.tabpagebuflist(nr)
+  local tab_id
+  if nr == nil or nr == 0 then
+    tab_id = vim._cur_tab or 1
+  else
+    tab_id = (vim._tab_order or {})[nr]
+  end
+  local t = (vim._tabs or {})[tab_id]
+  local bufs = {}
+  for _, buf in ipairs(t and t.buffers or {}) do
+    bufs[#bufs + 1] = buf
+  end
+  return bufs
 end
 
 -- (vim.fn.bufnr / bufname live in prelude/fs.lua, which loads after this chunk —

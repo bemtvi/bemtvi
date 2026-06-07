@@ -1,0 +1,26 @@
+Custom tabline playground
+=========================
+
+This buffer is open in tab 1. The line across the very top of the screen is the
+custom 'tabline' defined in init.lua — rendered by the same %-format engine the
+statusline uses.
+
+Open a second tab to see it list both:
+
+    :tabedit examples/tabs/sample.txt
+
+Now the tabline shows two labels, e.g.
+
+    1:sample.txt(exa/tab)   2:sample.txt(exa/tab)              close
+
+The active tab's label is drawn in the TabLineSel highlight; switch between them
+with gt and gT and watch the colour follow. Each label is produced by
+my_tab_label(n) in lua/myutils.lua, which:
+
+  * lists the tab's buffers with vim.fn.tabpagebuflist(n),
+  * skips side-panel buffers (NvimTree / undotree / diffpanel),
+  * shows the file tail plus a 3-char-per-segment parent-dir hint, and
+  * appends a `*` when vim.bo[bufnr].modified is true.
+
+Edit this buffer (press i, type something, then <Esc>) and the `*` appears on
+tab 1's label. Save with :w and it goes away.

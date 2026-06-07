@@ -193,6 +193,12 @@ local function bo_get(bufnr, opt)
     if mirror ~= nil and mirror[canon] ~= nil then return mirror[canon] end
     return BUF_OPT_DEFAULT[canon]
   end
+  -- `modified` is read-only buffer *state* (not a settable option), mirrored by
+  -- the server so a `'tabline'`/statusline label can read `vim.bo[n].modified`.
+  if opt == "modified" or opt == "mod" then
+    local mirror = vim._bo_mirror[bufnr]
+    return (mirror ~= nil and mirror.modified) or false
+  end
   local store = vim._bo_store[bufnr]
   if store ~= nil and store[opt] ~= nil then return store[opt] end
   if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end

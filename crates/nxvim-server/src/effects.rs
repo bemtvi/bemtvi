@@ -555,7 +555,7 @@ impl Server {
         // Buffer-local option values, mirrored so `vim.bo` / `nvim_get_option_value`
         // read the core's current value (the default until set, and values set via
         // the `:set` ex path). Cheap (three scalars per buffer), so it isn't gated.
-        let mut bo: Vec<(u64, usize, usize, isize, bool)> = Vec::new();
+        let mut bo: Vec<(u64, usize, usize, isize, bool, bool)> = Vec::new();
         // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
         // marks contribute, so a session with no decoration plugin pays nothing.
         let mut extmarks: Vec<(u64, Vec<ExtmarkMirror>)> = Vec::new();
@@ -575,7 +575,14 @@ impl Server {
             let name = self.editor.buffer_name(id).unwrap_or_default();
             if let Some(b) = self.editor.buffer_of(id) {
                 let o = b.options;
-                bo.push((id.0, o.tabstop, o.shiftwidth, o.softtabstop, o.expandtab));
+                bo.push((
+                    id.0,
+                    o.tabstop,
+                    o.shiftwidth,
+                    o.softtabstop,
+                    o.expandtab,
+                    b.modified,
+                ));
                 if !b.extmarks.is_empty() {
                     let marks = b
                         .extmarks
@@ -668,6 +675,13 @@ impl Server {
                     .into_iter()
                     .map(|w| w.0)
                     .collect(),
+                buffers: self
+                    .editor
+                    .tab_window_buffers(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| b.0)
+                    .collect(),
                 current_window: self.editor.tab_current_window(id).map(|w| w.0).unwrap_or(0),
             })
             .collect();
@@ -689,6 +703,7 @@ impl Server {
             go.showtabline,
             go.laststatus,
             &go.statusline,
+            &go.tabline,
         );
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small

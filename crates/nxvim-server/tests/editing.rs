@@ -1314,6 +1314,40 @@ async fn r_replaces_a_whole_grapheme_cluster() {
 }
 
 #[tokio::test]
+async fn r_replaces_with_a_keymap_prefix_char_instantly() {
+    // `rg` must replace the char under the cursor with a literal `g` *now*, even
+    // though `g` is a live prefix of the native `gd`/`gD`/`gr` LSP mappings. The
+    // replacement char is an argument read literally, so it bypasses the keymap
+    // matcher; without the bypass the matcher withholds the `g` waiting to
+    // disambiguate `gd`/`gr`, and the replace appears to hang.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc<Esc>");
+    feed(&rpc, "0rg");
+    assert_eq!(lines(&rpc).await, vec!["gbc"]);
+}
+
+#[tokio::test]
+async fn counted_replace_with_a_keymap_prefix_char() {
+    // The count before `r` lives in pending and is untouched by the literal-arg
+    // bypass, so `3rg` still replaces three chars with `g` even though `g` is a
+    // native-map prefix.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabcd<Esc>");
+    feed(&rpc, "03rg");
+    assert_eq!(lines(&rpc).await, vec!["gggd"]);
+}
+
+#[tokio::test]
+async fn find_target_is_a_literal_keymap_prefix_char() {
+    // `fg` likewise reads its target char literally: it must jump to the `g`
+    // without the matcher withholding it as a `gd`/`gr` prefix.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabgde<Esc>");
+    feed(&rpc, "0fg");
+    assert_eq!(cursor(&rpc).await, (1, 2));
+}
+
+#[tokio::test]
 async fn insert_backspace_deletes_a_precomposed_char() {
     let (rpc, _incoming) = start(None).await;
     // Type "aé" (é precomposed, 2 bytes) then backspace once: the whole 'é' goes.

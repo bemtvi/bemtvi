@@ -40,7 +40,22 @@ impl Server {
     /// Run one key through the general mapping matcher and apply the steps it
     /// produces. The single path into [`Keymaps::feed`], driving the per-key
     /// [`input`](Self::input) loop.
+    ///
+    /// One key never reaches the matcher: when core is awaiting a *literal
+    /// argument* (the `r{char}` replacement, an `f`/`t`/`F`/`T` target, a `"{reg}`
+    /// name, or a text-object kind), that key is read raw — like vim's
+    /// `plain_vgetc` — straight into the editor. Otherwise the matcher would
+    /// withhold an argument such as the `g` of `rg`/`fg` as a live prefix of the
+    /// native `gd`/`gr` maps, and the command would appear to hang waiting for a
+    /// disambiguating key. The `pending_empty` guard upholds the no-reorder
+    /// invariant: a literal arg only ever follows a lead key that already left the
+    /// matcher, so nothing is withheld at this point.
     pub(crate) fn feed_matcher(&mut self, key: Key) {
+        if self.editor.awaiting_literal_arg() && self.keymaps.pending_empty() {
+            self.editor.input(key);
+            self.emit_lifecycle_events();
+            return;
+        }
         let mode = self.editor.mode;
         for step in self.keymaps.feed(mode, key) {
             self.apply_step(step);

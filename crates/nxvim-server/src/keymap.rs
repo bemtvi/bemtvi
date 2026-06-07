@@ -345,6 +345,16 @@ impl Keymaps {
         }
     }
 
+    /// Whether nothing is currently withheld in the prefix buffer. The server
+    /// checks this before bypassing the matcher for a core literal-argument key
+    /// (see [`crate::Server::feed_matcher`]): a literal arg only arises after its
+    /// lead key (`r`/`f`/`"`/…) already reached the editor, which leaves `pending`
+    /// empty — the guard makes that invariant explicit so a bypass can never
+    /// reorder past a genuinely-withheld prefix.
+    pub fn pending_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     /// Feed one input key in `mode` and return the steps it produced. The server
     /// calls this for every parsed key, executing the steps in order.
     pub fn feed(&mut self, mode: Mode, key: Key) -> Vec<Step> {

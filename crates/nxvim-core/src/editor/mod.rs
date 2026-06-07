@@ -788,6 +788,28 @@ impl Editor {
         self.pending.stage == Stage::ReplacePending
     }
 
+    /// True when the next key is consumed by core as a *literal argument* — the
+    /// `r{char}` replacement, an `f`/`t`/`F`/`T{char}` target, a `"{reg}` register
+    /// name, or an `i`/`a{kind}` text-object kind. Like vim, these argument keys are
+    /// read raw (`plain_vgetc`), **not** through the mapping layer, so the server
+    /// routes them straight to [`Self::input`] instead of the keymap matcher. This
+    /// is what keeps `rg`/`fg` instant: without it the matcher withholds the `g` as
+    /// a live prefix of the native `gd`/`gr` maps and the command appears to hang.
+    ///
+    /// `GPending` and `WindowPending` are deliberately excluded: `g`-prefix and
+    /// `<C-w>`-prefix keys *do* participate in mapping (the native `gd`/`gr`/`gg`
+    /// disambiguation, and user `<C-w>x` maps), so they must still go through the
+    /// matcher.
+    pub fn awaiting_literal_arg(&self) -> bool {
+        matches!(
+            self.pending.stage,
+            Stage::ReplacePending
+                | Stage::FindPending(_)
+                | Stage::RegisterPending
+                | Stage::TextObjectPending(_)
+        )
+    }
+
     /// The fixed end of the visual selection (the other end is [`Self::cursor`]).
     /// Only meaningful while [`Self::mode`] is a visual mode.
     pub(crate) fn visual_anchor(&self) -> Cursor {

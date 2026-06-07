@@ -272,7 +272,104 @@ end
 function vim.fn.substitute(str, pat, sub, flags)
   return vim._substitute(tostring(str), tostring(pat), tostring(sub or ""), tostring(flags or ""))
 end
-function vim.fn.setreg(_name, _value, _opts) vim._notimpl("vim.fn.setreg") end
+-- The read-only special registers `vim.fn.setreg` refuses to write: search `/`,
+-- last-insert `.`, filename `%`, last-command `:`, expression `=`, alternate `#`.
+-- nxvim can't honor a write to these (their value projects from live editor
+-- state), so it errors loud rather than storing a cell that the read path would
+-- silently shadow.
+local SETREG_READONLY = {
+  ["/"] = true, ["."] = true, ["%"] = true, [":"] = true, ["="] = true, ["#"] = true,
+}
+
+-- vim.fn.setreg(name, value [, options]): write a register. `name` "" / "@" means
+-- the unnamed register `"`. `value` is a string (charwise) or a list of strings
+-- (one per line, linewise). `options` is a string of flags: c/v charwise, l/V
+-- linewise, a/A append; b / <C-v> (blockwise) is rejected (no visual-block mode
+-- yet). An uppercase register name also appends. A string ending in a newline is
+-- linewise when no type flag forces otherwise. Returns 0 on success (1 is vim's
+-- failure code, but the failure cases here raise instead). The write is queued
+-- for the server (`vim._set_reg`) and write-through the mirror so a getreg later
+-- in the same chunk is consistent.
+function vim.fn.setreg(name, value, options)
+  name = tostring(name)
+  if name == "" or name == "@" then name = '"' end
+  local reg = name:sub(1, 1)
+  if SETREG_READONLY[reg] then
+    error("E354: Invalid register name: '" .. reg .. "'")
+  end
+
+  local linewise, append = false, false
+  local text
+  if type(value) == "table" then
+    -- A list is linewise: each item is a line, with a trailing newline so the
+    -- last item is a whole line too.
+    text = table.concat(value, "\n")
+    if #value > 0 then text = text .. "\n" end
+    linewise = true
+  else
+    text = tostring(value)
+  end
+
+  local opts = options and tostring(options) or ""
+  local type_given = false
+  for i = 1, #opts do
+    local ch = opts:sub(i, i)
+    if ch == "a" or ch == "A" then
+      append = true
+    elseif ch == "l" or ch == "V" then
+      linewise, type_given = true, true
+    elseif ch == "c" or ch == "v" then
+      linewise, type_given = false, true
+    elseif ch == "b" or ch == "\22" then
+      error("vim.fn.setreg: blockwise registers are not supported yet")
+    end
+  end
+  -- An uppercase register name appends to its lowercase store.
+  if reg:match("%u") then append = true end
+  -- A trailing newline on a plain string makes it linewise (vim), unless a flag
+  -- already decided the type.
+  if type(value) ~= "table" and not type_given and text:sub(-1) == "\n" then
+    linewise = true
+  end
+
+  local lower = reg:lower()
+  vim._registers = vim._registers or {}
+  local t = linewise and "V" or "v"
+  if append and vim._registers[lower] then
+    local prev = vim._registers[lower]
+    vim._registers[lower] = {
+      text = prev.text .. text,
+      type = (prev.type == "V" or linewise) and "V" or "v",
+    }
+  else
+    vim._registers[lower] = { text = text, type = t }
+  end
+  vim._set_reg(lower, text, linewise, append)
+  return 0
+end
+
+-- vim.fn.getreg(name [, ...]): the text stored in register `name` ("" / "@" /
+-- nil = the unnamed register), or "" when the register is empty / unset. Reads
+-- the `vim._registers` mirror the server refreshes before this chunk; an
+-- uppercase name reads its lowercase store, matching vim.
+function vim.fn.getreg(name)
+  name = tostring(name or '"')
+  if name == "" or name == "@" then name = '"' end
+  local reg = name:sub(1, 1):lower()
+  local entry = (vim._registers or {})[reg]
+  return entry and entry.text or ""
+end
+
+-- vim.fn.getregtype(name): "v" (charwise), "V" (linewise), or "" for an unknown
+-- register. An empty / unset (but valid) register is charwise -> "v", matching
+-- vim. Blockwise ("<C-v>{width}") waits on visual-block mode.
+function vim.fn.getregtype(name)
+  name = tostring(name or '"')
+  if name == "" or name == "@" then name = '"' end
+  local reg = name:sub(1, 1):lower()
+  local entry = (vim._registers or {})[reg]
+  return entry and entry.type or "v"
+end
 function vim.fn.setqflist(_list, _action, _what) vim._notimpl("vim.fn.setqflist") end
 
 -- vim.fn.input(opts[, default, completion]) / vim.fn.confirm(msg, choices, …):

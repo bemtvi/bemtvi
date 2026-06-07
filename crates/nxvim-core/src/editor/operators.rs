@@ -431,6 +431,40 @@ impl Editor {
         self.pending.register.is_some_and(is_readonly_register)
     }
 
+    /// The register file projected for the Lua `getreg` / `getregtype` mirror:
+    /// every stored cell plus the read-only specials, as `(name, text,
+    /// linewise)`. Names are the stored keys (lowercase / digit / symbol); the
+    /// server pushes this before any Lua that can read registers.
+    pub fn register_mirror(&self) -> Vec<(char, String, bool)> {
+        let mut out: Vec<(char, String, bool)> = self
+            .registers
+            .entries()
+            .into_iter()
+            .map(|(name, text, kind)| (name, text.to_string(), kind == RegKind::Line))
+            .collect();
+        for name in ['%', '/', ':'] {
+            if let Some((text, kind)) = self.register_text(Some(name)) {
+                if !text.is_empty() {
+                    out.push((name, text, kind == RegKind::Line));
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply a `vim.fn.setreg` write to the register file. The Lua bridge has
+    /// already rejected read-only specials and resolved uppercase/`a`-flag into
+    /// `append`, so this is the mechanical store (the black hole `'_'` discards
+    /// inside [`Registers::set_api`]).
+    pub fn set_register_api(&mut self, name: char, text: String, linewise: bool, append: bool) {
+        let kind = if linewise {
+            RegKind::Line
+        } else {
+            RegKind::Char
+        };
+        self.registers.set_api(name, text, kind, append);
+    }
+
     pub(crate) fn paste(&mut self, after: bool, count: usize) {
         let reg = self.pending.register;
         let (text, linewise) = match self.register_text(reg) {

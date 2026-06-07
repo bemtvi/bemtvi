@@ -16,7 +16,7 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, GlobalOptionOp, HlSet, LoopOp, LspClientData,
-    LspOp, PanelOp, RawKeymap, RawRhs, TabOp, UiInputReq, WindowOp,
+    LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, UiInputReq, WindowOp,
 };
 
 /// One window's row in the Rust→Lua window mirror, in layout order. The
@@ -172,6 +172,10 @@ pub(crate) struct Shared {
     /// Global-option writes from `vim.o` for a wired search option, drained by
     /// the server into the editor's global options after the chunk.
     pub(crate) global_ops: Vec<GlobalOptionOp>,
+    /// Register writes from `vim.fn.setreg`, drained by the server into the
+    /// editor's register file after the chunk. Reads resolve from the
+    /// `vim._registers` mirror, so only the write needs an op.
+    pub(crate) reg_ops: Vec<RegisterSetOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
@@ -468,6 +472,12 @@ impl LuaRuntime {
     /// the server to apply to the editor's global options.
     pub fn take_global_ops(&self) -> Vec<GlobalOptionOp> {
         std::mem::take(&mut self.shared.borrow_mut().global_ops)
+    }
+
+    /// Take the register writes queued by `vim.fn.setreg` since the last drain,
+    /// for the server to apply to the editor's register file.
+    pub fn take_reg_ops(&self) -> Vec<RegisterSetOp> {
+        std::mem::take(&mut self.shared.borrow_mut().reg_ops)
     }
 
     /// Take the `vim.ui.input` prompt requests queued since the last drain, for
@@ -840,6 +850,25 @@ impl LuaRuntime {
         entry.set("statusline", statusline)?;
         let set: mlua::Function = vim.get("_set_go_mirror")?;
         set.call(entry)
+    }
+
+    /// Refresh the Rust→Lua register mirror (`vim._registers[name] = { text, type
+    /// }`, `type` being `"v"` charwise / `"V"` linewise) that `vim.fn.getreg` /
+    /// `getregtype` read. Pushed alongside the buffer mirror before any Lua that
+    /// can read registers, so a read reflects the core's register file (including
+    /// the read-only specials the caller folds in). Keyed by the single-char
+    /// register name as a string.
+    pub fn set_reg_mirror(&self, regs: &[(char, String, bool)]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let entries = self.lua.create_table()?;
+        for (name, text, linewise) in regs {
+            let entry = self.lua.create_table()?;
+            entry.set("text", text.as_str())?;
+            entry.set("type", if *linewise { "V" } else { "v" })?;
+            entries.set(name.to_string(), entry)?;
+        }
+        let set: mlua::Function = vim.get("_set_reg_mirror")?;
+        set.call(entries)
     }
 
     /// Refresh the Rust→Lua tab mirror that backs `vim.api.nvim_tabpage_*` /

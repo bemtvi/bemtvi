@@ -259,6 +259,25 @@ pub enum OptionValue {
     String(String),
 }
 
+/// A register write queued by `vim.fn.setreg`, drained by the server into the
+/// live editor's register file after the chunk — the register analogue of
+/// [`BufOp`] / [`GlobalOptionOp`]. Reads (`vim.fn.getreg` / `getregtype`)
+/// resolve against the `vim._registers` mirror the server pushes before running
+/// Lua, so only the write needs an op. The Lua bridge has already rejected
+/// read-only specials and folded an uppercase name / `a` flag into `append`.
+#[derive(Clone, Debug)]
+pub struct RegisterSetOp {
+    /// Register name (lowercase / digit / `-` / `"`; never an uppercase or a
+    /// read-only special — the Lua side resolves those first).
+    pub name: char,
+    pub text: String,
+    /// Linewise (`V`) when set, charwise (`v`) otherwise. Blockwise is rejected
+    /// at the Lua bridge until visual-block mode lands.
+    pub linewise: bool,
+    /// Append to the register's current contents instead of overwriting.
+    pub append: bool,
+}
+
 /// A global (editor-wide) option mutation queued by `vim.o` for a search option
 /// (`ignorecase` / `smartcase` / `wrapscan` / `hlsearch` / `incsearch`), the
 /// global analogue of [`BufOp::SetOption`] / [`WindowOp::SetOption`]. The Lua

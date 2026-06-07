@@ -21,8 +21,8 @@ use crate::host::{
     stdpath,
 };
 use crate::ops::{
-    BufOp, ConfirmReq, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, TabOp,
-    UiInputReq, WindowOp,
+    BufOp, ConfirmReq, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, RegisterSetOp,
+    TabOp, UiInputReq, WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -895,6 +895,29 @@ pub(crate) fn install_runtime_api(
         lua.create_function(
             |_, (input, pat, sub, flags): (String, String, String, String)| {
                 vimregex::substitute(&input, &pat, &sub, &flags).map_err(mlua::Error::RuntimeError)
+            },
+        )?,
+    )?;
+
+    // `vim._set_reg(name, text, linewise, append)`: queue a [`RegisterSetOp`] for
+    // the server to apply to the editor's register file after the chunk — the
+    // write half of `vim.fn.setreg`. The Lua wrapper has already rejected
+    // read-only specials, resolved an uppercase name / `a` flag into `append`,
+    // and written through the `vim._registers` mirror for read-after-write within
+    // the chunk; this only records the deferred write.
+    let sh = shared.clone();
+    vim.set(
+        "_set_reg",
+        lua.create_function(
+            move |_, (name, text, linewise, append): (String, String, bool, bool)| {
+                let name = name.chars().next().unwrap_or('"');
+                sh.borrow_mut().reg_ops.push(RegisterSetOp {
+                    name,
+                    text,
+                    linewise,
+                    append,
+                });
+                Ok(())
             },
         )?,
     )?;

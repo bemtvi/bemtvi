@@ -30,7 +30,7 @@ mod vimregex;
 
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, GlobalOptionOp, HlSet, LoopOp, LspClientData,
-    LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs, TabOp, UiInputReq,
-    WindowOp,
+    LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp,
+    UiInputReq, WindowOp,
 };
 pub use runtime::{FloatMirror, LuaRuntime, TabMirror, WindowMirror};

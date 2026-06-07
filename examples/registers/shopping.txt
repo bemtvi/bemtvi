@@ -1,0 +1,15 @@
+Shopping & chores
+=================
+
+eggs
+bread
+coffee
+
+Try it:
+  "hp           paste the seeded charwise greeting after the cursor
+  :put t        drop the seeded two-line todo block below this line
+  <space>p      same, via the mapped key
+  :Stash        copy the current line into register "s
+  :Stashed      paste "s back below the cursor
+  :Shout        upper-case + append register "h, then "hp to see it
+  :registers    list every populated register

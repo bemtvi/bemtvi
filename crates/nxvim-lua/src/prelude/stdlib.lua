@@ -106,6 +106,15 @@ local O_GLOBAL_DEFAULT = {
 vim._go_mirror = vim._go_mirror or {}
 function vim._set_go_mirror(t) vim._go_mirror = t or {} end
 
+-- Rust→Lua mirror of the core register file, refreshed by the server
+-- (vim._set_reg_mirror) before any Lua that can read registers. Keyed by the
+-- single-char register name -> { text, type } where type is "v" (charwise) or
+-- "V" (linewise). Backs vim.fn.getreg / getregtype; vim.fn.setreg write-through
+-- mutates it directly so a read-after-write within one chunk stays consistent
+-- (core catches up when the server drains the queued RegisterSetOp).
+vim._registers = vim._registers or {}
+function vim._set_reg_mirror(t) vim._registers = t or {} end
+
 -- Arbitrary (Lua-only) global options plugins set via vim.o; the wired options
 -- live in their scope (vim.wo / vim.bo / vim._go_mirror) instead. Seeded with
 -- the few defaults colorschemes read (termguicolors / background / *blend).

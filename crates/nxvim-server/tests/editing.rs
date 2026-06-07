@@ -515,6 +515,172 @@ async fn read_only_register_refuses_a_delete() {
     assert_eq!(lines(&rpc).await, vec!["one", "two"]);
 }
 
+// ---- Phase 4: the Lua register surface (setreg / getreg / getregtype) + :put ----
+
+#[tokio::test]
+async fn setreg_then_paste_round_trips() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // `setreg` fills register `a` from Lua; `"ap` pastes it back (charwise:
+    // inserted after the cursor, which rests on the final `a` after `<Esc>`).
+    feed(&rpc, ":lua vim.fn.setreg('a', 'hi')<CR>");
+    feed(&rpc, "\"ap");
+    assert_eq!(lines(&rpc).await, vec!["alphahi"]);
+}
+
+#[tokio::test]
+async fn setreg_linewise_option_pastes_as_a_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // The `l` flag makes the register linewise, so `"ap` opens a new line below.
+    feed(&rpc, ":lua vim.fn.setreg('a', 'beta', 'l')<CR>");
+    feed(&rpc, "\"ap");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
+}
+
+#[tokio::test]
+async fn setreg_list_value_is_linewise() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // A list value is linewise, one item per line.
+    feed(&rpc, ":lua vim.fn.setreg('a', {'one', 'two'})<CR>");
+    feed(&rpc, "\"ap");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "one", "two"]);
+}
+
+#[tokio::test]
+async fn setreg_append_flag_concatenates() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ix<Esc>");
+    // The `a` flag appends to the register's current contents.
+    feed(&rpc, ":lua vim.fn.setreg('a', 'foo')<CR>");
+    feed(&rpc, ":lua vim.fn.setreg('a', 'bar', 'a')<CR>");
+    feed(&rpc, "\"ap");
+    assert_eq!(lines(&rpc).await, vec!["xfoobar"]);
+}
+
+#[tokio::test]
+async fn getreg_and_getregtype_read_the_core_register_file() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // A linewise yank into `a`; `getreg`/`getregtype` must read it from core.
+    // Route the answer back through the buffer (trailing newline trimmed) so a
+    // plain `lines()` assertion proves the read.
+    feed(&rpc, "\"ayy");
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, \
+         { vim.fn.getregtype('a') .. '|' .. (vim.fn.getreg('a'):gsub('%s+$', '')) })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec!["V|alpha"]);
+}
+
+#[tokio::test]
+async fn getregtype_is_charwise_for_an_empty_register() {
+    let (rpc, _incoming) = start(None).await;
+    // An untouched register is charwise ("v"); its contents are "".
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, \
+         { vim.fn.getregtype('z') .. '|' .. vim.fn.getreg('z') })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec!["v|"]);
+}
+
+#[tokio::test]
+async fn getreg_reads_the_search_register() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello bar<Esc>");
+    // The search sets `"/`; `getreg('/')` projects it like any read.
+    feed(&rpc, "/bar<CR>");
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { vim.fn.getreg('/') })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec!["bar"]);
+}
+
+#[tokio::test]
+async fn setreg_rejects_a_read_only_register() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // Writing the read-only filename register `%` must raise, not silently
+    // no-op: the pcall fails, so the buffer reads "ERR".
+    feed(
+        &rpc,
+        ":lua local ok = pcall(vim.fn.setreg, '%', 'x'); \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { ok and 'OK' or 'ERR' })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec!["ERR"]);
+}
+
+#[tokio::test]
+async fn put_inserts_register_below_the_current_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    // Yank "alpha" into `a`, move to the top, then `:put a` drops it below line 1
+    // as a whole line — even though the cursor sits mid-line.
+    feed(&rpc, "gg\"ayy");
+    feed(&rpc, ":put a<CR>");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "alpha", "beta"]);
+}
+
+#[tokio::test]
+async fn put_bang_inserts_above_the_current_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    feed(&rpc, "gg\"ayy");
+    // `:put!` inserts above the addressed line instead of below.
+    feed(&rpc, "G:put! a<CR>");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "alpha", "beta"]);
+}
+
+#[tokio::test]
+async fn put_of_a_charwise_register_is_still_linewise() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    // A charwise register set from Lua; `:put` inserts it as a whole line, not
+    // spliced into the current line.
+    feed(&rpc, ":lua vim.fn.setreg('a', 'beta')<CR>");
+    feed(&rpc, ":put a<CR>");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
+}
+
+/// The shipped `examples/registers/` config sources cleanly and its Lua
+/// register surface actually drives core: the seeded `"h` / `"t` registers
+/// paste, and the `:Stash` user command round-trips a line through `setreg` →
+/// `:put`. Proves the example isn't just "loads" but works end-to-end.
+#[tokio::test]
+async fn registers_example_config_runs() {
+    let dir = temp_dir("registers-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/registers/init.lua"
+    ))
+    .expect("read example init.lua");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
+
+    feed(&rpc, "ialpha<Esc>");
+    // The seeded linewise list register `"t` pastes as its own two lines.
+    feed(&rpc, ":put t<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "- buy milk", "- water plants"]
+    );
+
+    // `:Stash` writes the current line into `"s` via setreg; `:Stashed` reads it
+    // back with getreg and puts it below — a full Lua round-trip through core.
+    feed(&rpc, "gg:Stash<CR>");
+    feed(&rpc, ":Stashed<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "alpha", "- buy milk", "- water plants"]
+    );
+}
+
 #[tokio::test]
 async fn ex_write_persists_changes_to_disk() {
     let path = temp_path("write");

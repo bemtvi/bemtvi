@@ -122,6 +122,13 @@ impl Server {
                 OptionValue::String(s) => self.editor.set_global_option_str(&op.name, &s),
             }
         }
+        // Register writes from `vim.fn.setreg`: applied to the editor's register
+        // file after the chunk — the same store yanks/deletes write. The Lua side
+        // already rejected read-only specials and resolved uppercase/`a` append.
+        for op in self.lua.take_reg_ops() {
+            self.editor
+                .set_register_api(op.name, op.text, op.linewise, op.append);
+        }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
         // labelled text prompt and remember which callback awaits the result. Only
         // one prompt can be open at a time (a single command line); if several were
@@ -548,6 +555,11 @@ impl Server {
             go.showtabline,
             &go.statusline,
         );
+        // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
+        // core's current registers (stored cells + the read-only specials). Small
+        // (a handful of short strings), so it isn't gated on a dirty flag.
+        let regs = self.editor.register_mirror();
+        let _ = self.lua.set_reg_mirror(&regs);
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

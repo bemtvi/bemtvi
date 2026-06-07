@@ -306,6 +306,10 @@ impl Editor {
             }
             "d" | "de" | "del" | "dele" | "delet" | "delete" => self.ex_delete(range),
             "p" | "pr" | "pri" | "prin" | "print" => self.ex_print(range),
+            // `:[line]pu[t] [x]` inserts register `x` (default unnamed) as whole
+            // lines below the addressed line — always linewise, regardless of the
+            // register's own kind. `:put!` inserts above instead.
+            "pu" | "put" => self.ex_put(range, args, bang),
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
             // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
             "hi" | "highlight" => {
@@ -762,6 +766,49 @@ impl Editor {
         self.buffer_mut().remove(start..end);
         self.buffer_mut().normalize();
         self.cursor.line = range.lo.min(self.last_line());
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+        self.clamp_cursor();
+    }
+
+    /// `:[line]pu[t] [x]` — insert register `x` (default the unnamed register) as
+    /// whole lines below the addressed line (default the current line), or above
+    /// it with `:put!`. Always linewise: a charwise register's text is inserted as
+    /// a line regardless of its own kind, matching vim's `:put`. An empty register
+    /// reports `E353` rather than silently doing nothing.
+    fn ex_put(&mut self, range: ExRange, args: &str, above: bool) {
+        let arg = args.trim();
+        let reg = arg.chars().next();
+        let text = match self.register_text(reg) {
+            Some((text, _)) if !text.is_empty() => text,
+            _ => {
+                self.echo(format!("E353: Nothing in register {}", reg.unwrap_or('"')));
+                return;
+            }
+        };
+        self.push_undo();
+        // Force linewise: ensure the chunk is a whole number of lines so the
+        // insert can't splice into an existing line.
+        let mut chunk = text;
+        if !chunk.ends_with('\n') {
+            chunk.push('\n');
+        }
+        let line = range.hi.min(self.last_line());
+        let at = if above {
+            self.buffer().line_start(line)
+        } else {
+            self.buffer()
+                .line_start((line + 1).min(self.buffer().line_count()))
+        };
+        self.buffer_mut().insert(at, &chunk);
+        self.buffer_mut().normalize();
+        self.buffer_mut().modified = true;
+        // Cursor lands on the last inserted line, at its first non-blank (vim).
+        let inserted = chunk.matches('\n').count();
+        self.cursor.line = if above {
+            line + inserted - 1
+        } else {
+            line + inserted
+        };
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
     }

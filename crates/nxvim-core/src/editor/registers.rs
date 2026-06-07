@@ -83,6 +83,45 @@ impl Registers {
         self.cells.get(&name)
     }
 
+    /// Every stored register as `(name, text, kind)`, for the Rust→Lua mirror
+    /// `vim.fn.getreg` / `getregtype` read against. Order is unspecified (the
+    /// Lua side keys by name); read-only specials are added by the caller.
+    pub(crate) fn entries(&self) -> Vec<(char, &str, RegKind)> {
+        self.cells
+            .iter()
+            .map(|(name, cell)| (*name, cell.text.as_str(), cell.kind))
+            .collect()
+    }
+
+    /// Write a register from the `setreg()` API. Unlike a yank/delete this does
+    /// **not** mirror into the unnamed register — vim's `setreg` touches only the
+    /// named target (the unnamed register follows only via the explicit `u`
+    /// option, which Phase 4 does not wire). `append` concatenates to the
+    /// existing contents, staying linewise if either part is; the black hole
+    /// `'_'` discards. The name is folded to lowercase (uppercase append is
+    /// resolved by the caller into `append = true`).
+    pub(crate) fn set_api(&mut self, name: char, text: String, kind: RegKind, append: bool) {
+        if name == '_' {
+            return;
+        }
+        let name = name.to_ascii_lowercase();
+        if append {
+            let (mut buf, was_line) = match self.cells.get(&name) {
+                Some(cell) => (cell.text.clone(), cell.kind == RegKind::Line),
+                None => (String::new(), false),
+            };
+            buf.push_str(&text);
+            let merged = if was_line || kind == RegKind::Line {
+                RegKind::Line
+            } else {
+                kind
+            };
+            self.set(name, buf, merged);
+        } else {
+            self.set(name, text, kind);
+        }
+    }
+
     /// Write an explicitly named register: uppercase `A`–`Z` *appends* to the
     /// lowercase register (keeping it linewise if either part is), lowercase /
     /// digit / `-` overwrites. The unnamed register mirrors the result.

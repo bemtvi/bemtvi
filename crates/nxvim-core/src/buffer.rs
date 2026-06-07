@@ -1,5 +1,6 @@
 //! Text buffers, backed by a rope.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -100,6 +101,17 @@ pub struct Buffer {
     /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
     /// [`Buffer::mark_resync`]. See [`crate::extmark`].
     pub extmarks: crate::extmark::ExtmarkStore,
+    /// Buffer-local marks `a`–`z` (`m{a-z}` set, `` `{x} `` / `'{x}` jump), each a
+    /// `(line, byte-column)` position. They live on the buffer — not the window —
+    /// so they follow it across switches, matching vim. Like [`extmarks`], they are
+    /// kept current through the single edit choke point [`Buffer::record`]: a line
+    /// inserted/deleted above a mark shifts its line, text inserted/deleted earlier
+    /// in its line shifts its column, and deleting the marked line drops the mark
+    /// (so a later jump fails loudly rather than landing somewhere stale). Dropped
+    /// wholesale on [`Buffer::mark_resync`] and restored from the undo snapshot on
+    /// undo/redo, exactly as `extmarks` are. (Routing/validation lives in
+    /// [`crate::editor::marks`]; global `A`–`Z` marks live on the editor.)
+    pub marks: HashMap<char, (usize, usize)>,
 }
 
 impl Default for Buffer {
@@ -122,6 +134,7 @@ impl Buffer {
             lsp_edits: Vec::new(),
             lsp_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
+            marks: HashMap::new(),
         }
     }
 
@@ -163,6 +176,7 @@ impl Buffer {
             lsp_edits: Vec::new(),
             lsp_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
+            marks: HashMap::new(),
         })
     }
 
@@ -278,6 +292,12 @@ impl Buffer {
         // / LSP journals, which re-derive from the full text), so drop them all —
         // matching neovim losing extmarks on a destructive reload.
         self.extmarks.clear_all();
+        // Marks are byte/line positions against the old rope, just as meaningless
+        // against the wholesale-new one. Undo/redo restore them from the snapshot
+        // captured with the history point (see the editor's `restore`); a genuine
+        // reload (`:e!`) has nothing to restore from, so the marks are simply gone,
+        // matching vim clearing them on a destructive reload.
+        self.marks.clear();
         self.changedtick += 1;
         self.modified = true;
     }
@@ -304,6 +324,12 @@ impl Buffer {
     fn record(&mut self, edit: BufferEdit) {
         self.extmarks
             .shift(edit.start_byte, edit.old_end_byte, edit.new_end_byte);
+        shift_marks(
+            &mut self.marks,
+            edit.start_point,
+            edit.old_end_point,
+            edit.new_end_point,
+        );
         self.edits.push(edit.clone());
         self.lsp_edits.push(edit);
         self.changedtick += 1;
@@ -353,4 +379,57 @@ fn ensure_trailing_newline(text: &mut Rope) {
     } else if text.get_char(n - 1).map(|c| c != '\n').unwrap_or(true) {
         text.insert_char(n, '\n');
     }
+}
+
+/// Shift every buffer-local mark for an edit that replaced the region from point
+/// `s` to `oe` with new content ending at point `ne` (the `(row, byte-column)`
+/// triple of one [`BufferEdit`]). Called from the single edit choke point
+/// [`Buffer::record`], so marks stay correct across every edit path — the same
+/// arrangement `extmarks` use.
+///
+/// Marks are line-oriented, so the rule is expressed on `(row, col)` points
+/// rather than bare byte gravity:
+/// - A mark **before** the edit (`pos < s`) is untouched.
+/// - A mark **at or after** the edit's old end (`pos >= oe`) slides by the edit's
+///   row delta, and — only if it sat on the old-end row — by the column delta too.
+///   This covers a line inserted/deleted above (row shifts) and text
+///   inserted/deleted earlier in the mark's own line (column shifts), and gives a
+///   pure insertion *at* the mark right-gravity (the mark rides after inserted
+///   text), matching vim.
+/// - A mark **inside** the replaced region (`s <= pos < oe`) is dropped when its
+///   line is swallowed (`oe.row > pos.row`: a newline at or past the mark's line
+///   was deleted, so the line itself is gone — e.g. `dd` on the marked line);
+///   otherwise the edit is confined to the mark's line (`cc`, a within-line
+///   delete) and the mark collapses to the edit's start rather than vanishing.
+fn shift_marks(
+    marks: &mut HashMap<char, (usize, usize)>,
+    s: (usize, usize),
+    oe: (usize, usize),
+    ne: (usize, usize),
+) {
+    if s == oe && oe == ne {
+        return; // no-op edit (e.g. an empty insert/remove that still records)
+    }
+    marks.retain(|_, pos| {
+        if *pos < s {
+            // entirely before the edit — unaffected
+            true
+        } else if *pos >= oe {
+            let row = (pos.0 as isize + (ne.0 as isize - oe.0 as isize)) as usize;
+            let col = if pos.0 == oe.0 {
+                (pos.1 as isize + (ne.1 as isize - oe.1 as isize)) as usize
+            } else {
+                pos.1
+            };
+            *pos = (row, col);
+            true
+        } else if oe.0 > pos.0 {
+            // the mark's whole line was deleted (a newline beyond it went) — drop it
+            false
+        } else {
+            // within-line edit covering the mark column — collapse to the edit start
+            *pos = s;
+            true
+        }
+    });
 }

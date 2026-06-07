@@ -151,6 +151,10 @@ struct Snapshot {
     /// ride with the text (neovim keeps extmarks across undo) rather than being
     /// dropped by the wholesale-replace [`Buffer::mark_resync`].
     extmarks: crate::extmark::ExtmarkStore,
+    /// The buffer's `a`–`z` marks at this history point — restored on undo/redo
+    /// alongside `extmarks`, for the same reason: vim keeps marks across undo, and
+    /// the wholesale-replace [`Buffer::mark_resync`] would otherwise clear them.
+    marks: HashMap<char, (usize, usize)>,
 }
 
 /// A buffer as the editor holds it: the text [`Buffer`] plus the state vim keeps
@@ -179,11 +183,6 @@ struct OpenBuffer {
     saved_cursor: Cursor,
     saved_top: usize,
     saved_leftcol: usize,
-    /// Buffer-local marks `a`–`z` set with `m{a-z}`, each the cursor position at
-    /// the time it was set. They live on the buffer (not the window) so they
-    /// follow it across switches, matching vim. (Global `A`–`Z` marks live on the
-    /// [`Editor`]; see [`marks`].)
-    marks: HashMap<char, Cursor>,
 }
 
 impl OpenBuffer {
@@ -199,7 +198,6 @@ impl OpenBuffer {
             saved_cursor: Cursor::default(),
             saved_top: 0,
             saved_leftcol: 0,
-            marks: HashMap::new(),
         }
     }
 }

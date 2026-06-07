@@ -846,6 +846,90 @@ async fn jump_to_unset_mark_errors_loudly() {
     assert_eq!(cursor(&rpc).await, (1, 0));
 }
 
+// ----- marks (Phase 2: marks track edits) -----------------------------------
+
+#[tokio::test]
+async fn mark_shifts_down_when_a_line_is_inserted_above() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>");
+    // Mark `a` on line 3 ("gamma"), column 2.
+    feed(&rpc, "0ll");
+    assert_eq!(cursor(&rpc).await, (3, 2));
+    feed(&rpc, "ma");
+    // Open a brand-new line at the very top: every line below slides down one.
+    feed(&rpc, "ggOzeta<Esc>");
+    // The mark followed its text — `` `a `` lands on the now-line-4 "gamma" at the
+    // same column, not the stale line 3.
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (4, 2));
+}
+
+#[tokio::test]
+async fn mark_shifts_up_when_a_line_above_is_deleted() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // Mark `a` on line 4 ("delta"), column 2.
+    feed(&rpc, "0ll");
+    assert_eq!(cursor(&rpc).await, (4, 2));
+    feed(&rpc, "ma");
+    // Delete line 1: "delta" shifts up to line 3.
+    feed(&rpc, "ggdd");
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (3, 2));
+}
+
+#[tokio::test]
+async fn mark_is_dropped_when_its_line_is_deleted() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>");
+    // Mark `a` on line 3 ("gamma").
+    feed(&rpc, "0llma");
+    // Delete the marked line itself: the mark has nowhere to live and is dropped.
+    feed(&rpc, "dd");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
+    // Cursor parks on the new last line; jumping to the dropped mark errors loudly
+    // and leaves the cursor put — never a silent jump to a stale position.
+    let map = latest_after(&rpc, &mut incoming, "`a").await;
+    assert!(
+        view_str(&map, "message").contains("E20"),
+        "expected a loud 'mark not set' error after the line was deleted, got: {:?}",
+        view_str(&map, "message")
+    );
+    assert_eq!(cursor(&rpc).await, (2, 0));
+}
+
+#[tokio::test]
+async fn mark_column_shifts_when_text_is_inserted_earlier_in_its_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Mark `a` on the `w` of "world" (column 6).
+    feed(&rpc, "06l");
+    assert_eq!(cursor(&rpc).await, (1, 6));
+    feed(&rpc, "ma");
+    // Insert four characters at the start of the line: the mark slides right with
+    // its text, from column 6 to column 10.
+    feed(&rpc, "0iXYZ <Esc>");
+    assert_eq!(lines(&rpc).await, vec!["XYZ hello world"]);
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (1, 10));
+}
+
+#[tokio::test]
+async fn mark_rides_back_to_its_position_on_undo() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    // Mark `a` on line 2 ("beta"), column 1.
+    feed(&rpc, "0lma");
+    // Insert a line above, shifting the mark to line 3, then undo it.
+    feed(&rpc, "ggOinserted<Esc>");
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (3, 1));
+    // Undo restores the pre-insert text *and* the mark that rode with that state.
+    feed(&rpc, "u");
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (2, 1));
+}
+
 /// The shipped `examples/registers/` config sources cleanly and its Lua
 /// register surface actually drives core: the seeded `"h` / `"t` registers
 /// paste, and the `:Stash` user command round-trips a line through `setreg` →

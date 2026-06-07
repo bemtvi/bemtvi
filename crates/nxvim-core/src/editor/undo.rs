@@ -11,7 +11,7 @@ impl Editor {
     /// The snapshot's cursor is the live cursor when `id` is current, else the
     /// buffer's saved cursor.
     pub(crate) fn push_undo_for(&mut self, id: BufferId) {
-        let (text, cursor, seq, extmarks) = {
+        let (text, cursor, seq, extmarks, marks) = {
             let ob = self.buffers.get(id);
             let cursor = if id == self.cur_buffer() {
                 self.cursor
@@ -23,6 +23,7 @@ impl Editor {
                 cursor,
                 ob.cur_seq,
                 ob.buffer.extmarks.clone(),
+                ob.buffer.marks.clone(),
             )
         };
         let ob = self.buffers.get_mut(id);
@@ -31,6 +32,7 @@ impl Editor {
             cursor,
             seq,
             extmarks,
+            marks,
         });
         ob.redo_stack.clear();
         ob.cur_seq = ob.next_seq;
@@ -45,6 +47,7 @@ impl Editor {
             cursor: self.cursor,
             seq: self.buffers.get(self.cur_buffer()).cur_seq,
             extmarks: self.buffer().extmarks.clone(),
+            marks: self.buffer().marks.clone(),
         }
     }
 
@@ -102,10 +105,11 @@ impl Editor {
         let clean = ob.saved_seq == Some(ob.cur_seq);
         self.cursor = snap.cursor;
         self.buffer_mut().mark_resync();
-        // `mark_resync` clears extmarks (correct for a destructive reload); undo
-        // is not a reload, so restore the marks captured with this history point —
-        // they ride back to their positions in the state we're returning to.
+        // `mark_resync` clears extmarks and `a`–`z` marks (correct for a destructive
+        // reload); undo is not a reload, so restore both as captured with this
+        // history point — they ride back to their positions in the state we return to.
         self.buffer_mut().extmarks = snap.extmarks;
+        self.buffer_mut().marks = snap.marks;
         self.buffer_mut().modified = !clean;
         self.clamp_cursor();
     }

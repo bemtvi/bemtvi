@@ -206,7 +206,12 @@ As shipped:
   and walks lines via `match_forward_from` / `match_backward_before` (each its
   own haystack, so `^`/`$` anchor to line edges and the trailing-`\n` invariant
   never bites). `search_highlights` uses the same compiled regex's `find_all` per
-  visible row. **Multi-line patterns (`\n` in the pattern) are not supported.**
+  visible row. `n`/`N` navigation walks that **same non-overlapping sequence**
+  (`SearchRegex::find_from`, not a raw "leftmost match at-or-after the cursor"):
+  for a greedy pattern like `.+ab` a raw scan would re-match *starting inside* the
+  current match and `n` would crawl one grapheme deeper, so navigation instead
+  steps to the next match the highlighter actually drew (fixed post-Phase-4 in
+  `cd43f55`). **Multi-line patterns (`\n` in the pattern) are not supported.**
 - **Case.** `RegexBuilder::case_insensitive` (full Unicode folding, replacing the
   Phase 2 ASCII-only fold) seeded from the `ignorecase`/`smartcase` option; an
   inline `(?i)`/`(?-i)` in the pattern overrides it.

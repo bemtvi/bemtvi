@@ -67,7 +67,8 @@ gap. Recorded here so the sweep doesn't lose them.
   and `expandtab` drive rendering and `<Tab>`; `shiftwidth` only feeds the LSP
   indent width until the `>>`/`<<` operators land. The rest of vim's hundreds of
   options are still missing. Also: marks, folds, macros, registers beyond the
-  unnamed register, and most `:s` flags.
+  unnamed register, and `:s` substitution (the interactive `/` / `?` cursor
+  search is implemented — see the search design — but `:s` has no ex-command yet).
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written compatibility shim, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to

@@ -766,8 +766,10 @@ screen," and that is exactly the shape of these tests.
   `expandtab` (also via `:setlocal` / `vim.bo`); scoped
   `nvim_{set,get}_option_value` routes to the right scope. The bulk of vim's
   options are still missing.
-  Also mappings (`:map`), registers beyond the unnamed register, search (`/`, `?`,
-  `:s`), marks, folds, and macros.
+  Also mappings (`:map`), registers beyond the unnamed register, `:s`
+  substitution (the interactive `/` / `?` cursor search, `n`/`N`,
+  `hlsearch`/`incsearch`, and the search options are done — see
+  [the search design](specs/2026-06-02-search-design.md)), marks, folds, and macros.
 - **Per-buffer user commands.** User commands live in one global registry, so
   `nvim_buf_create_user_command(buffer, …)` currently registers *globally*
   (the buffer argument is ignored) — enough for an `on_attach` that defines a

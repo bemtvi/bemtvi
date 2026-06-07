@@ -6,7 +6,7 @@
 /// Global editor options that affect editing and search. Window-local rendering
 /// options (the number gutter) live on [`WindowOptions`]; per-buffer ones on
 /// [`BufferOptions`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Ignore case when searching (`/`, `?`, `n`, `N`).
     pub ignorecase: bool,
@@ -28,6 +28,11 @@ pub struct Options {
     /// (vim's default), `2` always. Gates both the projected `Vec<TabView>` and
     /// the top-row reservation in [`crate::Editor`]'s relayout.
     pub showtabline: u8,
+    /// The `'statusline'` format string (neovim's `%`-format mini-language).
+    /// Empty means the built-in default look; a non-empty value is parsed and
+    /// rendered by the statusline engine. Global-only for now (no per-window
+    /// override). The one wired string-valued global option.
+    pub statusline: String,
 }
 
 impl Default for Options {
@@ -42,6 +47,8 @@ impl Default for Options {
             incsearch: true,
             // Show the tabline only when more than one tab is open (vim's default).
             showtabline: 1,
+            // No custom statusline by default — the built-in look is used.
+            statusline: String::new(),
         }
     }
 }
@@ -191,20 +198,74 @@ pub enum NumOp {
     Query,
 }
 
+/// What a `:set` token does to a string-valued option (e.g. `statusline=%f`,
+/// `statusline?`, `statusline&`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrOp {
+    /// `name=value` — assign the (already unescaped) value.
+    Set(String),
+    /// `name` / `name?` — echo the current value.
+    Query,
+    /// `name&` — reset to the option's default (empty for `statusline`).
+    Reset,
+}
+
 /// A single resolved `:set` token: which canonical option, and the operation —
-/// boolean toggles ([`SetOp`]) or numeric assignments ([`NumOp`]) — depending on
-/// the option's kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// boolean toggles ([`SetOp`]), numeric assignments ([`NumOp`]), or string
+/// assignments ([`StrOp`]) — depending on the option's kind. Not `Copy` since
+/// [`SetCmd::Str`] owns its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetCmd {
     Bool { name: &'static str, op: SetOp },
     Num { name: &'static str, op: NumOp },
+    Str { name: &'static str, op: StrOp },
 }
 
-/// Whether a canonical option carries a boolean or a number.
+/// Whether a canonical option carries a boolean, a number, or a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OptKind {
     Bool,
     Num,
+    Str,
+}
+
+/// Split a `:set` argument string into tokens on **unescaped** whitespace,
+/// unescaping `\<char>` to `<char>` as it goes — vim's rule, so a value with
+/// spaces (`statusline=%f\ %l`) stays one token with the spaces intact, and a
+/// literal backslash is written `\\`. For an argument with no backslashes this
+/// is exactly `split_whitespace` (each run of spaces/tabs separates tokens, with
+/// no empty tokens), so existing `:set number rnu ts=4` parsing is unchanged.
+pub(crate) fn split_set_args(args: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut had_char = false; // distinguishes "" (no token) from a real empty token
+    let mut chars = args.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // A backslash escapes the next char (kept literally); a trailing
+                // backslash is dropped, matching vim.
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    had_char = true;
+                }
+            }
+            c if c.is_whitespace() => {
+                if had_char {
+                    tokens.push(std::mem::take(&mut cur));
+                    had_char = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                had_char = true;
+            }
+        }
+    }
+    if had_char {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 /// Resolve a single `:set` token (e.g. `number`, `nonu`, `rnu!`, `invnumber`,
@@ -217,17 +278,26 @@ enum OptKind {
 /// so a real option name that happens to start with `no` (none yet, but vim has
 /// them) is never mis-parsed as a negation.
 pub fn resolve_set(tok: &str) -> Option<SetCmd> {
-    // `name=value`: only valid for a number option.
+    // `name=value`: valid for a number or string option.
     if let Some((name, value)) = tok.split_once('=') {
         let (name, kind) = canonical(name)?;
-        if kind != OptKind::Num {
-            return None;
-        }
-        let value = value.trim().parse().ok()?;
-        return Some(SetCmd::Num {
-            name,
-            op: NumOp::Set(value),
-        });
+        return match kind {
+            OptKind::Num => {
+                let value = value.trim().parse().ok()?;
+                Some(SetCmd::Num {
+                    name,
+                    op: NumOp::Set(value),
+                })
+            }
+            // The value reaches here already unescaped by the tokenizer (`\ ` →
+            // space), so a statusline's spaces are intact. Kept verbatim (not
+            // trimmed): leading/trailing spaces in a statusline are meaningful.
+            OptKind::Str => Some(SetCmd::Str {
+                name,
+                op: StrOp::Set(value.to_string()),
+            }),
+            OptKind::Bool => None,
+        };
     }
     if let Some(name) = tok.strip_suffix('?') {
         let (name, kind) = canonical(name)?;
@@ -240,6 +310,20 @@ pub fn resolve_set(tok: &str) -> Option<SetCmd> {
                 name,
                 op: NumOp::Query,
             },
+            OptKind::Str => SetCmd::Str {
+                name,
+                op: StrOp::Query,
+            },
+        });
+    }
+    // `name&`: reset to the option's default. Only string options support it
+    // today (the bool/num reset paths aren't wired); others fall through to
+    // `None` (E518), as before.
+    if let Some(name) = tok.strip_suffix('&') {
+        let (name, kind) = canonical(name)?;
+        return (kind == OptKind::Str).then_some(SetCmd::Str {
+            name,
+            op: StrOp::Reset,
         });
     }
     if let Some(name) = tok.strip_suffix('!') {
@@ -252,7 +336,8 @@ pub fn resolve_set(tok: &str) -> Option<SetCmd> {
     }
     if let Some((name, kind)) = canonical(tok) {
         return Some(match kind {
-            // A bare boolean turns on; a bare number queries (vim shows its value).
+            // A bare boolean turns on; a bare number or string queries (vim shows
+            // its value).
             OptKind::Bool => SetCmd::Bool {
                 name,
                 op: SetOp::On,
@@ -260,6 +345,10 @@ pub fn resolve_set(tok: &str) -> Option<SetCmd> {
             OptKind::Num => SetCmd::Num {
                 name,
                 op: NumOp::Query,
+            },
+            OptKind::Str => SetCmd::Str {
+                name,
+                op: StrOp::Query,
             },
         });
     }
@@ -283,7 +372,7 @@ pub fn resolve_set(tok: &str) -> Option<SetCmd> {
 /// Map an option name or its standard abbreviation to its canonical spelling and
 /// kind.
 fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
-    use OptKind::{Bool, Num};
+    use OptKind::{Bool, Num, Str};
     match name {
         "number" | "nu" => Some(("number", Bool)),
         "relativenumber" | "rnu" => Some(("relativenumber", Bool)),
@@ -299,6 +388,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "sidescroll" | "ss" => Some(("sidescroll", Num)),
         "sidescrolloff" | "siso" => Some(("sidescrolloff", Num)),
         "showtabline" | "stal" => Some(("showtabline", Num)),
+        "statusline" | "stl" => Some(("statusline", Str)),
         _ => None,
     }
 }

@@ -1,7 +1,7 @@
 //! The `:set` command and its bool/number option-application helpers.
 
 use super::*;
-use crate::options::{resolve_set, NumOp, SetCmd, SetOp, WindowOptions};
+use crate::options::{resolve_set, split_set_args, NumOp, SetCmd, SetOp, StrOp, WindowOptions};
 
 /// Number of decimal digits in `n` (at least 1, so `0` is one digit).
 fn digit_count(n: usize) -> usize {
@@ -21,10 +21,11 @@ impl Editor {
     /// prefixes and `!`/`?` suffixes (`:set number`, `:set nonu`, `:set rnu!`) or
     /// a number option with `=value` / `?` (`:set tabstop=4`, `:set ts?`).
     pub(crate) fn ex_set(&mut self, args: &str) {
-        for tok in args.split_whitespace() {
-            match resolve_set(tok) {
+        for tok in split_set_args(args) {
+            match resolve_set(&tok) {
                 Some(SetCmd::Bool { name, op }) => self.apply_set_bool(name, op),
                 Some(SetCmd::Num { name, op }) => self.apply_set_num(name, op),
+                Some(SetCmd::Str { name, op }) => self.apply_set_str(name, op),
                 None => self.echo(format!("E518: Unknown option: {tok}")),
             }
         }
@@ -117,6 +118,24 @@ impl Editor {
                     }
                 };
                 self.echo(format!("{name}={v}"));
+            }
+        }
+    }
+
+    /// Apply one resolved string `:set` operation. The only string option today
+    /// is the global `statusline`; it routes through the shared
+    /// [`Editor::set_global_option_str`] setter so the `:set` and `vim.o` paths
+    /// share one home. `&` resets to the default (empty); `?` echoes the value.
+    fn apply_set_str(&mut self, name: &str, op: StrOp) {
+        match op {
+            StrOp::Set(value) => self.set_global_option_str(name, &value),
+            StrOp::Reset => self.set_global_option_str(name, ""),
+            StrOp::Query => {
+                let value = match name {
+                    "statusline" => self.options.statusline.clone(),
+                    _ => return,
+                };
+                self.echo(format!("{name}={value}"));
             }
         }
     }

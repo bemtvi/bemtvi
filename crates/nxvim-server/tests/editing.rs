@@ -5699,3 +5699,59 @@ async fn substitute_confirm_all_skipped_pushes_no_undo() {
         "u undoes the insert, not the :s"
     );
 }
+
+// ----- statusline option plumbing (string-valued global option, Phase 1) -----
+
+#[tokio::test]
+async fn vim_opt_statusline_round_trips_through_core() {
+    let (rpc, _incoming) = start(None).await;
+    // The `statusline` string global written through vim.opt reaches the core and
+    // reads back the same value via vim.o / vim.opt and the `stl` abbreviation —
+    // proving the String OptionValue threads through the Lua bridge and mirror,
+    // not just a Lua-side table.
+    exec_lua(&rpc, r#"vim.opt.statusline = "%f %l,%c""#).await;
+    let via_o = exec_lua(&rpc, r#"return vim.o.statusline"#).await;
+    assert_eq!(via_o.as_str(), Some("%f %l,%c"));
+    let via_opt = exec_lua(&rpc, r#"return vim.opt.statusline"#).await;
+    assert_eq!(via_opt.as_str(), Some("%f %l,%c"));
+    let via_abbrev = exec_lua(&rpc, r#"return vim.o.stl"#).await;
+    assert_eq!(via_abbrev.as_str(), Some("%f %l,%c"));
+}
+
+#[tokio::test]
+async fn vim_o_statusline_read_reflects_set_ex_command() {
+    let (rpc, _incoming) = start(None).await;
+    // Reading vim.o.statusline reflects a value set via the `:set` ex path (the
+    // server-pushed mirror), the same home the Lua write reaches.
+    feed(&rpc, ":set statusline=%f<CR>");
+    let via_o = exec_lua(&rpc, r#"return vim.o.statusline"#).await;
+    assert_eq!(via_o.as_str(), Some("%f"));
+}
+
+#[tokio::test]
+async fn set_statusline_query_echoes_value_with_escaped_spaces() {
+    let (rpc, mut incoming) = start(None).await;
+    // `:set statusline=…` carries spaces via vim's `\ ` escaping (the value would
+    // otherwise split into separate `:set` tokens). The escaped space survives as
+    // a real space, and `:set statusline?` echoes the stored value back.
+    feed(&rpc, r":set statusline=%f\ %l,%c<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline?<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(msg, "statusline=%f %l,%c");
+}
+
+#[tokio::test]
+async fn set_statusline_reset_clears_to_default() {
+    let (rpc, _incoming) = start(None).await;
+    // `:set statusline&` resets the option to its default (empty).
+    feed(&rpc, ":set statusline=%f<CR>");
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.o.statusline"#).await.as_str(),
+        Some("%f")
+    );
+    feed(&rpc, ":set statusline&<CR>");
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.o.statusline"#).await.as_str(),
+        Some("")
+    );
+}

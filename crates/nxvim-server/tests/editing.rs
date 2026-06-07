@@ -777,6 +777,75 @@ async fn clipboard_delete_without_a_provider_aborts() {
     assert_eq!(lines(&rpc).await, vec!["one", "two"]);
 }
 
+// ----- marks (Phase 1: buffer-local `a`–`z`, `m` set, `` ` `` / `'` jump) -----
+
+#[tokio::test]
+async fn mark_set_and_jump_exact() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>");
+    // Set mark `a` on line 2 at column 2 (the first `t` of "beta").
+    feed(&rpc, "ggjll");
+    assert_eq!(cursor(&rpc).await, (2, 2));
+    feed(&rpc, "ma");
+    // Move away, then `` `a `` returns to the exact (line, col).
+    feed(&rpc, "gg");
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (2, 2));
+}
+
+#[tokio::test]
+async fn mark_jump_line_lands_on_first_non_blank() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>o  beta<Esc>");
+    // Mark `a` sits at end of the indented line 2; `'a` is linewise and lands on
+    // the first non-blank (the `b` at column 2), not the exact mark column.
+    feed(&rpc, "ma");
+    feed(&rpc, "gg");
+    feed(&rpc, "'a");
+    assert_eq!(cursor(&rpc).await, (2, 2));
+}
+
+#[tokio::test]
+async fn mark_jump_exact_is_an_exclusive_operator_target() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Mark `a` on the `w` (column 6), back to column 0, then `` d`a `` deletes
+    // exclusively up to the mark: "hello " goes, "world" stays.
+    feed(&rpc, "06l");
+    assert_eq!(cursor(&rpc).await, (1, 6));
+    feed(&rpc, "ma0");
+    feed(&rpc, "d`a");
+    assert_eq!(lines(&rpc).await, vec!["world"]);
+}
+
+#[tokio::test]
+async fn mark_jump_line_is_a_linewise_operator_target() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // Mark `a` on line 3 ("gamma"); from line 1, `d'a` deletes lines 1–3
+    // linewise, leaving only "delta".
+    feed(&rpc, "ggjjma");
+    feed(&rpc, "gg");
+    feed(&rpc, "d'a");
+    assert_eq!(lines(&rpc).await, vec!["delta"]);
+}
+
+#[tokio::test]
+async fn jump_to_unset_mark_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    // Park the cursor on line 1, then jump to a mark that was never set.
+    feed(&rpc, "gg");
+    let map = latest_after(&rpc, &mut incoming, "`z").await;
+    assert!(
+        view_str(&map, "message").contains("E20"),
+        "expected a loud 'mark not set' error, got: {:?}",
+        view_str(&map, "message")
+    );
+    // The cursor did not move — no silent jump to a bogus position.
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
 /// The shipped `examples/registers/` config sources cleanly and its Lua
 /// register surface actually drives core: the seeded `"h` / `"t` registers
 /// paste, and the `:Stash` user command round-trips a line through `setreg` →

@@ -23,6 +23,7 @@ mod command;
 mod cursor;
 mod ex;
 mod insert;
+mod marks;
 mod motions;
 mod operators;
 mod options;
@@ -178,6 +179,11 @@ struct OpenBuffer {
     saved_cursor: Cursor,
     saved_top: usize,
     saved_leftcol: usize,
+    /// Buffer-local marks `a`–`z` set with `m{a-z}`, each the cursor position at
+    /// the time it was set. They live on the buffer (not the window) so they
+    /// follow it across switches, matching vim. (Global `A`–`Z` marks live on the
+    /// [`Editor`]; see [`marks`].)
+    marks: HashMap<char, Cursor>,
 }
 
 impl OpenBuffer {
@@ -193,6 +199,7 @@ impl OpenBuffer {
             saved_cursor: Cursor::default(),
             saved_top: 0,
             saved_leftcol: 0,
+            marks: HashMap::new(),
         }
     }
 }

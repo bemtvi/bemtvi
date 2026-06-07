@@ -404,8 +404,10 @@ impl Editor {
                 *i += 1;
                 have_base = true;
             }
-            // Marks aren't implemented yet; a mark address fails loud rather
-            // than resolving to a bogus line.
+            // A `'{mark}` range address. Buffer-local marks exist in the normal
+            // grammar (`m`/`` ` ``/`'`), but resolving one *here* (`:'a,'bd`) is
+            // not wired yet, so a mark address fails loud rather than resolving to
+            // a bogus line. (See docs/plans/2026-06-07-marks.md.)
             Some(b'\'') => return Err("E20: Mark not set".to_string()),
             Some(c) if c.is_ascii_digit() => {
                 let mut n = 0i64;

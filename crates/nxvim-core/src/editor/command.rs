@@ -159,6 +159,8 @@ pub(crate) enum Motion {
     EndWord,                      // e / E
     Find(FindKind, char),         // f/t/F/T {char}
     FindRepeat { reverse: bool }, // ; (same) / , (reversed)
+    MarkJumpExact(char),          // `{mark}  (charwise exclusive)
+    MarkJumpLine(char),           // '{mark}  (linewise, first non-blank)
 }
 
 /// The four find-char motions. `f`/`t` search forward, `F`/`T` backward; `t`/`T`
@@ -201,6 +203,14 @@ impl FindKind {
             FindKind::TillBack => FindKind::Till,
         }
     }
+}
+
+/// The two mark-jump motions: `` `{x} `` lands on the mark's exact byte position
+/// (charwise exclusive), `'{x}` on the first non-blank of its line (linewise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkJumpKind {
+    Exact, // `
+    Line,  // '
 }
 
 /// A text-object kind (`iw`, `a(`, `i"`, `ap`, …). The object *alphabet* lives
@@ -290,6 +300,10 @@ pub(crate) enum Stage {
     WindowPending,
     /// Saw `"`; the next key names the register for the coming yank/delete/paste.
     RegisterPending,
+    /// Saw `m`; the next key names the mark to set at the cursor.
+    MarkSetPending,
+    /// Saw `` ` `` (`Exact`) or `'` (`Line`); the next key names the mark to jump to.
+    MarkJumpPending(MarkJumpKind),
 }
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
@@ -322,6 +336,8 @@ enum ResolvedCommand {
     TextObject { ia: char, kind: ObjectKind },
     /// `r{char}`.
     Replace(char),
+    /// `m{mark}` — set a mark at the cursor.
+    SetMark(char),
     /// A visual-mode operator on the current selection (`d`/`y`/`c`).
     VisualOperate(char),
     /// A terminal single-key command (insert, paste, scroll, …).
@@ -454,6 +470,25 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
                 _ => Reset,
             };
         }
+        Stage::MarkSetPending => {
+            // The next key names the mark. An unsupported name is a loud dead-end
+            // (`Reset`), exactly like a missed find/register arg.
+            return match key.as_char() {
+                Some(name) if marks::is_mark_name(name) => Complete(ResolvedCommand::SetMark(name)),
+                _ => Reset,
+            };
+        }
+        Stage::MarkJumpPending(kind) => {
+            return match key.as_char() {
+                Some(name) if marks::is_mark_name(name) => {
+                    Complete(ResolvedCommand::Motion(match kind {
+                        MarkJumpKind::Exact => Motion::MarkJumpExact(name),
+                        MarkJumpKind::Line => Motion::MarkJumpLine(name),
+                    }))
+                }
+                _ => Reset,
+            };
+        }
         Stage::Start | Stage::GPending => {}
         Stage::ReplacePending => unreachable!("handled above"),
     }
@@ -477,6 +512,15 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
     if !gpending && pending.operator.is_none() && key.as_char() == Some('"') {
         let mut next = pending.clone();
         next.stage = Stage::RegisterPending;
+        return Prefix(next);
+    }
+
+    // `m{mark}` sets a mark at the cursor; the name follows. Like `"`, `m` is not
+    // a motion and never follows an operator, so it arms only at a command
+    // boundary with no operator pending (and not mid-`g`).
+    if !gpending && pending.operator.is_none() && key.as_char() == Some('m') {
+        let mut next = pending.clone();
+        next.stage = Stage::MarkSetPending;
         return Prefix(next);
     }
 
@@ -512,6 +556,22 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
         let mut next = pending.clone();
         next.stage = Stage::FindPending(kind);
         return Prefix(next);
+    }
+
+    // `` `{mark} `` / `'{mark}` begin a mark jump (the name follows). Like the
+    // find motions they arm whether or not an operator is pending, so `` `a `` is
+    // a plain jump and `` d`a `` / `d'a` take the mark as the operator's range.
+    if !gpending {
+        let jump = match key.as_char() {
+            Some('`') => Some(MarkJumpKind::Exact),
+            Some('\'') => Some(MarkJumpKind::Line),
+            _ => None,
+        };
+        if let Some(kind) = jump {
+            let mut next = pending.clone();
+            next.stage = Stage::MarkJumpPending(kind);
+            return Prefix(next);
+        }
     }
 
     // Direct motions — but while g-pending only `gg` (handled above) is a motion,
@@ -760,6 +820,13 @@ impl Editor {
                         Motion::Find(..) if self.mode.is_visual() => {
                             self.pending.stage = Stage::Start;
                         }
+                        // A jump to a mark that was never set: report it loudly
+                        // (vim's *E20: Mark not set*) instead of silently leaving
+                        // the cursor — and abort any pending operator with it.
+                        Motion::MarkJumpExact(_) | Motion::MarkJumpLine(_) => {
+                            self.echo("E20: Mark not set");
+                            self.reset_pending();
+                        }
                         _ => self.reset_pending(),
                     },
                 }
@@ -784,6 +851,10 @@ impl Editor {
             ResolvedCommand::Replace(c) => {
                 let count = self.effective_count();
                 self.replace_char(c, count);
+                self.reset_pending();
+            }
+            ResolvedCommand::SetMark(name) => {
+                self.set_mark(name);
                 self.reset_pending();
             }
             ResolvedCommand::VisualOperate(op) => self.visual_operate(op),

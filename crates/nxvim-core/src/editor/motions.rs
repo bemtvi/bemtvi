@@ -145,6 +145,18 @@ impl Editor {
                 return self.find_motion(kind, target, count, true);
             }
             Motion::Find(kind, target) => return self.find_motion(kind, target, count, false),
+            // `` `{mark} `` — charwise exclusive to the mark's exact position.
+            // `'{mark}` — linewise to the mark's line, landing on first non-blank
+            // (the `LineAnchor` axis `gg`/`G` use). An unset mark is `None`: an
+            // *execution* miss the caller reports loudly (E20), not a parse miss.
+            Motion::MarkJumpExact(name) => {
+                let pos = self.mark_position(name)?;
+                MotionResult::exclusive(self.buffer().byte_at(pos.line, pos.col))
+            }
+            Motion::MarkJumpLine(name) => {
+                let pos = self.mark_position(name)?;
+                MotionResult::linewise(self.buffer().line_start(pos.line), MoveAxis::LineAnchor)
+            }
             Motion::Left => {
                 let s = self.buffer().line(line);
                 let mut col = self.cursor.col;

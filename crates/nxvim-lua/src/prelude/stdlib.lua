@@ -90,12 +90,14 @@ local O_GLOBAL = {
   hlsearch = "hlsearch", hls = "hlsearch",
   incsearch = "incsearch", is = "incsearch",
   showtabline = "showtabline", stal = "showtabline",
+  laststatus = "laststatus", ls = "laststatus",
   statusline = "statusline", stl = "statusline",
 }
 -- Core defaults, the safety net before the server has pushed the mirror.
 local O_GLOBAL_DEFAULT = {
   ignorecase = false, smartcase = false, wrapscan = true,
   hlsearch = true, incsearch = true, showtabline = 1,
+  laststatus = 2,
   statusline = "",
 }
 

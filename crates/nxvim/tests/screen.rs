@@ -184,6 +184,51 @@ async fn a_statusline_highlight_group_paints_its_color_end_to_end() {
 }
 
 #[tokio::test]
+async fn laststatus_three_paints_a_single_global_status_bar() {
+    // `laststatus=3` drops the per-window status row and paints one global bar on
+    // the row just above the command line (ROWS - 2). The windows area shrinks by
+    // one, so the text rows above keep painting normally.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>gg");
+    feed(&rpc, r":set laststatus=3<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    // The buffer text still paints at the top.
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   hello");
+    // The global bar (default look) sits on ROWS - 2, reverse-video like a status.
+    let y = ROWS - 2;
+    let bar = row_text(&buf, y);
+    assert!(bar.contains("NORMAL"), "global bar shows the mode: {bar:?}");
+    assert!(
+        bar.contains("[No Name]"),
+        "global bar shows the file: {bar:?}"
+    );
+    assert!(reversed(&buf, 0, y), "the global bar uses the status look");
+}
+
+#[tokio::test]
+async fn laststatus_zero_paints_no_status_row() {
+    // `laststatus=0` hides the status line; the freed bottom row of the windows
+    // area becomes text (the `~` end-of-buffer filler), with no NORMAL/[No Name]
+    // bar anywhere above the command line.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>");
+    feed(&rpc, r":set laststatus=0<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    // The row that held the status line (ROWS - 2) is now an empty `~` filler row,
+    // not a reverse-video status bar.
+    let y = ROWS - 2;
+    assert!(
+        !reversed(&buf, 0, y),
+        "no status bar where the status used to be"
+    );
+    assert!(
+        !row_text(&buf, y).contains("NORMAL"),
+        "no mode bar: {:?}",
+        row_text(&buf, y)
+    );
+}
+
+#[tokio::test]
 async fn hybrid_number_column_shows_absolute_then_relative() {
     let (rpc, mut incoming) = start(None).await;
     // Three lines; leave the cursor on the middle one.

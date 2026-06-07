@@ -676,7 +676,7 @@ impl Server {
             .set_tab_mirror(&tabs, self.editor.current_tab_id().0);
         // Global options, mirrored so `vim.o` reads the core's current value (the
         // default until set, and values set via the `:set` ex path). Cheap (five
-        // search flags + showtabline), so it isn't gated.
+        // search flags + showtabline/laststatus), so it isn't gated.
         let go = self.editor.global_options();
         let _ = self.lua.set_go_mirror(
             (
@@ -687,6 +687,7 @@ impl Server {
                 go.incsearch,
             ),
             go.showtabline,
+            go.laststatus,
             &go.statusline,
         );
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the

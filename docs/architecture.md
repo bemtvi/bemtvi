@@ -457,8 +457,8 @@ beyond the number gutter and the scroll options that already ride
 `WindowOptions`. Floating windows are otherwise complete (model,
 paint, dynamic config, edge semantics); the remaining float fidelity knobs
 (`style="minimal"`, `footer`, `bufpos`, `relative="mouse"`) grow as a consumer
-demands them. The per-window status line is `laststatus=2`; the
-global/conditional `laststatus` modes are a small follow-up.
+demands them. All four `laststatus` modes ship (`0` never, `1` only with ≥2
+windows, `2` per-window default, `3` a single global status line).
 
 ---
 

@@ -38,6 +38,11 @@ pub(crate) struct WindowView {
     /// them left-to-right; an empty vec (an older server) falls back to a bare
     /// reverse-video status row.
     pub(crate) status: Vec<StatusSegment>,
+    /// Whether this window paints its own status row (per `'laststatus'`). False
+    /// (modes 0/3, or 1 with one window) gives the freed bottom row to text. An
+    /// older server omits the flag; defaults to `true` (the historical
+    /// every-window-has-a-status look).
+    pub(crate) status_visible: bool,
     pub(crate) cursor_line: usize,
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`.
@@ -141,6 +146,12 @@ pub struct View {
     pub(crate) incsearch_style: Option<Style>,
     pub(crate) status_line: Option<Style>,
     pub(crate) end_of_buffer: Option<Style>,
+    /// The single global status line (`laststatus=3`) as rendered segments,
+    /// spanning the full editor width and showing the focused window's facts.
+    /// Empty for modes 0/1/2 (status lines are per-window, or hidden); when
+    /// non-empty the renderer docks it on one row just above the command line and
+    /// no window paints its own status row. Global — one per editor.
+    pub(crate) global_status: Vec<StatusSegment>,
     /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
     /// present it has input focus: the editing cursor is drawn inside it. Global.
     pub(crate) panel: Option<PanelData>,
@@ -231,6 +242,8 @@ impl View {
             _ => vec![parse_window(map, &self.styles)],
         };
         self.separators = parse_separators(map_get(map, "separators"));
+        // The global status line (`laststatus=3`); empty/absent for per-window modes.
+        self.global_status = parse_status(map_get(map, "global_status"), &self.styles);
         self.tabline = parse_tabline(map_get(map, "tabline"));
         self.current_tab = map_u64(map, "current_tab") as usize;
         self.panel = match map_get(map, "panel") {
@@ -339,6 +352,10 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         cursor_screen_col: map_u16(m, "cursor_screen_col"),
         leftcol: map_u16(m, "leftcol"),
         status: parse_status(map_get(m, "status"), styles),
+        // Default true so an older server (no flag) keeps the per-window status.
+        status_visible: map_get(m, "status_visible")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         cursor_line: map_u64(m, "cursor_line") as usize,
         selection: parse_spans(map_get(m, "selection")),
         search: parse_multi_spans(map_get(m, "search")),

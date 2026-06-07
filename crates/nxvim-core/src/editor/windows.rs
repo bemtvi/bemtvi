@@ -910,26 +910,32 @@ impl Editor {
 
     /// Set a numeric global option from outside the editor, the numeric analogue
     /// of [`Editor::set_global_option_bool`] and the shared home for both the `:set
-    /// showtabline=…` ex path ([`Editor::apply_set_num`]) and the Lua `vim.o`
-    /// bridge — so the two routes validate, echo, and relayout identically. The
-    /// only wired numeric global is `showtabline` (0/1/2): an out-of-range value is
-    /// rejected loudly (vim's `E487` below the range, `E474` above it), and a valid
-    /// change re-lays the windows area, since it grows or shrinks the reserved
-    /// tabline row. An unknown name is a no-op (the Lua side forwards only the
-    /// canonical wired set).
+    /// {opt}=…` ex path ([`Editor::apply_set_num`]) and the Lua `vim.o` bridge — so
+    /// the two routes validate, echo, and relayout identically. The wired numeric
+    /// globals are `showtabline` (0/1/2) and `laststatus` (0/1/2/3): an
+    /// out-of-range value is rejected loudly (vim's `E487` below the range, `E474`
+    /// above it), and a valid change re-lays the windows area, since it grows or
+    /// shrinks the reserved tabline / global-statusline row. An unknown name is a
+    /// no-op (the Lua side forwards only the canonical wired set).
     pub fn set_global_option_num(&mut self, name: &str, value: i64) {
-        if name != "showtabline" {
-            return;
-        }
+        let max = match name {
+            "showtabline" => 2,
+            "laststatus" => 3,
+            _ => return,
+        };
         if value < 0 {
             self.echo(format!("E487: Argument must be positive: {name}={value}"));
             return;
         }
-        if value > 2 {
+        if value > max {
             self.echo(format!("E474: Invalid argument: {name}={value}"));
             return;
         }
-        self.options.showtabline = value as u8;
+        match name {
+            "showtabline" => self.options.showtabline = value as u8,
+            "laststatus" => self.options.laststatus = value as u8,
+            _ => unreachable!("validated above"),
+        }
         self.relayout();
         self.ensure_visible();
     }
@@ -1610,17 +1616,52 @@ impl Editor {
         usize::from(self.tabline_visible())
     }
 
+    /// Whether a *tiled* window paints its own per-window status row, per
+    /// `laststatus`: never at `0`, only with ≥2 tiled windows at `1`, always at
+    /// `2` (the default), and never at `3` (a single global status line replaces
+    /// the per-window ones). Floats are unaffected — they always carry their own
+    /// status row regardless of `laststatus`. The single gate the view projection
+    /// ([`crate::view`]) consults so the reserved text row and the client's paint
+    /// never disagree.
+    pub(crate) fn window_statusline_visible(&self, floating: bool) -> bool {
+        if floating {
+            return true;
+        }
+        match self.options.laststatus {
+            0 | 3 => false,
+            1 => self.windows.tiled_count() > 1,
+            _ => true,
+        }
+    }
+
+    /// Whether the single **global** status line is shown — only at
+    /// `laststatus=3`. It docks one row at the bottom of the windows area (the
+    /// bottom-of-frame analogue of the tabline) and shows the *current* window's
+    /// status; per-window status rows are then hidden
+    /// ([`Editor::window_statusline_visible`]).
+    pub(crate) fn global_statusline_visible(&self) -> bool {
+        self.options.laststatus == 3
+    }
+
+    /// Rows the global status line reserves at the bottom of the windows area: one
+    /// at `laststatus=3` ([`Editor::global_statusline_visible`]), zero otherwise.
+    fn global_statusline_rows(&self) -> usize {
+        usize::from(self.global_statusline_visible())
+    }
+
     /// Re-divide the current terminal area across the window tree. The windows
-    /// area excludes the global bottom panel (it docks below all windows) and the
-    /// top tabline row (shown only with ≥2 tabs); the command/message line is the
-    /// client's own row, already excluded from the height the client reports.
-    /// Re-run on resize and whenever the panel or tabline appears/disappears
+    /// area excludes the global bottom panel (it docks below all windows), the top
+    /// tabline row (shown only with ≥2 tabs), and the global status-line row (only
+    /// at `laststatus=3`); the command/message line is the client's own row,
+    /// already excluded from the height the client reports. Re-run on resize and
+    /// whenever the panel, tabline, or global status line appears/disappears
     /// (which grows/shrinks the windows area).
     pub(crate) fn relayout(&mut self) {
         let height = self
             .height
             .saturating_sub(self.panel_rows())
-            .saturating_sub(self.tabline_rows());
+            .saturating_sub(self.tabline_rows())
+            .saturating_sub(self.global_statusline_rows());
         // The focused window's cursor cell, as an offset from its own rect's
         // top-left — what a `relative="cursor"` float anchors to. Guard against a
         // transient invalid `current` (mid-close, before the surviving window is

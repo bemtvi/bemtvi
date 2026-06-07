@@ -176,6 +176,14 @@ pub struct WindowView {
     /// buffer and viewport live — so the server only has to run the (Lua-aware)
     /// engine over it. See [`crate::statusline`].
     pub status_ctx: StatuslineCtx,
+    /// Whether this window paints its own status row, per `'laststatus'`
+    /// ([`Editor::window_statusline_visible`]): false hides it (modes `0`/`3`, or
+    /// `1` with a single window) and the freed bottom row becomes text. When
+    /// false the window's `lines` already fill the extra row, so the client must
+    /// not carve a status row off this window's rect.
+    ///
+    /// [`Editor::window_statusline_visible`]: crate::Editor::window_statusline_visible
+    pub status_visible: bool,
 }
 
 /// One tab page's cell in the tabline. `label` is the tab's focused window's
@@ -235,16 +243,35 @@ pub struct View {
     /// the panel rather than the text window. Global — one per editor, below all
     /// windows.
     pub panel: Option<PanelView>,
+    /// The single **global** status line's `%`-format context, present only at
+    /// `'laststatus'`=3. It carries the *focused* window's facts (vim shows the
+    /// current window's status line in the global bar); the server runs the engine
+    /// over it across the full editor width and the client paints it docked one
+    /// row above the command line. `None` for modes `0/1/2`, where status lines
+    /// are per-window (or hidden) instead.
+    pub global_statusline: Option<StatuslineCtx>,
 }
 
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
-        View {
-            windows: ed
-                .window_layouts()
+        let windows: Vec<WindowView> = ed
+            .window_layouts()
+            .iter()
+            .map(|w| window_view(ed, w))
+            .collect();
+        // At `laststatus=3` the single global status line shows the *focused*
+        // window's facts; capture that window's `%`-context for the server to run
+        // the engine over (falling back to the first window if none is flagged).
+        let global_statusline = ed.global_statusline_visible().then(|| {
+            windows
                 .iter()
-                .map(|w| window_view(ed, w))
-                .collect(),
+                .find(|w| w.focused)
+                .unwrap_or(&windows[0])
+                .status_ctx
+                .clone()
+        });
+        View {
+            windows,
             tabline: ed.tab_labels().into_iter().map(tab_view).collect(),
             current_tab: ed.current_tab_index(),
             separators: ed.separators().to_vec(),
@@ -257,6 +284,7 @@ impl View {
             cmdline_cursor: ed.cmdline_cursor(),
             message: ed.message.clone(),
             panel: ed.panel_view(),
+            global_statusline,
         }
     }
 
@@ -303,9 +331,14 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     };
     let content_height = w.rect.height.saturating_sub(2 * inset);
     let content_width = w.rect.width.saturating_sub(2 * inset);
-    // The content's own rows minus its status line; selections fill to the text
-    // width (the area past the number gutter).
-    let height = content_height.saturating_sub(1).max(1);
+    // Whether this window draws its own status row (per `'laststatus'`); when it
+    // does not, the freed row becomes text, so the window shows one more line.
+    let status_visible = ed.window_statusline_visible(w.floating);
+    // The content's own rows minus its status line (when shown); selections fill
+    // to the text width (the area past the number gutter).
+    let height = content_height
+        .saturating_sub(usize::from(status_visible))
+        .max(1);
     let width = content_width.saturating_sub(number_width);
     let top = w.top;
     // A stashed cursor may sit past a buffer that shrank while this window was
@@ -394,6 +427,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         border: w.border,
         title: w.title.clone(),
         status_ctx,
+        status_visible,
     }
 }
 

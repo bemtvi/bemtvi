@@ -11,7 +11,7 @@ use rmpv::Value;
 use unicode_width::UnicodeWidthChar;
 
 use crate::anim::{arm_animation, lerp, Animation};
-use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans};
+use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans, StatusSegment};
 use crate::view::{PanelData, PmenuData, Separator, View, WindowView};
 
 /// Render `view` into a `width`x`height` cell grid using ratatui's test backend
@@ -134,15 +134,19 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     // the server's windows-area shrink); `0` otherwise, so single-tab frames are
     // unchanged.
     let tabline_rows = u16::from(!view.tabline.is_empty());
+    // The global status line (`laststatus=3`) claims one row docked below all
+    // windows (matching the server's windows-area shrink); `0` for per-window modes.
+    let global_status_rows = u16::from(!view.global_status.is_empty());
     let regions = Layout::vertical([
-        Constraint::Length(tabline_rows), // tabline (0 when ≤1 tab)
-        Constraint::Min(1),               // windows area
-        Constraint::Length(panel_rows),   // panel (0 when none)
-        Constraint::Length(1),            // command line
+        Constraint::Length(tabline_rows),       // tabline (0 when ≤1 tab)
+        Constraint::Min(1),                     // windows area
+        Constraint::Length(global_status_rows), // global status line (laststatus=3)
+        Constraint::Length(panel_rows),         // panel (0 when none)
+        Constraint::Length(1),                  // command line
     ])
     .split(frame.area());
-    let (tabline_area, wins_area, panel_area, cmd_area) =
-        (regions[0], regions[1], regions[2], regions[3]);
+    let (tabline_area, wins_area, global_status_area, panel_area, cmd_area) =
+        (regions[0], regions[1], regions[2], regions[3], regions[4]);
 
     if tabline_rows > 0 {
         render_tabline(frame, tabline_area, view);
@@ -184,6 +188,11 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         if win.focused {
             focused_inner = Some((text_inner, cursor_row));
         }
+    }
+
+    // The single global status line (`laststatus=3`), docked below all windows.
+    if global_status_rows > 0 {
+        render_status(frame, global_status_area, &view.global_status, view);
     }
 
     render_command(frame, cmd_area, view);
@@ -239,9 +248,11 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
 fn windows_area_rect(width: u16, height: u16, view: &View) -> Rect {
     let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
     let tabline_rows = u16::from(!view.tabline.is_empty());
+    let global_status_rows = u16::from(!view.global_status.is_empty());
     Layout::vertical([
         Constraint::Length(tabline_rows),
         Constraint::Min(1),
+        Constraint::Length(global_status_rows),
         Constraint::Length(panel_rows),
         Constraint::Length(1),
     ])
@@ -295,9 +306,15 @@ fn render_window(
     view: &View,
     anim: Option<&Animation>,
 ) -> (Rect, u16) {
-    // The status line is the window's bottom row; the text body is the rest.
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let (text_area, status_area) = (rows[0], rows[1]);
+    // The status line is the window's bottom row (when this window shows one, per
+    // `'laststatus'`); the text body is the rest. With no per-window status row the
+    // text body claims the whole rect — the server already sized `lines` to fill it.
+    let (text_area, status_area) = if win.status_visible {
+        let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+        (rows[0], Some(rows[1]))
+    } else {
+        (area, None)
+    };
     let height = text_area.height as usize;
 
     // Search-match highlights for the static viewport. A search never starts a
@@ -406,7 +423,9 @@ fn render_window(
         win.leftcol as usize,
         &theme,
     );
-    render_status(frame, status_area, win, view);
+    if let Some(status_area) = status_area {
+        render_status(frame, status_area, &win.status, view);
+    }
     (text_inner, cursor_row)
 }
 
@@ -793,20 +812,20 @@ fn expand_tabs(line: &str, tabstop: usize) -> String {
     out
 }
 
-/// Paint a window's status line from the segments the server's `%`-format engine
+/// Paint a status line from the `segments` the server's `%`-format engine
 /// projected (text + resolved style). The base look is the theme's `StatusLine`
 /// when loaded, else reverse-video; each segment's own style patches onto that
 /// base (so a `%#Group#` that sets only a foreground keeps the status background).
-/// Segments span the window's content width — the engine's `%=`/`%<` pass already
-/// padded or truncated them to fit — and the base style fills any remainder.
-/// An empty `status` (an older server) leaves the bare base look across the row.
-fn render_status(frame: &mut Frame, area: Rect, win: &WindowView, view: &View) {
+/// Segments span the painted width — the engine's `%=`/`%<` pass already padded
+/// or truncated them to fit — and the base style fills any remainder. An empty
+/// `segments` (an older server) leaves the bare base look across the row. Shared
+/// by the per-window status row and the global status line (`laststatus=3`).
+fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view: &View) {
     let base = view
         .status_line
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
 
-    let spans: Vec<Span> = win
-        .status
+    let spans: Vec<Span> = segments
         .iter()
         .map(|(text, style)| {
             let style = style.map_or(base, |s| base.patch(s));
@@ -971,8 +990,13 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     let wins_area = windows_area_rect(width, height, view);
     // A focused float's content sits inside its border; the popup anchors there.
     let area = float_inner(window_area(wins_area, win), win.border);
-    // The text body is the window rect minus its bottom status row.
-    let text_area = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)[0];
+    // The text body is the window rect minus its bottom status row — when this
+    // window shows one (per `'laststatus'`); otherwise it claims the whole rect.
+    let text_area = if win.status_visible {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)[0]
+    } else {
+        area
+    };
     if win.number_width > 0 {
         Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
             .split(text_area)[1]

@@ -71,11 +71,11 @@ impl Editor {
     fn apply_set_num(&mut self, name: &str, op: NumOp) {
         match op {
             NumOp::Set(v) => {
-                // `showtabline` is the one global numeric option; route it through
-                // the shared setter so the `:set` and `vim.o` paths validate, echo,
-                // and relayout identically.
-                if name == "showtabline" {
-                    self.set_global_option_num("showtabline", v);
+                // `showtabline` / `laststatus` are the global numeric options;
+                // route them through the shared setter so the `:set` and `vim.o`
+                // paths validate, echo, and relayout identically.
+                if name == "showtabline" || name == "laststatus" {
+                    self.set_global_option_num(name, v);
                     return;
                 }
                 let min = match name {
@@ -107,6 +107,7 @@ impl Editor {
                     "sidescroll" => self.windows.cur().options.sidescroll as i64,
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
                     "showtabline" => self.options.showtabline as i64,
+                    "laststatus" => self.options.laststatus as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {

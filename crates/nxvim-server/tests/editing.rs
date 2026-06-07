@@ -6535,6 +6535,229 @@ async fn statusline_non_vlua_expression_errors_loudly() {
     assert!(text.contains("somevar"), "names the expression: {text:?}");
 }
 
+// ----- laststatus (per-window status visibility + global status, Phase 6) -----
+//
+// `'laststatus'` decides where status lines go: `0` never, `1` only with ≥2
+// windows, `2` always (the default), `3` a single global status line at the
+// bottom. The per-window `status_visible` flag drives whether the client carves
+// a status row off a window; `global_status` (top-level) carries the mode-3 bar.
+
+/// Whether the first window paints its own status row (`windows[0].status_visible`).
+fn window0_status_visible(map: &[(Value, Value)]) -> bool {
+    field(map, "status_visible")
+        .and_then(Value::as_bool)
+        .expect("a status_visible flag")
+}
+
+/// The top-level `global_status` segments (`laststatus=3`), or `None` for the
+/// per-window modes (where it is `Nil`).
+fn global_status_segments(map: &[(Value, Value)]) -> Option<Vec<(String, Option<usize>)>> {
+    let arr = field_top(map, "global_status")?.as_array()?;
+    Some(
+        arr.iter()
+            .map(|seg| {
+                let Value::Map(m) = seg else {
+                    panic!("global_status segment is not a map")
+                };
+                let text = m
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some("text"))
+                    .and_then(|(_, v)| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let style = m
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some("style"))
+                    .and_then(|(_, v)| v.as_u64())
+                    .map(|n| n as usize);
+                (text, style)
+            })
+            .collect(),
+    )
+}
+
+/// The whole global status line as one string.
+fn global_status_text(map: &[(Value, Value)]) -> String {
+    global_status_segments(map)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect()
+}
+
+#[tokio::test]
+async fn laststatus_round_trips_through_set_and_vim_o() {
+    let (rpc, mut incoming) = start(None).await;
+    // Default is 2 (every window has a status line).
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.laststatus").await.as_u64(),
+        Some(2)
+    );
+    // `:set laststatus=0` reaches the core; `:set laststatus?` echoes it back, and
+    // `vim.o` (and its `ls` abbreviation) reflect the same value.
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        ":set laststatus=0<CR>:set laststatus?<CR>",
+    )
+    .await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("laststatus=0")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.laststatus").await.as_u64(),
+        Some(0)
+    );
+    // Writing through vim.o round-trips back into the core (the next redraw honors it).
+    exec_lua(&rpc, "vim.o.laststatus = 3").await;
+    assert_eq!(exec_lua(&rpc, "return vim.o.ls").await.as_u64(), Some(3));
+}
+
+#[tokio::test]
+async fn laststatus_two_shows_per_window_status_by_default() {
+    let (rpc, mut incoming) = start(None).await;
+    // The default: the sole window paints its own status row, so the 25-row
+    // windows area leaves 24 text rows and there is no global status bar.
+    let map = redraw_after(&rpc, &mut incoming, "i<Esc>").await;
+    assert!(
+        window0_status_visible(&map),
+        "default ls=2 keeps a per-window status"
+    );
+    assert_eq!(lines_len(&map), 24, "the status row costs one text row");
+    assert!(
+        global_status_segments(&map).is_none(),
+        "no global status bar in mode 2"
+    );
+}
+
+#[tokio::test]
+async fn laststatus_zero_hides_window_status_and_reclaims_the_row() {
+    let (rpc, mut incoming) = start(None).await;
+    // `laststatus=0` hides the status line entirely; the freed bottom row becomes
+    // text, so the single window now shows all 25 rows.
+    let map = redraw_after(&rpc, &mut incoming, ":set laststatus=0<CR>").await;
+    assert!(!window0_status_visible(&map), "mode 0 hides the status row");
+    assert_eq!(lines_len(&map), 25, "the freed row becomes text");
+    assert!(
+        global_status_segments(&map).is_none(),
+        "mode 0 has no global bar"
+    );
+}
+
+#[tokio::test]
+async fn laststatus_one_hides_status_until_a_second_window_opens() {
+    let (rpc, mut incoming) = start(None).await;
+    // `laststatus=1`: with a single window there is no status line (the row goes
+    // to text)…
+    let solo = redraw_after(&rpc, &mut incoming, ":set laststatus=1<CR>").await;
+    assert!(
+        !window0_status_visible(&solo),
+        "mode 1 hides status with one window"
+    );
+    assert_eq!(lines_len(&solo), 25, "the row is text while solo");
+    // …but a horizontal split brings the per-window status lines back.
+    let split = redraw_after(&rpc, &mut incoming, ":split<CR>").await;
+    assert!(
+        window0_status_visible(&split),
+        "mode 1 shows status once a second window opens"
+    );
+}
+
+#[tokio::test]
+async fn laststatus_three_shows_a_single_global_status_bar() {
+    let (rpc, mut incoming) = start(None).await;
+    // `laststatus=3`: no per-window status row; a single global bar (the default
+    // look: mode, file, ruler) docks at the bottom for the current window.
+    let map = redraw_after(&rpc, &mut incoming, ":set laststatus=3<CR>").await;
+    assert!(
+        !window0_status_visible(&map),
+        "mode 3 hides per-window status"
+    );
+    let text = global_status_text(&map);
+    assert!(
+        text.contains("NORMAL"),
+        "global bar shows the mode: {text:?}"
+    );
+    assert!(
+        text.contains("[No Name]"),
+        "global bar shows the file: {text:?}"
+    );
+    assert!(
+        text.trim_end().ends_with("1,1"),
+        "global bar ends with the ruler: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn laststatus_three_global_bar_honors_custom_statusline() {
+    let (rpc, mut incoming) = start(None).await;
+    // The global bar runs the same `%`-format engine, so a custom 'statusline'
+    // (here a `%{v:lua...}` expression) drives it just like a per-window one.
+    exec_lua(&rpc, "_G.gtag = function() return 'GLOBAL' end").await;
+    feed(&rpc, ":set laststatus=3<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=[%{v:lua.gtag()}]<CR>").await;
+    assert_eq!(global_status_text(&map), "[GLOBAL]");
+}
+
+#[tokio::test]
+async fn laststatus_out_of_range_is_rejected_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    // `laststatus` accepts 0..=3; above the range is vim's E474 (loud, not silent),
+    // and the option keeps its previous value.
+    let map = redraw_after(&rpc, &mut incoming, ":set laststatus=4<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E474"), "out-of-range is loud: {msg:?}");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.laststatus").await.as_u64(),
+        Some(2),
+        "the value is unchanged after a rejected set"
+    );
+}
+
+/// The shipped `examples/laststatus/` config sources cleanly and actually works
+/// end-to-end: it starts in `laststatus=3` (a single global bar driven by its
+/// custom `'statusline'`), and the `<leader>2` map it defines switches back to
+/// per-window status lines live. Proves the example isn't just "loads".
+#[tokio::test]
+async fn laststatus_example_config_runs() {
+    let dir = temp_dir("laststatus-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/laststatus/init.lua"
+    ))
+    .expect("read example init.lua");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
+
+    // It opens in mode 3: a global bar (its custom 'statusline', ending ` ls=3 `),
+    // and no per-window status row.
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        !window0_status_visible(&map),
+        "example starts global (mode 3)"
+    );
+    let bar = global_status_text(&map);
+    assert!(bar.contains("NORMAL"), "global bar shows the mode: {bar:?}");
+    assert!(
+        bar.trim_end().ends_with("ls=3"),
+        "global bar reads ls=3: {bar:?}"
+    );
+
+    // The `<Space>2` leader map flips back to per-window status lines.
+    let after = redraw_after(&rpc, &mut incoming, " 2").await;
+    assert!(
+        window0_status_visible(&after),
+        "<leader>2 restores per-window status"
+    );
+    assert!(
+        global_status_segments(&after).is_none(),
+        "no global bar in mode 2"
+    );
+}
+
 // ----- vim.fn editor-state builtins (statusline / lualine, Phase 5) -----
 //
 // The `vim.fn.*` surface a real `'statusline'` calls from inside `%{}`/`%!`:

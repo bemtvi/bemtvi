@@ -1,0 +1,15 @@
+laststatus controls WHERE the status line lives.
+
+  0  never draw a status line          (the row becomes text)
+  1  only with two or more windows     (a lone window has none)
+  2  every window has its own status   (vim's default)
+  3  one global status line at the bottom, shared by all windows
+
+Try the leader maps this config defines:
+
+  <Space>0 / <Space>1 / <Space>2 / <Space>3   switch laststatus live
+  <Ctrl-w>s   split — watch mode 1 grow a status line, and mode 3
+              keep a single shared bar while each window's text reflows
+
+The global bar (mode 3) runs the very same %-format engine as the
+per-window status, so a custom 'statusline' drives both identically.

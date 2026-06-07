@@ -74,6 +74,17 @@ impl Server {
             .map(|win| self.window_value(win, &view.mode_label, &statusline_fmt, &mut styles))
             .collect();
 
+        // The single global status line (`laststatus=3`), spanning the full editor
+        // width and showing the focused window's facts; `Nil` for modes 0/1/2,
+        // where status lines are per-window (the `status` array above) instead.
+        let global_status = match &view.global_statusline {
+            Some(ctx) => {
+                let width = self.ui.map_or(0, |(w, _)| w);
+                self.render_statusline(ctx, width, &view.mode_label, &statusline_fmt, &mut styles)
+            }
+            None => Value::Nil,
+        };
+
         // The split borders between windows.
         let separators = Value::Array(view.separators.iter().map(separator_value).collect());
 
@@ -100,6 +111,7 @@ impl Server {
         let styles_value = styles.into_value();
         let map = vec![
             (Value::from("windows"), Value::Array(windows)),
+            (Value::from("global_status"), global_status),
             (Value::from("separators"), separators),
             (Value::from("tabline"), tabline),
             (
@@ -199,6 +211,13 @@ impl Server {
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("status"), status),
+            // Whether this window paints its own status row (per `'laststatus'`).
+            // False hides it (modes 0/3, or 1 with one window); the client then
+            // gives the freed row to text rather than carving a status line.
+            (
+                Value::from("status_visible"),
+                Value::from(win.status_visible),
+            ),
             (Value::from("scroll"), scroll),
             // Float overlay chrome. A tiled window is `floating: false` with no
             // border/title, so the client paints it exactly as before.
@@ -232,6 +251,33 @@ impl Server {
         statusline_fmt: &str,
         styles: &mut StyleTable,
     ) -> Value {
+        // The status line spans the window's content width — its rect inset by the
+        // float border, matching where the client paints it (and what `%=`/`%<`
+        // resolve against).
+        let inset = if win.floating && win.border != BorderStyle::None {
+            1
+        } else {
+            0
+        };
+        let width = win.rect.width.saturating_sub(2 * inset);
+        self.render_statusline(&win.status_ctx, width, mode_label, statusline_fmt, styles)
+    }
+
+    /// Run the `%`-format engine over one [`StatuslineCtx`] across `width` cells and
+    /// project the result as a `status` segment array (`{ text, style }` per
+    /// highlighted run). Shared by the per-window status line ([`Self::status_value`])
+    /// and the single global one (`laststatus=3`); both differ only in their context
+    /// and width. `statusline_fmt` empty ⇒ the built-in default look (rendered through
+    /// the same engine). Each segment's highlight group resolves to a style-palette
+    /// id, `Nil` when it has none / the colorscheme leaves it undefined.
+    fn render_statusline(
+        &self,
+        ctx: &nxvim_core::statusline::StatuslineCtx,
+        width: usize,
+        mode_label: &str,
+        statusline_fmt: &str,
+        styles: &mut StyleTable,
+    ) -> Value {
         let default;
         let fmt = if statusline_fmt.is_empty() {
             default = default_statusline(mode_label);
@@ -248,16 +294,7 @@ impl Server {
         };
 
         let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw);
-        let pieces = statusline::expand(&items, &win.status_ctx, &mut eval);
-        // The status line spans the window's content width — its rect inset by the
-        // float border, matching where the client paints it (and what `%=`/`%<`
-        // resolve against).
-        let inset = if win.floating && win.border != BorderStyle::None {
-            1
-        } else {
-            0
-        };
-        let width = win.rect.width.saturating_sub(2 * inset);
+        let pieces = statusline::expand(&items, ctx, &mut eval);
         let segments = statusline::layout(&pieces, width);
 
         Value::Array(

@@ -891,15 +891,16 @@ impl LuaRuntime {
     }
 
     /// Refresh the Rust→Lua global-option mirror (`vim._go_mirror = { ignorecase,
-    /// smartcase, wrapscan, hlsearch, incsearch, showtabline, statusline }`) that
-    /// `vim.o` reads for the wired global options. Pushed alongside the buffer
-    /// mirror before any Lua that can read options, so a read reflects the core's
-    /// current value — the default until set, and a value set through the `:set`
-    /// ex path, not just one written from Lua.
+    /// smartcase, wrapscan, hlsearch, incsearch, showtabline, laststatus,
+    /// statusline }`) that `vim.o` reads for the wired global options. Pushed
+    /// alongside the buffer mirror before any Lua that can read options, so a read
+    /// reflects the core's current value — the default until set, and a value set
+    /// through the `:set` ex path, not just one written from Lua.
     pub fn set_go_mirror(
         &self,
         opts: (bool, bool, bool, bool, bool),
         showtabline: u8,
+        laststatus: u8,
         statusline: &str,
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
@@ -911,6 +912,7 @@ impl LuaRuntime {
         entry.set("hlsearch", hlsearch)?;
         entry.set("incsearch", incsearch)?;
         entry.set("showtabline", showtabline)?;
+        entry.set("laststatus", laststatus)?;
         entry.set("statusline", statusline)?;
         let set: mlua::Function = vim.get("_set_go_mirror")?;
         set.call(entry)

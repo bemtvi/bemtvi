@@ -28,6 +28,12 @@ pub struct Options {
     /// (vim's default), `2` always. Gates both the projected `Vec<TabView>` and
     /// the top-row reservation in [`crate::Editor`]'s relayout.
     pub showtabline: u8,
+    /// When to draw window status lines: `0` never, `1` only with two or more
+    /// windows, `2` always (vim's default), `3` a single **global** status line
+    /// at the bottom (shared by every window, shown for the current one). Modes
+    /// `0/1/2` toggle the per-window status row; `3` additionally docks one global
+    /// row in [`crate::Editor`]'s relayout, like the tabline at the top.
+    pub laststatus: u8,
     /// The `'statusline'` format string (neovim's `%`-format mini-language).
     /// Empty means the built-in default look; a non-empty value is parsed and
     /// rendered by the statusline engine. Global-only for now (no per-window
@@ -47,6 +53,8 @@ impl Default for Options {
             incsearch: true,
             // Show the tabline only when more than one tab is open (vim's default).
             showtabline: 1,
+            // Every window carries its own status line (vim's default).
+            laststatus: 2,
             // No custom statusline by default — the built-in look is used.
             statusline: String::new(),
         }
@@ -388,6 +396,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "sidescroll" | "ss" => Some(("sidescroll", Num)),
         "sidescrolloff" | "siso" => Some(("sidescrolloff", Num)),
         "showtabline" | "stal" => Some(("showtabline", Num)),
+        "laststatus" | "ls" => Some(("laststatus", Num)),
         "statusline" | "stl" => Some(("statusline", Str)),
         _ => None,
     }

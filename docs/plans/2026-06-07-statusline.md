@@ -184,11 +184,28 @@ routes `%:<mods>` through `fnamemodify`. fnamemodify cases are derived from real
 neovim. `getbufvar` deferred (no test demands it yet). The window-relative
 `line('w0'/'w$')` forms error loud (the mirror has no scroll position yet).
 
-### Phase 6 (later) — `laststatus=3`, then tabline reuse
+### Phase 6 (later) — `laststatus`, then tabline reuse
 
-- `laststatus` option (currently rejected loudly,
-  `crates/nxvim-core/src/editor/windows.rs:33`): `0/1/2`, then `3` for a single
-  global statusline row.
+- `laststatus` option ✅ done — `0` never, `1` only with ≥2 windows, `2` always
+  (the default), `3` a single global statusline row.
+
+  **Shipped:** `Options.laststatus` (`crates/nxvim-core/src/options.rs`), wired
+  through the shared `set_global_option_num` (0..=3, loud `E474`/`E487` out of
+  range) so the `:set laststatus=…`/`?`/`&` ex path and the `vim.o`/`vim.opt`
+  Lua bridge validate, echo, and relayout identically (`ls` abbreviation in the
+  Lua `O_GLOBAL` map + the `_go_mirror`). Per-window visibility is the new
+  `Editor::window_statusline_visible(floating)` gate, projected onto each
+  `WindowView` as `status_visible`; the core view reserves the text-area status
+  row only when shown, so a hidden status reclaims its row as text. Mode 3 docks
+  one global row in `relayout` (`global_statusline_rows`, the bottom analogue of
+  the tabline) and `View.global_statusline` carries the *focused* window's
+  `%`-context; the server renders it full-width via the shared
+  `render_statusline` helper (`redraw.rs`) into a top-level `global_status`
+  segment array, and the TUI paints it on the row above the command line while
+  carving no per-window status. Floats are unaffected (always carry their own
+  status). Verified end-to-end (`editing.rs` modes 0/1/2/3 + round-trip + the
+  shipped `examples/laststatus/` config; `screen.rs` paints the global bar / no
+  bar at mode 0).
 - **Tabline reuse** — the original request: a `tabline` string option that runs
   the *same* engine, with `%nT` tab-select / `%T` / `%X` close items. At this
   point `tabline = '%!v:lua.require("myutils").my_tab_line()'` works verbatim.

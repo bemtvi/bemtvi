@@ -40,6 +40,8 @@ fn main() -> Result<()> {
         file,
         config_dir,
         runtimepath,
+        // The real editor wires the host clipboard for the `"+` / `"*` registers.
+        clipboard: nxvim_server::ClipboardProvider::System,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread

@@ -11,6 +11,7 @@
 //! out its regions with its own widgets.
 
 pub mod buffer;
+pub mod clipboard;
 pub mod editor;
 pub mod highlight;
 pub mod input;
@@ -23,6 +24,7 @@ pub mod unicode;
 pub mod view;
 
 pub use buffer::{Buffer, BufferEdit, EditBatch};
+pub use clipboard::Clipboard;
 pub use editor::{
     command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,
     FloatAnchor, FloatConfig, FloatRelative, TabId, WindowConfigSpec, WindowId,

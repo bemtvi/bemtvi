@@ -166,22 +166,35 @@ Wire the prefix end-to-end so the auto-population from Phase 1 becomes reachable
 - **Tests** (`editing.rs`): `setreg('a','hi')` then `"ap`; `getreg`/`getregtype`
   round-trips charwise/linewise; `:put a` inserts a line below.
 
-### Phase 5 — System clipboard (`"+` / `"*`)
+### Phase 5 — System clipboard (`"+` / `"*`) — DONE
 
-- A `trait Clipboard { fn get(&self) -> Option<(String, RegKind)>; fn set(&self,
-  text: &str, kind: RegKind); }` injected as `Option<Box<dyn Clipboard>>` into
-  the `Editor`, exactly like `SyntaxEngine`
-  (`mod.rs:484` / `syntax.rs:49`). `Registers::get('+'|'*')` and the write path
-  defer to it; when absent (headless/tests with no provider) selecting `"+`
-  errors loudly rather than silently using the unnamed register.
-- Server supplies a real provider (`arboard` or platform shell-out) wired where
-  the syntax engine is installed.
-- `clipboard=unnamedplus` option (later within this phase, optional): makes
-  unnamed yanks mirror to `"+`.
-- **Tests**: a fake in-memory `Clipboard` injected by the test harness proves
-  `"+y` → provider, `"+p` ← provider, and round-trip kind. (No real OS clipboard
-  in tests — that would be a faithless, environment-dependent test; the injected
-  fake is the faithful seam.)
+- A `trait Clipboard { fn get(&self) -> Option<(String, bool)>; fn set(&self,
+  text: &str, linewise: bool); }` (`crates/nxvim-core/src/clipboard.rs`),
+  injected as `Option<Box<dyn Clipboard>>` into the `Editor` exactly like
+  `SyntaxEngine`. The boundary uses `bool` linewise (not `RegKind`, which stays
+  crate-private) to match the existing public register surface
+  (`register_mirror` / `set_register_api`). The `"+`/`"*` cases live in the
+  editor (`register_text` for reads, `yank_range`/`delete_yank_range` for
+  writes), mirroring how the read-only specials are handled — `Registers` stays
+  pure. A clipboard yank mirrors the unnamed register too (vim sets `""` on any
+  yank). When absent, `"+` errors loudly (`clipboard: No provider…`) and aborts
+  rather than silently using the unnamed register — the operator/visual/paste
+  paths all guard on it.
+- Server supplies a real provider via **platform shell-out**
+  (`crates/nxvim-server/src/clipboard.rs`: `pbcopy`/`pbpaste` on macOS,
+  `wl-copy`/`xclip` on Linux), chosen over `arboard` to add no dependency and
+  stay lazy (the tool runs only on a `"+` operation). Wired in `run()` next to
+  the syntax engine via `ServerInit.clipboard: ClipboardProvider`
+  (`System` / `Disabled` / `Custom`); the binary sets `System`, tests default to
+  `Disabled` and inject `Custom(fake)`.
+- `clipboard=unnamedplus` option — **deferred** (still out of scope; the
+  explicit `"+` prefix is the v1 surface).
+- **Tests** (`editing.rs`): a fake in-memory `Clipboard` injected via
+  `ClipboardProvider::Custom` proves `"+y` → provider, `"+p` ← provider,
+  round-trip kind (charwise/linewise), `"*` aliases `"+`, the unnamed mirror,
+  and that an absent provider errors loudly (paste *and* delete) without a silent
+  fallback. The real macOS shell-out was verified end-to-end out of band (no OS
+  clipboard in the suite — that would be faithless/environment-dependent).
 
 ### Phase 6 (later) — expression register, blockwise, macros
 

@@ -15,6 +15,7 @@
 //! [`redraw`] (View→wire projection), [`treesitter`] (highlight projection), and
 //! [`lsp`] (language-server integration).
 
+mod clipboard;
 mod dispatch;
 mod effects;
 mod evloop;
@@ -39,7 +40,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use treesitter::SyntaxState;
 
 /// Startup options for the server.
-#[derive(Debug, Default, Clone)]
+///
+/// Not `Clone`/`Debug`: [`ClipboardProvider::Custom`] holds a trait object that
+/// is neither. No caller needs those — every construction site builds a fresh
+/// value (`..Default::default()`) and moves it straight into [`run`].
+#[derive(Default)]
 pub struct ServerInit {
     /// File to open in the initial buffer, if any.
     pub file: Option<String>,
@@ -47,6 +52,25 @@ pub struct ServerInit {
     pub config_dir: Option<PathBuf>,
     /// Directories Lua searches for modules and runtime files (the runtimepath).
     pub runtimepath: Vec<PathBuf>,
+    /// What backs the system-clipboard registers `"+` / `"*`. Defaults to
+    /// [`ClipboardProvider::Disabled`] so tests are deterministic (no host
+    /// clipboard); the real binary sets [`ClipboardProvider::System`].
+    pub clipboard: ClipboardProvider,
+}
+
+/// How the server provides the `"+` / `"*` clipboard registers.
+#[derive(Default)]
+pub enum ClipboardProvider {
+    /// Best-effort real host clipboard (the binary's choice). If no clipboard
+    /// tool is found on this platform, the registers stay unavailable and error
+    /// loudly on use rather than silently falling back to the unnamed register.
+    System,
+    /// No provider — `"+` / `"*` error loudly. The default, so bare-server tests
+    /// never touch the host clipboard unless they opt in.
+    #[default]
+    Disabled,
+    /// A caller-supplied provider; tests inject an in-memory fake here.
+    Custom(Box<dyn nxvim_core::Clipboard>),
 }
 
 /// Resolve nxvim's config directory and runtimepath from the environment, the
@@ -228,6 +252,19 @@ where
     // installable grammars from the data dir at runtime; a buffer with no grammar
     // simply isn't highlighted.
     editor.set_syntax_engine(Box::new(nxvim_ts::Engine::new(nxvim_ts::data_dir())));
+    // The `"+` / `"*` registers route through an injected clipboard provider.
+    // `System` resolves a real host clipboard tool (best effort); `Custom` is a
+    // caller-supplied fake (tests); `Disabled` installs nothing and lets `"+`
+    // error loudly.
+    match init.clipboard {
+        ClipboardProvider::System => {
+            if let Some(cb) = clipboard::SystemClipboard::detect() {
+                editor.set_clipboard(Box::new(cb));
+            }
+        }
+        ClipboardProvider::Custom(cb) => editor.set_clipboard(cb),
+        ClipboardProvider::Disabled => {}
+    }
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     let (lsp, mut lsp_events) = LspManager::new();

@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
@@ -644,6 +645,136 @@ async fn put_of_a_charwise_register_is_still_linewise() {
     feed(&rpc, ":lua vim.fn.setreg('a', 'beta')<CR>");
     feed(&rpc, ":put a<CR>");
     assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
+}
+
+// ---- Phase 5: the system-clipboard registers "+ / "* ----
+
+/// An in-memory stand-in for the host clipboard, injected in place of the real
+/// OS provider so `"+` round-trips are deterministic and inspectable. A real OS
+/// clipboard would make these tests environment-dependent (and faithless); the
+/// shared handle lets a test seed the clipboard and read back what `"+y` wrote.
+#[derive(Clone, Default)]
+struct FakeClipboard(Arc<Mutex<Option<(String, bool)>>>);
+
+impl nxvim_core::Clipboard for FakeClipboard {
+    fn get(&self) -> Option<(String, bool)> {
+        self.0.lock().unwrap().clone()
+    }
+    fn set(&self, text: &str, linewise: bool) {
+        *self.0.lock().unwrap() = Some((text.to_string(), linewise));
+    }
+}
+
+impl FakeClipboard {
+    /// Seed the clipboard as if an external app put `text` on it.
+    fn seed(&self, text: &str, linewise: bool) {
+        *self.0.lock().unwrap() = Some((text.to_string(), linewise));
+    }
+    /// Read what the editor last wrote (or the seeded value).
+    fn peek(&self) -> Option<(String, bool)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Start a server whose `"+` / `"*` registers are backed by an injected
+/// [`FakeClipboard`]; returns the client plus the shared handle to inspect.
+async fn start_with_clipboard() -> (Rpc, UnboundedReceiver<Incoming>, FakeClipboard) {
+    let fake = FakeClipboard::default();
+    let (rpc, incoming) = start_with(ServerInit {
+        clipboard: nxvim_server::ClipboardProvider::Custom(Box::new(fake.clone())),
+        ..Default::default()
+    })
+    .await;
+    (rpc, incoming, fake)
+}
+
+#[tokio::test]
+async fn clipboard_register_round_trips_through_the_provider() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello world<Esc>");
+    // `"+yy` writes the line to the injected provider (linewise: trailing `\n`).
+    feed(&rpc, "\"+yy");
+    let _ = lines(&rpc).await; // barrier: the yank has been processed
+    assert_eq!(clip.peek(), Some(("hello world\n".to_string(), true)));
+    // `"+p` reads it back from the provider and pastes it below.
+    feed(&rpc, "o<Esc>\"+p");
+    assert_eq!(lines(&rpc).await, vec!["hello world", "", "hello world"]);
+}
+
+#[tokio::test]
+async fn clipboard_paste_reads_externally_seeded_contents() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    // Something external put a linewise line on the clipboard; `"+p` pastes it.
+    clip.seed("from outside\n", true);
+    feed(&rpc, "\"+p");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "from outside"]);
+}
+
+#[tokio::test]
+async fn clipboard_round_trips_charwise_kind() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello<Esc>");
+    // A charwise yank reaches the provider charwise…
+    feed(&rpc, "0\"+yl");
+    let _ = lines(&rpc).await; // barrier
+    assert_eq!(clip.peek(), Some(("h".to_string(), false)));
+    // …and a charwise clipboard paste splices inline, not as a new line.
+    clip.seed("X", false);
+    feed(&rpc, "0\"+p");
+    assert_eq!(lines(&rpc).await, vec!["hXello"]);
+}
+
+#[tokio::test]
+async fn clipboard_yank_mirrors_the_unnamed_register() {
+    let (rpc, _incoming, _clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello<Esc>");
+    // vim sets `""` on any yank regardless of target, so a plain `p` after a
+    // `"+yy` still pastes the same text.
+    feed(&rpc, "\"+yy");
+    feed(&rpc, "p");
+    assert_eq!(lines(&rpc).await, vec!["hello", "hello"]);
+}
+
+#[tokio::test]
+async fn star_register_aliases_plus() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    // `"*` and `"+` map to the one provider in v1.
+    clip.seed("star\n", true);
+    feed(&rpc, "\"*p");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "star"]);
+}
+
+#[tokio::test]
+async fn clipboard_paste_without_a_provider_errors_loudly() {
+    // The default server has no clipboard provider (Disabled).
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    feed(&rpc, "yy"); // fill the unnamed register
+    let map = latest_after(&rpc, &mut incoming, "\"+p").await;
+    assert!(
+        view_str(&map, "message").contains("clipboard"),
+        "expected a loud clipboard error, got: {:?}",
+        view_str(&map, "message")
+    );
+    // Crucially the unnamed register was NOT silently pasted instead.
+    assert_eq!(lines(&rpc).await, vec!["alpha"]);
+}
+
+#[tokio::test]
+async fn clipboard_delete_without_a_provider_aborts() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ione<Esc>otwo<Esc>");
+    // `"+dd` with no provider errors loudly and leaves the buffer untouched
+    // rather than destroying the line with nowhere to put it.
+    let map = latest_after(&rpc, &mut incoming, "gg\"+dd").await;
+    assert!(
+        view_str(&map, "message").contains("clipboard"),
+        "expected a loud clipboard error, got: {:?}",
+        view_str(&map, "message")
+    );
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
 }
 
 /// The shipped `examples/registers/` config sources cleanly and its Lua

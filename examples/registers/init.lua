@@ -60,3 +60,22 @@ end, {})
 vim.keymap.set("n", "<space>p", function()
   vim.cmd("put t")
 end, { desc = "put the seeded todo register" })
+
+-- ~~~ Phase 5: the system clipboard — "+ and "* ~~~
+--
+-- The `"+` / `"*` registers route to your OS clipboard, so text yanked here is
+-- pasteable in other apps and vice-versa. They use the same `"x` prefix as any
+-- other register — no Lua needed:
+--
+--   "+yy   yank the current line TO the system clipboard
+--   "+p    paste FROM the system clipboard
+--   "+yiw  yank the word under the cursor to the clipboard
+--
+-- When nxvim runs for real it wires a host clipboard tool (pbcopy/pbpaste on
+-- macOS, wl-copy/xclip on Linux). If none is found, `"+` errors loudly rather
+-- than silently falling back to the unnamed register. (In headless tests there
+-- is no provider, which is why this file does no `"+` work at startup.)
+--
+-- Convenience maps mirroring common vim muscle memory:
+vim.keymap.set({ "n", "v" }, "<space>y", '"+y', { desc = "yank to the system clipboard" })
+vim.keymap.set({ "n", "v" }, "<space>P", '"+p', { desc = "paste from the system clipboard" })

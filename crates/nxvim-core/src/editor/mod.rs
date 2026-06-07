@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::buffer::Buffer;
+use crate::clipboard::Clipboard;
 use crate::highlight::Highlights;
 use crate::input::Key;
 use crate::mode::Mode;
@@ -487,6 +488,12 @@ pub struct Editor {
     /// once. Dedups the failure message so opening many files of a broken-grammar
     /// language doesn't spam (a *missing* grammar is silent and never recorded).
     syntax_failed: HashSet<&'static str>,
+    /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
+    /// bare-core test (or a front end whose platform backend failed to start).
+    /// Injected by the server via [`Editor::set_clipboard`]; when absent,
+    /// selecting `"+` / `"*` errors loudly instead of touching the unnamed
+    /// register.
+    clipboard: Option<Box<dyn Clipboard>>,
 }
 
 impl Editor {
@@ -582,6 +589,7 @@ impl Editor {
             syntax: None,
             syntax_opened: HashMap::new(),
             syntax_failed: HashSet::new(),
+            clipboard: None,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

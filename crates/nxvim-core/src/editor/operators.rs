@@ -1,11 +1,17 @@
 //! Operators (`d`/`c`/`y`/`>`/…) and the editing primitives they drive
 //! (delete/yank/paste/join/replace/case).
 
-use super::command::is_readonly_register;
+use super::command::{is_clipboard_register, is_readonly_register};
 use super::*;
+use crate::clipboard::Clipboard;
 use crate::mode::Mode;
 use crate::unicode;
 use std::cmp::{max, min};
+
+/// Echoed when a `"+` / `"*` yank/delete/paste finds no clipboard provider
+/// installed (a headless box whose platform backend failed, or a bare-core
+/// test). vim prints a similar `clipboard: No provider` warning.
+const CLIPBOARD_UNAVAILABLE: &str = "clipboard: No provider available for register '+'/'*'";
 
 impl Editor {
     pub(crate) fn apply_operator(&mut self, op: char, m: MotionResult) {
@@ -45,9 +51,16 @@ impl Editor {
             return;
         }
         // `d`/`y`/`c` write a register; a read-only target aborts the whole
-        // operator before any text is touched (vim beeps and does nothing).
-        if matches!(op, 'd' | 'y' | 'c') && self.register_write_blocked() {
-            return;
+        // operator before any text is touched (vim beeps and does nothing), and a
+        // clipboard target with no provider aborts loudly rather than deleting.
+        if matches!(op, 'd' | 'y' | 'c') {
+            if self.register_write_blocked() {
+                return;
+            }
+            if self.clipboard_write_unavailable() {
+                self.echo(CLIPBOARD_UNAVAILABLE);
+                return;
+            }
         }
         match op {
             'y' => {
@@ -141,8 +154,14 @@ impl Editor {
             return;
         }
         // A read-only register target aborts the operation; vim beeps and stays
-        // in visual mode with the selection intact.
+        // in visual mode with the selection intact. A clipboard target with no
+        // provider aborts loudly, likewise leaving the selection untouched.
         if self.register_write_blocked() {
+            self.reset_pending();
+            return;
+        }
+        if self.clipboard_write_unavailable() {
+            self.echo(CLIPBOARD_UNAVAILABLE);
             self.reset_pending();
             return;
         }
@@ -233,7 +252,11 @@ impl Editor {
     fn yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
         if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
             let reg = self.pending.register;
-            self.registers.record_yank(reg, text, kind);
+            if is_clipboard_register(reg) {
+                self.clipboard_write(text, kind);
+            } else {
+                self.registers.record_yank(reg, text, kind);
+            }
         }
     }
 
@@ -243,7 +266,11 @@ impl Editor {
     fn delete_yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
         if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
             let reg = self.pending.register;
-            self.registers.record_delete(reg, text, kind);
+            if is_clipboard_register(reg) {
+                self.clipboard_write(text, kind);
+            } else {
+                self.registers.record_delete(reg, text, kind);
+            }
         }
     }
 
@@ -402,10 +429,18 @@ impl Editor {
         self.snapshot_taken = true;
     }
 
+    /// Install the host clipboard backing the `"+` / `"*` registers. The server
+    /// hands over a real OS provider at startup; a bare-core test leaves it
+    /// `None` and selecting `"+` / `"*` then errors loudly.
+    pub fn set_clipboard(&mut self, clipboard: Box<dyn Clipboard>) {
+        self.clipboard = Some(clipboard);
+    }
+
     /// Resolve the active register's contents for a paste. Read-only specials
     /// project from live editor state — `"%` the file name, `"/` the last search
-    /// pattern, `":` the last ex command — and every other name reads the stored
-    /// register file. `None` for an empty / absent register (paste does nothing).
+    /// pattern, `":` the last ex command — the clipboard registers `"+` / `"*`
+    /// read the injected provider, and every other name reads the stored register
+    /// file. `None` for an empty / absent register (paste does nothing).
     pub(crate) fn register_text(&self, reg: Option<char>) -> Option<(String, RegKind)> {
         match reg {
             Some('%') => {
@@ -420,8 +455,35 @@ impl Editor {
                 .ex_history
                 .last()
                 .map(|cmd| (cmd.clone(), RegKind::Char)),
+            Some('+') | Some('*') => self.clipboard.as_ref()?.get().map(|(text, linewise)| {
+                let kind = if linewise {
+                    RegKind::Line
+                } else {
+                    RegKind::Char
+                };
+                (text, kind)
+            }),
             _ => self.registers.get(reg).map(|c| (c.text.clone(), c.kind)),
         }
+    }
+
+    /// Write a yank/delete to the host clipboard (the `"+` / `"*` target). Mirrors
+    /// the unnamed register too — vim sets `""` on any yank/delete regardless of
+    /// the explicit target — so a plain `p` still works after `"+y`. With no
+    /// provider installed, errors loudly rather than silently dropping the text.
+    fn clipboard_write(&mut self, text: String, kind: RegKind) {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            self.echo(CLIPBOARD_UNAVAILABLE);
+            return;
+        };
+        clipboard.set(&text, kind == RegKind::Line);
+        self.registers.set_api('"', text, kind, false);
+    }
+
+    /// Whether the active register targets the clipboard but no provider is
+    /// installed — the write must abort loudly instead of touching anything.
+    fn clipboard_write_unavailable(&self) -> bool {
+        is_clipboard_register(self.pending.register) && self.clipboard.is_none()
     }
 
     /// Whether the active register refuses writes (a read-only special). A
@@ -467,6 +529,12 @@ impl Editor {
 
     pub(crate) fn paste(&mut self, after: bool, count: usize) {
         let reg = self.pending.register;
+        // A clipboard paste with no provider errors loudly rather than silently
+        // pasting the unnamed register's contents instead.
+        if self.clipboard_write_unavailable() {
+            self.echo(CLIPBOARD_UNAVAILABLE);
+            return;
+        }
         let (text, linewise) = match self.register_text(reg) {
             Some((text, kind)) if !text.is_empty() => (text, kind == RegKind::Line),
             _ => return,

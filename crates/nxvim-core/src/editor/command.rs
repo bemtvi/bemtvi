@@ -348,12 +348,12 @@ enum ParseStep {
 
 /// Valid `"x` register names so far: the named `a`–`z`/`A`–`Z`, the numbered
 /// `0`–`9`, the small-delete `-`, the black hole `_`, the unnamed `"`, and the
-/// read-only specials `%` (filename), `/` (last search), `:` (last command).
-/// The remaining specials — `.` (last insert), `=`, clipboard `+` `*`, and the
-/// alternate-file `#` — are rejected until their phases land, so selecting one
-/// is a loud dead-end, never a silent no-op.
+/// read-only specials `%` (filename), `/` (last search), `:` (last command), and
+/// the system-clipboard `+` / `*`. The remaining specials — `.` (last insert),
+/// `=`, and the alternate-file `#` — are rejected until their phases land, so
+/// selecting one is a loud dead-end, never a silent no-op.
 fn is_register_name(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':' | '+' | '*')
 }
 
 /// The registers vim refuses to *write* (yank/delete into): the last-search
@@ -364,6 +364,14 @@ fn is_register_name(c: char) -> bool {
 /// abort is the whole of the signal.
 pub(crate) fn is_readonly_register(c: char) -> bool {
     matches!(c, '/' | '.' | '%' | ':' | '=' | '#')
+}
+
+/// Whether `reg` selects a system-clipboard register (`"+` or `"*`). These don't
+/// live in the in-memory register file — they route to the injected
+/// [`crate::clipboard::Clipboard`] provider — so yank/delete/paste special-case
+/// them. `"*` and `"+` map to the one provider in v1 (no X11 PRIMARY split).
+pub(crate) fn is_clipboard_register(reg: Option<char>) -> bool {
+    matches!(reg, Some('+') | Some('*'))
 }
 
 /// Map a key to its [`Motion`], or `None` if it is not a (g-free) motion key.

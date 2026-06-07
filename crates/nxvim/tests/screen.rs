@@ -579,6 +579,7 @@ async fn start_floats_example() -> (Rpc, UnboundedReceiver<Incoming>) {
                 file: Some(dir.join("sample.txt").to_string_lossy().into_owned()),
                 config_dir: Some(dir.clone()),
                 runtimepath: vec![dir],
+                ..Default::default()
             },
         ));
     });

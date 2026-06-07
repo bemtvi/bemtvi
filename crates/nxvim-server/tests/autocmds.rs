@@ -59,6 +59,7 @@ async fn start_with_file_and_config(
         file: Some(file.to_string()),
         config_dir: Some(dir.to_path_buf()),
         runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
     };
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {

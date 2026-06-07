@@ -141,6 +141,7 @@ async fn start(
                 file: Some(file),
                 config_dir: Some(config_dir),
                 runtimepath: vec![rtp],
+                ..Default::default()
             },
         ));
     });

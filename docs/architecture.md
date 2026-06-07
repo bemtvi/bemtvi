@@ -712,9 +712,10 @@ screen," and that is exactly the shape of these tests.
   native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
   `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
   the [LSP support design](specs/2026-06-02-lsp-support-design.md)).
-  **All ~400 vendored `lsp/<server>.lua` configs LOAD and START unmodified — but
-  starting a server is not the same as it *working*** (the distinction this
-  paragraph is careful about). The config-resolution surface is real and
+  **All ~400 vendored `lsp/<server>.lua` configs LOAD and START unmodified, and
+  the nxvim-side gap between merely *starting* a server and actually *driving* it
+  — the careful distinction the LSP completion plan tracked — is now closed (all
+  eight phases landed).** The config-resolution surface is real and
   regression-tested (`crates/nxvim-lua/tests/lspconfig_configs.rs` loads every
   config and resolves its `root_dir` + `cmd`): `vim.system`/`vim.json`/`vim.uv`
   (`fs_stat`, `os_homedir`, `cwd`, `fs_realpath`, `os_uname`), the `vim.fn`
@@ -728,12 +729,12 @@ screen," and that is exactly the shape of these tests.
   a server is up, the editing loop — `vim.lsp.buf.*`, `vim.diagnostic.*`, and
   capability-gated `on_attach` keymaps — genuinely works.
 
-  Through Phase 8 the config's `settings` / `init_options` / `capabilities` are
+  Concretely, the config's `settings` / `init_options` / `capabilities` are
   forwarded at `initialize`, the lifecycle hooks (`before_init` / `on_init` /
   `on_exit`) fire, and the deferred-callback surface (`vim.lsp.util.*`,
   `client:request`, `vim.ui.*`, the buffer/window getters) is real — see
   [the LSP completion plan](plans/2026-06-05-lsp-completion.md) for the phase-by-phase route
-  from "starts" to "works". Two whole configs are skipped: gdscript (a non-stdio
+  it took from "starts" to "works". Two whole configs are skipped: gdscript (a non-stdio
   TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a user-only
   `bundle_path`).
 

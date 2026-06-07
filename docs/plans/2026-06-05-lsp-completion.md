@@ -1,5 +1,12 @@
 # Making nvim-lspconfig *actually* work — completion plan
 
+> **Status: COMPLETE.** All eight phases (0–8) landed; this document is now
+> *history*, not a live to-do. The remaining gaps are the per-phase
+> *approximations* each phase recorded — tracked canonically in code
+> (`INCOMPLETE:` / `vim._notimpl`) and summarized in
+> [`docs/known-approximations.md`](../known-approximations.md), which the code
+> wins over if they ever disagree.
+
 ## Why this document exists
 
 The Phase-7b work made all ~400 vendored `lsp/<server>.lua` configs **load and

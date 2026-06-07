@@ -166,6 +166,12 @@ impl LuaRuntime {
         let shared = Rc::new(RefCell::new(Shared::default()));
         install_vim(&lua, &shared)?;
         install_runtime_api(&lua, &shared, &runtimepath)?;
+        // The `vim.treesitter` Lua platform's low-level primitives
+        // (`vim._create_ts_parser` & co.), backed by the in-process grammars the
+        // highlight engine already loads. Registering them is cheap and lazy — no
+        // grammar is touched until a plugin actually calls one — so it is always
+        // installed; the data dir is resolved the same way the engine resolves it.
+        nxvim_ts::lua::install(&lua, &nxvim_ts::data_dir())?;
         seed_package_path(&lua, &runtimepath)?;
         // The pure-Lua half of `vim.*`, layered over the Rust bridge above. Split
         // across focused modules but loaded in source order — each is its own

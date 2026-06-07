@@ -41,49 +41,37 @@ pub struct Grammar {
     _lib: libloading::Library,
 }
 
+/// Just the parser half of a grammar: the `Language` and the dynamic library it
+/// lives in, with **no** query files required. The `vim.treesitter` Lua platform
+/// stands on this — a plugin creates a parser or compiles its own query without
+/// the editor's `highlights.scm`/`indents.scm`, which only the [`Grammar`]
+/// highlighter needs. The library is held so the language's code outlives every
+/// tree and node derived from it (see the Lua binding's lifetime model).
+pub struct LoadedLanguage {
+    // Field order matters: `language` drops before `_lib`.
+    pub language: Language,
+    _lib: libloading::Library,
+}
+
+impl LoadedLanguage {
+    /// Load just the `Language` for `lang` from `data_dir` — the parser library,
+    /// dlopen'd and ABI-probed, without touching any query file. Same
+    /// missing-vs-broken distinction as [`Grammar::load`].
+    pub fn load(data_dir: &Path, lang: &str) -> Result<LoadedLanguage, LoadError> {
+        let (language, lib) = open_language(data_dir, lang)?;
+        Ok(LoadedLanguage {
+            language,
+            _lib: lib,
+        })
+    }
+}
+
 impl Grammar {
     /// Load the grammar for `lang` from `data_dir`. Distinguishes a *missing*
     /// parser ([`LoadError::NotInstalled`], silent) from a parser that is present
     /// but broken ([`LoadError::Failed`], worth echoing).
     pub fn load(data_dir: &Path, lang: &str) -> Result<Grammar, LoadError> {
-        // Security boundary: `lang` flows into the parser `.so` path and the
-        // query directory, and we then `dlopen` that path — i.e. execute native
-        // code. A name containing `.`, `/`, `\`, or path components could escape
-        // `data_dir` (traversal / absolute path) and load an arbitrary shared
-        // object. Reject anything that isn't a plain grammar identifier before
-        // touching the filesystem. The engine only ever *should* see names from
-        // the fixed filetype table, but it must not assume that.
-        if !is_valid_language(lang) {
-            return Err(LoadError::Failed(anyhow!("invalid language name '{lang}'")));
-        }
-
-        // No parser file at all is the common, expected case — not a failure.
-        let Some(lib_path) = parser_path(data_dir, lang) else {
-            return Err(LoadError::NotInstalled);
-        };
-
-        // SAFETY: loading arbitrary native code is inherently unsafe. A poison
-        // grammar can segfault the process (neovim's posture); the ABI probe
-        // below is the load-time mitigation.
-        let lib = unsafe { libloading::Library::new(&lib_path) }
-            .with_context(|| format!("dlopen {}", lib_path.display()))
-            .map_err(LoadError::Failed)?;
-
-        let symbol = format!("tree_sitter_{}", lang.replace('-', "_"));
-        let language = unsafe {
-            let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> = lib
-                .get(symbol.as_bytes())
-                .with_context(|| format!("symbol {symbol} in {}", lib_path.display()))
-                .map_err(LoadError::Failed)?;
-            Language::from_raw(func() as *const _)
-        };
-
-        // Validate the grammar ABI against our tree-sitter before trusting it.
-        let mut probe = Parser::new();
-        probe
-            .set_language(&language)
-            .with_context(|| format!("grammar '{lang}' ABI incompatible"))
-            .map_err(LoadError::Failed)?;
+        let (language, lib) = open_language(data_dir, lang)?;
 
         let hl_path = query_path(data_dir, lang, "highlights.scm");
         let hl_src = std::fs::read_to_string(&hl_path)
@@ -118,6 +106,56 @@ impl Grammar {
             _lib: lib,
         })
     }
+}
+
+/// dlopen the parser library for `lang` under `data_dir`, resolve its
+/// `tree_sitter_<lang>` export, and ABI-probe it — returning the `Language` and
+/// the library that must outlive it. The shared core of [`Grammar::load`] and
+/// [`LoadedLanguage::load`]; the only place that executes installed native code.
+fn open_language(
+    data_dir: &Path,
+    lang: &str,
+) -> Result<(Language, libloading::Library), LoadError> {
+    // Security boundary: `lang` flows into the parser `.so` path and the query
+    // directory, and we then `dlopen` that path — i.e. execute native code. A
+    // name containing `.`, `/`, `\`, or path components could escape `data_dir`
+    // (traversal / absolute path) and load an arbitrary shared object. Reject
+    // anything that isn't a plain grammar identifier before touching the
+    // filesystem. Callers only ever *should* pass names from the fixed filetype
+    // table (or a plugin's `get_parser(lang)`), but must not assume that.
+    if !is_valid_language(lang) {
+        return Err(LoadError::Failed(anyhow!("invalid language name '{lang}'")));
+    }
+
+    // No parser file at all is the common, expected case — not a failure.
+    let Some(lib_path) = parser_path(data_dir, lang) else {
+        return Err(LoadError::NotInstalled);
+    };
+
+    // SAFETY: loading arbitrary native code is inherently unsafe. A poison
+    // grammar can segfault the process (neovim's posture); the ABI probe below
+    // is the load-time mitigation.
+    let lib = unsafe { libloading::Library::new(&lib_path) }
+        .with_context(|| format!("dlopen {}", lib_path.display()))
+        .map_err(LoadError::Failed)?;
+
+    let symbol = format!("tree_sitter_{}", lang.replace('-', "_"));
+    let language = unsafe {
+        let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> = lib
+            .get(symbol.as_bytes())
+            .with_context(|| format!("symbol {symbol} in {}", lib_path.display()))
+            .map_err(LoadError::Failed)?;
+        Language::from_raw(func() as *const _)
+    };
+
+    // Validate the grammar ABI against our tree-sitter before trusting it.
+    let mut probe = Parser::new();
+    probe
+        .set_language(&language)
+        .with_context(|| format!("grammar '{lang}' ABI incompatible"))
+        .map_err(LoadError::Failed)?;
+
+    Ok((language, lib))
 }
 
 /// A grammar identifier: non-empty and only ASCII letters, digits, `_` or `-`

@@ -14,11 +14,13 @@
 
 pub mod engine;
 pub mod loader;
+#[cfg(feature = "lua")]
+pub mod lua;
 
 use std::path::PathBuf;
 
 pub use engine::Engine;
-pub use loader::Grammar;
+pub use loader::{Grammar, LoadedLanguage};
 
 /// Resolve nxvim's data directory (where `parser/` and `queries/` live).
 /// `$NXVIM_DATA_DIR` overrides everything (used by tests); otherwise the

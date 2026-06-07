@@ -8,6 +8,15 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The `vim.treesitter` Lua platform: the `mlua` userdata binding (`src/lua.rs`)
+# exposing the loaded grammars to Lua. Optional so a build that only needs the
+# synchronous highlight `Engine` doesn't link `mlua`. The Lua *backend* feature
+# (`lua51`/`luajit`) is selected by `nxvim-lua`, never here — the two are
+# mutually exclusive, so this crate only pulls `mlua` and lets the dependent
+# pick the version (see CLAUDE.md's "never --all-features" note).
+lua = ["dep:mlua"]
+
 [dependencies]
 anyhow.workspace = true
 ropey.workspace = true
@@ -15,3 +24,4 @@ nxvim-core.workspace = true
 tree-sitter.workspace = true
 streaming-iterator.workspace = true
 libloading.workspace = true
+mlua = { workspace = true, optional = true }

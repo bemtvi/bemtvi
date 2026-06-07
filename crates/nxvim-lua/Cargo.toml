@@ -21,6 +21,10 @@ luajit = ["mlua/luajit"]
 [dependencies]
 anyhow.workspace = true
 mlua.workspace = true
+# The treesitter crate, with its `vim.treesitter` Lua binding enabled. nxvim-lua
+# owns the Lua VM, so it installs the binding (`nxvim_ts::lua::install`) and
+# selects the shared mlua backend (`lua51`/`luajit`) the binding links against.
+nxvim-ts = { workspace = true, features = ["lua"] }
 regex.workspace = true
 rmpv.workspace = true
 serde_json.workspace = true

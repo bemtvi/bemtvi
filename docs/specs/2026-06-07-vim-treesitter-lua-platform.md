@@ -1,6 +1,10 @@
 # The `vim.treesitter` Lua platform — design
 
-**Status:** proposed (scoping only; no code yet). Builds the `vim.treesitter` Lua
+**Status:** phase 1 shipped (the userdata + lifetime model and the
+`vim._create_ts_parser` / `_ts_has_language` / `_ts_parse_query` primitives, with
+`TSParser:parse` reading a string — `crates/nxvim-ts/src/lua.rs`, tested in
+`crates/nxvim/tests/treesitter_lua.rs`); phases 2–5 pending. Builds the
+`vim.treesitter` Lua
 API as a **plugin platform** — Lua-owned parsers/trees/queries exposed as
 userdata over the in-process tree-sitter trees — so treesitter-consuming plugins
 (textobjects, context/sticky-scroll, incremental selection, AST/query tools)
@@ -227,12 +231,21 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
 
 ## Implementation phases
 
-1. **Userdata + lifetime model.** `nxvim-ts/src/lua.rs`: `TSNode`/`TSTree`/
-   `TSQuery` userdata over tree-sitter with the `Rc<Tree>` erasure; the
-   `vim._create_ts_parser` / `vim._ts_has_language` / `vim._ts_parse_query`
-   primitives; `TSParser:parse(source)` reading a **string**. mlua feature wired;
-   `install()` called from `nxvim-lua`. Black-box test: parse a string, walk
-   nodes, survive a reparse. *No high-level API yet — proves the hardest part.*
+1. **Userdata + lifetime model.** ✅ **Done.** `nxvim-ts/src/lua.rs`: `TSNode`/
+   `TSTree`/`TSQuery` userdata over tree-sitter with the `Rc<TreeInner>` erasure
+   (the `Rc` co-owns the `Tree` *and* the `LoadedLanguage` whose dylib the node
+   types live in); the `vim._create_ts_parser` / `vim._ts_has_language` /
+   `vim._ts_parse_query` primitives; `TSParser:parse(source)` reading a
+   **string** and returning `(tree, changed_ranges)` (matching neovim's
+   `parser_parse`, not the `{TSTree,…}` sketch above). The full upstream
+   `TSNode` method surface is implemented so phases 2–3 vendor the Lua against no
+   Rust gaps. A new `nxvim-ts::loader::LoadedLanguage` loads a grammar's parser
+   *without* requiring `highlights.scm` (the platform needs only the `Language`).
+   mlua wired behind nxvim-ts's optional `lua` feature; `install()` called from
+   `nxvim-lua::LuaRuntime::new`. Black-box tests (`tests/treesitter_lua.rs`):
+   parse a string, walk nodes, hold a node across a reparse *and* a GC of its
+   source tree, incremental `tree:edit` reparse, query compile + loud error,
+   missing-grammar loud error. *No high-level API yet — proves the hardest part.*
 2. **Vendor neovim treesitter Lua + `get_parser` over buffers.** Add the
    vendored `vim/treesitter/*.lua` to the runtimepath; route
    `language.add`/`_ts_inspect_language` to `nxvim-ts::loader`; adapt

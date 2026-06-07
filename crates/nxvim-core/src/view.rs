@@ -11,7 +11,7 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{BorderStyle, BufferId, Editor, WindowLayout};
+use crate::editor::{BorderStyle, BufferId, Editor, TabLabel, WindowLayout};
 use crate::mode::Mode;
 use crate::unicode;
 
@@ -172,6 +172,17 @@ pub struct WindowView {
     pub title: Option<String>,
 }
 
+/// One tab page's cell in the tabline. `label` is the tab's focused window's
+/// buffer name (`[No Name]` when unset), `modified` flags unsaved changes, and
+/// `window_count` is how many windows the tab holds. The client formats the cell
+/// (vim's default `{count}{+} {label}`) and highlights the `current` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabView {
+    pub label: String,
+    pub modified: bool,
+    pub window_count: usize,
+}
+
 /// A snapshot of everything a client needs to draw a frame: the **global** chrome
 /// (mode label, command line, message, panel) plus the list of [`WindowView`]s to
 /// paint. With one window the list has a single entry spanning the whole text
@@ -180,6 +191,13 @@ pub struct WindowView {
 pub struct View {
     /// The windows to paint, in layout order. Always at least one.
     pub windows: Vec<WindowView>,
+    /// The tab pages, in tabline order — **empty** when only one tab is open (the
+    /// client then draws no tabline). When non-empty, `current_tab` indexes the
+    /// active cell.
+    pub tabline: Vec<TabView>,
+    /// Index into `tabline` of the active tab. Meaningful only when `tabline` is
+    /// non-empty.
+    pub current_tab: usize,
     /// The split borders between windows, in windows-area cells. Empty with a
     /// single window.
     pub separators: Vec<Separator>,
@@ -221,6 +239,8 @@ impl View {
                 .iter()
                 .map(|w| window_view(ed, w))
                 .collect(),
+            tabline: ed.tab_labels().into_iter().map(tab_view).collect(),
+            current_tab: ed.current_tab_index(),
             separators: ed.separators().to_vec(),
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,
@@ -243,6 +263,15 @@ impl View {
             .iter()
             .find(|w| w.focused)
             .unwrap_or(&self.windows[0])
+    }
+}
+
+/// Project a core [`TabLabel`] into the wire-facing [`TabView`].
+fn tab_view(label: TabLabel) -> TabView {
+    TabView {
+        label: label.name,
+        modified: label.modified,
+        window_count: label.window_count,
     }
 }
 

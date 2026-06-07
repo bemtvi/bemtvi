@@ -548,15 +548,15 @@ impl Node {
 }
 
 /// The window layout: every open window keyed by id, the `root` of the split
-/// tree arranging them, the `current` (focused) window, the next id to hand out,
-/// and the separators the last [`WindowTree::layout`] produced. Mirrors
-/// [`BufferStore`]; with one window the tree is a single `Leaf`, there are no
-/// separators, and `current` always resolves.
+/// tree arranging them, the `current` (focused) window, and the separators the
+/// last [`WindowTree::layout`] produced. Window ids are minted by [`Editor`]
+/// (globally unique across tabs), not here. Mirrors [`BufferStore`]; with one
+/// window the tree is a single `Leaf`, there are no separators, and `current`
+/// always resolves.
 struct WindowTree {
     windows: BTreeMap<WindowId, Window>,
     root: Node,
     current: WindowId,
-    next_id: u64,
     /// Borders between splits, recomputed on every [`WindowTree::layout`]. Empty
     /// with a single window.
     separators: Vec<Separator>,
@@ -569,9 +569,18 @@ struct WindowTree {
 
 impl WindowTree {
     /// A tree seeded with a single window (id 1) bound to `buffer` and focused,
-    /// the window analogue of [`BufferStore::with_one`].
+    /// the window analogue of [`BufferStore::with_one`]. The first tab uses this;
+    /// later tabs ([`Editor::new_tab`]) use [`WindowTree::with_window`] with an
+    /// [`Editor`]-minted id so window handles stay unique across tabs.
     fn with_one(buffer: BufferId) -> Self {
-        let id = WindowId(1);
+        WindowTree::with_window(WindowId(1), buffer, WindowOptions::default())
+    }
+
+    /// A tree seeded with a single window of a specific (caller-minted) `id`,
+    /// bound to `buffer` with `options`. Used to back a freshly created tab page,
+    /// whose window id comes from [`Editor::alloc_window_id`] so it never collides
+    /// with a window in another tab.
+    fn with_window(id: WindowId, buffer: BufferId, options: WindowOptions) -> Self {
         let mut windows = BTreeMap::new();
         windows.insert(
             id,
@@ -581,7 +590,7 @@ impl WindowTree {
                 saved_top: 0,
                 saved_leftcol: 0,
                 rect: Rect::default(),
-                options: WindowOptions::default(),
+                options,
                 float: None,
             },
         );
@@ -589,7 +598,6 @@ impl WindowTree {
             windows,
             root: Node::Leaf(id),
             current: id,
-            next_id: 2,
             separators: Vec::new(),
             floats: Vec::new(),
         }
@@ -636,13 +644,6 @@ impl WindowTree {
     /// quitting the editor.
     fn tiled_count(&self) -> usize {
         self.leaves().len()
-    }
-
-    /// Mint a fresh, never-reused window id.
-    fn alloc_id(&mut self) -> WindowId {
-        let id = WindowId(self.next_id);
-        self.next_id += 1;
-        id
     }
 
     /// Re-sort the [float](Self::floats) list bottom-to-top by `(zindex, id)`, so
@@ -1083,6 +1084,16 @@ pub(crate) struct WindowLayout {
     pub(crate) title: Option<String>,
 }
 
+/// One tab page's label data for the [`View`] tabline: the file name of the
+/// tab's focused window's buffer (`[No Name]` when unset), whether that buffer is
+/// modified, and how many windows the tab holds. Mirrors vim's default tabline
+/// label (`{win_count}{+ if modified} {name}`); the client formats the cells.
+pub(crate) struct TabLabel {
+    pub(crate) name: String,
+    pub(crate) modified: bool,
+    pub(crate) window_count: usize,
+}
+
 /// A directional window-focus move (`<C-w>h/j/k/l`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WinDir {
@@ -1108,6 +1119,8 @@ enum WindowCmd {
     Only,
     /// `<C-w>q` — `:q`: close the focused window, or quit if it is the last.
     Quit,
+    /// `<C-w>T` — move the focused window to a new tab page.
+    ToNewTab,
     /// `<C-w>=` — equalize every window's size.
     Equalize,
     /// `<C-w>+` (grow) / `<C-w>-` (shrink) — change the focused window's height
@@ -1144,6 +1157,7 @@ fn window_command(key: Key) -> Option<WindowCmd> {
         'c' => WindowCmd::Close,
         'o' => WindowCmd::Only,
         'q' => WindowCmd::Quit,
+        'T' => WindowCmd::ToNewTab,
         '=' => WindowCmd::Equalize,
         '+' => WindowCmd::ResizeHeight(true),
         '-' => WindowCmd::ResizeHeight(false),
@@ -1353,6 +1367,8 @@ enum NormalCmd {
     ScrollHalf(bool),                                // <C-d> (true) / <C-u> (false)
     ScrollPage(bool),                                // <C-f> (true) / <C-b> (false)
     AltBuffer,                                       // <C-^> / <C-6>
+    TabNext(Option<usize>),                          // gt  ({count}gt → tab number)
+    TabPrev(Option<usize>),                          // gT  ({count}gT → count back)
 }
 
 /// The stage of a partially-typed command — what the *next* key means. The
@@ -1509,10 +1525,17 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
 
     let gpending = pending.stage == Stage::GPending;
 
-    // `g` prefix: a lone `g` arms it; a second `g` is `gg`.
+    // `g` prefix: a lone `g` arms it; a second `g` is `gg`; `gt`/`gT` cycle tabs.
     if gpending {
-        if key.as_char() == Some('g') {
-            return Complete(ResolvedCommand::Motion(Motion::GotoTop));
+        match key.as_char() {
+            Some('g') => return Complete(ResolvedCommand::Motion(Motion::GotoTop)),
+            Some('t') => {
+                return Complete(ResolvedCommand::Normal(NormalCmd::TabNext(pending.count)))
+            }
+            Some('T') => {
+                return Complete(ResolvedCommand::Normal(NormalCmd::TabPrev(pending.count)))
+            }
+            _ => {}
         }
     } else if key.as_char() == Some('g') {
         let mut next = pending.clone();
@@ -1853,6 +1876,14 @@ pub struct Editor {
     tabs: Vec<TabSlot>,
     /// Index into [`Editor::tabs`] of the active tab.
     current_tab: usize,
+    /// The next window id to mint, monotonic and **global** across every tab (a
+    /// window handle is never reused, matching neovim). The active tab's splits and
+    /// every new tab's first window draw from this one counter, so two tabs can
+    /// never hand out the same [`WindowId`]. Seeded past the first window (id 1).
+    next_win_id: u64,
+    /// The next tab id to mint, monotonic and never reused. Seeded past the first
+    /// tab (id 1).
+    next_tab_id: u64,
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
@@ -2058,6 +2089,8 @@ impl Editor {
                 tree: None,
             }],
             current_tab: 0,
+            next_win_id: 2,
+            next_tab_id: 2,
             alternate: None,
             mode: Mode::Normal,
             cursor: Cursor::default(),
@@ -2452,6 +2485,221 @@ impl Editor {
         Some(self.tab_tree(id)?.current)
     }
 
+    /// The active tab's index in tabline order (the highlighted cell).
+    pub(crate) fn current_tab_index(&self) -> usize {
+        self.current_tab
+    }
+
+    /// Every window id across **all** tab pages, in tab order then in-tab layout
+    /// order (`nvim_list_wins`, which spans every tabpage in neovim). Within a tab
+    /// the order matches [`Editor::tab_window_ids`].
+    pub fn all_window_ids(&self) -> Vec<WindowId> {
+        self.tabs
+            .iter()
+            .flat_map(|slot| self.tab_window_ids(slot.id).unwrap_or_default())
+            .collect()
+    }
+
+    /// One [`TabLabel`] per tab in tabline order — empty when only one tab is open
+    /// (vim's `showtabline=1` hides the tabline then). Each label names the tab's
+    /// focused window's buffer, whether it is modified, and the tab's window count.
+    pub(crate) fn tab_labels(&self) -> Vec<TabLabel> {
+        if self.tabs.len() <= 1 {
+            return Vec::new();
+        }
+        self.tabs
+            .iter()
+            .map(|slot| {
+                let tree = self
+                    .tab_tree(slot.id)
+                    .expect("a listed tab always has a tree");
+                let buf_id = tree.get(tree.current).buffer;
+                let buf = self.buffers.get(buf_id);
+                let name = buf
+                    .buffer
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "[No Name]".to_string());
+                TabLabel {
+                    name,
+                    modified: buf.buffer.modified,
+                    window_count: tree.count(),
+                }
+            })
+            .collect()
+    }
+
+    /// Make tab `id` the active tab (`nvim_set_current_tabpage`). A no-op if `id`
+    /// is already active or names no open tab.
+    pub fn set_current_tabpage(&mut self, id: TabId) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.id == id) {
+            self.switch_tab(idx);
+        }
+    }
+
+    /// Stash the live view position (`cursor`/`top`/`leftcol`) of the focused
+    /// window back into its [`Window`], so a later [`Editor::enter_window`] (in
+    /// this tab, or on return to it) restores it. The shared prelude of every
+    /// focus / tab switch.
+    fn stash_focused_view(&mut self) {
+        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        let w = self.windows.cur_mut();
+        w.saved_cursor = cursor;
+        w.saved_top = top;
+        w.saved_leftcol = leftcol;
+    }
+
+    /// Make the tab at `target` (an index into [`Editor::tabs`]) the active one:
+    /// stash the live window layout into the outgoing tab's slot, swap the
+    /// incoming tab's stashed layout onto [`Editor::windows`], and re-enter its
+    /// focused window. The tab analogue of [`Editor::focus_window`] — keeping
+    /// `self.windows` always the active layout means the whole editing machine is
+    /// untouched. A no-op for the current tab or an out-of-range index.
+    fn switch_tab(&mut self, target: usize) {
+        if target == self.current_tab || target >= self.tabs.len() {
+            return;
+        }
+        // Stash the outgoing tab's live view into its focused window, then move the
+        // whole live tree into its (currently empty) slot.
+        self.stash_focused_view();
+        let incoming = self.tabs[target]
+            .tree
+            .take()
+            .expect("an inactive tab always holds its stashed layout");
+        let outgoing = std::mem::replace(&mut self.windows, incoming);
+        self.tabs[self.current_tab].tree = Some(outgoing);
+        self.current_tab = target;
+        // Lay the now-live tree out for the current area, then enter its focused
+        // window (restores its buffer + view, clears transient state). A second
+        // relayout settles any cursor-relative float now that the cursor is live.
+        self.relayout();
+        let cur = self.windows.current;
+        self.enter_window(cur);
+        if !self.windows.floats.is_empty() {
+            self.relayout();
+        }
+    }
+
+    /// `:tabnew` / `:tabedit` / `<C-w>T` core: open a new tab — a fresh single
+    /// window bound to `buf` with `options` — directly after the current tab, and
+    /// make it active. The outgoing tab's layout is stashed first. The caller
+    /// follows up (e.g. `:enew` for an empty `:tabnew`, `:edit` for a file).
+    fn new_tab(&mut self, buf: BufferId, options: WindowOptions) {
+        self.stash_focused_view();
+        let new_win = self.alloc_window_id();
+        let tree = WindowTree::with_window(new_win, buf, options);
+        let outgoing = std::mem::replace(&mut self.windows, tree);
+        self.tabs[self.current_tab].tree = Some(outgoing);
+        let id = self.alloc_tab_id();
+        let insert_at = self.current_tab + 1;
+        self.tabs.insert(insert_at, TabSlot { id, tree: None });
+        self.current_tab = insert_at;
+        // The new window is live; sync the editor's live buffer + view to it and
+        // lay the (now one-row-shorter, if the tabline just appeared) area out.
+        self.set_cur_buffer(buf);
+        self.cursor = Cursor::default();
+        self.top = 0;
+        self.leftcol = 0;
+        self.mode = Mode::Normal;
+        self.reset_pending();
+        self.scroll_from = None;
+        self.pending_scroll = None;
+        self.message.clear();
+        self.relayout();
+        self.clamp_cursor();
+        self.ensure_visible();
+    }
+
+    /// `gt` / `:tabnext` — go to the next tab (wrapping), or, with a count, to that
+    /// absolute 1-based tab number (`{count}gt`, `:tabnext {count}`).
+    fn goto_tab_next(&mut self, count: Option<usize>) {
+        let n = self.tabs.len();
+        let target = match count {
+            Some(c) => c.saturating_sub(1).min(n - 1),
+            None => (self.current_tab + 1) % n,
+        };
+        self.switch_tab(target);
+    }
+
+    /// `gT` / `:tabprevious` — go `count` tabs back (default 1), wrapping.
+    fn goto_tab_prev(&mut self, count: Option<usize>) {
+        let n = self.tabs.len();
+        let back = count.unwrap_or(1) % n;
+        let target = (self.current_tab + n - back) % n;
+        self.switch_tab(target);
+    }
+
+    /// `:tabclose[!]` — close the current tab page (its whole layout; the buffers
+    /// stay loaded in the store). The tab to the right becomes active, or the last
+    /// tab if the closed one was last. Refuses to close the only tab (vim's
+    /// `E784`).
+    fn close_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            self.echo("E784: Cannot close last tab page");
+            return;
+        }
+        let closing = self.current_tab;
+        // The closing tab's tree is live on `self.windows`; its slot is empty.
+        // Drop the slot, then replace the live tree with a surviving tab's stash.
+        self.tabs.remove(closing);
+        let target = closing.min(self.tabs.len() - 1);
+        let incoming = self.tabs[target]
+            .tree
+            .take()
+            .expect("a surviving tab is inactive, so holds its stashed layout");
+        self.windows = incoming;
+        self.current_tab = target;
+        self.relayout();
+        let cur = self.windows.current;
+        self.enter_window(cur);
+        if !self.windows.floats.is_empty() {
+            self.relayout();
+        }
+    }
+
+    /// `:tabonly` — close every tab page but the current one (their buffers stay
+    /// loaded). A no-op when only one tab is open. The kept tab's live layout is
+    /// untouched; only the tabline-row reservation may change, so we re-lay.
+    fn tab_only(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let kept = self.tabs.remove(self.current_tab);
+        self.tabs.clear();
+        self.tabs.push(kept);
+        self.current_tab = 0;
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// `<C-w>T` — move the focused window to a new tab page. The window leaves its
+    /// current tab (a neighbor expands to fill the freed area) and becomes the only
+    /// window of a fresh tab, carrying its buffer and view position. Fails (no-op)
+    /// when it is the only window in the tab, as vim does.
+    fn window_to_new_tab(&mut self) {
+        if self.windows.leaves().len() <= 1 {
+            return;
+        }
+        // Capture the moving window's buffer, options, and live view before it is
+        // removed from this tab.
+        let cur = self.windows.current;
+        let buf = self.windows.get(cur).buffer;
+        let options = self.windows.get(cur).options;
+        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        // Remove it here; a survivor takes focus and the live view becomes theirs.
+        self.remove_window(cur);
+        // Open the new tab around the captured buffer, then restore the moved
+        // window's own view into its (now live) single window.
+        self.new_tab(buf, options);
+        self.cursor = cursor;
+        self.top = top;
+        self.leftcol = leftcol;
+        self.clamp_cursor();
+        self.ensure_visible();
+    }
+
     // ----- window management ------------------------------------------------
 
     /// The focused window's id (the `nvim_get_current_win` target).
@@ -2477,7 +2725,22 @@ impl Editor {
     /// `nvim_open_win` can return the new handle synchronously (the real window
     /// is created when the queued op drains).
     pub fn next_window_id(&self) -> WindowId {
-        WindowId(self.windows.next_id)
+        WindowId(self.next_win_id)
+    }
+
+    /// Mint a fresh, globally-unique window id (the single source of window
+    /// handles; every split, float, and new-tab window draws from here).
+    fn alloc_window_id(&mut self) -> WindowId {
+        let id = WindowId(self.next_win_id);
+        self.next_win_id += 1;
+        id
+    }
+
+    /// Mint a fresh, never-reused tab id.
+    fn alloc_tab_id(&mut self) -> TabId {
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        id
     }
 
     /// Make window `id` the focused one (`nvim_set_current_win`). A no-op if `id`
@@ -2657,7 +2920,7 @@ impl Editor {
         // A float inherits the focused window's window-local options (the number
         // gutter), so it renders consistently with the rest of the editor.
         let options = self.windows.get(self.windows.current).options;
-        let id = self.windows.alloc_id();
+        let id = self.alloc_window_id();
         self.windows.windows.insert(
             id,
             Window {
@@ -2873,7 +3136,7 @@ impl Editor {
         let buffer = self.windows.get(cur).buffer;
         // A split inherits the source window's window-local options, as vim does.
         let options = self.windows.get(cur).options;
-        let new_id = self.windows.alloc_id();
+        let new_id = self.alloc_window_id();
         self.windows.windows.insert(
             new_id,
             Window {
@@ -3394,13 +3657,25 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// Rows the tabline reserves at the top of the reported area: one when more
+    /// than one tab is open (vim's `showtabline=1` default), zero otherwise. The
+    /// client paints the tabline into this row and offsets the windows area below
+    /// it — the top-of-frame analogue of the bottom panel.
+    fn tabline_rows(&self) -> usize {
+        usize::from(self.tabs.len() > 1)
+    }
+
     /// Re-divide the current terminal area across the window tree. The windows
-    /// area excludes the global bottom panel (it docks below all windows); the
-    /// command/message line is the client's own row, already excluded from the
-    /// height the client reports. Re-run on resize and whenever the panel opens
-    /// or closes (which grows/shrinks the windows area).
+    /// area excludes the global bottom panel (it docks below all windows) and the
+    /// top tabline row (shown only with ≥2 tabs); the command/message line is the
+    /// client's own row, already excluded from the height the client reports.
+    /// Re-run on resize and whenever the panel or tabline appears/disappears
+    /// (which grows/shrinks the windows area).
     fn relayout(&mut self) {
-        let height = self.height.saturating_sub(self.panel_rows());
+        let height = self
+            .height
+            .saturating_sub(self.panel_rows())
+            .saturating_sub(self.tabline_rows());
         // The focused window's cursor cell, as an offset from its own rect's
         // top-left — what a `relative="cursor"` float anchors to. Guard against a
         // transient invalid `current` (mid-close, before the surviving window is
@@ -3679,6 +3954,7 @@ impl Editor {
             WindowCmd::Close => self.close_window(),
             WindowCmd::Only => self.only_window(),
             WindowCmd::Quit => self.ex_quit(false),
+            WindowCmd::ToNewTab => self.window_to_new_tab(),
             WindowCmd::Equalize => self.equalize_windows(),
             WindowCmd::ResizeHeight(grow) => {
                 self.resize_window(SplitDir::Horizontal, if grow { count } else { -count })
@@ -3759,6 +4035,8 @@ impl Editor {
             NormalCmd::ScrollHalf(down) => self.scroll_half(down),
             NormalCmd::ScrollPage(down) => self.scroll_page(down),
             NormalCmd::AltBuffer => self.goto_alternate(),
+            NormalCmd::TabNext(n) => self.goto_tab_next(n),
+            NormalCmd::TabPrev(n) => self.goto_tab_prev(n),
         }
         self.reset_pending();
     }
@@ -5962,6 +6240,15 @@ impl Editor {
             "clo" | "close" => self.close_window(),
             "hid" | "hide" => self.close_window(),
             "on" | "only" => self.only_window(),
+            "tabnew" | "tabe" | "tabed" | "tabedit" => self.ex_tabnew(args),
+            "tabc" | "tabclo" | "tabclose" => self.close_tab(),
+            "tabo" | "tabonly" => self.tab_only(),
+            "tabn" | "tabnext" => self.goto_tab_next(parse_opt_count_arg(args)),
+            "tabp" | "tabN" | "tabprevious" | "tabNext" => {
+                self.goto_tab_prev(parse_opt_count_arg(args))
+            }
+            "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
+            "tabl" | "tablast" => self.goto_tab_next(Some(self.tabs.len())),
             "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
             "vert" | "vertical" | "ver" => self.ex_vertical(args),
             "ls" | "buffers" | "files" => self.ex_buffers(),
@@ -6147,6 +6434,36 @@ impl Editor {
     fn ex_new(&mut self, dir: SplitDir) {
         self.split(dir);
         self.ex_enew();
+    }
+
+    /// `:tabnew` / `:tabedit [file]` — open a new tab page after the current one.
+    /// With a file argument the new tab edits it; with none it opens a fresh
+    /// `[No Name]` buffer (vim's behavior for both names). The new tab inherits the
+    /// source window's local options (the number gutter), like a split does.
+    ///
+    /// The buffer is resolved *before* the tab is created — a fresh empty one, the
+    /// named file reused if already open, or a new buffer loaded from disk — so the
+    /// new tab never reuses (and clobbers) the current tab's buffer the way an
+    /// in-place `:edit` of a throwaway buffer would.
+    fn ex_tabnew(&mut self, args: &str) {
+        let options = self.windows.cur().options;
+        let file = args.trim();
+        let buf = if file.is_empty() {
+            self.add_buffer(Buffer::empty())
+        } else {
+            let path = PathBuf::from(file);
+            match self.find_buffer_by_path(&path) {
+                Some(id) => id,
+                None => match Buffer::from_file(&path) {
+                    Ok(b) => self.add_buffer(b),
+                    Err(e) => {
+                        self.echo(e.to_string());
+                        self.add_buffer(Buffer::empty())
+                    }
+                },
+            }
+        };
+        self.new_tab(buf, options);
     }
 
     /// `:res[ize] {n}` — set the focused window's height; `:vertical resize {n}`
@@ -7275,11 +7592,14 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
 /// Parse a buffer-navigation count argument (`:bnext 2`). Empty / invalid / zero
 /// all mean 1, matching vim's default repeat count.
 fn parse_count_arg(args: &str) -> usize {
-    args.trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|n| *n > 0)
-        .unwrap_or(1)
+    parse_opt_count_arg(args).unwrap_or(1)
+}
+
+/// A positive numeric command argument, or `None` when absent / non-numeric. The
+/// `Option`-preserving form of [`parse_count_arg`] — `:tabnext` (no count → next
+/// tab) needs the absent case distinguished from `1` (no count → tab 1).
+fn parse_opt_count_arg(args: &str) -> Option<usize> {
+    args.trim().parse::<usize>().ok().filter(|n| *n > 0)
 }
 
 /// Map a file path's extension to a treesitter language / filetype name, or

@@ -100,8 +100,10 @@ impl Server {
             )])),
             // ----- windows --------------------------------------------------
             "nvim_list_wins" => Ok(Value::Array(
+                // Spans every tabpage, matching neovim; the current tab's windows
+                // come first (tab order, then in-tab layout order).
                 self.editor
-                    .window_ids()
+                    .all_window_ids()
                     .into_iter()
                     .map(|id| Value::from(id.0))
                     .collect(),
@@ -268,6 +270,13 @@ impl Server {
                     .collect(),
             )),
             "nvim_get_current_tabpage" => Ok(Value::from(self.editor.current_tab_id().0)),
+            "nvim_set_current_tabpage" => {
+                let tab = self.resolve_tabpage(params.first());
+                self.editor.set_current_tabpage(tab);
+                self.emit_lifecycle_events();
+                self.run_pending();
+                Ok(Value::Nil)
+            }
             "nvim_tabpage_is_valid" => {
                 let tab = self.resolve_tabpage(params.first());
                 Ok(Value::from(self.editor.tab_is_valid(tab)))

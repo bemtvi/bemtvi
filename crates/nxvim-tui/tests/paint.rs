@@ -589,3 +589,64 @@ fn a_zero_duration_scroll_gesture_does_not_arm_an_animation() {
     let buf = client.paint(20, 5);
     assert_eq!(row_text(&buf, 0).trim_end(), "l3");
 }
+
+/// Build a `tabline` array value from `(label, modified, window_count)` triples.
+fn tabline(tabs: &[(&str, bool, u64)]) -> Value {
+    Value::Array(
+        tabs.iter()
+            .map(|(label, modified, count)| {
+                Value::Map(vec![
+                    (Value::from("label"), Value::from(*label)),
+                    (Value::from("modified"), Value::from(*modified)),
+                    (Value::from("window_count"), Value::from(*count)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn tabline_paints_a_top_row_and_pushes_the_window_down() {
+    // Two tabs ⇒ a tabline on row 0 (the active cell reverse-video), and the
+    // window's text starts on row 1 — the windows area shrank by the tabline row.
+    let buf = paint(
+        &view(vec![
+            ("lines", lines(&["hello"])),
+            (
+                "tabline",
+                tabline(&[("a.txt", false, 1), ("b.txt", true, 1)]),
+            ),
+            ("current_tab", Value::from(1u64)),
+        ]),
+        40,
+        6,
+    );
+
+    let top = row_text(&buf, 0);
+    assert!(top.contains("a.txt"), "tab 1 label on the tabline: {top:?}");
+    assert!(top.contains("b.txt"), "tab 2 label on the tabline: {top:?}");
+    assert!(
+        top.contains('+'),
+        "the modified tab shows a + flag: {top:?}"
+    );
+
+    // The window text was pushed below the tabline row.
+    assert_eq!(row_text(&buf, 1).trim_end(), "hello");
+
+    // The active (second) cell is reverse-video; the first is not. Cell 0 is the
+    // leading space of tab 1 (normal); the `b` of "b.txt" sits past tab 1's text.
+    let b_col = top.find("b.txt").unwrap() as u16;
+    assert!(
+        reversed(&buf, b_col, 0),
+        "the active tab cell is highlighted"
+    );
+    assert!(!reversed(&buf, 1, 0), "the inactive tab cell is not");
+}
+
+#[test]
+fn no_tabline_with_a_single_tab() {
+    // One (or zero) tab ⇒ no tabline; the window keeps row 0, unchanged from the
+    // pre-tabs frame.
+    let buf = paint(&view(vec![("lines", lines(&["hello"]))]), 40, 6);
+    assert_eq!(row_text(&buf, 0).trim_end(), "hello");
+}

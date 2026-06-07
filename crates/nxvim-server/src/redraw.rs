@@ -4,7 +4,7 @@
 
 use crate::Server;
 use nxvim_core::highlight::Style;
-use nxvim_core::view::{ScrollAnim, Separator, ViewRect, WindowView};
+use nxvim_core::view::{ScrollAnim, Separator, TabView, ViewRect, WindowView};
 use nxvim_core::{BorderStyle, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;
@@ -63,6 +63,10 @@ impl Server {
         // The split borders between windows.
         let separators = Value::Array(view.separators.iter().map(separator_value).collect());
 
+        // The tabline cells (empty array when only one tab is open, so the client
+        // draws no tabline) and the active cell index.
+        let tabline = Value::Array(view.tabline.iter().map(tab_value).collect());
+
         // The insert-mode completion popup, `Nil` when none is open. The focused
         // window's text-area width (its width minus its number gutter) bounds the
         // overlay so it can't spill past the editable region.
@@ -83,6 +87,11 @@ impl Server {
         let map = vec![
             (Value::from("windows"), Value::Array(windows)),
             (Value::from("separators"), separators),
+            (Value::from("tabline"), tabline),
+            (
+                Value::from("current_tab"),
+                Value::from(view.current_tab as u64),
+            ),
             (
                 Value::from("mode_label"),
                 Value::from(view.mode_label.as_str()),
@@ -265,6 +274,20 @@ impl StyleTable {
     fn into_value(self) -> Value {
         Value::Array(self.list.iter().map(style_value).collect())
     }
+}
+
+/// Encode a tab page as a `{ label, modified, window_count }` map for the redraw
+/// map's `tabline` array. The client formats the cell and highlights the active
+/// one (carried separately as `current_tab`).
+fn tab_value(tab: &TabView) -> Value {
+    Value::Map(vec![
+        (Value::from("label"), Value::from(tab.label.as_str())),
+        (Value::from("modified"), Value::from(tab.modified)),
+        (
+            Value::from("window_count"),
+            Value::from(tab.window_count as u64),
+        ),
+    ])
 }
 
 /// Encode a split border as a `{ vertical, x, y, length }` map (cells, relative

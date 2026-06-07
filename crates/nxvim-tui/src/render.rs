@@ -130,13 +130,23 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     // Each window draws its own status line at the bottom of its rect, so there
     // is no longer a global status row here.
     let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    // The tabline claims one row at the very top when ≥2 tabs are open (matching
+    // the server's windows-area shrink); `0` otherwise, so single-tab frames are
+    // unchanged.
+    let tabline_rows = u16::from(!view.tabline.is_empty());
     let regions = Layout::vertical([
-        Constraint::Min(1),             // windows area
-        Constraint::Length(panel_rows), // panel (0 when none)
-        Constraint::Length(1),          // command line
+        Constraint::Length(tabline_rows), // tabline (0 when ≤1 tab)
+        Constraint::Min(1),               // windows area
+        Constraint::Length(panel_rows),   // panel (0 when none)
+        Constraint::Length(1),            // command line
     ])
     .split(frame.area());
-    let (wins_area, panel_area, cmd_area) = (regions[0], regions[1], regions[2]);
+    let (tabline_area, wins_area, panel_area, cmd_area) =
+        (regions[0], regions[1], regions[2], regions[3]);
+
+    if tabline_rows > 0 {
+        render_tabline(frame, tabline_area, view);
+    }
 
     // Paint each window; capture the focused one's text-inner rect and (possibly
     // interpolated) cursor row for the terminal cursor and the popup anchor.
@@ -228,12 +238,14 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
 /// hit-test lands on the cells the renderer drew.
 fn windows_area_rect(width: u16, height: u16, view: &View) -> Rect {
     let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    let tabline_rows = u16::from(!view.tabline.is_empty());
     Layout::vertical([
+        Constraint::Length(tabline_rows),
         Constraint::Min(1),
         Constraint::Length(panel_rows),
         Constraint::Length(1),
     ])
-    .split(Rect::new(0, 0, width, height))[0]
+    .split(Rect::new(0, 0, width, height))[1]
 }
 
 /// A window's absolute rect: its wire rect offset by the windows-area origin, or
@@ -804,6 +816,30 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
         view.message.clone()
     };
     frame.render_widget(Paragraph::new(content), area);
+}
+
+/// Render the tabline across the top row: one cell per tab, each ` {count} {name}{+} `
+/// (the window count only when >1, a `+` when the tab's buffer is modified, matching
+/// vim's default tabline). The active cell is reverse-video; the strip past the last
+/// cell is left blank (vim's `TabLineFill`). Drawn only with ≥2 tabs.
+fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
+    let mut spans: Vec<Span> = Vec::with_capacity(view.tabline.len());
+    for (i, tab) in view.tabline.iter().enumerate() {
+        let count = if tab.window_count > 1 {
+            format!("{} ", tab.window_count)
+        } else {
+            String::new()
+        };
+        let modified = if tab.modified { "+" } else { "" };
+        let text = format!(" {count}{}{modified} ", tab.label);
+        let style = if i == view.current_tab {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(text, style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The leading prompt shown ahead of the editable command line: the multi-char

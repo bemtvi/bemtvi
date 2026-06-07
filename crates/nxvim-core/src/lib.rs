@@ -31,4 +31,4 @@ pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};
 pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
-pub use view::{PanelView, View, ViewRect, WindowView};
+pub use view::{PanelView, TabView, View, ViewRect, WindowView};

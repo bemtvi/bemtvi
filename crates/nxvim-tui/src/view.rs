@@ -104,6 +104,12 @@ pub struct View {
     pub(crate) windows: Vec<WindowView>,
     /// The split separators between windows (empty with one window).
     pub(crate) separators: Vec<Separator>,
+    /// The tab pages, in tabline order — empty when only one tab is open (no
+    /// tabline is drawn). When non-empty, `current_tab` indexes the active cell.
+    pub(crate) tabline: Vec<TabData>,
+    /// Index into `tabline` of the active tab (meaningful only when `tabline` is
+    /// non-empty).
+    pub(crate) current_tab: usize,
     pub(crate) mode_label: String,
     pub(crate) command_mode: bool,
     /// True while `r` waits for its replacement character (a one-shot replace
@@ -155,6 +161,16 @@ pub(crate) struct PmenuData {
     /// The selected item's documentation lines, drawn in a preview box beside the
     /// popup. Empty ⇒ no preview (nothing selected, or the item has no docs).
     pub(crate) doc: Vec<String>,
+}
+
+/// One tabline cell mirrored from the server's redraw: the buffer label, its
+/// modified flag, and the tab's window count. The client formats the rendered
+/// text (vim's default `{count}{+} {label}`).
+#[derive(Clone)]
+pub(crate) struct TabData {
+    pub(crate) label: String,
+    pub(crate) modified: bool,
+    pub(crate) window_count: usize,
 }
 
 /// The bottom panel mirrored from the server's redraw: a title, the visible
@@ -212,6 +228,8 @@ impl View {
             _ => vec![parse_window(map, &self.styles)],
         };
         self.separators = parse_separators(map_get(map, "separators"));
+        self.tabline = parse_tabline(map_get(map, "tabline"));
+        self.current_tab = map_u64(map, "current_tab") as usize;
         self.panel = match map_get(map, "panel") {
             Some(Value::Map(p)) => Some(PanelData {
                 title: map_str(p, "title"),
@@ -366,6 +384,26 @@ fn parse_border(value: Option<&Value>) -> Option<BorderType> {
         Some("solid") => Some(BorderType::QuadrantInside),
         _ => None,
     }
+}
+
+/// Parse the `tabline` array: each entry a `{ label, modified, window_count }`
+/// map. Empty (so no tabline drawn) when only one tab is open.
+fn parse_tabline(value: Option<&Value>) -> Vec<TabData> {
+    let Some(Value::Array(arr)) = value else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| match v {
+            Value::Map(t) => Some(TabData {
+                label: map_str(t, "label"),
+                modified: map_get(t, "modified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                window_count: map_u64(t, "window_count") as usize,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Parse the `separators` array: each entry a `{ vertical, x, y, length }` map.

@@ -15,6 +15,11 @@
 --   gt / gT                   next / previous tab;  {count}gt jumps to tab N
 --   :tabnext / :tabprevious / :tablast / :tabfirst
 --   <C-w>T                    move the focused window to its own new tab
+--   :tab split                clone the current buffer + cursor into a new tab
+--   :tab edit FILE            open FILE in a new tab (the `:tab {cmd}` modifier)
+--   :drop FILE                jump to a window already showing FILE (in any tab),
+--                             else :edit it here
+--   :tab drop FILE            same, but open FILE in a NEW tab when not shown
 --   :tabclose                 close the current tab (refuses the last one)
 --   :tabonly                  close every tab but this one
 --   :q                        on a tab's last window, closes the TAB (other tabs

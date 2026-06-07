@@ -197,6 +197,32 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// `:tab split` — open the *current* buffer in a new tab, preserving the
+    /// focused window's cursor/scroll. Unlike [`Editor::new_tab`] (which resets
+    /// the view, as `:tabnew` does), this clones the live view into its own tab,
+    /// matching vim's "a split made into a tab page".
+    pub(crate) fn tab_split(&mut self) {
+        let buf = self.current_buffer_id();
+        let options = self.windows.cur().options;
+        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        self.new_tab(buf, options);
+        self.cursor = cursor;
+        self.top = top;
+        self.leftcol = leftcol;
+        self.clamp_cursor();
+        self.ensure_visible();
+    }
+
+    /// Focus window `win` in the tab at index `tab_idx`, switching tabs first if
+    /// it is not already active. Backs `:drop` / `:tab drop` when the requested
+    /// file is already shown somewhere.
+    pub(crate) fn goto_tab_window(&mut self, tab_idx: usize, win: WindowId) {
+        if tab_idx != self.current_tab {
+            self.switch_tab(tab_idx);
+        }
+        self.set_current_window(win);
+    }
+
     /// `gt` / `:tabnext` — go to the next tab (wrapping), or, with a count, to that
     /// absolute 1-based tab number (`{count}gt`, `:tabnext {count}`).
     pub(crate) fn goto_tab_next(&mut self, count: Option<usize>) {

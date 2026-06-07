@@ -756,3 +756,155 @@ async fn tabclose_refuses_last_tab_and_rejects_out_of_range() {
     assert_eq!(bad, "E474: Invalid argument: 9");
     assert_eq!(tab_order(&rpc).await, vec![1, 2, 3]);
 }
+
+// ----- Phase 4: the `:tab {cmd}` modifier and `:drop` / `:tab drop` ---------
+
+/// The current buffer's handle (`nvim_get_current_buf`).
+async fn cur_buf(rpc: &Rpc) -> u64 {
+    handle(&req(rpc, "nvim_get_current_buf", vec![]).await)
+}
+
+/// The focused window's cursor as `(1-based row, 0-based col)`.
+async fn cur_cursor(rpc: &Rpc) -> (u64, u64) {
+    match req(rpc, "nvim_win_get_cursor", vec![Value::from(0u64)]).await {
+        Value::Array(a) => (
+            a.first().and_then(Value::as_u64).unwrap_or(0),
+            a.get(1).and_then(Value::as_u64).unwrap_or(0),
+        ),
+        v => panic!("expected a cursor array, got {v:?}"),
+    }
+}
+
+/// The current buffer's lines (`nvim_buf_get_lines`).
+async fn cur_lines(rpc: &Rpc) -> Vec<String> {
+    match req(
+        rpc,
+        "nvim_buf_get_lines",
+        vec![
+            Value::from(0u64),
+            Value::from(0i64),
+            Value::from(-1i64),
+            Value::Boolean(false),
+        ],
+    )
+    .await
+    {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn tab_split_clones_the_current_buffer_and_view_into_a_new_tab() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "iline one<CR>line two<CR>line three<Esc>").await;
+    feed_sync(&rpc, "ggj").await; // land on line 2, deterministically
+    let buf = cur_buf(&rpc).await;
+    let pos = cur_cursor(&rpc).await;
+
+    feed_sync(&rpc, ":tab split<CR>").await;
+
+    assert_eq!(tab_order(&rpc).await, vec![1, 2], ":tab split adds a tab");
+    assert_eq!(cur_tab(&rpc).await, 2, "the new tab is active");
+    assert_eq!(
+        cur_buf(&rpc).await,
+        buf,
+        ":tab split shows the same buffer (a cloned split), not a fresh one"
+    );
+    assert_eq!(
+        cur_cursor(&rpc).await,
+        pos,
+        ":tab split preserves the cursor/view, unlike :tabnew"
+    );
+}
+
+#[tokio::test]
+async fn drop_focuses_an_existing_window_in_another_tab() {
+    let file = temp_file("drop_jump", "alpha\nbeta\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":tabedit {file}<CR>")).await; // tab 2 shows the file
+    let file_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, ":tabfirst<CR>").await; // back to tab 1 ([No Name])
+    assert_eq!(cur_tab(&rpc).await, 1);
+
+    feed_sync(&rpc, &format!(":drop {file}<CR>")).await;
+
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1, 2],
+        ":drop opens no new tab when the file is already shown"
+    );
+    assert_eq!(
+        cur_tab(&rpc).await,
+        2,
+        ":drop jumps to the tab whose window shows the file"
+    );
+    assert_eq!(cur_buf(&rpc).await, file_buf);
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[tokio::test]
+async fn drop_edits_the_file_in_place_when_not_open_anywhere() {
+    let file = temp_file("drop_edit", "alpha\nbeta\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":drop {file}<CR>")).await;
+
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1],
+        ":drop of an unopened file makes no new tab"
+    );
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec!["alpha", "beta"],
+        ":drop edits the file in the current window when it isn't open"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[tokio::test]
+async fn tab_drop_opens_an_unopened_file_in_a_new_tab() {
+    let file = temp_file("tabdrop_new", "alpha\nbeta\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":tab drop {file}<CR>")).await;
+
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1, 2],
+        ":tab drop of an unopened file opens a new tab"
+    );
+    assert_eq!(cur_tab(&rpc).await, 2);
+    assert_eq!(cur_lines(&rpc).await, vec!["alpha", "beta"]);
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[tokio::test]
+async fn tab_drop_focuses_an_existing_window_instead_of_opening_a_tab() {
+    let file = temp_file("tabdrop_jump", "alpha\nbeta\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":tabedit {file}<CR>")).await; // tab 2 shows the file
+    let file_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, ":tabfirst<CR>").await; // tab 1
+
+    feed_sync(&rpc, &format!(":tab drop {file}<CR>")).await;
+
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1, 2],
+        ":tab drop reuses the tab already showing the file (no third tab)"
+    );
+    assert_eq!(cur_tab(&rpc).await, 2);
+    assert_eq!(cur_buf(&rpc).await, file_buf);
+
+    let _ = std::fs::remove_file(&file);
+}

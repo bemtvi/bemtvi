@@ -221,10 +221,13 @@ function vim.api.nvim_buf_del_keymap(buffer, mode, lhs)
 end
 
 -- Invoke the function RHS for entry `id` (called from Rust when a Lua-backed
--- mapping fires). A no-op if no function is registered under that id.
+-- mapping fires). A no-op if no function is registered under that id. Run through
+-- vim._pump so the RHS is a pumped entry: a vim.fn.input / vim.fn.confirm in the
+-- mapping parks on the command line and resumes with the answer (vim._pump
+-- re-raises a throwing RHS for the server to surface).
 function vim._run_keymap(id)
   local fn = vim._keymap_fns[id]
-  if fn then fn() end
+  if fn then vim._pump(fn) end
 end
 
 -- Textlock for <expr> mappings. An <expr> RHS must *compute* the keys to feed and

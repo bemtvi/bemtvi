@@ -47,6 +47,27 @@ function vim._run_cb(id, keep, ...)
   if fn then return fn(...) end
 end
 
+-- vim._pump(fn, ...): run fn(...) inside a coroutine so a SYNCHRONOUS prompt
+-- (vim.fn.input / vim.fn.confirm) called within it can `coroutine.yield` to park
+-- the chunk on the command line while it waits for the answer, then resume inline
+-- with it. The pumped entry points (a :lua chunk, a keymap RHS, a user command)
+-- run their Lua through this; a bare callback (timer / schedule / autocmd) does
+-- not, so a blocking prompt there fails loud rather than hanging.
+--
+-- Returns (true, fn's-first-return) when fn ran to completion, or (false) when it
+-- parked on a prompt — the prompt-result callback the prompt registered resumes
+-- the coroutine later (see vim.fn.input). A fn error is re-raised (level 0, so no
+-- extra position is prepended) for the server to surface as E5108.
+function vim._pump(fn, ...)
+  local co = coroutine.create(fn)
+  local ok, a = coroutine.resume(co, ...)
+  if not ok then error(a, 0) end
+  if coroutine.status(co) == "dead" then
+    return true, a -- completed; `a` is fn's first return value
+  end
+  return false -- suspended: parked on a prompt
+end
+
 -- vim.schedule(fn): defer `fn` to the end of the current convergence — it runs
 -- after the work that scheduled it settles, no longer nested in the caller's
 -- stack frame (the strict improvement over the old inline `fn()`), but still

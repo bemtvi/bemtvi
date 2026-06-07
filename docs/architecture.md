@@ -617,9 +617,12 @@ screen," and that is exactly the shape of these tests.
   `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — multiple windows, the `vim.treesitter` Lua API,
   buffer-local options not yet honored by the core, a per-buffer command registry,
-  richer diagnostic surfaces, and the **synchronous prompts** `vim.fn.input` /
-  `vim.fn.confirm` (which need an inline-return input pump). Legacy Vimscript
-  (`eval.c`) is **not** on the roadmap — see guiding principle 2.
+  and richer diagnostic surfaces. (The **synchronous prompts** `vim.fn.input` /
+  `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,
+  or user command — runs its Lua inside a coroutine via `vim._pump`, so the prompt
+  `coroutine.yield`s to park the chunk on the command line and the result resumes
+  it inline. See `examples/sync-prompts/`.) Legacy Vimscript (`eval.c`) is **not**
+  on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists, but only `number`/`relativenumber`
   (the line-number column) are honored so far, and options are still global —
   **buffer-local options** are the next gap. Also mappings (`:map`), registers

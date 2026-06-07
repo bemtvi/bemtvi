@@ -29,7 +29,7 @@ mod runtime;
 mod vimregex;
 
 pub use ops::{
-    BufOp, CallbackArgs, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp,
     LspServerCapabilities, PanelOp, RawKeymap, RawRhs, UiInputReq,
 };
 pub use runtime::LuaRuntime;

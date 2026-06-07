@@ -275,12 +275,72 @@ end
 function vim.fn.setreg(_name, _value, _opts) vim._notimpl("vim.fn.setreg") end
 function vim.fn.setqflist(_list, _action, _what) vim._notimpl("vim.fn.setqflist") end
 
--- vim.fn.input(opts) / vim.fn.confirm(msg, choices, …): SYNCHRONOUS prompts —
--- they block and RETURN the user's answer inline (a string / a 1-based index).
--- nxvim has a prompt surface (vim.ui.input / the panel), but only in its async
--- callback shape; the inline-return contract here needs a re-entrant input pump
--- that doesn't yet exist, so both fail loud rather than fake a value. See
--- docs/architecture.md → "Not yet implemented (roadmap)" for the target.
-function vim.fn.input(_opts, _default, _completion) vim._notimpl("vim.fn.input") end
-function vim.fn.confirm(_msg, _choices, _default, _type) vim._notimpl("vim.fn.confirm") end
+-- vim.fn.input(opts[, default, completion]) / vim.fn.confirm(msg, choices, …):
+-- SYNCHRONOUS prompts — they block the calling chunk and RETURN the user's answer
+-- inline (input → the typed string, "" on cancel; confirm → a 1-based button
+-- index, 0 on cancel). They drive nxvim's command line (a CmdlineKind::Prompt /
+-- ::Confirm) and suspend the running coroutine until the user answers, so they
+-- work only inside a coroutine-PUMPED entry — a :lua chunk, a keymap RHS, or a
+-- user command, all of which the server runs through vim._pump. Called from a
+-- bare callback (a timer / vim.schedule / autocmd), there is no coroutine to
+-- suspend, so they fail loud instead of hanging or faking a value.
+
+-- Register a one-shot callback that resumes THIS coroutine with the prompt's
+-- result, ask the server to open the prompt (via `open`, which queues the request
+-- carrying the callback id), then yield until the result resumes us. Re-raises a
+-- throwing continuation so the server surfaces it (E5108).
+local function await_prompt(open)
+  local co = coroutine.running()
+  if not co then
+    error(
+      "vim.fn.input/confirm requires a synchronous pumped context "
+        .. "(a :lua chunk, keymap, or command); it cannot block in a callback",
+      0
+    )
+  end
+  local cb = vim._next_cb_id()
+  vim._cb_fns[cb] = function(value)
+    local ok, err = coroutine.resume(co, value)
+    if not ok then error(err, 0) end
+  end
+  open(cb)
+  return coroutine.yield()
+end
+
+function vim.fn.input(opts, default, _completion)
+  local prompt
+  if type(opts) == "table" then
+    prompt, default = opts.prompt, opts.default
+  else
+    prompt = opts
+  end
+  prompt = tostring(prompt or "")
+  default = tostring(default or "")
+  local text = await_prompt(function(cb) vim._ui_input(prompt, default, cb) end)
+  return text or "" -- a cancelled input is "" (not nil); the contract vs vim.ui.input
+end
+
+function vim.fn.confirm(msg, choices, default, _type)
+  -- Parse the `\n`-separated choice list. Each choice marks its accelerator with
+  -- `&` (e.g. "&Yes"); absent, the first char is the accelerator. Render it
+  -- bracketed for display ("&Yes" → "[Y]es") and lowercase it for key matching.
+  local accels, labels = {}, {}
+  for choice in tostring(choices or "&Ok"):gmatch("[^\n]+") do
+    local amp = choice:find("&", 1, true)
+    local acc, label
+    if amp then
+      acc = choice:sub(amp + 1, amp + 1)
+      label = choice:sub(1, amp - 1) .. "[" .. acc .. "]" .. choice:sub(amp + 2)
+    else
+      acc = choice:sub(1, 1)
+      label = "[" .. acc .. "]" .. choice:sub(2)
+    end
+    accels[#accels + 1] = acc:lower()
+    labels[#labels + 1] = label
+  end
+  local label = tostring(msg or "") .. " " .. table.concat(labels, ", ") .. ": "
+  default = tonumber(default) or 0
+  local idx = await_prompt(function(cb) vim._confirm(label, accels, default, cb) end)
+  return tonumber(idx) or 0
+end
 

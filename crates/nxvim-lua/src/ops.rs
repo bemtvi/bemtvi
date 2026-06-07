@@ -377,3 +377,22 @@ pub struct UiInputReq {
     /// The `vim._cb_fns` id whose `on_confirm` wrapper receives the result.
     pub cb_id: u64,
 }
+
+/// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a
+/// single-key button dialog showing `label` (the message plus the rendered
+/// buttons, already formatted by the Lua wrapper) and fire callback `cb_id` (a
+/// `vim._cb_fns` entry that resumes the blocked coroutine) with the chosen
+/// button's 1-based index — or `0` on cancel. Queued in
+/// [`crate::runtime::Shared::confirms`], drained by the server.
+#[derive(Clone, Debug)]
+pub struct ConfirmReq {
+    /// The fully-rendered prompt label (message + bracketed buttons).
+    pub label: String,
+    /// The lowercase accelerator key for each button, in order; a keypress
+    /// matching one (case-insensitively) resolves to its 1-based index.
+    pub accelerators: Vec<String>,
+    /// The button selected by `<CR>` (1-based; `0` = none, so `<CR>` cancels).
+    pub default: i64,
+    /// The `vim._cb_fns` id whose continuation receives the chosen index.
+    pub cb_id: u64,
+}

@@ -15,8 +15,8 @@ use crate::convert::{json_to_lua, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap,
-    RawRhs, UiInputReq,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp, PanelOp,
+    RawKeymap, RawRhs, UiInputReq,
 };
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -65,6 +65,9 @@ pub(crate) struct Shared {
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
+    /// `vim.fn.confirm` button-dialog requests, drained by the server into the
+    /// editor's command line (`Editor::open_confirm`) after the chunk.
+    pub(crate) confirms: Vec<ConfirmReq>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -126,6 +129,52 @@ impl LuaRuntime {
     /// Run a Lua chunk. Errors are returned for the server to surface.
     pub fn exec(&self, chunk: &str) -> mlua::Result<()> {
         self.lua.load(chunk).exec()
+    }
+
+    /// Compile `chunk` to a callable function, trying the expression form
+    /// (`return <chunk>`) first and falling back to statements — the same
+    /// dual-mode load `Chunk::eval` does, so both an expression and a statement
+    /// block become a function we can run inside a coroutine.
+    fn load_callable(&self, chunk: &str) -> mlua::Result<mlua::Function> {
+        if let Ok(f) = self.lua.load(format!("return {chunk}")).into_function() {
+            return Ok(f);
+        }
+        self.lua.load(chunk).into_function()
+    }
+
+    /// Run `func` through the prompt pump (`vim._pump`), which executes it inside a
+    /// coroutine so a `vim.fn.input` / `vim.fn.confirm` in it can park on the
+    /// command line and resume with the answer. Returns the function's first
+    /// return value (`Some`) when it ran to completion, or `None` when it parked
+    /// on a prompt (the prompt-result callback resumes the coroutine later). A
+    /// throwing function propagates its error (re-raised by `vim._pump`).
+    fn pump(&self, func: mlua::Function) -> mlua::Result<Option<mlua::Value>> {
+        let pump: mlua::Function = self.vim()?.get("_pump")?;
+        let (completed, value): (bool, mlua::Value) = pump.call(func)?;
+        Ok(completed.then_some(value))
+    }
+
+    /// Run a `:lua` chunk under the prompt pump — the [`exec`](Self::exec)
+    /// analogue for the queued `:lua` drain, so a `vim.fn.input` / `vim.fn.confirm`
+    /// in the chunk parks on the command line instead of erroring "outside a
+    /// coroutine". Errors are returned for the server to surface.
+    pub fn exec_pumped(&self, chunk: &str) -> mlua::Result<()> {
+        let func = self.lua.load(chunk).into_function()?;
+        self.pump(func)?;
+        Ok(())
+    }
+
+    /// [`eval_to_value`](Self::eval_to_value) under the prompt pump — the
+    /// `nvim_exec_lua` entry. When the chunk parks on a prompt its return value is
+    /// not available synchronously, so `Nil` is returned and the chunk's eventual
+    /// value is discarded (a documented limit of blocking from a synchronous RPC
+    /// getter; drive prompts from a keymap / `:lua` instead).
+    pub fn eval_to_value_pumped(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
+        let func = self.load_callable(chunk)?;
+        match self.pump(func)? {
+            Some(value) => lua_to_rmpv(&value),
+            None => Ok(rmpv::Value::Nil),
+        }
     }
 
     /// Evaluate a Lua chunk and convert its return value to an RPC [`rmpv::Value`]
@@ -267,6 +316,12 @@ impl LuaRuntime {
     /// the server to open as command-line prompts (Phase 8).
     pub fn take_ui_inputs(&self) -> Vec<UiInputReq> {
         std::mem::take(&mut self.shared.borrow_mut().ui_inputs)
+    }
+
+    /// Take the `vim.fn.confirm` button-dialog requests queued since the last
+    /// drain, for the server to open as command-line confirm prompts.
+    pub fn take_confirms(&self) -> Vec<ConfirmReq> {
+        std::mem::take(&mut self.shared.borrow_mut().confirms)
     }
 
     /// Deliver a `vim.ui.input` result to its callback `id`: the typed line
@@ -563,7 +618,11 @@ impl LuaRuntime {
                 }
                 opts.set("fargs", fargs)?;
                 opts.set("bang", false)?;
-                f.call::<()>(opts)
+                // Run through the prompt pump so a `vim.fn.input` / `vim.fn.confirm`
+                // in the command's body can block and use the answer.
+                let pump: mlua::Function = self.vim()?.get("_pump")?;
+                pump.call::<mlua::MultiValue>((f, opts))?;
+                Ok(())
             }
             mlua::Value::String(s) => {
                 self.shared

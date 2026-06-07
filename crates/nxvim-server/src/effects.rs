@@ -74,6 +74,16 @@ impl Server {
             self.editor.open_prompt(req.prompt, req.default);
             self.pending_ui_input = Some(req.cb_id);
         }
+        // `vim.fn.confirm` button dialogs: open the command line as a single-key
+        // confirm prompt and remember the callback that resumes the blocked
+        // `vim.fn.confirm` coroutine. Shares the `pending_ui_input` slot and the
+        // `prompt_results` channel with `vim.ui.input` (only one prompt is open at
+        // a time); the chosen index arrives as a string the Lua side reads back.
+        for req in self.lua.take_confirms() {
+            self.editor
+                .open_confirm(req.label, req.accelerators, req.default);
+            self.pending_ui_input = Some(req.cb_id);
+        }
     }
 
     /// Apply one [`BufOp`] to the live editor (Phase 6). Converts the neovim line
@@ -269,7 +279,10 @@ impl Server {
         self.push_buf_mirror();
         loop {
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
-                if let Err(e) = self.lua.exec(&chunk) {
+                // `exec_pumped` (not `exec`) so a `vim.fn.input` / `vim.fn.confirm`
+                // in a `:lua` chunk can block on the command line and resume with
+                // the answer instead of erroring "outside a coroutine".
+                if let Err(e) = self.lua.exec_pumped(&chunk) {
                     self.editor.echo(format!("E5108: Error executing lua: {e}"));
                 }
                 self.apply_lua_effects();

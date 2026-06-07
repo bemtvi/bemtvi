@@ -202,6 +202,12 @@ enum CmdlineKind {
     /// callback (and `<Esc>` hands it `nil`), via [`Editor::prompt_results`]. The
     /// label is held in [`Editor::cmdline_prompt`].
     Prompt,
+    /// A `vim.fn.confirm` button dialog: a single keypress matching a button
+    /// accelerator (or `<CR>` → default, `<Esc>` → 0) resolves it, delivering the
+    /// chosen 1-based index as a string through [`Editor::prompt_results`] (the
+    /// same channel `Prompt` uses; the Lua side reads it back as a number). The
+    /// rendered message + buttons are held in [`Editor::cmdline_prompt`].
+    Confirm,
 }
 
 #[derive(Clone)]
@@ -970,6 +976,13 @@ pub struct Editor {
     /// each tick (like [`Editor::panel_selects`]) and fires the registered
     /// callback. nxvim-native; not a neovim concept.
     pub prompt_results: Vec<Option<String>>,
+    /// For an open [`CmdlineKind::Confirm`]: the lowercase accelerator key of each
+    /// button, in order. A keypress matching one (case-insensitively) resolves to
+    /// its 1-based index. Empty unless a confirm prompt is open.
+    confirm_accelerators: Vec<String>,
+    /// For an open [`CmdlineKind::Confirm`]: the button `<CR>` selects (1-based;
+    /// `0` = none, so `<CR>` cancels like `<Esc>`).
+    confirm_default: i64,
     /// The last search pattern, its direction, and its trailing offset, for
     /// `n`/`N` repeat and an empty-pattern re-search. `None` until the first
     /// search.
@@ -1116,6 +1129,8 @@ impl Editor {
             cmdline_kind: CmdlineKind::Ex,
             cmdline_prompt: String::new(),
             prompt_results: Vec::new(),
+            confirm_accelerators: Vec::new(),
+            confirm_default: 0,
             last_search: None,
             search_operator: None,
             pending_search_count: 1,
@@ -3118,6 +3133,12 @@ impl Editor {
     }
 
     fn handle_command(&mut self, key: Key) {
+        // A `vim.fn.confirm` dialog resolves on a single keypress, not a typed
+        // line, so it owns the key ahead of the line-editing path below.
+        if matches!(self.cmdline_kind, CmdlineKind::Confirm) {
+            self.handle_confirm(key);
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.cancel_cmdline();
@@ -3146,6 +3167,9 @@ impl Editor {
                         self.cmdline_prompt.clear();
                         self.prompt_results.push(Some(text));
                     }
+                    // A confirm dialog is resolved by `handle_confirm` (routed at
+                    // the top of this fn), so it never reaches the line-submit path.
+                    CmdlineKind::Confirm => {}
                 }
                 return;
             }
@@ -3216,11 +3240,60 @@ impl Editor {
         self.cmdline_prompt = label;
     }
 
-    /// The `vim.ui.input` prompt label (empty unless a [`CmdlineKind::Prompt`] is
-    /// open), projected into the [`View`] so the client renders it ahead of the
-    /// editable line in place of the single-char [`Editor::cmdline_prefix`].
+    /// Open the command line as a `vim.fn.confirm` button dialog: a
+    /// [`CmdlineKind::Confirm`] showing `label` (the message plus rendered
+    /// buttons). It has no editable line — a single keypress matching one of
+    /// `accelerators` (lowercase, in button order) resolves to that button's
+    /// 1-based index, `<CR>` selects `default` (1-based; `0` cancels), and
+    /// `<Esc>` / `<C-c>` cancel with `0`. The chosen index is delivered as a
+    /// string through [`Editor::prompt_results`] (the channel `Prompt` uses; the
+    /// server forwards it to the blocked `vim.fn.confirm`). The server calls this
+    /// when it drains a queued confirm request.
+    pub fn open_confirm(&mut self, label: String, accelerators: Vec<String>, default: i64) {
+        self.mode = Mode::Command;
+        self.cmdline.clear();
+        self.cmdline_col = 0;
+        self.cmdline_kind = CmdlineKind::Confirm;
+        self.cmdline_prompt = label;
+        self.confirm_accelerators = accelerators;
+        self.confirm_default = default;
+    }
+
+    /// Resolve an open confirm dialog from a single keypress, pushing the chosen
+    /// 1-based index (or `0` to cancel) as a string onto [`Editor::prompt_results`]
+    /// and returning to normal mode. An unrecognized key is ignored (the dialog
+    /// stays open), matching neovim's "press one of the listed keys" behavior.
+    fn handle_confirm(&mut self, key: Key) {
+        let index = match key.code {
+            KeyCode::Esc => Some(0),
+            KeyCode::Char('c') if key.ctrl => Some(0),
+            KeyCode::Enter => Some(self.confirm_default),
+            KeyCode::Char(c) if !key.ctrl => {
+                let pressed = c.to_ascii_lowercase().to_string();
+                self.confirm_accelerators
+                    .iter()
+                    .position(|acc| *acc == pressed)
+                    .map(|i| i as i64 + 1)
+            }
+            _ => None,
+        };
+        if let Some(index) = index {
+            self.mode = Mode::Normal;
+            self.cmdline_prompt.clear();
+            self.confirm_accelerators.clear();
+            self.prompt_results.push(Some(index.to_string()));
+        }
+    }
+
+    /// The `vim.ui.input` / `vim.fn.confirm` prompt label (empty unless a
+    /// [`CmdlineKind::Prompt`] or [`CmdlineKind::Confirm`] is open), projected
+    /// into the [`View`] so the client renders it ahead of the editable line in
+    /// place of the single-char [`Editor::cmdline_prefix`].
     pub(crate) fn cmdline_prompt(&self) -> &str {
-        if matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+        if matches!(
+            self.cmdline_kind,
+            CmdlineKind::Prompt | CmdlineKind::Confirm
+        ) {
             &self.cmdline_prompt
         } else {
             ""
@@ -3676,7 +3749,7 @@ impl Editor {
 
         let search_dir = match self.cmdline_kind {
             CmdlineKind::Search(dir) => Some(dir),
-            CmdlineKind::Ex | CmdlineKind::Prompt => None,
+            CmdlineKind::Ex | CmdlineKind::Prompt | CmdlineKind::Confirm => None,
         };
         let incsearch = self.mode == Mode::Command
             && search_dir.is_some()
@@ -3728,6 +3801,7 @@ impl Editor {
         match self.cmdline_kind {
             CmdlineKind::Ex => &self.ex_history,
             CmdlineKind::Search(_) => &self.search_history,
+            CmdlineKind::Confirm => &[],
             CmdlineKind::Prompt => &[],
         }
     }
@@ -3775,10 +3849,10 @@ impl Editor {
         match self.cmdline_kind {
             CmdlineKind::Ex => ':',
             CmdlineKind::Search(dir) => dir.prefix(),
-            // A `vim.ui.input` prompt renders its multi-char label via
-            // `cmdline_prompt()` instead; the single-char prefix is unused (a
-            // space keeps the projection well-formed).
-            CmdlineKind::Prompt => ' ',
+            // A `vim.ui.input` prompt and a `vim.fn.confirm` dialog render their
+            // multi-char label via `cmdline_prompt()` instead; the single-char
+            // prefix is unused (a space keeps the projection well-formed).
+            CmdlineKind::Prompt | CmdlineKind::Confirm => ' ',
         }
     }
 

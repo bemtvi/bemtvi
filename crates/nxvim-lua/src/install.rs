@@ -20,7 +20,7 @@ use crate::host::{
     create_dir_all_mode, find_executable, get_runtime_file, getftime, glob_paths, parse_mode,
     stdpath,
 };
-use crate::ops::{BufOp, HlSet, LoopOp, LspOp, PanelOp, UiInputReq};
+use crate::ops::{BufOp, ConfirmReq, HlSet, LoopOp, LspOp, PanelOp, UiInputReq};
 use crate::runtime::Shared;
 use crate::vimregex;
 
@@ -612,6 +612,28 @@ pub(crate) fn install_runtime_api(
             });
             Ok(())
         })?,
+    )?;
+
+    // `vim._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`
+    // button dialog ([`ConfirmReq`]). The server opens the command line as a
+    // single-key confirm prompt showing `label`; a keypress matching one of
+    // `accelerators` (or `<CR>` → `default`, `<Esc>` → 0) resolves it, firing
+    // `vim._cb_fns[cb_id]` with the chosen 1-based index to resume the blocked
+    // `vim.fn.confirm` call.
+    let sh = shared.clone();
+    vim.set(
+        "_confirm",
+        lua.create_function(
+            move |_, (label, accelerators, default, cb_id): (String, Vec<String>, i64, u64)| {
+                sh.borrow_mut().confirms.push(ConfirmReq {
+                    label,
+                    accelerators,
+                    default,
+                    cb_id,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `vim._ui_opener()`: the OS file/URL opener argv prefix `vim.ui.open` spawns

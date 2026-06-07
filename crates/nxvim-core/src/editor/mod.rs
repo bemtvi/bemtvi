@@ -146,6 +146,10 @@ struct Snapshot {
     /// [`OpenBuffer::cur_seq`]), so undo/redo can tell when it has landed back
     /// on the last-saved state and clear `modified`.
     seq: u64,
+    /// The buffer's extmarks at this history point. Restored on undo/redo so marks
+    /// ride with the text (neovim keeps extmarks across undo) rather than being
+    /// dropped by the wholesale-replace [`Buffer::mark_resync`].
+    extmarks: crate::extmark::ExtmarkStore,
 }
 
 /// A buffer as the editor holds it: the text [`Buffer`] plus the state vim keeps

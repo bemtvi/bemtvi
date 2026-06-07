@@ -219,6 +219,59 @@ async fn an_extmark_shifts_with_edits() {
     );
 }
 
+/// Extmarks survive undo/redo (neovim preserves them — only a destructive
+/// reload drops marks). An edit then undo must leave the mark in place, restored
+/// to its history-point position; a redo brings the edit (and the shifted mark)
+/// back. Regression guard: undo replaces the whole rope via `mark_resync`, which
+/// must not be allowed to wipe the marks.
+#[tokio::test]
+async fn extmarks_survive_undo_and_redo() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "ihello world<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('undo')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { end_row = 0, end_col = 5, hl_group = 'Comment' })
+        "#,
+    )
+    .await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        span_with_group(hl, "Comment") == Some((0, 5))
+    })
+    .await;
+
+    // Prepend "AB" — the mark slides to 2..7 — then undo: it must return to 0..5,
+    // not vanish.
+    feed(&rpc, "gg0iAB<Esc>");
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        span_with_group(hl, "Comment") == Some((2, 7))
+    })
+    .await;
+    feed(&rpc, "u");
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        span_with_group(hl, "Comment") == Some((0, 5))
+    })
+    .await;
+    assert_eq!(
+        span_with_group(&hl, "Comment"),
+        Some((0, 5)),
+        "undo restores the mark to its pre-edit position, not clears it"
+    );
+
+    // Redo brings the edit back, and the mark shifts with it again.
+    feed(&rpc, "<C-r>");
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        span_with_group(hl, "Comment") == Some((2, 7))
+    })
+    .await;
+    assert_eq!(
+        span_with_group(&hl, "Comment"),
+        Some((2, 7)),
+        "redo restores the post-edit mark position"
+    );
+}
+
 /// `nvim_buf_clear_namespace` removes a namespace's marks, so the highlight
 /// disappears from subsequent redraws.
 #[tokio::test]

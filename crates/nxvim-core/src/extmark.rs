@@ -41,7 +41,7 @@ pub struct Extmark {
 
 /// Marks within one namespace, plus that namespace's monotonic id allocator.
 /// Ids are never reused, matching neovim (a deleted id is gone for good).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct NsMarks {
     marks: BTreeMap<u64, Extmark>,
     next_id: u64,
@@ -50,7 +50,11 @@ struct NsMarks {
 /// All extmarks of one buffer, partitioned by namespace id. A namespace id is an
 /// opaque `u32` key here — the name↔id registry lives at the scripting layer
 /// (`nvim_create_namespace`); core only ever sees ids.
-#[derive(Debug, Default)]
+///
+/// `Clone` so undo/redo can snapshot and restore it: the marks at each history
+/// point ride with that point, surviving the wholesale-rope-replace `mark_resync`
+/// (which otherwise clears them, for a destructive reload).
+#[derive(Debug, Default, Clone)]
 pub struct ExtmarkStore {
     by_ns: HashMap<u32, NsMarks>,
 }

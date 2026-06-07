@@ -10,6 +10,8 @@
 use anyhow::Result;
 use nxvim_server::{run as run_server, ServerInit};
 
+mod ts_worker;
+
 /// Internal flag that re-invokes this binary as the treesitter syntax worker
 /// (see `nxvim-ts`). Hidden from users; spawned only by the server.
 const TS_WORKER_FLAG: &str = "--__ts-worker";
@@ -113,9 +115,6 @@ fn run_ts_worker() -> Result<()> {
         .enable_io()
         .enable_time()
         .build()?;
-    runtime.block_on(nxvim_ts::run_worker(
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-    ));
+    runtime.block_on(ts_worker::run(tokio::io::stdin(), tokio::io::stdout()));
     Ok(())
 }

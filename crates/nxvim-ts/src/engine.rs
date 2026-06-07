@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
+use nxvim_core::{BufferEdit, BufferId, IndentParams, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree};
@@ -17,10 +18,6 @@ use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree};
 use crate::loader::Grammar;
 
 const LINE_TYPE: LineType = LineType::LF_CR;
-
-// The edit and span shapes are the shared syntax-wire types, defined once in
-// `nxvim-rpc` so this worker and the server can't drift apart (see that module).
-pub use nxvim_rpc::syntax::{EditWire, SpanWire};
 
 /// Per-buffer parse state.
 struct BufferState {
@@ -55,7 +52,7 @@ pub struct Engine {
     /// `None` means a previous load attempt for that language failed; we don't
     /// retry it (so a missing grammar costs one failed `dlopen`, not one per key).
     grammars: HashMap<String, Option<Grammar>>,
-    buffers: HashMap<u64, BufferState>,
+    buffers: HashMap<BufferId, BufferState>,
 }
 
 impl Engine {
@@ -85,8 +82,10 @@ impl Engine {
     }
 
     /// (Re)initialize a buffer from full text and do the initial parse. Returns
-    /// an error string if the language has no usable grammar.
-    pub fn open(&mut self, buffer: u64, lang: &str, text: &str) -> Result<(), String> {
+    /// an error string if the language has no usable grammar. (The inherent form
+    /// surfaces the error so the worker can emit `ts_error`; the [`SyntaxEngine`]
+    /// trait method discards it — the editor reports load failures separately.)
+    pub fn open(&mut self, buffer: BufferId, lang: &str, text: &str) -> Result<(), String> {
         // Touch the grammar cache so a missing grammar reports once.
         let language = match self.grammar(lang)? {
             Some(g) => g.language.clone(),
@@ -108,7 +107,7 @@ impl Engine {
     }
 
     /// Apply edit deltas to a buffer's shadow + tree, then reparse incrementally.
-    pub fn edit(&mut self, buffer: u64, edits: &[EditWire]) {
+    pub fn edit(&mut self, buffer: BufferId, edits: &[BufferEdit]) {
         let Some(state) = self.buffers.get_mut(&buffer) else {
             return; // never opened; the editor opens before editing
         };
@@ -154,22 +153,22 @@ impl Engine {
     }
 
     /// Forget a buffer's shadow text and parse tree (the editor deleted it).
-    pub fn close(&mut self, buffer: u64) {
+    pub fn close(&mut self, buffer: BufferId) {
         self.buffers.remove(&buffer);
     }
 
     /// Whether a buffer is known (opened) and which language it uses.
-    pub fn language_of(&self, buffer: u64) -> Option<&str> {
+    pub fn language_of(&self, buffer: BufferId) -> Option<&str> {
         self.buffers.get(&buffer).map(|b| b.language.as_str())
     }
 
     /// Extract highlight spans for the visible line range `[first_line, last_line)`.
     pub fn highlights(
         &mut self,
-        buffer: u64,
+        buffer: BufferId,
         first_line: usize,
         last_line: usize,
-    ) -> Vec<SpanWire> {
+    ) -> Vec<Span> {
         let Some(state) = self.buffers.get(&buffer) else {
             return Vec::new();
         };
@@ -183,6 +182,36 @@ impl Engine {
     }
 }
 
+/// The synchronous backend the editor owns (`nxvim-core`'s [`SyntaxEngine`]).
+/// Highlighting delegates to the inherent methods; `indent` is not implemented
+/// yet (a later phase ports nvim-treesitter's `indent.lua`), so it returns
+/// `None` — an **honest fallback**, not a fake success: the caller then uses
+/// copy-previous-line autoindent, then column 0.
+impl SyntaxEngine for Engine {
+    fn open(&mut self, buffer: BufferId, language: &str, text: &str) {
+        // The error (no/incompatible grammar) is the editor's to surface; the
+        // trait contract is best-effort, so we drop it here. The worker path uses
+        // the inherent `Engine::open`, which still returns it.
+        let _ = Engine::open(self, buffer, language, text);
+    }
+
+    fn edit(&mut self, buffer: BufferId, edits: &[BufferEdit]) {
+        Engine::edit(self, buffer, edits);
+    }
+
+    fn close(&mut self, buffer: BufferId) {
+        Engine::close(self, buffer);
+    }
+
+    fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span> {
+        Engine::highlights(self, buffer, first, last)
+    }
+
+    fn indent(&mut self, _buffer: BufferId, _line: usize, _p: &IndentParams) -> Option<usize> {
+        None
+    }
+}
+
 /// Run the highlights query over the byte range covering the visible lines and
 /// resolve the captures into per-line byte spans (most-specific capture wins).
 fn extract_spans(
@@ -191,7 +220,7 @@ fn extract_spans(
     rope: &Rope,
     first_line: usize,
     last_line: usize,
-) -> Vec<SpanWire> {
+) -> Vec<Span> {
     let line_count = rope.len_lines(LINE_TYPE).saturating_sub(1);
     let last_line = last_line.min(line_count);
     if first_line >= last_line {
@@ -256,7 +285,7 @@ fn extract_spans(
                     while i < content_len && groups[i] == Some(g) {
                         i += 1;
                     }
-                    out.push(SpanWire {
+                    out.push(Span {
                         line,
                         start_byte: start,
                         end_byte: i,

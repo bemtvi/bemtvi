@@ -17,6 +17,7 @@ pub mod input;
 pub mod mode;
 pub mod options;
 pub mod search;
+pub mod syntax;
 pub mod unicode;
 pub mod view;
 
@@ -29,4 +30,5 @@ pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use input::{parse_keys, Key, KeyCode};
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};
+pub use syntax::{IndentParams, Span, SyntaxEngine};
 pub use view::{PanelView, View, ViewRect, WindowView};

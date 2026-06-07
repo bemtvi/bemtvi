@@ -1,7 +1,12 @@
 # Treesitter syntax highlighting — design
 
 **Date:** 2026-06-01
-**Status:** Implemented (crate `nxvim-ts`; tests in `crates/nxvim/tests/syntax.rs`)
+**Status:** Implemented (crate `nxvim-ts`; tests in `crates/nxvim/tests/syntax.rs`).
+**Process-isolation architecture superseded** by
+[`2026-06-06-in-process-treesitter-and-indentation-design.md`](2026-06-06-in-process-treesitter-and-indentation-design.md),
+which moves the parser in-process to enable synchronous treesitter indentation.
+The grammar model, query layout, and highlighting *behavior* described below
+still hold; only the separate worker process is replaced.
 
 ## Goal
 

@@ -1,33 +1,32 @@
-//! Worker-level black-box tests: drive the public `run_worker` over an in-memory
-//! pipe (exactly as the editor server drives the child process) and assert on
-//! the `ts_*` notifications it sends back. These reach the worker's trust
-//! boundary — a malformed `language` or edit delta arriving from the wire — that
-//! the full-stack server tests can't, because the server never emits malformed
-//! messages.
+//! Worker-level black-box tests: spawn the **real** `nxvim --__ts-worker` child
+//! (exactly as the editor server does) and drive it directly over RPC on its
+//! stdio, asserting on the `ts_*` notifications it sends back. These reach the
+//! worker's trust boundary — a malformed `language` or edit delta arriving from
+//! the wire — that the full-stack server tests can't, because the server never
+//! emits malformed messages.
 //!
-//! The tests share process-global env (`NXVIM_DATA_DIR`) and a compiled grammar
-//! fixture, so they serialize on a single lock.
+//! (The worker loop itself lives in the binary at `src/ts_worker.rs`; the parse
+//! engine it drives lives in `nxvim-ts`. Since the loop is now a binary-private
+//! fn, these tests reach it the way the server does — as a subprocess — rather
+//! than calling it in-process. Each test spawns its own child and hands it the
+//! grammar fixture via the child's `NXVIM_DATA_DIR`, so no shared global env and
+//! no lock are needed.)
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_ts::run_worker;
 use rmpv::Value;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Mutex;
-
-/// Serializes the env-mutating, subprocess-free worker tests.
-fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 // ----- grammar fixture (mirrors nxvim/tests/syntax.rs) ----------------------
 
 /// Build (once) a `NXVIM_DATA_DIR` containing a compiled tree-sitter-rust
-/// grammar + its highlights query, and point the worker's `data_dir()` at it.
+/// grammar + its highlights query, and return its path (handed to each worker
+/// child via its environment).
 fn fixture_data_dir() -> &'static Path {
     static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
     DATA_DIR.get_or_init(|| {
@@ -58,7 +57,6 @@ fn fixture_data_dir() -> &'static Path {
         )
         .unwrap();
 
-        std::env::set_var("NXVIM_DATA_DIR", &dir);
         dir
     })
 }
@@ -86,13 +84,22 @@ fn home_dir() -> PathBuf {
 
 // ----- worker harness -------------------------------------------------------
 
-/// Spawn `run_worker` over a duplex pipe and return a connected client.
-fn spawn_worker() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (worker_end, client_end) = tokio::io::duplex(1 << 16);
-    let (wr, ww) = tokio::io::split(worker_end);
-    tokio::spawn(run_worker(wr, ww));
-    let (cr, cw) = tokio::io::split(client_end);
-    connect(cr, cw)
+/// Spawn `nxvim --__ts-worker` with the fixture data dir and return the child
+/// (kept alive — `kill_on_drop` reaps it) plus a connected RPC client.
+fn spawn_worker() -> (Child, Rpc, UnboundedReceiver<Incoming>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nxvim"))
+        .arg("--__ts-worker")
+        .env("NXVIM_DATA_DIR", fixture_data_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn nxvim worker");
+    let stdout = child.stdout.take().expect("worker stdout");
+    let stdin = child.stdin.take().expect("worker stdin");
+    let (rpc, incoming) = connect(stdout, stdin);
+    (child, rpc, incoming)
 }
 
 fn msg(pairs: Vec<(&str, Value)>) -> Vec<Value> {
@@ -133,9 +140,7 @@ async fn next_notification(
 
 #[tokio::test]
 async fn rejects_language_names_that_escape_the_data_dir() {
-    let _guard = test_lock().lock().await;
-    fixture_data_dir(); // sets NXVIM_DATA_DIR to a known-good dir
-    let (rpc, mut incoming) = spawn_worker();
+    let (_child, rpc, mut incoming) = spawn_worker();
 
     // A language name with path components would, unvalidated, join into the
     // parser `.so` path and let the worker dlopen an arbitrary shared object.
@@ -164,9 +169,7 @@ async fn rejects_language_names_that_escape_the_data_dir() {
 
 #[tokio::test]
 async fn malformed_edit_neither_crashes_nor_silences_the_buffer() {
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let (rpc, mut incoming) = spawn_worker();
+    let (_child, rpc, mut incoming) = spawn_worker();
 
     // Open a real rust buffer and drain its initial highlights.
     rpc.notify(

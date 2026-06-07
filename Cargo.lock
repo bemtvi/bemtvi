@@ -1071,6 +1071,7 @@ name = "nxvim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nxvim-core",
  "nxvim-lsp",
  "nxvim-rpc",
  "nxvim-server",
@@ -1148,13 +1149,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libloading",
- "nxvim-rpc",
- "rmpv",
+ "nxvim-core",
  "ropey",
  "streaming-iterator",
- "tokio",
  "tree-sitter",
- "tree-sitter-rust",
 ]
 
 [[package]]

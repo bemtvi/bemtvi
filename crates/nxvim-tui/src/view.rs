@@ -2,6 +2,7 @@
 //! notification parsing that fills it in.
 
 use ratatui::style::Style;
+use ratatui::widgets::BorderType;
 use rmpv::Value;
 use std::time::Duration;
 
@@ -58,6 +59,16 @@ pub(crate) struct WindowView {
     /// painting, mirrored from the server so the text lines up with the server's
     /// `cursor_screen_col` (computed with the same value). Defaults to 8.
     pub(crate) tabstop: u16,
+    /// Whether this window is a **float**: the renderer paints it in a second,
+    /// on-top pass (over the tiled windows) rather than tiling it. Tiled windows
+    /// and the legacy flat redraw are `false`.
+    pub(crate) floating: bool,
+    /// The float's border type, or `None` for a borderless float / tiled window.
+    /// When set the renderer draws a bordered box around the window's rect and
+    /// paints the content one cell inside it.
+    pub(crate) border: Option<BorderType>,
+    /// The float's title, drawn on the top border. `None` when untitled.
+    pub(crate) title: Option<String>,
 }
 
 /// A window's rect in windows-area cells (mirrors `nxvim_core::ViewRect`).
@@ -327,6 +338,28 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             0 => 8,
             ts => ts,
         },
+        floating: map_get(m, "floating")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        border: parse_border(map_get(m, "border")),
+        title: {
+            let t = map_str(m, "title");
+            (!t.is_empty()).then_some(t)
+        },
+    }
+}
+
+/// Map a float's wire border name (matching `nvim_win_get_config`) to the ratatui
+/// [`BorderType`] used to draw it. `"none"`, a missing value, or an unknown name
+/// yields `None` (no border). `"solid"` (neovim's space border) renders as the
+/// nearest line style, `QuadrantInside`.
+fn parse_border(value: Option<&Value>) -> Option<BorderType> {
+    match value.and_then(Value::as_str) {
+        Some("single") => Some(BorderType::Plain),
+        Some("rounded") => Some(BorderType::Rounded),
+        Some("double") => Some(BorderType::Double),
+        Some("solid") => Some(BorderType::QuadrantInside),
+        _ => None,
     }
 }
 

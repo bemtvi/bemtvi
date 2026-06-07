@@ -11,7 +11,7 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{BufferId, Editor, WindowLayout};
+use crate::editor::{BorderStyle, BufferId, Editor, WindowLayout};
 use crate::mode::Mode;
 use crate::unicode;
 
@@ -154,6 +154,17 @@ pub struct WindowView {
     ///
     /// [`cursor_screen_col`]: WindowView::cursor_screen_col
     pub tabstop: usize,
+    /// Whether this window is a **float**: drawn on top of the tiled windows at
+    /// its absolute `rect`. The client paints floats in a second, on-top pass (in
+    /// list order, which is z-order); a tiled window is `false`.
+    pub floating: bool,
+    /// The float's border style (`None` for a tiled window or a borderless
+    /// float). When set, the client draws the border around `rect` and the inner
+    /// content (this view's `lines`/gutter/status) sits one cell inside it — the
+    /// projection already sized `lines` to that inset area.
+    pub border: BorderStyle,
+    /// The float's title, drawn on its top border. `None` when untitled.
+    pub title: Option<String>,
 }
 
 /// A snapshot of everything a client needs to draw a frame: the **global** chrome
@@ -241,10 +252,21 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .expect("a live window's buffer is always open");
     let line_count = buf.line_count();
     let number_width = ed.number_width_for(w.options, line_count);
-    // The window's own rows minus its status line; selections fill to the text
+    // A bordered float spends one cell on each side on its border, so its content
+    // (gutter + text + status) lives in the rect inset by one cell. Tiled windows
+    // and borderless floats use the whole rect. The client draws the border on the
+    // outer `rect`, then paints this content into the inset area, so the two agree.
+    let inset = if w.floating && w.border != BorderStyle::None {
+        1
+    } else {
+        0
+    };
+    let content_height = w.rect.height.saturating_sub(2 * inset);
+    let content_width = w.rect.width.saturating_sub(2 * inset);
+    // The content's own rows minus its status line; selections fill to the text
     // width (the area past the number gutter).
-    let height = w.rect.height.saturating_sub(1).max(1);
-    let width = w.rect.width.saturating_sub(number_width);
+    let height = content_height.saturating_sub(1).max(1);
+    let width = content_width.saturating_sub(number_width);
     let top = w.top;
     // A stashed cursor may sit past a buffer that shrank while this window was
     // inactive; clamp it for the rendered ruler / cursor row.
@@ -316,6 +338,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         relativenumber: w.options.relativenumber,
         number_width,
         tabstop: buf.options.effective_tabstop(),
+        floating: w.floating,
+        border: w.border,
+        title: w.title.clone(),
     }
 }
 

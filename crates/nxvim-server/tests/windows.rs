@@ -1111,3 +1111,420 @@ async fn nvim_win_set_height_resizes_a_window() {
         .unwrap_or(0);
     assert_eq!(h, 15, "the focused window's text height is now 15 rows");
 }
+
+// ----- floating windows (phase 1: model + positioning + lifecycle) ----------
+//
+// Phase 1 makes a float a real, queryable, focusable window over RPC; it is not
+// yet painted (that is Phase 2). So these assert on geometry via
+// `nvim_win_get_position` / `nvim_win_get_config` / `nvim_list_wins`, never on a
+// rendered frame.
+
+/// `nvim_open_win(0, enter, {relative=…, …})` -> the new float's id. `entries`
+/// are the float config keys.
+async fn open_float(rpc: &Rpc, enter: bool, entries: Vec<(&str, Value)>) -> u64 {
+    let config = Value::Map(
+        entries
+            .into_iter()
+            .map(|(k, v)| (Value::from(k), v))
+            .collect(),
+    );
+    rpc.request(
+        "nvim_open_win",
+        vec![Value::from(0u64), Value::from(enter), config],
+    )
+    .await
+    .expect("open_win float")
+    .as_u64()
+    .expect("a window id")
+}
+
+/// `nvim_win_get_position(win)` -> (row, col) in windows-area cells.
+async fn win_position(rpc: &Rpc, win: u64) -> (u64, u64) {
+    match rpc
+        .request("nvim_win_get_position", vec![Value::from(win)])
+        .await
+        .expect("get_position")
+    {
+        Value::Array(a) => (
+            a.first().and_then(Value::as_u64).unwrap_or(0),
+            a.get(1).and_then(Value::as_u64).unwrap_or(0),
+        ),
+        _ => (0, 0),
+    }
+}
+
+/// `nvim_win_get_config(win)` -> the config map as `(key, value)` string-keyed
+/// pairs.
+async fn win_config(rpc: &Rpc, win: u64) -> Vec<(String, Value)> {
+    match rpc
+        .request("nvim_win_get_config", vec![Value::from(win)])
+        .await
+        .expect("get_config")
+    {
+        Value::Map(m) => m
+            .into_iter()
+            .filter_map(|(k, v)| k.as_str().map(|s| (s.to_string(), v)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn config_str<'a>(cfg: &'a [(String, Value)], key: &str) -> Option<&'a str> {
+    cfg.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.as_str())
+}
+
+fn config_u64(cfg: &[(String, Value)], key: &str) -> Option<u64> {
+    cfg.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.as_u64())
+}
+
+#[tokio::test]
+async fn nvim_open_win_float_positions_and_leaves_tiled_untouched() {
+    let (rpc, _incoming) = start(None).await;
+    let tiled = list_wins(&rpc).await[0];
+
+    let float = open_float(
+        &rpc,
+        false, // do not steal focus
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(2u64)),
+            ("col", Value::from(5u64)),
+            ("width", Value::from(20u64)),
+            ("height", Value::from(4u64)),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        win_position(&rpc, float).await,
+        (2, 5),
+        "the float sits at its editor-relative row/col"
+    );
+    // The tiled window kept its full-area rect — a float steals no space.
+    assert_eq!(win_position(&rpc, tiled).await, (0, 0));
+    let tiled_w = rpc
+        .request("nvim_win_get_width", vec![Value::from(tiled)])
+        .await
+        .expect("get_width")
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(tiled_w, 80, "the tiled window still spans the full width");
+    // The float is listed after the tiled window.
+    assert_eq!(list_wins(&rpc).await, vec![tiled, float]);
+}
+
+#[tokio::test]
+async fn nvim_open_win_float_anchor_ne_extends_left() {
+    let (rpc, _incoming) = start(None).await;
+    // anchor NE pins the float's top-*right* corner at (row, col), so its
+    // top-left x is col - width.
+    let float = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("editor")),
+            ("anchor", Value::from("NE")),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(30u64)),
+            ("width", Value::from(10u64)),
+            ("height", Value::from(4u64)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        win_position(&rpc, float).await,
+        (0, 20),
+        "NE anchor: top-left = col(30) - width(10)"
+    );
+}
+
+#[tokio::test]
+async fn nvim_open_win_float_relative_cursor_tracks_the_cursor() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabcdef<Esc>0"); // cursor at line 0, col 0
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let at_col0 = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("cursor")),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(0u64)),
+            ("width", Value::from(4u64)),
+            ("height", Value::from(2u64)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        win_position(&rpc, at_col0).await,
+        (0, 0),
+        "a cursor-relative float lands on the cursor cell"
+    );
+
+    feed(&rpc, "lll"); // cursor to col 3
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let at_col3 = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("cursor")),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(0u64)),
+            ("width", Value::from(4u64)),
+            ("height", Value::from(2u64)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        win_position(&rpc, at_col3).await,
+        (0, 3),
+        "the second float tracks the moved cursor"
+    );
+}
+
+#[tokio::test]
+async fn nvim_open_win_float_relative_win_anchors_to_that_window() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "<C-w>v"); // vsplit -> two side-by-side windows
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let wins = list_wins(&rpc).await;
+    let cur = current_win(&rpc).await;
+    let other = *wins.iter().find(|w| **w != cur).expect("a second window");
+    let (_, other_col) = win_position(&rpc, other).await;
+
+    let float = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("win")),
+            ("win", Value::from(other)),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(0u64)),
+            ("width", Value::from(5u64)),
+            ("height", Value::from(3u64)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        win_position(&rpc, float).await.1,
+        other_col,
+        "a win-relative float starts at that window's left edge"
+    );
+}
+
+#[tokio::test]
+async fn nvim_open_win_floats_listed_in_zindex_order() {
+    let (rpc, _incoming) = start(None).await;
+    let tiled = list_wins(&rpc).await[0];
+    let high = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(0u64)),
+            ("width", Value::from(4u64)),
+            ("height", Value::from(2u64)),
+            ("zindex", Value::from(100u64)),
+        ],
+    )
+    .await;
+    let low = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(0u64)),
+            ("width", Value::from(4u64)),
+            ("height", Value::from(2u64)),
+            ("zindex", Value::from(10u64)),
+        ],
+    )
+    .await;
+    // Tiled first, then floats bottom-to-top by zindex (low before high).
+    assert_eq!(list_wins(&rpc).await, vec![tiled, low, high]);
+}
+
+#[tokio::test]
+async fn nvim_open_win_float_focus_and_close() {
+    let (rpc, _incoming) = start(None).await;
+    let tiled = list_wins(&rpc).await[0];
+    let float = open_float(
+        &rpc,
+        true, // enter the float
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(1u64)),
+            ("width", Value::from(10u64)),
+            ("height", Value::from(3u64)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        current_win(&rpc).await,
+        float,
+        "opening with enter focuses it"
+    );
+
+    rpc.request(
+        "nvim_win_close",
+        vec![Value::from(float), Value::from(false)],
+    )
+    .await
+    .expect("win_close");
+    assert_eq!(list_wins(&rpc).await, vec![tiled], "the float is gone");
+    assert_eq!(
+        current_win(&rpc).await,
+        tiled,
+        "focus fell back to the tiled window"
+    );
+}
+
+#[tokio::test]
+async fn nvim_open_win_float_clamps_onscreen() {
+    let (rpc, _incoming) = start(None).await; // 80x24 windows area
+    let float = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(100u64)),
+            ("col", Value::from(100u64)),
+            ("width", Value::from(10u64)),
+            ("height", Value::from(4u64)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        win_position(&rpc, float).await,
+        (20, 70),
+        "a float placed off-screen clamps to the bottom-right (24-4, 80-10)"
+    );
+}
+
+#[tokio::test]
+async fn nvim_win_get_config_round_trips_a_float_and_reports_tiled() {
+    let (rpc, _incoming) = start(None).await;
+    let tiled = list_wins(&rpc).await[0];
+    // A tiled window reports an empty `relative`.
+    let tcfg = win_config(&rpc, tiled).await;
+    assert_eq!(config_str(&tcfg, "relative"), Some(""));
+
+    let float = open_float(
+        &rpc,
+        false,
+        vec![
+            ("relative", Value::from("editor")),
+            ("anchor", Value::from("SE")),
+            ("row", Value::from(3u64)),
+            ("col", Value::from(7u64)),
+            ("width", Value::from(12u64)),
+            ("height", Value::from(5u64)),
+            ("zindex", Value::from(80u64)),
+            ("border", Value::from("rounded")),
+        ],
+    )
+    .await;
+    let cfg = win_config(&rpc, float).await;
+    assert_eq!(config_str(&cfg, "relative"), Some("editor"));
+    assert_eq!(config_str(&cfg, "anchor"), Some("SE"));
+    assert_eq!(config_u64(&cfg, "width"), Some(12));
+    assert_eq!(config_u64(&cfg, "height"), Some(5));
+    assert_eq!(config_u64(&cfg, "zindex"), Some(80));
+    assert_eq!(config_str(&cfg, "border"), Some("rounded"));
+}
+
+#[tokio::test]
+async fn nvim_open_win_rejects_unsupported_relative() {
+    let (rpc, _incoming) = start(None).await;
+    let config = Value::Map(vec![
+        (Value::from("relative"), Value::from("mouse")),
+        (Value::from("row"), Value::from(0u64)),
+        (Value::from("col"), Value::from(0u64)),
+        (Value::from("width"), Value::from(4u64)),
+        (Value::from("height"), Value::from(2u64)),
+    ]);
+    let result = rpc
+        .request(
+            "nvim_open_win",
+            vec![Value::from(0u64), Value::from(false), config],
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an unsupported `relative` fails loud, not silently as a split: {result:?}"
+    );
+    // And no stray window was created.
+    assert_eq!(list_wins(&rpc).await.len(), 1);
+}
+
+/// Run a Lua chunk and return its value (the `nvim_exec_lua` entry point).
+async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(code), Value::Array(vec![])],
+    )
+    .await
+    .expect("exec_lua")
+}
+
+#[tokio::test]
+async fn lua_nvim_open_win_opens_a_float() {
+    let (rpc, _incoming) = start(None).await;
+    let tiled = list_wins(&rpc).await[0];
+
+    // The Lua float form queues `WindowOp::OpenFloat`; the returned (predicted) id
+    // matches the real window id the op mints when it drains.
+    let id = exec_lua(
+        &rpc,
+        "return vim.api.nvim_open_win(0, true, { relative = 'editor', \
+         row = 3, col = 7, width = 18, height = 5, border = 'rounded', title = 'Lua' })",
+    )
+    .await
+    .as_u64()
+    .expect("a window id");
+
+    assert_eq!(
+        win_position(&rpc, id).await,
+        (3, 7),
+        "float at its config row/col"
+    );
+    assert_eq!(
+        list_wins(&rpc).await,
+        vec![tiled, id],
+        "float listed after tiled"
+    );
+    let cfg = win_config(&rpc, id).await;
+    assert_eq!(config_str(&cfg, "relative"), Some("editor"));
+    assert_eq!(config_str(&cfg, "border"), Some("rounded"));
+    assert_eq!(config_str(&cfg, "title"), Some("Lua"));
+    assert_eq!(config_u64(&cfg, "width"), Some(18));
+    // The float took focus (`enter = true`).
+    assert_eq!(current_win(&rpc).await, id);
+}
+
+#[tokio::test]
+async fn lua_nvim_open_win_rejects_unsupported_border() {
+    let (rpc, mut incoming) = start(None).await;
+    // An unsupported `border` fails loud from Lua too (no silent fallback): the
+    // chunk errors (surfaced as an E5108 message) and no window is created.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_open_win(0, true, { relative = 'editor', \
+         width = 4, height = 2, border = 'shadow' })",
+    )
+    .await;
+    assert_eq!(list_wins(&rpc).await.len(), 1, "no stray window");
+    let frame = drain_to_latest(&mut incoming).expect("a redraw");
+    assert!(
+        frame.message.contains("border") && frame.message.contains("not supported"),
+        "the unsupported border is reported loudly: {:?}",
+        frame.message
+    );
+}

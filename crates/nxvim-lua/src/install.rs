@@ -584,6 +584,32 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `vim._open_float(cfg)`: queue the float form of `nvim_open_win`. The prelude
+    // builds `cfg` (a validated table of primitive fields) and calls this; the
+    // server drains the op into `Editor::open_float_window`. The split form keeps
+    // its own `_open_win` bridge above.
+    let sh = shared.clone();
+    vim.set(
+        "_open_float",
+        lua.create_function(move |_, cfg: Table| {
+            sh.borrow_mut().window_ops.push(WindowOp::OpenFloat {
+                buf: cfg.get("buf")?,
+                enter: cfg.get("enter")?,
+                relative: cfg.get("relative")?,
+                win: cfg.get::<Option<u64>>("win")?.unwrap_or(0),
+                anchor: cfg.get("anchor")?,
+                row: cfg.get("row")?,
+                col: cfg.get("col")?,
+                width: cfg.get("width")?,
+                height: cfg.get("height")?,
+                zindex: cfg.get("zindex")?,
+                focusable: cfg.get("focusable")?,
+                border: cfg.get("border")?,
+                title: cfg.get::<Option<String>>("title")?,
+            });
+            Ok(())
+        })?,
+    )?;
 
     // `vim._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request
     // ([`LspOp::BufRequest`]) or one of the edit ops (`Format`/`CodeAction`),

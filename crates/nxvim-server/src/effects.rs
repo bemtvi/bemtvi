@@ -6,7 +6,9 @@ use crate::evloop::{LoopCommand, LoopEvent};
 use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::Server;
 use nxvim_core::highlight::HlDef;
-use nxvim_core::{parse_color, BufferId, WindowId};
+use nxvim_core::{
+    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowId,
+};
 use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, OptionValue, PanelOp, WindowMirror, WindowOp};
 use rmpv::Value;
 use std::collections::HashSet;
@@ -228,6 +230,82 @@ impl Server {
                 if !enter {
                     self.editor.set_current_window(prev);
                 }
+            }
+            WindowOp::OpenFloat {
+                buf,
+                enter,
+                relative,
+                win,
+                anchor,
+                row,
+                col,
+                width,
+                height,
+                zindex,
+                focusable,
+                border,
+                title,
+            } => {
+                let buffer = if buf == 0 {
+                    self.editor.current_buffer_id()
+                } else {
+                    BufferId(buf)
+                };
+                // The prelude validated the string fields, so any unexpected value
+                // here is a bug; reject loudly rather than silently mispositioning.
+                let relative = match relative.as_str() {
+                    "editor" => FloatRelative::Editor,
+                    "cursor" => FloatRelative::Cursor,
+                    "win" => {
+                        let id = if win == 0 {
+                            self.editor.current_window_id()
+                        } else {
+                            WindowId(win)
+                        };
+                        FloatRelative::Win(id)
+                    }
+                    other => {
+                        self.editor
+                            .echo(format!("nvim_open_win: invalid 'relative': '{other}'"));
+                        return;
+                    }
+                };
+                let anchor = match anchor.as_str() {
+                    "NW" => FloatAnchor::NW,
+                    "NE" => FloatAnchor::NE,
+                    "SW" => FloatAnchor::SW,
+                    "SE" => FloatAnchor::SE,
+                    other => {
+                        self.editor
+                            .echo(format!("nvim_open_win: invalid 'anchor': '{other}'"));
+                        return;
+                    }
+                };
+                let border = match border.as_str() {
+                    "none" => BorderStyle::None,
+                    "single" => BorderStyle::Single,
+                    "rounded" => BorderStyle::Rounded,
+                    "double" => BorderStyle::Double,
+                    "solid" => BorderStyle::Solid,
+                    other => {
+                        self.editor
+                            .echo(format!("nvim_open_win: invalid 'border': '{other}'"));
+                        return;
+                    }
+                };
+                let config = FloatConfig {
+                    relative,
+                    anchor,
+                    row: row as isize,
+                    col: col as isize,
+                    width: (width as usize).max(1),
+                    height: (height as usize).max(1),
+                    zindex,
+                    focusable,
+                    border,
+                    title,
+                };
+                self.editor.open_float_window(buffer, config, enter);
             }
         }
     }

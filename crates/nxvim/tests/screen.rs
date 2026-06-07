@@ -5,7 +5,7 @@
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, View};
+use nxvim_tui::{paint, paint_with_cursor, View};
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
@@ -254,4 +254,334 @@ async fn messages_command_renders_a_panel_at_the_bottom() {
     assert!(bar.contains("[X]"), "close button: {bar:?}");
     // The first content row (just below the bar) shows the history line.
     assert_eq!(row_text(&buf, ROWS - 11).trim_end(), "hello panel");
+}
+
+// ----- floating windows (phase 2: painting the overlay) ---------------------
+//
+// Phase 1 made a float a real, queryable window over RPC; Phase 2 paints it on
+// top of the tiled layout. These assert on the rendered cell grid: the float's
+// content lands at its rect, it is opaque over the buffer beneath (`Clear`), its
+// border/title draw, higher `zindex` wins an overlap, and a focused float owns
+// the terminal cursor.
+
+/// `nvim_create_buf(listed=false, scratch=true)` -> a fresh buffer id to bind a
+/// float to (so its content is distinguishable from the window beneath).
+async fn new_buffer(rpc: &Rpc) -> u64 {
+    rpc.request(
+        "nvim_create_buf",
+        vec![Value::from(false), Value::from(true)],
+    )
+    .await
+    .expect("create_buf")
+    .as_u64()
+    .expect("a buffer id")
+}
+
+/// `nvim_open_win(buf, enter, {…})` -> the float's window id. `buf` is a buffer
+/// handle (`0` = current); `entries` are the float config keys.
+async fn open_float(rpc: &Rpc, buf: u64, enter: bool, entries: Vec<(&str, Value)>) -> u64 {
+    let config = Value::Map(
+        entries
+            .into_iter()
+            .map(|(k, v)| (Value::from(k), v))
+            .collect(),
+    );
+    rpc.request(
+        "nvim_open_win",
+        vec![Value::from(buf), Value::from(enter), config],
+    )
+    .await
+    .expect("open float")
+    .as_u64()
+    .expect("a window id")
+}
+
+#[tokio::test]
+async fn a_float_paints_over_the_buffer_beneath() {
+    let (rpc, mut incoming) = start(None).await;
+    // The tiled window holds "background" on its first line.
+    feed(&rpc, "ibackground<Esc>");
+    // A borderless float on its own buffer, covering the top-left, focused so we
+    // can type its content in.
+    let fb = new_buffer(&rpc).await;
+    open_float(
+        &rpc,
+        fb,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(0u64)),
+            ("col", Value::from(0u64)),
+            ("width", Value::from(40u64)),
+            ("height", Value::from(3u64)),
+        ],
+    )
+    .await;
+    feed(&rpc, "iFLOAT<Esc>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // The float (its own gutter shows line 1, then "FLOAT") replaces the cells it
+    // covers: the buffer's "background" no longer shows through (the `Clear`).
+    let row0 = row_text(&buf, 0);
+    assert!(
+        row0.contains("FLOAT"),
+        "the float's text is painted: {row0:?}"
+    );
+    assert!(
+        !row0.contains("background"),
+        "the float is opaque over the buffer beneath: {row0:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bordered_float_draws_its_border_and_title() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ibackground<Esc>");
+    let fb = new_buffer(&rpc).await;
+    // A single-bordered, titled float at (col 2, row 1), 20x6 outer.
+    open_float(
+        &rpc,
+        fb,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(20u64)),
+            ("height", Value::from(6u64)),
+            ("border", Value::from("single")),
+            ("title", Value::from("Hello")),
+        ],
+    )
+    .await;
+    feed(&rpc, "iinside<Esc>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // The border box: top-left and bottom-right corners at the outer rect edges.
+    assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "┌", "top-left corner");
+    assert_eq!(
+        buf.cell((2 + 20 - 1, 1 + 6 - 1)).unwrap().symbol(),
+        "┘",
+        "bottom-right corner"
+    );
+    // The title rides on the top border row.
+    let top = row_text(&buf, 1);
+    assert!(top.contains("Hello"), "title on the top border: {top:?}");
+    // The left border runs down the content rows, and the inset content shows the
+    // float's text (one cell inside the border, past its own gutter).
+    assert_eq!(buf.cell((2, 2)).unwrap().symbol(), "│", "left border");
+    let content = row_text(&buf, 2);
+    assert!(content.contains("inside"), "inset content: {content:?}");
+}
+
+#[tokio::test]
+async fn the_cursor_stays_inside_a_focused_float_on_a_long_line() {
+    // Regression: moving right (`l`) along a line wider than the float used to draw
+    // the terminal cursor past the float's right border (nxvim has no horizontal
+    // scroll), so it appeared to "keep going after the floating window". The cursor
+    // must stay clamped to the float's text area.
+    let (rpc, mut incoming) = start(None).await;
+    let fb = new_buffer(&rpc).await;
+    // A single-bordered float at (col 5, row 2), 20 wide. Inner text area: past the
+    // border (x 6) and the 4-cell gutter (x 10), 13 cells wide -> ends at x 23.
+    open_float(
+        &rpc,
+        fb,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(2u64)),
+            ("col", Value::from(5u64)),
+            ("width", Value::from(20u64)),
+            ("height", Value::from(6u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await;
+    // Type a line far wider than the float, then walk the cursor right past its edge.
+    feed(&rpc, "i");
+    feed(&rpc, &"x".repeat(60));
+    feed(&rpc, "<Esc>0");
+    feed(&rpc, &"l".repeat(40));
+    barrier(&rpc).await;
+    let params = latest_redraw(&mut incoming).await.expect("a redraw");
+    let (_buf, cursor) = paint_with_cursor(&View::from_redraw(&params), COLS, ROWS);
+    let (cx, cy) = cursor.expect("a cursor");
+    // The float's outer rect spans x in [5, 25); the cursor must stay within it
+    // (pinned to the last visible text cell, x 23), never escaping to the right.
+    assert!(
+        (5..25).contains(&cx),
+        "cursor escaped the float horizontally: x={cx}"
+    );
+    assert_eq!(
+        cx, 23,
+        "cursor pinned to the float's last visible text column"
+    );
+    // And it stays on the float's text rows (row 2 border, 3 = first text row).
+    assert!(
+        (3..7).contains(&cy),
+        "cursor escaped the float vertically: y={cy}"
+    );
+}
+
+#[tokio::test]
+async fn a_higher_zindex_float_paints_over_a_lower_one() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ibackground<Esc>");
+
+    // Open the HIGH-zindex float first, then a LOW-zindex float that covers it,
+    // created later. If paint followed creation order the later (low-z) float
+    // would win; zindex sorting must keep the high-z float on top.
+    let top_buf = new_buffer(&rpc).await;
+    open_float(
+        &rpc,
+        top_buf,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(4u64)),
+            ("col", Value::from(10u64)),
+            ("width", Value::from(8u64)),
+            ("height", Value::from(3u64)),
+            ("border", Value::from("single")),
+            ("zindex", Value::from(100u64)),
+        ],
+    )
+    .await;
+    feed(&rpc, "iTOP<Esc>");
+
+    let under_buf = new_buffer(&rpc).await;
+    open_float(
+        &rpc,
+        under_buf,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(2u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(30u64)),
+            ("height", Value::from(8u64)),
+            ("border", Value::from("single")),
+            ("zindex", Value::from(50u64)),
+        ],
+    )
+    .await;
+    feed(&rpc, "iUNDER<Esc>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // The high-z float's top-left corner sits inside the low-z float's area; it is
+    // still visible, so the high-z float won the overlap despite being older.
+    assert_eq!(
+        buf.cell((10, 4)).unwrap().symbol(),
+        "┌",
+        "the higher-zindex float paints over the lower one"
+    );
+}
+
+/// Boot a server sourcing `examples/floats/init.lua`, opened on its sample file,
+/// then attach a UI matching the paint grid — the end-to-end check that the
+/// shipped example config actually opens a float in the real client.
+async fn start_floats_example() -> (Rpc, UnboundedReceiver<Incoming>) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/floats");
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("server runtime");
+        let _ = runtime.block_on(run_server(
+            server_end,
+            ServerInit {
+                file: Some(dir.join("sample.txt").to_string_lossy().into_owned()),
+                config_dir: Some(dir.clone()),
+                runtimepath: vec![dir],
+            },
+        ));
+    });
+    let (reader, writer) = tokio::io::split(client_end);
+    let (rpc, incoming) = connect(reader, writer);
+    rpc.request(
+        "nvim_ui_attach",
+        vec![
+            Value::from(COLS as u64),
+            Value::from((ROWS - 1) as u64),
+            Value::Map(vec![]),
+        ],
+    )
+    .await
+    .expect("ui attach");
+    (rpc, incoming)
+}
+
+#[tokio::test]
+async fn the_floats_example_opens_a_visible_float_on_startup() {
+    let (rpc, mut incoming) = start_floats_example().await;
+    // The config opens a startup "hint" float (not focused) — so there are two
+    // windows, and the main buffer (the sample file) keeps focus.
+    let wins = rpc
+        .request("nvim_list_wins", vec![])
+        .await
+        .expect("list_wins");
+    assert_eq!(
+        wins.as_array().map(Vec::len),
+        Some(2),
+        "the example opened the startup float on top of the tiled window"
+    );
+    let buf = screen(&rpc, &mut incoming).await;
+    // The hint float is a single-bordered box at (col 20, row 0) titled
+    // "nxvim floats"; its top-left corner and title paint on the top row.
+    assert_eq!(
+        buf.cell((20, 0)).unwrap().symbol(),
+        "┌",
+        "hint float border"
+    );
+    assert!(
+        row_text(&buf, 0).contains("nxvim floats"),
+        "hint float title: {:?}",
+        row_text(&buf, 0)
+    );
+    // The buffer text beneath still shows on a row the 3-tall float doesn't cover
+    // (display row 4 = sample line 5), so the float stole no space from the tiled
+    // window.
+    assert!(
+        row_text(&buf, 4).contains("paints over them"),
+        "the tiled window still renders the sample buffer: {:?}",
+        row_text(&buf, 4)
+    );
+}
+
+#[tokio::test]
+async fn a_focused_float_owns_the_terminal_cursor() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ibackground<Esc>");
+    let fb = new_buffer(&rpc).await;
+    open_float(
+        &rpc,
+        fb,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(3u64)),
+            ("col", Value::from(5u64)),
+            ("width", Value::from(20u64)),
+            ("height", Value::from(5u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await;
+    feed(&rpc, "ihi<Esc>"); // cursor rests on the 'i' (screen col 1) of "hi"
+    let params = {
+        barrier(&rpc).await;
+        latest_redraw(&mut incoming).await.expect("a redraw")
+    };
+    let (_buf, cursor) = paint_with_cursor(&View::from_redraw(&params), COLS, ROWS);
+
+    // The cursor lands inside the float: past its border (col 5 -> +1) and its
+    // 4-cell number gutter (+4), at screen column 1 of "hi" (+1) -> x = 11; one
+    // row down past the top border (row 3 -> +1) -> y = 4.
+    assert_eq!(
+        cursor,
+        Some((5 + 1 + GUTTER + 1, 3 + 1)),
+        "cursor inside the float"
+    );
 }

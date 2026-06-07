@@ -355,21 +355,83 @@ function vim.api.nvim_win_close(win, force)
   end
 end
 
--- nvim_open_win(buffer, enter, config): the split form. `config.vertical` (or
--- `config.split == "left"/"right"`) makes a vsplit. Returns the new window's id
--- (predicted from the mirror's `_next_win`); the real window is created when the
--- queued op drains. `relative` floats are deferred to the floats spec.
+-- The float config values nxvim can position / draw. An unsupported one fails
+-- loud (the no-silent-stub rule), mirroring the RPC `parse_float_config`, rather
+-- than quietly falling back. Phase 2 supports these; the rest grow as needed.
+local FLOAT_RELATIVE = { editor = true, cursor = true, win = true }
+local FLOAT_ANCHOR = { NW = true, NE = true, SW = true, SE = true }
+local FLOAT_BORDER = {
+  none = true, single = true, rounded = true, double = true, solid = true,
+}
+
+-- Flatten neovim's `title` (a string, or a list of `{text, hl}` chunks) to the
+-- plain string nxvim draws on the border; the per-chunk highlight is dropped.
+local function float_title(title)
+  if type(title) == "string" then return title end
+  if type(title) == "table" then
+    local parts = {}
+    for _, chunk in ipairs(title) do
+      parts[#parts + 1] = type(chunk) == "table" and chunk[1] or chunk
+    end
+    local joined = table.concat(parts)
+    if joined ~= "" then return joined end
+  end
+  return nil
+end
+
+-- nvim_open_win(buffer, enter, config): both forms. A non-empty `config.relative`
+-- opens a **float** positioned absolutely on top of the tiled layout; otherwise it
+-- is the split form (`config.vertical` / `config.split == "left"/"right"` makes a
+-- vsplit). Returns the new window's id (predicted from the mirror's `_next_win`);
+-- the real window is created when the queued op drains.
 function vim.api.nvim_open_win(buffer, enter, config)
   config = config or {}
-  local vertical = config.vertical == true
-    or config.split == "left" or config.split == "right"
   local id = vim._next_win or 1001
   vim._next_win = id + 1
-  vim._open_win(buffer or 0, vertical, enter ~= false)
+  local enters = enter ~= false
+  local buf = (buffer == nil or buffer == 0) and vim.api.nvim_get_current_buf() or buffer
+
+  if type(config.relative) == "string" and config.relative ~= "" then
+    -- Float form. Validate the enumerated fields loudly before queuing.
+    if not FLOAT_RELATIVE[config.relative] then
+      error("nvim_open_win: 'relative' value '" .. config.relative .. "' is not supported yet", 2)
+    end
+    local anchor = config.anchor or "NW"
+    if not FLOAT_ANCHOR[anchor] then
+      error("nvim_open_win: invalid 'anchor': '" .. tostring(anchor) .. "'", 2)
+    end
+    local border = config.border or "none"
+    if type(border) ~= "string" or not FLOAT_BORDER[border] then
+      error("nvim_open_win: 'border' style '" .. tostring(border) .. "' is not supported yet", 2)
+    end
+    if not config.width or not config.height
+        or config.width <= 0 or config.height <= 0 then
+      error("nvim_open_win: 'width' and 'height' must be positive", 2)
+    end
+    vim._open_float({
+      buf = buffer or 0,
+      enter = enters,
+      relative = config.relative,
+      win = config.win or 0,
+      anchor = anchor,
+      row = math.floor(config.row or 0),
+      col = math.floor(config.col or 0),
+      width = math.floor(config.width),
+      height = math.floor(config.height),
+      zindex = math.floor(config.zindex or 50),
+      focusable = config.focusable ~= false,
+      border = border,
+      title = float_title(config.title),
+    })
+  else
+    local vertical = config.vertical == true
+      or config.split == "left" or config.split == "right"
+    vim._open_win(buffer or 0, vertical, enters)
+  end
+
   -- Write-through: reflect the new window in the mirror so reads later in this
   -- chunk (nvim_list_wins, nvim_win_get_buf) see it before the op drains. Real
   -- dimensions land on the next mirror refresh.
-  local buf = (buffer == nil or buffer == 0) and vim.api.nvim_get_current_buf() or buffer
   vim._wins = vim._wins or {}
   vim._win_order = vim._win_order or {}
   -- A split inherits the source (current) window's gutter options, as the core
@@ -384,7 +446,7 @@ function vim.api.nvim_open_win(buffer, enter, config)
     number = number, relativenumber = relativenumber,
   }
   vim._win_order[#vim._win_order + 1] = id
-  if enter ~= false then vim._cur_win = id end
+  if enters then vim._cur_win = id end
   return id
 end
 

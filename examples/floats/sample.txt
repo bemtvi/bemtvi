@@ -1,0 +1,30 @@
+Floating-windows playground — open floats and watch them paint on top.
+
+A float is a window positioned by absolute coordinates ON TOP of the tiled
+layout, rather than tiled into it. It steals no space from its neighbours: it
+paints over them. This is how plugins draw hover, completion docs, which-key,
+telescope, notifications, and bordered vim.ui prompts.
+
+A hint float opened on startup (top of the screen, single border, titled
+"nxvim floats"). It did not steal focus — your cursor is still down here.
+
+Try, in order:
+  1. :FloatHello     a centered, rounded, titled float ("hello from a float").
+                     It takes focus — the cursor is now inside the float.
+  2. :FloatClose     (or \x) close it again; the buffer beneath is intact.
+  3. :FloatStack     two overlapping floats. The higher zindex sits on top,
+                     even though it was opened first — stacking is by zindex.
+  4. 10G then :FloatCursor   jump down, then open a float at the cursor cell.
+
+Each float binds THIS buffer, so it shows the same text — the border, title,
+and position are what mark it as a float. A float steals no space: the lines
+here never reflow when one opens.
+
+line A
+line B
+line C
+line D
+line E
+line F
+line G
+line H

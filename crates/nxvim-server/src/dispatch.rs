@@ -3,7 +3,7 @@
 
 use crate::redraw::{lines_value, style_value};
 use crate::Server;
-use nxvim_core::{BufferId, WindowId};
+use nxvim_core::{BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowId};
 use nxvim_rpc::Incoming;
 use rmpv::Value;
 
@@ -185,30 +185,65 @@ impl Server {
                 Ok(Value::Nil)
             }
             "nvim_open_win" => {
-                // (buffer, enter, config) — split form only. `config.vertical`
-                // (or `config.split == "left"/"right"`) makes it a vsplit. The
-                // new window is created bound to `buffer` and (always, for now)
-                // focused; `enter == false` then refocuses the previous window.
+                // (buffer, enter, config). A non-empty `config.relative` opens a
+                // float (positioned absolutely on top of the tiled layout); else
+                // it is the split form — `config.vertical` (or `config.split ==
+                // "left"/"right"`) makes a vsplit. The new window is created bound
+                // to `buffer` and focused; `enter == false` refocuses the previous
+                // window.
                 let buf = BufferId(uint(params.first(), 0) as u64);
                 let enter = params.get(1).and_then(Value::as_bool).unwrap_or(true);
                 let config = params.get(2);
-                let vertical = config
-                    .and_then(map_get("vertical"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or_else(|| {
-                        matches!(
-                            config.and_then(map_get("split")).and_then(Value::as_str),
-                            Some("left" | "right")
-                        )
-                    });
-                let prev = self.editor.current_window_id();
-                let new = self.editor.open_split_window(buf, vertical);
-                if !enter {
-                    self.editor.set_current_window(prev);
-                }
+                let relative = config
+                    .and_then(map_get("relative"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let new = if relative.is_empty() {
+                    let vertical = config
+                        .and_then(map_get("vertical"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or_else(|| {
+                            matches!(
+                                config.and_then(map_get("split")).and_then(Value::as_str),
+                                Some("left" | "right")
+                            )
+                        });
+                    let prev = self.editor.current_window_id();
+                    let new = self.editor.open_split_window(buf, vertical);
+                    if !enter {
+                        self.editor.set_current_window(prev);
+                    }
+                    new
+                } else {
+                    // Float form. `buffer == 0` means the current buffer.
+                    let buf = if buf.0 == 0 {
+                        self.editor.current_buffer_id()
+                    } else {
+                        buf
+                    };
+                    let cfg = self.parse_float_config(config)?;
+                    self.editor.open_float_window(buf, cfg, enter)
+                };
                 self.emit_lifecycle_events();
                 self.run_pending();
                 Ok(Value::from(new.0))
+            }
+            "nvim_win_get_config" => {
+                let win = self.resolve_win(params.first());
+                Ok(self.win_config_value(win))
+            }
+            "nvim_win_get_position" => {
+                // [row, col] of the window's top-left in windows-area cells.
+                let win = self.resolve_win(params.first());
+                let (x, y) = self
+                    .editor
+                    .window_rect(win)
+                    .map(|r| (r.0, r.1))
+                    .unwrap_or((0, 0));
+                Ok(Value::Array(vec![
+                    Value::from(y as u64),
+                    Value::from(x as u64),
+                ]))
             }
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
             "nvim_list_bufs" => Ok(Value::Array(
@@ -339,6 +374,120 @@ impl Server {
         }
     }
 
+    /// Parse a `nvim_open_win` float `config` map into a [`FloatConfig`]. The
+    /// caller has already established `relative` is non-empty (the float form).
+    /// Per the no-silent-stub rule, a `relative`/`anchor`/`border` value nxvim
+    /// cannot position yet is an error naming what is unsupported, never a silent
+    /// fallback. `width`/`height` are required and must be positive (as neovim).
+    fn parse_float_config(&self, config: Option<&Value>) -> Result<FloatConfig, String> {
+        let get = |k: &'static str| config.and_then(map_get(k));
+        let relative = match get("relative").and_then(Value::as_str).unwrap_or("") {
+            "editor" => FloatRelative::Editor,
+            "cursor" => FloatRelative::Cursor,
+            "win" => {
+                let w = get("win").and_then(Value::as_u64).unwrap_or(0);
+                let id = if w == 0 {
+                    self.editor.current_window_id()
+                } else {
+                    WindowId(w)
+                };
+                FloatRelative::Win(id)
+            }
+            other => {
+                return Err(format!(
+                    "nvim_open_win: 'relative' value '{other}' is not supported yet"
+                ))
+            }
+        };
+        let anchor = match get("anchor").and_then(Value::as_str).unwrap_or("NW") {
+            "NW" => FloatAnchor::NW,
+            "NE" => FloatAnchor::NE,
+            "SW" => FloatAnchor::SW,
+            "SE" => FloatAnchor::SE,
+            other => return Err(format!("nvim_open_win: invalid 'anchor': '{other}'")),
+        };
+        let width = uint(get("width"), 0);
+        let height = uint(get("height"), 0);
+        if width == 0 || height == 0 {
+            return Err("nvim_open_win: 'width' and 'height' must be positive".to_string());
+        }
+        let border = match get("border") {
+            None => BorderStyle::None,
+            Some(v) => match v.as_str() {
+                None | Some("none") => BorderStyle::None,
+                Some("single") => BorderStyle::Single,
+                Some("rounded") => BorderStyle::Rounded,
+                Some("double") => BorderStyle::Double,
+                Some("solid") => BorderStyle::Solid,
+                Some(other) => {
+                    return Err(format!(
+                        "nvim_open_win: 'border' style '{other}' is not supported yet"
+                    ))
+                }
+            },
+        };
+        Ok(FloatConfig {
+            relative,
+            anchor,
+            row: get("row").and_then(as_int).unwrap_or(0),
+            col: get("col").and_then(as_int).unwrap_or(0),
+            width,
+            height,
+            zindex: get("zindex")
+                .and_then(Value::as_u64)
+                .map(|z| z as u32)
+                .unwrap_or(50),
+            focusable: get("focusable").and_then(Value::as_bool).unwrap_or(true),
+            border,
+            title: parse_title(get("title")),
+        })
+    }
+
+    /// The `nvim_win_get_config` value for window `win`: neovim's config map for a
+    /// float (`relative`/`anchor`/`row`/`col`/`width`/`height`/`zindex`/
+    /// `focusable`/`border`), or `{ relative = "" }` for a tiled window.
+    fn win_config_value(&self, win: WindowId) -> Value {
+        let Some(cfg) = self.editor.window_float_config(win) else {
+            return Value::Map(vec![(Value::from("relative"), Value::from(""))]);
+        };
+        let relative = match cfg.relative {
+            FloatRelative::Editor => "editor",
+            FloatRelative::Win(_) => "win",
+            FloatRelative::Cursor => "cursor",
+        };
+        let anchor = match cfg.anchor {
+            FloatAnchor::NW => "NW",
+            FloatAnchor::NE => "NE",
+            FloatAnchor::SW => "SW",
+            FloatAnchor::SE => "SE",
+        };
+        let border = match cfg.border {
+            BorderStyle::None => "none",
+            BorderStyle::Single => "single",
+            BorderStyle::Rounded => "rounded",
+            BorderStyle::Double => "double",
+            BorderStyle::Solid => "solid",
+        };
+        let mut entries = vec![
+            (Value::from("relative"), Value::from(relative)),
+            (Value::from("anchor"), Value::from(anchor)),
+            (Value::from("row"), Value::from(cfg.row as i64)),
+            (Value::from("col"), Value::from(cfg.col as i64)),
+            (Value::from("width"), Value::from(cfg.width as u64)),
+            (Value::from("height"), Value::from(cfg.height as u64)),
+            (Value::from("zindex"), Value::from(cfg.zindex as u64)),
+            (Value::from("focusable"), Value::from(cfg.focusable)),
+            (Value::from("border"), Value::from(border)),
+        ];
+        if let FloatRelative::Win(id) = cfg.relative {
+            entries.push((Value::from("win"), Value::from(id.0)));
+        }
+        if let Some(title) = &cfg.title {
+            entries.push((Value::from("title"), Value::from(title.as_str())));
+        }
+        Value::Map(entries)
+    }
+
     pub(crate) fn get_lines(&self, params: &[Value]) -> Value {
         // params[0] is the buffer handle: 0 = current, else a specific buffer.
         // An unknown handle yields an empty list rather than erroring.
@@ -384,8 +533,37 @@ fn uint(v: Option<&Value>, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Read a signed integer RPC value, accepting a float (neovim's `nvim_open_win`
+/// `row`/`col` may be fractional — we truncate) as well as an integer.
+fn as_int(v: &Value) -> Option<isize> {
+    v.as_i64()
+        .map(|n| n as isize)
+        .or_else(|| v.as_f64().map(|f| f as isize))
+}
+
 fn text(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Parse a `nvim_open_win` `title`: either a plain string, or neovim's
+/// `[[text, hl], …]` chunk list (we keep the text, drop the per-chunk highlight
+/// — Phase 2 paints the title in the border style, not per-chunk). `None` for an
+/// absent or empty title.
+fn parse_title(v: Option<&Value>) -> Option<String> {
+    let title = match v {
+        Some(Value::String(s)) => s.as_str().unwrap_or("").to_string(),
+        Some(Value::Array(chunks)) => chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                // A chunk is `[text]` or `[text, hl]`; the first element is text.
+                Value::Array(parts) => parts.first().and_then(Value::as_str),
+                Value::String(s) => s.as_str(),
+                _ => None,
+            })
+            .collect(),
+        _ => return None,
+    };
+    (!title.is_empty()).then_some(title)
 }
 
 /// Read an RPC array-of-strings argument (the panel methods' `lines`). Non-array

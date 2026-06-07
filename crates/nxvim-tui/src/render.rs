@@ -5,7 +5,7 @@ use crossterm::cursor::SetCursorStyle;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rmpv::Value;
 use unicode_width::UnicodeWidthChar;
@@ -19,6 +19,25 @@ use crate::view::{PanelData, PmenuData, Separator, View, WindowView};
 /// client uses, so tests assert on exactly what a user would see.
 pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
     paint_doc_scrolled(view, width, height, 0)
+}
+
+/// Like [`paint`], but also returns the terminal cursor position the frame
+/// placed (`None` when hidden). The hook a test uses to assert where the cursor
+/// landed — e.g. inside a focused float's inner area. Not part of the runtime API.
+#[doc(hidden)]
+pub fn paint_with_cursor(
+    view: &View,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, Option<(u16, u16)>) {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, view, None, 0))
+        .expect("draw");
+    let cursor = terminal.get_cursor_position().ok().map(|p| (p.x, p.y));
+    (terminal.backend().buffer().clone(), cursor)
 }
 
 /// Like [`paint`], but with the completion doc preview scrolled down `doc_scroll`
@@ -121,8 +140,10 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
 
     // Paint each window; capture the focused one's text-inner rect and (possibly
     // interpolated) cursor row for the terminal cursor and the popup anchor.
+    // Tiled windows paint first; floats overlay them in a second pass so they sit
+    // on top — the focused window (tiled or float) wins the cursor either way.
     let mut focused_inner: Option<(Rect, u16)> = None;
-    for win in &view.windows {
+    for win in view.windows.iter().filter(|w| !w.floating) {
         let area = window_area(wins_area, win);
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
@@ -133,6 +154,28 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     }
 
     render_separators(frame, wins_area, &view.separators, view);
+
+    // Floats, on top, in list order (the server already sorts them by zindex). A
+    // float is opaque (`Clear`) over what it covers, draws its border + title, and
+    // paints its own gutter/text/status inside. A float never scroll-animates.
+    for win in view.windows.iter().filter(|w| w.floating) {
+        let outer = window_area(wins_area, win);
+        frame.render_widget(Clear, outer);
+        let inner = match win.border {
+            Some(border) => {
+                let block = float_block(border, win.title.as_deref());
+                let inner = block.inner(outer);
+                frame.render_widget(block, outer);
+                inner
+            }
+            None => outer,
+        };
+        let (text_inner, cursor_row) = render_window(frame, inner, win, view, None);
+        if win.focused {
+            focused_inner = Some((text_inner, cursor_row));
+        }
+    }
+
     render_command(frame, cmd_area, view);
 
     // The insert-mode completion popup floats over the focused window's text area,
@@ -162,8 +205,15 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     } else if let (Some((inner, cursor_row)), Some(win)) = (focused_inner, view.focused()) {
         // The cursor row is interpolated during a slide, but the column comes
         // straight from the focused window — correct because the scroll commands
-        // move only vertically.
-        frame.set_cursor_position((inner.x + win.cursor_screen_col, inner.y + cursor_row));
+        // move only vertically. Clamp both to the window's text area: nxvim has no
+        // horizontal scroll yet, so a cursor on a line wider than the window would
+        // otherwise be drawn past its right edge — escaping a narrow float (or
+        // vsplit) onto whatever sits beside it. The logical cursor column is
+        // unchanged; only the painted terminal cursor is pinned to the last
+        // visible cell. (Rows are already bounded by the window's text height.)
+        let col = inner.x + win.cursor_screen_col.min(inner.width.saturating_sub(1));
+        let row = inner.y + cursor_row.min(inner.height.saturating_sub(1));
+        frame.set_cursor_position((col, row));
     }
 }
 
@@ -192,6 +242,28 @@ fn window_area(wins_area: Rect, win: &WindowView) -> Rect {
             height: r.height.min(wins_area.height.saturating_sub(r.y)),
         },
         None => wins_area,
+    }
+}
+
+/// The bordered [`Block`] for a float: `BorderType` glyphs all round, with the
+/// `title` (when present) on the top border, padded with a space each side so it
+/// reads as a label rather than running into the corners. Left-aligned, matching
+/// neovim's default `title_pos = "left"`.
+fn float_block(border: BorderType, title: Option<&str>) -> Block<'static> {
+    let mut block = Block::new().borders(Borders::ALL).border_type(border);
+    if let Some(title) = title {
+        block = block.title_top(Line::from(format!(" {title} ")).left_aligned());
+    }
+    block
+}
+
+/// A float's inner content rect (past its border), or the whole `area` for a
+/// borderless float. Shared by the renderer and [`text_inner_rect`] so a focused
+/// float's cursor/popup anchor lands on the cells the border left for content.
+fn float_inner(area: Rect, border: Option<BorderType>) -> Rect {
+    match border {
+        Some(border) => float_block(border, None).inner(area),
+        None => area,
     }
 }
 
@@ -831,7 +903,8 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
         return Rect::new(0, 0, 0, 0);
     };
     let wins_area = windows_area_rect(width, height, view);
-    let area = window_area(wins_area, win);
+    // A focused float's content sits inside its border; the popup anchors there.
+    let area = float_inner(window_area(wins_area, win), win.border);
     // The text body is the window rect minus its bottom status row.
     let text_area = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)[0];
     if win.number_width > 0 {

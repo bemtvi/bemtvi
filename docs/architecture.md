@@ -260,6 +260,19 @@ width), the client reports **both** dimensions of the windows area on
 `nvim_ui_attach`/`nvim_ui_try_resize`. There is still no grid, no cell encoding,
 and no `ext_linegrid`.
 
+**Floating windows are a second, on-top layer.** Each `WindowView` carries
+`floating`, `border` (`none`/`single`/`rounded`/`double`/`solid`), and `title`.
+The list is ordered tiled-windows-first, then the floats bottom-to-top by
+`(zindex, id)` — the same order `nvim_list_wins` reports — so the client renders
+in two passes: it tiles the non-floating windows and their separators, then
+overlays the floats in list order. Each float is made opaque (`Clear`s the cells
+it covers), draws its border + title, and paints its own gutter/text/status one
+cell inside the border; a focused float owns the terminal cursor. The completion
+pmenu stays the highest layer, above the floats. The core sizes a bordered
+float's content `lines` to the inset (`rect` minus one cell each side) so the
+projection and the painted box agree; the float's outer `rect` is what the client
+draws the border around. (See [*Windows*](#windows).)
+
 ---
 
 ## Text model
@@ -365,11 +378,26 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   transient state.
 - **RPC / Lua.** `nvim_list_wins`, `nvim_get_current_win`/`nvim_set_current_win`,
   `nvim_win_get_buf`/`set_buf`, `nvim_win_get_cursor`/`set_cursor` (window-handled,
-  `0` = current), `nvim_win_get_width`/`height` + setters, `nvim_win_close`, and
-  `nvim_open_win` (split form; `relative` floats deferred). The Lua bindings
-  follow the established "Lua queues, core mutates" flow: window *reads* resolve
-  against the `vim._wins` mirror the server pushes before each Lua entry; window
-  *mutations* queue a `WindowOp` drained into the core after the chunk.
+  `0` = current), `nvim_win_get_width`/`height` + setters, `nvim_win_close`,
+  `nvim_win_get_config`/`nvim_win_get_position`, and `nvim_open_win` (both the
+  split form and the float form). The Lua bindings follow the established "Lua
+  queues, core mutates" flow: window *reads* resolve against the `vim._wins`
+  mirror the server pushes before each Lua entry; window *mutations* queue a
+  `WindowOp` drained into the core after the chunk.
+- **Floating windows.** A float is a `Window` the layout tree does **not** own: it
+  lives in `WindowTree.floats` (ids kept sorted by `(zindex, id)`), carries a
+  `FloatConfig` (`relative` editor/win/cursor, `anchor`, `row`/`col`, `width`/
+  `height`, `zindex`, `focusable`, `border`, `title`), and is positioned
+  absolutely by a second `layout()` pass after the tiled rects are known — so it
+  steals no space from its siblings and paints on top. `nvim_open_win` with a
+  non-empty `relative` opens one (RPC and Lua, the latter via `WindowOp::OpenFloat`);
+  the client draws it as an opaque, bordered, titled overlay above the tiled
+  layout (see [*View protocol*](#view-protocol-ui)). Focus, the window list, and
+  close already span floats because they key off `WindowId`. Unsupported config
+  values (`relative="mouse"`, an unknown `border`) fail **loud** rather than
+  silently falling back to a tiled split. Still deferred: `nvim_win_set_config`
+  (move/resize/restyle, split↔float conversion) and the float edge semantics
+  (`:q`/`:only`/focus with floats present, `focusable`, parent-close).
 - **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from
   the same server-side lifecycle diff as the buffer events, ordered
   `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.
@@ -379,11 +407,11 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   number-gutter options (`number` / `relativenumber`) are **window-local** (a
   `WindowOptions` per window, set via `:set`/`:setlocal`/`vim.wo`).
 
-Still pending: **tab pages**, **floating windows** (`nvim_open_win` with
-`relative` — the seams are built to carry them), and **more window-local options**
-(`wrap`, `cursorline`, …) beyond the number gutter that already rides
-`WindowOptions`. The per-window status line is `laststatus=2`; the
-global/conditional `laststatus` modes are a small follow-up.
+Still pending: **tab pages**, the rest of the **floating-windows** surface
+(`nvim_win_set_config` and the float edge semantics — see the floats bullet
+above), and **more window-local options** (`wrap`, `cursorline`, …) beyond the
+number gutter that already rides `WindowOptions`. The per-window status line is
+`laststatus=2`; the global/conditional `laststatus` modes are a small follow-up.
 
 ---
 

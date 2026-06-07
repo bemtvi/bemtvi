@@ -5,7 +5,7 @@
 use crate::Server;
 use nxvim_core::highlight::Style;
 use nxvim_core::view::{ScrollAnim, Separator, ViewRect, WindowView};
-use nxvim_core::PanelView;
+use nxvim_core::{BorderStyle, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -162,6 +162,17 @@ impl Server {
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("scroll"), scroll),
+            // Float overlay chrome. A tiled window is `floating: false` with no
+            // border/title, so the client paints it exactly as before.
+            (Value::from("floating"), Value::from(win.floating)),
+            (Value::from("border"), Value::from(border_name(win.border))),
+            (
+                Value::from("title"),
+                match &win.title {
+                    Some(t) => Value::from(t.as_str()),
+                    None => Value::Nil,
+                },
+            ),
         ])
     }
 
@@ -258,6 +269,18 @@ fn separator_value(sep: &Separator) -> Value {
         (Value::from("y"), Value::from(sep.y as u64)),
         (Value::from("length"), Value::from(sep.length as u64)),
     ])
+}
+
+/// The wire name for a float's [`BorderStyle`] — the same tokens
+/// `nvim_win_get_config` returns, which the client maps to its border glyphs.
+fn border_name(border: BorderStyle) -> &'static str {
+    match border {
+        BorderStyle::None => "none",
+        BorderStyle::Single => "single",
+        BorderStyle::Rounded => "rounded",
+        BorderStyle::Double => "double",
+        BorderStyle::Solid => "solid",
+    }
 }
 
 /// Encode a window's screen rect as a `{ x, y, width, height }` map (cells,

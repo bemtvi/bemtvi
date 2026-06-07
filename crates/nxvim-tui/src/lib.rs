@@ -24,8 +24,8 @@ mod view;
 
 pub use keys::{encode_key, encode_paste};
 pub use render::{
-    close_button, cursor_style, paint, paint_doc_scrolled, panel_content_rect, pmenu_doc_geometry,
-    pmenu_geometry, ScrollHarness,
+    close_button, cursor_style, paint, paint_doc_scrolled, paint_with_cursor, panel_content_rect,
+    pmenu_doc_geometry, pmenu_geometry, ScrollHarness,
 };
 pub use view::View;
 

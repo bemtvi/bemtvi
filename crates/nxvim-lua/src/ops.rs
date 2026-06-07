@@ -308,6 +308,26 @@ pub enum WindowOp {
         vertical: bool,
         enter: bool,
     },
+    /// `nvim_open_win(buf, enter, config)` (float form) — open a floating window
+    /// onto buffer `buf`, positioned by the float config. The prelude has already
+    /// validated the string fields (`relative`/`anchor`/`border`) against the
+    /// supported set and errored loudly otherwise, so the drain trusts them. `win`
+    /// (`0` = current) is the parent for `relative == "win"`; ignored otherwise.
+    OpenFloat {
+        buf: u64,
+        enter: bool,
+        relative: String,
+        win: u64,
+        anchor: String,
+        row: i64,
+        col: i64,
+        width: u64,
+        height: u64,
+        zindex: u32,
+        focusable: bool,
+        border: String,
+        title: Option<String>,
+    },
 }
 
 /// The arguments handed to a deferred callback when the server runs it via

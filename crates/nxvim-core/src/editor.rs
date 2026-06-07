@@ -326,12 +326,105 @@ impl Rect {
     }
 }
 
+/// What a [`FloatConfig`] positions itself against (`nvim_open_win`'s `relative`):
+/// the whole windows area (`editor`), another window's rect (`win`), or the
+/// focused window's cursor cell (`cursor`). `relative` values nxvim does not
+/// position yet (`mouse`, `tabline`, `laststatus`) are rejected loudly at the RPC
+/// boundary rather than silently treated as `editor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatRelative {
+    Editor,
+    Win(WindowId),
+    Cursor,
+}
+
+/// Which corner of a float is pinned to its `(row, col)` anchor point
+/// (`nvim_open_win`'s `anchor`). `NW` is neovim's default: the top-left corner
+/// sits at the anchor and the float extends down-right. An `E` anchor extends
+/// left (subtracting the width), an `S` anchor extends up (subtracting the
+/// height) — matching neovim's `win_float` corner math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloatAnchor {
+    #[default]
+    NW,
+    NE,
+    SW,
+    SE,
+}
+
+/// A float's border style (`nvim_open_win`'s `border`). The *width* of the border
+/// (one cell on each side when present) is part of the geometry — a bordered
+/// float's inner text area is `width - 2 × height - 2` — so it is carried from
+/// Phase 1; the actual border glyphs are painted by the TUI in Phase 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    #[default]
+    None,
+    Single,
+    Rounded,
+    Double,
+    Solid,
+}
+
+/// A floating window's placement (`nvim_open_win`'s float `config`). Held on
+/// [`Window::float`] (`None` for a tiled window); the [`WindowTree`] positions it
+/// absolutely each layout from this config, on top of the tiled tree. `width`/
+/// `height` are the **outer** box (border included); `row`/`col` offset the
+/// `anchor` corner from the `relative` origin.
+///
+/// Not `Copy`: `title` owns a `String`. Read it through `Window::float`'s
+/// `Option<FloatConfig>` by reference (or `.clone()` where an owned value is
+/// needed) — see [`Editor::window_float_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatConfig {
+    pub relative: FloatRelative,
+    pub anchor: FloatAnchor,
+    pub row: isize,
+    pub col: isize,
+    pub width: usize,
+    pub height: usize,
+    /// Stacking order; higher floats paint over lower ones. Neovim's default is
+    /// 50. Ties break by window id (creation order).
+    pub zindex: u32,
+    /// Whether `<C-w>` focus commands can land on this float (`nvim_set_current_win`
+    /// can always focus it). Honored by the focus cycle in Phase 4.
+    pub focusable: bool,
+    pub border: BorderStyle,
+    /// Optional label drawn on the top border (`nvim_open_win`'s `title`), `None`
+    /// for an untitled float. Only meaningful with a `border`; the TUI renders it
+    /// on the border's top row.
+    pub title: Option<String>,
+}
+
+impl Default for FloatConfig {
+    fn default() -> Self {
+        FloatConfig {
+            relative: FloatRelative::Editor,
+            anchor: FloatAnchor::NW,
+            row: 0,
+            col: 0,
+            width: 1,
+            height: 1,
+            zindex: 50,
+            focusable: true,
+            border: BorderStyle::None,
+            title: None,
+        }
+    }
+}
+
 /// A window: one viewport onto a buffer. Mirrors the way [`OpenBuffer`] splits
 /// state — the buffer binding plus, *while this window is not focused*, its saved
 /// cursor/scroll so refocusing restores the view. While the window *is* focused
 /// the live position is [`Editor::cursor`] / [`Editor::top`]; the `saved_*`
 /// fields are meaningless then (they are stashed only on focus-out, the
 /// window analogue of `OpenBuffer::saved_cursor`).
+///
+/// A window is either **tiled** (`float: None`, a `Node::Leaf` in the layout
+/// tree) or **floating** (`float: Some(_)`, an id in [`WindowTree::floats`] that
+/// no `Leaf` references — positioned absolutely on top of the tree). The two are
+/// otherwise identical: a float still binds a buffer, has a cursor/scroll, and is
+/// focusable.
 struct Window {
     buffer: BufferId,
     saved_cursor: Cursor,
@@ -340,6 +433,8 @@ struct Window {
     /// Window-local options (the number gutter). A split inherits these from the
     /// window it was split off, mirroring vim.
     options: WindowOptions,
+    /// `Some` for a floating window (its placement), `None` for a tiled one.
+    float: Option<FloatConfig>,
 }
 
 /// The orientation of a split: `Horizontal` stacks children top-to-bottom
@@ -391,6 +486,11 @@ struct WindowTree {
     /// Borders between splits, recomputed on every [`WindowTree::layout`]. Empty
     /// with a single window.
     separators: Vec<Separator>,
+    /// Floating window ids — those in `windows` with `float.is_some()`, which no
+    /// `Leaf` in `root` references. Kept sorted by `(zindex, id)` so iterating it
+    /// yields bottom-to-top paint order. Empty until the first `nvim_open_win`
+    /// float.
+    floats: Vec<WindowId>,
 }
 
 impl WindowTree {
@@ -407,6 +507,7 @@ impl WindowTree {
                 saved_top: 0,
                 rect: Rect::default(),
                 options: WindowOptions::default(),
+                float: None,
             },
         );
         WindowTree {
@@ -415,6 +516,7 @@ impl WindowTree {
             current: id,
             next_id: 2,
             separators: Vec::new(),
+            floats: Vec::new(),
         }
     }
 
@@ -460,11 +562,33 @@ impl WindowTree {
         id
     }
 
+    /// Re-sort the [float](Self::floats) list bottom-to-top by `(zindex, id)`, so
+    /// iterating it is paint order and id breaks a zindex tie by creation order.
+    /// Called after a float is added or its zindex changes.
+    fn sort_floats(&mut self) {
+        let mut keyed: Vec<(u32, u64, WindowId)> = self
+            .floats
+            .iter()
+            .map(|&id| {
+                let z = self
+                    .windows
+                    .get(&id)
+                    .and_then(|w| w.float.as_ref())
+                    .map_or(0, |f| f.zindex);
+                (z, id.0, id)
+            })
+            .collect();
+        keyed.sort_by_key(|&(z, n, _)| (z, n));
+        self.floats = keyed.into_iter().map(|(_, _, id)| id).collect();
+    }
+
     /// Assign each window its `rect` by dividing `total` across the tree, and
     /// recompute the [`Separator`]s between splits. A single leaf takes the whole
     /// area; a `Split` subtracts one cell per inter-child border, distributes the
-    /// rest by `sizes`, and recurses.
-    fn layout(&mut self, total: Rect) {
+    /// rest by `sizes`, and recurses. After the tiled pass, [floats](Self::floats)
+    /// are positioned absolutely on top (`cursor_off` is the focused window's
+    /// cursor cell offset from its own rect top-left, for `relative="cursor"`).
+    fn layout(&mut self, total: Rect, cursor_off: (usize, usize)) {
         let mut rects: Vec<(WindowId, Rect)> = Vec::new();
         let mut seps: Vec<Separator> = Vec::new();
         layout_node(&mut self.root, total, &mut rects, &mut seps);
@@ -474,6 +598,81 @@ impl WindowTree {
             }
         }
         self.separators = seps;
+        self.position_floats(total, cursor_off);
+    }
+
+    /// Position every floating window absolutely on top of the freshly-laid tiled
+    /// tree. Runs *after* the tiled pass so a `relative="win"`/`"cursor"` float
+    /// reads up-to-date tiled rects. The cursor's absolute cell is the focused
+    /// window's rect origin plus `cursor_off`. A no-op when there are no floats,
+    /// so a session without floats lays out exactly as before.
+    fn position_floats(&mut self, total: Rect, cursor_off: (usize, usize)) {
+        if self.floats.is_empty() {
+            return;
+        }
+        // The focused window's rect origin plus the cursor offset. During a
+        // focused-window close `current` is briefly the removed window; fall back
+        // to the bare offset (the caller re-lays once the survivor is entered).
+        let cursor_cell = match self.windows.get(&self.current) {
+            Some(w) => (w.rect.x + cursor_off.0, w.rect.y + cursor_off.1),
+            None => cursor_off,
+        };
+        let placements: Vec<(WindowId, Rect)> = self
+            .floats
+            .iter()
+            .filter_map(|&id| {
+                let cfg = self.windows.get(&id)?.float.clone()?;
+                let origin = match cfg.relative {
+                    FloatRelative::Editor => total,
+                    FloatRelative::Win(wid) => {
+                        self.windows.get(&wid).map(|w| w.rect).unwrap_or(total)
+                    }
+                    FloatRelative::Cursor => Rect {
+                        x: cursor_cell.0,
+                        y: cursor_cell.1,
+                        width: 0,
+                        height: 0,
+                    },
+                };
+                Some((id, place_float(origin, total, &cfg)))
+            })
+            .collect();
+        for (id, rect) in placements {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.rect = rect;
+            }
+        }
+    }
+}
+
+/// Resolve a float's outer `rect` from its `origin` (the rect its `relative`
+/// names) and the `bounds` (the windows area). Applies the `row`/`col` offset
+/// from the origin's top-left, shifts so the `anchor` corner lands there (an `E`
+/// anchor subtracts the width, an `S` anchor the height — neovim's corner math),
+/// then clamps the box to stay fully on-screen. `width`/`height` are the outer
+/// box; a float larger than `bounds` pins to the top-left rather than shrinking.
+fn place_float(origin: Rect, bounds: Rect, cfg: &FloatConfig) -> Rect {
+    let w = cfg.width.max(1);
+    let h = cfg.height.max(1);
+    let mut x = origin.x as isize + cfg.col;
+    let mut y = origin.y as isize + cfg.row;
+    if matches!(cfg.anchor, FloatAnchor::NE | FloatAnchor::SE) {
+        x -= w as isize;
+    }
+    if matches!(cfg.anchor, FloatAnchor::SW | FloatAnchor::SE) {
+        y -= h as isize;
+    }
+    let lo_x = bounds.x as isize;
+    let lo_y = bounds.y as isize;
+    let hi_x = ((bounds.x + bounds.width).saturating_sub(w) as isize).max(lo_x);
+    let hi_y = ((bounds.y + bounds.height).saturating_sub(h) as isize).max(lo_y);
+    let x = x.clamp(lo_x, hi_x).max(0) as usize;
+    let y = y.clamp(lo_y, hi_y).max(0) as usize;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
     }
 }
 
@@ -776,7 +975,9 @@ fn equalize_node(node: &mut Node) {
 
 /// Per-window data for the [`View`] projection: the window's buffer, the view
 /// position to render it at (live for the focused window, stashed otherwise),
-/// its rect, and whether it holds focus.
+/// its rect, whether it holds focus, and — for a float — the overlay chrome
+/// (`floating`/`border`/`title`) the client paints it with. Tiled windows carry
+/// `floating: false`, `border: None`, `title: None`.
 pub(crate) struct WindowLayout {
     pub(crate) buffer: BufferId,
     pub(crate) cursor: Cursor,
@@ -786,6 +987,14 @@ pub(crate) struct WindowLayout {
     /// This window's window-local options (the number gutter), so the projection
     /// renders each window's own gutter rather than a single global one.
     pub(crate) options: WindowOptions,
+    /// Whether this window is a float (drawn on top of the tiled layout at its
+    /// absolute `rect`). The client paints floats in a second, on-top pass.
+    pub(crate) floating: bool,
+    /// The float's border style (`None` for a tiled window or a borderless
+    /// float). A bordered float's content area is its `rect` inset by one cell.
+    pub(crate) border: BorderStyle,
+    /// The float's title, drawn on the top border. `None` when untitled.
+    pub(crate) title: Option<String>,
 }
 
 /// A directional window-focus move (`<C-w>h/j/k/l`).
@@ -1980,9 +2189,12 @@ impl Editor {
         self.windows.current
     }
 
-    /// All window ids in layout order (the `nvim_list_wins` order).
+    /// All window ids (the `nvim_list_wins` order): the tiled windows in layout
+    /// order first, then the floats bottom-to-top by `(zindex, id)`.
     pub fn window_ids(&self) -> Vec<WindowId> {
-        self.windows.leaves()
+        let mut ids = self.windows.leaves();
+        ids.extend(self.windows.floats.iter().copied());
+        ids
     }
 
     /// Number of open windows (always ≥ 1).
@@ -2161,27 +2373,86 @@ impl Editor {
         self.windows.current
     }
 
+    /// `nvim_open_win` (float form) — create a **floating** window bound to `buf`,
+    /// positioned by `config`, and (when `enter`) focus it. Unlike
+    /// [`Editor::open_split_window`] this does **not** touch the layout tree: the
+    /// new window is added to the float list and positioned absolutely on top, so
+    /// the tiled windows keep their rects. Returns the new window's id.
+    pub fn open_float_window(
+        &mut self,
+        buf: BufferId,
+        config: FloatConfig,
+        enter: bool,
+    ) -> WindowId {
+        // A float inherits the focused window's window-local options (the number
+        // gutter), so it renders consistently with the rest of the editor.
+        let options = self.windows.get(self.windows.current).options;
+        let id = self.windows.alloc_id();
+        self.windows.windows.insert(
+            id,
+            Window {
+                buffer: buf,
+                saved_cursor: Cursor::default(),
+                saved_top: 0,
+                rect: Rect::default(),
+                options,
+                float: Some(config),
+            },
+        );
+        self.windows.floats.push(id);
+        self.windows.sort_floats();
+        if enter {
+            // Focus the float like any window switch (stashes the outgoing view,
+            // binds the float's buffer). `relayout` then positions it.
+            self.focus_window(id);
+        }
+        self.relayout();
+        if enter {
+            self.ensure_visible();
+        }
+        id
+    }
+
+    /// The float placement of window `id` (`nvim_win_get_config`), or `None` if
+    /// `id` is a tiled window or not open. The server formats it into neovim's
+    /// config map (`{ relative = "" }` for a tiled window).
+    pub fn window_float_config(&self, id: WindowId) -> Option<FloatConfig> {
+        self.windows.windows.get(&id).and_then(|w| w.float.clone())
+    }
+
     /// Per-window data the [`View`] projection needs: each window's buffer, its
     /// view position (the *live* `cursor`/`top` for the focused window, the
     /// stashed `saved_*` for the rest), its computed rect, and whether it holds
     /// focus. In layout order.
     pub(crate) fn window_layouts(&self) -> Vec<WindowLayout> {
         let cur = self.windows.current;
+        let layout_of = |id: WindowId| {
+            let w = self.windows.get(id);
+            let focused = id == cur;
+            let (floating, border, title) = match &w.float {
+                Some(cfg) => (true, cfg.border, cfg.title.clone()),
+                None => (false, BorderStyle::None, None),
+            };
+            WindowLayout {
+                buffer: w.buffer,
+                cursor: if focused { self.cursor } else { w.saved_cursor },
+                top: if focused { self.top } else { w.saved_top },
+                rect: w.rect,
+                focused,
+                options: w.options,
+                floating,
+                border,
+                title,
+            }
+        };
+        // Tiled windows in tree order first, then the floats bottom-to-top by
+        // `(zindex, id)` — the same order `window_ids`/`nvim_list_wins` uses, so
+        // the client paints floats on top in z-order.
         self.windows
             .leaves()
             .into_iter()
-            .map(|id| {
-                let w = self.windows.get(id);
-                let focused = id == cur;
-                WindowLayout {
-                    buffer: w.buffer,
-                    cursor: if focused { self.cursor } else { w.saved_cursor },
-                    top: if focused { self.top } else { w.saved_top },
-                    rect: w.rect,
-                    focused,
-                    options: w.options,
-                }
-            })
+            .chain(self.windows.floats.iter().copied())
+            .map(layout_of)
             .collect()
     }
 
@@ -2217,6 +2488,7 @@ impl Editor {
                 saved_top: top,
                 rect: Rect::default(),
                 options,
+                float: None,
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -2249,7 +2521,13 @@ impl Editor {
         }
         let closing_rect = self.windows.get(id).rect;
         let was_focused = id == self.windows.current;
-        remove_leaf(&mut self.windows.root, id);
+        // A float is not in the layout tree — drop it from the float list; a tiled
+        // window collapses its parent split.
+        if self.windows.get(id).float.is_some() {
+            self.windows.floats.retain(|f| *f != id);
+        } else {
+            remove_leaf(&mut self.windows.root, id);
+        }
         self.windows.windows.remove(&id);
         if was_focused {
             // Pick the spatially nearest survivor (using the pre-relayout rects)
@@ -2257,6 +2535,12 @@ impl Editor {
             let new_cur = self.nearest_window(closing_rect);
             self.relayout();
             self.enter_window(new_cur);
+            // `current` was the removed window during the relayout above, so any
+            // cursor-relative floats were placed against a fallback origin —
+            // re-lay now that the survivor is focused.
+            if !self.windows.floats.is_empty() {
+                self.relayout();
+            }
         } else {
             self.relayout();
             self.ensure_visible();
@@ -2641,12 +2925,28 @@ impl Editor {
     /// or closes (which grows/shrinks the windows area).
     fn relayout(&mut self) {
         let height = self.height.saturating_sub(self.panel_rows());
-        self.windows.layout(Rect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height,
-        });
+        // The focused window's cursor cell, as an offset from its own rect's
+        // top-left — what a `relative="cursor"` float anchors to. Guard against a
+        // transient invalid `current` (mid-close, before the surviving window is
+        // entered): `cursor_virtcol` reads the current window's buffer, which is
+        // gone for that instant. Only floats consume this, so (0, 0) is harmless.
+        let cursor_off = if self.windows.windows.contains_key(&self.windows.current) {
+            (
+                self.cursor_virtcol(),
+                self.cursor.line.saturating_sub(self.top),
+            )
+        } else {
+            (0, 0)
+        };
+        self.windows.layout(
+            Rect {
+                x: 0,
+                y: 0,
+                width: self.width,
+                height,
+            },
+            cursor_off,
+        );
     }
 
     /// Take any pending `:sleep` duration in milliseconds, clearing it. The

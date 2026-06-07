@@ -16,7 +16,7 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, GlobalOptionOp, HlSet, LoopOp, LspClientData,
-    LspOp, PanelOp, RawKeymap, RawRhs, UiInputReq, WindowOp,
+    LspOp, PanelOp, RawKeymap, RawRhs, TabOp, UiInputReq, WindowOp,
 };
 
 /// One window's row in the Rust→Lua window mirror, in layout order. The
@@ -59,6 +59,19 @@ pub struct FloatMirror {
     /// `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"`.
     pub border: String,
     pub title: Option<String>,
+}
+
+/// One tab page's row in the Rust→Lua tab mirror, in tabline order. Backs the
+/// `vim.api.nvim_tabpage_*` reads (`list_wins`/`get_win`/`is_valid`/`get_number`)
+/// the same way [`WindowMirror`] backs the window getters, so they resolve from
+/// Lua without an RPC round-trip.
+#[derive(Clone, Debug, Default)]
+pub struct TabMirror {
+    pub id: u64,
+    /// The tab's window ids, in its in-tab layout order.
+    pub windows: Vec<u64>,
+    /// The tab's focused window id (`nvim_tabpage_get_win`).
+    pub current_window: u64,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -108,6 +121,10 @@ pub(crate) struct Shared {
     /// `nvim_set_current_win` API, drained by the server into the live editor
     /// after the chunk (Phase 5).
     pub(crate) window_ops: Vec<WindowOp>,
+    /// Tab-page mutations from `vim.api.nvim_set_current_tabpage`, drained by the
+    /// server into the live editor after the chunk (Phase 3). Reads resolve from
+    /// the `vim._tabs` mirror, so only the switch needs an op.
+    pub(crate) tab_ops: Vec<TabOp>,
     /// Global-option writes from `vim.o` for a wired search option, drained by
     /// the server into the editor's global options after the chunk.
     pub(crate) global_ops: Vec<GlobalOptionOp>,
@@ -365,6 +382,12 @@ impl LuaRuntime {
     /// the last drain, for the server to apply to the live editor (Phase 5).
     pub fn take_window_ops(&self) -> Vec<WindowOp> {
         std::mem::take(&mut self.shared.borrow_mut().window_ops)
+    }
+
+    /// Take the tab-page mutations queued by `nvim_set_current_tabpage` since the
+    /// last drain, for the server to apply to the live editor (Phase 3).
+    pub fn take_tab_ops(&self) -> Vec<TabOp> {
+        std::mem::take(&mut self.shared.borrow_mut().tab_ops)
     }
 
     /// Take the global-option writes queued by `vim.o` since the last drain, for
@@ -720,12 +743,16 @@ impl LuaRuntime {
     }
 
     /// Refresh the Rust→Lua global-option mirror (`vim._go_mirror = { ignorecase,
-    /// smartcase, wrapscan, hlsearch, incsearch }`) that `vim.o` reads for the
-    /// wired global search options. Pushed alongside the buffer mirror before any
+    /// smartcase, wrapscan, hlsearch, incsearch, showtabline }`) that `vim.o` reads
+    /// for the wired global options. Pushed alongside the buffer mirror before any
     /// Lua that can read options, so a read reflects the core's current value —
     /// the default until set, and a value set through the `:set` ex path, not just
     /// one written from Lua.
-    pub fn set_go_mirror(&self, opts: (bool, bool, bool, bool, bool)) -> mlua::Result<()> {
+    pub fn set_go_mirror(
+        &self,
+        opts: (bool, bool, bool, bool, bool),
+        showtabline: u8,
+    ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let (ignorecase, smartcase, wrapscan, hlsearch, incsearch) = opts;
         let entry = self.lua.create_table()?;
@@ -734,8 +761,32 @@ impl LuaRuntime {
         entry.set("wrapscan", wrapscan)?;
         entry.set("hlsearch", hlsearch)?;
         entry.set("incsearch", incsearch)?;
+        entry.set("showtabline", showtabline)?;
         let set: mlua::Function = vim.get("_set_go_mirror")?;
         set.call(entry)
+    }
+
+    /// Refresh the Rust→Lua tab mirror that backs `vim.api.nvim_tabpage_*` /
+    /// `nvim_list_tabpages` / `nvim_get_current_tabpage`: `tabs` is one
+    /// [`TabMirror`] per tab page in tabline order and `cur_tab` the active id.
+    /// Pushed alongside the buffer/window mirror before any Lua that can read tab
+    /// state, so a read reflects the core's current layout.
+    pub fn set_tab_mirror(&self, tabs: &[TabMirror], cur_tab: u64) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let tab_arr = self.lua.create_table()?;
+        for (i, t) in tabs.iter().enumerate() {
+            let entry = self.lua.create_table()?;
+            entry.set("id", t.id)?;
+            let wins = self.lua.create_table()?;
+            for (j, w) in t.windows.iter().enumerate() {
+                wins.set(j + 1, *w)?;
+            }
+            entry.set("windows", wins)?;
+            entry.set("current_window", t.current_window)?;
+            tab_arr.set(i + 1, entry)?;
+        }
+        let set: mlua::Function = vim.get("_set_tab_mirror")?;
+        set.call((tab_arr, cur_tab))
     }
 
     /// Whether `name` was registered via `nvim_create_user_command` (so the

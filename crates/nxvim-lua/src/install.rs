@@ -21,8 +21,8 @@ use crate::host::{
     stdpath,
 };
 use crate::ops::{
-    BufOp, ConfirmReq, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, UiInputReq,
-    WindowOp,
+    BufOp, ConfirmReq, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, TabOp,
+    UiInputReq, WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -615,6 +615,19 @@ pub(crate) fn install_runtime_api(
     // prelude already validated the enumerated strings); a missing key stays
     // `None` so the core leaves it unchanged. `relative = ""` rides through as the
     // re-tile form.
+    // `vim._set_current_tab(tab)`: queue the tab switch of
+    // `nvim_set_current_tabpage` (Phase 3). The only tab mutation in the API —
+    // the `nvim_tabpage_*` reads resolve from the `vim._tabs` mirror. The prelude
+    // has already resolved `0` to the current tab and updated the mirror
+    // (write-through) so a read-after-set in the same chunk agrees.
+    let sh = shared.clone();
+    vim.set(
+        "_set_current_tab",
+        lua.create_function(move |_, tab: u64| {
+            sh.borrow_mut().tab_ops.push(TabOp::SetCurrent { tab });
+            Ok(())
+        })?,
+    )?;
     let sh = shared.clone();
     vim.set(
         "_win_set_config",

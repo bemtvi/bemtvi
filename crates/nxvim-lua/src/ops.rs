@@ -350,6 +350,17 @@ pub enum WindowOp {
     },
 }
 
+/// A tab-page mutation queued by the tab Lua API (`vim.api.nvim_set_current_tabpage`),
+/// drained by the server in `apply_lua_effects` and applied to the live editor —
+/// the tab analogue of [`WindowOp`]. Reads (`nvim_list_tabpages`,
+/// `nvim_tabpage_*`) need no op: they resolve against the `vim._tabs` mirror the
+/// server pushes before running Lua. `0` is the current tab, resolved server-side.
+#[derive(Clone, Debug)]
+pub enum TabOp {
+    /// `nvim_set_current_tabpage(tab)` — make tab `tab` the active tab page.
+    SetCurrent { tab: u64 },
+}
+
 /// The arguments handed to a deferred callback when the server runs it via
 /// [`crate::LuaRuntime::run_callback`]. A `vim.schedule` / timer callback takes none; an
 /// async `vim.system` `on_exit` takes the finished child's result, built into the

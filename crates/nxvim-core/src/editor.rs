@@ -2581,11 +2581,12 @@ impl Editor {
             .collect()
     }
 
-    /// One [`TabLabel`] per tab in tabline order — empty when only one tab is open
-    /// (vim's `showtabline=1` hides the tabline then). Each label names the tab's
-    /// focused window's buffer, whether it is modified, and the tab's window count.
+    /// One [`TabLabel`] per tab in tabline order — empty when the tabline is
+    /// hidden ([`Editor::tabline_visible`], e.g. `showtabline=1` with a single
+    /// tab). Each label names the tab's focused window's buffer, whether it is
+    /// modified, and the tab's window count.
     pub(crate) fn tab_labels(&self) -> Vec<TabLabel> {
-        if self.tabs.len() <= 1 {
+        if !self.tabline_visible() {
             return Vec::new();
         }
         self.tabs
@@ -2892,6 +2893,32 @@ impl Editor {
             "incsearch" => self.options.incsearch = value,
             _ => {}
         }
+    }
+
+    /// Set a numeric global option from outside the editor, the numeric analogue
+    /// of [`Editor::set_global_option_bool`] and the shared home for both the `:set
+    /// showtabline=…` ex path ([`Editor::apply_set_num`]) and the Lua `vim.o`
+    /// bridge — so the two routes validate, echo, and relayout identically. The
+    /// only wired numeric global is `showtabline` (0/1/2): an out-of-range value is
+    /// rejected loudly (vim's `E487` below the range, `E474` above it), and a valid
+    /// change re-lays the windows area, since it grows or shrinks the reserved
+    /// tabline row. An unknown name is a no-op (the Lua side forwards only the
+    /// canonical wired set).
+    pub fn set_global_option_num(&mut self, name: &str, value: i64) {
+        if name != "showtabline" {
+            return;
+        }
+        if value < 0 {
+            self.echo(format!("E487: Argument must be positive: {name}={value}"));
+            return;
+        }
+        if value > 2 {
+            self.echo(format!("E474: Invalid argument: {name}={value}"));
+            return;
+        }
+        self.options.showtabline = value as u8;
+        self.relayout();
+        self.ensure_visible();
     }
 
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).
@@ -3738,12 +3765,25 @@ impl Editor {
         self.ensure_visible();
     }
 
-    /// Rows the tabline reserves at the top of the reported area: one when more
-    /// than one tab is open (vim's `showtabline=1` default), zero otherwise. The
-    /// client paints the tabline into this row and offsets the windows area below
-    /// it — the top-of-frame analogue of the bottom panel.
+    /// Whether the tabline is drawn right now, per `showtabline`: never at `0`,
+    /// only with more than one tab at `1` (the default), always at `2`. The single
+    /// gate both [`Editor::tabline_rows`] (the reserved row) and
+    /// [`Editor::tab_labels`] (the projected labels) consult, so they never
+    /// disagree.
+    pub(crate) fn tabline_visible(&self) -> bool {
+        match self.options.showtabline {
+            0 => false,
+            2 => true,
+            _ => self.tabs.len() > 1,
+        }
+    }
+
+    /// Rows the tabline reserves at the top of the reported area: one when the
+    /// tabline is shown ([`Editor::tabline_visible`]), zero otherwise. The client
+    /// paints the tabline into this row and offsets the windows area below it —
+    /// the top-of-frame analogue of the bottom panel.
     fn tabline_rows(&self) -> usize {
-        usize::from(self.tabs.len() > 1)
+        usize::from(self.tabline_visible())
     }
 
     /// Re-divide the current terminal area across the window tree. The windows
@@ -6457,6 +6497,13 @@ impl Editor {
             self.close_window();
             return;
         }
+        // Last tiled window of *this* tab, but other tabs are open: `:q` closes the
+        // tab page (like `:tabclose`), not the editor — its buffers stay loaded, so
+        // there's nothing to lose and no modified guard, same as a non-last window.
+        if self.tabs.len() > 1 {
+            self.close_tab();
+            return;
+        }
         self.ex_quit_all(bang);
     }
 
@@ -7270,6 +7317,13 @@ impl Editor {
     fn apply_set_num(&mut self, name: &str, op: NumOp) {
         match op {
             NumOp::Set(v) => {
+                // `showtabline` is the one global numeric option; route it through
+                // the shared setter so the `:set` and `vim.o` paths validate, echo,
+                // and relayout identically.
+                if name == "showtabline" {
+                    self.set_global_option_num("showtabline", v);
+                    return;
+                }
                 let min = match name {
                     "tabstop" => 1,
                     "shiftwidth" | "sidescroll" | "sidescrolloff" => 0,
@@ -7298,6 +7352,7 @@ impl Editor {
                 let v: i64 = match name {
                     "sidescroll" => self.windows.cur().options.sidescroll as i64,
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
+                    "showtabline" => self.options.showtabline as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {

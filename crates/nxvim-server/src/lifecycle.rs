@@ -3,7 +3,7 @@
 
 use crate::filetype_of;
 use crate::{Server, WindowRect};
-use nxvim_core::{BufferId, WindowId};
+use nxvim_core::{BufferId, TabId, WindowId};
 use std::path::Path;
 
 impl Server {
@@ -56,6 +56,26 @@ impl Server {
             .as_ref()
             .is_some_and(|prev| *prev != rects);
 
+        // Tab diff (Phase 3): tabs added/closed and the active-tab change since the
+        // last emit. A tab transition always coincides with a window transition (a
+        // switch changes the focused window; create/close add or drop windows), but
+        // we still fold these into the fast-path guard so a tab event can never be
+        // swallowed.
+        let cur_tab = self.editor.current_tab_id();
+        let tabs = self.editor.tab_ids();
+        let new_tabs: Vec<TabId> = tabs
+            .iter()
+            .copied()
+            .filter(|t| !self.known_tabs.contains(t))
+            .collect();
+        let closed_tabs: Vec<TabId> = self
+            .known_tabs
+            .iter()
+            .copied()
+            .filter(|t| !tabs.contains(t))
+            .collect();
+        let tab_changed = self.last_tab_id != Some(cur_tab);
+
         if !unannounced
             && !entered
             && !entered_insert
@@ -63,8 +83,24 @@ impl Server {
             && closed_wins.is_empty()
             && !win_changed
             && !resized
+            && new_tabs.is_empty()
+            && closed_tabs.is_empty()
+            && !tab_changed
         {
             return; // fast path: nothing transitioned
+        }
+
+        // ----- tab new / leave (outermost, before the window events) -----
+        // `TabNew` for freshly-created tabs, then `TabLeave` for the tab we're
+        // leaving — vim brackets a switch as `TabLeave → WinLeave → … → WinEnter
+        // → TabEnter`, so the tab-leave fires before the window-leave below.
+        for t in &new_tabs {
+            self.fire_tab("TabNew", *t);
+        }
+        if tab_changed {
+            if let Some(old) = self.last_tab_id {
+                self.fire_tab("TabLeave", old);
+            }
         }
 
         // ----- window leave/new/closed (before the buffer events) -----
@@ -126,6 +162,19 @@ impl Server {
             self.fire_window("WinResized", cur_win, b);
         }
         self.last_window_rects = Some(rects);
+
+        // ----- tab enter / closed (outermost, after the window events) -----
+        // `TabEnter` for the now-active tab (after `WinEnter`, closing the
+        // `TabLeave → … → TabEnter` bracket), then `TabClosed` for any tab the
+        // transition removed (the tab — and its windows — are already gone).
+        if tab_changed {
+            self.last_tab_id = Some(cur_tab);
+            self.fire_tab("TabEnter", cur_tab);
+        }
+        for t in &closed_tabs {
+            self.fire_tab("TabClosed", *t);
+        }
+        self.known_tabs = tabs;
     }
 
     /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.
@@ -148,6 +197,30 @@ impl Server {
             None => (0, String::new()),
         };
         // Keep the buffer mirror in lockstep, as the buffer-event path does.
+        self.push_buf_mirror();
+        if let Err(e) = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file) {
+            self.editor
+                .echo(format!("E5108: Error in {event} autocmd: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Fire a tab-lifecycle autocmd (`TabNew`/`TabEnter`/`TabLeave`/`TabClosed`).
+    /// The pattern / `<amatch>` is the tab id (as a string, like the window
+    /// events); the callback's buffer context is the tab's focused window's buffer
+    /// when the tab still exists (`None` for a `TabClosed` tab, already gone).
+    /// Mirrors [`Server::fire_window`] for tab events.
+    pub(crate) fn fire_tab(&mut self, event: &str, tab: TabId) {
+        let pattern = tab.0.to_string();
+        let buf = self
+            .editor
+            .tab_current_window(tab)
+            .and_then(|w| self.editor.window_buffer(w));
+        let (bufnr, file) = match buf {
+            Some(b) => (b.0, self.editor.buffer_name(b).unwrap_or_default()),
+            None => (0, String::new()),
+        };
+        // Keep the buffer mirror in lockstep, as the window-event path does.
         self.push_buf_mirror();
         if let Err(e) = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file) {
             self.editor

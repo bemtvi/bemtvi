@@ -431,10 +431,30 @@ by the window-local `sidescroll` / `sidescrolloff`. The core decides `leftcol`
 `ensure_visible`); the client paints from that offset, leaving the number gutter
 fixed. (Design: [`docs/plans/2026-06-07-horizontal-scrolling-and-wrap.md`](plans/2026-06-07-horizontal-scrolling-and-wrap.md).)
 
-Still pending: **tab pages**, **line wrapping** (`wrap` — the display-row
-projection; Phase 2 of the horizontal-scroll plan), and **more window-local
-options** (`cursorline`, …) beyond the number gutter and the scroll options that
-already ride `WindowOptions`. Floating windows are otherwise complete (model,
+**Tab pages** multiply the window layout the same way `BufferStore` multiplied
+the buffer: `Editor::windows` stays the *active* tab's live `WindowTree`, while
+inactive tabs stash their tree in a `Vec<TabSlot>` (`current_tab` indexes the
+active one). A switch (`gt`/`gT`/`:tabnext`/`nvim_set_current_tabpage`) is a
+`mem::swap` of the live tree with the target's stash, then re-enters the incoming
+tab's focused window — the tab analogue of `focus_window`, so the entire editing
+machine is untouched (`self.windows` is always the active layout). `:tabnew` /
+`:tabedit` / `<C-w>T` create one (window ids are minted globally off
+`Editor::next_win_id` so they never collide across tabs); `:tabclose` / `:tabonly`
+refuse the final tab, and `:q` on a tab's last window closes the *tab* while
+others remain. The `View` carries a `Vec<TabView>` (focused buffer name +
+modified flag + window count) and the active index, gated — along with the
+reserved top row the server's `relayout` subtracts — by the global `showtabline`
+(0/1/2) through one `tabline_visible` check. The lifecycle diff fires
+`TabNew`/`TabLeave`/`TabEnter`/`TabClosed`, bracketing the window events
+(`TabLeave → WinLeave → … → WinEnter → TabEnter`); the `nvim_tabpage_*` reads
+resolve against a `vim._tabs` mirror and `nvim_set_current_tabpage` queues a
+`TabOp`, the same "Lua queues, core mutates" flow as windows. (Design:
+[`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md).)
+
+Still pending: **line wrapping** (`wrap` — the display-row projection; Phase 2 of
+the horizontal-scroll plan) and **more window-local options** (`cursorline`, …)
+beyond the number gutter and the scroll options that already ride
+`WindowOptions`. Floating windows are otherwise complete (model,
 paint, dynamic config, edge semantics); the remaining float fidelity knobs
 (`style="minimal"`, `footer`, `bufpos`, `relative="mouse"`) grow as a consumer
 demands them. The per-window status line is `laststatus=2`; the
@@ -693,13 +713,15 @@ screen," and that is exactly the shape of these tests.
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up), treesitter
   injections, and a `:set`-driven highlight toggle.
-- **Tab pages.** Multiple **windows** (splits, the layout tree, per-window view
-  state, the `<C-w>` family, and the `nvim_win_*` / Lua API) and **floating
-  windows** (`nvim_open_win` with `relative`, the z-ordered overlay layer,
-  `nvim_win_set_config`, and the `:q`/`:only`/focus/autocmd edge semantics) are
-  implemented — see [*Windows*](#windows). What remains on this axis is tab pages
-  (a `Vec<WindowTree>` + a tabline) and window-local options (`wrap`,
-  `cursorline`, …).
+- **Window-local options.** Multiple **windows** (splits, the layout tree,
+  per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
+  **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay
+  layer, `nvim_win_set_config`, and the `:q`/`:only`/focus/autocmd edge
+  semantics), and **tab pages** (a `Vec<TabSlot>` deriving the active
+  `WindowTree`, the tabline, `gt`/`:tab*`/`<C-w>T`, the `Tab*` autocmds, the
+  `nvim_tabpage_*` Lua surface, and `showtabline`) are all implemented — see
+  [*Windows*](#windows). What remains on this axis is more window-local options
+  (`wrap`, `cursorline`, …).
 - A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
   `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
   (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
@@ -746,11 +768,11 @@ screen," and that is exactly the shape of these tests.
   doc explains how to enumerate them straight from the code (`grep -rn
   'INCOMPLETE:'` for approximations, the `vim._notimpl` raises / runtime
   `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
-  that have no call site to tag — tab pages and floating windows, the
+  that have no call site to tag — the
   `vim.treesitter` Lua API, the bulk of vim's options beyond the handful nxvim
   honors (window-local `number`/`relativenumber` + the horizontal-scroll
-  `sidescroll`/`sidescrolloff` and the buffer-local indentation options are wired;
-  `wrap`/`cursorline`/… are not), a per-buffer command
+  `sidescroll`/`sidescrolloff`, the buffer-local indentation options, and global
+  `showtabline` are wired; `wrap`/`cursorline`/… are not), a per-buffer command
   registry, and richer diagnostic surfaces. (The **synchronous prompts**
   `vim.fn.input` /
   `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,

@@ -24,6 +24,10 @@ pub struct Options {
     /// Preview the match incrementally while typing the search. (Honored in a
     /// later phase; stored here so `:set` accepts it now.)
     pub incsearch: bool,
+    /// When to draw the tabline: `0` never, `1` only with more than one tab
+    /// (vim's default), `2` always. Gates both the projected `Vec<TabView>` and
+    /// the top-row reservation in [`crate::Editor`]'s relayout.
+    pub showtabline: u8,
 }
 
 impl Default for Options {
@@ -36,6 +40,8 @@ impl Default for Options {
             wrapscan: true,
             hlsearch: true,
             incsearch: true,
+            // Show the tabline only when more than one tab is open (vim's default).
+            showtabline: 1,
         }
     }
 }
@@ -292,6 +298,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "expandtab" | "et" => Some(("expandtab", Bool)),
         "sidescroll" | "ss" => Some(("sidescroll", Num)),
         "sidescrolloff" | "siso" => Some(("sidescrolloff", Num)),
+        "showtabline" | "stal" => Some(("showtabline", Num)),
         _ => None,
     }
 }

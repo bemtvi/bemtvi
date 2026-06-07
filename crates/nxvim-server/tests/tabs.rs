@@ -450,3 +450,196 @@ async fn tabline_marks_a_modified_buffer() {
     );
     assert!(!cells[0].modified, "the untouched tab is not");
 }
+
+// ----- Phase 3: Lua tab API, showtabline & last-tab quit --------------------
+
+/// Run a Lua chunk via `nvim_exec_lua` and return its result value.
+async fn exec_lua(rpc: &Rpc, chunk: &str) -> Value {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(chunk), Value::Array(vec![])],
+    )
+    .await
+    .expect("exec_lua")
+}
+
+#[tokio::test]
+async fn lua_tabpage_reads_resolve_from_the_mirror() {
+    let (rpc, _incoming) = start().await;
+    // Two tabs, the second active (`:tabnew` switches to it).
+    feed_sync(&rpc, ":tabnew<CR>").await;
+
+    // `nvim_list_tabpages` / `nvim_get_current_tabpage` read the `vim._tabs`
+    // mirror, agreeing with the RPC surface.
+    let list = exec_lua(&rpc, "return vim.api.nvim_list_tabpages()").await;
+    assert_eq!(handles(&list), vec![1, 2], "Lua lists both tabs in order");
+    let cur = exec_lua(&rpc, "return vim.api.nvim_get_current_tabpage()").await;
+    assert_eq!(handle(&cur), 2, "Lua sees the new tab as current");
+
+    // Number / validity against the mirror.
+    let num = exec_lua(&rpc, "return vim.api.nvim_tabpage_get_number(1)").await;
+    assert_eq!(handle(&num), 1, "tab 1 is number 1");
+    let valid = exec_lua(&rpc, "return vim.api.nvim_tabpage_is_valid(99)").await;
+    assert_eq!(
+        valid,
+        Value::from(false),
+        "an unknown tab is invalid in Lua"
+    );
+
+    // The per-tab window set, and `0` resolving to the current tab.
+    let wins0 = handles(&exec_lua(&rpc, "return vim.api.nvim_tabpage_list_wins(0)").await);
+    let win0 = handle(&exec_lua(&rpc, "return vim.api.nvim_tabpage_get_win(0)").await);
+    assert_eq!(wins0.len(), 1, "the current tab owns one window");
+    assert_eq!(wins0[0], win0, "its focused window is that window");
+}
+
+#[tokio::test]
+async fn lua_set_current_tabpage_switches_the_tab() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, ":tabnew<CR>").await; // now on tab 2
+
+    // Switching back through the Lua API queues a `TabOp` the server applies.
+    exec_lua(&rpc, "vim.api.nvim_set_current_tabpage(1)").await;
+    let cur = handle(&req(&rpc, "nvim_get_current_tabpage", vec![]).await);
+    assert_eq!(cur, 1, "nvim_set_current_tabpage(1) switched to tab 1");
+
+    // The write-through means a read *within* the same chunk already sees it.
+    let same = exec_lua(
+        &rpc,
+        "vim.api.nvim_set_current_tabpage(2); return vim.api.nvim_get_current_tabpage()",
+    )
+    .await;
+    assert_eq!(handle(&same), 2, "read-after-set is consistent in-chunk");
+}
+
+#[tokio::test]
+async fn showtabline_zero_hides_the_tabline_even_with_two_tabs() {
+    let (rpc, mut incoming) = start().await;
+    feed_sync(&rpc, ":set showtabline=0<CR>").await;
+    // Two tabs would normally draw a tabline; `showtabline=0` suppresses it.
+    let (cells, _) = tabline_after(&rpc, &mut incoming, ":tabnew<CR>").await;
+    assert!(
+        cells.is_empty(),
+        "showtabline=0 draws no tabline: {cells:?}"
+    );
+
+    let tabs = handles(&req(&rpc, "nvim_list_tabpages", vec![]).await);
+    assert_eq!(tabs, vec![1, 2], "the tabs still exist, just unshown");
+}
+
+#[tokio::test]
+async fn showtabline_two_shows_the_tabline_with_one_tab() {
+    let (rpc, mut incoming) = start().await;
+    // `showtabline=2` always draws the tabline — even with the single startup tab.
+    let (cells, current) = tabline_after(&rpc, &mut incoming, ":set showtabline=2<CR>").await;
+    assert_eq!(
+        cells.len(),
+        1,
+        "showtabline=2 draws the lone tab: {cells:?}"
+    );
+    assert_eq!(current, 0, "the only tab is active (index 0)");
+    assert_eq!(cells[0].label, "[No Name]");
+}
+
+/// Feed `keys`, settle, and return the freshest redraw's `message` line.
+async fn message_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> String {
+    while incoming.try_recv().is_ok() {}
+    feed_sync(rpc, keys).await;
+    for _ in 0..200 {
+        let mut latest = None;
+        while let Ok(msg) = incoming.try_recv() {
+            if let Incoming::Notification { method, params } = msg {
+                if method == "redraw" {
+                    if let Some(Value::Map(map)) = params.into_iter().next() {
+                        latest = map_get(&map, "message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        if let Some(m) = latest {
+            return m;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no redraw with a message arrived for {keys:?}");
+}
+
+#[tokio::test]
+async fn showtabline_query_echoes_the_value() {
+    let (rpc, mut incoming) = start().await;
+    feed_sync(&rpc, ":set showtabline=2<CR>").await;
+    // `:set stal?` (the abbreviation) echoes the current value on the message line.
+    let msg = message_after(&rpc, &mut incoming, ":set stal?<CR>").await;
+    assert_eq!(
+        msg, "showtabline=2",
+        "the query echoes the canonical name=value"
+    );
+}
+
+#[tokio::test]
+async fn vim_o_showtabline_round_trips_and_drives_the_tabline() {
+    let (rpc, mut incoming) = start().await;
+    // Default reads as 1 (the core default, before any set).
+    let def = exec_lua(&rpc, "return vim.o.showtabline").await;
+    assert_eq!(def.as_u64(), Some(1), "vim.o.showtabline defaults to 1");
+
+    // Writing 2 through vim.o reaches the core and draws the tabline with one tab.
+    let (cells, _) = tabline_after(&rpc, &mut incoming, ":lua vim.o.showtabline = 2<CR>").await;
+    assert_eq!(
+        cells.len(),
+        1,
+        "vim.o write drew the lone-tab tabline: {cells:?}"
+    );
+    // And the read reflects the core value (the `stal` abbreviation too).
+    let now = exec_lua(&rpc, "return vim.o.stal").await;
+    assert_eq!(now.as_u64(), Some(2), "vim.o.stal reads back the set value");
+}
+
+#[tokio::test]
+async fn showtabline_out_of_range_is_rejected_loudly_on_both_paths() {
+    let (rpc, mut incoming) = start().await;
+
+    // The `:set` path: above the range is E474, below it is E487 — and the value
+    // is left unchanged (the default 1).
+    let high = message_after(&rpc, &mut incoming, ":set showtabline=5<CR>").await;
+    assert_eq!(high, "E474: Invalid argument: showtabline=5");
+    let low = message_after(&rpc, &mut incoming, ":set showtabline=-1<CR>").await;
+    assert_eq!(low, "E487: Argument must be positive: showtabline=-1");
+
+    // The `vim.o` path rejects identically (the shared setter), so a bad write
+    // from Lua surfaces the same error rather than silently no-op'ing.
+    let lua_high = message_after(&rpc, &mut incoming, ":lua vim.o.showtabline = 5<CR>").await;
+    assert_eq!(lua_high, "E474: Invalid argument: showtabline=5");
+
+    // After all the rejected writes, the option is still its default.
+    let still = exec_lua(&rpc, "return vim.o.showtabline").await;
+    assert_eq!(
+        still.as_u64(),
+        Some(1),
+        "a rejected write leaves the default"
+    );
+}
+
+#[tokio::test]
+async fn q_on_the_last_window_of_a_tab_closes_the_tab_not_the_editor() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, ":tabnew<CR>").await; // two tabs, on tab 2 (one window)
+
+    // `:q` on the lone window of tab 2 closes the *tab*, dropping back to tab 1 —
+    // the editor keeps running (other tabs exist).
+    feed_sync(&rpc, ":q<CR>").await;
+    let tabs = handles(&req(&rpc, "nvim_list_tabpages", vec![]).await);
+    assert_eq!(tabs, vec![1], ":q closed tab 2, leaving tab 1");
+    let cur = handle(&req(&rpc, "nvim_get_current_tabpage", vec![]).await);
+    assert_eq!(cur, 1, "focus fell back to the surviving tab");
+
+    // The server is still responsive (it did not quit).
+    let mode = req(&rpc, "nvim_get_mode", vec![]).await;
+    assert!(matches!(mode, Value::Map(_)), "the editor is still alive");
+}

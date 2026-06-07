@@ -7,11 +7,12 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::Server;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
-    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec,
-    WindowId,
+    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId,
+    WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BufOp, CallbackArgs, FloatMirror, HlSet, LoopOp, OptionValue, PanelOp, WindowMirror, WindowOp,
+    BufOp, CallbackArgs, FloatMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp,
+    WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -101,15 +102,21 @@ impl Server {
         for op in self.lua.take_window_ops() {
             self.apply_window_op(op);
         }
+        // Tab-page mutations from `nvim_set_current_tabpage` (Phase 3): applied to
+        // the live editor after the chunk. Their `TabLeave`/`TabEnter`/… autocmds
+        // fire from `emit_lifecycle_events`, run once the ops have settled.
+        for op in self.lua.take_tab_ops() {
+            self.apply_tab_op(op);
+        }
         // Global-option writes from `vim.o` (a wired search option): applied to the
         // editor's global options after the chunk — the same state the `:set` ex
         // path writes. All boolean today (the wired global set is the search flags).
         for op in self.lua.take_global_ops() {
             match op.value {
                 OptionValue::Bool(b) => self.editor.set_global_option_bool(&op.name, b),
-                // No numeric global option is wired yet; ignore rather than guess a
-                // target (the Lua side only forwards the boolean search options).
-                OptionValue::Number(_) => {}
+                // `showtabline` is the one wired numeric global (the Lua side
+                // forwards the search booleans and `showtabline`).
+                OptionValue::Number(n) => self.editor.set_global_option_num(&op.name, n),
             }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
@@ -410,6 +417,21 @@ impl Server {
         }
     }
 
+    /// Apply one [`TabOp`] to the live editor (Phase 3) — the deferred form of
+    /// `nvim_set_current_tabpage`, the tab analogue of [`Server::apply_window_op`].
+    pub(crate) fn apply_tab_op(&mut self, op: TabOp) {
+        match op {
+            TabOp::SetCurrent { tab } => {
+                let id = if tab == 0 {
+                    self.editor.current_tab_id()
+                } else {
+                    TabId(tab)
+                };
+                self.editor.set_current_tabpage(id);
+            }
+        }
+    }
+
     /// Refresh the Rust→Lua buffer mirror (`vim._bufs` + `vim._cur_cursor` +
     /// current window) the buffer-read API resolves against (Phase 6). Pushed
     /// before any Lua entry that can read buffer/cursor state. The per-buffer line
@@ -482,17 +504,42 @@ impl Server {
             .lua
             .set_buf_mirror(&bufs, cursor, cur_win, &wins, next_win);
         let _ = self.lua.set_bo_mirror(&bo);
-        // Global search options, mirrored so `vim.o` reads the core's current value
-        // (the default until set, and values set via the `:set` ex path). Cheap
-        // (five flags), so it isn't gated.
+        // The tab snapshot (Phase 3): one entry per tab page in tabline order, each
+        // carrying its window ids and focused window, so `nvim_tabpage_*` reads from
+        // Lua resolve against live state.
+        let tabs: Vec<TabMirror> = self
+            .editor
+            .tab_ids()
+            .into_iter()
+            .map(|id| TabMirror {
+                id: id.0,
+                windows: self
+                    .editor
+                    .tab_window_ids(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|w| w.0)
+                    .collect(),
+                current_window: self.editor.tab_current_window(id).map(|w| w.0).unwrap_or(0),
+            })
+            .collect();
+        let _ = self
+            .lua
+            .set_tab_mirror(&tabs, self.editor.current_tab_id().0);
+        // Global options, mirrored so `vim.o` reads the core's current value (the
+        // default until set, and values set via the `:set` ex path). Cheap (five
+        // search flags + showtabline), so it isn't gated.
         let go = self.editor.global_options();
-        let _ = self.lua.set_go_mirror((
-            go.ignorecase,
-            go.smartcase,
-            go.wrapscan,
-            go.hlsearch,
-            go.incsearch,
-        ));
+        let _ = self.lua.set_go_mirror(
+            (
+                go.ignorecase,
+                go.smartcase,
+                go.wrapscan,
+                go.hlsearch,
+                go.incsearch,
+            ),
+            go.showtabline,
+        );
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

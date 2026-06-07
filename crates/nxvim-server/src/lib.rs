@@ -29,7 +29,7 @@ mod treesitter;
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
 use lsp::{CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
-use nxvim_core::{BufferId, Editor, Mode, WindowId};
+use nxvim_core::{BufferId, Editor, Mode, TabId, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
@@ -180,6 +180,13 @@ struct Server {
     /// `WinResized` (splits, `<C-w>`-resizes, terminal resizes). `None` until the
     /// seed so the first emit doesn't spuriously fire it.
     last_window_rects: Option<Vec<WindowRect>>,
+    /// The active tab at the last lifecycle diff; `None` until the startup seed. A
+    /// change fires `TabLeave`(old) → … → `TabEnter`(new), bracketing the window
+    /// events the switch causes (`TabLeave → WinLeave → … → WinEnter → TabEnter`).
+    last_tab_id: Option<TabId>,
+    /// Every tab id seen at the last diff, in tabline order. Ids added since fire
+    /// `TabNew`; ids gone fire `TabClosed`.
+    known_tabs: Vec<TabId>,
     /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
     /// `Server::input` runs every key through before `editor.input`. Rebuilt from
     /// `vim._keymaps` when its version advances (checked once per input batch).
@@ -249,6 +256,8 @@ where
         last_window_id: None,
         known_windows: Vec::new(),
         last_window_rects: None,
+        last_tab_id: None,
+        known_tabs: Vec::new(),
         keymaps: Keymaps::default(),
         evloop,
         scheduled: VecDeque::new(),
@@ -334,6 +343,10 @@ where
     // first `WinEnter` still fires alongside `BufEnter`, the window analogue.
     server.known_windows = server.editor.window_ids();
     server.last_window_rects = Some(server.window_rects_snapshot());
+    // Pre-seed the tab set so the initial tab doesn't fire `TabNew` (neovim, like
+    // for the first window, doesn't); `last_tab_id` stays `None` so a later switch
+    // still fires the first `TabEnter`/`TabLeave` pair.
+    server.known_tabs = server.editor.tab_ids();
     server.emit_lifecycle_events();
     server.run_pending();
 

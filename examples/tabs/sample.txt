@@ -1,0 +1,24 @@
+nxvim tab pages — a quick tour
+==============================
+
+A tab page is its own window layout. Open a few and switch between them:
+
+  :tabnew              a fresh empty tab
+  :tabedit other.txt   a tab editing another file
+  gt / gT              walk forward / backward through the tabs
+  2gt                  jump straight to tab 2
+  <C-w>v then <C-w>T   split, then send that window off to its own tab
+
+The tabline across the top lists every tab by its focused buffer's name; the
+active one is highlighted, and a "+" marks a tab with unsaved changes.
+
+Run :TabList to print every tab (number, window count, focused window) and
+:TabFirst to jump back to the first tab through the Lua API.
+
+Closing:
+  :tabclose            drop this tab (refuses the very last one)
+  :tabonly             keep only this tab
+  :q                   on a tab's last window, closes the TAB — the editor keeps
+                       running while other tabs remain; the final window quits.
+
+Toggle the bar with :set showtabline=0 (never) / 1 (with 2+ tabs) / 2 (always).

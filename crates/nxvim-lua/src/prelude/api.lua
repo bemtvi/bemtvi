@@ -56,6 +56,13 @@ end
 vim._wins = vim._wins or {}
 vim._win_order = vim._win_order or { 1000 }
 vim._next_win = vim._next_win or 1001
+-- Tab mirror (Phase 3): `vim._tabs[id]` = per-tab record ({ id, windows,
+-- current_window }), `vim._tab_order` the tabline order `nvim_list_tabpages`
+-- returns, `vim._cur_tab` the active id. Seeded to the single startup tab so a
+-- read before the server's first mirror push still answers.
+vim._tabs = vim._tabs or { [1] = { id = 1, windows = { 1000 }, current_window = 1000 } }
+vim._tab_order = vim._tab_order or { 1 }
+vim._cur_tab = vim._cur_tab or 1
 -- Arbitrary (Lua-only) window options plugins set via vim.wo; the wired gutter
 -- options (number/relativenumber) live on the `vim._wins` mirror instead.
 vim._wo_store = vim._wo_store or {}
@@ -84,6 +91,20 @@ function vim._set_buf_mirror(entries, row, col, win, wins, next_win)
   vim._wins = by_id
   vim._win_order = order
   vim._next_win = next_win or vim._next_win
+end
+
+-- Receive the tab mirror (Phase 3): `tabs` is the tabline-ordered array the
+-- server pushed, `cur` the active tab id. Keyed by id into `vim._tabs` with the
+-- order kept in `vim._tab_order`, mirroring the window mirror's shape.
+function vim._set_tab_mirror(tabs, cur)
+  local by_id, order = {}, {}
+  for _, t in ipairs(tabs or {}) do
+    by_id[t.id] = t
+    order[#order + 1] = t.id
+  end
+  vim._tabs = by_id
+  vim._tab_order = order
+  vim._cur_tab = cur or 1
 end
 
 -- Resolve a buffer handle to a concrete bufnr (0 / nil -> current buffer), the
@@ -353,6 +374,52 @@ function vim.api.nvim_win_close(win, force)
     end
     vim._win_order = order
   end
+end
+
+-- ----- tab pages (Phase 3) -------------------------------------------------
+-- Reads resolve from the `vim._tabs` mirror the server pushes before each Lua
+-- entry; `nvim_set_current_tabpage` is the lone mutation (queue + write-through),
+-- the same "Lua queues, core mutates" flow as the window API. `0`/`nil` is the
+-- current tab throughout.
+local function resolve_tab(tab)
+  if tab == nil or tab == 0 then return vim._cur_tab or 1 end
+  return tab
+end
+
+function vim.api.nvim_get_current_tabpage() return vim._cur_tab or 1 end
+
+function vim.api.nvim_list_tabpages() return vim._tab_order or { vim._cur_tab or 1 } end
+
+function vim.api.nvim_tabpage_is_valid(tab)
+  return (vim._tabs or {})[resolve_tab(tab)] ~= nil
+end
+
+function vim.api.nvim_tabpage_get_number(tab)
+  tab = resolve_tab(tab)
+  for i, id in ipairs(vim._tab_order or {}) do
+    if id == tab then return i end
+  end
+  return 0
+end
+
+function vim.api.nvim_tabpage_list_wins(tab)
+  local t = (vim._tabs or {})[resolve_tab(tab)]
+  return t and t.windows or {}
+end
+
+function vim.api.nvim_tabpage_get_win(tab)
+  local t = (vim._tabs or {})[resolve_tab(tab)]
+  return t and t.current_window or (vim._cur_win or 1000)
+end
+
+function vim.api.nvim_set_current_tabpage(tab)
+  tab = resolve_tab(tab)
+  vim._cur_tab = tab -- write-through so a read-after-set in this chunk is consistent
+  -- The active window/cursor follow the new tab; the server re-pushes the full
+  -- mirror after the op drains, so a coarse write-through of the focus is enough.
+  local t = (vim._tabs or {})[tab]
+  if t and t.current_window then vim._cur_win = t.current_window end
+  vim._set_current_tab(tab)
 end
 
 -- The float config values nxvim can position / draw. An unsupported one fails

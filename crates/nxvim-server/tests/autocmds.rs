@@ -660,3 +660,105 @@ async fn examples_windows_config_loads_and_drives_the_window_api() {
         "window events were recorded"
     );
 }
+
+// ----- Phase 3: tab lifecycle events -----------------------------------------
+
+#[tokio::test]
+async fn tabnew_fires_tabnew_tableave_tabenter_in_order() {
+    // `:tabnew` creates a tab (TabNew), leaves the old one (TabLeave), and enters
+    // the new one (TabEnter). The `match` is the tab id, so each marker says which.
+    let dir = temp_dir("au_tab_new");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
+         vim.api.nvim_create_autocmd('TabNew', { callback = rec('new') })\n\
+         vim.api.nvim_create_autocmd('TabLeave', { callback = rec('leave') })\n\
+         vim.api.nvim_create_autocmd('TabEnter', { callback = rec('enter') })\n",
+    )
+    .await;
+    // Drop any startup events so we observe only the `:tabnew` transition.
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    redraw_after(&rpc, &mut incoming, ":tabnew<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "new2,leave1,enter2");
+}
+
+#[tokio::test]
+async fn tab_switch_brackets_the_window_events() {
+    // A tab switch fires the bracket `TabLeave → WinLeave → WinEnter → TabEnter`.
+    // Recording only the tags (no ids) makes the assertion purely about ordering.
+    let dir = temp_dir("au_tab_bracket");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function() _G.log[#_G.log+1] = tag end end\n\
+         vim.api.nvim_create_autocmd('TabLeave', { callback = rec('TL') })\n\
+         vim.api.nvim_create_autocmd('WinLeave', { callback = rec('WL') })\n\
+         vim.api.nvim_create_autocmd('WinEnter', { callback = rec('WE') })\n\
+         vim.api.nvim_create_autocmd('TabEnter', { callback = rec('TE') })\n",
+    )
+    .await;
+    // Two tabs (now on tab 2), then clear the log so only the switch is observed.
+    redraw_after(&rpc, &mut incoming, ":tabnew<CR>").await;
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    // `gT` switches from tab 2 back to tab 1.
+    redraw_after(&rpc, &mut incoming, "gT").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "TL,WL,WE,TE", "tab events bracket the window events");
+}
+
+#[tokio::test]
+async fn tabclose_fires_tabenter_survivor_then_tabclosed() {
+    // Closing a tab enters the survivor (TabEnter) and then announces the gone tab
+    // (TabClosed) — the tab, and its windows, are already removed.
+    let dir = temp_dir("au_tab_close");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
+         vim.api.nvim_create_autocmd('TabEnter', { callback = rec('enter') })\n\
+         vim.api.nvim_create_autocmd('TabClosed', { callback = rec('closed') })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, ":tabnew<CR>").await; // on tab 2
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    redraw_after(&rpc, &mut incoming, ":tabclose<CR>").await; // back to tab 1
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "enter1,closed2");
+}
+
+#[tokio::test]
+async fn examples_tabs_config_loads_and_drives_the_tab_api() {
+    // End-to-end check of the shipped `examples/tabs/` config: source its real
+    // init.lua, then exercise the helpers it defines. Proves the example is
+    // runnable (no Lua errors) and that its tab API + autocmds + showtabline work.
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/tabs/init.lua");
+    let init = std::fs::read_to_string(&example).expect("read examples/tabs/init.lua");
+    let dir = temp_dir("examples_tabs");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    // The config sets showtabline=2 via vim.o, so the tabline shows immediately.
+    let stal = exec_lua(&rpc, r#"return vim.o.showtabline"#).await;
+    assert_eq!(
+        stal.as_u64(),
+        Some(2),
+        "the config set showtabline=2 via vim.o"
+    );
+
+    // Open a second tab; the tab autocmds record the lifecycle.
+    redraw_after(&rpc, &mut incoming, ":tabnew<CR>").await;
+    let tabs = exec_lua(&rpc, r#"return #vim.api.nvim_list_tabpages()"#).await;
+    assert_eq!(tabs.as_u64(), Some(2), ":tabnew opened a second tab");
+    let logged = exec_lua(&rpc, r#"return #_G.tab_log"#).await;
+    assert!(
+        logged.as_u64().unwrap_or(0) >= 1,
+        "tab events were recorded by the config's autocmds"
+    );
+
+    // :TabFirst drives nvim_set_current_tabpage back to tab 1.
+    redraw_after(&rpc, &mut incoming, ":TabFirst<CR>").await;
+    let cur = exec_lua(&rpc, r#"return vim.api.nvim_get_current_tabpage()"#).await;
+    assert_eq!(cur.as_u64(), Some(1), ":TabFirst switched to the first tab");
+}

@@ -66,7 +66,7 @@ vim.g = vim.g or {}
 --     softtabstop / expandtab       -> buffer-local (delegated to vim.bo)
 --   * ignorecase / smartcase /
 --     wrapscan / hlsearch /
---     incsearch                     -> global (vim._go_mirror + the
+--     incsearch / showtabline       -> global (vim._go_mirror + the
 --                                      vim._set_global_option Rust bridge)
 -- Any other option (termguicolors, background, winblend, pumblend, …) lands in
 -- the plain Lua store `vim._o_store`: observable read/write, not yet honored.
@@ -89,11 +89,12 @@ local O_GLOBAL = {
   wrapscan = "wrapscan", ws = "wrapscan",
   hlsearch = "hlsearch", hls = "hlsearch",
   incsearch = "incsearch", is = "incsearch",
+  showtabline = "showtabline", stal = "showtabline",
 }
 -- Core defaults, the safety net before the server has pushed the mirror.
 local O_GLOBAL_DEFAULT = {
   ignorecase = false, smartcase = false, wrapscan = true,
-  hlsearch = true, incsearch = true,
+  hlsearch = true, incsearch = true, showtabline = 1,
 }
 
 -- Rust→Lua mirror of the core's global option values, refreshed by the server

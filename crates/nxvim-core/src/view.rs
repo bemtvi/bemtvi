@@ -10,7 +10,8 @@
 //! `cursor_screen_col` additionally carries the cursor's screen-cell column,
 //! accounting for wide characters and tabs.
 
-use crate::editor::Editor;
+use crate::buffer::Buffer;
+use crate::editor::{BufferId, Editor, WindowLayout};
 use crate::mode::Mode;
 use crate::unicode;
 
@@ -65,20 +66,100 @@ pub struct PanelView {
     pub height: usize,
 }
 
-/// A snapshot of everything a client needs to draw a frame.
+/// A rectangle in screen cells, relative to the **windows area** (the region the
+/// window tree lays out into — the frame minus the global bottom panel and
+/// command line). The client offsets it by that area's origin when painting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ViewRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// A split border between sibling windows: a vertical `│` run (between the
+/// columns of a vertical split) or a horizontal `─` run (between the rows of a
+/// horizontal split), anchored at `(x, y)` in **windows-area** cells and
+/// `length` cells long. The core computes these from the layout tree; the client
+/// only paints them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Separator {
+    pub vertical: bool,
+    pub x: usize,
+    pub y: usize,
+    pub length: usize,
+}
+
+/// One window's renderable content: its screen `rect`, whether it holds focus,
+/// and every field that is per-window (text, cursor, selection, search, gutter,
+/// status-line data, and any scroll gesture). The client paints each window at
+/// its `rect` with its own gutter, text body, and a status line on its bottom
+/// row; the terminal cursor is drawn only in the `focused` window. With a single
+/// window this is the whole text area — identical to the pre-windows view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowView {
+    /// Where this window sits in the windows area.
+    pub rect: ViewRect,
+    /// The buffer this window shows. The server projects this buffer's syntax /
+    /// diagnostics slice for the window (two windows onto the same buffer share
+    /// one `SyntaxState`, each slicing its own `(top, height)`).
+    pub buffer: BufferId,
+    /// Whether this window holds focus (the terminal cursor is drawn here).
+    pub focused: bool,
+    /// Visible text rows (the window's text body — `rect.height - 1` rows, the
+    /// last row being its status line). Rows past the buffer are the literal
+    /// `"~"`, as in vim.
+    pub lines: Vec<String>,
+    /// Cursor row relative to the top of this window's text body.
+    pub cursor_row: usize,
+    /// Cursor byte/column offset within its line (for the ruler and
+    /// `nvim_win_get_cursor`).
+    pub cursor_col: usize,
+    /// Cursor's screen-cell column on its line (wide-char and tab aware), for
+    /// placing the terminal cursor.
+    pub cursor_screen_col: usize,
+    /// File name for this window's status line (`"[No Name]"` when unset).
+    pub file_name: String,
+    pub modified: bool,
+    /// 1-based cursor line, for this window's status-line ruler.
+    pub cursor_line: usize,
+    /// Per visible row (aligned with `lines`), the half-open screen-column span
+    /// `[start, end)` to paint as the visual-mode selection, or `None`. `end` may
+    /// exceed the row's text width to mark a selected newline (one extra cell) or
+    /// to fill a linewise selection to the window's text edge.
+    pub selection: Vec<Option<(usize, usize)>>,
+    /// Per visible row, the half-open screen-column spans of every search match
+    /// (`Search`/`hlsearch`). Empty inner vecs for rows with no match.
+    pub search: Vec<Vec<(usize, usize)>>,
+    /// Per visible row, the single match the live `incsearch` preview rests on,
+    /// or `None`.
+    pub incsearch: Vec<Option<(usize, usize)>>,
+    /// Present only on a redraw caused by a scroll command that moved this
+    /// window's viewport; carries the data a client needs to animate the slide.
+    pub scroll: Option<ScrollAnim>,
+    /// 1-based buffer line number per visible row (aligned with `lines`), or
+    /// `None` for `~` filler rows. The client formats the number column from
+    /// these.
+    pub numbers: Vec<Option<usize>>,
+    /// `:set number` — show the absolute line number.
+    pub number: bool,
+    /// `:set relativenumber` — show numbers relative to the cursor line.
+    pub relativenumber: bool,
+    /// Width in cells of the number column (`0` when both options are off).
+    pub number_width: usize,
+}
+
+/// A snapshot of everything a client needs to draw a frame: the **global** chrome
+/// (mode label, command line, message, panel) plus the list of [`WindowView`]s to
+/// paint. With one window the list has a single entry spanning the whole text
+/// area, so the rendered frame matches the pre-windows view exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
-    /// Visible text rows (the text viewport). Empty rows below the buffer are
-    /// the literal string `"~"`, as in vim.
-    pub lines: Vec<String>,
-    /// Cursor position within the text viewport (row relative to the top of the
-    /// visible window; `col` is a byte/column offset within the line).
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    /// Cursor's screen-cell column on its line (wide-char and tab aware). Used
-    /// by clients to place the terminal cursor; `cursor_col` stays the byte
-    /// column for the ruler and `nvim_win_get_cursor`.
-    pub cursor_screen_col: usize,
+    /// The windows to paint, in layout order. Always at least one.
+    pub windows: Vec<WindowView>,
+    /// The split borders between windows, in windows-area cells. Empty with a
+    /// single window.
+    pub separators: Vec<Separator>,
     /// Uppercase mode name for the status line, e.g. `"NORMAL"`.
     pub mode_label: String,
     /// True while in command-line mode; the cursor then belongs to the command
@@ -93,9 +174,8 @@ pub struct View {
     /// The command-line prompt character: `:` for an ex command, `/` / `?` for a
     /// forward / backward search. Only meaningful while `command_mode`.
     pub cmdline_prefix: char,
-    /// The multi-char prompt label for a `vim.ui.input` prompt (Phase 8), shown
-    /// ahead of the editable line in place of `cmdline_prefix`. Empty for
-    /// `:`/`/`/`?`. Only meaningful while `command_mode`.
+    /// The multi-char prompt label for a `vim.ui.input` prompt, shown ahead of
+    /// the editable line in place of `cmdline_prefix`. Empty for `:`/`/`/`?`.
     pub cmdline_prompt: String,
     /// Cursor position within `cmdline` as a character count from its start, so
     /// the client can place the command cursor mid-line after `<Left>`/`<Right>`
@@ -103,60 +183,78 @@ pub struct View {
     pub cmdline_cursor: usize,
     /// Transient status message (shown on the command line when not typing one).
     pub message: String,
-    /// File name for the status line (`"[No Name]"` when unset).
-    pub file_name: String,
-    pub modified: bool,
-    /// 1-based cursor line, for the status-line ruler.
-    pub cursor_line: usize,
-    /// Per visible row (aligned with `lines`), the half-open screen-column span
-    /// `[start, end)` to paint as the visual-mode selection, or `None` when that
-    /// row carries no selection. All `None` outside visual modes. `end` may
-    /// exceed the row's text width to mark a selected newline (one extra cell) or
-    /// to fill a linewise selection to the viewport edge.
-    pub selection: Vec<Option<(usize, usize)>>,
-    /// Per visible row (aligned with `lines`), the half-open screen-column spans
-    /// of every search match on that row — the `Search`/`hlsearch` highlight.
-    /// Empty inner vecs for rows with no match; all empty when no search is
-    /// active (or it was cleared by `:noh`).
-    pub search: Vec<Vec<(usize, usize)>>,
-    /// Per visible row, the single match the live `incsearch` preview rests on
-    /// (the `IncSearch` highlight), or `None`. All `None` outside an active
-    /// incsearch preview.
-    pub incsearch: Vec<Option<(usize, usize)>>,
-    /// Present only on a redraw caused by a scroll command that moved the
-    /// viewport; carries the data a client needs to animate the slide.
-    pub scroll: Option<ScrollAnim>,
-    /// 1-based buffer line number per visible row (aligned with `lines`), or
-    /// `None` for `~` filler rows past the end of the buffer. The client formats
-    /// the number column (absolute / relative / hybrid) from these.
-    pub numbers: Vec<Option<usize>>,
-    /// `:set number` — show the absolute line number.
-    pub number: bool,
-    /// `:set relativenumber` — show numbers relative to the cursor line.
-    pub relativenumber: bool,
-    /// Width in cells of the number column (`0` when both options are off).
-    pub number_width: usize,
     /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
     /// present it has input focus, so the client draws the editing cursor inside
-    /// the panel rather than the text window.
+    /// the panel rather than the text window. Global — one per editor, below all
+    /// windows.
     pub panel: Option<PanelView>,
 }
 
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
-        // The text window height — the full UI height minus any rows the bottom
-        // panel claims (so `lines` is sized to the area the client paints text).
-        let height = ed.text_height();
-        let line_count = ed.buffer().line_count();
-        // Selections fill to the text width — the area past the number gutter.
-        let width = ed.text_width();
+        View {
+            windows: ed
+                .window_layouts()
+                .iter()
+                .map(|w| window_view(ed, w))
+                .collect(),
+            separators: ed.separators().to_vec(),
+            mode_label: ed.mode.label().to_string(),
+            command_mode: ed.mode == Mode::Command,
+            pending_replace: ed.pending_replace(),
+            cmdline: ed.cmdline.clone(),
+            cmdline_prefix: ed.cmdline_prefix(),
+            cmdline_prompt: ed.cmdline_prompt().to_string(),
+            cmdline_cursor: ed.cmdline_cursor(),
+            message: ed.message.clone(),
+            panel: ed.panel_view(),
+        }
+    }
 
-        let lines = window_lines(ed, ed.top, height, line_count);
-        let selection = selection_spans(ed, width, line_count, ed.top, height);
-        let (search, incsearch) = ed.search_highlights(ed.top, height);
-        let numbers = window_numbers(ed.top, height, line_count);
+    /// The focused window — the one the terminal cursor is drawn in, and the
+    /// reference point for global overlays (the completion popup, the
+    /// under-cursor diagnostic). There is always at least one window; falls back
+    /// to the first if somehow none is flagged.
+    pub fn focused(&self) -> &WindowView {
+        self.windows
+            .iter()
+            .find(|w| w.focused)
+            .unwrap_or(&self.windows[0])
+    }
+}
 
-        let scroll = ed.pending_scroll().map(|ps| {
+/// Project one window into a [`WindowView`], slicing *its* buffer at *its* view
+/// position. The focused window renders the editor's live `cursor`/`top` and owns
+/// the transient overlays — the visual selection, the live `incsearch` preview,
+/// and the scroll-animation band; the rest render their stashed positions with
+/// only the persistent `hlsearch` highlight.
+fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
+    let buf = ed
+        .buffer_of(w.buffer)
+        .expect("a live window's buffer is always open");
+    let line_count = buf.line_count();
+    let number_width = ed.number_width_for(line_count);
+    // The window's own rows minus its status line; selections fill to the text
+    // width (the area past the number gutter).
+    let height = w.rect.height.saturating_sub(1).max(1);
+    let width = w.rect.width.saturating_sub(number_width);
+    let top = w.top;
+    // A stashed cursor may sit past a buffer that shrank while this window was
+    // inactive; clamp it for the rendered ruler / cursor row.
+    let cur_line = w.cursor.line.min(line_count.saturating_sub(1));
+
+    let lines = window_lines(buf, top, height, line_count);
+    let numbers = window_numbers(top, height, line_count);
+    // The selection and incsearch preview belong to the focused window only.
+    let selection = if w.focused {
+        selection_spans(ed, buf, width, line_count, top, height)
+    } else {
+        vec![None; height]
+    };
+    let (search, incsearch) = ed.search_highlights_in(buf, w.cursor, w.focused, top, height);
+
+    let scroll = if w.focused {
+        ed.pending_scroll().map(|ps| {
             let base_line = ps.from_top.min(ps.to_top);
             let count = ps.from_top.abs_diff(ps.to_top) + height;
             ScrollAnim {
@@ -166,54 +264,50 @@ impl View {
                 to_cursor: ps.to_cursor,
                 duration_ms: ps.duration_ms,
                 base_line,
-                lines: window_lines(ed, base_line, count, line_count),
-                selection: selection_spans(ed, width, line_count, base_line, count),
+                lines: window_lines(buf, base_line, count, line_count),
+                selection: selection_spans(ed, buf, width, line_count, base_line, count),
                 numbers: window_numbers(base_line, count, line_count),
             }
-        });
+        })
+    } else {
+        None
+    };
 
-        let file_name = ed
-            .buffer()
-            .path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "[No Name]".to_string());
+    let file_name = buf
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "[No Name]".to_string());
 
-        let cursor_screen_col = {
-            let line = ed.buffer().line(ed.cursor.line);
-            unicode::virtcol(&line, ed.cursor.col, unicode::TABSTOP)
-        };
+    let cursor_screen_col = {
+        let line = buf.line(cur_line);
+        unicode::virtcol(&line, w.cursor.col, unicode::TABSTOP)
+    };
 
-        View {
-            lines,
-            cursor_row: ed
-                .cursor
-                .line
-                .saturating_sub(ed.top)
-                .min(height.saturating_sub(1)),
-            cursor_col: ed.cursor.col,
-            cursor_screen_col,
-            mode_label: ed.mode.label().to_string(),
-            command_mode: ed.mode == Mode::Command,
-            pending_replace: ed.pending_replace(),
-            cmdline: ed.cmdline.clone(),
-            cmdline_prefix: ed.cmdline_prefix(),
-            cmdline_prompt: ed.cmdline_prompt().to_string(),
-            cmdline_cursor: ed.cmdline_cursor(),
-            message: ed.message.clone(),
-            file_name,
-            modified: ed.buffer().modified,
-            cursor_line: ed.cursor.line + 1,
-            selection,
-            search,
-            incsearch,
-            scroll,
-            numbers,
-            number: ed.options.number,
-            relativenumber: ed.options.relativenumber,
-            number_width: ed.number_width(),
-            panel: ed.panel_view(),
-        }
+    WindowView {
+        rect: ViewRect {
+            x: w.rect.x,
+            y: w.rect.y,
+            width: w.rect.width,
+            height: w.rect.height,
+        },
+        buffer: w.buffer,
+        focused: w.focused,
+        lines,
+        cursor_row: cur_line.saturating_sub(top).min(height.saturating_sub(1)),
+        cursor_col: w.cursor.col,
+        cursor_screen_col,
+        file_name,
+        modified: buf.modified,
+        cursor_line: cur_line + 1,
+        selection,
+        search,
+        incsearch,
+        scroll,
+        numbers,
+        number: ed.options.number,
+        relativenumber: ed.options.relativenumber,
+        number_width,
     }
 }
 
@@ -230,12 +324,12 @@ fn window_numbers(base: usize, count: usize, line_count: usize) -> Vec<Option<us
 
 /// Build `count` rendered rows starting at buffer line `base`, padding rows past
 /// the end of the buffer with `"~"` (as vim shows below the last line).
-fn window_lines(ed: &Editor, base: usize, count: usize, line_count: usize) -> Vec<String> {
+fn window_lines(buf: &Buffer, base: usize, count: usize, line_count: usize) -> Vec<String> {
     let mut lines = Vec::with_capacity(count);
     for row in 0..count {
         let idx = base + row;
         if idx < line_count {
-            lines.push(ed.buffer().line(idx));
+            lines.push(buf.line(idx));
         } else {
             lines.push("~".to_string());
         }
@@ -245,9 +339,11 @@ fn window_lines(ed: &Editor, base: usize, count: usize, line_count: usize) -> Ve
 
 /// Compute, for each of the `count` rows starting at buffer line `base`, the
 /// half-open screen-column span to highlight as the visual selection (or
-/// `None`). Returns all-`None` outside visual modes.
+/// `None`). Returns all-`None` outside visual modes. Called for the focused
+/// window only, so the editor's live `mode`/`cursor`/anchor describe `buf`.
 fn selection_spans(
     ed: &Editor,
+    buf: &Buffer,
     width: usize,
     line_count: usize,
     base: usize,
@@ -273,7 +369,7 @@ fn selection_spans(
         if buf_line >= line_count || buf_line < start.line || buf_line > end.line {
             continue;
         }
-        let text = ed.buffer().line(buf_line);
+        let text = buf.line(buf_line);
 
         if linewise {
             // Whole line, filled to the viewport edge — as vim paints it.

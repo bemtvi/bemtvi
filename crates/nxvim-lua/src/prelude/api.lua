@@ -40,7 +40,11 @@ vim._cur_win = vim._cur_win or 1000
 -- table is created here so the earlier-defined setter can index it safely.
 vim._bo_store = vim._bo_store or {}
 
-function vim._set_buf_mirror(entries, row, col, win)
+vim._wins = vim._wins or {}
+vim._win_order = vim._win_order or { 1000 }
+vim._next_win = vim._next_win or 1001
+
+function vim._set_buf_mirror(entries, row, col, win, wins, next_win)
   -- The server omits `lines` for a buffer whose changedtick is unchanged (the
   -- cheap cursor-moved-no-edit path); keep the prior `lines` in that case.
   for bufnr, entry in pairs(entries) do
@@ -53,6 +57,17 @@ function vim._set_buf_mirror(entries, row, col, win)
   vim._bufs = entries
   vim._cur_cursor = { row = row or 1, col = col or 0 }
   vim._cur_win = win or 1000
+  -- The window snapshot (Phase 5): `vim._wins[id]` = per-window record, and
+  -- `vim._win_order` the layout order `nvim_list_wins` returns. `vim._next_win`
+  -- is the id the next `nvim_open_win` will get, so it can return synchronously.
+  local by_id, order = {}, {}
+  for _, w in ipairs(wins or {}) do
+    by_id[w.id] = w
+    order[#order + 1] = w.id
+  end
+  vim._wins = by_id
+  vim._win_order = order
+  vim._next_win = next_win or vim._next_win
 end
 
 -- Resolve a buffer handle to a concrete bufnr (0 / nil -> current buffer), the
@@ -246,14 +261,105 @@ end
 -- behavior-carrying ones, defined elsewhere.)
 function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
 
--- Single-window nxvim: one window handle, and the cursor is the editor cursor.
--- INCOMPLETE: `win` is ignored (handle 1000 is the only window). Faithful once
--- nxvim grows a window layout tree; until then a config that targets a specific
--- window gets the current cursor regardless of which handle it passed.
+-- Window API (Phase 5). Reads resolve against the `vim._wins` mirror the server
+-- refreshes before running Lua; mutations queue a WindowOp (the `vim._win_*` /
+-- `vim._open_win` Rust bridges) the server drains into the live editor after the
+-- chunk, the same "Lua queues, core mutates" flow as the buffer API. `0`/`nil`
+-- means the current window throughout.
+local function resolve_win(win)
+  if win == nil or win == 0 then return vim._cur_win or 1000 end
+  return win
+end
+
 function vim.api.nvim_get_current_win() return vim._cur_win or 1000 end
-function vim.api.nvim_win_get_cursor(_win)
+
+function vim.api.nvim_list_wins() return vim._win_order or { vim._cur_win or 1000 } end
+
+function vim.api.nvim_set_current_win(win)
+  win = resolve_win(win)
+  vim._cur_win = win -- write-through so a read-after-set in this chunk is consistent
+  vim._set_current_win(win)
+end
+
+function vim.api.nvim_win_get_buf(win)
+  win = resolve_win(win)
+  local w = (vim._wins or {})[win]
+  return w and w.buffer or vim.api.nvim_get_current_buf()
+end
+
+function vim.api.nvim_win_set_buf(win, buf)
+  win = resolve_win(win)
+  vim._win_set_buf(win, buf or 0)
+end
+
+function vim.api.nvim_win_get_cursor(win)
+  win = resolve_win(win)
+  local w = (vim._wins or {})[win]
+  if w then return { w.row, w.col } end
   local c = vim._cur_cursor or { row = 1, col = 0 }
   return { c.row, c.col }
+end
+
+function vim.api.nvim_win_set_cursor(win, pos)
+  win = resolve_win(win)
+  local row, col = pos[1], pos[2]
+  vim._win_set_cursor(win, row - 1, col) -- queue (server takes a 0-based line)
+  -- Write-through the mirror so a read-after-write within this chunk agrees.
+  local w = (vim._wins or {})[win]
+  if w then w.row, w.col = row, col end
+  if win == (vim._cur_win or 1000) then vim._cur_cursor = { row = row, col = col } end
+end
+
+function vim.api.nvim_win_get_width(win)
+  win = resolve_win(win)
+  local w = (vim._wins or {})[win]
+  return w and w.width or 0
+end
+
+function vim.api.nvim_win_get_height(win)
+  win = resolve_win(win)
+  local w = (vim._wins or {})[win]
+  return w and w.height or 0
+end
+
+function vim.api.nvim_win_set_width(win, width) vim._win_set_width(resolve_win(win), width) end
+function vim.api.nvim_win_set_height(win, height) vim._win_set_height(resolve_win(win), height) end
+
+function vim.api.nvim_win_close(win, force)
+  win = resolve_win(win)
+  vim._win_close(win, force and true or false)
+  -- Write-through: drop it from the mirror so a within-chunk read agrees.
+  if (vim._wins or {})[win] then
+    vim._wins[win] = nil
+    local order = {}
+    for _, id in ipairs(vim._win_order or {}) do
+      if id ~= win then order[#order + 1] = id end
+    end
+    vim._win_order = order
+  end
+end
+
+-- nvim_open_win(buffer, enter, config): the split form. `config.vertical` (or
+-- `config.split == "left"/"right"`) makes a vsplit. Returns the new window's id
+-- (predicted from the mirror's `_next_win`); the real window is created when the
+-- queued op drains. `relative` floats are deferred to the floats spec.
+function vim.api.nvim_open_win(buffer, enter, config)
+  config = config or {}
+  local vertical = config.vertical == true
+    or config.split == "left" or config.split == "right"
+  local id = vim._next_win or 1001
+  vim._next_win = id + 1
+  vim._open_win(buffer or 0, vertical, enter ~= false)
+  -- Write-through: reflect the new window in the mirror so reads later in this
+  -- chunk (nvim_list_wins, nvim_win_get_buf) see it before the op drains. Real
+  -- dimensions land on the next mirror refresh.
+  local buf = (buffer == nil or buffer == 0) and vim.api.nvim_get_current_buf() or buffer
+  vim._wins = vim._wins or {}
+  vim._win_order = vim._win_order or {}
+  vim._wins[id] = { id = id, buffer = buf, row = 1, col = 0, width = 0, height = 0 }
+  vim._win_order[#vim._win_order + 1] = id
+  if enter ~= false then vim._cur_win = id end
+  return id
 end
 
 function vim.api.nvim_buf_is_loaded(bufnr)

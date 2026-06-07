@@ -12,13 +12,79 @@ use crate::parse::{
     parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem, SearchSpans,
 };
 
-/// The server's view, mirrored client-side for rendering.
+/// One window's content mirrored from a redraw `windows[i]` sub-map: its screen
+/// rect, focus flag, and all the per-window fields (text, cursor, selection,
+/// search, syntax/diagnostics, gutter, and status-line data). The client paints
+/// each of these at its `rect` with its own gutter, text body, and status line.
 #[derive(Default)]
-pub struct View {
+pub(crate) struct WindowView {
+    /// The window's rect in **windows-area** cells, or `None` for the legacy flat
+    /// redraw (a single window that fills the whole windows area — the synthetic
+    /// paint fixtures). The renderer offsets a `Some` rect by the windows-area
+    /// origin; a `None` rect takes the whole area.
+    pub(crate) rect: Option<WinRect>,
+    pub(crate) focused: bool,
     pub(crate) lines: Vec<String>,
     pub(crate) cursor_row: u16,
     pub(crate) cursor_col: u16,
     pub(crate) cursor_screen_col: u16,
+    pub(crate) file_name: String,
+    pub(crate) modified: bool,
+    pub(crate) cursor_line: usize,
+    /// Per visible row, the half-open screen-column span `[start, end)` to paint
+    /// as the visual selection, or `None`.
+    pub(crate) selection: Vec<Option<(u16, u16)>>,
+    /// Per visible row, the half-open screen-column spans of every search match
+    /// (`hlsearch`). Empty inner vecs for rows with no match.
+    pub(crate) search: SearchSpans,
+    /// Per visible row, the single span the live `incsearch` preview rests on.
+    pub(crate) incsearch: IncSearchSpans,
+    /// Per visible row, the treesitter highlight spans `(start_col, end_col,
+    /// group, style_id)` in screen columns. `style_id` indexes [`View::styles`]
+    /// (the global palette) when resolved through a colorscheme; `None` falls
+    /// back to the client's built-in [`group_style`](crate::render::group_style).
+    pub(crate) highlights: Vec<Vec<HlSpan>>,
+    /// Per visible row, the LSP diagnostic underline spans `(start_col, end_col,
+    /// severity, style_id)` in screen columns.
+    pub(crate) diagnostics: Vec<Vec<DiagSpan>>,
+    /// A scroll gesture for this window, when its viewport just moved.
+    pub(crate) scroll: Option<ScrollData>,
+    /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
+    pub(crate) numbers: Vec<Option<usize>>,
+    pub(crate) number: bool,
+    pub(crate) relativenumber: bool,
+    pub(crate) number_width: u16,
+}
+
+/// A window's rect in windows-area cells (mirrors `nxvim_core::ViewRect`).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WinRect {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+}
+
+/// A split separator the client draws between windows: a vertical `│` or
+/// horizontal `─` run of `length` cells anchored at `(x, y)` in windows-area
+/// cells. Empty with a single window.
+#[derive(Clone, Copy)]
+pub(crate) struct Separator {
+    pub(crate) vertical: bool,
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) length: u16,
+}
+
+/// The server's view, mirrored client-side for rendering: the **global** chrome
+/// (mode, command line, message, panel, popup, style palette) plus the list of
+/// [`WindowView`]s to paint and the split [`Separator`]s between them.
+#[derive(Default)]
+pub struct View {
+    /// The windows to paint, in layout order. Always at least one.
+    pub(crate) windows: Vec<WindowView>,
+    /// The split separators between windows (empty with one window).
+    pub(crate) separators: Vec<Separator>,
     pub(crate) mode_label: String,
     pub(crate) command_mode: bool,
     /// True while `r` waits for its replacement character (a one-shot replace
@@ -34,32 +100,8 @@ pub struct View {
     /// the terminal cursor mid-line after `<Left>`/`<Right>` edits.
     pub(crate) cmdline_cursor: usize,
     pub(crate) message: String,
-    pub(crate) file_name: String,
-    pub(crate) modified: bool,
-    pub(crate) cursor_line: usize,
-    /// Per visible row, the half-open screen-column span `[start, end)` to paint
-    /// as the visual selection, or `None`. Mirrors the server's `View::selection`.
-    pub(crate) selection: Vec<Option<(u16, u16)>>,
-    /// Per visible row, the half-open screen-column spans of every search match
-    /// (`hlsearch`). Empty inner vecs for rows with no match. Mirrors the
-    /// server's `View::search`.
-    pub(crate) search: SearchSpans,
-    /// Per visible row, the single span the live `incsearch` preview rests on, or
-    /// `None`. Mirrors the server's `View::incsearch`.
-    pub(crate) incsearch: IncSearchSpans,
-    /// Per visible row, the treesitter highlight spans `(start_col, end_col,
-    /// group, style_id)` in screen columns. `style_id` indexes [`View::styles`]
-    /// when the server resolved the span through a loaded colorscheme; `None`
-    /// means fall back to the client's built-in
-    /// [`group_style`](crate::render::group_style) theme.
-    pub(crate) highlights: Vec<Vec<HlSpan>>,
-    /// Per visible row, the LSP diagnostic underline spans `(start_col, end_col,
-    /// severity, style_id)` in screen columns, composed over the syntax/selection
-    /// in [`highlight_line`](crate::render). Empty for a buffer with no
-    /// diagnostics.
-    pub(crate) diagnostics: Vec<Vec<DiagSpan>>,
     /// The per-frame style palette the server resolved from the active
-    /// colorscheme; `highlights`/chrome ids index into it. Empty with no theme.
+    /// colorscheme; per-window `highlights`/chrome ids index into it. Global.
     pub(crate) styles: Vec<Style>,
     /// Resolved editor-chrome styles (`None` when the theme leaves the group
     /// undefined — the client then keeps its built-in look for that region).
@@ -71,20 +113,11 @@ pub struct View {
     pub(crate) incsearch_style: Option<Style>,
     pub(crate) status_line: Option<Style>,
     pub(crate) end_of_buffer: Option<Style>,
-    pub(crate) scroll: Option<ScrollData>,
-    /// Per visible row, the 1-based buffer line number (`None` for `~` fillers),
-    /// from which the client formats the number column.
-    pub(crate) numbers: Vec<Option<usize>>,
-    /// `:set number` / `:set relativenumber` flags and the gutter width in cells
-    /// (`0` when both are off), mirrored from the server.
-    pub(crate) number: bool,
-    pub(crate) relativenumber: bool,
-    pub(crate) number_width: u16,
     /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
-    /// present it has input focus: the editing cursor is drawn inside it.
+    /// present it has input focus: the editing cursor is drawn inside it. Global.
     pub(crate) panel: Option<PanelData>,
     /// The insert-mode completion popup, or `None` when none is open. Drawn last,
-    /// as an overlay over the text area.
+    /// over the focused window's text area. Global.
     pub(crate) pmenu: Option<PmenuData>,
 }
 
@@ -123,10 +156,6 @@ impl View {
         let Some(Value::Map(map)) = params.first() else {
             return;
         };
-        self.lines = map_str_array(map, "lines");
-        self.cursor_row = map_u16(map, "cursor_row");
-        self.cursor_col = map_u16(map, "cursor_col");
-        self.cursor_screen_col = map_u16(map, "cursor_screen_col");
         self.mode_label = map_str(map, "mode_label");
         self.command_mode = map_get(map, "command_mode")
             .and_then(Value::as_bool)
@@ -139,17 +168,8 @@ impl View {
         self.cmdline_prompt = map_str(map, "cmdline_prompt");
         self.cmdline_cursor = map_u64(map, "cmdline_cursor") as usize;
         self.message = map_str(map, "message");
-        self.file_name = map_str(map, "file_name");
-        self.modified = map_get(map, "modified")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.cursor_line = map_u64(map, "cursor_line") as usize;
-        self.selection = parse_spans(map_get(map, "selection"));
-        self.search = parse_multi_spans(map_get(map, "search"));
-        self.incsearch = parse_spans(map_get(map, "incsearch"));
-        self.highlights = parse_highlights(map_get(map, "highlights"));
-        self.diagnostics = parse_diagnostics(map_get(map, "diagnostics"));
-        // The style palette must land before chrome, which indexes into it.
+        // The style palette must land before windows (their scroll bands snapshot
+        // it) and chrome (which indexes into it).
         self.styles = parse_styles(map_get(map, "styles"));
         let chrome = |key| chrome_style(map_get(map, "chrome"), key, &self.styles);
         self.normal = chrome("normal");
@@ -160,14 +180,19 @@ impl View {
         self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
         self.end_of_buffer = chrome("end_of_buffer");
-        self.numbers = parse_numbers(map_get(map, "numbers"));
-        self.number = map_get(map, "number")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.relativenumber = map_get(map, "relativenumber")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.number_width = map_u16(map, "number_width");
+        // The window list (the multi-window form), or a single window built from
+        // the legacy flat top-level fields (the synthetic paint fixtures).
+        self.windows = match map_get(map, "windows") {
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|w| match w {
+                    Value::Map(wm) => Some(parse_window(wm, &self.styles)),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![parse_window(map, &self.styles)],
+        };
+        self.separators = parse_separators(map_get(map, "separators"));
         self.panel = match map_get(map, "panel") {
             Some(Value::Map(p)) => Some(PanelData {
                 title: map_str(p, "title"),
@@ -196,24 +221,17 @@ impl View {
             }),
             _ => None,
         };
-        self.scroll = match map_get(map, "scroll") {
-            Some(Value::Map(s)) => Some(ScrollData {
-                from_top: map_u64(s, "from_top") as f32,
-                to_top: map_u64(s, "to_top") as f32,
-                from_cursor: map_u64(s, "from_cursor") as f32,
-                to_cursor: map_u64(s, "to_cursor") as f32,
-                duration: Duration::from_millis(map_u64(s, "duration_ms")),
-                base_line: map_u64(s, "base_line") as usize,
-                lines: map_str_array(s, "lines"),
-                selection: parse_spans(map_get(s, "selection")),
-                numbers: parse_numbers(map_get(s, "numbers")),
-                highlights: parse_highlights(map_get(s, "highlights")),
-                // The band's ids index this redraw's palette — snapshot it now,
-                // since a later redraw will replace `self.styles`.
-                styles: self.styles.clone(),
-            }),
-            _ => None,
-        };
+    }
+
+    /// The focused window — where the terminal cursor is drawn and the reference
+    /// point for the completion popup — or `None` before the first redraw (a
+    /// default `View` has no windows). A real redraw always carries at least one
+    /// window, with one flagged focused; falls back to the first if none is.
+    pub(crate) fn focused(&self) -> Option<&WindowView> {
+        self.windows
+            .iter()
+            .find(|w| w.focused)
+            .or_else(|| self.windows.first())
     }
 
     /// Whether the editor is in insert mode, mirrored from the server's
@@ -236,4 +254,88 @@ impl View {
         view.update(params);
         view
     }
+}
+
+/// Parse one window from a map slice — either a `windows[i]` sub-map (with a
+/// `rect`) or the legacy flat top-level redraw (no `rect`, so the renderer gives
+/// the single window the whole windows area). `styles` is the global palette the
+/// window's scroll band snapshots.
+fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
+    let rect = match map_get(m, "rect") {
+        Some(Value::Map(r)) => Some(WinRect {
+            x: map_u16(r, "x"),
+            y: map_u16(r, "y"),
+            width: map_u16(r, "width"),
+            height: map_u16(r, "height"),
+        }),
+        _ => None,
+    };
+    let scroll = match map_get(m, "scroll") {
+        Some(Value::Map(s)) => Some(ScrollData {
+            from_top: map_u64(s, "from_top") as f32,
+            to_top: map_u64(s, "to_top") as f32,
+            from_cursor: map_u64(s, "from_cursor") as f32,
+            to_cursor: map_u64(s, "to_cursor") as f32,
+            duration: Duration::from_millis(map_u64(s, "duration_ms")),
+            base_line: map_u64(s, "base_line") as usize,
+            lines: map_str_array(s, "lines"),
+            selection: parse_spans(map_get(s, "selection")),
+            numbers: parse_numbers(map_get(s, "numbers")),
+            highlights: parse_highlights(map_get(s, "highlights")),
+            // The band's ids index this redraw's palette — snapshot it now, since
+            // a later redraw will replace the live `styles`.
+            styles: styles.to_vec(),
+        }),
+        _ => None,
+    };
+    WindowView {
+        rect,
+        // A flat redraw has no `focused` flag; its sole window is always focused.
+        focused: map_get(m, "focused")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        lines: map_str_array(m, "lines"),
+        cursor_row: map_u16(m, "cursor_row"),
+        cursor_col: map_u16(m, "cursor_col"),
+        cursor_screen_col: map_u16(m, "cursor_screen_col"),
+        file_name: map_str(m, "file_name"),
+        modified: map_get(m, "modified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        cursor_line: map_u64(m, "cursor_line") as usize,
+        selection: parse_spans(map_get(m, "selection")),
+        search: parse_multi_spans(map_get(m, "search")),
+        incsearch: parse_spans(map_get(m, "incsearch")),
+        highlights: parse_highlights(map_get(m, "highlights")),
+        diagnostics: parse_diagnostics(map_get(m, "diagnostics")),
+        scroll,
+        numbers: parse_numbers(map_get(m, "numbers")),
+        number: map_get(m, "number")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        relativenumber: map_get(m, "relativenumber")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        number_width: map_u16(m, "number_width"),
+    }
+}
+
+/// Parse the `separators` array: each entry a `{ vertical, x, y, length }` map.
+fn parse_separators(value: Option<&Value>) -> Vec<Separator> {
+    let Some(Value::Array(arr)) = value else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| match v {
+            Value::Map(s) => Some(Separator {
+                vertical: map_get(s, "vertical")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                x: map_u16(s, "x"),
+                y: map_u16(s, "y"),
+                length: map_u16(s, "length"),
+            }),
+            _ => None,
+        })
+        .collect()
 }

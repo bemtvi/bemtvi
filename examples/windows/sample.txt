@@ -1,0 +1,20 @@
+Windows playground — split this buffer and watch each window keep its own view.
+
+Try, in order:
+  1. <C-w>v          split vertically. The message line shows WinNew + WinEnter.
+  2. :WinList        list both windows with their buffer, cursor, and size.
+  3. <C-w>l then G   focus the right window and jump to the last line.
+  4. <C-w>h          focus back left — its cursor is right where you left it.
+  5. 5<C-w>>         widen the focused window by 5 columns; <C-w>= re-equalizes.
+  6. :WinDemo        open another split from Lua (nvim_open_win) and report it.
+  7. <C-w>o          drop all but the focused window; :q closes one at a time.
+
+Both windows show THIS buffer, so an edit in one appears in the other instantly
+(shared buffer, independent view). `:lua print(vim.inspect(_G.win_log))` shows
+every window event that has fired so far.
+
+line A
+line B
+line C
+line D
+line E

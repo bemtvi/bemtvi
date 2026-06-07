@@ -30,7 +30,7 @@ mod treesitter;
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
 use lsp::{CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
-use nxvim_core::{BufferId, Editor, Mode};
+use nxvim_core::{BufferId, Editor, Mode, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
@@ -106,10 +106,9 @@ fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
     plugins
 }
 
-/// The single window handle nxvim reports to Lua (`nvim_get_current_win`). nxvim
-/// is single-window; neovim's first window id is 1000, so configs that key state
-/// by window id see a stable, conventional handle (Phase 6).
-pub(crate) const CURRENT_WIN: u64 = 1000;
+/// A window's `(id, (x, y, width, height))` rect snapshot, the unit of the
+/// [`Server::last_window_rects`] diff that fires `WinResized`.
+type WindowRect = (WindowId, (usize, usize, usize, usize));
 
 struct Server {
     editor: Editor,
@@ -174,6 +173,17 @@ struct Server {
     /// (from a non-insert mode) fires `InsertEnter`; tracked here so the per-key
     /// diff can spot the edge without touching the core's insert chokepoints.
     last_mode: Mode,
+    /// The focused window at the last lifecycle diff; `None` until the startup
+    /// seed. A change fires `WinLeave`(old) → `WinEnter`(new), bracketing the
+    /// buffer events a window switch causes (Phase 5).
+    last_window_id: Option<WindowId>,
+    /// Every window id seen at the last diff, in layout order. Ids added since
+    /// fire `WinNew`; ids gone fire `WinClosed`.
+    known_windows: Vec<WindowId>,
+    /// Each window's `(id, x, y, w, h)` rect at the last diff; a change fires
+    /// `WinResized` (splits, `<C-w>`-resizes, terminal resizes). `None` until the
+    /// seed so the first emit doesn't spuriously fire it.
+    last_window_rects: Option<Vec<WindowRect>>,
     /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
     /// `Server::input` runs every key through before `editor.input`. Rebuilt from
     /// `vim._keymaps` when its version advances (checked once per input batch).
@@ -238,6 +248,9 @@ where
         last_buffer_id: None,
         announced: HashSet::new(),
         last_mode: Mode::Normal,
+        last_window_id: None,
+        known_windows: Vec::new(),
+        last_window_rects: None,
         keymaps: Keymaps::default(),
         evloop,
         scheduled: VecDeque::new(),
@@ -318,6 +331,11 @@ where
     // Startup seed: the initial buffer and the config's autocmds both exist now,
     // so fire the first buffer's lifecycle events (`BufReadPost`→`FileType`→
     // `BufEnter` for a file arg, `BufEnter` alone for the bare `[No Name]`).
+    // Pre-seed the window set so the first window doesn't fire `WinNew` (neovim
+    // skips it for the initial window); `last_window_id` stays `None` so the
+    // first `WinEnter` still fires alongside `BufEnter`, the window analogue.
+    server.known_windows = server.editor.window_ids();
+    server.last_window_rects = Some(server.window_rects_snapshot());
     server.emit_lifecycle_events();
     server.run_pending();
 

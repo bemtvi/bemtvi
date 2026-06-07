@@ -360,8 +360,10 @@ impl Server {
         let (arow, acol) = menu.anchor;
         let line = self.editor.buffer().line(arow);
         let anchor_col = unicode::virtcol(&line, acol, unicode::TABSTOP);
-        let cursor_row = view.cursor_row;
-        let text_height = view.lines.len();
+        // The popup anchors in the focused window's text body.
+        let focused = view.focused();
+        let cursor_row = focused.cursor_row;
+        let text_height = focused.lines.len();
 
         let items: Vec<Value> = menu
             .visible

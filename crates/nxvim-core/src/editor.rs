@@ -16,7 +16,7 @@ use crate::mode::Mode;
 use crate::options::{resolve_set, Options, SetOp};
 use crate::search::SearchRegex;
 use crate::unicode;
-use crate::view::{PanelView, View};
+use crate::view::{PanelView, Separator, View};
 
 /// Default content height of the bottom panel, in rows (vim's quickfix
 /// default). The projection clamps it down so the text window keeps a row.
@@ -64,6 +64,12 @@ pub struct Cursor {
 /// matching vim's buffer numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BufferId(pub u64);
+
+/// Stable identifier for a window — a viewport onto a buffer. Like [`BufferId`]
+/// it is monotonic, 1-based, and never reused once assigned, matching neovim's
+/// window handles. The first window is allocated at startup, bound to buffer 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId(pub u64);
 
 #[derive(Debug, Clone, Default)]
 struct Register {
@@ -301,6 +307,552 @@ impl BufferStore {
     }
 }
 
+/// A rectangle in terminal cells: top-left origin `(x, y)` plus size. The window
+/// layout tree computes one of these per window; the core stays UI-free, so this
+/// is a plain struct rather than a ratatui `Rect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Rect {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+impl Rect {
+    /// The cell at the rect's center, used to compare two windows' positions when
+    /// picking a directional-focus or close-survivor neighbor.
+    fn center(&self) -> (usize, usize) {
+        (self.x + self.width / 2, self.y + self.height / 2)
+    }
+}
+
+/// A window: one viewport onto a buffer. Mirrors the way [`OpenBuffer`] splits
+/// state — the buffer binding plus, *while this window is not focused*, its saved
+/// cursor/scroll so refocusing restores the view. While the window *is* focused
+/// the live position is [`Editor::cursor`] / [`Editor::top`]; the `saved_*`
+/// fields are meaningless then (they are stashed only on focus-out, the
+/// window analogue of `OpenBuffer::saved_cursor`).
+struct Window {
+    buffer: BufferId,
+    saved_cursor: Cursor,
+    saved_top: usize,
+    rect: Rect,
+}
+
+/// The orientation of a split: `Horizontal` stacks children top-to-bottom
+/// (`:split` / `<C-w>s`), `Vertical` places them left-to-right (`:vsplit` /
+/// `<C-w>v`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitDir {
+    Horizontal,
+    Vertical,
+}
+
+/// A node in the window layout tree: either a single window (`Leaf`) or a
+/// `Split` dividing its area among `children` by `sizes` (relative weights —
+/// equal for an even split, leftover cells handed to the first children).
+enum Node {
+    Leaf(WindowId),
+    Split {
+        dir: SplitDir,
+        children: Vec<Node>,
+        sizes: Vec<usize>,
+    },
+}
+
+impl Node {
+    /// Append every leaf window id under this node in layout (left-to-right,
+    /// top-to-bottom) order.
+    fn collect_leaves(&self, out: &mut Vec<WindowId>) {
+        match self {
+            Node::Leaf(id) => out.push(*id),
+            Node::Split { children, .. } => {
+                for c in children {
+                    c.collect_leaves(out);
+                }
+            }
+        }
+    }
+}
+
+/// The window layout: every open window keyed by id, the `root` of the split
+/// tree arranging them, the `current` (focused) window, the next id to hand out,
+/// and the separators the last [`WindowTree::layout`] produced. Mirrors
+/// [`BufferStore`]; with one window the tree is a single `Leaf`, there are no
+/// separators, and `current` always resolves.
+struct WindowTree {
+    windows: BTreeMap<WindowId, Window>,
+    root: Node,
+    current: WindowId,
+    next_id: u64,
+    /// Borders between splits, recomputed on every [`WindowTree::layout`]. Empty
+    /// with a single window.
+    separators: Vec<Separator>,
+}
+
+impl WindowTree {
+    /// A tree seeded with a single window (id 1) bound to `buffer` and focused,
+    /// the window analogue of [`BufferStore::with_one`].
+    fn with_one(buffer: BufferId) -> Self {
+        let id = WindowId(1);
+        let mut windows = BTreeMap::new();
+        windows.insert(
+            id,
+            Window {
+                buffer,
+                saved_cursor: Cursor::default(),
+                saved_top: 0,
+                rect: Rect::default(),
+            },
+        );
+        WindowTree {
+            windows,
+            root: Node::Leaf(id),
+            current: id,
+            next_id: 2,
+            separators: Vec::new(),
+        }
+    }
+
+    fn get(&self, id: WindowId) -> &Window {
+        self.windows
+            .get(&id)
+            .expect("current window id is always valid")
+    }
+
+    fn get_mut(&mut self, id: WindowId) -> &mut Window {
+        self.windows
+            .get_mut(&id)
+            .expect("current window id is always valid")
+    }
+
+    /// The focused window.
+    fn cur(&self) -> &Window {
+        self.get(self.current)
+    }
+
+    /// The focused window, mutably.
+    fn cur_mut(&mut self) -> &mut Window {
+        let id = self.current;
+        self.get_mut(id)
+    }
+
+    /// All window ids in layout order (the `nvim_list_wins` order).
+    fn leaves(&self) -> Vec<WindowId> {
+        let mut out = Vec::new();
+        self.root.collect_leaves(&mut out);
+        out
+    }
+
+    /// How many windows are open. Always ≥ 1.
+    fn count(&self) -> usize {
+        self.windows.len()
+    }
+
+    /// Mint a fresh, never-reused window id.
+    fn alloc_id(&mut self) -> WindowId {
+        let id = WindowId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// Assign each window its `rect` by dividing `total` across the tree, and
+    /// recompute the [`Separator`]s between splits. A single leaf takes the whole
+    /// area; a `Split` subtracts one cell per inter-child border, distributes the
+    /// rest by `sizes`, and recurses.
+    fn layout(&mut self, total: Rect) {
+        let mut rects: Vec<(WindowId, Rect)> = Vec::new();
+        let mut seps: Vec<Separator> = Vec::new();
+        layout_node(&mut self.root, total, &mut rects, &mut seps);
+        for (id, rect) in rects {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.rect = rect;
+            }
+        }
+        self.separators = seps;
+    }
+}
+
+/// Split `avail` cells among children weighted by `sizes`, handing any rounding
+/// leftover to the first children (vim's behavior). When `sizes` already sum to
+/// `avail` this is the identity (so an absolute `:resize` lands exactly). Every
+/// child then gets **at least one** cell when there are enough to go around (no
+/// zero-extent windows from a lopsided weight like `<C-w>_`'s); only when `avail`
+/// is smaller than the child count do trailing children get nothing. Returns one
+/// cell count per size; the sum equals `avail`.
+fn distribute(avail: usize, sizes: &[usize]) -> Vec<usize> {
+    let n = sizes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let total: usize = sizes.iter().sum::<usize>().max(1);
+    let mut out: Vec<usize> = sizes.iter().map(|s| avail * s / total).collect();
+    let mut leftover = avail.saturating_sub(out.iter().sum());
+    let mut i = 0;
+    while leftover > 0 {
+        out[i % n] += 1;
+        i += 1;
+        leftover -= 1;
+    }
+    // Repair any zero-extent child (a lopsided weight floored it to nothing) by
+    // stealing a cell from the current largest, while there's room for one each.
+    if avail >= n {
+        while let Some(z) = out.iter().position(|&c| c == 0) {
+            let max = out
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &c)| c)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            out[max] -= 1;
+            out[z] += 1;
+        }
+    }
+    out
+}
+
+/// Recursively assign rects to the leaves under `node` within `rect`, collecting
+/// the border [`Separator`]s between split children. A `Horizontal` split stacks
+/// children top-to-bottom with a `─` row between each (dividing height); a
+/// `Vertical` split lays them left-to-right with a `│` column between each
+/// (dividing width). One cell is reserved per inter-child border.
+///
+/// As a side effect each split's `sizes` are rewritten to the cell extents it
+/// just assigned, so after a layout `sizes` is always in **cells**: the resize
+/// commands (`<C-w>+`/`-`/`<`/`>`/`=`) do plain cell arithmetic on it, and a
+/// terminal resize re-runs layout with those cells as weights — `distribute`
+/// rescales them proportionally, preserving each split's relative shares.
+fn layout_node(
+    node: &mut Node,
+    rect: Rect,
+    rects: &mut Vec<(WindowId, Rect)>,
+    seps: &mut Vec<Separator>,
+) {
+    match node {
+        Node::Leaf(id) => rects.push((*id, rect)),
+        Node::Split {
+            dir,
+            children,
+            sizes,
+        } => {
+            let n = children.len();
+            let borders = n.saturating_sub(1);
+            match dir {
+                SplitDir::Horizontal => {
+                    let avail = rect.height.saturating_sub(borders);
+                    let heights = distribute(avail, sizes);
+                    *sizes = heights.clone();
+                    let mut y = rect.y;
+                    for (i, (child, h)) in children.iter_mut().zip(heights).enumerate() {
+                        let child_rect = Rect {
+                            x: rect.x,
+                            y,
+                            width: rect.width,
+                            height: h,
+                        };
+                        layout_node(child, child_rect, rects, seps);
+                        y += h;
+                        if i + 1 < n {
+                            seps.push(Separator {
+                                vertical: false,
+                                x: rect.x,
+                                y,
+                                length: rect.width,
+                            });
+                            y += 1;
+                        }
+                    }
+                }
+                SplitDir::Vertical => {
+                    let avail = rect.width.saturating_sub(borders);
+                    let widths = distribute(avail, sizes);
+                    *sizes = widths.clone();
+                    let mut x = rect.x;
+                    for (i, (child, w)) in children.iter_mut().zip(widths).enumerate() {
+                        let child_rect = Rect {
+                            x,
+                            y: rect.y,
+                            width: w,
+                            height: rect.height,
+                        };
+                        layout_node(child, child_rect, rects, seps);
+                        x += w;
+                        if i + 1 < n {
+                            seps.push(Separator {
+                                vertical: true,
+                                x,
+                                y: rect.y,
+                                length: rect.height,
+                            });
+                            x += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Replace the `target` leaf in the tree with a `Split` of two leaves — the new
+/// window first (the top/left, which takes focus) and the old window second.
+/// Returns `false` if `target` is not in the tree. The sizes start equal, so the
+/// split is even (vim's default); manual resize is a later phase.
+fn split_leaf(node: &mut Node, target: WindowId, dir: SplitDir, new_id: WindowId) -> bool {
+    match node {
+        Node::Leaf(id) if *id == target => {
+            *node = Node::Split {
+                dir,
+                children: vec![Node::Leaf(new_id), Node::Leaf(target)],
+                sizes: vec![1, 1],
+            };
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { children, .. } => children
+            .iter_mut()
+            .any(|c| split_leaf(c, target, dir, new_id)),
+    }
+}
+
+/// Remove the `target` leaf from the tree, collapsing a `Split` that is left
+/// with a single child into that child. Returns `false` if `target` is not
+/// found. Only ever called when more than one window is open, so the root is a
+/// `Split` and the last window is never removed.
+fn remove_leaf(node: &mut Node, target: WindowId) -> bool {
+    let Node::Split {
+        children, sizes, ..
+    } = node
+    else {
+        return false;
+    };
+    let removed = if let Some(pos) = children
+        .iter()
+        .position(|c| matches!(c, Node::Leaf(id) if *id == target))
+    {
+        children.remove(pos);
+        sizes.remove(pos);
+        true
+    } else {
+        children.iter_mut().any(|c| remove_leaf(c, target))
+    };
+    if removed && children.len() == 1 {
+        *node = children.remove(0);
+    }
+    removed
+}
+
+/// The smallest extent (cells) a window may be shrunk to along a split axis, so
+/// resizing a neighbor never collapses it: one text row plus its status line for
+/// a horizontal split, one column for a vertical one. A leaf at this size still
+/// renders (its text height floors to 1).
+fn min_extent(dir: SplitDir) -> usize {
+    match dir {
+        SplitDir::Horizontal => 2,
+        SplitDir::Vertical => 1,
+    }
+}
+
+/// Grow `sizes[i]` by `delta` cells (shrink it when `delta` is negative),
+/// taking the opposite amount from a neighbor so the split's total extent is
+/// unchanged — exactly vim's "steal from the window below/right" resize. The
+/// neighbor is the next sibling, or the previous one when `i` is last. Both the
+/// resized child and its neighbor stay at or above [`min_extent`].
+fn adjust_sizes(sizes: &mut [usize], i: usize, delta: isize, dir: SplitDir) {
+    let n = sizes.len();
+    if n < 2 || delta == 0 {
+        return;
+    }
+    let j = if i + 1 < n { i + 1 } else { i - 1 };
+    let min = min_extent(dir);
+    if delta > 0 {
+        // Grow `i` by as much as the neighbor can spare above the minimum.
+        let give = (delta as usize).min(sizes[j].saturating_sub(min));
+        sizes[i] += give;
+        sizes[j] -= give;
+    } else {
+        // Shrink `i` no further than its own minimum; the neighbor takes it.
+        let take = ((-delta) as usize).min(sizes[i].saturating_sub(min));
+        sizes[i] -= take;
+        sizes[j] += take;
+    }
+}
+
+/// Find leaf `target` under `node` and, at the **nearest** ancestor split whose
+/// orientation is `axis`, resize the child on the path toward it by `delta`
+/// cells (via [`adjust_sizes`]). Returns whether `target` is in this subtree;
+/// `done` guards so only that nearest split is touched. A no-op if there is no
+/// ancestor split of that orientation (e.g. resizing height with only vertical
+/// splits above).
+fn resize_toward(
+    node: &mut Node,
+    target: WindowId,
+    axis: SplitDir,
+    delta: isize,
+    done: &mut bool,
+) -> bool {
+    match node {
+        Node::Leaf(id) => *id == target,
+        Node::Split {
+            dir,
+            children,
+            sizes,
+        } => {
+            let mut on_path = None;
+            for (i, child) in children.iter_mut().enumerate() {
+                if resize_toward(child, target, axis, delta, done) {
+                    on_path = Some(i);
+                    break;
+                }
+            }
+            let Some(i) = on_path else {
+                return false;
+            };
+            if !*done && *dir == axis {
+                adjust_sizes(sizes, i, delta, axis);
+                *done = true;
+            }
+            true
+        }
+    }
+}
+
+/// Maximize leaf `target`'s extent along `axis`: at **every** ancestor split of
+/// that orientation, give the child on the path the lion's share and the rest a
+/// single weight, so the window fills the dimension across nested splits (vim's
+/// `<C-w>_` / `<C-w>|`). Sizes are weights here; the next layout renormalizes
+/// them to cells, clamping siblings to one cell each. Returns whether `target`
+/// is in this subtree.
+fn maximize_toward(node: &mut Node, target: WindowId, axis: SplitDir) -> bool {
+    match node {
+        Node::Leaf(id) => *id == target,
+        Node::Split {
+            dir,
+            children,
+            sizes,
+        } => {
+            let mut on_path = None;
+            for (i, child) in children.iter_mut().enumerate() {
+                if maximize_toward(child, target, axis) {
+                    on_path = Some(i);
+                    break;
+                }
+            }
+            let Some(i) = on_path else {
+                return false;
+            };
+            if *dir == axis {
+                for s in sizes.iter_mut() {
+                    *s = 1;
+                }
+                // A weight large enough to dominate any realistic terminal, so
+                // `distribute` hands this child everything but the siblings'
+                // reserved one cell.
+                sizes[i] = 10_000;
+            }
+            true
+        }
+    }
+}
+
+/// Reset every split's `sizes` to equal weights (vim's `<C-w>=`); the next
+/// layout renders even shares.
+fn equalize_node(node: &mut Node) {
+    if let Node::Split {
+        children, sizes, ..
+    } = node
+    {
+        for s in sizes.iter_mut() {
+            *s = 1;
+        }
+        for child in children.iter_mut() {
+            equalize_node(child);
+        }
+    }
+}
+
+/// Per-window data for the [`View`] projection: the window's buffer, the view
+/// position to render it at (live for the focused window, stashed otherwise),
+/// its rect, and whether it holds focus.
+pub(crate) struct WindowLayout {
+    pub(crate) buffer: BufferId,
+    pub(crate) cursor: Cursor,
+    pub(crate) top: usize,
+    pub(crate) rect: Rect,
+    pub(crate) focused: bool,
+}
+
+/// A directional window-focus move (`<C-w>h/j/k/l`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinDir {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+/// A `<C-w>` window command: the second key after the `<C-w>` prefix, resolved by
+/// [`parse_step`] and applied in [`Editor::execute`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCmd {
+    /// `<C-w>s` (horizontal) / `<C-w>v` (vertical) — split the focused window.
+    Split(SplitDir),
+    /// `<C-w>h/j/k/l` — move focus to the window in that direction.
+    FocusDir(WinDir),
+    /// `<C-w>w` (forward) / `<C-w>W` (backward) — cyclic focus.
+    FocusCycle(bool),
+    /// `<C-w>c` — close the focused window (refuses the last one).
+    Close,
+    /// `<C-w>o` — keep only the focused window.
+    Only,
+    /// `<C-w>q` — `:q`: close the focused window, or quit if it is the last.
+    Quit,
+    /// `<C-w>=` — equalize every window's size.
+    Equalize,
+    /// `<C-w>+` (grow) / `<C-w>-` (shrink) — change the focused window's height
+    /// by the count (default 1).
+    ResizeHeight(bool),
+    /// `<C-w>>` (grow) / `<C-w><` (shrink) — change the focused window's width by
+    /// the count (default 1).
+    ResizeWidth(bool),
+    /// `<C-w>_` — maximize the focused window's height.
+    MaxHeight,
+    /// `<C-w>|` — maximize the focused window's width.
+    MaxWidth,
+}
+
+/// Resolve the key *after* `<C-w>` into a [`WindowCmd`], or `None` for a key that
+/// is not a window command.
+fn window_command(key: Key) -> Option<WindowCmd> {
+    // A bare `<C-w><C-w>` is the same as `<C-w>w` (cyclic focus) in vim.
+    if key.ctrl {
+        return match key.code {
+            KeyCode::Char('w') => Some(WindowCmd::FocusCycle(true)),
+            _ => None,
+        };
+    }
+    Some(match key.as_char()? {
+        's' => WindowCmd::Split(SplitDir::Horizontal),
+        'v' => WindowCmd::Split(SplitDir::Vertical),
+        'w' => WindowCmd::FocusCycle(true),
+        'W' => WindowCmd::FocusCycle(false),
+        'h' => WindowCmd::FocusDir(WinDir::Left),
+        'j' => WindowCmd::FocusDir(WinDir::Down),
+        'k' => WindowCmd::FocusDir(WinDir::Up),
+        'l' => WindowCmd::FocusDir(WinDir::Right),
+        'c' => WindowCmd::Close,
+        'o' => WindowCmd::Only,
+        'q' => WindowCmd::Quit,
+        '=' => WindowCmd::Equalize,
+        '+' => WindowCmd::ResizeHeight(true),
+        '-' => WindowCmd::ResizeHeight(false),
+        '>' => WindowCmd::ResizeWidth(true),
+        '<' => WindowCmd::ResizeWidth(false),
+        '_' => WindowCmd::MaxHeight,
+        '|' => WindowCmd::MaxWidth,
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum MotionKind {
     Exclusive,
@@ -517,6 +1069,8 @@ enum Stage {
     ReplacePending,
     /// Saw `i`/`a` (operator-pending or visual); the next key is the object kind.
     TextObjectPending(char),
+    /// Saw the `<C-w>` window prefix; the next key is the window command.
+    WindowPending,
 }
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
@@ -549,6 +1103,8 @@ enum ResolvedCommand {
     VisualOperate(char),
     /// A terminal single-key command (insert, paste, scroll, …).
     Normal(NormalCmd),
+    /// A `<C-w>` window command (split, focus, close, …).
+    Window(WindowCmd),
 }
 
 /// What [`parse_step`] decides for `(pending, key)`. Pure: no buffer, no
@@ -626,6 +1182,12 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             return match key.as_char().and_then(ObjectKind::from_key) {
                 Some(kind) => Complete(ResolvedCommand::TextObject { ia, kind }),
                 None => AbortObject,
+            };
+        }
+        Stage::WindowPending => {
+            return match window_command(key) {
+                Some(cmd) => Complete(ResolvedCommand::Window(cmd)),
+                None => Reset,
             };
         }
         Stage::Start | Stage::GPending => {}
@@ -708,8 +1270,16 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         };
     }
 
-    // Ctrl-keyed scrolling, redo, and the alternate-buffer toggle.
+    // Ctrl-keyed scrolling, redo, the alternate-buffer toggle, and the `<C-w>`
+    // window-command prefix.
     if key.ctrl {
+        // `<C-w>` opens the window-command stage (normal mode only — in visual it
+        // is left unbound, as in vim). The second key resolves the command.
+        if key.code == KeyCode::Char('w') && !mode.is_visual() {
+            let mut next = pending.clone();
+            next.stage = Stage::WindowPending;
+            return Prefix(next);
+        }
         return match key.code {
             KeyCode::Char('d') => Complete(RC::Normal(N::ScrollHalf(true))),
             KeyCode::Char('u') => Complete(RC::Normal(N::ScrollHalf(false))),
@@ -944,11 +1514,14 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 
 /// The complete editor state: the open buffers plus the single window's state.
 pub struct Editor {
-    /// All open buffers, keyed by id. [`Editor::current`] selects the one the
-    /// window shows; reach the current text model through [`Editor::buffer`].
+    /// All open buffers, keyed by id. The current buffer is *derived* from the
+    /// focused window ([`Editor::cur_buffer`]); reach its text model through
+    /// [`Editor::buffer`].
     buffers: BufferStore,
-    /// The buffer the window currently shows. Always present in `buffers`.
-    current: BufferId,
+    /// The window layout — the split tree, the focused window, and per-window
+    /// view state. Phase 1 holds exactly one window; the buffer it shows is the
+    /// current buffer.
+    windows: WindowTree,
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
@@ -1117,9 +1690,10 @@ impl Editor {
 
     fn with_buffer(buffer: Buffer) -> Self {
         let (buffers, current) = BufferStore::with_one(buffer);
-        Editor {
+        let windows = WindowTree::with_one(current);
+        let mut editor = Editor {
             buffers,
-            current,
+            windows,
             alternate: None,
             mode: Mode::Normal,
             cursor: Cursor::default(),
@@ -1163,21 +1737,40 @@ impl Editor {
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
             pending_sleep: None,
-        }
+        };
+        // Lay the sole window out into the default area so per-window rect
+        // accessors (text width/height) are valid before the first `resize`.
+        editor.relayout();
+        editor
     }
 
     // ----- public API used by the server -----------------------------------
 
-    /// The current buffer's text model. The window always shows exactly one
+    /// The buffer the focused window shows — the *current* buffer. Derived from
+    /// the window (vim's model) rather than stored independently, so `:b`/`:e`
+    /// rebinding the window's buffer is all it takes to change it.
+    fn cur_buffer(&self) -> BufferId {
+        self.windows.cur().buffer
+    }
+
+    /// Rebind the focused window to show buffer `id`. The buffer-switch seam
+    /// (`enter_buffer`, and the `:bdelete` fallback) writes the current buffer
+    /// through here; it changes only *which* buffer the window shows.
+    fn set_cur_buffer(&mut self, id: BufferId) {
+        self.windows.cur_mut().buffer = id;
+    }
+
+    /// The current buffer's text model. The focused window shows exactly one
     /// buffer; this resolves it through the store, so the rest of the editor can
     /// keep saying `self.buffer()` without caring how many buffers are open.
     pub fn buffer(&self) -> &Buffer {
-        &self.buffers.get(self.current).buffer
+        &self.buffers.get(self.cur_buffer()).buffer
     }
 
     /// Mutable access to the current buffer's text model (see [`Editor::buffer`]).
     pub fn buffer_mut(&mut self) -> &mut Buffer {
-        &mut self.buffers.get_mut(self.current).buffer
+        let id = self.cur_buffer();
+        &mut self.buffers.get_mut(id).buffer
     }
 
     /// Read-only access to buffer `id`'s text model, or `None` if no such buffer
@@ -1203,12 +1796,13 @@ impl Editor {
     /// The current buffer's full editor-side state (text + undo/redo + saved
     /// position). Internal helper for the undo path and switching.
     fn cur_mut(&mut self) -> &mut OpenBuffer {
-        self.buffers.get_mut(self.current)
+        let id = self.cur_buffer();
+        self.buffers.get_mut(id)
     }
 
     /// The id of the buffer the window currently shows.
     pub fn current_buffer_id(&self) -> BufferId {
-        self.current
+        self.cur_buffer()
     }
 
     /// All open buffer ids, ascending (the `nvim_list_bufs` order).
@@ -1268,12 +1862,12 @@ impl Editor {
     /// the current-buffer id changed), so this touches neither `modified` nor the
     /// edit journal — switching a buffer must never make it look edited.
     fn switch_buffer(&mut self, id: BufferId) {
-        if id == self.current || !self.buffers.map.contains_key(&id) {
+        if id == self.cur_buffer() || !self.buffers.map.contains_key(&id) {
             return;
         }
         // Stash the outgoing position with its buffer; it becomes the alternate.
         let (cursor, top) = (self.cursor, self.top);
-        let outgoing = self.current;
+        let outgoing = self.cur_buffer();
         let out = self.buffers.get_mut(outgoing);
         out.saved_cursor = cursor;
         out.saved_top = top;
@@ -1290,7 +1884,7 @@ impl Editor {
     fn enter_buffer(&mut self, id: BufferId) {
         let incoming = self.buffers.get(id);
         let (saved_cursor, saved_top) = (incoming.saved_cursor, incoming.saved_top);
-        self.current = id;
+        self.set_cur_buffer(id);
         self.cursor = saved_cursor;
         self.top = saved_top;
         self.mode = Mode::Normal;
@@ -1309,6 +1903,412 @@ impl Editor {
             Some(id) => self.switch_buffer(id),
             None => self.echo("E23: No alternate file"),
         }
+    }
+
+    // ----- window management ------------------------------------------------
+
+    /// The focused window's id (the `nvim_get_current_win` target).
+    pub fn current_window_id(&self) -> WindowId {
+        self.windows.current
+    }
+
+    /// All window ids in layout order (the `nvim_list_wins` order).
+    pub fn window_ids(&self) -> Vec<WindowId> {
+        self.windows.leaves()
+    }
+
+    /// Number of open windows (always ≥ 1).
+    pub fn window_count(&self) -> usize {
+        self.windows.count()
+    }
+
+    /// The id the next [`Editor::open_split_window`] / split will mint, without
+    /// allocating it. The Lua bridge pushes this into its mirror so
+    /// `nvim_open_win` can return the new handle synchronously (the real window
+    /// is created when the queued op drains).
+    pub fn next_window_id(&self) -> WindowId {
+        WindowId(self.windows.next_id)
+    }
+
+    /// Make window `id` the focused one (`nvim_set_current_win`). A no-op if `id`
+    /// is not open or already current.
+    pub fn set_current_window(&mut self, id: WindowId) {
+        self.focus_window(id);
+    }
+
+    /// The buffer window `id` shows (`nvim_win_get_buf`), or `None` if there is
+    /// no such window.
+    pub fn window_buffer(&self, id: WindowId) -> Option<BufferId> {
+        self.windows.windows.get(&id).map(|w| w.buffer)
+    }
+
+    /// Rebind window `id` to show buffer `buf` *without* changing focus
+    /// (`nvim_win_set_buf`). The focused window swaps its live buffer (like `:b`);
+    /// an inactive window updates its binding and clamps its stashed cursor to the
+    /// new buffer. A no-op if either handle is unknown.
+    pub fn set_window_buffer(&mut self, id: WindowId, buf: BufferId) {
+        if !self.windows.windows.contains_key(&id) || !self.buffers.map.contains_key(&buf) {
+            return;
+        }
+        if id == self.windows.current {
+            self.switch_buffer(buf);
+            return;
+        }
+        let lines = self.buffers.get(buf).buffer.line_count();
+        let w = self.windows.get_mut(id);
+        w.buffer = buf;
+        if w.saved_cursor.line >= lines {
+            w.saved_cursor.line = lines.saturating_sub(1);
+            w.saved_cursor.col = 0;
+        }
+    }
+
+    /// Window `id`'s cursor as `(0-based line, byte col)` — the live cursor for
+    /// the focused window, the stashed one otherwise (`nvim_win_get_cursor`).
+    /// `None` if there is no such window.
+    pub fn window_cursor(&self, id: WindowId) -> Option<(usize, usize)> {
+        let w = self.windows.windows.get(&id)?;
+        let c = if id == self.windows.current {
+            self.cursor
+        } else {
+            w.saved_cursor
+        };
+        Some((c.line, c.col))
+    }
+
+    /// Move window `id`'s cursor to `(0-based line, byte col)` (`nvim_win_set_cursor`).
+    /// The focused window moves its live cursor (clamped, view kept visible); an
+    /// inactive window updates its stashed position (clamped to its buffer's line
+    /// count; the column is re-clamped when the window is next focused). A no-op
+    /// for an unknown id.
+    pub fn set_window_cursor(&mut self, id: WindowId, line: usize, col: usize) {
+        if !self.windows.windows.contains_key(&id) {
+            return;
+        }
+        if id == self.windows.current {
+            self.cursor.line = line;
+            self.cursor.col = col;
+            self.clamp_cursor();
+            self.desired_col = self.cursor_virtcol();
+            self.ensure_visible();
+            return;
+        }
+        let buf = self.windows.get(id).buffer;
+        let lines = self.buffers.get(buf).buffer.line_count();
+        let w = self.windows.get_mut(id);
+        w.saved_cursor.line = line.min(lines.saturating_sub(1));
+        w.saved_cursor.col = col;
+    }
+
+    /// Window `id`'s rect as `(x, y, width, height)` in windows-area cells, or
+    /// `None` if there is no such window. `height` includes the status-line row;
+    /// the API width/height the server returns derive from this.
+    pub fn window_rect(&self, id: WindowId) -> Option<(usize, usize, usize, usize)> {
+        self.windows
+            .windows
+            .get(&id)
+            .map(|w| (w.rect.x, w.rect.y, w.rect.width, w.rect.height))
+    }
+
+    /// Set window `id`'s width to `width` columns (`nvim_win_set_width`), stealing
+    /// from / yielding to a sibling. A no-op with one window or an unknown id.
+    pub fn set_window_width(&mut self, id: WindowId, width: usize) {
+        let Some((_, _, w, _)) = self.window_rect(id) else {
+            return;
+        };
+        self.resize_window_id(id, SplitDir::Vertical, width as isize - w as isize);
+    }
+
+    /// Set window `id`'s text height to `height` rows (`nvim_win_set_height`). The
+    /// rect carries the status line, so the target rect height is `height + 1`. A
+    /// no-op with one window or an unknown id.
+    pub fn set_window_height(&mut self, id: WindowId, height: usize) {
+        let Some((_, _, _, h)) = self.window_rect(id) else {
+            return;
+        };
+        self.resize_window_id(id, SplitDir::Horizontal, (height + 1) as isize - h as isize);
+    }
+
+    /// Close window `id` (`nvim_win_close`). Returns `false` if it is the last
+    /// window (which can't be closed). `force` is accepted for API compatibility;
+    /// closing a window in nxvim never unloads its buffer (the buffer stays in the
+    /// store), so there is nothing to force.
+    pub fn close_window_by_id(&mut self, id: WindowId, _force: bool) -> bool {
+        self.remove_window(id)
+    }
+
+    /// `nvim_open_win` (split form) — split the focused window and bind the new,
+    /// now-focused window to `buf`. Returns the new window's id. `vertical`
+    /// chooses a `:vsplit` over a `:split`.
+    pub fn open_split_window(&mut self, buf: BufferId, vertical: bool) -> WindowId {
+        let dir = if vertical {
+            SplitDir::Vertical
+        } else {
+            SplitDir::Horizontal
+        };
+        self.split(dir);
+        self.switch_buffer(buf);
+        self.windows.current
+    }
+
+    /// Per-window data the [`View`] projection needs: each window's buffer, its
+    /// view position (the *live* `cursor`/`top` for the focused window, the
+    /// stashed `saved_*` for the rest), its computed rect, and whether it holds
+    /// focus. In layout order.
+    pub(crate) fn window_layouts(&self) -> Vec<WindowLayout> {
+        let cur = self.windows.current;
+        self.windows
+            .leaves()
+            .into_iter()
+            .map(|id| {
+                let w = self.windows.get(id);
+                let focused = id == cur;
+                WindowLayout {
+                    buffer: w.buffer,
+                    cursor: if focused { self.cursor } else { w.saved_cursor },
+                    top: if focused { self.top } else { w.saved_top },
+                    rect: w.rect,
+                    focused,
+                }
+            })
+            .collect()
+    }
+
+    /// The split borders the last layout produced (empty with one window).
+    pub(crate) fn separators(&self) -> &[Separator] {
+        &self.windows.separators
+    }
+
+    /// Split the focused window in `dir`: the new window is a clone of the
+    /// current (same buffer, copied cursor/scroll) and takes focus, landing in
+    /// the new top/left window as vim's `:split` / `:vsplit` do. Both windows
+    /// then show the same view position; the old one keeps it via its stash.
+    fn split(&mut self, dir: SplitDir) {
+        let cursor = self.cursor;
+        let top = self.top;
+        let cur = self.windows.current;
+        // Stash the live position into the outgoing window so the old (bottom /
+        // right) sibling keeps its view; seed the new window from the same spot.
+        {
+            let w = self.windows.get_mut(cur);
+            w.saved_cursor = cursor;
+            w.saved_top = top;
+        }
+        let buffer = self.windows.get(cur).buffer;
+        let new_id = self.windows.alloc_id();
+        self.windows.windows.insert(
+            new_id,
+            Window {
+                buffer,
+                saved_cursor: cursor,
+                saved_top: top,
+                rect: Rect::default(),
+            },
+        );
+        split_leaf(&mut self.windows.root, cur, dir, new_id);
+        self.windows.current = new_id;
+        // The new window shows the same buffer at the same position, so the live
+        // `cursor`/`top` already describe it — only the viewport shrank.
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// `<C-w>c` / `:close` — close the focused window and expand a neighbor to
+    /// fill the freed area. Refuses to close the last window (vim's `E444`); the
+    /// quit-when-last semantics belong to `:q`.
+    fn close_window(&mut self) {
+        let cur = self.windows.current;
+        if !self.remove_window(cur) {
+            self.echo("E444: Cannot close last window");
+        }
+    }
+
+    /// Remove window `id` (focused or not) and collapse its parent split. When
+    /// the closed window held focus, the spatially nearest survivor takes it (and
+    /// its view position is restored); otherwise focus is untouched. Returns
+    /// `false` — without touching the layout — if `id` is the last window (it
+    /// can't be closed) or not open. Shared by `<C-w>c`/`:close` and the
+    /// `nvim_win_close` API.
+    fn remove_window(&mut self, id: WindowId) -> bool {
+        if self.windows.count() <= 1 || !self.windows.windows.contains_key(&id) {
+            return false;
+        }
+        let closing_rect = self.windows.get(id).rect;
+        let was_focused = id == self.windows.current;
+        remove_leaf(&mut self.windows.root, id);
+        self.windows.windows.remove(&id);
+        if was_focused {
+            // Pick the spatially nearest survivor (using the pre-relayout rects)
+            // as the new focus, then re-lay and restore its view.
+            let new_cur = self.nearest_window(closing_rect);
+            self.relayout();
+            self.enter_window(new_cur);
+        } else {
+            self.relayout();
+            self.ensure_visible();
+        }
+        true
+    }
+
+    /// `<C-w>o` / `:only` — drop every window but the focused one, which expands
+    /// to the whole area. A no-op with a single window. The kept window stays
+    /// focused, so the live view position is untouched.
+    fn only_window(&mut self) {
+        if self.windows.count() <= 1 {
+            return;
+        }
+        let keep = self.windows.current;
+        self.windows.windows.retain(|id, _| *id == keep);
+        self.windows.root = Node::Leaf(keep);
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// `<C-w>=` / `:wincmd =` — reset every split to even shares and re-lay.
+    fn equalize_windows(&mut self) {
+        equalize_node(&mut self.windows.root);
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// `<C-w>+`/`-` (height) and `<C-w>>`/`<` (width), and `:resize`/`:vertical
+    /// resize` — grow or shrink the focused window by `delta` cells along `axis`,
+    /// stealing from (or yielding to) a sibling. A no-op with a single window or
+    /// no ancestor split of that orientation. `sizes` are in cells after the last
+    /// layout, so this is plain cell arithmetic; the re-layout repaints it.
+    fn resize_window(&mut self, axis: SplitDir, delta: isize) {
+        let cur = self.windows.current;
+        self.resize_window_id(cur, axis, delta);
+    }
+
+    /// Resize window `id` (focused or not) by `delta` cells along `axis`. The
+    /// id-targeting core of [`Editor::resize_window`], shared with the
+    /// `nvim_win_set_width`/`set_height` API. A no-op with one window, a zero
+    /// delta, or an unknown id.
+    fn resize_window_id(&mut self, id: WindowId, axis: SplitDir, delta: isize) {
+        if delta == 0 || self.windows.count() <= 1 || !self.windows.windows.contains_key(&id) {
+            return;
+        }
+        let mut done = false;
+        resize_toward(&mut self.windows.root, id, axis, delta, &mut done);
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// `<C-w>_` (height) / `<C-w>|` (width) — maximize the focused window along
+    /// `axis`, shrinking the others to the minimum. A no-op with one window.
+    fn maximize_window(&mut self, axis: SplitDir) {
+        if self.windows.count() <= 1 {
+            return;
+        }
+        let cur = self.windows.current;
+        maximize_toward(&mut self.windows.root, cur, axis);
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// The surviving window whose rect center is closest to `from` — the
+    /// new-focus pick after a close. Survivors are read from the (post-removal)
+    /// tree; rects are still the pre-relayout values, which is exactly what
+    /// "nearest to where the closed window was" wants.
+    fn nearest_window(&self, from: Rect) -> WindowId {
+        let (fx, fy) = from.center();
+        self.windows
+            .leaves()
+            .into_iter()
+            .min_by_key(|id| {
+                let (cx, cy) = self.windows.get(*id).rect.center();
+                fx.abs_diff(cx) + fy.abs_diff(cy)
+            })
+            .expect("closing a non-last window always leaves a survivor")
+    }
+
+    /// Move focus to the nearest window in `dir` (vim's `<C-w>h/j/k/l`). Only
+    /// windows wholly on that side qualify; the closest by center wins. A no-op
+    /// if there is none that way.
+    fn focus_dir(&mut self, dir: WinDir) {
+        let cur = self.windows.current;
+        let from = self.windows.get(cur).rect;
+        let (fx, fy) = from.center();
+        let target = self
+            .windows
+            .leaves()
+            .into_iter()
+            .filter(|id| *id != cur)
+            .filter(|id| {
+                let r = self.windows.get(*id).rect;
+                match dir {
+                    WinDir::Left => r.x + r.width <= from.x,
+                    WinDir::Right => r.x >= from.x + from.width,
+                    WinDir::Up => r.y + r.height <= from.y,
+                    WinDir::Down => r.y >= from.y + from.height,
+                }
+            })
+            .min_by_key(|id| {
+                let (cx, cy) = self.windows.get(*id).rect.center();
+                fx.abs_diff(cx) + fy.abs_diff(cy)
+            });
+        if let Some(id) = target {
+            self.focus_window(id);
+        }
+    }
+
+    /// Cyclic window focus (vim's `<C-w>w` forward / `<C-w>W` backward), wrapping
+    /// around the layout order.
+    fn focus_cycle(&mut self, forward: bool) {
+        let order = self.windows.leaves();
+        let n = order.len();
+        if n <= 1 {
+            return;
+        }
+        let cur = self.windows.current;
+        let i = order.iter().position(|id| *id == cur).unwrap_or(0);
+        let next = if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        };
+        self.focus_window(order[next]);
+    }
+
+    /// The window analogue of [`Editor::switch_buffer`]: stash the focused
+    /// window's live view position, then make `id` current and restore its view.
+    /// A no-op if `id` is already focused or not a live window.
+    fn focus_window(&mut self, id: WindowId) {
+        if id == self.windows.current || !self.windows.windows.contains_key(&id) {
+            return;
+        }
+        let cursor = self.cursor;
+        let top = self.top;
+        let out = self.windows.current;
+        {
+            let w = self.windows.get_mut(out);
+            w.saved_cursor = cursor;
+            w.saved_top = top;
+        }
+        self.enter_window(id);
+    }
+
+    /// Make `id` the current window, restoring the buffer it shows and its saved
+    /// view position, landing in normal mode with transient state cleared. The
+    /// window analogue of [`Editor::enter_buffer`]: it does *not* stash the
+    /// outgoing window (the caller did, or it is being closed). The restored
+    /// cursor is clamped to the buffer's current line count (it may have shrunk
+    /// while this window was inactive).
+    fn enter_window(&mut self, id: WindowId) {
+        self.windows.current = id;
+        let w = self.windows.get(id);
+        let (buffer, cursor, top) = (w.buffer, w.saved_cursor, w.saved_top);
+        self.set_cur_buffer(buffer);
+        self.cursor = cursor;
+        self.top = top;
+        self.mode = Mode::Normal;
+        self.reset_pending();
+        self.scroll_from = None;
+        self.pending_scroll = None;
+        self.message.clear();
+        self.clamp_cursor();
+        self.ensure_visible();
     }
 
     /// The id of an already-open buffer bound to `path`, if any. Matches by
@@ -1476,7 +2476,7 @@ impl Editor {
             }
         }
         self.buffers.get_mut(id).buffer.normalize();
-        if id == self.current {
+        if id == self.cur_buffer() {
             self.clamp_cursor();
             self.desired_col = self.cursor_virtcol();
             self.desired_eol = false;
@@ -1496,7 +2496,7 @@ impl Editor {
     fn push_undo_for(&mut self, id: BufferId) {
         let (text, cursor, seq) = {
             let ob = self.buffers.get(id);
-            let cursor = if id == self.current {
+            let cursor = if id == self.cur_buffer() {
                 self.cursor
             } else {
                 ob.saved_cursor
@@ -1516,7 +2516,23 @@ impl Editor {
     pub fn resize(&mut self, width: usize, height: usize) {
         self.width = width.max(1);
         self.height = height.max(1);
+        self.relayout();
         self.ensure_visible();
+    }
+
+    /// Re-divide the current terminal area across the window tree. The windows
+    /// area excludes the global bottom panel (it docks below all windows); the
+    /// command/message line is the client's own row, already excluded from the
+    /// height the client reports. Re-run on resize and whenever the panel opens
+    /// or closes (which grows/shrinks the windows area).
+    fn relayout(&mut self) {
+        let height = self.height.saturating_sub(self.panel_rows());
+        self.windows.layout(Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height,
+        });
     }
 
     /// Take any pending `:sleep` duration in milliseconds, clearing it. The
@@ -1622,13 +2638,6 @@ impl Editor {
         view
     }
 
-    /// Width in cells available for buffer text: the text-area width minus the
-    /// number column. Selection fills measure against this (and future soft-wrap
-    /// / horizontal scroll will too), so the gutter is never counted as text.
-    pub(crate) fn text_width(&self) -> usize {
-        self.width.saturating_sub(self.number_width())
-    }
-
     pub(crate) fn pending_scroll(&self) -> Option<PendingScroll> {
         self.pending_scroll
     }
@@ -1647,8 +2656,10 @@ impl Editor {
     }
 
     pub(crate) fn text_height(&self) -> usize {
-        // The panel (when open) eats rows off the bottom of the text window.
-        self.height.saturating_sub(self.panel_rows()).max(1)
+        // The window's own rows minus its status line. The panel is already
+        // excluded from the window rect by `relayout`, so it is not subtracted
+        // again here.
+        self.windows.cur().rect.height.saturating_sub(1).max(1)
     }
 
     // ----- normal / visual mode --------------------------------------------
@@ -1734,6 +2745,33 @@ impl Editor {
             }
             ResolvedCommand::VisualOperate(op) => self.visual_operate(op),
             ResolvedCommand::Normal(cmd) => self.execute_normal(cmd),
+            ResolvedCommand::Window(cmd) => self.execute_window(cmd),
+        }
+    }
+
+    /// Apply a `<C-w>` window command. Pending state is already a clean boundary
+    /// (the prefix consumed it), so each arm just drives the window layout.
+    fn execute_window(&mut self, cmd: WindowCmd) {
+        // The resize family honors a leading count (`3<C-w>+`); read it before
+        // the pending state is cleared.
+        let count = self.effective_count() as isize;
+        self.reset_pending();
+        match cmd {
+            WindowCmd::Split(dir) => self.split(dir),
+            WindowCmd::FocusDir(dir) => self.focus_dir(dir),
+            WindowCmd::FocusCycle(forward) => self.focus_cycle(forward),
+            WindowCmd::Close => self.close_window(),
+            WindowCmd::Only => self.only_window(),
+            WindowCmd::Quit => self.ex_quit(false),
+            WindowCmd::Equalize => self.equalize_windows(),
+            WindowCmd::ResizeHeight(grow) => {
+                self.resize_window(SplitDir::Horizontal, if grow { count } else { -count })
+            }
+            WindowCmd::ResizeWidth(grow) => {
+                self.resize_window(SplitDir::Vertical, if grow { count } else { -count })
+            }
+            WindowCmd::MaxHeight => self.maximize_window(SplitDir::Horizontal),
+            WindowCmd::MaxWidth => self.maximize_window(SplitDir::Vertical),
         }
     }
 
@@ -3739,8 +4777,11 @@ impl Editor {
     /// nothing should show: while typing an `incsearch` the live command line
     /// lights up, otherwise the last search does — but only while `hlsearch` is on
     /// and a search is active (cleared by `:noh`).
-    pub(crate) fn search_highlights(
+    pub(crate) fn search_highlights_in(
         &self,
+        buf: &Buffer,
+        cursor: Cursor,
+        focused: bool,
         base: usize,
         count: usize,
     ) -> (SearchSpans, IncSearchSpans) {
@@ -3751,7 +4792,10 @@ impl Editor {
             CmdlineKind::Search(dir) => Some(dir),
             CmdlineKind::Ex | CmdlineKind::Prompt | CmdlineKind::Confirm => None,
         };
-        let incsearch = self.mode == Mode::Command
+        // The live incsearch preview belongs to the focused window (the command
+        // line is there); `hlsearch` is global and shows in every window.
+        let incsearch = focused
+            && self.mode == Mode::Command
             && search_dir.is_some()
             && self.options.incsearch
             && !self.cmdline.is_empty();
@@ -3771,14 +4815,14 @@ impl Editor {
         let Ok(re) = self.compile_search(&pattern) else {
             return (matches, current);
         };
-        let line_count = self.buffer().line_count();
+        let line_count = buf.line_count();
 
         for (row, row_spans) in matches.iter_mut().enumerate() {
             let buf_line = base + row;
             if buf_line >= line_count {
                 break;
             }
-            let text = self.buffer().line(buf_line);
+            let text = buf.line(buf_line);
             for (s, e) in re.find_all(&text) {
                 let span = (
                     unicode::virtcol(&text, s, unicode::TABSTOP),
@@ -3787,7 +4831,7 @@ impl Editor {
                 row_spans.push(span);
                 // The preview cursor sits on the start of its match, so an exact
                 // column hit on the cursor's line marks the current match.
-                if incsearch && buf_line == self.cursor.line && s == self.cursor.col {
+                if incsearch && buf_line == cursor.line && s == cursor.col {
                     current[row] = Some(span);
                 }
             }
@@ -3879,20 +4923,29 @@ impl Editor {
             "w" | "write" => self.ex_write(args),
             "q" | "quit" => self.ex_quit(bang),
             "wq" | "x" | "xit" | "exit" => {
-                // Write the current buffer, then quit (`:q` rules: exit unless
-                // another buffer is still unsaved). A failed write leaves the
-                // current buffer modified, so `:q` then reports it.
+                // Write the current buffer, then `:q` it (close the window, or
+                // quit on the last window). A failed write leaves the buffer
+                // modified, so a last-window quit then reports it.
                 self.ex_write(args);
                 self.ex_quit(bang);
             }
-            "qa" | "qall" | "quita" | "quitall" => self.ex_quit(bang),
+            "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
             "wa" | "wall" => self.ex_write_all(),
             "wqa" | "xa" | "xall" => {
                 self.ex_write_all();
-                self.ex_quit(bang);
+                self.ex_quit_all(bang);
             }
             "e" | "edit" => self.ex_edit(args, bang),
             "ene" | "enew" => self.ex_enew(),
+            "sp" | "spl" | "split" => self.ex_split(SplitDir::Horizontal, args),
+            "vs" | "vsp" | "vsplit" | "vspl" => self.ex_split(SplitDir::Vertical, args),
+            "new" => self.ex_new(SplitDir::Horizontal),
+            "vne" | "vnew" => self.ex_new(SplitDir::Vertical),
+            "clo" | "close" => self.close_window(),
+            "hid" | "hide" => self.close_window(),
+            "on" | "only" => self.only_window(),
+            "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
+            "vert" | "vertical" | "ver" => self.ex_vertical(args),
             "ls" | "buffers" | "files" => self.ex_buffers(),
             "b" | "bu" | "buf" | "buffer" => {
                 if let Some(id) = self.resolve_buffer(args) {
@@ -3954,14 +5007,27 @@ impl Editor {
         }
     }
 
-    /// `:q` — quit the editor, but only if nothing would be lost. With `!`, exit
-    /// unconditionally (discarding every buffer). Otherwise, if any buffer has
-    /// unsaved changes, *don't* quit: switch the window to that buffer (the
-    /// current one if it's the one modified, else the lowest-numbered modified
-    /// buffer) and report `E37`, so the user sees what's blocking the quit. With
-    /// no modified buffers, exit. (Single-window nxvim, so `:q` and `:qa` are the
-    /// same; real windows will split them later.)
+    /// `:q` / `<C-w>q` — close the focused window. With more than one window open
+    /// this is exactly `<C-w>c`: the window goes away and its buffer stays in the
+    /// store (other windows may still show it, or it's reachable via `:b`), so
+    /// there is nothing to lose and no modified guard — closing a non-last window
+    /// onto a modified buffer is fine. Only the **last** window is a real editor
+    /// quit, which defers to [`Self::ex_quit_all`] (and its `E37` guard).
     fn ex_quit(&mut self, bang: bool) {
+        if self.windows.count() > 1 {
+            self.close_window();
+            return;
+        }
+        self.ex_quit_all(bang);
+    }
+
+    /// `:qa` (and last-window `:q`) — quit the *editor*, but only if nothing
+    /// would be lost. With `!`, exit unconditionally (discarding every buffer).
+    /// Otherwise, if any buffer has unsaved changes, *don't* quit: switch the
+    /// window to that buffer (the current one if it's the one modified, else the
+    /// lowest-numbered modified buffer) and report `E37`, so the user sees what's
+    /// blocking the quit. With no modified buffers, exit.
+    fn ex_quit_all(&mut self, bang: bool) {
         if bang {
             self.should_quit = true;
             return;
@@ -4036,6 +5102,73 @@ impl Editor {
         }
     }
 
+    /// `:split [file]` / `:vsplit [file]` — split the focused window, then (with a
+    /// file argument) `:edit` it in the new window. With no argument both windows
+    /// show the same buffer.
+    fn ex_split(&mut self, dir: SplitDir, args: &str) {
+        self.split(dir);
+        let file = args.trim();
+        if !file.is_empty() {
+            self.ex_edit(file, false);
+        }
+    }
+
+    /// `:new` / `:vnew` — split the focused window and open a fresh `[No Name]`
+    /// buffer in the new window.
+    fn ex_new(&mut self, dir: SplitDir) {
+        self.split(dir);
+        self.ex_enew();
+    }
+
+    /// `:res[ize] {n}` — set the focused window's height; `:vertical resize {n}`
+    /// routes here with `axis = Vertical` for its width. `{n}` is absolute; `+n`
+    /// / `-n` are relative. A bare `:resize` maximizes along the axis (vim). The
+    /// extent is text rows for height (the status line is excluded, as in vim) and
+    /// columns for width.
+    fn ex_resize(&mut self, axis: SplitDir, args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            self.maximize_window(axis);
+            return;
+        }
+        let delta = if let Some(rest) = arg.strip_prefix('+') {
+            rest.trim().parse::<isize>().ok()
+        } else if let Some(rest) = arg.strip_prefix('-') {
+            rest.trim().parse::<isize>().ok().map(|n| -n)
+        } else {
+            // Absolute: aim for `target` and resize by the difference from the
+            // current extent.
+            match arg.parse::<usize>() {
+                Ok(target) => {
+                    let rect = self.windows.cur().rect;
+                    let current = match axis {
+                        SplitDir::Horizontal => rect.height.saturating_sub(1),
+                        SplitDir::Vertical => rect.width,
+                    };
+                    Some(target as isize - current as isize)
+                }
+                Err(_) => None,
+            }
+        };
+        match delta {
+            Some(d) => self.resize_window(axis, d),
+            None => self.echo("E487: Argument must be a number"),
+        }
+    }
+
+    /// `:vertical {cmd}` — the `vertical` modifier. Re-routes the split / resize
+    /// commands to their vertical (width-dividing) form.
+    fn ex_vertical(&mut self, args: &str) {
+        let (name, _bang, rest) = split_ex(args.trim());
+        match name {
+            "res" | "resize" => self.ex_resize(SplitDir::Vertical, rest),
+            "sp" | "spl" | "split" => self.ex_split(SplitDir::Vertical, rest),
+            "new" => self.ex_new(SplitDir::Vertical),
+            "" => self.echo("E471: Argument required"),
+            _ => self.deferred_commands.push(format!("vertical {args}")),
+        }
+    }
+
     /// `:enew` — open a new, empty `[No Name]` buffer in the window. Reuses a
     /// throwaway current buffer rather than stacking another empty one.
     fn ex_enew(&mut self) {
@@ -4064,7 +5197,7 @@ impl Editor {
     /// row (id-sorted), with vim's flag columns: `%` current / `#` alternate,
     /// `a` active / `h` hidden, `+` modified.
     fn ex_buffers(&mut self) {
-        let current = self.current;
+        let current = self.cur_buffer();
         let alternate = self.alternate;
         let live_cursor = self.cursor.line;
         let mut lines = Vec::new();
@@ -4123,7 +5256,7 @@ impl Editor {
     fn resolve_buffer(&mut self, arg: &str) -> Option<BufferId> {
         let arg = arg.trim();
         if arg.is_empty() {
-            return Some(self.current);
+            return Some(self.cur_buffer());
         }
         if arg == "#" {
             return match self.alternate {
@@ -4172,7 +5305,7 @@ impl Editor {
     fn ex_bnext(&mut self, count: usize) {
         let ids = self.buffer_ids();
         let len = ids.len();
-        if let Some(i) = ids.iter().position(|id| *id == self.current) {
+        if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
             self.switch_buffer(ids[(i + count) % len]);
         }
     }
@@ -4181,7 +5314,7 @@ impl Editor {
     fn ex_bprev(&mut self, count: usize) {
         let ids = self.buffer_ids();
         let len = ids.len();
-        if let Some(i) = ids.iter().position(|id| *id == self.current) {
+        if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
             self.switch_buffer(ids[(i + len - count % len) % len]);
         }
     }
@@ -4218,7 +5351,7 @@ impl Editor {
 
         // When removing the current buffer, move to the alternate if it's a
         // distinct, still-open buffer (vim's behavior), else the nearest id.
-        let was_current = target == self.current;
+        let was_current = target == self.cur_buffer();
         let replacement = if was_current {
             self.alternate
                 .filter(|a| *a != target && self.buffers.map.contains_key(a))
@@ -4234,7 +5367,7 @@ impl Editor {
         if self.buffers.map.is_empty() {
             // Never leave zero buffers: open a fresh, empty one in the window.
             let id = self.add_buffer(Buffer::empty());
-            self.current = id;
+            self.set_cur_buffer(id);
             self.alternate = None;
             self.cursor = Cursor::default();
             self.top = 0;
@@ -4300,6 +5433,8 @@ impl Editor {
             wants_select,
             targets: Vec::new(),
         });
+        // The panel claimed rows off the bottom: shrink the windows area to match.
+        self.relayout();
         self.ensure_visible();
         self.scroll_panel_into_view();
     }
@@ -4426,6 +5561,8 @@ impl Editor {
         if let Some(closed) = self.panel.take() {
             self.last_panel = Some(closed);
         }
+        // The windows area grows back into the rows the panel held.
+        self.relayout();
         self.ensure_visible();
     }
 
@@ -4447,6 +5584,8 @@ impl Editor {
             gpending: false,
             ..panel
         });
+        // Reopening reclaims the panel's rows from the windows area.
+        self.relayout();
         self.ensure_visible();
         self.scroll_panel_into_view();
         true
@@ -4645,15 +5784,15 @@ impl Editor {
         }
     }
 
-    /// Width in cells of the line-number column, `0` when no number option is
-    /// on. Sized like vim: at least 4 cells, widening to fit the buffer's
-    /// largest line number plus one trailing space.
-    pub(crate) fn number_width(&self) -> usize {
+    /// The number-gutter width for a window showing a buffer with `line_count`
+    /// lines: `0` when both number options are off, else at least 4 cells,
+    /// widening to fit the largest line number plus one trailing space. Sized
+    /// per window so each gutter fits its own buffer.
+    pub(crate) fn number_width_for(&self, line_count: usize) -> usize {
         if !self.options.number && !self.options.relativenumber {
             return 0;
         }
-        let digits = digit_count(self.buffer().line_count());
-        (digits + 1).max(4)
+        (digit_count(line_count) + 1).max(4)
     }
 
     // ----- undo / redo ------------------------------------------------------
@@ -4664,7 +5803,7 @@ impl Editor {
         Snapshot {
             text: self.buffer().text.clone(),
             cursor: self.cursor,
-            seq: self.buffers.get(self.current).cur_seq,
+            seq: self.buffers.get(self.cur_buffer()).cur_seq,
         }
     }
 

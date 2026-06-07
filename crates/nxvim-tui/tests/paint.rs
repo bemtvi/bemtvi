@@ -112,6 +112,68 @@ fn status_row_is_reversed() {
     assert!(reversed(&buf, 0, 3), "status row should be reverse-video");
 }
 
+/// A `{ x, y, width, height }` rect sub-map.
+fn rect(x: u64, y: u64, w: u64, h: u64) -> Value {
+    Value::Map(vec![
+        (Value::from("x"), Value::from(x)),
+        (Value::from("y"), Value::from(y)),
+        (Value::from("width"), Value::from(w)),
+        (Value::from("height"), Value::from(h)),
+    ])
+}
+
+/// One window sub-map for the `windows` redraw array.
+fn window(r: Value, focused: bool, file: &str, text: &[&str]) -> Value {
+    Value::Map(vec![
+        (Value::from("rect"), r),
+        (Value::from("focused"), Value::from(focused)),
+        (Value::from("lines"), lines(text)),
+        (Value::from("file_name"), Value::from(file)),
+        (Value::from("cursor_line"), Value::from(1u64)),
+    ])
+}
+
+#[test]
+fn two_stacked_windows_each_paint_text_a_status_line_and_a_separator() {
+    // A 20×10 grid: the windows area is rows 0..9 (the command line is row 9),
+    // split into a top window (rows 0..4), a horizontal separator (row 4), and a
+    // bottom window (rows 5..9). Each window paints its text on its top rows and
+    // a status line on its bottom row; the bottom window holds focus.
+    let windows = Value::Array(vec![
+        window(rect(0, 0, 20, 4), false, "top.txt", &["top text"]),
+        window(rect(0, 5, 20, 4), true, "bot.txt", &["bottom text"]),
+    ]);
+    let separators = Value::Array(vec![Value::Map(vec![
+        (Value::from("vertical"), Value::from(false)),
+        (Value::from("x"), Value::from(0u64)),
+        (Value::from("y"), Value::from(4u64)),
+        (Value::from("length"), Value::from(20u64)),
+    ])]);
+    let v = view(vec![("windows", windows), ("separators", separators)]);
+    let buf = paint(&v, 20, 10);
+
+    // Top window: text on row 0, its own status line on row 3.
+    assert_eq!(row_text(&buf, 0).trim_end(), "top text");
+    assert!(
+        row_text(&buf, 3).contains("top.txt"),
+        "top status: {:?}",
+        row_text(&buf, 3)
+    );
+    // The horizontal separator between the windows.
+    assert_eq!(row_text(&buf, 4), "─".repeat(20));
+    // Bottom window: text on row 5, its own status line on row 8.
+    assert_eq!(row_text(&buf, 5).trim_end(), "bottom text");
+    assert!(
+        row_text(&buf, 8).contains("bot.txt"),
+        "bottom status: {:?}",
+        row_text(&buf, 8)
+    );
+    // Both status rows are reverse-video; the command row (9) is blank.
+    assert!(reversed(&buf, 0, 3), "top status reversed");
+    assert!(reversed(&buf, 0, 8), "bottom status reversed");
+    assert_eq!(row_text(&buf, 9).trim_end(), "");
+}
+
 #[test]
 fn a_selection_span_highlights_exactly_its_cells() {
     let sel = Value::Array(vec![Value::Array(vec![

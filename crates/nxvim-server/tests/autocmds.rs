@@ -165,6 +165,16 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// `nvim_exec_lua(code)` -> its return value (a synchronous Lua getter).
+async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![Value::from(code), Value::Array(vec![])],
+    )
+    .await
+    .expect("nvim_exec_lua")
+}
+
 #[tokio::test]
 async fn exec_autocmds_runs_callback_with_buffer_and_match_args() {
     // A callback registered for a custom event runs on nvim_exec_autocmds and
@@ -444,4 +454,123 @@ async fn insertenter_sees_buffer_context() {
     redraw_after(&rpc, &mut incoming, "i<Esc>").await;
     let msg = lua_message(&rpc, &mut incoming, "print(_G.seen)").await;
     assert_eq!(msg, format!("1:{}", file.display()));
+}
+
+// ----- Phase 5: window lifecycle events --------------------------------------
+
+#[tokio::test]
+async fn splitting_fires_winnew_winleave_winenter_in_order() {
+    // `<C-w>s` creates a window (WinNew), leaves the old one (WinLeave), and
+    // enters the new one (WinEnter). The `match` is the window id, so each marker
+    // carries which window fired.
+    let dir = temp_dir("au_win_split");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
+         vim.api.nvim_create_autocmd('WinNew', { callback = rec('new') })\n\
+         vim.api.nvim_create_autocmd('WinLeave', { callback = rec('leave') })\n\
+         vim.api.nvim_create_autocmd('WinEnter', { callback = rec('enter') })\n",
+    )
+    .await;
+    // Drop the startup WinEnter(1) so we observe only the split's events.
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    redraw_after(&rpc, &mut incoming, "<C-w>s").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "new2,leave1,enter2");
+}
+
+#[tokio::test]
+async fn closing_a_window_fires_winclosed_then_winenter_survivor() {
+    // `<C-w>c` on the focused window fires WinClosed for it and WinEnter for the
+    // survivor that takes focus.
+    let dir = temp_dir("au_win_close");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
+         vim.api.nvim_create_autocmd('WinClosed', { callback = rec('closed') })\n\
+         vim.api.nvim_create_autocmd('WinEnter', { callback = rec('enter') })\n",
+    )
+    .await;
+    // Split (focus moves to the new window 2), then clear the log.
+    redraw_after(&rpc, &mut incoming, "<C-w>s").await;
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    // Close the focused window 2; window 1 survives and takes focus.
+    redraw_after(&rpc, &mut incoming, "<C-w>c").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "closed2,enter1");
+}
+
+#[tokio::test]
+async fn focus_motion_fires_winleave_and_winenter() {
+    let dir = temp_dir("au_win_focus");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
+         vim.api.nvim_create_autocmd('WinLeave', { callback = rec('leave') })\n\
+         vim.api.nvim_create_autocmd('WinEnter', { callback = rec('enter') })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "<C-w>s").await; // two windows, focus on 2
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
+    // `<C-w>j` moves focus from window 2 (top) down to window 1 (bottom).
+    redraw_after(&rpc, &mut incoming, "<C-w>j").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "leave2,enter1");
+}
+
+#[tokio::test]
+async fn nvim_open_win_creates_a_window_and_fires_winnew() {
+    // The programmatic split form of nvim_open_win: open a fresh buffer in a new
+    // window. WinNew fires for the new window, and it ends up in vim's window list.
+    let dir = temp_dir("au_open_win");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.new = {}\n\
+         vim.api.nvim_create_autocmd('WinNew', {\n\
+         \x20 callback = function(a) _G.new[#_G.new+1] = a.match end })\n",
+    )
+    .await;
+    lua_message(&rpc, &mut incoming, "_G.new = {}").await;
+    // Open the current buffer (handle 0) in a new split window.
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "_G.win = vim.api.nvim_open_win(0, true, { vertical = false }); \
+         print(#vim.api.nvim_list_wins() .. ',' .. tostring(_G.win))",
+    )
+    .await;
+    // Two windows now; the returned handle is the new window's id.
+    let parts: Vec<&str> = msg.split(',').collect();
+    assert_eq!(parts[0], "2", "open_win added a second window: {msg}");
+    // WinNew fired for the new window (its id matches the returned handle).
+    let fired = lua_message(&rpc, &mut incoming, "print(table.concat(_G.new, ','))").await;
+    assert_eq!(fired, parts[1], "WinNew fired for the opened window {msg}");
+}
+
+#[tokio::test]
+async fn examples_windows_config_loads_and_drives_the_window_api() {
+    // End-to-end check of the shipped `examples/windows/` config: source its real
+    // init.lua, then exercise the helper commands it defines. Proves the example
+    // is runnable (no Lua errors) and that its window API + autocmds work.
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/windows/init.lua");
+    let init = std::fs::read_to_string(&example).expect("read examples/windows/init.lua");
+    let dir = temp_dir("examples_windows");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    // The config defines :WinDemo (opens a split via nvim_open_win) and :WinList.
+    redraw_after(&rpc, &mut incoming, ":WinDemo<CR>").await;
+    let count = exec_lua(&rpc, r#"return #vim.api.nvim_list_wins()"#).await;
+    assert_eq!(count.as_u64(), Some(2), ":WinDemo opened a second window");
+
+    // The window autocmds recorded the lifecycle (at least the WinNew/WinEnter the
+    // split produced).
+    let logged = exec_lua(&rpc, r#"return #_G.win_log"#).await;
+    assert!(
+        logged.as_u64().unwrap_or(0) >= 1,
+        "window events were recorded"
+    );
 }

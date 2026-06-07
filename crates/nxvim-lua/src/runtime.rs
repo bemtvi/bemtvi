@@ -16,7 +16,7 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, HlSet, LoopOp, LspClientData, LspOp, PanelOp,
-    RawKeymap, RawRhs, UiInputReq,
+    RawKeymap, RawRhs, UiInputReq, WindowOp,
 };
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -62,6 +62,10 @@ pub(crate) struct Shared {
     /// Buffer mutations from `vim.api.nvim_buf_set_lines`, drained by the server
     /// into the live editor after the chunk (Phase 6).
     pub(crate) buf_ops: Vec<BufOp>,
+    /// Window mutations from the `vim.api.nvim_win_*` / `nvim_open_win` /
+    /// `nvim_set_current_win` API, drained by the server into the live editor
+    /// after the chunk (Phase 5).
+    pub(crate) window_ops: Vec<WindowOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
@@ -310,6 +314,12 @@ impl LuaRuntime {
     /// drain, for the server to apply to the live editor (Phase 6).
     pub fn take_buf_ops(&self) -> Vec<BufOp> {
         std::mem::take(&mut self.shared.borrow_mut().buf_ops)
+    }
+
+    /// Take the window mutations queued by the `vim.api.nvim_win_*` family since
+    /// the last drain, for the server to apply to the live editor (Phase 5).
+    pub fn take_window_ops(&self) -> Vec<WindowOp> {
+        std::mem::take(&mut self.shared.borrow_mut().window_ops)
     }
 
     /// Take the `vim.ui.input` prompt requests queued since the last drain, for
@@ -569,11 +579,19 @@ impl LuaRuntime {
     /// the caller is only refreshing the cheap cursor/window fields (the server
     /// gates the line arrays on `changedtick`), in which case the existing mirror
     /// `lines` are kept.
+    /// `wins` is one entry per open window in layout order: `(id, buffer, row
+    /// (1-based), col, width, height (text rows))`. `cur_win` is the focused id
+    /// and `next_win` the id the next `nvim_open_win` will mint (so the Lua side
+    /// can return the new handle synchronously while the real window is created
+    /// when the queued op drains).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,
         bufs: &[(u64, Option<Vec<String>>, String)],
         cursor: (u64, u64),
         win: u64,
+        wins: &[(u64, u64, u64, u64, u64, u64)],
+        next_win: u64,
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
@@ -590,8 +608,19 @@ impl LuaRuntime {
             entry.set("bufnr", *bufnr)?;
             entries.set(*bufnr, entry)?;
         }
+        let win_arr = self.lua.create_table()?;
+        for (i, (id, buffer, row, col, width, height)) in wins.iter().enumerate() {
+            let w = self.lua.create_table()?;
+            w.set("id", *id)?;
+            w.set("buffer", *buffer)?;
+            w.set("row", *row)?;
+            w.set("col", *col)?;
+            w.set("width", *width)?;
+            w.set("height", *height)?;
+            win_arr.set(i + 1, w)?;
+        }
         let set: mlua::Function = vim.get("_set_buf_mirror")?;
-        set.call((entries, cursor.0, cursor.1, win))
+        set.call((entries, cursor.0, cursor.1, win, win_arr, next_win))
     }
 
     /// Whether `name` was registered via `nvim_create_user_command` (so the

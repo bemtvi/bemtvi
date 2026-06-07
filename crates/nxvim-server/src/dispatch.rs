@@ -3,7 +3,7 @@
 
 use crate::redraw::{lines_value, style_value};
 use crate::Server;
-use nxvim_core::BufferId;
+use nxvim_core::{BufferId, WindowId};
 use nxvim_rpc::Incoming;
 use rmpv::Value;
 
@@ -95,11 +95,121 @@ impl Server {
                 Value::from("mode"),
                 Value::from(self.editor.mode.short_code()),
             )])),
-            "nvim_win_get_cursor" => Ok(Value::Array(vec![
+            // ----- windows --------------------------------------------------
+            "nvim_list_wins" => Ok(Value::Array(
+                self.editor
+                    .window_ids()
+                    .into_iter()
+                    .map(|id| Value::from(id.0))
+                    .collect(),
+            )),
+            "nvim_get_current_win" => Ok(Value::from(self.editor.current_window_id().0)),
+            "nvim_set_current_win" => {
+                let id = WindowId(uint(params.first(), 0) as u64);
+                self.editor.set_current_window(id);
+                self.emit_lifecycle_events();
+                self.run_pending();
+                Ok(Value::Nil)
+            }
+            "nvim_win_get_buf" => {
+                let win = self.resolve_win(params.first());
+                Ok(match self.editor.window_buffer(win) {
+                    Some(b) => Value::from(b.0),
+                    None => Value::from(0u64),
+                })
+            }
+            "nvim_win_set_buf" => {
+                let win = self.resolve_win(params.first());
+                let buf = BufferId(uint(params.get(1), 0) as u64);
+                self.editor.set_window_buffer(win, buf);
+                self.emit_lifecycle_events();
+                self.run_pending();
+                Ok(Value::Nil)
+            }
+            "nvim_win_get_cursor" => {
+                let win = self.resolve_win(params.first());
+                let (line, col) = self.editor.window_cursor(win).unwrap_or((0, 0));
                 // (1-based line, 0-based column) like neovim.
-                Value::from((self.editor.cursor.line + 1) as u64),
-                Value::from(self.editor.cursor.col as u64),
-            ])),
+                Ok(Value::Array(vec![
+                    Value::from((line + 1) as u64),
+                    Value::from(col as u64),
+                ]))
+            }
+            "nvim_win_set_cursor" => {
+                let win = self.resolve_win(params.first());
+                // [row (1-based), col (0-based)].
+                let pos = params.get(1).and_then(Value::as_array);
+                let row = pos
+                    .and_then(|a| a.first())
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let col = pos
+                    .and_then(|a| a.get(1))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                self.editor.set_window_cursor(win, row - 1, col);
+                Ok(Value::Nil)
+            }
+            "nvim_win_get_width" => {
+                let win = self.resolve_win(params.first());
+                let w = self.editor.window_rect(win).map(|r| r.2).unwrap_or(0);
+                Ok(Value::from(w as u64))
+            }
+            "nvim_win_get_height" => {
+                let win = self.resolve_win(params.first());
+                // Text rows = rect height minus the status line.
+                let h = self
+                    .editor
+                    .window_rect(win)
+                    .map(|r| r.3.saturating_sub(1))
+                    .unwrap_or(0);
+                Ok(Value::from(h as u64))
+            }
+            "nvim_win_set_width" => {
+                let win = self.resolve_win(params.first());
+                self.editor.set_window_width(win, uint(params.get(1), 0));
+                Ok(Value::Nil)
+            }
+            "nvim_win_set_height" => {
+                let win = self.resolve_win(params.first());
+                self.editor.set_window_height(win, uint(params.get(1), 0));
+                Ok(Value::Nil)
+            }
+            "nvim_win_close" => {
+                let win = self.resolve_win(params.first());
+                let force = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+                self.editor.close_window_by_id(win, force);
+                self.emit_lifecycle_events();
+                self.run_pending();
+                Ok(Value::Nil)
+            }
+            "nvim_open_win" => {
+                // (buffer, enter, config) — split form only. `config.vertical`
+                // (or `config.split == "left"/"right"`) makes it a vsplit. The
+                // new window is created bound to `buffer` and (always, for now)
+                // focused; `enter == false` then refocuses the previous window.
+                let buf = BufferId(uint(params.first(), 0) as u64);
+                let enter = params.get(1).and_then(Value::as_bool).unwrap_or(true);
+                let config = params.get(2);
+                let vertical = config
+                    .and_then(map_get("vertical"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        matches!(
+                            config.and_then(map_get("split")).and_then(Value::as_str),
+                            Some("left" | "right")
+                        )
+                    });
+                let prev = self.editor.current_window_id();
+                let new = self.editor.open_split_window(buf, vertical);
+                if !enter {
+                    self.editor.set_current_window(prev);
+                }
+                self.emit_lifecycle_events();
+                self.run_pending();
+                Ok(Value::from(new.0))
+            }
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
             "nvim_list_bufs" => Ok(Value::Array(
                 self.editor
@@ -217,6 +327,15 @@ impl Server {
                 Ok(Value::Nil)
             }
             other => Err(format!("Unknown method: {other}")),
+        }
+    }
+
+    /// Resolve a window-handle RPC argument to a [`WindowId`], mapping neovim's
+    /// `0` (and a missing argument) to the current window.
+    fn resolve_win(&self, v: Option<&Value>) -> WindowId {
+        match v.and_then(Value::as_u64) {
+            Some(0) | None => self.editor.current_window_id(),
+            Some(n) => WindowId(n),
         }
     }
 

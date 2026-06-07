@@ -321,11 +321,23 @@ fn redraw_get<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
         .map(|(_, v)| v)
 }
 
+/// A per-window redraw value for `key`, read from the first window's sub-map
+/// (`windows[0]`) — the fields that used to be flat on the redraw map (lines,
+/// highlights, diagnostics, …) now live under each window.
+fn window0_get<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
+    let Value::Map(win) = redraw_get(params, "windows")?.as_array()?.first()? else {
+        return None;
+    };
+    win.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
 /// Decode the `diagnostics` redraw key into per-row `(start, end, severity)`
 /// screen-column spans (dropping the trailing style-id, which is `Nil` with no
 /// colorscheme loaded).
 fn diagnostics_of(params: &[Value]) -> Vec<Vec<(u64, u64, u64)>> {
-    redraw_get(params, "diagnostics")
+    window0_get(params, "diagnostics")
         .and_then(Value::as_array)
         .map(|rows| {
             rows.iter()
@@ -455,7 +467,7 @@ fn diag(line: u32, start: u32, end: u32, severity: u32, message: &str) -> Json {
 /// syntax worker has replied, so it is now caught up (non-pending) and will drain
 /// the buffer's edit journal before the LSP sync on the next edit.
 fn has_highlights(params: &[Value]) -> bool {
-    redraw_get(params, "highlights")
+    window0_get(params, "highlights")
         .and_then(Value::as_array)
         .is_some_and(|rows| {
             rows.iter()

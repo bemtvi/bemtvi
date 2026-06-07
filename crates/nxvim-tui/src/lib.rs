@@ -47,8 +47,10 @@ use anim::{arm_animation, Animation};
 use ratatui::DefaultTerminal;
 use render::render;
 
-/// Rows reserved at the bottom for the status line and command line.
-const CHROME_ROWS: u16 = 2;
+/// Rows reserved at the bottom for the global command/message line. Each window
+/// now draws its own status line inside its rect, so only the command line is
+/// reserved here; the height the client reports is the windows-area height.
+const CHROME_ROWS: u16 = 1;
 
 /// How long the client waits after a keystroke, with no further input, before
 /// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`

@@ -234,6 +234,38 @@ pub enum BufOp {
     },
 }
 
+/// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,
+/// `nvim_win_set_buf`/`set_cursor`/`set_width`/`set_height`/`close`, `nvim_open_win`),
+/// drained by the server in `apply_lua_effects` and applied to the live editor —
+/// the window analogue of [`BufOp`]. Reads (`nvim_list_wins`, `nvim_win_get_*`)
+/// need no op: they resolve against the `vim._wins` mirror the server pushes
+/// before running Lua. `0` is the current window/buffer, resolved server-side.
+#[derive(Clone, Debug)]
+pub enum WindowOp {
+    /// `nvim_set_current_win(win)` — focus window `win`.
+    SetCurrent { win: u64 },
+    /// `nvim_win_set_buf(win, buf)` — rebind window `win` to buffer `buf`.
+    SetBuf { win: u64, buf: u64 },
+    /// `nvim_win_set_cursor(win, {row, col})` — move window `win`'s cursor.
+    /// `line` is 0-based (the prelude converts neovim's 1-based row); `col` is the
+    /// 0-based byte column.
+    SetCursor { win: u64, line: usize, col: usize },
+    /// `nvim_win_set_width(win, width)` — set window `win`'s column width.
+    SetWidth { win: u64, width: usize },
+    /// `nvim_win_set_height(win, height)` — set window `win`'s text-row height.
+    SetHeight { win: u64, height: usize },
+    /// `nvim_win_close(win, force)` — close window `win`.
+    Close { win: u64, force: bool },
+    /// `nvim_open_win(buf, enter, config)` (split form) — split the focused window
+    /// onto buffer `buf`. `vertical` makes it a vsplit; `enter == false` keeps
+    /// focus on the previous window.
+    Open {
+        buf: u64,
+        vertical: bool,
+        enter: bool,
+    },
+}
+
 /// The arguments handed to a deferred callback when the server runs it via
 /// [`crate::LuaRuntime::run_callback`]. A `vim.schedule` / timer callback takes none; an
 /// async `vim.system` `on_exit` takes the finished child's result, built into the

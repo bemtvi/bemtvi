@@ -205,15 +205,15 @@ impl Server {
     /// the scroll-animation band (which share `styles`).
     pub(crate) fn highlights_for(
         &self,
+        buffer: nxvim_core::BufferId,
         numbers: &[Option<usize>],
         styles: &mut StyleTable,
     ) -> Value {
-        // Spans for the buffer currently in the window (absent until its first
-        // `ts_highlights` reply lands, or for a buffer with no grammar).
-        let spans_by_line = self
-            .syntax_states
-            .get(&self.editor.current_buffer_id())
-            .map(|state| &state.spans);
+        // Spans for this window's buffer (absent until its first `ts_highlights`
+        // reply lands, or for a buffer with no grammar). Two windows onto the
+        // same buffer share one `SyntaxState`, each slicing its own rows.
+        let spans_by_line = self.syntax_states.get(&buffer).map(|state| &state.spans);
+        let buf = self.editor.buffer_of(buffer);
         let rows = numbers
             .iter()
             .map(|num| match num {
@@ -222,7 +222,9 @@ impl Server {
                     let Some(spans) = spans_by_line.and_then(|m| m.get(&line_idx)) else {
                         return Value::Array(Vec::new());
                     };
-                    let text = self.editor.buffer().line(line_idx);
+                    let Some(text) = buf.map(|b| b.line(line_idx)) else {
+                        return Value::Array(Vec::new());
+                    };
                     let row = spans
                         .iter()
                         .map(|s| {

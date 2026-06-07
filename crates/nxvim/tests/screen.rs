@@ -12,14 +12,15 @@ use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const COLS: u16 = 80;
-const ROWS: u16 = 24; // text area is ROWS - 2 chrome rows = 22
+const ROWS: u16 = 24; // windows area is ROWS - 1 cmd row = 23; text is 22 (status inside)
 /// Default number-column width for a small buffer: nxvim ships with the hybrid
 /// number column on, sized to 4 cells (vim's `numberwidth` minimum). Text,
 /// selection, and cursor columns are all offset by this much.
 const GUTTER: u16 = 4;
 
-/// Start a server and attach with a text-area height matching the paint grid
-/// (ROWS - 2 chrome rows), so the captured `View` fills the grid exactly.
+/// Start a server and attach with a windows-area height matching the paint grid
+/// (ROWS minus the one global command row — the client now draws each window's
+/// status line inside its rect), so the captured `View` fills the grid exactly.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {
@@ -41,7 +42,7 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
         "nvim_ui_attach",
         vec![
             Value::from(COLS as u64),
-            Value::from((ROWS - 2) as u64),
+            Value::from((ROWS - 1) as u64),
             Value::Map(vec![]),
         ],
     )

@@ -17,7 +17,17 @@ impl Server {
     /// server (so callers project nothing). Both borrows are released before any
     /// `&mut self` use.
     pub(crate) fn current_diagnostics(&self) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
-        let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
+        self.diagnostics_of(self.editor.current_buffer_id())
+    }
+
+    /// Buffer-addressed form of [`Server::current_diagnostics`], for projecting a
+    /// non-focused window's own buffer. Same `(diagnostics, encoding)` or `None`
+    /// when that buffer has no attached server.
+    pub(crate) fn diagnostics_of(
+        &self,
+        buffer: nxvim_core::BufferId,
+    ) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
+        let state = self.lsp_states.get(&buffer)?;
         let key = state.server.as_ref()?;
         let encoding = self.lsp_servers.get(key)?.encoding;
         Some((&state.diagnostics, encoding))
@@ -36,16 +46,18 @@ impl Server {
     /// built-in severity color).
     pub(crate) fn diagnostics_for(
         &self,
+        buffer: nxvim_core::BufferId,
         numbers: &[Option<usize>],
         styles: &mut StyleTable,
     ) -> Value {
         // `vim.diagnostic.config({ underline = false })` hides the squiggles; the
         // message line and the location list (other surfaces) are unaffected.
         let diags_encoding = if self.diagnostics_underline {
-            self.current_diagnostics()
+            self.diagnostics_of(buffer)
         } else {
             None
         };
+        let buf = self.editor.buffer_of(buffer);
         let Some((diags, encoding)) = diags_encoding else {
             // One empty entry per row so the client's `diagnostics[row]` index
             // stays aligned with `highlights`/`numbers`.
@@ -58,7 +70,9 @@ impl Server {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
-                let text = self.editor.buffer().line(line_idx);
+                let Some(text) = buf.map(|b| b.line(line_idx)) else {
+                    return Value::Array(Vec::new());
+                };
                 let spans = diags
                     .iter()
                     .filter_map(|d| {

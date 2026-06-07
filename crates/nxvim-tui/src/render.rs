@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::anim::{arm_animation, lerp, Animation};
 use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans};
-use crate::view::{PanelData, PmenuData, View};
+use crate::view::{PanelData, PmenuData, Separator, View, WindowView};
 
 /// Tab stop width in cells. Must match `nxvim_core::unicode::TABSTOP` so the
 /// painted text lines up with the server's reported screen columns.
@@ -103,36 +103,126 @@ impl ScrollHarness {
     }
 }
 
-/// Lay out the three regions and render each with its own widget. When `anim`
-/// is present and unfinished, the text area shows an interpolated slice of the
-/// scroll band instead of the static viewport.
+/// Lay the frame out and paint it: each window at its rect (gutter + text body +
+/// its own status line), the split separators between them, then the global
+/// command line, completion popup, and panel. The windows area is the frame
+/// minus the global bottom panel and command line; with one window it spans that
+/// whole area, so the output matches the pre-windows single-window frame exactly.
+/// When `anim` is present it animates the **focused** window's slide.
 pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, doc_scroll: u16) {
-    // The panel docks below the status line, claiming `height + 1` rows (content
-    // plus its title bar); `0` rows — an empty region — when no panel is open.
-    // The server already shrank the text `lines` to match, so the text area
-    // (`Min(1)`) lands at exactly the right height. The command line stays the
-    // very last row (where `:` typing and the cursor live).
+    // The panel docks below all windows, claiming `height + 1` rows (content plus
+    // its title bar); `0` when none is open. The command line is the last row.
+    // Each window draws its own status line at the bottom of its rect, so there
+    // is no longer a global status row here.
     let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
     let regions = Layout::vertical([
-        Constraint::Min(1),             // text area
-        Constraint::Length(1),          // status line
+        Constraint::Min(1),             // windows area
         Constraint::Length(panel_rows), // panel (0 when none)
         Constraint::Length(1),          // command line
     ])
     .split(frame.area());
-    let (text_area, status_area, panel_area, cmd_area) =
-        (regions[0], regions[1], regions[2], regions[3]);
+    let (wins_area, panel_area, cmd_area) = (regions[0], regions[1], regions[2]);
 
+    // Paint each window; capture the focused one's text-inner rect and (possibly
+    // interpolated) cursor row for the terminal cursor and the popup anchor.
+    let mut focused_inner: Option<(Rect, u16)> = None;
+    for win in &view.windows {
+        let area = window_area(wins_area, win);
+        // Only the focused window animates a scroll slide.
+        let win_anim = if win.focused { anim } else { None };
+        let (text_inner, cursor_row) = render_window(frame, area, win, view, win_anim);
+        if win.focused {
+            focused_inner = Some((text_inner, cursor_row));
+        }
+    }
+
+    render_separators(frame, wins_area, &view.separators, view);
+    render_command(frame, cmd_area, view);
+
+    // The insert-mode completion popup floats over the focused window's text area,
+    // drawn after the windows so it sits on top.
+    if let (Some(pmenu), Some((inner, _))) = (&view.pmenu, focused_inner) {
+        render_pmenu(frame, inner, pmenu, doc_scroll);
+    }
+
+    // A focused panel owns the cursor: draw it on the panel's current line and
+    // skip the text/command cursor entirely.
+    if let Some(panel) = &view.panel {
+        let content = render_panel(frame, panel_area, panel);
+        frame.set_cursor_position((
+            content.x,
+            content.y + panel.cursor_row.min(content.height.saturating_sub(1)),
+        ));
+        return;
+    }
+
+    if view.command_mode {
+        // Offset past the leading prompt — a single prefix char (`:`/`/`/`?`) or
+        // the multi-char `vim.ui.input` label; the cursor then follows
+        // `cmdline_cursor` (a char offset) so it sits mid-line after edits.
+        let prompt_width = cmdline_prompt_width(view);
+        let col = cmd_area.x + prompt_width + view.cmdline_cursor as u16;
+        frame.set_cursor_position((col, cmd_area.y));
+    } else if let (Some((inner, cursor_row)), Some(win)) = (focused_inner, view.focused()) {
+        // The cursor row is interpolated during a slide, but the column comes
+        // straight from the focused window — correct because the scroll commands
+        // move only vertically.
+        frame.set_cursor_position((inner.x + win.cursor_screen_col, inner.y + cursor_row));
+    }
+}
+
+/// The windows-area rect (the frame minus the global bottom panel and command
+/// line) for a `width`×`height` terminal showing `view` — the region the window
+/// tree lays out into. Shared by the renderer and the geometry helpers so a
+/// hit-test lands on the cells the renderer drew.
+fn windows_area_rect(width: u16, height: u16, view: &View) -> Rect {
+    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(panel_rows),
+        Constraint::Length(1),
+    ])
+    .split(Rect::new(0, 0, width, height))[0]
+}
+
+/// A window's absolute rect: its wire rect offset by the windows-area origin, or
+/// the whole windows area for a legacy flat redraw (no rect → single window).
+fn window_area(wins_area: Rect, win: &WindowView) -> Rect {
+    match win.rect {
+        Some(r) => Rect {
+            x: wins_area.x + r.x,
+            y: wins_area.y + r.y,
+            width: r.width.min(wins_area.width.saturating_sub(r.x)),
+            height: r.height.min(wins_area.height.saturating_sub(r.y)),
+        },
+        None => wins_area,
+    }
+}
+
+/// Paint one window into `area`: the theme background, the number gutter, the
+/// text body (or an interpolated slide when `anim` is set), and a status line on
+/// the bottom row. Returns the text-inner rect (past the gutter) and the
+/// (possibly interpolated) cursor row, for placing the terminal cursor.
+fn render_window(
+    frame: &mut Frame,
+    area: Rect,
+    win: &WindowView,
+    view: &View,
+    anim: Option<&Animation>,
+) -> (Rect, u16) {
+    // The status line is the window's bottom row; the text body is the rest.
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let (text_area, status_area) = (rows[0], rows[1]);
     let height = text_area.height as usize;
-    let frame_lines: Vec<String>;
-    let frame_sel: Vec<Option<(u16, u16)>>;
+
     // Search-match highlights for the static viewport. A search never starts a
     // scroll animation, so the slide band carries none — left empty while sliding.
     let empty_search: SearchSpans = Vec::new();
     let empty_incsearch: IncSearchSpans = Vec::new();
-    // Syntax highlights for the painted rows — the static viewport, or, during a
-    // slide, the matching slice of the over-scanned band so the scroll is colored
-    // throughout instead of flashing white until it settles.
+    let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
+
+    let frame_lines: Vec<String>;
+    let frame_sel: Vec<Option<(u16, u16)>>;
     let frame_hl: Vec<Vec<HlSpan>>;
     let frame_numbers: Vec<Option<usize>>;
     let cursor_row: u16;
@@ -168,31 +258,28 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
             current_line = cur + 1;
         }
         None => {
-            frame_lines = view.lines.clone();
-            frame_sel = view.selection.clone();
-            frame_numbers = view.numbers.clone();
-            frame_hl = view.highlights.clone();
-            cursor_row = view.cursor_row;
-            current_line = view.cursor_line;
+            frame_lines = win.lines.clone();
+            frame_sel = win.selection.clone();
+            frame_numbers = win.numbers.clone();
+            frame_hl = win.highlights.clone();
+            cursor_row = win.cursor_row;
+            current_line = win.cursor_line;
         }
     }
 
-    // Paint the whole text area with the theme's `Normal` background first (when
-    // a colorscheme is loaded), so every following widget's spans patch their
+    // Paint the text body with the theme's `Normal` background first (when a
+    // colorscheme is loaded), so every following widget's spans patch their
     // foreground onto it and the gutter, end-of-line gaps, and `~` rows all share
-    // the editor background. With no theme this is skipped — the terminal default
-    // shows through, exactly as before.
+    // the editor background. With no theme this is skipped.
     if let Some(normal) = view.normal {
         frame.render_widget(Block::default().style(normal), text_area);
     }
 
-    // Split a number-column gutter off the left of the text area when enabled.
-    // The gutter is its own widget; the text, selection, and cursor columns are
-    // all measured from the text sub-area, so they stay gutter-agnostic.
-    let text_inner = if view.number_width > 0 {
-        let cols = Layout::horizontal([Constraint::Length(view.number_width), Constraint::Min(0)])
+    // Split a number-column gutter off the left of the text body when enabled.
+    let text_inner = if win.number_width > 0 {
+        let cols = Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
             .split(text_area);
-        render_gutter(frame, cols[0], &frame_numbers, current_line, view);
+        render_gutter(frame, cols[0], &frame_numbers, current_line, win, view);
         cols[1]
     } else {
         text_area
@@ -210,17 +297,15 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         incsearch: view.incsearch_style,
         end_of_buffer: view.end_of_buffer,
     };
-    // The slide band carries no search spans; the static viewport uses the view's.
+    // The slide band carries no search spans; the static viewport uses the win's.
     let (frame_search, frame_incsearch): (&SearchSpans, &IncSearchSpans) = match anim {
         Some(_) => (&empty_search, &empty_incsearch),
-        None => (&view.search, &view.incsearch),
+        None => (&win.search, &win.incsearch),
     };
-    // Diagnostics, like search, are painted on the settled viewport only — the
-    // slide band carries none (squiggles reappear once the scroll lands).
-    let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
+    // Diagnostics, like search, are painted on the settled viewport only.
     let frame_diag: &[Vec<DiagSpan>] = match anim {
         Some(_) => &empty_diag,
-        None => &view.diagnostics,
+        None => &win.diagnostics,
     };
     render_text(
         frame,
@@ -234,45 +319,42 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         &frame_numbers,
         &theme,
     );
-    render_status(frame, status_area, view);
-    render_command(frame, cmd_area, view);
+    render_status(frame, status_area, win, view);
+    (text_inner, cursor_row)
+}
 
-    // The insert-mode completion popup floats over the text area, drawn after the
-    // text so it sits on top. The editing cursor (placed below) stays visible
-    // above the menu. A panel and the popup never coexist (the popup is
-    // insert-mode; a focused panel grabs every key), so this never fights the
-    // panel cursor handled next.
-    if let Some(pmenu) = &view.pmenu {
-        render_pmenu(frame, text_inner, pmenu, doc_scroll);
-    }
-
-    // A focused panel owns the cursor: draw it on the panel's current line and
-    // skip the text/command cursor entirely.
-    if let Some(panel) = &view.panel {
-        let content = render_panel(frame, panel_area, panel);
-        frame.set_cursor_position((
-            content.x,
-            content.y + panel.cursor_row.min(content.height.saturating_sub(1)),
-        ));
-        return;
-    }
-
-    if view.command_mode {
-        // Offset past the leading prompt — a single prefix char (`:`/`/`/`?`) or
-        // the multi-char `vim.ui.input` label; the cursor then follows
-        // `cmdline_cursor` (a char offset) so it sits mid-line after edits.
-        let prompt_width = cmdline_prompt_width(view);
-        let col = cmd_area.x + prompt_width + view.cmdline_cursor as u16;
-        frame.set_cursor_position((col, cmd_area.y));
-    } else {
-        // The cursor row is interpolated during a slide, but the column comes
-        // straight from the destination view — correct because the scroll
-        // commands move only vertically. A future horizontal scroll would need
-        // to interpolate the column too.
-        frame.set_cursor_position((
-            text_inner.x + view.cursor_screen_col,
-            text_inner.y + cursor_row,
-        ));
+/// Draw the split separators between windows: a vertical `│` or horizontal `─`
+/// run, anchored in the windows area. The theme's `StatusLine` style tints them
+/// (reverse-video out of the box), matching vim's `WinSeparator` default of
+/// reusing the status-line look. None to draw with a single window.
+fn render_separators(frame: &mut Frame, wins_area: Rect, separators: &[Separator], view: &View) {
+    let style = view
+        .status_line
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
+    for sep in separators {
+        let x = wins_area.x + sep.x;
+        let y = wins_area.y + sep.y;
+        let (w, h, lines): (u16, u16, Vec<Line>) = if sep.vertical {
+            // A column of `│`, one cell per row.
+            let rows = (0..sep.length)
+                .map(|_| Line::from(Span::styled("│", style)))
+                .collect();
+            (1, sep.length, rows)
+        } else {
+            // A single row of `─`.
+            let row = vec![Line::from(Span::styled(
+                "─".repeat(sep.length as usize),
+                style,
+            ))];
+            (sep.length, 1, row)
+        };
+        let rect = Rect::new(
+            x,
+            y,
+            w.min(wins_area.right().saturating_sub(x)),
+            h.min(wins_area.bottom().saturating_sub(y)),
+        );
+        frame.render_widget(Paragraph::new(Text::from(lines)), rect);
     }
 }
 
@@ -287,6 +369,7 @@ fn render_gutter(
     area: Rect,
     numbers: &[Option<usize>],
     current_line: usize,
+    win: &WindowView,
     view: &View,
 ) {
     let width = area.width as usize;
@@ -295,7 +378,7 @@ fn render_gutter(
             .iter()
             .map(|num| {
                 let is_current = *num == Some(current_line);
-                let cell = gutter_cell(*num, current_line, view.number, view.relativenumber, width);
+                let cell = gutter_cell(*num, current_line, win.number, win.relativenumber, width);
                 let style = if is_current {
                     view.cursor_line_nr.unwrap_or_default()
                 } else {
@@ -602,10 +685,10 @@ fn expand_tabs(line: &str) -> String {
     out
 }
 
-fn render_status(frame: &mut Frame, area: Rect, view: &View) {
-    let modified = if view.modified { " [+]" } else { "" };
-    let left = format!(" {}  {}{}", view.mode_label, view.file_name, modified);
-    let right = format!("{},{} ", view.cursor_line, view.cursor_col + 1);
+fn render_status(frame: &mut Frame, area: Rect, win: &WindowView, view: &View) {
+    let modified = if win.modified { " [+]" } else { "" };
+    let left = format!(" {}  {}{}", view.mode_label, win.file_name, modified);
+    let right = format!("{},{} ", win.cursor_line, win.cursor_col + 1);
 
     let width = area.width as usize;
     let pad = width.saturating_sub(left.chars().count() + right.chars().count());
@@ -736,22 +819,21 @@ fn pmenu_start(selected: Option<usize>, rows: usize) -> usize {
     }
 }
 
-/// The text-area inner rect (past the number gutter) for a `width`×`height`
-/// terminal showing `view` — the cell space the popup and its doc box anchor in.
-/// Mirrors the region split in [`render`]; shared by the popup and doc-box
-/// geometry so hit-tests land on exactly the cells the renderer draws.
+/// The focused window's text-area inner rect (past its number gutter) for a
+/// `width`×`height` terminal showing `view` — the cell space the popup and its
+/// doc box anchor in. Mirrors the window layout in [`render`]/[`render_window`];
+/// shared by the popup and doc-box geometry so hit-tests land on exactly the
+/// cells the renderer draws. An empty rect before the first redraw (no window).
 fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
-    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
-    let regions = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(panel_rows),
-        Constraint::Length(1),
-    ])
-    .split(Rect::new(0, 0, width, height));
-    let text_area = regions[0];
-    if view.number_width > 0 {
-        Layout::horizontal([Constraint::Length(view.number_width), Constraint::Min(0)])
+    let Some(win) = view.focused() else {
+        return Rect::new(0, 0, 0, 0);
+    };
+    let wins_area = windows_area_rect(width, height, view);
+    let area = window_area(wins_area, win);
+    // The text body is the window rect minus its bottom status row.
+    let text_area = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)[0];
+    if win.number_width > 0 {
+        Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
             .split(text_area)[1]
     } else {
         text_area

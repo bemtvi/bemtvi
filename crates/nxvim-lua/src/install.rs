@@ -20,7 +20,7 @@ use crate::host::{
     create_dir_all_mode, find_executable, get_runtime_file, getftime, glob_paths, parse_mode,
     stdpath,
 };
-use crate::ops::{BufOp, ConfirmReq, HlSet, LoopOp, LspOp, PanelOp, UiInputReq};
+use crate::ops::{BufOp, ConfirmReq, HlSet, LoopOp, LspOp, PanelOp, UiInputReq, WindowOp};
 use crate::runtime::Shared;
 use crate::vimregex;
 
@@ -436,6 +436,83 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `vim._win_op(...)`: the window-mutation bridges (Phase 5). Each queues a
+    // [`WindowOp`] the server drains into the live editor after the chunk; the
+    // Lua-facing `vim.api.nvim_win_*` wrappers (prelude) have already updated the
+    // `vim._wins` mirror (write-through) where a read-after-write needs it.
+    let sh = shared.clone();
+    vim.set(
+        "_set_current_win",
+        lua.create_function(move |_, win: u64| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetCurrent { win });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_win_set_buf",
+        lua.create_function(move |_, (win, buf): (u64, u64)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetBuf { win, buf });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_win_set_cursor",
+        lua.create_function(move |_, (win, line, col): (u64, usize, usize)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetCursor { win, line, col });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_win_set_width",
+        lua.create_function(move |_, (win, width): (u64, usize)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetWidth { win, width });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_win_set_height",
+        lua.create_function(move |_, (win, height): (u64, usize)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetHeight { win, height });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_win_close",
+        lua.create_function(move |_, (win, force): (u64, bool)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::Close { win, force });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_open_win",
+        lua.create_function(move |_, (buf, vertical, enter): (u64, bool, bool)| {
+            sh.borrow_mut().window_ops.push(WindowOp::Open {
+                buf,
+                vertical,
+                enter,
+            });
+            Ok(())
+        })?,
     )?;
 
     // `vim._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request

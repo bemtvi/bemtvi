@@ -193,9 +193,15 @@ own methods with nxvim's own semantics — they are not a compatibility surface.
 ### View protocol (UI)
 
 The core projects editor state into a [`View`](../crates/nxvim-core/src/view.rs):
-the visible text rows, the cursor position, and the data a status/command line
-need (mode, file name, modified flag, ruler, message, command-line text). The
-server sends it as a single `redraw` notification carrying one msgpack map.
+a **list of windows** plus the global chrome. Each `WindowView` carries one
+window's `rect`, focus flag, visible text rows, cursor, selection/search spans,
+gutter numbers, and status-line data (file name, modified flag, ruler); the
+`View` adds the inter-split `separators` and the **global** fields one editor has
+(mode label, command line, message, panel). The server sends it as a single
+`redraw` notification carrying one msgpack map (a `windows` array + a
+`separators` array + the global keys). With one window the list has a single
+entry spanning the whole text area, so the frame is identical to the pre-windows
+view. (See [*Windows*](#windows).)
 
 The `View` also carries the editor's **styled** regions: `selection`, a per-row
 array of half-open screen-column spans `[start, end)` marking the visual-mode
@@ -241,12 +247,14 @@ offsets and the hybrid absolute-on-cursor-line formatting from that data. Text,
 selection, and cursor columns are all measured from the text sub-area, so they
 stay gutter-agnostic.
 
-The **client owns layout**. It reserves two rows for chrome and renders three
-ratatui-native widgets — text area, status line, command line — with a ratatui
-`Layout` (see [`nxvim-tui`](../crates/nxvim-tui/src/lib.rs)). Because layout is
-the client's job, the client tells the server only how tall the *text area* is
-(`nvim_ui_attach`/`nvim_ui_try_resize` carry the text-viewport height), so the
-core scrolls against the right window size. There is no grid, no cell encoding,
+The **client owns chrome layout**, but the *window* rects come from the core.
+The client paints each `WindowView` at its `rect` — splitting off that window's
+gutter, drawing its text/selection/search, and a status line on its bottom row —
+then draws the `separators` between splits and reserves the bottom rows for the
+global command/message line and panel. The terminal cursor is drawn only in the
+`focused` window. Because the core lays out the windows (vertical splits divide
+width), the client reports **both** dimensions of the windows area on
+`nvim_ui_attach`/`nvim_ui_try_resize`. There is still no grid, no cell encoding,
 and no `ext_linegrid`.
 
 ---
@@ -300,11 +308,12 @@ The surface is the usual vim set: `:e` (open-or-switch, reusing the throwaway
 `nvim_get_current_buf`, `nvim_set_current_buf`, `nvim_create_buf`,
 `nvim_buf_get_name`, and a buffer-addressed `nvim_buf_get_lines`.
 
-`:q` quits the editor, but only when nothing would be lost: with a modified
-buffer anywhere it refuses, switches the window to that buffer, and reports
-`E37` (so you see what's blocking) — matching neovim's behavior when exiting the
-last window with `hidden` buffers. `:q!` exits unconditionally. With one window
-`:q` and `:qa` coincide; real windows will split them later.
+`:q` is **window-aware** (see [*Windows*](#windows)): with more than one window
+open it closes the current window; only on the *last* window is it a real editor
+quit, which — like `:qa` — refuses when a modified buffer would be lost,
+switching the window to that buffer and reporting `E37` (so you see what's
+blocking), matching neovim's last-window behavior with `hidden` buffers. `:q!` /
+`:qa!` exit unconditionally.
 
 The treesitter worker tracks each buffer independently: the server keeps a
 `SyntaxState` per `BufferId`, routes `ts_highlights` replies by id, and sends
@@ -312,9 +321,53 @@ The treesitter worker tracks each buffer independently: the server keeps a
 its cached parse instead of re-opening. (See
 [*Syntax highlighting*](#syntax-highlighting-treesitter).)
 
-What's still missing is **windows**: splits, the layout tree, and per-window
-cursors. With one window, each buffer's last cursor/scroll is saved on switch
-and restored on return.
+---
+
+## Windows
+
+A **window** is a viewport onto a buffer; splitting creates more of them, tiled
+by a layout tree. nxvim mirrors the buffer split: just as buffer state was
+factored out of `Editor`, **window state** is now multiplied. `Editor` holds a
+`WindowTree` — a `BTreeMap<WindowId, Window>` keyed by a monotonic, never-reused
+`WindowId`, plus a `Node` tree (`Leaf(WindowId)` | `Split { dir, children,
+sizes }`) arranging them and a `current` (focused) id. Each `Window` binds a
+`BufferId` and, *while not focused*, stashes its `saved_cursor`/`saved_top`; the
+focused window's live cursor/scroll stay on `Editor` (so the whole motion/
+operator state machine is untouched). The current buffer is **derived** from the
+current window — `:b`/`:e` rebind the focused window's buffer.
+
+- **The core owns layout.** `WindowTree::layout(total)` divides the area: an
+  `HSplit` stacks children (dividing height, a `─` separator row between each), a
+  `VSplit` places them side by side (dividing width, a `│` column between).
+  `sizes` are normalized to cells on every layout, so resizing is plain cell
+  arithmetic and a terminal resize rescales proportionally. Each leaf's text
+  height is `rect.height - 1` (its own status line).
+- **Surface.** Splits: `:split`/`:vsplit`/`:new`/`:vnew` and `<C-w>s`/`<C-w>v`.
+  Focus: `<C-w>h/j/k/l` (spatial), `<C-w>w`/`<C-w>W` (cyclic). Close: `<C-w>c`/
+  `:close`, `<C-w>o`/`:only`, `:hide`, `<C-w>q`/`:q`. Sizing: `<C-w>=`,
+  `<C-w>+`/`-`/`<`/`>` (with counts), `<C-w>_`/`<C-w>|`, `:resize`/`:vertical
+  resize`. `focus_window` is the window analogue of the buffer switch: it stashes
+  the outgoing view, restores the incoming one (cursor re-clamped), and clears
+  transient state.
+- **RPC / Lua.** `nvim_list_wins`, `nvim_get_current_win`/`nvim_set_current_win`,
+  `nvim_win_get_buf`/`set_buf`, `nvim_win_get_cursor`/`set_cursor` (window-handled,
+  `0` = current), `nvim_win_get_width`/`height` + setters, `nvim_win_close`, and
+  `nvim_open_win` (split form; `relative` floats deferred). The Lua bindings
+  follow the established "Lua queues, core mutates" flow: window *reads* resolve
+  against the `vim._wins` mirror the server pushes before each Lua entry; window
+  *mutations* queue a `WindowOp` drained into the core after the chunk.
+- **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from
+  the same server-side lifecycle diff as the buffer events, ordered
+  `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.
+- **Shared per buffer.** Two windows onto one buffer share its `SyntaxState`,
+  diagnostics, and undo — each just projects a different `(top, height)` slice.
+  The register, options, command line, message line, and panel stay **global**.
+
+Still pending: **tab pages**, **floating windows** (`nvim_open_win` with
+`relative` — the seams are built to carry them), and **window-local options**
+(`wrap`, `cursorline`, …), the window analogue of the pending buffer-local
+options. The per-window status line is `laststatus=2`; the global/conditional
+`laststatus` modes are a small follow-up.
 
 ---
 
@@ -567,9 +620,12 @@ screen," and that is exactly the shape of these tests.
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up), treesitter
   injections, and a `:set`-driven highlight toggle.
-- Multiple **windows**, tabs, and splits; the window layout tree. (Multiple
-  *buffers* are implemented — see [*Buffers*](#buffers) — but there is still
-  exactly one window onto one buffer.)
+- **Tab pages** and **floating windows.** Multiple **windows** (splits, the
+  layout tree, per-window view state, the `<C-w>` family, and the `nvim_win_*` /
+  Lua API) are implemented — see [*Windows*](#windows). What remains on this axis
+  is tab pages (a `Vec<WindowTree>` + a tabline), floating/anchored windows
+  (`nvim_open_win` with `relative`, a z-ordered overlay layer), and window-local
+  options (`wrap`, `cursorline`, …).
 - A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
   `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
   (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
@@ -615,9 +671,9 @@ screen," and that is exactly the shape of these tests.
   doc explains how to enumerate them straight from the code (`grep -rn
   'INCOMPLETE:'` for approximations, the `vim._notimpl` raises / runtime
   `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
-  that have no call site to tag — multiple windows, the `vim.treesitter` Lua API,
-  buffer-local options not yet honored by the core, a per-buffer command registry,
-  and richer diagnostic surfaces. (The **synchronous prompts** `vim.fn.input` /
+  that have no call site to tag — tab pages and floating windows, the
+  `vim.treesitter` Lua API, buffer-local and window-local options not yet honored
+  by the core, a per-buffer command registry, and richer diagnostic surfaces. (The **synchronous prompts** `vim.fn.input` /
   `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,
   or user command — runs its Lua inside a coroutine via `vim._pump`, so the prompt
   `coroutine.yield`s to park the chunk on the command line and the result resumes

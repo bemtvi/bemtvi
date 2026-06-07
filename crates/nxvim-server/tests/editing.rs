@@ -40,9 +40,13 @@ async fn start_with(init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (reader, writer) = tokio::io::split(client_end);
     let (rpc, incoming) = connect(reader, writer);
 
+    // Attach a 25-row windows area: each window spends its bottom row on a
+    // status line, so the text viewport these tests reason about is 24 rows
+    // (25 − 1). (The attached height is the windows-area height — the frame minus
+    // the client's command row — not the text height.)
     rpc.request(
         "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
+        vec![Value::from(80u64), Value::from(25u64), Value::Map(vec![])],
     )
     .await
     .expect("ui attach");
@@ -186,8 +190,32 @@ async fn scroll_after(
     redraw_after_matching(rpc, incoming, keys, |map| scroll(map).is_some()).await
 }
 
-/// Look up a top-level key in a redraw map.
+/// Look up a key in a redraw map: a global key at the top level, or a per-window
+/// key (lines, cursor_*, selection, search, numbers, scroll, …) under the first
+/// window (`windows[0]`). Key names don't collide between the two, so the
+/// windows[0] fallback is unambiguous and keeps the single-window test helpers
+/// working unchanged across the per-window protocol move.
 fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+        .or_else(|| window0_field(map, key))
+}
+
+/// A per-window key from the first window's sub-map (`windows[0]`).
+fn window0_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    let windows = field_top(map, "windows")?.as_array()?;
+    let Value::Map(win) = windows.first()? else {
+        return None;
+    };
+    win.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+/// A strictly top-level lookup (no window fallback), for resolving `windows`
+/// itself without recursing.
+fn field_top<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .map(|(_, v)| v)
@@ -502,6 +530,7 @@ fn view_get<'a>(view: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     view.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .map(|(_, v)| v)
+        .or_else(|| window0_field(view, key))
 }
 
 #[tokio::test]
@@ -4376,8 +4405,20 @@ async fn win_get_cursor_reflects_the_real_cursor() {
 #[tokio::test]
 async fn get_current_win_is_the_single_window_handle() {
     let (rpc, _incoming) = start(None).await;
+    // Phase 5: window handles are the editor's real ids (the first window is 1),
+    // and the current window is among those `nvim_list_wins` reports.
     let win = exec_lua(&rpc, r#"return vim.api.nvim_get_current_win()"#).await;
-    assert_eq!(win.as_u64(), Some(1000));
+    assert_eq!(win.as_u64(), Some(1));
+    let listed = exec_lua(
+        &rpc,
+        r#"local w = vim.api.nvim_list_wins(); return #w == 1 and w[1] or -1"#,
+    )
+    .await;
+    assert_eq!(
+        listed.as_u64(),
+        Some(1),
+        "the one window is listed by its id"
+    );
 }
 
 #[tokio::test]

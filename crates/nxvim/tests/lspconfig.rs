@@ -248,12 +248,20 @@ fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec
     latest
 }
 
-/// Whether a `redraw` carries at least one non-empty `diagnostics` row.
+/// Whether a `redraw` carries at least one non-empty `diagnostics` row. The
+/// per-row `diagnostics` now live under the first window (`windows[0]`).
 fn has_diagnostics(params: &[Value]) -> bool {
     let Some(Value::Map(map)) = params.first() else {
         return false;
     };
-    let Some((_, Value::Array(rows))) = map.iter().find(|(k, _)| k.as_str() == Some("diagnostics"))
+    let Some((_, Value::Array(windows))) = map.iter().find(|(k, _)| k.as_str() == Some("windows"))
+    else {
+        return false;
+    };
+    let Some(Value::Map(win)) = windows.first() else {
+        return false;
+    };
+    let Some((_, Value::Array(rows))) = win.iter().find(|(k, _)| k.as_str() == Some("diagnostics"))
     else {
         return false;
     };

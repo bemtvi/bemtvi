@@ -4,15 +4,19 @@
 
 use crate::Server;
 use nxvim_core::highlight::Style;
-use nxvim_core::view::ScrollAnim;
+use nxvim_core::view::{ScrollAnim, Separator, ViewRect, WindowView};
 use nxvim_core::PanelView;
 use rmpv::Value;
 use std::collections::HashMap;
 
 impl Server {
     /// Push the current view to the client as a single `redraw` notification
-    /// carrying an nxvim-native view map (no neovim grid protocol). The client
-    /// renders the regions with its own widgets.
+    /// carrying an nxvim-native view map (no neovim grid protocol). The map holds
+    /// the **global** chrome (mode, command line, message, panel, popup) plus a
+    /// `windows` array — one sub-map per window with its rect and per-window text,
+    /// gutter, status, and highlight data — and a `separators` array for the
+    /// inter-split borders. With one window the array has a single entry and the
+    /// client paints exactly as before.
     pub(crate) fn redraw(&mut self) {
         let (w, h) = match self.ui {
             Some(dims) => dims,
@@ -30,8 +34,6 @@ impl Server {
         // on the server (the registry lives in the core). Spans carry an index
         // into a per-frame, deduped `styles` palette; the client paints the RGB.
         let mut styles = StyleTable::default();
-        let highlights = self.highlights_for(&view.numbers, &mut styles);
-        let diagnostics = self.diagnostics_for(&view.numbers, &mut styles);
         let chrome = self.chrome_styles(&mut styles);
 
         // The message line shows the diagnostic under the cursor, but only when
@@ -44,41 +46,37 @@ impl Server {
             view.message.clone()
         };
 
-        let lines = lines_value(&view.lines);
-        let selection = spans_value(&view.selection);
-        let search = multi_spans_value(&view.search);
-        let incsearch = spans_value(&view.incsearch);
-        let numbers = numbers_value(&view.numbers);
-        let scroll = match &view.scroll {
-            Some(s) => self.project_band(s, &mut styles),
-            None => Value::Nil,
-        };
+        // Project each window: its rect, per-window text/gutter/status data, and
+        // its own buffer's syntax/diagnostic slice.
+        let windows: Vec<Value> = view
+            .windows
+            .iter()
+            .map(|win| self.window_value(win, &mut styles))
+            .collect();
+
+        // The split borders between windows.
+        let separators = Value::Array(view.separators.iter().map(separator_value).collect());
+
+        // The insert-mode completion popup, `Nil` when none is open. The focused
+        // window's text-area width (its width minus its number gutter) bounds the
+        // overlay so it can't spill past the editable region.
+        let text_width = view
+            .focused()
+            .rect
+            .width
+            .saturating_sub(view.focused().number_width);
+        let pmenu = self.pmenu_value(&view, text_width);
         // The bottom panel (`:messages`, `:ls`), `Nil` when none is open.
         let panel = match &view.panel {
             Some(p) => project_panel(p),
             None => Value::Nil,
         };
-        // The insert-mode completion popup, `Nil` when none is open. The text
-        // area width (frame minus the number gutter) bounds the overlay so it
-        // can't spill past the editable region.
-        let pmenu = self.pmenu_value(&view, w.saturating_sub(view.number_width));
 
-        // Built last: every `highlights`/`chrome` style id above indexes into it.
+        // Built last: every per-window/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
         let map = vec![
-            (Value::from("lines"), lines),
-            (
-                Value::from("cursor_row"),
-                Value::from(view.cursor_row as u64),
-            ),
-            (
-                Value::from("cursor_col"),
-                Value::from(view.cursor_col as u64),
-            ),
-            (
-                Value::from("cursor_screen_col"),
-                Value::from(view.cursor_screen_col as u64),
-            ),
+            (Value::from("windows"), Value::Array(windows)),
+            (Value::from("separators"), separators),
             (
                 Value::from("mode_label"),
                 Value::from(view.mode_label.as_str()),
@@ -102,31 +100,6 @@ impl Server {
                 Value::from(view.cmdline_cursor as u64),
             ),
             (Value::from("message"), Value::from(message.as_str())),
-            (
-                Value::from("file_name"),
-                Value::from(view.file_name.as_str()),
-            ),
-            (Value::from("modified"), Value::from(view.modified)),
-            (
-                Value::from("cursor_line"),
-                Value::from(view.cursor_line as u64),
-            ),
-            (Value::from("selection"), selection),
-            (Value::from("search"), search),
-            (Value::from("incsearch"), incsearch),
-            (Value::from("scroll"), scroll),
-            (Value::from("numbers"), numbers),
-            (Value::from("number"), Value::from(view.number)),
-            (
-                Value::from("relativenumber"),
-                Value::from(view.relativenumber),
-            ),
-            (
-                Value::from("number_width"),
-                Value::from(view.number_width as u64),
-            ),
-            (Value::from("highlights"), highlights),
-            (Value::from("diagnostics"), diagnostics),
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
             (Value::from("panel"), panel),
@@ -136,11 +109,71 @@ impl Server {
         self.rpc.notify("redraw", vec![Value::Map(map)]);
     }
 
+    /// Project one window into its redraw sub-map: the rect and focus flag, the
+    /// per-window text/cursor/gutter/status fields, and the window's own syntax
+    /// highlights, diagnostic underlines, and scroll band (each resolving styles
+    /// into the shared per-frame `styles` palette).
+    fn window_value(&self, win: &WindowView, styles: &mut StyleTable) -> Value {
+        let highlights = self.highlights_for(win.buffer, &win.numbers, styles);
+        let diagnostics = self.diagnostics_for(win.buffer, &win.numbers, styles);
+        let scroll = match &win.scroll {
+            Some(s) => self.project_band(win.buffer, s, styles),
+            None => Value::Nil,
+        };
+        Value::Map(vec![
+            (Value::from("rect"), rect_value(&win.rect)),
+            (Value::from("focused"), Value::from(win.focused)),
+            (Value::from("lines"), lines_value(&win.lines)),
+            (
+                Value::from("cursor_row"),
+                Value::from(win.cursor_row as u64),
+            ),
+            (
+                Value::from("cursor_col"),
+                Value::from(win.cursor_col as u64),
+            ),
+            (
+                Value::from("cursor_screen_col"),
+                Value::from(win.cursor_screen_col as u64),
+            ),
+            (
+                Value::from("file_name"),
+                Value::from(win.file_name.as_str()),
+            ),
+            (Value::from("modified"), Value::from(win.modified)),
+            (
+                Value::from("cursor_line"),
+                Value::from(win.cursor_line as u64),
+            ),
+            (Value::from("selection"), spans_value(&win.selection)),
+            (Value::from("search"), multi_spans_value(&win.search)),
+            (Value::from("incsearch"), spans_value(&win.incsearch)),
+            (Value::from("numbers"), numbers_value(&win.numbers)),
+            (Value::from("number"), Value::from(win.number)),
+            (
+                Value::from("relativenumber"),
+                Value::from(win.relativenumber),
+            ),
+            (
+                Value::from("number_width"),
+                Value::from(win.number_width as u64),
+            ),
+            (Value::from("highlights"), highlights),
+            (Value::from("diagnostics"), diagnostics),
+            (Value::from("scroll"), scroll),
+        ])
+    }
+
     /// Project a scroll-animation band into the `scroll` sub-map a client animates
     /// the slide from. Mirrors the main map's lines/selection/numbers/highlights
     /// projection over the (taller) animation window.
-    pub(crate) fn project_band(&self, s: &ScrollAnim, styles: &mut StyleTable) -> Value {
-        let highlights = self.highlights_for(&s.numbers, styles);
+    pub(crate) fn project_band(
+        &self,
+        buffer: nxvim_core::BufferId,
+        s: &ScrollAnim,
+        styles: &mut StyleTable,
+    ) -> Value {
+        let highlights = self.highlights_for(buffer, &s.numbers, styles);
         Value::Map(vec![
             (Value::from("from_top"), Value::from(s.from_top as u64)),
             (Value::from("to_top"), Value::from(s.to_top as u64)),
@@ -213,6 +246,28 @@ impl StyleTable {
     fn into_value(self) -> Value {
         Value::Array(self.list.iter().map(style_value).collect())
     }
+}
+
+/// Encode a split border as a `{ vertical, x, y, length }` map (cells, relative
+/// to the windows area) for the redraw map's `separators` array.
+fn separator_value(sep: &Separator) -> Value {
+    Value::Map(vec![
+        (Value::from("vertical"), Value::from(sep.vertical)),
+        (Value::from("x"), Value::from(sep.x as u64)),
+        (Value::from("y"), Value::from(sep.y as u64)),
+        (Value::from("length"), Value::from(sep.length as u64)),
+    ])
+}
+
+/// Encode a window's screen rect as a `{ x, y, width, height }` map (cells,
+/// relative to the windows area) for the redraw map.
+fn rect_value(rect: &ViewRect) -> Value {
+    Value::Map(vec![
+        (Value::from("x"), Value::from(rect.x as u64)),
+        (Value::from("y"), Value::from(rect.y as u64)),
+        (Value::from("width"), Value::from(rect.width as u64)),
+        (Value::from("height"), Value::from(rect.height as u64)),
+    ])
 }
 
 /// Encode a slice of text rows as a msgpack array of strings for the redraw map.

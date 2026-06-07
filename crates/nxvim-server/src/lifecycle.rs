@@ -2,8 +2,8 @@
 //! `BufReadPost`/`FileType`/`BufEnter`/`InsertEnter`, and `init.lua` sourcing.
 
 use crate::filetype_of;
-use crate::Server;
-use nxvim_core::BufferId;
+use crate::{Server, WindowRect};
+use nxvim_core::{BufferId, WindowId};
 use std::path::Path;
 
 impl Server {
@@ -23,6 +23,9 @@ impl Server {
     pub(crate) fn emit_lifecycle_events(&mut self) {
         let buf = self.editor.current_buffer_id();
         let mode = self.editor.mode;
+        let cur_win = self.editor.current_window_id();
+        let wins = self.editor.window_ids();
+
         let unannounced = !self.announced.contains(&buf);
         let entered = self.last_buffer_id != Some(buf);
         // A transition *into* insert (or replace — neovim fires InsertEnter for
@@ -31,9 +34,59 @@ impl Server {
         // Track the mode every call — even the no-op fast path — so a later entry
         // is still seen after an insert→normal round trip that took the fast path.
         self.last_mode = mode;
-        if !unannounced && !entered && !entered_insert {
+
+        // Window diff (Phase 5): windows added/closed since the last emit, the
+        // focus change, and any rect change. Cheap vecs of ids — computed every
+        // call so the fast-path check below sees them.
+        let new_wins: Vec<WindowId> = wins
+            .iter()
+            .copied()
+            .filter(|w| !self.known_windows.contains(w))
+            .collect();
+        let closed_wins: Vec<WindowId> = self
+            .known_windows
+            .iter()
+            .copied()
+            .filter(|w| !wins.contains(w))
+            .collect();
+        let win_changed = self.last_window_id != Some(cur_win);
+        let rects = self.window_rects_snapshot();
+        let resized = self
+            .last_window_rects
+            .as_ref()
+            .is_some_and(|prev| *prev != rects);
+
+        if !unannounced
+            && !entered
+            && !entered_insert
+            && new_wins.is_empty()
+            && closed_wins.is_empty()
+            && !win_changed
+            && !resized
+        {
             return; // fast path: nothing transitioned
         }
+
+        // ----- window leave/new/closed (before the buffer events) -----
+        // WinNew for freshly-created windows.
+        for w in &new_wins {
+            let b = self.editor.window_buffer(*w);
+            self.fire_window("WinNew", *w, b);
+        }
+        // WinLeave for the window we're leaving, then WinClosed for any that are
+        // gone (vim's order around a switch is WinLeave → … → WinEnter).
+        if win_changed {
+            if let Some(old) = self.last_window_id {
+                let b = self.editor.window_buffer(old);
+                self.fire_window("WinLeave", old, b);
+            }
+        }
+        for w in &closed_wins {
+            // The window is already gone, so its buffer is unknown — fire with no
+            // buffer context (a buffer-local autocmd can't be bound to it anyway).
+            self.fire_window("WinClosed", *w, None);
+        }
+        self.known_windows = wins;
 
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let file_backed = !name.is_empty();
@@ -61,6 +114,46 @@ impl Server {
         if entered_insert {
             self.fire_lifecycle("InsertEnter", mode.short_code(), buf, &name);
         }
+
+        // ----- window enter / resized (after the buffer events) -----
+        if win_changed {
+            self.last_window_id = Some(cur_win);
+            let b = self.editor.window_buffer(cur_win);
+            self.fire_window("WinEnter", cur_win, b);
+        }
+        if resized {
+            let b = self.editor.window_buffer(cur_win);
+            self.fire_window("WinResized", cur_win, b);
+        }
+        self.last_window_rects = Some(rects);
+    }
+
+    /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.
+    pub(crate) fn window_rects_snapshot(&self) -> Vec<WindowRect> {
+        self.editor
+            .window_ids()
+            .into_iter()
+            .map(|w| (w, self.editor.window_rect(w).unwrap_or_default()))
+            .collect()
+    }
+
+    /// Fire a window-lifecycle autocmd (`WinNew`/`WinEnter`/`WinLeave`/
+    /// `WinClosed`/`WinResized`). The pattern / `<amatch>` is the window id (as a
+    /// string, like neovim); the callback's buffer context is the window's buffer
+    /// when known. Mirrors [`Server::fire_lifecycle`] for buffer events.
+    pub(crate) fn fire_window(&mut self, event: &str, win: WindowId, buf: Option<BufferId>) {
+        let pattern = win.0.to_string();
+        let (bufnr, file) = match buf {
+            Some(b) => (b.0, self.editor.buffer_name(b).unwrap_or_default()),
+            None => (0, String::new()),
+        };
+        // Keep the buffer mirror in lockstep, as the buffer-event path does.
+        self.push_buf_mirror();
+        if let Err(e) = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file) {
+            self.editor
+                .echo(format!("E5108: Error in {event} autocmd: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// Push the current-buffer snapshot into the VM, fire `event` for `pattern` /

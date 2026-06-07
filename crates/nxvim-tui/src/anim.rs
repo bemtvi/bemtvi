@@ -84,7 +84,9 @@ pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// - Any other scroll-less redraw is a real change (a keypress, edit, or cursor
 ///   move) and interrupts the slide, as before.
 pub(crate) fn arm_animation(view: &View, current: Option<Animation>) -> Option<Animation> {
-    if let Some(s) = view.scroll.as_ref() {
+    // The scroll gesture, like the cursor, belongs to the focused window.
+    let scroll = view.focused().and_then(|w| w.scroll.as_ref());
+    if let Some(s) = scroll {
         // A zero-duration gesture has no slide to play, and arming one would
         // later divide elapsed time by a zero duration when computing progress
         // (a NaN/inf that paints one glitched frame). Drop any in-flight slide
@@ -106,6 +108,10 @@ fn repaints_destination(view: &View, anim: &Animation) -> bool {
     // interpolation; the destination is reached at exactly those lines.
     let dest_top = anim.to_top as usize + 1; // first visible line, 1-based
     let dest_cursor = anim.to_cursor as usize + 1; // cursor line, 1-based
-    let top_line = view.numbers.first().copied().flatten();
-    top_line == Some(dest_top) && view.cursor_line == dest_cursor
+                                                   // The slide belongs to the focused window; read its destination viewport.
+    let Some(win) = view.focused() else {
+        return false;
+    };
+    let top_line = win.numbers.first().copied().flatten();
+    top_line == Some(dest_top) && win.cursor_line == dest_cursor
 }

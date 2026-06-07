@@ -5,10 +5,9 @@
 use crate::evloop::{LoopCommand, LoopEvent};
 use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::Server;
-use crate::CURRENT_WIN;
 use nxvim_core::highlight::HlDef;
-use nxvim_core::{parse_color, BufferId};
-use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, PanelOp};
+use nxvim_core::{parse_color, BufferId, WindowId};
+use nxvim_lua::{BufOp, CallbackArgs, HlSet, LoopOp, PanelOp, WindowOp};
 use rmpv::Value;
 use std::collections::HashSet;
 
@@ -64,6 +63,13 @@ impl Server {
         // Lua side already did against the `vim._bufs` mirror.
         for op in self.lua.take_buf_ops() {
             self.apply_buf_op(op);
+        }
+        // Window mutations from the `vim.api.nvim_win_*` family (Phase 5): applied
+        // to the live editor after the chunk. Their `WinNew`/`WinEnter`/… autocmds
+        // fire from `emit_lifecycle_events`, which `run_pending` runs once the
+        // ops have settled.
+        for op in self.lua.take_window_ops() {
+            self.apply_window_op(op);
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
         // labelled text prompt and remember which callback awaits the result. Only
@@ -140,6 +146,62 @@ impl Server {
         self.sync_lsp_buffer(id);
     }
 
+    /// Apply one [`WindowOp`] to the live editor (Phase 5) — the deferred form of
+    /// the `nvim_win_*` RPC handlers, so a `vim.api.nvim_*` window call from Lua
+    /// drives the same core methods. A `0` window resolves to the current one; a
+    /// `0` buffer (`nvim_open_win`) to the current buffer.
+    pub(crate) fn apply_window_op(&mut self, op: WindowOp) {
+        let resolve_win = |s: &Self, w: u64| {
+            if w == 0 {
+                s.editor.current_window_id()
+            } else {
+                WindowId(w)
+            }
+        };
+        match op {
+            WindowOp::SetCurrent { win } => {
+                let id = resolve_win(self, win);
+                self.editor.set_current_window(id);
+            }
+            WindowOp::SetBuf { win, buf } => {
+                let id = resolve_win(self, win);
+                self.editor.set_window_buffer(id, BufferId(buf));
+            }
+            WindowOp::SetCursor { win, line, col } => {
+                let id = resolve_win(self, win);
+                self.editor.set_window_cursor(id, line, col);
+            }
+            WindowOp::SetWidth { win, width } => {
+                let id = resolve_win(self, win);
+                self.editor.set_window_width(id, width);
+            }
+            WindowOp::SetHeight { win, height } => {
+                let id = resolve_win(self, win);
+                self.editor.set_window_height(id, height);
+            }
+            WindowOp::Close { win, force } => {
+                let id = resolve_win(self, win);
+                self.editor.close_window_by_id(id, force);
+            }
+            WindowOp::Open {
+                buf,
+                vertical,
+                enter,
+            } => {
+                let buffer = if buf == 0 {
+                    self.editor.current_buffer_id()
+                } else {
+                    BufferId(buf)
+                };
+                let prev = self.editor.current_window_id();
+                self.editor.open_split_window(buffer, vertical);
+                if !enter {
+                    self.editor.set_current_window(prev);
+                }
+            }
+        }
+    }
+
     /// Refresh the Rust→Lua buffer mirror (`vim._bufs` + `vim._cur_cursor` +
     /// current window) the buffer-read API resolves against (Phase 6). Pushed
     /// before any Lua entry that can read buffer/cursor state. The per-buffer line
@@ -173,7 +235,32 @@ impl Server {
             (self.editor.cursor.line + 1) as u64, // 1-based row, neovim convention
             self.editor.cursor.col as u64,        // 0-based column
         );
-        let _ = self.lua.set_buf_mirror(&bufs, cursor, CURRENT_WIN);
+        // The window snapshot (Phase 5): one entry per window in layout order,
+        // each carrying its buffer, cursor (1-based row / 0-based col), and text
+        // dimensions, so the `nvim_win_*` getters read live state from Lua.
+        let wins: Vec<(u64, u64, u64, u64, u64, u64)> = self
+            .editor
+            .window_ids()
+            .into_iter()
+            .map(|id| {
+                let buffer = self.editor.window_buffer(id).map(|b| b.0).unwrap_or(0);
+                let (line, col) = self.editor.window_cursor(id).unwrap_or((0, 0));
+                let (_, _, w, h) = self.editor.window_rect(id).unwrap_or((0, 0, 0, 0));
+                (
+                    id.0,
+                    buffer,
+                    (line + 1) as u64,
+                    col as u64,
+                    w as u64,
+                    h.saturating_sub(1) as u64, // text rows (minus the status line)
+                )
+            })
+            .collect();
+        let cur_win = self.editor.current_window_id().0;
+        let next_win = self.editor.next_window_id().0;
+        let _ = self
+            .lua
+            .set_buf_mirror(&bufs, cursor, cur_win, &wins, next_win);
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
@@ -365,6 +452,12 @@ impl Server {
                 break;
             }
         }
+        // The drained work may have changed the buffer/window topology (a queued
+        // `:lua` window op, a `vim.cmd('split')`, a buffer switch). Diff once more
+        // so the resulting `WinNew`/`WinEnter`/`BufEnter`/… autocmds fire — the
+        // batch boundary, after everything has settled. Idempotent: a no-op when
+        // nothing changed since the last per-key diff (the common case).
+        self.emit_lifecycle_events();
     }
 }
 

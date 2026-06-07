@@ -172,14 +172,26 @@ fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec
     latest
 }
 
+/// The first window's sub-map (`windows[0]`) from a redraw — where the per-window
+/// fields (highlights, scroll, …) now live.
+fn window0(params: &[Value]) -> Option<&Vec<(Value, Value)>> {
+    let Value::Map(map) = params.first()? else {
+        return None;
+    };
+    let windows = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("windows"))
+        .and_then(|(_, v)| v.as_array())?;
+    match windows.first()? {
+        Value::Map(win) => Some(win),
+        _ => None,
+    }
+}
+
 /// The per-row highlight spans `[(start_col, end_col, group)]` from a redraw map.
 fn highlights_of(params: &[Value]) -> Vec<Vec<(u64, u64, String)>> {
-    let Some(Value::Map(map)) = params.first() else {
-        return Vec::new();
-    };
-    let Some(rows) = map
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("highlights"))
+    let Some(rows) = window0(params)
+        .and_then(|win| win.iter().find(|(k, _)| k.as_str() == Some("highlights")))
         .and_then(|(_, v)| v.as_array())
     else {
         return Vec::new();
@@ -204,10 +216,7 @@ fn highlights_of(params: &[Value]) -> Vec<Vec<(u64, u64, String)>> {
 /// The scroll-band highlights from a redraw carrying a scroll gesture, or `None`
 /// if this redraw has no scroll.
 fn scroll_band_highlights(params: &[Value]) -> Option<Vec<Vec<(u64, u64, String)>>> {
-    let Some(Value::Map(map)) = params.first() else {
-        return None;
-    };
-    let scroll = map
+    let scroll = window0(params)?
         .iter()
         .find(|(k, _)| k.as_str() == Some("scroll"))
         .map(|(_, v)| v)?;
@@ -706,11 +715,8 @@ async fn a_plain_text_buffer_has_no_highlights() {
 
 /// True if this redraw carries a (non-nil) scroll gesture.
 fn redraw_has_scroll(params: &[Value]) -> bool {
-    let Some(Value::Map(map)) = params.first() else {
-        return false;
-    };
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some("scroll"))
+    window0(params)
+        .and_then(|win| win.iter().find(|(k, _)| k.as_str() == Some("scroll")))
         .map(|(_, v)| !matches!(v, Value::Nil))
         .unwrap_or(false)
 }
@@ -718,10 +724,7 @@ fn redraw_has_scroll(params: &[Value]) -> bool {
 /// The scroll gesture's destination top line (`to_top`), if this redraw carries
 /// one.
 fn scroll_to_top(params: &[Value]) -> Option<usize> {
-    let Some(Value::Map(map)) = params.first() else {
-        return None;
-    };
-    let Value::Map(s) = map
+    let Value::Map(s) = window0(params)?
         .iter()
         .find(|(k, _)| k.as_str() == Some("scroll"))
         .map(|(_, v)| v)?

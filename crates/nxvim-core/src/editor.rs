@@ -6370,14 +6370,27 @@ impl Editor {
         if cmd.is_empty() {
             return;
         }
-        if let Ok(n) = cmd.parse::<usize>() {
-            let line = n.saturating_sub(1).min(self.last_line());
-            self.cursor.line = line;
-            self.cursor.col = self.first_non_blank(line);
+
+        // Strip and resolve any leading range (`.`, `$`, `%`, `N`, `+N`, `lo,hi`)
+        // before the command name. A range with no command moves the cursor to
+        // the last address; a malformed range fails loud rather than guessing.
+        let (range, rest) = match self.parse_ex_range(cmd) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            if range.explicit {
+                self.cursor.line = range.hi;
+                self.cursor.col = self.first_non_blank(range.hi);
+            }
             return;
         }
 
-        let (name, bang, args) = split_ex(cmd);
+        let (name, bang, args) = split_ex(rest);
         match name {
             "w" | "write" => self.ex_write(args),
             "q" | "quit" => self.ex_quit(bang),
@@ -6441,6 +6454,8 @@ impl Editor {
             // exactly what `:set` already targets for them.
             "set" | "se" | "setlocal" | "setl" => self.ex_set(args),
             "noh" | "nohlsearch" => self.search_active = false,
+            "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu"
+            | "substitut" | "substitute" => self.ex_substitute(range, args),
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
             // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
             "hi" | "highlight" => {
@@ -6450,8 +6465,294 @@ impl Editor {
             }
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
-            _ => self.deferred_commands.push(cmd.to_string()),
+            _ => self.deferred_commands.push(rest.to_string()),
         }
+    }
+
+    /// Consume any leading range from `cmd`, resolving addresses against the
+    /// cursor and buffer. Returns the resolved 0-based inclusive range
+    /// (defaulting to the current line when no address is present) and the
+    /// remaining command text. Fails loud on a backwards range, an unset mark,
+    /// or a malformed address — never silently swaps or guesses.
+    fn parse_ex_range<'a>(&self, cmd: &'a str) -> Result<(ExRange, &'a str), String> {
+        let bytes = cmd.as_bytes();
+        let cur = self.cursor.line;
+
+        // `%` is the whole file (`1,$`) and stands alone.
+        if bytes.first() == Some(&b'%') {
+            let range = ExRange {
+                lo: 0,
+                hi: self.last_line(),
+                explicit: true,
+            };
+            return Ok((range, &cmd[1..]));
+        }
+
+        let mut i = 0;
+        let first = self.parse_ex_address(cmd, &mut i, cur)?;
+        let has_sep = matches!(bytes.get(i), Some(b',') | Some(b';'));
+        if first.is_none() && !has_sep {
+            // No address at all — the range defaults to the current line.
+            let range = ExRange {
+                lo: cur,
+                hi: cur,
+                explicit: false,
+            };
+            return Ok((range, cmd));
+        }
+
+        let lo = first.unwrap_or(cur);
+        let hi = if has_sep {
+            // `;` moves the cursor to the first address before resolving the
+            // second; `,` resolves the second against the original cursor.
+            let base = if bytes[i] == b';' { lo } else { cur };
+            i += 1;
+            self.parse_ex_address(cmd, &mut i, base)?.unwrap_or(cur)
+        } else {
+            lo
+        };
+
+        if lo > hi {
+            return Err("E493: Backwards range given".to_string());
+        }
+        let range = ExRange {
+            lo,
+            hi,
+            explicit: true,
+        };
+        Ok((range, &cmd[i..]))
+    }
+
+    /// Parse one ex address at `*i`: an optional base (`.`, `$`, `N`, `'m`)
+    /// followed by any number of `+N` / `-N` offsets (a bare `+`/`-` counts as
+    /// 1). `base` is the line a relative address (one with no explicit base, or
+    /// a `.`) is measured from. Advances `*i` past what it consumes and returns
+    /// the resolved 0-based line clamped to the buffer, or `None` when no
+    /// address token is present.
+    fn parse_ex_address(
+        &self,
+        cmd: &str,
+        i: &mut usize,
+        base: usize,
+    ) -> Result<Option<usize>, String> {
+        let bytes = cmd.as_bytes();
+        let start = *i;
+        let mut line = base as i64;
+        let mut have_base = false;
+
+        match bytes.get(*i) {
+            Some(b'.') => {
+                *i += 1;
+                have_base = true;
+            }
+            Some(b'$') => {
+                line = self.last_line() as i64;
+                *i += 1;
+                have_base = true;
+            }
+            // Marks aren't implemented yet; a mark address fails loud rather
+            // than resolving to a bogus line.
+            Some(b'\'') => return Err("E20: Mark not set".to_string()),
+            Some(c) if c.is_ascii_digit() => {
+                let mut n = 0i64;
+                while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
+                    n = n * 10 + i64::from(d - b'0');
+                    *i += 1;
+                }
+                line = n - 1; // 1-based source line -> 0-based index
+                have_base = true;
+            }
+            _ => {}
+        }
+
+        let mut have_offset = false;
+        while let Some(&sign) = bytes.get(*i).filter(|b| matches!(b, b'+' | b'-')) {
+            *i += 1;
+            let mut n = 0i64;
+            let mut digits = false;
+            while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
+                n = n * 10 + i64::from(d - b'0');
+                *i += 1;
+                digits = true;
+            }
+            if !digits {
+                n = 1;
+            }
+            line += if sign == b'+' { n } else { -n };
+            have_offset = true;
+        }
+
+        if !have_base && !have_offset {
+            *i = start;
+            return Ok(None);
+        }
+        Ok(Some(line.clamp(0, self.last_line() as i64) as usize))
+    }
+
+    /// `:[range]s/{pat}/{rep}/[flags] [count]` — substitute matches of `pat`
+    /// with `rep` over the range (canonical regex, the `/`-search dialect).
+    /// Flags: `g` (every match on a line), `i`/`I` (force ignore/match case),
+    /// `n` (count only, no edit). Fails loud on a bad delimiter, an unknown
+    /// flag, the not-yet-built `c` flag, an invalid pattern, or no match.
+    fn ex_substitute(&mut self, range: ExRange, args: &str) {
+        let spec = args.trim();
+        let Some(delim) = spec.chars().next() else {
+            // A bare `:s` repeats the last substitute (Phase 2); none stored yet.
+            self.echo("E33: No previous substitute regular expression");
+            return;
+        };
+        if delim.is_alphanumeric() || delim == '\\' || delim == '"' {
+            self.echo("E146: Regular expressions can't be delimited by letters");
+            return;
+        }
+        let (pat, rep, flags) = split_substitute(&spec[delim.len_utf8()..], delim);
+
+        // Parse flag letters, then an optional trailing count.
+        let mut global = false;
+        let mut nflag = false;
+        let mut icase: Option<bool> = None;
+        let tail = flags.trim();
+        let tb = tail.as_bytes();
+        let mut k = 0;
+        while k < tb.len() {
+            match tb[k] {
+                b'g' => global = true,
+                b'i' => icase = Some(true),
+                b'I' => icase = Some(false),
+                b'n' => nflag = true,
+                b'c' => {
+                    self.echo("substitute: the 'c' (confirm) flag is not implemented yet");
+                    return;
+                }
+                b' ' | b'\t' | b'0'..=b'9' => break,
+                _ => {
+                    self.echo(format!("E488: Trailing characters: {}", &tail[k..]));
+                    return;
+                }
+            }
+            k += 1;
+        }
+        let rest = tail[k..].trim();
+        let count = if rest.is_empty() {
+            None
+        } else {
+            match rest.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    self.echo(format!("E488: Trailing characters: {rest}"));
+                    return;
+                }
+            }
+        };
+
+        // An empty pattern reuses the last search/substitute pattern.
+        let pattern = if pat.is_empty() {
+            match self.last_search.as_ref() {
+                Some((p, _, _)) => p.clone(),
+                None => {
+                    self.echo("E35: No previous regular expression");
+                    return;
+                }
+            }
+        } else {
+            pat
+        };
+        let ignorecase = icase.unwrap_or_else(|| self.search_ignorecase(&pattern));
+        let re = match SearchRegex::compile(&pattern, ignorecase) {
+            Ok(re) => re,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+
+        // A trailing count restricts the edit to `count` lines from the range's
+        // last line (vim semantics), overriding the range's start.
+        let (lo, hi) = match count {
+            Some(c) => (range.hi, (range.hi + c - 1).min(self.last_line())),
+            None => (range.lo, range.hi),
+        };
+
+        // `n` reports the match count and edits nothing.
+        if nflag {
+            let (mut matches, mut nlines) = (0usize, 0usize);
+            for l in lo..=hi {
+                let m = re.find_all(&self.buffer().line(l)).len();
+                if m > 0 {
+                    matches += m;
+                    nlines += 1;
+                }
+            }
+            if matches == 0 {
+                self.echo(format!("E486: Pattern not found: {pattern}"));
+            } else {
+                self.echo(format!(
+                    "{matches} {} on {nlines} {}",
+                    if matches == 1 { "match" } else { "matches" },
+                    if nlines == 1 { "line" } else { "lines" },
+                ));
+                self.set_substitute_search(pattern);
+            }
+            return;
+        }
+
+        // Edit pass. A `\r` in the replacement splits a line into several, so a
+        // running `added` offset keeps later original lines pointing at the
+        // right (shifted) index.
+        let (mut subs, mut nlines) = (0usize, 0usize);
+        let mut added = 0i64;
+        let mut last_changed: Option<usize> = None;
+        let mut pushed = false;
+        for orig in lo..=hi {
+            let idx = (orig as i64 + added) as usize;
+            let old = self.buffer().line(idx);
+            let (new_text, n) = re.substitute_line(&old, &rep, global);
+            if n == 0 {
+                continue;
+            }
+            if !pushed {
+                self.push_undo();
+                pushed = true;
+            }
+            let start = self.buffer().line_start(idx);
+            self.buffer_mut().remove(start..start + old.len());
+            self.buffer_mut().insert(start, &new_text);
+            let extra = new_text.matches('\n').count();
+            added += extra as i64;
+            subs += n;
+            nlines += 1;
+            last_changed = Some(idx + extra);
+        }
+
+        let Some(last) = last_changed else {
+            self.echo(format!("E486: Pattern not found: {pattern}"));
+            return;
+        };
+        self.buffer_mut().normalize();
+        self.cursor.line = last;
+        self.cursor.col = self.first_non_blank(last);
+        self.clamp_cursor();
+        self.set_substitute_search(pattern);
+
+        // vim stays silent for a single substitution on a single line.
+        if subs != 1 || nlines != 1 {
+            self.echo(format!(
+                "{subs} {} on {nlines} {}",
+                if subs == 1 {
+                    "substitution"
+                } else {
+                    "substitutions"
+                },
+                if nlines == 1 { "line" } else { "lines" },
+            ));
+        }
+    }
+
+    /// Record `pattern` as the last-used search pattern (so `n` and `hlsearch`
+    /// pick it up after a `:s`, matching vim) and light up the highlight.
+    fn set_substitute_search(&mut self, pattern: String) {
+        self.last_search = Some((pattern, SearchDir::Forward, SearchOffset::None));
+        self.search_active = true;
     }
 
     fn ex_write(&mut self, args: &str) {
@@ -7745,6 +8046,50 @@ fn char_class(c: char) -> CharClass {
     } else {
         CharClass::Punct
     }
+}
+
+/// A resolved, 0-based, inclusive line range parsed from the head of an
+/// ex-command. `explicit` is false when no address was present and the range
+/// defaulted to the current line (so a bare range can be told from none).
+#[derive(Clone, Copy)]
+struct ExRange {
+    lo: usize,
+    hi: usize,
+    explicit: bool,
+}
+
+/// Split a substitute body (everything after the leading delimiter) into
+/// `(pattern, replacement, flags)` on unescaped `delim`. A `\` before the
+/// delimiter makes it literal (dropped from the field); any other `\x` is kept
+/// verbatim so the regex / replacement expander sees it. Everything past the
+/// second delimiter — the flags and trailing count — is taken verbatim.
+fn split_substitute(body: &str, delim: char) -> (String, String, String) {
+    let mut parts: Vec<String> = vec![String::new()];
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        // Once pat and rep are captured, flags + count are taken verbatim.
+        if parts.len() >= 3 {
+            parts[2].push(c);
+        } else if c == '\\' {
+            let cur = parts.last_mut().expect("at least one part");
+            match chars.next() {
+                Some(n) if n == delim => cur.push(delim),
+                Some(n) => {
+                    cur.push('\\');
+                    cur.push(n);
+                }
+                None => cur.push('\\'),
+            }
+        } else if c == delim {
+            parts.push(String::new());
+        } else {
+            parts.last_mut().expect("at least one part").push(c);
+        }
+    }
+    let pat = parts.first().cloned().unwrap_or_default();
+    let rep = parts.get(1).cloned().unwrap_or_default();
+    let flags = parts.get(2).cloned().unwrap_or_default();
+    (pat, rep, flags)
 }
 
 /// Split an ex-command into `(name, bang, args)`.

@@ -5064,3 +5064,275 @@ async fn show_document_external_location_raises() {
         "external show_document must raise"
     );
 }
+
+// ---- Phase 0: ex range parsing -------------------------------------------
+//
+// A bare range (no command) resolves and moves the cursor to the *last*
+// address, landing on its first non-blank — vim's behavior for `:5<CR>`,
+// `:1,5<CR>`, `:%<CR>`. These exercise the range parser without `:s` yet.
+
+async fn range_fixture() -> (Rpc, UnboundedReceiver<Incoming>) {
+    let (rpc, incoming) = start(None).await;
+    // Five lines; line 4 is indented so we can see the cursor land on the
+    // first non-blank rather than column 0.
+    feed(&rpc, "ione<CR>two<CR>three<CR>    four<CR>five<Esc>gg");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "    four", "five"],
+        "fixture buffer"
+    );
+    (rpc, incoming)
+}
+
+#[tokio::test]
+async fn ex_range_absolute_line_jumps() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":3<CR>");
+    assert_eq!(cursor(&rpc).await, (3, 0));
+}
+
+#[tokio::test]
+async fn ex_range_dollar_jumps_to_last_line() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":$<CR>");
+    assert_eq!(cursor(&rpc).await, (5, 0));
+}
+
+#[tokio::test]
+async fn ex_range_dot_offset_moves_relative() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":3<CR>"); // on line 3
+    feed(&rpc, ":.+2<CR>"); // +2 -> line 5
+    assert_eq!(cursor(&rpc).await, (5, 0));
+    feed(&rpc, ":.-1<CR>"); // -1 -> line 4 (indented)
+    assert_eq!(cursor(&rpc).await, (4, 4), "lands on first non-blank");
+}
+
+#[tokio::test]
+async fn ex_range_bare_offset_is_relative_to_cursor() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":2<CR>"); // on line 2
+    feed(&rpc, ":+2<CR>"); // a leading +/- offset is relative to the cursor
+    assert_eq!(cursor(&rpc).await, (4, 4));
+}
+
+#[tokio::test]
+async fn ex_range_pair_moves_to_last_address() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":2,4<CR>");
+    assert_eq!(
+        cursor(&rpc).await,
+        (4, 4),
+        "a pair moves to the last address"
+    );
+}
+
+#[tokio::test]
+async fn ex_range_percent_moves_to_last_line() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":%<CR>");
+    assert_eq!(cursor(&rpc).await, (5, 0));
+}
+
+#[tokio::test]
+async fn ex_range_out_of_buffer_clamps() {
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":999<CR>");
+    assert_eq!(
+        cursor(&rpc).await,
+        (5, 0),
+        "an over-large line clamps to last"
+    );
+}
+
+#[tokio::test]
+async fn ex_range_reversed_errors_loudly() {
+    let (rpc, mut incoming) = range_fixture().await;
+    // vim would prompt to swap; we can't prompt, so fail loud rather than
+    // silently swap (the no-silent-errors rule).
+    let map = redraw_after(&rpc, &mut incoming, ":3,1<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        msg.contains("E493"),
+        "expected E493 backwards-range error, got {msg:?}"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "cursor stays put on a bad range"
+    );
+}
+
+#[tokio::test]
+async fn ex_range_unknown_mark_errors_loudly() {
+    let (rpc, mut incoming) = range_fixture().await;
+    // Marks aren't implemented; a mark address must fail loud, not resolve to
+    // a bogus line.
+    let map = redraw_after(&rpc, &mut incoming, ":'a<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        msg.contains("E20"),
+        "expected E20 mark-not-set error, got {msg:?}"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "cursor stays put on a bad range"
+    );
+}
+
+// ---- Phase 1: the :substitute command -----------------------------------
+//
+// Pattern + replacement are canonical regex (the dialect `/` search uses):
+// `(\w+)` captures, `$1` back-refs, `\r` -> newline in the replacement.
+
+#[tokio::test]
+async fn substitute_replaces_first_match_on_current_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo bar foo<Esc>");
+    feed(&rpc, ":s/foo/baz<CR>"); // trailing delimiter optional
+    assert_eq!(lines(&rpc).await, vec!["baz bar foo"], "first match only");
+}
+
+#[tokio::test]
+async fn substitute_g_flag_replaces_every_match_on_the_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo bar foo<Esc>");
+    feed(&rpc, ":s/foo/baz/g<CR>");
+    assert_eq!(lines(&rpc).await, vec!["baz bar baz"]);
+}
+
+#[tokio::test]
+async fn substitute_percent_range_spans_the_whole_buffer() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>");
+    feed(&rpc, ":%s/foo/bar/g<CR>");
+    assert_eq!(lines(&rpc).await, vec!["bar", "bar", "bar"]);
+}
+
+#[tokio::test]
+async fn substitute_line_range_limits_the_edit() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>");
+    feed(&rpc, ":1,2s/foo/bar<CR>");
+    assert_eq!(lines(&rpc).await, vec!["bar", "bar", "foo"]);
+}
+
+#[tokio::test]
+async fn substitute_expands_capture_groups() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    // Canonical-regex groups `(\w+)`, PCRE-style `$1`/`$2` back-refs (the
+    // documented divergence from vim's `\(\)` / `\1`).
+    feed(&rpc, ":s/(\\w+) (\\w+)/$2 $1/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["world hello"]);
+}
+
+#[tokio::test]
+async fn substitute_empty_replacement_deletes_the_match() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoobar<Esc>");
+    feed(&rpc, ":s/o//g<CR>");
+    assert_eq!(lines(&rpc).await, vec!["fbar"]);
+}
+
+#[tokio::test]
+async fn substitute_carriage_return_splits_the_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ia, b, c<Esc>");
+    feed(&rpc, ":s/, /\\r/g<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a", "b", "c"],
+        "\\r in the replacement splits one line into three"
+    );
+}
+
+#[tokio::test]
+async fn substitute_case_override_flags() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iFOO foo<Esc>");
+    feed(&rpc, ":s/foo/x/gi<CR>"); // i: ignore case -> both match
+    assert_eq!(lines(&rpc).await, vec!["x x"]);
+}
+
+#[tokio::test]
+async fn substitute_n_flag_counts_without_changing_the_buffer() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo foo foo<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":s/foo/x/gn<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo foo foo"],
+        "n flag makes no edits"
+    );
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("3 matches on 1 line")
+    );
+}
+
+#[tokio::test]
+async fn substitute_unknown_flag_fails_loud() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":s/foo/bar/z<CR>").await;
+    assert_eq!(lines(&rpc).await, vec!["foo"], "no edit on a bad flag");
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        msg.contains("E488"),
+        "expected trailing-chars error, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn substitute_no_match_reports_e486_and_keeps_cursor() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo bar<Esc>gg0");
+    let before = cursor(&rpc).await;
+    let map = redraw_after(&rpc, &mut incoming, ":s/zzz/x/<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo bar"],
+        "buffer untouched on a miss"
+    );
+    assert_eq!(cursor(&rpc).await, before, "cursor stays put on a miss");
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E486: Pattern not found: zzz")
+    );
+}
+
+#[tokio::test]
+async fn substitute_reports_count_message() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo foo<CR>foo foo<CR>foo foo<Esc>");
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/bar/g<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("6 substitutions on 3 lines")
+    );
+}
+
+#[tokio::test]
+async fn substitute_is_a_single_undo() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>");
+    feed(&rpc, ":%s/foo/bar/g<CR>");
+    assert_eq!(lines(&rpc).await, vec!["bar", "bar", "bar"]);
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo", "foo", "foo"],
+        "one u undoes the whole :%s"
+    );
+}
+
+#[tokio::test]
+async fn substitute_cursor_lands_on_last_changed_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<CR>foo<Esc>gg");
+    feed(&rpc, ":%s/foo/baz<CR>");
+    // Cursor on the last line a substitution happened (line 3), first non-blank.
+    assert_eq!(cursor(&rpc).await, (3, 0));
+}

@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use mlua::{Lua, Table, Variadic};
+use mlua::{Lua, Table, UserData, UserDataMethods, Variadic};
 
 use crate::convert::{
     color_field, env_pairs, flag_field, json_to_lua, lua_to_json, opt_table_to_json, stringify,
@@ -29,6 +29,25 @@ use crate::vimregex;
 
 /// Lua registry key under which the panel's `on_select` callback is stored.
 pub(crate) const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
+
+/// `vim.regex(pat)` userdata: a compiled vim pattern. Its `:match_str(text)`
+/// returns the match's `(start, end)` byte offsets or `nil` — the shape neovim's
+/// regex object exposes, consumed by `vim.treesitter.query`'s `#match?`.
+struct LuaRegex {
+    re: regex::Regex,
+}
+
+impl UserData for LuaRegex {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("match_str", |_, this, text: mlua::String| {
+            let text = text.to_str()?;
+            Ok(match this.re.find(&text) {
+                Some(m) => (Some(m.start() as i64), Some(m.end() as i64)),
+                None => (None, None),
+            })
+        });
+    }
+}
 
 pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     let vim = lua.create_table()?;
@@ -875,6 +894,19 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `vim.regex(pat)`: compile a vim pattern into a regex object exposing
+    // `:match_str(text)` -> (start, end) byte offsets or nil. Backs `query.lua`'s
+    // `#match?` predicate (it compiles each `\v`-prefixed pattern through here).
+    // Same vim-magic dialect as `vim.fn.substitute`; an invalid pattern raises.
+    vim.set(
+        "regex",
+        lua.create_function(|_, pat: String| {
+            Ok(LuaRegex {
+                re: vimregex::compile(&pat).map_err(mlua::Error::RuntimeError)?,
+            })
+        })?,
+    )?;
+
     // `vim._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),
     // block until it exits, and return `{ code, stdout, stderr }`. The pure-Lua
     // `vim.system` wrapper layers neovim's object shape (`:wait()` / `on_exit`)
@@ -1010,6 +1042,18 @@ pub(crate) fn install_runtime_api(
             Ok(std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()))
+        })?,
+    )?;
+    // `vim.uv.hrtime()`: a monotonic clock in nanoseconds. Only differences are
+    // meaningful (the epoch is the first call); `vim.treesitter`'s `tcall` uses it
+    // to measure parse/query time.
+    uv.set(
+        "hrtime",
+        lua.create_function(|_, ()| {
+            use std::sync::OnceLock;
+            use std::time::Instant;
+            static BASE: OnceLock<Instant> = OnceLock::new();
+            Ok(BASE.get_or_init(Instant::now).elapsed().as_nanos() as i64)
         })?,
     )?;
     // `vim.uv.fs_realpath(path)`: the canonical path (symlinks resolved), or nil.

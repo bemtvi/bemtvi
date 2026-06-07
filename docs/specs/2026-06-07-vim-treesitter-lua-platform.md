@@ -1,9 +1,17 @@
 # The `vim.treesitter` Lua platform — design
 
-**Status:** phase 1 shipped (the userdata + lifetime model and the
-`vim._create_ts_parser` / `_ts_has_language` / `_ts_parse_query` primitives, with
-`TSParser:parse` reading a string — `crates/nxvim-ts/src/lua.rs`, tested in
-`crates/nxvim/tests/treesitter_lua.rs`); phases 2–5 pending. Builds the
+**Status:** phases 1–4 shipped — the plugin-facing API is complete. The vendored
+neovim `vim.treesitter` Lua runs on nxvim's bespoke primitives:
+`get_parser(buf):parse()` parses real buffers off the pushed snapshot,
+`get_string_parser` parses literals, and `query.parse` + `iter_captures` /
+`iter_matches` evaluate predicates (`#eq?`, `#match?`, …) and directives over a
+faithful, **unfiltered** query cursor ported from neovim's `treesitter.c`. The
+vendored Lua is embedded under `crates/nxvim-lua/src/vendor/nvim/` and registered
+into `package.preload`; the Rust primitives live in `crates/nxvim-ts/src/lua.rs`;
+the snapshot/`nvim_buf_attach` seam is adapted in
+`crates/nxvim-lua/src/prelude/treesitter.lua`; all tested end to end in
+`crates/nxvim/tests/treesitter_lua.rs`. Phase 5 (injections / decoration-provider
+highlighting / Lua-driven indent) remains deferred. Builds the
 `vim.treesitter` Lua
 API as a **plugin platform** — Lua-owned parsers/trees/queries exposed as
 userdata over the in-process tree-sitter trees — so treesitter-consuming plugins
@@ -246,26 +254,42 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
    parse a string, walk nodes, hold a node across a reparse *and* a GC of its
    source tree, incremental `tree:edit` reparse, query compile + loud error,
    missing-grammar loud error. *No high-level API yet — proves the hardest part.*
-2. **Vendor neovim treesitter Lua + `get_parser` over buffers.** Add the
-   vendored `vim/treesitter/*.lua` to the runtimepath; route
-   `language.add`/`_ts_inspect_language` to `nxvim-ts::loader`; adapt
-   `:parse(source=bufnr)` to read the pushed snapshot. `get_parser(0):parse()`
-   works end-to-end.
-3. **Query surface.** Ensure `query.get` (load `queries/<lang>/<name>.scm` off the
-   data dir), `query.parse`, `iter_captures`/`iter_matches`, predicates,
-   directives, and metadata all run via the vendored query.lua atop our
-   primitives. The plugin-facing API is complete.
-4. **Coexistence hardening + consumer acceptance.** Confirm laziness (no Lua tree
-   without `get_parser`), the two-parsers cost is opt-in, and a real query-driven
-   user-Lua routine passes. Update `docs/architecture.md` (treesitter section +
-   roadmap) and `known-approximations.md`.
+2. **Vendor neovim treesitter Lua + `get_parser` over buffers.** ✅ **Done.**
+   The vendored `vim/treesitter/*.lua` (plus the `vim.func` / `vim.F` /
+   `vim._core.util` / `vim.pos._util` helpers it stands on) is embedded under
+   `crates/nxvim-lua/src/vendor/nvim/` and registered into `package.preload` by
+   `runtime.rs` (hermetic — no runtime dependency on the `vendor/neovim`
+   submodule). `prelude/treesitter.lua` wires it: defines `vim._defer_require`,
+   sets `vim.func`/`vim.F`, requires `vim.treesitter`, and adapts the two snapshot
+   seams — `TSParser:parse(bufnr)` reads `vim._bufs[bufnr].lines`, and a
+   buffer-sourced `LanguageTree` re-reads that snapshot each `:parse()` (full
+   reparse, no `nvim_buf_attach`). New primitives: `_ts_get_language_version` /
+   `_ts_get_minimum_language_version` / `_ts_inspect_language` / parse-from-bufnr /
+   `set_included_ranges`. `get_parser(buf):parse()` works end-to-end.
+3. **Query surface.** ✅ **Done.** `query.parse` / `iter_captures` /
+   `iter_matches`, predicates (`#eq?`, `#match?` via `vim.regex`, `#any-of?`, …),
+   directives, and metadata all run via the vendored `query.lua`. The bespoke core
+   is `vim._create_ts_querycursor` + `TSQuery:inspect()`, ported from neovim's
+   `treesitter.c` over the raw tree-sitter cursor FFI so matches are returned
+   **unfiltered** (predicate evaluation stays in Lua, bug-for-bug with upstream —
+   the safe Rust iterator's text-predicate filtering would diverge on `#match?`'s
+   regex dialect). `query.get` (loading `queries/<lang>/<name>.scm`) works where
+   query files exist; the parser-only fixture returns `nil` for a missing query.
+4. **Coexistence hardening + consumer acceptance.** ✅ **Done.** A `LanguageTree`
+   is created only on `get_parser`; buffers without a treesitter consumer pay
+   nothing. The real-consumer acceptance test (select every function name in a
+   buffer via a query) passes, alongside `#eq?`/`#match?`, `iter_matches`,
+   buffer-edit reflection, and `language.inspect`. Docs updated here +
+   `architecture.md` + `known-approximations.md`.
 5. **(Later, separately scoped)** injections (LanguageTree children /
    `language_for_range`), then — only if pursued — the bridge work for
-   decoration-provider highlighting and Lua-driven indent.
+   decoration-provider highlighting (`vim.treesitter.start`; the highlighter is a
+   loud not-implemented stub today) and Lua-driven indent.
 
 Each phase is independently testable and leaves the tree green. Phase 1 front-
-loads the only genuinely novel risk (the node/tree lifetime over the Lua
-boundary); phases 2–4 are integration of vendored Lua against those primitives.
+loaded the only genuinely novel risk (the node/tree lifetime over the Lua
+boundary); phases 2–4 were integration of vendored Lua against those primitives,
+plus the one further bespoke piece — the unfiltered query cursor.
 
 ---
 

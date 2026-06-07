@@ -47,10 +47,28 @@ These have **no single call site to tag** because the subsystem itself is
 absent — a config touching them hits a nil index or a generic error, not a named
 gap. Recorded here so the sweep doesn't lose them.
 
-- **Treesitter Lua API.** nxvim highlights in a separate process, so
-  `vim.treesitter.*` (parsers, queries, `get_node`, language registration,
-  injections) is a near-empty shell — only the version-probe shape exists
-  (tagged). Anything reaching for a parser hits nil.
+- **Treesitter Lua API — now a real platform, with a few deferred edges.** The
+  `vim.treesitter` plugin API is implemented: `get_parser(buf):parse()`,
+  `get_string_parser`, `get_node`/`get_node_text`, and `query.parse` +
+  `iter_captures`/`iter_matches` with predicates/directives all run neovim's
+  vendored Lua on bespoke Rust primitives (see the
+  [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md)). Remaining
+  gaps, each a *deliberate* deferral rather than a silent stub:
+  - **Decoration-provider highlighting** (`vim.treesitter.start` / the
+    highlighter): nxvim highlights from the Rust engine, not a Lua-owned tree.
+    `vim.treesitter.highlighter` is a small shim — legacy-API probes (`hl_map`)
+    read nil and `active` is empty, but `highlighter.new` fails loud
+    (`vim._notimpl`), so `vim.treesitter.start` raises rather than faking it.
+  - **Injections.** A buffer's root tree parses; `LanguageTree` child languages /
+    `language_for_range` are not wired, so an injected-language query returns only
+    the host tree's captures.
+  - **Live incremental buffer updates.** There is no `nvim_buf_attach`; a
+    buffer-sourced parser re-reads the snapshot and **fully reparses** on each
+    `:parse()` (correct, but pays the full cost — the "two parsers" tradeoff).
+  - **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) fights the
+    snapshot bridge (it wants the live buffer mid-keystroke); the Rust indent
+    stays. `query.get` needs `io` for on-disk `queries/<lang>/*.scm`; a missing
+    query file returns nil.
 - **`vim.uv` / `vim.loop` beyond timers.** `new_pipe`, TCP (`new_tcp` — the
   TCP transport behind the skipped gdscript `vim.lsp.rpc.connect`), and
   event-based `fs_*` watchers are absent.

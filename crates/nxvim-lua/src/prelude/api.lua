@@ -676,6 +676,53 @@ function vim.api.nvim_buf_is_loaded(bufnr)
   return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil
 end
 
+-- nvim_buf_is_valid: whether the handle names a buffer nxvim knows about. With no
+-- separate "valid but unloaded" notion in the snapshot mirror yet, this matches
+-- is_loaded (every mirrored buffer is loaded).
+function vim.api.nvim_buf_is_valid(bufnr)
+  return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil
+end
+
+-- nvim_buf_line_count: number of lines in the buffer snapshot.
+function vim.api.nvim_buf_line_count(bufnr)
+  local buf = vim._bufs[vim._resolve_bufnr(bufnr)]
+  return (buf and buf.lines) and #buf.lines or 0
+end
+
+-- nvim_buf_get_offset: byte offset of the start of (0-based) line `index`, i.e.
+-- the sum of every preceding line's bytes plus its newline. `index == line_count`
+-- yields the buffer's total byte length. Backs vim.treesitter._range.add_bytes
+-- for buffer-sourced node ranges.
+function vim.api.nvim_buf_get_offset(bufnr, index)
+  local buf = vim._bufs[vim._resolve_bufnr(bufnr)]
+  if not buf or not buf.lines then return -1 end
+  local lines = buf.lines
+  local off = 0
+  for i = 1, index do
+    off = off + #(lines[i] or "") + 1
+  end
+  return off
+end
+
+-- nvim_buf_get_text: the text in the (0-based, end-exclusive) byte range
+-- [start_row,start_col)..[end_row,end_col), returned as a list of lines (the span
+-- split on newlines). Columns are byte indices into their line. vim.treesitter
+-- uses this to extract node text from a buffer.
+function vim.api.nvim_buf_get_text(bufnr, start_row, start_col, end_row, end_col, _opts)
+  local buf = vim._bufs[vim._resolve_bufnr(bufnr)]
+  if not buf or not buf.lines then return {} end
+  local lines = buf.lines
+  if start_row == end_row then
+    return { (lines[start_row + 1] or ""):sub(start_col + 1, end_col) }
+  end
+  local out = { (lines[start_row + 1] or ""):sub(start_col + 1) }
+  for r = start_row + 1, end_row - 1 do
+    out[#out + 1] = lines[r + 1] or ""
+  end
+  out[#out + 1] = (lines[end_row + 1] or ""):sub(1, end_col)
+  return out
+end
+
 function vim.api.nvim_buf_get_lines(bufnr, start, end_, strict)
   local buf = vim._bufs[vim._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then

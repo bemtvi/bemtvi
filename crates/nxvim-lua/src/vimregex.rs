@@ -71,6 +71,19 @@ pub fn substitute(input: &str, pat: &str, sub: &str, flags: &str) -> Result<Stri
     Ok(out)
 }
 
+/// Compile a vim pattern into an RE2 [`regex::Regex`], the engine behind the
+/// `vim.regex(pat)` Lua object (its `:match_str`). Translates vim's magic dialect
+/// the same way [`substitute`] does and folds an inline `\c`/`\C` into the
+/// case-sensitivity. Fails loud (named error) on an invalid/unsupported pattern.
+pub fn compile(pat: &str) -> Result<regex::Regex, String> {
+    let mut ignorecase = false;
+    let translated = translate_pattern(pat, &mut ignorecase)?;
+    RegexBuilder::new(&translated)
+        .case_insensitive(ignorecase)
+        .build()
+        .map_err(|e| format!("vim.regex: invalid pattern {pat:?}: {e}"))
+}
+
 /// Translate a vim pattern to an RE2 pattern, tracking the active magic level and
 /// folding `\c`/`\C` into `ignorecase`.
 fn translate_pattern(pat: &str, ignorecase: &mut bool) -> Result<String, String> {

@@ -95,6 +95,50 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
+/// neovim's own `vim.treesitter` Lua, vendored verbatim under `src/vendor/nvim/`
+/// (see each file's header + that tree's `LICENSE`). Registered into Lua's
+/// `package.preload` by module name so `require('vim.treesitter…')` resolves them
+/// from memory — hermetic, shipping in the binary, with no runtime dependency on
+/// the `vendor/neovim` submodule. They run on the bespoke primitives installed by
+/// [`nxvim_ts::lua::install`]; `prelude/treesitter.lua` supplies the remaining
+/// globals and adapts the snapshot seam. Order is irrelevant (lazy `require`).
+const VENDORED_TS_LUA: &[(&str, &str)] = &[
+    ("vim.F", include_str!("vendor/nvim/vim/F.lua")),
+    ("vim.func", include_str!("vendor/nvim/vim/func.lua")),
+    (
+        "vim.func._memoize",
+        include_str!("vendor/nvim/vim/func/_memoize.lua"),
+    ),
+    (
+        "vim._core.util",
+        include_str!("vendor/nvim/vim/_core/util.lua"),
+    ),
+    (
+        "vim.pos._util",
+        include_str!("vendor/nvim/vim/pos/_util.lua"),
+    ),
+    (
+        "vim.treesitter._range",
+        include_str!("vendor/nvim/vim/treesitter/_range.lua"),
+    ),
+    (
+        "vim.treesitter.language",
+        include_str!("vendor/nvim/vim/treesitter/language.lua"),
+    ),
+    (
+        "vim.treesitter.query",
+        include_str!("vendor/nvim/vim/treesitter/query.lua"),
+    ),
+    (
+        "vim.treesitter.languagetree",
+        include_str!("vendor/nvim/vim/treesitter/languagetree.lua"),
+    ),
+    (
+        "vim.treesitter",
+        include_str!("vendor/nvim/vim/treesitter.lua"),
+    ),
+];
+
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -148,6 +192,20 @@ pub struct LuaRuntime {
     runtimepath: Vec<PathBuf>,
 }
 
+/// Register the [`VENDORED_TS_LUA`] modules into Lua's `package.preload` keyed by
+/// module name, each compiled to a loader function, so `require(name)` returns it
+/// without touching the filesystem. The chunk name carries into tracebacks.
+fn register_vendored_modules(lua: &Lua) -> mlua::Result<()> {
+    let package: Table = lua.globals().get("package")?;
+    let preload: Table = package.get("preload")?;
+    for (name, src) in VENDORED_TS_LUA {
+        let chunk_name = format!("@vendor/nvim/{}.lua", name.replace('.', "/"));
+        let loader = lua.load(*src).set_name(chunk_name).into_function()?;
+        preload.set(*name, loader)?;
+    }
+    Ok(())
+}
+
 impl LuaRuntime {
     /// Build the VM and point `require` at `runtimepath`: each entry's `lua/`
     /// subdirectory is prepended to `package.path` as `<rt>/lua/?.lua` and
@@ -173,6 +231,10 @@ impl LuaRuntime {
         // installed; the data dir is resolved the same way the engine resolves it.
         nxvim_ts::lua::install(&lua, &nxvim_ts::data_dir())?;
         seed_package_path(&lua, &runtimepath)?;
+        // Register the vendored `vim.treesitter` Lua into `package.preload` so a
+        // later `require('vim.treesitter…')` loads it from memory. Done before the
+        // prelude so `prelude/treesitter.lua` can require it.
+        register_vendored_modules(&lua)?;
         // The pure-Lua half of `vim.*`, layered over the Rust bridge above. Split
         // across focused modules but loaded in source order — each is its own
         // chunk (its own `local` scope), so the order is what one big chunk's was.
@@ -180,6 +242,12 @@ impl LuaRuntime {
         for (name, src) in PRELUDE_MODULES {
             lua.load(*src).set_name(*name).exec()?;
         }
+        // Wire the vendored `vim.treesitter` onto the primitives + snapshot bridge.
+        // Loaded last: it `require`s the high-level API, which calls back into the
+        // `vim.api`/autocmd surface the prelude above installs.
+        lua.load(include_str!("prelude/treesitter.lua"))
+            .set_name("nxvim:prelude/treesitter")
+            .exec()?;
         Ok(LuaRuntime {
             lua,
             shared,

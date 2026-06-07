@@ -627,6 +627,40 @@ designs:
 and
 [the catppuccin colorscheme](specs/2026-06-01-catppuccin-colorscheme-design.md).
 
+### The `vim.treesitter` Lua platform
+
+Parallel to (not a replacement for) the redraw highlighter above, nxvim exposes
+neovim's **`vim.treesitter` Lua API** so treesitter-consuming plugins (textobjects,
+AST/query tools, query-driven motions) run unmodified. It mirrors neovim's own
+split — a small bespoke C-equivalent layer with neovim's real Lua on top:
+
+- **Bespoke primitives in Rust** (`nxvim-ts/src/lua.rs`, behind the crate's `lua`
+  feature): the `TSParser`/`TSTree`/`TSNode`/`TSQuery` userdata, `TSQuery:inspect`,
+  and `vim._create_ts_querycursor` — the analogue of neovim's
+  `src/nvim/lua/treesitter.c`. The cursor is ported over the raw `tree_sitter::ffi`
+  so matches are returned **unfiltered** (predicates evaluate in Lua, bug-for-bug
+  with upstream). The node/tree lifetime over the Lua boundary is reconciled by
+  co-owning an `Rc<TreeInner>` and erasing the borrow to `'static` (sound because
+  trees are immutable snapshots).
+- **Vendored neovim Lua on top** (`nxvim-lua/src/vendor/nvim/`, Apache-2.0, kept
+  verbatim with a provenance header): `vim/treesitter/*.lua` + the `vim.func` /
+  `vim.F` / `vim._core.util` / `vim.pos._util` helpers, embedded into
+  `package.preload` so it ships in the binary with no dependency on the
+  `vendor/neovim` submodule. `nxvim-lua/src/prelude/treesitter.lua` wires it onto
+  the primitives.
+- **The snapshot seam.** Unlike neovim's live buffer handle, nxvim's Lua bridge is
+  a snapshot + effect queue. `TSParser:parse(bufnr)` reads the pushed
+  `vim._bufs[bufnr]` lines, and a buffer-sourced `LanguageTree` re-reads that
+  snapshot on every `:parse()` (a full reparse — there is no `nvim_buf_attach`).
+  String parsers (`get_string_parser`) keep their incremental trees.
+
+This is **additive**: a `LanguageTree` is created only when a plugin calls
+`get_parser`, so buffers without a treesitter consumer pay nothing; one that has a
+consumer pays a second parse (the Rust engine's + Lua's). Decoration-provider
+highlighting (`vim.treesitter.start`), Lua-driven indent, and injections are
+explicit non-goals for now (the highlighter is a loud not-implemented stub). Full
+design: [the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md).
+
 ---
 
 ## Cross-platform & the future GUI
@@ -712,7 +746,12 @@ screen," and that is exactly the shape of these tests.
 
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up), treesitter
-  injections, and a `:set`-driven highlight toggle.
+  injections, and a `:set`-driven highlight toggle. The **`vim.treesitter` Lua
+  platform** itself is in place — `get_parser(buf):parse()`, `get_string_parser`,
+  and `query.parse` + `iter_captures`/`iter_matches` with predicates run neovim's
+  vendored Lua on bespoke Rust primitives (see [*The `vim.treesitter` Lua
+  platform*](#the-vimtreesitter-lua-platform)); injections, decoration-provider
+  highlighting (`vim.treesitter.start`), and Lua-driven indent remain deferred.
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay

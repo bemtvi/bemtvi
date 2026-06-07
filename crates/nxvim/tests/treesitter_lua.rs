@@ -290,3 +290,247 @@ async fn create_parser_missing_grammar_errors() {
     // pcall failed (loud error) and the message names the missing language.
     assert_eq!(v.as_str(), Some("named"));
 }
+
+// ----- high-level vim.treesitter (vendored Lua over the primitives) ---------
+
+/// `vim.treesitter.get_string_parser(...):parse()` returns a tree whose root and
+/// children match — the vendored `LanguageTree` running on our primitives.
+#[tokio::test]
+async fn string_parser_parses_and_walks() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        local p = vim.treesitter.get_string_parser('fn main() {}', 'rust')
+        local root = p:parse()[1]:root()
+        return root:type() .. '|' .. root:named_child(0):type()
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("source_file|function_item"));
+}
+
+/// `query.parse` + `iter_captures` with an `#eq?` predicate — the full query
+/// pipeline (the ffi cursor + match + the vendored `query.lua` predicate eval).
+/// Only the `foo` function's name satisfies `(#eq? @name "foo")`.
+#[tokio::test]
+async fn query_iter_captures_eq_predicate() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        local src = 'fn foo() {}\nfn bar() {}\n'
+        local q = vim.treesitter.query.parse('rust',
+          '((function_item name: (identifier) @name) (#eq? @name "foo"))')
+        local root = vim.treesitter.get_string_parser(src, 'rust'):parse()[1]:root()
+        local names = {}
+        for id, node in q:iter_captures(root, src) do
+          names[#names + 1] = vim.treesitter.get_node_text(node, src)
+        end
+        return table.concat(names, ',')
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("foo"));
+}
+
+/// `iter_matches` yields one match per `function_item`, each carrying its `@name`
+/// capture — exercises `match:captures()`/`match:info()` and `get_node_text`.
+#[tokio::test]
+async fn query_iter_matches_lists_all() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        local src = 'fn foo() {}\nfn bar() {}\n'
+        local q = vim.treesitter.query.parse('rust',
+          '(function_item name: (identifier) @name)')
+        local root = vim.treesitter.get_string_parser(src, 'rust'):parse()[1]:root()
+        local names = {}
+        for _, match in q:iter_matches(root, src) do
+          for id, nodes in pairs(match) do
+            for _, node in ipairs(nodes) do
+              names[#names + 1] = vim.treesitter.get_node_text(node, src)
+            end
+          end
+        end
+        table.sort(names)
+        return table.concat(names, ',')
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("bar,foo"));
+}
+
+/// A `#match?` predicate filters by vim-regex — the path where unfiltered cursor
+/// iteration matters (predicates are evaluated in `query.lua`/`vim.regex`, not by
+/// tree-sitter). Only names starting with `f` survive `(#match? @name "^f")`.
+#[tokio::test]
+async fn query_match_predicate_uses_vim_regex() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        local src = 'fn foo() {}\nfn bar() {}\nfn fizz() {}\n'
+        local q = vim.treesitter.query.parse('rust',
+          '((function_item name: (identifier) @name) (#match? @name "^f"))')
+        local root = vim.treesitter.get_string_parser(src, 'rust'):parse()[1]:root()
+        local names = {}
+        for id, node in q:iter_captures(root, src) do
+          names[#names + 1] = vim.treesitter.get_node_text(node, src)
+        end
+        table.sort(names)
+        return table.concat(names, ',')
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("fizz,foo"));
+}
+
+/// `get_parser(buf):parse()` over a real buffer reads the pushed snapshot, and a
+/// re-parse after an edit reflects the change (the snapshot-refresh adapter).
+#[tokio::test]
+async fn buffer_parser_reflects_edits() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'fn a() {}' })
+        local p = vim.treesitter.get_parser(0, 'rust')
+        local c1 = p:parse()[1]:root():named_child_count()
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'fn a() {}', 'fn b() {}' })
+        local c2 = p:parse()[1]:root():named_child_count()
+        return c1 .. ',' .. c2
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("1,2"));
+}
+
+/// A real consumer end to end: a user-Lua routine that selects every function
+/// name in a buffer via a query — the platform's acceptance test.
+#[tokio::test]
+async fn real_consumer_collects_function_names() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, {
+          'fn alpha() {}',
+          'struct S;',
+          'fn beta() { let x = 1; }',
+        })
+        local parser = vim.treesitter.get_parser(0, 'rust')
+        local root = parser:parse()[1]:root()
+        local q = vim.treesitter.query.parse('rust',
+          '(function_item name: (identifier) @fn)')
+        local out = {}
+        for id, node in q:iter_captures(root, 0) do
+          out[#out + 1] = vim.treesitter.get_node_text(node, 0)
+        end
+        table.sort(out)
+        return table.concat(out, ',')
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("alpha,beta"));
+}
+
+/// `vim.treesitter.get_node` resolves the smallest named node at a position —
+/// the path through `named_node_for_range` / `tree_for_range`, which calls
+/// `vim.nonnil` (a stdlib helper that must exist, else the call fails loud).
+#[tokio::test]
+async fn get_node_resolves_node_at_position() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'fn main() {}' })
+        -- Parse first so the tree is available, then resolve the node at (0, 3),
+        -- which sits on `main` (the function's name identifier).
+        vim.treesitter.get_parser(0, 'rust'):parse()
+        local node = vim.treesitter.get_node({ bufnr = 0, lang = 'rust', pos = { 0, 3 } })
+        return node and node:type() or 'nil'
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("identifier"));
+}
+
+/// `get_node` with no `pos` resolves the node under the **window cursor** — the
+/// `:TSNodeAt`-style pattern. It only works against a *parsed* tree, and since
+/// neovim's parser cache is weak-valued (and nxvim has no background highlighter
+/// holding it), the consumer must parse first *and* keep a strong ref to the
+/// parser across the `get_node` call — exactly what the example does.
+#[tokio::test]
+async fn get_node_at_cursor_after_parse() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'fn main() {}' })
+        -- Strong `parser` ref keeps the weak-cached parser alive across get_node,
+        -- so get_node's internal get_parser returns this freshly-parsed instance.
+        local parser = vim.treesitter.get_parser(0, 'rust')
+        parser:parse()
+        -- Cursor is at (1, 0) (1-based row); get_node reads it via nvim_win_get_cursor.
+        local node = vim.treesitter.get_node({ bufnr = 0, lang = 'rust' })
+        return node and node:type() or 'nil'
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("function_item"));
+}
+
+/// `vim.treesitter.language.inspect` surfaces the grammar's symbols/fields/ABI
+/// via the `_ts_inspect_language` primitive.
+#[tokio::test]
+async fn language_inspect_reports_symbols() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        local info = vim.treesitter.language.inspect('rust')
+        return tostring(info.symbols['function_item'] == true)
+          .. ',' .. tostring(info.abi_version >= 13)
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("true,true"));
+}

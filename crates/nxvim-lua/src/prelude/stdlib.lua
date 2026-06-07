@@ -183,6 +183,63 @@ function vim.tbl_values(t)
   return values
 end
 
+-- vim.tbl_count(t): number of entries in `t` (any keys, not just the sequence).
+function vim.tbl_count(t)
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  return n
+end
+
+-- vim.deep_equal(a, b): structural equality. Used by vim.treesitter.query to spot
+-- specific directives (e.g. `#set! injection.combined`).
+function vim.deep_equal(a, b)
+  if a == b then return true end
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  for k, v in pairs(a) do
+    if not vim.deep_equal(v, b[k]) then return false end
+  end
+  for k in pairs(b) do
+    if a[k] == nil then return false end
+  end
+  return true
+end
+
+-- vim.npcall(fn, ...): pcall that maps failure to nil — `select(2, pcall(...))`
+-- on success, nil on error. vim.treesitter.get_parser guards _create_parser with
+-- it so a parser that can't be built returns nil rather than raising.
+function vim.npcall(fn, ...)
+  local ok, rv = pcall(fn, ...)
+  if ok then return rv end
+end
+
+-- vim.nonnil(...): the first non-nil argument, or nil (verbatim from neovim's
+-- vim/_core/shared.lua; the replacement for the deprecated vim.F.if_nil).
+-- vim.treesitter.tree_for_range uses it to default `opts.ignore_injections`.
+function vim.nonnil(...)
+  local nargs = select("#", ...)
+  for i = 1, nargs do
+    local v = select(i, ...)
+    if v ~= nil then
+      return v
+    end
+  end
+  return nil
+end
+
+-- vim._tointeger / vim._assert_integer: integer coercion (verbatim from neovim's
+-- vim/_core/shared.lua). vim.func._memoize uses them to parse a `concat-N` hash
+-- spec; _assert_integer raises on a non-integer, _tointeger returns nil.
+function vim._tointeger(x, base)
+  local nx = tonumber(x, base)
+  if nx and nx == math.floor(nx) then
+    return nx
+  end
+end
+
+function vim._assert_integer(x, base)
+  return vim._tointeger(x, base) or error(("Cannot convert %s to integer"):format(x))
+end
+
 -- vim.tbl_get(o, ...): follow the `...` keys into nested table `o`, returning the
 -- value reached or nil if any step is missing (or hits a non-table before the
 -- last key). The safe nested access `lsp/<server>.lua` configs use to read deep

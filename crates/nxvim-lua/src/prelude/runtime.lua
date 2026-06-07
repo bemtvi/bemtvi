@@ -1,5 +1,5 @@
 -- nxvim Lua prelude — runtime services.
--- The vim._notimpl loud-failure funnel, the deferred-callback registry (vim.schedule / _cb_fns / proc pids), and vim.notify / vim.inspect / the vim.treesitter version-probe shell.
+-- The vim._notimpl loud-failure funnel, the deferred-callback registry (vim.schedule / _cb_fns / proc pids), and vim.notify / vim.inspect. (vim.treesitter is wired later, in prelude/treesitter.lua.)
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
 
@@ -105,17 +105,6 @@ end
 -- vim.notify_once: in neovim this dedups by message; we have no message history
 -- to dedup against during a one-shot colorscheme load, so route to notify.
 function vim.notify_once(msg, level, opts) return vim.notify(msg, level, opts) end
-
--- vim.treesitter: nxvim runs its own out-of-process treesitter highlighter, not
--- neovim's in-VM one, so this namespace is otherwise absent. catppuccin probes
--- `vim.treesitter.highlighter.hl_map` purely to detect ancient neovim 0.7; an
--- empty `highlighter` makes that field nil, so the modern path is taken.
--- INCOMPLETE: the namespace is a near-empty shell — only the version-probe shape
--- exists. Every real API (vim.treesitter.get_parser, .query.*, .start, language
--- registration, etc.) is absent, so a config calling one hits a nil-index rather
--- than a named failure. A real impl would either bridge to nxvim's out-of-process
--- highlighter or route the unimplemented entry points through vim._notimpl.
-vim.treesitter = vim.treesitter or { highlighter = {} }
 
 function vim.inspect(value)
   local function ins(v, indent)

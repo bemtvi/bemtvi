@@ -59,6 +59,14 @@ gap. Recorded here so the sweep doesn't lose them.
     `vim.treesitter.highlighter` is a small shim — legacy-API probes (`hl_map`)
     read nil and `active` is empty, but `highlighter.new` fails loud
     (`vim._notimpl`), so `vim.treesitter.start` raises rather than faking it.
+  - **In-memory query overrides don't change the paint.** A plugin that overrides
+    a highlight/indent query via `vim.treesitter.query.set` changes only the
+    Lua-side `LanguageTree`; the redraw painter resolves highlights and indent
+    through the Rust engine, which reads `queries/<lang>/*.scm` from disk
+    (runtimepath). **On-disk** query overrides *are* honored — a drop-in
+    nvim-treesitter `queries/` tree works; **in-memory** ones are not. Direct
+    consequence of the engine/API split in
+    [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md).
   - **Injections.** A buffer's root tree parses; `LanguageTree` child languages /
     `language_for_range` are not wired, so an injected-language query returns only
     the host tree's captures.

@@ -665,6 +665,14 @@ highlighting (`vim.treesitter.start`), Lua-driven indent, and injections are
 explicit non-goals for now (the highlighter is a loud not-implemented stub). Full
 design: [the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md).
 
+The boundary this section embodies — **native engine for editor behavior,
+vendored neovim Lua API for plugins** — is the same one LSP follows (a native
+async server under the vendored `vim.lsp`), and it is recorded as a standing
+decision in [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md). That
+ADR also names the *bridge pattern* (`vim.treesitter.start`, LSP semantic tokens)
+by which a vendored API is wired to the native engine underneath, projecting into
+the extmark highlight layer rather than into core's synchronous path.
+
 ---
 
 ## Cross-platform & the future GUI

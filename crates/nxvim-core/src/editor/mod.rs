@@ -604,6 +604,11 @@ pub struct Editor {
     /// [`crate::editor::mouse`].
     mouse_select: Option<mouse::MouseSelect>,
 
+    /// State for an in-flight separator / status-line drag (Phase 5): which window
+    /// edge is grabbed and the press origin the drag resizes against. `None` unless
+    /// a left-press landed on a split divider. See [`crate::editor::mouse`].
+    mouse_resize: Option<mouse::ResizeDrag>,
+
     /// Set by a scroll command or a cursor motion at the moment it fires:
     /// `(top, cursor.line)` *before* the move. Consumed at the end of `input` to
     /// build `pending_scroll` when the viewport ends up moving more than a line.
@@ -779,6 +784,7 @@ impl Editor {
             soft_tab: None,
             visual_anchor: Cursor::default(),
             mouse_select: None,
+            mouse_resize: None,
             scroll_from: None,
             pending_scroll: None,
             placement_undo: Vec::new(),
@@ -977,33 +983,44 @@ impl Editor {
 
         // If this key moved the viewport — an explicit scroll command, or a
         // motion that jumped off-screen — record the gesture for the client to
-        // animate. A one-line shift (holding `j`/`k` at the edge) is left alone
-        // so continuous scrolling stays crisp.
-        if let Some((from_top, from_cursor)) = self.scroll_from.take() {
-            if from_top.abs_diff(self.top) > 1 {
-                // Cap the visual travel so a huge jump (e.g. `G` in a big file)
-                // animates a bounded slide of the last couple of screens instead
-                // of projecting thousands of lines into the view.
-                let cap = self.text_height().saturating_mul(2).max(1);
-                let clamp = |from: usize, to: usize| {
-                    if from > to {
-                        from.min(to + cap)
-                    } else {
-                        from.max(to.saturating_sub(cap))
-                    }
-                };
-                let from_top = clamp(from_top, self.top);
-                let from_cursor = clamp(from_cursor, self.cursor.line);
-                let dist = from_top.abs_diff(self.top) as u64;
-                self.pending_scroll = Some(PendingScroll {
-                    from_top,
-                    to_top: self.top,
-                    from_cursor,
-                    to_cursor: self.cursor.line,
-                    duration_ms: (dist * 8).clamp(80, 160),
-                });
-            }
+        // animate.
+        self.finalize_scroll_gesture();
+    }
+
+    /// Turn a recorded `scroll_from` into a `pending_scroll` animation when the
+    /// focused window's viewport moved more than a line — an explicit scroll, an
+    /// off-screen motion, or the mouse wheel. A one-line shift (holding `j`/`k` at
+    /// the edge, or a single-line wheel notch) is left alone so continuous
+    /// scrolling stays crisp. Shared by keyboard [`input`](Self::input) and the
+    /// wheel ([`mouse`](Self::mouse)) so both animate identically.
+    pub(crate) fn finalize_scroll_gesture(&mut self) {
+        let Some((from_top, from_cursor)) = self.scroll_from.take() else {
+            return;
+        };
+        if from_top.abs_diff(self.top) <= 1 {
+            return;
         }
+        // Cap the visual travel so a huge jump (e.g. `G` in a big file) animates a
+        // bounded slide of the last couple of screens instead of projecting
+        // thousands of lines into the view.
+        let cap = self.text_height().saturating_mul(2).max(1);
+        let clamp = |from: usize, to: usize| {
+            if from > to {
+                from.min(to + cap)
+            } else {
+                from.max(to.saturating_sub(cap))
+            }
+        };
+        let from_top = clamp(from_top, self.top);
+        let from_cursor = clamp(from_cursor, self.cursor.line);
+        let dist = from_top.abs_diff(self.top) as u64;
+        self.pending_scroll = Some(PendingScroll {
+            from_top,
+            to_top: self.top,
+            from_cursor,
+            to_cursor: self.cursor.line,
+            duration_ms: (dist * 8).clamp(80, 160),
+        });
     }
 
     /// Run an ex-command directly (the `nvim_command` API entry point).

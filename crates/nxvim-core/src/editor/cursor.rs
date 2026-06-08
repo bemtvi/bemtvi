@@ -142,7 +142,7 @@ impl Editor {
 
     /// Snap the cursor column down to the nearest grapheme boundary (a no-op for
     /// ASCII), so byte offsets handed to the rope are always valid.
-    fn snap_cursor(&mut self) {
+    pub(crate) fn snap_cursor(&mut self) {
         let s = self.buffer().line_cow(self.cursor.line);
         self.cursor.col = unicode::floor_grapheme(&s, self.cursor.col.min(s.len()));
     }

@@ -33,6 +33,27 @@ pub(crate) struct MouseSelect {
     anchor: SelectAnchor,
 }
 
+/// In-flight separator / status-line drag (Phase 5): a left-press that landed on
+/// a split divider grabs the window edge next to it; subsequent drags resize that
+/// window to follow the pointer. The resize is **absolute** against the press
+/// `origin` (not incremental), so pushing past a window's minimum and dragging
+/// back tracks the pointer cleanly instead of drifting.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResizeDrag {
+    /// The window whose edge is grabbed — the one *left of* a vertical divider or
+    /// *above* a horizontal one, so a drag toward it (right / down) grows it.
+    win: WindowId,
+    /// The divider's orientation: `true` for a vertical separator (resize width),
+    /// `false` for a horizontal separator or a status line (resize height).
+    vertical: bool,
+    /// The press cell along the drag axis (the column for a vertical divider, the
+    /// row for a horizontal one), the fixed point the drag measures from.
+    origin: usize,
+    /// Total cells already applied to the resize, so each drag issues only the
+    /// remaining delta to reach the pointer's current offset from `origin`.
+    applied: isize,
+}
+
 /// The anchored extent a left-drag extends from, set by the press by click count.
 #[derive(Debug, Clone, Copy)]
 enum SelectAnchor {
@@ -80,6 +101,21 @@ impl Editor {
             }
             (MouseButton::Left, MouseAction::Drag | MouseAction::Release)
                 if self.mode == Mode::MultiCursor => {}
+            // A press on a split divider (a separator or a status line with a
+            // window below it) grabs that edge; drags resize, release lets go.
+            // Checked before the text-press arms so a divider click never places
+            // the cursor or starts a selection.
+            (MouseButton::Left, MouseAction::Press)
+                if self.resize_handle_at(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_begin_resize(ev.row, ev.col)
+            }
+            (MouseButton::Left, MouseAction::Drag) if self.mouse_resize.is_some() => {
+                self.mouse_resize_drag(ev.row, ev.col)
+            }
+            (MouseButton::Left, MouseAction::Release) if self.mouse_resize.is_some() => {
+                self.mouse_resize = None
+            }
             // Shift+left-press extends the selection to the click (vim's
             // `<S-LeftMouse>` under the default `popup_setpos` mousemodel) instead
             // of placing the cursor and starting fresh.
@@ -93,8 +129,11 @@ impl Editor {
             // Release ends the drag but keeps `mouse_select` so the next press can
             // still see this one for multi-click counting; vim keeps the selection.
             (MouseButton::Left, MouseAction::Release) => {}
-            // The wheel, the other buttons, and bare moves are wired in later
-            // phases; ignore them for now.
+            // The wheel scrolls the window *under the pointer* without moving focus
+            // or (unless a line scrolls off) the cursor.
+            (MouseButton::Wheel, action) => self.mouse_wheel(action, ev.row, ev.col, ev.shift),
+            // The other buttons and bare moves are wired in later phases; ignore
+            // them for now.
             _ => {}
         }
     }
@@ -141,6 +180,99 @@ impl Editor {
             count,
             anchor,
         });
+    }
+
+    /// Resolve a **global** screen cell to the split divider it grabs, as the
+    /// window whose edge is dragged plus the divider orientation (`true` =
+    /// vertical separator → resize width, `false` = horizontal separator or status
+    /// line → resize height). The cell grabs a divider when it is:
+    ///
+    /// 1. on a vertical separator — the window directly to its left is grown;
+    /// 2. on a horizontal separator — the window directly above it is grown;
+    /// 3. on a window's status row that has a horizontal separator one row below
+    ///    (i.e. another window beneath it) — that window is grown.
+    ///
+    /// `None` otherwise (text, gutter, the bottom-most status line, the tabline, or
+    /// outside every window), so the press falls through to the normal handling.
+    fn resize_handle_at(&self, row: usize, col: usize) -> Option<(WindowId, bool)> {
+        let top_chrome = self.tabline_rows();
+        if row < top_chrome {
+            return None;
+        }
+        let (x, y) = (col, row - top_chrome);
+        for sep in self.separators() {
+            if sep.vertical {
+                if x == sep.x && y >= sep.y && y < sep.y + sep.length {
+                    // The window left of the divider grows when dragged right.
+                    let (win, ..) = self.window_at(sep.x.checked_sub(1)?, y)?;
+                    return Some((win, true));
+                }
+            } else if y == sep.y && x >= sep.x && x < sep.x + sep.length {
+                // The window above the divider grows when dragged down.
+                let (win, ..) = self.window_at(x, sep.y.checked_sub(1)?)?;
+                return Some((win, false));
+            }
+        }
+        // Not on a separator: a window's own status row is a drag handle too, but
+        // only when a horizontal separator sits just below it — otherwise it is the
+        // bottom-most window and there is nothing beneath to resize against.
+        let (win, _, rel_y) = self.window_at(x, y)?;
+        let (_, text_height) = self.window_content_size(win)?;
+        if rel_y == text_height {
+            let below = y + 1;
+            let has_window_below = self
+                .separators()
+                .iter()
+                .any(|s| !s.vertical && s.y == below && x >= s.x && x < s.x + s.length);
+            if has_window_below {
+                return Some((win, false));
+            }
+        }
+        None
+    }
+
+    /// Begin a separator / status-line drag: stash which window edge is grabbed and
+    /// the press cell the resize measures from. Clears any pending text selection so
+    /// the divider press can't leave a stale anchor behind. A no-op (leaving
+    /// `mouse_resize` unset) if the cell isn't actually a divider — the dispatch
+    /// guard already checked, so this only re-resolves it.
+    fn mouse_begin_resize(&mut self, row: usize, col: usize) {
+        let Some((win, vertical)) = self.resize_handle_at(row, col) else {
+            return;
+        };
+        self.mouse_select = None;
+        self.mouse_resize = Some(ResizeDrag {
+            win,
+            vertical,
+            origin: if vertical { col } else { row },
+            applied: 0,
+        });
+    }
+
+    /// Continue a separator / status-line drag: resize the grabbed window so its
+    /// edge follows the pointer. The target offset from the press `origin` is
+    /// absolute, and `applied` records how much has been issued, so each drag sends
+    /// only the remaining delta — pushing past a window's minimum and dragging back
+    /// tracks the pointer instead of drifting.
+    fn mouse_resize_drag(&mut self, row: usize, col: usize) {
+        let Some(rd) = self.mouse_resize else {
+            return;
+        };
+        let current = if rd.vertical { col } else { row };
+        let want = current as isize - rd.origin as isize;
+        let step = want - rd.applied;
+        if step == 0 {
+            return;
+        }
+        let axis = if rd.vertical {
+            SplitDir::Vertical
+        } else {
+            SplitDir::Horizontal
+        };
+        self.resize_window_id(rd.win, axis, step);
+        if let Some(rd) = self.mouse_resize.as_mut() {
+            rd.applied = want;
+        }
     }
 
     /// Shift+left-press (`<S-LeftMouse>`): extend the selection to the click,
@@ -334,6 +466,219 @@ impl Editor {
         self.set_cursor_char(anchor);
         self.visual_anchor = self.cursor;
         self.set_cursor_char(cursor);
+    }
+
+    /// Scroll wheel: scroll the window **under the pointer** by `'mousescroll'`
+    /// (`Shift` makes a vertical notch a full page), leaving focus and — unless a
+    /// line scrolls off — the cursor where they are. A notch over no window (the
+    /// tabline, a separator, the panel) is ignored, as is a direction `'mousescroll'`
+    /// disables with a `0` step. Vertical maps to `top`, horizontal to `leftcol`.
+    fn mouse_wheel(&mut self, action: MouseAction, row: usize, col: usize, shift: bool) {
+        let Some(win) = self.window_at_cell(row, col) else {
+            return;
+        };
+        let (ver, hor) = self.mousescroll_steps();
+        match action {
+            MouseAction::WheelUp | MouseAction::WheelDown => {
+                // Shift escalates a notch to a screenful (vim's `<S-ScrollWheel*>`
+                // → `<C-b>`/`<C-f>`), keeping a two-line overlap like `scroll_page`.
+                let step = if shift {
+                    self.window_text_height(win).saturating_sub(2).max(1)
+                } else {
+                    ver
+                };
+                if step == 0 {
+                    return; // `mousescroll=ver:0` disables vertical wheel
+                }
+                let down = action == MouseAction::WheelDown;
+                let delta = if down { step as i64 } else { -(step as i64) };
+                self.wheel_scroll_vertical(win, delta);
+            }
+            MouseAction::WheelLeft | MouseAction::WheelRight => {
+                if hor == 0 {
+                    return; // `mousescroll=hor:0` disables horizontal wheel
+                }
+                let right = action == MouseAction::WheelRight;
+                let delta = if right { hor as i64 } else { -(hor as i64) };
+                self.wheel_scroll_horizontal(win, delta);
+            }
+            // `mouse_wheel` is only reached for `MouseButton::Wheel`, whose parse
+            // only ever yields the four wheel directions.
+            _ => {}
+        }
+    }
+
+    /// Parse `'mousescroll'` (`"ver:{lines},hor:{cols}"`) into the `(vertical,
+    /// horizontal)` step counts. A missing field falls back to vim's default
+    /// (`ver:3` / `hor:6`); a `0` count disables that direction.
+    fn mousescroll_steps(&self) -> (usize, usize) {
+        let (mut ver, mut hor) = (3, 6);
+        for part in self.options.mousescroll.split(',') {
+            match part.split_once(':') {
+                Some(("ver", n)) => ver = n.parse().unwrap_or(ver),
+                Some(("hor", n)) => hor = n.parse().unwrap_or(hor),
+                _ => {}
+            }
+        }
+        (ver, hor)
+    }
+
+    /// Scroll window `win` vertically by `delta` lines (negative = toward the top
+    /// of the buffer), clamped so the first line can't pass the top row. The cursor
+    /// stays on its buffer line while that line is still visible; once the scroll
+    /// would push it off, it is pulled to the nearest visible edge (vim's wheel
+    /// with `scrolloff` 0). The focused window moves its live viewport and emits the
+    /// smooth-scroll gesture; an inactive window updates its stashed scroll — the
+    /// wheel famously scrolls a window you are not focused in. Pulling the cursor
+    /// onto a visible line on the focused window is load-bearing, not cosmetic: the
+    /// per-redraw `ensure_visible` would otherwise snap `top` straight back.
+    fn wheel_scroll_vertical(&mut self, win: WindowId, delta: i64) {
+        let last = self.window_last_line(win);
+        let th = self.window_text_height(win);
+        if win == self.current_window_id() {
+            let old_top = self.top;
+            let new_top = (old_top as i64 + delta).clamp(0, last as i64) as usize;
+            if new_top == old_top {
+                return;
+            }
+            self.scroll_from = Some((old_top, self.cursor.line));
+            self.top = new_top;
+            let bottom = self.top + th.saturating_sub(1);
+            if self.cursor.line < self.top {
+                self.cursor.line = self.top;
+            } else if self.cursor.line > bottom {
+                self.cursor.line = bottom.min(last);
+            } else {
+                // Cursor still visible — leave it (and its `curswant`) untouched.
+                self.finalize_scroll_gesture();
+                return;
+            }
+            self.settle_desired_col(false);
+            self.preserve_desired = true;
+            self.finalize_scroll_gesture();
+        } else {
+            let old_top = self.windows.get(win).saved_top;
+            let new_top = (old_top as i64 + delta).clamp(0, last as i64) as usize;
+            if new_top == old_top {
+                return;
+            }
+            let bottom = new_top + th.saturating_sub(1);
+            let w = self.windows.get_mut(win);
+            w.saved_top = new_top;
+            if w.saved_cursor.line < new_top {
+                w.saved_cursor.line = new_top;
+            } else if w.saved_cursor.line > bottom {
+                w.saved_cursor.line = bottom.min(last);
+            }
+        }
+    }
+
+    /// Scroll window `win` horizontally by `delta` columns (negative = left),
+    /// clamped to `[0, max_leftcol]` so it can't scroll past the content — when
+    /// every visible line already fits there is nothing off-screen and a notch is a
+    /// no-op (vim doesn't scroll into empty space). Like the vertical wheel this
+    /// moves `leftcol` without changing focus; on the focused window the cursor is
+    /// pulled back into the visible band (honoring `sidescrolloff`) so the
+    /// per-redraw `ensure_visible_horizontal` doesn't immediately undo the scroll.
+    /// Only meaningful under `nowrap`.
+    fn wheel_scroll_horizontal(&mut self, win: WindowId, delta: i64) {
+        let max = self.window_max_leftcol(win) as i64;
+        if win == self.current_window_id() {
+            let old = self.leftcol;
+            let new = (old as i64 + delta).clamp(0, max) as usize;
+            if new == old {
+                return;
+            }
+            self.leftcol = new;
+            self.keep_cursor_in_leftcol();
+        } else {
+            let w = self.windows.get_mut(win);
+            let new = (w.saved_leftcol as i64 + delta).clamp(0, max) as usize;
+            w.saved_leftcol = new;
+        }
+    }
+
+    /// The furthest right `leftcol` window `win` may scroll to: the widest line in
+    /// its current viewport minus the text width, floored at 0. At this offset the
+    /// widest visible line's last column sits at the right edge, so a window whose
+    /// lines all fit (`widest <= text width`) has a max of 0 — no horizontal scroll.
+    fn window_max_leftcol(&self, win: WindowId) -> usize {
+        let (Some((top, _)), Some((content_w, text_h)), Some(buf_id), Some(opts)) = (
+            self.window_scroll(win),
+            self.window_content_size(win),
+            self.window_buffer(win),
+            self.window_options(win),
+        ) else {
+            return 0;
+        };
+        let buf = &self.buffers.get(buf_id).buffer;
+        let line_count = buf.line_count();
+        let text_w = content_w.saturating_sub(self.number_width_for(opts, line_count));
+        let ts = buf.options.effective_tabstop();
+        let widest = (top..(top + text_h).min(line_count))
+            .map(|l| {
+                let s = buf.line(l);
+                crate::unicode::virtcol(&s, s.len(), ts)
+            })
+            .max()
+            .unwrap_or(0);
+        widest.saturating_sub(text_w)
+    }
+
+    /// Pull the focused window's cursor into the visible horizontal band
+    /// `[leftcol + sidescrolloff, leftcol + width - sidescrolloff)` by moving its
+    /// column, mirroring [`ensure_visible_horizontal`](Editor::ensure_visible_horizontal)'s
+    /// bounds so that — once the cursor sits inside them — that pass is a no-op and
+    /// the wheel's `leftcol` survives the redraw.
+    fn keep_cursor_in_leftcol(&mut self) {
+        let tw = self.text_width();
+        if tw == 0 {
+            return;
+        }
+        let opts = self.windows.cur().options;
+        let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);
+        let lo = self.leftcol + so;
+        let hi = (self.leftcol + tw).saturating_sub(so + 1);
+        let vc = self.cursor_virtcol();
+        let target = if vc < lo {
+            lo
+        } else if vc > hi {
+            hi
+        } else {
+            return;
+        };
+        let line = self.buffer().line(self.cursor.line);
+        let ts = self.buffer().options.effective_tabstop();
+        self.cursor.col = crate::unicode::byte_at_virtcol(&line, target, ts);
+        self.snap_cursor();
+        self.desired_col = self.cursor_virtcol();
+        self.preserve_desired = true;
+    }
+
+    /// The window whose content area is under the **global** screen cell `(row,
+    /// col)`, or `None` when the cell is on the tabline, a window separator, or
+    /// outside every window. Unlike [`hit_test`](Self::hit_test) this stops at the
+    /// window — the wheel needs only *which* window to scroll, not a buffer cell.
+    fn window_at_cell(&self, row: usize, col: usize) -> Option<WindowId> {
+        let top_chrome = self.tabline_rows();
+        if row < top_chrome {
+            return None;
+        }
+        self.window_at(col, row - top_chrome).map(|(win, ..)| win)
+    }
+
+    /// Window `win`'s text-area height in rows (its content height minus the status
+    /// line), at least 1 — the page size for a `Shift`+wheel notch.
+    fn window_text_height(&self, win: WindowId) -> usize {
+        self.window_content_size(win).map_or(1, |(_, h)| h).max(1)
+    }
+
+    /// Window `win`'s last real buffer line (0-based), the floor `top` can scroll
+    /// to. `0` for an unknown window.
+    fn window_last_line(&self, win: WindowId) -> usize {
+        self.window_buffer(win).map_or(0, |b| {
+            self.buffers.get(b).buffer.line_count().saturating_sub(1)
+        })
     }
 
     /// Whether `'mouse'` enables mouse input for the current mode. `a` enables

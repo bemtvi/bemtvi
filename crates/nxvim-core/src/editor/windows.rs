@@ -1585,9 +1585,9 @@ impl Editor {
 
     /// Resize window `id` (focused or not) by `delta` cells along `axis`. The
     /// id-targeting core of [`Editor::resize_window`], shared with the
-    /// `nvim_win_set_width`/`set_height` API. A no-op with one window, a zero
-    /// delta, or an unknown id.
-    fn resize_window_id(&mut self, id: WindowId, axis: SplitDir, delta: isize) {
+    /// `nvim_win_set_width`/`set_height` API and the mouse separator drag. A no-op
+    /// with one window, a zero delta, or an unknown id.
+    pub(crate) fn resize_window_id(&mut self, id: WindowId, axis: SplitDir, delta: isize) {
         if delta == 0 || self.windows.count() <= 1 || !self.windows.windows.contains_key(&id) {
             return;
         }

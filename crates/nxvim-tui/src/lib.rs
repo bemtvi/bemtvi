@@ -340,58 +340,91 @@ where
                             ],
                         );
                     }
-                    // The mouse wheel drives the completion UI. Over the doc preview
-                    // box it scrolls the docs — a purely client-side gesture (the box
-                    // height is the client's to know), three lines per notch, clamped
-                    // so it can't overscroll. Over the popup list itself it moves the
-                    // selection one item per notch (server state; the list scrolls to
-                    // follow), non-wrapping so it stops at the ends like a scrollbar.
-                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                    // The mouse wheel. A client-owned overlay claims a *vertical*
+                    // notch when the pointer is over it: the completion doc preview
+                    // scrolls its docs client-side (the box height is the client's to
+                    // know), three lines per notch, clamped so it can't overscroll;
+                    // the popup list moves its selection one item per notch (server
+                    // state, non-wrapping like a scrollbar); the message panel moves
+                    // its cursor one entry. Anything else — every horizontal notch,
+                    // and any notch not over an overlay — is a text-area scroll
+                    // forwarded to the server, which owns the hit-test back to the
+                    // window under the pointer (grid 0 — nxvim is single-grid).
+                    MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight => {
                         let size = terminal.size().unwrap_or_default();
+                        let vertical = matches!(
+                            m.kind,
+                            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                        );
                         let down = m.kind == MouseEventKind::ScrollDown;
                         let doc = pmenu_doc_geometry(size.width, size.height, &view);
-                        let over_doc = doc
-                            .is_some_and(|(bx, by, bw, bh, _)| within(m.column, m.row, bx, by, bw, bh));
-                        if let Some((.., max_scroll)) = doc.filter(|_| over_doc) {
-                            const STEP: u16 = 3;
-                            doc_scroll = if down {
-                                (doc_scroll + STEP).min(max_scroll)
-                            } else {
-                                doc_scroll.saturating_sub(STEP)
-                            };
-                            terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
-                        } else if let Some((px, py, pw, ph, _)) =
-                            pmenu_geometry(size.width, size.height, &view)
-                        {
-                            if within(m.column, m.row, px, py, pw, ph) {
-                                if let Some(pmenu) = view.pmenu.as_ref() {
-                                    let n = pmenu.items.len();
-                                    if n > 0 {
-                                        let next = match pmenu.selected {
-                                            Some(i) if down => (i + 1).min(n - 1),
-                                            Some(i) => i.saturating_sub(1),
-                                            None => 0,
-                                        };
-                                        rpc.notify(
-                                            "nxvim_complete_select",
-                                            vec![Value::from(next as u64)],
-                                        );
-                                    }
-                                }
-                            }
-                        } else if let Some(panel) = view.panel.as_ref() {
-                            // Over the panel, the wheel moves its selection one entry
-                            // per notch — the panel scrolls to follow, like j/k. The
-                            // server owns the (logical, word-wrapped) cursor, so this
-                            // just feeds the same keys the panel already handles.
-                            if let Some((cx, cy, cw, ch)) =
+                        let over_doc = vertical
+                            && doc.is_some_and(|(bx, by, bw, bh, _)| {
+                                within(m.column, m.row, bx, by, bw, bh)
+                            });
+                        let over_pmenu = vertical
+                            && pmenu_geometry(size.width, size.height, &view).is_some_and(
+                                |(px, py, pw, ph, _)| within(m.column, m.row, px, py, pw, ph),
+                            );
+                        let over_panel = vertical
+                            && view.panel.as_ref().is_some_and(|panel| {
                                 panel_content_rect(size.width, size.height, panel.height)
-                            {
-                                if within(m.column, m.row, cx, cy, cw, ch) {
-                                    let key = if down { "<Down>" } else { "<Up>" };
-                                    rpc.notify("nvim_input", vec![Value::from(key)]);
+                                    .is_some_and(|(cx, cy, cw, ch)| {
+                                        within(m.column, m.row, cx, cy, cw, ch)
+                                    })
+                            });
+                        if over_doc {
+                            if let Some((.., max_scroll)) = doc {
+                                const STEP: u16 = 3;
+                                doc_scroll = if down {
+                                    (doc_scroll + STEP).min(max_scroll)
+                                } else {
+                                    doc_scroll.saturating_sub(STEP)
+                                };
+                                terminal
+                                    .draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                            }
+                        } else if over_pmenu {
+                            if let Some(pmenu) = view.pmenu.as_ref() {
+                                let n = pmenu.items.len();
+                                if n > 0 {
+                                    let next = match pmenu.selected {
+                                        Some(i) if down => (i + 1).min(n - 1),
+                                        Some(i) => i.saturating_sub(1),
+                                        None => 0,
+                                    };
+                                    rpc.notify(
+                                        "nxvim_complete_select",
+                                        vec![Value::from(next as u64)],
+                                    );
                                 }
                             }
+                        } else if over_panel {
+                            // The server owns the panel's (logical, word-wrapped)
+                            // cursor, so this just feeds the keys it already handles.
+                            let key = if down { "<Down>" } else { "<Up>" };
+                            rpc.notify("nvim_input", vec![Value::from(key)]);
+                        } else {
+                            let action = match m.kind {
+                                MouseEventKind::ScrollDown => "down",
+                                MouseEventKind::ScrollUp => "up",
+                                MouseEventKind::ScrollRight => "right",
+                                _ => "left",
+                            };
+                            rpc.notify(
+                                "nvim_input_mouse",
+                                vec![
+                                    Value::from("wheel"),
+                                    Value::from(action),
+                                    Value::from(mouse_modifier(m.modifiers)),
+                                    Value::from(0u64),
+                                    Value::from(m.row as u64),
+                                    Value::from(m.column as u64),
+                                ],
+                            );
                         }
                     }
                     _ => {}

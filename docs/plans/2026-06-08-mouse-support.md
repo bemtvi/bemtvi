@@ -1,12 +1,14 @@
 # Mouse support — server-owned hit-testing plan
 
-> **Status: IN PROGRESS.** Phases 0–3 have landed: the `nvim_input_mouse` RPC,
+> **Status: IN PROGRESS.** Phases 0–5 have landed: the `nvim_input_mouse` RPC,
 > the `MouseEvent` core type, the four `'mouse*'` options, server-side hit-testing,
 > left-click to place the cursor + focus the window, left-drag to make a charwise
-> Visual selection (TUI forwards press/drag/release), and multi-click (double =
-> word, triple = line) timed by `'mousetime'` against an injectable server clock.
-> Phases 4–8 remain. This is a design spec and a phased build order; the ✅/⬜
-> markers below track what is built.
+> Visual selection (TUI forwards press/drag/release), multi-click (double = word,
+> triple = line) timed by `'mousetime'` against an injectable server clock, the
+> scroll wheel scrolling the window under the pointer (`'mousescroll'` step, Shift =
+> page, vertical + horizontal) without moving focus, and dragging a separator /
+> status line to resize splits. Phases 6–8 remain. This is a design spec and a
+> phased build order; the ✅/⬜ markers below track what is built.
 
 ## Status legend
 
@@ -310,7 +312,7 @@ Visual mode exists — then bump the `next_click_count` cap to 4 and add a
 
 ---
 
-## Phase 4 — Scroll wheel scrolls the window under the pointer ⬜
+## Phase 4 — Scroll wheel scrolls the window under the pointer ✅
 
 **Goal.** Vertical wheel scrolls the window **under the pointer** by `'mousescroll'`
 ver lines (default 3) **without moving focus or the cursor**; Shift+wheel scrolls
@@ -334,9 +336,30 @@ scroll position — wheel famously scrolls windows you're not in.
 window unchanged. Wheel over the *other* split scrolls only that split. Shift =
 page. `mousescroll=ver:0` disables vertical.
 
+**Landed as:** `Editor::mouse`'s `(Wheel, _)` arm → `mouse_wheel` +
+`wheel_scroll_vertical` / `wheel_scroll_horizontal` (`nxvim-core/src/editor/mouse.rs`).
+`window_at_cell` resolves the window without focusing it; the focused window moves
+its live `top`/`leftcol` and edge-pulls the cursor (load-bearing — the per-redraw
+`ensure_visible` would otherwise snap the scroll back), while an inactive window
+mutates its stashed `saved_top`/`saved_leftcol`/`saved_cursor` so the wheel scrolls
+a window you are not in. The smooth-scroll gesture is shared with keyboard scrolls
+by factoring `Editor::finalize_scroll_gesture` out of `input` post-processing
+(`editor/mod.rs`); only the focused window animates (the `scroll` projection is
+focused-only). `mousescroll_steps` parses `'mousescroll'` (`ver`/`hor`, `0`
+disables); `Shift` escalates a vertical notch to a page. The TUI forwards an
+unclaimed wheel notch (over no client overlay) to `nvim_input_mouse("wheel", …)`,
+including crossterm `ScrollLeft`/`ScrollRight` for horizontal (`nxvim-tui/src/lib.rs`).
+Tests: `wheel_down_scrolls_three_lines`, `wheel_up_scrolls_back`,
+`wheel_over_other_split_scrolls_only_it`, `shift_wheel_scrolls_page`,
+`mousescroll_sets_vertical_step`, `mousescroll_ver_zero_disables_vertical`,
+`wheel_right_scrolls_columns`, `wheel_outside_any_window_is_ignored`,
+`mouse_example_config_runs`. Example: `examples/mouse/` (`init.lua` + `sample.txt`).
+**Deferred:** the Phase-2 left-drag auto-scroll (a drag past the viewport edge) is
+*not* folded in here — it still awaits a separate pass.
+
 ---
 
-## Phase 5 — Drag the status line / separator to resize splits ⬜
+## Phase 5 — Drag the status line / separator to resize splits ✅
 
 **Goal.** Press on a window separator (vertical divider or a status line acting
 as a horizontal divider) and drag → resize the adjacent splits by the drag delta.
@@ -350,6 +373,27 @@ resize ops (`windows.rs`).
 
 **Test.** Two vertical splits 40/40; press on the separator, drag 5 cells right →
 left window 45, right 35. Horizontal split status-line drag resizes heights.
+
+**Landed as:** `Editor::resize_handle_at` + `mouse_begin_resize` /
+`mouse_resize_drag` and a `ResizeDrag { win, vertical, origin, applied }` field on
+`Editor` (`nxvim-core/src/editor/mouse.rs`). `resize_handle_at` resolves a global
+cell to the grabbed edge by walking the View's `separators` (a vertical separator
+grows the window to its *left*, a horizontal one the window *above*) and treats a
+window's status row as a handle when a horizontal separator sits one row below it
+(another window beneath) — so the bottom-most status line is correctly inert. The
+drag is **absolute** against the press `origin` (tracking `applied` cells so a
+push past a window's minimum and back follows the pointer without drift) and feeds
+the existing `Editor::resize_window_id` (now `pub(crate)`) with `SplitDir::Vertical`
+for width / `SplitDir::Horizontal` for height. The press arm runs before the
+text-press arms, so a divider grab never places the cursor or starts a selection,
+and it doesn't move focus (vim). **No TUI change needed** — the TUI already
+forwards every non-overlay left press/drag/release as a raw cell; the server owns
+the new hit-test. Tests (`nxvim-server/tests/mouse.rs`):
+`drag_separator_resizes_vertical_split`, `drag_separator_left_shrinks`,
+`drag_status_line_resizes_horizontal_split`,
+`drag_horizontal_separator_resizes_height`,
+`drag_bottom_status_line_does_not_resize`. Example: `examples/mouse/` notes the
+divider-drag gesture.
 
 ---
 

@@ -1,0 +1,47 @@
+nxvim mouse playground — every gesture below is server-hit-tested.
+
+CLICK to place the cursor on any character on this line: the quick brown fox.
+DOUBLE-CLICK a word like marmalade or constellation to select just that word.
+TRIPLE-CLICK anywhere on this line to select the whole line at once, linewise.
+
+DRAG from here ───────────────────────────────────────────► to there, and the
+charwise Visual selection follows the pointer; release and it stays put for y/d.
+
+SHIFT+CLICK extends the current selection to the click without losing the anchor.
+Start a selection, then shift-click further along to grow it in place.
+
+This very long line exists so the horizontal wheel has somewhere to go under nowrap: aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggggggggg hhhhhhhhhh iiiiiiiiii jjjjjjjjjj kkkkkkkkkk llllllllll mmmmmmmmmm — the end.
+
+Open a vertical split with :vsplit and then spin the wheel over the OTHER half —
+it scrolls without stealing focus, the way an inactive window scrolls in vim.
+
+01  the lines below are numbered so a wheel notch's travel is easy to see
+02  ------------------------------------------------------------------------
+03  scroll down with the wheel and watch the top line change by the step
+04  Shift+wheel jumps a whole page instead of a single notch
+05  ------------------------------------------------------------------------
+06  filler
+07  filler
+08  filler
+09  filler
+10  filler
+11  filler
+12  filler
+13  filler
+14  filler
+15  filler
+16  filler
+17  filler
+18  filler
+19  filler
+20  filler
+21  filler
+22  filler
+23  filler
+24  filler
+25  filler
+26  filler
+27  filler
+28  filler
+29  filler
+30  the bottom — you scrolled all the way here with the wheel

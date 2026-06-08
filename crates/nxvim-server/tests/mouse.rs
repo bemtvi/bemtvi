@@ -8,13 +8,14 @@
 //! failing loud. Phase 1 — left-click places the cursor and focuses the window.
 //! Phase 2 — left-drag makes a charwise Visual selection. Phase 3 — multi-click
 //! escalates the unit (double = word, triple = line), timed by `'mousetime'`
-//! against a fake clock.
+//! against a fake clock. Phase 4 — the wheel scrolls the window under the pointer
+//! (`'mousescroll'` step, `Shift` = page) without moving focus or the cursor.
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, drain_to_latest_redraw, feed, feed_mouse, feed_mouse_at, lines,
-    message, mode, spawn, write_temp, TestClock,
+    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_at,
+    lines, message, mode, spawn, temp_dir, write_temp, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -428,4 +429,427 @@ async fn drag_after_shift_click_keeps_extending() {
     // Anchor still col 0 → selection 0..=8 ("hello wor").
     feed(&rpc, "d");
     assert_eq!(lines(&rpc).await[0], "ld");
+}
+
+// ===== Phase 4: wheel scrolls the window under the pointer ===================
+
+/// A buffer of `n` distinct lines (`line001`…), tall enough to scroll.
+fn numbered(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("line{i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Coerce a Lua-returned number `Value` to `u64` (it may arrive as int or float).
+fn as_num(v: &Value) -> u64 {
+    v.as_u64()
+        .or_else(|| v.as_i64().map(|i| i as u64))
+        .or_else(|| v.as_f64().map(|f| f as u64))
+        .expect("number")
+}
+
+/// Window `win`'s 1-based topline (`winsaveview().topline`), read through
+/// `nvim_win_call` so it works for an unfocused window too. Doubles as a barrier.
+async fn win_topline(rpc: &Rpc, win: u64) -> u64 {
+    let v = exec_lua(
+        rpc,
+        &format!(
+            "return vim.api.nvim_win_call({win}, function() return vim.fn.winsaveview().topline end)"
+        ),
+    )
+    .await;
+    as_num(&v)
+}
+
+/// Window `win`'s `leftcol` (`winsaveview().leftcol`), via `nvim_win_call`.
+async fn win_leftcol(rpc: &Rpc, win: u64) -> u64 {
+    let v = exec_lua(
+        rpc,
+        &format!(
+            "return vim.api.nvim_win_call({win}, function() return vim.fn.winsaveview().leftcol end)"
+        ),
+    )
+    .await;
+    as_num(&v)
+}
+
+/// Window `win`'s content height in rows (`nvim_win_get_height`) — the page size a
+/// `Shift`+wheel notch scrolls.
+async fn win_height(rpc: &Rpc, win: u64) -> u64 {
+    as_num(&exec_lua(rpc, &format!("return vim.api.nvim_win_get_height({win})")).await)
+}
+
+/// All window ids in layout order (`nvim_list_wins`).
+async fn all_wins(rpc: &Rpc) -> Vec<u64> {
+    match rpc
+        .request("nvim_list_wins", vec![])
+        .await
+        .expect("list_wins")
+    {
+        Value::Array(a) => a.iter().filter_map(Value::as_u64).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A wheel gesture carrying a `modifier` string (e.g. `"S"` for a `Shift`-page),
+/// which the modifier-less `feed_mouse` can't send.
+fn wheel_mod(rpc: &Rpc, action: &str, modifier: &str, row: usize, col: usize) {
+    rpc.notify(
+        "nvim_input_mouse",
+        vec![
+            Value::from("wheel"),
+            Value::from(action),
+            Value::from(modifier),
+            Value::from(0u64),
+            Value::from(row as u64),
+            Value::from(col as u64),
+        ],
+    );
+}
+
+/// A vertical wheel-down notch scrolls the focused window by `'mousescroll'` (3 by
+/// default) lines, leaving the cursor on its line while that line stays visible.
+#[tokio::test]
+async fn wheel_down_scrolls_three_lines() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "8G"); // cursor mid-screen so a 3-line scroll won't push it off
+    assert_eq!(win_topline(&rpc, win).await, 1);
+    feed_mouse(&rpc, "wheel", "down", 5, 10);
+    assert_eq!(win_topline(&rpc, win).await, 4, "scrolled 3 lines down");
+    assert_eq!(cursor(&rpc).await.0, 8, "cursor stays on its line");
+    assert_eq!(current_win(&rpc).await, win, "focus unchanged");
+}
+
+/// Wheel-up scrolls back toward the top of the buffer, the inverse of wheel-down,
+/// and stops at the first line.
+#[tokio::test]
+async fn wheel_up_scrolls_back() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "8G");
+    feed_mouse(&rpc, "wheel", "down", 5, 10); // top 0 -> 3
+    feed_mouse(&rpc, "wheel", "down", 5, 10); // top 3 -> 6
+    assert_eq!(win_topline(&rpc, win).await, 7);
+    feed_mouse(&rpc, "wheel", "up", 5, 10); // top 6 -> 3
+    assert_eq!(win_topline(&rpc, win).await, 4, "scrolled 3 lines up");
+    assert_eq!(cursor(&rpc).await.0, 8, "cursor stayed visible throughout");
+}
+
+/// Wheeling over an *unfocused* split scrolls only that split — focus and the
+/// active window's view stay put (the wheel scrolls a window you are not in).
+#[tokio::test]
+async fn wheel_over_other_split_scrolls_only_it() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-w>v"); // vertical split: new (left) window focused, original right
+    let focused = current_win(&rpc).await;
+    let other = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != focused)
+        .expect("a second window");
+    let focused_top0 = win_topline(&rpc, focused).await;
+    let other_top0 = win_topline(&rpc, other).await;
+    feed_mouse(&rpc, "wheel", "down", 5, 45); // col 45 lands in the right split
+    assert_eq!(
+        win_topline(&rpc, other).await,
+        other_top0 + 3,
+        "the pointed-at split scrolled"
+    );
+    assert_eq!(
+        win_topline(&rpc, focused).await,
+        focused_top0,
+        "the focused split did not scroll"
+    );
+    assert_eq!(current_win(&rpc).await, focused, "focus did not move");
+    assert_eq!(cursor(&rpc).await.0, 1, "cursor did not move");
+}
+
+/// `Shift`+wheel scrolls a whole page (window height minus a two-line overlap),
+/// not a `'mousescroll'` notch.
+#[tokio::test]
+async fn shift_wheel_scrolls_page() {
+    let (rpc, _incoming) = start(&numbered(200)).await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "gg");
+    let page = win_height(&rpc, win).await.saturating_sub(2).max(1);
+    wheel_mod(&rpc, "down", "S", 5, 10);
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        1 + page,
+        "a shift-notch scrolled one page"
+    );
+}
+
+/// `'mousescroll'` sets the vertical step: `ver:5` scrolls five lines a notch.
+#[tokio::test]
+async fn mousescroll_sets_vertical_step() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set mousescroll=ver:5,hor:6").await;
+    feed(&rpc, "10G"); // mid-screen so the 5-line scroll keeps it visible
+    feed_mouse(&rpc, "wheel", "down", 5, 10);
+    assert_eq!(win_topline(&rpc, win).await, 6, "scrolled five lines");
+    assert_eq!(cursor(&rpc).await.0, 10, "cursor stays put");
+}
+
+/// `'mousescroll'` `ver:0` disables the vertical wheel entirely — a notch is a
+/// no-op, not a one-line fallback.
+#[tokio::test]
+async fn mousescroll_ver_zero_disables_vertical() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set mousescroll=ver:0,hor:6").await;
+    feed(&rpc, "8G");
+    let top0 = win_topline(&rpc, win).await;
+    feed_mouse(&rpc, "wheel", "down", 5, 10);
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0,
+        "vertical wheel disabled"
+    );
+}
+
+/// A horizontal wheel notch scrolls the window by `'mousescroll'` hor columns
+/// under `nowrap`, pulling the cursor into the newly-visible band.
+#[tokio::test]
+async fn wheel_right_scrolls_columns() {
+    let long = "x".repeat(200);
+    let (rpc, _incoming) = start(&long).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "gg0");
+    assert_eq!(win_leftcol(&rpc, win).await, 0);
+    wheel_mod(&rpc, "right", "", 5, 10);
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        6,
+        "scrolled six columns right"
+    );
+    // The cursor was pulled to the first visible column so the scroll sticks.
+    assert_eq!(cursor(&rpc).await.1, 6);
+}
+
+/// The horizontal wheel won't scroll past the content: when every line already
+/// fits in the window there is nothing off-screen to the right, so a right notch
+/// is a no-op (vim doesn't scroll into empty space).
+#[tokio::test]
+async fn wheel_right_does_not_scroll_past_content() {
+    let (rpc, _incoming) = start("hello\nworld\nshort lines").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "gg0");
+    assert_eq!(win_leftcol(&rpc, win).await, 0);
+    wheel_mod(&rpc, "right", "", 5, 3);
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        0,
+        "no horizontal scroll when every line fits on screen"
+    );
+}
+
+/// The horizontal wheel stops at the content's right edge — it can scroll a long
+/// line into view but no further, so the last column never leaves the screen.
+#[tokio::test]
+async fn wheel_right_stops_at_content_edge() {
+    // One line a touch wider than the 80-col window (no gutter): 90 columns.
+    let (rpc, _incoming) = start(&"x".repeat(90)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "gg0");
+    // Many right notches; leftcol saturates at widest(90) - width(80) = 10.
+    for _ in 0..20 {
+        wheel_mod(&rpc, "right", "", 5, 3);
+        let _ = cursor(&rpc).await; // barrier between gestures
+    }
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        10,
+        "leftcol clamps so the line's last column stays on screen"
+    );
+}
+
+/// A wheel notch that lands on no window (here, far below the single window in the
+/// bottom chrome / past the buffer) does not scroll it.
+#[tokio::test]
+async fn wheel_outside_any_window_is_ignored() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "8G");
+    let top0 = win_topline(&rpc, win).await;
+    feed_mouse(&rpc, "wheel", "down", 200, 200); // row/col past every window
+    assert_eq!(win_topline(&rpc, win).await, top0, "no window scrolled");
+}
+
+// ===== Phase 5: drag the separator / status line to resize splits ===========
+
+/// A window's rect width (`nvim_win_get_width`).
+async fn win_width(rpc: &Rpc, win: u64) -> u64 {
+    rpc.request("nvim_win_get_width", vec![Value::from(win)])
+        .await
+        .expect("get_width")
+        .as_u64()
+        .expect("width")
+}
+
+/// The two window ids in layout order (left→right for a vsplit, top→bottom for a
+/// horizontal split).
+async fn two_wins(rpc: &Rpc) -> (u64, u64) {
+    let wins = all_wins(rpc).await;
+    (wins[0], wins[1])
+}
+
+/// Dragging a vertical separator right resizes the splits by the drag delta,
+/// without moving focus or starting a selection.
+#[tokio::test]
+async fn drag_separator_resizes_vertical_split() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // Two side-by-side windows: left width 40 (cols 0..40), separator at x=40,
+    // right at cols 41..80. The new (left) window holds focus.
+    feed(&rpc, "<C-w>v");
+    let (left, right) = two_wins(&rpc).await;
+    assert_eq!(win_width(&rpc, left).await, 40);
+    let focused = current_win(&rpc).await;
+
+    // Grab the separator at col 40 and drag it 5 cells right.
+    feed_mouse(&rpc, "left", "press", 2, 40);
+    feed_mouse(&rpc, "left", "drag", 2, 45);
+    feed_mouse(&rpc, "left", "release", 2, 45);
+
+    assert_eq!(
+        win_width(&rpc, left).await,
+        45,
+        "left grew by the drag delta"
+    );
+    assert_eq!(win_width(&rpc, right).await, 34, "right shrank to match");
+    assert_eq!(
+        current_win(&rpc).await,
+        focused,
+        "the drag didn't move focus"
+    );
+    assert_eq!(mode(&rpc).await, "n", "the drag didn't start a selection");
+}
+
+/// Dragging a separator back left shrinks the window it had grown — the drag is
+/// absolute against the press point, so it tracks the pointer both ways.
+#[tokio::test]
+async fn drag_separator_left_shrinks() {
+    let (rpc, _incoming) = start("hello\nworld").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-w>v");
+    let (left, right) = two_wins(&rpc).await;
+    feed_mouse(&rpc, "left", "press", 2, 40);
+    feed_mouse(&rpc, "left", "drag", 2, 46); // +6 → left 46
+    feed_mouse(&rpc, "left", "drag", 2, 34); // back past origin → left 34
+    feed_mouse(&rpc, "left", "release", 2, 34);
+    assert_eq!(
+        win_width(&rpc, left).await,
+        34,
+        "left tracked the pointer back"
+    );
+    assert_eq!(win_width(&rpc, right).await, 45);
+}
+
+/// Dragging a window's status line down resizes a horizontal split's heights —
+/// the status line acts as the divider (vim's status-line drag).
+#[tokio::test]
+async fn drag_status_line_resizes_horizontal_split() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-w>s"); // stack: new top focused, original bottom
+    let (top, bottom) = two_wins(&rpc).await;
+    let (top0, bot0) = (win_height(&rpc, top).await, win_height(&rpc, bottom).await);
+
+    // The top window sits at y=0, so its status line is the row at its text
+    // height (0-based). Grab it and drag two rows down.
+    let status_row = top0 as usize;
+    feed_mouse(&rpc, "left", "press", status_row, 5);
+    feed_mouse(&rpc, "left", "drag", status_row + 2, 5);
+    feed_mouse(&rpc, "left", "release", status_row + 2, 5);
+
+    assert_eq!(
+        win_height(&rpc, top).await,
+        top0 + 2,
+        "top grew by the drag"
+    );
+    assert_eq!(
+        win_height(&rpc, bottom).await,
+        bot0 - 2,
+        "bottom shrank to match"
+    );
+}
+
+/// The horizontal separator row between two stacked windows is a drag handle too
+/// (it sits one row below the upper window's status line).
+#[tokio::test]
+async fn drag_horizontal_separator_resizes_height() {
+    let (rpc, _incoming) = start("hello\nworld").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-w>s");
+    let (top, bottom) = two_wins(&rpc).await;
+    let top0 = win_height(&rpc, top).await;
+    let sep_row = top0 as usize + 1; // separator one row below the status line
+    feed_mouse(&rpc, "left", "press", sep_row, 5);
+    feed_mouse(&rpc, "left", "drag", sep_row + 3, 5);
+    feed_mouse(&rpc, "left", "release", sep_row + 3, 5);
+    assert_eq!(win_height(&rpc, top).await, top0 + 3);
+    let _ = bottom;
+}
+
+/// The bottom-most window's status line has nothing below it, so pressing it is a
+/// no-op — no resize, no crash.
+#[tokio::test]
+async fn drag_bottom_status_line_does_not_resize() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-w>s");
+    let (top, bottom) = two_wins(&rpc).await;
+    let (top0, bot0) = (win_height(&rpc, top).await, win_height(&rpc, bottom).await);
+    // The bottom window's status line is its last row, just above the command
+    // line; there is no window beneath it to resize against.
+    let bottom_y = rpc
+        .request("nvim_win_get_position", vec![Value::from(bottom)])
+        .await
+        .expect("get_position")
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(Value::as_u64)
+        .expect("y") as usize;
+    let status_row = bottom_y + bot0 as usize; // bottom_y + text_height
+    feed_mouse(&rpc, "left", "press", status_row, 5);
+    feed_mouse(&rpc, "left", "drag", status_row + 2, 5);
+    feed_mouse(&rpc, "left", "release", status_row + 2, 5);
+    assert_eq!(win_height(&rpc, top).await, top0, "heights unchanged");
+    assert_eq!(win_height(&rpc, bottom).await, bot0);
+}
+
+/// The shipped `examples/mouse/` config sources cleanly (no Lua error) and its
+/// `:set` calls actually reach the core — observable through `:set mousescroll?`.
+#[tokio::test]
+async fn mouse_example_config_runs() {
+    let dir = temp_dir("mouse-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/mouse/init.lua"
+    ))
+    .expect("read example init.lua");
+    std::fs::write(dir.join("init.lua"), &init).expect("write init.lua");
+    let server_init = ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir],
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(server_init);
+    attach(&rpc, 80, 24).await;
+
+    // The example's `vim.cmd("set mousescroll=ver:5,hor:6")` reached the core.
+    command(&rpc, "set mousescroll?").await;
+    let map = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw");
+    assert_eq!(message(&map), "mousescroll=ver:5,hor:6");
+    // And nothing errored on the way (the notify, the user command, the sets).
+    let banner = message(&map);
+    assert!(!banner.contains("Error"), "example errored: {banner:?}");
 }

@@ -144,6 +144,12 @@ struct Server {
     /// itself lives in the editor's [`nxvim_core::SyntaxEngine`]; this is only the
     /// slim span cache the redraw projects.
     syntax_states: HashMap<BufferId, SyntaxState>,
+    /// Languages whose *on-disk* treesitter queries have already been resolved
+    /// through the Lua runtimepath and offered to the engine (the buffer-open half
+    /// of the query bridge). Guards the resolve to once per language — a pure
+    /// `after/queries` / `;extends` overlay is merged by Lua the first time a buffer
+    /// of that language is about to be highlighted, never re-resolved per redraw.
+    ts_resolved_langs: HashSet<String>,
     /// The in-process LSP client: spawns/supervises N language servers and
     /// bridges them to the [`LspEvent`] channel the main loop selects on.
     lsp: LspManager,
@@ -306,6 +312,7 @@ where
         rpc,
         ui: None,
         syntax_states: HashMap::new(),
+        ts_resolved_langs: HashSet::new(),
         lsp,
         lsp_states: HashMap::new(),
         lsp_servers: HashMap::new(),

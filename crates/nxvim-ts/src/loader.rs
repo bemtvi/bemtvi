@@ -10,10 +10,19 @@
 //! <data>/queries/<lang>/indents.scm      # optional — treesitter indentation
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use tree_sitter::{Language, Parser, Query};
+
+/// The query-text overrides the engine holds, keyed by `(lang, query_name)` —
+/// the store [`Grammar::load`] consults in place of the on-disk query, and the
+/// landing point of the query-resolution bridge (Lua resolves the merged string,
+/// the engine compiles + caches + executes it). Only `highlights` / `indents`
+/// (the paint-driving names) are ever present. See
+/// [`Engine::set_query`](crate::engine::Engine::set_query).
+pub type QueryOverrides = HashMap<(String, String), String>;
 
 /// Why [`Grammar::load`] didn't return a grammar, so the engine (and the editor
 /// above it) can stay silent for an uninstalled language but surface a real load
@@ -70,13 +79,28 @@ impl Grammar {
     /// Load the grammar for `lang` from `data_dir`. Distinguishes a *missing*
     /// parser ([`LoadError::NotInstalled`], silent) from a parser that is present
     /// but broken ([`LoadError::Failed`], worth echoing).
-    pub fn load(data_dir: &Path, lang: &str) -> Result<Grammar, LoadError> {
+    ///
+    /// `overrides` is the query-resolution bridge's store: a `(lang, name)` entry
+    /// supplies the query text directly (a `vim.treesitter.query.set` /
+    /// `after/queries` / `;extends` merge resolved by Lua) in place of the on-disk
+    /// `highlights.scm` / `indents.scm`. With no entry the disk file is read
+    /// exactly as before, so the common no-customization case is byte-identical.
+    pub fn load(
+        data_dir: &Path,
+        lang: &str,
+        overrides: &QueryOverrides,
+    ) -> Result<Grammar, LoadError> {
         let (language, lib) = open_language(data_dir, lang)?;
 
-        let hl_path = query_path(data_dir, lang, "highlights.scm");
-        let hl_src = std::fs::read_to_string(&hl_path)
-            .with_context(|| format!("reading {}", hl_path.display()))
-            .map_err(LoadError::Failed)?;
+        let hl_src = match overrides.get(&(lang.to_string(), "highlights".to_string())) {
+            Some(text) => text.clone(),
+            None => {
+                let hl_path = query_path(data_dir, lang, "highlights.scm");
+                std::fs::read_to_string(&hl_path)
+                    .with_context(|| format!("reading {}", hl_path.display()))
+                    .map_err(LoadError::Failed)?
+            }
+        };
         let query = Query::new(&language, &hl_src)
             .with_context(|| format!("compiling {lang} highlights"))
             .map_err(LoadError::Failed)?;
@@ -84,18 +108,28 @@ impl Grammar {
         // `indents.scm` is optional: a language with no indent query simply has no
         // treesitter indentation (the editor falls back). A *present* file that
         // fails to compile is a real error, surfaced like a broken highlights query.
-        let indents_path = query_path(data_dir, lang, "indents.scm");
-        let indents = match std::fs::read_to_string(&indents_path) {
-            Ok(src) => Some(
-                Query::new(&language, &src)
+        let indents = match overrides.get(&(lang.to_string(), "indents".to_string())) {
+            Some(text) => Some(
+                Query::new(&language, text)
                     .with_context(|| format!("compiling {lang} indents"))
                     .map_err(LoadError::Failed)?,
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(LoadError::Failed(
-                    anyhow::Error::new(e).context(format!("reading {}", indents_path.display())),
-                ))
+            None => {
+                let indents_path = query_path(data_dir, lang, "indents.scm");
+                match std::fs::read_to_string(&indents_path) {
+                    Ok(src) => Some(
+                        Query::new(&language, &src)
+                            .with_context(|| format!("compiling {lang} indents"))
+                            .map_err(LoadError::Failed)?,
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(LoadError::Failed(
+                            anyhow::Error::new(e)
+                                .context(format!("reading {}", indents_path.display())),
+                        ))
+                    }
+                }
             }
         };
 
@@ -187,6 +221,6 @@ fn parser_path(data_dir: &Path, lang: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-fn query_path(data_dir: &Path, lang: &str, file: &str) -> PathBuf {
+pub(crate) fn query_path(data_dir: &Path, lang: &str, file: &str) -> PathBuf {
     data_dir.join("queries").join(lang).join(file)
 }

@@ -182,22 +182,37 @@ impl Server {
                 OptionValue::String(s) => self.editor.set_global_option_str(&op.name, &s),
             }
         }
-        // Treesitter bridge toggles from `vim.treesitter.start` / `stop`: forward
-        // each to the editor's per-buffer override (ADR 0001, #1), then drop that
-        // buffer's highlight memo so the next redraw re-queries the engine — the
-        // toggle changes what paints without changing the buffer's changedtick.
+        // Treesitter bridges from `vim.treesitter.*`: the per-buffer start/stop
+        // toggle (ADR 0001, #1) and the query-resolution push (#4). Each ends by
+        // dropping the affected highlight memo(s) so the next redraw re-queries the
+        // engine — the change isn't reflected in any buffer's changedtick.
         for op in self.lua.take_ts_ops() {
-            let bufnr = match op {
+            match op {
                 TsOp::Start { bufnr, lang } => {
                     self.editor.ts_start(BufferId(bufnr), lang);
-                    bufnr
+                    self.syntax_states.remove(&BufferId(bufnr));
                 }
                 TsOp::Stop { bufnr } => {
                     self.editor.ts_stop(BufferId(bufnr));
-                    bufnr
+                    self.syntax_states.remove(&BufferId(bufnr));
                 }
-            };
-            self.syntax_states.remove(&BufferId(bufnr));
+                TsOp::SetQuery { lang, name } => {
+                    // Pull the merged string back through the faithful Lua resolver
+                    // (so `;extends`/`after` merges are included), then push it to
+                    // the engine. A resolver error echoes loud rather than silently
+                    // leaving the customization unapplied.
+                    match self.lua.resolve_ts_query(&lang, &name) {
+                        Ok(text) => self.editor.set_ts_query(&lang, &name, text),
+                        Err(e) => self.editor.echo(format!(
+                            "treesitter: resolving query {lang}/{name} failed: {e}"
+                        )),
+                    }
+                    // A query change is rare (config time) and lang-wide, so drop
+                    // every buffer's highlight memo rather than track which buffers
+                    // are this language; they all re-query on the next redraw.
+                    self.syntax_states.clear();
+                }
+            }
         }
         // Register writes from `vim.fn.setreg`: applied to the editor's register
         // file after the chunk — the same store yanks/deletes write. The Lua side

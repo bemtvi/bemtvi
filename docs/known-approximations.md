@@ -66,17 +66,21 @@ gap. Recorded here so the sweep doesn't lose them.
     highlight-only `start` does not create a Lua-side `LanguageTree`, so a config
     that calls `start` and then reaches for `vim.treesitter.highlighter.active[buf]
     .tree` (rare) won't find one until something calls `get_parser`.
-  - **Customized queries don't change the paint.** The redraw painter resolves
-    highlights and indent through the Rust engine, which compiles a **single**
-    `queries/<lang>/highlights.scm` (and `indents.scm`) per grammar — it does *not*
-    run neovim's query-resolution logic. So three things a config/plugin expects to
-    affect highlighting are inert against the paint: in-memory
-    `vim.treesitter.query.set`, `after/queries/<lang>/*.scm` overlays, and
-    `;extends` / `;inherits` modeline merges. A drop-in *base* `queries/<lang>/`
-    tree **is** honored (it's the one file the engine reads); layering/merging on
-    top of it is not. The fix is the query-resolution bridge — Lua resolves, the
-    engine executes — its prerequisite (`vim.treesitter.start`, above) is now in
-    place, so it is the next bridge to build; see
+  - **Customized queries — `query.set` *and* on-disk overlays both change the
+    paint.** The query-resolution bridge (ADR 0001, #4 — Lua resolves, the engine
+    executes) is **built**, via two triggers. (1) `vim.treesitter.query.set(lang,
+    name, text)`: the server pulls the merged string back through the vendored
+    `query.get` (so a `;extends` modeline in the set text merges onto the base) and
+    pushes it to the engine, which recompiles in place. (2) The **buffer-open
+    trigger**: the first time a buffer of some language is highlighted, the server
+    resolves `highlights`/`indents` through the same `query.get` and offers them to
+    the engine, which keeps the override only when it differs from the base file —
+    so a *pure on-disk* `after/queries/<lang>/*.scm` overlay or a `;extends` /
+    `;inherits` file dropped in with **no** `query.set` call also reaches the paint,
+    while an un-customized language stays byte-identical on the disk-read path. The
+    engine's data dir is on the Lua runtimepath, so the resolver sees the same base
+    `queries/<lang>/` the engine reads. A broken query echoes loud and keeps the
+    prior paint. See
     [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and
     [the query-bridge design](specs/2026-06-08-treesitter-query-bridge-design.md).
   - **Injections.** A buffer's root tree parses; `LanguageTree` child languages /

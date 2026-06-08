@@ -376,6 +376,17 @@ impl LuaRuntime {
     /// `<rt>/lua/?/init.lua` (the layout neovim plugins ship), so a plugin
     /// dropped on the runtimepath is `require`-able by module name.
     pub fn new(runtimepath: Vec<PathBuf>) -> mlua::Result<Self> {
+        // Put the engine's data dir on the runtimepath so the vendored
+        // `vim.treesitter.query` resolver finds the same base `queries/<lang>/`
+        // trees the native engine reads from `NXVIM_DATA_DIR` — the analogue of
+        // neovim's parser/query install dir (`stdpath('data')/site`) being on the
+        // rtp. Without it, the query-resolution bridge could not merge an
+        // `after/queries` overlay or a `;extends` base onto the engine's grammar.
+        let mut runtimepath = runtimepath;
+        let data_dir = nxvim_ts::data_dir();
+        if !runtimepath.contains(&data_dir) {
+            runtimepath.push(data_dir);
+        }
         // Load the full safe stdlib *plus* `debug`. Real plugins (catppuccin
         // among them) call `debug.getinfo` to locate their own install path, and
         // neovim exposes the full `debug` library to its trusted user config —
@@ -498,6 +509,19 @@ impl LuaRuntime {
     pub fn eval_to_value(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
         let value: mlua::Value = self.lua.load(chunk).eval()?;
         lua_to_rmpv(&value)
+    }
+
+    /// Resolve the merged `(lang, name)` treesitter query **string** through the
+    /// vendored `vim.treesitter.query` resolver — the Lua half of the
+    /// query-resolution bridge (#4). Returns the final text the engine should
+    /// compile (explicit `query.set` + `;extends` base + `after/queries`, merged
+    /// faithfully by upstream), or `None` when no query resolves (revert to the
+    /// engine's on-disk default). Called by the server when it drains a
+    /// [`TsOp::SetQuery`](crate::TsOp), and on a buffer's first highlight.
+    pub fn resolve_ts_query(&self, lang: &str, name: &str) -> mlua::Result<Option<String>> {
+        let treesitter: Table = self.vim()?.get("treesitter")?;
+        let resolver: mlua::Function = treesitter.get("_resolved_query_string")?;
+        resolver.call((lang, name))
     }
 
     /// Mirror a buffer's diagnostics into `vim._diagnostics[bufnr]` as the plain

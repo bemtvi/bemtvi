@@ -81,4 +81,25 @@ pub trait SyntaxEngine {
     /// indentation is active, versus *no ts-indent at all* (keep vim's
     /// autoindent-off default of column 0) when it isn't.
     fn indents_available(&self, buffer: BufferId) -> bool;
+
+    /// Install (or, with `text = None`, clear) a resolved query override for
+    /// `(lang, name)` — the engine half of the query-resolution bridge. The Lua
+    /// API has already merged `query.set` / `after/queries` / `;extends` into the
+    /// final `text`; the engine compiles + caches it, consulting it in place of
+    /// the on-disk query. Only `highlights` / `indents` affect the paint; other
+    /// names are no-ops. `Err(reason)` on a compile failure, for a loud echo.
+    fn set_query(&mut self, lang: &str, name: &str, text: Option<String>) -> Result<(), String>;
+
+    /// Install a *resolved on-disk overlay* for `(lang, name)` at buffer-open: the
+    /// same as [`set_query`](Self::set_query), but the override is kept **only if
+    /// `text` differs** from the base file the engine reads off disk. A language
+    /// with no `after/queries` / `;extends` customization resolves back to its own
+    /// base file, so this is a no-op and the engine stays on the byte-identical
+    /// disk-read path. `Err(reason)` on a compile failure, for a loud echo.
+    fn set_query_overlay(
+        &mut self,
+        lang: &str,
+        name: &str,
+        text: Option<String>,
+    ) -> Result<(), String>;
 }

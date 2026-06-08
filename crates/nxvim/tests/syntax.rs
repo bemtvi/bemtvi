@@ -819,3 +819,256 @@ async fn treesitter_stop_clears_highlighting_even_for_a_known_extension() {
         "vim.treesitter.stop must clear highlighting for a .rs buffer"
     );
 }
+
+// ----- query-resolution bridge (ADR 0001, #4) -------------------------------
+
+/// Does row 0 carry a span of capture group `group` (major part before any `.`)?
+fn row0_has_group(hl: &[Vec<(u64, u64, String)>], group: &str) -> bool {
+    hl.first().is_some_and(|row| {
+        row.iter()
+            .any(|(_, _, g)| g.split('.').next() == Some(group))
+    })
+}
+
+/// A keyword span sitting at column 0 (the `fn` of `fn main`).
+fn row0_keyword_at_0(hl: &[Vec<(u64, u64, String)>]) -> bool {
+    hl.first().is_some_and(|row| {
+        row.iter()
+            .any(|(s, _, g)| *s == 0 && g.split('.').next() == Some("keyword"))
+    })
+}
+
+#[tokio::test]
+async fn query_set_replaces_the_engine_highlights_query() {
+    // `vim.treesitter.query.set(lang, 'highlights', text)` (no modeline) REPLACES
+    // the query, exactly as in neovim. The engine must paint with the new query:
+    // `(identifier) @variable` lights up `main` but no longer the `fn` keyword.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("q-set", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Baseline: the disk query highlights `fn` as a keyword at column 0.
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+
+    // Override with an identifier-only query.
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'highlights', '(identifier) @variable')",
+    )
+    .await;
+
+    // The keyword span is gone; `main` is now captured as @variable.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        !row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
+    })
+    .await;
+    assert!(
+        !row0_keyword_at_0(&hl),
+        "the replaced query no longer paints the `fn` keyword: {hl:?}"
+    );
+    assert!(
+        row0_has_group(&hl, "variable"),
+        "the replaced query paints `main` as @variable: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn query_set_with_extends_merges_onto_the_base_query() {
+    // A `;extends` modeline merges the override ON TOP of the base query rather
+    // than replacing it. The merge runs in the vendored Lua (`query.get` prepends
+    // the base file found on the runtimepath — which now includes the engine's
+    // data dir), so the engine paints BOTH the base `fn` keyword and the added
+    // @variable on `main`. This is the case the loader could never do alone.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("q-extends", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'highlights', ';extends\\n(identifier) @variable')",
+    )
+    .await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
+    })
+    .await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "`;extends` keeps the base `fn` keyword: {hl:?}"
+    );
+    assert!(
+        row0_has_group(&hl, "variable"),
+        "`;extends` adds the @variable capture on top: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_broken_set_query_echoes_loud_and_keeps_the_old_paint() {
+    // No silent stubs: an override that fails to compile must echo loud (like a
+    // broken on-disk query), not swallow the error. The previously compiled query
+    // is left in place, so the buffer degrades to "unchanged", never to dark.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("q-broken", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'highlights', '((((')",
+    )
+    .await;
+
+    // The compile failure is surfaced on the message line.
+    let mut seen = false;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if message_of(&params).contains("failed to compile") {
+                seen = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(seen, "a broken query.set must echo a compile failure");
+
+    // And the buffer still paints the prior (base) query — not dark.
+    let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "a broken override keeps the previous paint: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn clearing_a_set_query_reverts_to_the_disk_query() {
+    // `query.set(lang, name, nil)` drops the override; the engine reverts to the
+    // on-disk query (resolved back through Lua off the data-dir runtimepath entry),
+    // so the `fn` keyword the replace had removed comes back.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("q-clear", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+
+    // Replace (keyword disappears), then clear (keyword returns).
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'highlights', '(identifier) @variable')",
+    )
+    .await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| !row0_keyword_at_0(hl)).await;
+
+    exec_lua(&rpc, "vim.treesitter.query.set('rust', 'highlights', nil)").await;
+    let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "clearing the override restores the disk query's `fn` keyword: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_treesitter_query_example_config_extends_on_startup() {
+    // The shipped `examples/treesitter-query/` config calls
+    // `vim.treesitter.query.set('rust','highlights', ';extends\n(identifier) @variable')`
+    // at the top level of init.lua. Sourced at startup against its own sample, the
+    // buffer must paint BOTH the base `fn` keyword and the added @variable — the
+    // query bridge resolving + pushing the merge end-to-end through the example.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/treesitter-query")
+        .canonicalize()
+        .expect("example dir exists");
+    let sample = example.join("sample.rs").display().to_string();
+    let (rpc, mut incoming) = start_with_config(Some(sample), example).await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
+    })
+    .await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "the example keeps the base `fn` keyword: {hl:?}"
+    );
+    assert!(
+        row0_has_group(&hl, "variable"),
+        "the example's ;extends adds @variable on `main`: {hl:?}"
+    );
+}
+
+/// Create a fresh runtimepath dir holding an on-disk `queries/rust/highlights.scm`
+/// overlay with the given text (a `;extends` modeline merges onto the engine's
+/// base query, which also sits on the runtimepath via `NXVIM_DATA_DIR`).
+fn query_overlay_runtimepath(tag: &str, scm: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nxvim-tsq-{}-{}", std::process::id(), tag));
+    let qdir = dir.join("queries").join("rust");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(qdir.join("highlights.scm"), scm).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn an_on_disk_query_overlay_merges_with_no_query_set() {
+    // The buffer-open half of the bridge: a *pure on-disk* `queries/rust/`
+    // overlay with a `;extends` modeline — and NO `vim.treesitter.query.set` call
+    // anywhere — must still change what the engine paints. The first time a rust
+    // buffer is highlighted, the server resolves the merged query through the Lua
+    // runtimepath (base on `NXVIM_DATA_DIR` + this overlay) and pushes it. The
+    // buffer paints BOTH the base `fn` keyword and the overlay's @variable on
+    // `main`, neither of which the engine could reach from a single base file.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let rtp = query_overlay_runtimepath("extends", ";extends\n(identifier) @variable");
+    let file = temp_rs("q-overlay", "fn main() {}\n");
+    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
+    })
+    .await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "the on-disk `;extends` overlay keeps the base `fn` keyword: {hl:?}"
+    );
+    assert!(
+        row0_has_group(&hl, "variable"),
+        "the on-disk overlay adds @variable on `main` with no query.set: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_on_disk_replacing_query_overlay_replaces_the_base() {
+    // A pure on-disk overlay with NO `;extends` modeline REPLACES the base query
+    // (it becomes the sole non-extension file resolution picks), just as a plain
+    // `query.set` would — again with no `query.set` call. The buffer paints the
+    // overlay's @variable on `main` and no longer the base `fn` keyword, proving
+    // the buffer-open trigger honors a replacing overlay too, not only `;extends`.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let rtp = query_overlay_runtimepath("replace", "(identifier) @variable");
+    let file = temp_rs("q-overlay-replace", "fn main() {}\n");
+    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        !row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
+    })
+    .await;
+    assert!(
+        !row0_keyword_at_0(&hl),
+        "the replacing on-disk overlay drops the base `fn` keyword: {hl:?}"
+    );
+    assert!(
+        row0_has_group(&hl, "variable"),
+        "the replacing on-disk overlay paints `main` as @variable: {hl:?}"
+    );
+}

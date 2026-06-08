@@ -87,16 +87,25 @@ is the shared substrate ([`extmark.rs`](../../crates/nxvim-core/src/extmark.rs):
    projection is the open wire.
 3. **LSP on-type formatting** (if pursued) — an async edit that must use the
    arrive-late / apply-as-follow-up pattern, never blocking the keystroke.
-4. **Query resolution → execution** — a plugin customizing a highlight/indent
-   query (in-memory `query.set`, an `after/queries` overlay, or a `;extends`
-   merge). The native engine reads a *single* `highlights.scm`; it does not run
-   neovim's query-merge logic. The bridge goes one level deeper than the others:
-   **Lua resolves** the final query string (`query.get` already merges explicit +
-   `;extends` + runtimepath, faithfully), the server **pushes** it to the engine
-   on buffer-open / `query.set`, and the engine **compiles + caches + executes** it
-   (loud on a bad query). Lua owns resolution, Rust owns execution; it subsumes the
-   in-memory-query leak in *Consequences* below. **Deferred behind bridge #1**;
-   design: [treesitter query bridge](../specs/2026-06-08-treesitter-query-bridge-design.md).
+4. **Query resolution → execution** (*implemented*) — a plugin customizing a
+   highlight/indent query (in-memory `query.set`, an `after/queries` overlay, or
+   a `;extends`/`;inherits` merge). The native engine reads a *single*
+   `highlights.scm`; it does not run neovim's query-merge logic. The bridge goes
+   one level deeper than the others: **Lua resolves** the final query string
+   (`query.get` merges explicit + `;extends` + runtimepath, faithfully — and the
+   engine's data dir is now on that runtimepath), the server **pushes** it to the
+   engine, and the engine **compiles + caches + executes** it in place (loud on a
+   bad query; the prior query is kept). Lua owns resolution, Rust owns execution.
+   Two triggers feed it: the `query.set` path (the prelude wraps `query.set` to
+   emit a `TsOp::SetQuery`; the server re-resolves via a `_resolved_query_string`
+   seam → `Editor::set_ts_query` → `Engine::set_query`) and the **buffer-open**
+   path (the first time a buffer of some language is highlighted, the server
+   resolves its `highlights`/`indents` through the same seam and offers them via
+   `Editor::set_resolved_ts_query` → `Engine::set_query_overlay`, which keeps the
+   override only when it differs from the base file — so a pure on-disk
+   `after/queries`/`;extends` overlay with *no* `query.set` reaches the paint while
+   an un-customized language stays byte-identical on the disk-read path). Design:
+   [treesitter query bridge](../specs/2026-06-08-treesitter-query-bridge-design.md).
 
 Same shape each time: an enrichment that lives outside core's sync path is wired
 into the projection layer; the synchronous treesitter floor is always underneath,
@@ -126,11 +135,9 @@ so a missing or slow server degrades to "syntactic but correct," never to blank.
   the buffer *and* answers queries. Most plugins only query, so they don't notice.
   Where it leaks, it is a bridge or a documented approximation: `start()` →
   bridge (#1 above); a *customized* highlight/indent query — in-memory `query.set`,
-  an `after/queries` overlay, or a `;extends` merge — doesn't change the paint
-  today, because the engine reads a single `highlights.scm` rather than running
-  neovim's query-merge → bridge (#4 above, deferred) and recorded in
-  [known-approximations.md](../known-approximations.md); injection-aware plugins →
-  the deferred injections work.
+  an `after/queries` overlay, or a `;extends`/`;inherits` merge — now changes the
+  paint through bridge (#4 above), which resolves the merge in Lua and pushes it to
+  the engine; injection-aware plugins → the deferred injections work.
 
 ## Alternatives considered
 

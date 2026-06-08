@@ -47,6 +47,12 @@ impl Server {
         self.reap_closed_buffers();
 
         let buffer = self.editor.current_buffer_id();
+        // Resolve this buffer's on-disk query overlays through Lua before the engine
+        // opens it (below), so an `after/queries` / `;extends` merge with no explicit
+        // `query.set` still reaches the paint. Once per language; a no-customization
+        // language resolves back to its base file and the engine stays on the disk path.
+        self.resolve_ts_queries_for(buffer);
+
         let line_count = self.editor.buffer().line_count();
         // Highlight a one-screen overscan above and below the viewport, so the
         // lines a scroll reveals are already cached and colored — no white flash
@@ -74,6 +80,37 @@ impl Server {
         let state = self.syntax_states.entry(buffer).or_default();
         state.key = Some(key);
         state.spans = by_line;
+    }
+
+    /// The buffer-open half of the query-resolution bridge (ADR 0001, #4): the
+    /// first time a buffer of some language is about to be highlighted, resolve its
+    /// `highlights` / `indents` queries through the faithful vendored Lua resolver
+    /// (which walks the runtimepath — base `queries/<lang>/`, `;extends` /
+    /// `;inherits` modelines, and `after/queries/<lang>/` overlays) and offer the
+    /// merged string to the engine. The engine keeps the override only when it
+    /// differs from the base file it would otherwise read off disk, so a language
+    /// with no customization stays byte-identical on the disk path.
+    ///
+    /// Runs here, on the server's async side just before the synchronous engine
+    /// query, because resolution may call Lua and the engine must never call Lua
+    /// mid-parse (the "push-on-change, never pull-in-redraw" constraint). Guarded to
+    /// once per language; an explicit `query.set` is handled separately by the
+    /// [`TsOp::SetQuery`](nxvim_lua::TsOp) effect.
+    fn resolve_ts_queries_for(&mut self, buffer: BufferId) {
+        let Some(lang) = self.editor.ts_language_for(buffer) else {
+            return; // stopped, or no grammar for this buffer's path
+        };
+        if !self.ts_resolved_langs.insert(lang.clone()) {
+            return; // already resolved this language's on-disk overlays
+        }
+        for name in ["highlights", "indents"] {
+            match self.lua.resolve_ts_query(&lang, name) {
+                Ok(text) => self.editor.set_resolved_ts_query(&lang, name, text),
+                Err(e) => self.editor.echo(format!(
+                    "treesitter: resolving query {lang}/{name} failed: {e}"
+                )),
+            }
+        }
     }
 
     /// Drop the highlight memo of every buffer the editor no longer has open

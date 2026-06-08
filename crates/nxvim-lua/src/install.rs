@@ -1085,6 +1085,19 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `vim._ts_set_query(lang, name)`: queue a [`TsOp::SetQuery`] for the server to
+    // re-resolve and push to the engine — the query-resolution bridge (#4). The
+    // Lua wrapper has already stored the override into `explicit_queries` (via the
+    // real `query.set`); this only signals *which* query changed, and the server
+    // pulls the merged string back through `query.get` when it drains.
+    let sh = shared.clone();
+    vim.set(
+        "_ts_set_query",
+        lua.create_function(move |_, (lang, name): (String, String)| {
+            sh.borrow_mut().ts_ops.push(TsOp::SetQuery { lang, name });
+            Ok(())
+        })?,
+    )?;
 
     // `vim.regex(pat)`: compile a vim pattern into a regex object exposing
     // `:match_str(text)` -> (start, end) byte offsets or nil. Backs `query.lua`'s

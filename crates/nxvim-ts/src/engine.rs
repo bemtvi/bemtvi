@@ -16,7 +16,7 @@ use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Query, QueryCursor, Tree};
 
-use crate::loader::{Grammar, LoadError};
+use crate::loader::{query_path, Grammar, LoadError, QueryOverrides};
 
 const LINE_TYPE: LineType = LineType::LF_CR;
 
@@ -82,6 +82,9 @@ pub struct Engine {
     data_dir: PathBuf,
     grammars: HashMap<String, Slot>,
     buffers: HashMap<BufferId, BufferState>,
+    /// Query-text overrides from the resolution bridge, consulted by
+    /// [`Grammar::load`] and applied in place by [`Engine::set_query`].
+    query_overrides: QueryOverrides,
 }
 
 impl Engine {
@@ -90,6 +93,7 @@ impl Engine {
             data_dir,
             grammars: HashMap::new(),
             buffers: HashMap::new(),
+            query_overrides: QueryOverrides::new(),
         }
     }
 
@@ -98,7 +102,7 @@ impl Engine {
     /// per language; later calls are a cache hit.
     fn grammar(&mut self, lang: &str) -> &Slot {
         if !self.grammars.contains_key(lang) {
-            let slot = match Grammar::load(&self.data_dir, lang) {
+            let slot = match Grammar::load(&self.data_dir, lang, &self.query_overrides) {
                 Ok(g) => Slot::Loaded(g),
                 Err(LoadError::NotInstalled) => Slot::NotInstalled,
                 Err(LoadError::Failed(e)) => Slot::Failed(format!("{e:#}")),
@@ -106,6 +110,122 @@ impl Engine {
             self.grammars.insert(lang.to_string(), slot);
         }
         &self.grammars[lang]
+    }
+
+    /// Install (or, with `text = None`, clear) a resolved query override for
+    /// `(lang, name)` — the engine half of the query-resolution bridge. Lua has
+    /// already merged `query.set` / `after/queries` / `;extends` into the final
+    /// `text`; here the engine compiles + caches it, consulting it in place of the
+    /// on-disk query. Only the paint-driving names `highlights` / `indents` reach
+    /// the engine; any other name is a no-op (folds/injections stay Lua-side).
+    ///
+    /// If the grammar is already loaded, the affected query is recompiled **in
+    /// place** against the live `Language` — never by evicting the grammar, whose
+    /// library must outlive the `Language` every open buffer's parser holds. A
+    /// compile failure is returned (the editor echoes it loud) and the previous
+    /// compiled query is left untouched, so a bad override degrades to "no change"
+    /// rather than a dark buffer.
+    pub fn set_query(
+        &mut self,
+        lang: &str,
+        name: &str,
+        text: Option<String>,
+    ) -> Result<(), String> {
+        if name != "highlights" && name != "indents" {
+            return Ok(());
+        }
+        let key = (lang.to_string(), name.to_string());
+        match &text {
+            Some(t) => {
+                self.query_overrides.insert(key, t.clone());
+            }
+            None => {
+                self.query_overrides.remove(&key);
+            }
+        }
+        self.recompile_query(lang, name, text)
+    }
+
+    /// Install a resolved on-disk overlay only when it differs from the base file
+    /// the engine would read off disk — the buffer-open half of the query bridge
+    /// (a pure `after/queries` / `;extends` merge, with no explicit `query.set`).
+    /// When `text` matches the disk file (a language with no customization), the
+    /// override is *cleared* so the engine stays on the byte-identical disk path.
+    /// Delegates to [`Self::set_query`] for the actual compile + in-place recompile.
+    pub fn set_query_overlay(
+        &mut self,
+        lang: &str,
+        name: &str,
+        text: Option<String>,
+    ) -> Result<(), String> {
+        if name != "highlights" && name != "indents" {
+            return Ok(());
+        }
+        // The base file content (None when absent). A resolved overlay equal to it
+        // carries no customization, so we drop the override and read disk instead.
+        let disk = self.read_disk_query(lang, name)?;
+        let effective = match text {
+            Some(t) if Some(&t) != disk.as_ref() => Some(t),
+            // Equal to disk, or nothing resolved: no override → disk path.
+            _ => None,
+        };
+        self.set_query(lang, name, effective)
+    }
+
+    /// Read the on-disk `<name>.scm` for `lang`, returning `None` when absent. The
+    /// base content [`set_query`](Self::set_query) reverts to on clear and that
+    /// [`set_query_overlay`](Self::set_query_overlay) compares a resolved overlay
+    /// against.
+    fn read_disk_query(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
+        let path = query_path(&self.data_dir, lang, &format!("{name}.scm"));
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("reading {}: {e}", path.display())),
+        }
+    }
+
+    /// Recompile the affected query in place against the already-loaded `Language`,
+    /// or do nothing if the grammar isn't loaded yet (the next `Grammar::load`
+    /// picks up the override map). `text` is the override just stored (`None` on a
+    /// clear, where the source reverts to the on-disk file). Shared by both query
+    /// entry points so the in-place recompile lives in one place.
+    fn recompile_query(
+        &mut self,
+        lang: &str,
+        name: &str,
+        text: Option<String>,
+    ) -> Result<(), String> {
+        // The source for the affected query: the override text, or — on clear —
+        // the on-disk file (absent indents file means "no indent query"). Read
+        // before the grammar borrow so `&self.read_disk_query` can't collide.
+        let src = match text {
+            Some(t) => Some(t),
+            None => self.read_disk_query(lang, name)?,
+        };
+        // Recompile in place only if the grammar is already loaded; otherwise the
+        // override is picked up by the next `Grammar::load`.
+        let Some(Slot::Loaded(g)) = self.grammars.get_mut(lang) else {
+            return Ok(());
+        };
+        match name {
+            "highlights" => {
+                let s = src.ok_or_else(|| format!("no highlights query on disk for '{lang}'"))?;
+                g.query = Query::new(&g.language, &s)
+                    .map_err(|e| format!("compiling {lang} highlights: {e}"))?;
+            }
+            "indents" => {
+                g.indents = match src {
+                    Some(s) => Some(
+                        Query::new(&g.language, &s)
+                            .map_err(|e| format!("compiling {lang} indents: {e}"))?,
+                    ),
+                    None => None,
+                };
+            }
+            _ => unreachable!("guarded above"),
+        }
+        Ok(())
     }
 
     /// (Re)initialize a buffer from full text and do the initial parse. The
@@ -482,6 +602,19 @@ impl SyntaxEngine for Engine {
             self.grammars.get(&state.language),
             Some(Slot::Loaded(g)) if g.indents.is_some()
         )
+    }
+
+    fn set_query(&mut self, lang: &str, name: &str, text: Option<String>) -> Result<(), String> {
+        Engine::set_query(self, lang, name, text)
+    }
+
+    fn set_query_overlay(
+        &mut self,
+        lang: &str,
+        name: &str,
+        text: Option<String>,
+    ) -> Result<(), String> {
+        Engine::set_query_overlay(self, lang, name, text)
     }
 }
 

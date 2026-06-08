@@ -116,3 +116,74 @@ do
     return LanguageTree.new(vim._resolve_bufnr(buf), lang, opts)
   end
 end
+
+-- ~~~ Query-resolution bridge (ADR 0001, #4): Lua resolves, the engine executes.
+--
+-- The native engine compiles ONE `highlights.scm` / `indents.scm` per grammar; it
+-- doesn't run neovim's query-merge logic, so a customized query (in-memory
+-- `query.set`, an `after/queries` overlay, a `;extends` base merge) is otherwise
+-- inert against the paint. The fix keeps resolution in the faithful vendored Lua
+-- and only moves *execution* to the engine: when a paint-driving query changes,
+-- the server pulls the merged string from here and pushes it to the engine.
+do
+  local tsquery = require('vim.treesitter.query')
+
+  -- Track which (lang, name) currently have a non-empty explicit `query.set`, so
+  -- the resolve seam below can fail loud if it ever stops capturing (e.g. a
+  -- re-vendor changes how `get` reaches `parse`) rather than silently dropping the
+  -- override.
+  local was_set = {}
+  local function key(lang, name)
+    return lang .. '\0' .. name
+  end
+
+  -- Resolve the *merged* query string the engine should compile — exactly what
+  -- `vim.treesitter.query.get(lang, name)` builds right before it parses. `get`
+  -- returns a compiled Query (it keeps no source text) and is memoized, so we
+  -- transiently wrap `tsquery.parse` (which `get` calls by table lookup) to
+  -- capture the string it is handed, force a fresh resolve, then restore. This
+  -- reuses ALL of upstream's merge logic (explicit + `;extends` + `after`) with no
+  -- query-merge code duplicated in nxvim and no edit to the vendored file — the
+  -- same "wrap from the prelude" discipline as the snapshot seams above.
+  function vim.treesitter._resolved_query_string(lang, name)
+    local captured = nil
+    local orig_parse = tsquery.parse
+    tsquery.parse = function(_, s)
+      captured = s
+      return true
+    end
+    local ok, err = pcall(function()
+      tsquery.get:clear(lang, name) -- bypass the memo: force a real resolve
+      tsquery.get(lang, name)
+    end)
+    tsquery.parse = orig_parse
+    tsquery.get:clear(lang, name) -- drop our throwaway result from the memo
+    if not ok then
+      error(('treesitter: resolving query %s/%s failed: %s'):format(lang, name, err))
+    end
+    if captured == nil and was_set[key(lang, name)] then
+      error(
+        ('treesitter query bridge: the resolve seam captured nothing for the '
+          .. 'set query %s/%s — the vendored query.get/parse contract changed'):format(lang, name)
+      )
+    end
+    return captured
+  end
+
+  -- Wrap `query.set` to (1) store the override the same as upstream and (2) signal
+  -- the server which query changed. Only `highlights` / `indents` drive the
+  -- engine's paint; other names (folds, injections, textobjects, …) update only
+  -- the Lua side, exactly as before.
+  local orig_set = tsquery.set
+  function tsquery.set(lang, name, text)
+    orig_set(lang, name, text)
+    if text ~= nil and text ~= '' then
+      was_set[key(lang, name)] = true
+    else
+      was_set[key(lang, name)] = nil
+    end
+    if name == 'highlights' or name == 'indents' then
+      vim._ts_set_query(lang, name)
+    end
+  end
+end

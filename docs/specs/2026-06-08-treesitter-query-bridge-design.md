@@ -1,14 +1,30 @@
 # Treesitter query bridge — Lua resolves, Rust executes — design
 
-**Status:** accepted; **unblocked — its prerequisite
-[`vim.treesitter.start`](../decisions/0001-native-engines-vendored-lua-apis.md)
-(bridge #1) is now implemented.** This bridge is itself not yet built. It closes
-the gap recorded in
+**Status:** accepted; **implemented.** Both triggers are built: the
+`vim.treesitter.query.set` path (the prelude seam, the `TsOp::SetQuery` effect,
+the `_resolved_query_string` resolver, `Engine::set_query`, and the engine's data
+dir on the Lua runtimepath) and the **buffer-open trigger** for a *pure on-disk*
+`after/queries` / `;extends` overlay with no `query.set` call
+(`Server::resolve_ts_queries_for` → `Editor::set_resolved_ts_query` →
+`Engine::set_query_overlay`, which installs the resolved merge only when it
+differs from the engine's base disk file). This bridge closes the gap recorded in
 [known-approximations.md](../known-approximations.md): a customized highlight or
 indent query does not change what the native engine paints. It is the fourth
 worked instance of ADR 0001's bridge pattern, one level deeper than the others —
 the vendored Lua owns query *resolution*, the native engine owns query
 *execution*.
+
+> **Implementation note — getting the resolved *string*.** `query.get(lang, name)`
+> returns a *compiled* `Query` and keeps no source text, and it is memoized. The
+> bridge needs the merged *string* the engine compiles, so the prelude adds
+> `vim.treesitter._resolved_query_string(lang, name)`: it transiently wraps
+> `query.parse` (which `get` calls by table lookup), clears the `get` memo for the
+> key to force a fresh resolve, captures the string `get` hands `parse`, then
+> restores. This reuses *all* of upstream's merge logic with no query-merge code
+> duplicated and **no edit to the vendored file** — the same "wrap from the
+> prelude" discipline as the snapshot seams. A loud guard fires if the seam ever
+> stops capturing a query that was explicitly `set` (e.g. a re-vendor changes how
+> `get` reaches `parse`), so the contract can't break silently.
 
 ## Problem
 

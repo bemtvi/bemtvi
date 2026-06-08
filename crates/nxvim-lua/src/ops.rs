@@ -371,6 +371,12 @@ pub enum TsOp {
     Start { bufnr: u64, lang: String },
     /// `vim.treesitter.stop(buf)`: stop highlighting `bufnr`.
     Stop { bufnr: u64 },
+    /// `vim.treesitter.query.set(lang, name, …)` (the query-resolution bridge,
+    /// #4): the named query for `lang` changed. The server re-resolves the merged
+    /// string from Lua and pushes it to the engine — only `name` is carried; the
+    /// resolved text is fetched on drain (so `;extends`/`after` merges are
+    /// included), not trusted from the raw `set` argument.
+    SetQuery { lang: String, name: String },
 }
 
 /// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,

@@ -58,6 +58,11 @@ impl Editor {
     /// Accesses `syntax` / `buffers` / `syntax_opened` as disjoint fields so the
     /// engine's `&mut` never collides with the buffer borrow it reads text from.
     fn sync_syntax_engine(&mut self, buf: BufferId) {
+        // The language the engine highlights this buffer as, or `None` when there
+        // is nothing to parse (no grammar for the path, or `vim.treesitter.stop`).
+        let Some(language) = self.ts_language_for(buf) else {
+            return;
+        };
         let Some(engine) = self.syntax.as_mut() else {
             return;
         };
@@ -65,17 +70,6 @@ impl Editor {
             return;
         };
         let buffer = &mut open_buf.buffer;
-        // Resolve the language: a `vim.treesitter.start` override wins (force a
-        // lang, or — `Some(None)` — explicitly stop highlighting); otherwise fall
-        // back to the path's extension. Owned, so it does not borrow `self`.
-        let language: String = match self.ts_override.get(&buf) {
-            Some(Some(lang)) => lang.clone(),
-            Some(None) => return, // stopped via vim.treesitter.stop
-            None => match language_of_path(buffer.path.as_deref()) {
-                Some(lang) => lang.to_string(),
-                None => return, // no grammar for this path: nothing to parse
-            },
-        };
 
         // Capture a load failure to echo *after* the engine/buffer field borrows
         // end (so the `&mut self` echo doesn't collide with them).
@@ -118,6 +112,23 @@ impl Editor {
         }
     }
 
+    /// The language the engine would highlight `buf` as, or `None` when there is
+    /// nothing to parse. A `vim.treesitter.start` override wins (force a lang, or
+    /// — `Some(None)` — explicitly stop); otherwise the path's extension decides.
+    /// Both "stopped" and "no grammar for this path" collapse to `None` (the engine
+    /// treats them identically). The server reads this on the async side to know
+    /// which language's queries to resolve before the buffer's first highlight.
+    pub fn ts_language_for(&self, buf: BufferId) -> Option<String> {
+        match self.ts_override.get(&buf) {
+            Some(Some(lang)) => Some(lang.clone()),
+            Some(None) => None, // stopped via vim.treesitter.stop
+            None => {
+                let path = self.buffer_of(buf)?.path.as_deref();
+                language_of_path(path).map(str::to_string)
+            }
+        }
+    }
+
     /// Enable native treesitter highlighting for `buf` in `lang`, the bridge
     /// behind `vim.treesitter.start(buf, lang)` (ADR 0001, bridge #1). Forces
     /// `lang` regardless of the path's extension — so a buffer the extension
@@ -137,6 +148,40 @@ impl Editor {
             engine.close(buf);
         }
         self.syntax_opened.remove(&buf);
+    }
+
+    /// Install (or clear, with `text = None`) a resolved treesitter query for
+    /// `(lang, name)`, the editor seam of the query-resolution bridge (ADR 0001,
+    /// bridge #4). The server resolves the merged string via the vendored Lua and
+    /// hands it down; the engine compiles + caches it. A compile failure echoes
+    /// loud (no-silent-stubs) rather than leaving a broken override unmentioned.
+    pub fn set_ts_query(&mut self, lang: &str, name: &str, text: Option<String>) {
+        let Some(engine) = self.syntax.as_mut() else {
+            return;
+        };
+        if let Err(reason) = engine.set_query(lang, name, text) {
+            self.echo(format!(
+                "treesitter: query '{lang}/{name}' failed to compile: {reason}"
+            ));
+        }
+    }
+
+    /// Install a *resolved on-disk* query overlay for `(lang, name)` at buffer-open
+    /// — the pure-`after/queries` / `;extends` half of the query bridge, with no
+    /// explicit `query.set` behind it. Lua resolved `text` by merging the
+    /// runtimepath; the engine installs it **only if it differs** from the base
+    /// file it would otherwise read off disk, so a language with no customization
+    /// stays on the byte-identical disk path and pays nothing. A compile failure
+    /// echoes loud, like [`Self::set_ts_query`].
+    pub fn set_resolved_ts_query(&mut self, lang: &str, name: &str, text: Option<String>) {
+        let Some(engine) = self.syntax.as_mut() else {
+            return;
+        };
+        if let Err(reason) = engine.set_query_overlay(lang, name, text) {
+            self.echo(format!(
+                "treesitter: query '{lang}/{name}' failed to compile: {reason}"
+            ));
+        }
     }
 
     /// Highlight spans for the line range `[first, last)` of buffer `buf`,

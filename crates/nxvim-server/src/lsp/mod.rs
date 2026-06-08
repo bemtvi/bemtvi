@@ -260,12 +260,21 @@ pub(crate) fn lsp_range_to_bytes_in(
 
 /// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:
 /// the character offset converted against its line, the row added as a line start.
+///
+/// The `row` is **clamped** to the buffer's last editable line: a server's
+/// `Position.line` is untrusted, and an out-of-range row would otherwise reach
+/// `buffer.line_start(row)` → ropey's `assert!(line_idx <= len_lines)` and panic
+/// the server thread (a one-line malformed-reply DoS). Clamping mirrors the
+/// column clamp `byte_col` already applies — a past-end position lands at the end
+/// of the document rather than crashing the editor.
 pub(crate) fn lsp_pos_to_byte_in(
     buffer: &Buffer,
     pos: Position,
     encoding: PositionEncoding,
 ) -> usize {
-    let row = pos.line as usize;
+    // `line_count` is the number of editable lines; a valid line index is
+    // `0..=line_count` (the count itself addresses the end of the last line).
+    let row = (pos.line as usize).min(buffer.line_count());
     let line = buffer.line(row);
     buffer.line_start(row) + byte_col(encoding, &line, pos.character as usize)
 }

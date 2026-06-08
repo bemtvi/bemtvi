@@ -340,6 +340,52 @@ async fn format_and_rename_never_block_the_editor() {
     );
 }
 
+#[tokio::test]
+async fn a_formatting_edit_with_an_out_of_bounds_line_does_not_crash_the_editor() {
+    let _guard = test_lock().lock().await;
+    // SECURITY/ROBUSTNESS: a (malicious or buggy) server returns a formatting edit
+    // whose range references a line far beyond the buffer's last line. The byte
+    // conversion must clamp rather than index the rope out of bounds — an
+    // unclamped `Position.line` reaches `line_start(row)` → ropey's
+    // `assert!(line_idx <= len_lines)` and panics the single server thread,
+    // taking the whole editor down. The editor must survive and stay editable.
+    let record = configure_mock(
+        "fmt-oob-line",
+        serde_json::json!({
+            // Buffer has 1 line; the edit's range starts on line 99.
+            "formatting": [text_edit(99, 0, 99, 0, "INJECTED")],
+        }),
+    );
+    let file = temp_file("fmt-oob-line", "rs", "let x = 1;\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+
+    cmd(&rpc, "LspFormat").await;
+    // Let the reply land and be applied.
+    for _ in 0..10 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The editor is still alive and editable — it did not panic on the bad line.
+    // The out-of-bounds position is clamped to end-of-document (a benign no-crash
+    // outcome), so the inserted text lands at the buffer end rather than indexing
+    // the rope out of bounds. The key property is that the editor survives and the
+    // RPC connection stays up; a follow-up edit still works.
+    feed(&rpc, "Gokeep<Esc>");
+    let after = lines(&rpc).await;
+    assert_eq!(
+        after.first().map(String::as_str),
+        Some("let x = 1;"),
+        "the original line is intact; the editor survived: {after:?}"
+    );
+    assert_eq!(
+        after.last().map(String::as_str),
+        Some("keep"),
+        "the editor is still editable after the malformed reply: {after:?}"
+    );
+}
+
 /// Restores an env var to its prior value on drop, so a test that sets a
 /// process-global env var leaves it as it found it even on a panic.
 struct EnvGuard(&'static str, Option<std::ffi::OsString>);

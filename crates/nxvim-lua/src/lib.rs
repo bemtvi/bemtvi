@@ -34,4 +34,7 @@ pub use ops::{
     LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs,
     RegisterSetOp, TabOp, UiInputReq, WindowOp,
 };
-pub use runtime::{ExtmarkMirror, FloatMirror, HlDefMirror, LuaRuntime, TabMirror, WindowMirror};
+pub use runtime::{
+    BoMirror, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror, LuaRuntime, TabMirror,
+    WindowMirror,
+};

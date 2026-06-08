@@ -11,8 +11,8 @@ use nxvim_core::{
     UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, HlDefMirror, HlSet, LoopOp,
-    OptionValue, PanelOp, TabMirror, TabOp, WindowMirror, WindowOp,
+    BoMirror, BufMirror, BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror,
+    HlDefMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -617,11 +617,11 @@ impl Server {
     /// mirror is re-serialized — so the common cursor-moved-no-edit path only
     /// refreshes the O(1) cursor/window fields.
     pub(crate) fn push_buf_mirror(&mut self) {
-        let mut bufs: Vec<(u64, Option<Vec<String>>, String)> = Vec::new();
+        let mut bufs: Vec<BufMirror> = Vec::new();
         // Buffer-local option values, mirrored so `vim.bo` / `nvim_get_option_value`
         // read the core's current value (the default until set, and values set via
         // the `:set` ex path). Cheap (three scalars per buffer), so it isn't gated.
-        let mut bo: Vec<(u64, usize, usize, isize, bool, bool)> = Vec::new();
+        let mut bo: Vec<BoMirror> = Vec::new();
         // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
         // marks contribute, so a session with no decoration plugin pays nothing.
         let mut extmarks: Vec<(u64, Vec<ExtmarkMirror>)> = Vec::new();
@@ -641,14 +641,14 @@ impl Server {
             let name = self.editor.buffer_name(id).unwrap_or_default();
             if let Some(b) = self.editor.buffer_of(id) {
                 let o = b.options;
-                bo.push((
-                    id.0,
-                    o.tabstop,
-                    o.shiftwidth,
-                    o.softtabstop,
-                    o.expandtab,
-                    b.modified,
-                ));
+                bo.push(BoMirror {
+                    bufnr: id.0,
+                    tabstop: o.tabstop,
+                    shiftwidth: o.shiftwidth,
+                    softtabstop: o.softtabstop,
+                    expandtab: o.expandtab,
+                    modified: b.modified,
+                });
                 if !b.extmarks.is_empty() {
                     let marks = b
                         .extmarks
@@ -677,7 +677,11 @@ impl Server {
                     extmarks.push((id.0, marks));
                 }
             }
-            bufs.push((id.0, lines, name));
+            bufs.push(BufMirror {
+                bufnr: id.0,
+                lines,
+                name,
+            });
         }
         // Drop tick entries for buffers that no longer exist, so the map can't grow
         // unboundedly across a long session of opening and closing buffers.
@@ -789,19 +793,17 @@ impl Server {
         // default until set, and values set via the `:set` ex path). Cheap (five
         // search flags + showtabline/laststatus), so it isn't gated.
         let go = self.editor.global_options();
-        let _ = self.lua.set_go_mirror(
-            (
-                go.ignorecase,
-                go.smartcase,
-                go.wrapscan,
-                go.hlsearch,
-                go.incsearch,
-            ),
-            go.showtabline,
-            go.laststatus,
-            &go.statusline,
-            &go.tabline,
-        );
+        let _ = self.lua.set_go_mirror(&GoMirror {
+            ignorecase: go.ignorecase,
+            smartcase: go.smartcase,
+            wrapscan: go.wrapscan,
+            hlsearch: go.hlsearch,
+            incsearch: go.incsearch,
+            showtabline: go.showtabline,
+            laststatus: go.laststatus,
+            statusline: go.statusline.clone(),
+            tabline: go.tabline.clone(),
+        });
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small
         // (a handful of short strings), so it isn't gated on a dirty flag.

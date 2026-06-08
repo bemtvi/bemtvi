@@ -9,7 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use mlua::{Lua, LuaOptions, StdLib, Table};
+use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table};
+use serde::Serialize;
 
 use crate::convert::{json_to_lua, lua_to_rmpv};
 use crate::host::seed_package_path;
@@ -20,11 +21,26 @@ use crate::ops::{
     WindowOp,
 };
 
+/// `skip_serializing_if` predicate: drop a `false` flag from the serialized
+/// table so an unset attribute is *absent*, not `false` — matching how neovim's
+/// API (`nvim_get_hl`) reports only the attributes that are set.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// `skip_serializing_if` predicate for the float's `win`: omit it when `0` (no
+/// parent), the sentinel the server uses for a non-`relative="win"` float.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// One window's row in the Rust→Lua window mirror, in layout order. The
 /// number/relativenumber flags back `vim.wo`'s wired window-local options;
 /// `float` carries a floating window's placement so `nvim_win_get_config` reads
-/// it from Lua (`None` for a tiled window).
-#[derive(Clone, Debug, Default)]
+/// it from Lua (`None` for a tiled window). Serialized into its Lua table by
+/// `to_value`; the field names are the table keys, so they match the shape the
+/// `nvim_win_*` getters expect.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct WindowMirror {
     pub id: u64,
     pub buffer: u64,
@@ -37,17 +53,19 @@ pub struct WindowMirror {
     pub height: u64,
     pub number: bool,
     pub relativenumber: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub float: Option<FloatMirror>,
 }
 
 /// A floating window's placement for the [`WindowMirror`], pre-formatted into the
 /// strings `nvim_win_get_config` returns (the server translates the core's
 /// `FloatConfig` enums into these so nxvim-lua stays free of the core's types).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FloatMirror {
     /// `"editor"` / `"win"` / `"cursor"`.
     pub relative: String,
-    /// The parent window for `relative == "win"`, else `0`.
+    /// The parent window for `relative == "win"`, else `0` (omitted).
+    #[serde(skip_serializing_if = "is_zero")]
     pub win: u64,
     /// `"NW"` / `"NE"` / `"SW"` / `"SE"`.
     pub anchor: String,
@@ -59,6 +77,7 @@ pub struct FloatMirror {
     pub focusable: bool,
     /// `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"`.
     pub border: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }
 
@@ -66,7 +85,7 @@ pub struct FloatMirror {
 /// `vim.api.nvim_tabpage_*` reads (`list_wins`/`get_win`/`is_valid`/`get_number`)
 /// the same way [`WindowMirror`] backs the window getters, so they resolve from
 /// Lua without an RPC round-trip.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct TabMirror {
     pub id: u64,
     /// The tab's window ids, in its in-tab layout order.
@@ -82,14 +101,17 @@ pub struct TabMirror {
 /// One extmark's row in the Rust→Lua extmark mirror, pushed before each chunk so
 /// `nvim_buf_get_extmarks` reads positions current with the buffer. `(row, col)`
 /// are 0-based, the server having converted the byte anchors against the rope.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ExtmarkMirror {
     pub ns: u32,
     pub id: u64,
     pub row: u64,
     pub col: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_row: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_col: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hl_group: Option<String>,
     pub priority: u32,
 }
@@ -99,19 +121,74 @@ pub struct ExtmarkMirror {
 /// Colors ride as the `0xRRGGBB` integers neovim's API reports; a `link` group
 /// carries only `link` (its attrs are ignored, matching neovim), and the Lua side
 /// follows the chain when asked for the resolved form (`{ link = false }`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct HlDefMirror {
+    /// The group name keys the mirror table (`vim._hl_defs[name]`), so it isn't a
+    /// field of the serialized entry.
+    #[serde(skip)]
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fg: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bg: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sp: Option<u32>,
+    #[serde(skip_serializing_if = "is_false")]
     pub bold: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub italic: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub underline: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub undercurl: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub strikethrough: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub reverse: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+}
+
+/// One buffer's row in the Rust→Lua buffer mirror (`vim._buffers[bufnr]`). `lines`
+/// rides only on the ticks where the buffer changed (the server passes `None` to
+/// reuse the table already in Lua, the bulk the per-chunk push otherwise skips);
+/// `bufnr` is both the mirror key and a field the entry carries.
+#[derive(Clone, Debug, Serialize)]
+pub struct BufMirror {
+    pub bufnr: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<String>>,
+    pub name: String,
+}
+
+/// One buffer's wired buffer-local options (`vim._bo_mirror[bufnr]`) read by
+/// `vim.bo` / `nvim_get_option_value`. `bufnr` keys the table, so it isn't a
+/// field of the serialized entry.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoMirror {
+    #[serde(skip)]
+    pub bufnr: u64,
+    pub tabstop: usize,
+    pub shiftwidth: usize,
+    pub softtabstop: isize,
+    pub expandtab: bool,
+    pub modified: bool,
+}
+
+/// The wired global options (`vim._go_mirror`) read by `vim.o`. Serialized as one
+/// flat table, so the awkward positional signature the hand-rolled setter carried
+/// becomes a single struct the caller fills by field name.
+#[derive(Clone, Debug, Serialize)]
+pub struct GoMirror {
+    pub ignorecase: bool,
+    pub smartcase: bool,
+    pub wrapscan: bool,
+    pub hlsearch: bool,
+    pub incsearch: bool,
+    pub showtabline: u8,
+    pub laststatus: u8,
+    pub statusline: String,
+    pub tabline: String,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -893,10 +970,20 @@ impl LuaRuntime {
     /// current `mode()` short code (`"n"`/`"i"`/`"v"`/…), stored as
     /// `vim._cur_mode` so a `%{}` statusline expression reading `vim.fn.mode()`
     /// reflects this frame.
+    /// Serialize a mirror struct into the Lua table the `_set_*_mirror` receivers
+    /// read. Disables mlua's array metatable so the result is a *plain* table —
+    /// byte-identical to the hand-rolled `create_table()` tables these setters used
+    /// to build, so nothing on the Lua side (length, `pairs`, `getmetatable`) sees
+    /// a difference.
+    fn to_lua<T: Serialize + ?Sized>(&self, value: &T) -> mlua::Result<mlua::Value> {
+        let opts = mlua::SerializeOptions::new().set_array_metatable(false);
+        self.lua.to_value_with(value, opts)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,
-        bufs: &[(u64, Option<Vec<String>>, String)],
+        bufs: &[BufMirror],
         cursor: (u64, u64),
         win: u64,
         wins: &[WindowMirror],
@@ -905,54 +992,13 @@ impl LuaRuntime {
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
-        for (bufnr, lines, name) in bufs {
-            let entry = self.lua.create_table()?;
-            if let Some(lines) = lines {
-                let arr = self.lua.create_table()?;
-                for (i, line) in lines.iter().enumerate() {
-                    arr.set(i + 1, self.lua.create_string(line)?)?;
-                }
-                entry.set("lines", arr)?;
-            }
-            entry.set("name", self.lua.create_string(name)?)?;
-            entry.set("bufnr", *bufnr)?;
-            entries.set(*bufnr, entry)?;
+        for b in bufs {
+            entries.set(b.bufnr, self.to_lua(b)?)?;
         }
-        let win_arr = self.lua.create_table()?;
-        for (i, m) in wins.iter().enumerate() {
-            let w = self.lua.create_table()?;
-            w.set("id", m.id)?;
-            w.set("buffer", m.buffer)?;
-            w.set("row", m.row)?;
-            w.set("col", m.col)?;
-            w.set("width", m.width)?;
-            w.set("height", m.height)?;
-            w.set("number", m.number)?;
-            w.set("relativenumber", m.relativenumber)?;
-            // A float carries its placement as a nested table, the shape
-            // `nvim_win_get_config` returns (and that `nvim_win_set_config`'s
-            // write-through merges into).
-            if let Some(f) = &m.float {
-                let ft = self.lua.create_table()?;
-                ft.set("relative", self.lua.create_string(&f.relative)?)?;
-                if f.win != 0 {
-                    ft.set("win", f.win)?;
-                }
-                ft.set("anchor", self.lua.create_string(&f.anchor)?)?;
-                ft.set("row", f.row)?;
-                ft.set("col", f.col)?;
-                ft.set("width", f.width)?;
-                ft.set("height", f.height)?;
-                ft.set("zindex", f.zindex)?;
-                ft.set("focusable", f.focusable)?;
-                ft.set("border", self.lua.create_string(&f.border)?)?;
-                if let Some(title) = &f.title {
-                    ft.set("title", self.lua.create_string(title)?)?;
-                }
-                w.set("float", ft)?;
-            }
-            win_arr.set(i + 1, w)?;
-        }
+        // The window array (`nvim_win_*` reads it by index); each `WindowMirror`
+        // serializes to the table shape `nvim_win_get_config` returns, the nested
+        // float included.
+        let win_arr = self.to_lua(wins)?;
         let set: mlua::Function = vim.get("_set_buf_mirror")?;
         set.call((entries, cursor.0, cursor.1, win, win_arr, next_win, mode))
     }
@@ -966,26 +1012,7 @@ impl LuaRuntime {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
         for (bufnr, marks) in bufs {
-            let arr = self.lua.create_table()?;
-            for (i, m) in marks.iter().enumerate() {
-                let t = self.lua.create_table()?;
-                t.set("ns", m.ns)?;
-                t.set("id", m.id)?;
-                t.set("row", m.row)?;
-                t.set("col", m.col)?;
-                if let Some(r) = m.end_row {
-                    t.set("end_row", r)?;
-                }
-                if let Some(c) = m.end_col {
-                    t.set("end_col", c)?;
-                }
-                if let Some(g) = &m.hl_group {
-                    t.set("hl_group", self.lua.create_string(g)?)?;
-                }
-                t.set("priority", m.priority)?;
-                arr.set(i + 1, t)?;
-            }
-            entries.set(*bufnr, arr)?;
+            entries.set(*bufnr, self.to_lua(marks)?)?;
         }
         let set: mlua::Function = vim.get("_set_extmark_mirror")?;
         set.call(entries)
@@ -1000,38 +1027,7 @@ impl LuaRuntime {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
         for d in defs {
-            let entry = self.lua.create_table()?;
-            if let Some(c) = d.fg {
-                entry.set("fg", c)?;
-            }
-            if let Some(c) = d.bg {
-                entry.set("bg", c)?;
-            }
-            if let Some(c) = d.sp {
-                entry.set("sp", c)?;
-            }
-            if d.bold {
-                entry.set("bold", true)?;
-            }
-            if d.italic {
-                entry.set("italic", true)?;
-            }
-            if d.underline {
-                entry.set("underline", true)?;
-            }
-            if d.undercurl {
-                entry.set("undercurl", true)?;
-            }
-            if d.strikethrough {
-                entry.set("strikethrough", true)?;
-            }
-            if d.reverse {
-                entry.set("reverse", true)?;
-            }
-            if let Some(link) = &d.link {
-                entry.set("link", self.lua.create_string(link)?)?;
-            }
-            entries.set(self.lua.create_string(&d.name)?, entry)?;
+            entries.set(self.lua.create_string(&d.name)?, self.to_lua(d)?)?;
         }
         let set: mlua::Function = vim.get("_set_hl_mirror")?;
         set.call(entries)
@@ -1046,20 +1042,11 @@ impl LuaRuntime {
     /// `(bufnr, tabstop, shiftwidth, softtabstop, expandtab, modified)` per open
     /// buffer (`modified` backs `vim.bo[n].modified`, which a `'tabline'` label
     /// reads).
-    pub fn set_bo_mirror(
-        &self,
-        bufs: &[(u64, usize, usize, isize, bool, bool)],
-    ) -> mlua::Result<()> {
+    pub fn set_bo_mirror(&self, bufs: &[BoMirror]) -> mlua::Result<()> {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
-        for (bufnr, tabstop, shiftwidth, softtabstop, expandtab, modified) in bufs {
-            let entry = self.lua.create_table()?;
-            entry.set("tabstop", *tabstop)?;
-            entry.set("shiftwidth", *shiftwidth)?;
-            entry.set("softtabstop", *softtabstop)?;
-            entry.set("expandtab", *expandtab)?;
-            entry.set("modified", *modified)?;
-            entries.set(*bufnr, entry)?;
+        for b in bufs {
+            entries.set(b.bufnr, self.to_lua(b)?)?;
         }
         let set: mlua::Function = vim.get("_set_bo_mirror")?;
         set.call(entries)
@@ -1071,27 +1058,9 @@ impl LuaRuntime {
     /// Pushed alongside the buffer mirror before any Lua that can read options, so a
     /// read reflects the core's current value — the default until set, and a value
     /// set through the `:set` ex path, not just one written from Lua.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_go_mirror(
-        &self,
-        opts: (bool, bool, bool, bool, bool),
-        showtabline: u8,
-        laststatus: u8,
-        statusline: &str,
-        tabline: &str,
-    ) -> mlua::Result<()> {
+    pub fn set_go_mirror(&self, go: &GoMirror) -> mlua::Result<()> {
         let vim = self.vim()?;
-        let (ignorecase, smartcase, wrapscan, hlsearch, incsearch) = opts;
-        let entry = self.lua.create_table()?;
-        entry.set("ignorecase", ignorecase)?;
-        entry.set("smartcase", smartcase)?;
-        entry.set("wrapscan", wrapscan)?;
-        entry.set("hlsearch", hlsearch)?;
-        entry.set("incsearch", incsearch)?;
-        entry.set("showtabline", showtabline)?;
-        entry.set("laststatus", laststatus)?;
-        entry.set("statusline", statusline)?;
-        entry.set("tabline", tabline)?;
+        let entry = self.to_lua(go)?;
         let set: mlua::Function = vim.get("_set_go_mirror")?;
         set.call(entry)
     }
@@ -1152,23 +1121,7 @@ impl LuaRuntime {
     /// state, so a read reflects the core's current layout.
     pub fn set_tab_mirror(&self, tabs: &[TabMirror], cur_tab: u64) -> mlua::Result<()> {
         let vim = self.vim()?;
-        let tab_arr = self.lua.create_table()?;
-        for (i, t) in tabs.iter().enumerate() {
-            let entry = self.lua.create_table()?;
-            entry.set("id", t.id)?;
-            let wins = self.lua.create_table()?;
-            for (j, w) in t.windows.iter().enumerate() {
-                wins.set(j + 1, *w)?;
-            }
-            entry.set("windows", wins)?;
-            let bufs = self.lua.create_table()?;
-            for (j, b) in t.buffers.iter().enumerate() {
-                bufs.set(j + 1, *b)?;
-            }
-            entry.set("buffers", bufs)?;
-            entry.set("current_window", t.current_window)?;
-            tab_arr.set(i + 1, entry)?;
-        }
+        let tab_arr = self.to_lua(tabs)?;
         let set: mlua::Function = vim.get("_set_tab_mirror")?;
         set.call((tab_arr, cur_tab))
     }

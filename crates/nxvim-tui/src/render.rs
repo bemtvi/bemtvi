@@ -465,6 +465,11 @@ fn render_window(
         Some(_) => (&empty_search, &empty_incsearch),
         None => (&win.search, &win.incsearch),
     };
+    // Secondary multi-cursor selections, like search, paint on the settled viewport.
+    let frame_secondary_sel: &SearchSpans = match anim {
+        Some(_) => &empty_search,
+        None => &win.secondary_selection,
+    };
     // Diagnostics, like search, are painted on the settled viewport only.
     let frame_diag: &[Vec<DiagSpan>] = match anim {
         Some(_) => &empty_diag,
@@ -475,6 +480,7 @@ fn render_window(
         text_inner,
         &frame_lines,
         &frame_sel,
+        frame_secondary_sel,
         frame_search,
         frame_incsearch,
         &frame_hl,
@@ -484,10 +490,88 @@ fn render_window(
         win.leftcol as usize,
         &theme,
     );
+    // Paint the secondary multi-cursors over the settled text. They're a
+    // static-state decoration (like search / diagnostics), so skip them mid-slide
+    // — the interpolated positions wouldn't line up with the projected ones.
+    if anim.is_none() {
+        render_secondary_cursors(frame, text_inner, win, view);
+        // In placement mode, recolor the active (primary) cursor cell so it reads
+        // as "dropping cursors", distinct from the reverse-video placed ones.
+        if win.focused && view.is_multicursor() {
+            paint_cursor_cell(
+                frame,
+                text_inner,
+                win.cursor_screen_col,
+                win.cursor_row,
+                win.leftcol,
+                Style::default()
+                    .bg(MULTICURSOR_ACCENT)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+    }
     if let Some(status_area) = status_area {
         render_status(frame, status_area, &win.status, view);
     }
     (text_inner, cursor_row)
+}
+
+/// Paint each secondary multi-cursor as a styled cell over the already-rendered
+/// text. The terminal has only one real cursor (the primary, placed via
+/// `set_cursor_position`); the extra cursors are shown this way. Their look tracks
+/// the same mode-driven cursor *shape* the primary uses (`cursor_style`): a block
+/// cursor (normal/visual) paints reverse-video, while the bar (insert) and
+/// underline (replace) shapes — neither paintable in a single cell — both show as
+/// an underline (tinted with the multi-cursor accent so it doesn't read as one of
+/// the text's own underlines), so a mode change propagates to every cursor.
+/// Positions off the horizontal scroll or past the text edges are dropped,
+/// matching the primary cursor's clamp.
+fn render_secondary_cursors(frame: &mut Frame, text_inner: Rect, win: &WindowView, view: &View) {
+    // The block shape (normal/visual) paints reverse-video; the bar (insert) and
+    // underline (replace) shapes — neither paintable in a cell — both show as an
+    // underline, tinted with the multi-cursor accent so it reads as a cursor rather
+    // than blending into the text's own (default-colored) underlines.
+    let patch = if view.is_insert() || view.is_replace() {
+        Style::default()
+            .add_modifier(Modifier::UNDERLINED)
+            .underline_color(MULTICURSOR_ACCENT)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    };
+    for &(row, col) in &win.secondary_cursors {
+        paint_cursor_cell(frame, text_inner, col, row, win.leftcol, patch);
+    }
+}
+
+/// The multi-cursor accent (a warm amber): the active cursor's background in
+/// MULTICURSOR placement mode, and the secondary cursors' underline color in
+/// insert/replace mode, so every multi-cursor decoration reads as one family.
+const MULTICURSOR_ACCENT: Color = Color::Rgb(229, 192, 123);
+
+/// Patch the cell at window-relative `(row, screen_col)` with `patch`, applying
+/// the same `leftcol` horizontal shift the text gets and dropping anything off
+/// the scroll or past the text edges (matching the primary cursor's clamp).
+fn paint_cursor_cell(
+    frame: &mut Frame,
+    text_inner: Rect,
+    screen_col: u16,
+    row: u16,
+    leftcol: u16,
+    patch: Style,
+) {
+    let Some(rel_col) = screen_col.checked_sub(leftcol) else {
+        return;
+    };
+    let x = text_inner.x + rel_col;
+    let y = text_inner.y + row;
+    if x >= text_inner.right() || y >= text_inner.bottom() {
+        return;
+    }
+    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+        let style = cell.style().patch(patch);
+        cell.set_style(style);
+    }
 }
 
 /// Draw the split separators between windows: a vertical `│` or horizontal `─`
@@ -612,6 +696,7 @@ fn render_text(
     area: Rect,
     lines: &[String],
     selection: &[Option<(u16, u16)>],
+    secondary_selection: &[Vec<(u16, u16)>],
     search: &[Vec<(u16, u16)>],
     incsearch: &[Option<(u16, u16)>],
     highlights: &[Vec<HlSpan>],
@@ -631,6 +716,7 @@ fn render_text(
             .enumerate()
             .map(|(row, l)| {
                 let sel = selection.get(row).copied().flatten();
+                let sec_sel = secondary_selection.get(row).unwrap_or(&empty_search);
                 let matches = search.get(row).unwrap_or(&empty_search);
                 let cur = incsearch.get(row).copied().flatten();
                 let hl = highlights.get(row).unwrap_or(&empty);
@@ -638,7 +724,8 @@ fn render_text(
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
-                    l, sel, matches, cur, hl, diag, width, is_filler, tabstop, leftcol, theme,
+                    l, sel, sec_sel, matches, cur, hl, diag, width, is_filler, tabstop, leftcol,
+                    theme,
                 )
             })
             .collect::<Vec<_>>(),
@@ -668,6 +755,7 @@ fn render_text(
 fn highlight_line(
     line: &str,
     sel: Option<(u16, u16)>,
+    secondary_sel: &[(u16, u16)],
     search: &[(u16, u16)],
     incsearch: Option<(u16, u16)>,
     hl: &[HlSpan],
@@ -701,7 +789,7 @@ fn highlight_line(
     let mut col = 0usize;
     for ch in expanded.chars() {
         if col >= leftcol {
-            let style = cell_style(col, sel, search, incsearch, hl, diag, theme);
+            let style = cell_style(col, sel, secondary_sel, search, incsearch, hl, diag, theme);
             if style != run_style && !run.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut run), run_style));
             }
@@ -716,8 +804,15 @@ fn highlight_line(
 
     // Extend the selection past end-of-text (selected newline / linewise fill),
     // within the scrolled viewport `[leftcol, leftcol + max_width)`. The pad count
-    // is a difference of absolute columns, which equals the painted-cell count.
-    if let Some((_, e)) = sel {
+    // is a difference of absolute columns, which equals the painted-cell count. The
+    // primary's `sel` and every secondary selection on this row can each run past
+    // the text; pad out to the furthest of them so a linewise fill reaches the edge.
+    let pad_end = sel
+        .map(|(_, e)| e)
+        .into_iter()
+        .chain(secondary_sel.iter().map(|(_, e)| *e))
+        .max();
+    if let Some(e) = pad_end {
         let start = col.max(leftcol);
         let e = (e as usize).min(leftcol + max_width);
         if start < e {
@@ -731,9 +826,11 @@ fn highlight_line(
 /// The style of the screen cell at column `col`: its highlight span's resolved
 /// palette style (or [`group_style`] fallback when the span carries no id),
 /// with the selection composed on top when the cell is selected.
+#[allow(clippy::too_many_arguments)]
 fn cell_style(
     col: usize,
     sel: Option<(u16, u16)>,
+    secondary_sel: &[(u16, u16)],
     search: &[(u16, u16)],
     incsearch: Option<(u16, u16)>,
     hl: &[HlSpan],
@@ -759,11 +856,10 @@ fn cell_style(
     if incsearch.is_some_and(in_span) {
         style = search_style(style, theme.incsearch, Color::LightYellow);
     }
-    // The visual selection sits on top of everything.
-    if let Some((s, e)) = sel {
-        if col >= s as usize && col < e as usize {
-            style = selection_style(style, theme);
-        }
+    // The visual selection sits on top of everything — the primary's `sel`, plus
+    // any secondary multi-cursor selection covering this cell (same `Visual` style).
+    if sel.is_some_and(in_span) || secondary_sel.iter().copied().any(in_span) {
+        style = selection_style(style, theme);
     }
     // A diagnostic adds its underline last, so it survives the selection: the
     // cell keeps its syntax fg and selection bg and gains the severity's

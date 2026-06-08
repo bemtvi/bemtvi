@@ -25,6 +25,7 @@ mod ex;
 mod insert;
 mod marks;
 mod motions;
+mod multicursor;
 mod operators;
 mod options;
 mod panel;
@@ -41,6 +42,7 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
+pub(crate) use self::multicursor::PlacementSnapshot;
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
@@ -118,7 +120,7 @@ struct TabSlot {
     tree: Option<WindowTree>,
 }
 
-pub(crate) use registers::{RegKind, Registers};
+pub(crate) use registers::{RegKind, RegisterCell, Registers};
 
 /// What the command line is editing: an `:` ex command, a `/`,`?` search, or a
 /// scripted text prompt (`vim.ui.input`). One [`Mode::Command`] serves all three;
@@ -423,6 +425,10 @@ pub struct Editor {
     /// `vim.ui.input` prompt). Decides the prompt label and what `<CR>` submits.
     /// Only meaningful in [`Mode::Command`].
     cmdline_kind: CmdlineKind,
+    /// The mode to restore when the command line closes. Normally [`Mode::Normal`],
+    /// but a `/`-search opened from [`Mode::MultiCursor`] returns there, so you can
+    /// `/`-navigate to a match and keep dropping cursors. Set on entry.
+    cmdline_return_mode: Mode,
     /// The label shown ahead of the command line for a [`CmdlineKind::Prompt`]
     /// (`vim.ui.input`'s `opts.prompt`); empty for `:`/`/`/`?` (those use the
     /// single-char [`Editor::cmdline_prefix`]). Cleared when the prompt closes.
@@ -582,6 +588,29 @@ pub struct Editor {
     /// `View` and then cleared (so it animates exactly once).
     pending_scroll: Option<PendingScroll>,
 
+    /// Undo/redo history for cursor *placement* in [`Mode::MultiCursor`]: each
+    /// entry snapshots the placed-cursor set (primary + secondaries) before a
+    /// placement command (`<A-c>`, `c`, `{count}c{motion}`, `cc`) mutated it, so
+    /// `u`/`<C-r>` *while placing* step through the drops instead of the text undo
+    /// tree — a `10cj` undoes as one step. Both stacks are cleared when a placement
+    /// session begins or ends; a fresh placement after an undo discards the redo
+    /// future. nxvim-native, transient: placement history is not document history.
+    placement_undo: Vec<PlacementSnapshot>,
+    placement_redo: Vec<PlacementSnapshot>,
+
+    /// The text each cursor captured in the **last multi-cursor yank/delete**, in
+    /// ascending document order (so entry `i` belongs to the `i`-th cursor by
+    /// position). A multi-cursor `p`/`P` pastes each cursor's own entry when the
+    /// count still matches the live cursor set; otherwise it falls back to the
+    /// unnamed register at every cursor. Populated by [`Editor::edit_each_cursor`]
+    /// via the collector below.
+    cursor_registers: Vec<RegisterCell>,
+    /// Active only during a multi-cursor editing sweep: each per-cursor yank/delete
+    /// slice is pushed here as `(range_start, cell)`, then sorted by position into
+    /// [`Editor::cursor_registers`] when the sweep ends. `None` outside a sweep, so
+    /// single-cursor yanks never touch the per-cursor set.
+    cursor_register_collect: Option<Vec<(usize, RegisterCell)>>,
+
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
 
@@ -680,6 +709,7 @@ impl Editor {
             cmdline: String::new(),
             cmdline_col: 0,
             cmdline_kind: CmdlineKind::Ex,
+            cmdline_return_mode: Mode::Normal,
             cmdline_prompt: String::new(),
             prompt_results: Vec::new(),
             confirm_accelerators: Vec::new(),
@@ -725,6 +755,10 @@ impl Editor {
             visual_anchor: Cursor::default(),
             scroll_from: None,
             pending_scroll: None,
+            placement_undo: Vec::new(),
+            placement_redo: Vec::new(),
+            cursor_registers: Vec::new(),
+            cursor_register_collect: None,
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
             pending_sleep: None,

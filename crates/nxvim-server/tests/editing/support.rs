@@ -209,6 +209,32 @@ pub fn view_selection(view: &[(Value, Value)]) -> Vec<Option<(u64, u64)>> {
         .unwrap_or_default()
 }
 
+/// Per visible row, the highlighted screen-column spans `[start, end)` of every
+/// *secondary* cursor's visual selection (the primary's lives in `selection`).
+/// Empty inner vecs for rows no secondary selection touches.
+pub fn view_secondary_selection(view: &[(Value, Value)]) -> Vec<Vec<(u64, u64)>> {
+    view_get(view, "secondary_selection")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|v| {
+                                    let pair = v.as_array()?;
+                                    Some((pair.first()?.as_u64()?, pair.get(1)?.as_u64()?))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn view_str(view: &[(Value, Value)], key: &str) -> String {
     view_get(view, key)
         .and_then(Value::as_str)

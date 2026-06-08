@@ -206,6 +206,17 @@ impl Server {
                 Value::from("cursor_screen_col"),
                 Value::from(win.cursor_screen_col as u64),
             ),
+            (
+                Value::from("cursors"),
+                Value::Array(
+                    win.secondary_cursors
+                        .iter()
+                        .map(|&(row, col)| {
+                            Value::Array(vec![Value::from(row as u64), Value::from(col as u64)])
+                        })
+                        .collect(),
+                ),
+            ),
             (Value::from("leftcol"), Value::from(win.leftcol as u64)),
             (
                 Value::from("file_name"),
@@ -217,6 +228,10 @@ impl Server {
                 Value::from(win.cursor_line as u64),
             ),
             (Value::from("selection"), spans_value(&win.selection)),
+            (
+                Value::from("secondary_selection"),
+                multi_spans_value(&win.secondary_selection),
+            ),
             (Value::from("search"), multi_spans_value(&win.search)),
             (Value::from("incsearch"), spans_value(&win.incsearch)),
             (Value::from("numbers"), numbers_value(&win.numbers)),

@@ -51,6 +51,20 @@ fn reversed(buf: &Buffer, x: u16, y: u16) -> bool {
         .unwrap_or(false)
 }
 
+fn underlined(buf: &Buffer, x: u16, y: u16) -> bool {
+    buf.cell((x, y))
+        .map(|c| c.style().add_modifier.contains(Modifier::UNDERLINED))
+        .unwrap_or(false)
+}
+
+fn bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).and_then(|c| c.style().bg)
+}
+
+fn underline_color(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).and_then(|c| c.style().underline_color)
+}
+
 fn lines(strs: &[&str]) -> Value {
     Value::Array(strs.iter().map(|s| Value::from(*s)).collect())
 }
@@ -94,6 +108,97 @@ fn cursor_shape_follows_the_mode() {
             "{label} mode should keep the block cursor"
         );
     }
+}
+
+/// A window's `cursors` array: one `[row, screen_col]` pair per secondary cursor.
+fn cursors(positions: &[(u64, u64)]) -> Value {
+    Value::Array(
+        positions
+            .iter()
+            .map(|&(r, c)| Value::Array(vec![Value::from(r), Value::from(c)]))
+            .collect(),
+    )
+}
+
+#[test]
+fn secondary_cursors_paint_as_reverse_video_blocks() {
+    // The terminal's one real cursor is the primary; extra multi-cursors are
+    // painted as reverse-video block cells so they're visible.
+    let v = view(vec![
+        ("lines", lines(&["abc", "def"])),
+        ("cursors", cursors(&[(1, 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert!(
+        reversed(&buf, 0, 1),
+        "the secondary cursor cell (row 1, col 0) should be reverse-video"
+    );
+    assert!(
+        !reversed(&buf, 1, 1),
+        "a neighboring non-cursor cell stays normal"
+    );
+}
+
+#[test]
+fn secondary_cursor_shape_follows_the_mode() {
+    // The extra cursor mirrors the primary's mode-driven shape: a block (normal)
+    // paints reverse-video; the insert bar shape — unpaintable in a cell — shows
+    // as an underline, so a mode change propagates to every cursor.
+    let normal = view(vec![
+        ("lines", lines(&["abc", "def"])),
+        ("cursors", cursors(&[(1, 0)])),
+    ]);
+    let buf = paint(&normal, 20, 5);
+    assert!(reversed(&buf, 0, 1), "normal mode → reverse-video block");
+    assert!(!underlined(&buf, 0, 1));
+
+    let insert = view(vec![
+        ("lines", lines(&["abc", "def"])),
+        ("cursors", cursors(&[(1, 0)])),
+        ("mode_label", Value::from("INSERT")),
+    ]);
+    let buf = paint(&insert, 20, 5);
+    assert!(underlined(&buf, 0, 1), "insert mode → underline");
+    assert!(!reversed(&buf, 0, 1), "no block in insert mode");
+}
+
+#[test]
+fn secondary_cursor_underline_uses_a_distinct_accent_color() {
+    // The primary insert cursor is a true bar; a secondary can only be a styled
+    // cell, so it shows as an underline. To keep it from blending into the text's
+    // own underlines, the underline is tinted with the multi-cursor accent.
+    let insert = view(vec![
+        ("lines", lines(&["abc", "def"])),
+        ("cursors", cursors(&[(1, 0)])),
+        ("mode_label", Value::from("INSERT")),
+    ]);
+    let buf = paint(&insert, 20, 5);
+    assert_eq!(
+        underline_color(&buf, 0, 1),
+        Some(Color::Rgb(229, 192, 123)),
+        "the secondary cursor's underline is tinted with the multi-cursor accent"
+    );
+}
+
+#[test]
+fn multicursor_mode_recolors_the_active_cursor() {
+    // In MULTICURSOR placement mode the active (primary) cursor cell is recolored
+    // with a distinct background, so it reads as "dropping cursors".
+    let v = view(vec![
+        ("lines", lines(&["abc", "def"])),
+        ("mode_label", Value::from("MULTICURSOR")),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(
+        bg(&buf, 0, 0),
+        Some(Color::Rgb(229, 192, 123)),
+        "the active cursor (0,0) is recolored in placement mode"
+    );
+
+    // In normal mode it is the plain terminal cursor — no recolored cell.
+    let v = view(vec![("lines", lines(&["abc", "def"]))]);
+    let buf = paint(&v, 20, 5);
+    assert_ne!(bg(&buf, 0, 0), Some(Color::Rgb(229, 192, 123)));
 }
 
 #[test]
@@ -260,6 +365,41 @@ fn a_selection_span_highlights_exactly_its_cells() {
     assert!(
         !reversed(&buf, 3, 0),
         "cell past the span must not be highlighted"
+    );
+}
+
+#[test]
+fn secondary_selection_spans_highlight_their_cells() {
+    // Row 0 carries the primary selection (cols [0,3)); row 1 carries a secondary
+    // multi-cursor's selection (cols [0,3)) in `secondary_selection` — both paint
+    // as reverse-video, so a multi-cursor visual selection shows on every cursor.
+    let primary = Value::Array(vec![
+        Value::Array(vec![Value::from(0u64), Value::from(3u64)]),
+        Value::Nil,
+    ]);
+    let secondary = Value::Array(vec![
+        Value::Array(vec![]), // row 0: no secondary selection
+        Value::Array(vec![Value::Array(vec![
+            Value::from(0u64),
+            Value::from(3u64),
+        ])]),
+    ]);
+    let v = view(vec![
+        ("lines", lines(&["hello", "hello"])),
+        ("selection", primary),
+        ("secondary_selection", secondary),
+    ]);
+    let buf = paint(&v, 20, 5);
+    // Primary selection on row 0.
+    assert!(reversed(&buf, 0, 0) && reversed(&buf, 2, 0));
+    // Secondary selection on row 1.
+    assert!(
+        reversed(&buf, 0, 1) && reversed(&buf, 1, 1) && reversed(&buf, 2, 1),
+        "the secondary cursor's selection cells are reverse-video"
+    );
+    assert!(
+        !reversed(&buf, 3, 1),
+        "the cell past the secondary span must not be highlighted"
     );
 }
 

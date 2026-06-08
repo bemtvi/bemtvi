@@ -534,14 +534,25 @@ impl Keymaps {
 /// char of its `mode()` short code (`Normal` → `'n'`, `Insert` → `'i'`,
 /// `Visual` → `'v'`, `VisualLine` → `'V'`, `Command` → `'c'`). Paired with
 /// [`mode_buckets`], which decides which of these tries a declared map lands in.
+///
+/// Multi-cursor *placement* mode is the one divergence from `short_code`: it
+/// reports `"n"` so `mode()`-checking scripts read it as normal, but it selects
+/// its **own** `'m'` trie so a `vim.keymap.set('m', …)` map fires only while
+/// placing and a plain `'n'` map does not leak in (the placement grammar still
+/// reaches the editor untouched whenever the `'m'` trie has no match).
 fn mode_key(mode: Mode) -> char {
+    if mode == Mode::MultiCursor {
+        return 'm';
+    }
     mode.short_code().chars().next().unwrap_or('n')
 }
 
 /// The editor-mode trie buckets a declared map-mode code lands in — the build-time
 /// counterpart of [`mode_key`]. A `'v'`/`'x'` map covers both Visual and
-/// Visual-Line (nxvim has no Select mode, so they coincide); `''` (vim's `:map`)
-/// covers normal + visual. Operator-pending (`'o'`) is **deferred**: nxvim has no
+/// Visual-Line (nxvim has no Select mode, so they coincide); `'m'` is the
+/// nxvim-specific multi-cursor *placement* bucket; `''` (vim's `:map`) covers
+/// normal + visual + placement (every normal-ish mode). Operator-pending (`'o'`)
+/// is **deferred**: nxvim has no
 /// operator-pending *mode* (a pending operator lives in private core state while
 /// `editor.mode == Normal`), so there is no trie to select it by — the normal-trie
 /// replay path already preserves `d{motion}`/`dgg`, and a true `omap` trie awaits a
@@ -552,7 +563,8 @@ fn mode_buckets(code: &str) -> &'static [char] {
         "i" => &['i'],
         "c" => &['c'],
         "v" | "x" => &['v', 'V'],
-        "" => &['n', 'v', 'V'],
+        "m" => &['m'],
+        "" => &['n', 'v', 'V', 'm'],
         _ => &[],
     }
 }

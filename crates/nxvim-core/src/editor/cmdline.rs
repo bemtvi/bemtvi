@@ -14,6 +14,7 @@ impl Editor {
         if from_visual {
             self.record_visual_marks();
         }
+        self.cmdline_return_mode = self.command_return_mode();
         self.mode = Mode::Command;
         self.cmdline.clear();
         self.cmdline_col = 0;
@@ -33,6 +34,7 @@ impl Editor {
     /// (`3/foo` finds the 3rd match), stashed for submit since `reset_pending`
     /// clears it.
     pub(crate) fn enter_search(&mut self, dir: SearchDir, count: usize) {
+        self.cmdline_return_mode = self.command_return_mode();
         self.mode = Mode::Command;
         self.cmdline.clear();
         self.cmdline_col = 0;
@@ -60,7 +62,7 @@ impl Editor {
                 let text = std::mem::take(&mut self.cmdline);
                 self.cmdline_col = 0;
                 let kind = self.cmdline_kind;
-                self.mode = Mode::Normal;
+                self.mode = self.cmdline_return_mode;
                 match kind {
                     CmdlineKind::Ex => {
                         self.remember_ex(&text);
@@ -134,9 +136,21 @@ impl Editor {
             self.cmdline_prompt.clear();
             self.prompt_results.push(None);
         }
-        self.mode = Mode::Normal;
+        self.mode = self.cmdline_return_mode;
         self.cmdline.clear();
         self.cmdline_col = 0;
+    }
+
+    /// The mode a command line opened *now* should restore when it closes: back to
+    /// [`Mode::MultiCursor`] when opened from placement mode (so a `/`-search can
+    /// hop to a match and keep dropping cursors), else [`Mode::Normal`] — even from
+    /// Visual, which vim leaves on `:`/`/`.
+    fn command_return_mode(&self) -> Mode {
+        if self.mode == Mode::MultiCursor {
+            Mode::MultiCursor
+        } else {
+            Mode::Normal
+        }
     }
 
     /// Open the command line as a scripted `vim.ui.input` prompt (Phase 8): a
@@ -145,6 +159,7 @@ impl Editor {
     /// [`Editor::prompt_results`]. The server calls this when it drains a queued
     /// `vim.ui.input` request, then fires the registered Lua callback on submit.
     pub fn open_prompt(&mut self, label: String, default: String) {
+        self.cmdline_return_mode = Mode::Normal;
         self.mode = Mode::Command;
         self.cmdline = default;
         self.cmdline_col = self.cmdline.len();
@@ -162,6 +177,7 @@ impl Editor {
     /// server forwards it to the blocked `vim.fn.confirm`). The server calls this
     /// when it drains a queued confirm request.
     pub fn open_confirm(&mut self, label: String, accelerators: Vec<String>, default: i64) {
+        self.cmdline_return_mode = Mode::Normal;
         self.mode = Mode::Command;
         self.cmdline.clear();
         self.cmdline_col = 0;

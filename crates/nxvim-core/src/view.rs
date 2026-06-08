@@ -11,7 +11,9 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{language_of_path, BorderStyle, BufferId, Editor, TabLabel, WindowLayout};
+use crate::editor::{
+    language_of_path, BorderStyle, BufferId, Cursor, Editor, TabLabel, WindowLayout,
+};
 use crate::mode::Mode;
 use crate::statusline::StatuslineCtx;
 use crate::unicode;
@@ -124,6 +126,14 @@ pub struct WindowView {
     /// Cursor's screen-cell column on its line (wide-char and tab aware), for
     /// placing the terminal cursor.
     pub cursor_screen_col: usize,
+    /// Secondary (multi-)cursors visible in this window, each as `(row, screen
+    /// col)` relative to the top of the text body — the primary cursor is carried
+    /// separately by [`cursor_row`]/[`cursor_screen_col`]. Empty for an
+    /// unfocused window or when no multi-cursors are active.
+    ///
+    /// [`cursor_row`]: WindowView::cursor_row
+    /// [`cursor_screen_col`]: WindowView::cursor_screen_col
+    pub secondary_cursors: Vec<(usize, usize)>,
     /// File name for this window's status line (`"[No Name]"` when unset).
     pub file_name: String,
     pub modified: bool,
@@ -134,6 +144,16 @@ pub struct WindowView {
     /// exceed the row's text width to mark a selected newline (one extra cell) or
     /// to fill a linewise selection to the window's text edge.
     pub selection: Vec<Option<(usize, usize)>>,
+    /// Per visible row, the half-open screen-column spans of every **secondary**
+    /// multi-cursor's visual selection (the primary's lives in [`selection`]).
+    /// Painted with the same `Visual` style; empty inner vecs for rows no
+    /// secondary selection touches, and empty everywhere outside a visual mode.
+    /// Mirrors the shape of [`search`] so a row can carry several disjoint
+    /// selections (one cursor per).
+    ///
+    /// [`selection`]: WindowView::selection
+    /// [`search`]: WindowView::search
+    pub secondary_selection: Vec<Vec<(usize, usize)>>,
     /// Per visible row, the half-open screen-column spans of every search match
     /// (`Search`/`hlsearch`). Empty inner vecs for rows with no match.
     pub search: Vec<Vec<(usize, usize)>>,
@@ -353,6 +373,12 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     } else {
         vec![None; height]
     };
+    // Per-cursor visual selections of the secondary multi-cursors (focused only).
+    let secondary_selection = if w.focused {
+        secondary_selection_spans(ed, buf, width, line_count, top, height)
+    } else {
+        vec![Vec::new(); height]
+    };
     let (search, incsearch) = ed.search_highlights_in(buf, w.cursor, w.focused, top, height);
 
     let scroll = if w.focused {
@@ -386,6 +412,26 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         unicode::virtcol(&line, w.cursor.col, buf.options.effective_tabstop())
     };
 
+    // Secondary multi-cursors visible in the focused window, as (row, screen
+    // col). Off-screen cursors are dropped; the primary is carried separately.
+    let secondary_cursors = if w.focused {
+        ed.secondary_cursor_bytes()
+            .into_iter()
+            .filter_map(|byte| {
+                let line = buf.byte_to_line(byte);
+                if line < top || line >= top + height {
+                    return None;
+                }
+                let col = byte - buf.line_start(line);
+                let s = buf.line(line);
+                let screen_col = unicode::virtcol(&s, col, buf.options.effective_tabstop());
+                Some((line - top, screen_col))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let status_ctx = window_status_ctx(StatusCtxInputs {
         buf,
         w,
@@ -411,10 +457,12 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         leftcol: w.leftcol,
         cursor_col: w.cursor.col,
         cursor_screen_col,
+        secondary_cursors,
         file_name,
         modified: buf.modified,
         cursor_line: cur_line + 1,
         selection,
+        secondary_selection,
         search,
         incsearch,
         scroll,
@@ -523,44 +571,94 @@ fn selection_spans(
         return spans;
     }
 
-    // Order the two ends of the selection by buffer position.
-    let a = ed.visual_anchor();
-    let c = ed.cursor;
-    let (start, end) = if (a.line, a.col) <= (c.line, c.col) {
-        (a, c)
-    } else {
-        (c, a)
-    };
+    let (start, end) = order_selection(ed.visual_anchor(), ed.cursor);
     let linewise = ed.mode == Mode::VisualLine;
-
+    let ts = ed.tabstop();
     for (row, span) in spans.iter_mut().enumerate() {
         let buf_line = base + row;
-        if buf_line >= line_count || buf_line < start.line || buf_line > end.line {
+        if buf_line >= line_count {
             continue;
         }
-        let text = buf.line(buf_line);
-
-        if linewise {
-            // Whole line, filled to the viewport edge — as vim paints it.
-            *span = Some((0, width));
-            continue;
-        }
-
-        // Charwise: clip the inclusive [start, end] region to this row.
-        let ts = ed.tabstop();
-        let lo = if buf_line == start.line { start.col } else { 0 };
-        let start_col = unicode::virtcol(&text, lo, ts);
-        let end_col = if buf_line == end.line {
-            // Include the grapheme under the trailing cursor.
-            let hi = unicode::next_grapheme(&text, end.col.min(text.len()));
-            unicode::virtcol(&text, hi, ts)
-        } else {
-            // The selection continues onto the next line: highlight the text and
-            // one extra cell standing in for the selected newline.
-            unicode::virtcol(&text, text.len(), ts) + 1
-        };
-        *span = Some((start_col, end_col));
+        *span = selection_row_span(buf, width, start, end, linewise, ts, buf_line);
     }
 
     spans
+}
+
+/// Like [`selection_spans`] but for the **secondary** multi-cursors: per row, the
+/// spans of every secondary cursor's selection (its anchor→head). Empty outside a
+/// visual mode or with no secondary cursors. The primary's selection is projected
+/// separately into [`WindowView::selection`].
+fn secondary_selection_spans(
+    ed: &Editor,
+    buf: &Buffer,
+    width: usize,
+    line_count: usize,
+    base: usize,
+    count: usize,
+) -> Vec<Vec<(usize, usize)>> {
+    let mut rows = vec![Vec::new(); count];
+    if !ed.mode.is_visual() || !ed.has_secondary_cursors() {
+        return rows;
+    }
+    let linewise = ed.mode == Mode::VisualLine;
+    let ts = ed.tabstop();
+    for (anchor, head) in ed.secondary_selections() {
+        let (start, end) = order_selection(anchor, head);
+        for (row, list) in rows.iter_mut().enumerate() {
+            let buf_line = base + row;
+            if buf_line >= line_count {
+                continue;
+            }
+            if let Some(span) = selection_row_span(buf, width, start, end, linewise, ts, buf_line) {
+                list.push(span);
+            }
+        }
+    }
+    rows
+}
+
+/// Order a selection's two ends (`anchor`, `cursor`) by buffer position into
+/// `(start, end)`.
+fn order_selection(a: Cursor, c: Cursor) -> (Cursor, Cursor) {
+    if (a.line, a.col) <= (c.line, c.col) {
+        (a, c)
+    } else {
+        (c, a)
+    }
+}
+
+/// The half-open screen-column span to highlight on buffer line `buf_line` for a
+/// single selection running from ordered `start` to `end`, or `None` if the line
+/// lies outside it. Shared by the primary selection and every secondary cursor's.
+fn selection_row_span(
+    buf: &Buffer,
+    width: usize,
+    start: Cursor,
+    end: Cursor,
+    linewise: bool,
+    ts: usize,
+    buf_line: usize,
+) -> Option<(usize, usize)> {
+    if buf_line < start.line || buf_line > end.line {
+        return None;
+    }
+    if linewise {
+        // Whole line, filled to the viewport edge — as vim paints it.
+        return Some((0, width));
+    }
+    let text = buf.line(buf_line);
+    // Charwise: clip the inclusive [start, end] region to this row.
+    let lo = if buf_line == start.line { start.col } else { 0 };
+    let start_col = unicode::virtcol(&text, lo, ts);
+    let end_col = if buf_line == end.line {
+        // Include the grapheme under the trailing cursor.
+        let hi = unicode::next_grapheme(&text, end.col.min(text.len()));
+        unicode::virtcol(&text, hi, ts)
+    } else {
+        // The selection continues onto the next line: highlight the text and one
+        // extra cell standing in for the selected newline.
+        unicode::virtcol(&text, text.len(), ts) + 1
+    };
+    Some((start_col, end_col))
 }

@@ -9,9 +9,9 @@ use rmpv::Value;
 
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
-    parse_diagnostics, parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items,
-    parse_spans, parse_status, parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem,
-    SearchSpans, StatusSegment,
+    parse_cursor_list, parse_diagnostics, parse_highlights, parse_multi_spans, parse_numbers,
+    parse_pmenu_items, parse_spans, parse_status, parse_styles, DiagSpan, HlSpan, IncSearchSpans,
+    PmenuItem, SearchSpans, StatusSegment,
 };
 use crate::style::{Border, Style};
 
@@ -56,6 +56,12 @@ pub struct WindowView {
     pub lines: Vec<String>,
     pub cursor_row: u16,
     pub cursor_screen_col: u16,
+    /// Secondary multi-cursor positions as `(row, screen_col)` within this
+    /// window's text body — the terminal's one real cursor is the primary
+    /// (`cursor_row`/`cursor_screen_col`); the renderer paints these as
+    /// reverse-video block cells. Empty for an unfocused window or with no
+    /// multi-cursors active (also empty from an older server that omits the key).
+    pub secondary_cursors: Vec<(u16, u16)>,
     /// First visible screen column (horizontal scroll offset) under `nowrap`. The
     /// renderer drops this many leading screen cells from each text row and shifts
     /// the cursor and every span left by it; the number gutter is not offset.
@@ -74,6 +80,10 @@ pub struct WindowView {
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`.
     pub selection: Vec<Option<(u16, u16)>>,
+    /// Per visible row, the half-open screen-column spans of every **secondary**
+    /// multi-cursor's visual selection (the primary's lives in `selection`).
+    /// Painted with the same `Visual` style; empty rows carry empty vecs.
+    pub secondary_selection: SearchSpans,
     /// Per visible row, the half-open screen-column spans of every search match
     /// (`hlsearch`). Empty inner vecs for rows with no match.
     pub search: SearchSpans,
@@ -333,6 +343,13 @@ impl View {
         self.mode_label == "REPLACE" || self.pending_replace
     }
 
+    /// Whether the editor is in multi-cursor *placement* mode, mirrored from the
+    /// server's `mode_label`. The renderer recolors the active (primary) cursor
+    /// while it's here, signaling that motions drop cursors rather than edit.
+    pub fn is_multicursor(&self) -> bool {
+        self.mode_label == "MULTICURSOR"
+    }
+
     /// Build a view from a `redraw` notification's params — the client's own
     /// parsing path — so tests and tools can paint a known view.
     pub fn from_redraw(params: &[Value]) -> Self {
@@ -383,6 +400,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         lines: map_str_array(m, "lines"),
         cursor_row: map_u16(m, "cursor_row"),
         cursor_screen_col: map_u16(m, "cursor_screen_col"),
+        secondary_cursors: parse_cursor_list(map_get(m, "cursors")),
         leftcol: map_u16(m, "leftcol"),
         status: parse_status(map_get(m, "status"), styles),
         // Default true so an older server (no flag) keeps the per-window status.
@@ -391,6 +409,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .unwrap_or(true),
         cursor_line: map_u64(m, "cursor_line") as usize,
         selection: parse_spans(map_get(m, "selection")),
+        secondary_selection: parse_multi_spans(map_get(m, "secondary_selection")),
         search: parse_multi_spans(map_get(m, "search")),
         incsearch: parse_spans(map_get(m, "incsearch")),
         highlights: parse_highlights(map_get(m, "highlights")),

@@ -267,6 +267,7 @@ enum NormalCmd {
     ToggleCase,                                      // ~
     EnterVisual,                                     // v
     EnterVisualLine,                                 // V
+    VisualSwapEnds,                                  // o / O (move to other end of selection)
     EnterCommand,                                    // :
     EnterSearch(SearchDir),                          // / ?
     SearchNext,                                      // n
@@ -278,6 +279,8 @@ enum NormalCmd {
     AltBuffer,                                       // <C-^> / <C-6>
     TabNext(Option<usize>),                          // gt  ({count}gt → tab number)
     TabPrev(Option<usize>),                          // gT  ({count}gT → count back)
+    AddCursor,                                       // <A-c> (enter MULTICURSOR + place)
+    PlaceCursor,                                     // c (drop a cursor in MULTICURSOR)
     DotRepeat,                                       // .  (replay the last change)
 }
 
@@ -641,6 +644,18 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
     use ParseStep::*;
     use ResolvedCommand as RC;
 
+    // In MULTICURSOR placement mode, `c` is the place-cursor command. A bare `c`
+    // (no count) drops one cursor at the primary; a counted `{n}c{motion}` falls
+    // through to the operator path below, placing `n` cursors along the motion
+    // (`10cj`). `cc` doubles to a linewise place (handled in `begin_operator`).
+    if mode == Mode::MultiCursor
+        && pending.operator.is_none()
+        && pending.count.is_none()
+        && key.as_char() == Some('c')
+    {
+        return Complete(RC::Normal(N::PlaceCursor));
+    }
+
     // With an operator pending only a doubled operator, a search-motion hand-off,
     // or a cancel reaches here (motions were resolved just above).
     if let Some(op) = pending.operator {
@@ -688,6 +703,13 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         _ => {}
     }
 
+    // `<A-c>`/`<M-c>` enters multi-cursor placement mode and drops a cursor (and,
+    // from within the mode, drops another). Checked ahead of `as_char`, which
+    // rejects any alt-modified key. Not in visual mode.
+    if key.alt && key.code == KeyCode::Char('c') && !mode.is_visual() {
+        return Complete(RC::Normal(N::AddCursor));
+    }
+
     let c = match key.as_char() {
         Some(c) => c,
         None => return Reset,
@@ -702,6 +724,10 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             '=' => return Complete(RC::VisualOperate('=')),
             'v' => return Complete(RC::Normal(N::EnterVisual)),
             'V' => return Complete(RC::Normal(N::EnterVisualLine)),
+            // `o`/`O` move the cursor to the other end of the selection (charwise/
+            // linewise both; no visual-block corner distinction yet), so you can
+            // extend the side you started from.
+            'o' | 'O' => return Complete(RC::Normal(N::VisualSwapEnds)),
             ':' => return Complete(RC::Normal(N::EnterCommand)),
             _ => {}
         }
@@ -827,14 +853,34 @@ impl Editor {
             ParseStep::Prefix(p) => self.pending = p,
             ParseStep::Complete(cmd) => self.execute(cmd),
             ParseStep::Cancel => {
-                self.reset_pending();
-                if self.mode.is_visual() {
-                    // Leaving Visual mode stamps the `` `< `` / `` `> `` selection
-                    // marks (what `gv` and the angle-mark jumps read) before we drop
-                    // back to Normal.
-                    self.record_visual_marks();
-                    self.mode = Mode::Normal;
-                    self.clamp_cursor();
+                if self.mode == Mode::MultiCursor {
+                    // A half-typed place command (`10c…`) cancels without leaving the
+                    // mode; a clean `<Esc>` finishes placement — the cursors persist
+                    // into Normal, where motions/edits act on them all.
+                    let had_pending = self.pending.operator.is_some()
+                        || self.pending.count.is_some()
+                        || self.pending.stage != Stage::Start;
+                    self.reset_pending();
+                    if !had_pending {
+                        self.finish_multicursor();
+                    }
+                } else {
+                    self.reset_pending();
+                    if self.mode.is_visual() {
+                        // Leaving Visual mode stamps the `` `< `` / `` `> `` selection
+                        // marks (what `gv` and the angle-mark jumps read) before we
+                        // drop back to Normal. A placed multi-cursor set survives —
+                        // only the per-cursor selections collapse (a *second* `<Esc>`
+                        // in Normal then drops the cursors).
+                        self.record_visual_marks();
+                        self.clear_anchor_marks();
+                        self.mode = Mode::Normal;
+                        self.clamp_cursor();
+                    } else {
+                        // `<Esc>` in Normal collapses any placed multi-cursor set
+                        // back to the primary.
+                        self.clear_secondary_cursors();
+                    }
                 }
             }
             ParseStep::Reset => self.reset_pending(),
@@ -862,6 +908,46 @@ impl Editor {
                 // matching the old `pending_find` block.
                 if let Motion::Find(kind, target) = m {
                     self.last_find = Some((kind, target));
+                }
+                // MULTICURSOR `{count}c{motion}`: place `count` cursors starting at
+                // the current position — `10cj` drops one here and at each of nine
+                // lines down. The first cursor is the *current* spot (so `2cw` on
+                // "one two three" covers "one" and "two", not "two" and "three"),
+                // then the motion steps `count - 1` times. Non-toggling, so a step
+                // onto an existing cursor (or the entry cursor under the primary)
+                // adds without clearing it.
+                if self.mode == Mode::MultiCursor && self.pending.operator == Some('c') {
+                    let n = self.effective_count().max(1);
+                    self.reset_pending(); // each step is a single, un-counted motion
+                                          // Record once before the batch so the whole `{count}c{motion}`
+                                          // run undoes as a single placement step (`10cj` → one `u`).
+                    self.record_placement_undo();
+                    self.ensure_cursor_here();
+                    for _ in 1..n {
+                        if let Some(mr) = self.resolve_motion(m) {
+                            self.apply_movement(mr);
+                        }
+                        self.ensure_cursor_here();
+                    }
+                    return;
+                }
+                // Multi-cursor (placement finished): resolve and apply the motion
+                // at every cursor — a plain motion moves them all, an
+                // operator-pending motion (`dw`/`yw`/`cw`) operates at each. In a
+                // visual mode the motion extends every cursor's selection (its head
+                // moves, its anchor stays); operators never pend there (the
+                // selection's `d`/`y`/`c` route through `VisualOperate`).
+                if self.has_secondary_cursors()
+                    && (self.mode == Mode::Normal || self.mode.is_visual())
+                {
+                    if self.pending.operator.is_some() {
+                        self.edit_each_cursor(|ed| ed.apply_motion_once(m));
+                    } else {
+                        self.scroll_from = Some((self.top, self.cursor.line));
+                        self.for_each_cursor(|ed| ed.apply_motion_once(m));
+                    }
+                    self.reset_pending();
+                    return;
                 }
                 // A global mark `A`–`Z` may point into another buffer. That jump
                 // can't be a within-buffer motion offset (and operating across
@@ -921,6 +1007,13 @@ impl Editor {
             }
             ResolvedCommand::TextObject { ia, kind } => {
                 let count = self.effective_count();
+                // Multi-cursor (Normal mode only): operate over the object at every
+                // cursor, as one undo group.
+                if self.has_secondary_cursors() && self.mode == Mode::Normal {
+                    self.edit_each_cursor(|ed| ed.apply_text_object_once(ia, kind, count));
+                    self.reset_pending();
+                    return;
+                }
                 if let Some((lo, hi, linewise)) = self.text_object_range(ia, kind, count) {
                     self.apply_text_object(lo, hi, linewise);
                 } else if self.mode.is_visual() {
@@ -932,7 +1025,7 @@ impl Editor {
             }
             ResolvedCommand::Replace(c) => {
                 let count = self.effective_count();
-                self.replace_char(c, count);
+                self.edit_each_cursor(|ed| ed.replace_char(c, count));
                 self.reset_pending();
             }
             ResolvedCommand::SetMark(name) => {
@@ -998,33 +1091,47 @@ impl Editor {
             return;
         }
         match cmd {
-            NormalCmd::InsertBefore => self.enter_insert_at(self.cursor.col),
+            // The insert-entry keys reposition *every* cursor to its own column
+            // (line-end for `A`, first-non-blank for `I`, …) before typing — see
+            // `enter_insert_each`. `o`/`O` open a line at every cursor.
+            NormalCmd::InsertBefore => self.enter_insert_each(|ed| ed.cursor.col),
             NormalCmd::InsertLineStart => {
-                let col = self.first_non_blank(self.cursor.line);
-                self.enter_insert_at(col);
+                self.enter_insert_each(|ed| ed.first_non_blank(ed.cursor.line))
             }
-            NormalCmd::InsertAfter => {
-                let col = (self.cursor.col + 1).min(self.line_len());
-                self.enter_insert_at(col);
+            NormalCmd::InsertAfter => self.enter_insert_each(|ed| ed.cursor.col + 1),
+            NormalCmd::InsertLineEnd => self.enter_insert_each(|ed| ed.line_len()),
+            NormalCmd::OpenBelow => self.edit_each_cursor(|ed| ed.open_line(true)),
+            NormalCmd::OpenAbove => self.edit_each_cursor(|ed| ed.open_line(false)),
+            NormalCmd::DeleteUnder => self.edit_each_cursor(|ed| ed.delete_under_cursor(count)),
+            NormalCmd::AddCursor => self.add_cursor(),
+            NormalCmd::PlaceCursor => {
+                self.record_placement_undo();
+                self.place_cursor_here();
             }
-            NormalCmd::InsertLineEnd => self.enter_insert_at(self.line_len()),
-            NormalCmd::OpenBelow => self.open_line(true),
-            NormalCmd::OpenAbove => self.open_line(false),
-            NormalCmd::DeleteUnder => self.delete_under_cursor(count),
-            NormalCmd::DeleteBefore => self.delete_before_cursor(count),
-            NormalCmd::DeleteToEol => self.delete_to_eol(),
-            NormalCmd::ChangeToEol => {
-                self.delete_to_eol();
-                self.mode = Mode::Insert;
-                self.snapshot_taken = true;
-            }
-            NormalCmd::SubstituteChar => {
-                self.delete_under_cursor(count);
-                self.mode = Mode::Insert;
-                self.snapshot_taken = true;
-            }
+            NormalCmd::DeleteBefore => self.edit_each_cursor(|ed| ed.delete_before_cursor(count)),
+            NormalCmd::DeleteToEol => self.edit_each_cursor(|ed| ed.delete_to_eol()),
+            NormalCmd::ChangeToEol => self.edit_each_cursor(|ed| {
+                ed.delete_to_eol();
+                ed.mode = Mode::Insert;
+                ed.snapshot_taken = true;
+            }),
+            NormalCmd::SubstituteChar => self.edit_each_cursor(|ed| {
+                ed.delete_under_cursor(count);
+                ed.mode = Mode::Insert;
+                ed.snapshot_taken = true;
+            }),
+            // With a multi-cursor set, paste gives each cursor its own per-cursor
+            // yank (or broadcasts the active register when they don't match) — see
+            // `paste_multi`; the single-cursor path is plain `paste`.
+            NormalCmd::PasteAfter if self.cursors_active() => self.paste_multi(true, count),
+            NormalCmd::PasteBefore if self.cursors_active() => self.paste_multi(false, count),
             NormalCmd::PasteAfter => self.paste(true, count),
             NormalCmd::PasteBefore => self.paste(false, count),
+            // In placement mode `u`/`<C-r>` step the cursor *placement* history
+            // (drop/undrop), not the text undo tree — placing cursors never edits
+            // the document, so there is nothing textual to undo while still placing.
+            NormalCmd::Undo if self.mode == Mode::MultiCursor => self.undo_placement(),
+            NormalCmd::Redo if self.mode == Mode::MultiCursor => self.redo_placement(),
             // Undo/redo edit the buffer (bumping `changedtick`) but are not the
             // dot-repeat target: mark the command non-repeatable so the recorder
             // discards it and `.` keeps replaying the change that preceded it.
@@ -1036,8 +1143,8 @@ impl Editor {
                 self.change_not_repeatable = true;
                 self.redo();
             }
-            NormalCmd::Join => self.join_lines(count.max(2)),
-            NormalCmd::ToggleCase => self.toggle_case(count),
+            NormalCmd::Join => self.edit_each_cursor(|ed| ed.join_lines(count.max(2))),
+            NormalCmd::ToggleCase => self.edit_each_cursor(|ed| ed.toggle_case(count)),
             // `R` enters Replace mode: snapshot for undo, then overtype until
             // `<Esc>` (the insert handler honors `Mode::Replace`).
             NormalCmd::EnterReplace => {
@@ -1050,12 +1157,17 @@ impl Editor {
             NormalCmd::EnterVisual => {
                 if !self.mode.is_visual() {
                     self.visual_anchor = self.cursor;
+                    // With a multi-cursor set placed, each secondary anchors its own
+                    // selection where it sits — visual then extends/operates on all.
+                    self.begin_visual_anchors();
                 }
                 self.mode = Mode::Visual;
             }
+            NormalCmd::VisualSwapEnds => self.visual_swap_ends(),
             NormalCmd::EnterVisualLine => {
                 if !self.mode.is_visual() {
                     self.visual_anchor = self.cursor;
+                    self.begin_visual_anchors();
                 }
                 self.mode = Mode::VisualLine;
             }
@@ -1117,6 +1229,28 @@ impl Editor {
     /// Only reached once the operator is already pending (the first `d`/`c`/`y`
     /// armed it in [`parse_command`]), so this is purely the doubled path.
     fn begin_operator(&mut self, op: char) {
+        // MULTICURSOR `{count}cc`: drop a cursor on each of `count` lines from the
+        // primary down (the linewise place; `cc` places one at the current line).
+        if self.mode == Mode::MultiCursor && op == 'c' {
+            let n = self.effective_count().max(1);
+            self.reset_pending();
+            // One undo step covers the whole `{count}cc` linewise drop.
+            self.record_placement_undo();
+            for i in 0..n {
+                self.ensure_cursor_here();
+                if i + 1 < n {
+                    self.move_vertical(1, false);
+                }
+            }
+            return;
+        }
+        // Multi-cursor (Normal mode only): the doubled operator runs at every
+        // cursor, as one undo group.
+        if self.has_secondary_cursors() && self.mode == Mode::Normal {
+            self.edit_each_cursor(|ed| ed.apply_doubled_operator_once(op));
+            self.reset_pending();
+            return;
+        }
         let count = self.effective_count();
         let last = self.cursor.line + count - 1;
         let target = self.buffer().line_start(last.min(self.last_line()));
@@ -1125,6 +1259,54 @@ impl Editor {
         self.pending.operator = None;
         self.apply_operator(op, m);
         self.reset_pending();
+    }
+
+    /// Resolve motion `m` at the *current* cursor and apply it — as the pending
+    /// operator's range when one is set, else as plain movement. Per-cursor: reads
+    /// pending (operator/count) but does **not** reset it, so [`for_each_cursor`]
+    /// can replay it at every cursor before the single reset. A motion that
+    /// doesn't resolve (a find/`;`/`,` miss at this cursor) is a no-op here.
+    ///
+    /// [`for_each_cursor`]: Editor::for_each_cursor
+    fn apply_motion_once(&mut self, m: Motion) {
+        let Some(mr) = self.resolve_motion(m) else {
+            return;
+        };
+        match self.pending.operator {
+            Some(op) => self.apply_operator(op, mr),
+            None => self.apply_movement(mr),
+        }
+    }
+
+    /// Apply a doubled operator (`dd`/`yy`/`cc`) at the current cursor over its
+    /// `count` lines. Per-cursor (reads pending, never resets it), so
+    /// [`edit_each_cursor`] can replay it at every cursor.
+    ///
+    /// [`edit_each_cursor`]: Editor::edit_each_cursor
+    fn apply_doubled_operator_once(&mut self, op: char) {
+        let count = self.effective_count();
+        let last = self.cursor.line + count - 1;
+        let target = self.buffer().line_start(last.min(self.last_line()));
+        let m = MotionResult::linewise(target, MoveAxis::LineAnchor);
+        self.apply_operator(op, m);
+    }
+
+    /// Apply the pending operator over the text object at the current cursor
+    /// (`diw`/`ci"`/…). Per-cursor (reads pending, never resets it); a no-op when
+    /// no object is found at this cursor.
+    fn apply_text_object_once(&mut self, ia: char, kind: ObjectKind, count: usize) {
+        let Some((lo, hi, linewise)) = self.text_object_range(ia, kind, count) else {
+            return;
+        };
+        let Some(op) = self.pending.operator else {
+            return;
+        };
+        if linewise {
+            let first_line = self.buffer().byte_to_line(lo);
+            self.apply_operator_to_range(op, lo, hi, true, first_line);
+        } else {
+            self.apply_operator_to_range(op, lo, hi, false, 0);
+        }
     }
 
     /// Apply a resolved motion: as an operator's range if one is pending,

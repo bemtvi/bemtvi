@@ -397,6 +397,39 @@ async fn cc_on_a_single_line_buffer_replaces_it() {
 }
 
 #[tokio::test]
+async fn visual_o_moves_cursor_to_the_other_end() {
+    // `o` in visual mode jumps the cursor to the opposite end of the selection
+    // (and back), leaving the span unchanged.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "v3l"); // anchor col 0, cursor col 3
+    assert_eq!(cursor(&rpc).await, (1, 3), "cursor at the extended end");
+    feed(&rpc, "o");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "o moved the cursor to the anchor end"
+    );
+    feed(&rpc, "o");
+    assert_eq!(cursor(&rpc).await, (1, 3), "a second o swaps back");
+}
+
+#[tokio::test]
+async fn visual_o_swaps_the_extendable_end() {
+    // After `o`, extending now grows/shrinks the *former anchor* end: starting
+    // anchored at col 0 with the cursor at col 2, `o` then `l` pulls the left edge
+    // in by one, so the selection is cols 1..2 ("el").
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "vllold"); // v, extend to col2, swap ends, l, delete "el"
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hlo world"],
+        "o moved the active end so l shrank the selection from the left"
+    );
+}
+
+#[tokio::test]
 async fn visual_linewise_change_at_eof_replaces_in_place() {
     // `Vjc` over the buffer's final two lines reopens a single empty line in
     // their place, then takes the typed text.

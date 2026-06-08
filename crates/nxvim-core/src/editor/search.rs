@@ -357,6 +357,13 @@ impl Editor {
         if pattern.is_empty() {
             return;
         }
+        // A committed search / `n` / `*` in Normal mode abandons a multi-cursor
+        // session — navigating away collapses to the primary. In MULTICURSOR
+        // placement mode the search instead *navigates to* a match so you can drop
+        // a cursor there, so the placed cursors are kept.
+        if self.mode != Mode::MultiCursor {
+            self.clear_secondary_cursors();
+        }
         // A committed search turns on `hlsearch` highlighting (cleared by `:noh`).
         self.search_active = true;
         let re = match self.compile_search(pattern) {

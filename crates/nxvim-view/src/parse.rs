@@ -297,6 +297,26 @@ pub(crate) fn parse_numbers(value: Option<&Value>) -> Vec<Option<usize>> {
         .unwrap_or_default()
 }
 
+/// Parse the per-window `cursors` array — secondary multi-cursor positions, each
+/// a `[row, screen_col]` pair — into `(row, col)` tuples. Empty (no extra
+/// cursors) or absent (an older server) both yield an empty vec.
+pub(crate) fn parse_cursor_list(value: Option<&Value>) -> Vec<(u16, u16)> {
+    value
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| match v.as_array() {
+                    Some(pair) if pair.len() == 2 => Some((
+                        pair[0].as_u64().unwrap_or(0) as u16,
+                        pair[1].as_u64().unwrap_or(0) as u16,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse a float's wire border name (matching `nvim_win_get_config`) into the
 /// neutral [`Border`](crate::style::Border). `"none"`, a missing value, or an
 /// unknown name yields `None` (no border).

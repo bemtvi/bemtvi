@@ -50,6 +50,20 @@ impl UndoTree {
         }
     }
 
+    /// Overwrite the current node's snapshot cursor + multi-cursor marks with the
+    /// live ones, so undoing back to this node restores them — see
+    /// [`Editor::push_undo`]. Only the [`CURSOR_NS`] marks are replaced; the rest of
+    /// the snapshot (text, `a`–`z` marks, other extmarks) is untouched.
+    fn set_cur_snapshot_cursors(&mut self, primary: Cursor, positions: &[usize]) {
+        let snap = &mut self.nodes[self.cur].snap;
+        snap.cursor = primary;
+        snap.extmarks.clear(crate::extmark::CURSOR_NS, None);
+        for &at in positions {
+            snap.extmarks
+                .set(crate::extmark::CURSOR_NS, None, at, None, None, 0);
+        }
+    }
+
     /// Seq of the current state (`b_u_seq_cur`).
     pub(crate) fn cur_seq(&self) -> u64 {
         self.nodes[self.cur].seq
@@ -286,8 +300,30 @@ impl Editor {
         }
         let id = self.cur_buffer();
         self.commit_undo(id);
+        // Bake the live multi-cursor positions into the node we'll undo back to, so
+        // undoing the edit we're about to make restores the cursors to where they
+        // are *now* — not where this edit will shift them. The node `cur` was
+        // committed before these cursors were placed (or with their later
+        // positions), so its frozen snapshot would otherwise be stale.
+        self.refresh_undo_cursor_marks(id);
         let now = self.now_mono;
         self.cur_mut().undo.mark_dirty(now);
+    }
+
+    /// Update the current undo node's snapshot so its cursor and multi-cursor marks
+    /// match the live state — see [`push_undo`](Self::push_undo). A no-op without
+    /// secondary cursors, so single-cursor undo (and its existing cursor-placement
+    /// semantics) is untouched.
+    fn refresh_undo_cursor_marks(&mut self, id: BufferId) {
+        if !self.has_secondary_cursors() {
+            return;
+        }
+        let primary = self.cursor;
+        let positions = self.secondary_cursor_bytes();
+        self.buffers
+            .get_mut(id)
+            .undo
+            .set_cur_snapshot_cursors(primary, &positions);
     }
 
     pub(crate) fn undo(&mut self) {
@@ -350,8 +386,9 @@ impl Editor {
         self.cursor = snap.cursor;
         self.buffer_mut().mark_resync();
         // `mark_resync` clears extmarks and `a`–`z` marks (correct for a destructive
-        // reload); undo is not a reload, so restore both as captured with this
-        // history point — they ride back to their positions in the state we return to.
+        // reload); undo is not a reload, so restore all as captured with this history
+        // point — extmarks (including the multi-cursor marks), `a`–`z` marks, and the
+        // cursor ride back to where they were in the state we return to.
         self.buffer_mut().extmarks = snap.extmarks;
         self.buffer_mut().marks = snap.marks;
         self.buffer_mut().modified = !clean;

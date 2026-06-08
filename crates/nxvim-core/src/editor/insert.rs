@@ -7,11 +7,37 @@ use crate::mode::Mode;
 use crate::unicode;
 
 impl Editor {
-    pub(crate) fn enter_insert_at(&mut self, col: usize) {
+    /// Enter Insert mode at a per-cursor target column. `target` is evaluated at
+    /// each cursor (the primary and every secondary) so `a`/`A`/`I` reposition
+    /// *every* cursor to its own line's append/line-end/first-non-blank column, not
+    /// just the primary's; the typed text then lands at each. With no secondary
+    /// cursors this is just a single move to `target(self)` before entering insert.
+    pub(crate) fn enter_insert_each(&mut self, target: impl Fn(&Editor) -> usize) {
         self.push_undo();
         self.snapshot_taken = true;
-        self.cursor.col = col.min(self.line_len());
+        // Switch to Insert *before* the sweep: `for_each_cursor` clamps each cursor
+        // at the end, and only in Insert mode may a cursor sit at `col == line_len`
+        // (the append column `A`/`a`-at-EOL needs). Clamped in Normal mode it would
+        // be pulled one cell left, dropping appended text a column short.
         self.mode = Mode::Insert;
+        self.for_each_cursor(|ed| {
+            ed.cursor.col = target(ed).min(ed.line_len());
+        });
+    }
+
+    /// Split the line at the cursor (insert `\n`) and auto-indent the new line —
+    /// the per-cursor primitive behind insert-mode `Enter`, run at every cursor via
+    /// [`Editor::for_each_cursor`].
+    fn insert_newline(&mut self) {
+        let at = self.cursor_char();
+        self.buffer_mut().insert_char(at, '\n');
+        self.cursor.line += 1;
+        self.buffer_mut().modified = true;
+        self.buffer_mut().normalize();
+        // Auto-indent the new line (treesitter, else copy-previous, else 0) and
+        // park the cursor past the indent — vim's `Enter` behavior.
+        let width = self.indent_for(self.cursor.line);
+        self.cursor.col = self.set_line_indent(self.cursor.line, width);
     }
 
     pub(crate) fn handle_insert(&mut self, key: Key) {
@@ -25,26 +51,28 @@ impl Editor {
                 // `` `^ `` — where Insert mode was last left — is the insert-stop
                 // column, captured before the normal-mode backstep below.
                 self.record_last_insert();
-                if self.cursor.col > 0 {
-                    let s = self.buffer().line(self.cursor.line);
-                    self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
-                }
+                // Back every cursor (the primary and any secondary multi-cursors)
+                // off its insert-stop column onto the last inserted cell — the
+                // typed text landed at all of them via `for_each_cursor`, so the
+                // leaving-insert backstep must too, not just the primary.
+                self.for_each_cursor(|ed| {
+                    if ed.cursor.col > 0 {
+                        let s = ed.buffer().line(ed.cursor.line);
+                        ed.cursor.col = unicode::prev_grapheme(&s, ed.cursor.col);
+                    }
+                });
                 self.clamp_cursor();
                 self.snapshot_taken = false;
             }
+            // `Enter` and `Backspace`, like a typed `Char`, run at every cursor via
+            // `for_each_cursor` (the insert session already holds the undo snapshot,
+            // so no `edit_each_cursor` wrap). The `".` last-insert register records
+            // the keystroke once, not once per cursor.
             KeyCode::Enter => {
-                let at = self.cursor_char();
-                self.buffer_mut().insert_char(at, '\n');
+                self.for_each_cursor(|ed| ed.insert_newline());
                 self.insert_text.push('\n'); // `".` last-insert register
-                self.cursor.line += 1;
-                self.buffer_mut().modified = true;
-                self.buffer_mut().normalize();
-                // Auto-indent the new line (treesitter, else copy-previous, else 0)
-                // and park the cursor past the indent — vim's `Enter` behavior.
-                let width = self.indent_for(self.cursor.line);
-                self.cursor.col = self.set_line_indent(self.cursor.line, width);
             }
-            KeyCode::Backspace => self.insert_backspace(soft_tab),
+            KeyCode::Backspace => self.for_each_cursor(|ed| ed.insert_backspace(soft_tab)),
             KeyCode::Tab => self.insert_tab(soft_tab),
             KeyCode::Left => {
                 let s = self.buffer().line(self.cursor.line);
@@ -67,21 +95,32 @@ impl Editor {
                     self.buffer_mut().modified = true;
                 }
             }
+            // A typed character lands at every cursor (the primary and any
+            // secondary multi-cursors); with none, `for_each_cursor` is just the
+            // single-cursor insert. The `".` last-insert register records the
+            // keystroke once, not once per cursor.
             KeyCode::Char(c) => {
-                let at = self.cursor_char();
-                if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
-                    let s = self.buffer().line(self.cursor.line);
-                    let end = self.buffer().line_start(self.cursor.line)
-                        + unicode::next_grapheme(&s, self.cursor.col);
-                    self.buffer_mut().remove(at..end);
-                }
-                self.buffer_mut().insert_char(at, c);
-                self.cursor.col += c.len_utf8();
-                self.buffer_mut().modified = true;
+                self.for_each_cursor(|ed| ed.insert_char_at_cursor(c));
                 self.insert_text.push(c); // `".` last-insert register
             }
             _ => {}
         }
+    }
+
+    /// Insert (or, in Replace mode, overtype) one character at the current cursor
+    /// and advance past it. The per-cursor primitive [`handle_insert`] runs at
+    /// every cursor via [`Editor::for_each_cursor`].
+    fn insert_char_at_cursor(&mut self, c: char) {
+        let at = self.cursor_char();
+        if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
+            let s = self.buffer().line(self.cursor.line);
+            let end = self.buffer().line_start(self.cursor.line)
+                + unicode::next_grapheme(&s, self.cursor.col);
+            self.buffer_mut().remove(at..end);
+        }
+        self.buffer_mut().insert_char(at, c);
+        self.cursor.col += c.len_utf8();
+        self.buffer_mut().modified = true;
     }
 
     /// Insert a tab at the cursor. The width it advances by is the buffer's

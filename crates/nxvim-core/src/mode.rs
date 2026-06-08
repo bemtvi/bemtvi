@@ -11,6 +11,11 @@ pub enum Mode {
     VisualLine,
     /// Command-line mode (`:` ex commands).
     Command,
+    /// Multi-cursor *placement* mode (nxvim-specific, entered with `<A-c>`).
+    /// Motions move only the active (primary) cursor so you can navigate and drop
+    /// cursors (`c` / `{count}c{motion}`); leaving with `<Esc>` keeps the placed
+    /// cursors and returns to Normal, where motions and edits act on them all.
+    MultiCursor,
 }
 
 impl Mode {
@@ -23,6 +28,7 @@ impl Mode {
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
             Mode::Command => "COMMAND",
+            Mode::MultiCursor => "MULTICURSOR",
         }
     }
 
@@ -35,7 +41,14 @@ impl Mode {
             Mode::Visual => "v",
             Mode::VisualLine => "V",
             Mode::Command => "c",
+            // No vim equivalent; reads as normal mode for `mode()`-checking scripts.
+            Mode::MultiCursor => "n",
         }
+    }
+
+    /// Whether this is the nxvim-specific multi-cursor *placement* mode.
+    pub fn is_multicursor(self) -> bool {
+        matches!(self, Mode::MultiCursor)
     }
 
     pub fn is_insert(self) -> bool {

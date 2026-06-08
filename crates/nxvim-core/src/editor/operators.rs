@@ -163,6 +163,13 @@ impl Editor {
     }
 
     pub(crate) fn visual_operate(&mut self, op: char) {
+        // With a multi-cursor set placed, the operator runs over every cursor's own
+        // selection as one undo group; this single-cursor body is the primary-only
+        // path.
+        if self.has_secondary_cursors() {
+            self.visual_operate_multi(op);
+            return;
+        }
         let (lo, hi, linewise, first_line) = self.visual_range();
         // `=` reindents the selected lines; unlike d/y/c it neither yanks nor needs
         // the shared snapshot (`reindent_lines` takes its own), so handle it first.
@@ -300,22 +307,76 @@ impl Editor {
     }
 
     fn visual_range(&self) -> (usize, usize, bool, usize) {
+        let linewise = self.mode == Mode::VisualLine;
+        let (lo, hi, first_line) = self.visual_range_lw(linewise);
+        (lo, hi, linewise, first_line)
+    }
+
+    /// The selection's `(lo, hi, first_line)` byte range between `visual_anchor`
+    /// and the cursor, with `linewise` passed explicitly rather than read from
+    /// `self.mode` — so a per-cursor operator sweep keeps using the right kind
+    /// even after an editing `f` (visual `c`) has flipped the mode to Insert.
+    pub(crate) fn visual_range_lw(&self, linewise: bool) -> (usize, usize, usize) {
         let a = self.visual_anchor;
         let b = self.cursor;
-        if self.mode == Mode::VisualLine {
+        if linewise {
             let (la, lb) = (min(a.line, b.line), max(a.line, b.line));
             let lo = self.buffer().line_start(la);
             let hi = self
                 .buffer()
                 .line_start((lb + 1).min(self.buffer().line_count()));
-            (lo, hi, true, la)
+            (lo, hi, la)
         } else {
             let ca = self.buffer().byte_at(a.line, a.col);
             let cb = self.buffer().byte_at(b.line, b.col);
             let lo = min(ca, cb);
             let hi = max(ca, cb) + 1;
-            (lo, hi.min(self.last_char_idx().max(lo + 1)), false, 0)
+            (lo, hi.min(self.last_char_idx().max(lo + 1)), 0)
         }
+    }
+
+    /// Per-cursor visual operator: apply `op` over **every** cursor's own
+    /// selection (`anchor`..`head`) as a single undo group, then leave visual —
+    /// `c` drops into Insert at every cursor, `d`/`y`/`=` settle back in Normal.
+    /// The cursor heads survive into the next mode (the multi-cursor set persists).
+    fn visual_operate_multi(&mut self, op: char) {
+        // `d`/`y`/`c` write a register; a read-only or unavailable-clipboard target
+        // aborts the whole operation, leaving the selection intact (vim beeps).
+        if matches!(op, 'd' | 'y' | 'c') {
+            if self.register_write_blocked() {
+                self.reset_pending();
+                return;
+            }
+            if self.clipboard_write_unavailable() {
+                self.echo(CLIPBOARD_UNAVAILABLE);
+                self.reset_pending();
+                return;
+            }
+        }
+        let linewise = self.mode == Mode::VisualLine;
+        // Stamp the primary selection's `` `< `` / `` `> `` marks before leaving.
+        self.record_visual_marks();
+        // One undo group; `for_each_cursor` restores each cursor's own anchor into
+        // `visual_anchor` so `visual_range_lw` brackets that cursor's selection.
+        self.edit_each_cursor(|ed| ed.visual_operate_once(op, linewise));
+        self.mode = if op == 'c' {
+            Mode::Insert
+        } else {
+            Mode::Normal
+        };
+        self.clear_anchor_marks();
+        self.reset_pending();
+    }
+
+    /// One cursor's slice of a multi-cursor visual operator: apply `op` over the
+    /// selection between this cursor's `visual_anchor` and head. Reads no pending
+    /// state and opens no undo group of its own — [`edit_each_cursor`] wraps the
+    /// whole sweep in one.
+    ///
+    /// [`edit_each_cursor`]: Editor::edit_each_cursor
+    pub(crate) fn visual_operate_once(&mut self, op: char, linewise: bool) {
+        let (lo, hi, first_line) = self.visual_range_lw(linewise);
+        self.apply_operator_to_range(op, lo, hi, linewise, first_line);
     }
 
     /// Snap `[lo, hi)` and extract it as register-bound text + its kind, or
@@ -343,6 +404,7 @@ impl Editor {
     /// unnamed register when none is selected), routing through vim's yank rules.
     fn yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
         if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
+            self.collect_cursor_register(lo, &text, kind);
             let reg = self.pending.register;
             if is_clipboard_register(reg) {
                 self.clipboard_write(text, kind);
@@ -357,12 +419,29 @@ impl Editor {
     /// Call this — never `yank_range` — before any operator that removes text.
     fn delete_yank_range(&mut self, lo: usize, hi: usize, linewise: bool) {
         if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
+            self.collect_cursor_register(lo, &text, kind);
             let reg = self.pending.register;
             if is_clipboard_register(reg) {
                 self.clipboard_write(text, kind);
             } else {
                 self.registers.record_delete(reg, text, kind);
             }
+        }
+    }
+
+    /// During a multi-cursor editing sweep, stash this cursor's yanked/deleted
+    /// slice (keyed by its range start for document-order sorting) so a later
+    /// multi-cursor paste can return each cursor its own text. A no-op outside a
+    /// sweep (the collector is `None`). See [`Editor::cursor_registers`].
+    fn collect_cursor_register(&mut self, at: usize, text: &str, kind: RegKind) {
+        if let Some(collect) = self.cursor_register_collect.as_mut() {
+            collect.push((
+                at,
+                RegisterCell {
+                    text: text.to_string(),
+                    kind,
+                },
+            ));
         }
     }
 
@@ -634,6 +713,17 @@ impl Editor {
             Some((text, kind)) if !text.is_empty() => (text, kind == RegKind::Line),
             _ => return,
         };
+        self.paste_text(&text, linewise, count, after);
+    }
+
+    /// Insert register-resolved `text` at the cursor `count` times — the body of
+    /// [`Editor::paste`] once the source text and its line/char kind are known.
+    /// Split out so a multi-cursor paste can feed each cursor its own per-cursor
+    /// register text (see [`Editor::cursor_registers`]) through the same logic.
+    pub(crate) fn paste_text(&mut self, text: &str, linewise: bool, count: usize, after: bool) {
+        if text.is_empty() {
+            return;
+        }
         self.push_undo();
         if linewise {
             let at = if after {
@@ -674,5 +764,34 @@ impl Editor {
         self.buffer_mut().normalize();
         self.buffer_mut().modified = true;
         self.clamp_cursor();
+    }
+
+    /// `p`/`P` with a multi-cursor set active. When the per-cursor register set
+    /// from the last multi-cursor yank/delete still matches the live cursor count,
+    /// each cursor pastes its **own** captured text (so `yy`+`p` over two cursors
+    /// duplicates each line under itself, not one line under both). Otherwise — a
+    /// single-source yank, or the set changed — every cursor pastes the active
+    /// register, vim's plain `p` broadcast to all.
+    pub(crate) fn paste_multi(&mut self, after: bool, count: usize) {
+        let mut positions = self.secondary_cursor_bytes();
+        positions.push(self.cursor_char());
+        positions.sort_unstable();
+        if positions.len() == self.cursor_registers.len() {
+            // Pair each cursor (ascending) with its own captured slice. Visiting
+            // highest-byte-first (inside `edit_each_cursor`/`for_each_cursor`) means
+            // a paste never shifts a not-yet-visited lower cursor, so the original
+            // position is still the live one when we look it up.
+            let by_pos: std::collections::HashMap<usize, RegisterCell> = positions
+                .into_iter()
+                .zip(self.cursor_registers.iter().cloned())
+                .collect();
+            self.edit_each_cursor(move |ed| {
+                if let Some(cell) = by_pos.get(&ed.cursor_char()) {
+                    ed.paste_text(&cell.text, cell.kind == RegKind::Line, count, after);
+                }
+            });
+        } else {
+            self.edit_each_cursor(|ed| ed.paste(after, count));
+        }
     }
 }

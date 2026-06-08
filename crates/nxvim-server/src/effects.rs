@@ -692,6 +692,14 @@ impl Server {
                     let marks = b
                         .extmarks
                         .iter_with_ns()
+                        // The reserved multi-cursor namespaces (cursor heads and
+                        // their visual anchors) are internal editor state, not
+                        // user-visible extmarks — keep them out of the
+                        // `nvim_buf_get_extmarks` mirror.
+                        .filter(|(ns, _)| {
+                            *ns != nxvim_core::extmark::CURSOR_NS
+                                && *ns != nxvim_core::extmark::ANCHOR_NS
+                        })
                         .map(|(ns, m)| {
                             let (row, col) = byte_rowcol(b, m.start);
                             let (end_row, end_col) = match m.end {

@@ -35,6 +35,8 @@ mod lsp_util;
 mod lua_surface;
 #[path = "editing/marks.rs"]
 mod marks;
+#[path = "editing/multicursor.rs"]
+mod multicursor;
 #[path = "editing/numbers.rs"]
 mod numbers;
 #[path = "editing/panel.rs"]

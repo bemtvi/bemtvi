@@ -15,6 +15,25 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+/// Reserved namespace for the editor's secondary (multi-)cursors. They are
+/// stored as point extmarks so the buffer's single edit choke point
+/// ([`ExtmarkStore::shift`]) keeps every extra cursor's byte anchor correct
+/// across edits for free. The id sits at the top of the `u32` range, far above
+/// any namespace `nvim_create_namespace` hands out, so it never collides with a
+/// plugin's. Carrying no `hl_group`/`end`, these marks render nothing and are
+/// filtered out of the user-facing extmark mirror.
+pub const CURSOR_NS: u32 = u32::MAX;
+
+/// Reserved namespace for the per-cursor *visual anchors* of multi-cursor visual
+/// mode. While a visual mode is active each secondary cursor's selection runs
+/// from its [`CURSOR_NS`] head mark to a paired anchor mark here — **same id in
+/// both namespaces**, so the two are looked up together. Like [`CURSOR_NS`] these
+/// are point marks carrying no `hl_group`, so they render nothing and are kept
+/// out of the user-facing extmark mirror. They exist only between entering visual
+/// mode and the operator/`<Esc>` that ends it. Sits just below [`CURSOR_NS`], far
+/// above any plugin namespace.
+pub const ANCHOR_NS: u32 = u32::MAX - 1;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

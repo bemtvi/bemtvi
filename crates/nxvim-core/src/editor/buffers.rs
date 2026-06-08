@@ -97,6 +97,14 @@ impl Editor {
         self.buffers.map.get(&id).map(|ob| ob.buffer.line_count())
     }
 
+    /// Whether `id` is an open buffer (`nvim_buf_is_valid`). The RPC surface uses
+    /// this to reject a client-supplied buffer handle before binding a window to
+    /// it — binding a window to a non-existent buffer would make a later
+    /// `buffers.get` on it panic and crash the server.
+    pub fn buffer_is_valid(&self, id: BufferId) -> bool {
+        self.buffers.map.contains_key(&id)
+    }
+
     /// Add a buffer to the store and return its id, without switching to it.
     pub(crate) fn add_buffer(&mut self, buffer: Buffer) -> BufferId {
         self.buffers.insert(buffer)

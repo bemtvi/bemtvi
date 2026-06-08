@@ -237,6 +237,13 @@ impl Server {
                     } else {
                         buf
                     };
+                    // Reject an unknown buffer handle loudly (neovim's "Invalid
+                    // buffer id"). A float binds the window to `buf` directly, so an
+                    // unvalidated handle would make a later `buffers.get` panic and
+                    // crash the server — a single-request DoS from the client.
+                    if !self.editor.buffer_is_valid(buf) {
+                        return Err(format!("nvim_open_win: Invalid buffer id: {}", buf.0));
+                    }
                     let cfg = self.parse_float_config(config)?;
                     self.editor.open_float_window(buf, cfg, enter)
                 };

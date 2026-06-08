@@ -2244,3 +2244,31 @@ async fn bordered_float_size_is_content_area_neovim_semantics() {
     );
     assert_eq!(win.lines.first().map(String::as_str), Some("alpha"));
 }
+
+/// SECURITY: a client sends `nvim_open_win` with a bogus, never-created buffer
+/// handle in the float form. The server must not panic; a follow-up request must
+/// still get a response (the server loop is alive).
+#[tokio::test]
+async fn open_float_with_invalid_buffer_handle_does_not_crash() {
+    let (rpc, _incoming) = start(None).await;
+    let config = Value::Map(vec![
+        (Value::from("relative"), Value::from("editor")),
+        (Value::from("row"), Value::from(1u64)),
+        (Value::from("col"), Value::from(1u64)),
+        (Value::from("width"), Value::from(10u64)),
+        (Value::from("height"), Value::from(3u64)),
+    ]);
+    // buffer = 999999 (never created), enter = true.
+    let _ = rpc
+        .request(
+            "nvim_open_win",
+            vec![Value::from(999999u64), Value::from(true), config],
+        )
+        .await;
+    // The server loop must still answer.
+    let mode = rpc
+        .request("nvim_get_mode", vec![])
+        .await
+        .expect("server still alive after invalid-buffer nvim_open_win");
+    assert!(mode.is_map());
+}

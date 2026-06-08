@@ -34,6 +34,7 @@ ratatui.workspace = true
 portable-pty.workspace = true
 vt100.workspace = true
 tree-sitter-rust.workspace = true
+tree-sitter-md.workspace = true
 serde_json.workspace = true
 # The integration tests speak the msgpack-RPC wire directly to drive the server.
 nxvim-rpc.workspace = true

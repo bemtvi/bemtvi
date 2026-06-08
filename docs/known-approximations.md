@@ -83,9 +83,19 @@ gap. Recorded here so the sweep doesn't lose them.
     prior paint. See
     [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and
     [the query-bridge design](specs/2026-06-08-treesitter-query-bridge-design.md).
-  - **Injections.** A buffer's root tree parses; `LanguageTree` child languages /
-    `language_for_range` are not wired, so an injected-language query returns only
-    the host tree's captures.
+  - **Injections — built** (ADR 0001, #5 — Lua resolves the injection query, the
+    engine executes the layers). The engine runs the resolved `injections` query
+    over the root tree each parse, parses each injected region with its child grammar
+    through `included_ranges` (buffer-coordinate child trees, incremental reparse,
+    a per-frame parse budget), and paints child captures over the host — single,
+    combined (`#set! injection.combined`), and nested (to a depth bound) injections,
+    with the full `injection.language` / `self` / `parent` / `include-children`
+    directive vocabulary. On the platform side the vendored `LanguageTree` builds the
+    same injected child trees over nxvim's snapshot primitives, so `children()` /
+    `language_for_range` / `get_node(…, ignore_injections=false)` resolve the injected
+    language; a drift oracle test asserts the engine's paint agrees with the vendored
+    `_get_injections`. A missing child grammar degrades to the host's flat paint. See
+    [the injections design](specs/2026-06-08-treesitter-injections-design.md).
   - **Live incremental buffer updates.** There is no `nvim_buf_attach`; a
     buffer-sourced parser re-reads the snapshot and **fully reparses** on each
     `:parse()` (correct, but pays the full cost — the "two parsers" tradeoff).

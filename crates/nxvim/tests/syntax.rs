@@ -38,33 +38,32 @@ fn fixture_data_dir() -> &'static Path {
     static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
     DATA_DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join("nxvim-ts-fixture");
-        let parser_dir = dir.join("parser");
-        let query_dir = dir.join("queries").join("rust");
-        std::fs::create_dir_all(&parser_dir).unwrap();
-        std::fs::create_dir_all(&query_dir).unwrap();
+        std::fs::create_dir_all(dir.join("parser")).unwrap();
 
-        // Compile the grammar's C sources into parser/rust.so (named `.so` on
-        // every OS, which our loader tries first), via the system C compiler.
-        let src = grammar_src_dir().join("src");
-        let out = parser_dir.join("rust.so");
-        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let status = std::process::Command::new(compiler)
-            .args(["-shared", "-fPIC", "-O1"])
-            .arg("-I")
-            .arg(&src)
-            .arg(src.join("parser.c"))
-            .arg(src.join("scanner.c"))
-            .arg("-o")
-            .arg(&out)
-            .status()
-            .expect("run C compiler");
-        assert!(status.success(), "compiling rust grammar fixture failed");
-
-        std::fs::write(
-            query_dir.join("highlights.scm"),
+        // `rust`: the workhorse grammar most tests use. Its highlights query is the
+        // crate constant; no injection query on disk (injection tests set their own).
+        let rust_src = registry_crate_dir("tree-sitter-rust-0.24.2").join("src");
+        compile_grammar(&dir, "rust", &rust_src);
+        write_query(
+            &dir,
+            "rust",
+            "highlights",
             tree_sitter_rust::HIGHLIGHTS_QUERY,
-        )
-        .unwrap();
+        );
+
+        // `markdown`: a host grammar that *injects* — its `injections.scm` maps a
+        // fenced code block to the fence's language, so the injection tests can
+        // drive cross-language (markdown → rust) and nested (markdown → rust → …)
+        // injections, not just rust-in-rust. Only the block grammar is installed;
+        // its `markdown_inline` / html / yaml injections resolve to uninstalled
+        // grammars and are silently skipped (best-effort), which is fine here.
+        let md = registry_crate_dir("tree-sitter-md-0.5.3").join("tree-sitter-markdown");
+        compile_grammar(&dir, "markdown", &md.join("src"));
+        for name in ["highlights", "injections"] {
+            let scm = std::fs::read_to_string(md.join("queries").join(format!("{name}.scm")))
+                .expect("read markdown query");
+            write_query(&dir, "markdown", name, &scm);
+        }
 
         // The engine loads grammars + queries from here, in-process.
         std::env::set_var("NXVIM_DATA_DIR", &dir);
@@ -72,20 +71,47 @@ fn fixture_data_dir() -> &'static Path {
     })
 }
 
-/// Locate the unpacked `tree-sitter-rust` crate source in the cargo registry
-/// (a dev-dependency, so cargo guarantees it is present).
-fn grammar_src_dir() -> PathBuf {
+/// Compile a grammar's C sources (`parser.c` + the always-present `scanner.c`) from
+/// `src_dir` into `<data>/parser/<lang>.so` (named `.so` on every OS, which our
+/// loader tries first), via the system C compiler — mirroring how a user installs a
+/// parser, but hermetic.
+fn compile_grammar(data_dir: &Path, lang: &str, src_dir: &Path) {
+    let out = data_dir.join("parser").join(format!("{lang}.so"));
+    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = std::process::Command::new(compiler)
+        .args(["-shared", "-fPIC", "-O1"])
+        .arg("-I")
+        .arg(src_dir)
+        .arg(src_dir.join("parser.c"))
+        .arg(src_dir.join("scanner.c"))
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .expect("run C compiler");
+    assert!(status.success(), "compiling {lang} grammar fixture failed");
+}
+
+/// Write `<data>/queries/<lang>/<name>.scm`.
+fn write_query(data_dir: &Path, lang: &str, name: &str, scm: &str) {
+    let dir = data_dir.join("queries").join(lang);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.scm")), scm).unwrap();
+}
+
+/// Locate an unpacked crate source directory in the cargo registry by its
+/// `<name>-<version>` folder name (a dev-dependency, so cargo guarantees presence).
+fn registry_crate_dir(crate_dir: &str) -> PathBuf {
     let cargo_home = std::env::var("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home_dir().join(".cargo"));
     let registry = cargo_home.join("registry").join("src");
     for index in std::fs::read_dir(&registry).expect("read cargo registry src") {
-        let candidate = index.unwrap().path().join("tree-sitter-rust-0.24.2");
+        let candidate = index.unwrap().path().join(crate_dir);
         if candidate.is_dir() {
             return candidate;
         }
     }
-    panic!("tree-sitter-rust-0.24.2 source not found under {registry:?}");
+    panic!("{crate_dir} source not found under {registry:?}");
 }
 
 fn home_dir() -> PathBuf {
@@ -1070,5 +1096,514 @@ async fn an_on_disk_replacing_query_overlay_replaces_the_base() {
     assert!(
         row0_has_group(&hl, "variable"),
         "the replacing on-disk overlay paints `main` as @variable: {hl:?}"
+    );
+}
+
+// ----- injections bridge, Phase 0 -------------------------------------------
+// `injections` joins `highlights` / `indents` as a paint-relevant query name that
+// resolves through the vendored Lua and is pushed to the engine, which compiles +
+// stores it on the grammar. Phase 0 proves only the *resolution* half: the query
+// reaches the engine and compiles (valid → silent, broken → loud). Nothing
+// consumes the stored injection query for paint yet — that is Phase 1 — so these
+// tests make no paint-of-an-injected-region assertion.
+
+/// Poll a bounded window of frames for a treesitter compile-failure echo, returning
+/// `true` as soon as one is seen. Used by the Phase-0 no-echo assertions (expecting
+/// `false`) and mirrors the polling shape of the broken-`query.set` test.
+async fn saw_ts_compile_failure(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool {
+    for _ in 0..30 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if message_of(&params).contains("failed to compile") {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn query_set_injections_compiles_without_echo() {
+    // A *valid* `query.set(lang, 'injections', text)` now reaches the engine and
+    // compiles silently (no "failed to compile" echo), and — since nothing reads
+    // the stored injection query for paint yet — leaves the base highlights intact.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("inj-set", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((line_comment) @injection.content (#set! injection.language \"rust\"))')",
+    )
+    .await;
+
+    assert!(
+        !saw_ts_compile_failure(&rpc, &mut incoming).await,
+        "a valid injections query.set must not echo a compile failure"
+    );
+    let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "the injections push leaves the base paint intact: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_broken_injections_query_echoes_loud() {
+    // No silent stubs: an injection query that fails to compile must echo loud,
+    // exactly like a broken `highlights` query — proving `injections` is wired
+    // through the same compile-and-surface path, not silently dropped.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("inj-broken", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', '((((')",
+    )
+    .await;
+
+    assert!(
+        saw_ts_compile_failure(&rpc, &mut incoming).await,
+        "a broken injections query.set must echo a compile failure"
+    );
+    // The base paint survives a broken injection push.
+    let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "a broken injections push keeps the base paint: {hl:?}"
+    );
+}
+
+/// Create a fresh runtimepath dir holding an on-disk `queries/rust/injections.scm`
+/// — the buffer-open resolution path for injections, the analogue of
+/// [`query_overlay_runtimepath`] for the highlights overlay.
+fn injections_overlay_runtimepath(tag: &str, scm: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nxvim-tsi-{}-{}", std::process::id(), tag));
+    let qdir = dir.join("queries").join("rust");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(qdir.join("injections.scm"), scm).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn an_on_disk_injections_overlay_compiles_without_echo() {
+    // The buffer-open half: a pure on-disk `queries/rust/injections.scm` (no
+    // `query.set` call) is resolved through the Lua runtimepath the first time a
+    // rust buffer is highlighted and pushed to the engine. A valid one compiles
+    // silently and does not disturb the base paint.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let rtp = injections_overlay_runtimepath(
+        "valid",
+        "((line_comment) @injection.content (#set! injection.language \"rust\"))",
+    );
+    let file = temp_rs("inj-overlay", "fn main() {}\n");
+    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
+
+    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+    assert!(
+        !saw_ts_compile_failure(&rpc, &mut incoming).await,
+        "a valid on-disk injections overlay must not echo a compile failure"
+    );
+    let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
+    assert!(
+        row0_keyword_at_0(&hl),
+        "the on-disk injections overlay leaves the base paint intact: {hl:?}"
+    );
+}
+
+// ----- injections bridge, Phase 1 -------------------------------------------
+// Single-level injection highlighting: the engine runs the injection query over
+// the root tree, parses each injected region with its child grammar, and paints
+// the child's captures over the host's. Self-injection (host == injected == rust)
+// exercises the whole pipeline with only the one fixture grammar.
+
+/// Does `row` carry a span of major capture group `major` starting at screen column
+/// `col`? Used to catch an injected capture at a column the host paints differently.
+fn row_group_at(hl: &[Vec<(u64, u64, String)>], row: usize, col: u64, major: &str) -> bool {
+    hl.get(row).is_some_and(|spans| {
+        spans
+            .iter()
+            .any(|(s, _, g)| *s == col && g.split('.').next() == Some(major))
+    })
+}
+
+/// `row_group_at` for the `keyword` group — catches an injected `fn`/`let` inside a
+/// string, a column the host paints `@string`.
+fn row_keyword_at(hl: &[Vec<(u64, u64, String)>], row: usize, col: u64) -> bool {
+    row_group_at(hl, row, col, "keyword")
+}
+
+/// `row_keyword_at` on row 0 — the common single-line injection case.
+fn row0_keyword_at(hl: &[Vec<(u64, u64, String)>], col: u64) -> bool {
+    row_keyword_at(hl, 0, col)
+}
+
+#[tokio::test]
+async fn injected_rust_paints_over_a_host_string_self_injection() {
+    // A rust string's content is painted flat as `@string` by the host grammar.
+    // Injecting rust INTO that content makes the inner `fn` paint as a keyword — a
+    // finer capture inside a node the host paints flat, which the single-tree paint
+    // could never produce. Host == injected == rust, so no second grammar is needed.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    // The injected snippet's `fn` sits at column 17 (after `const S: &str = "`).
+    let file = temp_rs("inj-self", "const S: &str = \"fn x() {}\";\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Baseline: the string interior is flat — its content carries no keyword.
+    let base = wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    assert!(
+        !row0_keyword_at(&base, 17),
+        "baseline: the host paints the string flat, no keyword inside it: {base:?}"
+    );
+
+    // Inject rust into the string's content.
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.language \"rust\"))')",
+    )
+    .await;
+
+    // The injected `fn` now paints as a keyword at column 17, over the host @string.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row0_keyword_at(hl, 17)).await;
+    assert!(
+        row0_keyword_at(&hl, 17),
+        "the injected rust paints `fn` as a keyword inside the string: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_keeps_the_injection_layers_alive() {
+    // The child layers are re-derived from the root tree after every edit (Phase 1
+    // rebuilds from scratch). An edit must not lose the injection: after opening a
+    // new line below, the string on row 0 is still injected and its `fn` still
+    // paints as a keyword — proving the post-edit rebuild re-finds the region.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("inj-edit", "const S: &str = \"fn x() {}\";\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.language \"rust\"))')",
+    )
+    .await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_keyword_at(hl, 17)).await;
+
+    // Open a new line below (an edit that leaves row 0's string untouched), forcing
+    // a reparse + injection-layer rebuild.
+    feed(&rpc, "ofn z() {}<Esc>");
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row0_keyword_at(hl, 17)).await;
+    assert!(
+        row0_keyword_at(&hl, 17),
+        "the injection survives an edit's layer rebuild: {hl:?}"
+    );
+}
+
+// ----- injections bridge, Phase 2 -------------------------------------------
+// Faithful child parsing: the child grammar parses the host buffer through
+// `included_ranges` (buffer-absolute coordinates, no substring copy) and reparses
+// incrementally across edits. Plus the dynamic `@injection.language` node-text
+// form and sibling regions of the same language.
+
+#[tokio::test]
+async fn an_edit_inside_an_injected_region_tracks_incrementally() {
+    // The injected child reparses across edits. Start with a string holding a bare
+    // identifier (no keyword inside it), inject rust, then type `fn ` INTO the
+    // string. The incremental child reparse must pick up the new text and paint the
+    // freshly-typed `fn` as a keyword — proving the captures track the edit, not a
+    // stale one-shot parse.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("inj-incr", "const S: &str = \"x\";\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.language \"rust\"))')",
+    )
+    .await;
+    // The lone identifier `x` carries no keyword inside the string.
+    let injected =
+        wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    assert!(
+        !row0_keyword_at(&injected, 17),
+        "baseline: a bare identifier in the string is no keyword: {injected:?}"
+    );
+
+    // Jump onto the `x` (one past the opening quote) and insert `fn ` before it, so
+    // the string content becomes `fn x`. The opening quote stays at column 16, so
+    // the injected `fn` lands at column 17.
+    feed(&rpc, "f\"lifn <Esc>");
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row0_keyword_at(hl, 17)).await;
+    assert!(
+        row0_keyword_at(&hl, 17),
+        "the incremental child reparse paints the newly-typed `fn`: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn sibling_injected_regions_of_the_same_language_both_paint() {
+    // Two separate injected regions of the same language each get their own child
+    // layer; both must paint. Here two rust strings on two rows both highlight their
+    // inner `fn` — at column 17 (after `const A: &str = "`) on each row.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs(
+        "inj-sib",
+        "const A: &str = \"fn a() {}\";\nconst B: &str = \"fn b() {}\";\n",
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.language \"rust\"))')",
+    )
+    .await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        row_keyword_at(hl, 0, 17) && row_keyword_at(hl, 1, 17)
+    })
+    .await;
+    assert!(
+        row_keyword_at(&hl, 0, 17),
+        "the first injected region paints its `fn`: {hl:?}"
+    );
+    assert!(
+        row_keyword_at(&hl, 1, 17),
+        "the second sibling injected region paints its `fn` too: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_injected_language_can_come_from_a_capture_node_text() {
+    // The injected language can be resolved dynamically from an `@injection.language`
+    // capture's node TEXT (e.g. a markdown fence's info string), not only a static
+    // `#set!`. Here the const's name identifier `rust` drives the language, and the
+    // string body is injected with it — `fn` inside paints as a keyword.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    // `fn` of the injected body sits at column 20 (after `const rust: &str = "`).
+    let file = temp_rs("inj-dyn", "const rust: &str = \"fn x() {}\";\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '(const_item name: (identifier) @injection.language \
+          value: (string_literal (string_content) @injection.content))')",
+    )
+    .await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row0_keyword_at(hl, 20)).await;
+    assert!(
+        row0_keyword_at(&hl, 20),
+        "the language from the `@injection.language` node text injects rust: {hl:?}"
+    );
+}
+
+// ----- injections bridge, Phase 3 -------------------------------------------
+// Cross-language, combined, and nested injections, driven by the markdown host
+// grammar (its on-disk `injections.scm` maps a fenced block to the fence's
+// language) plus rust.
+
+#[tokio::test]
+async fn markdown_injects_rust_into_a_fenced_code_block() {
+    // The canonical cross-language case: a markdown doc with a ```rust fence. The
+    // markdown grammar's injection query resolves the fence's language from its info
+    // string and injects rust into the fenced content, so `fn` inside the block
+    // paints as a keyword — a second grammar painting over the markdown host.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("inj-md", "md", "```rust\nfn z() {}\n```\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Row 1 is `fn z() {}` inside the fence; injected as rust → `fn` at column 0.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 1, 0)).await;
+    assert!(
+        row_keyword_at(&hl, 1, 0),
+        "markdown injects rust into the fenced code block: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_nested_injection_paints_the_innermost_grammar() {
+    // Two levels deep: markdown injects rust into the fenced block (level 1), and
+    // rust then injects rust into the string literal inside it (level 2). The
+    // innermost `fn` — inside the string, inside the fence — must paint as a keyword,
+    // which only the recursive layer build can reach.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp(
+        "inj-nest",
+        "md",
+        "```rust\nconst S: &str = \"fn z() {}\";\n```\n",
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Level 1 is live at open (markdown → rust): row 1's `const` is a keyword, but
+    // the string body is still flat (no level-2 injection query for rust yet).
+    let base = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 1, 0)).await;
+    assert!(
+        !row_keyword_at(&base, 1, 17),
+        "baseline: without rust's injection query the string body is flat: {base:?}"
+    );
+
+    // Give rust an injection query → level 2 (rust-in-rust) builds under the fence.
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.language \"rust\"))')",
+    )
+    .await;
+
+    // The innermost `fn` (string body, column 17 on row 1) now paints as a keyword.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 1, 17)).await;
+    assert!(
+        row_keyword_at(&hl, 1, 17),
+        "the two-level nested injection paints the innermost grammar: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn injection_self_injects_the_host_language() {
+    // `(#set! injection.self)` injects the *host's own* language — here rust into a
+    // rust string, with no language named. The inner `fn` paints as a keyword.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("inj-self-dir", "const S: &str = \"fn x() {}\";\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.self))')",
+    )
+    .await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row0_keyword_at(hl, 17)).await;
+    assert!(
+        row0_keyword_at(&hl, 17),
+        "`injection.self` injects the host (rust) into its own string: {hl:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_combined_injection_parses_split_regions_as_one_tree() {
+    // `(#set! injection.combined)` parses every match of the pattern as ONE child
+    // tree spanning all their ranges. Two rust strings hold the two halves of a
+    // block comment — `/* a` and `b */`. Combined, they parse as the single comment
+    // `/* ab */`, so the SECOND region's `b` paints as a comment. Non-combined, `b`
+    // would just be a stray identifier — so this is a true combined-only signal.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs(
+        "inj-comb",
+        "const A: &str = \"/* a\";\nconst B: &str = \"b */\";\n",
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
+    exec_lua(
+        &rpc,
+        "vim.treesitter.query.set('rust', 'injections', \
+         '((string_content) @injection.content (#set! injection.language \"rust\") \
+           (#set! injection.combined))')",
+    )
+    .await;
+
+    // The `b` opening the second region (row 1, column 17) is inside the combined
+    // comment → painted @comment, which a per-region parse could never produce.
+    let hl =
+        wait_for_highlights(&rpc, &mut incoming, |hl| row_group_at(hl, 1, 17, "comment")).await;
+    assert!(
+        row_group_at(&hl, 1, 17, "comment"),
+        "the combined injection parses the split regions as one comment: {hl:?}"
+    );
+}
+
+// ----- injections bridge, Phase 4 (the platform half / drift oracle) --------
+
+#[tokio::test]
+async fn the_engine_paint_agrees_with_the_platform_injection_resolution() {
+    // Drift oracle: the engine's painted injection (the directive logic ported to
+    // Rust) and the vendored `LanguageTree`'s `_get_injections` (pure Lua, over
+    // nxvim's snapshot primitives) must agree on what is injected where. For a
+    // markdown ```rust fence the engine paints rust into the fence AND the platform
+    // resolves the fenced region's language to rust — a divergence between the two
+    // independent ports of the injection-directive vocabulary would surface here.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("inj-oracle", "md", "```rust\nfn z() {}\n```\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Engine side: rust is painted inside the fence — row 1's `fn` is a keyword.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 1, 0)).await;
+    assert!(
+        row_keyword_at(&hl, 1, 0),
+        "engine paints rust into the fenced block: {hl:?}"
+    );
+
+    // Platform side: the vendored LanguageTree resolves the same region to rust.
+    let lang = exec_lua(
+        &rpc,
+        r#"
+        local p = vim.treesitter.get_parser(0, 'markdown')
+        p:parse(true)
+        local child = p:language_for_range({ 1, 0, 1, 0 })
+        return child and child:lang() or 'nil'
+        "#,
+    )
+    .await;
+    assert_eq!(
+        lang.as_str(),
+        Some("rust"),
+        "the platform resolves the fenced region to rust, agreeing with the engine paint"
+    );
+}
+
+#[tokio::test]
+async fn the_treesitter_injections_example_config_injects_on_startup() {
+    // The shipped `examples/treesitter-injections/` config calls
+    // `vim.treesitter.query.set('rust','injections', <string_content → rust>)` at
+    // the top of init.lua. Sourced at startup against its own sample, the Rust
+    // inside the `const SNIPPET` string literal must paint — its `fn` (row 4, column
+    // 23) is a keyword — proving the injection bridge resolves + pushes + paints
+    // end-to-end through the example, so the shipped config can't rot.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/treesitter-injections")
+        .canonicalize()
+        .expect("example dir exists");
+    let sample = example.join("sample.rs").display().to_string();
+    let (rpc, mut incoming) = start_with_config(Some(sample), example).await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 4, 23)).await;
+    assert!(
+        row_keyword_at(&hl, 4, 23),
+        "the example injects rust into the string, painting its `fn` as a keyword: {hl:?}"
     );
 }

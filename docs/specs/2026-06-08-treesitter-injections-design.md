@@ -1,6 +1,41 @@
 # Treesitter injections — Lua resolves the query, the engine executes the layers — design
 
-**Status:** proposed; **phased.** This is the fifth worked instance of
+**Status:** **implemented (Phases 0–4).**
+*Phase 0* — the `injections` query name resolves through the bridge and is compiled
++ stored on the grammar (`loader.rs` `Grammar.injections`, `engine.rs`
+`is_engine_query`, `treesitter.rs` `resolve_ts_queries_for`, the prelude `query.set`
+seam).
+*Phase 1* — single-level injection highlighting: `engine.rs` `BufferState.injections`
++ `InjectionLayer`, layer building run after every reparse and on an
+injection-query change, `collect_injection_regions`, and a layered `extract_spans`
+where injected layers paint over the host.
+*Phase 2* — faithful child parsing: the child grammar parses the buffer through
+`Parser::set_included_ranges` (`ts_range`/`point_at`), so child trees are in
+buffer coordinates; incremental child reparse (`update_injection_layers` replays
+the edits onto the surviving child trees, keyed by language); the dynamic
+`@injection.language` node-text language form; and a per-pass `INJECTION_DEADLINE`
+budget (stale-tree fallback).
+*Phase 3* — combined injections + nesting + the remaining directive vocabulary.
+`collect_injection_regions` now returns `(language, ranges)` region-sets (combined
+patterns accumulate all matches' ranges into one set), resolves the language via
+`injection.self` / `injection.parent` (threaded `self_lang`/`parent_lang`), and
+masks named children unless `injection.include-children` (`content_ranges`).
+`build_injection_layers` is a breadth-first walk that recurses into each layer's
+own injections to `MAX_INJECTION_DEPTH`; the painter clips a layer's captures to
+its `ranges` (so a combined node spanning the gap paints only within them). A
+second fixture grammar, `tree-sitter-md`, drives cross-language / nested / combined
+tests. Tested in [`syntax.rs`](../../crates/nxvim/tests/syntax.rs) "injections
+bridge, Phase 0/1/2/3" (markdown → rust fence, markdown → rust → rust nesting,
+`injection.self`, combined split-comment).
+*Phase 4* — the platform half needed no new plumbing: the snapshot parser binding
+already honors `set_included_ranges` and `LanguageTree.new` resolves its injection
+query via the bridge's `query.get`, so the vendored `LanguageTree:parse(true)`
+builds injected child trees over nxvim's snapshot. Verified end to end —
+`children()` / `language_for_range` / `get_node(…, ignore_injections=false)` resolve
+the injected language (`treesitter_lua.rs`), and a **drift oracle** asserts the
+engine's paint agrees with the vendored `_get_injections` for the same buffer
+(`syntax.rs` `the_engine_paint_agrees_with_the_platform_injection_resolution`).
+This is the fifth worked instance of
 [ADR 0001](../decisions/0001-native-engines-vendored-lua-apis.md)'s bridge
 pattern, and the deepest: it extends the
 [query-resolution bridge](2026-06-08-treesitter-query-bridge-design.md) one name

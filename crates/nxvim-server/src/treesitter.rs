@@ -84,7 +84,8 @@ impl Server {
 
     /// The buffer-open half of the query-resolution bridge (ADR 0001, #4): the
     /// first time a buffer of some language is about to be highlighted, resolve its
-    /// `highlights` / `indents` queries through the faithful vendored Lua resolver
+    /// `highlights` / `indents` / `injections` queries through the faithful vendored
+    /// Lua resolver
     /// (which walks the runtimepath — base `queries/<lang>/`, `;extends` /
     /// `;inherits` modelines, and `after/queries/<lang>/` overlays) and offer the
     /// merged string to the engine. The engine keeps the override only when it
@@ -103,7 +104,7 @@ impl Server {
         if !self.ts_resolved_langs.insert(lang.clone()) {
             return; // already resolved this language's on-disk overlays
         }
-        for name in ["highlights", "indents"] {
+        for name in ["highlights", "indents", "injections"] {
             match self.lua.resolve_ts_query(&lang, name) {
                 Ok(text) => self.editor.set_resolved_ts_query(&lang, name, text),
                 Err(e) => self.editor.echo(format!(

@@ -19,8 +19,8 @@ use tree_sitter::{Language, Parser, Query};
 /// The query-text overrides the engine holds, keyed by `(lang, query_name)` —
 /// the store [`Grammar::load`] consults in place of the on-disk query, and the
 /// landing point of the query-resolution bridge (Lua resolves the merged string,
-/// the engine compiles + caches + executes it). Only `highlights` / `indents`
-/// (the paint-driving names) are ever present. See
+/// the engine compiles + caches + executes it). Only the paint-relevant names
+/// `highlights` / `indents` / `injections` are ever present. See
 /// [`Engine::set_query`](crate::engine::Engine::set_query).
 pub type QueryOverrides = HashMap<(String, String), String>;
 
@@ -38,15 +38,18 @@ pub enum LoadError {
 }
 
 /// A loaded grammar: the dynamic library (kept alive because `language` borrows
-/// code inside it), the `Language`, the compiled highlights `Query`, and an
-/// optional compiled indents `Query` (treesitter indentation; absent when the
-/// language ships no `indents.scm`).
+/// code inside it), the `Language`, the compiled highlights `Query`, an optional
+/// compiled indents `Query` (treesitter indentation), and an optional compiled
+/// injections `Query` (the injection-query bridge — which patterns mark a node's
+/// text as another language). Both optionals are absent when the language ships no
+/// `indents.scm` / `injections.scm`.
 pub struct Grammar {
-    // Field order matters: `language`/`query`/`indents` drop before `_lib`, so the
-    // loaded code outlives anything pointing into it.
+    // Field order matters: `language`/`query`/`indents`/`injections` drop before
+    // `_lib`, so the loaded code outlives anything pointing into it.
     pub language: Language,
     pub query: Query,
     pub indents: Option<Query>,
+    pub injections: Option<Query>,
     _lib: libloading::Library,
 }
 
@@ -105,40 +108,58 @@ impl Grammar {
             .with_context(|| format!("compiling {lang} highlights"))
             .map_err(LoadError::Failed)?;
 
-        // `indents.scm` is optional: a language with no indent query simply has no
-        // treesitter indentation (the editor falls back). A *present* file that
+        // `indents.scm` / `injections.scm` are optional: a language with no indent
+        // query simply has no treesitter indentation (the editor falls back); one
+        // with no injection query has no sub-language layers. A *present* file that
         // fails to compile is a real error, surfaced like a broken highlights query.
-        let indents = match overrides.get(&(lang.to_string(), "indents".to_string())) {
-            Some(text) => Some(
-                Query::new(&language, text)
-                    .with_context(|| format!("compiling {lang} indents"))
-                    .map_err(LoadError::Failed)?,
-            ),
-            None => {
-                let indents_path = query_path(data_dir, lang, "indents.scm");
-                match std::fs::read_to_string(&indents_path) {
-                    Ok(src) => Some(
-                        Query::new(&language, &src)
-                            .with_context(|| format!("compiling {lang} indents"))
-                            .map_err(LoadError::Failed)?,
-                    ),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => {
-                        return Err(LoadError::Failed(
-                            anyhow::Error::new(e)
-                                .context(format!("reading {}", indents_path.display())),
-                        ))
-                    }
-                }
-            }
-        };
+        let indents = load_optional_query(data_dir, lang, &language, "indents", overrides)?;
+        let injections = load_optional_query(data_dir, lang, &language, "injections", overrides)?;
 
         Ok(Grammar {
             language,
             query,
             indents,
+            injections,
             _lib: lib,
         })
+    }
+}
+
+/// Load and compile an **optional** query (`indents.scm`, `injections.scm`): the
+/// `overrides` entry wins, else the on-disk `<name>.scm`, else `None` when no file
+/// exists. A present-but-broken source — override *or* disk — is a real
+/// [`LoadError::Failed`], surfaced like a broken highlights query (no silent
+/// stubs). The required `highlights` query is loaded separately, since its absence
+/// is itself a failure.
+fn load_optional_query(
+    data_dir: &Path,
+    lang: &str,
+    language: &Language,
+    name: &str,
+    overrides: &QueryOverrides,
+) -> Result<Option<Query>, LoadError> {
+    let src = match overrides.get(&(lang.to_string(), name.to_string())) {
+        Some(text) => Some(text.clone()),
+        None => {
+            let path = query_path(data_dir, lang, &format!("{name}.scm"));
+            match std::fs::read_to_string(&path) {
+                Ok(src) => Some(src),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(LoadError::Failed(
+                        anyhow::Error::new(e).context(format!("reading {}", path.display())),
+                    ))
+                }
+            }
+        }
+    };
+    match src {
+        Some(s) => Ok(Some(
+            Query::new(language, &s)
+                .with_context(|| format!("compiling {lang} {name}"))
+                .map_err(LoadError::Failed)?,
+        )),
+        None => Ok(None),
     }
 }
 

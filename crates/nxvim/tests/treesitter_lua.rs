@@ -498,3 +498,68 @@ async fn language_inspect_reports_symbols() {
 
     assert_eq!(v.as_str(), Some("true,true"));
 }
+
+// ----- injected child trees on the platform (injections Phase 4) ------------
+// The vendored `LanguageTree` runs `_get_injections` over nxvim's snapshot
+// primitives — `parse(true)` builds injected child trees, `children()` lists them,
+// and `language_for_range` / `get_node(…, ignore_injections=false)` resolve the
+// *injected* language at a position. Self-injection (rust-in-rust) exercises the
+// whole path with the one fixture grammar.
+
+/// `parse(true)` builds an injected child `LanguageTree`, and `language_for_range`
+/// inside the injected region resolves to the child language.
+#[tokio::test]
+async fn parser_builds_injected_children_and_resolves_language_for_range() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        vim.treesitter.query.set('rust', 'injections',
+          '((string_content) @injection.content (#set! injection.language "rust"))')
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'const S: &str = "fn z() {}";' })
+        local p = vim.treesitter.get_parser(0, 'rust')
+        p:parse(true) -- include injected children
+        local kids = {}
+        for lang in pairs(p:children()) do kids[#kids + 1] = lang end
+        -- column 17 sits in the string body (the injected rust region).
+        local child = p:language_for_range({ 0, 17, 0, 17 })
+        return #kids .. '|' .. table.concat(kids, ',') .. '|' .. (child and child:lang() or 'nil')
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("1|rust|rust"));
+}
+
+/// `get_node(…, ignore_injections = false)` descends into the injected child tree
+/// and returns the *injected* grammar's node, where the default (host) resolution
+/// stops at the host's flat node.
+#[tokio::test]
+async fn get_node_descends_into_the_injected_tree() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        vim.treesitter.query.set('rust', 'injections',
+          '((string_content) @injection.content (#set! injection.language "rust"))')
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'const S: &str = "fn z() {}";' })
+        local p = vim.treesitter.get_parser(0, 'rust')
+        p:parse(true)
+        -- (0,17) is the `f` of the injected `fn`. The host paints the whole body as
+        -- one `string_content`; descending into the injection yields the rust item.
+        local host = vim.treesitter.get_node({ bufnr = 0, lang = 'rust', pos = { 0, 17 } })
+        local inj = vim.treesitter.get_node(
+          { bufnr = 0, lang = 'rust', pos = { 0, 17 }, ignore_injections = false })
+        return (host and host:type() or 'nil') .. '|' .. (inj and inj:type() or 'nil')
+        "#,
+    )
+    .await;
+
+    assert_eq!(v.as_str(), Some("string_content|function_item"));
+}

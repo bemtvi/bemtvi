@@ -171,8 +171,9 @@ do
   end
 
   -- Wrap `query.set` to (1) store the override the same as upstream and (2) signal
-  -- the server which query changed. Only `highlights` / `indents` drive the
-  -- engine's paint; other names (folds, injections, textobjects, …) update only
+  -- the server which query changed. Only the paint-relevant names drive the engine:
+  -- `highlights` / `indents` paint directly, `injections` feeds the sub-language
+  -- layers built on the root tree. Other names (folds, textobjects, …) update only
   -- the Lua side, exactly as before.
   local orig_set = tsquery.set
   function tsquery.set(lang, name, text)
@@ -182,7 +183,7 @@ do
     else
       was_set[key(lang, name)] = nil
     end
-    if name == 'highlights' or name == 'indents' then
+    if name == 'highlights' or name == 'indents' or name == 'injections' then
       vim._ts_set_query(lang, name)
     end
   end

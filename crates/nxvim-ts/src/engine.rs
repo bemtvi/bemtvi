@@ -6,7 +6,7 @@
 //! — not the file. Highlights are extracted by running the grammar's query over
 //! just the requested line range.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,12 +28,54 @@ const LINE_TYPE: LineType = LineType::LF_CR;
 /// than a hang. Generous enough that a normal incremental reparse never trips it.
 const PARSE_DEADLINE: Duration = Duration::from_millis(50);
 
+/// Wall-clock budget for **all** of a buffer's child (injection) parses on one
+/// refresh, the injection analogue of [`PARSE_DEADLINE`]. Injected regions reparse
+/// per edit, so an adversarial config (many regions, or a pathological child
+/// grammar) could otherwise stall the edit path. On expiry the remaining child
+/// parses are cancelled and their last-good (edit-shifted) trees are kept, so the
+/// cost is one frame of stale injected highlights rather than a hang.
+const INJECTION_DEADLINE: Duration = Duration::from_millis(50);
+
+/// How deep injected layers may nest (host → injected → injected-within-injected →
+/// …). Markdown → rust → regex is two levels; real configs rarely exceed three.
+/// The bound caps a pathological or cyclic config (e.g. a self-injection that keeps
+/// finding regions) from building unbounded layers each frame; past it, deeper
+/// regions are dropped.
+const MAX_INJECTION_DEPTH: usize = 4;
+
 /// Per-buffer parse state.
 struct BufferState {
     shadow: Rope,
     parser: Parser,
     tree: Option<Tree>,
     language: String,
+    /// Injected sub-language layers, re-derived from the root tree after each
+    /// reparse (and when the injection query changes). Empty when the grammar
+    /// ships no injection query or no region matches. See
+    /// [`Engine::rebuild_injection_layers`].
+    injections: Vec<InjectionLayer>,
+}
+
+/// One injected sub-language layer: a child grammar's parse of the host buffer
+/// restricted (via `Parser::set_included_ranges`) to the injected region(s) — the
+/// rust inside a `vim.cmd[[…]]`, or rust inside a string.
+///
+/// The child parses *through* `included_ranges` over the buffer shadow, so `tree`'s
+/// byte/point coordinates are **buffer-absolute** — no per-layer offset and no
+/// substring copy. This is faithful for position-sensitive grammars and lets one
+/// combined layer own several ranges. The layer is keyed by `language` for
+/// incremental reparse: across an edit the old tree is `edit`ed and reused as the
+/// parse hint rather than rebuilt from scratch.
+struct InjectionLayer {
+    /// The injected language (already normalized, e.g. `rust`); looked up in the
+    /// grammar cache to find the child highlights query.
+    language: String,
+    /// The child parse tree, in buffer coordinates.
+    tree: Tree,
+    /// The buffer byte ranges this layer covers. A combined layer owns several; a
+    /// node spanning the gap between two ranges must paint only *within* them, so
+    /// the painter clips this layer's captures to these ranges.
+    ranges: Vec<Range<usize>>,
 }
 
 impl BufferState {
@@ -70,7 +112,9 @@ impl BufferState {
 /// load failure. Cached on first use, so the dlopen (and its outcome) happen
 /// once per language, not once per keystroke.
 enum Slot {
-    Loaded(Grammar),
+    // Boxed: a loaded `Grammar` (a `Language` + several compiled `Query`s) dwarfs
+    // the other two variants, so inline storage would bloat every absent slot.
+    Loaded(Box<Grammar>),
     /// No parser installed — silent.
     NotInstalled,
     /// Installed but broken; the reason to echo.
@@ -103,7 +147,7 @@ impl Engine {
     fn grammar(&mut self, lang: &str) -> &Slot {
         if !self.grammars.contains_key(lang) {
             let slot = match Grammar::load(&self.data_dir, lang, &self.query_overrides) {
-                Ok(g) => Slot::Loaded(g),
+                Ok(g) => Slot::Loaded(Box::new(g)),
                 Err(LoadError::NotInstalled) => Slot::NotInstalled,
                 Err(LoadError::Failed(e)) => Slot::Failed(format!("{e:#}")),
             };
@@ -116,8 +160,9 @@ impl Engine {
     /// `(lang, name)` — the engine half of the query-resolution bridge. Lua has
     /// already merged `query.set` / `after/queries` / `;extends` into the final
     /// `text`; here the engine compiles + caches it, consulting it in place of the
-    /// on-disk query. Only the paint-driving names `highlights` / `indents` reach
-    /// the engine; any other name is a no-op (folds/injections stay Lua-side).
+    /// on-disk query. Only the paint-relevant names ([`is_engine_query`] —
+    /// `highlights` / `indents` / `injections`) reach the engine; any other name is
+    /// a no-op (`folds` / `textobjects` stay Lua-side).
     ///
     /// If the grammar is already loaded, the affected query is recompiled **in
     /// place** against the live `Language` — never by evicting the grammar, whose
@@ -131,7 +176,7 @@ impl Engine {
         name: &str,
         text: Option<String>,
     ) -> Result<(), String> {
-        if name != "highlights" && name != "indents" {
+        if !is_engine_query(name) {
             return Ok(());
         }
         let key = (lang.to_string(), name.to_string());
@@ -143,7 +188,16 @@ impl Engine {
                 self.query_overrides.remove(&key);
             }
         }
-        self.recompile_query(lang, name, text)
+        self.recompile_query(lang, name, text)?;
+        // A changed injection query re-derives every affected buffer's child layers
+        // (they are a function of this query over each buffer's tree). `highlights`
+        // / `indents` need no rebuild — the painter reads them straight off the
+        // grammar each frame. Skipped on a compile failure (handled above), so a
+        // bad query leaves the prior layers in place rather than dropping them.
+        if name == "injections" {
+            self.rebuild_injection_layers_for_lang(lang);
+        }
+        Ok(())
     }
 
     /// Install a resolved on-disk overlay only when it differs from the base file
@@ -158,7 +212,7 @@ impl Engine {
         name: &str,
         text: Option<String>,
     ) -> Result<(), String> {
-        if name != "highlights" && name != "indents" {
+        if !is_engine_query(name) {
             return Ok(());
         }
         // The base file content (None when absent). A resolved overlay equal to it
@@ -223,9 +277,230 @@ impl Engine {
                     None => None,
                 };
             }
+            "injections" => {
+                g.injections = match src {
+                    Some(s) => Some(
+                        Query::new(&g.language, &s)
+                            .map_err(|e| format!("compiling {lang} injections: {e}"))?,
+                    ),
+                    None => None,
+                };
+            }
             _ => unreachable!("guarded above"),
         }
         Ok(())
+    }
+
+    /// Re-derive every open buffer's injection layers — the rebuild a changed
+    /// injection query triggers. *All* buffers, not just those whose top-level
+    /// language matches: with nesting, a buffer of language A can carry a layer of
+    /// language B (e.g. a markdown buffer's injected rust), so a change to B's
+    /// injection query must refresh A too. A query change is config-time and rare,
+    /// so rebuilding every buffer is cheap enough. Buffer ids are collected first so
+    /// the per-buffer rebuild can take `&mut self`.
+    fn rebuild_injection_layers_for_lang(&mut self, _lang: &str) {
+        let ids: Vec<BufferId> = self.buffers.keys().copied().collect();
+        for id in ids {
+            self.rebuild_injection_layers(id);
+        }
+    }
+
+    /// Re-derive a buffer's injected child layers from scratch (drops the old child
+    /// trees) — the rebuild for buffer-open and an injection-query change, where the
+    /// query (or buffer) is new so there is nothing to reparse incrementally from.
+    fn rebuild_injection_layers(&mut self, buffer: BufferId) {
+        let regions = self.top_level_injection_regions(buffer);
+        self.build_injection_layers(buffer, regions, HashMap::new());
+    }
+
+    /// Re-derive a buffer's injected child layers **incrementally** after an edit.
+    /// Each surviving child tree is `edit`ed with this frame's deltas and reused as
+    /// the parse hint for the region of its language, so unchanged subtrees are not
+    /// reparsed (and it doubles as the last-good fallback under the parse budget).
+    fn update_injection_layers(&mut self, buffer: BufferId, edits: &[InputEdit]) {
+        // Lift the old layers out, shifting each tree by this frame's deltas so it
+        // can serve as an incremental reparse hint for its language's new region(s).
+        let old_by_lang = {
+            let Some(state) = self.buffers.get_mut(&buffer) else {
+                return;
+            };
+            let mut map: HashMap<String, Vec<Tree>> = HashMap::new();
+            for mut layer in std::mem::take(&mut state.injections) {
+                for e in edits {
+                    layer.tree.edit(e);
+                }
+                map.entry(layer.language).or_default().push(layer.tree);
+            }
+            map
+        };
+        let regions = self.top_level_injection_regions(buffer);
+        self.build_injection_layers(buffer, regions, old_by_lang);
+    }
+
+    /// Run the host grammar's injection query over the root tree and resolve the
+    /// matches to `(language, ranges)` region-sets — the top (depth-1) of the layer
+    /// tree. The host is the query's `injection.self`; it has no parent. `&self` (no
+    /// grammar load), so it can borrow the buffer + grammar caches together and
+    /// return owned data the caller then builds with `&mut self`.
+    fn top_level_injection_regions(&self, buffer: BufferId) -> Vec<(String, Vec<Range<usize>>)> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Vec::new();
+        };
+        match self.grammars.get(&state.language) {
+            Some(Slot::Loaded(host)) => match host.injections.as_ref() {
+                Some(query) => collect_injection_regions(
+                    query,
+                    tree,
+                    &state.shadow,
+                    Some(&state.language),
+                    None,
+                ),
+                None => Vec::new(), // no injection query → no layers
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Run `query_lang`'s injection query over a child `tree` to find the regions it
+    /// injects — one level of nesting. `injection.self` resolves to `query_lang`,
+    /// `injection.parent` to `parent_lang` (the language that injected this layer).
+    fn nested_injection_regions(
+        &self,
+        query_lang: &str,
+        tree: &Tree,
+        buffer: BufferId,
+        parent_lang: &str,
+    ) -> Vec<(String, Vec<Range<usize>>)> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let Some(Slot::Loaded(g)) = self.grammars.get(query_lang) else {
+            return Vec::new();
+        };
+        let Some(query) = g.injections.as_ref() else {
+            return Vec::new();
+        };
+        collect_injection_regions(
+            query,
+            tree,
+            &state.shadow,
+            Some(query_lang),
+            Some(parent_lang),
+        )
+    }
+
+    /// Build the child layers for `regions` (each a `(language, ranges)` region-set),
+    /// reusing the edit-shifted trees in `old_by_lang` (FIFO per language) as
+    /// incremental parse hints — empty for a full rebuild. Each set is parsed by its
+    /// child grammar restricted to its ranges via `included_ranges` (so one combined
+    /// injection's many ranges form one tree, and the tree is in buffer coordinates).
+    ///
+    /// Nesting is a breadth-first walk: after a layer parses, its own grammar's
+    /// injection query runs over it to enqueue the regions *it* injects, down to
+    /// [`MAX_INJECTION_DEPTH`]. Shallower layers are pushed first, so the painter's
+    /// layer rank (vector order) already makes a deeper layer win over a shallower.
+    ///
+    /// A missing or broken child grammar is silently skipped (best-effort) and the
+    /// region keeps the host's flat paint. The whole pass is bounded by
+    /// [`INJECTION_DEADLINE`]: once over budget a cancelled parse falls back to its
+    /// (edit-shifted) old tree — one frame stale, never a hang. Runs entirely in Rust
+    /// (no Lua), so it is safe off the synchronous redraw path.
+    fn build_injection_layers(
+        &mut self,
+        buffer: BufferId,
+        regions: Vec<(String, Vec<Range<usize>>)>,
+        mut old_by_lang: HashMap<String, Vec<Tree>>,
+    ) {
+        // The host language injected the top-level regions; it is their parent for
+        // the `injection.parent` directive when those layers are queried in turn.
+        let Some(host_lang) = self.buffers.get(&buffer).map(|s| s.language.clone()) else {
+            return;
+        };
+        let started = Instant::now();
+        let mut layers = Vec::with_capacity(regions.len());
+        // (language, ranges, depth, injector) — `injector` is the language that
+        // injected this region, used as `injection.parent` when recursing into it.
+        let mut queue: VecDeque<(String, Vec<Range<usize>>, usize, String)> = regions
+            .into_iter()
+            .map(|(lang, ranges)| (lang, ranges, 1, host_lang.clone()))
+            .collect();
+
+        while let Some((language, mut ranges, depth, injector)) = queue.pop_front() {
+            // Lazily load (cache) the child grammar; skip silently if it is missing
+            // or broken — the region just keeps the host's flat paint.
+            let child_language = match self.grammar(&language) {
+                Slot::Loaded(g) => g.language.clone(),
+                _ => continue,
+            };
+            let mut parser = Parser::new();
+            if parser.set_language(&child_language).is_err() {
+                continue;
+            }
+            // An edit-shifted tree of this language, reused as the incremental parse
+            // hint and the stale fallback if this frame's parse is cancelled.
+            let old = old_by_lang.get_mut(&language).and_then(Vec::pop);
+
+            // `included_ranges` must be ascending and non-overlapping.
+            ranges.sort_by_key(|r| r.start);
+            let Some(state) = self.buffers.get(&buffer) else {
+                return;
+            };
+            let shadow = &state.shadow;
+            let included: Vec<tree_sitter::Range> =
+                ranges.iter().map(|r| ts_range(shadow, r)).collect();
+            if included.is_empty() || parser.set_included_ranges(&included).is_err() {
+                continue;
+            }
+            let tree = {
+                let mut budget = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
+                    if started.elapsed() >= INJECTION_DEADLINE {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                };
+                let options = ParseOptions::new().progress_callback(&mut budget);
+                let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
+                parser.parse_with_options(&mut callback, old.as_ref(), Some(options))
+            };
+            let tree = match tree {
+                Some(tree) => tree,
+                // Budget exhausted (or parse cancelled): keep the last-good child
+                // tree if there is one, painting one frame stale. A brand-new region
+                // with no prior tree is dropped this frame and re-attempted next.
+                None => {
+                    if let Some(tree) = old {
+                        layers.push(InjectionLayer {
+                            language,
+                            tree,
+                            ranges,
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            // Nesting: enqueue the regions this layer itself injects, one level down.
+            if depth < MAX_INJECTION_DEPTH {
+                for (lang, sub) in
+                    self.nested_injection_regions(&language, &tree, buffer, &injector)
+                {
+                    queue.push_back((lang, sub, depth + 1, language.clone()));
+                }
+            }
+            layers.push(InjectionLayer {
+                language,
+                tree,
+                ranges,
+            });
+        }
+
+        if let Some(state) = self.buffers.get_mut(&buffer) {
+            state.injections = layers;
+        }
     }
 
     /// (Re)initialize a buffer from full text and do the initial parse. The
@@ -248,9 +523,11 @@ impl Engine {
             parser,
             tree: None,
             language: lang.to_string(),
+            injections: Vec::new(),
         };
         state.reparse();
         self.buffers.insert(buffer, state);
+        self.rebuild_injection_layers(buffer);
         OpenOutcome::Ok
     }
 
@@ -259,6 +536,9 @@ impl Engine {
         let Some(state) = self.buffers.get_mut(&buffer) else {
             return; // never opened; the editor opens before editing
         };
+        // The deltas that actually applied, kept so the same edits can be replayed
+        // onto each injected child tree for its incremental reparse.
+        let mut applied: Vec<InputEdit> = Vec::new();
         for e in edits {
             // Defend the shadow against a bad delta: an out-of-range, mis-ordered,
             // or mid-codepoint range would panic ropey and leave the shadow and
@@ -286,18 +566,24 @@ impl Engine {
             if !e.text.is_empty() && state.shadow.try_insert(e.start_byte, &e.text).is_err() {
                 continue;
             }
+            let input_edit = InputEdit {
+                start_byte: e.start_byte,
+                old_end_byte: e.old_end_byte,
+                new_end_byte: e.new_end_byte,
+                start_position: point(e.start_point),
+                old_end_position: point(e.old_end_point),
+                new_end_position: point(e.new_end_point),
+            };
             if let Some(tree) = state.tree.as_mut() {
-                tree.edit(&InputEdit {
-                    start_byte: e.start_byte,
-                    old_end_byte: e.old_end_byte,
-                    new_end_byte: e.new_end_byte,
-                    start_position: point(e.start_point),
-                    old_end_position: point(e.old_end_point),
-                    new_end_position: point(e.new_end_point),
-                });
+                tree.edit(&input_edit);
             }
+            applied.push(input_edit);
         }
         state.reparse();
+        // The injected regions move with every edit, so re-derive the child layers
+        // from the fresh root tree — incrementally, replaying `applied` onto the
+        // surviving child trees. `state`'s borrow ends at the line above.
+        self.update_injection_layers(buffer, &applied);
     }
 
     /// Forget a buffer's shadow text and parse tree (the editor deleted it).
@@ -310,7 +596,9 @@ impl Engine {
         self.buffers.get(&buffer).map(|b| b.language.as_str())
     }
 
-    /// Extract highlight spans for the visible line range `[first_line, last_line)`.
+    /// Extract highlight spans for the visible line range `[first_line, last_line)`,
+    /// merging the host tree with any injected child layers (each painting over the
+    /// host within its region — neovim's "injected language wins" rule).
     pub fn highlights(
         &mut self,
         buffer: BufferId,
@@ -323,10 +611,30 @@ impl Engine {
         let Some(tree) = state.tree.as_ref() else {
             return Vec::new();
         };
-        let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
+        let Some(Slot::Loaded(host)) = self.grammars.get(&state.language) else {
             return Vec::new();
         };
-        extract_spans(grammar, tree, &state.shadow, first_line, last_line)
+
+        // Layer 0 is the host tree. Each loaded injected child contributes a deeper
+        // layer that paints over it; all layers' nodes are in buffer coordinates
+        // (the children parse through `included_ranges`), so the painter reads every
+        // layer's predicate text from the one shadow. A child whose grammar isn't
+        // loaded contributes nothing (the host paint stands).
+        let mut layers = vec![Layer {
+            query: &host.query,
+            tree,
+            ranges: &[], // the host covers the whole buffer — no clipping
+        }];
+        for inj in &state.injections {
+            if let Some(Slot::Loaded(child)) = self.grammars.get(&inj.language) {
+                layers.push(Layer {
+                    query: &child.query,
+                    tree: &inj.tree,
+                    ranges: &inj.ranges,
+                });
+            }
+        }
+        extract_spans(&layers, &state.shadow, first_line, last_line)
     }
 
     /// Target indent **width in columns** for the 0-indexed `line`, by running the
@@ -618,59 +926,90 @@ impl SyntaxEngine for Engine {
     }
 }
 
-/// Run the highlights query over the byte range covering the visible lines and
-/// resolve the captures into per-line byte spans (most-specific capture wins).
+/// One capture source the painter merges: a compiled `query` run over `tree`. Both
+/// the host tree and every injected child tree have buffer-absolute coordinates
+/// (the children parse through `included_ranges`), so all layers share the one
+/// buffer shadow as their predicate text source and need no per-layer offset.
+///
+/// `ranges` clips this layer's captures: empty for the host (it covers everything),
+/// the injected ranges for a child — a combined child's node can span the gap
+/// between its ranges, and only the parts inside the ranges may paint.
+struct Layer<'a> {
+    query: &'a Query,
+    tree: &'a Tree,
+    ranges: &'a [Range<usize>],
+}
+
+/// Run each layer's query over the byte range covering the visible lines and
+/// resolve the captures into per-line byte spans. Within a layer the most-specific
+/// (narrowest) capture wins; across layers a deeper (injected) layer overwrites a
+/// shallower one inside its region — so injected highlighting paints over the host.
 fn extract_spans(
-    grammar: &Grammar,
-    tree: &Tree,
-    rope: &Rope,
+    layers: &[Layer],
+    shadow: &Rope,
     first_line: usize,
     last_line: usize,
 ) -> Vec<Span> {
-    let line_count = rope.len_lines(LINE_TYPE).saturating_sub(1);
+    let line_count = shadow.len_lines(LINE_TYPE).saturating_sub(1);
     let last_line = last_line.min(line_count);
     if first_line >= last_line {
         return Vec::new();
     }
-    let lo = rope.line_to_byte_idx(first_line, LINE_TYPE);
-    let hi = rope.line_to_byte_idx(last_line, LINE_TYPE);
+    let lo = shadow.line_to_byte_idx(first_line, LINE_TYPE);
+    let hi = shadow.line_to_byte_idx(last_line, LINE_TYPE);
 
-    let query = &grammar.query;
-    let names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-    cursor.set_byte_range(lo..hi);
-
-    // Collect captures intersecting the viewport as (start, end, group).
-    let mut raw: Vec<(usize, usize, &str)> = Vec::new();
-    let provider =
-        |node: Node| std::iter::once(node_bytes(rope, node.start_byte()..node.end_byte()));
-    let mut caps = cursor.captures(query, tree.root_node(), provider);
-    while let Some((m, idx)) = caps.next() {
-        let cap = m.captures[*idx];
-        let name = names[cap.index as usize];
-        if name.starts_with('_') {
-            continue; // internal/predicate capture, not a highlight group
-        }
-        let (s, e) = (cap.node.start_byte(), cap.node.end_byte());
-        if e > s {
-            raw.push((s, e, name));
+    // Collect captures intersecting the viewport as (start, end, group, layer), all
+    // in buffer coordinates. A child tree only holds nodes inside its included
+    // ranges, so restricting its cursor to the viewport already bounds it to the
+    // visible part of the injected region.
+    let mut raw: Vec<(usize, usize, &str, usize)> = Vec::new();
+    for (rank, layer) in layers.iter().enumerate() {
+        let names = layer.query.capture_names();
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(lo..hi);
+        let provider =
+            |node: Node| std::iter::once(node_bytes(shadow, node.start_byte()..node.end_byte()));
+        let mut caps = cursor.captures(layer.query, layer.tree.root_node(), provider);
+        while let Some((m, idx)) = caps.next() {
+            let cap = m.captures[*idx];
+            let name = names[cap.index as usize];
+            if name.starts_with('_') {
+                continue; // internal/predicate capture, not a highlight group
+            }
+            let (s, e) = (cap.node.start_byte(), cap.node.end_byte());
+            if e <= s {
+                continue;
+            }
+            if layer.ranges.is_empty() {
+                raw.push((s, e, name, rank)); // host: no clipping
+            } else {
+                // Child: clip to the injected ranges so a node spanning the gap
+                // between a combined layer's ranges paints only within them.
+                for r in layer.ranges {
+                    let (cs, ce) = (s.max(r.start), e.min(r.end));
+                    if cs < ce {
+                        raw.push((cs, ce, name, rank));
+                    }
+                }
+            }
         }
     }
-    drop(caps);
 
-    // Broadest spans first so narrower (more specific) captures overwrite them.
-    raw.sort_by_key(|(s, e, _)| (std::cmp::Reverse(e - s), *s));
+    // Fill order: shallower layers first, then broadest-first within a layer, so a
+    // later write always wins — a deeper layer over a shallower one, and a narrower
+    // capture over a broader one within the same layer.
+    raw.sort_by_key(|(s, e, _, rank)| (*rank, std::cmp::Reverse(e - s), *s));
 
     let mut out = Vec::new();
     for line in first_line..last_line {
-        let line_start = rope.line_to_byte_idx(line, LINE_TYPE);
-        let text = rope.line(line, LINE_TYPE).to_string();
+        let line_start = shadow.line_to_byte_idx(line, LINE_TYPE);
+        let text = shadow.line(line, LINE_TYPE).to_string();
         let content_len = text.trim_end_matches(['\n', '\r']).len();
         if content_len == 0 {
             continue;
         }
         let mut groups: Vec<Option<&str>> = vec![None; content_len];
-        for &(s, e, name) in &raw {
+        for &(s, e, name, _) in &raw {
             if e <= line_start || s >= line_start + content_len {
                 continue;
             }
@@ -705,6 +1044,160 @@ fn extract_spans(
     out
 }
 
+/// Run the injection `query` over `tree` and resolve each match to its
+/// `(language, ranges)` region-sets — the directive interpreter, a faithful port of
+/// `languagetree.lua::_get_injection` + `add_injection`.
+///
+/// `self_lang` is the language whose tree this is (the query's `injection.self`);
+/// `parent_lang` is the language that injected it (`injection.parent`), absent at
+/// the host. The language is resolved in upstream's order: `injection.self` >
+/// `injection.parent` > a static `(#set! injection.language "<lang>")`, then a
+/// dynamic `@injection.language` capture's **node text** overrides all (e.g. a
+/// markdown fence's `info_string`). Content ranges come from each
+/// `@injection.content` node, with non-`include-children` masking out named
+/// children. A `(#set! injection.combined)` pattern accumulates all its matches'
+/// ranges into one region-set (one child tree); otherwise each match is its own set.
+/// A match with no resolvable language, or no ranges, is skipped.
+fn collect_injection_regions(
+    query: &Query,
+    tree: &Tree,
+    rope: &Rope,
+    self_lang: Option<&str>,
+    parent_lang: Option<&str>,
+) -> Vec<(String, Vec<Range<usize>>)> {
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let provider =
+        |node: Node| std::iter::once(node_bytes(rope, node.start_byte()..node.end_byte()));
+    let mut out: Vec<(String, Vec<Range<usize>>)> = Vec::new();
+    // Combined region-sets are keyed by (language, pattern) to an index into `out`,
+    // so every match of a combined pattern appends to the same set.
+    let mut combined_set: HashMap<(String, usize), usize> = HashMap::new();
+    let mut matches = cursor.matches(query, tree.root_node(), provider);
+    while let Some(m) = matches.next() {
+        let props = query.property_settings(m.pattern_index);
+        let has = |key: &str| props.iter().any(|p| &*p.key == key);
+        let combined = has("injection.combined");
+        let include_children = has("injection.include-children");
+        // Base language: the self / parent directive, else the static `#set!` tag.
+        let base = if has("injection.self") {
+            self_lang
+        } else if has("injection.parent") {
+            parent_lang
+        } else {
+            props.iter().find_map(|p| {
+                (&*p.key == "injection.language")
+                    .then_some(p.value.as_deref())
+                    .flatten()
+            })
+        };
+        // A dynamic `@injection.language` node text overrides the base; gather it and
+        // the content ranges in one pass over the captures.
+        let mut dynamic_lang: Option<String> = None;
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for cap in m.captures {
+            match names[cap.index as usize] {
+                "injection.language" => {
+                    let (s, e) = (cap.node.start_byte(), cap.node.end_byte());
+                    if let Ok(text) = String::from_utf8(node_bytes(rope, s..e)) {
+                        dynamic_lang = Some(text);
+                    }
+                }
+                "injection.content" => {
+                    for r in content_ranges(cap.node, include_children) {
+                        if r.end > r.start {
+                            ranges.push(r);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(language) = dynamic_lang.as_deref().or(base).and_then(normalize_lang) else {
+            continue; // no resolvable language for this match
+        };
+        if ranges.is_empty() {
+            continue; // an empty set would be read as "the whole buffer"
+        }
+        if combined {
+            match combined_set.get(&(language.clone(), m.pattern_index)) {
+                Some(&idx) => out[idx].1.extend(ranges),
+                None => {
+                    combined_set.insert((language.clone(), m.pattern_index), out.len());
+                    out.push((language, ranges));
+                }
+            }
+        } else {
+            out.push((language, ranges));
+        }
+    }
+    out
+}
+
+/// The injected byte ranges of one `@injection.content` node. With
+/// `include_children` (or a leaf node) it is the node's whole range; otherwise the
+/// named children are masked out, leaving the gaps around them — a faithful port of
+/// `languagetree.lua::get_node_ranges`.
+fn content_ranges(node: Node, include_children: bool) -> Vec<Range<usize>> {
+    let (start, end) = (node.start_byte(), node.end_byte());
+    if include_children || node.named_child_count() == 0 {
+        // One range element — `once` (not a `vec!`/array literal) so it can't be
+        // misread as expanding the range into a Vec of indices.
+        return std::iter::once(start..end).collect();
+    }
+    let mut ranges = Vec::new();
+    let mut cur = start;
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i as u32) else {
+            continue;
+        };
+        let (cs, ce) = (child.start_byte(), child.end_byte());
+        if cs > cur {
+            ranges.push(cur..cs);
+        }
+        cur = ce;
+    }
+    if end > cur {
+        ranges.push(cur..end);
+    }
+    ranges
+}
+
+/// A tree-sitter `Range` for the buffer byte range `r`, with its `Point`s computed
+/// from the shadow — what [`Parser::set_included_ranges`] needs to restrict a child
+/// parse to an injected region.
+fn ts_range(shadow: &Rope, r: &Range<usize>) -> tree_sitter::Range {
+    tree_sitter::Range {
+        start_byte: r.start,
+        end_byte: r.end,
+        start_point: point_at(shadow, r.start),
+        end_point: point_at(shadow, r.end),
+    }
+}
+
+/// The `(row, col)` point of buffer byte `byte` in the shadow.
+fn point_at(shadow: &Rope, byte: usize) -> Point {
+    let line = shadow.byte_to_line_idx(byte, LINE_TYPE);
+    let line_start = shadow.line_to_byte_idx(line, LINE_TYPE);
+    Point::new(line, byte - line_start)
+}
+
+/// Normalize an injection language name the way `languagetree.lua`'s `resolve_lang`
+/// does — strip whitespace, lowercase, `-`→`_` — and reject anything that isn't a
+/// legal grammar identifier. Returns `None` for an empty or invalid name (skipped).
+fn normalize_lang(raw: &str) -> Option<String> {
+    let norm: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+        .replace('-', "_");
+    if norm.is_empty() || !norm.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    Some(norm)
+}
+
 /// Bytes of `rope[range]`, walking chunks (no whole-buffer materialization).
 fn node_bytes(rope: &Rope, range: Range<usize>) -> Vec<u8> {
     let mut out = Vec::with_capacity(range.len());
@@ -733,4 +1226,13 @@ fn read_chunk(rope: &Rope, byte: usize) -> &[u8] {
 
 fn point((row, col): (usize, usize)) -> Point {
     Point::new(row, col)
+}
+
+/// Whether a query name is one the engine itself compiles + executes (the
+/// paint-relevant names), so a resolution-bridge push for it lands on the grammar.
+/// `highlights` and `indents` drive the paint directly; `injections` drives the
+/// sub-language layers built on top of the root tree. Every other resolved name
+/// (`folds`, `textobjects`, …) stays Lua-side and is a no-op here.
+fn is_engine_query(name: &str) -> bool {
+    matches!(name, "highlights" | "indents" | "injections")
 }

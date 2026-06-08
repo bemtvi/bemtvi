@@ -64,9 +64,13 @@ vt100 = "=0.16.2"
 tree-sitter = "=0.26.9"
 streaming-iterator = "=0.1.9"
 libloading = "=0.8.9"
-# Dev-only: a real grammar to compile into a test fixture (never linked into the
-# editor — nxvim loads grammars dynamically at runtime).
+# Dev-only: real grammars compiled into a test fixture (never linked into the
+# editor — nxvim loads grammars dynamically at runtime). `tree-sitter-md` is a host
+# grammar that injects (markdown fenced code blocks → the fence's language), so the
+# injection tests can exercise cross-language + nested injections, not just
+# rust-in-rust self-injection.
 tree-sitter-rust = "=0.24.2"
+tree-sitter-md = "=0.5.3"
 
 # LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP
 # design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and

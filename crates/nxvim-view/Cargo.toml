@@ -1,0 +1,12 @@
+[package]
+name = "nxvim-view"
+description = "Frontend-agnostic client model for nxvim: the redraw `View` decoder, a neutral style/border representation, and input key-notation encoding shared by every UI client (TUI, GUI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmpv.workspace = true

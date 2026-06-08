@@ -1088,6 +1088,7 @@ dependencies = [
  "nxvim-rpc",
  "nxvim-server",
  "nxvim-tui",
+ "nxvim-view",
  "portable-pty",
  "ratatui",
  "rmpv",
@@ -1178,10 +1179,18 @@ dependencies = [
  "crossterm",
  "futures",
  "nxvim-rpc",
+ "nxvim-view",
  "ratatui",
  "rmpv",
  "tokio",
  "unicode-width",
+]
+
+[[package]]
+name = "nxvim-view"
+version = "0.1.0"
+dependencies = [
+ "rmpv",
 ]
 
 [[package]]

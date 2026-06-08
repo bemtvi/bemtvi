@@ -1,37 +1,11 @@
-//! The scroll-animation state machine: the [`ScrollData`] gesture mirrored from
-//! a redraw, the in-flight [`Animation`] driven by the client clock, and the
-//! [`arm_animation`] lifecycle owner shared by the live loop and the test driver.
+//! The scroll-animation state machine: the in-flight [`Animation`] driven by the
+//! client clock, and the [`arm_animation`] lifecycle owner shared by the live
+//! loop and the test driver. The [`ScrollData`](nxvim_view::ScrollData) gesture
+//! it animates is decoded from the redraw in [`nxvim_view`].
 
-use ratatui::style::Style;
 use std::time::{Duration, Instant};
 
-use crate::parse::HlSpan;
-use crate::view::View;
-
-/// The scroll gesture mirrored from the server's redraw, ready to animate.
-/// Line/cursor positions are kept as `f32` for interpolation; `lines`/`selection`
-/// are the band covering the slide, anchored at `base_line`.
-#[derive(Clone)]
-pub(crate) struct ScrollData {
-    pub(crate) from_top: f32,
-    pub(crate) to_top: f32,
-    pub(crate) from_cursor: f32,
-    pub(crate) to_cursor: f32,
-    pub(crate) duration: Duration,
-    pub(crate) base_line: usize,
-    pub(crate) lines: Vec<String>,
-    pub(crate) selection: Vec<Option<(u16, u16)>>,
-    pub(crate) numbers: Vec<Option<usize>>,
-    /// Syntax highlights for the band (aligned with `lines`), so the slide is
-    /// colored frame by frame instead of flashing white until it settles. Style
-    /// ids index `styles` below.
-    pub(crate) highlights: Vec<Vec<HlSpan>>,
-    /// The style palette captured with this gesture. Snapshotted (not read live
-    /// from [`View::styles`]) because a delayed highlight redraw arriving
-    /// mid-slide replaces the live palette, which would leave the band's frozen
-    /// style ids pointing at the wrong entries.
-    pub(crate) styles: Vec<Style>,
-}
+use nxvim_view::{HlSpan, ScrollData, Style, View};
 
 /// An in-flight scroll animation, driven by the client's local clock.
 pub(crate) struct Animation {

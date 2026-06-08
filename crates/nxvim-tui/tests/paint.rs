@@ -3,7 +3,8 @@
 //! input here — this pins the *client's painting contract*, not server logic.
 
 use crossterm::cursor::SetCursorStyle;
-use nxvim_tui::{cursor_style, paint, ScrollHarness, View};
+use nxvim_tui::{cursor_style, paint, ScrollHarness};
+use nxvim_view::View;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;

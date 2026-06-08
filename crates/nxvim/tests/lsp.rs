@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, paint_doc_scrolled, pmenu_doc_geometry, pmenu_geometry, View};
+use nxvim_tui::{paint, paint_doc_scrolled, pmenu_doc_geometry, pmenu_geometry};
+use nxvim_view::View;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use serde_json::Value as Json;

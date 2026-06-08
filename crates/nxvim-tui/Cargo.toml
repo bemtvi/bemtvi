@@ -17,3 +17,4 @@ crossterm.workspace = true
 ratatui.workspace = true
 unicode-width.workspace = true
 nxvim-rpc.workspace = true
+nxvim-view.workspace = true

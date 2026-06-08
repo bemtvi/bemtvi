@@ -5,7 +5,8 @@
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, paint_with_cursor, View};
+use nxvim_tui::{paint, paint_with_cursor};
+use nxvim_view::View;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;

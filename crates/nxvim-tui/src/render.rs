@@ -11,8 +11,62 @@ use rmpv::Value;
 use unicode_width::UnicodeWidthChar;
 
 use crate::anim::{arm_animation, lerp, Animation};
-use crate::parse::{DiagSpan, HlSpan, IncSearchSpans, SearchSpans, StatusSegment};
-use crate::view::{PanelData, PmenuData, Separator, View, WindowView};
+use nxvim_view::{
+    DiagSpan, HlSpan, IncSearchSpans, PanelData, PmenuData, SearchSpans, Separator, StatusSegment,
+    View, WindowView,
+};
+
+/// Convert a neutral [`nxvim_view::Style`] into the ratatui [`Style`] the renderer
+/// paints. `fg`/`bg` become truecolor, `sp` the underline color, and each flag its
+/// modifier. ratatui has no undercurl modifier, so `undercurl` aliases to
+/// `UNDERLINED` (the `sp` underline color still distinguishes it). Absent fields
+/// stay unset so the style patches cleanly onto whatever it is painted over.
+fn rt(s: nxvim_view::Style) -> Style {
+    let mut style = Style::default();
+    if let Some(c) = s.fg {
+        style = style.fg(rgb(c));
+    }
+    if let Some(c) = s.bg {
+        style = style.bg(rgb(c));
+    }
+    if let Some(c) = s.sp {
+        style = style.underline_color(rgb(c));
+    }
+    if s.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if s.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if s.underline || s.undercurl {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if s.strikethrough {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if s.reverse {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+/// Unpack a `0xRRGGBB` color integer into a truecolor [`Color::Rgb`]. The top
+/// byte is ignored (the wire never sets it).
+fn rgb(c: u32) -> Color {
+    let [_, r, g, b] = c.to_be_bytes();
+    Color::Rgb(r, g, b)
+}
+
+/// Map a neutral float [`nxvim_view::Border`] to the ratatui [`BorderType`] used
+/// to draw it. `Solid` (neovim's space border) renders as the nearest line style.
+fn bt(b: nxvim_view::Border) -> BorderType {
+    match b {
+        nxvim_view::Border::Single => BorderType::Plain,
+        nxvim_view::Border::Rounded => BorderType::Rounded,
+        nxvim_view::Border::Double => BorderType::Double,
+        nxvim_view::Border::Solid => BorderType::QuadrantInside,
+    }
+}
 
 /// Render `view` into a `width`x`height` cell grid using ratatui's test backend
 /// and return the painted buffer. This drives the *same* `render` the live
@@ -177,7 +231,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         frame.render_widget(Clear, outer);
         let inner = match win.border {
             Some(border) => {
-                let block = float_block(border, win.title.as_deref());
+                let block = float_block(bt(border), win.title.as_deref());
                 let inner = block.inner(outer);
                 frame.render_widget(block, outer);
                 inner
@@ -373,7 +427,7 @@ fn render_window(
     // colorscheme is loaded), so every following widget's spans patch their
     // foreground onto it and the gutter, end-of-line gaps, and `~` rows all share
     // the editor background. With no theme this is skipped.
-    if let Some(normal) = view.normal {
+    if let Some(normal) = view.normal.map(rt) {
         frame.render_widget(Block::default().style(normal), text_area);
     }
 
@@ -388,16 +442,23 @@ fn render_window(
     };
 
     // Token style ids index a palette captured with the frame they belong to:
-    // the in-flight animation's snapshot while sliding, else the live view's.
+    // the in-flight animation's snapshot while sliding, else the live view's. The
+    // neutral palette is converted to ratatui styles once here so `cell_style` can
+    // compose them with `.patch`/`.fg`/… as it walks each row's cells.
+    let palette: Vec<Style> = match anim {
+        Some(a) => &a.styles,
+        None => &view.styles,
+    }
+    .iter()
+    .copied()
+    .map(rt)
+    .collect();
     let theme = LineTheme {
-        palette: match anim {
-            Some(a) => &a.styles,
-            None => &view.styles,
-        },
-        visual: view.visual,
-        search: view.search_style,
-        incsearch: view.incsearch_style,
-        end_of_buffer: view.end_of_buffer,
+        palette: &palette,
+        visual: view.visual.map(rt),
+        search: view.search_style.map(rt),
+        incsearch: view.incsearch_style.map(rt),
+        end_of_buffer: view.end_of_buffer.map(rt),
     };
     // The slide band carries no search spans; the static viewport uses the win's.
     let (frame_search, frame_incsearch): (&SearchSpans, &IncSearchSpans) = match anim {
@@ -436,6 +497,7 @@ fn render_window(
 fn render_separators(frame: &mut Frame, wins_area: Rect, separators: &[Separator], view: &View) {
     let style = view
         .status_line
+        .map(rt)
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
     for sep in separators {
         let x = wins_area.x + sep.x;
@@ -486,9 +548,10 @@ fn render_gutter(
                 let is_current = *num == Some(current_line);
                 let cell = gutter_cell(*num, current_line, win.number, win.relativenumber, width);
                 let style = if is_current {
-                    view.cursor_line_nr.unwrap_or_default()
+                    view.cursor_line_nr.map(rt).unwrap_or_default()
                 } else {
                     view.line_nr
+                        .map(rt)
                         .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM))
                 };
                 Line::from(Span::styled(cell, style))
@@ -823,12 +886,13 @@ fn expand_tabs(line: &str, tabstop: usize) -> String {
 fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view: &View) {
     let base = view
         .status_line
+        .map(rt)
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
 
     let spans: Vec<Span> = segments
         .iter()
         .map(|(text, style)| {
-            let style = style.map_or(base, |s| base.patch(s));
+            let style = style.map_or(base, |s| base.patch(rt(s)));
             Span::styled(text.clone(), style)
         })
         .collect();
@@ -857,7 +921,7 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
             .tabline_segments
             .iter()
             .map(|(text, style)| match style {
-                Some(s) => Span::styled(text.clone(), *s),
+                Some(s) => Span::styled(text.clone(), rt(*s)),
                 None => Span::raw(text.clone()),
             })
             .collect();
@@ -1004,7 +1068,7 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     };
     let wins_area = windows_area_rect(width, height, view);
     // A focused float's content sits inside its border; the popup anchors there.
-    let area = float_inner(window_area(wins_area, win), win.border);
+    let area = float_inner(window_area(wins_area, win), win.border.map(bt));
     // The text body is the window rect minus its bottom status row — when this
     // window shows one (per `'laststatus'`); otherwise it claims the whole rect.
     let text_area = if win.status_visible {

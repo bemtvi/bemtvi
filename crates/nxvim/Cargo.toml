@@ -35,4 +35,6 @@ tree-sitter-rust.workspace = true
 serde_json.workspace = true
 # The integration tests speak the msgpack-RPC wire directly to drive the server.
 nxvim-rpc.workspace = true
+# The screen/syntax/lsp tests build a `View` from a redraw and paint it.
+nxvim-view.workspace = true
 rmpv.workspace = true

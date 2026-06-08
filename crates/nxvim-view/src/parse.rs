@@ -1,37 +1,39 @@
-//! Decoding of the server's `redraw` notification map into the client's render
-//! model: small msgpack-map accessors and the per-region span/style parsers.
+//! Decoding of the server's `redraw` notification map into the client model:
+//! small msgpack-map accessors and the per-region span/style parsers. Everything
+//! here is frontend-agnostic — styles decode to the neutral [`Style`].
 
-use ratatui::style::{Color, Modifier, Style};
 use rmpv::Value;
 
+use crate::style::Style;
+
 /// One treesitter highlight span in screen columns: `(start, end, group,
-/// style_id)`. `style_id` indexes the frame's style palette when the server
-/// resolved the capture through a loaded colorscheme; `None` falls back to the
-/// client's built-in [`group_style`](crate::render::group_style).
-pub(crate) type HlSpan = (u16, u16, String, Option<usize>);
+/// style_id)`. `style_id` indexes the frame's [`style palette`](crate::View::styles)
+/// when the server resolved the capture through a loaded colorscheme; `None`
+/// leaves the client to fall back to its own per-group theme.
+pub type HlSpan = (u16, u16, String, Option<usize>);
 
 /// One diagnostic underline span in screen columns: `(start, end, severity,
 /// style_id)`. `severity` is `1`=error … `4`=hint; `style_id` indexes the
 /// frame's style palette when the server resolved the `DiagnosticUnderline*`
 /// group through a loaded colorscheme, `None` to fall back to a built-in
 /// severity-colored undercurl.
-pub(crate) type DiagSpan = (u16, u16, u8, Option<usize>);
+pub type DiagSpan = (u16, u16, u8, Option<usize>);
 
 /// Per visible row, the screen-column spans of every search match (`hlsearch`).
-pub(crate) type SearchSpans = Vec<Vec<(u16, u16)>>;
+pub type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
-pub(crate) type IncSearchSpans = Vec<Option<(u16, u16)>>;
+pub type IncSearchSpans = Vec<Option<(u16, u16)>>;
 
 /// One rendered status-line segment: its literal text and the resolved style.
 /// `style` is `None` for a segment with no highlight group (or one the
 /// colorscheme left undefined) — the client then paints it in the base
 /// `StatusLine` look.
-pub(crate) type StatusSegment = (String, Option<Style>);
+pub type StatusSegment = (String, Option<Style>);
 
 /// One completion-popup row: `(label, kind, detail)`. `kind` is the
 /// `CompletionItemKind` as a small int (`0` = unspecified) the client could map
 /// to an icon; `detail` is `""` when the server provided none.
-pub(crate) type PmenuItem = (String, u8, String);
+pub type PmenuItem = (String, u8, String);
 
 /// Parse the `pmenu` redraw key's `items` array into `(label, kind, detail)`
 /// rows. Malformed entries are dropped, yielding an empty list.
@@ -168,7 +170,7 @@ pub(crate) fn parse_multi_spans(value: Option<&Value>) -> SearchSpans {
 /// of `[start_col, end_col, group, style_id]` spans in screen columns. The
 /// trailing `style_id` (an index into the frame's `styles` palette) is `Nil`
 /// when the server couldn't resolve the span through a colorscheme, in which
-/// case the client falls back to [`group_style`](crate::render::group_style).
+/// case the client falls back to its own per-group theme.
 pub(crate) fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
     value
         .and_then(Value::as_array)
@@ -204,8 +206,7 @@ pub(crate) fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
 /// row) of `[start_col, end_col, severity, style_id]` underline spans in screen
 /// columns. The trailing `style_id` indexes the frame's `styles` palette when
 /// the server resolved the `DiagnosticUnderline*` group through a colorscheme;
-/// `Nil` falls back to a built-in severity color in
-/// [`diagnostic_style`](crate::render::diagnostic_style).
+/// `Nil` falls back to a built-in severity color in the client.
 pub(crate) fn parse_diagnostics(value: Option<&Value>) -> Vec<Vec<DiagSpan>> {
     value
         .and_then(Value::as_array)
@@ -239,8 +240,8 @@ pub(crate) fn parse_diagnostics(value: Option<&Value>) -> Vec<Vec<DiagSpan>> {
 
 /// Parse the per-frame `styles` palette: an array of `{ fg, bg, sp, <attrs> }`
 /// maps (colors as `0xRRGGBB` integers, attributes as `true` flags), each
-/// converted to the ratatui [`Style`] the renderer paints. Highlight spans and
-/// chrome regions index into the returned vec.
+/// converted to a neutral [`Style`]. Highlight spans and chrome regions index
+/// into the returned vec.
 pub(crate) fn parse_styles(value: Option<&Value>) -> Vec<Style> {
     value
         .and_then(Value::as_array)
@@ -248,48 +249,32 @@ pub(crate) fn parse_styles(value: Option<&Value>) -> Vec<Style> {
         .unwrap_or_default()
 }
 
-/// Build a ratatui [`Style`] from one `styles`-palette entry. `fg`/`bg` become
-/// truecolor; `sp` sets the underline color; each present boolean adds its
-/// modifier. Absent fields are left unset so the style patches cleanly onto
-/// whatever it is painted over (e.g. the `Normal` background).
+/// Build a neutral [`Style`] from one `styles`-palette entry. `fg`/`bg`/`sp`
+/// become truecolor; each present boolean sets its attribute flag. Absent fields
+/// are left unset so the style patches cleanly onto whatever it is painted over.
 fn style_from_value(value: &Value) -> Style {
     let Value::Map(map) = value else {
         return Style::default();
     };
-    let mut style = Style::default();
-    if let Some(c) = rgb_color(map, "fg") {
-        style = style.fg(c);
+    let flag = |key| map_get(map, key).and_then(Value::as_bool).unwrap_or(false);
+    Style {
+        fg: rgb_color(map, "fg"),
+        bg: rgb_color(map, "bg"),
+        sp: rgb_color(map, "sp"),
+        bold: flag("bold"),
+        italic: flag("italic"),
+        underline: flag("underline"),
+        undercurl: flag("undercurl"),
+        strikethrough: flag("strikethrough"),
+        reverse: flag("reverse"),
     }
-    if let Some(c) = rgb_color(map, "bg") {
-        style = style.bg(c);
-    }
-    if let Some(c) = rgb_color(map, "sp") {
-        style = style.underline_color(c);
-    }
-    for (key, modifier) in [
-        ("bold", Modifier::BOLD),
-        ("italic", Modifier::ITALIC),
-        ("underline", Modifier::UNDERLINED),
-        // ratatui has no undercurl modifier, so it aliases to UNDERLINED here —
-        // the underline-color (`sp`) still distinguishes it visually. The server
-        // keeps `underline`/`undercurl` as distinct flags (nxvim-lua's `HlSet`).
-        ("undercurl", Modifier::UNDERLINED),
-        ("strikethrough", Modifier::CROSSED_OUT),
-        ("reverse", Modifier::REVERSED),
-    ] {
-        if map_get(map, key).and_then(Value::as_bool).unwrap_or(false) {
-            style = style.add_modifier(modifier);
-        }
-    }
-    style
 }
 
-/// Read a `0xRRGGBB` color integer at `key` and unpack it into a truecolor
-/// [`Color::Rgb`]. `None` when the key is absent.
-fn rgb_color(map: &[(Value, Value)], key: &str) -> Option<Color> {
-    let packed = map_get(map, key).and_then(Value::as_u64)?;
-    let [_, r, g, b] = (packed as u32).to_be_bytes();
-    Some(Color::Rgb(r, g, b))
+/// Read a `0xRRGGBB` color integer at `key`. `None` when the key is absent. The
+/// value is stored as-is; clients unpack the low three bytes (the wire never sets
+/// the top byte).
+fn rgb_color(map: &[(Value, Value)], key: &str) -> Option<u32> {
+    map_get(map, key).and_then(Value::as_u64).map(|c| c as u32)
 }
 
 /// Resolve one chrome region (`normal`, `visual`, …) to its style by looking up
@@ -310,4 +295,18 @@ pub(crate) fn parse_numbers(value: Option<&Value>) -> Vec<Option<usize>> {
         .and_then(Value::as_array)
         .map(|a| a.iter().map(|v| v.as_u64().map(|n| n as usize)).collect())
         .unwrap_or_default()
+}
+
+/// Parse a float's wire border name (matching `nvim_win_get_config`) into the
+/// neutral [`Border`](crate::style::Border). `"none"`, a missing value, or an
+/// unknown name yields `None` (no border).
+pub(crate) fn parse_border(value: Option<&Value>) -> Option<crate::style::Border> {
+    use crate::style::Border;
+    match value.and_then(Value::as_str) {
+        Some("single") => Some(Border::Single),
+        Some("rounded") => Some(Border::Rounded),
+        Some("double") => Some(Border::Double),
+        Some("solid") => Some(Border::Solid),
+        _ => None,
+    }
 }

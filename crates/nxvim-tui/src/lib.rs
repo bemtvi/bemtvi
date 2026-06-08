@@ -18,16 +18,13 @@
 
 mod anim;
 mod keys;
-mod parse;
 mod render;
-mod view;
 
-pub use keys::{encode_key, encode_paste};
+pub use keys::encode_key;
 pub use render::{
     close_button, cursor_style, paint, paint_doc_scrolled, paint_with_cursor, panel_content_rect,
     pmenu_doc_geometry, pmenu_geometry, ScrollHarness,
 };
-pub use view::View;
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
@@ -37,6 +34,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
+use nxvim_view::{encode_paste, View};
 use rmpv::Value;
 use std::io::Write;
 use std::time::Duration;

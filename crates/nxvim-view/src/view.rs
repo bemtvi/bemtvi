@@ -1,106 +1,133 @@
 //! The server's view, mirrored client-side for rendering, and the `redraw`
-//! notification parsing that fills it in.
+//! notification parsing that fills it in. Frontend-agnostic: styles are the
+//! neutral [`Style`], so a TUI and a GUI share this model and each converts to
+//! its own toolkit at paint time.
 
-use ratatui::style::Style;
-use ratatui::widgets::BorderType;
-use rmpv::Value;
 use std::time::Duration;
 
-use crate::anim::ScrollData;
+use rmpv::Value;
+
 use crate::parse::{
-    chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_diagnostics,
-    parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items, parse_spans,
-    parse_status, parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem, SearchSpans,
-    StatusSegment,
+    chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
+    parse_diagnostics, parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items,
+    parse_spans, parse_status, parse_styles, DiagSpan, HlSpan, IncSearchSpans, PmenuItem,
+    SearchSpans, StatusSegment,
 };
+use crate::style::{Border, Style};
+
+/// The scroll gesture mirrored from the server's redraw, ready to animate.
+/// Line/cursor positions are kept as `f32` for interpolation; `lines`/`selection`
+/// are the band covering the slide, anchored at `base_line`. A client that
+/// animates scrolling (the TUI) drives this; one that doesn't can ignore it.
+#[derive(Clone)]
+pub struct ScrollData {
+    pub from_top: f32,
+    pub to_top: f32,
+    pub from_cursor: f32,
+    pub to_cursor: f32,
+    pub duration: Duration,
+    pub base_line: usize,
+    pub lines: Vec<String>,
+    pub selection: Vec<Option<(u16, u16)>>,
+    pub numbers: Vec<Option<usize>>,
+    /// Syntax highlights for the band (aligned with `lines`), so the slide is
+    /// colored frame by frame instead of flashing white until it settles. Style
+    /// ids index `styles` below.
+    pub highlights: Vec<Vec<HlSpan>>,
+    /// The style palette captured with this gesture. Snapshotted (not read live
+    /// from [`View::styles`]) because a delayed highlight redraw arriving
+    /// mid-slide replaces the live palette, which would leave the band's frozen
+    /// style ids pointing at the wrong entries.
+    pub styles: Vec<Style>,
+}
 
 /// One window's content mirrored from a redraw `windows[i]` sub-map: its screen
 /// rect, focus flag, and all the per-window fields (text, cursor, selection,
 /// search, syntax/diagnostics, gutter, and status-line data). The client paints
 /// each of these at its `rect` with its own gutter, text body, and status line.
 #[derive(Default)]
-pub(crate) struct WindowView {
+pub struct WindowView {
     /// The window's rect in **windows-area** cells, or `None` for the legacy flat
     /// redraw (a single window that fills the whole windows area — the synthetic
     /// paint fixtures). The renderer offsets a `Some` rect by the windows-area
     /// origin; a `None` rect takes the whole area.
-    pub(crate) rect: Option<WinRect>,
-    pub(crate) focused: bool,
-    pub(crate) lines: Vec<String>,
-    pub(crate) cursor_row: u16,
-    pub(crate) cursor_screen_col: u16,
+    pub rect: Option<WinRect>,
+    pub focused: bool,
+    pub lines: Vec<String>,
+    pub cursor_row: u16,
+    pub cursor_screen_col: u16,
     /// First visible screen column (horizontal scroll offset) under `nowrap`. The
     /// renderer drops this many leading screen cells from each text row and shifts
     /// the cursor and every span left by it; the number gutter is not offset.
-    pub(crate) leftcol: u16,
+    pub leftcol: u16,
     /// This window's status line as rendered segments (`text` + resolved
     /// `style`), projected by the server's `%`-format engine. The client paints
     /// them left-to-right; an empty vec (an older server) falls back to a bare
     /// reverse-video status row.
-    pub(crate) status: Vec<StatusSegment>,
+    pub status: Vec<StatusSegment>,
     /// Whether this window paints its own status row (per `'laststatus'`). False
     /// (modes 0/3, or 1 with one window) gives the freed bottom row to text. An
     /// older server omits the flag; defaults to `true` (the historical
     /// every-window-has-a-status look).
-    pub(crate) status_visible: bool,
-    pub(crate) cursor_line: usize,
+    pub status_visible: bool,
+    pub cursor_line: usize,
     /// Per visible row, the half-open screen-column span `[start, end)` to paint
     /// as the visual selection, or `None`.
-    pub(crate) selection: Vec<Option<(u16, u16)>>,
+    pub selection: Vec<Option<(u16, u16)>>,
     /// Per visible row, the half-open screen-column spans of every search match
     /// (`hlsearch`). Empty inner vecs for rows with no match.
-    pub(crate) search: SearchSpans,
+    pub search: SearchSpans,
     /// Per visible row, the single span the live `incsearch` preview rests on.
-    pub(crate) incsearch: IncSearchSpans,
+    pub incsearch: IncSearchSpans,
     /// Per visible row, the treesitter highlight spans `(start_col, end_col,
     /// group, style_id)` in screen columns. `style_id` indexes [`View::styles`]
-    /// (the global palette) when resolved through a colorscheme; `None` falls
-    /// back to the client's built-in [`group_style`](crate::render::group_style).
-    pub(crate) highlights: Vec<Vec<HlSpan>>,
+    /// (the global palette) when resolved through a colorscheme; `None` leaves
+    /// the client to fall back to its own per-group theme.
+    pub highlights: Vec<Vec<HlSpan>>,
     /// Per visible row, the LSP diagnostic underline spans `(start_col, end_col,
     /// severity, style_id)` in screen columns.
-    pub(crate) diagnostics: Vec<Vec<DiagSpan>>,
+    pub diagnostics: Vec<Vec<DiagSpan>>,
     /// A scroll gesture for this window, when its viewport just moved.
-    pub(crate) scroll: Option<ScrollData>,
+    pub scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
-    pub(crate) numbers: Vec<Option<usize>>,
-    pub(crate) number: bool,
-    pub(crate) relativenumber: bool,
-    pub(crate) number_width: u16,
+    pub numbers: Vec<Option<usize>>,
+    pub number: bool,
+    pub relativenumber: bool,
+    pub number_width: u16,
     /// This window's buffer `tabstop`: how many cells to expand a `\t` to when
     /// painting, mirrored from the server so the text lines up with the server's
     /// `cursor_screen_col` (computed with the same value). Defaults to 8.
-    pub(crate) tabstop: u16,
+    pub tabstop: u16,
     /// Whether this window is a **float**: the renderer paints it in a second,
     /// on-top pass (over the tiled windows) rather than tiling it. Tiled windows
     /// and the legacy flat redraw are `false`.
-    pub(crate) floating: bool,
+    pub floating: bool,
     /// The float's border type, or `None` for a borderless float / tiled window.
     /// When set the renderer draws a bordered box around the window's rect and
     /// paints the content one cell inside it.
-    pub(crate) border: Option<BorderType>,
+    pub border: Option<Border>,
     /// The float's title, drawn on the top border. `None` when untitled.
-    pub(crate) title: Option<String>,
+    pub title: Option<String>,
 }
 
 /// A window's rect in windows-area cells (mirrors `nxvim_core::ViewRect`).
 #[derive(Default, Clone, Copy)]
-pub(crate) struct WinRect {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) width: u16,
-    pub(crate) height: u16,
+pub struct WinRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// A split separator the client draws between windows: a vertical `│` or
 /// horizontal `─` run of `length` cells anchored at `(x, y)` in windows-area
 /// cells. Empty with a single window.
 #[derive(Clone, Copy)]
-pub(crate) struct Separator {
-    pub(crate) vertical: bool,
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) length: u16,
+pub struct Separator {
+    pub vertical: bool,
+    pub x: u16,
+    pub y: u16,
+    pub length: u16,
 }
 
 /// The server's view, mirrored client-side for rendering: the **global** chrome
@@ -109,60 +136,60 @@ pub(crate) struct Separator {
 #[derive(Default)]
 pub struct View {
     /// The windows to paint, in layout order. Always at least one.
-    pub(crate) windows: Vec<WindowView>,
+    pub windows: Vec<WindowView>,
     /// The split separators between windows (empty with one window).
-    pub(crate) separators: Vec<Separator>,
+    pub separators: Vec<Separator>,
     /// The tab pages, in tabline order — empty when only one tab is open (no
     /// tabline is drawn). When non-empty, `current_tab` indexes the active cell.
-    pub(crate) tabline: Vec<TabData>,
+    pub tabline: Vec<TabData>,
     /// A custom `'tabline'` rendered by the server's `%`-format engine into styled
     /// segments spanning the editor width. Empty when no `'tabline'` is set (the
     /// client then formats the [`TabData`] cells itself); when non-empty it is
     /// painted in place of those cells on the same reserved top row.
-    pub(crate) tabline_segments: Vec<StatusSegment>,
+    pub tabline_segments: Vec<StatusSegment>,
     /// Index into `tabline` of the active tab (meaningful only when `tabline` is
     /// non-empty).
-    pub(crate) current_tab: usize,
-    pub(crate) mode_label: String,
-    pub(crate) command_mode: bool,
+    pub current_tab: usize,
+    pub mode_label: String,
+    pub command_mode: bool,
     /// True while `r` waits for its replacement character (a one-shot replace
     /// that stays in normal mode). Drives the replace cursor shape.
-    pub(crate) pending_replace: bool,
-    pub(crate) cmdline: String,
+    pub pending_replace: bool,
+    pub cmdline: String,
     /// The command-line prompt char (`:` ex, `/` / `?` search). Defaults to `:`.
-    pub(crate) cmdline_prefix: char,
+    pub cmdline_prefix: char,
     /// The multi-char `vim.ui.input` prompt label, rendered ahead of the editable
     /// line in place of `cmdline_prefix`. Empty for `:`/`/`/`?`.
-    pub(crate) cmdline_prompt: String,
+    pub cmdline_prompt: String,
     /// Command cursor position as a character offset into `cmdline`, for placing
     /// the terminal cursor mid-line after `<Left>`/`<Right>` edits.
-    pub(crate) cmdline_cursor: usize,
-    pub(crate) message: String,
+    pub cmdline_cursor: usize,
+    pub message: String,
     /// The per-frame style palette the server resolved from the active
     /// colorscheme; per-window `highlights`/chrome ids index into it. Global.
-    pub(crate) styles: Vec<Style>,
+    pub styles: Vec<Style>,
     /// Resolved editor-chrome styles (`None` when the theme leaves the group
     /// undefined — the client then keeps its built-in look for that region).
-    pub(crate) normal: Option<Style>,
-    pub(crate) line_nr: Option<Style>,
-    pub(crate) cursor_line_nr: Option<Style>,
-    pub(crate) visual: Option<Style>,
-    pub(crate) search_style: Option<Style>,
-    pub(crate) incsearch_style: Option<Style>,
-    pub(crate) status_line: Option<Style>,
-    pub(crate) end_of_buffer: Option<Style>,
+    pub normal: Option<Style>,
+    pub line_nr: Option<Style>,
+    pub cursor_line_nr: Option<Style>,
+    pub visual: Option<Style>,
+    pub search_style: Option<Style>,
+    pub incsearch_style: Option<Style>,
+    pub status_line: Option<Style>,
+    pub end_of_buffer: Option<Style>,
     /// The single global status line (`laststatus=3`) as rendered segments,
     /// spanning the full editor width and showing the focused window's facts.
     /// Empty for modes 0/1/2 (status lines are per-window, or hidden); when
     /// non-empty the renderer docks it on one row just above the command line and
     /// no window paints its own status row. Global — one per editor.
-    pub(crate) global_status: Vec<StatusSegment>,
+    pub global_status: Vec<StatusSegment>,
     /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
     /// present it has input focus: the editing cursor is drawn inside it. Global.
-    pub(crate) panel: Option<PanelData>,
+    pub panel: Option<PanelData>,
     /// The insert-mode completion popup, or `None` when none is open. Drawn last,
     /// over the focused window's text area. Global.
-    pub(crate) pmenu: Option<PmenuData>,
+    pub pmenu: Option<PmenuData>,
 }
 
 /// The insert-mode completion popup mirrored from the server's redraw: the ranked
@@ -170,43 +197,43 @@ pub struct View {
 /// anchor and content size in **text-area cells** (the client adds the gutter and
 /// text-area origin, then draws a bordered box around the content).
 #[derive(Clone)]
-pub(crate) struct PmenuData {
-    pub(crate) items: Vec<PmenuItem>,
-    pub(crate) selected: Option<usize>,
-    pub(crate) row: u16,
-    pub(crate) col: u16,
-    pub(crate) width: u16,
-    pub(crate) height: u16,
+pub struct PmenuData {
+    pub items: Vec<PmenuItem>,
+    pub selected: Option<usize>,
+    pub row: u16,
+    pub col: u16,
+    pub width: u16,
+    pub height: u16,
     /// The selected item's documentation lines, drawn in a preview box beside the
     /// popup. Empty ⇒ no preview (nothing selected, or the item has no docs).
-    pub(crate) doc: Vec<String>,
+    pub doc: Vec<String>,
 }
 
 /// One tabline cell mirrored from the server's redraw: the buffer label, its
 /// modified flag, and the tab's window count. The client formats the rendered
 /// text (vim's default `{count}{+} {label}`).
 #[derive(Clone)]
-pub(crate) struct TabData {
-    pub(crate) label: String,
-    pub(crate) modified: bool,
-    pub(crate) window_count: usize,
+pub struct TabData {
+    pub label: String,
+    pub modified: bool,
+    pub window_count: usize,
 }
 
 /// The bottom panel mirrored from the server's redraw: a title, the visible
 /// content slice, the cursor row within it, and the content height to lay out.
 #[derive(Clone)]
-pub(crate) struct PanelData {
-    pub(crate) title: String,
-    pub(crate) lines: Vec<String>,
-    pub(crate) cursor_row: u16,
+pub struct PanelData {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub cursor_row: u16,
     /// Display rows the selected (possibly wrapped) entry spans; the whole span
     /// is drawn as the focused line. Defaults to 1 (an unwrapped entry).
-    pub(crate) cursor_span: u16,
-    pub(crate) height: u16,
+    pub cursor_span: u16,
+    pub height: u16,
 }
 
 impl View {
-    pub(crate) fn update(&mut self, params: &[Value]) {
+    pub fn update(&mut self, params: &[Value]) {
         let Some(Value::Map(map)) = params.first() else {
             return;
         };
@@ -286,7 +313,7 @@ impl View {
     /// point for the completion popup — or `None` before the first redraw (a
     /// default `View` has no windows). A real redraw always carries at least one
     /// window, with one flagged focused; falls back to the first if none is.
-    pub(crate) fn focused(&self) -> Option<&WindowView> {
+    pub fn focused(&self) -> Option<&WindowView> {
         self.windows
             .iter()
             .find(|w| w.focused)
@@ -295,14 +322,14 @@ impl View {
 
     /// Whether the editor is in insert mode, mirrored from the server's
     /// `mode_label`. Drives the thin-bar "edit cursor" shape.
-    pub(crate) fn is_insert(&self) -> bool {
+    pub fn is_insert(&self) -> bool {
         self.mode_label == "INSERT"
     }
 
     /// Whether the editor is replacing: either `R` replace mode (`mode_label`)
     /// or `r` waiting for its one replacement char. Both drive the underline
     /// cursor shape, matching vim's replace/operator-pending feedback.
-    pub(crate) fn is_replace(&self) -> bool {
+    pub fn is_replace(&self) -> bool {
         self.mode_label == "REPLACE" || self.pending_replace
     }
 
@@ -391,20 +418,6 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             let t = map_str(m, "title");
             (!t.is_empty()).then_some(t)
         },
-    }
-}
-
-/// Map a float's wire border name (matching `nvim_win_get_config`) to the ratatui
-/// [`BorderType`] used to draw it. `"none"`, a missing value, or an unknown name
-/// yields `None` (no border). `"solid"` (neovim's space border) renders as the
-/// nearest line style, `QuadrantInside`.
-fn parse_border(value: Option<&Value>) -> Option<BorderType> {
-    match value.and_then(Value::as_str) {
-        Some("single") => Some(BorderType::Plain),
-        Some("rounded") => Some(BorderType::Rounded),
-        Some("double") => Some(BorderType::Double),
-        Some("solid") => Some(BorderType::QuadrantInside),
-        _ => None,
     }
 }
 

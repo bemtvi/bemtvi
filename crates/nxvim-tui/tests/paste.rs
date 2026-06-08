@@ -3,7 +3,7 @@
 //! instead of arriving as one keystroke per character. Black-box, no process:
 //! drives the public `encode_paste` the client uses on a paste event.
 
-use nxvim_tui::encode_paste;
+use nxvim_view::encode_paste;
 
 #[test]
 fn plain_text_passes_through_verbatim() {

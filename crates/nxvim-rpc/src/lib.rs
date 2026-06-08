@@ -209,30 +209,34 @@ fn dispatch(
     in_tx: &mpsc::UnboundedSender<Incoming>,
     pending: &Pending,
 ) -> std::result::Result<(), ()> {
-    let arr = match val {
+    let mut arr = match val {
         Value::Array(a) => a,
         _ => return Ok(()), // ignore malformed frames
     };
+    // `arr` is owned, so move the payload-bearing fields (params / result) out
+    // instead of deep-cloning them — these can be large (e.g. a `set_lines` /
+    // `get_lines` array) and this runs on every inbound frame. The id (Copy) and
+    // the short method name are still read by reference.
     match arr.first().and_then(Value::as_u64) {
         Some(0) => {
             let id = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
             let method = arr.get(2).and_then(Value::as_str).unwrap_or("").to_string();
-            let params = params_of(arr.get(3));
+            let params = take_params(&mut arr, 3);
             in_tx
                 .send(Incoming::Request { id, method, params })
                 .map_err(|_| ())?;
         }
         Some(1) => {
             let id = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
-            let err = arr.get(2).cloned().unwrap_or(Value::Nil);
-            let res = arr.get(3).cloned().unwrap_or(Value::Nil);
+            let err = take(&mut arr, 2);
+            let res = take(&mut arr, 3);
             if let Some(tx) = pending.lock().unwrap().remove(&id) {
                 let _ = tx.send(if err.is_nil() { Ok(res) } else { Err(err) });
             }
         }
         Some(2) => {
             let method = arr.get(1).and_then(Value::as_str).unwrap_or("").to_string();
-            let params = params_of(arr.get(2));
+            let params = take_params(&mut arr, 2);
             in_tx
                 .send(Incoming::Notification { method, params })
                 .map_err(|_| ())?;
@@ -242,9 +246,19 @@ fn dispatch(
     Ok(())
 }
 
-fn params_of(v: Option<&Value>) -> Vec<Value> {
-    match v {
-        Some(Value::Array(p)) => p.clone(),
+/// Move element `idx` out of `arr`, leaving `Value::Nil` in its place; `Nil`
+/// when the index is out of bounds. Lets `dispatch` take ownership of a frame's
+/// payload fields without cloning them.
+fn take(arr: &mut [Value], idx: usize) -> Value {
+    arr.get_mut(idx)
+        .map(|v| std::mem::replace(v, Value::Nil))
+        .unwrap_or(Value::Nil)
+}
+
+/// Move the params array out of `arr[idx]` (empty when absent or not an array).
+fn take_params(arr: &mut [Value], idx: usize) -> Vec<Value> {
+    match take(arr, idx) {
+        Value::Array(p) => p,
         _ => Vec::new(),
     }
 }

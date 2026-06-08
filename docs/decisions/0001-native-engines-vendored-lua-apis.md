@@ -81,10 +81,21 @@ is the shared substrate ([`extmark.rs`](../../crates/nxvim-core/src/extmark.rs):
    extension table); `highlighter.new` (the real decoration provider) stays a loud
    `_notimpl`. A highlight-only `start` does *not* create a Lua `LanguageTree`, so
    such a buffer still parses once — the double parse begins only on `get_parser`.
-2. **LSP semantic tokens** — async, server-side. Cached on arrival and projected
-   as extmarks *above* the treesitter floor. Request plumbing exists in
-   [`nxvim-lsp`](../../crates/nxvim-lsp/src/dispatch.rs); the response→extmark
-   projection is the open wire.
+2. **LSP semantic tokens** (*implemented* — Phase 1) — async, server-side. The
+   editor advertises the capability, captures the server's `legend` at
+   `initialize`, and requests the whole-buffer token set on open and after each
+   change; the reply is decoded against the legend + negotiated encoding and
+   projected as highlight intervals at
+   [`SEMANTIC_HL_PRIORITY`](../../crates/nxvim-core/src/extmark.rs) (125) — *above*
+   the treesitter floor (100), *below* user extmarks — folded into the same
+   `highlights_for` merge the other sources ride. A token whose `@lsp.*` group is
+   undefined in the active theme is dropped, so the syntactic floor shows through
+   rather than blanking. The decode + projection live in
+   [`server/src/lsp/semantic.rs`](../../crates/nxvim-server/src/lsp/semantic.rs);
+   the request plumbing is in [`nxvim-lsp`](../../crates/nxvim-lsp/src/dispatch.rs).
+   Delta refresh (`full/delta`) and the `vim.lsp.semantic_tokens` Lua control
+   surface remain (Phases 2–3 of
+   [the semantic-tokens plan](../plans/2026-06-08-lsp-semantic-tokens.md)).
 3. **LSP on-type formatting** (if pursued) — an async edit that must use the
    arrive-late / apply-as-follow-up pattern, never blocking the keystroke.
 4. **Query resolution → execution** (*implemented*) — a plugin customizing a

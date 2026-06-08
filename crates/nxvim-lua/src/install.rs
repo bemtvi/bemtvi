@@ -887,18 +887,52 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `vim._diagnostic_config(underline)`: queue [`LspOp::DiagnosticConfig`] — the
-    // prelude resolves the merged `underline` to a bool and pushes it so the
-    // server gates the squiggle rendering.
+    // `vim._diagnostic_open_float()`: queue [`LspOp::DiagnosticOpenFloat`] — open
+    // the float listing the cursor line's diagnostics in full.
+    let sh = shared.clone();
+    vim.set(
+        "_diagnostic_open_float",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().lsp_ops.push(LspOp::DiagnosticOpenFloat);
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._diagnostic_config(underline, virtual_text, virt_prefix, signs, sign_text)`:
+    // queue [`LspOp::DiagnosticConfig`] — the prelude resolves the merged
+    // `underline` / `virtual_text` / `signs` to bools (and the virt-text `prefix` /
+    // the per-severity sign glyphs to strings) and pushes them so the server gates
+    // the squiggle, inline-message, and gutter-sign rendering. `sign_text` is the
+    // four `[error, warn, info, hint]` glyphs in order; anything else is a prelude
+    // bug, so reject it loudly rather than silently rendering the wrong column.
     let sh = shared.clone();
     vim.set(
         "_diagnostic_config",
-        lua.create_function(move |_, underline: bool| {
-            sh.borrow_mut()
-                .lsp_ops
-                .push(LspOp::DiagnosticConfig { underline });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_,
+                  (underline, virtual_text, virt_prefix, signs, sign_text): (
+                bool,
+                bool,
+                String,
+                bool,
+                Vec<String>,
+            )| {
+                let sign_text: [String; 4] = sign_text.try_into().map_err(|v: Vec<String>| {
+                    mlua::Error::RuntimeError(format!(
+                        "vim._diagnostic_config: sign_text must be 4 glyphs, got {}",
+                        v.len()
+                    ))
+                })?;
+                sh.borrow_mut().lsp_ops.push(LspOp::DiagnosticConfig {
+                    underline,
+                    virtual_text,
+                    virt_prefix,
+                    signs,
+                    sign_text,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `vim._lsp_client_request(client_id, method, params, cb_id)`: queue a generic
@@ -972,6 +1006,47 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `vim._lsp_semantic_enable(bufnr, enabled)`: queue [`LspOp::SemanticTokensEnable`]
+    // (Phase 3) — `vim.lsp.semantic_tokens.start`/`stop` flip the per-buffer
+    // projection (`bufnr` already resolved from `0`/`nil` → current in Lua).
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_semantic_enable",
+        lua.create_function(move |_, (bufnr, enabled): (u64, bool)| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::SemanticTokensEnable { bufnr, enabled });
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._lsp_semantic_refresh(bufnr)`: queue [`LspOp::SemanticTokensRefresh`]
+    // (Phase 3) — `vim.lsp.semantic_tokens.force_refresh` drops the delta cursor and
+    // re-requests the whole token set.
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_semantic_refresh",
+        lua.create_function(move |_, bufnr: u64| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::SemanticTokensRefresh { bufnr });
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._lsp_semantic_config(enabled)`: queue [`LspOp::SemanticTokensConfig`]
+    // (Phase 3) — `vim.lsp.semantic_tokens.enable` is nxvim's editor-wide gate.
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_semantic_config",
+        lua.create_function(move |_, enabled: bool| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::SemanticTokensConfig { enabled });
+            Ok(())
+        })?,
     )?;
 
     // `vim._ui_input(prompt, default, cb_id)`: queue a `vim.ui.input` prompt

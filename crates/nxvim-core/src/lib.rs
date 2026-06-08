@@ -31,7 +31,7 @@ pub use editor::{
     FloatAnchor, FloatConfig, FloatRelative, TabId, UndoEntry, UndoTreeView, WindowConfigSpec,
     WindowId,
 };
-pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, TS_HL_PRIORITY};
+pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent};
 pub use mode::Mode;

@@ -33,6 +33,10 @@ pub const ROWS: u16 = 24;
 /// columns are offset by this much once the gutter is split off (matches
 /// `screen.rs`).
 pub const GUTTER: u16 = 4;
+/// The width of the reserved diagnostic sign column (vim's fixed 2-cell
+/// `signcolumn`). With signs on (the default), a diagnostic-bearing buffer's text
+/// is offset by this much *in addition to* the [`GUTTER`].
+pub const SIGN: u16 = 2;
 
 /// Serializes the subprocess-spawning tests (shared env + server lifecycle).
 pub use nxvim_test_harness::serial_lock as test_lock;
@@ -297,6 +301,85 @@ pub fn diagnostics_of(params: &[Value]) -> Vec<Vec<(u64, u64, u64)>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Decode the `diagnostics_virt` redraw key into per-row inline virtual-text
+/// decorations: `Some((text, severity))` for a row carrying one, `None` for a
+/// bare row (the trailing style-id is dropped, `Nil` with no colorscheme).
+pub fn diagnostics_virt_of(params: &[Value]) -> Vec<Option<(String, u64)>> {
+    window0_get(params, "diagnostics_virt")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let t = row.as_array()?;
+                    Some((t[0].as_str()?.to_string(), t[1].as_u64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Decode the `diagnostics_signs` redraw key into per-row gutter signs:
+/// `Some((glyph, severity))` for a row carrying one, `None` for a bare row (the
+/// trailing style-id is dropped, `Nil` with no colorscheme).
+pub fn diagnostics_signs_of(params: &[Value]) -> Vec<Option<(String, u64)>> {
+    window0_get(params, "diagnostics_signs")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let t = row.as_array()?;
+                    Some((t[0].as_str()?.to_string(), t[1].as_u64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `sign_column` redraw flag for window 0 (whether a sign column is reserved).
+pub fn sign_column_of(params: &[Value]) -> bool {
+    window0_get(params, "sign_column")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Poll (bounded) until a redraw whose `diagnostics_signs` has a sign on some row
+/// arrives, returning that row's `(glyph, severity)`.
+pub async fn wait_for_signs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> (String, u64) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if let Some(hit) = diagnostics_signs_of(&params).into_iter().flatten().next() {
+                return hit;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("a diagnostic gutter sign never appeared in a redraw");
+}
+
+/// Poll (bounded) until a redraw whose `diagnostics_virt` has a non-empty row
+/// arrives, returning that row's `(text, severity)`.
+pub async fn wait_for_virt_text(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> (String, u64) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if let Some(hit) = diagnostics_virt_of(&params).into_iter().flatten().next() {
+                return hit;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("inline diagnostic virtual text never appeared in a redraw");
 }
 
 /// Poll (bounded) until a redraw whose `diagnostics` has at least one non-empty

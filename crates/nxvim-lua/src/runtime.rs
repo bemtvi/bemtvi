@@ -17,8 +17,8 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, TsOp,
-    UiInputReq, WindowOp,
+    LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
+    TabOp, TsOp, UiInputReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -548,6 +548,37 @@ impl LuaRuntime {
         set.call((bufnr, list))
     }
 
+    /// Mirror a buffer's decoded semantic tokens into `vim._semantic_tokens[bufnr]`
+    /// as the plain data `vim.lsp.semantic_tokens.get_at_pos` reads back (Phase 3,
+    /// the diagnostics-mirror analogue). Called on every `semanticTokens/full`(/delta)
+    /// reply; keyed by `bufnr`. Each entry's `modifiers` is both a list (legend
+    /// order) and a set (`modifiers[name] == true`), matching neovim's shape.
+    pub fn set_semantic_tokens(
+        &self,
+        bufnr: u64,
+        tokens: &[SemanticTokenData],
+    ) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let set: mlua::Function = vim.get("_set_semantic_tokens")?;
+        let list = self.lua.create_table()?;
+        for (i, tok) in tokens.iter().enumerate() {
+            let t = self.lua.create_table()?;
+            t.set("line", tok.line)?;
+            t.set("start_col", tok.start_col)?;
+            t.set("end_col", tok.end_col)?;
+            t.set("type", tok.token_type.clone())?;
+            t.set("client_id", tok.client_id)?;
+            let mods = self.lua.create_table()?;
+            for (j, m) in tok.modifiers.iter().enumerate() {
+                mods.set(j + 1, m.clone())?;
+                mods.set(m.clone(), true)?;
+            }
+            t.set("modifiers", mods)?;
+            list.set(i + 1, t)?;
+        }
+        set.call((bufnr, list))
+    }
+
     /// Mirror one LSP client into `vim.lsp._clients[id]` (the Rust→Lua client
     /// registry) so `get_client_by_id` — and the `LspAttach` `on_attach` it feeds
     /// — can read `client.server_capabilities`. Pushed once per server when it
@@ -569,6 +600,7 @@ impl LuaRuntime {
         caps.set("documentFormattingProvider", c.document_formatting)?;
         caps.set("renameProvider", c.rename)?;
         caps.set("codeActionProvider", c.code_action)?;
+        caps.set("semanticTokensProvider", c.semantic_tokens)?;
         set.call((client.id, client.name.clone(), caps))
     }
 

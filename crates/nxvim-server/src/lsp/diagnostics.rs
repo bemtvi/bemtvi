@@ -52,7 +52,7 @@ impl Server {
     ) -> Value {
         // `vim.diagnostic.config({ underline = false })` hides the squiggles; the
         // message line and the location list (other surfaces) are unaffected.
-        let diags_encoding = if self.diagnostics_underline {
+        let diags_encoding = if self.diag_config.underline {
             self.diagnostics_of(buffer)
         } else {
             None
@@ -109,6 +109,138 @@ impl Server {
             })
             .collect();
         Value::Array(rows)
+    }
+
+    /// Build the per-row `diagnostics_virt` payload: for each visible row, the
+    /// inline virtual-text decoration — the most severe diagnostic *starting* on
+    /// that buffer line — as `[text, severity, style_id]`, or `Nil` when the row
+    /// has none (or virtual text is off). `text` is the config prefix followed by
+    /// the diagnostic's first message line; `severity` is `1`=error … `4`=hint;
+    /// `style_id` indexes the per-frame `styles` palette when the matching
+    /// `DiagnosticVirtualText*` group resolves (`Nil` otherwise, so the client
+    /// falls back to a built-in severity color). Mirrors [`Server::diagnostics_for`]
+    /// but emits one optional decoration per row rather than a span list — the text
+    /// is positioned after end-of-line by the client, so no column conversion runs.
+    pub(crate) fn diagnostics_virt_text_for(
+        &self,
+        buffer: nxvim_core::BufferId,
+        numbers: &[Option<usize>],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let diags = if self.diag_config.virtual_text {
+            self.diagnostics_of(buffer).map(|(d, _)| d)
+        } else {
+            None
+        };
+        let Some(diags) = diags else {
+            // One `Nil` per row so the client's `diagnostics_virt[row]` index
+            // stays aligned with `numbers`/`diagnostics`.
+            return Value::Array(numbers.iter().map(|_| Value::Nil).collect());
+        };
+        let rows = numbers
+            .iter()
+            .map(|num| {
+                let Some(n) = num else {
+                    return Value::Nil;
+                };
+                let line = (n - 1) as u32;
+                // The most severe diagnostic that *starts* on this row wins the
+                // line's one inline slot (ties broken by leftmost column).
+                let best = diags
+                    .iter()
+                    .filter(|d| d.range.start.line == line)
+                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
+                let Some(d) = best else {
+                    return Value::Nil;
+                };
+                let severity = severity_code(d.severity);
+                let text = format!("{}{}", self.diag_config.virt_prefix, first_line(&d.message));
+                let style_id = match self
+                    .editor
+                    .highlights
+                    .resolve(severity_virt_group(severity))
+                {
+                    Some(style) => Value::from(styles.intern(style) as u64),
+                    None => Value::Nil,
+                };
+                Value::Array(vec![
+                    Value::from(text),
+                    Value::from(severity as u64),
+                    style_id,
+                ])
+            })
+            .collect();
+        Value::Array(rows)
+    }
+
+    /// Build the per-row `diagnostics_signs` payload: for each visible row, the
+    /// gutter sign for the most severe diagnostic *starting* on that buffer line —
+    /// as `[glyph, severity, style_id]`, or `Nil` when the row has none (or signs
+    /// are off). `glyph` is the config (or built-in) per-severity letter; `severity`
+    /// is `1`=error … `4`=hint; `style_id` indexes the per-frame `styles` palette
+    /// when the matching `DiagnosticSign*` group resolves (`Nil` otherwise, so the
+    /// client falls back to a built-in severity color). Mirrors
+    /// [`Server::diagnostics_virt_text_for`] but addressed to the gutter.
+    pub(crate) fn diagnostics_signs_for(
+        &self,
+        buffer: nxvim_core::BufferId,
+        numbers: &[Option<usize>],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let diags = if self.diag_config.signs {
+            self.diagnostics_of(buffer).map(|(d, _)| d)
+        } else {
+            None
+        };
+        let Some(diags) = diags else {
+            // One `Nil` per row so the client's `diagnostics_signs[row]` index
+            // stays aligned with `numbers`/`diagnostics`.
+            return Value::Array(numbers.iter().map(|_| Value::Nil).collect());
+        };
+        let rows = numbers
+            .iter()
+            .map(|num| {
+                let Some(n) = num else {
+                    return Value::Nil;
+                };
+                let line = (n - 1) as u32;
+                // The most severe diagnostic that *starts* on this row wins the
+                // line's sign cell (ties broken by leftmost column).
+                let best = diags
+                    .iter()
+                    .filter(|d| d.range.start.line == line)
+                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
+                let Some(d) = best else {
+                    return Value::Nil;
+                };
+                let severity = severity_code(d.severity);
+                let glyph = self.diag_config.sign_glyph(severity).to_string();
+                let style_id = match self
+                    .editor
+                    .highlights
+                    .resolve(severity_sign_group(severity))
+                {
+                    Some(style) => Value::from(styles.intern(style) as u64),
+                    None => Value::Nil,
+                };
+                Value::Array(vec![
+                    Value::from(glyph),
+                    Value::from(severity as u64),
+                    style_id,
+                ])
+            })
+            .collect();
+        Value::Array(rows)
+    }
+
+    /// Whether this window reserves a gutter sign column: `signs` is enabled and
+    /// the window's buffer currently has at least one diagnostic. Matches vim's
+    /// `signcolumn=auto` — a clean buffer (or `signs = false`) keeps its old layout.
+    pub(crate) fn diagnostics_sign_column(&self, buffer: nxvim_core::BufferId) -> bool {
+        self.diag_config.signs
+            && self
+                .diagnostics_of(buffer)
+                .is_some_and(|(d, _)| !d.is_empty())
     }
 
     /// The message of the highest-severity diagnostic whose range covers the
@@ -191,6 +323,37 @@ impl Server {
         Some((lines, targets))
     }
 
+    /// `vim.diagnostic.open_float()`: open a float (the bottom panel, the same
+    /// surface hover uses) listing every diagnostic on the cursor's line in full —
+    /// the multi-line messages with their `source` and `code`, which the inline
+    /// virtual text truncates to one line. Diagnostics are sorted by severity then
+    /// start column; each is formatted as `E  source: message [code]`, its message
+    /// split across as many panel rows as it has lines. A loud no-op (an echoed
+    /// message, no panel) when the cursor's line has no diagnostics.
+    pub(crate) fn diagnostics_open_float(&mut self) {
+        // The cursor line's diagnostics: those *starting* on it (neovim's `lnum`
+        // scope), matching the virt-text / sign surfaces. Collected and sorted
+        // before any `&mut self` use so the borrow is released for `open_panel`.
+        let row = self.editor.cursor.line as u32;
+        let lines = match self.current_diagnostics() {
+            Some((diags, _)) => {
+                let mut items: Vec<&Diagnostic> =
+                    diags.iter().filter(|d| d.range.start.line == row).collect();
+                items.sort_by_key(|d| (severity_code(d.severity), d.range.start.character));
+                items
+                    .iter()
+                    .flat_map(|d| diagnostic_float_lines(d))
+                    .collect::<Vec<_>>()
+            }
+            None => Vec::new(),
+        };
+        if lines.is_empty() {
+            self.editor.echo("No diagnostics under cursor");
+            return;
+        }
+        self.editor.open_panel("Diagnostics", lines, false, 0);
+    }
+
     /// `vim.diagnostic.goto_next`/`goto_prev`: move the cursor to the next
     /// (`forward`) or previous diagnostic in the current buffer, wrapping around
     /// the ends. `severity` (1=ERROR…4=HINT) restricts the set when set. A no-op
@@ -265,4 +428,46 @@ impl Server {
             .cloned()
             .collect()
     }
+}
+
+/// Format one diagnostic as the panel rows `vim.diagnostic.open_float` shows: a
+/// header `E  source: <first message line> [code]` followed by any remaining
+/// message lines verbatim. Every line is control-sanitized like the single-line
+/// surfaces ([`first_line`]) — the message text is untrusted server output, and
+/// the panel paints it.
+fn diagnostic_float_lines(d: &Diagnostic) -> Vec<String> {
+    let mut msg_lines = d
+        .message
+        .lines()
+        .map(sanitize_control)
+        .filter(|l| !l.trim().is_empty());
+    let mut header = format!("{}  ", severity_short(severity_code(d.severity)));
+    if let Some(src) = d.source.as_deref().filter(|s| !s.is_empty()) {
+        header.push_str(&sanitize_control(src));
+        header.push_str(": ");
+    }
+    header.push_str(&msg_lines.next().unwrap_or_default());
+    if let Some(code) = diagnostic_code(d) {
+        header.push_str(&format!(" [{code}]"));
+    }
+    let mut out = vec![header];
+    out.extend(msg_lines);
+    out
+}
+
+/// A diagnostic's `code` rendered for the float header (a number stringified, a
+/// string sanitized), or `None` when the server attached none.
+fn diagnostic_code(d: &Diagnostic) -> Option<String> {
+    use nxvim_lsp::lsp_types::NumberOrString;
+    match d.code.as_ref()? {
+        NumberOrString::Number(n) => Some(n.to_string()),
+        NumberOrString::String(s) => Some(sanitize_control(s)),
+    }
+}
+
+/// Strip terminal control characters from one line of (untrusted) server text,
+/// the per-line half of [`first_line`]'s sanitizing — so a float row carrying a
+/// multi-line message can't smuggle an escape sequence to the terminal.
+fn sanitize_control(line: &str) -> String {
+    line.chars().filter(|c| !c.is_control()).collect()
 }

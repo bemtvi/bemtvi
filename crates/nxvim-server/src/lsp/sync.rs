@@ -56,8 +56,22 @@ impl Server {
                 }
                 return;
             }
-            LspOp::DiagnosticConfig { underline } => {
-                self.diagnostics_underline = underline;
+            LspOp::DiagnosticOpenFloat => {
+                self.diagnostics_open_float();
+                return;
+            }
+            LspOp::DiagnosticConfig {
+                underline,
+                virtual_text,
+                virt_prefix,
+                signs,
+                sign_text,
+            } => {
+                self.diag_config.underline = underline;
+                self.diag_config.virtual_text = virtual_text;
+                self.diag_config.virt_prefix = virt_prefix;
+                self.diag_config.signs = signs;
+                self.diag_config.sign_text = sign_text;
                 self.lsp_dirty = true;
                 return;
             }
@@ -89,6 +103,42 @@ impl Server {
                 encoding,
             } => {
                 self.show_lua_document(&uri, line, character, &encoding);
+                return;
+            }
+            LspOp::SemanticTokensEnable { bufnr, enabled } => {
+                let buffer = BufferId(bufnr);
+                let state = self.lsp_states.entry(buffer).or_default();
+                state.semantic_enabled = Some(enabled);
+                // Starting (re-)requests so a cold cache fills; stopping just hides
+                // the existing paint. Either way the projection must re-evaluate.
+                if enabled {
+                    self.request_semantic_tokens(buffer);
+                }
+                self.lsp_dirty = true;
+                return;
+            }
+            LspOp::SemanticTokensRefresh { bufnr } => {
+                let buffer = BufferId(bufnr);
+                // Drop the delta cursor so the refresh re-requests the whole `full`
+                // set (neovim's `force_refresh` discards the prior result).
+                if let Some(state) = self.lsp_states.get_mut(&buffer) {
+                    state.semantic.result_id = None;
+                }
+                self.request_semantic_tokens(buffer);
+                return;
+            }
+            LspOp::SemanticTokensConfig { enabled } => {
+                self.semantic_tokens_enabled = enabled;
+                // Flipping back on re-requests every attached buffer so the paint
+                // returns even if its cache was never filled (e.g. the feature was
+                // off at attach time); off just hides the paint (cache survives).
+                if enabled {
+                    let buffers: Vec<BufferId> = self.lsp_states.keys().copied().collect();
+                    for buffer in buffers {
+                        self.request_semantic_tokens(buffer);
+                    }
+                }
+                self.lsp_dirty = true;
                 return;
             }
         };
@@ -180,6 +230,7 @@ impl Server {
             encoding,
             sync_kind,
             client_id,
+            ..
         }) = self.lsp_servers.get(&key)
         else {
             let state = self.lsp_states.entry(buffer).or_default();
@@ -200,6 +251,12 @@ impl Server {
         // Set when this sync is the buffer's first `didOpen` under the server: the
         // attach moment, so `LspAttach` fires once the state is re-inserted below.
         let mut just_attached = false;
+
+        // Set when this sync pushed new content to the server (open or change), so
+        // a `semanticTokens/full` refresh is requested once the state is back in
+        // the map (the request reads it). Gated server-side on the server actually
+        // advertising semantic tokens, so this is free for servers without them.
+        let mut content_synced = false;
 
         if !state.opened {
             // First open (or re-open after a respawn): full text supersedes any
@@ -224,6 +281,7 @@ impl Server {
             // spurious `didSave` for saves that predate the open.
             state.last_save_tick = cur_save_tick;
             just_attached = true;
+            content_synced = true;
         } else if tick_changed && sync_kind != TextDocumentSyncKind::NONE {
             let batch = self.editor.buffer_mut().take_lsp_edits();
             state.version += 1;
@@ -247,6 +305,7 @@ impl Server {
                 },
             );
             state.last_tick = cur_tick;
+            content_synced = true;
         }
 
         // Save: the buffer's write counter advanced since the last sync, so a `:w`
@@ -266,6 +325,13 @@ impl Server {
         if just_attached {
             let file = path.to_string_lossy().into_owned();
             self.fire_lsp_attach(buffer, &file, client_id);
+        }
+
+        // Refresh semantic tokens whenever the server saw new content (the request
+        // no-ops unless the server advertised a legend). After the attach hook, so
+        // an `on_attach` that toggles the feature is already in effect.
+        if content_synced {
+            self.request_semantic_tokens(buffer);
         }
     }
 
@@ -437,6 +503,8 @@ impl Server {
                         encoding,
                         sync_kind: caps.sync_kind,
                         client_id,
+                        legend: caps.legend.clone(),
+                        semantic_tokens_delta: caps.semantic_tokens_delta,
                     },
                 );
                 // Mirror the client into `vim.lsp._clients[id]` so `on_attach` can

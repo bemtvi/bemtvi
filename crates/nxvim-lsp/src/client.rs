@@ -21,14 +21,16 @@ use lsp_types::{
     CompletionItemCapability, CompletionItemCapabilityResolveSupport,
     DocumentFormattingClientCapabilities, GeneralClientCapabilities, MarkupKind, MessageType,
     PositionEncodingKind, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
-    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncClientCapabilities, TextDocumentSyncKind, WorkspaceClientCapabilities,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
+    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, ServerCapabilities,
+    TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
+    TextDocumentSyncKind, TokenFormat, WorkspaceClientCapabilities,
     WorkspaceEditClientCapabilities,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{LspEvent, PositionEncoding, ProviderCaps, ServerKey};
+use crate::protocol::{LspEvent, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey};
 
 /// State shared by the client `MainLoop`'s notification handlers: which server
 /// this loop belongs to, the channel to forward distilled events on, and the log.
@@ -250,6 +252,31 @@ fn client_capabilities() -> ClientCapabilities {
                 related_information: Some(true),
                 ..Default::default()
             }),
+            // Declare semantic-tokens support so a server that gates the feature on
+            // the client publishes its `legend` and answers `semanticTokens/full`
+            // (ADR 0001 bridge #2). We request the `full` token set (whole document)
+            // and its `full/delta` refinement (Phase 2) — once a buffer has cached a
+            // `resultId`, the editor sends `full/delta` so the server can ship a diff
+            // instead of the whole array. `range` is still unwired. The
+            // type/modifier vocabularies are the LSP standard sets; a server is free
+            // to publish a legend that references others (the decode falls back to
+            // the raw name). `formats: [relative]` is the only token encoding the
+            // protocol defines. `augments_syntax_tokens` is true: we paint semantic
+            // tokens *over* the treesitter floor, not instead of it.
+            semantic_tokens: Some(SemanticTokensClientCapabilities {
+                dynamic_registration: Some(false),
+                requests: SemanticTokensClientCapabilitiesRequests {
+                    range: Some(false),
+                    full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                },
+                token_types: standard_token_types(),
+                token_modifiers: standard_token_modifiers(),
+                formats: vec![TokenFormat::RELATIVE],
+                overlapping_token_support: Some(false),
+                multiline_token_support: Some(false),
+                augments_syntax_tokens: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {
@@ -298,7 +325,99 @@ pub(crate) fn provider_caps(caps: &ServerCapabilities) -> ProviderCaps {
         document_formatting: present("documentFormattingProvider"),
         rename: present("renameProvider"),
         code_action: present("codeActionProvider"),
+        semantic_tokens: present("semanticTokensProvider"),
     }
+}
+
+/// The standard LSP semantic token *types* nxvim understands, advertised in the
+/// client capability. A server may publish a legend referencing types outside
+/// this set; the decode still maps them by raw name (an unknown type just won't
+/// resolve a highlight group). Kept in protocol order for readability only — the
+/// legend, not this list, fixes a server's indices.
+fn standard_token_types() -> Vec<SemanticTokenType> {
+    vec![
+        SemanticTokenType::NAMESPACE,
+        SemanticTokenType::TYPE,
+        SemanticTokenType::CLASS,
+        SemanticTokenType::ENUM,
+        SemanticTokenType::INTERFACE,
+        SemanticTokenType::STRUCT,
+        SemanticTokenType::TYPE_PARAMETER,
+        SemanticTokenType::PARAMETER,
+        SemanticTokenType::VARIABLE,
+        SemanticTokenType::PROPERTY,
+        SemanticTokenType::ENUM_MEMBER,
+        SemanticTokenType::EVENT,
+        SemanticTokenType::FUNCTION,
+        SemanticTokenType::METHOD,
+        SemanticTokenType::MACRO,
+        SemanticTokenType::KEYWORD,
+        SemanticTokenType::MODIFIER,
+        SemanticTokenType::COMMENT,
+        SemanticTokenType::STRING,
+        SemanticTokenType::NUMBER,
+        SemanticTokenType::REGEXP,
+        SemanticTokenType::OPERATOR,
+        SemanticTokenType::DECORATOR,
+    ]
+}
+
+/// The standard LSP semantic token *modifiers* nxvim understands. As with the
+/// types, a server's legend may reference others; those fall back to the raw name.
+fn standard_token_modifiers() -> Vec<SemanticTokenModifier> {
+    vec![
+        SemanticTokenModifier::DECLARATION,
+        SemanticTokenModifier::DEFINITION,
+        SemanticTokenModifier::READONLY,
+        SemanticTokenModifier::STATIC,
+        SemanticTokenModifier::DEPRECATED,
+        SemanticTokenModifier::ABSTRACT,
+        SemanticTokenModifier::ASYNC,
+        SemanticTokenModifier::MODIFICATION,
+        SemanticTokenModifier::DOCUMENTATION,
+        SemanticTokenModifier::DEFAULT_LIBRARY,
+    ]
+}
+
+/// The server's `semanticTokensProvider.legend` distilled to plain string arrays,
+/// or `None` when the server advertises no semantic-tokens provider. The integer
+/// indices a `semanticTokens/full` reply carries are positions into these arrays,
+/// so the editor needs them to decode (Decision 4 keeps the encoding-aware
+/// conversion editor-side; the legend rides along the same `Initialized` path).
+pub(crate) fn semantic_legend(caps: &ServerCapabilities) -> Option<SemanticLegend> {
+    use lsp_types::SemanticTokensServerCapabilities as Cap;
+    let legend = match caps.semantic_tokens_provider.as_ref()? {
+        Cap::SemanticTokensOptions(opts) => &opts.legend,
+        Cap::SemanticTokensRegistrationOptions(opts) => &opts.semantic_tokens_options.legend,
+    };
+    Some(SemanticLegend {
+        token_types: legend
+            .token_types
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect(),
+        token_modifiers: legend
+            .token_modifiers
+            .iter()
+            .map(|m| m.as_str().to_string())
+            .collect(),
+    })
+}
+
+/// Whether the server advertised `semanticTokensProvider.full.delta == true` — it
+/// can answer `semanticTokens/full/delta` with diffs (Phase 2). `false` when the
+/// provider is absent, or its `full` is a bare `true` / has `delta != true` (the
+/// editor then always re-requests the whole `full` set). `full/delta` to a server
+/// that didn't advertise it would error and loop, so this gates the delta path.
+pub(crate) fn semantic_tokens_delta(caps: &ServerCapabilities) -> bool {
+    use lsp_types::SemanticTokensFullOptions as Full;
+    use lsp_types::SemanticTokensServerCapabilities as Cap;
+    let opts = match caps.semantic_tokens_provider.as_ref() {
+        Some(Cap::SemanticTokensOptions(opts)) => opts,
+        Some(Cap::SemanticTokensRegistrationOptions(opts)) => &opts.semantic_tokens_options,
+        None => return false,
+    };
+    matches!(opts.full, Some(Full::Delta { delta: Some(true) }))
 }
 
 /// The document-sync kind the server wants (full text, incremental deltas, or

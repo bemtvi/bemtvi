@@ -434,6 +434,44 @@ async fn a_float_paints_over_the_buffer_beneath() {
 }
 
 #[tokio::test]
+async fn a_float_paints_buf_set_lines_content_with_a_clean_gutter() {
+    // Regression: a float bound to a scratch buffer whose content was written with
+    // `nvim_buf_set_lines` (never entered / typed into) — the path diagnostic /
+    // hover / completion popups use — must paint those lines IN FULL. A float
+    // defaults to a clean gutter (no line-number column), so the content is not
+    // squeezed or truncated. (Before: the float inherited the editor's 4-cell
+    // number gutter, so `nvim_open_win({width=13})` content was clipped to 9 cells.)
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ibackground<Esc>");
+    // A single-bordered float at (col 0, row 0), 11-cell *content* wide — exactly
+    // the width of the line, so any gutter would clip it.
+    exec_lua(
+        &rpc,
+        "local b = vim.api.nvim_create_buf(false, true)\n\
+         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'abcdefghijk' })\n\
+         vim.api.nvim_open_win(b, false, { relative = 'editor', row = 0, col = 0,\n\
+                                           width = 11, height = 1, border = 'single',\n\
+                                           focusable = false })",
+    )
+    .await;
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // The content row is inside the top border (row 1). With a clean gutter the
+    // first cell past the left border is the first character, and the whole line
+    // fits — no digits, no truncation.
+    let content = row_text(&buf, 1);
+    assert!(
+        content.contains("abcdefghijk"),
+        "the float paints its full set line, ungutted and untruncated: {content:?}"
+    );
+    assert_eq!(
+        buf.cell((1, 1)).unwrap().symbol(),
+        "a",
+        "content starts right after the left border — no number gutter: {content:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_bordered_float_draws_its_border_and_title() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ibackground<Esc>");
@@ -737,12 +775,9 @@ async fn a_focused_float_owns_the_terminal_cursor() {
     };
     let (_buf, cursor) = paint_with_cursor(&View::from_redraw(&params), COLS, ROWS);
 
-    // The cursor lands inside the float: past its border (col 5 -> +1) and its
-    // 4-cell number gutter (+4), at screen column 1 of "hi" (+1) -> x = 11; one
-    // row down past the top border (row 3 -> +1) -> y = 4.
-    assert_eq!(
-        cursor,
-        Some((5 + 1 + GUTTER + 1, 3 + 1)),
-        "cursor inside the float"
-    );
+    // The cursor lands inside the float: past its border (col 5 -> +1), at screen
+    // column 1 of "hi" (+1) -> x = 7; one row down past the top border
+    // (row 3 -> +1) -> y = 4. A float has a clean gutter (no number column), so
+    // there is no gutter offset to add.
+    assert_eq!(cursor, Some((5 + 1 + 1, 3 + 1)), "cursor inside the float");
 }

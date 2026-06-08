@@ -31,7 +31,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::client::{
     encoding_of, exit_code_signal, merged_client_capabilities, new_client, provider_caps,
-    sync_kind_of,
+    semantic_legend, semantic_tokens_delta, sync_kind_of,
 };
 use crate::dispatch::{apply_notify, issue_request};
 use crate::log::{LogLevel, LspLog};
@@ -378,6 +378,8 @@ async fn run_server_once(
     let encoding = encoding_of(&init_result.capabilities);
     let sync_kind = sync_kind_of(&init_result.capabilities);
     let providers = provider_caps(&init_result.capabilities);
+    let legend = semantic_legend(&init_result.capabilities);
+    let semantic_tokens_delta = semantic_tokens_delta(&init_result.capabilities);
     log.log(
         LogLevel::Info,
         name,
@@ -388,6 +390,8 @@ async fn run_server_once(
         caps: ServerCaps {
             sync_kind,
             providers,
+            legend,
+            semantic_tokens_delta,
         },
         encoding,
         // The raw result for the config's `on_init` hook (Phase 3); `Null` if it

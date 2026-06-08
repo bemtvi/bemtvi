@@ -39,3 +39,5 @@ mod formatting;
 mod goto;
 #[path = "lsp/lifecycle.rs"]
 mod lifecycle;
+#[path = "lsp/semantic.rs"]
+mod semantic;

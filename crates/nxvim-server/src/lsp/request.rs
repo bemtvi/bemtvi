@@ -52,7 +52,10 @@ impl Server {
             | LspReqKind::Rename
             | LspReqKind::CodeAction
             | LspReqKind::ResolveCodeAction
-            | LspReqKind::CompletionResolve => return,
+            | LspReqKind::CompletionResolve
+            // Semantic tokens are whole-buffer, issued by `request_semantic_tokens`
+            // on open/change rather than at the cursor.
+            | LspReqKind::SemanticTokens => return,
         };
         self.lsp.request(key, token, req);
     }
@@ -251,6 +254,12 @@ impl Server {
         // then must drop it — applying stale edits would corrupt the buffer. A
         // mere cursor move is fine to apply over.
         let tick_changed = pending.tick != self.editor.buffer().changedtick;
+        // The buffer/tick the request was issued for — semantic tokens are
+        // whole-buffer (cache to the issuing buffer regardless of focus, drop on
+        // *its* content change), so they use these rather than the current-buffer
+        // staleness above.
+        let req_buffer = pending.buffer;
+        let req_tick = pending.tick;
         self.lsp_requests.remove(&kind);
 
         match reply {
@@ -331,6 +340,12 @@ impl Server {
                     return;
                 }
                 self.merge_resolved_completion(documentation, detail);
+            }
+            LspReply::SemanticTokens(data) => {
+                // Whole-buffer, focus-independent: cache to the issuing buffer
+                // (which may not be current) and let `on_semantic_tokens_reply`
+                // drop it on that buffer's own content change.
+                self.on_semantic_tokens_reply(req_buffer, req_tick, data);
             }
             // Generic `client:request` replies are routed to their Lua handler in
             // `on_lsp_event` before reaching here, never through the typed path.

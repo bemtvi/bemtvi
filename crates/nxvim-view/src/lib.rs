@@ -19,6 +19,8 @@ mod style;
 mod view;
 
 pub use keys::{encode_paste, notation, Key};
-pub use parse::{DiagSpan, HlSpan, IncSearchSpans, PmenuItem, SearchSpans, StatusSegment};
+pub use parse::{
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, PmenuItem, SearchSpans, StatusSegment,
+};
 pub use style::{Border, Style};
 pub use view::{PanelData, PmenuData, ScrollData, Separator, TabData, View, WinRect, WindowView};

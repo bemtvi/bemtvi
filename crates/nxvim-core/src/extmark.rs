@@ -43,6 +43,13 @@ pub const DEFAULT_PRIORITY: u32 = 4096;
 /// `vim.highlight.priorities.treesitter`). Extmarks default above this.
 pub const TS_HL_PRIORITY: u32 = 100;
 
+/// Priority LSP semantic tokens paint at (neovim's
+/// `vim.highlight.priorities.semantic_tokens`): just *above* the treesitter floor
+/// ([`TS_HL_PRIORITY`]) — the server's authoritative classification refines the
+/// syntactic guess — and *below* [`DEFAULT_PRIORITY`], so a user/plugin extmark
+/// still wins over both.
+pub const SEMANTIC_HL_PRIORITY: u32 = 125;
+
 /// A single extmark, identified within its buffer by `(namespace, id)`.
 ///
 /// `start`/`end` are byte offsets into the buffer rope, kept current by

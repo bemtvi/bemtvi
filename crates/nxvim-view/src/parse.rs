@@ -19,6 +19,18 @@ pub type HlSpan = (u16, u16, String, Option<usize>);
 /// severity-colored undercurl.
 pub type DiagSpan = (u16, u16, u8, Option<usize>);
 
+/// One row's inline diagnostic virtual text: `(text, severity, style_id)`. The
+/// `text` (already prefixed by the server) is painted after the line's
+/// end-of-text, colored by the resolved `DiagnosticVirtualText*` `style_id`
+/// (frame-palette index) or a built-in severity foreground when `None`.
+pub type DiagVirt = (String, u8, Option<usize>);
+
+/// One row's gutter diagnostic sign: `(glyph, severity, style_id)`. The `glyph`
+/// (the server's per-severity sign text) is painted in the reserved sign column,
+/// colored by the resolved `DiagnosticSign*` `style_id` (frame-palette index) or a
+/// built-in severity foreground when `None`.
+pub type DiagSign = (String, u8, Option<usize>);
+
 /// Per visible row, the screen-column spans of every search match (`hlsearch`).
 pub type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
@@ -207,6 +219,55 @@ pub(crate) fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
 /// columns. The trailing `style_id` indexes the frame's `styles` palette when
 /// the server resolved the `DiagnosticUnderline*` group through a colorscheme;
 /// `Nil` falls back to a built-in severity color in the client.
+/// Parse the `diagnostics_virt` redraw key into per-row optional inline
+/// decorations: each row is `Nil` (no virt text) or `[text, severity, style_id]`.
+/// Malformed entries decode to `None`, leaving that row undecorated.
+pub(crate) fn parse_diagnostics_virt(value: Option<&Value>) -> Vec<Option<DiagVirt>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let t = row.as_array()?;
+                    if t.len() != 3 {
+                        return None;
+                    }
+                    Some((
+                        t[0].as_str()?.to_string(),
+                        t[1].as_u64()? as u8,
+                        t[2].as_u64().map(|id| id as usize),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the `diagnostics_signs` redraw key into per-row optional gutter signs:
+/// each row is `Nil` (no sign) or `[glyph, severity, style_id]`. Malformed entries
+/// decode to `None`, leaving that row's sign cell blank. Same shape as
+/// [`parse_diagnostics_virt`].
+pub(crate) fn parse_diagnostics_signs(value: Option<&Value>) -> Vec<Option<DiagSign>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let t = row.as_array()?;
+                    if t.len() != 3 {
+                        return None;
+                    }
+                    Some((
+                        t[0].as_str()?.to_string(),
+                        t[1].as_u64()? as u8,
+                        t[2].as_u64().map(|id| id as usize),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn parse_diagnostics(value: Option<&Value>) -> Vec<Vec<DiagSpan>> {
     value
         .and_then(Value::as_array)

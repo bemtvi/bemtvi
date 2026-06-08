@@ -114,13 +114,30 @@ pub enum LspOp {
     /// `vim.diagnostic.setloclist()` — open the current buffer's diagnostics as
     /// the navigable panel location list (the `:LspDiagnostics` surface).
     DiagnosticSetloclist,
-    /// `vim.diagnostic.config({ underline = … })` — toggle the one diagnostic
-    /// surface nxvim has (the underline spans). Other config keys (virt-text,
-    /// signs) have no surface yet and are stored Lua-side without an op.
+    /// `vim.diagnostic.open_float()` — open a float listing the cursor line's
+    /// diagnostics in full (the multi-line messages with `source`/`code`). A loud
+    /// no-op when the line is clean.
+    DiagnosticOpenFloat,
+    /// `vim.diagnostic.config({ underline = …, virtual_text = …, signs = … })` —
+    /// toggle the diagnostic surfaces nxvim renders. Other config keys (float) are
+    /// stored Lua-side without an op until their surface lands.
     DiagnosticConfig {
         /// Whether diagnostic underline spans are painted (neovim's `underline`,
         /// default on; `false` disables the squiggles).
         underline: bool,
+        /// Whether the inline end-of-line virtual-text message is painted
+        /// (neovim's `virtual_text`, default off).
+        virtual_text: bool,
+        /// The leader glyph the virtual text is prefixed with (`prefix` in the
+        /// table form of `virtual_text`; default `■ `).
+        virt_prefix: String,
+        /// Whether the gutter sign column is painted (neovim's `signs`, default
+        /// on; `false` reserves no column).
+        signs: bool,
+        /// The per-severity gutter glyphs, indexed by severity code minus one
+        /// (`[error, warn, info, hint]`) — the `text` map of the `signs` table, or
+        /// the built-in `E`/`W`/`I`/`H` letters. Always exactly four entries.
+        sign_text: [String; 4],
     },
     /// `client:request(method, params, handler)` (Phase 5) — issue a generic LSP
     /// request to the client `client_id`'s server and route its reply to the Lua
@@ -168,6 +185,30 @@ pub enum LspOp {
         character: u32,
         /// The position offset encoding (`utf-8` / `utf-16` / `utf-32`).
         encoding: String,
+    },
+    /// `vim.lsp.semantic_tokens.start(bufnr)` / `stop(bufnr)` (Phase 3) — flip the
+    /// per-buffer semantic-token projection on or off. `start` also re-requests the
+    /// token set if the cache is cold; `stop` leaves the cache but hides the paint.
+    SemanticTokensEnable {
+        /// The target buffer (already resolved from `0`/`nil` → current in Lua).
+        bufnr: u64,
+        /// `true` to start (project + request), `false` to stop (hide the paint).
+        enabled: bool,
+    },
+    /// `vim.lsp.semantic_tokens.force_refresh(bufnr)` (Phase 3) — drop the cached
+    /// `result_id` and re-request the whole `full` token set, repainting from the
+    /// server's fresh classification.
+    SemanticTokensRefresh {
+        /// The target buffer (already resolved from `0`/`nil` → current in Lua).
+        bufnr: u64,
+    },
+    /// `vim.lsp.semantic_tokens.enable(enabled)` (Phase 3) — nxvim's editor-wide
+    /// gate for the whole semantic-tokens feature (neovim has only the per-buffer
+    /// `start`/`stop`). Off ⇒ no semantic paint anywhere; flipping back on
+    /// re-requests every attached buffer so the paint returns.
+    SemanticTokensConfig {
+        /// Whether semantic tokens are enabled editor-wide (default on).
+        enabled: bool,
     },
 }
 
@@ -526,6 +567,29 @@ pub struct DiagnosticData {
     pub source: Option<String>,
 }
 
+/// One decoded semantic token mirrored into `vim._semantic_tokens[bufnr]` so the
+/// synchronous getter `vim.lsp.semantic_tokens.get_at_pos` can read it from pure
+/// Lua (the Rust→Lua mirror, the analogue of `vim._diagnostics`). Positions are
+/// 0-based; `start_col`/`end_col` are line-local **byte** offsets (already
+/// converted from the server's encoding when the tokens were decoded), matching
+/// neovim's byte-column `get_at_pos` shape.
+#[derive(Clone, Debug)]
+pub struct SemanticTokenData {
+    /// 0-based buffer line the token sits on.
+    pub line: u32,
+    /// 0-based start byte column.
+    pub start_col: u32,
+    /// 0-based (exclusive) end byte column.
+    pub end_col: u32,
+    /// The legend token-type name (e.g. `"function"`).
+    pub token_type: String,
+    /// The active modifier names (e.g. `["readonly", "static"]`), legend order.
+    pub modifiers: Vec<String>,
+    /// The owning LSP client id (the buffer's server), matching neovim's per-token
+    /// `client_id`.
+    pub client_id: u64,
+}
+
 /// One LSP client mirrored into `vim.lsp._clients[id]` so `on_attach` (and any
 /// Lua) can read `client.server_capabilities` (Phase 7b Slice 3). Pushed once per
 /// server when it finishes `initialize`; the server translates its `ProviderCaps`
@@ -558,6 +622,7 @@ pub struct LspServerCapabilities {
     pub document_formatting: bool,
     pub rename: bool,
     pub code_action: bool,
+    pub semantic_tokens: bool,
 }
 
 /// One `vim.keymap.set` entry, read back from `vim._keymaps` as plain data for

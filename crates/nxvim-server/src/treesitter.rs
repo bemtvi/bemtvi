@@ -154,19 +154,26 @@ impl Server {
                 let ts_spans = spans_by_line.and_then(|m| m.get(&line_idx));
                 let text = b.line_cow(line_idx);
                 let tab = b.options.effective_tabstop();
+                let ts_len = ts_spans.map_or(0, |s| s.len()) as u32;
 
-                // Fast path: no extmarks on this line ⇒ emit the (already
-                // non-overlapping) treesitter spans verbatim, byte-identical to
-                // the pre-extmark projection.
+                // LSP semantic tokens (ADR 0001 bridge #2): a third highlight
+                // source at SEMANTIC_HL_PRIORITY, between treesitter and extmarks.
+                // Built before the extmark scan so its count offsets the extmark
+                // orders, keeping the source layering deterministic.
+                let sem = self.semantic_intervals(buffer, line_idx, ts_len);
+
+                // Fast path: no extmarks *and* no semantic tokens on this line ⇒
+                // emit the (already non-overlapping) treesitter spans verbatim,
+                // byte-identical to the pre-extmark projection.
                 let ext = self.extmark_intervals(
                     buffer,
                     line_idx,
                     b.line_start(line_idx),
                     text.len(),
-                    // treesitter spans take orders [0, n); extmarks sort above.
-                    ts_spans.map_or(0, |s| s.len()) as u32,
+                    // treesitter spans take orders [0, n); semantic + extmarks above.
+                    ts_len + sem.len() as u32,
                 );
-                if ext.is_empty() {
+                if ext.is_empty() && sem.is_empty() {
                     let Some(spans) = ts_spans else {
                         return Value::Array(Vec::new());
                     };
@@ -191,8 +198,9 @@ impl Server {
                     return Value::Array(row);
                 }
 
-                // Merge path: treesitter spans (priority TS_HL_PRIORITY) and the
-                // line's extmarks, resolved into non-overlapping winning segments.
+                // Merge path: treesitter spans (priority TS_HL_PRIORITY), semantic
+                // tokens (SEMANTIC_HL_PRIORITY), and the line's extmarks
+                // (DEFAULT_PRIORITY), resolved into non-overlapping winning segments.
                 let mut intervals = Vec::new();
                 if let Some(spans) = ts_spans {
                     for (i, s) in spans.iter().enumerate() {
@@ -206,6 +214,7 @@ impl Server {
                         });
                     }
                 }
+                intervals.extend(sem);
                 intervals.extend(ext);
                 let mut vc = unicode::LineVirtcol::new(&text, tab);
                 let row = crate::extmarks::merge_intervals(&intervals)

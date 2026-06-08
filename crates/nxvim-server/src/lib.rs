@@ -30,7 +30,9 @@ mod treesitter;
 
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
-use lsp::{CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
+use lsp::{
+    CompletionMenu, DiagnosticConfig, LspDocState, LspReqKind, PendingLspReq, ServerRuntime,
+};
 use nxvim_core::{BufferId, Editor, Key, Mode, TabId, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
@@ -192,10 +194,14 @@ struct Server {
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
     lsp_code_actions: Vec<CodeActionData>,
-    /// Whether diagnostic underline spans are painted, toggled by
-    /// `vim.diagnostic.config({ underline = … })` (Slice 2). Default `true`; the
-    /// one diagnostic-config key with a backing surface in nxvim.
-    diagnostics_underline: bool,
+    /// The `vim.diagnostic.config` keys with a backing surface — the underline
+    /// spans and the inline virtual text — toggled by `vim.diagnostic.config`.
+    diag_config: DiagnosticConfig,
+    /// The editor-wide semantic-tokens gate (Phase 3), toggled by
+    /// `vim.lsp.semantic_tokens.enable`. Default on; `false` hides the semantic
+    /// paint everywhere and stops the refresh requests (the per-buffer
+    /// `LspDocState::semantic_enabled` is the narrower override).
+    semantic_tokens_enabled: bool,
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
     /// every entry).
@@ -333,7 +339,8 @@ where
         lsp_requests: HashMap::new(),
         completion: None,
         lsp_code_actions: Vec::new(),
-        diagnostics_underline: true,
+        diag_config: DiagnosticConfig::default(),
+        semantic_tokens_enabled: true,
         last_buffer_id: None,
         announced: HashSet::new(),
         last_mode: Mode::Normal,

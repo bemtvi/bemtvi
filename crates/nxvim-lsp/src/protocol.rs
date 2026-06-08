@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use lsp_types::{
-    CodeAction, Diagnostic, Location, Position, Range, TextDocumentContentChangeEvent,
-    TextDocumentSyncKind, TextEdit, Url,
+    CodeAction, Diagnostic, Location, Position, Range, SemanticToken, SemanticTokensEdit,
+    TextDocumentContentChangeEvent, TextDocumentSyncKind, TextEdit, Url,
 };
 
 /// Identifies one language server instance: a `(name, workspace-root)` pair.
@@ -62,6 +62,28 @@ pub enum PositionEncoding {
 pub struct ServerCaps {
     pub sync_kind: TextDocumentSyncKind,
     pub providers: ProviderCaps,
+    /// The `semanticTokensProvider.legend` (`tokenTypes` / `tokenModifiers` as
+    /// plain strings), needed to decode the packed token data — the integer
+    /// `tokenType` / `tokenModifiers` indices a `semanticTokens/full` reply
+    /// carries are positions into these arrays. `None` when the server advertises
+    /// no semantic-tokens provider (the feature stays off for its buffers).
+    pub legend: Option<SemanticLegend>,
+    /// Whether the server advertised `semanticTokensProvider.full.delta` — it
+    /// answers `semanticTokens/full/delta` with diffs. The editor only sends the
+    /// delta request to a server that advertised it; otherwise every refresh re-
+    /// requests the whole `full` set (Phase 2). Meaningless without a `legend`.
+    pub semantic_tokens_delta: bool,
+}
+
+/// The `semanticTokensProvider.legend`: the ordered token-type and
+/// token-modifier name arrays a server publishes at `initialize`. The decode maps
+/// a token's `token_type` index into `token_types` and each set bit of its
+/// `token_modifiers_bitset` into `token_modifiers`, yielding the names that build
+/// the `@lsp.type.*` / `@lsp.typemod.*` highlight groups.
+#[derive(Clone, Debug, Default)]
+pub struct SemanticLegend {
+    pub token_types: Vec<String>,
+    pub token_modifiers: Vec<String>,
 }
 
 /// The language-feature providers a server advertised at `initialize`, one bool
@@ -82,6 +104,7 @@ pub struct ProviderCaps {
     pub document_formatting: bool,
     pub rename: bool,
     pub code_action: bool,
+    pub semantic_tokens: bool,
 }
 
 /// A fire-and-forget document-sync notification, already in LSP coordinates. The
@@ -196,6 +219,27 @@ pub enum LspRequest {
     ResolveCompletion {
         item: serde_json::Value,
     },
+    /// `textDocument/semanticTokens/full` — the whole-buffer token set (ADR 0001
+    /// bridge #2). Unlike the cursor-anchored features, this is requested per
+    /// *buffer* (on open and after each change), and the reply
+    /// ([`LspReply::SemanticTokens`]) carries the packed token array the editor
+    /// decodes against the server's legend + encoding and projects over the
+    /// treesitter floor.
+    SemanticTokensFull {
+        uri: Url,
+    },
+    /// `textDocument/semanticTokens/full/delta` — the *diff* from a prior token set
+    /// (Phase 2). Sent in place of `SemanticTokensFull` once a buffer has cached a
+    /// `result_id` (the delta cursor): the server replies with edits to splice into
+    /// the cached array ([`SemanticTokensData::Delta`]) instead of the whole set,
+    /// shrinking the per-edit wire payload. A server that can't honor the
+    /// `previous_result_id` may instead reply with a fresh full set
+    /// ([`SemanticTokensData::Full`]) — the transparent fallback the editor applies
+    /// by replacing the cache.
+    SemanticTokensDelta {
+        uri: Url,
+        previous_result_id: String,
+    },
     /// A **generic** request issued by Lua `client:request(method, params, …)`
     /// (Phase 5): an arbitrary `method` with raw JSON `params`, whose raw JSON
     /// result routes back to a Lua handler ([`LspReply::Raw`]). This is the seam
@@ -276,12 +320,47 @@ pub enum LspReply {
         documentation: Option<String>,
         detail: Option<String>,
     },
+    /// The semantic tokens from `textDocument/semanticTokens/full` or
+    /// `full/delta` (ADR 0001 bridge #2). The token data stays in the protocol's
+    /// *packed* form (already-deserialized 5-field [`SemanticToken`] deltas) — the
+    /// editor decodes it against the server's legend + negotiated encoding into
+    /// per-line byte spans, because only the editor holds the buffer text the
+    /// char→byte conversion needs (like the completion edit ranges). See
+    /// [`SemanticTokensData`] for the full-vs-delta shapes.
+    SemanticTokens(SemanticTokensData),
     /// The reply to an [`LspRequest::Raw`] (Phase 5): the server's raw JSON result
     /// (`Ok`) or an error message (`Err`) — an unsupported method, a transport
     /// failure, or the server replying an error. Routed back to the Lua handler as
     /// `(err, result)`, bypassing the editor-feature staleness machinery the typed
     /// replies use (a config command's reply always fires its handler).
     Raw(Result<serde_json::Value, String>),
+}
+
+/// A `textDocument/semanticTokens/full` or `full/delta` reply distilled for the
+/// editor, decoded editor-side ([`crate::lsp::semantic`](../../nxvim-server))
+/// against the negotiated legend + encoding. The `result_id` (when present) is the
+/// delta cursor a later refresh quotes as `previousResultId`.
+#[derive(Clone, Debug)]
+pub enum SemanticTokensData {
+    /// A whole token set — from `semanticTokens/full`, or a `full/delta` the server
+    /// answered with a fresh full set (it couldn't, or chose not to, diff against
+    /// the quoted `previousResultId`). Replaces the editor's cached token array
+    /// wholesale; an empty `tokens` ⇒ the server classified nothing (the buffer
+    /// falls back to the treesitter floor).
+    Full {
+        result_id: Option<String>,
+        tokens: Vec<SemanticToken>,
+    },
+    /// Splice edits from `full/delta`: each [`SemanticTokensEdit`]'s
+    /// `start`/`delete_count` index the *flat integer* array of the previously
+    /// cached token set, and `data` is the replacement tokens. The editor patches
+    /// its cache and re-decodes. An empty `edits` ⇒ nothing changed (the cache,
+    /// and so the paint, is left as-is — distinct from an empty [`Self::Full`],
+    /// which clears it).
+    Delta {
+        result_id: Option<String>,
+        edits: Vec<SemanticTokensEdit>,
+    },
 }
 
 /// A [`WorkspaceEdit`](lsp_types::WorkspaceEdit) normalized to per-document text

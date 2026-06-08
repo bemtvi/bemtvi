@@ -129,9 +129,10 @@ async fn a_diagnostic_cell_is_painted_with_an_underline() {
     let buf = paint(&View::from_redraw(&params), COLS, ROWS);
 
     // "bad" sits at byte/screen columns 4..7 on line 0; the painted cells are
-    // offset by the number-column gutter.
-    let on = GUTTER + 4; // first cell of "bad"
-    let off = GUTTER + 7; // the space just after "bad"
+    // offset by the reserved sign column (signs default on with a diagnostic) plus
+    // the number-column gutter.
+    let on = SIGN + GUTTER + 4; // first cell of "bad"
+    let off = SIGN + GUTTER + 7; // the space just after "bad"
     assert_eq!(buf.cell((on, 0)).unwrap().symbol(), "b");
     assert!(
         buf.cell((on, 0))
@@ -153,5 +154,104 @@ async fn a_diagnostic_cell_is_painted_with_an_underline() {
             .add_modifier
             .contains(Modifier::UNDERLINED),
         "the cell just past the diagnostic is not underlined"
+    );
+}
+
+#[tokio::test]
+async fn inline_virtual_text_is_painted_after_the_line() {
+    // Tier 2: with `virtual_text` enabled the diagnostic's message is painted to
+    // the grid after the line's end-of-text, in the error severity's foreground —
+    // proving the decoration survives all the way to the rendered cells.
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "diag-virt-paint",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "diagnostics": [diag(0, 4, 7, 1, "use of bad")],
+        }),
+    );
+    let file = temp_file("diag-virt-paint", "rs", "let bad = 1\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    wait_for_diagnostics(&rpc, &mut incoming).await;
+
+    exec_lua(&rpc, "vim.diagnostic.config({ virtual_text = true })").await;
+    let params = loop {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(p) = drain_latest_redraw(&mut incoming) {
+            if diagnostics_virt_of(&p).iter().any(Option::is_some) {
+                break p;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let buf = paint(&View::from_redraw(&params), COLS, ROWS);
+
+    // "let bad = 1" is 11 cells; the virt text follows after the gutter + a
+    // one-cell gap. Scan the row for the prefix glyph and assert its color.
+    let row: String = (0..COLS)
+        .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+        .collect();
+    assert!(
+        row.contains("■ use of bad"),
+        "the inline message is painted after the line: {row:?}"
+    );
+    let glyph_x = (0..COLS)
+        .find(|&x| buf.cell((x, 0)).unwrap().symbol() == "■")
+        .expect("the prefix glyph is on the row");
+    assert_eq!(
+        buf.cell((glyph_x, 0)).unwrap().style().fg,
+        Some(Color::Red),
+        "in the error severity's built-in foreground"
+    );
+}
+
+#[tokio::test]
+async fn a_diagnostic_sign_is_painted_in_the_gutter() {
+    // Tier 2: with signs on (the default) the diagnostic's line carries its
+    // severity glyph in the reserved sign column — at the far left, before the
+    // number gutter — in the error severity's foreground.
+    let _guard = test_lock().lock().await;
+    let record = configure_mock(
+        "diag-sign-paint",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "diagnostics": [diag(0, 4, 7, 1, "bad")],
+        }),
+    );
+    let file = temp_file("diag-sign-paint", "rs", "let bad = 1\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    wait_for_diagnostics(&rpc, &mut incoming).await;
+
+    let params = loop {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(p) = drain_latest_redraw(&mut incoming) {
+            if sign_column_of(&p) {
+                break p;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let buf = paint(&View::from_redraw(&params), COLS, ROWS);
+
+    // The sign sits in the first column of line 0, before the number gutter.
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().symbol(),
+        "E",
+        "the error glyph leads the sign column"
+    );
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().style().fg,
+        Some(Color::Red),
+        "in the error severity's built-in foreground"
+    );
+    // The text proper begins past the sign column + the number gutter.
+    assert_eq!(
+        buf.cell((SIGN + GUTTER, 0)).unwrap().symbol(),
+        "l",
+        "the line text starts after both gutters"
     );
 }

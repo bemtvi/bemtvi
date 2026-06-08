@@ -12,9 +12,13 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::anim::{arm_animation, lerp, Animation};
 use nxvim_view::{
-    DiagSpan, HlSpan, IncSearchSpans, PanelData, PmenuData, SearchSpans, Separator, StatusSegment,
-    View, WindowView,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, PanelData, PmenuData, SearchSpans,
+    Separator, StatusSegment, View, WindowView,
 };
+
+/// Width in cells of the diagnostic sign column when reserved (vim's fixed
+/// 2-cell `signcolumn`, independent of the number gutter's width).
+const SIGN_WIDTH: u16 = 2;
 
 /// Convert a neutral [`nxvim_view::Style`] into the ratatui [`Style`] the renderer
 /// paints. `fg`/`bg` become truecolor, `sp` the underline color, and each flag its
@@ -376,6 +380,8 @@ fn render_window(
     let empty_search: SearchSpans = Vec::new();
     let empty_incsearch: IncSearchSpans = Vec::new();
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
+    let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
+    let empty_signs: Vec<Option<DiagSign>> = Vec::new();
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
     // window of the full buffer). The static path — the overwhelmingly common
@@ -443,14 +449,25 @@ fn render_window(
         frame.render_widget(Block::default().style(normal), text_area);
     }
 
-    // Split a number-column gutter off the left of the text body when enabled.
+    // Reserve a 2-cell diagnostic sign column at the far left (vim's signcolumn,
+    // left of the number gutter) when this window's buffer has diagnostics and
+    // signs are on. Its glyphs are painted below, once the style palette is built.
+    let (sign_area, gutter_area) = if win.sign_column {
+        let cols = Layout::horizontal([Constraint::Length(SIGN_WIDTH), Constraint::Min(0)])
+            .split(text_area);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, text_area)
+    };
+
+    // Split a number-column gutter off the left of the remaining body when enabled.
     let text_inner = if win.number_width > 0 {
         let cols = Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
-            .split(text_area);
+            .split(gutter_area);
         render_gutter(frame, cols[0], frame_numbers, current_line, win, view);
         cols[1]
     } else {
-        text_area
+        gutter_area
     };
 
     // Token style ids index a palette captured with the frame they belong to:
@@ -487,6 +504,20 @@ fn render_window(
         Some(_) => &empty_diag,
         None => &win.diagnostics,
     };
+    let frame_virt: &[Option<DiagVirt>] = match anim {
+        Some(_) => &empty_virt,
+        None => &win.diagnostics_virt,
+    };
+    // Signs, like diagnostics, are painted on the settled viewport only — a slide
+    // band carries none (the reserved column stays blank while animating, so the
+    // text below it doesn't jump). Painted now that the palette resolves style ids.
+    if let Some(sign_area) = sign_area {
+        let frame_signs: &[Option<DiagSign>] = match anim {
+            Some(_) => &empty_signs,
+            None => &win.diagnostics_signs,
+        };
+        render_sign_column(frame, sign_area, frame_signs, &palette);
+    }
     render_text(
         frame,
         text_inner,
@@ -497,6 +528,7 @@ fn render_window(
         frame_incsearch,
         frame_hl,
         frame_diag,
+        frame_virt,
         frame_numbers,
         win.tabstop.max(1) as usize,
         win.leftcol as usize,
@@ -657,6 +689,47 @@ fn render_gutter(
     frame.render_widget(Paragraph::new(text), area);
 }
 
+/// Paint the diagnostic sign column reserved by [`render_window`]: each row with a
+/// sign shows its severity glyph (padded to the column width) in the resolved
+/// `DiagnosticSign*` palette style, or a built-in severity foreground when the
+/// colorscheme defines none; rows with no sign are blank. `signs` is empty while a
+/// scroll animates, so the reserved column paints blank and the text below it
+/// stays put.
+fn render_sign_column(
+    frame: &mut Frame,
+    area: Rect,
+    signs: &[Option<DiagSign>],
+    palette: &[Style],
+) {
+    let width = area.width as usize;
+    let text = Text::from(
+        (0..area.height as usize)
+            .map(|row| match signs.get(row).and_then(Option::as_ref) {
+                Some((glyph, severity, id)) => {
+                    let style = id
+                        .and_then(|i| palette.get(i).copied())
+                        .unwrap_or_else(|| Style::default().fg(severity_color(*severity)));
+                    Line::from(Span::styled(pad_to_width(glyph, width), style))
+                }
+                None => Line::from(" ".repeat(width)),
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+/// A sign glyph fitted to exactly `width` cells: truncated if too wide, then
+/// right-padded with spaces (so a 1-cell `E` fills the 2-cell column as `E `).
+fn pad_to_width(s: &str, width: usize) -> String {
+    let mut out = truncate_to_width(s, width);
+    let painted: usize = out
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    out.push_str(&" ".repeat(width.saturating_sub(painted)));
+    out
+}
+
 /// Build one `width`-cell gutter cell for a row whose buffer line is `num`
 /// (`None` for a `~` filler). Numbers are right-aligned with a trailing space,
 /// except the hybrid cursor line whose absolute number is left-aligned — vim's
@@ -713,6 +786,7 @@ fn render_text(
     incsearch: &[Option<(u16, u16)>],
     highlights: &[Vec<HlSpan>],
     diagnostics: &[Vec<DiagSpan>],
+    diagnostics_virt: &[Option<DiagVirt>],
     numbers: &[Option<usize>],
     tabstop: usize,
     leftcol: usize,
@@ -733,11 +807,12 @@ fn render_text(
                 let cur = incsearch.get(row).copied().flatten();
                 let hl = highlights.get(row).unwrap_or(&empty);
                 let diag = diagnostics.get(row).unwrap_or(&empty_diag);
+                let virt = diagnostics_virt.get(row).and_then(Option::as_ref);
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
-                    l, sel, sec_sel, matches, cur, hl, diag, width, is_filler, tabstop, leftcol,
-                    theme,
+                    l, sel, sec_sel, matches, cur, hl, diag, virt, width, is_filler, tabstop,
+                    leftcol, theme,
                 )
             })
             .collect::<Vec<_>>(),
@@ -772,6 +847,7 @@ fn highlight_line(
     incsearch: Option<(u16, u16)>,
     hl: &[HlSpan],
     diag: &[DiagSpan],
+    virt: Option<&DiagVirt>,
     max_width: usize,
     is_filler: bool,
     tabstop: usize,
@@ -814,6 +890,10 @@ fn highlight_line(
         spans.push(Span::styled(run, run_style));
     }
 
+    // Visible cells painted so far (text past the horizontal scroll). The virt
+    // text below is clamped against this so it never overruns the viewport.
+    let mut painted = col.saturating_sub(leftcol);
+
     // Extend the selection past end-of-text (selected newline / linewise fill),
     // within the scrolled viewport `[leftcol, leftcol + max_width)`. The pad count
     // is a difference of absolute columns, which equals the painted-cell count. The
@@ -830,9 +910,50 @@ fn highlight_line(
         if start < e {
             let pad = " ".repeat(e - start);
             spans.push(Span::styled(pad, selection_style(Style::default(), theme)));
+            painted += e - start;
+        }
+    }
+
+    // Inline diagnostic virtual text after a one-cell gap, truncated to whatever
+    // viewport width is left (never on a `~` filler row). The server already
+    // prefixed the text; the client only positions and colors it.
+    if let Some((text, severity, id)) = virt {
+        if !is_filler && painted + 1 < max_width {
+            let avail = max_width - painted - 1;
+            let shown = truncate_to_width(text, avail);
+            if !shown.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(shown, virt_text_style(*severity, *id, theme)));
+            }
         }
     }
     Line::from(spans)
+}
+
+/// Truncate `s` to at most `max` screen cells (wide chars counted by their
+/// display width), dropping any trailing char that would straddle the boundary.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// The style for a diagnostic's inline virtual text: the colorscheme's resolved
+/// `DiagnosticVirtualText*` palette entry when the server interned one, else a
+/// built-in severity foreground.
+fn virt_text_style(severity: u8, id: Option<usize>, theme: &LineTheme) -> Style {
+    if let Some(style) = id.and_then(|i| theme.palette.get(i)) {
+        return *style;
+    }
+    Style::default().fg(severity_color(severity))
 }
 
 /// The style of the screen cell at column `col`: its highlight span's resolved
@@ -1184,11 +1305,18 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     } else {
         area
     };
-    if win.number_width > 0 {
-        Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
-            .split(text_area)[1]
+    // Reserve the sign column first (left of the number gutter), mirroring
+    // `render_window`, so the popup anchors past both gutters.
+    let gutter_area = if win.sign_column {
+        Layout::horizontal([Constraint::Length(SIGN_WIDTH), Constraint::Min(0)]).split(text_area)[1]
     } else {
         text_area
+    };
+    if win.number_width > 0 {
+        Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
+            .split(gutter_area)[1]
+    } else {
+        gutter_area
     }
 }
 

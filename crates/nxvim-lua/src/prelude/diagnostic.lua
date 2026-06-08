@@ -68,21 +68,53 @@ function vim.diagnostic.setloclist(_opts)
   vim._diagnostic_setloclist()
 end
 
+-- vim.diagnostic.open_float([opts]): open a float listing the cursor line's
+-- diagnostics in full (the multi-line messages with source/code that the inline
+-- virtual text truncates). The server reads the cursor at apply time and routes
+-- through the float surface (the bottom panel hover uses); a clean line opens
+-- nothing. `opts` (scope/severity filters, formatting) is not yet honored — the
+-- default cursor-line scope is what nxvim shows.
+function vim.diagnostic.open_float(_opts)
+  vim._diagnostic_open_float()
+end
+
+-- The built-in gutter sign glyphs, indexed 1=ERROR…4=HINT (neovim's `E`/`W`/`I`/
+-- `H` letters), overridden per-severity by the `signs.text` map.
+local DEFAULT_SIGN_TEXT = { "E", "W", "I", "H" }
+
 -- vim.diagnostic.config([opts]): merge `opts` into the stored config and return
--- the merged table when called bare. nxvim has one diagnostic surface — the
--- underline spans — so the `underline` key is honored (false hides the
--- squiggles); virt-text/signs and the rest are stored without behavior until a
--- surface exists.
--- INCOMPLETE: only `underline` drives anything. `virtual_text`, `signs`,
--- `virtual_lines`, `float`, `severity_sort`, … are recorded and echoed back but
--- have no rendering surface, so a config enabling inline virtual-text diagnostics
--- sees no change. `_namespace` is ignored (one global config). Faithful once
--- those diagnostic surfaces exist.
-vim.diagnostic._config = { underline = true }
+-- the merged table when called bare. nxvim renders three surfaces — the underline
+-- spans (`underline`), the inline end-of-line message (`virtual_text`), and the
+-- gutter sign column (`signs`) — so those keys drive rendering; the rest are
+-- stored without behavior until a surface exists.
+-- INCOMPLETE: `virtual_lines`, `severity_sort`, … are recorded and echoed back
+-- but have no rendering surface yet (`float` is honored by
+-- `vim.diagnostic.open_float`, but the `config.float` defaults that pre-style it
+-- are not). `_namespace` is ignored (one global config). Faithful once those
+-- diagnostic surfaces exist.
+vim.diagnostic._config = { underline = true, virtual_text = false, signs = true }
 function vim.diagnostic.config(opts, _namespace)
   if opts == nil then return vim.diagnostic._config end
   for k, v in pairs(opts) do vim.diagnostic._config[k] = v end
-  -- `underline` is true/false/table (a table is an enabled, filtered form);
-  -- only an explicit `false` disables.
-  vim._diagnostic_config(vim.diagnostic._config.underline ~= false)
+  -- `underline`/`virtual_text`/`signs` are true/false/table (a table is an
+  -- enabled, filtered form); only an explicit `false`/`nil` disables. The
+  -- virt-text `prefix` rides the `virtual_text` table form (default `■ `); the
+  -- per-severity sign glyphs ride the `signs.text` map (default `E`/`W`/`I`/`H`).
+  local vt = vim.diagnostic._config.virtual_text
+  local prefix = "■ "
+  if type(vt) == "table" and vt.prefix ~= nil then prefix = tostring(vt.prefix) end
+  local signs = vim.diagnostic._config.signs
+  local sign_text = { DEFAULT_SIGN_TEXT[1], DEFAULT_SIGN_TEXT[2], DEFAULT_SIGN_TEXT[3], DEFAULT_SIGN_TEXT[4] }
+  if type(signs) == "table" and type(signs.text) == "table" then
+    for sev = 1, 4 do
+      if signs.text[sev] ~= nil then sign_text[sev] = tostring(signs.text[sev]) end
+    end
+  end
+  vim._diagnostic_config(
+    vim.diagnostic._config.underline ~= false,
+    vt ~= false and vt ~= nil,
+    prefix,
+    signs ~= false and signs ~= nil,
+    sign_text
+  )
 end

@@ -9,9 +9,10 @@ use rmpv::Value;
 
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
-    parse_cursor_list, parse_diagnostics, parse_highlights, parse_multi_spans, parse_numbers,
-    parse_pmenu_items, parse_spans, parse_status, parse_styles, DiagSpan, HlSpan, IncSearchSpans,
-    PmenuItem, SearchSpans, StatusSegment,
+    parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
+    parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items, parse_spans,
+    parse_status, parse_styles, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, PmenuItem,
+    SearchSpans, StatusSegment,
 };
 use crate::style::{Border, Style};
 
@@ -97,6 +98,16 @@ pub struct WindowView {
     /// Per visible row, the LSP diagnostic underline spans `(start_col, end_col,
     /// severity, style_id)` in screen columns.
     pub diagnostics: Vec<Vec<DiagSpan>>,
+    /// Per visible row, the inline diagnostic virtual text painted after the
+    /// line's end-of-text (`Some((text, severity, style_id))`), or `None`.
+    pub diagnostics_virt: Vec<Option<DiagVirt>>,
+    /// Per visible row, the gutter diagnostic sign painted in the reserved sign
+    /// column (`Some((glyph, severity, style_id))`), or `None` for a blank cell.
+    pub diagnostics_signs: Vec<Option<DiagSign>>,
+    /// Whether this window reserves a 2-cell sign column left of the number gutter
+    /// (vim's `signcolumn=auto`: true once the buffer has a diagnostic and signs
+    /// are on). False keeps the old gutter layout.
+    pub sign_column: bool,
     /// A scroll gesture for this window, when its viewport just moved.
     pub scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
@@ -414,6 +425,11 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         incsearch: parse_spans(map_get(m, "incsearch")),
         highlights: parse_highlights(map_get(m, "highlights")),
         diagnostics: parse_diagnostics(map_get(m, "diagnostics")),
+        diagnostics_virt: parse_diagnostics_virt(map_get(m, "diagnostics_virt")),
+        diagnostics_signs: parse_diagnostics_signs(map_get(m, "diagnostics_signs")),
+        sign_column: map_get(m, "sign_column")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         scroll,
         numbers: parse_numbers(map_get(m, "numbers")),
         number: map_get(m, "number")

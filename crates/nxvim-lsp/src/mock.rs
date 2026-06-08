@@ -53,6 +53,18 @@
 //!   `documentation`/`detail` filled in) returned for `completionItem/resolve`.
 //!   Absent ⇒ `null` (which fails to deserialize, exercising the resolve-failure
 //!   path: logged, the item stays docless).
+//! - `semantic_tokens`: scripts `textDocument/semanticTokens/full` and
+//!   `full/delta`. An object `{ legend: { tokenTypes, tokenModifiers },
+//!   data: [..u32..], result_id?, delta? }` — the `legend` is advertised as the
+//!   `semanticTokensProvider` capability (so the editor decodes against it) and the
+//!   `data`/`result_id` are returned for every `semanticTokens/full` request. When
+//!   the editor sends `full/delta` (it does once it has cached a `result_id`), the
+//!   `delta` field scripts the reply: `{ result_id?, edits: [{ start, deleteCount,
+//!   data }] }` returns those edits, or `{ data: [..u32..], result_id? }` returns a
+//!   fresh full set (the server's transparent fallback). Absent `delta` ⇒ a
+//!   `full/delta` request is answered with the full `data`/`result_id` (the same
+//!   full-set fallback). Absent `semantic_tokens` ⇒ the server advertises no
+//!   semantic-tokens provider and the request falls back to `null`.
 //! - `custom_replies`: a `{ method: result }` map scripting the reply to an
 //!   otherwise-unhandled request — the generic `client:request` path (Phase 5).
 //!   A method not in the map falls back to a `null` result.
@@ -158,6 +170,23 @@ pub fn run(script_path: &str) {
             // can't deserialize into a `CompletionItem` — exercising the editor's
             // resolve-failure path (logged, item left docless).
             "completionItem/resolve" => reply_scripted(&stdout, id, &script, "completion_resolve"),
+            // Semantic tokens: return the scripted packed `data` (+ optional
+            // `result_id`) for the whole document. Absent ⇒ `null` (no tokens).
+            "textDocument/semanticTokens/full" => {
+                if let Some(id) = id {
+                    let result = semantic_full_result(&script);
+                    write_response(&stdout, id, result);
+                }
+            }
+            // A `full/delta` refresh (the editor sends it once it has cached a
+            // `result_id`): return the scripted `delta` (edits, or a fresh full
+            // set), falling back to the full set when no `delta` is scripted.
+            "textDocument/semanticTokens/full/delta" => {
+                if let Some(id) = id {
+                    let result = semantic_delta_result(&script);
+                    write_response(&stdout, id, result);
+                }
+            }
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply. A `custom_replies` map (method ->
             // result) scripts the answer to a generic `client:request` (Phase 5);
@@ -213,6 +242,24 @@ fn initialize_result(script: &Value) -> Value {
         "renameProvider": true,
         "codeActionProvider": true,
     });
+    // Advertise the semantic-tokens provider only when the script supplies a
+    // legend (so a test without `semantic_tokens` exercises a server that doesn't
+    // offer the feature). When the script also scripts a `delta` reply, advertise
+    // `full: { delta: true }` so the editor sends `full/delta`; otherwise a plain
+    // `full: true`.
+    if let Some(legend) = script.pointer("/semantic_tokens/legend") {
+        if let Value::Object(base) = &mut capabilities {
+            let full = if script.pointer("/semantic_tokens/delta").is_some() {
+                json!({ "delta": true })
+            } else {
+                json!(true)
+            };
+            base.insert(
+                "semanticTokensProvider".to_string(),
+                json!({ "legend": legend, "full": full }),
+            );
+        }
+    }
     if let Some(Value::Object(overrides)) = script.get("capabilities") {
         if let Value::Object(base) = &mut capabilities {
             for (k, v) in overrides {
@@ -256,6 +303,42 @@ fn completion_result(script: &Value, call: &mut usize) -> Value {
         return seq.get(n).cloned().unwrap_or(Value::Null);
     }
     script.get("completion").cloned().unwrap_or(Value::Null)
+}
+
+/// The `semanticTokens/full` reply: the scripted packed `data` (+ optional
+/// `resultId`), or `null` when no `semantic_tokens` is scripted.
+fn semantic_full_result(script: &Value) -> Value {
+    let Some(st) = script.get("semantic_tokens") else {
+        return Value::Null;
+    };
+    let mut out = json!({ "data": st.get("data").cloned().unwrap_or(json!([])) });
+    if let Some(rid) = st.get("result_id") {
+        out["resultId"] = rid.clone();
+    }
+    out
+}
+
+/// The `semanticTokens/full/delta` reply: the scripted `delta` — either an
+/// `{ edits, resultId? }` diff or a `{ data, resultId? }` fresh full set — and the
+/// full set as the fallback when no `delta` is scripted (the server answering a
+/// delta request with a full result).
+fn semantic_delta_result(script: &Value) -> Value {
+    let Some(st) = script.get("semantic_tokens") else {
+        return Value::Null;
+    };
+    let Some(delta) = st.get("delta") else {
+        return semantic_full_result(script);
+    };
+    let mut out = json!({});
+    if let Some(edits) = delta.get("edits") {
+        out["edits"] = edits.clone();
+    } else if let Some(data) = delta.get("data") {
+        out["data"] = data.clone();
+    }
+    if let Some(rid) = delta.get("result_id") {
+        out["resultId"] = rid.clone();
+    }
+    out
 }
 
 /// Answer a request with the script's `field` value (cloned), or `null` when the

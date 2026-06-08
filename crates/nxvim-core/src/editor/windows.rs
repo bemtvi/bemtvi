@@ -1177,9 +1177,15 @@ impl Editor {
         config: FloatConfig,
         enter: bool,
     ) -> WindowId {
-        // A float inherits the focused window's window-local options (the number
-        // gutter), so it renders consistently with the rest of the editor.
-        let options = self.windows.get(self.windows.current).options;
+        // A float defaults to a clean gutter — no line-number column — so popup
+        // content (diagnostics, hover, completion docs, plugin UIs) fills the
+        // window width instead of being squeezed/truncated by an inherited gutter.
+        // This matches how floats read in neovim; a caller that wants numbers in a
+        // floating editor re-enables them with `nvim_win_set_option(win, "number")`.
+        // The horizontal-scroll settings still come from the focused window.
+        let mut options = self.windows.get(self.windows.current).options;
+        options.number = false;
+        options.relativenumber = false;
         let id = self.alloc_window_id();
         self.windows.windows.insert(
             id,

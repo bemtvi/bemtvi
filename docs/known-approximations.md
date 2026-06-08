@@ -126,6 +126,25 @@ gap. Recorded here so the sweep doesn't lose them.
   build an evaluator.
 - **`:TSInstall`-style grammar fetch/compile.** Grammars load from the data dir;
   installing them there is manual.
+- **LSP semantic tokens — complete (Phases 1–3), with approximations.** A server
+  that advertises `semanticTokensProvider` has its whole-buffer
+  `textDocument/semanticTokens/full`(/`delta`) set decoded and painted *over* the
+  treesitter floor (ADR 0001 bridge #2 — `crates/nxvim-server/src/lsp/semantic.rs`),
+  and the `vim.lsp.semantic_tokens` control surface
+  (`start`/`stop`/`force_refresh`/`get_at_pos`/`enable`) plus
+  `client.server_capabilities.semanticTokensProvider` are live. The approximations:
+  **one resolvable group per cell** — a token paints its most-specific `@lsp.*`
+  capture that resolves, not neovim's stack of `@lsp.type.<t>` + per-modifier
+  `@lsp.mod.<m>`/`@lsp.typemod.<t>.<m>` (the merge layer picks one winner, it doesn't
+  blend); **theme-gated** — a token whose group is undefined is dropped so the floor
+  shows (no semantic paint without `@lsp.*` definitions); **no `range`** — only
+  `full`/`full/delta`, the whole document is tokenized; **`highlight_token` is a loud
+  gap** (`vim._notimpl` — it would put a Lua callback on the decode hot path);
+  `get_at_pos` reads the cached mirror even for a `stop`ped buffer (the cache
+  survives a stop), and the per-buffer `start`/`stop` has no per-client granularity
+  (one semantic cache per buffer); repaints on every reply including mid-insert
+  (`update_in_insert` always on). See
+  `docs/plans/2026-06-08-lsp-semantic-tokens.md` and `examples/semantic-tokens/`.
 - **Synchronous prompts — now implemented.** `vim.fn.input` / `vim.fn.confirm`
   return the user's answer *inline*: a pumped Lua entry (`:lua` chunk, keymap, or
   user command) runs inside a coroutine via `vim._pump`, so the prompt
@@ -145,7 +164,7 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
 | Core honors only the indentation buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `expandtab` are recorded but inert |
 | No per-buffer command registry | `nvim_buf_create_user_command` registers globally |
-| No diagnostic-display surfaces — virtual-text / signs / diagnostic float (distinct from the floating-window primitive, which exists) | `vim.diagnostic.config` keys other than `underline` |
+| Diagnostic-display surfaces are approximations, not gaps — all four ship. `underline`, `virtual_text` (inline end-of-line message), `signs` (gutter glyph), and the on-demand float (`vim.diagnostic.open_float`) are implemented — see `docs/plans/2026-06-08-diagnostic-display-surfaces.md`. | `vim.diagnostic.config` keys other than `underline` / `virtual_text` / `signs` (`virtual_lines`, `severity_sort`, and the `config.float` pre-style defaults). `open_float` ignores its `opts` (scope/severity filters, `format`/`header`/`prefix`/`border`) — the default cursor-line scope shows, in the bottom panel (plain lines, like hover) not a cursor-anchored bordered popup. The `virtual_text` table honors `prefix` and the `signs` table its `text` glyph map; their `format` / `severity` filters and sign `priority`/`culhl` are not applied, the line's most-severe diagnostic wins the one inline slot / sign cell, and the sign column is client-side only (a fixed 2 cells not subtracted from `nxvim-core`'s text width, so a full-width line under `nowrap` can clip its last two cells). |
 | No per-namespace highlight tables | `nvim_set_hl` non-zero namespace folded into global |
 
 ## Relationship to the LSP completion plan

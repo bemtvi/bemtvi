@@ -17,17 +17,22 @@ use std::path::{Path, PathBuf};
 
 use nxvim_core::unicode;
 use nxvim_core::{Buffer, BufferEdit, BufferId};
+use std::collections::BTreeMap;
+
 use nxvim_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent,
+    Diagnostic, DiagnosticSeverity, Position, Range, SemanticToken, TextDocumentContentChangeEvent,
     TextDocumentSyncKind, Url,
 };
-use nxvim_lsp::{CompletionItemData, PositionEncoding, ProviderCaps, ServerKey, ServerSpawn};
+use nxvim_lsp::{
+    CompletionItemData, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn,
+};
 use nxvim_lua::{DiagnosticData, LspServerCapabilities};
 
 mod completion;
 mod diagnostics;
 mod edit;
 mod request;
+mod semantic;
 mod sync;
 
 /// One per-line jump target for a navigable LSP panel (diagnostics, references,
@@ -61,6 +66,65 @@ pub(crate) struct LspDocState {
     /// Latest `publishDiagnostics` for this buffer, projected into the redraw
     /// (`diagnostics_for`) and the under-cursor message line.
     diagnostics: Vec<Diagnostic>,
+    /// Latest `semanticTokens/full` result for this buffer, decoded into the
+    /// per-line highlight spans `highlights_for` merges over the treesitter floor
+    /// (ADR 0001 bridge #2). Empty until the first reply lands.
+    semantic: SemanticTokensCache,
+    /// Per-buffer semantic-token override (Phase 3): `None` is the auto default
+    /// (enabled when the server advertises a legend); `Some(false)` is an explicit
+    /// `vim.lsp.semantic_tokens.stop` (hide the paint, skip refreshes);
+    /// `Some(true)` an explicit `start`. The cache survives a stop, so a later
+    /// `start` repaints from it without a round-trip.
+    semantic_enabled: Option<bool>,
+}
+
+impl LspDocState {
+    /// Whether the semantic-token projection is active for this buffer: the auto
+    /// default (on) unless explicitly stopped via `vim.lsp.semantic_tokens.stop`.
+    /// The editor-wide gate ([`Server::semantic_tokens_enabled`]) is checked
+    /// separately by the projection.
+    pub(crate) fn semantic_on(&self) -> bool {
+        self.semantic_enabled.unwrap_or(true)
+    }
+}
+
+/// A buffer's decoded semantic tokens, plus the bookkeeping a `full/delta`
+/// refresh (Phase 2) needs. The decoded `spans` are what the projection reads;
+/// `result_id` is the delta cursor the next request quotes.
+#[derive(Default)]
+pub(crate) struct SemanticTokensCache {
+    /// The server's `resultId` for the current token set, quoted as
+    /// `previousResultId` by the next `full/delta` request. `None` until the first
+    /// reply, or when the server sends none — in which case the next refresh falls
+    /// back to a whole `full` request.
+    pub(crate) result_id: Option<String>,
+    /// The raw packed token set the current `spans` were decoded from, kept so a
+    /// `full/delta` reply can splice its edits into it and re-decode (Phase 2). The
+    /// LSP delta edits index this array's *flat integer* form. Empty until the first
+    /// reply.
+    pub(crate) tokens: Vec<SemanticToken>,
+    /// Decoded tokens bucketed by 0-based buffer line — the same per-line shape
+    /// the syntax engine caches, so projection mirrors `highlights_for`. Each span
+    /// is line-local byte offsets plus the candidate `@lsp.*` capture names (most
+    /// specific first) the projection resolves at paint time.
+    pub(crate) spans: BTreeMap<usize, Vec<SemanticSpan>>,
+}
+
+/// One decoded semantic token on a single buffer line: a line-local `[start, end)`
+/// byte span and the candidate highlight-capture names it could paint as, ordered
+/// most-specific first (`lsp.typemod.<type>.<mod>` … `lsp.type.<type>`). The
+/// projection resolves the first candidate that maps to a style and **drops the
+/// token entirely if none do**, so an undefined `@lsp.*` group never blanks the
+/// treesitter span beneath it.
+pub(crate) struct SemanticSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) groups: Vec<String>,
+    /// The legend token-type name (e.g. `"function"`), kept for the
+    /// `vim.lsp.semantic_tokens.get_at_pos` mirror — the projection uses `groups`.
+    pub(crate) ty: String,
+    /// The active modifier names (legend order), for the same mirror.
+    pub(crate) mods: Vec<String>,
 }
 
 /// Which language-feature request a [`ReqToken`] / [`PendingLspReq`] belongs to.
@@ -81,6 +145,7 @@ pub(crate) enum LspReqKind {
     CodeAction,
     ResolveCodeAction,
     CompletionResolve,
+    SemanticTokens,
 }
 
 impl LspReqKind {
@@ -99,6 +164,7 @@ impl LspReqKind {
             LspReqKind::CodeAction => 10,
             LspReqKind::ResolveCodeAction => 11,
             LspReqKind::CompletionResolve => 12,
+            LspReqKind::SemanticTokens => 13,
         }
     }
 
@@ -117,6 +183,7 @@ impl LspReqKind {
             10 => LspReqKind::CodeAction,
             11 => LspReqKind::ResolveCodeAction,
             12 => LspReqKind::CompletionResolve,
+            13 => LspReqKind::SemanticTokens,
             _ => return None,
         })
     }
@@ -148,6 +215,9 @@ impl LspReqKind {
             // it never surfaces an empty-result message (an unresolved item just
             // shows no preview), so this is only a formal fallback.
             LspReqKind::CompletionResolve => "No completion documentation",
+            // Semantic tokens are a background highlight refresh; an empty reply
+            // just leaves the treesitter floor showing, never a message.
+            LspReqKind::SemanticTokens => "No semantic tokens",
         }
     }
 
@@ -183,6 +253,15 @@ pub(crate) struct ServerRuntime {
     encoding: PositionEncoding,
     sync_kind: TextDocumentSyncKind,
     client_id: u64,
+    /// The server's semantic-tokens legend (`tokenTypes`/`tokenModifiers`), needed
+    /// to decode a `semanticTokens/full` reply. `None` when the server advertises
+    /// no semantic-tokens provider — its buffers then carry the treesitter floor
+    /// alone.
+    legend: Option<SemanticLegend>,
+    /// Whether the server advertised `full/delta` support. When `false`, every
+    /// semantic-tokens refresh re-requests the whole `full` set rather than a diff
+    /// (sending `full/delta` to a server that didn't advertise it would error).
+    semantic_tokens_delta: bool,
 }
 
 /// The live insert-mode completion popup (Phase 5), server-owned like the
@@ -440,6 +519,7 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
         document_formatting: p.document_formatting,
         rename: p.rename,
         code_action: p.code_action,
+        semantic_tokens: p.semantic_tokens,
     }
 }
 
@@ -474,6 +554,68 @@ pub(crate) fn severity_group(severity: u8) -> &'static str {
     }
 }
 
+/// The highlight group whose foreground paints a diagnostic's inline virtual
+/// text at this severity, resolved through the registry like [`severity_group`].
+pub(crate) fn severity_virt_group(severity: u8) -> &'static str {
+    match severity {
+        2 => "DiagnosticVirtualTextWarn",
+        3 => "DiagnosticVirtualTextInfo",
+        4 => "DiagnosticVirtualTextHint",
+        _ => "DiagnosticVirtualTextError",
+    }
+}
+
+/// The highlight group whose foreground paints a diagnostic's gutter sign at this
+/// severity, resolved through the registry like [`severity_group`].
+pub(crate) fn severity_sign_group(severity: u8) -> &'static str {
+    match severity {
+        2 => "DiagnosticSignWarn",
+        3 => "DiagnosticSignInfo",
+        4 => "DiagnosticSignHint",
+        _ => "DiagnosticSignError",
+    }
+}
+
+/// The subset of `vim.diagnostic.config` keys nxvim has a backing surface for,
+/// threaded from Lua via [`LspOp::DiagnosticConfig`](nxvim_lua::LspOp). `underline`
+/// gates the squiggle spans; `virtual_text` gates the inline end-of-line message
+/// and `virt_prefix` is its leader glyph; `signs` gates the gutter sign column and
+/// `sign_text` holds its per-severity glyphs, indexed by severity code minus one
+/// (`[error, warn, info, hint]`). Defaults match neovim 0.10: underline and signs
+/// on, virtual text off, prefix `■ `, sign glyphs `E`/`W`/`I`/`H`.
+pub(crate) struct DiagnosticConfig {
+    pub(crate) underline: bool,
+    pub(crate) virtual_text: bool,
+    pub(crate) virt_prefix: String,
+    pub(crate) signs: bool,
+    pub(crate) sign_text: [String; 4],
+}
+
+impl DiagnosticConfig {
+    /// The gutter glyph for a severity code (`1`=error … `4`=hint), from
+    /// `sign_text` (a config `text` map, or the built-in `E`/`W`/`I`/`H` letters).
+    pub(crate) fn sign_glyph(&self, severity: u8) -> &str {
+        &self.sign_text[(severity.clamp(1, 4) - 1) as usize]
+    }
+}
+
+impl Default for DiagnosticConfig {
+    fn default() -> Self {
+        Self {
+            underline: true,
+            virtual_text: false,
+            virt_prefix: "■ ".to_string(),
+            signs: true,
+            sign_text: [
+                "E".to_string(),
+                "W".to_string(),
+                "I".to_string(),
+                "H".to_string(),
+            ],
+        }
+    }
+}
+
 /// One-letter severity tag for the location-list column (`E`/`W`/`I`/`H`).
 pub(crate) fn severity_short(severity: u8) -> char {
     match severity {
@@ -485,14 +627,22 @@ pub(crate) fn severity_short(severity: u8) -> char {
 }
 
 /// The first non-empty line of a (possibly multi-line, markdown) diagnostic
-/// message, for the single-line message line and location-list rows.
+/// message, for the single-line message line, the location-list rows, and the
+/// inline virtual text. Terminal control characters (ESC, BEL, backspace, …) are
+/// stripped: the message text comes from the language server (untrusted), and
+/// every caller hands the result to a client that paints it, so an escape
+/// sequence smuggled into a diagnostic must not reach the terminal. Sanitizing
+/// here — at the single point the server projects the text — covers all clients
+/// (TUI, GUI, remote) at once.
 pub(crate) fn first_line(message: &str) -> String {
     message
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
-        .to_string()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// Human label for a document-sync kind.

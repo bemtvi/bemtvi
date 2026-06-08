@@ -883,3 +883,79 @@ function vim.lsp.buf.rename(new_name, _opts)
   end)
 end
 
+-- ----- vim.lsp.semantic_tokens: the control surface (Phase 3) ----------------
+-- The projection is automatic: a server that advertises `semanticTokensProvider`
+-- lights its buffers up over the treesitter floor without any call here. This
+-- surface is the override — turn it off/on per buffer (`stop`/`start`), force a
+-- re-request (`force_refresh`), read the tokens under a position (`get_at_pos`),
+-- or gate the whole feature editor-wide (`enable`). The decode/projection live in
+-- the server; these enqueue an `LspOp` it applies (the `vim.diagnostic.*` shape).
+vim.lsp.semantic_tokens = vim.lsp.semantic_tokens or {}
+
+-- The mirror the server pushes into on every `semanticTokens/full`(/delta) reply,
+-- keyed by bufnr → list of `{ line, start_col, end_col, type, modifiers, client_id }`
+-- (0-based, byte columns). `get_at_pos` reads it; nothing else should write it.
+vim._semantic_tokens = vim._semantic_tokens or {}
+function vim._set_semantic_tokens(bufnr, list)
+  vim._semantic_tokens[bufnr or 0] = list or {}
+end
+
+-- Resolve a `0`/`nil` bufnr to the current buffer (the id the mirror is keyed by),
+-- matching how the diagnostics surface resolves its buffer.
+local function semantic_bufnr(bufnr)
+  if bufnr == nil or bufnr == 0 then return vim.api.nvim_get_current_buf() end
+  return bufnr
+end
+
+-- start(bufnr, client_id, opts): (re-)enable the semantic-token projection for a
+-- buffer and request a fresh token set if the cache is cold. `client_id`/`opts`
+-- are accepted for neovim-signature compatibility; nxvim has one semantic cache
+-- per buffer, so they don't select among clients.
+function vim.lsp.semantic_tokens.start(bufnr, _client_id, _opts)
+  vim._lsp_semantic_enable(semantic_bufnr(bufnr), true)
+end
+
+-- stop(bufnr, client_id): hide the buffer's semantic paint (the cache survives, so
+-- a later `start` repaints without a round-trip).
+function vim.lsp.semantic_tokens.stop(bufnr, _client_id)
+  vim._lsp_semantic_enable(semantic_bufnr(bufnr), false)
+end
+
+-- force_refresh(bufnr): drop the cached result id and re-request the whole token
+-- set, repainting from the server's fresh classification.
+function vim.lsp.semantic_tokens.force_refresh(bufnr)
+  vim._lsp_semantic_refresh(semantic_bufnr(bufnr))
+end
+
+-- get_at_pos(bufnr, row, col): the cached semantic tokens covering a position, as a
+-- list of `{ line, start_col, end_col, type, modifiers, client_id }` (0-based, byte
+-- columns; `modifiers` is both a list and a `[name]=true` set). `row`/`col` default
+-- to the cursor when omitted. Reads the mirror — no request is issued.
+function vim.lsp.semantic_tokens.get_at_pos(bufnr, row, col)
+  bufnr = semantic_bufnr(bufnr)
+  if row == nil or col == nil then
+    local pos = vim.api.nvim_win_get_cursor(0)
+    row, col = pos[1] - 1, pos[2]
+  end
+  local out = {}
+  for _, t in ipairs(vim._semantic_tokens[bufnr] or {}) do
+    if t.line == row and col >= t.start_col and col < t.end_col then
+      out[#out + 1] = t
+    end
+  end
+  return out
+end
+
+-- enable(enabled): nxvim's editor-wide gate for the whole feature (neovim has only
+-- the per-buffer start/stop). `false` hides all semantic paint and stops refresh
+-- requests; `true` (the default) restores it, re-requesting every attached buffer.
+function vim.lsp.semantic_tokens.enable(enabled)
+  vim._lsp_semantic_config(enabled ~= false)
+end
+
+-- highlight_token: the per-token highlight-customization hook stays a loud gap — it
+-- would put a Lua callback on the decode hot path, out of scope for Phase 3.
+function vim.lsp.semantic_tokens.highlight_token()
+  vim._notimpl("vim.lsp.semantic_tokens.highlight_token")
+end
+

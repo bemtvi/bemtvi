@@ -186,12 +186,11 @@ impl Editor {
                 self.leftcol = 0;
                 let ob = self.cur_mut();
                 ob.buffer = buf;
-                ob.undo_stack.clear();
-                ob.redo_stack.clear();
-                // Reloaded from disk: a fresh state that is, by definition, saved.
-                ob.cur_seq = ob.next_seq;
-                ob.next_seq += 1;
-                ob.saved_seq = Some(ob.cur_seq);
+                // Reloaded from disk: discard the old history and start a fresh
+                // tree rooted at the reloaded text — a state that is, by
+                // definition, saved. Undo cannot cross the reload.
+                ob.undo = UndoTree::new(&ob.buffer);
+                ob.saved_seq = Some(ob.undo.cur_seq());
                 ob.buffer.mark_resync();
                 ob.buffer.modified = false;
             }
@@ -318,6 +317,9 @@ impl Editor {
             }
         }
         self.buffers.get_mut(id).buffer.normalize();
+        // A workspace edit is a complete one-shot; commit it now so it lands as a
+        // single undo node, independent of any later edit to `id`.
+        self.commit_undo(id);
         if id == self.cur_buffer() {
             self.clamp_cursor();
             self.desired_col = self.cursor_virtcol();

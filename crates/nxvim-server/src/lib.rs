@@ -229,6 +229,14 @@ struct Server {
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
     /// refresh each time (Phase 6).
     buf_mirror_ticks: HashMap<BufferId, u64>,
+    /// Per-buffer undo fingerprint last serialized into the `vim._undotree` Lua
+    /// mirror ([`Server::push_undotree_mirror`]), so an unchanged tree isn't
+    /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
+    undo_mirror_versions: HashMap<BufferId, (u64, usize, u64, bool)>,
+    /// Monotonic base for the editor's time: `start.elapsed()` seconds are stamped
+    /// onto undo nodes and handed to `vim.fn.localtime()`. Monotonic so elapsed
+    /// labels survive wall-clock jumps; see [`Editor::set_now_mono`].
+    start: std::time::Instant,
     /// The `vim._cb_fns` id of the `vim.ui.input` callback awaiting the open
     /// command-line prompt's result, or `None` when no scripted prompt is open
     /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
@@ -300,6 +308,8 @@ where
         evloop,
         scheduled: VecDeque::new(),
         buf_mirror_ticks: HashMap::new(),
+        undo_mirror_versions: HashMap::new(),
+        start: std::time::Instant::now(),
         pending_ui_input: None,
     };
 

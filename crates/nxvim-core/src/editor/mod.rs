@@ -41,6 +41,7 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
+pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
@@ -139,14 +140,13 @@ enum CmdlineKind {
     Confirm,
 }
 
+/// The full materialized state at one undo point: text plus the bits vim keeps
+/// across undo. Cloning is cheap — `ropey::Rope` is a persistent rope, so a clone
+/// shares structure with the original and only diverged chunks cost memory.
 #[derive(Clone)]
 struct Snapshot {
     text: ropey::Rope,
     cursor: Cursor,
-    /// Undo-sequence number of the state this snapshot captures (see
-    /// [`OpenBuffer::cur_seq`]), so undo/redo can tell when it has landed back
-    /// on the last-saved state and clear `modified`.
-    seq: u64,
     /// The buffer's extmarks at this history point. Restored on undo/redo so marks
     /// ride with the text (neovim keeps extmarks across undo) rather than being
     /// dropped by the wholesale-replace [`Buffer::mark_resync`].
@@ -157,26 +157,77 @@ struct Snapshot {
     marks: HashMap<char, (usize, usize)>,
 }
 
+/// Index of a node within [`UndoTree::nodes`]. Stable for a node's lifetime —
+/// nodes are only appended, never removed (until `undolevels` pruning lands).
+type NodeIdx = usize;
+
+/// One reachable buffer state in the undo *tree*. Unlike a linear undo stack, a
+/// node can have several `children`: undoing then typing something new forks a
+/// branch instead of discarding the old future, so every state stays reachable
+/// (the data `vim.fn.undotree()` and visualizers like the undotree plugin draw).
+/// Mirrors neovim's `u_header_T`, but stores a whole-buffer [`Snapshot`] rather
+/// than a line-delta — see the rope-clone note on `Snapshot`.
+struct UndoNode {
+    /// Sequence number of this state; higher == newer. The root (original loaded
+    /// text) is `0`. Used by `:undo {N}` to jump to an arbitrary state.
+    seq: u64,
+    /// Parent state (the one a plain `u` returns to). `None` only for the root.
+    parent: Option<NodeIdx>,
+    /// Child states in creation order; `children.last()` is the newest branch,
+    /// which is the one a plain `<C-r>` redoes into.
+    children: Vec<NodeIdx>,
+    /// When this state was created, in **monotonic** seconds since the editor's
+    /// time base (injected by the server). Monotonic — not wall-clock — so the
+    /// "N minutes ago" label `vim.fn.undotree()` feeds the visualizer stays
+    /// correct and non-negative across NTP steps / clock changes. The root's time
+    /// is `0` and never displayed (it renders as "(Orig)").
+    time: i64,
+    /// The save number stamped when this exact state was written to disk, else
+    /// `None`. `Some(n)` means it was the buffer's `n`-th write. Surfaced as the
+    /// `save` field of `vim.fn.undotree()` entries (neovim's `uh_save_nr`).
+    save: Option<u64>,
+    snap: Snapshot,
+}
+
+/// A buffer's branching undo history. The live buffer text always corresponds to
+/// node `cur` plus at most one *uncommitted* edit (tracked by `dirty`): a pending
+/// change is materialized into a new child node lazily, at the moment focus
+/// leaves the state — the next change-group boundary or an undo/redo/`:undo`.
+/// That lazy-commit timing is exactly when the old two-stack model snapshotted,
+/// so cursor/text/seq land identically; it just retains the abandoned branches.
+struct UndoTree {
+    /// Arena of states; `nodes[0]` is always the root (seq 0, original text).
+    nodes: Vec<UndoNode>,
+    /// The node the live buffer is currently sitting on.
+    cur: NodeIdx,
+    /// Source of the next `seq`; only ever increments. `seq_last == next_seq - 1`.
+    next_seq: u64,
+    /// The live buffer has an edit not yet committed to a node. Set when a change
+    /// group begins; cleared when the pending state is committed.
+    dirty: bool,
+    /// Monotonic time the current pending edit began (meaningful only while
+    /// `dirty`). Used as the timestamp of the *virtual* current node
+    /// `vim.fn.undotree()` shows for an uncommitted edit, so the projection is
+    /// stable (doesn't drift with the clock) until the edit commits.
+    dirty_since: i64,
+    /// Number of writes (`:w`) of this buffer so far — the source of each saved
+    /// node's `save` number. `vim.fn.undotree()` reports it as `save_last`.
+    /// (Neovim's `b_u_save_nr_last`.)
+    save_last: u64,
+}
+
 /// A buffer as the editor holds it: the text [`Buffer`] plus the state vim keeps
 /// with the buffer rather than the window — undo/redo history and, while the
 /// buffer is not current, the last cursor/scroll position so switching back
 /// restores the view.
 struct OpenBuffer {
     buffer: Buffer,
-    undo_stack: Vec<Snapshot>,
-    redo_stack: Vec<Snapshot>,
-    /// Monotonic id of the current text state. A fresh number is minted for each
-    /// edit; undo/redo carry it on their snapshots. Compared against `saved_seq`
-    /// to decide whether the buffer matches what's on disk. (Neovim's
-    /// `b_u_seq_cur`.)
-    cur_seq: u64,
-    /// `cur_seq` as of the last write, or `None` once an edit has diverged from
-    /// disk past the point any retained snapshot can return to. The buffer is
-    /// `modified` exactly when `Some(cur_seq) != saved_seq`. (Neovim's
-    /// `b_u_save_nr`.)
+    /// Branching undo history. The current text state's id is `undo.cur_seq()`.
+    undo: UndoTree,
+    /// The seq that matches what's on disk, or `None` once history can no longer
+    /// return to the saved state. On undo/redo the buffer reads as `modified`
+    /// exactly when the landed-on seq differs from this. (Neovim's `b_u_save_nr`.)
     saved_seq: Option<u64>,
-    /// Source of the next `cur_seq`; only ever increments.
-    next_seq: u64,
     /// Window position saved when this buffer stops being current; restored on
     /// switch-back. Meaningless while the buffer *is* current — the live position
     /// is then [`Editor::cursor`] / `Editor::top` / `Editor::leftcol`.
@@ -187,14 +238,12 @@ struct OpenBuffer {
 
 impl OpenBuffer {
     fn new(buffer: Buffer) -> Self {
+        let undo = UndoTree::new(&buffer);
         OpenBuffer {
             buffer,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            undo,
             // A freshly loaded buffer matches disk: state 0 is the saved state.
-            cur_seq: 0,
             saved_seq: Some(0),
-            next_seq: 1,
             saved_cursor: Cursor::default(),
             saved_top: 0,
             saved_leftcol: 0,
@@ -457,6 +506,11 @@ pub struct Editor {
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
+    /// Current time in **monotonic** seconds, injected by the server before each
+    /// message (core does no I/O, so it can't read a clock itself). Stamped onto
+    /// undo nodes at commit and surfaced via `vim.fn.undotree()`/`localtime()`;
+    /// monotonic so elapsed-time labels are immune to wall-clock jumps.
+    now_mono: i64,
     /// Provenance for soft-tab `<BS>`: `(line, anchor_col)` of the whitespace run
     /// the *immediately preceding* `<Tab>` keypress inserted as spaces (its
     /// `anchor_col` is where the whole run began, preserved across consecutive
@@ -596,6 +650,7 @@ impl Editor {
             pending: PendingCommand::default(),
             last_find: None,
             snapshot_taken: false,
+            now_mono: 0,
             soft_tab: None,
             visual_anchor: Cursor::default(),
             scroll_from: None,
@@ -678,6 +733,13 @@ impl Editor {
     /// never blocks the client (a separate thread/process).
     pub fn take_sleep(&mut self) -> Option<u64> {
         self.pending_sleep.take()
+    }
+
+    /// Inject the current monotonic time (seconds) — the server calls this before
+    /// handling each message so undo-node timestamps and `vim.fn.localtime()`
+    /// share one monotonic timeline. See [`Editor::now_mono`].
+    pub fn set_now_mono(&mut self, secs: i64) {
+        self.now_mono = secs;
     }
 
     /// Feed a single key into the editor.

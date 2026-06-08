@@ -12,6 +12,11 @@ use rmpv::Value;
 
 impl Server {
     pub(crate) async fn handle(&mut self, message: Incoming) {
+        // Stamp the editor's monotonic clock once per message: undo-node commits
+        // during this message read it, and `vim.fn.localtime()` mirrors it.
+        let now = self.start.elapsed().as_secs() as i64;
+        self.editor.set_now_mono(now);
+        let _ = self.lua.set_mono_secs(now);
         match message {
             Incoming::Request { id, method, params } => {
                 match self.dispatch(&method, &params) {

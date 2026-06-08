@@ -7,8 +7,8 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::Server;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
-    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId,
-    WindowConfigSpec, WindowId,
+    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId, UndoEntry,
+    UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
     BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, HlSet, LoopOp, OptionValue,
@@ -37,6 +37,36 @@ fn byte_rowcol(buf: &nxvim_core::Buffer, byte: usize) -> (u64, u64) {
     let row = buf.byte_to_line(byte);
     let col = byte - buf.line_start(row);
     (row as u64, col as u64)
+}
+
+/// Serialize a [`UndoTreeView`] into the msgpack map `vim.fn.undotree()` returns.
+fn undotree_value(v: &UndoTreeView) -> Value {
+    let entries: Vec<Value> = v.entries.iter().map(undo_entry_value).collect();
+    Value::Map(vec![
+        (Value::from("synced"), Value::from(1)),
+        (Value::from("seq_last"), Value::from(v.seq_last)),
+        (Value::from("seq_cur"), Value::from(v.seq_cur)),
+        (Value::from("save_last"), Value::from(v.save_last)),
+        (Value::from("save_cur"), Value::from(v.save_cur)),
+        (Value::from("time_cur"), Value::from(v.time_cur)),
+        (Value::from("entries"), Value::Array(entries)),
+    ])
+}
+
+/// Serialize one [`UndoEntry`] (recursively, including its `alt` branches).
+fn undo_entry_value(e: &UndoEntry) -> Value {
+    let mut map = vec![
+        (Value::from("seq"), Value::from(e.seq)),
+        (Value::from("time"), Value::from(e.time)),
+    ];
+    if let Some(s) = e.save {
+        map.push((Value::from("save"), Value::from(s)));
+    }
+    if !e.alt.is_empty() {
+        let alt: Vec<Value> = e.alt.iter().map(undo_entry_value).collect();
+        map.push((Value::from("alt"), Value::Array(alt)));
+    }
+    Value::Map(map)
 }
 
 /// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `vim._wins`
@@ -710,6 +740,31 @@ impl Server {
         // (a handful of short strings), so it isn't gated on a dirty flag.
         let regs = self.editor.register_mirror();
         let _ = self.lua.set_reg_mirror(&regs);
+        self.push_undotree_mirror();
+    }
+
+    /// Refresh the `vim._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
+    /// Only buffers whose undo fingerprint changed since the last push are
+    /// re-projected (the tree walk is O(history), so this keeps the hot
+    /// buffer-mirror path cheap when nothing edited).
+    pub(crate) fn push_undotree_mirror(&mut self) {
+        let ids = self.editor.buffer_ids();
+        let live: Vec<u64> = ids.iter().map(|id| id.0).collect();
+        let mut updates: Vec<(u64, Value)> = Vec::new();
+        for id in ids {
+            let version = self.editor.undo_version(id);
+            if self.undo_mirror_versions.get(&id) == Some(&version) {
+                continue;
+            }
+            updates.push((id.0, undotree_value(&self.editor.undotree_of(id))));
+            self.undo_mirror_versions.insert(id, version);
+        }
+        let pruned = self.undo_mirror_versions.len() != live.len();
+        self.undo_mirror_versions
+            .retain(|id, _| live.contains(&id.0));
+        if !updates.is_empty() || pruned {
+            let _ = self.lua.set_undotree_mirror(&updates, &live);
+        }
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

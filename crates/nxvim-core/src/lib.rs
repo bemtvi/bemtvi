@@ -28,7 +28,8 @@ pub use buffer::{Buffer, BufferEdit, EditBatch};
 pub use clipboard::Clipboard;
 pub use editor::{
     command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,
-    FloatAnchor, FloatConfig, FloatRelative, TabId, WindowConfigSpec, WindowId,
+    FloatAnchor, FloatConfig, FloatRelative, TabId, UndoEntry, UndoTreeView, WindowConfigSpec,
+    WindowId,
 };
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};

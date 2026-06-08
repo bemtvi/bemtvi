@@ -109,6 +109,46 @@ pub(crate) fn lua_to_rmpv(value: &mlua::Value) -> mlua::Result<rmpv::Value> {
     })
 }
 
+/// Convert an RPC [`rmpv::Value`] into the equivalent `mlua::Value` — the inverse
+/// of [`lua_to_rmpv`], for handing server-built msgpack data (e.g. the
+/// `vim.fn.undotree()` projection) to Lua. Maps become string-keyed tables (a
+/// non-string key is stringified); arrays and integer/float/bool/string/nil map
+/// directly; binary blobs become Lua strings.
+pub(crate) fn rmpv_to_lua(lua: &Lua, value: &rmpv::Value) -> mlua::Result<mlua::Value> {
+    use rmpv::Value as R;
+    Ok(match value {
+        R::Nil => mlua::Value::Nil,
+        R::Boolean(b) => mlua::Value::Boolean(*b),
+        R::Integer(i) => match i.as_i64() {
+            Some(n) => mlua::Value::Integer(n),
+            None => mlua::Value::Number(i.as_f64().unwrap_or(0.0)),
+        },
+        R::F32(n) => mlua::Value::Number(*n as f64),
+        R::F64(n) => mlua::Value::Number(*n),
+        R::String(s) => mlua::Value::String(lua.create_string(s.as_bytes())?),
+        R::Binary(b) => mlua::Value::String(lua.create_string(b)?),
+        R::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.raw_set(i + 1, rmpv_to_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        R::Map(pairs) => {
+            let t = lua.create_table()?;
+            for (k, v) in pairs {
+                let key = match k {
+                    R::String(s) => s.as_str().unwrap_or_default().to_string(),
+                    other => other.to_string(),
+                };
+                t.raw_set(key, rmpv_to_lua(lua, v)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        R::Ext(_, _) => mlua::Value::Nil,
+    })
+}
+
 /// Convert a parsed [`serde_json::Value`] into the equivalent `mlua::Value` for
 /// `vim.json.decode`: objects become string-keyed tables, arrays become Lua
 /// sequences, and JSON `null` becomes `nil` (so a null-valued object key reads

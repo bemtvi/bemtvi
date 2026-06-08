@@ -1062,6 +1062,38 @@ function vim.fn.tabpagenr(arg)
   error("tabpagenr(): unsupported argument '" .. tostring(arg) .. "'", 2)
 end
 
+-- vim.fn.localtime(): the current time in seconds. nxvim sources this from a
+-- MONOTONIC clock (the server's `vim._mono_secs`, the same base stamped onto undo
+-- nodes), not wall-clock unix epoch, so `localtime() - node.time` elapsed math
+-- (e.g. the undotree visualizer's "N minutes ago") stays correct and non-negative
+-- across NTP steps and manual clock changes. Only differences are meaningful.
+function vim.fn.localtime()
+  return vim._mono_secs or 0
+end
+
+-- vim.fn.undotree([bufnr]): the buffer's undo tree, in neovim's shape
+-- ({ seq_last, seq_cur, save_last, save_cur, time_cur, synced, entries }, each
+-- entry { seq, time, save?, alt? }). Reads the `vim._undotree` mirror the server
+-- projects from the core's branching history before each Lua entry; `bufnr`
+-- 0/nil is the current buffer. A buffer with no recorded history yet yields an
+-- empty-`entries` tree rather than erroring.
+function vim.fn.undotree(bufnr)
+  bufnr = vim._resolve_bufnr(bufnr)
+  local t = (vim._undotree or {})[bufnr]
+  if t == nil then
+    return {
+      synced = 1,
+      seq_last = 0,
+      seq_cur = 0,
+      save_last = 0,
+      save_cur = 0,
+      time_cur = 0,
+      entries = {},
+    }
+  end
+  return t
+end
+
 -- vim.fn.tabpagebuflist(nr): the list of buffer numbers shown in tab page `nr`
 -- (1-based; nil/0 is the current tab), one per window in that tab — what a custom
 -- `'tabline'` label reads to find the tab's active file. Reads the tab mirror's

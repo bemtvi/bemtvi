@@ -705,6 +705,44 @@ impl LuaRuntime {
         g.set(key, value)
     }
 
+    /// Current monotonic time in seconds, read back by `vim.fn.localtime()`. Shares
+    /// the base the server stamps onto undo-node timestamps, so the undotree
+    /// visualizer's `localtime() - node.time` elapsed math is correct.
+    pub fn set_mono_secs(&self, secs: i64) -> mlua::Result<()> {
+        self.vim()?.set("_mono_secs", secs)
+    }
+
+    /// Refresh the `vim._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
+    /// `updates` carries `(bufnr, dict)` for the trees that changed since the last
+    /// push (each `dict` an `rmpv` map in neovim's `undotree()` shape); `live` is
+    /// every current bufnr, so entries for closed buffers are pruned.
+    pub fn set_undotree_mirror(
+        &self,
+        updates: &[(u64, rmpv::Value)],
+        live: &[u64],
+    ) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let mirror: Table = match vim.get("_undotree")? {
+            mlua::Value::Table(t) => t,
+            _ => {
+                let t = self.lua.create_table()?;
+                vim.set("_undotree", t.clone())?;
+                t
+            }
+        };
+        for (bufnr, dict) in updates {
+            mirror.set(*bufnr, crate::convert::rmpv_to_lua(&self.lua, dict)?)?;
+        }
+        // Prune trees for buffers that no longer exist.
+        for pair in mirror.clone().pairs::<u64, mlua::Value>() {
+            let (bufnr, _) = pair?;
+            if !live.contains(&bufnr) {
+                mirror.set(bufnr, mlua::Value::Nil)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Fire every autocmd registered for `event` whose pattern matches
     /// `pattern` (used for `ColorScheme` when a theme loads). Delegates to the
     /// prelude's `vim._fire`, which runs callbacks / queues `command` strings;

@@ -298,6 +298,16 @@ impl Editor {
             // (tabstop/shiftwidth/expandtab) live on the current buffer, which is
             // exactly what `:set` already targets for them.
             "set" | "se" | "setlocal" | "setl" => self.ex_set(args),
+            // `:u[ndo]` undoes one change; `:undo {N}` jumps to the state with
+            // sequence number N (anywhere in the tree). `:red[o]` redoes one.
+            "u" | "un" | "und" | "undo" => match args.trim() {
+                "" => self.undo(),
+                n => match n.parse::<u64>() {
+                    Ok(seq) => self.undo_to_seq(seq),
+                    Err(_) => self.echo(format!("E488: Trailing characters: {n}")),
+                },
+            },
+            "red" | "redo" => self.redo(),
             "noh" | "nohlsearch" => self.search_active = false,
             "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu"
             | "substitut" | "substitute" => self.ex_substitute(range, args),
@@ -1082,9 +1092,9 @@ impl Editor {
         match self.buffer_mut().write(path) {
             Ok((bytes, lines)) => {
                 // The current state is now what's on disk — undoing/redoing back
-                // to it should read as clean.
-                let ob = self.cur_mut();
-                ob.saved_seq = Some(ob.cur_seq);
+                // to it should read as clean, and the saved node carries a save
+                // number for `vim.fn.undotree()`.
+                self.mark_undo_saved(self.cur_buffer());
                 let name = self
                     .buffer()
                     .path
@@ -1361,10 +1371,13 @@ impl Editor {
 
     /// `:wall` — write every modified buffer that has a file name.
     fn ex_write_all(&mut self) {
+        let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
         let mut written = 0;
-        for ob in self.buffers.map.values_mut() {
+        for id in ids {
+            let ob = self.buffers.get_mut(id);
             if ob.buffer.modified && ob.buffer.path.is_some() && ob.buffer.write(None).is_ok() {
-                ob.saved_seq = Some(ob.cur_seq);
+                // The written state is now the saved node (carries a save number).
+                self.mark_undo_saved(id);
                 written += 1;
             }
         }

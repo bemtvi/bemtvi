@@ -361,6 +361,146 @@ async fn undo_reverts_the_last_change() {
 }
 
 #[tokio::test]
+async fn undo_ex_command_undoes_and_redoes_one_change() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc<Esc>");
+    feed(&rpc, ":undo<CR>");
+    assert_eq!(lines(&rpc).await, vec![""], ":undo undoes one change");
+    feed(&rpc, ":redo<CR>");
+    assert_eq!(lines(&rpc).await, vec!["abc"], ":redo restores it");
+}
+
+#[tokio::test]
+async fn redo_follows_the_change_after_an_undo() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec![""]);
+    feed(&rpc, "<C-r>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo"],
+        "<C-r> redoes the undone insert"
+    );
+}
+
+// The defining property of a *branching* undo history: undoing and then making a
+// new edit forks a branch rather than discarding the old future. The abandoned
+// edit stays reachable by its sequence number via `:undo {N}` — something a
+// linear two-stack undo can never do (the new edit would clear its redo stack).
+#[tokio::test]
+async fn undo_to_seq_reaches_an_abandoned_branch() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>"); // seq 1: "foo"
+    feed(&rpc, "u"); // back to seq 0: ""
+    feed(&rpc, "ibar<Esc>"); // seq 2: "bar" — forks a branch off seq 0
+    assert_eq!(lines(&rpc).await, vec!["bar"]);
+
+    feed(&rpc, ":undo 1<CR>"); // jump to the abandoned "foo" branch
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo"],
+        ":undo 1 reaches the branch a linear undo would have dropped"
+    );
+    feed(&rpc, ":undo 2<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["bar"],
+        ":undo 2 returns to the newer branch"
+    );
+    feed(&rpc, ":undo 0<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        ":undo 0 returns to the original text"
+    );
+}
+
+#[tokio::test]
+async fn undo_to_unknown_seq_is_reported_not_silent() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    let map = latest_after(&rpc, &mut incoming, ":undo 99<CR>").await;
+    let msg = view_str(&map, "message");
+    assert!(
+        msg.contains("99") && msg.contains("not found"),
+        "out-of-range :undo reports E830, got {msg:?}"
+    );
+    assert_eq!(lines(&rpc).await, vec!["foo"], "buffer is unchanged");
+}
+
+// `vim.fn.undotree()` projects the branching history into neovim's dict shape —
+// the data the undotree visualizer plugin draws. Every state (including an
+// abandoned branch) appears by seq, reachable via the spine + `alt` recursion.
+#[tokio::test]
+async fn undotree_fn_exposes_the_branching_tree() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>"); // seq 1
+    feed(&rpc, "u"); // back to root
+    feed(&rpc, "ibar<Esc>"); // seq 2, forks off root
+    let code = r#"
+        local t = vim.fn.undotree(0)
+        local seqs = {}
+        local function walk(es)
+          for _, e in ipairs(es) do
+            seqs[#seqs + 1] = e.seq
+            if e.alt then walk(e.alt) end
+          end
+        end
+        walk(t.entries)
+        table.sort(seqs)
+        return { t.seq_last, t.seq_cur, seqs }
+    "#;
+    let v = rpc
+        .request("nvim_exec_lua", vec![Value::from(code), Value::Nil])
+        .await
+        .expect("undotree");
+    let arr = v.as_array().expect("array result");
+    assert_eq!(arr[0].as_u64(), Some(2), "seq_last is the highest state");
+    assert_eq!(
+        arr[1].as_u64(),
+        Some(2),
+        "seq_cur is the current state (bar)"
+    );
+    let seqs: Vec<u64> = arr[2]
+        .as_array()
+        .expect("seqs array")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    assert_eq!(seqs, vec![1, 2], "both branches present in the tree by seq");
+}
+
+// A written state carries a `save` number, surfaced as `save`/`save_last`/
+// `save_cur` — what the visualizer marks with an `S`.
+#[tokio::test]
+async fn undotree_fn_marks_the_saved_state() {
+    let (rpc, _incoming) = start(None).await;
+    let path = temp_path("undotree");
+    feed(&rpc, "ifoo<Esc>");
+    rpc.request(
+        "nvim_command",
+        vec![Value::from(format!("w {}", path.display()).as_str())],
+    )
+    .await
+    .expect("write");
+    let v = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![
+                Value::from("local t = vim.fn.undotree(0); return { t.save_last, t.save_cur }"),
+                Value::Nil,
+            ],
+        )
+        .await
+        .expect("undotree");
+    let arr = v.as_array().expect("array result");
+    assert_eq!(arr[0].as_u64(), Some(1), "save_last counts the write");
+    assert_eq!(arr[1].as_u64(), Some(1), "the current state is that save");
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
 async fn yank_and_paste_duplicates_a_line() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ialpha<Esc>");

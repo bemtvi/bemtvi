@@ -1,5 +1,6 @@
 //! Text buffers, backed by a rope.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -187,22 +188,40 @@ impl Buffer {
 
     /// Contents of editable line `idx`, without its trailing newline.
     pub fn line(&self, idx: usize) -> String {
-        if idx >= self.line_count() {
-            return String::new();
-        }
-        let mut s = self.text.line(idx, LINE_TYPE).to_string();
-        if s.ends_with('\n') {
-            s.pop();
-            if s.ends_with('\r') {
-                s.pop();
-            }
-        }
-        s
+        self.line_cow(idx).into_owned()
     }
 
-    /// Number of bytes in editable line `idx`, excluding the newline.
+    /// Borrow editable line `idx` (without its trailing newline) as a `&str`
+    /// when the line occupies a single contiguous rope chunk — the
+    /// overwhelmingly common case — allocating only for the rare line that
+    /// straddles a chunk boundary. Prefer this over [`line`](Self::line) on hot
+    /// paths (grapheme walks, motions) where the line is only read.
+    pub fn line_cow(&self, idx: usize) -> Cow<'_, str> {
+        if idx >= self.line_count() {
+            return Cow::Borrowed("");
+        }
+        let sl = self.text.line(idx, LINE_TYPE);
+        match sl.as_str() {
+            Some(s) => Cow::Borrowed(strip_eol(s)),
+            None => Cow::Owned(strip_eol(&sl.to_string()).to_owned()),
+        }
+    }
+
+    /// Number of bytes in editable line `idx`, excluding the newline. Computed
+    /// straight from the rope slice's length (O(log n), no allocation).
     pub fn line_len(&self, idx: usize) -> usize {
-        self.line(idx).len()
+        if idx >= self.line_count() {
+            return 0;
+        }
+        let sl = self.text.line(idx, LINE_TYPE);
+        let mut n = sl.len();
+        if n > 0 && matches!(sl.get_char(n - 1), Ok('\n')) {
+            n -= 1;
+            if n > 0 && matches!(sl.get_char(n - 1), Ok('\r')) {
+                n -= 1;
+            }
+        }
+        n
     }
 
     /// Byte offset at the start of editable line `idx`.
@@ -459,6 +478,15 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 fn preserve_owner(path: &Path, meta: &std::fs::Metadata) {
     use std::os::unix::fs::MetadataExt;
     let _ = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()));
+}
+
+/// Strip a single trailing line break (`\n` or `\r\n`) from `s`, leaving any
+/// other characters — including interior or leading `\r` — untouched.
+fn strip_eol(s: &str) -> &str {
+    match s.strip_suffix('\n') {
+        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
+        None => s,
+    }
 }
 
 fn ensure_trailing_newline(text: &mut Rope) {

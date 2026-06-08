@@ -63,7 +63,7 @@ impl Editor {
     pub(crate) fn next_grapheme_idx(&self, idx: usize) -> usize {
         let line = self.buffer().byte_to_line(idx);
         let start = self.buffer().line_start(line);
-        let s = self.buffer().line(line);
+        let s = self.buffer().line_cow(line);
         let rel = idx - start;
         if rel < s.len() {
             start + unicode::next_grapheme(&s, rel)
@@ -79,7 +79,7 @@ impl Editor {
         }
         let line = self.buffer().byte_to_line(idx);
         let start = self.buffer().line_start(line);
-        let s = self.buffer().line(line);
+        let s = self.buffer().line_cow(line);
         let rel = idx - start;
         if rel == 0 {
             idx - 1
@@ -92,7 +92,7 @@ impl Editor {
     pub(crate) fn grapheme_floor_abs(&self, idx: usize) -> usize {
         let line = self.buffer().byte_to_line(idx);
         let start = self.buffer().line_start(line);
-        let s = self.buffer().line(line);
+        let s = self.buffer().line_cow(line);
         let rel = idx.saturating_sub(start).min(s.len());
         start + unicode::floor_grapheme(&s, rel)
     }
@@ -116,7 +116,7 @@ impl Editor {
 
     /// Virtual (screen) column of the cursor on its current line.
     pub(crate) fn cursor_virtcol(&self) -> usize {
-        let s = self.buffer().line(self.cursor.line);
+        let s = self.buffer().line_cow(self.cursor.line);
         unicode::virtcol(&s, self.cursor.col, self.tabstop())
     }
 
@@ -143,7 +143,7 @@ impl Editor {
     /// Snap the cursor column down to the nearest grapheme boundary (a no-op for
     /// ASCII), so byte offsets handed to the rope are always valid.
     fn snap_cursor(&mut self) {
-        let s = self.buffer().line(self.cursor.line);
+        let s = self.buffer().line_cow(self.cursor.line);
         self.cursor.col = unicode::floor_grapheme(&s, self.cursor.col.min(s.len()));
     }
 
@@ -157,7 +157,7 @@ impl Editor {
     }
 
     pub(crate) fn first_non_blank(&self, line: usize) -> usize {
-        let s = self.buffer().line(line);
+        let s = self.buffer().line_cow(line);
         s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count()
     }
 
@@ -194,7 +194,7 @@ impl Editor {
     /// column (or end-of-line when `$`-sticky), clamped to the line and a grapheme
     /// boundary.
     pub(crate) fn settle_desired_col(&mut self, allow_eol: bool) {
-        let s = self.buffer().line(self.cursor.line);
+        let s = self.buffer().line_cow(self.cursor.line);
         // Furthest valid resting byte: past-end for insert/allow_eol, otherwise
         // the start of the last grapheme (normal mode can't rest past EOL).
         let max_byte = if allow_eol {

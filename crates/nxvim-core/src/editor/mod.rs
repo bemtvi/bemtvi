@@ -25,6 +25,7 @@ mod cmdline;
 mod command;
 mod cursor;
 mod ex;
+mod explorer;
 mod insert;
 mod marks;
 mod motions;
@@ -546,6 +547,12 @@ pub struct Editor {
     /// pending operator, and the [`Stage`] of the in-progress sequence. Decided
     /// by the pure [`parse_step`]; reset on every completed command.
     pending: PendingCommand,
+    /// The half-typed `gg` prefix while a directory-listing buffer (the file
+    /// explorer) is focused: the first `g` arms it so the second completes the
+    /// jump-to-top, without delegating a bare `g` to the normal-mode grammar
+    /// (where it could start an editing `g`-command). See
+    /// [`Editor::handle_explorer`].
+    explorer_gpending: bool,
     /// The last find-char motion as `(kind, target)`, replayed by `;` (same
     /// direction) and `,` (opposite). Cross-command memory, not pending state, so
     /// it lives outside [`PendingCommand`] and survives `reset_pending`.
@@ -706,6 +713,19 @@ impl Editor {
     /// `from_file` already binds it as a new-file buffer.)
     pub fn open_or_named(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
+        // A directory opens as the in-window file explorer (vim's netrw), not as
+        // text. An unreadable directory (no permission) still fails loud, the same
+        // way an unreadable file does below.
+        if path.is_dir() {
+            return match Buffer::from_dir(&path) {
+                Ok(buffer) => Editor::with_buffer(buffer),
+                Err(e) => {
+                    let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
+                    editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
+                    editor
+                }
+            };
+        }
         match Buffer::from_file(&path) {
             Ok(buffer) => Editor::with_buffer(buffer),
             Err(e) => {
@@ -771,6 +791,7 @@ impl Editor {
             eol_request: false,
             registers: Registers::default(),
             pending: PendingCommand::default(),
+            explorer_gpending: false,
             last_find: None,
             redo_recording: Vec::new(),
             last_change: Vec::new(),
@@ -885,6 +906,17 @@ impl Editor {
         // buffer's mode handling and the `curswant`/scroll bookkeeping below.
         if self.panel.is_some() {
             self.handle_panel(key);
+            return;
+        }
+
+        // A directory-listing buffer (the file explorer) owns its keys in normal
+        // mode: navigation, `<CR>` to open the entry, `-` to go up. Editing keys
+        // are inert so the listing can't be corrupted; `:`/`/`/`?` fall through to
+        // open the command line. Once mid-sequence (`g` of `gg`) or in another
+        // mode the explorer keeps handling until it returns to a clean normal
+        // boundary. See [`Editor::handle_explorer`].
+        if self.mode == Mode::Normal && self.is_explorer_buffer() {
+            self.handle_explorer(key);
             return;
         }
 

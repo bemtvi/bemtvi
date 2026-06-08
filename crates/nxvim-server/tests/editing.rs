@@ -25,6 +25,8 @@ mod core_editing;
 mod dot_repeat;
 #[path = "editing/ex_substitute.rs"]
 mod ex_substitute;
+#[path = "editing/explorer.rs"]
+mod explorer;
 #[path = "editing/global_cmd.rs"]
 mod global_cmd;
 #[path = "editing/highlights.rs"]

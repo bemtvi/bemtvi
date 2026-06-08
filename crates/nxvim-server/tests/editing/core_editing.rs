@@ -9,12 +9,14 @@ async fn inserting_text_appears_in_the_buffer() {
 
 #[tokio::test]
 async fn unreadable_startup_file_keeps_its_name_and_echoes_the_error() {
-    // A directory can't be read as text, so `Buffer::from_file` fails. The buffer
-    // must still be bound to the path — not fall through to an unnamed scratch
-    // buffer that a later `:w` would clobber a stray file from — and the failure
-    // must be surfaced on the message line. (R4 in the 2026-06-02 review.)
-    let dir = temp_dir("openfail");
-    let path = dir.to_string_lossy().into_owned();
+    // A file whose bytes aren't valid UTF-8 can't be read as text, so
+    // `Buffer::from_file` fails. The buffer must still be bound to the path — not
+    // fall through to an unnamed scratch buffer that a later `:w` would clobber a
+    // stray file from — and the failure must be surfaced on the message line. (R4
+    // in the 2026-06-02 review.) (A *directory* is no longer an error: it opens
+    // the file explorer — see the `explorer` suite.)
+    let path = temp_path("openfail").to_string_lossy().into_owned();
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write invalid-utf8 file");
     let (rpc, mut incoming) = start(Some(path.clone())).await;
 
     // The buffer is named after the file the user asked for, not `[No Name]`.

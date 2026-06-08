@@ -1,0 +1,36 @@
+-- ~~~ nxvim file explorer playground (the in-window directory listing) ~~~
+--
+-- nxvim opens a DIRECTORY the way vim's netrw does: as a read-only listing you
+-- navigate in the window, not as text. Open the sample tree (from the repo root):
+--
+--     NXVIM_CONFIG=examples/explorer \
+--       cargo run -p nxvim -- examples/explorer/tree
+--
+-- You can also reach it from inside the editor with `:e examples/explorer/tree`
+-- (or `:e .` for the current directory).
+--
+-- WHAT YOU SEE — the listing, directories first (suffixed `/`), then files, each
+-- group sorted by name, with a `../` up-entry on top:
+--
+--     ../
+--     src/
+--     notes.txt
+--     readme.txt
+--
+-- WHAT TO TYPE:
+--   j / k, gg / G, <C-d> / <C-u>   move the selection (it is a real buffer, so the
+--                                  usual vertical motions work)
+--   <CR> on a file                 opens that file for editing
+--   <CR> on a directory (`src/`)   descends into it, re-listing in the same window
+--   <CR> on `../`  (or  -  )        goes up to the parent directory
+--
+-- Opening a file WIPES the listing buffer (it was just a picker), so it does not
+-- linger in `:ls` or as the alternate — exactly like vim's netrw.
+--
+-- The listing is effectively 'nomodifiable': editing keys (x, dd, i, p, …) are
+-- inert, so the picture of the filesystem can never be corrupted. The command
+-- line and search still work — `:`, `/`, `?` behave as in any buffer.
+--
+-- This needs no Lua configuration; the explorer is built into the core editor.
+-- This file is only the guided tour. Try descending into `src/`, opening a file,
+-- and `<C-^>`-ing back.

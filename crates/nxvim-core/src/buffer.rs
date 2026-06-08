@@ -113,6 +113,13 @@ pub struct Buffer {
     /// undo/redo, exactly as `extmarks` are. (Routing/validation lives in
     /// [`crate::editor::marks`]; global `A`–`Z` marks live on the editor.)
     pub marks: HashMap<char, (usize, usize)>,
+    /// When `Some(dir)`, this buffer is a **directory listing** — nxvim's
+    /// in-window file explorer (vim's netrw), not an editable text file. `dir` is
+    /// the canonical absolute path being listed; the editor routes `<CR>`/`-` to
+    /// [`crate::editor::Editor::handle_explorer`] (open the entry / go up) and
+    /// otherwise keeps the listing inert. Built by [`Buffer::from_dir`]; `None`
+    /// for every ordinary file/scratch buffer.
+    pub dir: Option<PathBuf>,
 }
 
 impl Default for Buffer {
@@ -136,6 +143,7 @@ impl Buffer {
             lsp_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
+            dir: None,
         }
     }
 
@@ -168,6 +176,58 @@ impl Buffer {
         Ok(Buffer {
             text,
             path: Some(path.to_path_buf()),
+            modified: false,
+            options: crate::options::BufferOptions::default(),
+            changedtick: 0,
+            save_tick: 0,
+            edits: Vec::new(),
+            resync: false,
+            lsp_edits: Vec::new(),
+            lsp_resync: false,
+            extmarks: crate::extmark::ExtmarkStore::default(),
+            marks: HashMap::new(),
+            dir: None,
+        })
+    }
+
+    /// Build a read-only **directory listing** buffer for `path` — the in-window
+    /// file explorer nxvim opens when asked to edit a directory (vim's netrw).
+    /// The lines are a `../` up-entry followed by the directory's entries sorted
+    /// directories-first then case-insensitively by name, each directory suffixed
+    /// with `/`. The buffer carries `dir: Some(canonical path)` so the editor
+    /// routes navigation keys to the explorer instead of editing it, and the same
+    /// path as its `path` so its name shows the directory (matching netrw).
+    /// Errors only when the directory can't be read (e.g. no permission); an empty
+    /// directory yields just the `../` line.
+    pub fn from_dir(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // Canonicalize so going up (`../`) and descending (`join`) are
+        // unambiguous however the path was spelled (`.`, a relative dir, a
+        // symlink). Fall back to the given path if it can't be resolved.
+        let dir = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut entries: Vec<(bool, String)> = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            entries.push((is_dir, entry.file_name().to_string_lossy().into_owned()));
+        }
+        // Directories first, then case-insensitive by name (netrw's default sort).
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        let mut text = String::from("../\n");
+        for (is_dir, name) in entries {
+            text.push_str(&name);
+            if is_dir {
+                text.push('/');
+            }
+            text.push('\n');
+        }
+        Ok(Buffer {
+            text: Rope::from_str(&text),
+            path: Some(dir.clone()),
+            dir: Some(dir),
             modified: false,
             options: crate::options::BufferOptions::default(),
             changedtick: 0,

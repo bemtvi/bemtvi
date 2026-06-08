@@ -1,0 +1,5 @@
+Scratch notes.
+
+- Directories are listed first, suffixed with `/`.
+- Files follow, each group sorted by name.
+- `../` on top goes up to the parent directory.

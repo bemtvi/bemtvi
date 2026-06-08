@@ -552,12 +552,21 @@ pub struct Editor {
     syntax: Option<Box<dyn SyntaxEngine>>,
     /// The language each buffer was last `open`ed in the engine with, so a query
     /// knows whether to re-`open` (first sync, or the path's language changed) vs
-    /// apply incremental `edit` deltas. Dropped when the buffer is deleted.
-    syntax_opened: HashMap<BufferId, &'static str>,
+    /// apply incremental `edit` deltas. Dropped when the buffer is deleted. A
+    /// `String` (not `&'static str`) because a `vim.treesitter.start` override can
+    /// name any runtime language, not just one of the built-in extension table's.
+    syntax_opened: HashMap<BufferId, String>,
     /// Languages whose grammar was *installed but failed to load*, already echoed
     /// once. Dedups the failure message so opening many files of a broken-grammar
     /// language doesn't spam (a *missing* grammar is silent and never recorded).
-    syntax_failed: HashSet<&'static str>,
+    syntax_failed: HashSet<String>,
+    /// Per-buffer treesitter language override, the [`Editor::ts_start`] /
+    /// [`Editor::ts_stop`] bridge behind `vim.treesitter.start` / `stop`. Absent:
+    /// the buffer highlights by its path's extension (the default floor).
+    /// `Some(lang)`: force `lang`, even for an extension the table misses.
+    /// `Some(None)`: explicitly stopped — no highlighting, even with a known
+    /// extension. (See ADR 0001, bridge #1.)
+    ts_override: HashMap<BufferId, Option<String>>,
     /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
     /// bare-core test (or a front end whose platform backend failed to start).
     /// Injected by the server via [`Editor::set_clipboard`]; when absent,
@@ -661,6 +670,7 @@ impl Editor {
             syntax: None,
             syntax_opened: HashMap::new(),
             syntax_failed: HashSet::new(),
+            ts_override: HashMap::new(),
             clipboard: None,
         };
         // Lay the sole window out into the default area so per-window rect

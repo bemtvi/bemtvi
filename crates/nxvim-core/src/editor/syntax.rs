@@ -65,8 +65,16 @@ impl Editor {
             return;
         };
         let buffer = &mut open_buf.buffer;
-        let Some(language) = language_of_path(buffer.path.as_deref()) else {
-            return; // no grammar for this path: nothing to parse
+        // Resolve the language: a `vim.treesitter.start` override wins (force a
+        // lang, or — `Some(None)` — explicitly stop highlighting); otherwise fall
+        // back to the path's extension. Owned, so it does not borrow `self`.
+        let language: String = match self.ts_override.get(&buf) {
+            Some(Some(lang)) => lang.clone(),
+            Some(None) => return, // stopped via vim.treesitter.stop
+            None => match language_of_path(buffer.path.as_deref()) {
+                Some(lang) => lang.to_string(),
+                None => return, // no grammar for this path: nothing to parse
+            },
         };
 
         // Capture a load failure to echo *after* the engine/buffer field borrows
@@ -75,14 +83,14 @@ impl Editor {
 
         // A fresh buffer, or one whose language changed (`:saveas` to another
         // extension), needs a full open; its stale journal is superseded.
-        if self.syntax_opened.get(&buf).copied() != Some(language) {
+        if self.syntax_opened.get(&buf).map(String::as_str) != Some(language.as_str()) {
             let _ = buffer.take_edits();
             if let OpenOutcome::LoadFailed(reason) =
-                engine.open(buf, language, &buffer.text.to_string())
+                engine.open(buf, &language, &buffer.text.to_string())
             {
                 load_failure = Some(reason);
             }
-            self.syntax_opened.insert(buf, language);
+            self.syntax_opened.insert(buf, language.clone());
         } else {
             // Already open in this language: feed it just what changed. A
             // whole-rope replacement (undo/redo, reload) re-opens; ordinary deltas
@@ -90,7 +98,7 @@ impl Editor {
             let batch = buffer.take_edits();
             if !batch.is_empty() {
                 if batch.resync {
-                    engine.open(buf, language, &buffer.text.to_string());
+                    engine.open(buf, &language, &buffer.text.to_string());
                 } else {
                     engine.edit(buf, &batch.edits);
                 }
@@ -102,12 +110,33 @@ impl Editor {
         // spam. A *missing* grammar yields `OpenOutcome::Ok` and stays silent:
         // highlighting is best-effort, not a missing feature.
         if let Some(reason) = load_failure {
-            if self.syntax_failed.insert(language) {
+            if self.syntax_failed.insert(language.clone()) {
                 self.echo(format!(
                     "treesitter: grammar '{language}' failed to load: {reason}"
                 ));
             }
         }
+    }
+
+    /// Enable native treesitter highlighting for `buf` in `lang`, the bridge
+    /// behind `vim.treesitter.start(buf, lang)` (ADR 0001, bridge #1). Forces
+    /// `lang` regardless of the path's extension — so a buffer the extension
+    /// table misses (a `.tex` file, a no-name scratch buffer) gets highlighted —
+    /// and overrides a prior `stop`. The next `highlights` call opens the grammar.
+    pub fn ts_start(&mut self, buf: BufferId, lang: String) {
+        self.ts_override.insert(buf, Some(lang));
+    }
+
+    /// Disable native treesitter highlighting for `buf`, the bridge behind
+    /// `vim.treesitter.stop(buf)`. Records an explicit "stopped" override (so the
+    /// buffer stays dark even with a known extension) and drops the engine's
+    /// parse state, so `highlights` returns nothing until a later `ts_start`.
+    pub fn ts_stop(&mut self, buf: BufferId) {
+        self.ts_override.insert(buf, None);
+        if let Some(engine) = self.syntax.as_mut() {
+            engine.close(buf);
+        }
+        self.syntax_opened.remove(&buf);
     }
 
     /// Highlight spans for the line range `[first, last)` of buffer `buf`,
@@ -127,6 +156,7 @@ impl Editor {
             engine.close(id);
         }
         self.syntax_opened.remove(&id);
+        self.ts_override.remove(&id);
     }
 
     /// Target indent **width in columns** for `line` of the current buffer, the

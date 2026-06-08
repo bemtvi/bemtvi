@@ -17,8 +17,8 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, UiInputReq,
-    WindowOp,
+    LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, TsOp,
+    UiInputReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -307,6 +307,9 @@ pub(crate) struct Shared {
     /// Global-option writes from `vim.o` for a wired search option, drained by
     /// the server into the editor's global options after the chunk.
     pub(crate) global_ops: Vec<GlobalOptionOp>,
+    /// Treesitter bridge requests from `vim.treesitter.start` / `stop`, drained
+    /// by the server into the editor's per-buffer treesitter override.
+    pub(crate) ts_ops: Vec<TsOp>,
     /// Register writes from `vim.fn.setreg`, drained by the server into the
     /// editor's register file after the chunk. Reads resolve from the
     /// `vim._registers` mirror, so only the write needs an op.
@@ -643,6 +646,13 @@ impl LuaRuntime {
         /// Take the global-option writes queued by `vim.o` since the last drain, for
         /// the server to apply to the editor's global options.
         take_global_ops -> Vec<GlobalOptionOp> = global_ops
+    }
+
+    take_queue! {
+        /// Take the treesitter bridge requests queued by `vim.treesitter.start` /
+        /// `stop` since the last drain, for the server to apply to the editor's
+        /// per-buffer treesitter override.
+        take_ts_ops -> Vec<TsOp> = ts_ops
     }
 
     take_queue! {

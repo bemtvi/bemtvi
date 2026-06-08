@@ -358,6 +358,21 @@ pub struct GlobalOptionOp {
     pub value: OptionValue,
 }
 
+/// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the
+/// `vim.treesitter` → native-engine seam (ADR 0001, bridge #1). The Lua side has
+/// already resolved `0` to the current buffer and (for `Start`) the language;
+/// the server forwards each to the editor's per-buffer treesitter override
+/// ([`Editor::ts_start`](nxvim_core::Editor::ts_start) / `ts_stop`). The query
+/// bridge (#4) adds a `SetQuery` variant here later.
+#[derive(Clone, Debug)]
+pub enum TsOp {
+    /// `vim.treesitter.start(buf, lang)`: highlight `bufnr` in `lang` via the
+    /// native engine, regardless of the path's extension.
+    Start { bufnr: u64, lang: String },
+    /// `vim.treesitter.stop(buf)`: stop highlighting `bufnr`.
+    Stop { bufnr: u64 },
+}
+
 /// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,
 /// `nvim_win_set_buf`/`set_cursor`/`set_width`/`set_height`/`close`, `nvim_open_win`),
 /// drained by the server in `apply_lua_effects` and applied to the live editor —

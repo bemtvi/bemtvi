@@ -112,6 +112,24 @@ async fn start_with(
     file: Option<String>,
     runtimepath: Vec<PathBuf>,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_full(file, runtimepath, None).await
+}
+
+/// As [`start_with`], but also sources `config_dir/init.lua` at startup — the
+/// real config-load path, used to exercise an `examples/<feature>/init.lua`
+/// end-to-end (so the shipped example can't rot).
+async fn start_with_config(
+    file: Option<String>,
+    config_dir: PathBuf,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_full(file, Vec::new(), Some(config_dir)).await
+}
+
+async fn start_full(
+    file: Option<String>,
+    runtimepath: Vec<PathBuf>,
+    config_dir: Option<PathBuf>,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -124,6 +142,7 @@ async fn start_with(
             ServerInit {
                 file,
                 runtimepath,
+                config_dir,
                 ..Default::default()
             },
         ));
@@ -774,5 +793,110 @@ async fn a_missing_grammar_is_silent() {
     assert!(
         highlights_of(&params).iter().all(|row| row.is_empty()),
         "a buffer with no installed grammar must not be highlighted"
+    );
+}
+
+// ----- vim.treesitter.start / stop bridge (ADR 0001, #1) --------------------
+
+#[tokio::test]
+async fn treesitter_start_highlights_a_buffer_the_extension_table_misses() {
+    // A `.txt` file: `language_of_path` has no mapping, so nxvim's extension
+    // floor never highlights it. `vim.treesitter.start(0, 'rust')` forces the
+    // native engine on at `rust` regardless of extension — the common case the
+    // bridge unblocks (getting *any* highlighting onto a buffer the table misses).
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_file("ts-start", "txt", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Before `start`: a `.txt` buffer is never highlighted.
+    for _ in 0..6 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let before = drain_latest_redraw(&mut incoming).expect("a redraw");
+    assert!(
+        highlights_of(&before).iter().all(|row| row.is_empty()),
+        "a .txt buffer must not be highlighted before vim.treesitter.start"
+    );
+
+    // Turn the native engine on for this buffer at `rust`.
+    exec_lua(&rpc, "vim.treesitter.start(0, 'rust')").await;
+
+    // Now the `fn` keyword on row 0 is highlighted by the rust grammar.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    let fn_span = hl[0]
+        .iter()
+        .find(|(s, _, _)| *s == 0)
+        .expect("a span at column 0 (the `fn` keyword) after start");
+    assert_eq!(fn_span.1, 2, "the `fn` keyword spans two columns");
+    assert_eq!(
+        fn_span.2.split('.').next().unwrap(),
+        "keyword",
+        "`fn` is a keyword, got group {:?}",
+        fn_span.2
+    );
+}
+
+#[tokio::test]
+async fn the_treesitter_start_example_config_highlights_on_startup() {
+    // The shipped `examples/treesitter-start/` config calls
+    // `vim.treesitter.start(0, "rust")` at the top level of init.lua. Sourcing it
+    // at startup (against its own `.txt` sample, which the extension table misses)
+    // must leave the buffer rust-highlighted on the first frame — verifying the
+    // example end-to-end and guarding it against rot.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/treesitter-start")
+        .canonicalize()
+        .expect("example dir exists");
+    let sample = example.join("sample.txt").display().to_string();
+    let (rpc, mut incoming) = start_with_config(Some(sample), example).await;
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    let fn_span = hl[0]
+        .iter()
+        .find(|(s, _, _)| *s == 0)
+        .expect("a span at column 0 (the `fn` keyword) from the example config");
+    assert_eq!(
+        fn_span.2.split('.').next().unwrap(),
+        "keyword",
+        "the example's vim.treesitter.start should highlight `fn` as a keyword, got {:?}",
+        fn_span.2
+    );
+}
+
+#[tokio::test]
+async fn treesitter_stop_clears_highlighting_even_for_a_known_extension() {
+    // A `.rs` buffer auto-highlights off the extension floor. `vim.treesitter.stop`
+    // is an *explicit* off switch: it must darken the buffer even though the
+    // extension is recognized (override `Some(None)` beats `language_of_path`).
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("ts-stop", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // It starts highlighted by the extension floor.
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+
+    // Stop, then confirm the buffer goes dark and stays dark.
+    exec_lua(&rpc, "vim.treesitter.stop(0)").await;
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.iter().all(|row| row.is_empty())
+    })
+    .await;
+    assert!(
+        hl.iter().all(|row| row.is_empty()),
+        "vim.treesitter.stop must clear highlighting for a .rs buffer"
     );
 }

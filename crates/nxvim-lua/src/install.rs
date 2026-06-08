@@ -22,7 +22,7 @@ use crate::host::{
 };
 use crate::ops::{
     BufOp, ConfirmReq, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue,
-    PanelOp, RegisterSetOp, TabOp, UiInputReq, WindowOp,
+    PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -1061,6 +1061,29 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `vim._ts_start(bufnr, lang)` / `vim._ts_stop(bufnr)`: queue a [`TsOp`] for
+    // the server to apply to the editor's per-buffer treesitter override — the
+    // `vim.treesitter.start` / `stop` bridge (ADR 0001, #1). The Lua wrapper has
+    // already resolved `0` to the current buffer and the language; this records
+    // the deferred toggle, which the server forwards to `Editor::ts_start` /
+    // `ts_stop` so the native engine highlights (or stops highlighting) the buffer.
+    let sh = shared.clone();
+    vim.set(
+        "_ts_start",
+        lua.create_function(move |_, (bufnr, lang): (u64, String)| {
+            sh.borrow_mut().ts_ops.push(TsOp::Start { bufnr, lang });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
+        "_ts_stop",
+        lua.create_function(move |_, bufnr: u64| {
+            sh.borrow_mut().ts_ops.push(TsOp::Stop { bufnr });
+            Ok(())
+        })?,
     )?;
 
     // `vim.regex(pat)`: compile a vim pattern into a regex object exposing

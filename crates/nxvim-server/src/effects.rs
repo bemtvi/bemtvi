@@ -12,7 +12,8 @@ use nxvim_core::{
 };
 use nxvim_lua::{
     BoMirror, BufMirror, BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror,
-    HlDefMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, WindowMirror, WindowOp,
+    HlDefMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, TsOp, WindowMirror,
+    WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -180,6 +181,23 @@ impl Server {
                 // `:set statusline=…` ex path writes.
                 OptionValue::String(s) => self.editor.set_global_option_str(&op.name, &s),
             }
+        }
+        // Treesitter bridge toggles from `vim.treesitter.start` / `stop`: forward
+        // each to the editor's per-buffer override (ADR 0001, #1), then drop that
+        // buffer's highlight memo so the next redraw re-queries the engine — the
+        // toggle changes what paints without changing the buffer's changedtick.
+        for op in self.lua.take_ts_ops() {
+            let bufnr = match op {
+                TsOp::Start { bufnr, lang } => {
+                    self.editor.ts_start(BufferId(bufnr), lang);
+                    bufnr
+                }
+                TsOp::Stop { bufnr } => {
+                    self.editor.ts_stop(BufferId(bufnr));
+                    bufnr
+                }
+            };
+            self.syntax_states.remove(&BufferId(bufnr));
         }
         // Register writes from `vim.fn.setreg`: applied to the editor's register
         // file after the chunk — the same store yanks/deletes write. The Lua side

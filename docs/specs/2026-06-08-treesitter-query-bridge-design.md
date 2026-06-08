@@ -1,8 +1,9 @@
 # Treesitter query bridge — Lua resolves, Rust executes — design
 
-**Status:** accepted; **deferred — sequenced after
+**Status:** accepted; **unblocked — its prerequisite
 [`vim.treesitter.start`](../decisions/0001-native-engines-vendored-lua-apis.md)
-(bridge #1).** Not yet implemented. This closes the gap recorded in
+(bridge #1) is now implemented.** This bridge is itself not yet built. It closes
+the gap recorded in
 [known-approximations.md](../known-approximations.md): a customized highlight or
 indent query does not change what the native engine paints. It is the fourth
 worked instance of ADR 0001's bridge pattern, one level deeper than the others —

@@ -36,23 +36,53 @@ vim.func = require('vim.func')
 -- The high-level API itself, now that the globals it reads at load time exist.
 vim.treesitter = require('vim.treesitter')
 
--- vim.treesitter.highlighter: nxvim does NOT implement decoration-provider
--- highlighting (vim.treesitter.start / the highlighter) — that's an explicit
--- non-goal of the platform; the Rust engine owns redraw highlighting. But the
--- vendored highlighter.lua can't even load here (it registers a decoration
+-- vim.treesitter.highlighter: nxvim does NOT run neovim's decoration-provider
+-- highlighter on the redraw hot path — the Rust engine owns redraw highlighting.
+-- The vendored highlighter.lua can't even load here (it registers a decoration
 -- provider at module scope, an API nxvim lacks), and plugins such as catppuccin
 -- *probe* `vim.treesitter.highlighter.hl_map` (a field neovim removed) to detect
 -- the pre-0.8 API. So replace the lazy require with a small honest table: probed
 -- fields (hl_map) read nil so the legacy path is skipped and the plugin's
--- `@`-capture highlight groups still load; `active` is an empty map so
--- stop()/get_captures_at_pos resolve to "no active highlighter"; and the real
--- entry point (new) fails loud rather than faking that highlighting works.
+-- `@`-capture highlight groups still load; `active[buf]` is populated by the
+-- start/stop bridge below (so code that checks "is TS highlighting on for this
+-- buffer?" sees the truth); and the real decoration-provider entry point (new)
+-- fails loud rather than faking the upstream highlighter object.
 vim.treesitter.highlighter = {
   active = {},
   new = function()
     vim._notimpl('vim.treesitter.highlighter.new (decoration-provider highlighting)')
   end,
 }
+
+-- vim.treesitter.start / stop — the bridge to nxvim's native engine (ADR 0001,
+-- #1). Rather than running neovim's Lua highlighter (a decoration provider on the
+-- redraw hot path nxvim lacks), `start` enables the in-core Rust engine for the
+-- buffer at the resolved language, and `stop` disables it — via the `_ts_start` /
+-- `_ts_stop` effects the server forwards to `Editor::ts_start` / `ts_stop`. This
+-- subsumes the common case the extension table misses: a buffer with no known
+-- extension (or a forced lang) gets highlighting once a config/plugin calls
+-- `start`. Resolution stays faithful (neovim's filetype→lang mapping); only
+-- *execution* moves to the native engine. Unlike upstream, this does NOT create a
+-- Lua-side LanguageTree — a highlight-only buffer parses once (in the engine);
+-- the double parse begins only if a plugin separately calls `get_parser`.
+function vim.treesitter.start(buf, lang)
+  buf = vim._resolve_bufnr(buf)
+  lang = lang or vim.treesitter.language.get_lang(vim.bo[buf].filetype) or vim.bo[buf].filetype
+  if not lang or lang == '' then
+    error(
+      ('vim.treesitter.start: could not determine language for buffer %d '
+      .. '(set filetype or pass an explicit lang)'):format(buf)
+    )
+  end
+  vim.treesitter.highlighter.active[buf] = { bufnr = buf, lang = lang }
+  vim._ts_start(buf, lang)
+end
+
+function vim.treesitter.stop(buf)
+  buf = vim._resolve_bufnr(buf)
+  vim.treesitter.highlighter.active[buf] = nil
+  vim._ts_stop(buf)
+end
 
 do
   local LanguageTree = require('vim.treesitter.languagetree')

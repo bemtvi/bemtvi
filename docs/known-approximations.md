@@ -54,11 +54,18 @@ gap. Recorded here so the sweep doesn't lose them.
   vendored Lua on bespoke Rust primitives (see the
   [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md)). Remaining
   gaps, each a *deliberate* deferral rather than a silent stub:
-  - **Decoration-provider highlighting** (`vim.treesitter.start` / the
-    highlighter): nxvim highlights from the Rust engine, not a Lua-owned tree.
-    `vim.treesitter.highlighter` is a small shim — legacy-API probes (`hl_map`)
-    read nil and `active` is empty, but `highlighter.new` fails loud
-    (`vim._notimpl`), so `vim.treesitter.start` raises rather than faking it.
+  - **`vim.treesitter.start` / `stop` bridge to the native engine** (ADR 0001,
+    bridge #1 — *implemented*). nxvim does not run neovim's decoration-provider
+    highlighter on the redraw hot path; instead `start(buf, lang)` enables the
+    in-core Rust engine for that buffer at `lang` (forcing highlighting even for an
+    extension the built-in table misses), and `stop(buf)` disables it (even for a
+    recognized extension). `vim.treesitter.highlighter` stays a small shim —
+    legacy-API probes (`hl_map`) read nil, `active[buf]` reflects the bridge's
+    on/off state, and the real decoration-provider entry point `highlighter.new`
+    still fails loud (`vim._notimpl`). The one approximation that remains: a
+    highlight-only `start` does not create a Lua-side `LanguageTree`, so a config
+    that calls `start` and then reaches for `vim.treesitter.highlighter.active[buf]
+    .tree` (rare) won't find one until something calls `get_parser`.
   - **Customized queries don't change the paint.** The redraw painter resolves
     highlights and indent through the Rust engine, which compiles a **single**
     `queries/<lang>/highlights.scm` (and `indents.scm`) per grammar — it does *not*
@@ -68,7 +75,8 @@ gap. Recorded here so the sweep doesn't lose them.
     `;extends` / `;inherits` modeline merges. A drop-in *base* `queries/<lang>/`
     tree **is** honored (it's the one file the engine reads); layering/merging on
     top of it is not. The fix is the query-resolution bridge — Lua resolves, the
-    engine executes — deferred behind `vim.treesitter.start`; see
+    engine executes — its prerequisite (`vim.treesitter.start`, above) is now in
+    place, so it is the next bridge to build; see
     [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and
     [the query-bridge design](specs/2026-06-08-treesitter-query-bridge-design.md).
   - **Injections.** A buffer's root tree parses; `LanguageTree` child languages /

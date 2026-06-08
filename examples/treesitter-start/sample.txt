@@ -1,0 +1,11 @@
+fn main() {
+    let greeting = "hello from a .txt file";
+    for i in 0..3 {
+        println!("{greeting} #{i}");
+    }
+}
+
+struct Point {
+    x: i64,
+    y: i64,
+}

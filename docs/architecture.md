@@ -660,10 +660,12 @@ split — a small bespoke C-equivalent layer with neovim's real Lua on top:
 
 This is **additive**: a `LanguageTree` is created only when a plugin calls
 `get_parser`, so buffers without a treesitter consumer pay nothing; one that has a
-consumer pays a second parse (the Rust engine's + Lua's). Decoration-provider
-highlighting (`vim.treesitter.start`), Lua-driven indent, and injections are
-explicit non-goals for now (the highlighter is a loud not-implemented stub). Full
-design: [the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md).
+consumer pays a second parse (the Rust engine's + Lua's). `vim.treesitter.start` /
+`stop` are wired as ADR 0001 bridge #1: they toggle the **native** engine for a
+buffer (a `lang` override) rather than running neovim's Lua decoration-provider
+highlighter on the redraw hot path, so a highlight-only buffer still parses once.
+Lua-driven indent and injections remain non-goals for now. Full design:
+[the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md).
 
 The boundary this section embodies — **native engine for editor behavior,
 vendored neovim Lua API for plugins** — is the same one LSP follows (a native
@@ -764,8 +766,9 @@ screen," and that is exactly the shape of these tests.
   platform** itself is in place — `get_parser(buf):parse()`, `get_string_parser`,
   and `query.parse` + `iter_captures`/`iter_matches` with predicates run neovim's
   vendored Lua on bespoke Rust primitives (see [*The `vim.treesitter` Lua
-  platform*](#the-vimtreesitter-lua-platform)); injections, decoration-provider
-  highlighting (`vim.treesitter.start`), and Lua-driven indent remain deferred.
+  platform*](#the-vimtreesitter-lua-platform)); `vim.treesitter.start` / `stop`
+  toggle the native engine per buffer (ADR 0001 bridge #1), while injections and
+  Lua-driven indent remain deferred.
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay

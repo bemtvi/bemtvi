@@ -71,10 +71,16 @@ is the shared substrate ([`extmark.rs`](../../crates/nxvim-core/src/extmark.rs):
 `TS_HL_PRIORITY = 100` < `DEFAULT_PRIORITY = 4096`), so an async/plugin mark rides
 *over* the synchronous treesitter floor:
 
-1. **`vim.treesitter.start` / `stop`** — a plugin/config toggling highlighting.
-   Bridges to *enabling the native engine* for that buffer with a `lang`
-   override, rather than running neovim's Lua highlighter on the redraw hot path.
-   (Today the highlighter is a loud `_notimpl` in the prelude; this is the patch.)
+1. **`vim.treesitter.start` / `stop`** (*implemented*) — a plugin/config toggling
+   highlighting. Bridges to *enabling the native engine* for that buffer with a
+   `lang` override, rather than running neovim's Lua highlighter on the redraw hot
+   path. `start(buf, lang)` forces highlighting (even for an extension the table
+   misses); `stop(buf)` disables it (even for a recognized extension). The prelude
+   overrides `start`/`stop` to emit a `TsOp` the server forwards to
+   `Editor::ts_start` / `ts_stop` (a per-buffer override consulted ahead of the
+   extension table); `highlighter.new` (the real decoration provider) stays a loud
+   `_notimpl`. A highlight-only `start` does *not* create a Lua `LanguageTree`, so
+   such a buffer still parses once — the double parse begins only on `get_parser`.
 2. **LSP semantic tokens** — async, server-side. Cached on arrival and projected
    as extmarks *above* the treesitter floor. Request plumbing exists in
    [`nxvim-lsp`](../../crates/nxvim-lsp/src/dispatch.rs); the response→extmark

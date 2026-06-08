@@ -647,18 +647,19 @@ fn selection_row_span(
         // Whole line, filled to the viewport edge — as vim paints it.
         return Some((0, width));
     }
-    let text = buf.line(buf_line);
+    let text = buf.line_cow(buf_line);
+    let mut vc = unicode::LineVirtcol::new(&text, ts);
     // Charwise: clip the inclusive [start, end] region to this row.
     let lo = if buf_line == start.line { start.col } else { 0 };
-    let start_col = unicode::virtcol(&text, lo, ts);
+    let start_col = vc.at(lo);
     let end_col = if buf_line == end.line {
         // Include the grapheme under the trailing cursor.
         let hi = unicode::next_grapheme(&text, end.col.min(text.len()));
-        unicode::virtcol(&text, hi, ts)
+        vc.at(hi)
     } else {
         // The selection continues onto the next line: highlight the text and one
         // extra cell standing in for the selected newline.
-        unicode::virtcol(&text, text.len(), ts) + 1
+        vc.at(text.len()) + 1
     };
     Some((start_col, end_col))
 }

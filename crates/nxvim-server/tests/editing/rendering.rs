@@ -128,6 +128,27 @@ async fn charwise_visual_highlights_the_selected_columns() {
 }
 
 #[tokio::test]
+async fn charwise_visual_highlight_accounts_for_a_tab_and_wide_char() {
+    let (rpc, mut incoming) = start(None).await;
+    // "\ta你b": a tab, then 'a', a double-width '你', and 'b'. The highlight span
+    // is in *screen* columns, so it must expand the tab (col-dependent width) and
+    // count '你' as two cells — exactly the projection path the single-pass
+    // virtcol mapper drives. With the default tabstop 4 the cells are:
+    //   \t → 0..4,  a → 4,  你 → 5..7,  b → 7.
+    feed(&rpc, "i<Tab>a你b<Esc>");
+    // Select the whole line charwise: column 0 (the tab), then step over a, 你, b.
+    feed(&rpc, "0vlll");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    // [0, 8): tab(4) + a(1) + 你(2) + b(1), inclusive of the trailing 'b'. A bare
+    // byte→column mapping (no tab expansion / wide-char width) would give end 6
+    // (the byte length); a stale forward-walk cursor would mis-place it.
+    assert_eq!(sel.first().copied().flatten(), Some((0, 8)));
+}
+
+#[tokio::test]
 async fn charwise_visual_spanning_lines_marks_the_newline_cell() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ifoo<CR>bar<Esc>");

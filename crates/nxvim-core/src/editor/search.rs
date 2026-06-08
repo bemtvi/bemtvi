@@ -596,11 +596,9 @@ impl Editor {
             }
             let text = buf.line_cow(buf_line);
             let ts = buf.options.effective_tabstop();
+            let mut vc = unicode::LineVirtcol::new(&text, ts);
             for (s, e) in re.find_all(&text) {
-                let span = (
-                    unicode::virtcol(&text, s, ts),
-                    unicode::virtcol(&text, e, ts),
-                );
+                let span = (vc.at(s), vc.at(e));
                 row_spans.push(span);
                 // The preview cursor sits on the start of its match, so an exact
                 // column hit on the cursor's line marks the current match.

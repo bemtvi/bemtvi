@@ -152,7 +152,7 @@ impl Server {
                     return Value::Array(Vec::new());
                 };
                 let ts_spans = spans_by_line.and_then(|m| m.get(&line_idx));
-                let text = b.line(line_idx);
+                let text = b.line_cow(line_idx);
                 let tab = b.options.effective_tabstop();
 
                 // Fast path: no extmarks on this line ⇒ emit the (already
@@ -170,11 +170,12 @@ impl Server {
                     let Some(spans) = ts_spans else {
                         return Value::Array(Vec::new());
                     };
+                    let mut vc = unicode::LineVirtcol::new(&text, tab);
                     let row = spans
                         .iter()
                         .map(|s| {
-                            let start = unicode::virtcol(&text, s.start, tab);
-                            let end = unicode::virtcol(&text, s.end, tab);
+                            let start = vc.at(s.start);
+                            let end = vc.at(s.end);
                             let style_id = match self.editor.highlights.resolve_capture(&s.group) {
                                 Some(style) => Value::from(styles.intern(style) as u64),
                                 None => Value::Nil,
@@ -206,11 +207,12 @@ impl Server {
                     }
                 }
                 intervals.extend(ext);
+                let mut vc = unicode::LineVirtcol::new(&text, tab);
                 let row = crate::extmarks::merge_intervals(&intervals)
                     .into_iter()
                     .map(|(sb, eb, group, capture)| {
-                        let start = unicode::virtcol(&text, sb, tab);
-                        let end = unicode::virtcol(&text, eb, tab);
+                        let start = vc.at(sb);
+                        let end = vc.at(eb);
                         let resolved = if capture {
                             self.editor.highlights.resolve_capture(group)
                         } else {

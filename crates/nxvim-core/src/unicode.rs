@@ -8,7 +8,9 @@
 //! single-byte grapheme); [`floor_grapheme`] additionally takes an all-ASCII
 //! fast path to skip grapheme segmentation on the cursor hot path.
 
-use unicode_segmentation::UnicodeSegmentation;
+use std::iter::Peekable;
+
+use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
 /// Width of a tab stop in cells. A constant until the options system (`:set
@@ -67,6 +69,77 @@ pub fn virtcol(line: &str, byte: usize, tabstop: usize) -> usize {
         col += grapheme_width(g, col, tabstop);
     }
     col
+}
+
+/// A byte-offset → virtual-column mapper for a single line that answers a
+/// **non-decreasing** sequence of queries by walking the line's graphemes at
+/// most once across all of them — amortized O(1) per query, versus
+/// [`virtcol`]'s O(byte) re-walk from column 0 on every call.
+///
+/// This is the projection hot path: per redraw, each visible row maps the
+/// `(start, end)` byte offsets of every syntax span / search match / selection
+/// to screen columns. Those offsets arrive sorted (spans are non-overlapping
+/// and left-to-right), so a single forward walk serves them all instead of the
+/// O(line_len × spans) re-scan a bare `virtcol` per offset would cost.
+///
+/// Correctness does not depend on the ordering: a query that moves *backwards*
+/// transparently restarts the walk from the start of the line, so any order
+/// yields the same result `virtcol` would — only the amortization is lost.
+/// Pure-ASCII tab-free lines (the common case) skip the walk entirely, since
+/// there `virtcol == byte`.
+pub struct LineVirtcol<'a> {
+    line: &'a str,
+    tabstop: usize,
+    /// Pure ASCII with no tab ⇒ every byte is one cell, so `virtcol == byte`.
+    simple: bool,
+    /// Grapheme walk state for the general path: the iterator's front sits at
+    /// byte `walked_byte`, which is at virtual column `walked_col`.
+    graphemes: Peekable<GraphemeIndices<'a>>,
+    walked_byte: usize,
+    walked_col: usize,
+}
+
+impl<'a> LineVirtcol<'a> {
+    /// Build a mapper for `line`. The O(line_len) `simple` scan is paid once per
+    /// line, replacing the per-offset re-walk.
+    pub fn new(line: &'a str, tabstop: usize) -> Self {
+        let simple = line.bytes().all(|b| b.is_ascii() && b != b'\t');
+        LineVirtcol {
+            line,
+            tabstop,
+            simple,
+            graphemes: line.grapheme_indices(true).peekable(),
+            walked_byte: 0,
+            walked_col: 0,
+        }
+    }
+
+    /// Virtual column of byte offset `byte` (snapped down to a grapheme boundary,
+    /// exactly as [`virtcol`] does). Cheapest when called with non-decreasing
+    /// `byte` values.
+    pub fn at(&mut self, byte: usize) -> usize {
+        if self.simple {
+            return byte.min(self.line.len());
+        }
+        // A backward query can't be served by the forward walk — restart it.
+        if byte < self.walked_byte {
+            self.graphemes = self.line.grapheme_indices(true).peekable();
+            self.walked_byte = 0;
+            self.walked_col = 0;
+        }
+        // Consume every grapheme that ends at or before `byte` (one extending
+        // past `byte` would be the grapheme `byte` floors into — excluded, matching
+        // `virtcol`/`floor_grapheme`).
+        while let Some(&(start, g)) = self.graphemes.peek() {
+            if start + g.len() > byte {
+                break;
+            }
+            self.walked_col += grapheme_width(g, self.walked_col, self.tabstop);
+            self.walked_byte = start + g.len();
+            self.graphemes.next();
+        }
+        self.walked_col
+    }
 }
 
 /// Byte offset of the grapheme whose cell span covers virtual column `target`

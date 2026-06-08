@@ -65,6 +65,20 @@ impl FloatAnchor {
             FloatAnchor::SE => "SE",
         }
     }
+
+    /// Parse an `nvim_open_win` `anchor` keyword — the inverse of [`Self::as_str`]
+    /// and the single source of truth shared by the RPC and Lua-effect parsers.
+    /// `None` for an unrecognized keyword; each caller reports its own
+    /// context-specific error (per the no-silent-fallback rule).
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        Some(match s {
+            "NW" => FloatAnchor::NW,
+            "NE" => FloatAnchor::NE,
+            "SW" => FloatAnchor::SW,
+            "SE" => FloatAnchor::SE,
+            _ => return None,
+        })
+    }
 }
 
 /// A float's border style (`nvim_open_win`'s `border`). The *width* of the border
@@ -93,6 +107,21 @@ impl BorderStyle {
             BorderStyle::Double => "double",
             BorderStyle::Solid => "solid",
         }
+    }
+
+    /// Parse an `nvim_open_win` `border` keyword — the inverse of [`Self::as_str`]
+    /// and the single source of truth shared by the RPC and Lua-effect parsers.
+    /// `None` for a style nxvim cannot render yet; each caller reports its own
+    /// context-specific error (per the no-silent-fallback rule).
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" => BorderStyle::None,
+            "single" => BorderStyle::Single,
+            "rounded" => BorderStyle::Rounded,
+            "double" => BorderStyle::Double,
+            "solid" => BorderStyle::Solid,
+            _ => return None,
+        })
     }
 }
 

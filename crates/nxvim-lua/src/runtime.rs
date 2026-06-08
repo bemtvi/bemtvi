@@ -344,6 +344,20 @@ fn register_vendored_modules(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Generate a `take_*` accessor that drains one [`Shared`] queue with
+/// `mem::take`. Every queue is filled by the Lua FFI closures and emptied once
+/// per turn by the server's effect drain; all sixteen have the identical body, so
+/// it lives here once rather than being hand-copied (where it is easy to drain the
+/// wrong field). Each invocation still carries its own doc comment.
+macro_rules! take_queue {
+    ($(#[$doc:meta])* $method:ident -> $ty:ty = $field:ident) => {
+        $(#[$doc])*
+        pub fn $method(&self) -> $ty {
+            std::mem::take(&mut self.shared.borrow_mut().$field)
+        }
+    };
+}
+
 impl LuaRuntime {
     /// Build the VM and point `require` at `runtimepath`: each entry's `lua/`
     /// subdirectory is prepended to `package.path` as `<rt>/lua/?.lua` and
@@ -549,102 +563,102 @@ impl LuaRuntime {
         run.call((id, code, signal))
     }
 
-    /// Take ex-commands queued by `vim.cmd` since the last drain.
-    pub fn take_commands(&self) -> Vec<String> {
-        std::mem::take(&mut self.shared.borrow_mut().commands)
+    take_queue! {
+        /// Take ex-commands queued by `vim.cmd` since the last drain.
+        take_commands -> Vec<String> = commands
     }
 
-    /// Take captured `print` output since the last drain.
-    pub fn take_output(&self) -> Vec<String> {
-        std::mem::take(&mut self.shared.borrow_mut().output)
+    take_queue! {
+        /// Take captured `print` output since the last drain.
+        take_output -> Vec<String> = output
     }
 
-    /// Take the highlight-group definitions queued by `nvim_set_hl` since the
-    /// last drain, for the server to apply to the core registry.
-    pub fn take_highlights(&self) -> Vec<HlSet> {
-        std::mem::take(&mut self.shared.borrow_mut().highlights)
+    take_queue! {
+        /// Take the highlight-group definitions queued by `nvim_set_hl` since the
+        /// last drain, for the server to apply to the core registry.
+        take_highlights -> Vec<HlSet> = highlights
     }
 
-    /// Take the panel requests queued by `vim.panel.*` since the last drain, for
-    /// the server to apply to the core (which owns the panel state).
-    pub fn take_panel_ops(&self) -> Vec<PanelOp> {
-        std::mem::take(&mut self.shared.borrow_mut().panel_ops)
+    take_queue! {
+        /// Take the panel requests queued by `vim.panel.*` since the last drain, for
+        /// the server to apply to the core (which owns the panel state).
+        take_panel_ops -> Vec<PanelOp> = panel_ops
     }
 
-    /// Take the server-start requests queued by `vim.lsp.start` since the last
-    /// drain, for the server to apply to its `LspManager`.
-    pub fn take_lsp_ops(&self) -> Vec<LspOp> {
-        std::mem::take(&mut self.shared.borrow_mut().lsp_ops)
+    take_queue! {
+        /// Take the server-start requests queued by `vim.lsp.start` since the last
+        /// drain, for the server to apply to its `LspManager`.
+        take_lsp_ops -> Vec<LspOp> = lsp_ops
     }
 
-    /// Take the async-runtime requests queued by `vim.schedule` / `vim.defer_fn` /
-    /// `vim.uv` timers / `vim.system` since the last drain, for the server to
-    /// service directly (`Schedule`) or forward to the event-loop actor.
-    pub fn take_loop_ops(&self) -> Vec<LoopOp> {
-        std::mem::take(&mut self.shared.borrow_mut().loop_ops)
+    take_queue! {
+        /// Take the async-runtime requests queued by `vim.schedule` / `vim.defer_fn` /
+        /// `vim.uv` timers / `vim.system` since the last drain, for the server to
+        /// service directly (`Schedule`) or forward to the event-loop actor.
+        take_loop_ops -> Vec<LoopOp> = loop_ops
     }
 
-    /// Take the buffer mutations queued by `nvim_buf_set_lines` since the last
-    /// drain, for the server to apply to the live editor (Phase 6).
-    pub fn take_buf_ops(&self) -> Vec<BufOp> {
-        std::mem::take(&mut self.shared.borrow_mut().buf_ops)
+    take_queue! {
+        /// Take the buffer mutations queued by `nvim_buf_set_lines` since the last
+        /// drain, for the server to apply to the live editor (Phase 6).
+        take_buf_ops -> Vec<BufOp> = buf_ops
     }
 
-    /// Take the extmark mutations queued by the `nvim_buf_set_extmark` family
-    /// since the last drain, for the server to apply to the target buffers'
-    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore).
-    pub fn take_extmark_ops(&self) -> Vec<ExtmarkOp> {
-        std::mem::take(&mut self.shared.borrow_mut().extmark_ops)
+    take_queue! {
+        /// Take the extmark mutations queued by the `nvim_buf_set_extmark` family
+        /// since the last drain, for the server to apply to the target buffers'
+        /// [`ExtmarkStore`](nxvim_core::ExtmarkStore).
+        take_extmark_ops -> Vec<ExtmarkOp> = extmark_ops
     }
 
-    /// Take the window mutations queued by the `vim.api.nvim_win_*` family since
-    /// the last drain, for the server to apply to the live editor (Phase 5).
-    pub fn take_window_ops(&self) -> Vec<WindowOp> {
-        std::mem::take(&mut self.shared.borrow_mut().window_ops)
+    take_queue! {
+        /// Take the window mutations queued by the `vim.api.nvim_win_*` family since
+        /// the last drain, for the server to apply to the live editor (Phase 5).
+        take_window_ops -> Vec<WindowOp> = window_ops
     }
 
-    /// Take the tab-page mutations queued by `nvim_set_current_tabpage` since the
-    /// last drain, for the server to apply to the live editor (Phase 3).
-    pub fn take_tab_ops(&self) -> Vec<TabOp> {
-        std::mem::take(&mut self.shared.borrow_mut().tab_ops)
+    take_queue! {
+        /// Take the tab-page mutations queued by `nvim_set_current_tabpage` since the
+        /// last drain, for the server to apply to the live editor (Phase 3).
+        take_tab_ops -> Vec<TabOp> = tab_ops
     }
 
-    /// Take the global-option writes queued by `vim.o` since the last drain, for
-    /// the server to apply to the editor's global options.
-    pub fn take_global_ops(&self) -> Vec<GlobalOptionOp> {
-        std::mem::take(&mut self.shared.borrow_mut().global_ops)
+    take_queue! {
+        /// Take the global-option writes queued by `vim.o` since the last drain, for
+        /// the server to apply to the editor's global options.
+        take_global_ops -> Vec<GlobalOptionOp> = global_ops
     }
 
-    /// Take the register writes queued by `vim.fn.setreg` since the last drain,
-    /// for the server to apply to the editor's register file.
-    pub fn take_reg_ops(&self) -> Vec<RegisterSetOp> {
-        std::mem::take(&mut self.shared.borrow_mut().reg_ops)
+    take_queue! {
+        /// Take the register writes queued by `vim.fn.setreg` since the last drain,
+        /// for the server to apply to the editor's register file.
+        take_reg_ops -> Vec<RegisterSetOp> = reg_ops
     }
 
-    /// Take the `vim.ui.input` prompt requests queued since the last drain, for
-    /// the server to open as command-line prompts (Phase 8).
-    pub fn take_ui_inputs(&self) -> Vec<UiInputReq> {
-        std::mem::take(&mut self.shared.borrow_mut().ui_inputs)
+    take_queue! {
+        /// Take the `vim.ui.input` prompt requests queued since the last drain, for
+        /// the server to open as command-line prompts (Phase 8).
+        take_ui_inputs -> Vec<UiInputReq> = ui_inputs
     }
 
-    /// Take the `vim.fn.confirm` button-dialog requests queued since the last
-    /// drain, for the server to open as command-line confirm prompts.
-    pub fn take_confirms(&self) -> Vec<ConfirmReq> {
-        std::mem::take(&mut self.shared.borrow_mut().confirms)
+    take_queue! {
+        /// Take the `vim.fn.confirm` button-dialog requests queued since the last
+        /// drain, for the server to open as command-line confirm prompts.
+        take_confirms -> Vec<ConfirmReq> = confirms
     }
 
-    /// Take the `nvim_feedkeys` typeahead requests queued since the last drain,
-    /// for the server to parse and feed (through the mapping engine or straight to
-    /// the editor).
-    pub fn take_feedkeys(&self) -> Vec<FeedKeysOp> {
-        std::mem::take(&mut self.shared.borrow_mut().feedkeys)
+    take_queue! {
+        /// Take the `nvim_feedkeys` typeahead requests queued since the last drain,
+        /// for the server to parse and feed (through the mapping engine or straight to
+        /// the editor).
+        take_feedkeys -> Vec<FeedKeysOp> = feedkeys
     }
 
-    /// Take the blocking `vim.fn.getcharstr()` requests queued since the last
-    /// drain — each a `vim._cb_fns` id of a parked coroutine the server arms to
-    /// resume with the next key.
-    pub fn take_getchar_reqs(&self) -> Vec<u64> {
-        std::mem::take(&mut self.shared.borrow_mut().getchar_reqs)
+    take_queue! {
+        /// Take the blocking `vim.fn.getcharstr()` requests queued since the last
+        /// drain — each a `vim._cb_fns` id of a parked coroutine the server arms to
+        /// resume with the next key.
+        take_getchar_reqs -> Vec<u64> = getchar_reqs
     }
 
     /// Resume a coroutine parked on `vim.fn.getcharstr()` (callback id `cb_id`)

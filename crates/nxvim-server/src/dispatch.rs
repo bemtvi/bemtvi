@@ -194,7 +194,7 @@ impl Server {
             }
             "nvim_win_close" => {
                 let win = self.resolve_win(params.first());
-                let force = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+                let force = flag(params.get(1), false);
                 self.editor.close_window_by_id(win, force);
                 self.emit_lifecycle_events();
                 self.run_pending();
@@ -208,7 +208,7 @@ impl Server {
                 // to `buffer` and focused; `enter == false` refocuses the previous
                 // window.
                 let buf = BufferId(uint(params.first(), 0) as u64);
-                let enter = params.get(1).and_then(Value::as_bool).unwrap_or(true);
+                let enter = flag(params.get(1), true);
                 let config = params.get(2);
                 let relative = config
                     .and_then(map_get("relative"))
@@ -380,7 +380,7 @@ impl Server {
                 // (0-based); the panel scrolls to keep it visible.
                 let title = text(params.first());
                 let lines = str_array(params.get(1));
-                let want_select = params.get(2).and_then(Value::as_bool).unwrap_or(false);
+                let want_select = flag(params.get(2), false);
                 let cursor = params.get(3).and_then(Value::as_u64).unwrap_or(0) as usize;
                 self.editor.open_panel(title, lines, want_select, cursor);
                 Ok(Value::Nil)
@@ -393,7 +393,7 @@ impl Server {
             }
             "nxvim_panel_set_select" => {
                 // (bool): toggle `<CR>` select events on the open panel.
-                let want = params.first().and_then(Value::as_bool).unwrap_or(false);
+                let want = flag(params.first(), false);
                 self.editor.set_panel_on_select(want);
                 Ok(Value::Nil)
             }
@@ -480,13 +480,9 @@ impl Server {
                 ))
             }
         };
-        let anchor = match get("anchor").and_then(Value::as_str).unwrap_or("NW") {
-            "NW" => FloatAnchor::NW,
-            "NE" => FloatAnchor::NE,
-            "SW" => FloatAnchor::SW,
-            "SE" => FloatAnchor::SE,
-            other => return Err(format!("nvim_open_win: invalid 'anchor': '{other}'")),
-        };
+        let anchor_kw = get("anchor").and_then(Value::as_str).unwrap_or("NW");
+        let anchor = FloatAnchor::from_keyword(anchor_kw)
+            .ok_or_else(|| format!("nvim_open_win: invalid 'anchor': '{anchor_kw}'"))?;
         let width = uint(get("width"), 0);
         let height = uint(get("height"), 0);
         if width == 0 || height == 0 {
@@ -494,18 +490,14 @@ impl Server {
         }
         let border = match get("border") {
             None => BorderStyle::None,
-            Some(v) => match v.as_str() {
-                None | Some("none") => BorderStyle::None,
-                Some("single") => BorderStyle::Single,
-                Some("rounded") => BorderStyle::Rounded,
-                Some("double") => BorderStyle::Double,
-                Some("solid") => BorderStyle::Solid,
-                Some(other) => {
-                    return Err(format!(
-                        "nvim_open_win: 'border' style '{other}' is not supported yet"
-                    ))
-                }
-            },
+            // A non-string `border` (neovim's per-edge glyph array) is not rendered
+            // yet; treat it as the default `none` rather than erroring, as before.
+            Some(v) => {
+                let kw = v.as_str().unwrap_or("none");
+                BorderStyle::from_keyword(kw).ok_or_else(|| {
+                    format!("nvim_open_win: 'border' style '{kw}' is not supported yet")
+                })?
+            }
         };
         Ok(FloatConfig {
             relative,
@@ -518,7 +510,7 @@ impl Server {
                 .and_then(Value::as_u64)
                 .map(|z| z as u32)
                 .unwrap_or(50),
-            focusable: get("focusable").and_then(Value::as_bool).unwrap_or(true),
+            focusable: flag(get("focusable"), true),
             border,
             title: parse_title(get("title")),
         })
@@ -553,27 +545,17 @@ impl Server {
             }
         }
         if let Some(a) = get("anchor").and_then(Value::as_str) {
-            spec.anchor = Some(match a {
-                "NW" => FloatAnchor::NW,
-                "NE" => FloatAnchor::NE,
-                "SW" => FloatAnchor::SW,
-                "SE" => FloatAnchor::SE,
-                other => return Err(format!("nvim_win_set_config: invalid 'anchor': '{other}'")),
-            });
+            spec.anchor = Some(
+                FloatAnchor::from_keyword(a)
+                    .ok_or_else(|| format!("nvim_win_set_config: invalid 'anchor': '{a}'"))?,
+            );
         }
         if let Some(b) = get("border") {
-            spec.border = Some(match b.as_str() {
-                None | Some("none") => BorderStyle::None,
-                Some("single") => BorderStyle::Single,
-                Some("rounded") => BorderStyle::Rounded,
-                Some("double") => BorderStyle::Double,
-                Some("solid") => BorderStyle::Solid,
-                Some(other) => {
-                    return Err(format!(
-                        "nvim_win_set_config: 'border' style '{other}' is not supported yet"
-                    ))
-                }
-            });
+            // As in `parse_float_config`, a non-string `border` falls back to `none`.
+            let kw = b.as_str().unwrap_or("none");
+            spec.border = Some(BorderStyle::from_keyword(kw).ok_or_else(|| {
+                format!("nvim_win_set_config: 'border' style '{kw}' is not supported yet")
+            })?);
         }
         spec.row = get("row").and_then(as_int);
         spec.col = get("col").and_then(as_int);
@@ -674,6 +656,10 @@ fn as_int(v: &Value) -> Option<isize> {
 
 fn text(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn flag(v: Option<&Value>, default: bool) -> bool {
+    v.and_then(Value::as_bool).unwrap_or(default)
 }
 
 /// Parse a `nvim_open_win` `title`: either a plain string, or neovim's

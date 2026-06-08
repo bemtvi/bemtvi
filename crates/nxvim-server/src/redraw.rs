@@ -244,7 +244,7 @@ impl Server {
             // Float overlay chrome. A tiled window is `floating: false` with no
             // border/title, so the client paints it exactly as before.
             (Value::from("floating"), Value::from(win.floating)),
-            (Value::from("border"), Value::from(border_name(win.border))),
+            (Value::from("border"), Value::from(win.border.as_str())),
             (
                 Value::from("title"),
                 match &win.title {
@@ -493,18 +493,6 @@ fn separator_value(sep: &Separator) -> Value {
         (Value::from("y"), Value::from(sep.y as u64)),
         (Value::from("length"), Value::from(sep.length as u64)),
     ])
-}
-
-/// The wire name for a float's [`BorderStyle`] — the same tokens
-/// `nvim_win_get_config` returns, which the client maps to its border glyphs.
-fn border_name(border: BorderStyle) -> &'static str {
-    match border {
-        BorderStyle::None => "none",
-        BorderStyle::Single => "single",
-        BorderStyle::Rounded => "rounded",
-        BorderStyle::Double => "double",
-        BorderStyle::Solid => "solid",
-    }
 }
 
 /// Encode a window's screen rect as a `{ x, y, width, height }` map (cells,

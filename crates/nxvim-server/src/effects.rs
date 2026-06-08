@@ -483,26 +483,19 @@ impl Server {
                         return;
                     }
                 };
-                let anchor = match anchor.as_str() {
-                    "NW" => FloatAnchor::NW,
-                    "NE" => FloatAnchor::NE,
-                    "SW" => FloatAnchor::SW,
-                    "SE" => FloatAnchor::SE,
-                    other => {
+                let anchor = match FloatAnchor::from_keyword(&anchor) {
+                    Some(a) => a,
+                    None => {
                         self.editor
-                            .echo(format!("nvim_open_win: invalid 'anchor': '{other}'"));
+                            .echo(format!("nvim_open_win: invalid 'anchor': '{anchor}'"));
                         return;
                     }
                 };
-                let border = match border.as_str() {
-                    "none" => BorderStyle::None,
-                    "single" => BorderStyle::Single,
-                    "rounded" => BorderStyle::Rounded,
-                    "double" => BorderStyle::Double,
-                    "solid" => BorderStyle::Solid,
-                    other => {
+                let border = match BorderStyle::from_keyword(&border) {
+                    Some(b) => b,
+                    None => {
                         self.editor
-                            .echo(format!("nvim_open_win: invalid 'border': '{other}'"));
+                            .echo(format!("nvim_open_win: invalid 'border': '{border}'"));
                         return;
                     }
                 };
@@ -557,31 +550,24 @@ impl Server {
                     }
                 }
                 if let Some(a) = anchor.as_deref() {
-                    spec.anchor = Some(match a {
-                        "NW" => FloatAnchor::NW,
-                        "NE" => FloatAnchor::NE,
-                        "SW" => FloatAnchor::SW,
-                        "SE" => FloatAnchor::SE,
-                        other => {
+                    match FloatAnchor::from_keyword(a) {
+                        Some(v) => spec.anchor = Some(v),
+                        None => {
                             self.editor
-                                .echo(format!("nvim_win_set_config: invalid 'anchor': '{other}'"));
+                                .echo(format!("nvim_win_set_config: invalid 'anchor': '{a}'"));
                             return;
                         }
-                    });
+                    }
                 }
                 if let Some(b) = border.as_deref() {
-                    spec.border = Some(match b {
-                        "none" => BorderStyle::None,
-                        "single" => BorderStyle::Single,
-                        "rounded" => BorderStyle::Rounded,
-                        "double" => BorderStyle::Double,
-                        "solid" => BorderStyle::Solid,
-                        other => {
+                    match BorderStyle::from_keyword(b) {
+                        Some(v) => spec.border = Some(v),
+                        None => {
                             self.editor
-                                .echo(format!("nvim_win_set_config: invalid 'border': '{other}'"));
+                                .echo(format!("nvim_win_set_config: invalid 'border': '{b}'"));
                             return;
                         }
-                    });
+                    }
                 }
                 spec.row = row.map(|v| v as isize);
                 spec.col = col.map(|v| v as isize);

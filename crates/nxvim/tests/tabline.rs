@@ -11,8 +11,9 @@
 //! `vim.bo[n].modified`, `vim.split`, and `vim.spairs`. It also guards the example
 //! against bitrot.
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{barrier, feed, map_get, start_attached};
 use rmpv::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -30,48 +31,17 @@ fn example_dir() -> PathBuf {
 /// example on the runtimepath so `require('myutils')` resolves `lua/myutils.lua`.
 async fn start(file: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
     let dir = example_dir();
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file: Some(file.to_string_lossy().into_owned()),
-                config_dir: Some(dir.clone()),
-                runtimepath: vec![dir],
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(22u64), Value::Map(vec![])],
+    start_attached(
+        ServerInit {
+            file: Some(file.to_string_lossy().into_owned()),
+            config_dir: Some(dir.clone()),
+            runtimepath: vec![dir],
+            ..Default::default()
+        },
+        80,
+        22,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// A redraw barrier: a request the server answers only after draining the input
-/// queue, so a following redraw drain sees this input's frame.
-async fn barrier(rpc: &Rpc) {
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-}
-
-fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
 }
 
 /// The concatenated text of a redraw map's `tabline_segments` (the rendered custom

@@ -1087,6 +1087,7 @@ dependencies = [
  "nxvim-lsp",
  "nxvim-rpc",
  "nxvim-server",
+ "nxvim-test-harness",
  "nxvim-tui",
  "nxvim-view",
  "portable-pty",
@@ -1153,7 +1154,19 @@ dependencies = [
  "nxvim-lsp",
  "nxvim-lua",
  "nxvim-rpc",
+ "nxvim-test-harness",
  "nxvim-ts",
+ "rmpv",
+ "tokio",
+]
+
+[[package]]
+name = "nxvim-test-harness"
+version = "0.1.0"
+dependencies = [
+ "nxvim-core",
+ "nxvim-rpc",
+ "nxvim-server",
  "rmpv",
  "tokio",
 ]

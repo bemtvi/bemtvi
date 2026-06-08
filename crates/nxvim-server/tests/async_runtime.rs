@@ -14,51 +14,15 @@
 
 use std::time::Duration;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
-use rmpv::Value;
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread (its runtime has timers enabled, so the
 /// event-loop actor can sleep) and return a connected, UI-attached client.
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, ServerInit::default()));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-/// Run a Lua chunk and return its value (the `nvim_exec_lua` entry point). Doubles
-/// as a barrier: awaiting the response means the server has processed every prior
-/// message and settled this one.
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("exec_lua")
-}
-
-async fn lua_bool(rpc: &Rpc, code: &str) -> Option<bool> {
-    exec_lua(rpc, code).await.as_bool()
-}
-
-async fn lua_u64(rpc: &Rpc, code: &str) -> Option<u64> {
-    exec_lua(rpc, code).await.as_u64()
+    start_attached(ServerInit::default(), 80, 24).await
 }
 
 // ----- Phase 1: vim.schedule (deferred within the tick) ----------------------

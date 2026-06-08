@@ -15,20 +15,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
-use rmpv::Value;
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{exec_lua, serial_lock as test_lock, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Mutex;
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-
-/// Serializes the tests (shared `NXVIM_DATA_DIR` env + worker lifecycle).
-fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 // ----- fixture grammar ------------------------------------------------------
 
@@ -92,44 +85,15 @@ fn home_dir() -> PathBuf {
 /// Start a server (no file open) and attach a UI. The fixture env must already
 /// be set so the VM's treesitter primitives resolve grammars from it.
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file: None,
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![
-            Value::from(COLS as u64),
-            Value::from((ROWS - 2) as u64),
-            Value::Map(vec![]),
-        ],
+    start_attached(
+        ServerInit {
+            file: None,
+            ..Default::default()
+        },
+        COLS,
+        ROWS - 2,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-/// Evaluate a Lua chunk on the server and return its value (`nvim_exec_lua`).
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("nvim_exec_lua")
 }
 
 // ----- tests ----------------------------------------------------------------

@@ -14,8 +14,11 @@ rust-version.workspace = true
 # alongside it.
 [features]
 default = ["luajit"]
-lua51 = ["nxvim-lua/lua51"]
-luajit = ["nxvim-lua/luajit"]
+# The backend toggle is threaded into the test harness too (a dev-dependency),
+# so a `--no-default-features --features lua51` test run doesn't drag luajit back
+# in through the harness alongside lua51 (which breaks mlua-sys).
+lua51 = ["nxvim-lua/lua51", "nxvim-test-harness/lua51"]
+luajit = ["nxvim-lua/luajit", "nxvim-test-harness/luajit"]
 
 [dependencies]
 anyhow.workspace = true
@@ -28,3 +31,9 @@ nxvim-lsp.workspace = true
 # In-process treesitter: the server constructs the engine and installs it on the
 # editor, which owns and queries it synchronously (no worker process).
 nxvim-ts.workspace = true
+
+[dev-dependencies]
+# Shared black-box test harness. Backend features are threaded in via this
+# crate's own lua51/luajit features (above) so the harness's nxvim-server
+# dependency resolves to the same single backend as the crate under test.
+nxvim-test-harness.workspace = true

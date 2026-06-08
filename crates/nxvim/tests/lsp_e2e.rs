@@ -48,9 +48,9 @@ use std::time::{Duration, Instant};
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
+use nxvim_test_harness::{drain_latest_redraw, message_of, serial_lock as lock};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Mutex;
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
@@ -61,13 +61,6 @@ const ROWS: u16 = 24;
 /// passing no-op) otherwise.
 fn e2e_enabled() -> bool {
     matches!(std::env::var("NXVIM_LSP_E2E").as_deref(), Ok("1"))
-}
-
-/// Serializes the cases: they share process-global env and each spawns a real,
-/// resource-hungry server.
-fn lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// The directory the installed servers live in (`scripts/lsp-e2e/lsp-e2e.sh`
@@ -295,17 +288,6 @@ async fn barrier(rpc: &Rpc) {
     .expect("barrier");
 }
 
-/// The latest buffered `redraw` params, if any.
-fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<Value>> {
-    let mut latest = None;
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == "redraw" {
-            latest = Some(params);
-        }
-    }
-    latest
-}
-
 /// Whether a `redraw` carries at least one non-empty `diagnostics` row. The
 /// per-row `diagnostics` now live under the first window (`windows[0]`).
 fn has_diagnostics(params: &[Value]) -> bool {
@@ -326,18 +308,6 @@ fn has_diagnostics(params: &[Value]) -> bool {
     };
     rows.iter()
         .any(|row| row.as_array().is_some_and(|spans| !spans.is_empty()))
-}
-
-/// The message-line text of a redraw (the under-cursor diagnostic / status line).
-fn message_of(params: &[Value]) -> String {
-    let Some(Value::Map(map)) = params.first() else {
-        return String::new();
-    };
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some("message"))
-        .and_then(|(_, v)| v.as_str())
-        .unwrap_or("")
-        .to_string()
 }
 
 // ----- the shared case runner -----------------------------------------------

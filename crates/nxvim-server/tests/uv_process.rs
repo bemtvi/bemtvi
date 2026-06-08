@@ -10,45 +10,17 @@
 //! kick off the spawn, see it pending, then after the child exits see the result
 //! settled.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
-use rmpv::Value;
-use std::path::PathBuf;
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{exec_lua, lua_bool, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+/// Start a headless server with an 80×24 UI attached.
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, ServerInit::default()));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("exec_lua")
-}
-
-async fn lua_bool(rpc: &Rpc, code: &str) -> Option<bool> {
-    exec_lua(rpc, code).await.as_bool()
+    start_attached(ServerInit::default(), 80, 24).await
 }
 
 /// Poll `_G.done` until the spawned child has exited and settled, or time out.

@@ -9,81 +9,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{buf_lines, command, cursor, feed, lines, start_attached};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread and return a connected client.
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, ServerInit::default()));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-/// Type a string of vim key-notation.
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// Run an ex-command (`nvim_command`), awaiting the response as a barrier.
-async fn command(rpc: &Rpc, cmd: &str) {
-    rpc.request("nvim_command", vec![Value::from(cmd)])
-        .await
-        .expect("command");
-}
-
-/// Fetch all current-buffer lines (also a barrier: awaiting it guarantees the
-/// server has processed every message sent before it).
-async fn lines(rpc: &Rpc) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(0u64),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Cursor position as `(1-based line, 0-based column)`.
-async fn cursor(rpc: &Rpc) -> (usize, usize) {
-    let result = rpc
-        .request("nvim_win_get_cursor", vec![Value::from(0u64)])
-        .await
-        .expect("get_cursor");
-    match result {
-        Value::Array(a) => (
-            a.first().and_then(Value::as_u64).unwrap_or(0) as usize,
-            a.get(1).and_then(Value::as_u64).unwrap_or(0) as usize,
-        ),
-        _ => (0, 0),
-    }
+    start_attached(ServerInit::default(), 80, 24).await
 }
 
 /// The current status `message`, read off the latest `redraw`. Sends a barrier
@@ -212,29 +146,6 @@ async fn buf_name(rpc: &Rpc, handle: u64) -> String {
         .as_str()
         .unwrap_or("")
         .to_string()
-}
-
-/// Lines of a specific buffer by handle (0 = current).
-async fn buf_lines(rpc: &Rpc, handle: u64) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(handle),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 #[tokio::test]

@@ -7,8 +7,9 @@
 //! `nvim_set_current_tabpage`), closing (`:tabclose`/`:tabonly`), and the
 //! tabline projected into the `redraw`. These tests drive those over RPC.
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{exec_lua, feed, map_get, start_attached};
 use rmpv::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,24 +17,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread and return a connected client.
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let init = ServerInit::default();
-        let _ = runtime.block_on(run_server(server_end, init));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
-    (rpc, incoming)
+    start_attached(ServerInit::default(), 80, 24).await
 }
 
 /// Issue a request and return the raw reply.
@@ -52,11 +36,6 @@ fn handles(v: &Value) -> Vec<u64> {
         Value::Array(a) => a.iter().map(|x| x.as_u64().expect("u64")).collect(),
         _ => panic!("expected an array, got {v:?}"),
     }
-}
-
-/// Type a string of vim key-notation.
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
 }
 
 #[tokio::test]
@@ -330,12 +309,6 @@ struct TabCell {
     window_count: u64,
 }
 
-fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
-}
-
 /// The `tabline` cells and `current_tab` index of one redraw map.
 fn parse_tabline(map: &[(Value, Value)]) -> (Vec<TabCell>, u64) {
     let cells = match map_get(map, "tabline") {
@@ -452,16 +425,6 @@ async fn tabline_marks_a_modified_buffer() {
 }
 
 // ----- Phase 3: Lua tab API, showtabline & last-tab quit --------------------
-
-/// Run a Lua chunk via `nvim_exec_lua` and return its result value.
-async fn exec_lua(rpc: &Rpc, chunk: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(chunk), Value::Array(vec![])],
-    )
-    .await
-    .expect("exec_lua")
-}
 
 #[tokio::test]
 async fn lua_tabpage_reads_resolve_from_the_mirror() {

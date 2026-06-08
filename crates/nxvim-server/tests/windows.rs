@@ -10,8 +10,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{attach, feed, lines, map_get, spawn, u64_at};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -23,63 +24,22 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
 
 /// As [`start`], but also source `config_dir`'s `init.lua` at startup (the real
 /// production path), so a test can drive an actual `examples/<feature>/` config.
+///
+/// A 24-row windows area (the frame minus the client's command row). A single
+/// window's rect is the whole 24 rows; a horizontal split divides 24 − 1 (one
+/// separator row) between the two.
 async fn start_with_config(
     file: Option<String>,
     config_dir: Option<PathBuf>,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let init = ServerInit {
-            file,
-            config_dir,
-            ..Default::default()
-        };
-        let _ = runtime.block_on(run_server(server_end, init));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    // A 24-row windows area (the frame minus the client's command row). A single
-    // window's rect is the whole 24 rows; a horizontal split divides 24 − 1 (one
-    // separator row) between the two.
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
+    let init = ServerInit {
+        file,
+        config_dir,
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Type a string of vim key-notation.
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// Fetch the focused window's buffer lines (also a barrier).
-async fn lines(rpc: &Rpc) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(0u64),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 /// One window parsed out of a redraw's `windows` array.
@@ -138,16 +98,6 @@ impl Frame {
         assert_eq!(focused.len(), 1, "exactly one window should hold focus");
         focused[0]
     }
-}
-
-fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
-}
-
-fn u64_at(map: &[(Value, Value)], key: &str) -> u64 {
-    map_get(map, key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 fn parse_rect(value: Option<&Value>) -> Rect {

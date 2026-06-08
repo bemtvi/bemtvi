@@ -3,8 +3,9 @@
 //! `barrier`/`lines` request guarantees all prior input was processed and its
 //! redraw emitted before we read the screen. No sleeps.
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{exec_lua, feed, start_attached};
 use nxvim_tui::{paint, paint_with_cursor};
 use nxvim_view::View;
 use ratatui::buffer::Buffer;
@@ -23,37 +24,15 @@ const GUTTER: u16 = 4;
 /// (ROWS minus the one global command row — the client now draws each window's
 /// status line inside its rect), so the captured `View` fills the grid exactly.
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file,
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![
-            Value::from(COLS as u64),
-            Value::from((ROWS - 1) as u64),
-            Value::Map(vec![]),
-        ],
+    start_attached(
+        ServerInit {
+            file,
+            ..Default::default()
+        },
+        COLS,
+        ROWS - 1,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
 }
 
 /// Barrier: awaiting this guarantees the server processed all prior input.
@@ -115,15 +94,6 @@ fn bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
 /// segment painting its resolved truecolor foreground.
 fn fg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
     buf.cell((x, y)).and_then(|c| c.style().fg)
-}
-
-async fn exec_lua(rpc: &Rpc, code: &str) {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("nvim_exec_lua");
 }
 
 #[tokio::test]
@@ -618,35 +588,17 @@ async fn a_higher_zindex_float_paints_over_a_lower_one() {
 /// shipped example config actually opens a float in the real client.
 async fn start_floats_example() -> (Rpc, UnboundedReceiver<Incoming>) {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/floats");
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file: Some(dir.join("sample.txt").to_string_lossy().into_owned()),
-                config_dir: Some(dir.clone()),
-                runtimepath: vec![dir],
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![
-            Value::from(COLS as u64),
-            Value::from((ROWS - 1) as u64),
-            Value::Map(vec![]),
-        ],
+    start_attached(
+        ServerInit {
+            file: Some(dir.join("sample.txt").to_string_lossy().into_owned()),
+            config_dir: Some(dir.clone()),
+            runtimepath: vec![dir],
+            ..Default::default()
+        },
+        COLS,
+        ROWS - 1,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
 }
 
 #[tokio::test]

@@ -17,8 +17,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{cursor_u64, drain_latest_redraw, feed, start_attached};
 use rmpv::Value;
 use serde_json::Value as Json;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -127,55 +128,25 @@ async fn start(
     rtp: PathBuf,
     config_dir: PathBuf,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
     let file = file.to_string_lossy().into_owned();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file: Some(file),
-                config_dir: Some(config_dir),
-                runtimepath: vec![rtp],
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![
-            Value::from(COLS as u64),
-            Value::from((ROWS - 2) as u64),
-            Value::Map(vec![]),
-        ],
+    start_attached(
+        ServerInit {
+            file: Some(file),
+            config_dir: Some(config_dir),
+            runtimepath: vec![rtp],
+            ..Default::default()
+        },
+        COLS,
+        ROWS - 2,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
 }
 
-/// Send key notation to the server (the `nvim_input` the UI client uses).
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// The current window cursor as 0-based `(row, col)` (the `nvim_win_get_cursor`
-/// row is 1-based, so it is decremented here to match the rest of the asserts).
+/// The current window cursor as 0-based `(row, col)`. The crate's `cursor_u64`
+/// returns the raw 1-based row; decrement it to match the rest of the asserts.
 async fn cursor(rpc: &Rpc) -> (u64, u64) {
-    let v = rpc
-        .request("nvim_win_get_cursor", vec![Value::from(0u64)])
-        .await
-        .expect("win_get_cursor");
-    let arr = v.as_array().expect("cursor array");
-    let row = arr[0].as_u64().expect("row").saturating_sub(1);
-    let col = arr[1].as_u64().expect("col");
-    (row, col)
+    let (row, col) = cursor_u64(rpc).await;
+    (row.saturating_sub(1), col)
 }
 
 /// Poll (bounded) until the cursor reaches `want`, driving redraws meanwhile.
@@ -236,17 +207,6 @@ async fn wait_for_record(rpc: &Rpc, record: &Path, pred: impl Fn(&[Json]) -> boo
 
 fn find<'a>(recs: &'a [Json], method: &str) -> Option<&'a Json> {
     recs.iter().find(|r| r["method"] == method)
-}
-
-/// The latest `redraw` params buffered on the notification channel.
-fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<Value>> {
-    let mut latest = None;
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == "redraw" {
-            latest = Some(params);
-        }
-    }
-    latest
 }
 
 /// Whether a `redraw` carries at least one non-empty `diagnostics` row. The

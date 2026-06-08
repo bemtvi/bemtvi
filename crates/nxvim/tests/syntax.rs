@@ -13,24 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{
+    drain_latest_redraw, exec_lua, feed, message_of, serial_lock as test_lock, start_attached,
+    window0, write_temp,
+};
 use nxvim_tui::paint;
 use nxvim_view::View;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Mutex;
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-
-/// Serializes the subprocess-spawning tests (shared env + worker lifecycle).
-fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 // ----- fixture grammar ------------------------------------------------------
 
@@ -130,49 +127,17 @@ async fn start_full(
     runtimepath: Vec<PathBuf>,
     config_dir: Option<PathBuf>,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file,
-                runtimepath,
-                config_dir,
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![
-            Value::from(COLS as u64),
-            Value::from((ROWS - 2) as u64),
-            Value::Map(vec![]),
-        ],
+    start_attached(
+        ServerInit {
+            file,
+            runtimepath,
+            config_dir,
+            ..Default::default()
+        },
+        COLS,
+        ROWS - 2,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("nvim_exec_lua")
 }
 
 async fn barrier(rpc: &Rpc) {
@@ -187,33 +152,6 @@ async fn barrier(rpc: &Rpc) {
     )
     .await
     .expect("barrier");
-}
-
-/// Drain buffered notifications, returning the most recent `redraw` params.
-fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<Value>> {
-    let mut latest = None;
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == "redraw" {
-            latest = Some(params);
-        }
-    }
-    latest
-}
-
-/// The first window's sub-map (`windows[0]`) from a redraw — where the per-window
-/// fields (highlights, scroll, …) now live.
-fn window0(params: &[Value]) -> Option<&Vec<(Value, Value)>> {
-    let Value::Map(map) = params.first()? else {
-        return None;
-    };
-    let windows = map
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("windows"))
-        .and_then(|(_, v)| v.as_array())?;
-    match windows.first()? {
-        Value::Map(win) => Some(win),
-        _ => None,
-    }
 }
 
 /// The per-row highlight spans `[(start_col, end_col, group)]` from a redraw map.
@@ -304,26 +242,7 @@ async fn wait_for_highlights(
 
 /// Write `content` to a fresh temp `.rs` file and return its path as a string.
 fn temp_rs(name: &str, content: &str) -> String {
-    temp_file(name, "rs", content)
-}
-
-/// Write `content` to a fresh temp file with extension `ext`; return its path.
-fn temp_file(name: &str, ext: &str, content: &str) -> String {
-    let path = std::env::temp_dir().join(format!("nxvim-ts-{}-{}.{ext}", std::process::id(), name));
-    std::fs::write(&path, content).unwrap();
-    path.display().to_string()
-}
-
-/// The `message` line from a redraw map (empty if absent).
-fn message_of(params: &[Value]) -> String {
-    let Some(Value::Map(map)) = params.first() else {
-        return String::new();
-    };
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some("message"))
-        .and_then(|(_, v)| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    write_temp(name, "rs", content)
 }
 
 // ----- tests ----------------------------------------------------------------
@@ -741,7 +660,7 @@ async fn a_broken_grammar_echoes_a_load_failure() {
     let broken = broken_data_dir();
     std::env::set_var("NXVIM_DATA_DIR", &broken);
 
-    let file = temp_file("broken", "py", "x = 1\n");
+    let file = write_temp("broken", "py", "x = 1\n");
     let (rpc, mut incoming) = start(Some(file)).await;
 
     let mut seen = false;
@@ -776,7 +695,7 @@ async fn a_missing_grammar_is_silent() {
     // (The rust fixture dir has a rust grammar but no python one.)
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file("missing", "py", "x = 1\n");
+    let file = write_temp("missing", "py", "x = 1\n");
     let (rpc, mut incoming) = start(Some(file)).await;
 
     // Settle several frames so any (erroneous) message would have appeared.
@@ -806,7 +725,7 @@ async fn treesitter_start_highlights_a_buffer_the_extension_table_misses() {
     // bridge unblocks (getting *any* highlighting onto a buffer the table misses).
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file("ts-start", "txt", "fn main() {}\n");
+    let file = write_temp("ts-start", "txt", "fn main() {}\n");
     let (rpc, mut incoming) = start(Some(file)).await;
 
     // Before `start`: a `.txt` buffer is never highlighted.

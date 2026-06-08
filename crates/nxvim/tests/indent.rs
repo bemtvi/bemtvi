@@ -11,17 +11,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
-use rmpv::Value;
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{
+    cursor, feed, lines, serial_lock as test_lock, start_attached, write_temp,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Mutex;
-
-/// Serializes the env-sharing tests (process-global `NXVIM_DATA_DIR`).
-fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 // ----- fixture grammar ------------------------------------------------------
 
@@ -204,84 +199,15 @@ fn home_dir() -> PathBuf {
 // ----- server harness -------------------------------------------------------
 
 async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file,
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
+    start_attached(
+        ServerInit {
+            file,
+            ..Default::default()
+        },
+        80,
+        24,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// All buffer lines; awaiting it is also a barrier (the server has processed
-/// every message sent before it).
-async fn lines(rpc: &Rpc) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(0u64),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Cursor position as `(1-based line, 0-based column)`.
-async fn cursor(rpc: &Rpc) -> (usize, usize) {
-    let result = rpc
-        .request("nvim_win_get_cursor", vec![Value::from(0u64)])
-        .await
-        .expect("get_cursor");
-    match result {
-        Value::Array(a) => (
-            a.first().and_then(Value::as_u64).unwrap_or(0) as usize,
-            a.get(1).and_then(Value::as_u64).unwrap_or(0) as usize,
-        ),
-        _ => (0, 0),
-    }
-}
-
-/// Write `content` to a fresh temp file with extension `ext`; return its path.
-fn temp_file(name: &str, ext: &str, content: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "nxvim-ts-indent-{}-{}.{ext}",
-        std::process::id(),
-        name
-    ));
-    std::fs::write(&path, content).unwrap();
-    path.display().to_string()
 }
 
 // ----- tests ----------------------------------------------------------------
@@ -290,7 +216,7 @@ fn temp_file(name: &str, ext: &str, content: &str) -> String {
 async fn o_opens_an_indented_line_inside_a_block() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file("o_block", "rs", "fn main() {\n}\n");
+    let file = write_temp("o_block", "rs", "fn main() {\n}\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     // expandtab → indentation is spaces; one level is the (default) 4-cell tabstop.
@@ -308,7 +234,7 @@ async fn o_opens_an_indented_line_inside_a_block() {
 async fn enter_in_insert_carries_treesitter_indent() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file("enter", "rs", "fn main() {\n}\n");
+    let file = write_temp("enter", "rs", "fn main() {\n}\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     feed(&rpc, ":set expandtab<CR>");
@@ -327,7 +253,7 @@ async fn o_nests_one_level_deeper_inside_an_inner_block() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
     // Cursor starts on the inner `if` opener; `o` must land two levels deep (8).
-    let file = temp_file("nested", "rs", "fn main() {\n    if a {\n    }\n}\n");
+    let file = write_temp("nested", "rs", "fn main() {\n    if a {\n    }\n}\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     feed(&rpc, ":set expandtab<CR>");
@@ -343,7 +269,7 @@ async fn o_nests_one_level_deeper_inside_an_inner_block() {
 async fn o_on_a_closing_brace_line_dedents() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file("dedent", "rs", "fn main() {\n    let x = 1;\n}\n");
+    let file = write_temp("dedent", "rs", "fn main() {\n    let x = 1;\n}\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     feed(&rpc, ":set expandtab<CR>");
@@ -361,7 +287,7 @@ async fn double_equal_reindents_the_current_line() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
     // A statement jammed to column 0 inside the body.
-    let file = temp_file("eqeq", "rs", "fn main() {\nlet x = 1;\n}\n");
+    let file = write_temp("eqeq", "rs", "fn main() {\nlet x = 1;\n}\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     feed(&rpc, ":set expandtab<CR>");
@@ -379,7 +305,7 @@ async fn double_equal_reindents_the_current_line() {
 async fn gg_equal_g_reindents_the_whole_buffer() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file(
+    let file = write_temp(
         "ggeqg",
         "rs",
         "fn main() {\nlet x = 1;\n        let y = 2;\n}\n",
@@ -399,7 +325,7 @@ async fn gg_equal_g_reindents_the_whole_buffer() {
 async fn equal_uses_tabs_when_noexpandtab() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let file = temp_file("tabs", "rs", "fn main() {\nlet x = 1;\n}\n");
+    let file = write_temp("tabs", "rs", "fn main() {\nlet x = 1;\n}\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     // Default is noexpandtab: one indent level is a literal tab (tabstop 4).
@@ -415,7 +341,7 @@ async fn o_on_a_plain_buffer_stays_at_column_zero() {
     // A non-source buffer has no grammar → no ts-indent. The copy-previous-line
     // fallback is gated on ts-indent being *available*, so `o` keeps vim's
     // autoindent-off default of column 0 even below an indented line.
-    let file = temp_file("plain", "txt", "    indented line\n");
+    let file = write_temp("plain", "txt", "    indented line\n");
     let (rpc, _incoming) = start(Some(file)).await;
 
     feed(&rpc, ":set expandtab<CR>");

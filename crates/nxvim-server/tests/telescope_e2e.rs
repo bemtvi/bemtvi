@@ -11,18 +11,10 @@
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
+use nxvim_test_harness::{exec_lua, feed, temp_dir};
 use rmpv::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-fn temp_dir(tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}_{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
 
 fn lazy_plugin(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -58,21 +50,6 @@ async fn start(dir: &std::path::Path) -> Option<(Rpc, UnboundedReceiver<Incoming
     .await
     .expect("ui attach");
     Some((rpc, incoming))
-}
-
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// Run a Lua chunk and return its value (a barrier — awaiting it guarantees the
-/// server processed everything sent before it, and ran the convergence fixpoint).
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("exec_lua")
 }
 
 /// Settle async work (plenary defers the finder through vim.schedule, drained on

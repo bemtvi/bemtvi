@@ -11,8 +11,9 @@
 
 use std::time::Duration;
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{drain_latest_redraw, exec_lua, feed, start_attached, window0};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -22,47 +23,15 @@ const ROWS: u16 = 24;
 // ----- harness --------------------------------------------------------------
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(
-            server_end,
-            ServerInit {
-                file: None,
-                ..Default::default()
-            },
-        ));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![
-            Value::from(COLS as u64),
-            Value::from((ROWS - 2) as u64),
-            Value::Map(vec![]),
-        ],
+    start_attached(
+        ServerInit {
+            file: None,
+            ..Default::default()
+        },
+        COLS,
+        ROWS - 2,
     )
     .await
-    .expect("ui attach");
-    (rpc, incoming)
-}
-
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("nvim_exec_lua")
 }
 
 async fn barrier(rpc: &Rpc) {
@@ -77,30 +46,6 @@ async fn barrier(rpc: &Rpc) {
     )
     .await
     .expect("barrier");
-}
-
-fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<Value>> {
-    let mut latest = None;
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == "redraw" {
-            latest = Some(params);
-        }
-    }
-    latest
-}
-
-fn window0(params: &[Value]) -> Option<&Vec<(Value, Value)>> {
-    let Value::Map(map) = params.first()? else {
-        return None;
-    };
-    let windows = map
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("windows"))
-        .and_then(|(_, v)| v.as_array())?;
-    match windows.first()? {
-        Value::Map(win) => Some(win),
-        _ => None,
-    }
 }
 
 /// The per-row highlight spans `[(start_col, end_col, group)]` from a redraw.

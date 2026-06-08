@@ -11,11 +11,9 @@
 //! The `start_with_config` / `feed` / `exec_lua` helpers are copied from the
 //! established pattern (integration-test files don't share a module).
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn, temp_dir};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -31,70 +29,9 @@ async fn start_with_config(
         runtimepath: vec![dir.to_path_buf()],
         ..Default::default()
     };
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, init));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Type a string of vim key-notation (fire-and-forget notification).
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
-}
-
-/// `nvim_exec_lua(code)` -> its return value (a synchronous Lua getter; also a
-/// barrier — awaiting it guarantees every message sent before it was processed).
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("nvim_exec_lua")
-}
-
-/// `nvim_buf_get_lines(handle, 0, -1, false)` for an explicit buffer handle.
-async fn buf_lines(rpc: &Rpc, handle: u64) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(handle),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}_{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
 }
 
 fn as_str(v: &Value) -> String {

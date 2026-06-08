@@ -8,11 +8,9 @@
 //! Integration-test files don't share a module, so the `start*/feed/...` helpers
 //! here are copied from the `editing.rs` pattern rather than imported.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{attach, drain_to_latest_redraw, exec_lua, message, spawn, temp_dir};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -28,22 +26,8 @@ async fn start_with_config(
         runtimepath: vec![dir.to_path_buf()],
         ..Default::default()
     };
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, init));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
     (rpc, incoming)
 }
 
@@ -61,45 +45,9 @@ async fn start_with_file_and_config(
         runtimepath: vec![dir.to_path_buf()],
         ..Default::default()
     };
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, init));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Drain every `redraw` currently queued in `incoming` and return the *most
-/// recent* one (skipping non-redraw notifications), or `None` when none is
-/// buffered. Redraws are full-state projections, so the latest reflects the
-/// freshest editor state.
-fn drain_to_latest_redraw(
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    let mut latest = None;
-    loop {
-        match incoming.try_recv() {
-            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
-                match params.into_iter().next() {
-                    Some(Value::Map(map)) => latest = Some(map),
-                    _ => panic!("redraw without a map"),
-                }
-            }
-            Ok(_) => continue,
-            Err(_) => return latest,
-        }
-    }
 }
 
 /// Feed `keys`, then return the `redraw` map the server emitted for that input.
@@ -123,7 +71,7 @@ async fn redraw_after(
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    if let Some(map) = drain_to_latest_redraw(incoming) {
+    if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
         return map;
     }
     // The barrier guarantees the input's redraw is queued before its response, so
@@ -131,49 +79,17 @@ async fn redraw_after(
     // lag; poll a bounded while rather than failing on the first miss.
     for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some(map) = drain_to_latest_redraw(incoming) {
+        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
             return map;
         }
     }
     panic!("no redraw arrived for {keys:?}");
 }
 
-fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
-}
-
-/// The message line from a redraw.
-fn message(map: &[(Value, Value)]) -> String {
-    field(map, "message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
-
 /// Feed a `:lua <chunk><CR>` line and return the resulting message line — the
 /// channel a fired callback's `print` lands on.
 async fn lua_message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, chunk: &str) -> String {
     message(&redraw_after(rpc, incoming, &format!(":lua {chunk}<CR>")).await)
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}_{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-/// `nvim_exec_lua(code)` -> its return value (a synchronous Lua getter).
-async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .expect("nvim_exec_lua")
 }
 
 #[tokio::test]

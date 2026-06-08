@@ -17,8 +17,10 @@ path = "src/main.rs"
 # nxvim-server inherits `default-features = false` from [workspace.dependencies].
 [features]
 default = ["luajit"]
-lua51 = ["nxvim-server/lua51"]
-luajit = ["nxvim-server/luajit"]
+# Backend toggle threaded to nxvim-server and, for tests, the shared harness, so
+# a `--no-default-features --features lua51` build keeps a single backend.
+lua51 = ["nxvim-server/lua51", "nxvim-test-harness/lua51"]
+luajit = ["nxvim-server/luajit", "nxvim-test-harness/luajit"]
 
 [dependencies]
 anyhow.workspace = true
@@ -38,3 +40,5 @@ nxvim-rpc.workspace = true
 # The screen/syntax/lsp tests build a `View` from a redraw and paint it.
 nxvim-view.workspace = true
 rmpv.workspace = true
+# Shared black-box test harness (backend threaded via this crate's features).
+nxvim-test-harness.workspace = true

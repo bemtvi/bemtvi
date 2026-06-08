@@ -10,6 +10,7 @@ members = [
     "crates/nxvim-ts",
     "crates/nxvim-lsp",
     "crates/nxvim-view",
+    "crates/nxvim-test-harness",
 ]
 
 [workspace.package]
@@ -32,6 +33,10 @@ nxvim-tui = { path = "crates/nxvim-tui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
 nxvim-lsp = { path = "crates/nxvim-lsp" }
 nxvim-view = { path = "crates/nxvim-view" }
+# Test-only harness. Inherits `default-features = false` so the lua51/luajit
+# backend toggle can be threaded through the crate under test (same pattern as
+# nxvim-server above); each consumer re-enables a backend via its own features.
+nxvim-test-harness = { path = "crates/nxvim-test-harness", default-features = false }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
 # builds. Pre-release lines (ropey 2.0-beta, mlua 0.12-rc) are intentionally

@@ -10,11 +10,11 @@
 //! buffer contents and the cursor. Integration-test files don't share a module,
 //! so the `start*/feed/...` helpers are copied from the established pattern.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{
+    attach, cursor, drain_to_latest_redraw, feed, lines, mode, spawn, temp_dir,
+};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -30,28 +30,9 @@ async fn start_with_config(
         runtimepath: vec![dir.to_path_buf()],
         ..Default::default()
     };
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, init));
-    });
-    let (reader, writer) = tokio::io::split(client_end);
-    let (rpc, incoming) = connect(reader, writer);
-    rpc.request(
-        "nvim_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
-    )
-    .await
-    .expect("ui attach");
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Type a string of vim key-notation (fire-and-forget notification).
-fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
 }
 
 /// Send the synthetic idle flush (`nxvim_input_flush`) the TUI fires after
@@ -63,28 +44,6 @@ async fn flush(rpc: &Rpc) {
     rpc.request("nxvim_input_flush", vec![])
         .await
         .expect("input flush");
-}
-
-/// Drain every `redraw` currently queued in `incoming` and return the *most
-/// recent* one (skipping non-redraw notifications), or `None` when none is
-/// buffered. Redraws are full-state projections, so the latest reflects the
-/// freshest editor state.
-fn drain_to_latest_redraw(
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    let mut latest = None;
-    loop {
-        match incoming.try_recv() {
-            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
-                match params.into_iter().next() {
-                    Some(Value::Map(map)) => latest = Some(map),
-                    _ => panic!("redraw without a map"),
-                }
-            }
-            Ok(_) => continue,
-            Err(_) => return latest,
-        }
-    }
 }
 
 /// Feed `keys`, then return the `redraw` map the server emitted for that input.
@@ -108,7 +67,7 @@ async fn redraw_after(
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    if let Some(map) = drain_to_latest_redraw(incoming) {
+    if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
         return map;
     }
     // The barrier guarantees the input's redraw is queued before its response, so
@@ -116,7 +75,7 @@ async fn redraw_after(
     // lag; poll a bounded while rather than failing on the first miss.
     for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some(map) = drain_to_latest_redraw(incoming) {
+        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
             return map;
         }
     }
@@ -150,68 +109,6 @@ fn panel_lines(map: &[(Value, Value)]) -> Vec<String> {
         },
         _ => Vec::new(),
     }
-}
-
-/// Fetch all buffer lines. Awaiting it also barriers: every message sent before
-/// it has been processed by the server.
-async fn lines(rpc: &Rpc) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(0u64),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The (1-based line, 0-based col) cursor position.
-async fn cursor(rpc: &Rpc) -> (usize, usize) {
-    let result = rpc
-        .request("nvim_win_get_cursor", vec![Value::from(0u64)])
-        .await
-        .expect("get_cursor");
-    match result {
-        Value::Array(a) => (
-            a.first().and_then(Value::as_u64).unwrap_or(0) as usize,
-            a.get(1).and_then(Value::as_u64).unwrap_or(0) as usize,
-        ),
-        _ => (0, 0),
-    }
-}
-
-/// The editor's `mode()` short code (`"n"`, `"i"`, …). Awaiting it also barriers.
-async fn mode(rpc: &Rpc) -> String {
-    let result = rpc
-        .request("nvim_get_mode", vec![])
-        .await
-        .expect("get_mode");
-    match result {
-        Value::Map(map) => field(&map, "mode")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    }
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}_{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
 }
 
 /// A function-RHS map fires on its sequence, and the keys it consumed do **not**

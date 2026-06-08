@@ -24,7 +24,7 @@ nxvim-core = { path = "crates/nxvim-core" }
 nxvim-rpc = { path = "crates/nxvim-rpc" }
 # default-features = false so the lua51/luajit backend toggle can be threaded
 # through these crates (see the mlua note below). Building any of them as a
-# workspace member still applies its own `default` feature (lua51).
+# workspace member still applies its own `default` feature (luajit).
 nxvim-server = { path = "crates/nxvim-server", default-features = false }
 nxvim-lua = { path = "crates/nxvim-lua", default-features = false }
 nxvim-tui = { path = "crates/nxvim-tui" }
@@ -37,9 +37,9 @@ nxvim-lsp = { path = "crates/nxvim-lsp" }
 #
 # mlua's Lua-version features (`lua51` vs `luajit`) are mutually exclusive, so
 # the version is NOT selected here — only `vendored` is. The version is chosen
-# by `nxvim-lua`'s own `lua51` (default) / `luajit` features, threaded up
-# through `nxvim-server` and the `nxvim` binary. Benchmark LuaJIT with e.g.
-# `cargo run -p nxvim --no-default-features --features luajit`.
+# by `nxvim-lua`'s own `luajit` (default) / `lua51` features, threaded up
+# through `nxvim-server` and the `nxvim` binary. Build on vendored PUC Lua with
+# e.g. `cargo run -p nxvim --no-default-features --features lua51`.
 anyhow = "=1.0.102"
 ropey = "=2.0.0-beta.1"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }

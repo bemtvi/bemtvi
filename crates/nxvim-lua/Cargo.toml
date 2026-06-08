@@ -10,11 +10,11 @@ rust-version.workspace = true
 
 [features]
 # Exactly one Lua backend must be enabled (mlua's version features are mutually
-# exclusive). `lua51` (vendored PUC Lua 5.1) is the default; `luajit` swaps in
-# LuaJIT for benchmarking / closer neovim parity. They flow up unchanged through
-# nxvim-server and the nxvim binary, so build the whole stack on LuaJIT with
-# `--no-default-features --features luajit`.
-default = ["lua51"]
+# exclusive). `luajit` is the default (closest neovim parity); `lua51` swaps in
+# vendored PUC Lua 5.1. They flow up unchanged through nxvim-server and the nxvim
+# binary, so build the whole stack on PUC Lua with
+# `--no-default-features --features lua51`.
+default = ["luajit"]
 lua51 = ["mlua/lua51"]
 luajit = ["mlua/luajit"]
 

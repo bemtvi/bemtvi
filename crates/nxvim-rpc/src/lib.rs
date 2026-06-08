@@ -134,7 +134,21 @@ where
         if writer.write_all(&bytes).await.is_err() {
             break;
         }
-        if writer.flush().await.is_err() {
+        // Coalesce the flush: write everything *already* queued before paying a
+        // single flush, so a burst of frames (e.g. a redraw per keystroke under
+        // fast typing) costs one flush syscall for the whole batch instead of
+        // one per frame. `try_recv` only drains what is queued right now — it
+        // never waits for new frames — so this adds no latency to the last frame
+        // in a burst, and a lone frame behaves exactly as before (drain empties
+        // immediately, then flush).
+        let mut write_err = false;
+        while let Ok(more) = out_rx.try_recv() {
+            if writer.write_all(&more).await.is_err() {
+                write_err = true;
+                break;
+            }
+        }
+        if write_err || writer.flush().await.is_err() {
             break;
         }
     }
@@ -263,8 +277,15 @@ fn take_params(arr: &mut [Value], idx: usize) -> Vec<Value> {
     }
 }
 
+/// Initial capacity for an encoded frame's buffer. A starting size large enough
+/// to hold the common small frame (a notification or a getter reply) in one
+/// allocation, and to cut the number of reallocations a larger redraw frame
+/// pays as it grows — versus starting from `Vec::new()`'s capacity 0 and
+/// reallocating from the first byte on every message.
+const ENCODE_BUF_HINT: usize = 1024;
+
 fn encode(val: &Value) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(ENCODE_BUF_HINT);
     rmpv::encode::write_value(&mut buf, val).expect("msgpack encoding cannot fail to a Vec");
     buf
 }

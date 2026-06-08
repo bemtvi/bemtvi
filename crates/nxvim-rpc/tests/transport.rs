@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming};
 use rmpv::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Wire up an `Rpc` over a duplex pipe and hand back the half a peer writes
 /// into (`peer`) plus the stream of incoming messages. The returned `Rpc` and
@@ -119,5 +119,65 @@ async fn split_frame_is_reassembled_and_dispatched() {
     match msg {
         Some(Incoming::Notification { method, .. }) => assert_eq!(method, "ping"),
         other => panic!("expected ping notification, got {other:?}"),
+    }
+}
+
+/// A burst of outbound notifications must all reach the peer, intact and in
+/// order. The writer task coalesces a queued burst into one drained batch and a
+/// single flush; this guards that batching against dropping or reordering
+/// frames (the editing suites exercise it incidentally via redraw bursts, but
+/// nothing else asserts writer-side delivery directly).
+#[tokio::test]
+async fn writer_delivers_a_burst_of_notifications_in_order() {
+    let (_peer, rpc, mut peer_reader, _incoming) = rig();
+
+    // Fire the burst synchronously: every frame is queued before the writer
+    // task wakes, so it drains them as one coalesced batch.
+    const N: u64 = 64;
+    for i in 0..N {
+        rpc.notify("tick", vec![Value::from(i)]);
+    }
+
+    // Read the written bytes and decode complete frames until we have all N (or
+    // time out). `buf` only ever holds the not-yet-decoded tail between reads.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut decoded: Vec<Value> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while (decoded.len() as u64) < N {
+        let n = tokio::time::timeout_at(deadline, peer_reader.read(&mut chunk))
+            .await
+            .expect("writer should deliver the burst before the deadline")
+            .expect("peer read");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        let mut cursor = std::io::Cursor::new(&buf);
+        // Decode whole frames; a partial trailing frame leaves `read_value`
+        // mid-stream, so drain only up to the last *complete* frame and keep the
+        // remainder for the next read.
+        let mut complete = 0u64;
+        while let Ok(v) = rmpv::decode::read_value(&mut cursor) {
+            decoded.push(v);
+            complete = cursor.position();
+        }
+        buf.drain(..complete as usize);
+    }
+
+    assert_eq!(
+        decoded.len() as u64,
+        N,
+        "every frame in the burst was delivered"
+    );
+    for (i, v) in decoded.iter().enumerate() {
+        // Each frame is the notification [2, "tick", [i]] — index preserved.
+        let arr = v.as_array().expect("array frame");
+        assert_eq!(arr[0].as_u64(), Some(2), "notification tag");
+        assert_eq!(arr[1].as_str(), Some("tick"));
+        assert_eq!(
+            arr[2].as_array().expect("params")[0].as_u64(),
+            Some(i as u64)
+        );
     }
 }

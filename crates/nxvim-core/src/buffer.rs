@@ -379,7 +379,7 @@ impl Buffer {
             .or_else(|| self.path.clone())
             .ok_or_else(|| anyhow::anyhow!("E32: No file name"))?;
         let contents = self.text.to_string();
-        std::fs::write(&target, &contents)?;
+        write_atomic(&target, contents.as_bytes())?;
         let lines = self.line_count();
         self.path = Some(target);
         self.modified = false;
@@ -388,6 +388,77 @@ impl Buffer {
         self.save_tick += 1;
         Ok((contents.len(), lines))
     }
+}
+
+/// Write `contents` to `path` atomically: stream into a temp file in the same
+/// directory, fsync it, then `rename` it over the target. A crash, `SIGKILL`,
+/// full disk, or power loss mid-save can lose the *new* write but never
+/// truncates or half-writes the file the way `std::fs::write`'s `O_TRUNC` would —
+/// the rename either fully publishes the new contents or leaves the old file
+/// untouched. (Atomicity holds within one filesystem, which is why the temp sits
+/// next to the final file.)
+///
+/// If `path` is a symlink it is resolved first, so the rename replaces the file
+/// the link points at — keeping the link rather than clobbering it with a regular
+/// file — and the temp lands on the same filesystem as that real file. An
+/// existing target's permissions (and, best-effort, its ownership) are carried
+/// onto the replacement so a save never silently downgrades them.
+///
+/// Trade-off vs. the old in-place write: an atomic save needs to *create* a temp
+/// entry in the target's directory, so a writable file inside a read-only
+/// directory can no longer be saved — it fails loudly (which the editor surfaces)
+/// instead of silently truncating. That matches nxvim's "fail loud" posture.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // Resolve a symlink (and any `..`) to the real file so we replace *it*, not
+    // the link, and so the temp shares its filesystem. A path that doesn't exist
+    // yet (a brand-new file) has no canonical form — keep it as given.
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = real.parent().unwrap_or_else(|| Path::new("."));
+    let existing = std::fs::metadata(&real).ok();
+
+    // Temp lives in the target's directory (same filesystem → atomic rename),
+    // hidden and pid-tagged so it neither collides with a concurrent process nor
+    // shows up as a stray visible file if a later step fails.
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(real.file_name().unwrap_or(std::ffi::OsStr::new("nxvim")));
+    tmp_name.push(format!(".nxvim-tmp.{}", std::process::id()));
+    let tmp = dir.join(tmp_name);
+
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents)?;
+        // Durability: the bytes (and the file's metadata) must reach disk before
+        // the rename publishes the temp under the target's name.
+        file.sync_all()?;
+        drop(file);
+        // Carry the prior file's mode (and best-effort owner) onto the temp so a
+        // save preserves them; a fresh file keeps `File::create`'s default mode.
+        if let Some(meta) = &existing {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+            #[cfg(unix)]
+            preserve_owner(&tmp, meta);
+        }
+        std::fs::rename(&tmp, &real)
+    };
+
+    let result = write();
+    if result.is_err() {
+        // Never leave a partial temp behind on failure.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Best-effort: carry `meta`'s owner/group onto `path`. Only the super-user can
+/// `chown` to an arbitrary owner, so for a normal user saving their own file this
+/// is a no-op; a failure (e.g. `EPERM` when an unprivileged user saves a file
+/// owned by someone else) must not fail the save, so the result is ignored.
+#[cfg(unix)]
+fn preserve_owner(path: &Path, meta: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()));
 }
 
 fn ensure_trailing_newline(text: &mut Rope) {

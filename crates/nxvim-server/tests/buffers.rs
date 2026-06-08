@@ -536,6 +536,94 @@ async fn buffer_rpc_api_lists_reads_switches_and_creates() {
     std::fs::remove_file(&b).ok();
 }
 
+/// `:w` must never clobber the original file when it cannot complete the save
+/// atomically. A read-only directory holding a writable file is the test seam:
+/// the old non-atomic write (`std::fs::write`, `O_TRUNC`) opens and truncates
+/// the file *in place* — that needs write permission on the file, not the dir —
+/// so it would overwrite the original. An atomic save instead creates a temp
+/// entry in the dir (which the read-only dir forbids) and renames it into place,
+/// so it fails loudly and leaves the original byte-for-byte intact.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_save_that_cannot_be_made_atomic_leaves_the_original_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nxvim_atomic_ro_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("keep.txt");
+    std::fs::write(&path, "original\n").unwrap();
+
+    let (rpc, _incoming) = start().await;
+    command(&rpc, &format!("e {}", name(&path))).await;
+    feed(&rpc, "oCLOBBER<Esc>");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    command(&rpc, "w").await;
+
+    // Restore dir perms first so cleanup runs regardless of the assertion.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        on_disk, "original\n",
+        "a save into an unwritable dir clobbered the original file"
+    );
+}
+
+/// An atomic save writes a fresh temp file and renames it over the target, so it
+/// must carry the existing file's permissions onto the replacement — otherwise a
+/// `:w` would silently downgrade a `0600` secret to the default `0644`.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_preserves_the_existing_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp_file("mode", "secret\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (rpc, _incoming) = start().await;
+    command(&rpc, &format!("e {}", name(&path))).await;
+    feed(&rpc, "oMORE<Esc>");
+    command(&rpc, "w").await;
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "atomic save downgraded the file mode");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret\nMORE\n");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// Saving a buffer bound to a *symlink* must write through to the link's target
+/// and keep the link itself — the atomic rename must resolve the symlink first,
+/// not replace it with a regular file.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_through_a_symlink_keeps_the_link_and_updates_the_target() {
+    let real = temp_file("symlink_real", "original\n");
+    let link =
+        std::env::temp_dir().join(format!("nxvim_buf_symlink_link_{}.txt", std::process::id()));
+    std::fs::remove_file(&link).ok();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let (rpc, _incoming) = start().await;
+    command(&rpc, &format!("e {}", name(&link))).await;
+    feed(&rpc, "oNEW<Esc>");
+    command(&rpc, "w").await;
+
+    // The link is still a symlink (not replaced by a regular file)...
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "save replaced the symlink with a regular file"
+    );
+    // ...and the edit landed on the real file it points to.
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "original\nNEW\n");
+
+    std::fs::remove_file(&link).ok();
+    std::fs::remove_file(&real).ok();
+}
+
 #[tokio::test]
 async fn wall_writes_every_modified_buffer() {
     let a = temp_file("a", "a1\n");

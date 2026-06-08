@@ -229,6 +229,11 @@ struct Server {
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
     /// refresh each time (Phase 6).
     buf_mirror_ticks: HashMap<BufferId, u64>,
+    /// Per-buffer line count last mirrored, so [`Server::push_buf_mirror`] can pass
+    /// the old line count as `on_lines`' `lastline` when an attached buffer changes
+    /// (`nvim_buf_attach`). Tracked only to fire faithful buffer-change callbacks —
+    /// telescope drives its prompt filtering off `on_lines`.
+    buf_mirror_lines: HashMap<BufferId, usize>,
     /// Per-buffer undo fingerprint last serialized into the `vim._undotree` Lua
     /// mirror ([`Server::push_undotree_mirror`]), so an unchanged tree isn't
     /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
@@ -324,6 +329,7 @@ where
         evloop,
         scheduled: VecDeque::new(),
         buf_mirror_ticks: HashMap::new(),
+        buf_mirror_lines: HashMap::new(),
         undo_mirror_versions: HashMap::new(),
         start: std::time::Instant::now(),
         hl_mirror_gen: None,

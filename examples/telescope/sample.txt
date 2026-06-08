@@ -1,0 +1,19 @@
+telescope.nvim on nxvim
+=======================
+
+Press Space then f then b to open the static fuzzy-finder demo — it needs no
+external tools. The prompt opens in insert mode; just start typing to filter.
+
+  <Space>fb   fuzzy-find over a built-in list of fruits   (no deps)
+  <Space>ff   find files in this directory                (needs fd / rg / find)
+  <Space>fg   live grep across this directory             (needs rg)
+
+Inside the picker:
+  type        filter as you go
+  <C-n>/<C-p> move the selection down / up
+  <CR>        accept the selection
+  <Esc>       close the picker
+
+This buffer is just here to give the editor something to open. Try <Space>ff and
+fuzzy-type "init" to jump to the example's init.lua, or <Space>fg and search for a
+word you can see on this screen.

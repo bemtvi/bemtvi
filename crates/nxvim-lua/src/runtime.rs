@@ -193,6 +193,10 @@ pub struct GoMirror {
     pub laststatus: u8,
     pub statusline: String,
     pub tabline: String,
+    /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
+    /// float-positioning plugin (telescope) can center its windows.
+    pub columns: u64,
+    pub lines: u64,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -219,6 +223,7 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
     ),
+    ("nxvim:prelude/compat", include_str!("prelude/compat.lua")),
 ];
 
 /// neovim's own `vim.treesitter` Lua, vendored verbatim under `src/vendor/nvim/`
@@ -921,6 +926,20 @@ impl LuaRuntime {
     pub fn fire_autocmd(&self, event: &str, pattern: &str) -> mlua::Result<()> {
         let fire: mlua::Function = self.vim()?.get("_fire")?;
         fire.call((event, pattern))
+    }
+
+    /// Fire the `nvim_buf_attach` `on_lines` callbacks for buffers that changed.
+    /// `changes` is `(bufnr, changedtick, old_line_count, new_line_count)` per
+    /// buffer; the prelude's `vim._buf_changed` looks up the attached callbacks and
+    /// invokes each with neovim's `on_lines` argument tuple (detaching one that
+    /// returns `true` or errors). A buffer with no attachment is a cheap no-op.
+    pub fn fire_buf_changes(&self, changes: &[(u64, u64, usize, usize)]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let fire: mlua::Function = vim.get("_buf_changed")?;
+        for &(buf, tick, old, new) in changes {
+            fire.call::<()>((buf, tick, 0u64, old as u64, new as u64))?;
+        }
+        Ok(())
     }
 
     /// Fire an autocmd *with buffer context* — the callback `args` carry the real

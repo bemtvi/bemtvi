@@ -364,24 +364,54 @@ async fn del_extmark_reports_existence() {
     );
 }
 
-/// An unsupported option fails loud rather than silently doing nothing (the
-/// no-silent-stubs rule): virtual text isn't modelled yet, so it errors.
+/// A genuinely unknown option fails loud rather than silently doing nothing (the
+/// no-silent-stubs rule): a key from neither the rendered set nor the
+/// accepted-but-unrendered decoration set errors, naming itself.
 #[tokio::test]
-async fn unsupported_extmark_option_errors() {
+async fn unknown_extmark_option_errors() {
     let (rpc, _rx) = start().await;
     let result = exec_lua(
         &rpc,
         r#"
-        local ns = vim.api.nvim_create_namespace('virt')
-        local ok, err = pcall(vim.api.nvim_buf_set_extmark, 0, ns, 0, 0, { virt_text = {{'x'}} })
+        local ns = vim.api.nvim_create_namespace('bogus')
+        local ok, err = pcall(vim.api.nvim_buf_set_extmark, 0, ns, 0, 0, { not_a_real_option = 1 })
         return tostring(ok) .. '|' .. tostring(err)
         "#,
     )
     .await;
     let s = result.as_str().unwrap_or("");
     assert!(
-        s.starts_with("false|") && s.contains("virt_text"),
-        "an unsupported option should raise naming the option, got {s:?}"
+        s.starts_with("false|") && s.contains("not_a_real_option"),
+        "an unknown option should raise naming the option, got {s:?}"
+    );
+}
+
+/// Virtual text (and the rest of the decoration family) is ACCEPTED and STORED —
+/// a documented approximation: the mark is created (so the plugin's render path
+/// doesn't break) and the payload is returned by a details read, but it isn't
+/// painted yet. This is what lets telescope's result counter / preview overlays
+/// run instead of erroring.
+#[tokio::test]
+async fn virtual_text_is_accepted_and_stored() {
+    let (rpc, _rx) = start().await;
+    let result = exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('virt')
+        local ok = pcall(vim.api.nvim_buf_set_extmark, 0, ns, 0, 0, {
+          virt_text = {{'x', 'Comment'}}, virt_text_pos = 'right_align',
+        })
+        local marks = vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true })
+        local d = marks[1] and marks[1][4]
+        local has_vt = d ~= nil and d.virt_text ~= nil
+        return tostring(ok) .. '|' .. tostring(#marks) .. '|' .. tostring(has_vt)
+        "#,
+    )
+    .await;
+    let s = result.as_str().unwrap_or("");
+    assert_eq!(
+        s, "true|1|true",
+        "virt_text should create a mark and be retrievable via details, got {s:?}"
     );
 }
 

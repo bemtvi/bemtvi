@@ -1020,9 +1020,28 @@ function vim.api.nvim_create_namespace(name)
   return id
 end
 
--- The extmark options v1 understands; any other key is rejected (no silent drop).
+-- The extmark options v1 RENDERS: position, span, highlight, priority.
 local EXTMARK_OPT_OK = {
   id = true, end_row = true, end_col = true, hl_group = true, priority = true,
+}
+-- Decoration options nxvim ACCEPTS and STORES (so nvim_buf_get_extmarks(…,
+-- {details=true}) returns them) but does NOT yet render — virtual text, virtual
+-- lines, signs, conceal, and the line/gravity flags. A documented approximation
+-- (the matchadd / winblend pattern): a plugin that decorates with virtual text
+-- (telescope's right-aligned result counter, a preview overlay, gitsigns) loads
+-- and runs; the supplementary glyphs just aren't painted yet. Rejecting them loud
+-- (the v1 behavior) would instead break the plugin's render path. The core
+-- extmark store still tracks the mark's POSITION (for get_extmarks), only the
+-- decoration payload is unrendered.
+local EXTMARK_OPT_DECORATION = {
+  virt_text = true, virt_text_pos = true, virt_text_win_col = true,
+  virt_text_hide = true, virt_text_repeat_linebreak = true, hl_mode = true,
+  hl_eol = true, virt_lines = true, virt_lines_above = true,
+  virt_lines_leftcol = true, sign_text = true, sign_hl_group = true,
+  number_hl_group = true, line_hl_group = true, cursorline_hl_group = true,
+  conceal = true, spell = true, ui_watched = true, url = true,
+  right_gravity = true, end_right_gravity = true, strict = true,
+  undo_restore = true, invalidate = true,
 }
 
 -- nvim_buf_set_extmark(buffer, ns, line, col, opts) -> id. `line`/`col` are
@@ -1031,9 +1050,17 @@ local EXTMARK_OPT_OK = {
 function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
   local b = vim._resolve_bufnr(buffer)
   opts = opts or {}
+  -- Collect any accepted-but-unrendered decoration payload so a details read can
+  -- return it; reject only a key from neither set (a true unknown).
+  local decoration = nil
   for k in pairs(opts) do
     if not EXTMARK_OPT_OK[k] then
-      error("nvim_buf_set_extmark: option '" .. tostring(k) .. "' is not supported yet", 2)
+      if EXTMARK_OPT_DECORATION[k] then
+        decoration = decoration or {}
+        decoration[k] = opts[k]
+      else
+        error("nvim_buf_set_extmark: option '" .. tostring(k) .. "' is not supported yet", 2)
+      end
     end
   end
   local hl_group = opts.hl_group
@@ -1057,6 +1084,7 @@ function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
     row = line, col = col,
     end_row = opts.end_row, end_col = opts.end_col,
     hl_group = hl_group, priority = priority,
+    decoration = decoration,
   }
   vim._extmark_set(b, ns, mark_id, line, col, opts.end_row, opts.end_col, hl_group, priority)
   return mark_id
@@ -1124,10 +1152,16 @@ function vim.api.nvim_buf_get_extmarks(buffer, ns, start, end_, opts)
       if in_range(m.row, m.col) then
         local e = { id, m.row, m.col }
         if opts.details then
-          e[4] = {
+          local d = {
             ns_id = nsid, end_row = m.end_row, end_col = m.end_col,
             hl_group = m.hl_group, priority = m.priority,
           }
+          -- Spread any accepted-but-unrendered decoration payload (virt_text, …)
+          -- into the details dict at top level, matching neovim's shape.
+          if m.decoration then
+            for k, v in pairs(m.decoration) do d[k] = v end
+          end
+          e[4] = d
         end
         out[#out + 1] = e
       end

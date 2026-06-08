@@ -615,12 +615,20 @@ impl Server {
         // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
         // marks contribute, so a session with no decoration plugin pays nothing.
         let mut extmarks: Vec<(u64, Vec<ExtmarkMirror>)> = Vec::new();
+        // Buffers whose text changed since the last mirror, for the `nvim_buf_attach`
+        // `on_lines` callbacks: `(bufnr, changedtick, old_line_count, new_line_count)`.
+        // Only buffers already known last push contribute (a buffer's first
+        // appearance is its creation, not an edit), and the callbacks are fired
+        // *after* every mirror is consistent (below), so a callback reading
+        // `nvim_buf_get_lines` sees the new content.
+        let mut changed: Vec<(u64, u64, usize, usize)> = Vec::new();
         for id in self.editor.buffer_ids() {
             let tick = self
                 .editor
                 .buffer_of(id)
                 .map(|b| b.changedtick)
                 .unwrap_or(0);
+            let known = self.buf_mirror_ticks.contains_key(&id);
             let fresh = self.buf_mirror_ticks.get(&id) != Some(&tick);
             let lines = if fresh {
                 self.buf_mirror_ticks.insert(id, tick);
@@ -628,6 +636,14 @@ impl Server {
             } else {
                 None
             };
+            if let Some(l) = &lines {
+                let new_count = l.len();
+                if known {
+                    let old_count = self.buf_mirror_lines.get(&id).copied().unwrap_or(new_count);
+                    changed.push((id.0, tick, old_count, new_count));
+                }
+                self.buf_mirror_lines.insert(id, new_count);
+            }
             let name = self.editor.buffer_name(id).unwrap_or_default();
             if let Some(b) = self.editor.buffer_of(id) {
                 let o = b.options;
@@ -677,6 +693,7 @@ impl Server {
         // unboundedly across a long session of opening and closing buffers.
         let live: HashSet<BufferId> = self.editor.buffer_ids().into_iter().collect();
         self.buf_mirror_ticks.retain(|id, _| live.contains(id));
+        self.buf_mirror_lines.retain(|id, _| live.contains(id));
 
         let cursor = (
             (self.editor.cursor.line + 1) as u64, // 1-based row, neovim convention
@@ -805,6 +822,7 @@ impl Server {
         // default until set, and values set via the `:set` ex path). Cheap (five
         // search flags + showtabline/laststatus), so it isn't gated.
         let go = self.editor.global_options();
+        let (columns, lines) = self.editor.screen_size();
         let _ = self.lua.set_go_mirror(&GoMirror {
             ignorecase: go.ignorecase,
             smartcase: go.smartcase,
@@ -815,6 +833,8 @@ impl Server {
             laststatus: go.laststatus,
             statusline: go.statusline.clone(),
             tabline: go.tabline.clone(),
+            columns: columns as u64,
+            lines: lines as u64,
         });
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small
@@ -839,6 +859,14 @@ impl Server {
         // synchronously (the buffer analogue of the window mirror's `next_win`).
         let _ = self.lua.set_next_buf(self.editor.next_buffer_id().0);
         self.push_undotree_mirror();
+        // Now that every mirror is consistent, fire the `nvim_buf_attach` `on_lines`
+        // callbacks for the buffers that changed. A callback reads the buffer via
+        // `nvim_buf_get_lines` (the mirror just refreshed) and typically schedules
+        // follow-up work (telescope re-runs its finder) — drained by the enclosing
+        // `run_pending` fixpoint, since this runs at its entry.
+        if !changed.is_empty() {
+            let _ = self.lua.fire_buf_changes(&changed);
+        }
     }
 
     /// Refresh the `vim._undotree` mirror that `vim.fn.undotree(bufnr)` reads.

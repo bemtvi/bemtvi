@@ -93,6 +93,12 @@ local O_GLOBAL = {
   laststatus = "laststatus", ls = "laststatus",
   statusline = "statusline", stl = "statusline",
   tabline = "tabline", tal = "tabline",
+  -- The editor screen extent (the server pushes the live size into the mirror);
+  -- read-mostly here — a float-positioning plugin (telescope) reads them to
+  -- center its windows, and `:set columns=` is not honored (the client owns the
+  -- terminal size), but a write still lands in the mirror so a read-back agrees.
+  columns = "columns", co = "columns",
+  lines = "lines",
 }
 -- Core defaults, the safety net before the server has pushed the mirror.
 local O_GLOBAL_DEFAULT = {
@@ -101,6 +107,7 @@ local O_GLOBAL_DEFAULT = {
   laststatus = 2,
   statusline = "",
   tabline = "",
+  columns = 80, lines = 24,
 }
 
 -- Rust→Lua mirror of the core's global option values, refreshed by the server
@@ -127,6 +134,19 @@ vim._o_store = vim._o_store or {
   termguicolors = false,
   winblend = 0,
   pumblend = 0,
+  -- Read-mostly editor options plugins (telescope, plenary.popup) read to lay out
+  -- floats and gate behavior. Observable defaults matching neovim's; not yet
+  -- honored by the core (the client owns the cmdline / message regions), but a
+  -- read returns a sane value instead of nil (which a `- cmdheight` arithmetic or
+  -- a `.. report` concat would choke on).
+  cmdheight = 1,
+  report = 2,
+  eventignore = "",
+  ambiwidth = "single",
+  helplang = "en",
+  mouse = "",
+  guicursor = "",
+  shell = os.getenv("SHELL") or "/bin/sh",
 }
 
 local function o_get(k)

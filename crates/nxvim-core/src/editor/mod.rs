@@ -836,6 +836,18 @@ impl Editor {
         self.message = msg;
     }
 
+    /// The editor's total screen size in `(columns, rows)` — the text-viewport
+    /// dimensions the client last sized us to (via [`Editor::resize`] / the most
+    /// recent `view`). Backs `vim.o.columns` / `vim.o.lines` (and
+    /// `nvim_list_uis`), the values a float-positioning plugin (telescope,
+    /// plenary.popup) reads to center and size its windows. NOTE: `rows` is the
+    /// editable text height — the client owns the cmdline / status regions — so it
+    /// runs a row or two short of neovim's total `lines`; it is the only screen
+    /// extent the core knows, and is close enough for float geometry.
+    pub fn screen_size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
     /// Produce a [`View`] of the current state for a text viewport of the given
     /// size. The client renders the view's regions with its own widgets.
     pub fn view(&mut self, width: usize, height: usize) -> View {

@@ -82,7 +82,7 @@ the full design in
 
 - **Truecolor terminal required.** nxvim emits 24-bit color escapes; use a
   terminal with truecolor support (most modern ones).
-- **Treesitter is out-of-process and grammars are installed separately.** Token
+- **Treesitter is in-process and grammars are installed separately.** Token
   colors (keyword/string/…) need a grammar for the filetype in nxvim's data dir;
   editor colors (background, gutter, selection, status) apply regardless. See
   [*Syntax highlighting*](architecture.md#syntax-highlighting-treesitter).

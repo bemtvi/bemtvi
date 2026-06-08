@@ -150,10 +150,11 @@ end
 -- make_position_params(window, encoding): the `{ textDocument, position }` a
 -- cursor-relative request (definition, hover, …) carries. The cursor comes from
 -- the real editor (Phase-6 mirror); its byte column is converted to `encoding`
--- (utf-16 default). `window` is ignored — single-window nxvim.
--- INCOMPLETE: `window` is ignored (always the current cursor) — faithful only
--- while nxvim is single-window. A config passing a specific window gets the
--- current one's position.
+-- (utf-16 default). `window` is ignored — always the current window's cursor.
+-- INCOMPLETE: `window` is ignored — this helper always reads the *current*
+-- window (`nvim_win_get_cursor(0)`), so a config passing a specific window
+-- handle gets the current one's position instead. (nxvim has multiple windows
+-- now; the helper just isn't window-arg-aware.)
 function vim.lsp.util.make_position_params(_window, encoding)
   encoding = encoding or "utf-16"
   local bufnr = vim.api.nvim_get_current_buf()

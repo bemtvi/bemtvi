@@ -80,8 +80,9 @@ gap. Recorded here so the sweep doesn't lose them.
   the one `tabstop` knob drives the whole indent width. `tabstop`, `softtabstop`,
   and `expandtab` drive rendering and `<Tab>`; `shiftwidth` only feeds the LSP
   indent width until the `>>`/`<<` operators land. The rest of vim's hundreds of
-  options are still missing. Also: marks, folds, macros, and registers beyond the
-  unnamed register. (`:s` substitution *is* implemented — ex-range parsing, the
+  options are still missing. Also: folds and macros (registers — named/numbered/
+  special + the system clipboard — and marks — buffer-local, global, and the
+  special marks — are both implemented). (`:s` substitution *is* implemented — ex-range parsing, the
   `g`/`i`/`I`/`n`/`c` flags with confirm, pattern/replacement reuse and repeat;
   it speaks the same canonical-regex dialect as `/` search, not vim magic. See
   `docs/plans/2026-06-07-substitute-command.md`.)
@@ -91,10 +92,13 @@ gap. Recorded here so the sweep doesn't lose them.
   build an evaluator.
 - **`:TSInstall`-style grammar fetch/compile.** Grammars load from the data dir;
   installing them there is manual.
-- **Synchronous prompts.** `vim.fn.input` / `vim.fn.confirm` must return the
-  user's answer *inline*; nxvim's prompt surface is async-callback only, so both
-  are loud gaps until a re-entrant input pump (nested loop or resumable coroutine)
-  exists.
+- **Synchronous prompts — now implemented.** `vim.fn.input` / `vim.fn.confirm`
+  return the user's answer *inline*: a pumped Lua entry (`:lua` chunk, keymap, or
+  user command) runs inside a coroutine via `vim._pump`, so the prompt
+  `coroutine.yield`s to park the chunk on the command line and the result resumes
+  it. See `examples/sync-prompts/`. (The remaining caveat: only *pumped* entry
+  points can prompt — Lua sourced at startup or off a bare callback has no
+  coroutine to yield from.)
 
 ## Cross-cutting root causes
 
@@ -103,11 +107,11 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 
 | Root cause | Approximations it clears |
 |---|---|
-| Single-window model | `nvim_win_get_cursor(win)`, `make_position_params(window)`, `open_floating_preview` handles, per-window placement, the single completion-doc preview box (no separate preview-window handle / `completeopt` matrix) |
+| LSP helpers not window-arg-aware (always use the current window) | `make_position_params(window)` ignores its `window` arg, `open_floating_preview` returns placeholder handles, the single completion-doc preview box (no separate preview-window handle / `completeopt` matrix). Note: splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*; it's these LSP-side helpers that still assume the current window. |
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
 | Core honors only the indentation buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `expandtab` are recorded but inert |
 | No per-buffer command registry | `nvim_buf_create_user_command` registers globally |
-| No virtual-text / signs / float surfaces | `vim.diagnostic.config` keys other than `underline` |
+| No diagnostic-display surfaces — virtual-text / signs / diagnostic float (distinct from the floating-window primitive, which exists) | `vim.diagnostic.config` keys other than `underline` |
 | No per-namespace highlight tables | `nvim_set_hl` non-zero namespace folded into global |
 
 ## Relationship to the LSP completion plan

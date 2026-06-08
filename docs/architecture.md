@@ -297,8 +297,12 @@ the buffer's `tabstop`), carried in the `View` as `cursor_screen_col`. `cursor.c
 remains a byte offset (what `nvim_win_get_cursor` returns); the TUI expands tabs
 when painting so glyphs line up with that virtual column.
 
-Undo is currently snapshot-based (cheap thanks to ropey's structural sharing);
-it will move to a change-tree closer to neovim's `undo.c` as editing grows.
+Undo is a **branching undo tree** of full-rope snapshots (cheap thanks to
+ropey's structural sharing): undoing then making a new edit forks a branch
+rather than discarding the old future, so every past state stays reachable.
+`u` / `<C-r>` walk parent / newest-child, `:undo {N}` jumps to any seq across
+branches, and `vim.fn.undotree()` projects the tree in neovim's dict shape —
+closer to neovim's `undo.c` than the original two-stack model.
 
 ---
 
@@ -734,7 +738,9 @@ screen," and that is exactly the shape of these tests.
   ratatui widgets per region itself.
 - Rope-backed (ropey 2.0), byte-indexed buffers with a strict trailing-newline
   invariant — closer to vim's own byte-column model.
-- Snapshot undo rather than a persistent undo tree — for now.
+- A branching undo tree of full-rope snapshots (cheap via ropey's structural
+  sharing) rather than neovim's diff-based `undo.c` change records — same
+  branching semantics (`:undo {N}`, `vim.fn.undotree()`), different storage.
 - **In-process treesitter** with installable grammars and incremental parsing —
   like neovim, but kept off `nxvim-core` behind a `SyntaxEngine` trait (so the
   pure core never links tree-sitter) and bounded by a parse deadline (see
@@ -827,8 +833,12 @@ screen," and that is exactly the shape of these tests.
   `expandtab` (also via `:setlocal` / `vim.bo`); scoped
   `nvim_{set,get}_option_value` routes to the right scope. The bulk of vim's
   options are still missing.
-  Also mappings (`:map`), registers beyond the unnamed register, marks, folds,
-  and macros. (The interactive `/` / `?` cursor search — `n`/`N`,
+  Named/numbered/special **registers** (`:registers`, `setreg`/`getreg`, the
+  system clipboard `"+`/`"*`) and **marks** (buffer-local `a`–`z`, global file
+  marks `A`–`Z`, the automatic special marks, `:marks`, and `'{mark}` ex-ranges)
+  are both done; what remains here is folds, macros, and the `:map`-family
+  ex-commands (intentionally postponed — keymaps are set via `vim.keymap.set` /
+  `nvim_set_keymap`). (The interactive `/` / `?` cursor search — `n`/`N`,
   `hlsearch`/`incsearch`, the search options — and `:s` substitution, which
   shares search's canonical-regex engine, are both done; see
   [the search design](specs/2026-06-02-search-design.md) and

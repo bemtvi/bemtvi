@@ -377,10 +377,18 @@ fn render_window(
     let empty_incsearch: IncSearchSpans = Vec::new();
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
 
-    let frame_lines: Vec<String>;
-    let frame_sel: Vec<Option<(u16, u16)>>;
-    let frame_hl: Vec<Vec<HlSpan>>;
-    let frame_numbers: Vec<Option<usize>>;
+    // Owned slide-band snapshots, populated only while animating (a `skip/take`
+    // window of the full buffer). The static path — the overwhelmingly common
+    // case — borrows straight from `win` instead of deep-cloning the whole
+    // viewport (lines, per-cell highlights, selection, numbers) every repaint.
+    let anim_lines: Vec<String>;
+    let anim_sel: Vec<Option<(u16, u16)>>;
+    let anim_hl: Vec<Vec<HlSpan>>;
+    let anim_numbers: Vec<Option<usize>>;
+    let frame_lines: &[String];
+    let frame_sel: &[Option<(u16, u16)>];
+    let frame_hl: &[Vec<HlSpan>];
+    let frame_numbers: &[Option<usize>];
     let cursor_row: u16;
     // 1-based buffer line the cursor sits on, used to compute relative numbers.
     // During a slide it tracks the interpolated cursor so the gutter stays in
@@ -400,24 +408,28 @@ fn render_window(
             let top = lerp(a.from_top, a.to_top, t).round() as usize;
             let cur = lerp(a.from_cursor, a.to_cursor, t).round() as usize;
             let off = top.saturating_sub(a.base_line);
-            frame_lines = a.lines.iter().skip(off).take(height).cloned().collect();
-            frame_sel = a.selection.iter().skip(off).take(height).copied().collect();
-            frame_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
-            frame_hl = a
+            anim_lines = a.lines.iter().skip(off).take(height).cloned().collect();
+            anim_sel = a.selection.iter().skip(off).take(height).copied().collect();
+            anim_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
+            anim_hl = a
                 .highlights
                 .iter()
                 .skip(off)
                 .take(height)
                 .cloned()
                 .collect();
+            frame_lines = &anim_lines;
+            frame_sel = &anim_sel;
+            frame_numbers = &anim_numbers;
+            frame_hl = &anim_hl;
             cursor_row = cur.saturating_sub(top) as u16;
             current_line = cur + 1;
         }
         None => {
-            frame_lines = win.lines.clone();
-            frame_sel = win.selection.clone();
-            frame_numbers = win.numbers.clone();
-            frame_hl = win.highlights.clone();
+            frame_lines = &win.lines;
+            frame_sel = &win.selection;
+            frame_numbers = &win.numbers;
+            frame_hl = &win.highlights;
             cursor_row = win.cursor_row;
             current_line = win.cursor_line;
         }
@@ -435,7 +447,7 @@ fn render_window(
     let text_inner = if win.number_width > 0 {
         let cols = Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
             .split(text_area);
-        render_gutter(frame, cols[0], &frame_numbers, current_line, win, view);
+        render_gutter(frame, cols[0], frame_numbers, current_line, win, view);
         cols[1]
     } else {
         text_area
@@ -478,14 +490,14 @@ fn render_window(
     render_text(
         frame,
         text_inner,
-        &frame_lines,
-        &frame_sel,
+        frame_lines,
+        frame_sel,
         frame_secondary_sel,
         frame_search,
         frame_incsearch,
-        &frame_hl,
+        frame_hl,
         frame_diag,
-        &frame_numbers,
+        frame_numbers,
         win.tabstop.max(1) as usize,
         win.leftcol as usize,
         &theme,

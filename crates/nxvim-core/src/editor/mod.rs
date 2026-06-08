@@ -5,8 +5,10 @@
 //! reading/writing files through [`Buffer`]. The async server feeds it input
 //! and reads back state; it never blocks.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::buffer::Buffer;
 use crate::clipboard::Clipboard;
@@ -14,6 +16,7 @@ use crate::highlight::Highlights;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::Options;
+use crate::search::SearchRegex;
 use crate::syntax::SyntaxEngine;
 use crate::view::View;
 
@@ -450,6 +453,12 @@ pub struct Editor {
     /// `n`/`N` repeat and an empty-pattern re-search. `None` until the first
     /// search.
     last_search: Option<(String, SearchDir, SearchOffset)>,
+    /// Memoized compiled search regex for the redraw highlight path, keyed by
+    /// `(pattern, ignorecase)`. The `hlsearch` pattern is stable across many
+    /// frames, so this skips recompiling the regex (an expensive
+    /// `RegexBuilder::build`) on every repaint of every window. `RefCell` for
+    /// interior mutability behind the `&self` highlight projection.
+    search_re_cache: RefCell<Option<(String, bool, Rc<SearchRegex>)>>,
     /// The last `:substitute` as `(pattern, replacement, flag letters)`, for
     /// bare `:s` / `:&` / `:&&` repeats and the `~` replacement recall. The flag
     /// letters exclude any trailing count. `None` until the first substitute.
@@ -723,6 +732,7 @@ impl Editor {
             confirm_accelerators: Vec::new(),
             confirm_default: 0,
             last_search: None,
+            search_re_cache: RefCell::new(None),
             last_substitute: None,
             subst_confirm: None,
             in_global: false,

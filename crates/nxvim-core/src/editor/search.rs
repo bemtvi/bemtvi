@@ -259,6 +259,24 @@ impl Editor {
         SearchRegex::compile(pattern, self.search_ignorecase(pattern))
     }
 
+    /// Like [`compile_search`](Self::compile_search), but reuses the last
+    /// compiled regex when the `(pattern, ignorecase)` pair is unchanged. Used
+    /// on the redraw highlight path, where the `hlsearch` pattern is stable
+    /// across many frames and recompiling it every repaint (per window) is the
+    /// dominant cost. Returns a shared handle so the cache can keep its copy.
+    fn compile_search_cached(&self, pattern: &str) -> Result<Rc<SearchRegex>, String> {
+        let ignorecase = self.search_ignorecase(pattern);
+        if let Some((p, ic, re)) = self.search_re_cache.borrow().as_ref() {
+            if p == pattern && *ic == ignorecase {
+                return Ok(Rc::clone(re));
+            }
+        }
+        let re = Rc::new(SearchRegex::compile(pattern, ignorecase)?);
+        *self.search_re_cache.borrow_mut() =
+            Some((pattern.to_string(), ignorecase, Rc::clone(&re)));
+        Ok(re)
+    }
+
     /// The next match of the compiled `re` in `dir` from byte offset `from`, as
     /// `(primary, wrapped)` whole-buffer `(start, end)` ranges. `primary` is the
     /// match in the search direction without wrapping; `wrapped` is the first
@@ -566,7 +584,7 @@ impl Editor {
             return (matches, current);
         };
         // A pattern still mid-edit (incsearch) may not compile yet; show nothing.
-        let Ok(re) = self.compile_search(&pattern) else {
+        let Ok(re) = self.compile_search_cached(&pattern) else {
             return (matches, current);
         };
         let line_count = buf.line_count();
@@ -576,7 +594,7 @@ impl Editor {
             if buf_line >= line_count {
                 break;
             }
-            let text = buf.line(buf_line);
+            let text = buf.line_cow(buf_line);
             let ts = buf.options.effective_tabstop();
             for (s, e) in re.find_all(&text) {
                 let span = (

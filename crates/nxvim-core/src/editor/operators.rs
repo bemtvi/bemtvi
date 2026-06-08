@@ -135,14 +135,30 @@ impl Editor {
     }
 
     /// Linewise change (`cc`/`S`, linewise-visual `c`): delete `lo..hi`, reopen a
-    /// single empty line at `first_line`, and park the cursor there for insert.
-    /// Shared by `apply_operator` and `visual_operate`.
+    /// single empty line where the deleted block was, and park the cursor there for
+    /// insert. Shared by `apply_operator` and `visual_operate`.
     fn linewise_change(&mut self, lo: usize, hi: usize, first_line: usize) {
+        // Did the change consume the whole buffer? If so, `normalize` below leaves
+        // exactly one empty line, which *is* the reopened line — adding another
+        // would leave a stray blank.
+        let whole_buffer = lo == 0 && hi >= self.buffer().len_bytes();
         self.delete_range(lo, hi);
-        let at = self.buffer().line_start(first_line.min(self.last_line()));
+        self.buffer_mut().normalize();
+        if whole_buffer {
+            self.cursor.line = 0;
+            self.cursor.col = 0;
+            return;
+        }
+        // Reopen the empty line at `first_line`. When the block was the buffer's
+        // tail, `first_line` now equals the line count, so `line_start` resolves to
+        // end-of-buffer and the newline *appends* the line in place — rather than
+        // the old `min(last_line())` clamp, which wrongly opened it before the
+        // surviving last line.
+        let target = first_line.min(self.buffer().line_count());
+        let at = self.buffer().line_start(target);
         self.buffer_mut().insert_char(at, '\n');
         self.buffer_mut().normalize();
-        self.cursor.line = first_line;
+        self.cursor.line = target;
         self.cursor.col = 0;
     }
 
@@ -169,6 +185,11 @@ impl Editor {
             self.echo(CLIPBOARD_UNAVAILABLE);
             self.reset_pending();
             return;
+        }
+        // Stash the selection's shape for dot-repeat before it is consumed: a
+        // visual `d`/`c` replays as a size-faithful reselect from the new cursor.
+        if matches!(op, 'd' | 'c') {
+            self.capture_visual_shape(op);
         }
         // Leaving Visual mode (by operating on the selection) sets the `` `< `` /
         // `` `> `` selection marks and the `` `[ `` / `` `] `` change bounds, both
@@ -215,6 +236,67 @@ impl Editor {
             _ => {}
         }
         self.reset_pending();
+    }
+
+    /// Capture the active visual selection's shape as a size-faithful dot-repeat
+    /// stream ([`VisualShape`]), stashed in `pending_visual` for the commit point
+    /// in [`Editor::input`]. Called before the buffer mutates, while
+    /// `visual_anchor`/`cursor` still describe the selection. The synthesized keys
+    /// reselect the same *extent* (line count, and column span on the last line)
+    /// from wherever the cursor sits, rather than re-running the original motions —
+    /// matching vim's visual `.`.
+    fn capture_visual_shape(&mut self, op: char) {
+        let linewise = self.mode == Mode::VisualLine;
+        let a = self.visual_anchor;
+        let b = self.cursor;
+        let (start, end) = if (a.line, a.col) <= (b.line, b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let rows = end.line - start.line;
+        let mut keys = Vec::new();
+        if linewise {
+            keys.push(Key::char('V'));
+            for _ in 0..rows {
+                keys.push(Key::char('j'));
+            }
+        } else {
+            keys.push(Key::char('v'));
+            for _ in 0..rows {
+                keys.push(Key::char('j'));
+            }
+            // The final line's column span. Single-line: extend right by the
+            // selected width − 1. Multi-line: `j` only carried the start column
+            // down, so snap to column 0 and walk out to the end column.
+            let cols = if rows == 0 {
+                self.grapheme_steps(start.line, start.col, end.col)
+            } else {
+                keys.push(Key::char('0'));
+                self.grapheme_steps(end.line, 0, end.col)
+            };
+            for _ in 0..cols {
+                keys.push(Key::char('l'));
+            }
+        }
+        keys.push(Key::char(op));
+        self.pending_visual = Some(VisualShape {
+            keys,
+            is_change: op == 'c',
+        });
+    }
+
+    /// The number of grapheme steps (i.e. `l` presses) from byte column `from` to
+    /// byte column `to` on `line` — how far a reselect must walk to span them.
+    fn grapheme_steps(&self, line: usize, from: usize, to: usize) -> usize {
+        let s = self.buffer().line(line);
+        let mut col = from;
+        let mut n = 0;
+        while col < to {
+            col = unicode::next_grapheme(&s, col);
+            n += 1;
+        }
+        n
     }
 
     fn visual_range(&self) -> (usize, usize, bool, usize) {
@@ -465,6 +547,9 @@ impl Editor {
                 .ex_history
                 .last()
                 .map(|cmd| (cmd.clone(), RegKind::Char)),
+            Some('.') => {
+                (!self.insert_text.is_empty()).then(|| (self.insert_text.clone(), RegKind::Char))
+            }
             Some('+') | Some('*') => self.clipboard.as_ref()?.get().map(|(text, linewise)| {
                 let kind = if linewise {
                     RegKind::Line
@@ -514,7 +599,7 @@ impl Editor {
             .into_iter()
             .map(|(name, text, kind)| (name, text.to_string(), kind == RegKind::Line))
             .collect();
-        for name in ['%', '/', ':'] {
+        for name in ['%', '/', ':', '.'] {
             if let Some((text, kind)) = self.register_text(Some(name)) {
                 if !text.is_empty() {
                     out.push((name, text, kind == RegKind::Line));

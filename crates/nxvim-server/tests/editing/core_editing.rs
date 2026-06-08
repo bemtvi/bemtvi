@@ -359,3 +359,49 @@ async fn capital_r_enters_replace_mode_and_overwrites() {
     let view = latest_view(&mut incoming).expect("a redraw view");
     assert_eq!(view_str(&view, "mode_label"), "NORMAL");
 }
+
+// ===== linewise change (`cc`/`S`/`Vjc`) places one fresh empty line ==========
+
+#[tokio::test]
+async fn cc_on_the_first_line_replaces_it() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<Esc>gg");
+    feed(&rpc, "ccX<Esc>"); // change the first line
+    assert_eq!(lines(&rpc).await, vec!["X", "b", "c"]);
+}
+
+#[tokio::test]
+async fn cc_on_a_middle_line_replaces_it() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<Esc>gg");
+    feed(&rpc, "jccX<Esc>"); // change the middle line
+    assert_eq!(lines(&rpc).await, vec!["a", "X", "c"]);
+}
+
+#[tokio::test]
+async fn cc_on_the_last_line_replaces_it_in_place() {
+    // Regression: a linewise change of the buffer's final line must reopen the
+    // empty line *where that line was*, not before the surviving last line.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<Esc>"); // cursor ends on the last line "c"
+    feed(&rpc, "ccX<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a", "b", "X"]);
+}
+
+#[tokio::test]
+async fn cc_on_a_single_line_buffer_replaces_it() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ionly<Esc>"); // one line: "only"
+    feed(&rpc, "ccX<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["X"]);
+}
+
+#[tokio::test]
+async fn visual_linewise_change_at_eof_replaces_in_place() {
+    // `Vjc` over the buffer's final two lines reopens a single empty line in
+    // their place, then takes the typed text.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<Esc>ggjj"); // cursor on "c", the third of four
+    feed(&rpc, "VjcX<Esc>"); // change the last two lines (c, d)
+    assert_eq!(lines(&rpc).await, vec!["a", "b", "X"]);
+}

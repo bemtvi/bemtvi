@@ -286,3 +286,87 @@ async fn put_of_a_charwise_register_is_still_linewise() {
     feed(&rpc, ":put a<CR>");
     assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
 }
+
+// ---- The `".` last-insert register (dot-repeat plan, Phase 3) ----------------
+
+#[tokio::test]
+async fn last_insert_register_pastes_the_typed_text() {
+    let (rpc, _incoming) = start(None).await;
+    // `iabc<Esc>` records "abc" in `".`; `".p` pastes it after the cursor.
+    feed(&rpc, "iabc<Esc>");
+    feed(&rpc, "\".p"); // paste `".` after 'c' -> "abcabc"
+    assert_eq!(lines(&rpc).await, vec!["abcabc"]);
+}
+
+#[tokio::test]
+async fn getreg_reads_the_last_insert_register() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iZZ<Esc>");
+    // Route `getreg('.')` back through the buffer behind a marker so a plain
+    // `lines()` assertion proves the read.
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec![">ZZ"]);
+}
+
+#[tokio::test]
+async fn last_insert_register_holds_changed_text() {
+    let (rpc, _incoming) = start(None).await;
+    // A change operator (`ciw`) is an insert session too — `".` is its typed text.
+    feed(&rpc, "ione two<Esc>0");
+    feed(&rpc, "ciwfoo<Esc>");
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec![">foo"]);
+}
+
+#[tokio::test]
+async fn last_insert_register_reflects_the_latest_session() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifirst<Esc>");
+    feed(&rpc, "osecond<Esc>"); // a newer insert session replaces `".`
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec![">second"]);
+}
+
+#[tokio::test]
+async fn last_insert_register_tracks_backspaced_text() {
+    let (rpc, _incoming) = start(None).await;
+    // Two `<BS>` rub out the "XY" typed last, so `".` is just "ab".
+    feed(&rpc, "iabXY<BS><BS><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["ab"]);
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec![">ab"]);
+}
+
+#[tokio::test]
+async fn last_insert_register_captures_newlines() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<Esc>"); // `".` is "one\ntwo"
+                                    // Split the register on its newline to prove the `<CR>` was captured.
+    feed(
+        &rpc,
+        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, vim.split(vim.fn.getreg('.'), '\\n'))<CR>",
+    );
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+}
+
+#[tokio::test]
+async fn last_insert_register_is_read_only() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc<Esc>");
+    // `".dd` targets the read-only last-insert register for a delete: vim aborts
+    // the whole command (no bell), so the line is untouched.
+    feed(&rpc, "\".dd");
+    assert_eq!(lines(&rpc).await, vec!["abc"]);
+}

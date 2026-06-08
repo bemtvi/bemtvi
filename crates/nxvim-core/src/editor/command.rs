@@ -278,6 +278,7 @@ enum NormalCmd {
     AltBuffer,                                       // <C-^> / <C-6>
     TabNext(Option<usize>),                          // gt  ({count}gt → tab number)
     TabPrev(Option<usize>),                          // gT  ({count}gT → count back)
+    DotRepeat,                                       // .  (replay the last change)
 }
 
 /// The stage of a partially-typed command — what the *next* key means. The
@@ -324,6 +325,20 @@ pub(crate) struct PendingCommand {
     pub(crate) stage: Stage,
 }
 
+impl PendingCommand {
+    /// At a clean command boundary: no count, operator, register, or argument
+    /// stage pending — the next key starts a fresh command. The dot-repeat
+    /// recorder uses this to bracket one command's key stream (see
+    /// [`crate::editor::Editor::input`]).
+    pub(crate) fn is_clean(&self) -> bool {
+        self.count.is_none()
+            && self.op_count.is_none()
+            && self.operator.is_none()
+            && self.register.is_none()
+            && self.stage == Stage::Start
+    }
+}
+
 /// A fully-resolved normal/visual command, ready for [`Editor::execute`].
 enum ResolvedCommand {
     /// A motion — plain movement, or (when `pending.operator` is set) its range.
@@ -364,12 +379,28 @@ enum ParseStep {
 
 /// Valid `"x` register names so far: the named `a`–`z`/`A`–`Z`, the numbered
 /// `0`–`9`, the small-delete `-`, the black hole `_`, the unnamed `"`, and the
-/// read-only specials `%` (filename), `/` (last search), `:` (last command), and
-/// the system-clipboard `+` / `*`. The remaining specials — `.` (last insert),
-/// `=`, and the alternate-file `#` — are rejected until their phases land, so
+/// read-only specials `%` (filename), `/` (last search), `:` (last command), `.`
+/// (last insert), and the system-clipboard `+` / `*`. The remaining specials —
+/// `=` and the alternate-file `#` — are rejected until their phases land, so
 /// selecting one is a loud dead-end, never a silent no-op.
 fn is_register_name(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':' | '+' | '*')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':' | '.' | '+' | '*')
+}
+
+/// The length of the leading count prefix in a recorded key stream — used by
+/// dot-repeat to strip the recorded command's own count before a `[count].`
+/// override prepends a new one. Mirrors [`parse_step`]'s count rule: a run of
+/// ASCII digits at the very front, except a leading `0` (the column-zero motion)
+/// does not start a count. `dw` → 0, `3x` → 1, `12dd` → 2.
+fn leading_count_len(keys: &[Key]) -> usize {
+    let mut len = 0;
+    for key in keys {
+        match key.as_char() {
+            Some(c) if c.is_ascii_digit() && !(c == '0' && len == 0) => len += 1,
+            _ => break,
+        }
+    }
+    len
 }
 
 /// Whether `m` is a **jump** in vim's sense — a motion that records the
@@ -706,6 +737,7 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         }
         'p' => Complete(RC::Normal(N::PasteAfter)),
         'P' => Complete(RC::Normal(N::PasteBefore)),
+        '.' => Complete(RC::Normal(N::DotRepeat)),
         'u' => Complete(RC::Normal(N::Undo)),
         'J' => Complete(RC::Normal(N::Join)),
         '~' => Complete(RC::Normal(N::ToggleCase)),
@@ -993,8 +1025,17 @@ impl Editor {
             }
             NormalCmd::PasteAfter => self.paste(true, count),
             NormalCmd::PasteBefore => self.paste(false, count),
-            NormalCmd::Undo => self.undo(),
-            NormalCmd::Redo => self.redo(),
+            // Undo/redo edit the buffer (bumping `changedtick`) but are not the
+            // dot-repeat target: mark the command non-repeatable so the recorder
+            // discards it and `.` keeps replaying the change that preceded it.
+            NormalCmd::Undo => {
+                self.change_not_repeatable = true;
+                self.undo();
+            }
+            NormalCmd::Redo => {
+                self.change_not_repeatable = true;
+                self.redo();
+            }
             NormalCmd::Join => self.join_lines(count.max(2)),
             NormalCmd::ToggleCase => self.toggle_case(count),
             // `R` enters Replace mode: snapshot for undo, then overtype until
@@ -1031,8 +1072,45 @@ impl Editor {
             NormalCmd::AltBuffer => self.goto_alternate(),
             NormalCmd::TabNext(n) => self.goto_tab_next(n),
             NormalCmd::TabPrev(n) => self.goto_tab_prev(n),
+            NormalCmd::DotRepeat => self.repeat_change(),
         }
         self.reset_pending();
+    }
+
+    /// Replay the last buffer-changing command (`.`). Re-feeds the recorded raw
+    /// key stream through [`Editor::input`] under the `replaying_change` guard, so
+    /// the entire grammar (counts, operators, registers, text objects, inserted
+    /// text) re-parses and re-executes exactly as typed. No-op when nothing has
+    /// been recorded yet (vim beeps; nxvim has no bell).
+    fn repeat_change(&mut self) {
+        if self.last_change.is_empty() {
+            return;
+        }
+        // `.` itself must never become the new last change — mark this command
+        // non-repeatable so a following `.` still replays the original.
+        self.change_not_repeatable = true;
+        // A count typed on `.` (`3.`) *replaces* the recorded command's own count
+        // (vim: `dw` then `3.` runs `3dw`): strip the recorded leading count and
+        // prepend the new one. With no new count the recorded keys stand verbatim,
+        // so `3x` then `.` still deletes three.
+        let keys = match self.pending.count {
+            Some(n) => {
+                let tail = &self.last_change[leading_count_len(&self.last_change)..];
+                let mut keys: Vec<Key> = n.to_string().chars().map(Key::char).collect();
+                keys.extend_from_slice(tail);
+                keys
+            }
+            None => self.last_change.clone(),
+        };
+        // Clear `.`'s own pending count before replaying, so a prepended count
+        // digit starts a fresh count rather than accumulating onto it (`3.` would
+        // otherwise feed `3` onto the existing `3` and run `33…`).
+        self.reset_pending();
+        self.replaying_change = true;
+        for key in keys {
+            self.input(key);
+        }
+        self.replaying_change = false;
     }
 
     /// Apply a doubled operator (`dd`/`cc`/`yy`): linewise over `count` lines.

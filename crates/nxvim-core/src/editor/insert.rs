@@ -35,6 +35,7 @@ impl Editor {
             KeyCode::Enter => {
                 let at = self.cursor_char();
                 self.buffer_mut().insert_char(at, '\n');
+                self.insert_text.push('\n'); // `".` last-insert register
                 self.cursor.line += 1;
                 self.buffer_mut().modified = true;
                 self.buffer_mut().normalize();
@@ -77,6 +78,7 @@ impl Editor {
                 self.buffer_mut().insert_char(at, c);
                 self.cursor.col += c.len_utf8();
                 self.buffer_mut().modified = true;
+                self.insert_text.push(c); // `".` last-insert register
             }
             _ => {}
         }
@@ -105,6 +107,8 @@ impl Editor {
         self.buffer_mut().insert(at, &ws);
         self.cursor.col += n;
         self.buffer_mut().modified = true;
+        // The expanded tab is part of the `".` last-insert register.
+        self.insert_text.push_str(&ws);
         // Only a pure-spaces fill is unit-deletable (a literal `\t` is one
         // grapheme the normal backspace already removes wholesale). Anchor at the
         // start of a contiguous prior soft-tab run, else where this tab began.
@@ -137,9 +141,11 @@ impl Editor {
             let start = self.buffer().line_start(self.cursor.line);
             let s = self.buffer().line(self.cursor.line);
             let prev_col = unicode::prev_grapheme(&s, self.cursor.col);
+            let removed = s[prev_col..self.cursor.col].chars().count();
             self.buffer_mut().remove(start + prev_col..at);
             self.cursor.col = prev_col;
             self.buffer_mut().modified = true;
+            self.trim_insert_text(removed); // `".` last-insert register
         } else if self.cursor.line > 0 {
             let prev_len = self.buffer().line_len(self.cursor.line - 1);
             let join_at = self.buffer().byte_at(self.cursor.line - 1, prev_len);
@@ -147,6 +153,19 @@ impl Editor {
             self.cursor.line -= 1;
             self.cursor.col = prev_len;
             self.buffer_mut().modified = true;
+            self.trim_insert_text(1); // the joined newline
+        }
+    }
+
+    /// Pop the last `n` characters off the `".` last-insert accumulator, e.g. when
+    /// a `<BS>` rubs out text typed earlier in the same session. Bounded so
+    /// backspacing past the session's own text (into pre-existing buffer
+    /// characters) merely empties the accumulator rather than underflowing.
+    fn trim_insert_text(&mut self, n: usize) {
+        for _ in 0..n {
+            if self.insert_text.pop().is_none() {
+                break;
+            }
         }
     }
 
@@ -193,10 +212,12 @@ impl Editor {
         }
         let line_start = self.buffer().line_start(self.cursor.line);
         let range = line_start + col..line_start + self.cursor.col;
+        let removed = self.cursor.col - col; // pure ASCII spaces: bytes == chars
         self.buffer_mut().remove(range);
         self.cursor.col = col;
         self.buffer_mut().modified = true;
-        // Keep peeling on the next <BS> while soft-tab spaces remain before us.
+        self.trim_insert_text(removed); // `".` last-insert register
+                                        // Keep peeling on the next <BS> while soft-tab spaces remain before us.
         if col > anchor {
             self.soft_tab = Some((line, anchor));
         }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::buffer::Buffer;
 use crate::clipboard::Clipboard;
 use crate::highlight::Highlights;
-use crate::input::Key;
+use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::Options;
 use crate::syntax::SyntaxEngine;
@@ -345,6 +345,30 @@ struct Panel {
     targets: Vec<Option<(PathBuf, usize, usize)>>,
 }
 
+/// A just-committed visual-mode change, captured by [`Editor::visual_operate`]
+/// for dot-repeat. `keys` is the synthesized **size-faithful** reselect-and-
+/// operate stream (`v`/`V` + motions + operator) — replaying it from any cursor
+/// reselects the same extent vim would, rather than re-running the original
+/// motions. For a change (`is_change`), the inserted text and a trailing `<Esc>`
+/// are appended at the commit point in [`Editor::input`] (known only once the
+/// insert session ends).
+pub(crate) struct VisualShape {
+    keys: Vec<Key>,
+    is_change: bool,
+}
+
+/// Project the literal text of an insert session into the keys that retype it,
+/// for appending to a dot-repeat replay stream: each char is its key, a newline
+/// becomes `<Enter>`. The caller adds the closing `<Esc>`.
+fn insert_text_keys(text: &str) -> Vec<Key> {
+    text.chars()
+        .map(|c| match c {
+            '\n' => Key::new(KeyCode::Enter),
+            c => Key::char(c),
+        })
+        .collect()
+}
+
 /// The complete editor state: the open buffers plus the single window's state.
 pub struct Editor {
     /// All open buffers, keyed by id. The current buffer is *derived* from the
@@ -503,6 +527,36 @@ pub struct Editor {
     /// direction) and `,` (opposite). Cross-command memory, not pending state, so
     /// it lives outside [`PendingCommand`] and survives `reset_pending`.
     last_find: Option<(FindKind, char)>,
+    /// Keys accumulated since the current normal-mode command boundary — the
+    /// in-progress candidate change. Committed to [`Editor::last_change`] when the
+    /// command finishes having edited the buffer; cleared when it finishes without
+    /// editing. Recorded at the [`Editor::input`] chokepoint (see the wrapper there).
+    redo_recording: Vec<Key>,
+    /// The committed last buffer-changing command, replayed verbatim by `.`. Empty
+    /// until the first dot-repeatable change.
+    last_change: Vec<Key>,
+    /// True while `.` is re-feeding [`Editor::last_change`] through `input`, so the
+    /// replayed keys neither record themselves nor overwrite `last_change`.
+    replaying_change: bool,
+    /// The buffer's `changedtick` when the current command began. Compared at the
+    /// command boundary: a higher tick means the command edited the buffer (commit
+    /// it as the last change); equal means a pure motion (discard).
+    change_start_tick: u64,
+    /// Set when the in-progress command is one `.` must *not* capture (`u`/`<C-r>`,
+    /// or anything routed through the command line). Reset at each boundary; when
+    /// set at commit time the candidate is discarded even though the buffer changed.
+    change_not_repeatable: bool,
+    /// The text typed during the most recent insert session — vim's `".` register
+    /// (last-insert). Cleared the instant a new insert session begins (the
+    /// Normal→Insert transition in [`Editor::input`]) and grown char-by-char in
+    /// [`Editor::handle_insert`], so once the session ends it holds exactly what
+    /// was inserted, read back by `register_text(Some('.'))` and `"."`/`<C-r>.`.
+    insert_text: String,
+    /// The in-flight visual-mode change's size-faithful replay stream (see
+    /// [`VisualShape`]). Set by [`Editor::visual_operate`] just before it mutates,
+    /// consumed at the dot-repeat commit point in [`Editor::input`]; reset at each
+    /// Normal-mode command boundary.
+    pending_visual: Option<VisualShape>,
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
@@ -658,6 +712,13 @@ impl Editor {
             registers: Registers::default(),
             pending: PendingCommand::default(),
             last_find: None,
+            redo_recording: Vec::new(),
+            last_change: Vec::new(),
+            replaying_change: false,
+            change_start_tick: 0,
+            change_not_repeatable: false,
+            insert_text: String::new(),
+            pending_visual: None,
             snapshot_taken: false,
             now_mono: 0,
             soft_tab: None,
@@ -771,10 +832,79 @@ impl Editor {
         self.preserve_desired = false;
         self.eol_request = false;
 
+        // The mode before dispatch: a Normal→Insert transition on this key starts
+        // a fresh insert session, which resets the `".` last-insert accumulator.
+        let was_insert = matches!(self.mode, Mode::Insert | Mode::Replace);
+
+        // Dot-repeat recording. The *outer* call (not a `.` replay) records its
+        // raw key stream from one normal/visual command boundary to the next; if
+        // the command edited the buffer it becomes `last_change`, replayed by `.`.
+        // Replayed keys (`replaying_change`) skip this entirely — they only execute.
+        let recording = !self.replaying_change;
+        // A new candidate change begins only at a clean *Normal*-mode boundary —
+        // not mid-Visual: a visual selection (`v`…`d`) is one change spanning the
+        // `v`, its motions, and the operator, so the bracket opens at the `v` and
+        // stays open until the operator returns to Normal.
+        let starting = recording && self.mode == Mode::Normal && self.pending.is_clean();
+        if starting {
+            self.redo_recording.clear();
+            self.change_start_tick = self.buffer().changedtick;
+            self.change_not_repeatable = false;
+            self.pending_visual = None;
+        }
+        if recording {
+            self.redo_recording.push(key);
+        }
+
         match self.mode {
             Mode::Insert | Mode::Replace => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
             _ => self.handle_normal(key),
+        }
+
+        // A command that just entered insert mode (`i`, `cw`, `o`, `s`, `R`, …)
+        // opens a new insert session: clear the `".` accumulator so it captures
+        // only this session's typed text. The key that entered insert never types
+        // text itself, so clearing after dispatch is safe — the following keys'
+        // `handle_insert` calls grow `insert_text` from empty.
+        if matches!(self.mode, Mode::Insert | Mode::Replace) && !was_insert {
+            self.insert_text.clear();
+        }
+
+        if recording {
+            // Entering the command line (`:`/`/`/`?`) makes this command
+            // non-repeatable: `:d`, `:s`, and operator-search `d/foo` are not
+            // `.`-repeatable in vim. Caught centrally since they all transit
+            // `Command` mode.
+            if self.mode == Mode::Command {
+                self.change_not_repeatable = true;
+            }
+            // The command is finished exactly when we are back at a clean normal-
+            // mode boundary — which correctly spans an insert session (`ciw…<Esc>`
+            // is not "done" until `<Esc>` returns to Normal).
+            let done = self.mode == Mode::Normal && self.pending.is_clean();
+            if done {
+                let changed = self.buffer().changedtick != self.change_start_tick;
+                if changed && !self.change_not_repeatable {
+                    // A visual-initiated change replays as a *size-faithful*
+                    // reselect (vim reselects the same extent from the new cursor,
+                    // not the original motions), so commit the synthesized stream
+                    // `visual_operate` stashed; a change (`c`) appends the inserted
+                    // text it could only know once insert ended. Everything else
+                    // commits its raw recorded keys.
+                    self.last_change = match self.pending_visual.take() {
+                        Some(mut shape) => {
+                            if shape.is_change {
+                                shape.keys.extend(insert_text_keys(&self.insert_text));
+                                shape.keys.push(Key::new(KeyCode::Esc));
+                            }
+                            shape.keys
+                        }
+                        None => std::mem::take(&mut self.redo_recording),
+                    };
+                }
+                self.redo_recording.clear();
+            }
         }
 
         // Update vim's `curswant`: vertical motions keep the remembered column,

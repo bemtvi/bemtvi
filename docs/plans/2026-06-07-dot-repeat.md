@@ -182,7 +182,7 @@ sets `change_not_repeatable` so the commit is skipped:
 
 ## Phases
 
-### Phase 1 — record + replay normal-mode changes (the core)
+### Phase 1 — record + replay normal-mode changes (the core) — ✅ landed
 
 End-to-end `.` for changes initiated in normal mode, replayed verbatim (the
 recorded count, register, operator, motion, and inserted text all re-parse from the
@@ -209,7 +209,7 @@ keys).
     `:d<CR>` is not repeated by `.`.
   - `.` with no prior change is a no-op (buffer unchanged).
 
-### Phase 2 — `[count].` count override
+### Phase 2 — `[count].` count override — ✅ landed
 
 In vim a count on `.` *replaces* the original command's count: `dw` then `3.` does
 `3dw`; `3x` then `.` still deletes 3 (no new count → reuse recorded).
@@ -228,18 +228,34 @@ In vim a count on `.` *replaces* the original command's count: `dw` then `3.` do
 Recorded but deliberately scoped out of Phase 1, each noted to stay honest rather
 than silently approximated:
 
-- **The `".` last-insert register.** The insert session's keys are already captured;
-  `".` wants the literal inserted *text*. A small projection (replay the insert keys
-  into a scratch string, or capture inserted chars during the session) fills the
-  register `is_register_name` currently rejects (`command.rs:371`). Natural follow-on
-  since the recording already exists.
-- **Faithful visual-mode dot-repeat.** A change begun in visual mode (`viwd`, `Vjd`)
-  records and *will* replay its keystrokes, but vim's visual `.` reselects the same
-  **size** (same line/char count) from the new cursor rather than re-running the same
-  motion keys. Phase 1 commits visual-initiated changes as plain key replay (a close
-  approximation); making it size-faithful (stash the last visual extent, synthesize
-  the reselect) is its own step. Until then the divergence is documented at the
-  recording site, not hidden.
+- **The `".` last-insert register.** — ✅ landed. Rather than projecting the redo
+  keys, the insert session's text is captured directly: an `Editor::insert_text`
+  accumulator is cleared on the Normal→Insert transition (the chokepoint in
+  `Editor::input`) and grown char-by-char in `handle_insert` (Char/Enter/Tab append,
+  `<BS>` trims). `register_text`/`register_mirror` expose it as the charwise `".`
+  (read-only, so `".dd` aborts via the existing `is_readonly_register('.')`), and
+  `is_register_name` now accepts `.`. So `".p` and `vim.fn.getreg('.')` return the
+  last inserted text. (Insert-mode `<C-r>.` is *not* wired — `handle_insert` has no
+  `<C-r>` register-paste path yet — so that remains out of scope.)
+- **Faithful visual-mode dot-repeat.** — ✅ landed. A visual `d`/`c` is now
+  size-faithful: `visual_operate` calls `capture_visual_shape`, which synthesizes a
+  reselect-and-operate key stream (`v`/`V` + `j`×rows + `l`×cols + op, columns
+  measured in graphemes) sized to the just-operated selection's extent, and stashes
+  it in `pending_visual`. The dot-repeat commit point in `input()` prefers that
+  stream over the raw recorded keys (and appends the inserted text + `<Esc>` for a
+  `c`), so `.` reselects the same extent from the new cursor rather than re-running
+  `viw`/word motions. The recording bracket also now opens only at a *Normal*-mode
+  boundary, so a whole `v`…`d` selection is captured as one change. (`=` and other
+  visual ops fall back to plain key replay; multi-line charwise reselect snaps to the
+  final line's column, a close approximation of vim's column model.)
+  - **Discovered, separate bug — ✅ fixed.** A linewise change of the buffer's
+    *final* line(s) (`cc`/`S`/`Vjc` at EOF) mis-placed the fresh empty line —
+    `linewise_change` clamped the insert position to `last_line()` (opening the line
+    *before* the surviving last line) and left the cursor past the end. Now it
+    appends the reopened line in place when the block was the tail, and treats a
+    whole-buffer change as the single empty line `normalize` already leaves.
+    Pre-existing and unrelated to dot-repeat; fixed test-first in
+    `editing/core_editing.rs` (cc on first/middle/last/single-line, `Vjc` at EOF).
 - **Operator + search motion (`d/pat<CR>` then `.`).** Excluded by the command-line
   rule above (it transits `Command` mode). Repeating it faithfully means recording
   the committed search pattern alongside the keys; deferred with the rest of the

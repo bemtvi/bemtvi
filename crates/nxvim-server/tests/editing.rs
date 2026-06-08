@@ -21,6 +21,8 @@ mod buffer_window_api;
 mod clipboard;
 #[path = "editing/core_editing.rs"]
 mod core_editing;
+#[path = "editing/dot_repeat.rs"]
+mod dot_repeat;
 #[path = "editing/ex_substitute.rs"]
 mod ex_substitute;
 #[path = "editing/global_cmd.rs"]

@@ -59,14 +59,18 @@ gap. Recorded here so the sweep doesn't lose them.
     `vim.treesitter.highlighter` is a small shim — legacy-API probes (`hl_map`)
     read nil and `active` is empty, but `highlighter.new` fails loud
     (`vim._notimpl`), so `vim.treesitter.start` raises rather than faking it.
-  - **In-memory query overrides don't change the paint.** A plugin that overrides
-    a highlight/indent query via `vim.treesitter.query.set` changes only the
-    Lua-side `LanguageTree`; the redraw painter resolves highlights and indent
-    through the Rust engine, which reads `queries/<lang>/*.scm` from disk
-    (runtimepath). **On-disk** query overrides *are* honored — a drop-in
-    nvim-treesitter `queries/` tree works; **in-memory** ones are not. Direct
-    consequence of the engine/API split in
-    [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md).
+  - **Customized queries don't change the paint.** The redraw painter resolves
+    highlights and indent through the Rust engine, which compiles a **single**
+    `queries/<lang>/highlights.scm` (and `indents.scm`) per grammar — it does *not*
+    run neovim's query-resolution logic. So three things a config/plugin expects to
+    affect highlighting are inert against the paint: in-memory
+    `vim.treesitter.query.set`, `after/queries/<lang>/*.scm` overlays, and
+    `;extends` / `;inherits` modeline merges. A drop-in *base* `queries/<lang>/`
+    tree **is** honored (it's the one file the engine reads); layering/merging on
+    top of it is not. The fix is the query-resolution bridge — Lua resolves, the
+    engine executes — deferred behind `vim.treesitter.start`; see
+    [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and
+    [the query-bridge design](specs/2026-06-08-treesitter-query-bridge-design.md).
   - **Injections.** A buffer's root tree parses; `LanguageTree` child languages /
     `language_for_range` are not wired, so an injected-language query returns only
     the host tree's captures.

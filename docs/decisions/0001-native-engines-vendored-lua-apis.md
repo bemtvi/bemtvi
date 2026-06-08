@@ -81,6 +81,16 @@ is the shared substrate ([`extmark.rs`](../../crates/nxvim-core/src/extmark.rs):
    projection is the open wire.
 3. **LSP on-type formatting** (if pursued) — an async edit that must use the
    arrive-late / apply-as-follow-up pattern, never blocking the keystroke.
+4. **Query resolution → execution** — a plugin customizing a highlight/indent
+   query (in-memory `query.set`, an `after/queries` overlay, or a `;extends`
+   merge). The native engine reads a *single* `highlights.scm`; it does not run
+   neovim's query-merge logic. The bridge goes one level deeper than the others:
+   **Lua resolves** the final query string (`query.get` already merges explicit +
+   `;extends` + runtimepath, faithfully), the server **pushes** it to the engine
+   on buffer-open / `query.set`, and the engine **compiles + caches + executes** it
+   (loud on a bad query). Lua owns resolution, Rust owns execution; it subsumes the
+   in-memory-query leak in *Consequences* below. **Deferred behind bridge #1**;
+   design: [treesitter query bridge](../specs/2026-06-08-treesitter-query-bridge-design.md).
 
 Same shape each time: an enrichment that lives outside core's sync path is wired
 into the projection layer; the synchronous treesitter floor is always underneath,
@@ -109,10 +119,12 @@ so a missing or slow server degrades to "syntactic but correct," never to blank.
 - **One ecosystem assumption we cannot honor:** that a single tree both highlights
   the buffer *and* answers queries. Most plugins only query, so they don't notice.
   Where it leaks, it is a bridge or a documented approximation: `start()` →
-  bridge (#1 above); a custom highlight/indent query set *in Lua memory* won't
-  change the paint (the painter reads disk `queries/<lang>/*.scm` via the native
-  engine) → recorded in [known-approximations.md](../known-approximations.md);
-  injection-aware plugins → the deferred injections work.
+  bridge (#1 above); a *customized* highlight/indent query — in-memory `query.set`,
+  an `after/queries` overlay, or a `;extends` merge — doesn't change the paint
+  today, because the engine reads a single `highlights.scm` rather than running
+  neovim's query-merge → bridge (#4 above, deferred) and recorded in
+  [known-approximations.md](../known-approximations.md); injection-aware plugins →
+  the deferred injections work.
 
 ## Alternatives considered
 

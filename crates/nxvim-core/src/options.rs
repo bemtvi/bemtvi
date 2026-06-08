@@ -42,9 +42,29 @@ pub struct Options {
     /// The `'tabline'` format string (the same `%`-format mini-language the
     /// statusline uses, plus the `%T`/`%X` tab click-region items). Empty means
     /// the built-in tab cells (`Vec<TabView>`); a non-empty value is parsed and
-    /// rendered by the same engine into a single styled row. A whole-line
+    /// rendered by the same engine into a single styled row. The mouse options
+    /// (`mouse`/`mousemodel`/`mousescroll`/`mousetime`) follow this block. A whole-line
     /// `%!v:lua.…()` is the usual form. Global by nature (there is one tabline).
     pub tabline: String,
+    /// Which modes mouse input is acted on (`'mouse'`): a set of mode chars —
+    /// `n`ormal, `v`isual, `i`nsert, `c`mdline, `a`ll, plus `r`/`h` (unused yet).
+    /// A gesture is honored only if the current mode's char (or `a`) is present;
+    /// otherwise it is a silent no-op (vim-faithful). Default `"nvi"` — note
+    /// **not** `"a"`, so cmdline-mode mouse is off out of the box.
+    pub mouse: String,
+    /// Right-click semantics (`'mousemodel'`): `popup`/`popup_setpos` pop a menu
+    /// (the selection-extend gesture is then `<S-LeftMouse>`), `extend` makes the
+    /// right button extend the selection. Default `"popup_setpos"`. Honored from
+    /// the phase that wires right-click; stored here so `:set` accepts it now.
+    pub mousemodel: String,
+    /// Wheel step (`'mousescroll'`): `"ver:{lines},hor:{cols}"`, a `0` count
+    /// disabling that direction. Default `"ver:3,hor:6"`. Honored from the wheel
+    /// phase; stored here so `:set` accepts it now.
+    pub mousescroll: String,
+    /// Max milliseconds between two presses for the second to count as a
+    /// multi-click (`'mousetime'`). Default `500`. Honored from the multi-click
+    /// phase; stored here so `:set` accepts it now.
+    pub mousetime: usize,
 }
 
 impl Default for Options {
@@ -65,6 +85,13 @@ impl Default for Options {
             statusline: String::new(),
             // No custom tabline by default — the built-in tab cells are used.
             tabline: String::new(),
+            // Mouse defaults match neovim exactly. `mouse` is `"nvi"` (not `"a"`):
+            // cmdline-mode mouse is off by default. `mousemodel` is `popup_setpos`,
+            // so right-click pops a menu and `<S-LeftMouse>` is the extend gesture.
+            mouse: "nvi".to_string(),
+            mousemodel: "popup_setpos".to_string(),
+            mousescroll: "ver:3,hor:6".to_string(),
+            mousetime: 500,
         }
     }
 }
@@ -407,6 +434,10 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "laststatus" | "ls" => Some(("laststatus", Num)),
         "statusline" | "stl" => Some(("statusline", Str)),
         "tabline" | "tal" => Some(("tabline", Str)),
+        "mouse" => Some(("mouse", Str)),
+        "mousemodel" | "mousem" => Some(("mousemodel", Str)),
+        "mousescroll" => Some(("mousescroll", Str)),
+        "mousetime" | "mouset" => Some(("mousetime", Num)),
         _ => None,
     }
 }

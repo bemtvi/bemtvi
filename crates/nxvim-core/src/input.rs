@@ -70,6 +70,147 @@ impl Key {
     }
 }
 
+/// Which physical mouse control a [`MouseEvent`] came from — the `button`
+/// argument of neovim's `nvim_input_mouse`. `Wheel` is the scroll wheel (its
+/// direction lives in [`MouseAction`]); `Move` is a bare pointer move
+/// (`'mousemoveevent'`); `X1`/`X2` are the back/forward thumb buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Wheel,
+    Move,
+    X1,
+    X2,
+}
+
+/// What a mouse button did — the `action` argument of `nvim_input_mouse`. For an
+/// ordinary button this is press / drag / release; for [`MouseButton::Wheel`] it
+/// is a scroll *direction* (`WheelUp`/`Down`/`Left`/`Right`); for
+/// [`MouseButton::Move`] it is [`MouseAction::MoveTo`].
+///
+/// Note neovim's deliberate API naming: a wheel `action = "up"` means *scroll the
+/// content toward the top of the buffer* — we model the observable behavior, so
+/// [`MouseAction::WheelUp`] scrolls up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MouseAction {
+    Press,
+    Drag,
+    Release,
+    MoveTo,
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+}
+
+/// A single mouse gesture at a screen cell — nxvim's analogue of a parsed
+/// [`Key`], fed to `Editor::mouse`. Coordinates are **global** zero-based screen
+/// cells (`grid 0`, the same space redraw events use); the editor owns the
+/// hit-test from a cell back to a window and buffer position, so every front end
+/// (TUI now, GUI later) only has to forward the raw cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MouseEvent {
+    pub button: MouseButton,
+    pub action: MouseAction,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    /// Global screen row (0-based).
+    pub row: usize,
+    /// Global screen column (0-based).
+    pub col: usize,
+    /// Server-stamped receive time in milliseconds, from a monotonic clock the
+    /// server owns. [`MouseEvent::parse`] leaves this `0` — the wire call carries
+    /// no timestamp; the server fills it in right after parsing so the editor's
+    /// multi-click detection (`'mousetime'`) compares pure deltas without reading
+    /// any clock itself, keeping `nxvim-core` time-free and deterministic in tests.
+    pub stamp_ms: u64,
+}
+
+impl MouseEvent {
+    /// Parse the `nvim_input_mouse(button, action, modifier, row, col)` arguments
+    /// into a [`MouseEvent`]. An unknown `button`, or an `action` that doesn't fit
+    /// the button (e.g. `"press"` on the wheel, or `"up"` on the left button), is
+    /// an `Err` naming the offending value — a malformed RPC call fails loud at the
+    /// boundary rather than being silently coerced. `grid` is not taken: nxvim is
+    /// single-grid, so the editor always hit-tests the global cell itself.
+    pub fn parse(
+        button: &str,
+        action: &str,
+        modifier: &str,
+        row: usize,
+        col: usize,
+    ) -> Result<MouseEvent, String> {
+        let button = match button {
+            "left" => MouseButton::Left,
+            "right" => MouseButton::Right,
+            "middle" => MouseButton::Middle,
+            "wheel" => MouseButton::Wheel,
+            "move" => MouseButton::Move,
+            "x1" => MouseButton::X1,
+            "x2" => MouseButton::X2,
+            other => return Err(format!("nvim_input_mouse: unknown button {other:?}")),
+        };
+        let action = match button {
+            MouseButton::Wheel => match action {
+                "up" => MouseAction::WheelUp,
+                "down" => MouseAction::WheelDown,
+                "left" => MouseAction::WheelLeft,
+                "right" => MouseAction::WheelRight,
+                other => {
+                    return Err(format!(
+                        "nvim_input_mouse: wheel action must be up/down/left/right, got {other:?}"
+                    ))
+                }
+            },
+            // A bare move ignores its action string (neovim does the same).
+            MouseButton::Move => MouseAction::MoveTo,
+            _ => match action {
+                "press" => MouseAction::Press,
+                "drag" => MouseAction::Drag,
+                "release" => MouseAction::Release,
+                other => {
+                    return Err(format!(
+                        "nvim_input_mouse: button action must be press/drag/release, got {other:?}"
+                    ))
+                }
+            },
+        };
+        let (ctrl, alt, shift) = parse_mouse_modifier(modifier)?;
+        Ok(MouseEvent {
+            button,
+            action,
+            ctrl,
+            alt,
+            shift,
+            row,
+            col,
+            // The server stamps this from its clock immediately after parsing.
+            stamp_ms: 0,
+        })
+    }
+}
+
+/// Parse the `modifier` argument of `nvim_input_mouse` — a run of modifier chars
+/// with the `-` separator optional, so `"C-S"`, `"cs"`, and `"CS"` all mean
+/// Ctrl+Shift. Returns `(ctrl, alt, shift)`. An unrecognized char is an `Err`
+/// (fail loud), matching the rest of [`MouseEvent::parse`].
+fn parse_mouse_modifier(modifier: &str) -> Result<(bool, bool, bool), String> {
+    let (mut ctrl, mut alt, mut shift) = (false, false, false);
+    for c in modifier.chars() {
+        match c.to_ascii_uppercase() {
+            'C' => ctrl = true,
+            'A' | 'M' | 'D' => alt = true,
+            'S' => shift = true,
+            '-' => {} // optional separator
+            other => return Err(format!("nvim_input_mouse: unknown modifier {other:?}")),
+        }
+    }
+    Ok((ctrl, alt, shift))
+}
+
 /// Parse a vim-style key-notation string into a list of [`Key`]s.
 ///
 /// Recognizes literal characters and `<...>` special forms with optional

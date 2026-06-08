@@ -397,7 +397,7 @@ impl Editor {
 
     /// Set the visual selection to span `[lo, hi)`: anchor at the first char,
     /// live cursor on the last char (inclusive). Empty ranges park both at `lo`.
-    fn set_visual_span(&mut self, lo: usize, hi: usize) {
+    pub(crate) fn set_visual_span(&mut self, lo: usize, hi: usize) {
         self.set_cursor_char(lo);
         self.visual_anchor = self.cursor;
         let end = if hi > lo {
@@ -427,7 +427,7 @@ impl Editor {
 
     /// `[start, end)` of the maximal run around `idx` of chars sharing its
     /// `span_class`. Buffer-wide; `end` never passes the trailing phantom `\n`.
-    fn class_span(&self, idx: usize, big: bool) -> (usize, usize) {
+    pub(crate) fn class_span(&self, idx: usize, big: bool) -> (usize, usize) {
         let last = self.last_char_idx();
         let idx = idx.min(last);
         let cls = self.span_class(idx, big);

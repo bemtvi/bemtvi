@@ -30,7 +30,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
@@ -91,6 +91,69 @@ pub async fn start_attached(
 /// Type a string of vim key-notation (a fire-and-forget `nvim_input` notify).
 pub fn feed(rpc: &Rpc, keys: &str) {
     rpc.notify("nvim_input", vec![Value::from(keys)]);
+}
+
+/// A fake monotonic millisecond clock for mouse multi-click tests. Hand its
+/// [`handle`](TestClock::handle) to [`ServerInit::mouse_clock`] before spawning,
+/// keep the `TestClock`, and [`set_ms`](TestClock::set_ms) it between gestures to
+/// place them inside or outside `'mousetime'` deterministically — the server
+/// stamps each `nvim_input_mouse` from this instead of the wall clock, so
+/// "two clicks 100 ms apart" never depends on real timing.
+#[derive(Clone, Default)]
+pub struct TestClock(Arc<AtomicU64>);
+
+impl TestClock {
+    /// A fresh clock reading `0`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Set the time the server will stamp onto the *next* mouse gesture. Only
+    /// takes effect for gestures the server processes after this store, so always
+    /// await a barrier (e.g. [`cursor`] / [`mode`]) between two `set_ms` + feeds.
+    pub fn set_ms(&self, ms: u64) {
+        self.0.store(ms, Ordering::SeqCst);
+    }
+    /// The shared handle to put in [`ServerInit::mouse_clock`].
+    pub fn handle(&self) -> Arc<AtomicU64> {
+        self.0.clone()
+    }
+}
+
+/// Send a mouse gesture via `nvim_input_mouse(button, action, "", 0, row, col)`
+/// — `row`/`col` are global, 0-based screen cells (`grid 0`), the way a real
+/// client reports them. Fire-and-forget; pair with a [`barrier`] / [`cursor`]
+/// read to observe the effect. For modifiers or to assert the RPC *rejects* a
+/// malformed call, drive `nvim_input_mouse` directly.
+pub fn feed_mouse(rpc: &Rpc, button: &str, action: &str, row: usize, col: usize) {
+    rpc.notify(
+        "nvim_input_mouse",
+        vec![
+            Value::from(button),
+            Value::from(action),
+            Value::from(""),
+            Value::from(0u64),
+            Value::from(row as u64),
+            Value::from(col as u64),
+        ],
+    );
+}
+
+/// Like [`feed_mouse`], but first advance `clock` to `ms` so the server stamps
+/// this gesture at that time — for driving `'mousetime'`-based multi-click
+/// (double/triple-click) deterministically. Await a barrier (e.g. [`cursor`] /
+/// [`mode`]) before the next `feed_mouse_at`, so the server reads this gesture's
+/// stamp before the clock moves on.
+pub fn feed_mouse_at(
+    rpc: &Rpc,
+    clock: &TestClock,
+    ms: u64,
+    button: &str,
+    action: &str,
+    row: usize,
+    col: usize,
+) {
+    clock.set_ms(ms);
+    feed_mouse(rpc, button, action, row, col);
 }
 
 /// Run an ex-command via `nvim_command`.

@@ -809,3 +809,78 @@ async fn all_mode_map_covers_placement() {
         "an '' all-mode map fires while placing"
     );
 }
+
+// ===== mouse: click toggles a cursor while placing ==========================
+
+/// In placement mode a left-click drops a cursor at the clicked cell, and a
+/// second click on that same cell removes it — the mouse form of the toggling
+/// `c` command. The primary navigates to the click for free.
+#[tokio::test]
+async fn mouse_click_toggles_cursor_while_placing() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iabc<CR>abc<CR>abc<Esc>gg");
+    command(&rpc, "set nonumber norelativenumber").await;
+    // Enter placement: a cursor at (0,0). With nonumber the global screen cell
+    // equals the buffer (line, col).
+    feed(&rpc, "<A-c>");
+    // Click a bare cell on line 2 (row 1, col 1) → adds a cursor there.
+    feed_mouse(&rpc, "left", "press", 1, 1);
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        secondary_cursors(&map),
+        vec![(0, 0), (1, 1)],
+        "the click added a cursor at the clicked cell"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 1),
+        "the primary navigated to the click"
+    );
+    // Click the same cell again → toggles that cursor off.
+    feed_mouse(&rpc, "left", "press", 1, 1);
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        secondary_cursors(&map),
+        vec![(0, 0)],
+        "the second click on the same cell removed the cursor"
+    );
+}
+
+/// Cursors dropped by mouse-click behave exactly like keyboard-placed ones: after
+/// `<Esc>` finishes placement, an edit applies at every clicked position.
+#[tokio::test]
+async fn mouse_placed_cursors_edit_together() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc<CR>abc<CR>abc<Esc>gg");
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<A-c>"); // cursor at (0,0)
+    feed_mouse(&rpc, "left", "press", 1, 0); // add at line 2, col 0
+    feed_mouse(&rpc, "left", "press", 2, 0); // add at line 3, col 0
+    let _ = lines(&rpc).await; // barrier
+    feed(&rpc, "<Esc>x"); // finish placement, then delete under every cursor
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["bc", "bc", "bc"],
+        "the edit ran at all three clicked cursors"
+    );
+}
+
+/// `u` in placement mode steps back a mouse-placed cursor, just like an undo of a
+/// keyboard `c` drop — the click records placement undo.
+#[tokio::test]
+async fn mouse_placement_is_undoable() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iabc<CR>abc<CR>abc<Esc>gg");
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<A-c>"); // cursor at (0,0)
+    feed_mouse(&rpc, "left", "press", 1, 1); // add at (1,1)
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(secondary_cursors(&map), vec![(0, 0), (1, 1)]);
+    // Undo the placement: the clicked cursor is removed, the first stays.
+    let map = redraw_after(&rpc, &mut incoming, "u").await;
+    assert_eq!(
+        secondary_cursors(&map),
+        vec![(0, 0)],
+        "u stepped back the mouse placement"
+    );
+}

@@ -30,7 +30,7 @@ use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, MouseButton, MouseEventKind,
+    EventStream, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming};
@@ -290,7 +290,55 @@ where
                                     }
                                 }
                             }
+                        } else {
+                            // No client-owned overlay (panel / completion popup) is
+                            // open, so this is a text-area click: forward the global
+                            // cell to the server, which owns the hit-test back to a
+                            // window + buffer position (focus-follows-click + cursor
+                            // placement). `grid` is 0 — nxvim is single-grid.
+                            rpc.notify(
+                                "nvim_input_mouse",
+                                vec![
+                                    Value::from("left"),
+                                    Value::from("press"),
+                                    Value::from(mouse_modifier(m.modifiers)),
+                                    Value::from(0u64),
+                                    Value::from(m.row as u64),
+                                    Value::from(m.column as u64),
+                                ],
+                            );
                         }
+                    }
+                    // Drag and release of the left button drive a text-area
+                    // selection: the server extends Visual from the press anchor on
+                    // drag, and keeps it on release. Forwarded unconditionally — the
+                    // server no-ops them unless a text press set an anchor, so a
+                    // stray drag over chrome does nothing.
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        rpc.notify(
+                            "nvim_input_mouse",
+                            vec![
+                                Value::from("left"),
+                                Value::from("drag"),
+                                Value::from(mouse_modifier(m.modifiers)),
+                                Value::from(0u64),
+                                Value::from(m.row as u64),
+                                Value::from(m.column as u64),
+                            ],
+                        );
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        rpc.notify(
+                            "nvim_input_mouse",
+                            vec![
+                                Value::from("left"),
+                                Value::from("release"),
+                                Value::from(mouse_modifier(m.modifiers)),
+                                Value::from(0u64),
+                                Value::from(m.row as u64),
+                                Value::from(m.column as u64),
+                            ],
+                        );
                     }
                     // The mouse wheel drives the completion UI. Over the doc preview
                     // box it scrolls the docs — a purely client-side gesture (the box
@@ -408,4 +456,22 @@ fn text_height(terminal_height: u16) -> u16 {
 /// the mouse hit-test shared by the completion popup and its doc preview box.
 fn within(col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
     col >= x && col < x + w && row >= y && row < y + h
+}
+
+/// The `nvim_input_mouse` modifier string for a crossterm mouse event's
+/// modifiers — e.g. Shift+Ctrl → `"CS"`. The server's parser accepts the chars in
+/// any order with the `-` separator optional, so concatenation is enough. Drives
+/// shift-click (extend the selection) and the future Ctrl/Alt gestures.
+fn mouse_modifier(mods: KeyModifiers) -> String {
+    let mut s = String::new();
+    if mods.contains(KeyModifiers::CONTROL) {
+        s.push('C');
+    }
+    if mods.contains(KeyModifiers::SHIFT) {
+        s.push('S');
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        s.push('A');
+    }
+    s
 }

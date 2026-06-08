@@ -42,6 +42,9 @@ fn main() -> Result<()> {
         runtimepath,
         // The real editor wires the host clipboard for the `"+` / `"*` registers.
         clipboard: nxvim_server::ClipboardProvider::System,
+        // The real binary uses the monotonic wall clock for mouse multi-click
+        // timing; only tests inject a fake clock here.
+        mouse_clock: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread

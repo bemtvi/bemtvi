@@ -4,13 +4,24 @@
 use crate::redraw::{lines_value, style_value};
 use crate::Server;
 use nxvim_core::{
-    BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId, WindowConfigSpec,
-    WindowId,
+    BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, MouseEvent, TabId,
+    WindowConfigSpec, WindowId,
 };
 use nxvim_rpc::Incoming;
 use rmpv::Value;
 
 impl Server {
+    /// The current time in milliseconds for stamping a mouse event. Reads the
+    /// injected fake clock ([`ServerInit::mouse_clock`](crate::ServerInit)) when a
+    /// test supplies one — so `'mousetime'`-based multi-click detection is driven
+    /// deterministically — otherwise the real monotonic clock since startup.
+    fn mouse_stamp_ms(&self) -> u64 {
+        match &self.mouse_clock {
+            Some(c) => c.load(std::sync::atomic::Ordering::SeqCst),
+            None => self.start.elapsed().as_millis() as u64,
+        }
+    }
+
     pub(crate) async fn handle(&mut self, message: Incoming) {
         // Stamp the editor's monotonic clock once per message: undo-node commits
         // during this message read it, and `vim.fn.localtime()` mirrors it.
@@ -66,6 +77,23 @@ impl Server {
                 let keys = text(params.first());
                 self.input(&keys);
                 Ok(Value::from(keys.len() as u64))
+            }
+            // `nvim_input_mouse(button, action, modifier, grid, row, col)`: a mouse
+            // gesture at a global screen cell. nxvim is single-grid, so `grid`
+            // (param 3) is ignored and the editor hit-tests the cell itself. A
+            // malformed button/action/modifier is a loud error at the boundary.
+            "nvim_input_mouse" => {
+                let button = text(params.first());
+                let action = text(params.get(1));
+                let modifier = text(params.get(2));
+                let row = uint(params.get(4), 0);
+                let col = uint(params.get(5), 0);
+                let mut ev = MouseEvent::parse(&button, &action, &modifier, row, col)?;
+                // Stamp the receive time from the server's clock; the editor's
+                // multi-click detection compares these deltas against `'mousetime'`.
+                ev.stamp_ms = self.mouse_stamp_ms();
+                self.editor.mouse(ev);
+                Ok(Value::Nil)
             }
             "nxvim_input_flush" => {
                 // The TUI's synthetic `timeoutlen` idle flush (design D4): resolve a

@@ -74,7 +74,7 @@ impl Editor {
                 // `showtabline` / `laststatus` are the global numeric options;
                 // route them through the shared setter so the `:set` and `vim.o`
                 // paths validate, echo, and relayout identically.
-                if name == "showtabline" || name == "laststatus" {
+                if name == "showtabline" || name == "laststatus" || name == "mousetime" {
                     self.set_global_option_num(name, v);
                     return;
                 }
@@ -108,6 +108,7 @@ impl Editor {
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
                     "showtabline" => self.options.showtabline as i64,
                     "laststatus" => self.options.laststatus as i64,
+                    "mousetime" => self.options.mousetime as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {
@@ -123,8 +124,9 @@ impl Editor {
         }
     }
 
-    /// Apply one resolved string `:set` operation. The only string option today
-    /// is the global `statusline`; it routes through the shared
+    /// Apply one resolved string `:set` operation. The string options are the
+    /// global `statusline` / `tabline` and the mouse strings (`mouse` /
+    /// `mousemodel` / `mousescroll`); each routes through the shared
     /// [`Editor::set_global_option_str`] setter so the `:set` and `vim.o` paths
     /// share one home. `&` resets to the default (empty); `?` echoes the value.
     fn apply_set_str(&mut self, name: &str, op: StrOp) {
@@ -135,6 +137,9 @@ impl Editor {
                 let value = match name {
                     "statusline" => self.options.statusline.clone(),
                     "tabline" => self.options.tabline.clone(),
+                    "mouse" => self.options.mouse.clone(),
+                    "mousemodel" => self.options.mousemodel.clone(),
+                    "mousescroll" => self.options.mousescroll.clone(),
                     _ => return,
                 };
                 self.echo(format!("{name}={value}"));

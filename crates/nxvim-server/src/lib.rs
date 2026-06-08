@@ -37,6 +37,8 @@ use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use treesitter::SyntaxState;
 
@@ -57,6 +59,11 @@ pub struct ServerInit {
     /// [`ClipboardProvider::Disabled`] so tests are deterministic (no host
     /// clipboard); the real binary sets [`ClipboardProvider::System`].
     pub clipboard: ClipboardProvider,
+    /// A fake millisecond clock for the mouse multi-click timestamp. `None` (the
+    /// default) uses the real monotonic clock; a test injects a shared counter here
+    /// and advances it between clicks to drive `'mousetime'` deterministically,
+    /// without depending on wall-clock timing. See [`Server::mouse_stamp_ms`].
+    pub mouse_clock: Option<Arc<AtomicU64>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -248,6 +255,9 @@ struct Server {
     /// onto undo nodes and handed to `vim.fn.localtime()`. Monotonic so elapsed
     /// labels survive wall-clock jumps; see [`Editor::set_now_mono`].
     start: std::time::Instant,
+    /// Optional fake clock for the mouse multi-click timestamp ([`ServerInit::mouse_clock`]);
+    /// when set, [`Server::mouse_stamp_ms`] reads it instead of `start.elapsed()`.
+    mouse_clock: Option<Arc<AtomicU64>>,
     /// The highlight-registry [`generation`](nxvim_core::highlight::Highlights::generation)
     /// last folded into the `vim._hl_defs` Lua mirror ([`Server::push_buf_mirror`]).
     /// The mirror (potentially hundreds of groups) is re-pushed only when this
@@ -339,6 +349,7 @@ where
         buf_mirror_lines: HashMap::new(),
         undo_mirror_versions: HashMap::new(),
         start: std::time::Instant::now(),
+        mouse_clock: init.mouse_clock,
         hl_mirror_gen: None,
         pending_ui_input: None,
         pending_getchar: None,

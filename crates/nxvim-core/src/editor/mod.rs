@@ -25,6 +25,7 @@ mod ex;
 mod insert;
 mod marks;
 mod motions;
+mod mouse;
 mod multicursor;
 mod operators;
 mod options;
@@ -579,6 +580,13 @@ pub struct Editor {
     /// hand-typed spaces always delete one at a time. `None` outside that window.
     soft_tab: Option<(usize, usize)>,
     visual_anchor: Cursor,
+    /// State for the in-flight left-button gesture: the multi-click counter that
+    /// escalates char → word → line on same-cell presses within `'mousetime'`, and
+    /// the anchor a drag extends from. Held across a press → drag → release and the
+    /// gap to the next press (so a quick repeat at the same cell is a double-click).
+    /// `None` before the first press / after a click outside any window. See
+    /// [`crate::editor::mouse`].
+    mouse_select: Option<mouse::MouseSelect>,
 
     /// Set by a scroll command or a cursor motion at the moment it fires:
     /// `(top, cursor.line)` *before* the move. Consumed at the end of `input` to
@@ -753,6 +761,7 @@ impl Editor {
             now_mono: 0,
             soft_tab: None,
             visual_anchor: Cursor::default(),
+            mouse_select: None,
             scroll_from: None,
             pending_scroll: None,
             placement_undo: Vec::new(),

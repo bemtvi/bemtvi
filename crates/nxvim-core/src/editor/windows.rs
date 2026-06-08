@@ -960,6 +960,17 @@ impl Editor {
     /// shrinks the reserved tabline / global-statusline row. An unknown name is a
     /// no-op (the Lua side forwards only the canonical wired set).
     pub fn set_global_option_num(&mut self, name: &str, value: i64) {
+        // `mousetime` is an unbounded non-negative millisecond count — it doesn't
+        // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
+        // so handle it before the bounded block.
+        if name == "mousetime" {
+            if value < 0 {
+                self.echo(format!("E487: Argument must be positive: {name}={value}"));
+                return;
+            }
+            self.options.mousetime = value as usize;
+            return;
+        }
         let max = match name {
             "showtabline" => 2,
             "laststatus" => 3,
@@ -992,6 +1003,9 @@ impl Editor {
         match name {
             "statusline" => self.options.statusline = value.to_string(),
             "tabline" => self.options.tabline = value.to_string(),
+            "mouse" => self.options.mouse = value.to_string(),
+            "mousemodel" => self.options.mousemodel = value.to_string(),
+            "mousescroll" => self.options.mousescroll = value.to_string(),
             _ => {}
         }
     }
@@ -1720,7 +1734,7 @@ impl Editor {
     /// tabline is shown ([`Editor::tabline_visible`]), zero otherwise. The client
     /// paints the tabline into this row and offsets the windows area below it —
     /// the top-of-frame analogue of the bottom panel.
-    fn tabline_rows(&self) -> usize {
+    pub(crate) fn tabline_rows(&self) -> usize {
         usize::from(self.tabline_visible())
     }
 

@@ -374,6 +374,10 @@ pub enum WindowOp {
     /// `line` is 0-based (the prelude converts neovim's 1-based row); `col` is the
     /// 0-based byte column.
     SetCursor { win: u64, line: usize, col: usize },
+    /// `vim.fn.winrestview({ topline = N })` (run via `nvim_win_call`) — scroll
+    /// window `win` so its first visible line is `top` (0-based; the prelude
+    /// converts neovim's 1-based `topline`).
+    SetTopline { win: u64, top: usize },
     /// `nvim_win_set_width(win, width)` — set window `win`'s column width.
     SetWidth { win: u64, width: usize },
     /// `nvim_win_set_height(win, height)` — set window `win`'s text-row height.

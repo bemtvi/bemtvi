@@ -498,6 +498,59 @@ function vim.api.nvim_win_close(win, force)
   end
 end
 
+-- ----- window view / screen position (the vim.fn.* which-key reads) ----------
+-- These resolve the *current* window — which `nvim_win_call(win, fn)` swaps to its
+-- target for the duration of the call (vim._cur_win / vim._cur_cursor), so which-
+-- key's `nvim_win_call(popup, vim.fn.winsaveview)` reads the popup's view.
+
+-- vim.fn.winsaveview(): the current window's view — cursor position, scroll
+-- (`topline`/`leftcol`), and the cursor-restore fields neovim returns. nxvim has
+-- no separate `curswant`/`coladd`/`skipcol` state, so those mirror `col` / are 0.
+function vim.fn.winsaveview()
+  local win = vim._cur_win or 1000
+  local w = (vim._wins or {})[win] or {}
+  local c = vim._cur_cursor or {}
+  local lnum = c.row or w.row or 1
+  local col = c.col or w.col or 0
+  return {
+    lnum = lnum,
+    col = col,
+    coladd = 0,
+    curswant = col,
+    topline = w.topline or 1,
+    leftcol = w.leftcol or 0,
+    skipcol = 0,
+  }
+end
+
+-- vim.fn.winrestview(view): restore the current window's view from a (partial)
+-- dict — the inverse of winsaveview. `lnum`/`col` move the cursor; `topline`
+-- scrolls (1-based -> the server's 0-based top); `leftcol` is mirrored. Both
+-- mutations queue against the concrete current-window handle, so they are honored
+-- even inside the `nvim_win_call` context lock (an explicit-handle write, not a
+-- "current"-bound one). which-key uses it to scroll its popup.
+function vim.fn.winrestview(view)
+  view = view or {}
+  local win = vim._cur_win or 1000
+  if view.lnum then
+    vim.api.nvim_win_set_cursor(win, { view.lnum, view.col or 0 })
+  end
+  local w = (vim._wins or {})[win]
+  if view.topline then
+    vim._win_set_topline(win, math.max(0, view.topline - 1))
+    if w then w.topline = view.topline end -- write-through for read-after-set
+  end
+  if view.leftcol and w then
+    w.leftcol = view.leftcol
+  end
+end
+
+-- vim.fn.screenrow() / screencol(): the cursor's 1-based position on the whole
+-- screen, mirrored by the server (vim._cur_screenrow / _cur_screencol) for the
+-- focused window. which-key reads them to avoid drawing its popup over the cursor.
+function vim.fn.screenrow() return vim._cur_screenrow or 0 end
+function vim.fn.screencol() return vim._cur_screencol or 0 end
+
 -- nvim_win_call(win, fn) / nvim_buf_call(buf, fn): run `fn` as if `win`/`buf`
 -- were current, returning fn's result. In neovim these temporarily switch the
 -- editor's current window/buffer for the duration of the callback; in nxvim the

@@ -681,6 +681,16 @@ pub(crate) fn install_runtime_api(
     )?;
     let sh = shared.clone();
     vim.set(
+        "_win_set_topline",
+        lua.create_function(move |_, (win, top): (u64, usize)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetTopline { win, top });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    vim.set(
         "_win_set_width",
         lua.create_function(move |_, (win, width): (u64, usize)| {
             sh.borrow_mut()

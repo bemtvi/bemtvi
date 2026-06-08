@@ -53,6 +53,10 @@ pub struct WindowMirror {
     pub height: u64,
     pub number: bool,
     pub relativenumber: bool,
+    /// First visible buffer line, 1-based (neovim's `winsaveview().topline`).
+    pub topline: u64,
+    /// First visible screen column (`winsaveview().leftcol`).
+    pub leftcol: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub float: Option<FloatMirror>,
 }
@@ -1126,6 +1130,16 @@ impl LuaRuntime {
     /// window mirror's `next_win`). Pushed alongside the buffer mirror.
     pub fn set_next_buf(&self, next_buf: u64) -> mlua::Result<()> {
         self.vim()?.set("_next_buf", next_buf)
+    }
+
+    /// Mirror the focused window cursor's screen position (1-based row/col, the
+    /// whole-screen coordinates `vim.fn.screenrow()` / `vim.fn.screencol()`
+    /// return), pushed alongside the buffer mirror. which-key reads them to keep
+    /// its popup from covering the cursor.
+    pub fn set_screen_cursor(&self, row: u64, col: u64) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        vim.set("_cur_screenrow", row)?;
+        vim.set("_cur_screencol", col)
     }
 
     /// Refresh the Rust→Lua tab mirror that backs `vim.api.nvim_tabpage_*` /

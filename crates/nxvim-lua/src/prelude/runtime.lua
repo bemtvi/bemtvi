@@ -21,6 +21,29 @@ function vim._notimpl(name, level)
   error("nxvim: not implemented: " .. name, level or 2)
 end
 
+-- Make a call to an unimplemented `vim.fn.<name>` fail *loud and named* instead of
+-- the bare "attempt to call a nil value" a missing field would otherwise give. The
+-- Rust bridge creates `vim.fn` as a plain table and the prelude adds the builtins
+-- nxvim provides (rawset keys, found before this `__index` ever fires); any name
+-- nxvim doesn't have yet resolves to a stub that records and raises through
+-- `vim._notimpl` when *called* — never on mere access. That matters two ways:
+--   * neovim's `vim.fn` is likewise always-callable (an unknown function raises
+--     E117 at call time, and `if vim.fn.foo then` is truthy), so feature-probing
+--     configs keep working; returning nil here would diverge.
+--   * a gap surfaces as "nxvim: not implemented: vim.fn.<name>" pointing at the
+--     call site, so a missing builtin is a one-line diagnosis rather than a buried
+--     nil-call error (which `nvim_exec_lua` would swallow to the message line).
+-- A plugin that genuinely wants to detect absence can still `vim.fn.has(...)` or
+-- pcall the call; it cannot rely on the field being nil (neither can it in neovim).
+setmetatable(vim.fn, {
+  __index = function(_, name)
+    local fn = function(...)
+      return vim._notimpl("vim.fn." .. name)
+    end
+    return fn
+  end,
+})
+
 -- ----- the async runtime: the deferred-callback registry ---------------------
 -- The spine of nxvim's event loop. A deferred function (vim.schedule, defer_fn,
 -- a vim.uv timer, a vim.system on_exit) is stored by integer id in vim._cb_fns

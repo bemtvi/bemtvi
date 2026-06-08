@@ -1038,6 +1038,50 @@ impl Editor {
         w.saved_cursor.col = col;
     }
 
+    /// Window `id`'s scroll offset as `(top, leftcol)` — the first visible buffer
+    /// line (0-based) and the first visible screen column. The focused window
+    /// reports its live offset; an inactive window its stashed one. `None` for an
+    /// unknown id. Backs `vim.fn.winsaveview`'s `topline`/`leftcol`.
+    pub fn window_scroll(&self, id: WindowId) -> Option<(usize, usize)> {
+        let w = self.windows.windows.get(&id)?;
+        Some(if id == self.windows.current {
+            (self.top, self.leftcol)
+        } else {
+            (w.saved_top, w.saved_leftcol)
+        })
+    }
+
+    /// Window `id`'s text offset — the number-gutter width, the columns before the
+    /// first text cell. `None` for an unknown id. Feeds the server's screen-column
+    /// math for `vim.fn.screencol`.
+    pub fn window_textoff(&self, id: WindowId) -> Option<usize> {
+        let w = self.windows.windows.get(&id)?;
+        let lines = self.buffers.get(w.buffer).buffer.line_count();
+        Some(self.number_width_for(w.options, lines))
+    }
+
+    /// Scroll window `id` so its first visible line is `top` (0-based), clamped to
+    /// the buffer's last line. The focused window moves its live viewport; an
+    /// inactive window updates its stashed `top` (applied when next focused). A
+    /// no-op for an unknown id. Backs `vim.fn.winrestview`'s `topline`.
+    pub fn set_window_topline(&mut self, id: WindowId, top: usize) {
+        let Some(w) = self.windows.windows.get(&id) else {
+            return;
+        };
+        let last = self
+            .buffers
+            .get(w.buffer)
+            .buffer
+            .line_count()
+            .saturating_sub(1);
+        let top = top.min(last);
+        if id == self.windows.current {
+            self.top = top;
+        } else {
+            self.windows.get_mut(id).saved_top = top;
+        }
+    }
+
     /// Window `id`'s rect as `(x, y, width, height)` in windows-area cells, or
     /// `None` if there is no such window. `height` includes the status-line row;
     /// the API width/height the server returns derive from this.

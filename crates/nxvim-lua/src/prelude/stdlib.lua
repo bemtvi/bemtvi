@@ -415,6 +415,20 @@ function vim.endswith(s, suffix) return suffix == "" or s:sub(-#suffix) == suffi
 
 function vim.split(s, sep, opts)
   opts = opts or {}
+  -- Empty separator: split into individual characters, matching neovim
+  -- (`vim.split("nxso", "") == { "n", "x", "s", "o" }`, `vim.split("", "") == {}`)
+  -- with no leading/trailing empty segment. `string.find(s, "", pos)` returns a
+  -- zero-width match at `pos` (`from == pos`, `to == pos - 1`), so the generic
+  -- loop below would leave `pos` unmoved and spin forever — which-key hits this
+  -- via `vim.split(modes, "")` (e.g. `"nxso"`). Handled up front; `trimempty` is a
+  -- no-op here since single characters are never empty.
+  if sep == "" then
+    local parts = {}
+    for i = 1, #s do
+      parts[i] = string.sub(s, i, i)
+    end
+    return parts
+  end
   local parts, pos = {}, 1
   while true do
     local from, to = string.find(s, sep, pos, opts.plain)
@@ -482,6 +496,54 @@ local function char_width(cp)
     return 2
   end
   return 1
+end
+
+-- Encode codepoint `cp` to its UTF-8 byte string. The inverse of `utf8_decode`,
+-- backing `vim.fn.nr2char`. An out-of-range / negative value is clamped to U+FFFD
+-- (the replacement char) so it always yields a valid string.
+local function utf8_encode(cp)
+  cp = math.floor(tonumber(cp) or 0)
+  if cp < 0 or cp > 0x10FFFF then cp = 0xFFFD end
+  if cp < 0x80 then
+    return string.char(cp)
+  elseif cp < 0x800 then
+    return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+  elseif cp < 0x10000 then
+    return string.char(
+      0xE0 + math.floor(cp / 0x1000),
+      0x80 + math.floor(cp / 0x40) % 0x40,
+      0x80 + cp % 0x40
+    )
+  end
+  return string.char(
+    0xF0 + math.floor(cp / 0x40000),
+    0x80 + math.floor(cp / 0x1000) % 0x40,
+    0x80 + math.floor(cp / 0x40) % 0x40,
+    0x80 + cp % 0x40
+  )
+end
+
+-- vim.fn.str2list(s[, utf8]): the codepoint of each character in `s`, as a list of
+-- numbers (`str2list("AB") == { 65, 66 }`). nxvim is always UTF-8, so the `utf8`
+-- flag is accepted and ignored (the result is the same either way). which-key's
+-- key parser (`Util.keys`) round-trips a keymap's lhs through this and `nr2char`.
+function vim.fn.str2list(s, _utf8)
+  s = tostring(s or "")
+  local out, i = {}, 1
+  while i <= #s do
+    local cp, len = utf8_decode(s, i)
+    if len == 0 then break end
+    out[#out + 1] = cp
+    i = i + len
+  end
+  return out
+end
+
+-- vim.fn.nr2char(nr[, utf8]): the string for codepoint `nr` (`nr2char(65) == "A"`).
+-- The inverse of one `str2list` element; nxvim is always UTF-8 so `utf8` is
+-- accepted and ignored.
+function vim.fn.nr2char(nr, _utf8)
+  return utf8_encode(nr)
 end
 
 -- vim.fn.strchars(s[, skipcc]): number of characters (codepoints) in `s`.

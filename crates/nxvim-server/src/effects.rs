@@ -407,6 +407,10 @@ impl Server {
                 let id = resolve_win(self, win);
                 self.editor.set_window_cursor(id, line, col);
             }
+            WindowOp::SetTopline { win, top } => {
+                let id = resolve_win(self, win);
+                self.editor.set_window_topline(id, top);
+            }
             WindowOp::SetWidth { win, width } => {
                 let id = resolve_win(self, win);
                 self.editor.set_window_width(id, width);
@@ -690,6 +694,7 @@ impl Server {
                 let (line, col) = self.editor.window_cursor(id).unwrap_or((0, 0));
                 let (cw, ch) = self.editor.window_content_size(id).unwrap_or((0, 0));
                 let opts = self.editor.window_options(id).unwrap_or_default();
+                let (top, leftcol) = self.editor.window_scroll(id).unwrap_or((0, 0));
                 WindowMirror {
                     id: id.0,
                     buffer,
@@ -702,12 +707,33 @@ impl Server {
                     height: ch as u64,
                     number: opts.number,
                     relativenumber: opts.relativenumber,
+                    // `winsaveview()` reports `topline` 1-based; `top` is 0-based.
+                    topline: (top + 1) as u64,
+                    leftcol: leftcol as u64,
                     float: self.editor.window_float_config(id).map(float_mirror),
                 }
             })
             .collect();
-        let cur_win = self.editor.current_window_id().0;
+        let cur_win_id = self.editor.current_window_id();
+        let cur_win = cur_win_id.0;
         let next_win = self.editor.next_window_id().0;
+        // The focused window cursor's whole-screen position (1-based), for
+        // `vim.fn.screenrow`/`screencol`: the window's rect origin, past its number
+        // gutter, plus the cursor offset within the scrolled viewport. INCOMPLETE:
+        // the column uses the cursor's byte offset, not its display column (tabs /
+        // wide chars aren't expanded), and the row ignores a `'showtabline'` offset
+        // — close enough for which-key's cursor-overlap check, off by a tab's width
+        // / one row in those cases.
+        if let (Some((wx, wy, _, _)), Some((top, leftcol)), Some(textoff)) = (
+            self.editor.window_rect(cur_win_id),
+            self.editor.window_scroll(cur_win_id),
+            self.editor.window_textoff(cur_win_id),
+        ) {
+            let (cl, cc) = (self.editor.cursor.line, self.editor.cursor.col);
+            let srow = wy + cl.saturating_sub(top) + 1;
+            let scol = wx + textoff + cc.saturating_sub(leftcol) + 1;
+            let _ = self.lua.set_screen_cursor(srow as u64, scol as u64);
+        }
         let _ = self.lua.set_buf_mirror(
             &bufs,
             cursor,

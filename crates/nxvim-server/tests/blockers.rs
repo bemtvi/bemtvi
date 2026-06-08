@@ -101,6 +101,201 @@ fn as_str(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }
 
+/// A `Value::Array` of strings as a `Vec<String>` (for asserting `vim.split` /
+/// `nr2char` results).
+fn as_strs(v: &Value) -> Vec<String> {
+    match v {
+        Value::Array(items) => items.iter().map(as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A `Value::Array` of integers as a `Vec<i64>` (for asserting `str2list`).
+fn as_ints(v: &Value) -> Vec<i64> {
+    match v {
+        Value::Array(items) => items.iter().filter_map(Value::as_i64).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// ===================== vim.split / str2list / nr2char =======================
+// The key-parsing surface which-key.nvim runs every keymap through: `Util.keys`
+// round-trips an lhs via `str2list`/`nr2char`, and `Mappings.add` splits a
+// multi-char mode string with `vim.split(modes, "")`. A regression here cost the
+// plugin its whole load path (a `setup()` that hung, then errored).
+
+#[tokio::test]
+async fn vim_split_empty_separator_splits_into_characters() {
+    let dir = temp_dir("split");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    // An empty separator splits into individual characters, matching neovim —
+    // with no leading/trailing empty segment. This *used to hang*: `string.find`
+    // returns a zero-width match for "", so the split loop never advanced `pos`.
+    // (which-key calls `vim.split("nxso", "")` to expand a mode string.)
+    assert_eq!(
+        as_strs(&exec_lua(&rpc, "return vim.split('nxso', '')").await),
+        vec!["n", "x", "s", "o"],
+    );
+    // Empty input with empty separator is the empty list (not `{ "" }`).
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.split('', '')").await,
+        Value::from(0u64),
+    );
+    // A normal (non-empty) separator is unaffected.
+    assert_eq!(
+        as_strs(&exec_lua(&rpc, "return vim.split('a,b,c', ',')").await),
+        vec!["a", "b", "c"],
+    );
+}
+
+#[tokio::test]
+async fn str2list_and_nr2char_round_trip() {
+    let dir = temp_dir("str2list");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    // str2list yields the codepoint of each character.
+    assert_eq!(
+        as_ints(&exec_lua(&rpc, "return vim.fn.str2list('AB')").await),
+        vec![65, 66],
+    );
+    // nr2char is its inverse, including a multibyte codepoint (😀 = U+1F600).
+    assert_eq!(
+        as_str(&exec_lua(&rpc, "return vim.fn.nr2char(65)").await),
+        "A",
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.fn.nr2char(0x1F600) == '\\240\\159\\152\\128'",
+        )
+        .await,
+        Value::Boolean(true),
+    );
+    // Full round-trip over a multibyte string: str2list -> nr2char rebuilds it.
+    assert_eq!(
+        as_str(
+            &exec_lua(
+                &rpc,
+                "local out = {}\n\
+                 for _, cp in ipairs(vim.fn.str2list('aé好')) do out[#out+1] = vim.fn.nr2char(cp) end\n\
+                 return table.concat(out)",
+            )
+            .await
+        ),
+        "aé好",
+    );
+}
+
+#[tokio::test]
+async fn missing_vim_fn_fails_loud_with_its_name() {
+    let dir = temp_dir("notimpl_fn");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    // A `vim.fn.<unknown>` is callable (neovim-faithful: `if vim.fn.foo then` is
+    // truthy), but *calling* it raises a named error — not the bare "attempt to
+    // call a nil value" a missing field would give, which `nvim_exec_lua` would
+    // otherwise swallow to the message line.
+    assert_eq!(
+        as_str(&exec_lua(&rpc, "return type(vim.fn.totally_made_up_fn)").await),
+        "function",
+    );
+    let err = as_str(
+        &exec_lua(
+            &rpc,
+            "local ok, e = pcall(vim.fn.totally_made_up_fn, 1, 2); return tostring(e)",
+        )
+        .await,
+    );
+    assert!(
+        err.contains("vim.fn.totally_made_up_fn"),
+        "error should name the missing function, got: {err:?}"
+    );
+    // It is also recorded in the gap registry for a future :checkhealth.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "pcall(vim.fn.another_missing_one); return vim._notimpl_hits['vim.fn.another_missing_one'] == true",
+        )
+        .await,
+        Value::Boolean(true),
+    );
+}
+
+// =================== window view / screen position ==========================
+// The popup-placement surface which-key reads to draw and scroll its float:
+// winsaveview/winrestview (its scroll) and screenrow/screencol (cursor-overlap).
+
+#[tokio::test]
+async fn winsaveview_winrestview_round_trip_the_scroll() {
+    let dir = temp_dir("winview");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    // Fill the buffer past one screen so a non-1 topline is valid (the harness
+    // window is 24 rows).
+    exec_lua(
+        &rpc,
+        "local lines = {}\n\
+         for i = 1, 60 do lines[i] = 'line ' .. i end\n\
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)",
+    )
+    .await;
+
+    // A fresh view: cursor at the top, no scroll.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local v = vim.fn.winsaveview(); return { v.lnum, v.col, v.topline, v.leftcol }",
+        )
+        .await,
+        Value::Array(vec![
+            Value::from(1u64),
+            Value::from(0u64),
+            Value::from(1u64),
+            Value::from(0u64),
+        ]),
+    );
+
+    // winrestview scrolls to a given topline; winsaveview reads it back.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "vim.fn.winrestview({ topline = 10 }); return vim.fn.winsaveview().topline",
+        )
+        .await,
+        Value::from(10u64),
+    );
+}
+
+#[tokio::test]
+async fn screenrow_and_screencol_track_the_cursor() {
+    let dir = temp_dir("screenpos");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'hello', 'world', 'third' })",
+    )
+    .await;
+
+    // Cursor at the top-left: row 1, and column 1 past the window's number gutter
+    // (so >= 1; nxvim shows a gutter by default). Read the baseline, then assert
+    // movement is reflected — robust to the exact gutter width.
+    let base = as_ints(&exec_lua(&rpc, "return { vim.fn.screenrow(), vim.fn.screencol() }").await);
+    assert_eq!(base[0], 1, "cursor starts on screen row 1");
+    assert!(
+        base[1] >= 1,
+        "screencol is 1-based and past the gutter: {base:?}"
+    );
+
+    // Move down two lines and right two columns; the screen position follows.
+    feed(&rpc, "jjll");
+    assert_eq!(
+        as_ints(&exec_lua(&rpc, "return { vim.fn.screenrow(), vim.fn.screencol() }").await),
+        vec![base[0] + 2, base[1] + 2],
+    );
+}
+
 // ============================ vim.go / vim.v ================================
 
 #[tokio::test]

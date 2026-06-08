@@ -212,6 +212,19 @@ impl Editor {
         self.clear_anchor_marks();
     }
 
+    /// Restore a window's stashed secondary multi-cursor set onto the current
+    /// buffer — the counterpart of stashing into `Window::saved_cursors` on
+    /// focus-out. Any leftover live marks are cleared first: a focus change that
+    /// did not stash the outgoing window (a window close, a tab switch landing on a
+    /// shared buffer) can leave stale [`CURSOR_NS`] marks behind, and restoring on
+    /// top of them would duplicate or leak cursors across the windows.
+    pub(crate) fn restore_secondary_cursors(&mut self, positions: Vec<usize>) {
+        self.clear_secondary_cursors();
+        for at in positions {
+            self.set_cursor_mark(None, at);
+        }
+    }
+
     /// Discard the placement-mode undo/redo history — at the start and end of a
     /// placement session, since it tracks only the live placing of cursors, never
     /// the document.

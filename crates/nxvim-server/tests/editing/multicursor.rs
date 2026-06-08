@@ -9,10 +9,45 @@
 
 use crate::support::*;
 
-/// The focused window's secondary-cursor screen positions as `(row, col)`
-/// pairs, read out of the redraw's per-window `cursors` array.
+/// The focused window's secondary-cursor positions as `(row, col)` pairs, read
+/// out of the redraw's per-window `cursors` array.
+///
+/// CONVENTION: the row is a **0-based screen row** (the redraw's own coordinate),
+/// *not* a 1-based buffer line. This is deliberately **off by one from
+/// [`cursor`]**, which relays `nvim_win_get_cursor`'s 1-based line. So a cursor on
+/// the buffer's first line reads as row `0` here but line `1` from `cursor`; a
+/// secondary sharing the primary's line is `secondary_cursors` row `N` vs
+/// `cursor` line `N + 1`. Don't cross-compare the two raw. We keep the raw redraw
+/// value rather than normalizing, so the helper stays a faithful read of what
+/// clients actually render.
 fn secondary_cursors(map: &[(Value, Value)]) -> Vec<(u64, u64)> {
     window0_field(map, "cursors")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    let pair = v.as_array()?;
+                    Some((pair.first()?.as_u64()?, pair.get(1)?.as_u64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Like [`secondary_cursors`] but reads the **focused** window's `cursors` array
+/// rather than `windows[0]` — needed once a split exists, since the focused
+/// window need not be the first in the redraw's `windows` list.
+fn focused_secondary_cursors(map: &[(Value, Value)]) -> Vec<(u64, u64)> {
+    let windows = match map_get(map, "windows") {
+        Some(Value::Array(a)) => a,
+        _ => return Vec::new(),
+    };
+    let focused = windows.iter().find_map(|w| match w {
+        Value::Map(m) if map_get(m, "focused").and_then(Value::as_bool) == Some(true) => Some(m),
+        _ => None,
+    });
+    let Some(m) = focused else { return Vec::new() };
+    map_get(m, "cursors")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
@@ -530,6 +565,42 @@ async fn visual_esc_collapses_selections_but_keeps_cursors() {
 }
 
 #[tokio::test]
+async fn single_cursor_undo_after_multicursor_does_not_resurrect_cursors() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<CR>baz<Esc>gg");
+
+    // Place a cursor on lines 1 and 2, finish placement, then a multi-cursor `x`.
+    feed(&rpc, "<A-c>jc<Esc>x");
+    assert_eq!(lines(&rpc).await, vec!["oo", "ar", "baz"]);
+
+    // Undo the multi-cursor edit (restoring the placed cursors), then collapse
+    // back to a single cursor and make an ordinary single-cursor edit lower down.
+    feed(&rpc, "u");
+    feed(&rpc, "<Esc>");
+    feed(&rpc, "Gx"); // last line, single cursor
+    assert_eq!(lines(&rpc).await, vec!["foo", "bar", "az"]);
+
+    // Undoing *this* single-cursor edit must leave the cursor at the change and
+    // must NOT resurrect the old multi-cursor set baked into the branch point.
+    let map = redraw_after(&rpc, &mut incoming, "u").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo", "bar", "baz"],
+        "text restored"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 0),
+        "cursor stayed at the change (1-based line 3), not the old multi-cursor position"
+    );
+    assert_eq!(
+        secondary_cursors(&map),
+        Vec::<(u64, u64)>::new(),
+        "no phantom multi-cursors were resurrected"
+    );
+}
+
+#[tokio::test]
 async fn undo_restores_cursors_to_their_pre_edit_position() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ifoo bar<Esc>gg");
@@ -882,5 +953,97 @@ async fn mouse_placement_is_undoable() {
         secondary_cursors(&map),
         vec![(0, 0)],
         "u stepped back the mouse placement"
+    );
+}
+
+// ----- per-window cursors ----------------------------------------------------
+
+/// Secondary cursors belong to the focused window, like the primary cursor does:
+/// drop a multi-cursor set in one split and the *other* split (even sharing the
+/// buffer) shows none of its own.
+#[tokio::test]
+async fn secondary_cursors_are_per_window() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<Esc>gg");
+
+    // Split first (both windows share the buffer, focus on the new one), then
+    // place two secondary cursors in the focused window.
+    feed(&rpc, "<C-w>v");
+    let map = redraw_after(&rpc, &mut incoming, "<A-c>jcjc<Esc>").await;
+    assert_eq!(
+        focused_secondary_cursors(&map),
+        vec![(0, 0), (1, 0)],
+        "two secondary cursors placed in this window",
+    );
+
+    // Switch to the other split: its cursor set is its own — empty — not the
+    // first window's leaked multi-cursors.
+    let map = redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    assert_eq!(
+        focused_secondary_cursors(&map),
+        Vec::<(u64, u64)>::new(),
+        "the other split has no secondary cursors of its own",
+    );
+}
+
+/// Each split keeps an independent cursor set across back-and-forth focus: a set
+/// placed in one window survives switching away and back, while the other window
+/// carries its own different set.
+#[tokio::test]
+async fn each_window_keeps_its_own_secondary_cursors() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<Esc>gg");
+
+    // Window A (the new split): one secondary cursor on line 1.
+    feed(&rpc, "<C-w>v");
+    let map = redraw_after(&rpc, &mut incoming, "<A-c>jc<Esc>").await;
+    assert_eq!(focused_secondary_cursors(&map), vec![(0, 0)], "A's set");
+
+    // Window B: two secondary cursors, on lines 1 and 2.
+    let map = redraw_after(&rpc, &mut incoming, "<C-w>wgg<A-c>jcjc<Esc>").await;
+    assert_eq!(
+        focused_secondary_cursors(&map),
+        vec![(0, 0), (1, 0)],
+        "B's own (different) set",
+    );
+
+    // Back to A: its single cursor is intact, not overwritten by B's.
+    let map = redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    assert_eq!(
+        focused_secondary_cursors(&map),
+        vec![(0, 0)],
+        "A still holds exactly its own set after the round trip",
+    );
+}
+
+/// The per-buffer undo tree is shared between two windows onto the same buffer,
+/// but a multi-cursor set is window-local: undoing *another* window's
+/// multi-cursor edit reverts the text without importing that window's cursors
+/// into the current one.
+#[tokio::test]
+async fn undo_does_not_import_another_windows_cursors() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<Esc>gg");
+
+    // Window A (the new split): place cursors on lines 1 and 2, then make a
+    // multi-cursor edit (`x` deletes the first char at every cursor).
+    feed(&rpc, "<C-w>v");
+    feed(&rpc, "<A-c>jcjc<Esc>x");
+
+    // Window B shares the buffer (and so the undo tree), but starts cursor-free.
+    let map = redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    assert_eq!(
+        focused_secondary_cursors(&map),
+        Vec::<(u64, u64)>::new(),
+        "B has no secondary cursors of its own",
+    );
+
+    // B undoes A's edit: the text reverts, but A's secondary cursors must not be
+    // resurrected in B.
+    let map = redraw_after(&rpc, &mut incoming, "u").await;
+    assert_eq!(
+        focused_secondary_cursors(&map),
+        Vec::<(u64, u64)>::new(),
+        "undoing another window's multi-cursor edit imports no cursors",
     );
 }

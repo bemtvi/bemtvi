@@ -28,6 +28,7 @@ impl UndoTree {
                 cursor: Cursor::default(),
                 extmarks: buffer.extmarks.clone(),
                 marks: buffer.marks.clone(),
+                cursor_window: None,
             },
         };
         UndoTree {
@@ -54,9 +55,15 @@ impl UndoTree {
     /// live ones, so undoing back to this node restores them — see
     /// [`Editor::push_undo`]. Only the [`CURSOR_NS`] marks are replaced; the rest of
     /// the snapshot (text, `a`–`z` marks, other extmarks) is untouched.
-    fn set_cur_snapshot_cursors(&mut self, primary: Cursor, positions: &[usize]) {
+    fn set_cur_snapshot_cursors(
+        &mut self,
+        primary: Cursor,
+        positions: &[usize],
+        window: Option<WindowId>,
+    ) {
         let snap = &mut self.nodes[self.cur].snap;
         snap.cursor = primary;
+        snap.cursor_window = window;
         snap.extmarks.clear(crate::extmark::CURSOR_NS, None);
         for &at in positions {
             snap.extmarks
@@ -226,11 +233,16 @@ impl Editor {
         } else {
             ob.saved_cursor
         };
+        // Only the current (focused) buffer carries a live secondary-cursor set,
+        // owned by the focused window; a background buffer's snapshot has no owning
+        // window (and no `CURSOR_NS` marks).
+        let cursor_window = (id == self.cur_buffer()).then_some(self.windows.current);
         Snapshot {
             text: ob.buffer.text.clone(),
             cursor,
             extmarks: ob.buffer.extmarks.clone(),
             marks: ob.buffer.marks.clone(),
+            cursor_window,
         }
     }
 
@@ -300,30 +312,32 @@ impl Editor {
         }
         let id = self.cur_buffer();
         self.commit_undo(id);
-        // Bake the live multi-cursor positions into the node we'll undo back to, so
-        // undoing the edit we're about to make restores the cursors to where they
-        // are *now* — not where this edit will shift them. The node `cur` was
-        // committed before these cursors were placed (or with their later
-        // positions), so its frozen snapshot would otherwise be stale.
+        // Bake the live cursor set into the node we'll undo back to, so undoing the
+        // edit we're about to make restores the cursor(s) to where they are *now* —
+        // not where this edit will shift them. The node `cur` may have been
+        // committed earlier (we're starting a fresh edit from a state we navigated
+        // to or undid back to), so its frozen snapshot cursor would otherwise be
+        // stale: undo would jump to the root's top-of-file default, or to a stale
+        // multi-cursor set baked in at a branch point.
         self.refresh_undo_cursor_marks(id);
         let now = self.now_mono;
         self.cur_mut().undo.mark_dirty(now);
     }
 
     /// Update the current undo node's snapshot so its cursor and multi-cursor marks
-    /// match the live state — see [`push_undo`](Self::push_undo). A no-op without
-    /// secondary cursors, so single-cursor undo (and its existing cursor-placement
-    /// semantics) is untouched.
+    /// match the live state — see [`push_undo`](Self::push_undo). Runs for the
+    /// single-cursor case too: the primary is re-synced (so undo lands at the
+    /// change, not the node's stale committed cursor) and any stale [`CURSOR_NS`]
+    /// marks left in the snapshot are cleared (so a single-cursor undo never
+    /// resurrects a multi-cursor set the user has since collapsed).
     fn refresh_undo_cursor_marks(&mut self, id: BufferId) {
-        if !self.has_secondary_cursors() {
-            return;
-        }
         let primary = self.cursor;
         let positions = self.secondary_cursor_bytes();
+        let window = Some(self.windows.current);
         self.buffers
             .get_mut(id)
             .undo
-            .set_cur_snapshot_cursors(primary, &positions);
+            .set_cur_snapshot_cursors(primary, &positions, window);
     }
 
     pub(crate) fn undo(&mut self) {
@@ -392,6 +406,16 @@ impl Editor {
         self.buffer_mut().extmarks = snap.extmarks;
         self.buffer_mut().marks = snap.marks;
         self.buffer_mut().modified = !clean;
+        // The secondary multi-cursor set is window-local, but the undo tree is
+        // shared by every window onto this buffer. Keep the baked `CURSOR_NS`/
+        // `ANCHOR_NS` marks only when *this* window baked them; otherwise drop them
+        // so undoing another window's multi-cursor edit reverts its text without
+        // resurrecting its cursors here (the primary still rides back, vim-style).
+        if snap.cursor_window != Some(self.windows.current) {
+            let buf = self.buffer_mut();
+            buf.extmarks.clear(crate::extmark::CURSOR_NS, None);
+            buf.extmarks.clear(crate::extmark::ANCHOR_NS, None);
+        }
         self.clamp_cursor();
     }
 }

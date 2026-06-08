@@ -211,6 +211,13 @@ pub async fn buf_lines(rpc: &Rpc, handle: u64) -> Vec<String> {
 }
 
 /// Cursor position as `(1-based line, 0-based column)`.
+///
+/// CONVENTION: the line is **1-based** — this relays `nvim_win_get_cursor`
+/// verbatim, which is 1-based like neovim, so a cursor on the first line reads as
+/// line `1`. Beware: the multi-cursor tests' `secondary_cursors` helper reports a
+/// **0-based screen row** instead, so the two are off by one — a secondary on the
+/// same line as the primary is `secondary_cursors` row `N` vs `cursor` line
+/// `N + 1`. Don't cross-compare the two raw.
 pub async fn cursor(rpc: &Rpc) -> (usize, usize) {
     let (line, col) = cursor_u64(rpc).await;
     (line as usize, col as usize)

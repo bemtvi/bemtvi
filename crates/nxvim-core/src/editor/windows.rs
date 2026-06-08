@@ -216,6 +216,12 @@ pub(crate) struct Window {
     pub(crate) saved_cursor: Cursor,
     pub(crate) saved_top: usize,
     pub(crate) saved_leftcol: usize,
+    /// While this window is not focused, the byte offsets of its secondary
+    /// (multi-)cursors — the per-window analogue of `saved_cursor`. The live set
+    /// is the focused window's `CURSOR_NS` marks; on focus-out they are stashed
+    /// here and on focus-in restored, so two windows onto the same buffer carry
+    /// independent multi-cursor sets. Meaningless (and empty) while focused.
+    pub(crate) saved_cursors: Vec<usize>,
     pub(crate) rect: Rect,
     /// Window-local options (the number gutter). A split inherits these from the
     /// window it was split off, mirroring vim.
@@ -293,6 +299,7 @@ impl WindowTree {
                 saved_cursor: Cursor::default(),
                 saved_top: 0,
                 saved_leftcol: 0,
+                saved_cursors: Vec::new(),
                 rect: Rect::default(),
                 options,
                 float: None,
@@ -1194,6 +1201,7 @@ impl Editor {
                 saved_cursor: Cursor::default(),
                 saved_top: 0,
                 saved_leftcol: 0,
+                saved_cursors: Vec::new(),
                 rect: Rect::default(),
                 options,
                 float: Some(config),
@@ -1393,11 +1401,16 @@ impl Editor {
         let cur = self.windows.current;
         // Stash the live position into the outgoing window so the old (bottom /
         // right) sibling keeps its view; seed the new window from the same spot.
+        // Clone the live secondary multi-cursors into the outgoing window's stash
+        // so refocusing it restores its own copy; the live `CURSOR_NS` marks stay
+        // in place for the new (focused) clone, which keeps the same view.
+        let secondaries = self.secondary_cursor_bytes();
         {
             let w = self.windows.get_mut(cur);
             w.saved_cursor = cursor;
             w.saved_top = top;
             w.saved_leftcol = leftcol;
+            w.saved_cursors = secondaries;
         }
         let buffer = self.windows.get(cur).buffer;
         // A split inherits the source window's window-local options, as vim does.
@@ -1410,6 +1423,7 @@ impl Editor {
                 saved_cursor: cursor,
                 saved_top: top,
                 saved_leftcol: leftcol,
+                saved_cursors: Vec::new(),
                 rect: Rect::default(),
                 options,
                 float: None,
@@ -1676,6 +1690,10 @@ impl Editor {
         if id == self.windows.current || !self.windows.windows.contains_key(&id) {
             return;
         }
+        // Stash the outgoing window's secondary multi-cursors before reading its
+        // primary position — finalizing placement (see `stash_secondary_cursors`)
+        // may snap the primary onto a placed cursor.
+        self.stash_secondary_cursors();
         let cursor = self.cursor;
         let top = self.top;
         let leftcol = self.leftcol;
@@ -1689,6 +1707,22 @@ impl Editor {
         self.enter_window(id);
     }
 
+    /// Stash the focused window's live secondary multi-cursor set into its
+    /// [`Window`] (the multi-cursor analogue of `saved_cursor`) and clear the live
+    /// `CURSOR_NS`/`ANCHOR_NS` marks, so the next focused window starts from a
+    /// clean slate. Finalizes any in-progress placement first, so the stashed set
+    /// is exactly the placed cursors. Must run while the focused window's buffer is
+    /// still current — before [`Editor::enter_window`] swaps it.
+    pub(crate) fn stash_secondary_cursors(&mut self) {
+        if self.mode == Mode::MultiCursor {
+            self.finish_multicursor();
+        }
+        let positions = self.secondary_cursor_bytes();
+        let cur = self.windows.current;
+        self.windows.get_mut(cur).saved_cursors = positions;
+        self.clear_secondary_cursors();
+    }
+
     /// Make `id` the current window, restoring the buffer it shows and its saved
     /// view position, landing in normal mode with transient state cleared. The
     /// window analogue of [`Editor::enter_buffer`]: it does *not* stash the
@@ -1697,9 +1731,10 @@ impl Editor {
     /// while this window was inactive).
     pub(crate) fn enter_window(&mut self, id: WindowId) {
         self.windows.current = id;
-        let w = self.windows.get(id);
+        let w = self.windows.get_mut(id);
         let (buffer, cursor, top, leftcol) =
             (w.buffer, w.saved_cursor, w.saved_top, w.saved_leftcol);
+        let saved_cursors = std::mem::take(&mut w.saved_cursors);
         self.set_cur_buffer(buffer);
         self.cursor = cursor;
         self.top = top;
@@ -1709,6 +1744,10 @@ impl Editor {
         self.scroll_from = None;
         self.pending_scroll = None;
         self.message.clear();
+        // Restore this window's secondary multi-cursors onto its buffer (clearing
+        // any leftover live marks first — a window close or tab switch can enter
+        // here without the previous focus having stashed its own set).
+        self.restore_secondary_cursors(saved_cursors);
         self.clamp_cursor();
         self.ensure_visible();
     }

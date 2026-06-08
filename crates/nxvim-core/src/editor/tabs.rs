@@ -141,6 +141,10 @@ impl Editor {
     /// this tab, or on return to it) restores it. The shared prelude of every
     /// focus / tab switch.
     fn stash_focused_view(&mut self) {
+        // Stash the focused window's secondary multi-cursors first — finalizing
+        // placement may snap the primary onto a placed cursor, which the view
+        // stash below must capture.
+        self.stash_secondary_cursors();
         let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
         let w = self.windows.cur_mut();
         w.saved_cursor = cursor;

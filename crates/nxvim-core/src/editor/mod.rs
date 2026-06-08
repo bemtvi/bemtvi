@@ -161,6 +161,13 @@ struct Snapshot {
     /// alongside `extmarks`, for the same reason: vim keeps marks across undo, and
     /// the wholesale-replace [`Buffer::mark_resync`] would otherwise clear them.
     marks: HashMap<char, (usize, usize)>,
+    /// The window whose secondary multi-cursor set is baked into `extmarks`'s
+    /// `CURSOR_NS`/`ANCHOR_NS` marks. The multi-cursor set is window-local but the
+    /// undo tree is per-buffer and shared by every window onto it, so on undo/redo
+    /// those marks are re-applied *only* when the focused window matches — else the
+    /// editing window's cursors would leak into another window. `None` for a state
+    /// with no owning window (the root, a snapshot of a non-current buffer).
+    cursor_window: Option<WindowId>,
 }
 
 /// Index of a node within [`UndoTree::nodes`]. Stable for a node's lifetime —

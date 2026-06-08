@@ -69,6 +69,28 @@ async fn undo_reverts_the_last_change() {
 }
 
 #[tokio::test]
+async fn undo_places_cursor_at_the_change_not_top_of_file() {
+    // Undoing the first edit on a loaded buffer walks back to the root undo node.
+    // The cursor must land at the change being undone, not snap to the root
+    // snapshot's default (0, 0) top-of-file position.
+    let path = write_n_lines("undo_cursor", 3);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "Gx"); // jump to the last line, delete its first char
+    assert_eq!(lines(&rpc).await, vec!["line1", "line2", "ine3"]);
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line1", "line2", "line3"],
+        "text restored"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 0),
+        "undo put the cursor at the changed line (1-based line 3), not the top of file"
+    );
+}
+
+#[tokio::test]
 async fn undo_ex_command_undoes_and_redoes_one_change() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "iabc<Esc>");

@@ -21,8 +21,8 @@ use crate::host::{
     stdpath,
 };
 use crate::ops::{
-    BufOp, ConfirmReq, ExtmarkOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp,
-    RegisterSetOp, TabOp, UiInputReq, WindowOp,
+    BufOp, ConfirmReq, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue,
+    PanelOp, RegisterSetOp, TabOp, UiInputReq, WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -470,6 +470,60 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `vim._feedkeys(keys, remap, insert)`: queue a [`FeedKeysOp`] for the server
+    // to drain into its typeahead after the chunk. The Lua-facing
+    // `nvim_feedkeys` (prelude) parses the mode flags into `remap`/`insert`.
+    let sh = shared.clone();
+    vim.set(
+        "_feedkeys",
+        lua.create_function(move |_, (keys, remap, insert): (String, bool, bool)| {
+            sh.borrow_mut().feedkeys.push(FeedKeysOp {
+                keys,
+                remap,
+                insert,
+            });
+            Ok(())
+        })?,
+    )?;
+    // `vim._getchar(cb_id)`: queue a blocking-getchar request carrying the parked
+    // coroutine's callback id. The server arms it as `pending_getchar` and resumes
+    // the coroutine with the next key (the `vim.fn.getcharstr` bridge).
+    let sh = shared.clone();
+    vim.set(
+        "_getchar",
+        lua.create_function(move |_, cb_id: u64| {
+            sh.borrow_mut().getchar_reqs.push(cb_id);
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._create_buf()`: queue a [`BufOp::Create`] for the server to drain into
+    // `Editor::create_buffer`. The Lua-facing `nvim_create_buf` (prelude) has
+    // already predicted the id (`vim._next_buf`) and mirrored the new buffer, so
+    // it returns synchronously; this only records the deferred creation.
+    let sh = shared.clone();
+    vim.set(
+        "_create_buf",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().buf_ops.push(BufOp::Create);
+            Ok(())
+        })?,
+    )?;
+
+    // `vim._buf_delete(bufnr, force)`: queue a [`BufOp::Delete`] for the server to
+    // drain into `Editor::delete_buffer` (the popup-teardown half of which-key's
+    // lifecycle). The Lua-facing `nvim_buf_delete` (prelude) has resolved `bufnr`
+    // and dropped it from the `vim._bufs` mirror (write-through); this records the
+    // deferred removal.
+    let sh = shared.clone();
+    vim.set(
+        "_buf_delete",
+        lua.create_function(move |_, (bufnr, force): (u64, bool)| {
+            sh.borrow_mut().buf_ops.push(BufOp::Delete { bufnr, force });
+            Ok(())
+        })?,
     )?;
 
     // The extmark funnels (`vim._extmark_set` / `_extmark_del` / `_extmark_clear`):

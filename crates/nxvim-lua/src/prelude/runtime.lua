@@ -97,6 +97,51 @@ end
 vim._proc_pids = vim._proc_pids or {}
 function vim._set_proc_pid(id, pid) vim._proc_pids[id] = pid end
 
+-- ----- vim.on_key: the keystroke observer ------------------------------------
+-- Plugins (which-key, debugging tools) register a function to watch every key the
+-- server processes. The registry lives Lua-side keyed by namespace id; the server
+-- checks vim._has_on_key once per key (cheap) and, when there are observers, calls
+-- vim._run_on_key(key, typed) for each. nxvim passes the key's vim notation for
+-- both arguments (it has no separate terminal-byte form).
+vim._on_key_fns = vim._on_key_fns or {}
+vim._on_key_seq = vim._on_key_seq or 0
+
+-- vim.on_key(fn[, ns_id[, opts]]): register `fn` as a keystroke observer and
+-- return its namespace id. `vim.on_key(nil, ns)` removes that observer;
+-- `vim.on_key(nil)` clears them all. Re-registering an existing ns replaces it.
+function vim.on_key(fn, ns_id, _opts)
+  if fn == nil then
+    if ns_id == nil then
+      vim._on_key_fns = {}
+      return 0
+    end
+    vim._on_key_fns[ns_id] = nil
+    return ns_id
+  end
+  if ns_id == nil then
+    vim._on_key_seq = vim._on_key_seq + 1
+    ns_id = vim._on_key_seq
+  end
+  vim._on_key_fns[ns_id] = fn
+  return ns_id
+end
+
+-- Whether any observer is registered (the server's per-key fast-path guard).
+function vim._has_on_key() return next(vim._on_key_fns) ~= nil end
+
+-- Run every observer with (key, typed). A throwing observer is DETACHED (matching
+-- neovim, which removes an on_key callback that errors) and the error reported,
+-- so one bad observer can't break input handling or silence the others.
+function vim._run_on_key(key, typed)
+  for ns, fn in pairs(vim._on_key_fns) do
+    local ok, err = pcall(fn, key, typed)
+    if not ok then
+      vim._on_key_fns[ns] = nil
+      vim.notify("nxvim: on_key callback errored and was removed: " .. tostring(err))
+    end
+  end
+end
+
 function vim.notify(msg, _level, _opts)
   if type(msg) == "table" then msg = table.concat(msg, "\n") end
   print(msg)

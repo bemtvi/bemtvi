@@ -30,8 +30,8 @@ mod uvfs;
 mod vimregex;
 
 pub use ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, GlobalOptionOp, HlSet, LoopOp,
-    LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
+    LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs,
     RegisterSetOp, TabOp, UiInputReq, WindowOp,
 };
-pub use runtime::{ExtmarkMirror, FloatMirror, LuaRuntime, TabMirror, WindowMirror};
+pub use runtime::{ExtmarkMirror, FloatMirror, HlDefMirror, LuaRuntime, TabMirror, WindowMirror};

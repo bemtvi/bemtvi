@@ -255,6 +255,98 @@ function vim._run_keymap_expr(id)
   return tostring(result)
 end
 
+-- ----- reading mappings back: nvim_get_keymap / maparg ----------------------
+-- The introspection side of the registry: where the matcher *consumes*
+-- vim._keymaps (compiled to tries server-side), these read it back as the maparg
+-- dict shape neovim hands plugins. A plugin that builds an overlay of your
+-- mappings (which-key, legendary, …) walks these to discover what is bound.
+
+-- Whether a registry entry's declared modes cover the single mode code `want`.
+-- `""` (vim's :map) covers everything; `x`/`v` are treated as interchangeable
+-- (nxvim has no separate Select mode, and visual maps may be declared either way).
+local function keymap_mode_match(modes, want)
+  for _, m in ipairs(modes) do
+    if m == want or m == "" then return true end
+    if (want == "x" or want == "v") and (m == "x" or m == "v") then return true end
+  end
+  return false
+end
+
+-- Render one registry entry as neovim's maparg(..., {dict}) table for mode `mode`.
+-- A function RHS reports `rhs = ""` with the function on `callback` (matching
+-- neovim, which carries a Lua RHS out-of-band); a string RHS reports the keys.
+local function keymap_dict(e, mode)
+  local d = {
+    lhs = e.lhs,
+    lhsraw = e.lhs,
+    mode = mode,
+    noremap = e.noremap and 1 or 0,
+    script = 0,
+    expr = e.expr and 1 or 0,
+    silent = e.silent and 1 or 0,
+    nowait = e.nowait and 1 or 0,
+    buffer = e.buffer or 0,
+    sid = 0,
+    lnum = 0,
+    desc = e.desc,
+  }
+  if e.rhs.kind == "lua" then
+    d.rhs = ""
+    d.callback = vim._keymap_fns[e.id]
+  else
+    d.rhs = e.rhs.str
+  end
+  return d
+end
+
+-- nvim_get_keymap(mode): every GLOBAL mapping that applies in `mode`, as maparg
+-- dicts. Buffer-local maps are excluded (nvim_buf_get_keymap returns those).
+function vim.api.nvim_get_keymap(mode)
+  local out = {}
+  for _, e in ipairs(vim._keymaps) do
+    if (e.buffer == nil or e.buffer == 0) and keymap_mode_match(e.modes, mode) then
+      out[#out + 1] = keymap_dict(e, mode)
+    end
+  end
+  return out
+end
+
+-- nvim_buf_get_keymap(buffer, mode): the BUFFER-LOCAL mappings of `buffer`
+-- (0 = current) that apply in `mode`, as maparg dicts.
+function vim.api.nvim_buf_get_keymap(buffer, mode)
+  buffer = vim._resolve_bufnr(buffer)
+  local out = {}
+  for _, e in ipairs(vim._keymaps) do
+    if e.buffer == buffer and keymap_mode_match(e.modes, mode) then
+      out[#out + 1] = keymap_dict(e, mode)
+    end
+  end
+  return out
+end
+
+-- vim.fn.maparg(name, mode, abbr, dict): the mapping bound to `name` in `mode`.
+-- With `dict` truthy returns the full maparg dict (or `{}` when unmapped); else
+-- the rhs string ("" when unmapped, or for a function RHS). `abbr` (abbreviation
+-- lookup) is accepted and ignored — nxvim has no abbreviations. A buffer-local
+-- map for the current buffer shadows a global one at the same lhs, matching vim.
+function vim.fn.maparg(name, mode, _abbr, dict)
+  if mode == nil or mode == "" then mode = vim._cur_mode or "n" end
+  local cur = vim._resolve_bufnr(0)
+  local best
+  for _, e in ipairs(vim._keymaps) do
+    if e.lhs == name and keymap_mode_match(e.modes, mode) then
+      if e.buffer == cur then
+        best = e -- buffer-local for the current buffer always wins
+      elseif (e.buffer == nil or e.buffer == 0) and (best == nil or best.buffer ~= cur) then
+        best = e -- a global match (kept unless a buffer-local one is found)
+      end
+    end
+  end
+  if not best then return dict and {} or "" end
+  if dict then return keymap_dict(best, mode) end
+  return best.rhs.kind == "lua" and "" or best.rhs.str
+end
+
 -- The `:ls` panel's <CR> handler: jump to the buffer whose number leads the
 -- selected listing line (`"  2 %a "name" line 1"`), then dismiss the list. The
 -- core installs this via `vim.panel.on_select` when `:ls` opens its panel, so

@@ -7,17 +7,21 @@ use crate::unicode;
 impl Editor {
     pub(crate) fn text_height(&self) -> usize {
         // The window's own rows minus a bordered float's one-cell inset (top and
-        // bottom) and its status line. The vertical analog of `text_width`: it
-        // must match the `height` `view::window_view` projects so the
-        // cursor-visibility math scrolls at the real bottom of the text area, not
-        // two phantom rows past it. The panel is already excluded from the window
-        // rect by `relayout`, so it is not subtracted again here.
+        // bottom) and its status line *when it has one*. The vertical analog of
+        // `text_width`: it must match the `height` `view::window_view` projects so
+        // the cursor-visibility math scrolls at the real bottom of the text area.
+        // The status line is gated on `window_statusline_visible` — exactly as the
+        // view projection is — so a float (no status line) uses its full inset
+        // height, and a tiled window subtracts its status row only when one shows.
+        // The panel is already excluded from the window rect by `relayout`, so it
+        // is not subtracted again here.
         let w = self.windows.cur();
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
+        let status = usize::from(self.window_statusline_visible(w.float.is_some()));
         w.rect
             .height
             .saturating_sub(2 * inset)
-            .saturating_sub(1)
+            .saturating_sub(status)
             .max(1)
     }
 

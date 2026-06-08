@@ -60,6 +60,10 @@ end
 vim._wins = vim._wins or {}
 vim._win_order = vim._win_order or { 1000 }
 vim._next_win = vim._next_win or 1001
+-- The id the next nvim_create_buf will mint, refreshed by the server (set_next_buf)
+-- before each Lua entry. Seeded to 2 (the startup buffer is 1) so a create before
+-- the first mirror push still predicts a fresh id.
+vim._next_buf = vim._next_buf or 2
 -- Tab mirror (Phase 3): `vim._tabs[id]` = per-tab record ({ id, windows,
 -- current_window }), `vim._tab_order` the tabline order `nvim_list_tabpages`
 -- returns, `vim._cur_tab` the active id. Seeded to the single startup tab so a
@@ -106,6 +110,71 @@ function vim._set_extmark_mirror(entries)
   end
   vim._extmarks = marks
 end
+
+-- vim._call_ctx_lock: set while inside an nvim_buf_call / nvim_win_call whose
+-- target differs from the real current buffer/window (see those functions). nxvim
+-- runs the callback in-VM with the "current" mirror swapped, so READS resolve to
+-- the target and explicit-handle WRITES queue the right handle — but a mutation
+-- that binds to "current" only at DRAIN time (an ex-command, feedkeys, an LSP buf
+-- request) would run against the REAL current, which the call never switched.
+-- Those funnels call vim._assert_call_ctx to fail loud rather than silently
+-- mutate the wrong context (the no-silent-stub rule applied to a known gap).
+vim._call_ctx_lock = false
+
+function vim._assert_call_ctx(what)
+  if vim._call_ctx_lock then
+    error(
+      "nvim_buf_call/nvim_win_call: " .. what .. " inside the callback would run "
+        .. "against the real current buffer/window, not the one passed to the "
+        .. "call — nxvim cannot retarget a queued mutation. Run it outside the "
+        .. "call, or use an explicit-handle API.",
+      0
+    )
+  end
+end
+
+-- Wrap the context-binding LSP / diagnostic bridges (Rust funnels that drain
+-- against the current buffer/window) so they honor the call-context lock. Done
+-- here, before lsp.lua defines the `vim.lsp.buf.*` wrappers that route through
+-- them, so every entry is covered at the single chokepoint. (These bridges were
+-- installed from Rust before the prelude loads, so they exist to be wrapped.)
+do
+  local guards = {
+    _lsp_buf = "an LSP buf request",
+    _lsp_buf_format = "vim.lsp.buf.format",
+    _lsp_buf_code_action = "vim.lsp.buf.code_action",
+    _lsp_buf_rename = "vim.lsp.buf.rename",
+    _diagnostic_goto = "a diagnostic jump",
+    _diagnostic_setloclist = "vim.diagnostic.setloclist",
+  }
+  for name, what in pairs(guards) do
+    local raw = vim[name]
+    if raw then
+      vim[name] = function(...)
+        vim._assert_call_ctx(what)
+        return raw(...)
+      end
+    end
+  end
+  -- nvim_command is the Rust-installed ex-command funnel (vim.cmd's sibling); it
+  -- runs against the real current buffer/window, so guard it the same way.
+  local raw_command = vim.api.nvim_command
+  if raw_command then
+    vim.api.nvim_command = function(cmd)
+      vim._assert_call_ctx("an ex-command (nvim_command)")
+      return raw_command(cmd)
+    end
+  end
+end
+
+-- Rust→Lua mirror of the core highlight registry, refreshed by the server
+-- (vim._set_hl_mirror) when the registry changes. Keyed by group name ->
+-- { fg, bg, sp (0xRRGGBB ints), bold/italic/… (true when set), link (string) }.
+-- Backs vim.api.nvim_get_hl; a link group carries only `link` (its own attrs are
+-- ignored, matching neovim), and nvim_get_hl follows the chain for the resolved
+-- form. Seeded empty so a read before the first push answers `{}` (no theme yet).
+vim._hl_defs = vim._hl_defs or {}
+function vim._set_hl_mirror(entries) vim._hl_defs = entries or {} end
 
 function vim._set_buf_mirror(entries, row, col, win, wins, next_win, mode)
   vim._cur_mode = mode or "n"
@@ -343,6 +412,14 @@ end
 -- behavior-carrying ones, defined elsewhere.)
 function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 end
 
+-- nvim_get_mode(): the editor's current mode, read from the `vim._cur_mode`
+-- snapshot the server refreshes before each Lua entry. `blocking` is always
+-- false — the in-VM Lua bindings only run when the server is between keys, so it
+-- is never blocked on input here. (The dedicated RPC method serves remote clients.)
+function vim.api.nvim_get_mode()
+  return { mode = vim._cur_mode or "n", blocking = false }
+end
+
 -- Window API (Phase 5). Reads resolve against the `vim._wins` mirror the server
 -- refreshes before running Lua; mutations queue a WindowOp (the `vim._win_*` /
 -- `vim._open_win` Rust bridges) the server drains into the live editor after the
@@ -419,6 +496,65 @@ function vim.api.nvim_win_close(win, force)
     end
     vim._win_order = order
   end
+end
+
+-- nvim_win_call(win, fn) / nvim_buf_call(buf, fn): run `fn` as if `win`/`buf`
+-- were current, returning fn's result. In neovim these temporarily switch the
+-- editor's current window/buffer for the duration of the callback; in nxvim the
+-- callback runs synchronously in-VM, where "current" is the mirror the server
+-- pushed (vim._cur_win / vim._cur_buf / vim._cur_cursor). So these swap that
+-- mirror context for the call, run `fn`, and restore it — which makes every
+-- *read* inside the callback (nvim_win_get_cursor, nvim_get_current_buf,
+-- vim.fn.line/col/winnr, …) resolve against the requested window/buffer, and
+-- every explicit-handle write (nvim_buf_set_lines(buf, …), nvim_win_set_cursor(
+-- win, …)) resolve the swapped mirror at call time and queue that concrete
+-- handle — so it, too, targets the right place.
+--
+-- What nxvim CAN'T do is retarget a mutation that binds to "current" only at
+-- DRAIN time — an ex-command (vim.cmd), feedkeys, or an LSP buf request — since
+-- the queued-ops model applies those against the editor's real current
+-- buffer/window after the chunk, which this call never actually switched. Rather
+-- than silently mutate the wrong context, `vim._call_ctx_lock` is set for the
+-- duration of a call whose target differs from the real current, and those
+-- funnels raise while it is set (see vim._assert_call_ctx). which-key uses these
+-- calls to read a window's view/dimensions, which is fully faithful.
+function vim.api.nvim_win_call(win, fn)
+  win = resolve_win(win)
+  local saved_win, saved_cursor, saved_buf = vim._cur_win, vim._cur_cursor, vim._cur_buf
+  local saved_lock = vim._call_ctx_lock
+  local w = (vim._wins or {})[win]
+  vim._cur_win = win
+  if w then
+    vim._cur_cursor = { row = w.row or 1, col = w.col or 0 }
+    local b = (vim._bufs or {})[w.buffer]
+    vim._cur_buf = { bufnr = w.buffer, name = (b and b.name) or "", filetype = "" }
+  end
+  -- Lock context-dependent mutations when this actually switches windows (stay
+  -- locked if an enclosing call already did).
+  vim._call_ctx_lock = saved_lock or (win ~= saved_win)
+  local ok, ret = pcall(fn)
+  vim._cur_win, vim._cur_cursor, vim._cur_buf = saved_win, saved_cursor, saved_buf
+  vim._call_ctx_lock = saved_lock
+  if not ok then error(ret, 0) end
+  return ret
+end
+
+function vim.api.nvim_buf_call(buf, fn)
+  buf = vim._resolve_bufnr(buf)
+  local saved_buf = vim._cur_buf
+  local saved_lock = vim._call_ctx_lock
+  local b = (vim._bufs or {})[buf]
+  vim._cur_buf = {
+    bufnr = buf,
+    name = (b and b.name) or "",
+    filetype = (saved_buf and buf == saved_buf.bufnr) and saved_buf.filetype or "",
+  }
+  vim._call_ctx_lock = saved_lock or (buf ~= (saved_buf and saved_buf.bufnr))
+  local ok, ret = pcall(fn)
+  vim._cur_buf = saved_buf
+  vim._call_ctx_lock = saved_lock
+  if not ok then error(ret, 0) end
+  return ret
 end
 
 -- ----- tab pages (Phase 3) -------------------------------------------------
@@ -1149,9 +1285,130 @@ function vim.fn.expand(expr)
   error("expand(): unsupported expression '" .. tostring(expr) .. "'", 2)
 end
 
+-- nvim_replace_termcodes(str, from_part, do_lt, special): in neovim, translate
+-- key notation (`<CR>`, `<C-w>`, `<lt>`, …) into the internal terminal-byte
+-- encoding. nxvim represents keys as that *notation* throughout — parse_keys and
+-- nvim_feedkeys consume notation directly — so the canonical internal form of a
+-- key string already IS the notation, and this returns `str` unchanged. The
+-- result round-trips exactly through nvim_feedkeys (which re-parses the notation),
+-- which is the contract callers rely on (build a "feed string", later feed it).
+-- The flags (from_part / do_lt / special) only shape neovim's byte output and are
+-- accepted for call-compatibility; `<lt>` and the special names are handled by
+-- parse_keys at feed time, so no pre-translation is needed here.
+function vim.api.nvim_replace_termcodes(str, _from_part, _do_lt, _special)
+  return tostring(str or "")
+end
+
+-- nvim_feedkeys(keys, mode, escape_ks): enqueue `keys` (vim notation) into the
+-- editor's typeahead, to run at the end of the current input batch / off-tick
+-- settle. `mode` flags: 'n' = noremap (feed straight, the fed keys are not
+-- themselves remapped); 'm' (or the empty/default mode) = remap (fed keys are run
+-- through the mapping engine, so they can trigger mappings); 'i' = insert at the
+-- FRONT of the typeahead (ahead of keys already queued). The 't' (as-if-typed)
+-- and 'x' (execute now) flags are accepted: nxvim always processes the typeahead
+-- within the same turn, so 'x' needs no special handling. `escape_ks` is accepted
+-- and ignored (nxvim notation carries no K_SPECIAL byte escaping).
+function vim.api.nvim_feedkeys(keys, mode, _escape_ks)
+  -- Fed keys run against the real current window at drain time, so they can't be
+  -- retargeted inside a context-swapped nvim_win_call/nvim_buf_call — fail loud.
+  vim._assert_call_ctx("nvim_feedkeys")
+  mode = tostring(mode or "")
+  local remap = mode:find("n", 1, true) == nil -- noremap only with an explicit 'n'
+  local insert = mode:find("i", 1, true) ~= nil
+  vim._feedkeys(tostring(keys or ""), remap, insert)
+end
+
+-- nvim_create_buf(listed, scratch) -> bufnr: create a new, empty buffer without a
+-- window and return its handle. `listed`/`scratch` are accepted (a scratch buffer
+-- is unlisted with no file) but nxvim's core models neither buflisted nor buftype
+-- yet, so they don't change behavior — the buffer is a plain empty buffer either
+-- way. The id is predicted from `vim._next_buf` (the server's next buffer id,
+-- refreshed in the mirror) so it returns synchronously, exactly as nvim_open_win
+-- predicts a window id; the real buffer is created when the queued op drains. The
+-- new buffer is mirrored into `vim._bufs` immediately so nvim_buf_set_lines and
+-- the other buffer-read API work on it within this same chunk.
+-- INCOMPLETE: `listed`/`scratch` are ignored (no buflisted/buftype in the core),
+-- so a scratch buffer is still listed by `:ls`. Faithful once the core models them.
+function vim.api.nvim_create_buf(_listed, _scratch)
+  local id = vim._next_buf or 2
+  vim._next_buf = id + 1
+  vim._bufs = vim._bufs or {}
+  vim._bufs[id] = { lines = { "" }, name = "", loaded = true }
+  vim._create_buf()
+  return id
+end
+
+-- nvim_buf_delete(buffer, opts): remove `buffer` from the editor (the popup
+-- teardown which-key runs when it closes its scratch buffer). `opts.force` drops
+-- a modified buffer without the E89 guard; `opts.unload` is accepted but maps to
+-- the same removal (nxvim's core has no "unloaded but listed" buffer state yet).
+-- Drops the buffer from the `vim._bufs` mirror (write-through) so a read later in
+-- this chunk agrees, then queues the real removal.
+-- INCOMPLETE: `opts.unload` can't keep the buffer listed-but-unloaded (no such
+-- core state), so it behaves like a full delete.
+function vim.api.nvim_buf_delete(buffer, opts)
+  local id = vim._resolve_bufnr(buffer)
+  opts = opts or {}
+  if vim._bufs then vim._bufs[id] = nil end
+  vim._buf_delete(id, opts.force and true or false)
+end
+
 -- vim.api.nvim_set_hl is installed from Rust (it captures the group definition
 -- for the server to fold into the core highlight registry), so it is not
 -- (re)defined here — doing so would shadow the Rust-backed version.
+
+-- nvim_get_hl(ns, opts): read highlight group definitions from the `vim._hl_defs`
+-- mirror the server refreshes when the registry changes. `ns` is accepted but
+-- ignored (namespace 0 only, as nvim_set_hl). Forms:
+--   * opts.name given          -> that group's definition. A link group returns
+--                                 `{ link = "Target" }`; a concrete group returns
+--                                 its colors (fg/bg/sp as 0xRRGGBB ints) and the
+--                                 set boolean attrs. Unknown group -> `{}`.
+--   * opts.name + link = false -> follow the link chain and return the resolved
+--                                 concrete definition (what which-key reads to
+--                                 blend popup colors).
+--   * no name                  -> every group keyed by name.
+-- A fresh table is returned each call so a caller mutating it can't corrupt the
+-- mirror. INCOMPLETE: only namespace 0 is modelled (per-namespace highlights via
+-- nvim_set_hl(ns, …) fold into the global table), and the extra metadata neovim
+-- attaches (`default`, `cterm*`) is absent — nxvim's registry is truecolor-only.
+local function copy_hl_def(d)
+  local out = {}
+  for k, v in pairs(d) do out[k] = v end
+  return out
+end
+
+function vim.api.nvim_get_hl(_ns, opts)
+  opts = opts or {}
+  local defs = vim._hl_defs or {}
+  if opts.name ~= nil then
+    local name = opts.name
+    if opts.link == false then
+      -- Follow the link chain to the concrete definition (cycle-guarded).
+      local seen = 0
+      while defs[name] and defs[name].link ~= nil and seen < 32 do
+        name = defs[name].link
+        seen = seen + 1
+      end
+    end
+    local d = defs[name]
+    return d and copy_hl_def(d) or {}
+  end
+  local out = {}
+  for name, d in pairs(defs) do out[name] = copy_hl_def(d) end
+  return out
+end
+
+-- nvim__redraw(opts): in neovim, force a UI repaint mid-execution (flushing the
+-- screen before the current chunk returns). nxvim's server repaints at the end
+-- of every input / RPC / event turn the Lua ran under (see `Server::handle` /
+-- `settle_events`), so the popup a chunk just built (its float window + buffer
+-- lines + extmarks, all queued and drained right after the chunk) paints on that
+-- same turn without an explicit flush — this is correct by construction, not a
+-- silent stub. The Lua VM runs inside the server's single thread, so it cannot
+-- itself drive a synchronous mid-chunk repaint; `opts` (valid/flush/cursor/…) is
+-- accepted for call-compatibility and needs no action here.
+function vim.api.nvim__redraw(_opts) end
 
 -- ----- vim.cmd: callable AND indexable ---------------------------------------
 -- vim.cmd("…") queues a raw ex-command (the Rust function installed earlier);
@@ -1164,6 +1421,7 @@ do
     if vim._expr_lock then
       error("E5555: <expr> mapping must not change the editor (vim.cmd is blocked)", 0)
     end
+    vim._assert_call_ctx("an ex-command (vim.cmd)")
     return raw_cmd(c)
   end
   local function build(name, ...)

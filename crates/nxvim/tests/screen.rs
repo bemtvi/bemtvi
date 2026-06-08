@@ -467,7 +467,8 @@ async fn a_bordered_float_draws_its_border_and_title() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ibackground<Esc>");
     let fb = new_buffer(&rpc).await;
-    // A single-bordered, titled float at (col 2, row 1), 20x6 outer.
+    // A single-bordered, titled float at (col 2, row 1), 20x6 *content* — the
+    // border is drawn outside it (neovim semantics), so the outer box is 22x8.
     open_float(
         &rpc,
         fb,
@@ -486,10 +487,11 @@ async fn a_bordered_float_draws_its_border_and_title() {
     feed(&rpc, "iinside<Esc>");
     let buf = screen(&rpc, &mut incoming).await;
 
-    // The border box: top-left and bottom-right corners at the outer rect edges.
+    // The border box: top-left at the origin, bottom-right at the outer edges
+    // (content 20x6 + one border cell per side = 22x8).
     assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "┌", "top-left corner");
     assert_eq!(
-        buf.cell((2 + 20 - 1, 1 + 6 - 1)).unwrap().symbol(),
+        buf.cell((2 + 22 - 1, 1 + 8 - 1)).unwrap().symbol(),
         "┘",
         "bottom-right corner"
     );
@@ -511,8 +513,10 @@ async fn the_cursor_stays_inside_a_focused_float_on_a_long_line() {
     // must stay clamped to the float's text area.
     let (rpc, mut incoming) = start(None).await;
     let fb = new_buffer(&rpc).await;
-    // A single-bordered float at (col 5, row 2), 20 wide. Inner text area: past the
-    // border (x 6) and the 4-cell gutter (x 10), 13 cells wide -> ends at x 23.
+    // A single-bordered float at (col 5, row 2), 20 wide *content* (neovim
+    // semantics: border drawn outside, so the outer box is 22 wide, x in [5, 27)).
+    // Inner text area: past the left border (x 6) and the 4-cell gutter (x 10),
+    // running to the last content cell at x 25.
     open_float(
         &rpc,
         fb,
@@ -536,19 +540,20 @@ async fn the_cursor_stays_inside_a_focused_float_on_a_long_line() {
     let params = latest_redraw(&mut incoming).await.expect("a redraw");
     let (_buf, cursor) = paint_with_cursor(&View::from_redraw(&params), COLS, ROWS);
     let (cx, cy) = cursor.expect("a cursor");
-    // The float's outer rect spans x in [5, 25); the cursor must stay within it
-    // (pinned to the last visible text cell, x 23), never escaping to the right.
+    // The float's outer rect spans x in [5, 27); the cursor must stay within it
+    // (pinned to the last visible text cell, x 25), never escaping to the right.
     assert!(
-        (5..25).contains(&cx),
+        (5..27).contains(&cx),
         "cursor escaped the float horizontally: x={cx}"
     );
     assert_eq!(
-        cx, 23,
+        cx, 25,
         "cursor pinned to the float's last visible text column"
     );
-    // And it stays on the float's text rows (row 2 border, 3 = first text row).
+    // And it stays on the float's text rows (row 2 border, 3..9 are the 6 content
+    // rows that follow it).
     assert!(
-        (3..7).contains(&cy),
+        (3..9).contains(&cy),
         "cursor escaped the float vertically: y={cy}"
     );
 }

@@ -31,7 +31,7 @@ mod treesitter;
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
 use lsp::{CompletionMenu, LspDocState, LspReqKind, PendingLspReq, ServerRuntime};
-use nxvim_core::{BufferId, Editor, Mode, TabId, WindowId};
+use nxvim_core::{BufferId, Editor, Key, Mode, TabId, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
@@ -237,10 +237,26 @@ struct Server {
     /// onto undo nodes and handed to `vim.fn.localtime()`. Monotonic so elapsed
     /// labels survive wall-clock jumps; see [`Editor::set_now_mono`].
     start: std::time::Instant,
+    /// The highlight-registry [`generation`](nxvim_core::highlight::Highlights::generation)
+    /// last folded into the `vim._hl_defs` Lua mirror ([`Server::push_buf_mirror`]).
+    /// The mirror (potentially hundreds of groups) is re-pushed only when this
+    /// changes — a colorscheme load, a `:hi`/`nvim_set_hl` — so the common chunk
+    /// pays nothing for `nvim_get_hl` support. `None` until the first push.
+    hl_mirror_gen: Option<u64>,
     /// The `vim._cb_fns` id of the `vim.ui.input` callback awaiting the open
     /// command-line prompt's result, or `None` when no scripted prompt is open
     /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
     pending_ui_input: Option<u64>,
+    /// The `vim._cb_fns` id of a coroutine parked on `vim.fn.getcharstr()`, or
+    /// `None`. While set, the next key the server processes is delivered to this
+    /// callback (resuming the coroutine) instead of being routed to the matcher —
+    /// nxvim's stand-in for vim's blocking `getchar()` reading the typeahead.
+    pending_getchar: Option<u64>,
+    /// Keys queued by `nvim_feedkeys`, drained after the input batch / off-tick
+    /// settle. Each carries whether it should be remapped (the `m` flag) or fed
+    /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
+    /// pushes to the front; otherwise to the back.
+    feed_buffer: VecDeque<(Key, bool)>,
 }
 
 /// Run the server over a connected stream until the client disconnects or the
@@ -310,7 +326,10 @@ where
         buf_mirror_ticks: HashMap::new(),
         undo_mirror_versions: HashMap::new(),
         start: std::time::Instant::now(),
+        hl_mirror_gen: None,
         pending_ui_input: None,
+        pending_getchar: None,
+        feed_buffer: VecDeque::new(),
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -397,6 +416,9 @@ where
     server.known_tabs = server.editor.tab_ids();
     server.emit_lifecycle_events();
     server.run_pending();
+    // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a
+    // plugin that gates "the editor has finished starting" reads it as true.
+    let _ = server.lua.set_vim_did_enter(true);
 
     loop {
         tokio::select! {

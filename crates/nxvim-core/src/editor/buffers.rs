@@ -77,6 +77,14 @@ impl Editor {
         self.add_buffer(Buffer::empty())
     }
 
+    /// The id the next [`Editor::create_buffer`] will hand out. Buffer ids are
+    /// monotonic and never reused, so a caller can predict the id of a buffer it
+    /// is about to create — the buffer analogue of [`Editor::next_window_id`],
+    /// used by the Lua `nvim_create_buf` to return synchronously.
+    pub fn next_buffer_id(&self) -> BufferId {
+        BufferId(self.buffers.next_id)
+    }
+
     /// Editable lines of buffer `id`, or `None` if no such buffer is open
     /// (the buffer-addressed form of [`Editor::lines`]).
     pub fn lines_of(&self, id: BufferId) -> Option<Vec<String>> {
@@ -515,12 +523,25 @@ impl Editor {
         let Some(target) = self.resolve_buffer(args) else {
             return;
         };
-        if self.buffers.get(target).buffer.modified && !bang {
+        self.delete_buffer(target, bang);
+    }
+
+    /// Remove buffer `target` from the editor — the shared core of `:bdelete` and
+    /// the `nvim_buf_delete` API. Refuses a modified buffer without `force` (the
+    /// `E89` guard). When the current buffer is removed, the window moves to the
+    /// alternate (or the nearest remaining id); removing the last buffer leaves a
+    /// fresh `[No Name]`. Returns `false` (a no-op) when the buffer is unknown or
+    /// the `E89` guard blocked an unforced delete of a modified buffer.
+    pub fn delete_buffer(&mut self, target: BufferId, force: bool) -> bool {
+        if !self.buffers.map.contains_key(&target) {
+            return false;
+        }
+        if self.buffers.get(target).buffer.modified && !force {
             self.echo(format!(
                 "E89: No write since last change for buffer {} (add ! to override)",
                 target.0
             ));
-            return;
+            return false;
         }
 
         // When removing the current buffer, move to the alternate if it's a
@@ -556,6 +577,7 @@ impl Editor {
             // the outgoing buffer is gone).
             self.enter_buffer(replacement.expect("a non-empty store has a neighbor"));
         }
+        true
     }
 
     /// The nearest buffer to `id` in id order among the *other* open buffers:

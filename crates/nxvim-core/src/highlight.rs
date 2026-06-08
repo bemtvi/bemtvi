@@ -120,6 +120,12 @@ impl Style {
 #[derive(Default)]
 pub struct Highlights {
     groups: HashMap<String, HlDef>,
+    /// Bumped on every mutation ([`Highlights::set`] / [`Highlights::clear`]),
+    /// so the server can mirror the table into Lua only when it actually changed
+    /// (the Rust→Lua `nvim_get_hl` mirror is otherwise hundreds of entries to
+    /// re-serialize before every Lua chunk). Wraps harmlessly: only equality
+    /// against the last-pushed value matters.
+    generation: u64,
 }
 
 /// Guards link resolution against a cycle (`A -> B -> A`): deep enough for any
@@ -142,17 +148,32 @@ impl Highlights {
         } else {
             self.groups.insert(name.to_string(), def);
         }
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// `:hi clear` — drop every group back to the empty default state.
     pub fn clear(&mut self) {
         self.groups.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// The raw (unresolved) definition for `name`, if any. `link` is still
     /// present — callers wanting a concrete style use [`Highlights::resolve`].
     pub fn get(&self, name: &str) -> Option<&HlDef> {
         self.groups.get(name)
+    }
+
+    /// A change counter bumped on every [`set`](Self::set) / [`clear`](Self::clear).
+    /// The server gates the Rust→Lua `nvim_get_hl` mirror push on it.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Iterate the raw `(name, def)` definitions — the source the server folds
+    /// into the Lua `vim._hl_defs` mirror that backs `nvim_get_hl`. Links are
+    /// kept unresolved (the Lua side follows the chain when asked).
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &HlDef)> {
+        self.groups.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     /// Resolve a group to a concrete [`Style`], following its link chain

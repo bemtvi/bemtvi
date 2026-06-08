@@ -11,8 +11,8 @@ use nxvim_core::{
     UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, HlSet, LoopOp, OptionValue,
-    PanelOp, TabMirror, TabOp, WindowMirror, WindowOp,
+    BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, HlDefMirror, HlSet, LoopOp,
+    OptionValue, PanelOp, TabMirror, TabOp, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -207,6 +207,30 @@ impl Server {
                 .open_confirm(req.label, req.accelerators, req.default);
             self.pending_ui_input = Some(req.cb_id);
         }
+        // `nvim_feedkeys` typeahead: parse each request's keys and queue them onto
+        // the server's feed buffer (the front for an `i` insert, else the back),
+        // carrying the remap flag. The buffer is drained — fed through the matcher
+        // or straight to the editor — by `drain_feedkeys` at the batch / settle
+        // boundary, never re-entrantly here.
+        for op in self.lua.take_feedkeys() {
+            let keys = nxvim_core::parse_keys(&op.keys);
+            if op.insert {
+                // Insert at the front while preserving the keys' own order.
+                for key in keys.into_iter().rev() {
+                    self.feed_buffer.push_front((key, op.remap));
+                }
+            } else {
+                for key in keys {
+                    self.feed_buffer.push_back((key, op.remap));
+                }
+            }
+        }
+        // A blocking `vim.fn.getcharstr()` parked its coroutine: arm `pending_getchar`
+        // so the next key the server processes resumes it (one in flight; a getchar
+        // loop reads one key at a time, so a later request simply replaces it).
+        for cb_id in self.lua.take_getchar_reqs() {
+            self.pending_getchar = Some(cb_id);
+        }
     }
 
     /// Apply one [`BufOp`] to the live editor (Phase 6). Converts the neovim line
@@ -223,6 +247,14 @@ impl Server {
                 end,
                 repl,
             } => (bufnr, start, end, repl),
+            BufOp::Create => {
+                // Hand out the id the Lua side already predicted (buffer ids are
+                // monotonic, so this matches `vim._next_buf`). The new buffer is
+                // empty and windowless until a later op (e.g. `nvim_win_set_buf` or
+                // `nvim_buf_set_lines`) touches it.
+                let _ = self.editor.create_buffer();
+                return;
+            }
             BufOp::SetOption { bufnr, name, value } => {
                 let id = BufferId(bufnr);
                 match value {
@@ -233,6 +265,10 @@ impl Server {
                     // a `String`, so this is unreachable in practice.
                     OptionValue::String(_) => {}
                 }
+                return;
+            }
+            BufOp::Delete { bufnr, force } => {
+                self.editor.delete_buffer(BufferId(bufnr), force);
                 return;
             }
         };
@@ -662,15 +698,18 @@ impl Server {
             .map(|id| {
                 let buffer = self.editor.window_buffer(id).map(|b| b.0).unwrap_or(0);
                 let (line, col) = self.editor.window_cursor(id).unwrap_or((0, 0));
-                let (_, _, w, h) = self.editor.window_rect(id).unwrap_or((0, 0, 0, 0));
+                let (cw, ch) = self.editor.window_content_size(id).unwrap_or((0, 0));
                 let opts = self.editor.window_options(id).unwrap_or_default();
                 WindowMirror {
                     id: id.0,
                     buffer,
                     row: (line + 1) as u64,
                     col: col as u64,
-                    width: w as u64,
-                    height: h.saturating_sub(1) as u64, // text rows (minus the status line)
+                    // The content size `nvim_win_get_width`/`get_height` report:
+                    // the gutter is included, a bordered float's border and a
+                    // window's status row are not (matches what's drawn).
+                    width: cw as u64,
+                    height: ch as u64,
                     number: opts.number,
                     relativenumber: opts.relativenumber,
                     float: self.editor.window_float_config(id).map(float_mirror),
@@ -689,6 +728,34 @@ impl Server {
         );
         let _ = self.lua.set_bo_mirror(&bo);
         let _ = self.lua.set_extmark_mirror(&extmarks);
+        // The highlight registry, mirrored so `nvim_get_hl` reads live group
+        // definitions from Lua. Gated on the registry's generation — a colorscheme
+        // populates hundreds of groups once and rarely changes them, so re-pushing
+        // the whole table every chunk would be wasteful; only a real change (a
+        // `:hi` / `nvim_set_hl` / `:colorscheme`) re-serializes it.
+        let hl_gen = self.editor.highlights.generation();
+        if self.hl_mirror_gen != Some(hl_gen) {
+            self.hl_mirror_gen = Some(hl_gen);
+            let defs: Vec<HlDefMirror> = self
+                .editor
+                .highlights
+                .iter()
+                .map(|(name, def)| HlDefMirror {
+                    name: name.to_string(),
+                    fg: def.fg.map(|c| c.to_u32()),
+                    bg: def.bg.map(|c| c.to_u32()),
+                    sp: def.sp.map(|c| c.to_u32()),
+                    bold: def.bold,
+                    italic: def.italic,
+                    underline: def.underline,
+                    undercurl: def.undercurl,
+                    strikethrough: def.strikethrough,
+                    reverse: def.reverse,
+                    link: def.link.clone(),
+                })
+                .collect();
+            let _ = self.lua.set_hl_mirror(&defs);
+        }
         // The tab snapshot (Phase 3): one entry per tab page in tabline order, each
         // carrying its window ids and focused window, so `nvim_tabpage_*` reads from
         // Lua resolve against live state.
@@ -740,6 +807,23 @@ impl Server {
         // (a handful of short strings), so it isn't gated on a dirty flag.
         let regs = self.editor.register_mirror();
         let _ = self.lua.set_reg_mirror(&regs);
+        // The `vim.v.*` predefined variables sourced from the pending-command
+        // state (`v:count` / `v:count1` / `v:register` / `v:operator`), so a
+        // keymap RHS / `<expr>` reading them reflects the count/register typed
+        // before it fired. Cheap (four scalars), so it isn't gated.
+        let _ = self.lua.set_v_mirror(
+            self.editor.pending_count() as u64,
+            self.editor.pending_count1() as u64,
+            &self.editor.pending_register().to_string(),
+            &self
+                .editor
+                .pending_operator()
+                .map(String::from)
+                .unwrap_or_default(),
+        );
+        // The id the next `nvim_create_buf` will mint, so it can return
+        // synchronously (the buffer analogue of the window mirror's `next_win`).
+        let _ = self.lua.set_next_buf(self.editor.next_buffer_id().0);
         self.push_undotree_mirror();
     }
 
@@ -850,7 +934,12 @@ impl Server {
     pub(crate) fn settle_events(&mut self, dirty: bool) {
         let had_scheduled = !self.scheduled.is_empty();
         self.run_pending();
-        if dirty || had_scheduled {
+        // An off-tick callback (a timer, a scheduled fn) may have queued
+        // `nvim_feedkeys` — e.g. which-key's deferred `M.start` re-feed; process
+        // that typeahead now, the off-tick analogue of `input`'s trailing drain.
+        let had_feed = !self.feed_buffer.is_empty();
+        self.drain_feedkeys();
+        if dirty || had_scheduled || had_feed {
             self.redraw();
         }
     }

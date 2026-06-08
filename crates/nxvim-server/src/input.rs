@@ -3,7 +3,7 @@
 
 use crate::keymap::{BuiltinAction, MappingRhs, Step};
 use crate::Server;
-use nxvim_core::{parse_keys, Key, KeyCode, Mode};
+use nxvim_core::{key_to_notation, parse_keys, Key, KeyCode, Mode};
 
 impl Server {
     pub(crate) fn input(&mut self, keys: &str) {
@@ -13,28 +13,115 @@ impl Server {
         // the next batch, an accepted ordering.
         self.refresh_keymaps();
         for key in parse_keys(keys) {
-            // Insert-mode completion popup is modal, stateful UI routing: while it
-            // is open it owns every key (navigate / accept / dismiss / live-refresh)
-            // ahead of the mapping engine (design B5). A key the popup *doesn't*
-            // claim dismisses it and returns `false`, so we fall through to the
-            // matcher below — `<C-k>` then fires signature help, `<Esc>` then leaves
-            // insert, etc. (`completion_menu_key` is only reached while open.)
-            if self.editor.mode == Mode::Insert
-                && self.completion_menu_open()
-                && self.completion_menu_key(key)
-            {
-                continue;
-            }
-            // The mapping layer interposes here, ahead of `editor.input`: each key
-            // is run through the withhold/replay matcher, which hands back the steps
-            // to apply (raw editor keys and/or a fired mapping). The built-in LSP
-            // keys — the `gd`/`gD`/`gr` go-to trio, `K` hover, and the insert-mode
-            // completion triggers — all ride it as overridable native default
-            // mappings (design B2/B3); the `command_status` oracle keeps core's
-            // `g`-motions (`gg`/`dgg`/…) intact under the `g`-prefix collision.
-            self.feed_matcher(key);
+            self.process_key(key);
         }
         self.run_pending();
+        // Typeahead queued by `nvim_feedkeys` during this batch (e.g. a keymap RHS
+        // that fed keys) is processed now, after the batch's own keys settle.
+        self.drain_feedkeys();
+    }
+
+    /// Route one input key. A coroutine parked on `vim.fn.getcharstr()` consumes
+    /// the key first (vim's blocking `getchar` reads from the typeahead ahead of
+    /// the editor); otherwise the key flows through the completion popup / mapping
+    /// engine as usual. Every key processed here is also reported to the
+    /// `vim.on_key` observers (including a getchar-consumed key, matching neovim).
+    pub(crate) fn process_key(&mut self, key: Key) {
+        self.notify_on_key(key);
+        if let Some(cb) = self.pending_getchar.take() {
+            self.resume_getchar(cb, key);
+            return;
+        }
+        // Insert-mode completion popup is modal, stateful UI routing: while it is
+        // open it owns every key (navigate / accept / dismiss / live-refresh) ahead
+        // of the mapping engine (design B5). A key the popup *doesn't* claim
+        // dismisses it and returns `false`, so we fall through to the matcher below
+        // — `<C-k>` then fires signature help, `<Esc>` then leaves insert, etc.
+        // (`completion_menu_key` is only reached while open.)
+        if self.editor.mode == Mode::Insert
+            && self.completion_menu_open()
+            && self.completion_menu_key(key)
+        {
+            return;
+        }
+        // The mapping layer interposes here, ahead of `editor.input`: each key is
+        // run through the withhold/replay matcher, which hands back the steps to
+        // apply (raw editor keys and/or a fired mapping). The built-in LSP keys —
+        // the `gd`/`gD`/`gr` go-to trio, `K` hover, and the insert-mode completion
+        // triggers — all ride it as overridable native default mappings (design
+        // B2/B3); the `command_status` oracle keeps core's `g`-motions (`gg`/`dgg`/…)
+        // intact under the `g`-prefix collision.
+        self.feed_matcher(key);
+    }
+
+    /// Report `key` (as vim notation) to every `vim.on_key` observer. Guarded by
+    /// the cheap `has_on_key` check so a session with no observer pays nothing.
+    /// An observer's queued effects drain immediately (an `on_key` that echoes /
+    /// `vim.cmd`s shouldn't strand its work until the next chunk).
+    pub(crate) fn notify_on_key(&mut self, key: Key) {
+        if !self.lua.has_on_key() {
+            return;
+        }
+        if let Err(e) = self.lua.run_on_key(&key_to_notation(key)) {
+            self.editor
+                .echo(format!("E5108: Error in on_key callback: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Resume a coroutine parked on `vim.fn.getcharstr()` (callback `cb`) with
+    /// `key`, the getchar analogue of delivering a `vim.ui.input` result. The
+    /// continuation commonly reads buffer/cursor state and may itself park on
+    /// another `getcharstr` (re-arming `pending_getchar`) or queue `nvim_feedkeys`,
+    /// both handled when its effects drain.
+    pub(crate) fn resume_getchar(&mut self, cb: u64, key: Key) {
+        self.push_buf_mirror();
+        if let Err(e) = self.lua.deliver_getchar(cb, &key_to_notation(key)) {
+            self.editor
+                .echo(format!("E5108: Error in getcharstr continuation: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Process the `nvim_feedkeys` typeahead to exhaustion: each queued key is fed
+    /// through the matcher (a `remap` feed, so it can trigger mappings) or straight
+    /// to the editor (a `noremap` feed), with its effects driven to convergence
+    /// before the next. A fed key can re-fill the buffer (a mapping that itself
+    /// feeds keys) or be claimed by a parked `getcharstr`; both are handled here.
+    /// Bounded by a generous budget so a self-perpetuating feed can't spin forever.
+    pub(crate) fn drain_feedkeys(&mut self) {
+        if self.feed_buffer.is_empty() {
+            return;
+        }
+        // A `nvim_feedkeys` producer (e.g. which-key) may have changed the keymap
+        // registry just before feeding (suspending its own triggers so the fed keys
+        // hit the real maps); pick that up before feeding.
+        self.refresh_keymaps();
+        let mut budget = 10_000usize;
+        while let Some((key, remap)) = self.feed_buffer.pop_front() {
+            if budget == 0 {
+                self.editor
+                    .echo("E132: feedkeys recursion limit exceeded".to_string());
+                self.feed_buffer.clear();
+                break;
+            }
+            budget -= 1;
+            // A fed key, like a typed one, is observed and can feed a parked getchar.
+            self.notify_on_key(key);
+            if let Some(cb) = self.pending_getchar.take() {
+                self.resume_getchar(cb, key);
+            } else if remap {
+                self.feed_matcher(key);
+            } else {
+                self.editor.input(key);
+                self.emit_lifecycle_events();
+            }
+            // Drive the fed key's effects (a fired Lua mapping, queued commands)
+            // and any further keys it fed; refresh tries in case a map changed them.
+            self.apply_lua_effects();
+            self.run_pending();
+            self.refresh_keymaps();
+        }
     }
 
     /// Run one key through the general mapping matcher and apply the steps it
@@ -204,6 +291,13 @@ impl Server {
         if let Some(message) = restore {
             self.editor.message = message;
         }
+        // The count / register typed before this mapping were its arguments
+        // (`v:count` / `v:register`, which the RHS may have just read); the mapping
+        // has consumed them, so clear the pending command state. A mapping fires
+        // outside `Editor::input`, so the editor never resets this itself, and it
+        // would otherwise leak into the next command (`3<leader>x` then `j` would
+        // move 3 lines).
+        self.editor.clear_pending_command();
     }
 
     /// Run an `<expr>` Lua RHS and feed the keys it returns. The function computes

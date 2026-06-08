@@ -2198,14 +2198,11 @@ async fn focused_bordered_float_scrolls_within_its_inset_width() {
     );
 }
 
-/// A focused, bordered float scrolls *vertically* within its bordered, status-line
-/// inset content height — not its raw rect height. A `height = 8` single-bordered
-/// float spends one row per border (top + bottom) and one on its status line, so
-/// exactly 5 text rows show. Moving the cursor onto the 6th line must scroll the
-/// float by one line; the bottom-of-window math has to subtract the border inset
-/// just like the width math does, or the float thinks it has two phantom rows (the
-/// borders) and the cursor sits pinned at the bottom for two presses before
-/// scrolling resumes.
+/// A focused, bordered float scrolls *vertically* within its content height. With
+/// neovim's semantics the configured `height` IS the content area — the border is
+/// drawn outside it and a float has no status line — so a `height = 8`
+/// single-bordered float shows exactly 8 text rows. Moving the cursor onto the 9th
+/// line must scroll the float by one line.
 #[tokio::test]
 async fn focused_bordered_float_scrolls_within_its_inset_height() {
     let (rpc, mut incoming) = start(None).await;
@@ -2215,7 +2212,7 @@ async fn focused_bordered_float_scrolls_within_its_inset_height() {
     feed(&rpc, &body.join("<CR>"));
     feed(&rpc, "<Esc>");
 
-    // A focused, single-bordered float onto the same buffer (0), 8 rows tall.
+    // A focused, single-bordered float onto the same buffer (0), 8 content rows.
     let _float = open_float(
         &rpc,
         true, // take focus
@@ -2231,7 +2228,7 @@ async fn focused_bordered_float_scrolls_within_its_inset_height() {
     )
     .await;
 
-    // Start at the top of the buffer inside the float: 5 text rows show line01..line05.
+    // Start at the top of the buffer inside the float: 8 text rows show line01..line08.
     let frame = windows_after(&rpc, &mut incoming, "gg").await;
     let win = frame.focused();
     assert_eq!(
@@ -2241,19 +2238,59 @@ async fn focused_bordered_float_scrolls_within_its_inset_height() {
     );
     assert_eq!(
         win.lines.len(),
-        5,
-        "a height-8 single-bordered float shows 5 text rows"
+        8,
+        "a height-8 single-bordered float shows 8 text rows (content height; border outside, no status line)"
     );
 
-    // Move the cursor onto the 6th line. With only 5 text rows visible, that is one
-    // past the bottom, so the float must scroll down by one line — line02 becomes
-    // the first visible row. (Buggy behavior: top stays at line01 because the
-    // bottom-of-window math counted the two border rows as text.)
-    let frame = windows_after(&rpc, &mut incoming, "5j").await;
+    // Move the cursor onto the 9th line. With 8 text rows visible, that is one past
+    // the bottom, so the float must scroll down by one line — line02 becomes the
+    // first visible row.
+    let frame = windows_after(&rpc, &mut incoming, "8j").await;
     let win = frame.focused();
     assert_eq!(
         win.lines.first().map(String::as_str),
         Some("line02"),
-        "moving onto the 6th line scrolls the bordered float by one line"
+        "moving onto the 9th line scrolls the bordered float by one line"
     );
+}
+
+/// A bordered float sizes its CONTENT to nvim_open_win's width/height (neovim's
+/// semantics): the border is drawn OUTSIDE that area, and a float carries no
+/// status line by default. So a `width = 24, height = 3` single-bordered float
+/// shows exactly 3 content rows and its outer rect is 26x5 (content + one border
+/// cell per side). (Regression for which-key-style popups, which pass content
+/// dimensions and expect every row to show.)
+#[tokio::test]
+async fn bordered_float_size_is_content_area_neovim_semantics() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<CR>beta<CR>gamma<CR>delta<Esc>");
+    let _float = open_float(
+        &rpc,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("row", Value::from(1u64)),
+            ("col", Value::from(2u64)),
+            ("width", Value::from(24u64)),
+            ("height", Value::from(3u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await;
+    let frame = windows_after(&rpc, &mut incoming, "gg").await;
+    let win = frame.focused();
+    assert_eq!(
+        win.lines.len(),
+        3,
+        "a height=3 bordered float shows 3 content rows (border + statusline don't eat content)"
+    );
+    assert_eq!(
+        win.rect.height, 5,
+        "outer rect height = content 3 + border 2"
+    );
+    assert_eq!(
+        win.rect.width, 26,
+        "outer rect width = content 24 + border 2"
+    );
+    assert_eq!(win.lines.first().map(String::as_str), Some("alpha"));
 }

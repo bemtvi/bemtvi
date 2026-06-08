@@ -99,6 +99,58 @@ pub fn parse_keys(input: &str) -> Vec<Key> {
     out
 }
 
+/// Render a [`Key`] back into vim key-notation — the inverse of [`parse_keys`]
+/// for a single key. A plain printable key is its own character (`f` → `"f"`); a
+/// special key or a modified key becomes a `<...>` form (`<Esc>`, `<C-w>`,
+/// `<S-Tab>`), the same notation [`parse_keys`] consumes, so the two round-trip.
+///
+/// This is what `vim.fn.getcharstr` / `vim.on_key` hand to Lua: nxvim has no
+/// terminal-byte key encoding, so its notation *is* the key's external form.
+pub fn key_to_notation(key: Key) -> String {
+    // `(named, base)`: whether the code needs a `<...>` wrapper on its own, and
+    // its notation stem.
+    let (named, base): (bool, String) = match key.code {
+        KeyCode::Char(' ') => (true, "Space".to_string()),
+        // A bare '<' is written `<lt>` so the result re-parses to '<' and never
+        // opens a spurious special form.
+        KeyCode::Char('<') if !key.ctrl && !key.alt => (true, "lt".to_string()),
+        KeyCode::Char(c) => (false, c.to_string()),
+        KeyCode::Enter => (true, "CR".to_string()),
+        KeyCode::Esc => (true, "Esc".to_string()),
+        KeyCode::Backspace => (true, "BS".to_string()),
+        KeyCode::Tab => (true, "Tab".to_string()),
+        KeyCode::Delete => (true, "Del".to_string()),
+        KeyCode::Left => (true, "Left".to_string()),
+        KeyCode::Right => (true, "Right".to_string()),
+        KeyCode::Up => (true, "Up".to_string()),
+        KeyCode::Down => (true, "Down".to_string()),
+        KeyCode::Home => (true, "Home".to_string()),
+        KeyCode::End => (true, "End".to_string()),
+        KeyCode::PageUp => (true, "PageUp".to_string()),
+        KeyCode::PageDown => (true, "PageDown".to_string()),
+    };
+    // A plain printable char with no ctrl/alt is bare (`f`, `F`, `5`); shift is
+    // already baked into the character, so it adds no `S-` prefix.
+    if !named && !key.ctrl && !key.alt {
+        return base;
+    }
+    let mut s = String::from("<");
+    if key.ctrl {
+        s.push_str("C-");
+    }
+    if key.alt {
+        s.push_str("A-");
+    }
+    // Shift is only notated for the named keys (`<S-Tab>`); on a printable char it
+    // is already reflected in the character itself.
+    if key.shift && named {
+        s.push_str("S-");
+    }
+    s.push_str(&base);
+    s.push('>');
+    s
+}
+
 fn parse_special(inner: &str) -> Option<Key> {
     let mut ctrl = false;
     let mut shift = false;

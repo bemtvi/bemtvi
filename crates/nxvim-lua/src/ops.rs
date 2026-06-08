@@ -246,6 +246,17 @@ pub enum BufOp {
         name: String,
         value: OptionValue,
     },
+    /// `nvim_create_buf(listed, scratch)` — create a new empty buffer with no
+    /// window. The Lua side already predicted the id (from `vim._next_buf`) and
+    /// mirrored the buffer; the server calls `Editor::create_buffer`, which hands
+    /// out that same id (buffer ids are monotonic, so the prediction holds as long
+    /// as nothing else creates a buffer between the mirror push and this drain).
+    Create,
+    /// `nvim_buf_delete(bufnr, { force })` — remove buffer `bufnr` from the editor
+    /// (the popup-teardown half of which-key's lifecycle). `force` drops a modified
+    /// buffer without the `E89` guard. The Lua side has already dropped it from the
+    /// `vim._bufs` mirror (write-through); the server calls `Editor::delete_buffer`.
+    Delete { bufnr: u64, force: bool },
 }
 
 /// An extmark mutation queued by the `nvim_buf_set_extmark` / `_del_extmark` /
@@ -313,6 +324,23 @@ pub struct RegisterSetOp {
     pub linewise: bool,
     /// Append to the register's current contents instead of overwriting.
     pub append: bool,
+}
+
+/// A `nvim_feedkeys(keys, mode, …)` request: enqueue `keys` (vim key-notation)
+/// into the server's typeahead, to be processed at the end of the current input
+/// batch / off-tick settle. `remap` (the `m`/default flag, cleared by `n`) routes
+/// the fed keys through the mapping engine; `insert` (the `i` flag) puts them at
+/// the front of the typeahead instead of the back. The server parses `keys` and
+/// drains them after the chunk — Lua queues, the server feeds.
+#[derive(Clone, Debug)]
+pub struct FeedKeysOp {
+    /// The keys to feed, as vim notation (`parse_keys` turns them into `Key`s).
+    pub keys: String,
+    /// Route the keys through the mapping engine (the `m`/default flag) rather
+    /// than straight to the editor (the `n` noremap flag).
+    pub remap: bool,
+    /// Insert at the FRONT of the typeahead (the `i` flag) rather than appending.
+    pub insert: bool,
 }
 
 /// A global (editor-wide) option mutation queued by `vim.o` for a search option

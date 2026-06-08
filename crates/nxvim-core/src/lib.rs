@@ -33,7 +33,7 @@ pub use editor::{
 };
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
-pub use input::{parse_keys, Key, KeyCode};
+pub use input::{key_to_notation, parse_keys, Key, KeyCode};
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};
 pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};

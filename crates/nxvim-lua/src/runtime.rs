@@ -15,8 +15,9 @@ use crate::convert::{json_to_lua, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, GlobalOptionOp, HlSet, LoopOp,
-    LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, UiInputReq, WindowOp,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
+    LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, TabOp, UiInputReq,
+    WindowOp,
 };
 
 /// One window's row in the Rust→Lua window mirror, in layout order. The
@@ -91,6 +92,26 @@ pub struct ExtmarkMirror {
     pub end_col: Option<u64>,
     pub hl_group: Option<String>,
     pub priority: u32,
+}
+
+/// One highlight group's row in the Rust→Lua highlight mirror (`vim._hl_defs`),
+/// pushed when the core registry changes so `nvim_get_hl` reads live definitions.
+/// Colors ride as the `0xRRGGBB` integers neovim's API reports; a `link` group
+/// carries only `link` (its attrs are ignored, matching neovim), and the Lua side
+/// follows the chain when asked for the resolved form (`{ link = false }`).
+#[derive(Clone, Debug, Default)]
+pub struct HlDefMirror {
+    pub name: String,
+    pub fg: Option<u32>,
+    pub bg: Option<u32>,
+    pub sp: Option<u32>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub undercurl: bool,
+    pub strikethrough: bool,
+    pub reverse: bool,
+    pub link: Option<String>,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -210,6 +231,14 @@ pub(crate) struct Shared {
     /// `vim.fn.confirm` button-dialog requests, drained by the server into the
     /// editor's command line (`Editor::open_confirm`) after the chunk.
     pub(crate) confirms: Vec<ConfirmReq>,
+    /// `nvim_feedkeys` typeahead requests, drained by the server into its feed
+    /// buffer and processed (through the mapping engine, or straight to the
+    /// editor) after the chunk / off-tick settle.
+    pub(crate) feedkeys: Vec<FeedKeysOp>,
+    /// Blocking `vim.fn.getcharstr()` requests: each carries the `vim._cb_fns` id
+    /// of the parked coroutine the server resumes with the next key. Normally at
+    /// most one is in flight (a getchar loop reads one key at a time).
+    pub(crate) getchar_reqs: Vec<u64>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -525,6 +554,53 @@ impl LuaRuntime {
     /// drain, for the server to open as command-line confirm prompts.
     pub fn take_confirms(&self) -> Vec<ConfirmReq> {
         std::mem::take(&mut self.shared.borrow_mut().confirms)
+    }
+
+    /// Take the `nvim_feedkeys` typeahead requests queued since the last drain,
+    /// for the server to parse and feed (through the mapping engine or straight to
+    /// the editor).
+    pub fn take_feedkeys(&self) -> Vec<FeedKeysOp> {
+        std::mem::take(&mut self.shared.borrow_mut().feedkeys)
+    }
+
+    /// Take the blocking `vim.fn.getcharstr()` requests queued since the last
+    /// drain — each a `vim._cb_fns` id of a parked coroutine the server arms to
+    /// resume with the next key.
+    pub fn take_getchar_reqs(&self) -> Vec<u64> {
+        std::mem::take(&mut self.shared.borrow_mut().getchar_reqs)
+    }
+
+    /// Resume a coroutine parked on `vim.fn.getcharstr()` (callback id `cb_id`)
+    /// with `key` (vim key-notation) — the getchar analogue of
+    /// [`Self::run_ui_input`]. Runs `vim._run_cb(id, false, key)`, a one-shot, so
+    /// the registry entry is dropped after firing. Effects the resumed coroutine
+    /// queues drain through `apply_lua_effects`.
+    pub fn deliver_getchar(&self, cb_id: u64, key: &str) -> mlua::Result<()> {
+        let run: mlua::Function = self.vim()?.get("_run_cb")?;
+        let arg = mlua::Value::String(self.lua.create_string(key)?);
+        run.call::<()>((cb_id, false, arg))
+    }
+
+    /// Whether any `vim.on_key` observer is registered — the cheap guard the
+    /// server checks per key before paying for [`Self::run_on_key`]. `false` on
+    /// any error (a malformed VM simply has no observers).
+    pub fn has_on_key(&self) -> bool {
+        self.read_has_on_key().unwrap_or(false)
+    }
+
+    fn read_has_on_key(&self) -> mlua::Result<bool> {
+        let f: mlua::Function = self.vim()?.get("_has_on_key")?;
+        f.call::<bool>(())
+    }
+
+    /// Fire every `vim.on_key` observer with `key` (vim key-notation), passed as
+    /// both the `(key, typed)` arguments neovim's on_key callback receives. A
+    /// throwing observer is detached (matching neovim) inside `vim._run_on_key`;
+    /// any other error is returned for the server to surface.
+    pub fn run_on_key(&self, key: &str) -> mlua::Result<()> {
+        let run: mlua::Function = self.vim()?.get("_run_on_key")?;
+        let k = mlua::Value::String(self.lua.create_string(key)?);
+        run.call::<()>((k.clone(), k))
     }
 
     /// Deliver a `vim.ui.input` result to its callback `id`: the typed line
@@ -915,6 +991,52 @@ impl LuaRuntime {
         set.call(entries)
     }
 
+    /// Refresh the Rust→Lua highlight mirror (`vim._hl_defs[name]`) that
+    /// `nvim_get_hl` reads. Pushed only when the core registry's generation
+    /// changed (a colorscheme rarely re-runs), so the common chunk pays nothing.
+    /// Each entry mirrors one [`HlDefMirror`]: colors as `0xRRGGBB` ints, the set
+    /// boolean attrs, and `link` for an alias group.
+    pub fn set_hl_mirror(&self, defs: &[HlDefMirror]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let entries = self.lua.create_table()?;
+        for d in defs {
+            let entry = self.lua.create_table()?;
+            if let Some(c) = d.fg {
+                entry.set("fg", c)?;
+            }
+            if let Some(c) = d.bg {
+                entry.set("bg", c)?;
+            }
+            if let Some(c) = d.sp {
+                entry.set("sp", c)?;
+            }
+            if d.bold {
+                entry.set("bold", true)?;
+            }
+            if d.italic {
+                entry.set("italic", true)?;
+            }
+            if d.underline {
+                entry.set("underline", true)?;
+            }
+            if d.undercurl {
+                entry.set("undercurl", true)?;
+            }
+            if d.strikethrough {
+                entry.set("strikethrough", true)?;
+            }
+            if d.reverse {
+                entry.set("reverse", true)?;
+            }
+            if let Some(link) = &d.link {
+                entry.set("link", self.lua.create_string(link)?)?;
+            }
+            entries.set(self.lua.create_string(&d.name)?, entry)?;
+        }
+        let set: mlua::Function = vim.get("_set_hl_mirror")?;
+        set.call(entries)
+    }
+
     /// Refresh the Rust→Lua buffer-option mirror (`vim._bo_mirror[bufnr] =
     /// { tabstop, shiftwidth, expandtab }`) that `vim.bo` / `nvim_get_option_value`
     /// read for the wired buffer-local options. Pushed alongside the buffer mirror
@@ -991,6 +1113,36 @@ impl LuaRuntime {
         }
         let set: mlua::Function = vim.get("_set_reg_mirror")?;
         set.call(entries)
+    }
+
+    /// Refresh the Rust→Lua `vim.v` mirror with the editor-sourced predefined
+    /// variables (`v:count` / `v:count1` / `v:register` / `v:operator`), pushed
+    /// alongside the buffer mirror before any Lua that can read them. `v:vim_did_enter`
+    /// is sticky (set once via [`Self::set_vim_did_enter`]) and deliberately not
+    /// touched here, so the per-tick refresh can't clear it.
+    pub fn set_v_mirror(
+        &self,
+        count: u64,
+        count1: u64,
+        register: &str,
+        operator: &str,
+    ) -> mlua::Result<()> {
+        let set: mlua::Function = self.vim()?.get("_set_v_mirror")?;
+        set.call((count, count1, register, operator))
+    }
+
+    /// Set `v:vim_did_enter` (`1` once the startup VimEnter point passes). Sticky:
+    /// the per-tick [`Self::set_v_mirror`] preserves it.
+    pub fn set_vim_did_enter(&self, entered: bool) -> mlua::Result<()> {
+        let set: mlua::Function = self.vim()?.get("_set_vim_did_enter")?;
+        set.call(entered)
+    }
+
+    /// Tell Lua the id the next `Editor::create_buffer` will hand out, so
+    /// `nvim_create_buf` can predict its return value (the buffer analogue of the
+    /// window mirror's `next_win`). Pushed alongside the buffer mirror.
+    pub fn set_next_buf(&self, next_buf: u64) -> mlua::Result<()> {
+        self.vim()?.set("_next_buf", next_buf)
     }
 
     /// Refresh the Rust→Lua tab mirror that backs `vim.api.nvim_tabpage_*` /

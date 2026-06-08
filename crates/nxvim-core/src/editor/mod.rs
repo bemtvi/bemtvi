@@ -884,6 +884,49 @@ impl Editor {
         self.visual_anchor
     }
 
+    // ----- pending-state mirror (vim.v.*) ----------------------------------
+
+    /// The count accumulated for the pending normal/visual command — `v:count`.
+    /// `0` when no count was typed (matching vim, which reports 0 while the
+    /// command still acts with an effective count of 1). A count typed both
+    /// before and after an operator (`2d3w`) multiplies, like
+    /// [`effective_count`](Self::effective_count).
+    pub fn pending_count(&self) -> usize {
+        match (self.pending.op_count, self.pending.count) {
+            (None, None) => 0,
+            (a, b) => a.unwrap_or(1) * b.unwrap_or(1),
+        }
+    }
+
+    /// `v:count1`: the pending count, but at least 1.
+    pub fn pending_count1(&self) -> usize {
+        self.pending_count().max(1)
+    }
+
+    /// The register named by a leading `"x` for the pending command
+    /// (`v:register`), or `"` (the unnamed register) when none was given —
+    /// matching vim's default.
+    pub fn pending_register(&self) -> char {
+        self.pending.register.unwrap_or('"')
+    }
+
+    /// The pending operator awaiting its motion (`v:operator` — `d`/`c`/`y`/…),
+    /// or `None` when no operator is pending.
+    pub fn pending_operator(&self) -> Option<char> {
+        self.pending.operator
+    }
+
+    /// Discard the accumulated normal/visual command (count, operator, register).
+    /// Called when a user mapping fires: the count/register typed ahead of it
+    /// (`3<leader>x`, `"a<leader>p`) were the mapping's arguments — surfaced to it
+    /// as `v:count` / `v:register` — and the mapping has now consumed them, exactly
+    /// as a built-in command would. Without this they would leak into the next
+    /// command, since a mapping fires *outside* [`Editor::input`] and so never
+    /// reaches the chokepoint that normally resets pending state.
+    pub fn clear_pending_command(&mut self) {
+        self.reset_pending();
+    }
+
     // ----- pending-state bookkeeping ---------------------------------------
 
     fn effective_count(&self) -> usize {

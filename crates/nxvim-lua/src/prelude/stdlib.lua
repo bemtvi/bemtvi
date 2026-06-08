@@ -168,6 +168,71 @@ vim.opt = setmetatable({}, {
   __newindex = function(_, k, v) vim.o[k] = v end,
 })
 
+-- vim.go: the *global* value of options (neovim's editor-wide scope). Unlike
+-- vim.o it never delegates to the window/buffer scope — reading a window/buffer
+-- option through vim.go yields its global default, matching neovim's "go is the
+-- global option store" semantics. The wired global options reflect the core
+-- (vim._go_mirror, the same home vim.o's global branch uses); any other option
+-- lands in the plain vim._o_store (observable read/write, not yet honored).
+local function go_get(k)
+  local canon = O_GLOBAL[k]
+  if canon then
+    local v = vim._go_mirror[canon]
+    if v ~= nil then return v end
+    return O_GLOBAL_DEFAULT[canon]
+  end
+  return vim._o_store[k]
+end
+local function go_set(k, v)
+  local canon = O_GLOBAL[k]
+  if canon then
+    vim._set_global_option(canon, v)
+    vim._go_mirror[canon] = v
+    return
+  end
+  vim._o_store[k] = v
+end
+vim.go = setmetatable({}, {
+  __index = function(_, k) return go_get(k) end,
+  __newindex = function(_, k, v) go_set(k, v) end,
+})
+
+-- vim.v: neovim's predefined `v:` variables. nxvim backs the few with a real
+-- editor source from a Rust→Lua mirror (vim._v_mirror) the server refreshes
+-- before any Lua that can read them:
+--   * count    — the count accumulated for the pending command (0 when none)
+--   * count1   — count, but at least 1 (v:count1)
+--   * register — the register named by a leading `"x`, else `"` (the unnamed)
+--   * operator — the pending operator char (`d`/`c`/`y`/…), "" when none
+-- `vim_did_enter` is set to 1 once the startup VimEnter point passes (it is NOT
+-- overwritten by the per-tick mirror refresh, so it stays sticky). `v:true` /
+-- `v:false` are the boolean constants plugins compare against (reached via
+-- `vim.v["true"]` since `true` is a Lua keyword). An unknown `v:` name reads
+-- whatever was stored (nil if never set) rather than failing — `v:` is a
+-- variable table, and many of neovim's predefined vars are legitimately empty.
+vim._v_mirror = vim._v_mirror or { vim_did_enter = 0 }
+-- Refresh the editor-sourced fields (count/register/operator); vim_did_enter and
+-- any plugin-set var are preserved (the server pushes this every tick).
+function vim._set_v_mirror(count, count1, register, operator)
+  local m = vim._v_mirror
+  m.count, m.count1, m.register, m.operator = count, count1, register, operator
+end
+function vim._set_vim_did_enter(v) vim._v_mirror.vim_did_enter = v and 1 or 0 end
+vim.v = setmetatable({}, {
+  __index = function(_, k)
+    if k == "true" then return true end
+    if k == "false" then return false end
+    local m = vim._v_mirror
+    if k == "count" then return m.count or 0 end
+    if k == "count1" then return m.count1 or 1 end
+    if k == "register" then return m.register or '"' end
+    if k == "operator" then return m.operator or "" end
+    if k == "vim_did_enter" then return m.vim_did_enter or 0 end
+    return m[k]
+  end,
+  __newindex = function(_, k, v) vim._v_mirror[k] = v end,
+})
+
 -- vim.env: process environment, read through to the host (writes shadow locally).
 vim.env = setmetatable({}, {
   __index = function(_, k) return os.getenv(k) end,
@@ -366,6 +431,164 @@ function vim.split(s, sep, opts)
   end
   return parts
 end
+
+-- ----- vim.fn string-width / character builtins ------------------------------
+-- The display/character helpers a popup plugin (which-key) calls to lay out its
+-- grid over UTF-8 text. nxvim runs PUC Lua 5.1 (byte strings, no `utf8` library),
+-- so these decode UTF-8 by hand. (vim.fn already exists — the Rust bridge created
+-- it before the prelude loads — so these extend it.)
+
+-- Decode the codepoint starting at byte index `i` (1-based) of `s`, returning
+-- (codepoint, byte_length), or (nil, 0) past the end. A malformed / truncated
+-- sequence is treated as a single 1-byte char so iteration always advances.
+local function utf8_decode(s, i)
+  local b = s:byte(i)
+  if not b then return nil, 0 end
+  if b < 0x80 then return b, 1 end
+  if b >= 0xF0 then
+    local b2, b3, b4 = s:byte(i + 1), s:byte(i + 2), s:byte(i + 3)
+    if b2 and b3 and b4 then
+      return (b % 0x08) * 0x40000 + (b2 % 0x40) * 0x1000 + (b3 % 0x40) * 0x40 + (b4 % 0x40), 4
+    end
+  elseif b >= 0xE0 then
+    local b2, b3 = s:byte(i + 1), s:byte(i + 2)
+    if b2 and b3 then
+      return (b % 0x10) * 0x1000 + (b2 % 0x40) * 0x40 + (b3 % 0x40), 3
+    end
+  elseif b >= 0xC0 then
+    local b2 = s:byte(i + 1)
+    if b2 then return (b % 0x20) * 0x40 + (b2 % 0x40), 2 end
+  end
+  return b, 1 -- ASCII control, stray continuation, or truncated lead byte
+end
+
+-- Display cells one codepoint occupies: 2 for the common East-Asian-wide and
+-- emoji ranges, else 1. INCOMPLETE: a pragmatic range check, not the full
+-- Unicode east-asian-width / emoji tables, and combining marks (which should be
+-- width 0) count as 1 — close enough for popup grid layout, wrong for dense CJK
+-- with combining marks. A real impl would consult a generated width table.
+local function char_width(cp)
+  if cp >= 0x1100 and (
+        cp <= 0x115F                            -- Hangul Jamo
+        or (cp >= 0x2E80 and cp <= 0xA4CF and cp ~= 0x303F) -- CJK … Yi
+        or (cp >= 0xAC00 and cp <= 0xD7A3)      -- Hangul Syllables
+        or (cp >= 0xF900 and cp <= 0xFAFF)      -- CJK Compat Ideographs
+        or (cp >= 0xFE30 and cp <= 0xFE4F)      -- CJK Compat Forms
+        or (cp >= 0xFF00 and cp <= 0xFF60)      -- Fullwidth Forms
+        or (cp >= 0xFFE0 and cp <= 0xFFE6)      -- Fullwidth signs
+        or (cp >= 0x1F300 and cp <= 0x1FAFF)    -- emoji & pictographs
+        or (cp >= 0x20000 and cp <= 0x3FFFD)    -- CJK Ext B+
+      ) then
+    return 2
+  end
+  return 1
+end
+
+-- vim.fn.strchars(s[, skipcc]): number of characters (codepoints) in `s`.
+-- INCOMPLETE: `skipcc` (skip composing characters) is ignored — every codepoint
+-- counts, since nxvim doesn't classify combining marks.
+function vim.fn.strchars(s, _skipcc)
+  s = tostring(s or "")
+  local i, n = 1, 0
+  while i <= #s do
+    local _, len = utf8_decode(s, i)
+    if len == 0 then break end
+    i, n = i + len, n + 1
+  end
+  return n
+end
+
+-- vim.fn.strdisplaywidth(s[, col]): the display cells `s` occupies, expanding
+-- tabs to the next tabstop boundary and counting wide chars as two. `col` is the
+-- starting screen column used for tab-stop math (default 0); the return value is
+-- the width of `s` itself (cells consumed beyond `col`). INCOMPLETE: tabs expand
+-- on a fixed tabstop of 8, not the current buffer's 'tabstop'.
+function vim.fn.strdisplaywidth(s, col)
+  s = tostring(s or "")
+  local ts, base = 8, col or 0
+  local w, i = base, 1
+  while i <= #s do
+    local cp, len = utf8_decode(s, i)
+    if len == 0 then break end
+    if cp == 9 then
+      w = w + (ts - (w % ts)) -- tab advances to the next tabstop
+    else
+      w = w + char_width(cp)
+    end
+    i = i + len
+  end
+  return w - base
+end
+
+-- vim.fn.strcharpart(s, start[, len]): the substring of `s` starting at character
+-- index `start` (0-based), spanning `len` characters (default: to the end). A
+-- negative `start` drops that many leading characters off the count (vim's
+-- behavior) and clamps the start to 0.
+function vim.fn.strcharpart(s, start, len)
+  s = tostring(s or "")
+  start = start or 0
+  if start < 0 then
+    if len ~= nil then len = len + start end
+    start = 0
+  end
+  if len ~= nil and len <= 0 then return "" end
+  local out, idx, i = {}, 0, 1
+  while i <= #s do
+    local _, blen = utf8_decode(s, i)
+    if blen == 0 then break end
+    if idx >= start and (len == nil or idx < start + len) then
+      out[#out + 1] = s:sub(i, i + blen - 1)
+    end
+    idx = idx + 1
+    i = i + blen
+  end
+  return table.concat(out)
+end
+
+-- vim.fn.strtrans(s): `s` with unprintable characters shown as printable text —
+-- control chars 0x00–0x1F as ^@…^_, 0x7F as ^? — matching vim, so a key label
+-- built from raw bytes displays readably. Multibyte UTF-8 is left intact.
+function vim.fn.strtrans(s)
+  s = tostring(s or "")
+  return (s:gsub("[%z\1-\31\127]", function(c)
+    local b = c:byte()
+    if b == 127 then return "^?" end
+    return "^" .. string.char(b + 64)
+  end))
+end
+
+-- vim.fn.keytrans(s): translate the internal form of a key sequence to readable
+-- key notation (`<C-w>`, `<Space>`, …). nxvim represents keys AS that notation
+-- throughout (parse_keys / nvim_feedkeys consume notation directly, and
+-- nvim_replace_termcodes returns its input unchanged), so the internal form
+-- already IS the notation — this returns `s` unchanged, the inverse of
+-- nvim_replace_termcodes exactly as in vim.
+function vim.fn.keytrans(s)
+  return tostring(s or "")
+end
+
+-- nvim_strwidth(text): the display cells `text` occupies (wide chars count as
+-- two). Unlike strdisplaywidth it does not expand tabs — it measures the raw
+-- string — matching neovim's API. Shares the char-width table above.
+function vim.api.nvim_strwidth(text)
+  text = tostring(text or "")
+  local w, i = 0, 1
+  while i <= #text do
+    local cp, len = utf8_decode(text, i)
+    if len == 0 then break end
+    w = w + char_width(cp)
+    i = i + len
+  end
+  return w
+end
+
+-- vim.fn.reg_recording() / reg_executing(): the register name of an in-progress
+-- macro recording / replay, or "" when none. nxvim's core has no `q`-macro
+-- recording yet, so both are always "" — an honest "nothing in progress" (the
+-- value vim returns the vast majority of the time), not a faked recording state.
+-- A statusline `%{reg_recording()}` recording indicator therefore stays blank.
+function vim.fn.reg_recording() return "" end
+function vim.fn.reg_executing() return "" end
 
 -- vim.spairs(t): pairs() in sorted-key order. Neovim's stable-iteration helper —
 -- a custom `'tabline'`/`str_join` uses it so output order is deterministic.

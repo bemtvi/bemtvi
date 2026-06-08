@@ -493,3 +493,20 @@ function vim.fn.confirm(msg, choices, default, _type)
   return tonumber(idx) or 0
 end
 
+-- vim.fn.getcharstr([expr]): read one key as a string.
+-- * no arg / expr == 0 — BLOCK until a key is typed and return its vim notation
+--   (e.g. "f", "<Esc>", "<C-w>"). Like vim.fn.input/confirm it suspends the
+--   running coroutine, so it only works inside a coroutine-PUMPED entry (a keymap
+--   RHS, :lua chunk, or user command). The next key the server receives resumes
+--   it — that key is consumed here rather than routed to the editor, exactly as
+--   vim's getchar() pulls from the typeahead.
+-- * expr == 1 — PEEK: return the pending typeahead char without waiting, "" when
+--   none. nxvim exposes no typeahead between input batches, so this is always ""
+--   (an honest "nothing is pending", not a faked value), and it never blocks.
+function vim.fn.getcharstr(expr)
+  if expr == 1 then
+    return ""
+  end
+  return await_prompt(function(cb) vim._getchar(cb) end) or ""
+end
+

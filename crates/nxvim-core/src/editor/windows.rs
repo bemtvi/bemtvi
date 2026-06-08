@@ -99,8 +99,10 @@ impl BorderStyle {
 /// A floating window's placement (`nvim_open_win`'s float `config`). Held on
 /// [`Window::float`] (`None` for a tiled window); the [`WindowTree`] positions it
 /// absolutely each layout from this config, on top of the tiled tree. `width`/
-/// `height` are the **outer** box (border included); `row`/`col` offset the
-/// `anchor` corner from the `relative` origin.
+/// `height` are the **inner content** area (neovim's `nvim_open_win` semantics);
+/// a border is drawn *outside* it, so the on-screen box is the content plus one
+/// border cell per side (see [`place_float`]). `row`/`col` offset the `anchor`
+/// corner from the `relative` origin.
 ///
 /// Not `Copy`: `title` owns a `String`. Read it through `Window::float`'s
 /// `Option<FloatConfig>` by reference (or `.clone()` where an owned value is
@@ -406,11 +408,22 @@ impl WindowTree {
 /// names) and the `bounds` (the windows area). Applies the `row`/`col` offset
 /// from the origin's top-left, shifts so the `anchor` corner lands there (an `E`
 /// anchor subtracts the width, an `S` anchor the height — neovim's corner math),
-/// then clamps the box to stay fully on-screen. `width`/`height` are the outer
-/// box; a float larger than `bounds` pins to the top-left rather than shrinking.
+/// then clamps the box to stay fully on-screen.
+///
+/// `cfg.width`/`cfg.height` are the **inner content** area (neovim's
+/// `nvim_open_win` semantics); the border, when present, is drawn *outside* it, so
+/// the outer box this rect describes is the content plus one border cell per side.
+/// `nvim_win_get_config` keeps reporting the inner dimensions (they are what
+/// `FloatConfig` stores) — only the placement grows by the border here. A float
+/// larger than `bounds` pins to the top-left rather than shrinking.
 fn place_float(origin: Rect, bounds: Rect, cfg: &FloatConfig) -> Rect {
-    let w = cfg.width.max(1);
-    let h = cfg.height.max(1);
+    let border = if cfg.border != BorderStyle::None {
+        2
+    } else {
+        0
+    };
+    let w = cfg.width.max(1) + border;
+    let h = cfg.height.max(1) + border;
     let mut x = origin.x as isize + cfg.col;
     let mut y = origin.y as isize + cfg.row;
     if matches!(cfg.anchor, FloatAnchor::NE | FloatAnchor::SE) {
@@ -1004,6 +1017,25 @@ impl Editor {
             .windows
             .get(&id)
             .map(|w| (w.rect.x, w.rect.y, w.rect.width, w.rect.height))
+    }
+
+    /// Window `id`'s **content** size as `(width, height)` — what
+    /// `nvim_win_get_width` / `nvim_win_get_height` report. The width includes the
+    /// number gutter (as neovim's does) but excludes a bordered float's side
+    /// columns; the height excludes a bordered float's border rows and the status
+    /// row when one is shown. Mirrors the [`crate::view::window_view`] /
+    /// [`Editor::text_height`] content math so the API agrees with what is drawn.
+    pub fn window_content_size(&self, id: WindowId) -> Option<(usize, usize)> {
+        let w = self.windows.windows.get(&id)?;
+        let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
+        let status = usize::from(self.window_statusline_visible(w.float.is_some()));
+        let width = w.rect.width.saturating_sub(2 * inset);
+        let height = w
+            .rect
+            .height
+            .saturating_sub(2 * inset)
+            .saturating_sub(status);
+        Some((width, height))
     }
 
     /// Set window `id`'s width to `width` columns (`nvim_win_set_width`), stealing
@@ -1619,16 +1651,21 @@ impl Editor {
         usize::from(self.tabline_visible())
     }
 
-    /// Whether a *tiled* window paints its own per-window status row, per
-    /// `laststatus`: never at `0`, only with ≥2 tiled windows at `1`, always at
-    /// `2` (the default), and never at `3` (a single global status line replaces
-    /// the per-window ones). Floats are unaffected — they always carry their own
-    /// status row regardless of `laststatus`. The single gate the view projection
-    /// ([`crate::view`]) consults so the reserved text row and the client's paint
-    /// never disagree.
+    /// Whether a window paints its own per-window status row. A **float** never
+    /// does by default (matching neovim — see the body), regardless of
+    /// `laststatus`. A **tiled** window follows `laststatus`: never at `0`, only
+    /// with ≥2 tiled windows at `1`, always at `2` (the default), and never at `3`
+    /// (a single global status line replaces the per-window ones). The single gate
+    /// the view projection ([`crate::view`]) and the scroll math
+    /// ([`Editor::text_height`]) consult so the reserved text row, the cursor
+    /// scrolling, and the client's paint never disagree.
     pub(crate) fn window_statusline_visible(&self, floating: bool) -> bool {
         if floating {
-            return true;
+            // A float carries no status line by default, matching neovim: its
+            // `last_status` only walks the tiled frame tree, so a float's
+            // status height stays 0 and its full inner height is content. (A
+            // per-window opt-in could grow here later; nxvim has none yet.)
+            return false;
         }
         match self.options.laststatus {
             0 | 3 => false,

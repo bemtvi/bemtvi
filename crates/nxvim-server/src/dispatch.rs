@@ -23,10 +23,16 @@ impl Server {
                     Ok(value) => self.rpc.respond(id, Ok(value)),
                     Err(err) => self.rpc.respond(id, Err(Value::from(err))),
                 }
+                // Typeahead a dispatched method queued via `nvim_feedkeys` (e.g. an
+                // `nvim_exec_lua` / `nvim_command` chunk that fed keys) is processed
+                // before the repaint, so the frame reflects the fed keys' effects.
+                // `nvim_input` already drained its own, so this is a no-op there.
+                self.drain_feedkeys();
                 self.redraw();
             }
             Incoming::Notification { method, params } => {
                 let _ = self.dispatch(&method, &params);
+                self.drain_feedkeys();
                 self.redraw();
             }
         }

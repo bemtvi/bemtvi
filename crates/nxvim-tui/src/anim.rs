@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use nxvim_view::{HlSpan, ScrollData, Style, View};
+use nxvim_view::{HlSpan, InlayHint, ScrollData, Style, View};
 
 /// An in-flight scroll animation, driven by the client's local clock.
 pub(crate) struct Animation {
@@ -20,6 +20,9 @@ pub(crate) struct Animation {
     pub(crate) selection: Vec<Option<(u16, u16)>>,
     pub(crate) numbers: Vec<Option<usize>>,
     pub(crate) highlights: Vec<Vec<HlSpan>>,
+    /// Inline inlay hints for the band (aligned with `lines`), so they slide with
+    /// the text instead of vanishing until the slide settles.
+    pub(crate) inlay_hints: Vec<Vec<InlayHint>>,
     /// Palette snapshot the band's style ids index into (see [`ScrollData`]).
     pub(crate) styles: Vec<Style>,
 }
@@ -38,6 +41,7 @@ impl Animation {
             selection: s.selection.clone(),
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
+            inlay_hints: s.inlay_hints.clone(),
             styles: s.styles.clone(),
         }
     }

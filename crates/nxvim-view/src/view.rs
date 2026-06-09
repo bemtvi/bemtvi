@@ -35,6 +35,10 @@ pub struct ScrollData {
     /// colored frame by frame instead of flashing white until it settles. Style
     /// ids index `styles` below.
     pub highlights: Vec<Vec<HlSpan>>,
+    /// Inline LSP inlay hints for the band (aligned with `lines`), so they slide
+    /// with the text rather than vanishing until the slide settles. Like the
+    /// per-window `inlay_hints`, each entry is `[col, text, style_id]`.
+    pub inlay_hints: Vec<Vec<InlayHint>>,
     /// The style palette captured with this gesture. Snapshotted (not read live
     /// from [`View::styles`]) because a delayed highlight redraw arriving
     /// mid-slide replaces the live palette, which would leave the band's frozen
@@ -411,6 +415,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             selection: parse_spans(map_get(s, "selection")),
             numbers: parse_numbers(map_get(s, "numbers")),
             highlights: parse_highlights(map_get(s, "highlights")),
+            inlay_hints: parse_inlay_hints(map_get(s, "inlay_hints")),
             // The band's ids index this redraw's palette — snapshot it now, since
             // a later redraw will replace the live `styles`.
             styles: styles.to_vec(),

@@ -32,7 +32,7 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use nxvim_view::{PanelData, StatusSegment, Style, View, WindowView};
+use nxvim_view::{InlayHint, PanelData, StatusSegment, Style, View, WindowView};
 use winit::window::Window;
 
 use crate::GuiConfig;
@@ -50,6 +50,10 @@ const DIAG_ERROR: u32 = 0xe0_6c_75;
 const DIAG_WARN: u32 = 0xe5_c0_7b;
 const DIAG_INFO: u32 = 0x56_b6_c2;
 const DIAG_HINT: u32 = 0x80_80_80;
+/// Built-in inlay-hint color when the colorscheme leaves `LspInlayHint` unset — a
+/// dim grey (neovim links `LspInlayHint` to a comment-like dimming by default).
+/// The GUI truecolor analogue of the TUI's `Color::DarkGray` fallback.
+pub const DEFAULT_INLAY: u32 = 0x80_80_80;
 /// Line height as a multiple of the font size.
 const LINE_SPACING: f32 = 1.30;
 /// The diagnostic sign column's width in cells (vim's `signcolumn`), reserved at
@@ -73,16 +77,17 @@ struct CacheEntry {
 /// strikethrough, and reverse are *quad* decorations painted separately, not
 /// shaping attributes, so they don't live here.) The cache keys on all of these,
 /// so a run reshapes only when its text, color, or weight/slant changes.
-struct Seg {
-    text: String,
-    fg: u32,
-    bold: bool,
-    italic: bool,
+#[derive(Clone)]
+pub struct Seg {
+    pub text: String,
+    pub fg: u32,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 impl Seg {
     /// A plain run with no weight/slant — gutter numbers, status text, etc.
-    fn plain(text: String, fg: u32) -> Self {
+    pub fn plain(text: String, fg: u32) -> Self {
         Self {
             text,
             fg,
@@ -116,6 +121,9 @@ pub struct ScrollFrame<'a> {
     pub lines: &'a [String],
     pub numbers: &'a [Option<usize>],
     pub highlights: &'a [Vec<nxvim_view::HlSpan>],
+    /// Inline inlay hints for the band (aligned with `lines`), so they slide with
+    /// the text instead of vanishing until the slide settles.
+    pub inlay_hints: &'a [Vec<InlayHint>],
     pub styles: &'a [Style],
 }
 
@@ -646,7 +654,12 @@ impl Renderer {
                         }
                     }
                     let hl = s.highlights.get(k).map(Vec::as_slice).unwrap_or(&[]);
-                    let segments = row_segments(&display, hl, s.styles, fg, slide_bg, win.leftcol);
+                    let mut segments =
+                        row_segments(&display, hl, s.styles, fg, slide_bg, win.leftcol);
+                    // Splice the band row's inlay hints in, like the settled path, so
+                    // they slide with the text instead of vanishing during the slide.
+                    let inlay = s.inlay_hints.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    segments = splice_inlay(segments, inlay, win.leftcol, s.styles);
                     let x = text_x0.saturating_sub(win.leftcol) as f32 * self.cell_w;
                     self.push_text(items, &segments, (x, y), fg, clip);
                 }
@@ -663,28 +676,51 @@ impl Renderer {
                     // path); the highlight spans on the wire are screen-column based.
                     let display = expand_tabs(raw, win.tabstop.max(1) as usize);
 
+                    // Inline LSP inlay hints on this row, spliced into the text below
+                    // (pushing later glyphs right). The column-keyed overlays here —
+                    // selection / search / diagnostics / cursor — must shift by the
+                    // same inserted width, so they ride through `inlay` (an empty
+                    // slice, the common case, reduces every shift to zero).
+                    let inlay = win.inlay_hints.get(i).map(Vec::as_slice).unwrap_or(&[]);
+
                     // Selection band(s) for this row.
                     if let Some(Some(span)) = win.selection.get(i) {
-                        self.push_span_quad(quads, text_x0, row, *span, win.leftcol, sel_bg);
+                        self.push_span_quad(quads, text_x0, row, *span, win.leftcol, inlay, sel_bg);
                     }
                     // Secondary multi-cursor selections, painted with the same
                     // `Visual` background as the primary (the server resolves which
                     // cursor owns which span; the client paints them alike).
                     if let Some(spans) = win.secondary_selection.get(i) {
                         for span in spans {
-                            self.push_span_quad(quads, text_x0, row, *span, win.leftcol, sel_bg);
+                            self.push_span_quad(
+                                quads,
+                                text_x0,
+                                row,
+                                *span,
+                                win.leftcol,
+                                inlay,
+                                sel_bg,
+                            );
                         }
                     }
                     // Search matches for this row.
                     if let Some(spans) = win.search.get(i) {
                         for span in spans {
-                            self.push_span_quad(quads, text_x0, row, *span, win.leftcol, search_bg);
+                            self.push_span_quad(
+                                quads,
+                                text_x0,
+                                row,
+                                *span,
+                                win.leftcol,
+                                inlay,
+                                search_bg,
+                            );
                         }
                     }
                     // The live incsearch preview match rides on top of `hlsearch`.
                     if let Some(Some(span)) = win.incsearch.get(i) {
                         let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
-                        self.push_span_quad(quads, text_x0, row, *span, win.leftcol, inc_bg);
+                        self.push_span_quad(quads, text_x0, row, *span, win.leftcol, inlay, inc_bg);
                     }
 
                     // The diagnostic sign in the far-left 2-cell column (when this
@@ -716,17 +752,19 @@ impl Renderer {
                         }
                     }
 
-                    // The text itself, syntax-colored from the row's highlights.
+                    // The text itself, syntax-colored from the row's highlights, with
+                    // the inlay hints spliced in at their anchor columns.
                     let hl = win.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]);
                     // Reverse fills (a foreground-colored quad behind the inverted
                     // glyph) go under the text; underline/strikethrough rules go over
                     // it. Both walk the same highlight spans (see the methods).
-                    self.push_reverse_fills(quads, win, view, text_x0, row, hl);
-                    let segments =
+                    self.push_reverse_fills(quads, win, view, text_x0, row, hl, inlay);
+                    let mut segments =
                         row_segments(&display, hl, &view.styles, fg, normal_bg, win.leftcol);
+                    segments = splice_inlay(segments, inlay, win.leftcol, &view.styles);
                     let pos = self.cell_px(text_x0.saturating_sub(win.leftcol), row as u16);
                     self.push_text(items, &segments, pos, fg, full);
-                    self.push_attr_rules(quads, win, view, text_x0, row, hl);
+                    self.push_attr_rules(quads, win, view, text_x0, row, hl, inlay);
 
                     // LSP diagnostic underlines, painted last so they survive over
                     // the syntax/selection: a thin colored rule under the cells.
@@ -736,7 +774,15 @@ impl Renderer {
                                 .and_then(|id| view.styles.get(id))
                                 .and_then(|st| st.sp.or(st.fg))
                                 .unwrap_or_else(|| severity_color(*severity));
-                            self.push_underline(quads, text_x0, row, (*s, *e), win.leftcol, color);
+                            self.push_underline(
+                                quads,
+                                text_x0,
+                                row,
+                                (*s, *e),
+                                win.leftcol,
+                                inlay,
+                                color,
+                            );
                         }
                     }
 
@@ -747,8 +793,12 @@ impl Renderer {
                     let is_filler = matches!(win.numbers.get(i), Some(None));
                     if !is_filler {
                         if let Some(Some((text, severity, id))) = win.diagnostics_virt.get(i) {
+                            // The line's painted width includes the spliced inlay
+                            // cells, so the virtual text sits past them too.
+                            let inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
                             let painted =
-                                display.chars().count().saturating_sub(win.leftcol as usize);
+                                display.chars().count().saturating_sub(win.leftcol as usize)
+                                    + inserted as usize;
                             let start = text_x0 + painted as u16 + 1;
                             let limit = (ox + wcols).saturating_sub(start);
                             if limit > 0 {
@@ -789,7 +839,26 @@ impl Renderer {
         // is active (it reappears on the command line / panel). While sliding it
         // tracks the interpolated cursor line so it moves with the text.
         if win.focused && view.panel.is_none() && !view.command_mode {
-            let cx = text_x0 + win.cursor_screen_col.saturating_sub(win.leftcol);
+            // The cursor shifts right by the inlay hints spliced in at or before its
+            // column (a hint exactly at the cursor sits before the cursor glyph), so
+            // it tracks the splice. Mid-slide that's the band's hints on the cursor's
+            // band row; settled it's the window's hints on the cursor row.
+            let cur_shift = match scroll {
+                None => {
+                    let row_inlay = win
+                        .inlay_hints
+                        .get(win.cursor_row as usize)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
+                }
+                Some(s) => {
+                    let idx = (s.cursor.round() as usize).saturating_sub(s.base_line);
+                    let row_inlay = s.inlay_hints.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+                    inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
+                }
+            };
+            let cx = text_x0 + win.cursor_screen_col.saturating_sub(win.leftcol) + cur_shift;
             let px = cx as f32 * self.cell_w;
             let py = match scroll {
                 Some(s) => (oy as f32 + (s.cursor - s.top)) * self.cell_h,
@@ -860,7 +929,14 @@ impl Renderer {
             let Some(rel) = ccol.checked_sub(win.leftcol) else {
                 continue; // scrolled off to the left
             };
-            let x = text_x0 + rel;
+            // Shift past the inlay hints spliced in at or before this cursor's
+            // column on its row, matching the primary cursor and the text splice.
+            let row_inlay = win
+                .inlay_hints
+                .get(crow as usize)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let x = text_x0 + rel + inlay_shift(row_inlay, win.leftcol, ccol, true);
             // Drop anything past the text area's right edge or below its last row.
             if crow >= text_rows || x >= text_x0.saturating_add(wcols) {
                 continue;
@@ -1322,6 +1398,7 @@ impl Renderer {
     /// Push a thin underline rule under cells `[s, e)` of `row` (a diagnostic
     /// underline / undercurl approximation), offset left by `leftcol` and anchored
     /// at column `base` like [`push_span_quad`].
+    #[allow(clippy::too_many_arguments)]
     fn push_underline(
         &self,
         quads: &mut Vec<Quad>,
@@ -1329,11 +1406,12 @@ impl Renderer {
         row: usize,
         span: (u16, u16),
         leftcol: u16,
+        inlay: &[InlayHint],
         color: u32,
     ) {
         let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol);
-        let end = base + e.saturating_sub(leftcol);
+        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
+        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
         if end <= start {
             return;
         }
@@ -1351,6 +1429,7 @@ impl Renderer {
     /// Push a thin strikethrough rule through the vertical middle of cells
     /// `[s, e)` of `row` (a `strikethrough` style attribute), offset and anchored
     /// like [`push_underline`].
+    #[allow(clippy::too_many_arguments)]
     fn push_strike(
         &self,
         quads: &mut Vec<Quad>,
@@ -1358,11 +1437,12 @@ impl Renderer {
         row: usize,
         span: (u16, u16),
         leftcol: u16,
+        inlay: &[InlayHint],
         color: u32,
     ) {
         let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol);
-        let end = base + e.saturating_sub(leftcol);
+        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
+        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
         if end <= start {
             return;
         }
@@ -1381,6 +1461,7 @@ impl Renderer {
     /// each run whose style sets `reverse`. `row_segments` already recolored the
     /// glyph to the background, so quad + glyph together read inverted. Painted
     /// before the text, as every quad draws under the glyphs.
+    #[allow(clippy::too_many_arguments)]
     fn push_reverse_fills(
         &self,
         quads: &mut Vec<Quad>,
@@ -1389,13 +1470,22 @@ impl Renderer {
         text_x0: u16,
         row: usize,
         hl: &[nxvim_view::HlSpan],
+        inlay: &[InlayHint],
     ) {
         let base_fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         for hs in hl {
             if let Some(st) = hs.3.and_then(|id| view.styles.get(id)) {
                 if st.reverse {
                     let color = st.fg.unwrap_or(base_fg);
-                    self.push_span_quad(quads, text_x0, row, (hs.0, hs.1), win.leftcol, color);
+                    self.push_span_quad(
+                        quads,
+                        text_x0,
+                        row,
+                        (hs.0, hs.1),
+                        win.leftcol,
+                        inlay,
+                        color,
+                    );
                 }
             }
         }
@@ -1405,6 +1495,7 @@ impl Renderer {
     /// undercurl) in the `sp`/`fg` color, and a strikethrough in the `fg` color,
     /// for each run whose style sets them. Drawn after the glyphs so the rule sits
     /// on top of the text.
+    #[allow(clippy::too_many_arguments)]
     fn push_attr_rules(
         &self,
         quads: &mut Vec<Quad>,
@@ -1413,6 +1504,7 @@ impl Renderer {
         text_x0: u16,
         row: usize,
         hl: &[nxvim_view::HlSpan],
+        inlay: &[InlayHint],
     ) {
         let base_fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         for hs in hl {
@@ -1422,17 +1514,22 @@ impl Renderer {
             let span = (hs.0, hs.1);
             if st.underline || st.undercurl {
                 let color = st.sp.or(st.fg).unwrap_or(base_fg);
-                self.push_underline(quads, text_x0, row, span, win.leftcol, color);
+                self.push_underline(quads, text_x0, row, span, win.leftcol, inlay, color);
             }
             if st.strikethrough {
                 let color = st.fg.unwrap_or(base_fg);
-                self.push_strike(quads, text_x0, row, span, win.leftcol, color);
+                self.push_strike(quads, text_x0, row, span, win.leftcol, inlay, color);
             }
         }
     }
 
     /// Push a background quad covering screen columns `[s, e)` of `row`, offset
-    /// left by `leftcol` and anchored at column `base` (the text origin).
+    /// left by `leftcol`, shifted right by the row's inlay hints (`inlay`), and
+    /// anchored at column `base` (the text origin). The span's left edge clears the
+    /// hints at or before `s` (a hint *at* `s` sits before the first highlighted
+    /// glyph, so it stays unhighlighted); its right edge clears only the hints
+    /// strictly before `e` (a hint *at* `e` is past the span).
+    #[allow(clippy::too_many_arguments)]
     fn push_span_quad(
         &self,
         quads: &mut Vec<Quad>,
@@ -1440,11 +1537,12 @@ impl Renderer {
         row: usize,
         span: (u16, u16),
         leftcol: u16,
+        inlay: &[InlayHint],
         color: u32,
     ) {
         let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol);
-        let end = base + e.saturating_sub(leftcol);
+        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
+        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
         if end <= start {
             return;
         }
@@ -1764,7 +1862,7 @@ fn gutter_cell(
     }
 }
 
-fn row_segments(
+pub fn row_segments(
     display: &str,
     hl: &[nxvim_view::HlSpan],
     styles: &[Style],
@@ -1807,7 +1905,17 @@ fn row_segments(
                     italic: st.italic,
                 });
             }
-            None => segments.push(Seg::plain(text, fg)),
+            // No colorscheme resolved this span: fall back to a built-in color for
+            // its capture group, so a buffer still highlights with no theme loaded.
+            None => {
+                let (color, italic) = group_fallback(&s.2, fg);
+                segments.push(Seg {
+                    text,
+                    fg: color,
+                    bold: false,
+                    italic,
+                });
+            }
         }
         col = end;
     }
@@ -1815,6 +1923,130 @@ fn row_segments(
         segments.push(Seg::plain(chars[col..n].iter().collect(), fg));
     }
     segments
+}
+
+/// Built-in syntax color for a treesitter capture `group` when no colorscheme
+/// resolved it (`style_id` is `None`) — the GUI's truecolor analogue of the TUI's
+/// `group_style`, so a buffer highlights even with no colorscheme loaded. Keys off
+/// the group's major component (before the first `.`), in One Dark hues that match
+/// the `DIAG_*` fallbacks already used here. Returns the foreground and whether the
+/// run is italic (comments); an unmapped group keeps the default `fg`.
+pub fn group_fallback(group: &str, fg: u32) -> (u32, bool) {
+    let major = group.split('.').next().unwrap_or(group);
+    let color = match major {
+        "keyword" | "conditional" | "repeat" | "include" | "exception" | "keyword_operator" => {
+            0xc6_78_dd
+        } // purple
+        "function" | "method" => 0x61_af_ef, // blue
+        "constructor" | "type" | "namespace" | "module" => 0xe5_c0_7b, // yellow
+        "string" | "character" => 0x98_c3_79, // green
+        "number" | "boolean" | "float" | "constant" => 0x56_b6_c2, // cyan
+        "attribute" | "label" | "property" | "field" => 0x56_b6_c2, // cyan
+        "comment" => return (0x5c_63_70, true), // grey, italic
+        "tag" => 0xe0_6c_75,                 // red
+        "operator" | "punctuation" => 0xab_b2_bf, // grey
+        _ => fg,
+    };
+    (color, false)
+}
+
+/// The combined cell width of the inlay hints on a row that fall at or before
+/// (`inclusive`) — or strictly before (`!inclusive`) — screen column `col`, with
+/// hints scrolled off the left (`hcol < leftcol`) excluded. This is how far the
+/// inline splice pushes a glyph/overlay at `col` to the right: a left edge / the
+/// cursor uses `inclusive` (a hint *at* the column sits before it); a right edge
+/// uses `!inclusive` (a hint *at* the column is past it). Hint width is char count,
+/// matching the renderer's ASCII-column convention. Mirrors the TUI's
+/// `inlay_cursor_shift` / the per-glyph shift its inline splice accumulates.
+pub fn inlay_shift(inlay: &[InlayHint], leftcol: u16, col: u16, inclusive: bool) -> u16 {
+    inlay
+        .iter()
+        .filter(|(hcol, _, _)| {
+            *hcol >= leftcol && (if inclusive { *hcol <= col } else { *hcol < col })
+        })
+        .map(|(_, text, _)| text.chars().count() as u16)
+        .sum()
+}
+
+/// Splice a row's inlay hints into its colored `base` segments at their anchor
+/// columns, pushing the following text right — the GUI analogue of the TUI's inline
+/// splice. `base` covers screen columns `[leftcol, n)` contiguously (every gap is a
+/// plain run), so we walk it tracking the current column and, before the glyph at a
+/// hint's column, flush the pending run and emit the hint as its own segment styled
+/// by its resolved `LspInlayHint` color (or [`DEFAULT_INLAY`] when undefined). A
+/// hint scrolled off the left is dropped; hints at or past end-of-text are appended.
+/// The shaper then lays the segments out contiguously, so the hint cells sit inline
+/// and shift the real glyphs — the column-keyed overlays shift to match via
+/// [`inlay_shift`]. With no hints `base` is returned untouched.
+pub fn splice_inlay(
+    base: Vec<Seg>,
+    inlay: &[InlayHint],
+    leftcol: u16,
+    styles: &[Style],
+) -> Vec<Seg> {
+    if inlay.is_empty() {
+        return base;
+    }
+    let mut out: Vec<Seg> = Vec::with_capacity(base.len() + inlay.len() * 2);
+    let mut col = leftcol as usize;
+    let mut hi = 0usize;
+    for seg in base {
+        let seg_chars: Vec<char> = seg.text.chars().collect();
+        let mut start = 0usize; // first char of the current pending run within this seg
+        for k in 0..seg_chars.len() {
+            let c = col + k;
+            if hi < inlay.len() && (inlay[hi].0 as usize) <= c {
+                if k > start {
+                    out.push(Seg {
+                        text: seg_chars[start..k].iter().collect(),
+                        fg: seg.fg,
+                        bold: seg.bold,
+                        italic: seg.italic,
+                    });
+                }
+                push_hint_segs(&mut out, inlay, &mut hi, c, leftcol, styles);
+                start = k;
+            }
+        }
+        if start < seg_chars.len() {
+            out.push(Seg {
+                text: seg_chars[start..].iter().collect(),
+                fg: seg.fg,
+                bold: seg.bold,
+                italic: seg.italic,
+            });
+        }
+        col += seg_chars.len();
+    }
+    // Hints anchored at or past end-of-text (e.g. an end-of-line type annotation).
+    push_hint_segs(&mut out, inlay, &mut hi, usize::MAX, leftcol, styles);
+    out
+}
+
+/// Emit every not-yet-emitted hint whose column is `<= upto` as its own [`Seg`],
+/// advancing `hi`. A hint scrolled off the left (`hcol < leftcol`) is consumed but
+/// not painted. The hint color is its resolved `LspInlayHint` style's foreground,
+/// or [`DEFAULT_INLAY`] when the colorscheme leaves the group undefined.
+fn push_hint_segs(
+    out: &mut Vec<Seg>,
+    inlay: &[InlayHint],
+    hi: &mut usize,
+    upto: usize,
+    leftcol: u16,
+    styles: &[Style],
+) {
+    while *hi < inlay.len() && (inlay[*hi].0 as usize) <= upto {
+        let (hcol, text, id) = &inlay[*hi];
+        *hi += 1;
+        if *hcol < leftcol {
+            continue; // scrolled off the left edge
+        }
+        let color = id
+            .and_then(|i| styles.get(i))
+            .and_then(|s| s.fg)
+            .unwrap_or(DEFAULT_INLAY);
+        out.push(Seg::plain(text.clone(), color));
+    }
 }
 
 /// Content hash for the shaped-buffer cache: the segments' text + colors and the

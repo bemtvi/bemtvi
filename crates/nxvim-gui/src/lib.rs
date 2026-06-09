@@ -40,6 +40,12 @@ pub use mouse::{
     button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
     panel_content_rect, vertical_action, within,
 };
+// The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
+// the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
+pub use render::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
+// The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
+// fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
+pub use render::{group_fallback, row_segments};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_view::{encode_paste, HlSpan, ScrollData, Style, View};
+use nxvim_view::{encode_paste, HlSpan, InlayHint, ScrollData, Style, View};
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use winit::application::ApplicationHandler;
@@ -218,6 +224,7 @@ struct ScrollAnim {
     lines: Vec<String>,
     numbers: Vec<Option<usize>>,
     highlights: Vec<Vec<HlSpan>>,
+    inlay_hints: Vec<Vec<InlayHint>>,
     styles: Vec<Style>,
 }
 
@@ -234,6 +241,7 @@ impl ScrollAnim {
             lines: s.lines.clone(),
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
+            inlay_hints: s.inlay_hints.clone(),
             styles: s.styles.clone(),
         }
     }
@@ -259,6 +267,7 @@ impl ScrollAnim {
             lines: &self.lines,
             numbers: &self.numbers,
             highlights: &self.highlights,
+            inlay_hints: &self.inlay_hints,
             styles: &self.styles,
         }
     }

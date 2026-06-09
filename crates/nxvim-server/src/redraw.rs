@@ -392,6 +392,9 @@ impl Server {
         styles: &mut StyleTable,
     ) -> Value {
         let highlights = self.highlights_for(buffer, &s.numbers, styles);
+        // Inlay hints ride the band too (keyed on `s.numbers` like highlights), so
+        // they slide with the text instead of vanishing until the slide settles.
+        let inlay_hints = self.inlay_hints_for(buffer, &s.numbers, styles);
         Value::Map(vec![
             (Value::from("from_top"), Value::from(s.from_top as u64)),
             (Value::from("to_top"), Value::from(s.to_top as u64)),
@@ -406,6 +409,7 @@ impl Server {
             (Value::from("selection"), spans_value(&s.selection)),
             (Value::from("numbers"), numbers_value(&s.numbers)),
             (Value::from("highlights"), highlights),
+            (Value::from("inlay_hints"), inlay_hints),
         ])
     }
 

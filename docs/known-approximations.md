@@ -162,7 +162,8 @@ gap. Recorded here so the sweep doesn't lose them.
   against the negotiated encoding, and paints each one **inline** at its column —
   shifting the real glyphs and the cursor right
   (`crates/nxvim-server/src/lsp/inlay.rs`, the splice in
-  `crates/nxvim-tui/src/render.rs::highlight_line`). Unlike semantic tokens it is
+  `crates/nxvim-tui/src/render.rs::highlight_line` and, for the GUI client, in
+  `crates/nxvim-gui/src/render.rs::splice_inlay`). Unlike semantic tokens it is
   **opt-in** (off by default). The approximations: **string labels only** — label
   *parts* are joined to their `value`s, dropping the per-part `location` (go-to on
   click) / `tooltip` / `textEdits`-on-accept (these need `inlayHint/resolve`,

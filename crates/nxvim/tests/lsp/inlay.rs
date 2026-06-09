@@ -44,6 +44,36 @@ fn inlay_on_row(params: &[Value], row: usize) -> Vec<(u64, String)> {
         .collect()
 }
 
+/// The per-band-row inline inlay hints from a redraw carrying a scroll gesture
+/// (`scroll.inlay_hints`), or `None` if this redraw has no scroll band. Each entry
+/// is the row's `(col, text)` hints, mirroring [`inlay_on_row`] over the band.
+fn scroll_band_inlay(params: &[Value]) -> Option<Vec<Vec<(u64, String)>>> {
+    let Value::Map(s) = window0_get(params, "scroll")? else {
+        return None;
+    };
+    let rows = s
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("inlay_hints"))
+        .and_then(|(_, v)| v.as_array())?;
+    Some(
+        rows.iter()
+            .map(|row| {
+                row.as_array()
+                    .map(|hints| {
+                        hints
+                            .iter()
+                            .filter_map(|h| {
+                                let a = h.as_array()?;
+                                Some((a.first()?.as_u64()?, a.get(1)?.as_str()?.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect(),
+    )
+}
+
 /// How many `textDocument/inlayHint` requests the mock has recorded.
 fn inlay_request_count(recs: &[Json]) -> usize {
     recs.iter()
@@ -225,6 +255,58 @@ async fn an_inlay_hint_shifts_the_text_right_on_the_grid() {
     assert_eq!(
         row, "let x:i32 = 1",
         "the inline hint shifts the trailing text right on the grid"
+    );
+}
+
+#[tokio::test]
+async fn inlay_hints_ride_the_scroll_band() {
+    let _guard = test_lock().lock().await;
+    // Regression: inlay hints used to vanish *during* a scroll slide — the band
+    // carried none, so they only reappeared once the slide settled. The band must
+    // now carry them (keyed on the band's lines like the syntax highlights), so they
+    // slide with the text. A hint on line 15 sits inside the <C-d> band (base_line
+    // 0, ~36 rows).
+    let record = configure_mock(
+        "inlay-scroll",
+        serde_json::json!({
+            "position_encoding": "utf-8",
+            "inlay_hints": [inlay(15, 5, ": i32", 1)],
+        }),
+    );
+    // A buffer taller than the viewport, so <C-d> produces a scroll gesture.
+    let content: String = (0..60).map(|i| format!("let v{i} = {i}\n")).collect();
+    let file = temp_file("inlay-scroll", "rs", &content);
+    let (rpc, mut incoming) = start(Some(file)).await;
+    wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
+    enable_inlay(&rpc).await;
+    // The hint on line 15 is requested, cached, and painted in the settled view.
+    wait_for_inlay(&rpc, &mut incoming, 15, ": i32").await;
+
+    // Half-page scroll: the redraw's scroll band must carry the hint on its
+    // line-15 row, so the slide shows it instead of dropping it until it settles.
+    feed(&rpc, "<C-d>");
+    let mut band = None;
+    for _ in 0..40 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+            if method == "redraw" {
+                if let Some(b) = scroll_band_inlay(&params) {
+                    band = Some(b);
+                }
+            }
+        }
+        if band.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let band = band.expect("a redraw carrying a scroll gesture");
+    assert!(
+        band.get(15)
+            .is_some_and(|row| row.contains(&(5, ": i32".to_string()))),
+        "the scroll band carries the inlay hint on band row 15: {:?}",
+        band.get(15)
     );
 }
 

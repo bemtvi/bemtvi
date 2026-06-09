@@ -43,7 +43,7 @@ subsystems:
 | `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
-| `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime and the `vim.*` standard library.           |
+| `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime (LuaJIT by default, vendored PUC Lua 5.1 via the `lua51` feature) and the `vim.*` standard library. |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
 | `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
 | `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
@@ -539,9 +539,12 @@ window but simpler: a transient overlay that grabs input focus while open.
   `vim.panel.on_select(vim._panel_select_buffer)` (a prelude helper that parses
   the buffer number off the selected line, jumps to it, and closes the list), so
   pressing `<CR>` on a listed buffer switches to it.
-- **The `[X]` is clickable.** The client enables mouse capture and hit-tests a
-  left-click against the title bar's close button (`close_button`), sending the
-  close key when hit — the only mouse interaction in the client today.
+- **The `[X]` is clickable.** A left-click on the title bar's close button
+  (`close_button`) closes the panel — one of the panel-overlay gestures in the
+  editor's broader, server-owned mouse support (click, drag-select, multi-click,
+  shift-extend, wheel scroll, divider drag, the `'mousemodel'` right-click menu,
+  middle-click paste, and tabline clicks), forwarded by both clients as
+  `nvim_input_mouse` with the server owning the hit-test.
 
 The redraw carries the panel as a `panel` map (`title`, `lines`, `cursor_row`,
 `height`), `Nil` when none is open; the client draws the editing cursor inside
@@ -551,20 +554,21 @@ the panel while it has focus.
 
 ## Lua
 
-nxvim embeds **Lua 5.1** via [mlua] (`lua51`, vendored) — the dialect LuaJIT,
-and therefore neovim, is compatible with. Scripts run **inside the server**,
-exactly as in neovim, and influence the editor through the same mechanisms RPC
-clients use. The VM loads the full safe stdlib **plus `debug`** (real plugins
-call `debug.getinfo` to locate their own install dir, and neovim exposes it),
-and the prelude ships a LuaJIT-compatible `bit` library since PUC Lua 5.1 lacks
-one. The backend is a Cargo feature: `nxvim-lua` exposes `lua51` (default,
-vendored PUC Lua 5.1) and `luajit`, threaded up unchanged through `nxvim-server`
-and the `nxvim` binary. Build the whole stack on LuaJIT for benchmarking with
-`cargo build -p nxvim --no-default-features --features luajit` (likewise
-`cargo test -p nxvim-server --no-default-features --features luajit`). The two
-mlua version features are mutually exclusive, so `[workspace.dependencies].mlua`
-selects only `vendored` and each crate sets `default-features = false` on the
-inter-crate deps to keep the default `lua51` from leaking into a `luajit` build.
+nxvim embeds **Lua 5.1** via [mlua] — the dialect neovim runs. Scripts run
+**inside the server**, exactly as in neovim, and influence the editor through the
+same mechanisms RPC clients use. The VM loads the full safe stdlib **plus
+`debug`** (real plugins call `debug.getinfo` to locate their own install dir, and
+neovim exposes it). The backend is a Cargo feature: `nxvim-lua` exposes `luajit`
+(**default**, closest neovim parity — it has `ffi` and `bit` natively) and
+`lua51` (vendored PUC Lua 5.1), threaded up unchanged through `nxvim-server` and
+the `nxvim` binary. Build the whole stack on PUC Lua with
+`cargo build -p nxvim --no-default-features --features lua51` (likewise
+`cargo test -p nxvim-server --no-default-features --features lua51`); the prelude
+ships a LuaJIT-compatible `bit` library and loads `ffi` so the PUC backend stays
+behavior-compatible. The two mlua version features are mutually exclusive, so
+`[workspace.dependencies].mlua` selects only `vendored` and each crate sets
+`default-features = false` on the inter-crate deps to keep the default `luajit`
+from leaking into a `lua51` build.
 
 **Effects flow through queues.** `vim.cmd(...)` / `vim.api.nvim_command(...)`
 queue ex-commands; `print(...)` / `vim.api.nvim_echo(...)` capture output;
@@ -670,8 +674,12 @@ consumer pays a second parse (the Rust engine's + Lua's). `vim.treesitter.start`
 `stop` are wired as ADR 0001 bridge #1: they toggle the **native** engine for a
 buffer (a `lang` override) rather than running neovim's Lua decoration-provider
 highlighter on the redraw hot path, so a highlight-only buffer still parses once.
-Lua-driven indent and injections remain non-goals for now. Full design:
-[the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md).
+Injections are implemented (ADR 0001 bridge #5 — the engine runs the resolved
+`injections` query and parses each region with its child grammar; the vendored
+`LanguageTree` mirrors the same child trees on the Lua side); Lua-driven indent
+remains a non-goal for now. Full design:
+[the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md)
+and [injections](specs/2026-06-08-treesitter-injections-design.md).
 
 The boundary this section embodies — **native engine for editor behavior,
 vendored neovim Lua API for plugins** — is the same one LSP follows (a native
@@ -716,8 +724,11 @@ sign column), floats with borders + titles, the split separators, the tabline
 (built-in or custom), per-window and global (`laststatus=3`) status lines, the
 completion pmenu (with its doc preview), the `:messages`/`:ls` panel, the
 command/message line, visual + secondary (multi-cursor) selections, search /
-incsearch, LSP diagnostic underlines + signs + inline virtual text, the
-secondary multi-cursors, and the text style attributes (bold/italic via bold and
+incsearch, LSP diagnostic underlines + signs + inline virtual text, **inline LSP
+inlay hints** (spliced into the row's shaped text so following glyphs — and the
+column-keyed selection / search / diagnostic / cursor overlays — shift right by
+the inserted width, the GUI analogue of the TUI's inline splice), the secondary
+multi-cursors, and the text style attributes (bold/italic via bold and
 italic faces, underline/strikethrough/reverse as quads) — plus **pixel-smooth
 scrolling**: the focused window slides the server's scroll-gesture band at a
 fractional (sub-pixel) line offset driven by the client clock, paced per frame from
@@ -728,7 +739,8 @@ vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse
 (`'mousemodel'`), middle-click paste, and the pmenu / panel overlay gestures, sent
 as the same `nvim_input_mouse` the TUI uses (the server owns the hit-test). Still
 deferred: wide-char column fidelity (a char index stands in for a screen column),
-and undercurl is drawn as a plain underline. Because the GUI can't be black-box
+and undercurl is drawn as a plain underline.
+Because the GUI can't be black-box
 tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
 frontend-specific translation layers have Tier-1 tests — the winit→notation input
 (`crates/nxvim-gui/tests/keys.rs`) and the pointer/overlay math
@@ -804,14 +816,15 @@ screen," and that is exactly the shape of these tests.
 [*Known approximations & missing features*](known-approximations.md).
 
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
-  dir today; installing them there is manual / a follow-up), treesitter
-  injections, and a `:set`-driven highlight toggle. The **`vim.treesitter` Lua
+  dir today; installing them there is manual / a follow-up) and a `:set`-driven
+  highlight toggle. (Treesitter **injections** have landed — ADR 0001 bridge #5,
+  see [*Syntax highlighting*](#syntax-highlighting-treesitter).) The **`vim.treesitter` Lua
   platform** itself is in place — `get_parser(buf):parse()`, `get_string_parser`,
   and `query.parse` + `iter_captures`/`iter_matches` with predicates run neovim's
   vendored Lua on bespoke Rust primitives (see [*The `vim.treesitter` Lua
   platform*](#the-vimtreesitter-lua-platform)); `vim.treesitter.start` / `stop`
-  toggle the native engine per buffer (ADR 0001 bridge #1), while injections and
-  Lua-driven indent remain deferred.
+  toggle the native engine per buffer (ADR 0001 bridge #1), and **injections** are
+  implemented (ADR 0001 bridge #5). Lua-driven indent remains deferred.
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay
@@ -915,8 +928,8 @@ screen," and that is exactly the shape of these tests.
   and `vim.system`'s `on_exit` fires off-tick. The `vim.uv`/`vim.loop` surface
   beyond timers (`new_pipe`, TCP, event-based `fs_*`) still grows as plugins demand
   it — e.g. `vim.lsp.rpc.connect`'s TCP transport (the skipped gdscript config).
-- LuaJIT (in place of vendored Lua 5.1) and the full `vim.*` standard library.
-- A native, non-terminal GUI client (e.g. for Windows).
+- The full `vim.*` standard library. (LuaJIT is already the **default** backend —
+  vendored PUC Lua 5.1 is the `lua51` opt-in — see [*Lua*](#lua).)
 
 [`tokio::io::duplex`]: https://docs.rs/tokio/latest/tokio/io/fn.duplex.html
 [mlua]: https://docs.rs/mlua

@@ -214,14 +214,15 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     // interpolated) cursor row for the terminal cursor and the popup anchor.
     // Tiled windows paint first; floats overlay them in a second pass so they sit
     // on top — the focused window (tiled or float) wins the cursor either way.
-    let mut focused_inner: Option<(Rect, u16)> = None;
+    let mut focused_inner: Option<(Rect, u16, u16)> = None;
     for win in view.windows.iter().filter(|w| !w.floating) {
         let area = window_area(wins_area, win);
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
-        let (text_inner, cursor_row) = render_window(frame, area, win, view, win_anim);
+        let (text_inner, cursor_row, cursor_shift) =
+            render_window(frame, area, win, view, win_anim);
         if win.focused {
-            focused_inner = Some((text_inner, cursor_row));
+            focused_inner = Some((text_inner, cursor_row, cursor_shift));
         }
     }
 
@@ -242,9 +243,9 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
             }
             None => outer,
         };
-        let (text_inner, cursor_row) = render_window(frame, inner, win, view, None);
+        let (text_inner, cursor_row, cursor_shift) = render_window(frame, inner, win, view, None);
         if win.focused {
-            focused_inner = Some((text_inner, cursor_row));
+            focused_inner = Some((text_inner, cursor_row, cursor_shift));
         }
     }
 
@@ -257,7 +258,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
 
     // The insert-mode completion popup floats over the focused window's text area,
     // drawn after the windows so it sits on top.
-    if let (Some(pmenu), Some((inner, _))) = (&view.pmenu, focused_inner) {
+    if let (Some(pmenu), Some((inner, _, _))) = (&view.pmenu, focused_inner) {
         render_pmenu(frame, inner, pmenu, doc_scroll);
     }
 
@@ -279,7 +280,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         let prompt_width = cmdline_prompt_width(view);
         let col = cmd_area.x + prompt_width + view.cmdline_cursor as u16;
         frame.set_cursor_position((col, cmd_area.y));
-    } else if let (Some((inner, cursor_row)), Some(win)) = (focused_inner, view.focused()) {
+    } else if let (Some((inner, cursor_row, shift)), Some(win)) = (focused_inner, view.focused()) {
         // The cursor row is interpolated during a slide, but the column comes
         // straight from the focused window — correct because the scroll commands
         // move only vertically. The horizontal scroll offset (`leftcol`) shifts the
@@ -289,19 +290,9 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         // cursor can never be drawn past a window's right edge — escaping a narrow
         // float or vsplit onto whatever sits beside it. (Rows are already bounded
         // by the window's text height.)
-        // Inline inlay hints on the cursor's row that sit at or before the cursor
-        // push the cursor right by their combined width (the same splice the text
-        // got). Skipped while a slide animates (hints aren't painted on the band).
-        let shift = if anim.is_none() {
-            inlay_cursor_shift(
-                &win.inlay_hints,
-                cursor_row,
-                win.cursor_screen_col,
-                win.leftcol,
-            )
-        } else {
-            0
-        };
+        // `shift` is how far the inline inlay hints on the cursor's row push it
+        // right (computed by `render_window` from the same band/window hints it
+        // painted, so the cursor tracks the splice during the slide and once settled).
         let col = inner.x
             + (win.cursor_screen_col + shift)
                 .saturating_sub(win.leftcol)
@@ -375,7 +366,7 @@ fn render_window(
     win: &WindowView,
     view: &View,
     anim: Option<&Animation>,
-) -> (Rect, u16) {
+) -> (Rect, u16, u16) {
     // The status line is the window's bottom row (when this window shows one, per
     // `'laststatus'`); the text body is the rest. With no per-window status row the
     // text body claims the whole rect — the server already sized `lines` to fill it.
@@ -394,7 +385,6 @@ fn render_window(
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
     let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
-    let empty_inlay: Vec<Vec<InlayHint>> = Vec::new();
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
     // window of the full buffer). The static path — the overwhelmingly common
@@ -404,9 +394,11 @@ fn render_window(
     let anim_sel: Vec<Option<(u16, u16)>>;
     let anim_hl: Vec<Vec<HlSpan>>;
     let anim_numbers: Vec<Option<usize>>;
+    let anim_inlay: Vec<Vec<InlayHint>>;
     let frame_lines: &[String];
     let frame_sel: &[Option<(u16, u16)>];
     let frame_hl: &[Vec<HlSpan>];
+    let frame_inlay: &[Vec<InlayHint>];
     let frame_numbers: &[Option<usize>];
     let cursor_row: u16;
     // 1-based buffer line the cursor sits on, used to compute relative numbers.
@@ -437,10 +429,18 @@ fn render_window(
                 .take(height)
                 .cloned()
                 .collect();
+            anim_inlay = a
+                .inlay_hints
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
             frame_lines = &anim_lines;
             frame_sel = &anim_sel;
             frame_numbers = &anim_numbers;
             frame_hl = &anim_hl;
+            frame_inlay = &anim_inlay;
             cursor_row = cur.saturating_sub(top) as u16;
             current_line = cur + 1;
         }
@@ -449,6 +449,7 @@ fn render_window(
             frame_sel = &win.selection;
             frame_numbers = &win.numbers;
             frame_hl = &win.highlights;
+            frame_inlay = &win.inlay_hints;
             cursor_row = win.cursor_row;
             current_line = win.cursor_line;
         }
@@ -521,12 +522,6 @@ fn render_window(
         Some(_) => &empty_virt,
         None => &win.diagnostics_virt,
     };
-    // Inlay hints, like diagnostics, paint on the settled viewport only — a slide
-    // band carries none (so the text doesn't jump mid-animation).
-    let frame_inlay: &[Vec<InlayHint>] = match anim {
-        Some(_) => &empty_inlay,
-        None => &win.inlay_hints,
-    };
     // Signs, like diagnostics, are painted on the settled viewport only — a slide
     // band carries none (the reserved column stays blank while animating, so the
     // text below it doesn't jump). Painted now that the palette resolves style ids.
@@ -578,7 +573,13 @@ fn render_window(
     if let Some(status_area) = status_area {
         render_status(frame, status_area, &win.status, view);
     }
-    (text_inner, cursor_row)
+    // How far the inline inlay hints on the cursor's row push the cursor right —
+    // computed from `frame_inlay`, so it's the band's hints mid-slide and the
+    // window's once settled (both indexed by the cursor's screen row). Returned so
+    // the caller places the focused window's cursor past the splice in either case.
+    let cursor_shift =
+        inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, win.leftcol);
+    (text_inner, cursor_row, cursor_shift)
 }
 
 /// Paint each secondary multi-cursor as a styled cell over the already-rendered

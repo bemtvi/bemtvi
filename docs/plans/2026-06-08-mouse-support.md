@@ -12,6 +12,15 @@
 > Phase 8 (wrap-aware hit-testing) remains; the right-click context-menu *widget*
 > is tracked separately. This is a design spec and a phased build order; the ✅/⬜
 > markers below track what is built.
+>
+> **Client forwarding.** Every gesture above is forwarded by **both** the TUI and
+> the winit/wgpu GUI client. Right- and middle-click were a late gap — the server
+> arms (Phase 7) were tested by driving `nvim_input_mouse` directly over RPC, but
+> *neither* client forwarded those buttons (each only wired the left button), so
+> they reached no user until the press was forwarded from both clients'
+> button-press handlers (`nxvim-tui/src/lib.rs`, `nxvim-gui/src/lib.rs` via the
+> pure `mouse::button_name` mapping; only the press is sent — the server no-ops
+> right/middle drag + release).
 
 ## Status legend
 
@@ -491,8 +500,17 @@ Tests (`nxvim-server/tests/mouse.rs`): `right_click_popup_setpos_moves_cursor`,
 `right_click_extend_model_extends_selection`, `right_click_popup_model_is_noop`,
 `middle_click_pastes_clipboard`, `middle_click_empty_clipboard_is_noop`,
 `insert_click_moves_caret_and_stays_insert` (plus a `start_with_clipboard` helper
-injecting a `FakeClipboard`). **No TUI change** — the client already forwards every
-non-overlay press as a raw cell with its real modifiers.
+injecting a `FakeClipboard`).
+
+**Client forwarding (corrected).** This was originally noted as "No TUI change —
+the client already forwards every non-overlay press." That was wrong: the TUI (and
+later the GUI) only wired the **left** button, so `Down(Right)` / `Down(Middle)`
+fell through their catch-all and never reached the server — these gestures were
+exercised only by tests driving `nvim_input_mouse` directly. Both clients now
+forward a right/middle **press** (the server no-ops their drag + release):
+`MouseEventKind::Down(Right | Middle)` in `nxvim-tui/src/lib.rs`, and the
+`ElementState::Pressed` arm in `nxvim-gui/src/lib.rs` mapping the winit button via
+the pure `mouse::button_name` (tested in `nxvim-gui/tests/mouse.rs`).
 
 **Earlier — `<S-LeftMouse>` extend.** The shift-click extend half of the `popup*`
 model shipped ahead of this phase: shift+left-press keeps the existing anchor and

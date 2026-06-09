@@ -37,7 +37,7 @@ mod render;
 
 pub use input::{encode_key, is_paste};
 pub use mouse::{
-    cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
+    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
     panel_content_rect, vertical_action, within,
 };
 
@@ -893,6 +893,22 @@ impl ApplicationHandler<UserEvent> for App {
                 ElementState::Pressed => self.mouse_left_press(),
                 ElementState::Released => self.mouse_left_release(),
             },
+            // Right / middle clicks have no client-owned overlay affordance, so
+            // they forward straight to the server at the pointer cell — the
+            // `'mousemodel'` right-click branch and middle-click paste live there.
+            // Only the press is meaningful (the server no-ops right/middle drag +
+            // release), mirroring the TUI.
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
+                if let (Some(name), Some((col, row))) =
+                    (mouse::button_name(button), self.pointer_cell())
+                {
+                    self.send_mouse(name, "press", col, row);
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Paste from the system clipboard (Cmd+V / Ctrl+Shift+V /

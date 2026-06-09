@@ -340,6 +340,29 @@ where
                             ],
                         );
                     }
+                    // Right / middle press: no client-owned overlay claims them, so
+                    // forward straight to the server, which owns the gesture — the
+                    // `'mousemodel'` right-click branch (extend / popup-setpos) and
+                    // middle-click paste of the `"*` register. Only the press is
+                    // meaningful (the server no-ops right/middle drag + release).
+                    MouseEventKind::Down(button @ (MouseButton::Right | MouseButton::Middle)) => {
+                        let name = if button == MouseButton::Right {
+                            "right"
+                        } else {
+                            "middle"
+                        };
+                        rpc.notify(
+                            "nvim_input_mouse",
+                            vec![
+                                Value::from(name),
+                                Value::from("press"),
+                                Value::from(mouse_modifier(m.modifiers)),
+                                Value::from(0u64),
+                                Value::from(m.row as u64),
+                                Value::from(m.column as u64),
+                            ],
+                        );
+                    }
                     // The mouse wheel. A client-owned overlay claims a *vertical*
                     // notch when the pointer is over it: the completion doc preview
                     // scrolls its docs client-side (the box height is the client's to

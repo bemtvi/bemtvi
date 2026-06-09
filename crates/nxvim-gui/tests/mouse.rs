@@ -6,10 +6,22 @@
 //! without a window; these cover the math it depends on.
 
 use nxvim_gui::{
-    cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
+    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
     panel_content_rect, vertical_action, within,
 };
+use winit::event::MouseButton;
 use winit::keyboard::ModifiersState;
+
+#[test]
+fn button_name_maps_the_three_forwarded_buttons() {
+    assert_eq!(button_name(MouseButton::Left), Some("left"));
+    assert_eq!(button_name(MouseButton::Right), Some("right"));
+    assert_eq!(button_name(MouseButton::Middle), Some("middle"));
+    // Buttons the server has no gesture for are dropped, not forwarded.
+    assert_eq!(button_name(MouseButton::Back), None);
+    assert_eq!(button_name(MouseButton::Forward), None);
+    assert_eq!(button_name(MouseButton::Other(9)), None);
+}
 
 #[test]
 fn modifier_string_is_ctrl_shift_alt_order() {

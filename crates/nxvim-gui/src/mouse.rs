@@ -13,7 +13,22 @@
 //! buffer position (`grid` is always 0 — nxvim is single-grid), and subtracts the
 //! tabline itself, exactly as it does for the TUI's raw terminal cells.
 
+use winit::event::MouseButton;
 use winit::keyboard::ModifiersState;
+
+/// The `nvim_input_mouse` button name for a winit button, or `None` for one the
+/// server has no gesture for (back/forward/other). `"left"` carries the
+/// focus-follows-click + selection machinery; `"right"` is the `'mousemodel'`
+/// branch (extend / popup-setpos); `"middle"` pastes the `"*` register. Mirrors
+/// the TUI, which forwards the same three names.
+pub fn button_name(button: MouseButton) -> Option<&'static str> {
+    match button {
+        MouseButton::Left => Some("left"),
+        MouseButton::Right => Some("right"),
+        MouseButton::Middle => Some("middle"),
+        _ => None,
+    }
+}
 
 /// The `nvim_input_mouse` modifier string for the live modifier state — e.g.
 /// Ctrl+Shift → `"CS"`. The server's parser accepts the chars in any order with

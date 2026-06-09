@@ -716,9 +716,10 @@ italic faces, underline/strikethrough/reverse as quads) — plus **pixel-smooth
 scrolling**: the focused window slides the server's scroll-gesture band at a
 fractional (sub-pixel) line offset driven by the client clock, paced per frame from
 winit's `about_to_wait` (where the TUI animates at whole-row granularity, the GPU
-client interpolates `top` without rounding). Input reaches parity too: vim-notation
-keys, system-clipboard paste, native open/save dialogs, and **mouse** — click /
-drag-select / release, wheel scroll, and the pmenu / panel overlay gestures, sent
+client interpolates `top` without rounding). Input reaches parity too:
+vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse**
+— left click / drag-select / release, wheel scroll, right-click
+(`'mousemodel'`), middle-click paste, and the pmenu / panel overlay gestures, sent
 as the same `nvim_input_mouse` the TUI uses (the server owns the hit-test). Still
 deferred: wide-char column fidelity (a char index stands in for a screen column),
 and undercurl is drawn as a plain underline. Because the GUI can't be black-box

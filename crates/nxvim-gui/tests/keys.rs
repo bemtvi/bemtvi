@@ -212,10 +212,12 @@ fn paste_gestures_are_recognized_and_dont_shadow_ctrl_v() {
 }
 
 #[test]
-fn save_dialog_fires_for_wn_and_bare_write_on_unnamed() {
-    // `:wn` always saves to a new file via the dialog, named buffer or not.
-    assert!(save_dialog_needed("wn", false));
-    assert!(save_dialog_needed("wn", true));
+fn save_dialog_fires_for_wo_and_bare_write_on_unnamed() {
+    // `:wo` always saves to a new file via the dialog, named buffer or not.
+    assert!(save_dialog_needed("wo", false));
+    assert!(save_dialog_needed("wo", true));
+    // `:wn` is *not* a save dialog — it is vim's `:wnext`, left to run as typed.
+    assert!(!save_dialog_needed("wn", true));
     // A bare `:w`/`:write` pops the dialog only when the buffer has no file yet.
     assert!(save_dialog_needed("w", true));
     assert!(save_dialog_needed("write", true));

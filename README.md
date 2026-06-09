@@ -122,7 +122,7 @@ Things nxvim has that neovim doesn't:
     and a bare `:e` (an alias of `:eo`) — pops a system **open** dialog, then
     runs the base command (`:e`/`:sp`/`:vs`/`:tabe`/…) on the chosen file,
     preserving its edit / split / tab semantics.
-  - `:wn` (and a bare `:w` on an unnamed buffer) pops a system **save** dialog
+  - `:wo` (and a bare `:w` on an unnamed buffer) pops a system **save** dialog
     and writes to the chosen path.
 - **A browsable message panel.** `:messages` and `:ls` open a navigable,
   bottom-docked panel (an nxvim-native surface, not a vim window) that plugins

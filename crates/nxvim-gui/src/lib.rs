@@ -27,9 +27,10 @@
 //!   `:tabeo`, `:newo`, `:vnewo` (and bare `:e`, an alias of `:eo`) — pops the
 //!   **open** dialog and re-runs the base command (`:e`/`:sp`/`:vs`/`:tabe`/…)
 //!   with the chosen file, preserving its edit / split / tab semantics.
-//! - `:wn`, and a bare `:w` on an unnamed buffer ([`save_dialog_needed`]), pop the
+//! - `:wo`, and a bare `:w` on an unnamed buffer ([`save_dialog_needed`]), pop the
 //!   **save** dialog and write the buffer to the chosen path (`:w <file>`, which
-//!   also binds the buffer to it).
+//!   also binds the buffer to it). (`:wo` mirrors the `…o` open family and, unlike
+//!   `:wn`, collides with no real ex-command — vim's `:wn` is `:wnext`.)
 
 mod input;
 mod mouse;
@@ -464,7 +465,7 @@ impl App {
         true
     }
 
-    /// Pop the native **save** dialog for `:wn` / a bare `:w` on an unnamed buffer,
+    /// Pop the native **save** dialog for `:wo` / a bare `:w` on an unnamed buffer,
     /// then `:w <file>` to the chosen path (which also binds the buffer to it).
     /// Same key-swallowing contract and raw-path rationale as [`Self::pick_open`].
     fn pick_save(&self) -> bool {
@@ -768,12 +769,14 @@ pub fn open_path_command(cmdline: &str) -> Option<(&'static str, &str)> {
     Some((base, arg))
 }
 
-/// Whether `<CR>` over `cmdline` should pop the native **save** dialog: `:wn`
+/// Whether `<CR>` over `cmdline` should pop the native **save** dialog: `:wo`
 /// (save to a new file) always, or a bare `:w`/`:write` when the focused buffer is
 /// `unnamed` (so a plain `:w` has no file to write to). `None`/false leaves the
-/// command to run as typed. Pure, so it is unit-tested in `tests/keys.rs`.
+/// command to run as typed. `:wo` is chosen to mirror the `…o` open family and
+/// because it shadows no real ex-command (vim's `:wn` is `:wnext`). Pure, so it
+/// is unit-tested in `tests/keys.rs`.
 pub fn save_dialog_needed(cmdline: &str, unnamed: bool) -> bool {
-    matches!(cmdline.trim(), "wn")
+    matches!(cmdline.trim(), "wo")
         || (unnamed && matches!(cmdline.trim(), "w" | "wr" | "wri" | "writ" | "write"))
 }
 

@@ -208,6 +208,26 @@ impl Buffer {
         }
     }
 
+    /// Bind (or clear) the buffer's file path without touching its contents.
+    ///
+    /// The usual ways a buffer gets a name are [`Buffer::from_file`] and `:w {path}`
+    /// ([`Buffer::write`]). This is the setter for the *in-memory* open/save paths
+    /// that have no filesystem to go through — notably the browser/WASM build, where
+    /// the File System Access API supplies the bytes and the name out of band.
+    pub fn set_path(&mut self, path: Option<PathBuf>) {
+        self.path = path;
+    }
+
+    /// Mark the buffer as matching its backing store: clear `modified` and pin the
+    /// save point (`save_tick`) at the current change. This is the state right after
+    /// a load or a save — `[+]` clears and any later `disk_changed` check has a
+    /// baseline. (A normal `:w` does this inside [`Buffer::write`]; the in-memory
+    /// open/save paths call it directly, since their I/O happens elsewhere.)
+    pub fn mark_clean(&mut self) {
+        self.modified = false;
+        self.save_tick = self.changedtick;
+    }
+
     /// Load a buffer from `path`. A missing file yields an empty buffer bound to
     /// that path (written on first save), matching `vim file-that-does-not-exist`.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {

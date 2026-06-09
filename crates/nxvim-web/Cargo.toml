@@ -1,0 +1,45 @@
+[package]
+name = "nxvim-web"
+description = "Fully client-side WebAssembly build of the nxvim editor core: the editor runs in the browser, with no server component."
+# This crate is deliberately EXCLUDED from the workspace (see the root Cargo.toml's
+# `[workspace] exclude`) so the normal host build/test/clippy never touches it — it
+# targets `wasm32-unknown-unknown` and is built via `build.sh`. Being outside the
+# workspace, it can't inherit `[workspace.package]` / `[workspace.dependencies]`, so
+# every field and dependency is spelled out (and pinned) here.
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["David Rios <david.rios.gomes@gmail.com>"]
+repository = "https://github.com/davidrios/nxvim"
+rust-version = "1.80"
+
+# `cdylib` is the WebAssembly artifact `wasm-bindgen` post-processes; `rlib` lets a
+# host-target test (`cargo test`) link the crate too.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The whole editor model: buffers, modes, motions, operators, ex-commands, undo,
+# search, and the renderable `View`. Pure and synchronous, with only pure-Rust
+# dependencies — so it compiles to `wasm32-unknown-unknown` unchanged. (Lua,
+# treesitter, and LSP live in `nxvim-server`, which a client-only build omits.)
+nxvim-core = { path = "../nxvim-core" }
+# The frontend-neutral input layer shared by every nxvim client: the `Key` enum,
+# vim key-notation encoding, and bracketed-paste encoding. Reused here so the web
+# client encodes input through the *same* contract the TUI/GUI use rather than
+# re-implementing it in JS. (Its other half — the msgpack `redraw` *decoder* — is for
+# the server wire, which this serverless build never produces, so it goes unused and
+# is dead-stripped by LTO.)
+nxvim-view = { path = "../nxvim-view" }
+# The JS↔Rust bindings. Pinned exactly; the `wasm-bindgen` CLI used by build.sh must
+# match: `cargo install wasm-bindgen-cli --version 0.2.123`.
+wasm-bindgen = "=0.2.123"
+# Serializes the editor's `View` into the JSON the JS renderer consumes. Pure Rust,
+# wasm-clean; pinned to the same version the workspace uses elsewhere.
+serde_json = "=1.0.150"
+
+# Small wasm with good runtime speed for the demo; `wasm-bindgen`'s recommended
+# release profile.
+[profile.release]
+opt-level = "s"
+lto = true

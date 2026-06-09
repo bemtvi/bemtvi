@@ -122,6 +122,50 @@ impl Editor {
         self.buffers.insert(buffer)
     }
 
+    /// Open `contents` into the window as if a file named `name` were edited — but
+    /// the bytes come from memory, not the filesystem. This is the browser/WASM open
+    /// path: the host has no filesystem, so the File System Access API hands us the
+    /// file's text and we load it here (the `:e {path}` analogue, minus the disk
+    /// read). Reuses the throwaway `[No Name]` buffer like `:e`/`:enew`, then
+    /// replaces the text through the normal edit path, binds the name, and resets to
+    /// a freshly-read state: unmodified, cursor and scroll at the top.
+    pub fn load_str(&mut self, name: Option<String>, contents: &str) {
+        if !self.current_is_throwaway() {
+            let id = self.add_buffer(Buffer::empty());
+            self.switch_buffer(id);
+        }
+        self.cursor = Cursor::default();
+        self.top = 0;
+        self.leftcol = 0;
+
+        let ob = self.cur_mut();
+        let len = ob.buffer.len_bytes();
+        ob.buffer.remove(0..len);
+        ob.buffer.insert(0, contents);
+        ob.buffer.normalize();
+        ob.buffer.set_path(name.map(std::path::PathBuf::from));
+        ob.buffer.mark_clean();
+        // Freshly loaded text is the new baseline: rebuild the undo tree rooted at it
+        // and record that state as saved. Without this the throwaway `[No Name]`
+        // buffer's empty-buffer undo root survives the in-place text swap, so the
+        // first `u` after an edit reverts the whole file away instead of undoing the
+        // edit. Mirrors `load_into_current` (the `:e` read path).
+        ob.undo = UndoTree::new(&ob.buffer);
+        ob.saved_seq = Some(ob.undo.cur_seq());
+    }
+
+    /// Record that the current buffer was just saved to `name`: bind the name (when
+    /// given) and clear the modified flag — the post-`:w` state. The actual write
+    /// happens outside core (in the browser build, via the File System Access API),
+    /// so this updates only the in-editor bookkeeping.
+    pub fn mark_saved(&mut self, name: Option<String>) {
+        let buf = self.buffer_mut();
+        if let Some(name) = name {
+            buf.set_path(Some(std::path::PathBuf::from(name)));
+        }
+        buf.mark_clean();
+    }
+
     /// Make `id` the current buffer: stash the outgoing window position with its
     /// buffer, record the alternate (`#`), and restore the incoming buffer's
     /// saved position. A no-op if `id` is already current or not in the store.

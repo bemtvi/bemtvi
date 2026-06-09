@@ -1,0 +1,5 @@
+/* Tailwind v4 entry point for the web demo's chrome. Compiled to a static, minified
+   web/tailwind.css by build.sh (the Tailwind CLI scans the sources below for the
+   utility classes actually used, so the output is tiny). No runtime CDN. */
+@import "tailwindcss";
+@source "./web/index.html";

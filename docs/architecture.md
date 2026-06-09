@@ -746,6 +746,71 @@ frontend-specific translation layers have Tier-1 tests — the winit→notation 
 (`crates/nxvim-gui/tests/keys.rs`) and the pointer/overlay math
 (`crates/nxvim-gui/tests/mouse.rs`); the rendered frame is validated by running it.
 
+### The web build — a fully client-side WebAssembly editor
+
+**`nxvim-web` runs the editor *in the browser*, with no server**
+([`crates/nxvim-web`](../crates/nxvim-web)). Where the native clients move only the
+UI off the editor, this moves the whole thing into a browser tab: `nxvim-core` —
+which is pure, synchronous, and depends only on pure-Rust crates — compiles to
+`wasm32-unknown-unknown` and runs client-side. It's the same "the core is portable
+because it's pure" property the crate split was designed for, taken to its limit.
+
+- **A thin wasm-bindgen wrapper.** `src/lib.rs` exposes one handle, `WebEditor`,
+  over `nxvim_core::Editor`: `key`/`paste` encode input, `command(cmd)` runs an
+  ex-command, `mouse(...)` forwards a gesture, `view_json()` serializes the editor's
+  `View` to JSON, and `load_file`/`buffer_text`/`mark_saved` are the in-memory file
+  path. The exported surface is just strings and numbers, so the only browser-facing
+  dependency is `wasm-bindgen` (no `web-sys`/`js-sys`).
+- **Input reuses the shared client layer.** `key`/`paste` go through
+  `nxvim-view`'s `Key`/`notation`/`encode_paste` — the *same* frontend-neutral
+  encoder the TUI (crossterm) and GUI (winit) use — so the web client doesn't
+  re-implement vim key-notation; the page only maps a browser `KeyboardEvent` to the
+  neutral modifier flags + key name, exactly as the native front ends map their
+  native events. (`nxvim-view`'s *other* half, the msgpack `redraw` decoder, is for
+  the server wire a serverless build never produces, so it's unused and dead-stripped.)
+- **Mouse and multi-cursor come for free from the core.** The hit-test from a
+  global screen cell back to a window + buffer position — plus multi-click word/line
+  selection, drag-select, wheel scroll, and the multi-cursor *toggle* in placement
+  mode — all live in `nxvim_core::editor::mouse`, not the server. So `mouse(...)`
+  just parses args into a `MouseEvent` and calls `editor.mouse(ev)`, exactly as the
+  server's `nvim_input_mouse` does, and the page forwards raw cells. The full
+  Helix-style multi-cursor (`<A-c>` to enter placement mode, `c`/motions to drop
+  cursors, edit-all, `Esc` to apply) works through the same `key` path; the renderer
+  paints placed cursors reverse-video and the active one amber.
+- **The browser is the renderer + the filesystem.** `web/index.html` decodes the
+  `view_json` and paints it as **HTML/CSS** (Tailwind, compiled to a static local
+  stylesheet at build time — no runtime CDN), the browser analogue of `nxvim-tui`'s
+  layout. File open/save use the **File System Access API**: a picked file's text is
+  fed in with `load_file` (the in-memory `:e`), and `buffer_text` is written back out
+  on save (the in-memory `:w`) — so a static page genuinely opens and writes the
+  user's local files, no backend involved. This is wired to the same `:eo`/`:wo`
+  command family the GUI uses (the page intercepts `<CR>` on those verbs and calls
+  the picker), plus toolbar buttons.
+- **In-memory open/save in the core.** The host has no filesystem, so the bytes
+  arrive from JS rather than through `Buffer`'s file I/O. Two small additions to
+  `nxvim-core` serve this: `Editor::load_str(name, contents)` (the `:e` analogue —
+  reuse the throwaway buffer, replace its text, bind the name, mark it clean) and
+  `Editor::mark_saved(name)` (the post-`:w` state), built on `Buffer::set_path` /
+  `Buffer::mark_clean`. Nothing else in core changes.
+- **Excluded from the workspace.** It targets wasm and is built via
+  `crates/nxvim-web/build.sh` (Tailwind CSS → `cargo build --target
+  wasm32-unknown-unknown` → `wasm-bindgen`), so it is in the root Cargo.toml's
+  `[workspace] exclude`: the host `cargo build/test/clippy --workspace` never touches
+  it, and it pins its own dependencies rather than inheriting the workspace's.
+
+Because there is no server, this build is the editor **core** only — modal editing,
+ex-commands, undo, search/substitute, registers/marks, buffers, splits, tab pages.
+The subsystems that live in `nxvim-server` — **Lua config, treesitter highlighting,
+and LSP** — are absent from a client-only build by construction (a browser tab has
+no subprocess, no dynamic grammar loading, and the LuaJIT backend doesn't target
+wasm).
+
+Like the GUI, the rendered frame needs a real browser to validate. The data path
+(load a file's contents → edit → read the buffer text back) is exercised through a
+small `window.__nxvim` test hook — so a headless browser can drive open→edit→save
+without the native picker, which can't be scripted — alongside rendering and
+keyboard editing.
+
 ---
 
 ## Testing philosophy

@@ -13,6 +13,12 @@ members = [
     "crates/nxvim-view",
     "crates/nxvim-test-harness",
 ]
+# nxvim-web is the fully client-side WebAssembly build of the editor. It targets
+# `wasm32-unknown-unknown` (built via `crates/nxvim-web/build.sh`), so it is NOT a
+# workspace member: excluding it keeps it out of the host `cargo build/test/clippy
+# --workspace` flow, which can't meaningfully compile or run a wasm cdylib. Being
+# excluded, it pins its own dependencies rather than inheriting the workspace's.
+exclude = ["crates/nxvim-web"]
 
 [workspace.package]
 version = "0.1.0"

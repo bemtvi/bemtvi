@@ -1,0 +1,16 @@
+# Netlify configuration for the nxvim web UI (crates/nxvim-web) — the only thing
+# this site publishes. Connect the repo once in the Netlify dashboard; thereafter
+# every push to the production branch runs the build below and deploys it.
+#
+# The build compiles the editor core to WebAssembly and vendors the tree-sitter
+# grammars, so the published files (web/pkg, web/vendor, web/tailwind.css) are
+# generated here — they're gitignored, not committed.
+[build]
+  command = "bash crates/nxvim-web/netlify-build.sh"
+  publish = "crates/nxvim-web/web"
+
+[build.environment]
+  # Node for Tailwind + the tree-sitter vendoring script; Rust (provisioned by
+  # Netlify via rustup) for the wasm build. Pin both for reproducible deploys.
+  NODE_VERSION = "20"
+  RUST_VERSION = "1.83.0"

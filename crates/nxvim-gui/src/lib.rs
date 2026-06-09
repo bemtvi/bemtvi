@@ -801,6 +801,19 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("nxvim")
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
+        // On Wayland/X11 the window's app_id / WM_CLASS must match the
+        // installed .desktop file's basename (its `StartupWMClass`) for the
+        // desktop environment to associate our icon — packaged in the AppImage
+        // as `assets/nxvim.desktop` — with the window. Without it the AppImage
+        // ships an icon the compositor never attaches to the running window.
+        #[cfg(all(
+            unix,
+            not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+        ))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland as _;
+            attrs.with_name("nxvim", "nxvim")
+        };
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

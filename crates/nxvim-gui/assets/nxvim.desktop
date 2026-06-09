@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=nxvim
+GenericName=Text Editor
+Comment=A neovim clone in Rust — native GUI client
+Exec=nxvim-gui %F
+Icon=nxvim
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/plain;
+Keywords=vim;neovim;editor;
+StartupNotify=true
+StartupWMClass=nxvim

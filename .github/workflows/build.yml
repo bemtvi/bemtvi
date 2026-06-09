@@ -66,6 +66,11 @@ jobs:
             echo "BIN=$BIN"
             echo "ASSET=$PREFIX-${{ inputs.version }}-${{ matrix.suffix }}.${{ matrix.ext }}"
           } >> "$GITHUB_ENV"
+          # The Linux GUI ships a second asset alongside the bare-binary tarball:
+          # a single-file AppImage (desktop-integrated, runs on old glibc).
+          if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.kind }}" = "gui" ]; then
+            echo "APPIMAGE_ASSET=$PREFIX-${{ inputs.version }}-${{ matrix.suffix }}.AppImage" >> "$GITHUB_ENV"
+          fi
           # CFBundle / pkg versions must be numeric; "edge" (and any non-numeric
           # tag) falls back to 0.0.0.
           V="${{ inputs.version }}"
@@ -107,7 +112,22 @@ jobs:
           sudo apt-get install -y \
             libwayland-dev libxkbcommon-dev libxcb1-dev \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
+            libgl1-mesa-dev libegl1-mesa-dev \
+            librsvg2-bin  # rsvg-convert: rasterizes the app icon for the AppImage
+
+      # Zig is the cross-linker cargo-zigbuild drives to pin the GUI's glibc
+      # floor (see the Linux-GUI build step). Only the Linux GUI needs it.
+      - name: Install Zig (Linux, GUI)
+        if: matrix.os == 'linux' && matrix.kind == 'gui'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild (Linux, GUI)
+        if: matrix.os == 'linux' && matrix.kind == 'gui'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
@@ -115,8 +135,19 @@ jobs:
           shared-key: ${{ matrix.target }}-${{ matrix.kind }}
 
       - name: Build
+        if: ${{ !(matrix.os == 'linux' && matrix.kind == 'gui') }}
         shell: bash
         run: cargo build --release -p "$CRATE" --target ${{ matrix.target }}
+
+      # Linux GUI: link against an old glibc (2.28 — Debian 10 / Ubuntu 18.04 /
+      # RHEL 8) so the dynamically-linked binary runs on systems far older than
+      # the runner's own glibc. cargo-zigbuild consumes the `.2.28` suffix to
+      # retarget the linker only; Cargo still writes to target/<triple>/release,
+      # so every downstream packaging path is unchanged.
+      - name: Build with pinned glibc floor (Linux, GUI)
+        if: matrix.os == 'linux' && matrix.kind == 'gui'
+        shell: bash
+        run: cargo zigbuild --release -p nxvim-gui --target ${{ matrix.target }}.2.28
 
       - name: Import signing certificates (macOS)
         if: matrix.os == 'macos'
@@ -247,6 +278,29 @@ jobs:
           APP="$RUNNER_TEMP/nxvim.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "target/${{ matrix.target }}/release/nxvim-gui" "$APP/Contents/MacOS/nxvim-gui"
+
+          # Build the .icns app icon from the same source SVG as the AppImage.
+          # macOS does not mask app icons (unlike iOS), so the SVG's own rounded
+          # square is the final shape. rsvg-convert (librsvg) renders each grid
+          # size; iconutil packs the .iconset. Generated before codesign so it is
+          # sealed into the bundle.
+          brew install --quiet librsvg
+          SVG=crates/nxvim-gui/assets/nxvim.svg
+          ICONSET="$RUNNER_TEMP/nxvim.iconset"
+          mkdir -p "$ICONSET"
+          render() { rsvg-convert -w "$1" -h "$1" "$SVG" -o "$ICONSET/$2"; }
+          render 16   icon_16x16.png
+          render 32   icon_16x16@2x.png
+          render 32   icon_32x32.png
+          render 64   icon_32x32@2x.png
+          render 128  icon_128x128.png
+          render 256  icon_128x128@2x.png
+          render 256  icon_256x256.png
+          render 512  icon_256x256@2x.png
+          render 512  icon_512x512.png
+          render 1024 icon_512x512@2x.png
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/nxvim.icns"
+
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -256,6 +310,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>nxvim</string>
             <key>CFBundleIdentifier</key><string>com.davidrios.nxvim.gui</string>
             <key>CFBundleExecutable</key><string>nxvim-gui</string>
+            <key>CFBundleIconFile</key><string>nxvim</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleVersion</key><string>$PKG_VERSION</string>
@@ -310,6 +365,8 @@ jobs:
           xcrun stapler staple "dist/$ASSET"
 
       # ── Linux: plain tarball of the binary (musl TUI or glibc GUI) ────────
+      # The GUI ships this raw-binary tarball *and* an AppImage (next step); the
+      # tarball is what distro packagers / Nix users want.
       - name: Package (Linux)
         if: matrix.os == 'linux'
         shell: bash
@@ -317,6 +374,50 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" "$BIN"
+
+      # ── Linux GUI: single-file, desktop-integrated AppImage ──────────────
+      - name: Build AppImage (Linux, GUI)
+        if: matrix.os == 'linux' && matrix.kind == 'gui'
+        shell: bash
+        env:
+          # GitHub runners have no FUSE; run the AppImage tooling by self-extracting.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            x86_64-*)  ARCH=x86_64 ;;
+            aarch64-*) ARCH=aarch64 ;;
+            *) echo "::error::unsupported AppImage arch for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          export ARCH
+          export PATH="$PWD:$PATH"  # let linuxdeploy find its sibling plugin
+
+          # linuxdeploy bundles the app's direct dependencies, but the community
+          # excludelist it applies deliberately omits the GPU/driver and core
+          # display libs (libGL, libEGL, libvulkan, libdrm, libwayland-*, libxcb,
+          # libxkbcommon, glibc). That is exactly what the wgpu/winit GUI needs:
+          # wgpu must dlopen the *host's* Vulkan/GL drivers at runtime — bundling
+          # mesa would break on NVIDIA and any mismatched driver stack.
+          for tool in linuxdeploy linuxdeploy-plugin-appimage; do
+            f="${tool}-${ARCH}.AppImage"
+            curl -fsSLo "$f" \
+              "https://github.com/linuxdeploy/${tool}/releases/download/continuous/${f}"
+            chmod +x "$f"
+          done
+
+          # Rasterize the source SVG to the 256×256 PNG linuxdeploy installs into
+          # the AppDir hicolor theme (stem must match the .desktop Icon= key).
+          rsvg-convert -w 256 -h 256 crates/nxvim-gui/assets/nxvim.svg -o nxvim.png
+
+          mkdir -p dist
+          OUTPUT="dist/$APPIMAGE_ASSET" VERSION="$PKG_VERSION" \
+            "./linuxdeploy-${ARCH}.AppImage" \
+              --appdir AppDir \
+              --executable "target/${{ matrix.target }}/release/nxvim-gui" \
+              --desktop-file crates/nxvim-gui/assets/nxvim.desktop \
+              --icon-file nxvim.png \
+              --output appimage
+          test -f "dist/$APPIMAGE_ASSET"
 
       - name: Package (Windows)
         if: matrix.os == 'windows'
@@ -330,4 +431,12 @@ jobs:
         with:
           name: ${{ env.ASSET }}
           path: dist/${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Upload AppImage artifact (Linux, GUI)
+        if: matrix.os == 'linux' && matrix.kind == 'gui'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.APPIMAGE_ASSET }}
+          path: dist/${{ env.APPIMAGE_ASSET }}
           if-no-files-found: error

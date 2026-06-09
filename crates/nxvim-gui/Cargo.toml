@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "nxvim-gui"
@@ -36,3 +37,10 @@ arboard.workspace = true
 # Native open/save dialog for the `:eo`/`:wn`/… pickers, on all three desktop
 # platforms (no GTK — see the rfd note in the workspace Cargo.toml).
 rfd.workspace = true
+
+# Windows host only: embeds the app icon into nxvim-gui.exe (see build.rs). Gated
+# on the *host* (build scripts run on the host) — our CI builds Windows natively,
+# so host == target == windows. Cross-compiling Windows from another host skips
+# the embed rather than failing.
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

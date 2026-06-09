@@ -17,7 +17,18 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       version: edge
-    secrets: inherit
+    # Forward only the macOS signing/notarization secrets build.yml declares —
+    # not `inherit` (which would expose every repo secret to the build, within
+    # one careless `${{ secrets.* }}` of the third-party tooling the Linux GUI
+    # AppImage job downloads). These are referenced only by macOS-gated steps.
+    secrets:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_INSTALLER_CERT_P12: ${{ secrets.MACOS_INSTALLER_CERT_P12 }}
+      MACOS_INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
 
   publish:
     needs: build

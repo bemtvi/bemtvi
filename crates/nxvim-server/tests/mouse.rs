@@ -685,6 +685,132 @@ async fn wheel_outside_any_window_is_ignored() {
     assert_eq!(win_topline(&rpc, win).await, top0, "no window scrolled");
 }
 
+// ===== Phase 4b: drag past the window edge auto-scrolls the buffer ==========
+
+/// Window `win`'s top-left position row in the windows area (`nvim_win_get_position`
+/// → `[row, col]`), the global screen row of its first text line when no tabline is
+/// shown. Doubles as a barrier.
+async fn win_position_row(rpc: &Rpc, win: u64) -> usize {
+    match rpc
+        .request("nvim_win_get_position", vec![Value::from(win)])
+        .await
+        .expect("win_get_position")
+    {
+        Value::Array(a) => a.first().and_then(Value::as_u64).unwrap_or(0) as usize,
+        _ => 0,
+    }
+}
+
+/// Dragging the selection below the window's last text row scrolls the buffer
+/// down a line per drag event and keeps the live end on the newly-exposed bottom
+/// line — vim's mouse drag-scroll, so a selection can grow past the viewport.
+#[tokio::test]
+async fn drag_below_window_scrolls_and_extends() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    let h = win_height(&rpc, win).await as usize; // text rows in the window
+    assert_eq!(win_topline(&rpc, win).await, 1, "starts at the top");
+    feed_mouse(&rpc, "left", "press", 0, 0); // anchor on line 1
+                                             // Drag well below the text body (past the status line).
+    feed_mouse(&rpc, "left", "drag", h + 5, 0);
+    assert_eq!(mode(&rpc).await, "v", "the drag entered Visual");
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        2,
+        "one line scrolled into view"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0 as usize,
+        2 + h - 1,
+        "the live end rode the new bottom line"
+    );
+    // A second drag at the same below-edge cell keeps scrolling.
+    feed_mouse(&rpc, "left", "drag", h + 5, 0);
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        3,
+        "held at the edge, it keeps scrolling"
+    );
+}
+
+/// Dragging to the **top visible line** scrolls the buffer up — the single-window
+/// case where that line is global row 0, so there is no row "above" the window to
+/// reach (the pointer clamps at 0). The edge line itself must trigger the scroll,
+/// or upward auto-scroll is impossible for the topmost window.
+#[tokio::test]
+async fn drag_to_top_visible_line_scrolls_up() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "40G"); // scroll down so there is room to scroll back up
+    let top0 = win_topline(&rpc, win).await;
+    assert!(top0 > 1, "the buffer scrolled down to show line 40");
+    feed_mouse(&rpc, "left", "press", 5, 0); // anchor a few lines down
+    feed_mouse(&rpc, "left", "drag", 0, 0); // drag up to the first visible line
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0 - 1,
+        "the top visible line scrolled the buffer up (single window, no tabline)"
+    );
+    // Held there (the client repeats the drag), it keeps scrolling up.
+    feed_mouse(&rpc, "left", "drag", 0, 0);
+    assert_eq!(win_topline(&rpc, win).await, top0 - 2, "keeps scrolling up");
+}
+
+/// Dragging above a window's first text row scrolls the buffer up. Exercised on
+/// the lower split (whose first text row sits mid-screen) so there are rows above
+/// it to drag into.
+#[tokio::test]
+async fn drag_above_window_scrolls_up() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "split").await; // stack two windows; the new top one is focused
+    feed(&rpc, "<C-w>j"); // focus the bottom window
+    let win = current_win(&rpc).await;
+    feed(&rpc, "50G"); // scroll it so there is room to scroll back up
+    let top0 = win_topline(&rpc, win).await;
+    assert!(top0 > 1, "the bottom split scrolled down to show line 50");
+    let row = win_position_row(&rpc, win).await; // its first text row (global)
+    feed_mouse(&rpc, "left", "press", row, 0); // anchor on its top visible line
+    feed_mouse(&rpc, "left", "drag", 0, 0); // drag up, above the split
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0 - 1,
+        "dragging above the split scrolled it up a line"
+    );
+}
+
+/// A drag that stays inside the text body does not scroll — only crossing the
+/// edge does (regression guard for the auto-scroll branch).
+#[tokio::test]
+async fn drag_within_window_does_not_scroll() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 3, 2); // a few rows down, still on screen
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(cursor(&rpc).await.0, 4, "extended to the dragged-over line");
+    assert_eq!(win_topline(&rpc, win).await, 1, "no scroll while on screen");
+}
+
+/// Triple-click then drag below the window extends the *linewise* selection while
+/// auto-scrolling — the unit chosen by the click count survives the scroll.
+#[tokio::test]
+async fn linewise_drag_below_window_autoscrolls() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    let h = win_height(&rpc, win).await as usize;
+    // Triple-click line 1 (a wall-clock gesture is fine — three same-cell presses
+    // inside the default 500ms `mousetime` escalate to a linewise select).
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    assert_eq!(mode(&rpc).await, "V", "triple-click is linewise Visual");
+    feed_mouse(&rpc, "left", "drag", h + 5, 0);
+    assert_eq!(mode(&rpc).await, "V", "still linewise after the drag");
+    assert_eq!(win_topline(&rpc, win).await, 2, "auto-scrolled down a line");
+}
+
 // ===== Phase 5: drag the separator / status line to resize splits ===========
 
 /// A window's rect width (`nvim_win_get_width`).

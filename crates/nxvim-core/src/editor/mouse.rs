@@ -566,25 +566,23 @@ impl Editor {
 
     /// Left-drag: extend the selection from its press anchor to the drag cell, in
     /// the unit the press chose — charwise for a single click, by whole words for a
-    /// double click, by whole lines for a triple. Ignored if no press is in flight
-    /// or the drag leaves the window it started in.
+    /// double click, by whole lines for a triple. Ignored if no press is in flight.
+    ///
+    /// The drag always extends the selection in the window the press focused (the
+    /// one the selection lives in), never hijacking another window the pointer
+    /// wanders into. When the pointer crosses above or below that window's text
+    /// band the window **auto-scrolls** one line that way ([`mouse_drag_target`]),
+    /// so the selection can grow past the viewport — vim's mouse drag-scroll. A
+    /// client repeats the drag while the button is held at the edge, turning the
+    /// per-event one-line step into a continuous scroll.
     fn mouse_left_drag(&mut self, row: usize, col: usize) {
         let Some(sel) = self.mouse_select else {
             return;
         };
-        let Some(MouseTarget::Text {
-            win,
-            line,
-            col: bcol,
-        }) = self.hit_test(row, col)
-        else {
+        let win = self.current_window_id();
+        let Some((line, bcol)) = self.mouse_drag_target(win, row, col) else {
             return;
         };
-        // The selection lives in the window the press focused; a drag that wanders
-        // into another window doesn't hijack it.
-        if win != self.current_window_id() {
-            return;
-        }
         match sel.anchor {
             SelectAnchor::Char(anchor) => {
                 // The first drag after a single click enters charwise Visual,
@@ -598,6 +596,57 @@ impl Editor {
             SelectAnchor::Word { lo, hi } => self.mouse_extend_word(line, bcol, lo, hi),
             SelectAnchor::Line(anchor_line) => self.mouse_extend_line(line, anchor_line),
         }
+    }
+
+    /// Resolve a left-drag at global cell `(row, col)` to the buffer position the
+    /// selection extends to, in the focused window `win`. When the drag reaches (or
+    /// passes) `win`'s first or last text row the window auto-scrolls one line that
+    /// way (vim's mouse drag-scroll) and the returned line is the newly-exposed edge
+    /// line; the column is clamped into the window so a drag off the side selects to
+    /// the line's edge. `None` only when `win` has no geometry.
+    ///
+    /// The trigger is the edge *line itself*, not the row beyond it: the topmost
+    /// window's first text row is global row 0, with nothing above to drag onto (the
+    /// client clamps the pointer at 0), so a strictly-beyond test could never scroll
+    /// it up. Reaching the top/bottom visible line is the gesture — `drag_scroll`
+    /// no-ops at the buffer ends, so an edge line with nothing past it just extends.
+    fn mouse_drag_target(
+        &mut self,
+        win: WindowId,
+        row: usize,
+        col: usize,
+    ) -> Option<(usize, usize)> {
+        let (wx, wy, ww, _) = self.window_rect(win)?;
+        let (_, text_height) = self.window_content_size(win)?;
+        // The window's text band in global screen rows: `[top_edge, bottom_edge]`.
+        let top_edge = self.tabline_rows() + wy;
+        let bottom_edge = top_edge + text_height.saturating_sub(1);
+        let rel_y = if row <= top_edge {
+            self.drag_scroll(false); // at/above the first line → reveal the line above
+            0
+        } else if row >= bottom_edge {
+            self.drag_scroll(true); // at/below the last line → reveal the line below
+            text_height.saturating_sub(1)
+        } else {
+            row - top_edge
+        };
+        let rel_x = col.saturating_sub(wx).min(ww.saturating_sub(1));
+        self.text_cell_to_buf(win, rel_x, rel_y)
+    }
+
+    /// Scroll the focused window's viewport one line toward an out-of-band drag
+    /// (`down` = the drag ran below the text, scroll toward the buffer's end),
+    /// clamped so `top` stays in `[0, last_line]`. A no-op at the clamp. The caller
+    /// then parks the cursor on the newly-exposed edge line, so the per-redraw
+    /// [`ensure_visible`](Self::ensure_visible) leaves the scroll alone (it would
+    /// otherwise snap `top` straight back).
+    fn drag_scroll(&mut self, down: bool) {
+        let last = self.window_last_line(self.current_window_id());
+        self.top = if down {
+            (self.top + 1).min(last)
+        } else {
+            self.top.saturating_sub(1)
+        };
     }
 
     /// Word-wise drag: grow the selection to cover whole words from the anchor word
@@ -891,23 +940,35 @@ impl Editor {
             return None; // the tabline — a later phase resolves tab clicks
         }
         let (win, rel_x, rel_y) = self.window_at(col, row - top_chrome)?;
-
-        // The window's content geometry, read for `win` whether or not it is the
-        // focused window (its live offset if focused, its stashed one otherwise).
-        let (top, leftcol) = self.window_scroll(win)?;
-        let opts = self.window_options(win)?;
-        let buf_id = self.window_buffer(win)?;
         let (_, text_height) = self.window_content_size(win)?;
         if rel_y >= text_height {
             // Below the text body: the status row (the last content line).
             return Some(MouseTarget::StatusLine { win });
         }
+        let (line, col) = self.text_cell_to_buf(win, rel_x, rel_y)?;
+        Some(MouseTarget::Text { win, line, col })
+    }
 
+    /// Map window `win`'s content-relative cell — `rel_y` a text row counted from
+    /// the window's first visible line, `rel_x` a column from its left edge — back
+    /// to a buffer `(line, col)`. The shared tail of [`hit_test`](Self::hit_test)
+    /// and the drag resolver: it undoes the window's vertical scroll, number
+    /// gutter, and horizontal scroll + tab/wide-char column math. Geometry is read
+    /// for `win` whether or not it is focused (its live offset if focused, its
+    /// stashed one otherwise). `None` only for an unknown window.
+    fn text_cell_to_buf(
+        &self,
+        win: WindowId,
+        rel_x: usize,
+        rel_y: usize,
+    ) -> Option<(usize, usize)> {
+        let (top, leftcol) = self.window_scroll(win)?;
+        let opts = self.window_options(win)?;
+        let buf_id = self.window_buffer(win)?;
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
-        // A click below the last line lands on the last line (vim's behavior).
+        // A cell below the last line lands on the last line (vim's behavior).
         let line = (top + rel_y).min(line_count.saturating_sub(1));
-
         let gutter = self.number_width_for(opts, line_count);
         let col = if rel_x < gutter {
             // The number column: place the cursor at the line's start.
@@ -921,7 +982,7 @@ impl Editor {
             let text = buf.line(line);
             crate::unicode::byte_at_virtcol(&text, screen_col, buf.options.effective_tabstop())
         };
-        Some(MouseTarget::Text { win, line, col })
+        Some((line, col))
     }
 
     /// Find the window whose on-screen content area contains the windows-area cell

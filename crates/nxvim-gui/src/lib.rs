@@ -73,6 +73,22 @@ use render::{Renderer, ScrollFrame};
 /// flushes it; this idle nudge is that something (mirrors the TUI's `TIMEOUT_LEN`).
 const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
 
+/// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
+/// auto-scrolling (≈25 lines/sec). winit only re-reports a drag (a `CursorMoved`
+/// while the button is held) on pointer motion, so without this repeat a
+/// selection dragged to the edge and held still would stop scrolling; this paces
+/// the continuous scroll the server does a line at a time per drag event.
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Whether a drag at grid `row` (global, 0-based) sits in the top/bottom edge
+/// band that arms continuous auto-scroll, for a grid `rows` cells tall. The top
+/// row and the bottom rows (the status line and the command row below the text
+/// body) qualify; the server decides whether that actually scrolls the focused
+/// window. Mirrors the TUI's `in_scroll_zone`.
+fn in_scroll_zone(row: u16, rows: u16) -> bool {
+    row == 0 || row + 2 >= rows
+}
+
 /// Client-side rendering configuration. The font family and point size are a
 /// purely client concern — the server works in cells, not pixels — so they're set
 /// here (CLI flags / environment), not through a server option. An unavailable
@@ -320,6 +336,13 @@ struct App {
     /// The cell the last left-drag was reported at, so motion within one cell is
     /// coalesced to a single drag (the server works in cells, not pixels).
     last_drag_cell: Option<(u16, u16)>,
+    /// While the left button is held with the pointer in the top/bottom edge band,
+    /// the cell to re-issue the drag at so the buffer keeps auto-scrolling without
+    /// further pointer motion. `None` when not at an edge or the button is up.
+    autoscroll: Option<(u16, u16)>,
+    /// When the next auto-scroll drag repeat is due (paced by [`AUTOSCROLL_INTERVAL`]);
+    /// drives a `WaitUntil` in [`Self::about_to_wait`], like [`Self::flush_deadline`].
+    autoscroll_deadline: Option<Instant>,
     /// Fractional wheel remainder per axis `(horizontal, vertical)`, so a
     /// pixel-precise trackpad still scrolls one whole line at a time (see
     /// [`mouse::drain_notches`]).
@@ -360,6 +383,8 @@ impl App {
             cursor_px: (0.0, 0.0),
             mouse_down: false,
             last_drag_cell: None,
+            autoscroll: None,
+            autoscroll_deadline: None,
             wheel_accum: (0.0, 0.0),
             doc_scroll: 0,
             reported: (0, 0),
@@ -577,6 +602,24 @@ impl App {
 
         // 3. No overlay: a text-area press, forwarded to the server (single-grid).
         self.send_mouse("left", "press", col, row);
+        // A press-and-hold already in the edge band auto-scrolls without a drag.
+        self.arm_autoscroll((col, row));
+    }
+
+    /// Arm or disarm continuous drag auto-scroll for a press/drag now at `cell`:
+    /// armed (with a fresh repeat deadline) when the cell sits in the top/bottom
+    /// edge band, cleared otherwise. [`Self::about_to_wait`] then re-issues the
+    /// drag every [`AUTOSCROLL_INTERVAL`] while it stays armed, so the buffer keeps
+    /// scrolling even though winit reports a drag only on actual pointer motion.
+    fn arm_autoscroll(&mut self, cell: (u16, u16)) {
+        let rows = self.renderer.as_ref().map_or(0, |r| r.grid_size().1);
+        if in_scroll_zone(cell.1, rows) {
+            self.autoscroll = Some(cell);
+            self.autoscroll_deadline = Some(Instant::now() + AUTOSCROLL_INTERVAL);
+        } else {
+            self.autoscroll = None;
+            self.autoscroll_deadline = None;
+        }
     }
 
     /// A `CursorMoved` while the left button is held: extend the Visual selection
@@ -594,6 +637,9 @@ impl App {
         }
         self.last_drag_cell = Some(cell);
         self.send_mouse("left", "drag", cell.0, cell.1);
+        // (Re)arm continuous auto-scroll when the drag is parked in the edge band;
+        // disarm once it moves back into the body.
+        self.arm_autoscroll(cell);
     }
 
     /// Left button released: finalize the Visual selection (the server keeps it)
@@ -602,6 +648,8 @@ impl App {
     fn mouse_left_release(&mut self) {
         self.mouse_down = false;
         self.last_drag_cell = None;
+        self.autoscroll = None; // release ends the drag, so stop scrolling
+        self.autoscroll_deadline = None;
         if let Some((col, row)) = self.pointer_cell() {
             self.send_mouse("left", "release", col, row);
         }
@@ -1027,12 +1075,27 @@ impl ApplicationHandler<UserEvent> for App {
             self.rpc.notify("nxvim_input_flush", vec![]);
             self.flush_deadline = None;
         }
+        // Continuous mouse drag-scroll: re-issue the held drag at its edge cell each
+        // interval so the buffer keeps scrolling while the pointer is held still.
+        // The server scrolls the focused window one line per drag it lands past the
+        // text body and re-extends the selection.
+        if let (Some((col, row)), Some(deadline)) = (self.autoscroll, self.autoscroll_deadline) {
+            if Instant::now() >= deadline {
+                self.send_mouse("left", "drag", col, row);
+                self.autoscroll_deadline = Some(Instant::now() + AUTOSCROLL_INTERVAL);
+            }
+        }
         if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
             self.scroll = None;
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw(); // settle to the live view
             }
         }
+        // The soonest pending timer wakeup (auto-scroll repeat, then the flush).
+        let timer = match (self.autoscroll_deadline, self.flush_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if self.scroll.is_some() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(8),
@@ -1040,8 +1103,8 @@ impl ApplicationHandler<UserEvent> for App {
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();
             }
-        } else if let Some(deadline) = self.flush_deadline {
-            // No slide, but a flush is pending: sleep exactly until it's due.
+        } else if let Some(deadline) = timer {
+            // No slide, but a timer is pending: sleep exactly until it's due.
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);

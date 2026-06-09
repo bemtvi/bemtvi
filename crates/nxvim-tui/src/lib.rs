@@ -60,6 +60,22 @@ const CHROME_ROWS: u16 = 1;
 /// user pressing another key — the timer-less divergence's blessed fix (design D4).
 const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
 
+/// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
+/// auto-scrolling (≈25 lines/sec). The terminal only reports a drag on pointer
+/// motion, so without this repeat a selection dragged to the edge and held still
+/// would stop scrolling; this paces the continuous scroll the server does a line
+/// at a time per drag event.
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Whether a drag at windows-area `row` (global, 0-based) sits in the top/bottom
+/// edge band that arms continuous auto-scroll, for a terminal `height` rows tall.
+/// The top row (above a tabline, or the first text row) and the bottom windows
+/// rows (the status line and below, where a drag has crossed past the text body)
+/// qualify; the server decides whether that actually scrolls the focused window.
+fn in_scroll_zone(row: u16, height: u16) -> bool {
+    row == 0 || row + 2 >= height
+}
+
 /// RAII guard for terminal mouse capture: enables mouse reporting on creation
 /// and **disables it on drop**, including when the event loop unwinds on a
 /// panic. ratatui's panic hook restores raw mode and the alternate screen but
@@ -199,6 +215,12 @@ where
     // each loop pass, so any event — including the next key — restarts the countdown,
     // which is exactly `timeoutlen`'s reset-on-input semantics.
     let mut flush_armed = false;
+    // Mouse drag-scroll: while the left button is held with the pointer parked in
+    // the top/bottom edge band, re-send that drag on a timer so the buffer keeps
+    // auto-scrolling without further pointer motion (the terminal only reports a
+    // drag when the pointer actually moves). `Some(cell)` holds the cell to repeat;
+    // cleared on release or when the pointer leaves the edge band.
+    let mut autoscroll: Option<(u16, u16)> = None;
 
     loop {
         tokio::select! {
@@ -307,6 +329,10 @@ where
                                     Value::from(m.column as u64),
                                 ],
                             );
+                            // Arm edge auto-scroll if the press already landed in the
+                            // edge band (a press-and-hold there scrolls without a drag).
+                            autoscroll = in_scroll_zone(m.row, size.height)
+                                .then_some((m.row, m.column));
                         }
                     }
                     // Drag and release of the left button drive a text-area
@@ -326,8 +352,14 @@ where
                                 Value::from(m.column as u64),
                             ],
                         );
+                        // (Re)arm continuous auto-scroll when the drag is parked in
+                        // the edge band; disarm once it moves back into the body.
+                        let size = terminal.size().unwrap_or_default();
+                        autoscroll =
+                            in_scroll_zone(m.row, size.height).then_some((m.row, m.column));
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
+                        autoscroll = None; // release ends the drag, so stop scrolling
                         rpc.notify(
                             "nvim_input_mouse",
                             vec![
@@ -496,6 +528,25 @@ where
             _ = sleep(TIMEOUT_LEN), if flush_armed => {
                 rpc.notify("nxvim_input_flush", vec![]);
                 flush_armed = false;
+            },
+            // Continuous mouse drag-scroll: the button is held with the pointer in
+            // the edge band, so re-issue the drag at its last cell. The server
+            // scrolls the focused window one line per drag it lands outside the
+            // text body and re-extends the selection; held still, this paces it.
+            _ = sleep(AUTOSCROLL_INTERVAL), if autoscroll.is_some() => {
+                if let Some((row, col)) = autoscroll {
+                    rpc.notify(
+                        "nvim_input_mouse",
+                        vec![
+                            Value::from("left"),
+                            Value::from("drag"),
+                            Value::from(""),
+                            Value::from(0u64),
+                            Value::from(row as u64),
+                            Value::from(col as u64),
+                        ],
+                    );
+                }
             },
         }
     }

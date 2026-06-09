@@ -8,12 +8,12 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rmpv::Value;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::anim::{arm_animation, lerp, Animation};
 use nxvim_view::{
-    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, PanelData, PmenuData, SearchSpans,
-    Separator, StatusSegment, View, WindowView,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PanelData, PmenuData,
+    SearchSpans, Separator, StatusSegment, View, WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -289,9 +289,21 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         // cursor can never be drawn past a window's right edge — escaping a narrow
         // float or vsplit onto whatever sits beside it. (Rows are already bounded
         // by the window's text height.)
+        // Inline inlay hints on the cursor's row that sit at or before the cursor
+        // push the cursor right by their combined width (the same splice the text
+        // got). Skipped while a slide animates (hints aren't painted on the band).
+        let shift = if anim.is_none() {
+            inlay_cursor_shift(
+                &win.inlay_hints,
+                cursor_row,
+                win.cursor_screen_col,
+                win.leftcol,
+            )
+        } else {
+            0
+        };
         let col = inner.x
-            + win
-                .cursor_screen_col
+            + (win.cursor_screen_col + shift)
                 .saturating_sub(win.leftcol)
                 .min(inner.width.saturating_sub(1));
         let row = inner.y + cursor_row.min(inner.height.saturating_sub(1));
@@ -382,6 +394,7 @@ fn render_window(
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
     let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
+    let empty_inlay: Vec<Vec<InlayHint>> = Vec::new();
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
     // window of the full buffer). The static path — the overwhelmingly common
@@ -508,6 +521,12 @@ fn render_window(
         Some(_) => &empty_virt,
         None => &win.diagnostics_virt,
     };
+    // Inlay hints, like diagnostics, paint on the settled viewport only — a slide
+    // band carries none (so the text doesn't jump mid-animation).
+    let frame_inlay: &[Vec<InlayHint>] = match anim {
+        Some(_) => &empty_inlay,
+        None => &win.inlay_hints,
+    };
     // Signs, like diagnostics, are painted on the settled viewport only — a slide
     // band carries none (the reserved column stays blank while animating, so the
     // text below it doesn't jump). Painted now that the palette resolves style ids.
@@ -529,6 +548,7 @@ fn render_window(
         frame_hl,
         frame_diag,
         frame_virt,
+        frame_inlay,
         frame_numbers,
         win.tabstop.max(1) as usize,
         win.leftcol as usize,
@@ -787,6 +807,7 @@ fn render_text(
     highlights: &[Vec<HlSpan>],
     diagnostics: &[Vec<DiagSpan>],
     diagnostics_virt: &[Option<DiagVirt>],
+    inlay_hints: &[Vec<InlayHint>],
     numbers: &[Option<usize>],
     tabstop: usize,
     leftcol: usize,
@@ -796,6 +817,7 @@ fn render_text(
     let empty: Vec<HlSpan> = Vec::new();
     let empty_diag: Vec<DiagSpan> = Vec::new();
     let empty_search: Vec<(u16, u16)> = Vec::new();
+    let empty_inlay: Vec<InlayHint> = Vec::new();
     let text = Text::from(
         lines
             .iter()
@@ -808,11 +830,12 @@ fn render_text(
                 let hl = highlights.get(row).unwrap_or(&empty);
                 let diag = diagnostics.get(row).unwrap_or(&empty_diag);
                 let virt = diagnostics_virt.get(row).and_then(Option::as_ref);
+                let inlay = inlay_hints.get(row).unwrap_or(&empty_inlay);
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
-                    l, sel, sec_sel, matches, cur, hl, diag, virt, width, is_filler, tabstop,
-                    leftcol, theme,
+                    l, sel, sec_sel, matches, cur, hl, diag, virt, inlay, width, is_filler,
+                    tabstop, leftcol, theme,
                 )
             })
             .collect::<Vec<_>>(),
@@ -848,6 +871,7 @@ fn highlight_line(
     hl: &[HlSpan],
     diag: &[DiagSpan],
     virt: Option<&DiagVirt>,
+    inlay: &[InlayHint],
     max_width: usize,
     is_filler: bool,
     tabstop: usize,
@@ -871,11 +895,34 @@ fn highlight_line(
     // Walk cells left to right, coalescing runs of identical style into spans.
     // Cells left of `leftcol` are skipped (scrolled off); the rest paint starting
     // at the left edge, keyed on their absolute column so spans still align.
+    //
+    // Inlay hints (already sorted by column) are spliced into the stream at their
+    // anchor column, *before* the real glyph there — pushing the following glyphs
+    // right. The overlay styles stay keyed on the original absolute `col`, so the
+    // selection / search / highlight / diagnostic spans remain correct per glyph
+    // (the style travels with the glyph, not its painted position); only the
+    // cursor, painted separately, needs the matching shift (see `inlay_shift`).
     let mut spans: Vec<Span> = Vec::new();
     let mut run = String::new();
     let mut run_style = Style::default();
     let mut col = 0usize;
+    let mut hi = 0usize; // next hint to emit
+    let mut inserted = 0usize; // visible hint cells spliced in so far
     for ch in expanded.chars() {
+        while hi < inlay.len() && (inlay[hi].0 as usize) <= col {
+            emit_inlay_hint(
+                &inlay[hi],
+                &mut spans,
+                &mut run,
+                &mut run_style,
+                col,
+                leftcol,
+                max_width,
+                &mut inserted,
+                theme,
+            );
+            hi += 1;
+        }
         if col >= leftcol {
             let style = cell_style(col, sel, secondary_sel, search, incsearch, hl, diag, theme);
             if style != run_style && !run.is_empty() {
@@ -887,12 +934,28 @@ fn highlight_line(
         col += UnicodeWidthChar::width(ch).unwrap_or(0);
     }
     if !run.is_empty() {
-        spans.push(Span::styled(run, run_style));
+        spans.push(Span::styled(std::mem::take(&mut run), run_style));
+    }
+    // Hints anchored at or past end-of-text (e.g. an end-of-line type annotation).
+    while hi < inlay.len() {
+        emit_inlay_hint(
+            &inlay[hi],
+            &mut spans,
+            &mut run,
+            &mut run_style,
+            col,
+            leftcol,
+            max_width,
+            &mut inserted,
+            theme,
+        );
+        hi += 1;
     }
 
-    // Visible cells painted so far (text past the horizontal scroll). The virt
-    // text below is clamped against this so it never overruns the viewport.
-    let mut painted = col.saturating_sub(leftcol);
+    // Visible cells painted so far (text past the horizontal scroll, plus the
+    // inline hint cells). The virt text below is clamped against this so it never
+    // overruns the viewport.
+    let mut painted = col.saturating_sub(leftcol) + inserted;
 
     // Extend the selection past end-of-text (selected newline / linewise fill),
     // within the scrolled viewport `[leftcol, leftcol + max_width)`. The pad count
@@ -954,6 +1017,71 @@ fn virt_text_style(severity: u8, id: Option<usize>, theme: &LineTheme) -> Style 
         return *style;
     }
     Style::default().fg(severity_color(severity))
+}
+
+/// Splice one inlay hint into the row's span stream at its anchor column: flush
+/// any pending text run, then push the hint's text (truncated to whatever viewport
+/// width is left), styled by its resolved `LspInlayHint` palette entry or a dim
+/// fallback. A hint scrolled off the left (`hcol < leftcol`) or with no room left
+/// is skipped. `inserted` accumulates the visible hint cells so the caller tracks
+/// the shift the splice adds to the following glyphs.
+#[allow(clippy::too_many_arguments)]
+fn emit_inlay_hint(
+    hint: &InlayHint,
+    spans: &mut Vec<Span<'static>>,
+    run: &mut String,
+    run_style: &mut Style,
+    col: usize,
+    leftcol: usize,
+    max_width: usize,
+    inserted: &mut usize,
+    theme: &LineTheme,
+) {
+    let (hcol, text, id) = hint;
+    if (*hcol as usize) < leftcol {
+        return; // scrolled off the left edge.
+    }
+    let painted = col.saturating_sub(leftcol) + *inserted;
+    let shown = truncate_to_width(text, max_width.saturating_sub(painted));
+    if shown.is_empty() {
+        return;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(std::mem::take(run), *run_style));
+    }
+    *inserted += UnicodeWidthStr::width(shown.as_str());
+    spans.push(Span::styled(shown, inlay_hint_style(*id, theme)));
+}
+
+/// The combined width of the inline inlay hints on `cursor_row` that sit at or
+/// before `cursor_col` (and inside the horizontal scroll) — how far the inline
+/// splice pushes the cursor to the right. A hint exactly at the cursor column is
+/// inserted before the cursor's glyph, so it counts. Hints scrolled off the left
+/// (`hcol < leftcol`) don't add visible cells (a best-effort approximation under
+/// horizontal scroll).
+fn inlay_cursor_shift(
+    inlay_hints: &[Vec<InlayHint>],
+    cursor_row: u16,
+    cursor_col: u16,
+    leftcol: u16,
+) -> u16 {
+    inlay_hints
+        .get(cursor_row as usize)
+        .into_iter()
+        .flatten()
+        .filter(|(hcol, _, _)| *hcol >= leftcol && *hcol <= cursor_col)
+        .map(|(_, text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
+        .sum()
+}
+
+/// The style for an inlay hint: the colorscheme's resolved `LspInlayHint` palette
+/// entry when the server interned one, else a built-in dim foreground (neovim
+/// links `LspInlayHint` to a comment-like dimming by default).
+fn inlay_hint_style(id: Option<usize>, theme: &LineTheme) -> Style {
+    if let Some(style) = id.and_then(|i| theme.palette.get(i)) {
+        return *style;
+    }
+    Style::default().fg(Color::DarkGray)
 }
 
 /// The style of the screen cell at column `col`: its highlight span's resolved

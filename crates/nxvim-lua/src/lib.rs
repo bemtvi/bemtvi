@@ -31,8 +31,8 @@ mod vimregex;
 
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp, RawKeymap, RawRhs,
-    RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
+    InlayHintMirrorData, LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp,
+    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
 };
 pub use runtime::{
     BoMirror, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror, LuaRuntime, TabMirror,

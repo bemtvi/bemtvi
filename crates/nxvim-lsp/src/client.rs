@@ -9,20 +9,24 @@
 //! `codeAction.codeActionLiteralSupport`, without which a server returns legacy
 //! `Command[]` and "apply the edit" becomes impossible.
 
+use std::future::ready;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use async_lsp::router::Router;
 use async_lsp::{MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
+use lsp_types::request::{InlayHintRefreshRequest, SemanticTokensRefresh, WorkspaceConfiguration};
 use lsp_types::{
     ClientCapabilities, CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CompletionClientCapabilities,
-    CompletionItemCapability, CompletionItemCapabilityResolveSupport,
-    DocumentFormattingClientCapabilities, GeneralClientCapabilities, MarkupKind, MessageType,
-    PositionEncodingKind, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
-    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, ServerCapabilities,
+    CompletionItemCapability, CompletionItemCapabilityResolveSupport, ConfigurationParams,
+    DocumentFormattingClientCapabilities, GeneralClientCapabilities, InlayHintClientCapabilities,
+    InlayHintResolveClientCapabilities, InlayHintWorkspaceClientCapabilities, MarkupKind,
+    MessageType, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
+    RenameClientCapabilities, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensWorkspaceClientCapabilities, ServerCapabilities,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
     TextDocumentSyncKind, TokenFormat, WorkspaceClientCapabilities,
     WorkspaceEditClientCapabilities,
@@ -30,7 +34,9 @@ use lsp_types::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{LspEvent, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey};
+use crate::protocol::{
+    LspEvent, PositionEncoding, ProviderCaps, RefreshKind, SemanticLegend, ServerKey,
+};
 
 /// State shared by the client `MainLoop`'s notification handlers: which server
 /// this loop belongs to, the channel to forward distilled events on, and the log.
@@ -38,6 +44,10 @@ pub(crate) struct ClientState {
     key: ServerKey,
     event_tx: UnboundedSender<LspEvent>,
     log: Arc<LspLog>,
+    /// The config's `settings` JSON, kept to answer the server's pull-model
+    /// `workspace/configuration` requests (lua_ls/gopls read their config this way,
+    /// returning the requested `section` slice). `None` when the config set none.
+    settings: Option<serde_json::Value>,
 }
 
 /// Build the `async-lsp` client `MainLoop` and its `ServerSocket`. The bare
@@ -50,9 +60,44 @@ pub(crate) fn new_client(
     key: ServerKey,
     event_tx: UnboundedSender<LspEvent>,
     log: Arc<LspLog>,
+    settings: Option<serde_json::Value>,
 ) -> (MainLoop<Router<ClientState>>, ServerSocket) {
     MainLoop::new_client(|_server| {
-        let mut router = Router::new(ClientState { key, event_tx, log });
+        let mut router = Router::new(ClientState {
+            key,
+            event_tx,
+            log,
+            settings,
+        });
+        // `workspace/configuration` (pull model): the server asks for its config by
+        // `section`; answer each item with that dotted path into the config's
+        // `settings` (or null when unset). This is how lua_ls/gopls actually read
+        // their options — a `settings`-configured server that *only* pulls (lua_ls
+        // ignores the `didChangeConfiguration` push for its hint options) otherwise
+        // runs on defaults, so e.g. inlay hints never turn on.
+        router.request::<WorkspaceConfiguration, _>(|st: &mut ClientState, params| {
+            let result = configuration_reply(st.settings.as_ref(), &params);
+            ready(Ok(result))
+        });
+        // `workspace/inlayHint/refresh` / `workspace/semanticTokens/refresh`: the
+        // server recomputed and wants the client to re-query. Forward it so the
+        // editor re-issues the whole-buffer request for this server's buffers, then
+        // ack. Without this, a server that produces hints/tokens asynchronously (and
+        // signals readiness only via refresh) never has them fetched.
+        router.request::<InlayHintRefreshRequest, _>(|st: &mut ClientState, ()| {
+            let _ = st.event_tx.send(LspEvent::WorkspaceRefresh {
+                key: st.key.clone(),
+                kind: RefreshKind::InlayHint,
+            });
+            ready(Ok(()))
+        });
+        router.request::<SemanticTokensRefresh, _>(|st: &mut ClientState, ()| {
+            let _ = st.event_tx.send(LspEvent::WorkspaceRefresh {
+                key: st.key.clone(),
+                kind: RefreshKind::SemanticTokens,
+            });
+            ready(Ok(()))
+        });
         router.notification::<PublishDiagnostics>(|st, params| {
             st.log.log(
                 LogLevel::Debug,
@@ -94,6 +139,42 @@ pub(crate) fn new_client(
         router.unhandled_event(|_st, _event| ControlFlow::Continue(()));
         router
     })
+}
+
+/// Build the `workspace/configuration` reply: one value per requested item, each
+/// the item's dotted `section` path resolved against the config's `settings` (the
+/// whole settings when the section is empty, `null` when the path is unset or no
+/// settings were configured). The pull-model analogue of the `didChangeConfiguration`
+/// push — neovim resolves each item the same way against `config.settings`.
+fn configuration_reply(
+    settings: Option<&serde_json::Value>,
+    params: &ConfigurationParams,
+) -> Vec<serde_json::Value> {
+    params
+        .items
+        .iter()
+        .map(|item| match settings {
+            Some(s) => config_section(s, item.section.as_deref().unwrap_or("")),
+            None => serde_json::Value::Null,
+        })
+        .collect()
+}
+
+/// Resolve a dotted config `section` (e.g. `"Lua.hint"`) to its value within
+/// `settings`: an empty section returns the whole table; a path that runs off a
+/// missing key returns `null` (the server then uses its default for that key).
+fn config_section(settings: &serde_json::Value, section: &str) -> serde_json::Value {
+    if section.is_empty() {
+        return settings.clone();
+    }
+    let mut cur = settings;
+    for part in section.split('.') {
+        match cur.get(part) {
+            Some(v) => cur = v,
+            None => return serde_json::Value::Null,
+        }
+    }
+    cur.clone()
 }
 
 /// Map an LSP `window/*Message` severity to a log level (`LOG`, the most verbose,
@@ -277,12 +358,43 @@ fn client_capabilities() -> ClientCapabilities {
                 augments_syntax_tokens: Some(true),
                 ..Default::default()
             }),
+            // Declare inlay-hint support so a server that gates the feature on the
+            // client answers `textDocument/inlayHint`. `resolveSupport` lists the
+            // properties we can fetch lazily via `inlayHint/resolve` — declared so a
+            // server may ship a bare label and fill the rest on demand (the resolve
+            // round-trip itself is Phase 2; until then an unresolved hint shows its
+            // eager label).
+            inlay_hint: Some(InlayHintClientCapabilities {
+                dynamic_registration: Some(false),
+                resolve_support: Some(InlayHintResolveClientCapabilities {
+                    properties: vec![
+                        "label.location".to_string(),
+                        "label.tooltip".to_string(),
+                        "tooltip".to_string(),
+                    ],
+                }),
+            }),
             ..Default::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {
             workspace_edit: Some(WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
                 ..Default::default()
+            }),
+            // We answer `workspace/configuration` (the pull model) from the config's
+            // `settings` — declaring it is what makes a pull-only server (lua_ls,
+            // gopls) read its options instead of running on defaults. Without it,
+            // lua_ls never enables inlay hints regardless of the `settings` we push.
+            configuration: Some(true),
+            // We honor the server→client refresh requests by re-querying, so declare
+            // support: a server that computes inlay hints / semantic tokens
+            // asynchronously signals readiness this way, and won't bother (or will
+            // produce nothing) unless the client advertises it can refresh.
+            inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
+                refresh_support: Some(true),
             }),
             ..Default::default()
         }),
@@ -326,6 +438,7 @@ pub(crate) fn provider_caps(caps: &ServerCapabilities) -> ProviderCaps {
         rename: present("renameProvider"),
         code_action: present("codeActionProvider"),
         semantic_tokens: present("semanticTokensProvider"),
+        inlay_hints: present("inlayHintProvider"),
     }
 }
 

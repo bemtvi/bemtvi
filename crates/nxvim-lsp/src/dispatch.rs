@@ -14,10 +14,11 @@ use lsp_types::{
     CodeActionContext, CodeActionParams, CompletionItem, CompletionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
-    HoverParams, Position, ReferenceContext, ReferenceParams, RenameParams,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelpParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    HoverParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Position,
+    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensResult, SignatureHelpParams,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier,
 };
 
 use crate::convert::{
@@ -25,7 +26,7 @@ use crate::convert::{
     normalize_workspace_edit, signature_help_reply,
 };
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{LspNotify, LspReply, LspRequest, SemanticTokensData};
+use crate::protocol::{InlayHintData, LspNotify, LspReply, LspRequest, SemanticTokensData};
 
 /// Translate an [`LspNotify`] into the corresponding `async-lsp` notification.
 /// Send errors are ignored: a dead socket is detected by the main loop ending.
@@ -304,6 +305,25 @@ pub(crate) async fn issue_request(
                 }
             }
         }
+        LspRequest::InlayHint { uri, range } => {
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                range,
+                work_done_progress_params: Default::default(),
+            };
+            match sock.inlay_hint(params).await {
+                Ok(hints) => {
+                    LspReply::InlayHints(hints.unwrap_or_default().iter().map(inlay_hint).collect())
+                }
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("inlayHint failed: {e}"));
+                    LspReply::InlayHints(Vec::new())
+                }
+            }
+        }
+        LspRequest::ResolveInlayHint { hint } => {
+            resolve_inlay_hint_reply(sock, hint, log, name).await
+        }
         LspRequest::ResolveCompletion { item } => {
             resolve_completion_reply(sock, item, log, name).await
         }
@@ -357,6 +377,47 @@ async fn resolve_completion_reply(
                 &format!("completionItem/resolve failed: {e}"),
             );
             none
+        }
+    }
+}
+
+/// Issue an `inlayHint/resolve` for a lazy hint and distill the reply to its
+/// resolved label ([`LspReply::ResolvedInlayHint`]). The `hint` is the original
+/// inlay hint as JSON (`InlayHintData::resolve_data`), deserialized back to an
+/// [`InlayHint`] to send verbatim — a server matches the resolve against the exact
+/// hint it issued. A malformed hint, an unsupported method, a server error, or a
+/// resolved hint that still has no label all degrade to `label: None` (logged), so
+/// the editor drops the placeholder rather than paint an empty hint — never a fake.
+async fn resolve_inlay_hint_reply(
+    sock: &mut ServerSocket,
+    hint: serde_json::Value,
+    log: &LspLog,
+    name: &str,
+) -> LspReply {
+    let hint: InlayHint = match serde_json::from_value(hint) {
+        Ok(hint) => hint,
+        Err(e) => {
+            log.log(
+                LogLevel::Warn,
+                name,
+                &format!("inlayHint/resolve: malformed hint: {e}"),
+            );
+            return LspReply::ResolvedInlayHint { label: None };
+        }
+    };
+    match sock.inlay_hint_resolve(hint).await {
+        Ok(resolved) => {
+            let core = inlay_label_core(&resolved);
+            let label = (!core.is_empty()).then(|| pad_label(&core, &resolved));
+            LspReply::ResolvedInlayHint { label }
+        }
+        Err(e) => {
+            log.log(
+                LogLevel::Warn,
+                name,
+                &format!("inlayHint/resolve failed: {e}"),
+            );
+            LspReply::ResolvedInlayHint { label: None }
         }
     }
 }
@@ -570,6 +631,60 @@ fn empty_semantic_tokens() -> SemanticTokensData {
     }
 }
 
+/// Distill one protocol [`InlayHint`] to the editor's [`InlayHintData`]: its
+/// anchor, the rendered label (the string form, or label parts joined to their
+/// `value`s — the interactive per-part `location`/`tooltip` are dropped for
+/// Phase 1), with `padding_left`/`padding_right` folded into a leading/trailing
+/// space, and the kind as a small int (`1`=type, `2`=parameter, `0`=unset).
+fn inlay_hint(hint: &InlayHint) -> InlayHintData {
+    let core = inlay_label_core(hint);
+    let kind = match hint.kind {
+        Some(InlayHintKind::TYPE) => 1,
+        Some(InlayHintKind::PARAMETER) => 2,
+        _ => 0,
+    };
+    // A hint with no usable label that the server marked resolvable (`data`) is
+    // *lazy*: round-trip it verbatim so the editor can fill the label on demand
+    // via `inlayHint/resolve` (Phase 2). An eager hint (label already present)
+    // carries no resolve data — nothing to fetch.
+    let resolve_data = if core.is_empty() && hint.data.is_some() {
+        serde_json::to_value(hint).ok()
+    } else {
+        None
+    };
+    InlayHintData {
+        line: hint.position.line,
+        character: hint.position.character,
+        label: pad_label(&core, hint),
+        kind,
+        resolve_data,
+    }
+}
+
+/// The unpadded label string of an inlay hint: a `String` label verbatim, or the
+/// label parts joined to their `value`s (the interactive per-part
+/// `location`/`tooltip` are dropped — recorded as an approximation). Empty ⇒ a
+/// lazy hint whose label arrives only via `inlayHint/resolve`.
+fn inlay_label_core(hint: &InlayHint) -> String {
+    match &hint.label {
+        InlayHintLabel::String(s) => s.clone(),
+        InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
+    }
+}
+
+/// Fold the hint's `padding_left`/`padding_right` into a leading/trailing space
+/// around its `core` label — the inline form the editor paints between glyphs.
+fn pad_label(core: &str, hint: &InlayHint) -> String {
+    let pad_l = hint.padding_left.unwrap_or(false);
+    let pad_r = hint.padding_right.unwrap_or(false);
+    format!(
+        "{}{}{}",
+        if pad_l { " " } else { "" },
+        core,
+        if pad_r { " " } else { "" },
+    )
+}
+
 /// A one-line summary of an outgoing request for the DEBUG log.
 fn describe_request(req: &LspRequest) -> String {
     let (label, pos) = match req {
@@ -609,6 +724,8 @@ fn describe_request(req: &LspRequest) -> String {
         LspRequest::SemanticTokensDelta {
             previous_result_id, ..
         } => return format!("→ semanticTokens/full/delta (prev {previous_result_id})"),
+        LspRequest::InlayHint { .. } => return "→ inlayHint".to_string(),
+        LspRequest::ResolveInlayHint { .. } => return "→ inlayHint/resolve".to_string(),
         LspRequest::Raw { method, .. } => return format!("→ {method} (client:request)"),
     };
     format!("→ {label} @ {}:{}", pos.line, pos.character)

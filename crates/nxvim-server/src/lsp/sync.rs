@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use nxvim_core::BufferId;
 use nxvim_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentSyncKind, Url};
-use nxvim_lsp::{LspEvent, LspNotify, LspReply, PositionEncoding, ServerKey};
+use nxvim_lsp::{LspEvent, LspNotify, LspReply, PositionEncoding, RefreshKind, ServerKey};
 use nxvim_lua::{LspClientData, LspOp};
 
 use super::*;
@@ -125,6 +125,27 @@ impl Server {
                     state.semantic.result_id = None;
                 }
                 self.request_semantic_tokens(buffer);
+                return;
+            }
+            LspOp::InlayHintEnable { bufnr, enabled } => {
+                let buffer = BufferId(bufnr);
+                let state = self.lsp_states.entry(buffer).or_default();
+                state.inlay_enabled = enabled;
+                if enabled {
+                    // Request a fresh set so the cache fills; the projection then
+                    // paints it. (No-op unless the server advertises the provider.)
+                    self.request_inlay_hints(buffer);
+                } else {
+                    if let Some(state) = self.lsp_states.get_mut(&buffer) {
+                        // Disabling clears the cache — no surviving paint (neovim drops
+                        // the hints on disable; they re-fetch on the next enable).
+                        state.inlay = Default::default();
+                    }
+                    // Clear the read mirror too, so `vim.lsp.inlay_hint.get` returns
+                    // nothing for a disabled buffer.
+                    let _ = self.lua.set_inlay_hints(buffer.0, &[]);
+                }
+                self.lsp_dirty = true;
                 return;
             }
             LspOp::SemanticTokensConfig { enabled } => {
@@ -327,11 +348,13 @@ impl Server {
             self.fire_lsp_attach(buffer, &file, client_id);
         }
 
-        // Refresh semantic tokens whenever the server saw new content (the request
-        // no-ops unless the server advertised a legend). After the attach hook, so
-        // an `on_attach` that toggles the feature is already in effect.
+        // Refresh semantic tokens and inlay hints whenever the server saw new
+        // content (each request no-ops unless the server advertised the feature and,
+        // for inlay hints, the buffer enabled it). After the attach hook, so an
+        // `on_attach` that toggles either feature is already in effect.
         if content_synced {
             self.request_semantic_tokens(buffer);
+            self.request_inlay_hints(buffer);
         }
     }
 
@@ -505,6 +528,7 @@ impl Server {
                         client_id,
                         legend: caps.legend.clone(),
                         semantic_tokens_delta: caps.semantic_tokens_delta,
+                        inlay_hints: caps.providers.inlay_hints,
                     },
                 );
                 // Mirror the client into `vim.lsp._clients[id]` so `on_attach` can
@@ -562,6 +586,14 @@ impl Server {
                 reply: LspReply::Raw(res),
                 ..
             } => self.on_client_request_reply(token.cb_id, res),
+            // An `inlayHint/resolve` reply routes by the `cb_id` its token carries
+            // (like a generic `client:request`), since many lazy hints can resolve
+            // at once and the single-slot kind-map can't tell them apart.
+            LspEvent::Reply {
+                token,
+                reply: LspReply::ResolvedInlayHint { label },
+                ..
+            } => self.on_inlay_hint_resolved(token.cb_id, label),
             LspEvent::Reply { token, reply, .. } => self.on_lsp_reply(token, reply),
             LspEvent::ServerExited {
                 key, code, signal, ..
@@ -607,6 +639,37 @@ impl Server {
             LspEvent::Log { message, .. } => {
                 // Record to `:messages` without disturbing the message line.
                 self.editor.messages.push(message);
+            }
+            LspEvent::WorkspaceRefresh { key, kind } => self.on_workspace_refresh(key, kind),
+        }
+    }
+
+    /// Honor a server→client `workspace/{inlayHint,semanticTokens}/refresh`: the
+    /// server recomputed and asked us to re-query, so re-issue the matching
+    /// whole-buffer request for every buffer this server owns. This is what makes a
+    /// server that produces decorations *asynchronously* (lua_ls, gopls — they have
+    /// nothing to return on the first request and only signal readiness via refresh)
+    /// actually paint: without it the editor would keep its initial empty cache.
+    /// `request_inlay_hints` / `request_semantic_tokens` already gate on the
+    /// per-buffer enable/provider, so a disabled or unsupported buffer is a no-op.
+    fn on_workspace_refresh(&mut self, key: ServerKey, kind: RefreshKind) {
+        let buffers: Vec<BufferId> = self
+            .lsp_states
+            .iter()
+            .filter(|(_, s)| s.server.as_ref() == Some(&key))
+            .map(|(id, _)| *id)
+            .collect();
+        for buffer in buffers {
+            match kind {
+                RefreshKind::InlayHint => self.request_inlay_hints(buffer),
+                RefreshKind::SemanticTokens => {
+                    // A refresh means "recompute"; drop the delta cursor so the
+                    // re-request fetches the whole `full` set (like force_refresh).
+                    if let Some(state) = self.lsp_states.get_mut(&buffer) {
+                        state.semantic.result_id = None;
+                    }
+                    self.request_semantic_tokens(buffer);
+                }
             }
         }
     }

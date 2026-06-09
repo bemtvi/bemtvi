@@ -10,9 +10,9 @@ use rmpv::Value;
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
-    parse_highlights, parse_multi_spans, parse_numbers, parse_pmenu_items, parse_spans,
-    parse_status, parse_styles, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, PmenuItem,
-    SearchSpans, StatusSegment,
+    parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers, parse_pmenu_items,
+    parse_spans, parse_status, parse_styles, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans,
+    InlayHint, PmenuItem, SearchSpans, StatusSegment,
 };
 use crate::style::{Border, Style};
 
@@ -108,6 +108,11 @@ pub struct WindowView {
     /// (vim's `signcolumn=auto`: true once the buffer has a diagnostic and signs
     /// are on). False keeps the old gutter layout.
     pub sign_column: bool,
+    /// Per visible row, the inline LSP inlay hints `(col, text, style_id)` in
+    /// screen columns, sorted left to right. The renderer inserts each hint's text
+    /// at its column, shifting the real glyphs (and the cursor) right. Empty inner
+    /// vecs for rows with no hints (and for a buffer with inlay hints disabled).
+    pub inlay_hints: Vec<Vec<InlayHint>>,
     /// A scroll gesture for this window, when its viewport just moved.
     pub scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
@@ -440,6 +445,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         sign_column: map_get(m, "sign_column")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        inlay_hints: parse_inlay_hints(map_get(m, "inlay_hints")),
         scroll,
         numbers: parse_numbers(map_get(m, "numbers")),
         number: map_get(m, "number")

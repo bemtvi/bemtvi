@@ -31,6 +31,7 @@ use nxvim_lua::{DiagnosticData, LspServerCapabilities};
 mod completion;
 mod diagnostics;
 mod edit;
+mod inlay;
 mod request;
 mod semantic;
 mod sync;
@@ -76,6 +77,15 @@ pub(crate) struct LspDocState {
     /// `Some(true)` an explicit `start`. The cache survives a stop, so a later
     /// `start` repaints from it without a round-trip.
     semantic_enabled: Option<bool>,
+    /// Latest `textDocument/inlayHint` result for this buffer, decoded into the
+    /// per-line inline hints `inlay_hints_for` projects over the buffer text. Empty
+    /// until the first reply lands (and while inlay hints are disabled).
+    inlay: InlayHintsCache,
+    /// Whether inlay hints are enabled for this buffer — **off by default** (unlike
+    /// semantic tokens, neovim's inlay hints are opt-in via
+    /// `vim.lsp.inlay_hint.enable`). The projection and the refresh request both
+    /// gate on this; toggling it off clears the cache (no surviving paint).
+    inlay_enabled: bool,
 }
 
 impl LspDocState {
@@ -127,6 +137,46 @@ pub(crate) struct SemanticSpan {
     pub(crate) mods: Vec<String>,
 }
 
+/// A buffer's decoded inlay hints, bucketed by 0-based buffer line — the same
+/// per-line shape the diagnostics/semantic caches use, so the projection mirrors
+/// them. Empty until the first reply (and while inlay hints are disabled, which
+/// clears it).
+#[derive(Default)]
+pub(crate) struct InlayHintsCache {
+    pub(crate) hints: BTreeMap<usize, Vec<InlayHintSpan>>,
+}
+
+/// One decoded inlay hint on a single buffer line: the line-local `byte_col` it
+/// anchors at (the LSP character already converted through the negotiated
+/// encoding), the rendered `text` (label with padding folded in), and the `kind`
+/// (`1`=type, `2`=parameter, `0`=unspecified) for the highlight group. The client
+/// inserts `text` at this column, shifting the real glyphs right.
+pub(crate) struct InlayHintSpan {
+    pub(crate) byte_col: usize,
+    pub(crate) text: String,
+    #[allow(dead_code)] // kind drives the group split in a later phase; one group today.
+    pub(crate) kind: u8,
+    /// For a **lazy** hint (one that arrived with no label but carried `data`): the
+    /// original hint JSON, round-tripped to `inlayHint/resolve` to fill `text` on
+    /// demand. A placeholder span carries an empty `text` until its resolve lands;
+    /// the projection and the `get` mirror both skip empty-`text` spans, so an
+    /// unresolved placeholder paints nothing. `None` for an eager hint.
+    pub(crate) resolve_data: Option<nxvim_lsp::serde_json::Value>,
+}
+
+/// An in-flight `inlayHint/resolve`, keyed by the `cb_id` its [`ReqToken`] carries
+/// (so concurrent resolves don't clobber each other in the single-slot
+/// `lsp_requests` kind-map — they route by `cb_id` like a generic `client:request`).
+/// Records where the resolved label lands: the issuing buffer, the `tick` it was
+/// issued against (the reply is dropped if the buffer changed since), and the
+/// `(line, idx)` of the placeholder span in [`InlayHintsCache::hints`] to fill.
+pub(crate) struct InlayResolveTarget {
+    pub(crate) buffer: BufferId,
+    pub(crate) tick: u64,
+    pub(crate) line: usize,
+    pub(crate) idx: usize,
+}
+
 /// Which language-feature request a [`ReqToken`] / [`PendingLspReq`] belongs to.
 /// The numeric mapping is what rides in the token's `kind` field across the
 /// manager and back; the editor owns its meaning.
@@ -146,6 +196,8 @@ pub(crate) enum LspReqKind {
     ResolveCodeAction,
     CompletionResolve,
     SemanticTokens,
+    InlayHints,
+    ResolveInlayHint,
 }
 
 impl LspReqKind {
@@ -165,6 +217,8 @@ impl LspReqKind {
             LspReqKind::ResolveCodeAction => 11,
             LspReqKind::CompletionResolve => 12,
             LspReqKind::SemanticTokens => 13,
+            LspReqKind::InlayHints => 14,
+            LspReqKind::ResolveInlayHint => 15,
         }
     }
 
@@ -184,6 +238,8 @@ impl LspReqKind {
             11 => LspReqKind::ResolveCodeAction,
             12 => LspReqKind::CompletionResolve,
             13 => LspReqKind::SemanticTokens,
+            14 => LspReqKind::InlayHints,
+            15 => LspReqKind::ResolveInlayHint,
             _ => return None,
         })
     }
@@ -218,6 +274,12 @@ impl LspReqKind {
             // Semantic tokens are a background highlight refresh; an empty reply
             // just leaves the treesitter floor showing, never a message.
             LspReqKind::SemanticTokens => "No semantic tokens",
+            // Inlay hints are a background decoration refresh; an empty reply just
+            // clears the buffer's hints, never a message.
+            LspReqKind::InlayHints => "No inlay hints",
+            // Resolving a lazy hint is a silent background fill; an empty reply
+            // just drops the placeholder, never a message.
+            LspReqKind::ResolveInlayHint => "No inlay hint",
         }
     }
 
@@ -262,6 +324,10 @@ pub(crate) struct ServerRuntime {
     /// semantic-tokens refresh re-requests the whole `full` set rather than a diff
     /// (sending `full/delta` to a server that didn't advertise it would error).
     semantic_tokens_delta: bool,
+    /// Whether the server advertised `inlayHintProvider`. A buffer requests inlay
+    /// hints only from a server that offers them (and only while enabled), so this
+    /// gates the refresh request the same way `legend` gates semantic tokens.
+    inlay_hints: bool,
 }
 
 /// The live insert-mode completion popup (Phase 5), server-owned like the
@@ -520,6 +586,7 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
         rename: p.rename,
         code_action: p.code_action,
         semantic_tokens: p.semantic_tokens,
+        inlay_hints: p.inlay_hints,
     }
 }
 

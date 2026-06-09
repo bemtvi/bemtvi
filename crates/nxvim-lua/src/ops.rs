@@ -210,6 +210,15 @@ pub enum LspOp {
         /// Whether semantic tokens are enabled editor-wide (default on).
         enabled: bool,
     },
+    /// `vim.lsp.inlay_hint.enable(enable, { bufnr })` — flip the per-buffer inlay-
+    /// hint projection on or off (off by default, unlike semantic tokens). `enable`
+    /// requests a fresh set; disabling clears the cache and hides the paint.
+    InlayHintEnable {
+        /// The target buffer (already resolved from `0`/`nil` → current in Lua).
+        bufnr: u64,
+        /// `true` to enable (project + request), `false` to disable (clear + hide).
+        enabled: bool,
+    },
 }
 
 /// A request to the async runtime (the "event loop"), queued by the `vim.schedule`
@@ -590,6 +599,28 @@ pub struct SemanticTokenData {
     pub client_id: u64,
 }
 
+/// One decoded inlay hint mirrored into `vim._inlay_hints[bufnr]` so the
+/// synchronous getter `vim.lsp.inlay_hint.get` can read it from pure Lua (the
+/// Rust→Lua mirror, the analogue of [`SemanticTokenData`] / `vim._diagnostics`).
+/// Pushed on every `textDocument/inlayHint` reply (and after a lazy hint resolves).
+/// `line` is 0-based; `col` is a line-local **byte** offset (already converted from
+/// the server's encoding when the hint was decoded), a documented approximation of
+/// neovim's encoding-native `position.character`.
+#[derive(Clone, Debug)]
+pub struct InlayHintMirrorData {
+    /// 0-based buffer line the hint anchors on.
+    pub line: u32,
+    /// 0-based byte column the hint anchors at.
+    pub col: u32,
+    /// The rendered label (padding already folded into a leading/trailing space).
+    pub label: String,
+    /// `1`=type, `2`=parameter, `0`=unspecified — neovim's `InlayHintKind`.
+    pub kind: u8,
+    /// The owning LSP client id (the buffer's server), matching neovim's per-hint
+    /// `client_id`.
+    pub client_id: u64,
+}
+
 /// One LSP client mirrored into `vim.lsp._clients[id]` so `on_attach` (and any
 /// Lua) can read `client.server_capabilities` (Phase 7b Slice 3). Pushed once per
 /// server when it finishes `initialize`; the server translates its `ProviderCaps`
@@ -623,6 +654,7 @@ pub struct LspServerCapabilities {
     pub rename: bool,
     pub code_action: bool,
     pub semantic_tokens: bool,
+    pub inlay_hints: bool,
 }
 
 /// One `vim.keymap.set` entry, read back from `vim._keymaps` as plain data for

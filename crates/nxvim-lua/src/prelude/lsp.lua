@@ -959,3 +959,89 @@ function vim.lsp.semantic_tokens.highlight_token()
   vim._notimpl("vim.lsp.semantic_tokens.highlight_token")
 end
 
+-- ----- vim.lsp.inlay_hint: the control surface (Phase 1) ---------------------
+-- Inlay hints are the inline `: i32` type / `name:` parameter labels a server
+-- injects between the buffer's glyphs. Unlike semantic tokens they are **opt-in**:
+-- a buffer shows none until `enable(true)`. The decode/projection/inline render
+-- live in the server; these enqueue an `LspOp` it applies, and keep a Lua mirror
+-- of the per-buffer enabled state so `is_enabled` answers without a round-trip.
+vim.lsp.inlay_hint = vim.lsp.inlay_hint or {}
+
+-- The per-buffer enabled mirror, keyed by bufnr → true. Written through by
+-- `enable`; read by `is_enabled`. Nothing else should write it.
+vim._inlay_hint_enabled = vim._inlay_hint_enabled or {}
+
+-- Resolve a `filter.bufnr` (or a bare bufnr / `0`/`nil`) to a concrete buffer id.
+local function inlay_bufnr(filter)
+  local b = type(filter) == "table" and filter.bufnr or filter
+  if b == nil or b == 0 then return vim.api.nvim_get_current_buf() end
+  return b
+end
+
+-- enable(enable, filter): turn inlay hints on (`enable ~= false`) or off for a
+-- buffer (`filter.bufnr`, default current). Enabling requests a fresh set;
+-- disabling clears it. Matches neovim's `vim.lsp.inlay_hint.enable` signature
+-- (the per-client granularity of `filter` is an approximation — nxvim keeps one
+-- inlay cache per buffer).
+function vim.lsp.inlay_hint.enable(enable, filter)
+  if enable == nil then enable = true end
+  local bufnr = inlay_bufnr(filter)
+  vim._inlay_hint_enabled[bufnr] = enable and true or nil
+  vim._lsp_inlay_hint_enable(bufnr, enable ~= false)
+end
+
+-- is_enabled(filter): whether inlay hints are enabled for a buffer (`filter.bufnr`,
+-- default current). Reads the Lua mirror — no request is issued.
+function vim.lsp.inlay_hint.is_enabled(filter)
+  return vim._inlay_hint_enabled[inlay_bufnr(filter)] == true
+end
+
+-- The mirror the server pushes into on every `textDocument/inlayHint` reply (and
+-- after a lazy hint resolves), keyed by bufnr → list of
+-- `{ line, col, label, kind, client_id }` (0-based; `col` is a byte column).
+-- `get` reads it; nothing else should write it.
+vim._inlay_hints = vim._inlay_hints or {}
+function vim._set_inlay_hints(bufnr, list)
+  vim._inlay_hints[bufnr or 0] = list or {}
+end
+
+-- get(filter): the cached inlay hints for a buffer (`filter.bufnr`, default
+-- current), optionally narrowed to `filter.range` (a `{ start = { line, character },
+-- ["end"] = { line, character } }` span, 0-based — `character` compared as a byte
+-- column, the mirror's convention). Returns neovim's shape — a list of
+-- `{ bufnr, client_id, inlay_hint = { position = { line, character }, label, kind } }`.
+-- Reads the mirror; no request is issued. (Per-part `location`/`tooltip`/`textEdits`
+-- are not surfaced — nxvim renders label-only; recorded as an approximation.)
+function vim.lsp.inlay_hint.get(filter)
+  filter = filter or {}
+  local bufnr = inlay_bufnr(filter)
+  local range = filter.range
+  local out = {}
+  for _, h in ipairs(vim._inlay_hints[bufnr] or {}) do
+    local keep = true
+    if range then
+      -- Inclusive line span; on the boundary lines, clip by the byte column.
+      local s, e = range.start, range["end"]
+      if h.line < s.line or h.line > e.line then
+        keep = false
+      elseif h.line == s.line and h.col < s.character then
+        keep = false
+      elseif h.line == e.line and h.col > e.character then
+        keep = false
+      end
+    end
+    if keep then
+      out[#out + 1] = {
+        bufnr = bufnr,
+        client_id = h.client_id,
+        inlay_hint = {
+          position = { line = h.line, character = h.col },
+          label = h.label,
+          kind = h.kind,
+        },
+      }
+    end
+  end
+  return out
+end
+

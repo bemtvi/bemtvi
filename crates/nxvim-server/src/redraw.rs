@@ -193,6 +193,7 @@ impl Server {
         let diagnostics_virt = self.diagnostics_virt_text_for(win.buffer, &win.numbers, styles);
         let diagnostics_signs = self.diagnostics_signs_for(win.buffer, &win.numbers, styles);
         let sign_column = self.diagnostics_sign_column(win.buffer);
+        let inlay_hints = self.inlay_hints_for(win.buffer, &win.numbers, styles);
         let scroll = match &win.scroll {
             Some(s) => self.project_band(win.buffer, s, styles),
             None => Value::Nil,
@@ -258,6 +259,7 @@ impl Server {
             (Value::from("diagnostics_virt"), diagnostics_virt),
             (Value::from("diagnostics_signs"), diagnostics_signs),
             (Value::from("sign_column"), Value::from(sign_column)),
+            (Value::from("inlay_hints"), inlay_hints),
             (Value::from("status"), status),
             // Whether this window paints its own status row (per `'laststatus'`).
             // False hides it (modes 0/3, or 1 with one window); the client then

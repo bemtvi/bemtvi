@@ -31,6 +31,13 @@ pub type DiagVirt = (String, u8, Option<usize>);
 /// built-in severity foreground when `None`.
 pub type DiagSign = (String, u8, Option<usize>);
 
+/// One inline LSP inlay hint: `(col, text, style_id)`. `col` is the screen column
+/// (the server resolved the byte anchor through the same tab/wide-char `virtcol`
+/// the highlights use) the hint's `text` is inserted at — shifting the real glyphs
+/// (and the cursor) right — colored by the resolved `LspInlayHint` `style_id`
+/// (frame-palette index) or a built-in dim foreground when `None`.
+pub type InlayHint = (u16, String, Option<usize>);
+
 /// Per visible row, the screen-column spans of every search match (`hlsearch`).
 pub type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
@@ -262,6 +269,40 @@ pub(crate) fn parse_diagnostics_signs(value: Option<&Value>) -> Vec<Option<DiagS
                         t[1].as_u64()? as u8,
                         t[2].as_u64().map(|id| id as usize),
                     ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the `inlay_hints` redraw key into per-row inline hints: each row is an
+/// array of `[col, text, style_id]` (empty for rows with none). Malformed entries
+/// are dropped. Same per-row-list shape as [`parse_diagnostics`], but each entry
+/// carries a column + text rather than a span.
+pub(crate) fn parse_inlay_hints(value: Option<&Value>) -> Vec<Vec<InlayHint>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|hints| {
+                            hints
+                                .iter()
+                                .filter_map(|hint| {
+                                    let t = hint.as_array()?;
+                                    if t.len() != 3 {
+                                        return None;
+                                    }
+                                    Some((
+                                        t[0].as_u64()? as u16,
+                                        t[1].as_str()?.to_string(),
+                                        t[2].as_u64().map(|id| id as usize),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 })
                 .collect()
         })

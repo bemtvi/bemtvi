@@ -145,6 +145,25 @@ gap. Recorded here so the sweep doesn't lose them.
   (one semantic cache per buffer); repaints on every reply including mid-insert
   (`update_in_insert` always on). See
   `docs/plans/2026-06-08-lsp-semantic-tokens.md` and `examples/semantic-tokens/`.
+- **LSP inlay hints — Phase 1 complete, with approximations.** A buffer with
+  `vim.lsp.inlay_hint.enable(true)` requests `textDocument/inlayHint` from a server
+  that advertises the provider (on enable + after each change), decodes the hints
+  against the negotiated encoding, and paints each one **inline** at its column —
+  shifting the real glyphs and the cursor right
+  (`crates/nxvim-server/src/lsp/inlay.rs`, the splice in
+  `crates/nxvim-tui/src/render.rs::highlight_line`). Unlike semantic tokens it is
+  **opt-in** (off by default). The approximations: **string labels only** — label
+  *parts* are joined to their `value`s, dropping the per-part `location` (go-to on
+  click) / `tooltip` / `textEdits`-on-accept (these need `inlayHint/resolve`,
+  Phase 2); **one `LspInlayHint` group** for all kinds (no
+  `LspInlayHintType`/`Parameter` split), with a dim built-in fallback when the
+  group is undefined; **whole document, no `range`** (the viewport-scoped request
+  is Phase 2 — the whole buffer is requested on every change); **per-buffer enable
+  only** (no per-client granularity; `vim.lsp.inlay_hint.get` is Phase 2);
+  horizontal-scroll (`leftcol>0`) + inline hints is best-effort (the cursor shift
+  ignores scrolled-off hints); repaints on every reply including mid-insert
+  (`update_in_insert` always on). See `docs/plans/2026-06-08-lsp-inlay-hints.md`
+  and `examples/inlay-hints/`.
 - **Synchronous prompts — now implemented.** `vim.fn.input` / `vim.fn.confirm`
   return the user's answer *inline*: a pumped Lua entry (`:lua` chunk, keymap, or
   user command) runs inside a coroutine via `vim._pump`, so the prompt

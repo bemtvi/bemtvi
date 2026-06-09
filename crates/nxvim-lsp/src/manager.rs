@@ -308,7 +308,12 @@ async fn run_server_once(
     // `async-lsp`'s `MainLoop` drives the `futures` AsyncRead/Write; bridge the
     // tokio child pipes with tokio-util's compat shims. Input is the child's
     // stdout (server→client), output its stdin (client→server).
-    let (mainloop, mut socket) = new_client(key.clone(), event_tx.clone(), log.clone());
+    let (mainloop, mut socket) = new_client(
+        key.clone(),
+        event_tx.clone(),
+        log.clone(),
+        spawn.settings.clone(),
+    );
     let mut mainloop_fut = tokio::spawn(async move {
         mainloop
             .run_buffered(stdout.compat(), stdin.compat_write())

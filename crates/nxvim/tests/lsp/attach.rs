@@ -201,6 +201,70 @@ async fn the_config_settings_init_options_and_capabilities_reach_the_server() {
 }
 
 #[tokio::test]
+async fn workspace_configuration_pull_is_answered_from_settings() {
+    let _guard = test_lock().lock().await;
+    // The pull model: a server (lua_ls, gopls) reads its config by *requesting*
+    // `workspace/configuration` for named sections, rather than only consuming the
+    // `didChangeConfiguration` push. nxvim must advertise `workspace.configuration`
+    // and answer each requested `section` with that dotted path into the config's
+    // `settings` — otherwise a pull-only server runs on defaults (the lua_ls
+    // inlay-hints-never-appear bug). The mock pulls three sections and records the
+    // editor's reply.
+    let record = configure_mock(
+        "cfgpull",
+        serde_json::json!({ "config_pull": ["mock-ls", "mock-ls.sentinel", "absent"] }),
+    );
+    let file = temp_file("cfgpull", "rs", "fn main() {}\n");
+
+    let dir = std::env::temp_dir().join(format!("nxvim-lsp-cfgpull-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    std::fs::write(
+        dir.join("init.lua"),
+        "vim.lsp.config('mock', { cmd = { 'mock' }, filetypes = { 'rust' }, \
+         settings = { ['mock-ls'] = { sentinel = 'PULLED' } } })\n\
+         vim.lsp.enable('mock')\n",
+    )
+    .expect("write init.lua");
+
+    let (rpc, _incoming) = start_with_config_dir(Some(file), dir.clone()).await;
+
+    let recs = wait_for_record(&rpc, &record, |r| has_method(r, "_config_response")).await;
+
+    // The client must advertise it answers the pull, or a real server never sends it.
+    let init = find(&recs, "initialize").expect("an initialize request");
+    assert_eq!(
+        init["params"]["capabilities"]["workspace"]["configuration"].as_bool(),
+        Some(true),
+        "the client should advertise workspace.configuration, got {:?}",
+        init["params"]["capabilities"]["workspace"]
+    );
+
+    // The recorded reply array: section "mock-ls" → its table, "mock-ls.sentinel" →
+    // the leaf string, "absent" → null (the server then uses its default there).
+    let reply = find(&recs, "_config_response").expect("a config-pull response");
+    let items = reply["params"].as_array().expect("response is an array");
+    assert_eq!(
+        items[0]["sentinel"].as_str(),
+        Some("PULLED"),
+        "section 'mock-ls' resolves to its settings table, got {:?}",
+        items[0]
+    );
+    assert_eq!(
+        items[1].as_str(),
+        Some("PULLED"),
+        "section 'mock-ls.sentinel' resolves to the leaf value, got {:?}",
+        items[1]
+    );
+    assert!(
+        items[2].is_null(),
+        "an unset section resolves to null, got {:?}",
+        items[2]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn before_init_shapes_the_initialize_params() {
     let _guard = test_lock().lock().await;
     // Phase 3: `before_init(init_params, config)` runs just before the handshake

@@ -31,7 +31,8 @@ mod treesitter;
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
 use lsp::{
-    CompletionMenu, DiagnosticConfig, LspDocState, LspReqKind, PendingLspReq, ServerRuntime,
+    CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
+    ServerRuntime,
 };
 use nxvim_core::{BufferId, Editor, Key, Mode, TabId, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
@@ -186,6 +187,14 @@ struct Server {
     /// The in-flight language-feature request per kind (definition, references,
     /// …), used to match a reply to its intent and drop stale ones.
     lsp_requests: HashMap<LspReqKind, PendingLspReq>,
+    /// In-flight `inlayHint/resolve`s, keyed by the `cb_id` their token carries.
+    /// Unlike the single-slot `lsp_requests`, many lazy hints can resolve at once,
+    /// so each gets a distinct `cb_id` (from `inlay_resolve_seq`) and routes back
+    /// by it — the [`InlayResolveTarget`] records which placeholder span to fill.
+    inlay_resolves: HashMap<u64, InlayResolveTarget>,
+    /// Monotonic source of `cb_id`s for `inlay_resolves` (never reused, so a stale
+    /// reply for a superseded resolve finds no target and is dropped).
+    inlay_resolve_seq: u64,
     /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
     /// like the diagnostics cache; projected into the `pmenu` redraw key and
     /// driven by the popup-open key routing in [`Server::completion_menu_key`].
@@ -337,6 +346,8 @@ where
         lsp_dirty: false,
         lsp_req_gen: 0,
         lsp_requests: HashMap::new(),
+        inlay_resolves: HashMap::new(),
+        inlay_resolve_seq: 0,
         completion: None,
         lsp_code_actions: Vec::new(),
         diag_config: DiagnosticConfig::default(),

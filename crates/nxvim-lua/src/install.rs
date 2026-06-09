@@ -1049,6 +1049,21 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `vim._lsp_inlay_hint_enable(bufnr, enabled)`: queue [`LspOp::InlayHintEnable`]
+    // — `vim.lsp.inlay_hint.enable(enable, { bufnr })` flips the per-buffer inlay-
+    // hint projection (off by default; `bufnr` already resolved from `0`/`nil` →
+    // current in Lua).
+    let sh = shared.clone();
+    vim.set(
+        "_lsp_inlay_hint_enable",
+        lua.create_function(move |_, (bufnr, enabled): (u64, bool)| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::InlayHintEnable { bufnr, enabled });
+            Ok(())
+        })?,
+    )?;
+
     // `vim._ui_input(prompt, default, cb_id)`: queue a `vim.ui.input` prompt
     // ([`UiInputReq`]). The server opens the editor's command line labelled
     // `prompt` (prefilled with `default`) and fires `vim._cb_fns[cb_id]` with the

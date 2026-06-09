@@ -53,9 +53,13 @@ impl Server {
             | LspReqKind::CodeAction
             | LspReqKind::ResolveCodeAction
             | LspReqKind::CompletionResolve
-            // Semantic tokens are whole-buffer, issued by `request_semantic_tokens`
-            // on open/change rather than at the cursor.
-            | LspReqKind::SemanticTokens => return,
+            // Semantic tokens and inlay hints are whole-buffer, issued by
+            // `request_semantic_tokens` / `request_inlay_hints` on open/change/enable
+            // rather than at the cursor; inlay-hint resolve is fired per lazy hint
+            // from `issue_inlay_resolves`, never at the cursor.
+            | LspReqKind::SemanticTokens
+            | LspReqKind::InlayHints
+            | LspReqKind::ResolveInlayHint => return,
         };
         self.lsp.request(key, token, req);
     }
@@ -347,9 +351,19 @@ impl Server {
                 // drop it on that buffer's own content change.
                 self.on_semantic_tokens_reply(req_buffer, req_tick, data);
             }
+            LspReply::InlayHints(hints) => {
+                // Whole-buffer, focus-independent like semantic tokens: cache to the
+                // issuing buffer and drop on *its* content change.
+                self.on_inlay_hints_reply(req_buffer, req_tick, hints);
+            }
             // Generic `client:request` replies are routed to their Lua handler in
             // `on_lsp_event` before reaching here, never through the typed path.
             LspReply::Raw(_) => unreachable!("raw replies are routed in on_lsp_event"),
+            // Inlay-hint resolve replies route by `cb_id` in `on_lsp_event` (many
+            // can be in flight at once), never through the single-slot kind path.
+            LspReply::ResolvedInlayHint { .. } => {
+                unreachable!("inlay-hint resolve replies are routed in on_lsp_event")
+            }
         }
     }
 

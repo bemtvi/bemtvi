@@ -65,6 +65,21 @@
 //!   `full/delta` request is answered with the full `data`/`result_id` (the same
 //!   full-set fallback). Absent `semantic_tokens` ⇒ the server advertises no
 //!   semantic-tokens provider and the request falls back to `null`.
+//! - `inlay_hints`: the `InlayHint[]` returned for `textDocument/inlayHint`. When
+//!   set, the mock advertises the `inlayHintProvider` capability (so the editor
+//!   requests them; `resolveProvider` too when `inlay_resolve` is scripted). Absent
+//!   ⇒ no provider, and the request falls back to `null`.
+//! - `inlay_resolve`: the resolved `InlayHint` (its lazy `label` filled in)
+//!   returned for `inlayHint/resolve`. Absent ⇒ `null`.
+//! - `inlay_refresh`: when set, the FIRST `textDocument/inlayHint` request returns
+//!   empty and the mock then sends a server→client `workspace/inlayHint/refresh`
+//!   (the lua_ls "nothing ready yet — ask again" shape); later requests return
+//!   `inlay_hints`. Proves the editor honors the refresh by re-querying.
+//! - `config_pull`: an array of section names. After the client's `initialized`,
+//!   the mock sends a server→client `workspace/configuration` request for those
+//!   sections (the pull-config model lua_ls/gopls use) and records the editor's
+//!   reply under the synthetic method `_config_response`, so a test can assert the
+//!   client answered each section from the config's `settings`.
 //! - `custom_replies`: a `{ method: result }` map scripting the reply to an
 //!   otherwise-unhandled request — the generic `client:request` path (Phase 5).
 //!   A method not in the map falls back to a `null` result.
@@ -93,8 +108,29 @@ pub fn run(script_path: &str) {
     // How many `textDocument/completion` requests we've answered, so
     // `completion_sequence` can hand back a different list per request.
     let mut completion_calls = 0usize;
+    // How many `textDocument/inlayHint` requests we've answered, so an
+    // `inlay_refresh` script can return empty on the first and hints after the
+    // server→client refresh (the lua_ls "compute asynchronously" shape).
+    let mut inlay_calls = 0usize;
+    // Ids for the server→client requests the mock originates (config pull, refresh).
+    let mut next_id = 10_000i64;
+    // The id of the `workspace/configuration` pull we sent, so its response can be
+    // recorded for the test to assert on.
+    let mut config_req_id: Option<i64> = None;
 
     while let Some(msg) = read_message(&mut reader) {
+        // A response to one of our server→client requests (it has an `id` but no
+        // `method`): capture the config-pull answer for tests, then ignore — never
+        // reply to a reply.
+        if msg.get("method").is_none() {
+            if let (Some(rid), Some(want)) = (msg.get("id").and_then(Value::as_i64), config_req_id)
+            {
+                if rid == want {
+                    record_named(&script, "_config_response", msg.get("result"));
+                }
+            }
+            continue;
+        }
         // Record every client→server message (so tests can read back what the
         // client advertised at `initialize` and which notifications it sent).
         record(&script, &msg);
@@ -119,6 +155,29 @@ pub fn run(script_path: &str) {
                 }
             }
             "exit" => return,
+            // After the client says it's `initialized`, a `config_pull` script makes
+            // the mock pull its config the way lua_ls/gopls do: send a
+            // `workspace/configuration` request for the scripted sections. The
+            // client's response is recorded (`_config_response`) for the test, and if
+            // it carries a truthy `hint.enable` we know the editor answered the pull
+            // from the config's `settings`.
+            "initialized" => {
+                if let Some(sections) = script.get("config_pull").and_then(Value::as_array) {
+                    let items: Vec<Value> =
+                        sections.iter().map(|s| json!({ "section": s })).collect();
+                    config_req_id = Some(next_id);
+                    write_message(
+                        &stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "workspace/configuration",
+                            "params": { "items": items },
+                        }),
+                    );
+                    next_id += 1;
+                }
+            }
             // On `didOpen`, push any scripted diagnostics for the just-opened
             // document so the editor has something to render (real servers
             // publish asynchronously after the open; the mock does it eagerly and
@@ -187,6 +246,37 @@ pub fn run(script_path: &str) {
                     write_response(&stdout, id, result);
                 }
             }
+            // Inlay hints: return the scripted `InlayHint[]` for the whole document.
+            // Absent ⇒ `null` (no hints). With `inlay_refresh` set, the FIRST request
+            // returns empty and the mock then sends a `workspace/inlayHint/refresh`
+            // (the lua_ls "nothing ready yet, ask again" shape); later requests return
+            // the scripted hints — so the test proves the editor honors the refresh.
+            "textDocument/inlayHint" => {
+                let call = inlay_calls;
+                inlay_calls += 1;
+                if script.get("inlay_refresh").is_some() && call == 0 {
+                    if let Some(id) = id {
+                        write_response(&stdout, id, json!([]));
+                    }
+                    write_message(
+                        &stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "workspace/inlayHint/refresh",
+                            "params": null,
+                        }),
+                    );
+                    next_id += 1;
+                } else {
+                    reply_scripted(&stdout, id, &script, "inlay_hints");
+                }
+            }
+            // The resolved `InlayHint` (its lazy `label` filled in) for a hint the
+            // editor sent to `inlayHint/resolve`. Absent ⇒ `null`, which can't
+            // deserialize into an `InlayHint` — exercising the editor's
+            // resolve-failure path (logged, placeholder dropped).
+            "inlayHint/resolve" => reply_scripted(&stdout, id, &script, "inlay_resolve"),
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply. A `custom_replies` map (method ->
             // result) scripts the answer to a generic `client:request` (Phase 5);
@@ -260,6 +350,20 @@ fn initialize_result(script: &Value) -> Value {
             );
         }
     }
+    // Advertise the inlay-hint provider only when the script supplies `inlay_hints`
+    // (so a test without it exercises a server that doesn't offer the feature). When
+    // the script also scripts an `inlay_resolve` reply, advertise
+    // `resolveProvider: true` so the editor knows it can resolve lazy hints.
+    if script.get("inlay_hints").is_some() {
+        if let Value::Object(base) = &mut capabilities {
+            let provider = if script.get("inlay_resolve").is_some() {
+                json!({ "resolveProvider": true })
+            } else {
+                json!(true)
+            };
+            base.insert("inlayHintProvider".to_string(), provider);
+        }
+    }
     if let Some(Value::Object(overrides)) = script.get("capabilities") {
         if let Value::Object(base) = &mut capabilities {
             for (k, v) in overrides {
@@ -283,6 +387,23 @@ fn record(script: &Value, msg: &Value) {
         return;
     };
     let line = json!({ "method": method, "params": msg.get("params") });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Append a synthetic record line under `method` with `params` — used to capture
+/// the *response* to a server→client request the mock originated (e.g. the editor's
+/// `workspace/configuration` answer), which `record` skips since it has no method.
+fn record_named(script: &Value, method: &str, params: Option<&Value>) {
+    let Some(path) = script.get("record").and_then(Value::as_str) else {
+        return;
+    };
+    let line = json!({ "method": method, "params": params.cloned().unwrap_or(Value::Null) });
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

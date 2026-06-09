@@ -105,6 +105,7 @@ pub struct ProviderCaps {
     pub rename: bool,
     pub code_action: bool,
     pub semantic_tokens: bool,
+    pub inlay_hints: bool,
 }
 
 /// A fire-and-forget document-sync notification, already in LSP coordinates. The
@@ -240,6 +241,24 @@ pub enum LspRequest {
         uri: Url,
         previous_result_id: String,
     },
+    /// `textDocument/inlayHint` — the inline type/parameter hints for a document
+    /// `range` (we send the whole buffer, `0..line_count`). Requested per buffer
+    /// (on enable and after each change, only while the buffer has inlay hints
+    /// enabled), and the reply ([`LspReply::InlayHints`]) carries the distilled
+    /// hints the editor decodes against the negotiated encoding and paints inline
+    /// over the buffer text.
+    InlayHint {
+        uri: Url,
+        range: Range,
+    },
+    /// `inlayHint/resolve` — fill a **lazy** hint's `label`/`tooltip` on demand
+    /// (Phase 2). The original [`InlayHint`](lsp_types::InlayHint) is round-tripped
+    /// verbatim as JSON (kept on [`InlayHintData::resolve_data`]); the manager
+    /// deserializes it back to send, and the reply ([`LspReply::ResolvedInlayHint`])
+    /// carries the resolved label. Mirrors [`LspRequest::ResolveCompletion`].
+    ResolveInlayHint {
+        hint: serde_json::Value,
+    },
     /// A **generic** request issued by Lua `client:request(method, params, …)`
     /// (Phase 5): an arbitrary `method` with raw JSON `params`, whose raw JSON
     /// result routes back to a Lua handler ([`LspReply::Raw`]). This is the seam
@@ -328,6 +347,15 @@ pub enum LspReply {
     /// char→byte conversion needs (like the completion edit ranges). See
     /// [`SemanticTokensData`] for the full-vs-delta shapes.
     SemanticTokens(SemanticTokensData),
+    /// The inlay hints from `textDocument/inlayHint`, distilled to the inline
+    /// decorations the editor paints (positions still in the negotiated encoding
+    /// for the editor to convert to bytes — only it holds the buffer text). An
+    /// empty list ⇒ the server produced no hints for the range.
+    InlayHints(Vec<InlayHintData>),
+    /// The label an `inlayHint/resolve` produced for a lazy hint (`None` ⇒ the
+    /// resolved hint still carried no label, was malformed, or the request failed —
+    /// the editor then drops the placeholder rather than painting an empty hint).
+    ResolvedInlayHint { label: Option<String> },
     /// The reply to an [`LspRequest::Raw`] (Phase 5): the server's raw JSON result
     /// (`Ok`) or an error message (`Err`) — an unsupported method, a transport
     /// failure, or the server replying an error. Routed back to the Lua handler as
@@ -385,6 +413,29 @@ pub struct CodeActionData {
     pub edit: Option<WorkspaceEditData>,
     pub resolve: Option<Box<CodeAction>>,
     pub command: Option<lsp_types::Command>,
+}
+
+/// One inlay hint distilled for the editor: its anchor `(line, character)` (the
+/// character still in the server's negotiated position encoding — the editor
+/// converts it to a byte column against the buffer text), the rendered `label`
+/// (the string form, or label parts joined to their `value`s, with `padding_left`
+/// / `padding_right` already folded into a leading/trailing space), and the
+/// `kind` (`1`=type, `2`=parameter, `0`=unspecified) the editor maps to a
+/// highlight group. The interactive extras (per-part `location`/`tooltip`,
+/// `tooltip`, `textEdits`) are dropped in Phase 1 — recorded as an approximation.
+#[derive(Clone, Debug)]
+pub struct InlayHintData {
+    pub line: u32,
+    pub character: u32,
+    pub label: String,
+    pub kind: u8,
+    /// The original protocol [`InlayHint`](lsp_types::InlayHint) serialized
+    /// verbatim, round-tripped to `inlayHint/resolve` (Phase 2) to fill a **lazy**
+    /// hint's `label`. `Some` only when the hint arrived with no usable label *and*
+    /// carried `data` (a server marked it resolvable); `None` for an eager hint
+    /// whose label is already present (nothing to resolve). Mirrors
+    /// [`CompletionItemData::resolve_data`].
+    pub resolve_data: Option<serde_json::Value>,
 }
 
 /// One completion candidate, distilled from a protocol
@@ -468,4 +519,19 @@ pub enum LspEvent {
     },
     /// `window/logMessage` / `window/showMessage`, or a manager-level note.
     Log { key: ServerKey, message: String },
+    /// A server→client refresh request (`workspace/inlayHint/refresh` or
+    /// `workspace/semanticTokens/refresh`): the server recomputed and is asking the
+    /// client to re-query the decorations for *all* the documents it serves. Many
+    /// servers (lua_ls, gopls) compute these asynchronously and only have results
+    /// to give *after* sending a refresh, so without honoring it a buffer's hints /
+    /// tokens never appear. The editor re-issues the matching whole-buffer request
+    /// for every buffer this server owns.
+    WorkspaceRefresh { key: ServerKey, kind: RefreshKind },
+}
+
+/// Which decoration a [`LspEvent::WorkspaceRefresh`] asks the editor to re-query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshKind {
+    InlayHint,
+    SemanticTokens,
 }

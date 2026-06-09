@@ -37,7 +37,11 @@ mod diagnostics;
 mod formatting;
 #[path = "lsp/goto.rs"]
 mod goto;
+#[path = "lsp/inlay.rs"]
+mod inlay;
 #[path = "lsp/lifecycle.rs"]
 mod lifecycle;
+#[path = "lsp/real_server.rs"]
+mod real_server;
 #[path = "lsp/semantic.rs"]
 mod semantic;

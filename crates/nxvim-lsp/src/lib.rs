@@ -36,8 +36,8 @@ pub use lsp_types;
 pub use convert::normalize_workspace_edit;
 pub use manager::LspManager;
 pub use protocol::{
-    CodeActionData, CompletionItemData, LspEvent, LspNotify, LspReply, LspRequest,
-    PositionEncoding, ProviderCaps, ReqToken, SemanticLegend, SemanticTokensData, ServerCaps,
-    ServerKey, ServerSpawn, WorkspaceEditData,
+    CodeActionData, CompletionItemData, InlayHintData, LspEvent, LspNotify, LspReply, LspRequest,
+    PositionEncoding, ProviderCaps, RefreshKind, ReqToken, SemanticLegend, SemanticTokensData,
+    ServerCaps, ServerKey, ServerSpawn, WorkspaceEditData,
 };
 pub use serde_json;

@@ -17,8 +17,8 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
-    TabOp, TsOp, UiInputReq, WindowOp,
+    InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp,
+    SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -580,6 +580,27 @@ impl LuaRuntime {
         set.call((bufnr, list))
     }
 
+    /// Mirror a buffer's decoded inlay hints into `vim._inlay_hints[bufnr]` as the
+    /// plain data `vim.lsp.inlay_hint.get` reads back (the semantic-tokens-mirror
+    /// analogue). Called on every `textDocument/inlayHint` reply (and after a lazy
+    /// hint resolves, or when hints are disabled — an empty list clears the mirror);
+    /// keyed by `bufnr`. `col` is a 0-based byte column.
+    pub fn set_inlay_hints(&self, bufnr: u64, hints: &[InlayHintMirrorData]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let set: mlua::Function = vim.get("_set_inlay_hints")?;
+        let list = self.lua.create_table()?;
+        for (i, h) in hints.iter().enumerate() {
+            let t = self.lua.create_table()?;
+            t.set("line", h.line)?;
+            t.set("col", h.col)?;
+            t.set("label", h.label.clone())?;
+            t.set("kind", h.kind)?;
+            t.set("client_id", h.client_id)?;
+            list.set(i + 1, t)?;
+        }
+        set.call((bufnr, list))
+    }
+
     /// Mirror one LSP client into `vim.lsp._clients[id]` (the Rust→Lua client
     /// registry) so `get_client_by_id` — and the `LspAttach` `on_attach` it feeds
     /// — can read `client.server_capabilities`. Pushed once per server when it
@@ -602,6 +623,7 @@ impl LuaRuntime {
         caps.set("renameProvider", c.rename)?;
         caps.set("codeActionProvider", c.code_action)?;
         caps.set("semanticTokensProvider", c.semantic_tokens)?;
+        caps.set("inlayHintProvider", c.inlay_hints)?;
         set.call((client.id, client.name.clone(), caps))
     }
 

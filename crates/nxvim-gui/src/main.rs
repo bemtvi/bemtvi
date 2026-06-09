@@ -15,6 +15,15 @@ fn main() -> Result<()> {
     // (`--font`/`--font-size`, overriding the `NXVIM_GUI_FONT*` environment).
     let (file, config) = parse_args();
 
+    // A *directory* argument (`nxvim-gui somedir`) opens the system file picker at
+    // that directory rather than the server's in-window netrw listing. So it is the
+    // GUI client's job, not the server's: divert it from `ServerInit.file` (which
+    // would open the explorer) into `open_dir`, leaving the server on `[No Name]`.
+    let (file, open_dir) = match file {
+        Some(f) if std::path::Path::new(&f).is_dir() => (None, Some(std::path::PathBuf::from(f))),
+        other => (other, None),
+    };
+
     // In-process, bidirectional transport between client and server.
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
 
@@ -42,7 +51,7 @@ fn main() -> Result<()> {
     });
 
     // The GUI client owns the main thread (winit's event loop requirement).
-    let result = nxvim_gui::run(client_end, config);
+    let result = nxvim_gui::run(client_end, config, open_dir);
 
     // When the client exits, the dropped stream signals the server to wind down.
     // Surface a server-thread panic as a non-zero exit, mirroring the TUI binary.

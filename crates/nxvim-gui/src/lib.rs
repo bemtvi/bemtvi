@@ -41,6 +41,7 @@ pub use mouse::{
     panel_content_rect, vertical_action, within,
 };
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -132,7 +133,7 @@ pub enum UserEvent {
 /// Run the GUI client over a connected stream until the window closes or the
 /// server disconnects, rendering with `config`'s font. Must be called on the main
 /// thread (winit's requirement).
-pub fn run<S>(stream: S, config: GuiConfig) -> Result<()>
+pub fn run<S>(stream: S, config: GuiConfig, open_dir: Option<PathBuf>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -192,7 +193,7 @@ where
     });
 
     let rpc = rpc_rx.recv()?;
-    let mut app = App::new(rpc, config);
+    let mut app = App::new(rpc, config, open_dir);
     event_loop.run_app(&mut app)?;
 
     // The UI is done: stop the IO thread and wait for it, so `stream` is dropped
@@ -330,10 +331,15 @@ struct App {
     /// The last `view.guifont` applied to the renderer, so a redraw only re-shapes
     /// when it actually changed (`:set guifont=…` / the init-time value).
     applied_guifont: String,
+    /// A directory passed on the command line (`nxvim-gui somedir`), if any. Popped
+    /// as the native file picker (anchored there) once the window exists, instead of
+    /// the server's in-window listing — see [`Self::resumed`]. Taken on first use so
+    /// it fires exactly once.
+    open_dir: Option<PathBuf>,
 }
 
 impl App {
-    fn new(rpc: Rpc, config: GuiConfig) -> Self {
+    fn new(rpc: Rpc, config: GuiConfig, open_dir: Option<PathBuf>) -> Self {
         Self {
             rpc,
             window: None,
@@ -350,6 +356,7 @@ impl App {
             flush_deadline: None,
             config,
             applied_guifont: String::new(),
+            open_dir,
         }
     }
 
@@ -433,6 +440,21 @@ impl App {
         true
     }
 
+    /// Like [`Self::pick_open`] but opens the dialog **anchored at `dir`** — the GUI's
+    /// answer to opening a *directory* (`:e somedir`, or `nxvim-gui somedir`). Rather
+    /// than the server's in-window netrw listing, the user gets the system file picker
+    /// already browsing that directory, and the picked file is opened with `base`.
+    /// Same key-swallowing and raw-path contract as [`Self::pick_open`]; a relative
+    /// `dir` resolves against the process cwd, exactly as the server's listing would.
+    fn pick_open_at(&self, base: &str, dir: &str) -> bool {
+        let picked = rfd::FileDialog::new()
+            .set_title("Open")
+            .set_directory(dir)
+            .pick_file();
+        self.run_picked(base, picked);
+        true
+    }
+
     /// Pop the native **save** dialog for `:wn` / a bare `:w` on an unnamed buffer,
     /// then `:w <file>` to the chosen path (which also binds the buffer to it).
     /// Same key-swallowing contract and raw-path rationale as [`Self::pick_open`].
@@ -444,7 +466,7 @@ impl App {
 
     /// Abort the half-typed command line, then run `<verb> <path>` for a picked
     /// file (nothing further on cancel). Shared by the open and save pickers.
-    fn run_picked(&self, verb: &str, picked: Option<std::path::PathBuf>) {
+    fn run_picked(&self, verb: &str, picked: Option<PathBuf>) {
         self.rpc.notify("nvim_input", vec![Value::from("<Esc>")]);
         if let Some(path) = picked {
             let path = path.to_string_lossy();
@@ -709,6 +731,34 @@ pub fn open_dialog_verb(cmdline: &str) -> Option<&'static str> {
     }
 }
 
+/// If `cmdline` is a file-**opening** ex command carrying a path argument, the
+/// `(base_verb, arg)` to act on: the canonical verb to re-run and the raw path tail.
+/// Only the commands the server routes through `ex_edit` — where a *directory*
+/// argument opens the in-window netrw listing — are matched: `:e`/`:edit`,
+/// `:sp`/`:split`, `:vs`/`:vsplit`, and `:tabe`/`:tabedit`/`:tabnew`. Everything
+/// else is left alone, so a directory argument to `:cd`, `:lcd`, `:w`, `:grep`,
+/// `:set`, … is *not* mistaken for an open (the caller would otherwise wrongly pop a
+/// file picker for `:cd somedir`). `None` for a non-open command or one with no
+/// argument (the bare forms are [`open_dialog_verb`]'s job). The caller decides
+/// whether `arg` is actually a directory; this is pure, so it is unit-tested in
+/// `tests/keys.rs`.
+pub fn open_path_command(cmdline: &str) -> Option<(&'static str, &str)> {
+    let (cmd, arg) = cmdline.trim_start().split_once(char::is_whitespace)?;
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return None; // no argument → a bare command, not an open-with-path
+    }
+    // A trailing `!` (`:e! dir`) is a force flag, irrelevant to listing a directory.
+    let base = match cmd.strip_suffix('!').unwrap_or(cmd) {
+        "e" | "edit" => "e",
+        "sp" | "spl" | "split" => "sp",
+        "vs" | "vsp" | "vspl" | "vsplit" => "vs",
+        "tabe" | "tabed" | "tabedit" | "tabnew" => "tabe",
+        _ => return None,
+    };
+    Some((base, arg))
+}
+
 /// Whether `<CR>` over `cmdline` should pop the native **save** dialog: `:wn`
 /// (save to a new file) always, or a bare `:w`/`:write` when the focused buffer is
 /// `unnamed` (so a plain `:w` has no file to write to). `None`/false leaves the
@@ -772,6 +822,11 @@ impl ApplicationHandler<UserEvent> for App {
         // Apply any `guifont` already received before the renderer existed (a
         // redraw can beat `resumed`); a no-op for the default empty value.
         self.apply_guifont();
+        // A directory given on the command line opens the native file picker there
+        // (taken so it fires once — `resumed` early-returns on later wake-ups).
+        if let Some(dir) = self.open_dir.take() {
+            self.pick_open_at("e", &dir.to_string_lossy());
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -862,6 +917,14 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     if let Some(base) = open_dialog_verb(&self.view.cmdline) {
                         if self.pick_open(base) {
+                            return;
+                        }
+                    } else if let Some((base, dir)) = open_path_command(&self.view.cmdline)
+                        .filter(|(_, arg)| Path::new(arg).is_dir())
+                    {
+                        // Opening a *directory* (`:e somedir`): pop the picker there
+                        // instead of letting the server show its netrw listing.
+                        if self.pick_open_at(base, dir) {
                             return;
                         }
                     } else {

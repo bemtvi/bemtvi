@@ -2,7 +2,9 @@
 //! as the public function the client uses. Black-box, no window, no GPU — the
 //! GUI analogue of `nxvim-tui`'s `keys` test.
 
-use nxvim_gui::{encode_key, is_paste, open_dialog_verb, parse_guifont, save_dialog_needed};
+use nxvim_gui::{
+    encode_key, is_paste, open_dialog_verb, open_path_command, parse_guifont, save_dialog_needed,
+};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 fn note(key: Key, mods: ModifiersState) -> Option<String> {
@@ -101,6 +103,47 @@ fn open_dialog_maps_o_commands_to_their_base_verb() {
     assert_eq!(open_dialog_verb("vnewo"), Some("vnew"));
     // Surrounding whitespace is ignored.
     assert_eq!(open_dialog_verb("  eo  "), Some("e"));
+}
+
+#[test]
+fn open_path_command_matches_only_the_open_family_with_an_arg() {
+    // The commands the server routes through `ex_edit` (where a directory argument
+    // opens netrw) — each maps to its canonical base verb, carrying the raw arg.
+    assert_eq!(open_path_command("e src"), Some(("e", "src")));
+    assert_eq!(open_path_command("edit src"), Some(("e", "src")));
+    assert_eq!(open_path_command("sp src"), Some(("sp", "src")));
+    assert_eq!(open_path_command("split src"), Some(("sp", "src")));
+    assert_eq!(open_path_command("vs src"), Some(("vs", "src")));
+    assert_eq!(open_path_command("vsplit src"), Some(("vs", "src")));
+    assert_eq!(open_path_command("tabe src"), Some(("tabe", "src")));
+    assert_eq!(open_path_command("tabedit src"), Some(("tabe", "src")));
+    assert_eq!(open_path_command("tabnew src"), Some(("tabe", "src")));
+    // A bang (`:e! dir`) is irrelevant to listing a directory; the verb still maps.
+    assert_eq!(open_path_command("e! src"), Some(("e", "src")));
+    // The argument is taken raw (vim's `:edit` parser keeps the whole tail) and
+    // surrounding whitespace is trimmed; a path with spaces stays intact.
+    assert_eq!(open_path_command("  e   my dir  "), Some(("e", "my dir")));
+}
+
+#[test]
+fn open_path_command_ignores_non_open_and_bare_commands() {
+    // Commands that legitimately take a directory but must NOT pop a file picker:
+    // changing the working directory, writing, grepping, setting an option, …
+    assert_eq!(open_path_command("cd src"), None);
+    assert_eq!(open_path_command("lcd src"), None);
+    assert_eq!(open_path_command("tcd src"), None);
+    assert_eq!(open_path_command("w src"), None);
+    assert_eq!(open_path_command("write src"), None);
+    assert_eq!(open_path_command("grep foo src"), None);
+    assert_eq!(open_path_command("set path=src"), None);
+    // A verb that merely starts with an open name is not one of them.
+    assert_eq!(open_path_command("earlier src"), None);
+    assert_eq!(open_path_command("spell src"), None);
+    // Bare forms carry no argument → handled by `open_dialog_verb`, not here.
+    assert_eq!(open_path_command("e"), None);
+    assert_eq!(open_path_command("sp"), None);
+    assert_eq!(open_path_command("e   "), None);
+    assert_eq!(open_path_command(""), None);
 }
 
 #[test]

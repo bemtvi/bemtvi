@@ -18,8 +18,8 @@ const LSP_MOCK_FLAG: &str = "--__lsp-mock";
 
 fn main() -> Result<()> {
     // Mock language server mode (debug builds only): a hermetic, scripted LSP
-    // server the test suite spawns instead of a real one. Like the worker, it
-    // never starts an editor. The script path follows the flag.
+    // server the test suite spawns instead of a real one. It never starts an
+    // editor; the script path follows the flag.
     #[cfg(debug_assertions)]
     if std::env::args().nth(1).as_deref() == Some(LSP_MOCK_FLAG) {
         let script = std::env::args().nth(2).unwrap_or_default();

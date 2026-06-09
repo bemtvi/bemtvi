@@ -380,7 +380,7 @@ fn register_vendored_modules(lua: &Lua) -> mlua::Result<()> {
 
 /// Generate a `take_*` accessor that drains one [`Shared`] queue with
 /// `mem::take`. Every queue is filled by the Lua FFI closures and emptied once
-/// per turn by the server's effect drain; all sixteen have the identical body, so
+/// per turn by the server's effect drain; all seventeen have the identical body, so
 /// it lives here once rather than being hand-copied (where it is easy to drain the
 /// wrong field). Each invocation still carries its own doc comment.
 macro_rules! take_queue {
@@ -1172,26 +1172,6 @@ impl LuaRuntime {
         set.call((bufnr, name, filetype))
     }
 
-    /// Refresh the Rust→Lua buffer mirror the buffer-read API resolves against
-    /// (Phase 6): `vim._bufs[bufnr] = { lines, name, loaded = true }` for every
-    /// open buffer, plus `vim._cur_cursor = { row, col }` (row 1-based, col 0-based,
-    /// neovim convention) and the current-window handle. The server pushes this
-    /// before running any Lua that can read buffer/cursor state, so synchronous
-    /// getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read live data
-    /// without reaching the `Server`. `set_lines` write-through mutates this same
-    /// mirror in Lua so a read-after-write within one chunk stays consistent.
-    ///
-    /// `bufs` is `(bufnr, lines, name)` per open buffer; `lines` may be empty when
-    /// the caller is only refreshing the cheap cursor/window fields (the server
-    /// gates the line arrays on `changedtick`), in which case the existing mirror
-    /// `lines` are kept.
-    /// `wins` is one [`WindowMirror`] per open window in layout order. `cur_win`
-    /// is the focused id and `next_win` the id the next `nvim_open_win` will mint
-    /// (so the Lua side can return the new handle synchronously while the real
-    /// window is created when the queued op drains). `mode` is the editor's
-    /// current `mode()` short code (`"n"`/`"i"`/`"v"`/…), stored as
-    /// `vim._cur_mode` so a `%{}` statusline expression reading `vim.fn.mode()`
-    /// reflects this frame.
     /// Serialize a mirror struct into the Lua table the `_set_*_mirror` receivers
     /// read. Disables mlua's array metatable so the result is a *plain* table —
     /// byte-identical to the hand-rolled `create_table()` tables these setters used
@@ -1202,6 +1182,22 @@ impl LuaRuntime {
         self.lua.to_value_with(value, opts)
     }
 
+    /// Refresh the Rust→Lua buffer mirror the buffer-read API resolves against
+    /// (Phase 6): `vim._bufs[bufnr] = { lines, name, loaded = true }` for every
+    /// open buffer, plus `vim._cur_cursor = { row, col }` (row 1-based, col 0-based,
+    /// neovim convention) and the current-window handle. The server pushes this
+    /// before running any Lua that can read buffer/cursor state, so synchronous
+    /// getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read live data
+    /// without reaching the `Server`. `set_lines` write-through mutates this same
+    /// mirror in Lua so a read-after-write within one chunk stays consistent.
+    ///
+    /// `bufs` is `(bufnr, lines, name)` per open buffer. `wins` is one
+    /// [`WindowMirror`] per open window in layout order, `win` the focused id, and
+    /// `next_win` the id the next `nvim_open_win` will mint (so the Lua side can
+    /// return the new handle synchronously while the real window is created when
+    /// the queued op drains). `mode` is the editor's current `mode()` short code
+    /// (`"n"`/`"i"`/`"v"`/…), stored as `vim._cur_mode` so a `%{}` statusline
+    /// expression reading `vim.fn.mode()` reflects this frame.
     #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,

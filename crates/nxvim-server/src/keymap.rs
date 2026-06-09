@@ -555,8 +555,8 @@ fn mode_key(mode: Mode) -> char {
 /// is **deferred**: nxvim has no
 /// operator-pending *mode* (a pending operator lives in private core state while
 /// `editor.mode == Normal`), so there is no trie to select it by — the normal-trie
-/// replay path already preserves `d{motion}`/`dgg`, and a true `omap` trie awaits a
-/// core accessor for the pending operator. An unknown code maps to nothing.
+/// replay path already preserves `d{motion}`/`dgg`, so a dedicated `omap` trie is
+/// deferred. An unknown code maps to nothing.
 fn mode_buckets(code: &str) -> &'static [char] {
     match code {
         "n" => &['n'],

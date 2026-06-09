@@ -414,7 +414,7 @@ pub(crate) fn encoding_of(caps: &ServerCapabilities) -> PositionEncoding {
 
 /// Reduce the protocol [`ServerCapabilities`] to the per-feature provider bools
 /// the editor surfaces as `client.server_capabilities`. Serializing once and
-/// probing the camelCase `*Provider` fields keeps all eleven uniform across the
+/// probing the camelCase `*Provider` fields keeps all thirteen uniform across the
 /// protocol's mix of `bool`/`OneOf`/options shapes: a provider counts as
 /// advertised when its field is present and not an explicit `false` (an options
 /// object — the common case — counts as supported).

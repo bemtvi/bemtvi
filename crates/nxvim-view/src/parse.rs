@@ -221,11 +221,6 @@ pub(crate) fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
         .unwrap_or_default()
 }
 
-/// Parse the per-row `diagnostics` payload: an array (one entry per visible
-/// row) of `[start_col, end_col, severity, style_id]` underline spans in screen
-/// columns. The trailing `style_id` indexes the frame's `styles` palette when
-/// the server resolved the `DiagnosticUnderline*` group through a colorscheme;
-/// `Nil` falls back to a built-in severity color in the client.
 /// Parse the `diagnostics_virt` redraw key into per-row optional inline
 /// decorations: each row is `Nil` (no virt text) or `[text, severity, style_id]`.
 /// Malformed entries decode to `None`, leaving that row undecorated.
@@ -309,6 +304,11 @@ pub(crate) fn parse_inlay_hints(value: Option<&Value>) -> Vec<Vec<InlayHint>> {
         .unwrap_or_default()
 }
 
+/// Parse the per-row `diagnostics` payload: an array (one entry per visible
+/// row) of `[start_col, end_col, severity, style_id]` underline spans in screen
+/// columns. The trailing `style_id` indexes the frame's `styles` palette when
+/// the server resolved the `DiagnosticUnderline*` group through a colorscheme;
+/// `Nil` falls back to a built-in severity color in the client.
 pub(crate) fn parse_diagnostics(value: Option<&Value>) -> Vec<Vec<DiagSpan>> {
     value
         .and_then(Value::as_array)

@@ -5,8 +5,9 @@
 //! named `"a`–`"z` (uppercase appends), and the black-hole `"_`. Every *routing*
 //! rule — which yank/delete lands in which register — lives here, so the
 //! operators that call in stay oblivious to register bookkeeping. Pure: no I/O,
-//! no Lua. (Read-only specials `"%` `".` `":` `"/`, the clipboard `"+` `"*`, and
-//! `"=` arrive in later phases.)
+//! no Lua. (The read-only specials `"%` `".` `":` `"/` and the clipboard `"+`
+//! `"*` are resolved from live editor state by [`Editor::register_text`], not
+//! stored here; only the expression register `"=` is not yet wired.)
 
 use std::collections::HashMap;
 

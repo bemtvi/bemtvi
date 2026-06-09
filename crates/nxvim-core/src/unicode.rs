@@ -13,8 +13,9 @@ use std::iter::Peekable;
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
-/// Width of a tab stop in cells. A constant until the options system (`:set
-/// tabstop`) exists.
+/// Default tab-stop width in cells — the fallback used where no buffer-local
+/// `tabstop` is in scope (e.g. panel rendering, some LSP column math). Buffer
+/// text uses [`crate::options::BufferOptions::effective_tabstop`] instead.
 pub const TABSTOP: usize = 8;
 
 /// Byte offset of the grapheme boundary immediately after `byte` (clamped to

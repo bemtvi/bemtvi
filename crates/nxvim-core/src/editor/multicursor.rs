@@ -12,8 +12,10 @@
 //! The headline operation is [`Editor::for_each_cursor`]: it runs an edit at the
 //! primary and every secondary, placing [`Editor::cursor`] at each in turn so the
 //! ordinary single-cursor effect helpers (`x`, an insert keystroke) work
-//! unchanged. This first slice wires up `<A-c>` (add a cursor below), the `x`
-//! delete, and insert-mode typing; `<Esc>` collapses back to one cursor.
+//! unchanged. `<A-c>` enters placement mode and drops a cursor at the current
+//! position (each repeat drops another); motions move only the primary, so you
+//! navigate and place. `<Esc>` then applies subsequent motions/edits to every
+//! cursor; a second `<Esc>` collapses back to one.
 
 use super::*;
 use crate::extmark::{ANCHOR_NS, CURSOR_NS};

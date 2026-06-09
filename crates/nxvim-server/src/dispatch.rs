@@ -394,8 +394,8 @@ impl Server {
             }
             "nxvim_resolve_capture" => {
                 // Debug hook: resolve a treesitter capture name through the
-                // `@`-group fallback chain to a concrete style (Phase 5 will use
-                // this in the redraw path). `Nil` when nothing matches.
+                // `@`-group fallback chain to a concrete style (the same
+                // resolution the redraw path uses). `Nil` when nothing matches.
                 let capture = text(params.first());
                 Ok(match self.editor.highlights.resolve_capture(&capture) {
                     Some(style) => style_value(&style),

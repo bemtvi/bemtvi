@@ -1,8 +1,9 @@
 //! The Lua runtime and the beginnings of the `vim.*` standard library.
 //!
-//! nxvim embeds Lua 5.1 (mlua's `lua51`, the dialect LuaJIT — and therefore
-//! neovim — is compatible with). Scripts run inside the *server*, exactly as in
-//! neovim, and influence the editor through the same mechanisms RPC clients use.
+//! nxvim embeds the Lua 5.1 dialect (mlua's `luajit` backend by default — the
+//! dialect neovim runs; `lua51` is a swappable alternative). Scripts run inside
+//! the *server*, exactly as in neovim, and influence the editor through the same
+//! mechanisms RPC clients use.
 //!
 //! The surface is split in two: editor-touching functions are installed from
 //! Rust ([`install`] — `vim.cmd`, `vim.api.nvim_command`/`nvim_echo`/`nvim_set_hl`,

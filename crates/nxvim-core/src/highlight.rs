@@ -14,7 +14,8 @@
 //! module is the resolution half — [`Highlights::resolve_capture`] walks the
 //! standard `@`-group fallback chain (`function.call` -> `@function.call` ->
 //! `@function` -> `Function`) so a theme that only defines `Function` still
-//! colors function calls. Painting itself lands later (design doc, Phase 5).
+//! colors function calls. The server resolves each capture on redraw and the
+//! client paints the resulting style.
 
 use std::collections::HashMap;
 
@@ -71,7 +72,7 @@ impl HlDef {
 }
 
 /// A fully resolved concrete style: every link followed, no aliases left. This
-/// is what the renderer paints (server resolves, client draws — design Phase 5).
+/// is what the renderer paints (server resolves, client draws).
 #[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
 pub struct Style {
     pub fg: Option<Rgb>,

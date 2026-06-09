@@ -1710,10 +1710,6 @@ impl Renderer {
     }
 }
 
-/// Split a tab-expanded row into `(text, color)` segments from its highlight
-/// spans; uncovered runs take the default `fg`. Columns are screen columns, so we
-/// slice by char index (== screen column for ASCII/tab text; wide-char fidelity
-/// is deferred). Pure, so it can run before the cache lookup keys off the result.
 /// The built-in diagnostic underline color for a severity (`1`=error … `4`=hint),
 /// used when no colorscheme defines `DiagnosticUnderline*`. Mirrors the TUI's
 /// `severity_color`.
@@ -1862,6 +1858,10 @@ fn gutter_cell(
     }
 }
 
+/// Split a tab-expanded row into `(text, color)` segments from its highlight
+/// spans; uncovered runs take the default `fg`. Columns are screen columns, so we
+/// slice by char index (== screen column for ASCII/tab text; wide-char fidelity
+/// is deferred). Pure, so it can run before the cache lookup keys off the result.
 pub fn row_segments(
     display: &str,
     hl: &[nxvim_view::HlSpan],
@@ -1892,7 +1892,7 @@ pub fn row_segments(
             Some(st) => {
                 // Reverse swaps fg/bg: the glyph takes the style's background (or
                 // the editor's `Normal` bg) and a foreground-colored quad behind it
-                // is painted by `push_attr_decorations`, so the run reads inverted.
+                // is painted by `push_reverse_fills`, so the run reads inverted.
                 let color = if st.reverse {
                     st.bg.unwrap_or(normal_bg)
                 } else {

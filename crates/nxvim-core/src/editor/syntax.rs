@@ -75,7 +75,7 @@ impl Editor {
         // end (so the `&mut self` echo doesn't collide with them).
         let mut load_failure: Option<String> = None;
 
-        // A fresh buffer, or one whose language changed (`:saveas` to another
+        // A fresh buffer, or one whose language changed (`:w other.ext` to a new
         // extension), needs a full open; its stale journal is superseded.
         if self.syntax_opened.get(&buf).map(String::as_str) != Some(language.as_str()) {
             let _ = buffer.take_edits();

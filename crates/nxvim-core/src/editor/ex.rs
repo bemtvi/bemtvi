@@ -259,9 +259,6 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
     (name, bang, args)
 }
 
-/// Parse a `:sleep` argument: `{n}` = seconds, `{n}m` = milliseconds, empty =
-/// 1 second (matching vim). Returns a vim-style `E475` error string for
-/// non-integer input.
 /// Parse a buffer-navigation count argument (`:bnext 2`). Empty / invalid / zero
 /// all mean 1, matching vim's default repeat count.
 fn parse_count_arg(args: &str) -> usize {
@@ -275,6 +272,9 @@ fn parse_opt_count_arg(args: &str) -> Option<usize> {
     args.trim().parse::<usize>().ok().filter(|n| *n > 0)
 }
 
+/// Parse a `:sleep` argument: `{n}` = seconds, `{n}m` = milliseconds, empty =
+/// 1 second (matching vim). Returns a vim-style `E475` error string for
+/// non-integer input.
 fn parse_sleep(args: &str) -> Result<u64, String> {
     let a = args.trim();
     if a.is_empty() {

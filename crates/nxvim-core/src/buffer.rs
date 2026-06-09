@@ -420,8 +420,9 @@ impl Buffer {
     }
 
     /// Mark that the whole rope was replaced (undo/redo, file reload), so any
-    /// pending deltas are moot and the consumer must re-sync from full text. Both
-    /// edit journals (syntax and LSP) are reset, so neither sends stale deltas.
+    /// pending deltas are moot and the consumer must re-sync from full text. All
+    /// three edit journals (syntax, LSP, and Lua-treesitter) are reset, so none
+    /// send stale deltas.
     pub fn mark_resync(&mut self) {
         self.edits.clear();
         self.lsp_edits.clear();

@@ -1,14 +1,23 @@
-//! `nxvim` entry point.
+//! `nxvim` entry point — the single binary, in either of two roles:
 //!
-//! Like `nvim`, the default invocation runs an *embedded* server: a headless
-//! editor on its own thread, and the terminal UI client on the main thread.
-//! They communicate over an in-process duplex stream using the exact same
-//! msgpack-RPC the editor would use for an external client — so the embedded
-//! and remote cases share one code path, and the server can never be blocked by
-//! UI rendering (it runs on a separate OS thread).
+//! - **default** (`nxvim [file]`): an *embedded* server (a headless editor on its
+//!   own thread) plus the terminal UI client on the main thread, over an
+//!   in-process duplex stream.
+//! - **`--server`** (`nxvim --server [file]`): just the headless server, speaking
+//!   msgpack-RPC over **stdin/stdout** and no UI. This is what a remote client
+//!   spawns over SSH (`ssh host nxvim --server`); the local `nxvim-gui` drives it
+//!   through the ssh pipe.
+//!
+//! Both roles run the *same* [`nxvim_server::run`]/[`run_io`] over the same RPC —
+//! the only difference is the transport (a duplex vs. this process's stdio), so
+//! the editor behaves identically whether embedded, headless, or remote.
 
 use anyhow::Result;
-use nxvim_server::{run as run_server, ServerInit};
+use nxvim_server::{run as run_server, run_io as run_server_io, ServerInit};
+
+/// Flag that runs this binary as the headless server over stdin/stdout (no UI) —
+/// the remote end of an SSH connection (`ssh host nxvim --server`).
+const SERVER_FLAG: &str = "--server";
 
 /// Internal, debug-only flag that runs this binary as a scripted mock language
 /// server (see `nxvim_lsp::mock`), used by the LSP test suite as a hermetic
@@ -27,8 +36,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Positional file argument, like `nvim file.txt`.
-    let file = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The file to open is the first non-flag argument (the same in either role).
+    let file = args.iter().find(|a| !a.starts_with('-')).cloned();
+
+    // Headless server role: RPC over this process's stdin/stdout, no UI. The
+    // client closing the pipe (EOF on stdin) winds the server down.
+    if args.iter().any(|a| a == SERVER_FLAG) {
+        return run_headless(file);
+    }
 
     // In-process, bidirectional transport between client and server.
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
@@ -83,6 +99,26 @@ fn main() -> Result<()> {
         std::process::exit(101); // Rust's conventional panic exit code
     }
     result
+}
+
+/// Run the headless server (`--server`) over this process's stdin/stdout until
+/// the client closes the pipe. No UI thread — the server owns the main thread's
+/// runtime directly. `default_runtime` reads *this* host's config/runtimepath, so
+/// over SSH it sources the remote machine's `init.lua`, plugins, and grammars.
+fn run_headless(file: Option<String>) -> Result<()> {
+    let (config_dir, runtimepath) = nxvim_server::default_runtime();
+    let init = ServerInit {
+        file,
+        config_dir,
+        runtimepath,
+        clipboard: nxvim_server::ClipboardProvider::System,
+        mouse_clock: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(run_server_io(tokio::io::stdin(), tokio::io::stdout(), init))
 }
 
 /// Best-effort human-readable text from a thread panic payload.

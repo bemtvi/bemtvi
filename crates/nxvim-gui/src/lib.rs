@@ -34,6 +34,7 @@
 
 mod input;
 mod mouse;
+pub mod remote;
 mod render;
 
 pub use input::{encode_key, is_paste};
@@ -149,15 +150,45 @@ impl GuiConfig {
 pub enum UserEvent {
     /// A decoded `redraw`: replace the view and repaint.
     Redraw(Box<View>),
+    /// A (re)connection came up: swap the App's live RPC handle to this server and
+    /// re-attach the UI. Sent for every connection *after* the first — the first
+    /// is handed over synchronously so the App can be built (see [`run`]).
+    Connected(Box<Rpc>),
     /// The server asked the UI to exit (`nxvim_exit`), or the connection closed.
     Exit,
 }
 
-/// Run the GUI client over a connected stream until the window closes or the
-/// server disconnects, rendering with `config`'s font. Must be called on the main
-/// thread (winit's requirement).
-pub fn run<S>(stream: S, config: GuiConfig, open_dir: Option<PathBuf>) -> Result<()>
+/// A bidirectional RPC transport the client drives: the in-process duplex (an
+/// embedded server) or an ssh child's stdio (a remote server). Boxed so the IO
+/// loop can swap between transports of *different concrete types* when the user
+/// `:connect`s to another host mid-session.
+trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
+
+/// Run the GUI client until the window closes or the server disconnects,
+/// rendering with `config`'s font. Must be called on the main thread (winit's
+/// requirement).
+///
+/// `connect_transport` is run *inside the IO thread's runtime* and yields the
+/// initial stream the RPC rides — a closure (not a ready stream) because a remote
+/// transport spawns an `ssh` child process whose pipes must be created on the
+/// same runtime that polls them. The embedded caller passes
+/// `|| async { Ok(duplex_end) }`; the SSH caller spawns `ssh` (see [`remote`]).
+/// A connect failure (e.g. `ssh` couldn't start) propagates back before any
+/// window opens.
+///
+/// After startup the App can `:connect` to a different remote host: it sends a
+/// [`remote::RemoteSpec`] on the reconnect channel, and the IO thread's session
+/// loop tears the current connection down and brings the new one up in place,
+/// keeping the same window.
+pub fn run<C, Fut, S>(
+    connect_transport: C,
+    config: GuiConfig,
+    open_dir: Option<PathBuf>,
+) -> Result<()>
 where
+    C: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<S>>,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -165,61 +196,114 @@ where
 
     // Shutdown signal: when the event loop exits — the window's close button, or a
     // server-sent `nxvim_exit` — the main thread notifies the IO thread so it
-    // drops the RPC connection. The IO thread (not `run`) owns `stream`, so unless
-    // it closes that, the embedded server never sees EOF, never winds down, and
-    // `main`'s `server_thread.join()` hangs forever — the close-button freeze.
+    // drops the RPC connection. The IO thread (not `run`) owns the stream, so
+    // unless it closes that, the server never sees EOF, never winds down, and
+    // `main`'s join hangs forever — the close-button freeze. (For an SSH
+    // transport, closing the stream also tears the `ssh` child down.)
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let io_shutdown = shutdown.clone();
 
-    // Hand the `Rpc` handle from the IO thread back to the main thread once the
-    // connection is up, so the winit side can fire input synchronously.
-    let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Rpc>();
+    // Hand the `Rpc` handle (or the connect error) from the IO thread back to the
+    // main thread once the connection is up, so the winit side can fire input
+    // synchronously — and so a failed connection surfaces before a window opens.
+    let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Result<Rpc>>();
+    // `:connect <spec>` from the App requests a switch to a different remote server.
+    let (reconnect_tx, mut reconnect_rx) =
+        tokio::sync::mpsc::unbounded_channel::<remote::RemoteSpec>();
     let io = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build client IO runtime");
         runtime.block_on(async move {
-            let (reader, writer) = tokio::io::split(stream);
-            let (rpc, mut incoming) = connect(reader, writer);
-            let _ = rpc_tx.send(rpc.clone());
-            loop {
-                tokio::select! {
-                    message = incoming.recv() => match message {
-                        Some(Incoming::Notification { method, params }) => match method.as_str() {
-                            "redraw" => {
-                                let view = View::from_redraw(&params);
-                                if proxy.send_event(UserEvent::Redraw(Box::new(view))).is_err() {
-                                    break; // event loop gone
+            // The initial transport (embedded duplex or first remote). Boxed so a
+            // later `:connect` can replace it with a transport of another type.
+            let mut stream: Box<dyn Transport> = match connect_transport().await {
+                Ok(stream) => Box::new(stream),
+                // Report the failure to the main thread and stop; no window opens.
+                Err(err) => {
+                    let _ = rpc_tx.send(Err(err));
+                    return;
+                }
+            };
+            let mut first = true;
+            'session: loop {
+                let (reader, writer) = tokio::io::split(stream);
+                let (rpc, mut incoming) = connect(reader, writer);
+                // Hand the new connection to the App: the first synchronously (so
+                // `App::new` has an `Rpc`); later ones as a `Connected` event that
+                // swaps the live handle and re-attaches the UI. Dropping the *old*
+                // session's `rpc`/`incoming` below — together with the App swapping
+                // its clone — is what lets the previous connection wind down.
+                if first {
+                    let _ = rpc_tx.send(Ok(rpc.clone()));
+                    first = false;
+                } else if proxy.send_event(UserEvent::Connected(Box::new(rpc.clone()))).is_err() {
+                    break; // event loop gone
+                }
+                loop {
+                    tokio::select! {
+                        message = incoming.recv() => match message {
+                            Some(Incoming::Notification { method, params }) => match method.as_str() {
+                                "redraw" => {
+                                    let view = View::from_redraw(&params);
+                                    if proxy.send_event(UserEvent::Redraw(Box::new(view))).is_err() {
+                                        break 'session; // event loop gone
+                                    }
                                 }
-                            }
-                            "nxvim_exit" => {
-                                let _ = proxy.send_event(UserEvent::Exit);
-                                break;
-                            }
-                            _ => {}
+                                "nxvim_exit" => {
+                                    let _ = proxy.send_event(UserEvent::Exit);
+                                    break 'session;
+                                }
+                                _ => {}
+                            },
+                            // Answer server-initiated requests with nil, like the TUI.
+                            Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
+                            None => break 'session, // connection closed → exit UI
                         },
-                        // Answer server-initiated requests with nil, like the TUI.
-                        Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
-                        None => break, // connection closed
-                    },
-                    // The UI exited: stop, so dropping the runtime below closes the
-                    // connection and the server winds down.
-                    _ = io_shutdown.notified() => break,
+                        // `:connect <spec>`: bring the new server up. On success,
+                        // restart the session on it (the old connection then winds
+                        // down); on failure, keep the current session and report why.
+                        spec = reconnect_rx.recv() => match spec {
+                            Some(spec) => match remote::connect(&spec).await {
+                                Ok(new_stream) => {
+                                    stream = Box::new(new_stream);
+                                    continue 'session;
+                                }
+                                Err(err) => eprintln!("nxvim-gui: :connect failed: {err:#}"),
+                            },
+                            None => break 'session, // App (the only sender) is gone
+                        },
+                        // The UI exited: stop, so dropping the runtime below closes
+                        // the connection and the server winds down.
+                        _ = io_shutdown.notified() => break 'session,
+                    }
                 }
             }
             // Tell the UI to exit if it hasn't already. Returning from this block
-            // drops the runtime, which aborts the connect tasks and closes
-            // `stream` — the EOF that lets the server (and `main`) finish.
+            // drops the runtime, which aborts the connect tasks and closes the
+            // stream — the EOF that lets the server (and `main`) finish.
             let _ = proxy.send_event(UserEvent::Exit);
         });
     });
 
-    let rpc = rpc_rx.recv()?;
-    let mut app = App::new(rpc, config, open_dir);
+    let rpc = match rpc_rx.recv() {
+        Ok(Ok(rpc)) => rpc,
+        // The transport failed to connect (e.g. `ssh` couldn't start, or the
+        // remote refused): surface it instead of opening a dead window.
+        Ok(Err(err)) => {
+            let _ = io.join();
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = io.join();
+            return Err(anyhow::anyhow!("client IO thread exited before connecting"));
+        }
+    };
+    let mut app = App::new(rpc, config, open_dir, reconnect_tx);
     event_loop.run_app(&mut app)?;
 
-    // The UI is done: stop the IO thread and wait for it, so `stream` is dropped
+    // The UI is done: stop the IO thread and wait for it, so the stream is dropped
     // (server sees EOF) before `main` joins the server thread.
     shutdown.notify_one();
     let _ = io.join();
@@ -369,12 +453,22 @@ struct App {
     /// the server's in-window listing — see [`Self::resumed`]. Taken on first use so
     /// it fires exactly once.
     open_dir: Option<PathBuf>,
+    /// Requests a `:connect <spec>` switch to a different remote server. The IO
+    /// thread brings the new connection up and feeds the swapped handle back as
+    /// [`UserEvent::Connected`] (see [`run`]).
+    reconnect: tokio::sync::mpsc::UnboundedSender<remote::RemoteSpec>,
 }
 
 impl App {
-    fn new(rpc: Rpc, config: GuiConfig, open_dir: Option<PathBuf>) -> Self {
+    fn new(
+        rpc: Rpc,
+        config: GuiConfig,
+        open_dir: Option<PathBuf>,
+        reconnect: tokio::sync::mpsc::UnboundedSender<remote::RemoteSpec>,
+    ) -> Self {
         Self {
             rpc,
+            reconnect,
             window: None,
             renderer: None,
             view: View::default(),
@@ -923,6 +1017,21 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            // A `:connect` brought up a new server: swap to its RPC handle (dropping
+            // the old one — the last clone, which lets the old connection wind down)
+            // and re-attach the UI. Clearing `reported` forces `report_size` to send
+            // a fresh `nvim_ui_attach`; resetting the view avoids painting the old
+            // server's buffer until the new one's first redraw arrives.
+            UserEvent::Connected(rpc) => {
+                self.rpc = *rpc;
+                self.view = View::default();
+                self.reported = (0, 0);
+                self.report_size(true);
+                self.apply_guifont();
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
             UserEvent::Exit => event_loop.exit(),
         }
     }
@@ -1004,6 +1113,16 @@ impl ApplicationHandler<UserEvent> for App {
                     && self.view.cmdline_prefix == ':'
                     && self.view.cmdline_prompt.is_empty()
                 {
+                    // `:connect [user@]host[:port][/file]` switches this window to a
+                    // remote server over SSH. It's a client affordance (the current
+                    // server knows nothing of it), so handle it here: dismiss the
+                    // command line on the current server and ask the IO thread to
+                    // bring the new connection up (see `UserEvent::Connected`).
+                    if let Some(spec) = remote::connect_command(&self.view.cmdline) {
+                        self.rpc.notify("nvim_input", vec![Value::from("<Esc>")]);
+                        let _ = self.reconnect.send(spec);
+                        return;
+                    }
                     if let Some(base) = open_dialog_verb(&self.view.cmdline) {
                         if self.pick_open(base) {
                             return;

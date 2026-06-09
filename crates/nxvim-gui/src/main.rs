@@ -1,19 +1,44 @@
 //! `nxvim-gui` entry point.
 //!
-//! Like the `nxvim` (TUI) binary, this runs an *embedded* server — a headless
-//! editor on its own thread — and a UI client on the main thread, joined by an
-//! in-process duplex stream over the exact same msgpack-RPC a remote client uses.
-//! The only difference from `nxvim` is the client: a native winit + wgpu window
-//! ([`nxvim_gui::run`]) instead of the terminal UI.
+//! Two ways to run, sharing one client:
+//!
+//! - **Embedded** (`nxvim-gui [file]`): like the `nxvim` TUI binary, a headless
+//!   server runs on its own thread, joined to the UI client over an in-process
+//!   duplex stream — the same msgpack-RPC a remote client uses.
+//! - **Remote** (`nxvim-gui [user@]host[:port] [file]`): the server runs on a
+//!   remote host reached over SSH ([`nxvim_gui::remote`]); only this thin client
+//!   is local. The editor state, Lua, LSP, and treesitter all live remote.
+//!
+//! Either way the client is the same native winit + wgpu window
+//! ([`nxvim_gui::run`]); only the transport it's handed differs.
 
 use anyhow::Result;
+use nxvim_gui::remote::RemoteSpec;
 use nxvim_gui::GuiConfig;
 use nxvim_server::{run as run_server, ServerInit};
 
 fn main() -> Result<()> {
-    // The positional file argument (like `nvim file.txt`) plus the font config
-    // (`--font`/`--font-size`, overriding the `NXVIM_GUI_FONT*` environment).
-    let (file, config) = parse_args();
+    // The positional arguments (first is the file *or* an SSH target; for a remote
+    // target the second is the remote file) plus the font config (`--font` /
+    // `--font-size`, overriding the `NXVIM_GUI_FONT*` environment).
+    let (positionals, config) = parse_args();
+
+    // A first positional shaped like `[user@]host[:port]` runs the editor on a
+    // remote host over SSH instead of embedding a local server. The second
+    // positional is then the file to open *there*.
+    if let Some(spec) = positionals.first().and_then(|a| RemoteSpec::parse(a)) {
+        let spec = spec.with_file(positionals.get(1).cloned());
+        // The transport is built inside the client's IO runtime (the ssh child's
+        // pipes must live on the runtime that polls them), so hand `run` a
+        // connector rather than a ready stream. No local server, no `open_dir`.
+        return nxvim_gui::run(
+            move || async move { nxvim_gui::remote::connect(&spec).await },
+            config,
+            None,
+        );
+    }
+
+    let file = positionals.into_iter().next();
 
     // A *directory* argument (`nxvim-gui somedir`) opens the system file picker at
     // that directory rather than the server's in-window netrw listing. So it is the
@@ -50,8 +75,13 @@ fn main() -> Result<()> {
         }
     });
 
-    // The GUI client owns the main thread (winit's event loop requirement).
-    let result = nxvim_gui::run(client_end, config, open_dir);
+    // The GUI client owns the main thread (winit's event loop requirement). The
+    // embedded transport is already built, so the connector just hands it over.
+    let result = nxvim_gui::run(
+        move || async move { anyhow::Ok(client_end) },
+        config,
+        open_dir,
+    );
 
     // When the client exits, the dropped stream signals the server to wind down.
     // Surface a server-thread panic as a non-zero exit, mirroring the TUI binary.
@@ -69,8 +99,11 @@ fn main() -> Result<()> {
 /// the file to open; `--font <name>` / `--font-size <pt>` (or the `=` form) set the
 /// font, taking precedence over the `NXVIM_GUI_FONT` / `NXVIM_GUI_FONT_SIZE`
 /// environment the config starts from. Unknown flags are ignored.
-fn parse_args() -> (Option<String>, GuiConfig) {
-    let mut file = None;
+///
+/// Positionals are returned in order: the first is the file *or* an SSH target,
+/// and (for a remote target) the second is the remote file — `main` decides which.
+fn parse_args() -> (Vec<String>, GuiConfig) {
+    let mut positionals = Vec::new();
     let mut config = GuiConfig::from_env();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -86,11 +119,11 @@ fn parse_args() -> (Option<String>, GuiConfig) {
             if let Some(size) = args.next() {
                 apply_font_size(&mut config, &size);
             }
-        } else if !arg.starts_with('-') && file.is_none() {
-            file = Some(arg);
+        } else if !arg.starts_with('-') {
+            positionals.push(arg);
         }
     }
-    (file, config)
+    (positionals, config)
 }
 
 /// Apply a `--font-size` value, warning (but not failing) on a non-numeric one.

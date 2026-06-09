@@ -313,6 +313,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, writer) = tokio::io::split(stream);
+    run_io(reader, writer, init).await
+}
+
+/// Run the server over **separate** read/write halves — the entry point for a
+/// transport whose two directions are distinct objects (the `nxvim --server`
+/// role's `stdin` + `stdout`), so it needn't `join` them only for [`run`] to
+/// `split` them straight back apart. [`run`] is the single-stream convenience
+/// over this.
+pub async fn run_io<R, W>(reader: R, writer: W, init: ServerInit) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (rpc, mut incoming) = connect(reader, writer);
 
     let mut editor = match init.file {

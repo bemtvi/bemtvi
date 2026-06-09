@@ -42,7 +42,7 @@ subsystems:
 | --------------- | ---------------------------------------------------- | -------------------------------------------------------------------- |
 | `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
-| `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
+| `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library; the `nxvim --server` role drives it over stdin/stdout for a remote SSH client. |
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime (LuaJIT by default, vendored PUC Lua 5.1 via the `lua51` feature) and the `vim.*` standard library. |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
 | `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
@@ -97,6 +97,21 @@ in-process [`tokio::io::duplex`] pipe. Because the boundary is the same RPC used
 for remote clients, the embedded and remote cases are *one code path*. Putting
 the server on a separate thread (with its own single-threaded runtime) means UI
 rendering can never stall editor processing, and vice versa.
+
+The **remote** case is the same RPC over a process/network boundary instead of a
+duplex. The single `nxvim` binary has a headless role — `nxvim --server` runs
+just the server speaking RPC over stdin/stdout (`nxvim_server::run_io`, the
+read/write-half entry point that `run` is the single-stream convenience over).
+The GUI client connects to a host over SSH — `nxvim-gui [user@]host[:port][/file]`,
+or `:connect …` from a running window — by spawning `ssh … nxvim --server` and
+driving the child's stdio as the transport (`crates/nxvim-gui/src/remote.rs`);
+the editor, Lua, LSP, and treesitter all run on the remote host, only the thin
+client is local. The GUI's IO thread runs a session loop that can swap the
+transport in place, so `:connect` tears the current connection down and brings a
+new one up without recreating the window. The connector hardens the spawn against
+argv/shell injection (rejects `-`-leading host/user, shell-quotes the remote
+command, `--`-terminates ssh options). See
+[the remote-SSH plan](plans/2026-06-09-remote-ssh-client.md).
 
 ### Async design
 
@@ -708,9 +723,11 @@ That claim is now load-bearing: **`nxvim-gui` is a native GUI client**
 the GUI sibling of `nxvim-tui` and reuses the same frontend-neutral
 [`nxvim-view`](../crates/nxvim-view) decode/input layer (`View`, `Style`, `Key`,
 `notation`, `encode_paste`) — the seam the view crate was extracted for. The
-`nxvim-gui` *binary* embeds a server on its own thread exactly like the `nxvim`
-binary, joined by the same in-process duplex RPC; the only difference is the
-client. winit owns the main thread (its loop is not async), so the RPC runs on a
+`nxvim-gui` *binary* embeds a server on its own thread exactly like the default
+`nxvim` binary, joined by the same in-process duplex RPC — or, given a
+`[user@]host` argument (or `:connect`), drives a *remote* `nxvim --server` over
+SSH instead (see [*Embedded vs. remote*](#embedded-vs-remote) above); the only
+difference from the TUI is the client. winit owns the main thread (its loop is not async), so the RPC runs on a
 separate IO thread that decodes each `redraw` into a `View` and forwards it to
 the event loop via an `EventLoopProxy`, while input goes the other way on a cloned
 `Rpc` handle (`notify` is synchronous, no runtime). Rendering is a monospace

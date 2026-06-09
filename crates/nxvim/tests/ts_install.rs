@@ -20,7 +20,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, message, mode,
-    serial_lock as test_lock, start_attached, write_temp,
+    serial_lock as test_lock, start_attached, window0_field, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -244,6 +244,30 @@ async fn wait_for_panel(
     panic!("timed out waiting for a panel line containing {needle:?}");
 }
 
+/// Total treesitter highlight spans across all rows in a redraw frame
+/// (`windows[0].highlights` is one array per row, each a list of spans).
+fn total_highlight_spans(map: &[(Value, Value)]) -> usize {
+    window0_field(map, "highlights")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().filter_map(Value::as_array).map(Vec::len).sum())
+        .unwrap_or(0)
+}
+
+/// Drive the loop until a redraw frame carries at least one highlight span, or
+/// time out (returning 0). Used to assert that a buffer open *before* its grammar
+/// existed lights up the instant the install lands — with no edit to bump the
+/// changedtick — i.e. that the install drops the server's highlight memo.
+async fn wait_for_highlights(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> usize {
+    for _ in 0..50 {
+        let _ = mode(rpc).await; // barrier: cycle the server loop + repaint
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| total_highlight_spans(m) > 0) {
+            return total_highlight_spans(&map);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    0
+}
+
 // ----- tests ----------------------------------------------------------------
 
 #[tokio::test]
@@ -284,6 +308,30 @@ async fn ts_install_compiles_grammar_and_enables_indent() {
     assert!(
         joined.contains("rust") && joined.contains("indents"),
         "TSInstallInfo panel missing rust/indents: {info:?}"
+    );
+}
+
+#[tokio::test]
+async fn ts_install_highlights_an_already_open_buffer_immediately() {
+    let _guard = test_lock().lock().await;
+    let (_data_dir, _mirror) = fixture("highlight");
+    // Open a .rs buffer *before* the grammar exists. The server memoizes the
+    // (empty) highlight spans keyed on (changedtick, viewport); neither changes on
+    // install, so without dropping that memo the buffer stays blank until the next
+    // edit/scroll/`:e`. Real neovim lights it up at once — so must we.
+    let file = write_temp("tsinstall_hl", "rs", "fn main() {\n    let x = 1;\n}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    feed(&rpc, ":TSInstall rust<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(msg.contains("rust"), "unexpected install message: {msg:?}");
+
+    // No edit, no scroll: highlighting must appear from the install alone.
+    let spans = wait_for_highlights(&rpc, &mut incoming).await;
+    assert!(
+        spans > 0,
+        "buffer open before :TSInstall got no highlights after the grammar landed \
+         (server highlight memo not invalidated on grammar reload)"
     );
 }
 

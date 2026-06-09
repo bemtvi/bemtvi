@@ -171,6 +171,12 @@ impl Server {
         match result {
             Ok(report) => {
                 self.editor.reload_ts_language(&report.lang);
+                // `reload_ts_language` re-opens open buffers in the *engine*, but the
+                // server's own highlight memo is keyed on (changedtick, viewport) —
+                // neither changes on install. Drop it (like `TsOp::SetQuery` does) so
+                // the next redraw re-queries the engine; otherwise a buffer opened
+                // before the grammar existed stays blank until the next edit/scroll.
+                self.syntax_states.clear();
                 let short = &report.revision[..report.revision.len().min(9)];
                 let queries = if report.queries.is_empty() {
                     "no queries".to_string()

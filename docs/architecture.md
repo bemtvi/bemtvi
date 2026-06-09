@@ -828,6 +828,42 @@ small `window.__nxvim` test hook — so a headless browser can drive open→edit
 without the native picker, which can't be scripted — alongside rendering and
 keyboard editing.
 
+### The web build — connecting to a real server over Socket.IO
+
+The serverless mode above is the editor *core* only. To get Lua, treesitter, and LSP
+in the browser, the **same WASM client** can instead drive a real `nxvim-server` over
+the network — without giving up the serverless mode. The browser can't open a tokio
+RPC connection (tokio's IO doesn't target wasm), so this rides two pieces:
+
+- **A second wasm handle, `RemoteClient`** (`crates/nxvim-web/src/remote.rs`), beside
+  `WebEditor` in the one cdylib. It does **synchronous** msgpack-RPC framing (no tokio):
+  outgoing encoders (`attach`/`key`/`input`/`paste`/`input_mouse`/`command`/`try_resize`/
+  `flush`) each return a `Vec<u8>` frame for JS to emit, and `feed(&[u8])` reassembles
+  inbound frames (mirroring `nxvim_rpc::reader_task`'s buffering, same `MAX_FRAME`/
+  `MAX_DEPTH`), decoding `redraw` into a `nxvim_view::View` — the same decoder the native
+  clients use, now brought to life (it's dead-stripped in serverless mode). `view_json()`
+  serializes the full server-styled `View` (palette, per-row highlights, diagnostics,
+  inlay hints, pmenu) so the renderer paints the *server's* highlighting, not the
+  client-side tree-sitter path.
+- **A bridge binary, `nxvim-web-bridge`** ([`crates/nxvim-web-bridge`](../crates/nxvim-web-bridge)),
+  a workspace member (unlike `nxvim-web` itself). It serves the built `web/` frontend —
+  **embedded into the binary** at compile time via `rust-embed` (read from disk in debug),
+  so one executable needs nothing else on disk — and carries the RPC. Transport is
+  **Socket.IO** (`socketioxide` on axum here, `socket.io-client` in the browser) for
+  reconnection / heartbeat / named-event framing over one channel. Each browser connection
+  spawns **its own `nxvim --server` child** (the single binary's headless role, §*Embedded
+  vs. remote*) and **byte-pumps** raw msgpack frames between the child's stdio and the
+  socket's binary `"rpc"` events — no re-framing on the wire; `RemoteClient::feed`
+  reassembles. The pump (`relay_connection`) is transport-agnostic — the Socket.IO layer
+  supplies an inbound channel and an `emit` callback — so it is tested against a real stub
+  child over real pipes, with the Socket.IO wire itself covered by a browser E2E. A
+  `/config.json` of `{"mode":"remote"}` (absent in a plain static host) is how the
+  frontend auto-detects which mode to boot; `?mode=local` forces serverless.
+
+A remote server has a real filesystem, so `:e`/`:w` are ordinary keystrokes there — no
+File System Access API needed in remote mode. The bridge is built in phases; see
+[`docs/plans/2026-06-09-remote-web-client-over-socketio.md`](plans/2026-06-09-remote-web-client-over-socketio.md).
+
 ---
 
 ## Testing philosophy

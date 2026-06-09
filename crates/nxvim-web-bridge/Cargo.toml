@@ -1,0 +1,33 @@
+[package]
+name = "nxvim-web-bridge"
+description = "Standalone server that serves the nxvim WASM web client and relays each browser's Socket.IO connection to a per-client `nxvim --server` child over stdio (Lua + treesitter + LSP, remotely)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# rt-multi-thread for `axum::serve`; the rest (process/io/net/sync) drive the
+# per-connection child and its stdio pump. The workspace feature set already has
+# process/io-util/net/sync/time/macros; this only adds the multi-thread runtime.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+# HTTP server (static assets + `/config.json`) and the Socket.IO transport layered
+# on top of it. socketioxide rides axum's router; binary frames flow as `bytes`.
+axum.workspace = true
+socketioxide.workspace = true
+bytes.workspace = true
+# The built web frontend (`../nxvim-web/web`) is embedded in release builds and read
+# from disk in debug; `mime_guess` resolves each asset's Content-Type.
+rust-embed.workspace = true
+mime_guess.workspace = true
+# `/config.json` payload (`{"mode":"remote"}`).
+serde_json.workspace = true
+
+[dev-dependencies]
+# Decode the relayed msgpack-RPC frames in the relay test; build the attach frame to send.
+rmpv.workspace = true
+# Blocking HTTP client for the static-asset / config.json tests.
+ureq.workspace = true

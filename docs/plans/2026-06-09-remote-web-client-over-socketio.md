@@ -119,7 +119,30 @@ the host target.
 `feed` split; two frames in one `feed`; corrupt prefix ⇒ `closed()`; `view_json()` carries
 styles/highlight/status; encoders decode back to the expected RPC arrays.
 
-## Phase 2 — the Socket.IO bridge crate (`crates/nxvim-web-bridge`)
+## Phase 2 — the Socket.IO bridge crate (`crates/nxvim-web-bridge`) — ✅ DONE
+
+> **Status: implemented.** Pinned `axum =0.8.9`, `socketioxide =0.18.3`, `bytes =1.11.1`,
+> `rust-embed =8.11.0`, `mime_guess =2.0.5`. The crate is `crates/nxvim-web-bridge`
+> (`lib.rs` = the relay + router, `main.rs` = arg-parse/serve, `build.rs` = the release
+> embed guard, `src/bin/stub_server.rs` = the test fixture). Two deviations from the
+> sketch below, both deliberate:
+>
+> 1. **The child is `nxvim --server`, not a standalone `nxvim-server` binary.** The
+>    headless server merged into `main` as the single `nxvim` binary's `--server` role
+>    (see architecture.md → *Embedded vs. remote*), so the bridge spawns `nxvim --server`.
+>    `$NXVIM_SERVER_BIN` points at the `nxvim` binary; the bridge appends `--server`.
+> 2. **The relay is factored out of the socket handler as `relay_connection`** (a
+>    transport-agnostic byte pump over an inbound channel + an `emit` callback). The
+>    Socket.IO event handlers are a thin wrapper that feeds it. This made the pump
+>    directly testable: `tests/bridge.rs` drives `relay_connection` against the real stub
+>    child over real OS pipes (input forwarded → reply pumped back → reassembled across a
+>    chunk split), plus HTTP-surface tests (`/config.json`, embedded `index.html`, 404)
+>    over real TCP via `ureq`. **The Socket.IO wire is *not* tested in Rust:** the
+>    `rust_socketio` 0.6 blocking client and `socketioxide` 0.18 don't interoperate at the
+>    engine.io polling handshake (each is CI'd against the JS reference, not the other), so
+>    the live socket round-trip is deferred to the Phase-5 Playwright E2E with the actual
+>    browser `socket.io-client`. The bridge's own Socket.IO setup is verified by hand
+>    (polling handshake → 200 + sid, ws upgrade → 101).
 
 New **workspace member** (add to root `Cargo.toml` `members`; inherits
 `[workspace.dependencies]`). New pins (confirm versions before pinning): `axum`,

@@ -687,6 +687,50 @@ async fn wall_writes_every_modified_buffer() {
 }
 
 #[tokio::test]
+async fn wall_warns_and_switches_to_a_buffer_changed_on_disk() {
+    let a = temp_file("a", "a1\n"); // buffer 1
+    let b = temp_file("b", "b1\n"); // buffer 2
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    feed(&rpc, "oAAA<Esc>");
+    command(&rpc, &format!("e {}", name(&b))).await;
+    feed(&rpc, "oBBB<Esc>");
+
+    // Someone rewrites buffer 1's file on disk behind our back.
+    std::fs::write(&a, "EXTERNAL\n").unwrap();
+
+    // `:wall` writes the buffers it safely can (b), but stops at the first one
+    // that changed on disk: it switches to that buffer and warns instead of
+    // clobbering it.
+    command(&rpc, "wall").await;
+    assert!(
+        message(&rpc, &mut incoming)
+            .await
+            .contains("changed on disk"),
+        "expected a clobber warning"
+    );
+    assert_eq!(current_buf(&rpc).await, 1, "must switch to the conflict");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "EXTERNAL\n",
+        "the conflicting file must be left untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "b1\nBBB\n",
+        "the non-conflicting buffer is still saved"
+    );
+
+    // `:wall!` forces every buffer through, clobbering the external change.
+    command(&rpc, "wall!").await;
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a1\nAAA\n");
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[tokio::test]
 async fn quit_warns_and_shows_a_modified_buffer_instead_of_losing_it() {
     // `:q` quits the editor only when nothing is unsaved; if a buffer is
     // modified it switches the window to that buffer and warns (E37), rather

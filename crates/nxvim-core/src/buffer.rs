@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use ropey::{LineType, Rope};
@@ -50,6 +51,33 @@ impl EditBatch {
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty() && !self.resync
     }
+}
+
+/// A snapshot of the buffer's file as nxvim last saw it on disk — captured when
+/// the file is read ([`Buffer::from_file`]) and refreshed after every successful
+/// [`Buffer::write`]. Comparing the live filesystem against it tells whether the
+/// file was changed by something *other* than this editor in the interim, so `:w`
+/// can refuse to clobber an outside edit (vim's `b_mtime` / `b_orig_size` pair).
+/// We track both mtime and size because either alone can miss a change (a same-
+/// length edit keeps the size; a coarse-resolution clock can repeat an mtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskState {
+    /// Last-modified time, when the platform/filesystem reports one.
+    mtime: Option<SystemTime>,
+    /// File length in bytes.
+    size: u64,
+}
+
+/// Stat `path` into a [`DiskState`], or `None` if it can't be stat'd (the file
+/// doesn't exist, or is otherwise inaccessible). A `None` here is itself a
+/// meaningful state — distinct from any `Some` — so a file that vanishes or
+/// appears registers as a change.
+fn disk_state(path: &Path) -> Option<DiskState> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(DiskState {
+        mtime: meta.modified().ok(),
+        size: meta.len(),
+    })
 }
 
 /// A text buffer.
@@ -133,6 +161,12 @@ pub struct Buffer {
     /// otherwise keeps the listing inert. Built by [`Buffer::from_dir`]; `None`
     /// for every ordinary file/scratch buffer.
     pub dir: Option<PathBuf>,
+    /// The file as last seen on disk (mtime + size), captured on read and
+    /// refreshed on each successful [`Buffer::write`]. Drives
+    /// [`Buffer::disk_changed`], which lets the editor refuse to overwrite a file
+    /// that changed underneath us. `None` until we observe an on-disk file (a
+    /// scratch buffer, or a `:e new-file` whose target doesn't exist yet).
+    disk: Option<DiskState>,
 }
 
 impl Default for Buffer {
@@ -159,6 +193,7 @@ impl Buffer {
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
+            disk: None,
         }
     }
 
@@ -188,6 +223,9 @@ impl Buffer {
             Rope::new()
         };
         ensure_trailing_newline(&mut text);
+        // Record what's on disk right now (mtime + size), so a later `:w` can tell
+        // if the file changed underneath us. `None` for a not-yet-existing file.
+        let disk = disk_state(path);
         Ok(Buffer {
             text,
             path: Some(path.to_path_buf()),
@@ -195,6 +233,7 @@ impl Buffer {
             options: crate::options::BufferOptions::default(),
             changedtick: 0,
             save_tick: 0,
+            disk,
             edits: Vec::new(),
             resync: false,
             lsp_edits: Vec::new(),
@@ -257,6 +296,9 @@ impl Buffer {
             lua_ts_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
+            // A directory listing is never written back to disk, so it needs no
+            // change tracking.
+            disk: None,
         })
     }
 
@@ -510,12 +552,31 @@ impl Buffer {
         let contents = self.text.to_string();
         write_atomic(&target, contents.as_bytes())?;
         let lines = self.line_count();
+        // Re-stat the file we just wrote so its mtime/size become the new baseline
+        // for [`disk_changed`]: after a save, *we* are what's on disk, so the very
+        // next `:w` shouldn't think the file changed underneath us.
+        self.disk = disk_state(&target);
         self.path = Some(target);
         self.modified = false;
         // Only on a successful write, so a consumer mirroring `save_tick` sees a
         // save exactly when the bytes reached disk (a failed write is no save).
         self.save_tick += 1;
         Ok((contents.len(), lines))
+    }
+
+    /// Whether the bound file changed on disk since nxvim last read or wrote it —
+    /// i.e. something *other* than this buffer touched it. Re-stats the file and
+    /// compares its mtime/size against the snapshot from the last read/write.
+    ///
+    /// A buffer with no path (scratch) never reports changed. A `None`↔`Some`
+    /// transition counts: a file that was deleted, or one that appeared where the
+    /// buffer expected none (a `:e new-file` whose name another process then
+    /// created), both register — in each case a blind `:w` would clobber.
+    pub fn disk_changed(&self) -> bool {
+        match self.path.as_deref() {
+            Some(path) => disk_state(path) != self.disk,
+            None => false,
+        }
     }
 }
 

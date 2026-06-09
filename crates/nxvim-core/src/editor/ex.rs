@@ -428,7 +428,7 @@ impl Editor {
         match name {
             "w" | "write" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
-                    self.ex_write(&a);
+                    self.ex_write(&a, bang);
                 }
             }
             "q" | "quit" => self.ex_quit(bang),
@@ -437,14 +437,14 @@ impl Editor {
                 // quit on the last window). A failed write leaves the buffer
                 // modified, so a last-window quit then reports it.
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
-                    self.ex_write(&a);
+                    self.ex_write(&a, bang);
                     self.ex_quit(bang);
                 }
             }
             "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
-            "wa" | "wall" => self.ex_write_all(),
+            "wa" | "wall" => self.ex_write_all(bang),
             "wqa" | "xa" | "xall" => {
-                self.ex_write_all();
+                self.ex_write_all(bang);
                 self.ex_quit_all(bang);
             }
             "e" | "edit" => {
@@ -1325,12 +1325,27 @@ impl Editor {
         }
     }
 
-    fn ex_write(&mut self, args: &str) {
+    fn ex_write(&mut self, args: &str, bang: bool) {
         let path = if args.is_empty() {
             None
         } else {
             Some(PathBuf::from(args))
         };
+        // Refuse to overwrite a file that changed on disk since we read or last
+        // saved it, unless forced with `:w!`. The guard only applies to a write to
+        // the buffer's *own* file — `:w other-name` targets a different file the
+        // buffer's disk snapshot says nothing about (that's E13 territory, not
+        // handled here). `:w!` skips the check and clobbers, as in vim.
+        let writes_own_file = match &path {
+            None => true,
+            Some(p) => self.buffer().path.as_deref() == Some(p.as_path()),
+        };
+        if !bang && writes_own_file && self.buffer().disk_changed() {
+            self.echo(
+                "WARNING: The file has changed on disk since editing started (add ! to override)",
+            );
+            return;
+        }
         match self.buffer_mut().write(path) {
             Ok((bytes, lines)) => {
                 // The current state is now what's on disk — undoing/redoing back
@@ -1632,17 +1647,43 @@ impl Editor {
     }
 
     /// `:wall` — write every modified buffer that has a file name.
-    fn ex_write_all(&mut self) {
+    ///
+    /// A buffer whose file changed on disk since we read it is *not* clobbered
+    /// (unless forced with `:wall!`): the safe buffers are still written, and the
+    /// conflicting ones skipped. If any was skipped we then switch to the *first*
+    /// such buffer and warn — the same way `:q` surfaces the buffer blocking a
+    /// quit — so the user lands on the file at risk rather than silently losing
+    /// the outside edit.
+    fn ex_write_all(&mut self, bang: bool) {
         let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
         let mut written = 0;
+        let mut conflict = None;
         for id in ids {
             let ob = self.buffers.get_mut(id);
-            if ob.buffer.modified && ob.buffer.path.is_some() && ob.buffer.write(None).is_ok() {
+            if !(ob.buffer.modified && ob.buffer.path.is_some()) {
+                continue;
+            }
+            if !bang && ob.buffer.disk_changed() {
+                // Don't clobber an outside edit; remember the first such buffer (ids
+                // ascend, so this is the lowest-numbered conflict) to surface below.
+                conflict.get_or_insert(id);
+                continue;
+            }
+            if self.buffers.get_mut(id).buffer.write(None).is_ok() {
                 // The written state is now the saved node (carries a save number).
                 self.mark_undo_saved(id);
                 written += 1;
             }
         }
-        self.echo(format!("{written} buffer(s) written"));
+        if let Some(id) = conflict {
+            // Surface the first at-risk buffer and warn (the switch clears the
+            // message, so set it afterwards); the safe buffers are already saved.
+            self.switch_buffer(id);
+            self.echo(
+                "WARNING: The file has changed on disk since editing started (add ! to override)",
+            );
+        } else {
+            self.echo(format!("{written} buffer(s) written"));
+        }
     }
 }

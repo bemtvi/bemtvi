@@ -285,6 +285,53 @@ async fn ex_write_persists_changes_to_disk() {
 }
 
 #[tokio::test]
+async fn ex_write_refuses_to_clobber_a_file_changed_on_disk() {
+    let path = temp_path("clobber");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    // An in-buffer edit, so there's something we'd be saving.
+    feed(&rpc, "Gomine<Esc>");
+
+    // Someone else rewrites the file on disk behind our back.
+    std::fs::write(&path, "EXTERNALLY CHANGED\n").unwrap();
+
+    // `:w` must refuse rather than silently clobber their changes...
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":w<CR>").await);
+    assert!(
+        msg.contains("changed on disk") && msg.contains("add ! to override"),
+        "expected a clobber warning, got: {msg:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "EXTERNALLY CHANGED\n",
+        "the on-disk file must be untouched by the refused write"
+    );
+
+    // ...but `:w!` forces it through, and afterwards the buffer is in sync with
+    // disk again (a second `:w` no longer trips the guard).
+    rpc.request("nvim_command", vec![Value::from("w!")])
+        .await
+        .expect("forced write");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "one\ntwo\nmine\n",
+        "`:w!` must overwrite despite the external change"
+    );
+
+    feed(&rpc, "obonus<Esc>");
+    rpc.request("nvim_command", vec![Value::from("w")])
+        .await
+        .expect("plain write after sync");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "one\ntwo\nmine\nbonus\n",
+        "after `:w!` re-synced disk state, a plain `:w` saves cleanly"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
 async fn lua_vim_cmd_drives_the_editor() {
     // A Lua chunk that opens a file should change what the buffer shows.
     let path = temp_path("lua");

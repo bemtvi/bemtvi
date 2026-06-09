@@ -16,14 +16,20 @@ WASM_BINDGEN_VERSION=0.2.123
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
-# 1. Rust + the wasm target. Netlify provisions Rust (RUST_VERSION) with rustup on
-#    PATH; install rustup ourselves only if a future image drops it.
+# 1. Rust toolchain + the wasm target. Netlify's image ships `rustup` but with no
+#    default toolchain configured, so we can't lean on it (or on RUST_VERSION) to
+#    provision one — install and select the toolchain explicitly. Pinned via
+#    RUST_VERSION in netlify.toml; defaults to stable. (Install rustup itself only
+#    if a future image drops it.)
+TOOLCHAIN="${RUST_VERSION:-stable}"
 if ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
+    | sh -s -- -y --default-toolchain none --profile minimal
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
 fi
+rustup toolchain install "$TOOLCHAIN" --profile minimal
+rustup default "$TOOLCHAIN"
 rustup target add wasm32-unknown-unknown
 
 # 2. wasm-bindgen CLI, pinned. Download the prebuilt binary (seconds) instead of

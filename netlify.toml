@@ -10,7 +10,9 @@
   publish = "crates/nxvim-web/web"
 
 [build.environment]
-  # Node for Tailwind + the tree-sitter vendoring script; Rust (provisioned by
-  # Netlify via rustup) for the wasm build. Pin both for reproducible deploys.
+  # Node (selected by Netlify) for Tailwind + the tree-sitter vendoring script.
   NODE_VERSION = "20"
+  # Rust toolchain version — read by netlify-build.sh, which installs/selects it
+  # via rustup (Netlify's image has rustup but no default toolchain, and doesn't
+  # provision RUST_VERSION itself). Pinned for reproducible deploys.
   RUST_VERSION = "1.83.0"

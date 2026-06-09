@@ -99,6 +99,20 @@ libloading = "=0.8.9"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-md = "=0.5.3"
 
+# `:TSInstall` grammar fetch + compile (nxvim-ts `install` module). All in-process
+# so a *prebuilt* nxvim needs no external curl/git/tar at runtime. `ureq` is the
+# blocking HTTP client over its bundled rustls (`tls`); rustls builds `ring` at
+# *build* time (a cc/perl compile, which whoever builds nxvim has) — the
+# runtime-no-compiler goal is about the end user, so this is fine, and it avoids
+# the manual TLS-connector wiring `native-tls` would need. GitHub source tarballs
+# are `.tar.gz` (`flate2` + `tar`); the fetched Zig toolchain ships `.tar.xz`
+# (`xz2`). `sha2` verifies the pinned Zig checksum before we execute it.
+ureq = { version = "=2.12.0", default-features = false, features = ["tls"] }
+tar = "=0.4.46"
+flate2 = "=1.1.9"
+xz2 = "=0.1.7"
+sha2 = "=0.10.9"
+
 # LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP
 # design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and
 # `$/cancelRequest`; lsp-types is the protocol type vocabulary.

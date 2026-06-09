@@ -112,6 +112,20 @@ impl Editor {
         }
     }
 
+    /// Re-resolve the grammar for `lang` after it was just installed
+    /// (`:TSInstall`). Evicts the engine's cached load verdict (so a prior "not
+    /// installed" becomes a fresh load), clears any one-shot load-failure latch,
+    /// and drops the per-buffer "opened in this language" markers so the next
+    /// highlight/indent sync re-opens each affected buffer against the new parser.
+    pub fn reload_ts_language(&mut self, lang: &str) {
+        if let Some(engine) = self.syntax.as_mut() {
+            engine.reload_grammar(lang);
+        }
+        self.syntax_failed.remove(lang);
+        self.syntax_opened
+            .retain(|_buf, opened| opened.as_str() != lang);
+    }
+
     /// The language the engine would highlight `buf` as, or `None` when there is
     /// nothing to parse. A `vim.treesitter.start` override wins (force a lang, or
     /// — `Some(None)` — explicitly stop); otherwise the path's extension decides.

@@ -135,8 +135,22 @@ gap. Recorded here so the sweep doesn't lose them.
   principle 2). `vim.fn.*` is a hand-written compatibility shim, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to
   build an evaluator.
-- **`:TSInstall`-style grammar fetch/compile.** Grammars load from the data dir;
-  installing them there is manual.
+- **`:TSInstall <lang>` grammar fetch/compile — implemented, with approximations.**
+  `:TSInstall` (and `:TSUpdate`, an alias; `:TSInstallInfo` lists what's
+  installed) fetches a grammar's source + queries
+  from **nvim-treesitter pinned to one commit** (`nxvim_ts::install`), compiles
+  `src/parser.c` (+ a `scanner.{c,cc}`) in-process, and drops `parser/<lang>.so`
+  + `queries/<lang>/` into the data dir; open buffers re-highlight/indent without
+  a manual `:e`. Approximations: (1) the compiler is `$NXVIM_CC` → a system
+  `cc`/`clang`/`gcc`/`zig` → a **pinned Zig** fetched + checksum-verified on
+  demand, so a user with no toolchain still works (Windows Zig — a `.zip` — isn't
+  auto-fetched yet; install a compiler or set `$NXVIM_CC`). (2) Grammars that need
+  `tree-sitter generate` (no committed `src/parser.c`) fail loud rather than
+  generating. (3) The nvim-treesitter ref is pinned in source (reproducible);
+  there's no `:TSInstall`-from-`HEAD`. A loaded real nvim-treesitter plugin keeps
+  its own `:TSInstall` — the native command defers to a registered user command.
+  An existing neovim `site/` is also searched read-only, so parsers you already
+  installed for nvim work with no `:TSInstall` at all.
 - **LSP semantic tokens — complete (Phases 1–3), with approximations.** A server
   that advertises `semanticTokensProvider` has its whole-buffer
   `textDocument/semanticTokens/full`(/`delta`) set decoded and painted *over* the

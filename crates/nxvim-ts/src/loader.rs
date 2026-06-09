@@ -224,6 +224,14 @@ fn is_valid_language(lang: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether a parser for `lang` is installed under `data_dir` (a `parser/<lang>.*`
+/// exists). Used by the engine to pick the effective root over the data-dir
+/// search path before loading. A bad name (which can't form a valid path) is
+/// simply "not here".
+pub fn has_parser(data_dir: &Path, lang: &str) -> bool {
+    is_valid_language(lang) && parser_path(data_dir, lang).is_some()
+}
+
 /// First existing `parser/<lang>.<ext>` over the platform's candidate
 /// extensions. `.so` is tried first on every OS because nvim-treesitter names
 /// its parsers `<lang>.so` even on macOS.

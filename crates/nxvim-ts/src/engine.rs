@@ -123,7 +123,13 @@ enum Slot {
 
 /// Owns every buffer's parse state and a lazily-populated grammar cache.
 pub struct Engine {
+    /// nxvim's own data dir — the writable root (where `:TSInstall` lands) and the
+    /// path query overrides resolve against. Always `roots[0]`.
     data_dir: PathBuf,
+    /// Grammar resolution search path: `data_dir` first, then read-only fallbacks
+    /// (an existing neovim `site/`). A grammar's parser *and* its queries are
+    /// loaded from the first root that has the parser, so the pair stays matched.
+    roots: Vec<PathBuf>,
     grammars: HashMap<String, Slot>,
     buffers: HashMap<BufferId, BufferState>,
     /// Query-text overrides from the resolution bridge, consulted by
@@ -133,8 +139,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(data_dir: PathBuf) -> Self {
+        let mut roots = vec![data_dir.clone()];
+        roots.extend(crate::extra_roots());
         Engine {
             data_dir,
+            roots,
             grammars: HashMap::new(),
             buffers: HashMap::new(),
             query_overrides: QueryOverrides::new(),
@@ -146,7 +155,16 @@ impl Engine {
     /// per language; later calls are a cache hit.
     fn grammar(&mut self, lang: &str) -> &Slot {
         if !self.grammars.contains_key(lang) {
-            let slot = match Grammar::load(&self.data_dir, lang, &self.query_overrides) {
+            // Pick the first search root that actually has this parser (its queries
+            // load from the same root); fall back to the writable data dir so a
+            // genuinely-missing grammar still reports NotInstalled from there.
+            let root = self
+                .roots
+                .iter()
+                .find(|r| crate::loader::has_parser(r, lang))
+                .cloned()
+                .unwrap_or_else(|| self.data_dir.clone());
+            let slot = match Grammar::load(&root, lang, &self.query_overrides) {
                 Ok(g) => Slot::Loaded(Box::new(g)),
                 Err(LoadError::NotInstalled) => Slot::NotInstalled,
                 Err(LoadError::Failed(e)) => Slot::Failed(format!("{e:#}")),
@@ -892,6 +910,14 @@ impl SyntaxEngine for Engine {
 
     fn close(&mut self, buffer: BufferId) {
         Engine::close(self, buffer);
+    }
+
+    fn reload_grammar(&mut self, lang: &str) {
+        // Drop the cached slot (Loaded/NotInstalled/Failed); the next `grammar()`
+        // re-resolves it from the search path — picking up a just-installed parser.
+        // Buffers already parsed under the old slot keep their state until the
+        // editor re-opens them (it drops `syntax_opened` markers in step).
+        self.grammars.remove(lang);
     }
 
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span> {

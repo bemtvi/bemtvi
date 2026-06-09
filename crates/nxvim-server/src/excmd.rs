@@ -86,6 +86,15 @@ impl Server {
                 // A fired autocmd may have queued `vim.cmd(...)` / callbacks.
                 self.apply_lua_effects();
             }
+            // `:TSInstall <lang>…` / `:TSUpdate <lang>…` — fetch + compile a
+            // treesitter grammar into the data dir (see `nxvim_ts::install`). The
+            // guard defers to a real nvim-treesitter plugin: if the user loaded one
+            // and it registered `:TSInstall`, this arm is skipped and the
+            // user-command arm below runs the plugin's instead (no silent shadow).
+            "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name) => self.ts_install(args),
+            // `:TSInstallInfo` — list the parsers installed across the search path.
+            // Same defer-to-plugin guard as the install commands.
+            "TSInstallInfo" if !self.lua.has_user_command(name) => self.ts_install_info(),
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor
@@ -96,6 +105,84 @@ impl Server {
             _ => self
                 .editor
                 .echo(format!("E492: Not an editor command: {name}")),
+        }
+    }
+
+    /// `:TSInstall <lang>…` — fetch + compile each named grammar into the data dir
+    /// off the editor thread. The work (network + a C compile) can take seconds, so
+    /// each language runs on a `spawn_blocking` worker; its result returns on the
+    /// `install_events` `select!` arm ([`Server::on_install_done`]). We echo a
+    /// "installing…" line now so the user sees the command took.
+    fn ts_install(&mut self, args: &str) {
+        let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+        if langs.is_empty() {
+            self.editor
+                .echo("TSInstall: usage: :TSInstall <language> [<language>…]");
+            return;
+        }
+        let data_dir = nxvim_ts::data_dir();
+        self.editor
+            .echo(format!("TSInstall: installing {}…", langs.join(", ")));
+        for lang in langs {
+            let tx = self.install_tx.clone();
+            let dir = data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = nxvim_ts::install::install(&dir, &lang);
+                // The receiver only drops at shutdown; a send error means we're
+                // exiting, so there's nothing to report to.
+                let _ = tx.send((lang, result));
+            });
+        }
+    }
+
+    /// `:TSInstallInfo` — open a panel listing every parser installed across the
+    /// data-dir search path (nxvim's own dir + a borrowed neovim `site/`), each
+    /// with the queries it ships and the root it resolves from. Installed parsers
+    /// only: the full installable catalog lives behind a network fetch we don't do
+    /// for a read-only info command.
+    fn ts_install_info(&mut self) {
+        let parsers = nxvim_ts::installed_parsers();
+        let mut lines = Vec::new();
+        if parsers.is_empty() {
+            lines.push("No treesitter parsers installed.".to_string());
+            lines.push(String::new());
+            lines.push("Install one with  :TSInstall <language>".to_string());
+        } else {
+            lines.push(format!("Installed treesitter parsers ({}):", parsers.len()));
+            lines.push(String::new());
+            for p in &parsers {
+                let queries = if p.queries.is_empty() {
+                    "(no queries)".to_string()
+                } else {
+                    p.queries.join(", ")
+                };
+                lines.push(format!("{:<14} {}", p.lang, queries));
+                lines.push(format!("{:<14} {}", "", p.root.display()));
+            }
+        }
+        self.editor.open_panel("TSInstall info", lines, false, 0);
+    }
+
+    /// Apply a finished `:TSInstall` job: on success, reload the grammar so every
+    /// open buffer of that language re-highlights / re-indents against the new
+    /// parser without a manual `:e`; on failure, echo the (loud) reason.
+    pub(crate) fn on_install_done(&mut self, outcome: crate::InstallOutcome) {
+        let (lang, result) = outcome;
+        match result {
+            Ok(report) => {
+                self.editor.reload_ts_language(&report.lang);
+                let short = &report.revision[..report.revision.len().min(9)];
+                let queries = if report.queries.is_empty() {
+                    "no queries".to_string()
+                } else {
+                    report.queries.join(", ")
+                };
+                self.editor.echo(format!(
+                    "TSInstall: installed {} @ {short} [{}] (queries: {queries})",
+                    report.lang, report.compiler
+                ));
+            }
+            Err(e) => self.editor.echo(format!("TSInstall: {lang} failed: {e:#}")),
         }
     }
 

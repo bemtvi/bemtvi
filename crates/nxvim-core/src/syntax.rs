@@ -67,6 +67,11 @@ pub trait SyntaxEngine {
     /// Forget a buffer's parse state (the editor deleted it).
     fn close(&mut self, buffer: BufferId);
 
+    /// Drop any cached load result for `lang` so the next `open` re-resolves the
+    /// grammar from disk. Called after `:TSInstall` writes a new parser, turning a
+    /// cached "not installed" verdict back into a fresh load attempt.
+    fn reload_grammar(&mut self, lang: &str);
+
     /// Highlight spans for the line range `[first, last)`.
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span>;
 

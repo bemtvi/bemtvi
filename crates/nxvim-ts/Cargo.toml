@@ -25,3 +25,9 @@ tree-sitter.workspace = true
 streaming-iterator.workspace = true
 libloading.workspace = true
 mlua = { workspace = true, optional = true }
+# `:TSInstall` grammar fetch + compile (src/install.rs).
+ureq.workspace = true
+tar.workspace = true
+flate2.workspace = true
+xz2.workspace = true
+sha2.workspace = true

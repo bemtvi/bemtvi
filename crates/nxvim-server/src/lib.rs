@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use treesitter::SyntaxState;
 
 /// Startup options for the server.
@@ -293,7 +294,17 @@ struct Server {
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
     feed_buffer: VecDeque<(Key, bool)>,
+    /// Sender half handed to each `:TSInstall` background job (a `spawn_blocking`
+    /// that fetches + compiles a grammar off the editor thread). Completions return
+    /// on the matching `select!` arm, where the editor reloads the grammar and
+    /// echoes the result — see [`Server::on_install_done`].
+    install_tx: UnboundedSender<InstallOutcome>,
 }
+
+/// A finished `:TSInstall` job: the requested language and the install result
+/// (the report, or a loud error). Delivered from the blocking worker to the
+/// server's `select!` loop.
+type InstallOutcome = (String, anyhow::Result<nxvim_ts::install::InstallReport>);
 
 /// Run the server over a connected stream until the client disconnects or the
 /// editor quits.
@@ -330,6 +341,9 @@ where
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     let (lsp, mut lsp_events) = LspManager::new();
     let (evloop, mut loop_events) = EventLoop::new();
+    // `:TSInstall` runs the fetch+compile off-thread (`spawn_blocking`); results
+    // come back here and are applied on the one server thread.
+    let (install_tx, mut install_events) = unbounded_channel::<InstallOutcome>();
 
     let mut server = Server {
         editor,
@@ -372,6 +386,7 @@ where
         pending_ui_input: None,
         pending_getchar: None,
         feed_buffer: VecDeque::new(),
+        install_tx,
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -498,6 +513,16 @@ where
                 // into one settle + repaint, like the syntax/LSP arms.
                 while let Ok(event) = loop_events.try_recv() {
                     server.on_loop_event(event);
+                }
+                server.settle_events(true);
+            }
+            // A `:TSInstall` background job finished (grammar fetched + compiled, or
+            // it failed). Apply on the server thread: reload the grammar so open
+            // buffers re-highlight/indent, and echo the outcome.
+            Some(outcome) = install_events.recv() => {
+                server.on_install_done(outcome);
+                while let Ok(outcome) = install_events.try_recv() {
+                    server.on_install_done(outcome);
                 }
                 server.settle_events(true);
             }

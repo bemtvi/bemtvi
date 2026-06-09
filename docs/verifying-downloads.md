@@ -39,6 +39,6 @@ codesign -dv --verbose=4 nxvim
 spctl -a -t exec -vv nxvim
 ```
 
-The binaries are not stapled (Apple does not support stapling a notarization ticket to a
+The TUI binary is not stapled (Apple does not support stapling a notarization ticket to a
 standalone executable), so the `spctl` check performs an online verification. A terminal
 install (`curl … | tar xz`) sets no quarantine attribute and runs offline regardless.

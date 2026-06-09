@@ -9,7 +9,7 @@ local vim = vim
 
 -- vim._notimpl(name): the loud-failure funnel for not-yet-implemented surface.
 -- Records `name` into vim._notimpl_hits (a set, so a future `:checkhealth` /
--- `vim.lsp._report` can enumerate which gaps a real config actually hit) and
+-- `vim._report` can enumerate which gaps a real config actually hit) and
 -- raises a named error. A stub that quietly returns a fake/empty value makes a
 -- broken server look configured; routing every hollow stub through here turns
 -- "we think it works" into a concrete, trackable list of what to build (the

@@ -563,7 +563,7 @@ interpreting:
   migrating them behind `nvim_input_mouse` is a clean follow-up once the server
   models those regions, not a blocker.
 
-**Future GUI** ([architecture.md → Cross-platform & the future GUI](../architecture.md#cross-platform--the-future-gui))
+**The GUI** ([architecture.md → Cross-platform & the GUI](../architecture.md#cross-platform--the-gui))
 converts pixel → cell (divide by the glyph cell size, with sub-cell precision
 discarded) and calls the **same** `nvim_input_mouse`. No server changes — the
 whole point of server-side hit-testing is that the GUI is the TUI with a

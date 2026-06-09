@@ -2,7 +2,7 @@
 //! loud. Instead of returning a fake/empty value that makes a broken server look
 //! configured, a not-yet-implemented function raises `nxvim: not implemented:
 //! <name>` and records `<name>` in `vim._notimpl_hits` (the running scoreboard a
-//! future `:checkhealth` / `vim.lsp._report` enumerates).
+//! future `:checkhealth` / `vim._report` enumerates).
 
 use nxvim_lua::LuaRuntime;
 

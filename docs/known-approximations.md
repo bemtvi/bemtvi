@@ -33,10 +33,13 @@ grep -rn 'INCOMPLETE:' crates/
 grep -rn 'vim\._notimpl(' crates/nxvim-lua/src/prelude/
 ```
 
-At runtime, every loud gap a real config trips is recorded in the
-`vim._notimpl_hits` set and enumerated by `vim.lsp._report()` (and a future
-`:checkhealth`) — so you can see exactly which gaps *a given config* hit, not
-just which exist.
+At runtime, every loud gap a real config trips is recorded in the global
+`vim._notimpl_hits` set (populated by `vim._notimpl` wherever it fires —
+`vim.fn`, `vim.uv`, the LSP layer, …), so you can see exactly which gaps *a given
+config* hit, not just which exist: inspect it directly
+(`:lua print(vim.inspect(vim._notimpl_hits))`), or via the future `:checkhealth`.
+The runtime scoreboard `vim._report()` also surfaces it as its `notimpl_hits`
+field, alongside the LSP-specific status.
 
 When you implement one: delete its `INCOMPLETE:` tag (or its `vim._notimpl`
 raise). If it's one of the subsystems below, update this file too.

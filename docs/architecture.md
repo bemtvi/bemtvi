@@ -592,8 +592,8 @@ autocmd. This is enough to run the **real, unmodified
 [catppuccin](https://github.com/catppuccin/nvim)** colorscheme: dropped onto the
 runtimepath, its `setup()` compiles the highlight table to Lua bytecode under
 `stdpath("cache")` and `load()` populates the highlight registry via
-`nvim_set_hl` — the same mechanics as under neovim. See
-[`docs/getting-started.md`](getting-started.md) to set it up.
+`nvim_set_hl` — the same mechanics as under neovim. See the
+[README](../README.md#configuration) to set it up.
 
 ---
 
@@ -691,7 +691,7 @@ the extmark highlight layer rather than into core's synchronous path.
 
 ---
 
-## Cross-platform & the future GUI
+## Cross-platform & the GUI
 
 nxvim targets all major OSes (Linux, macOS, Windows). The dependency choices are
 deliberately portable: `crossterm` for the terminal, `ropey`, `tokio`, and
@@ -703,7 +703,7 @@ Because every front end is just a client of nxvim's own RPC, a **native GUI** �
 notably a non-terminal GUI on Windows — is just another client crate consuming
 the same `View` protocol, with zero changes to the server or core.
 
-That claim is now load-bearing: **`nxvim-gui` is a prototype native GUI client**
+That claim is now load-bearing: **`nxvim-gui` is a native GUI client**
 ([`crates/nxvim-gui`](../crates/nxvim-gui)) on **winit + wgpu + glyphon**. It is
 the GUI sibling of `nxvim-tui` and reuses the same frontend-neutral
 [`nxvim-view`](../crates/nxvim-view) decode/input layer (`View`, `Style`, `Key`,

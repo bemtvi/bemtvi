@@ -295,7 +295,7 @@ vim._lsp_enabled = vim._lsp_enabled or {}         -- name -> enabled?
 
 -- Phase 1 visibility surfaces: a config that errors at load, and a server skipped
 -- at start, are recorded here (keyed by name, so a re-resolve never duplicates)
--- instead of silently degrading to `{}` / a bare `return`. `vim.lsp._report`
+-- instead of silently degrading to `{}` / a bare `return`. `vim._report`
 -- reads them back. See docs/plans/2026-06-05-lsp-completion.md (Phase 1).
 vim._lsp_load_errors = vim._lsp_load_errors or {} -- name -> load error message
 vim._lsp_skipped = vim._lsp_skipped or {}         -- name -> skip reason
@@ -321,7 +321,7 @@ end
 -- Errors raised inside a config's lifecycle hook (`before_init` / `on_init` /
 -- `on_exit`), keyed by "name:hook" → message. A hook that throws (e.g. one that
 -- reaches a Phase-0 gap like `vim.uv`) must not wedge the start/exit path, but the
--- failure is recorded and echoed, never swallowed. Surfaced by vim.lsp._report.
+-- failure is recorded and echoed, never swallowed. Surfaced by vim._report.
 vim._lsp_hook_errors = vim._lsp_hook_errors or {}
 local function lsp_record_hook_error(name, hook, err)
   local key = (name or "?") .. ":" .. hook
@@ -476,16 +476,17 @@ end
 
 vim.lsp.get_active_clients = vim.lsp.get_clients
 
--- vim.lsp._report(): the Phase-1 scoreboard — a snapshot of what the LSP layer is
--- doing and where it fell short, so no failure stays silent. `enabled` lists the
+-- vim._report(): the runtime scoreboard — a snapshot of what the LSP layer is
+-- doing and where it fell short (plus the global not-implemented hits, which are
+-- not LSP-specific), so no failure stays silent. `enabled` lists the
 -- configs marked for auto-activation; `started` the servers that reached
 -- `initialize` (the live clients); `load_errors` the configs that failed to load
 -- (name -> message); `skipped` the servers whose cmd didn't resolve to a
 -- spawnable argv (name -> reason); `notimpl_hits` the not-implemented functions a
 -- real config actually called (the Phase-0 set). A `:LspInfo`-style command can
--- render this later; for now it backs `:lua print(vim.inspect(vim.lsp._report()))`
+-- render this later; for now it backs `:lua print(vim.inspect(vim._report()))`
 -- and the tests.
-function vim.lsp._report()
+function vim._report()
   local enabled = {}
   for name, on in pairs(vim._lsp_enabled) do
     if on then enabled[#enabled + 1] = name end

@@ -14,5 +14,6 @@
   NODE_VERSION = "20"
   # Rust toolchain version — read by netlify-build.sh, which installs/selects it
   # via rustup (Netlify's image has rustup but no default toolchain, and doesn't
-  # provision RUST_VERSION itself). Pinned for reproducible deploys.
-  RUST_VERSION = "1.83.0"
+  # provision RUST_VERSION itself). Pinned to the toolchain this builds with; must
+  # be >= 1.85 (a transitive dep, rmpv, requires the edition2024 Cargo feature).
+  RUST_VERSION = "1.96.0"

@@ -154,6 +154,94 @@ fn split_global(body: &str, delim: char) -> (String, String) {
     (pat, String::new())
 }
 
+/// The directory part of `f` (vim's `:h` modifier): everything up to the last
+/// `/`. No slash → `.` (the current directory); a single leading `/` → `/`.
+fn fmod_head(f: &str) -> String {
+    match f.rfind('/') {
+        None => ".".to_string(),
+        Some(0) => "/".to_string(),
+        Some(p) => f[..p].to_string(),
+    }
+}
+
+/// The last path component of `f` (vim's `:t` modifier).
+fn fmod_tail(f: &str) -> String {
+    match f.rfind('/') {
+        Some(p) => f[p + 1..].to_string(),
+        None => f.to_string(),
+    }
+}
+
+/// `f` with the last extension of its tail component stripped (vim's `:r`
+/// modifier). A leading dot is *not* an extension (`.bashrc:r` == `.bashrc`).
+fn fmod_root(f: &str) -> String {
+    let (dir, tail) = match f.rfind('/') {
+        Some(p) => (&f[..=p], &f[p + 1..]),
+        None => ("", f),
+    };
+    let cut = tail
+        .char_indices()
+        .rev()
+        .find(|&(idx, c)| c == '.' && idx >= 1)
+        .map(|(idx, _)| idx);
+    match cut {
+        Some(idx) => format!("{dir}{}", &tail[..idx]),
+        None => f.to_string(),
+    }
+}
+
+/// The extension of `f` (vim's `:e` modifier), or `""` when the tail has none. A
+/// run of `k` consecutive `:e` widens it to the last `k` dot-separated components
+/// (capped at the count present) — vim's quirk, mirrored from `vim.fn.fnamemodify`.
+fn fmod_ext(f: &str, k: usize) -> String {
+    let tail = fmod_tail(f);
+    let dots: Vec<usize> = tail
+        .char_indices()
+        .filter(|&(idx, c)| c == '.' && idx >= 1)
+        .map(|(idx, _)| idx)
+        .collect();
+    if dots.is_empty() {
+        return String::new();
+    }
+    let idx = dots.len().saturating_sub(k);
+    tail[dots[idx] + 1..].to_string()
+}
+
+/// Apply a validated run of filename modifiers (`h`/`t`/`r`/`e` letters, the `:`
+/// already stripped) to `fname`, left to right. Consecutive `e`s collapse into a
+/// single widened [`fmod_ext`] call.
+fn apply_file_mods(fname: &str, mods: &[char]) -> String {
+    let mut fname = fname.to_string();
+    let mut i = 0;
+    while i < mods.len() {
+        match mods[i] {
+            'h' => {
+                fname = fmod_head(&fname);
+                i += 1;
+            }
+            't' => {
+                fname = fmod_tail(&fname);
+                i += 1;
+            }
+            'r' => {
+                fname = fmod_root(&fname);
+                i += 1;
+            }
+            'e' => {
+                let mut k = 0;
+                while i < mods.len() && mods[i] == 'e' {
+                    k += 1;
+                    i += 1;
+                }
+                fname = fmod_ext(&fname, k);
+            }
+            // Only the four pure modifiers reach here; the parser rejects the rest.
+            _ => i += 1,
+        }
+    }
+    fname
+}
+
 /// Split an ex-command into `(name, bang, args)`.
 fn split_ex(cmd: &str) -> (&str, bool, &str) {
     let bytes = cmd.as_bytes();
@@ -203,6 +291,100 @@ fn parse_sleep(args: &str) -> Result<u64, String> {
 }
 
 impl Editor {
+    /// The current buffer's file name as typed (vim's `%`), or `None` when the
+    /// buffer is unnamed.
+    fn current_file_name(&self) -> Option<String> {
+        self.buffer()
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The alternate buffer's file name (vim's `#`), or `None` when there is no
+    /// alternate or it is unnamed.
+    fn alternate_file_name(&self) -> Option<String> {
+        let id = self.alternate?;
+        self.buffers
+            .map
+            .get(&id)?
+            .buffer
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Expand the `%` (current file) and `#` (alternate file) tokens in a file
+    /// argument, each optionally followed by a run of `:` filename modifiers
+    /// (`:h` head, `:t` tail, `:r` root, `:e` extension). `\%` / `\#` are literal.
+    /// A `:` not introducing a known modifier ends the run and stays literal.
+    ///
+    /// Returns the rewritten argument, or a vim-style error string when a token
+    /// has no name to substitute, or when an env-dependent modifier (`:p` / `:~` /
+    /// `:.`) is used — those need the working directory / `$HOME`, which the pure
+    /// core deliberately can't read, so they fail loud rather than mis-expand.
+    fn expand_file_arg(&self, arg: &str) -> Result<String, String> {
+        let chars: Vec<char> = arg.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            // `\%` / `\#` insert a literal `%` / `#`.
+            if c == '\\' && matches!(chars.get(i + 1), Some('%') | Some('#')) {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c != '%' && c != '#' {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let name = if c == '%' {
+                self.current_file_name()
+                    .ok_or_else(|| "E499: Empty file name for '%'".to_string())?
+            } else {
+                self.alternate_file_name().ok_or_else(|| {
+                    "E194: No alternate file name to substitute for '#'".to_string()
+                })?
+            };
+            i += 1;
+            // Consume a run of `:x` modifiers immediately following the token.
+            let mut mods = Vec::new();
+            while chars.get(i) == Some(&':') {
+                match chars.get(i + 1) {
+                    Some(&m @ ('h' | 't' | 'r' | 'e')) => {
+                        mods.push(m);
+                        i += 2;
+                    }
+                    Some(&m @ ('p' | '~' | '.')) => {
+                        return Err(format!(
+                            "E499: ':{m}' filename modifier is not supported in \
+                             command-line expansion (needs the working directory)"
+                        ));
+                    }
+                    // A `:` that isn't a modifier ends the run; it stays literal.
+                    _ => break,
+                }
+            }
+            out.push_str(&apply_file_mods(&name, &mods));
+        }
+        Ok(out)
+    }
+
+    /// Expand `%`/`#` in a file argument for dispatch, echoing and returning `None`
+    /// on a bad expansion so the caller aborts the command (vim's behavior).
+    fn expand_file_arg_or_echo(&mut self, arg: &str) -> Option<String> {
+        match self.expand_file_arg(arg) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                self.echo(e);
+                None
+            }
+        }
+    }
+
     pub(crate) fn execute_ex(&mut self, raw: &str) {
         let cmd = raw.trim();
         if cmd.is_empty() {
@@ -244,14 +426,20 @@ impl Editor {
 
         let (name, bang, args) = split_ex(rest);
         match name {
-            "w" | "write" => self.ex_write(args),
+            "w" | "write" => {
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_write(&a);
+                }
+            }
             "q" | "quit" => self.ex_quit(bang),
             "wq" | "x" | "xit" | "exit" => {
                 // Write the current buffer, then `:q` it (close the window, or
                 // quit on the last window). A failed write leaves the buffer
                 // modified, so a last-window quit then reports it.
-                self.ex_write(args);
-                self.ex_quit(bang);
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_write(&a);
+                    self.ex_quit(bang);
+                }
             }
             "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
             "wa" | "wall" => self.ex_write_all(),
@@ -259,16 +447,32 @@ impl Editor {
                 self.ex_write_all();
                 self.ex_quit_all(bang);
             }
-            "e" | "edit" => self.ex_edit(args, bang),
+            "e" | "edit" => {
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_edit(&a, bang);
+                }
+            }
             "ene" | "enew" => self.ex_enew(),
-            "sp" | "spl" | "split" => self.ex_split(SplitDir::Horizontal, args),
-            "vs" | "vsp" | "vsplit" | "vspl" => self.ex_split(SplitDir::Vertical, args),
+            "sp" | "spl" | "split" => {
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_split(SplitDir::Horizontal, &a);
+                }
+            }
+            "vs" | "vsp" | "vsplit" | "vspl" => {
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_split(SplitDir::Vertical, &a);
+                }
+            }
             "new" => self.ex_new(SplitDir::Horizontal),
             "vne" | "vnew" => self.ex_new(SplitDir::Vertical),
             "clo" | "close" => self.close_window(),
             "hid" | "hide" => self.close_window(),
             "on" | "only" => self.only_window(),
-            "tabnew" | "tabe" | "tabed" | "tabedit" => self.ex_tabnew(args),
+            "tabnew" | "tabe" | "tabed" | "tabedit" => {
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_tabnew(&a);
+                }
+            }
             "tabc" | "tabclo" | "tabclose" => self.close_tab_cmd(args),
             "tabo" | "tabonly" => self.tab_only(),
             "tabm" | "tabmo" | "tabmove" => self.move_tab(args),
@@ -279,7 +483,11 @@ impl Editor {
             "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
             "tabl" | "tablast" => self.goto_tab_next(Some(self.tabs.len())),
             "tab" => self.ex_tab(args),
-            "dr" | "dro" | "drop" => self.ex_drop(args, false),
+            "dr" | "dro" | "drop" => {
+                if let Some(a) = self.expand_file_arg_or_echo(args) {
+                    self.ex_drop(&a, false);
+                }
+            }
             "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
             "vert" | "vertical" | "ver" => self.ex_vertical(args),
             "ls" | "buffers" | "files" => self.ex_buffers(),
@@ -1356,8 +1564,16 @@ impl Editor {
         let (name, _bang, rest) = split_ex(args.trim());
         match name {
             "sp" | "spl" | "split" => self.tab_split(),
-            "e" | "edit" | "new" | "ene" | "enew" => self.ex_tabnew(rest),
-            "dr" | "dro" | "drop" => self.ex_drop(rest, true),
+            "e" | "edit" | "new" | "ene" | "enew" => {
+                if let Some(a) = self.expand_file_arg_or_echo(rest) {
+                    self.ex_tabnew(&a);
+                }
+            }
+            "dr" | "dro" | "drop" => {
+                if let Some(a) = self.expand_file_arg_or_echo(rest) {
+                    self.ex_drop(&a, true);
+                }
+            }
             "" => self.echo("E471: Argument required"),
             _ => self.deferred_commands.push(format!("tab {args}")),
         }
@@ -1394,7 +1610,11 @@ impl Editor {
         let (name, _bang, rest) = split_ex(args.trim());
         match name {
             "res" | "resize" => self.ex_resize(SplitDir::Vertical, rest),
-            "sp" | "spl" | "split" => self.ex_split(SplitDir::Vertical, rest),
+            "sp" | "spl" | "split" => {
+                if let Some(a) = self.expand_file_arg_or_echo(rest) {
+                    self.ex_split(SplitDir::Vertical, &a);
+                }
+            }
             "new" => self.ex_new(SplitDir::Vertical),
             "" => self.echo("E471: Argument required"),
             _ => self.deferred_commands.push(format!("vertical {args}")),

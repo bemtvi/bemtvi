@@ -752,3 +752,66 @@ async fn ls_enter_jumps_to_the_selected_buffer() {
     std::fs::remove_file(&a).ok();
     std::fs::remove_file(&b).ok();
 }
+
+// ----- filename expansion in ex-command arguments (`%`, `#`, modifiers) --------
+
+#[tokio::test]
+async fn percent_expands_to_the_current_file_in_ex_commands() {
+    // `%` in a file-taking ex-command stands for the current file's name. `:e %`
+    // therefore re-edits the file in place — it must not open a *new* buffer named
+    // literally `%`.
+    let a = temp_file("pct", "x1\nx2\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    assert_eq!(list_bufs(&rpc).await, vec![1]);
+
+    command(&rpc, "e %").await;
+    assert_eq!(lines(&rpc).await, vec!["x1", "x2"]);
+    assert_eq!(
+        list_bufs(&rpc).await,
+        vec![1],
+        "`:e %` re-edits the current file rather than opening a buffer named '%'"
+    );
+
+    std::fs::remove_file(&a).ok();
+}
+
+#[tokio::test]
+async fn percent_modifiers_expand_in_a_write_target() {
+    // `%:r` is the current file with its extension stripped; `:w %:r.bak` writes a
+    // sibling `<base>.bak`. This exercises `%` plus a `:r` modifier plus trailing
+    // text concatenation in one argument.
+    let a = temp_file("wmod", "hello\nworld\n");
+    let bak = a.with_extension("bak");
+    std::fs::remove_file(&bak).ok();
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    command(&rpc, "w %:r.bak").await;
+
+    let written =
+        std::fs::read_to_string(&bak).expect("`:w %:r.bak` should write the derived file");
+    assert_eq!(written, "hello\nworld\n");
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&bak).ok();
+}
+
+#[tokio::test]
+async fn hash_expands_to_the_alternate_file() {
+    // `#` is the alternate file. After editing `a` then `b`, the alternate is `a`,
+    // so `:e #` jumps back to it (the `<C-^>` target, spelled as a filename arg).
+    let a = temp_file("halt", "a1\na2\n");
+    let b = temp_file("halt", "b1\nb2\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    command(&rpc, &format!("e {}", name(&b))).await;
+
+    command(&rpc, "e #").await;
+    assert_eq!(lines(&rpc).await, vec!["a1", "a2"]);
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}

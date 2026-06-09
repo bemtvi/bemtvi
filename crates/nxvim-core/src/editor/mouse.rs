@@ -66,6 +66,20 @@ enum SelectAnchor {
     Line(usize),
 }
 
+/// The `'mousemodel'` value, deciding what the right button does (and, by the
+/// same token, which gesture is the selection-extend one). Unknown strings fall
+/// back to the default, mirroring the permissive `:set` of the sibling mouse
+/// string options.
+enum MouseModel {
+    /// `popup_setpos` (default): right-click moves the cursor (keeping a selection
+    /// the click lands inside) and would pop a context menu.
+    PopupSetpos,
+    /// `popup`: right-click pops a context menu without moving the cursor.
+    Popup,
+    /// `extend`: right-click extends the selection toward the click.
+    Extend,
+}
+
 /// Where a screen cell landed once hit-tested. Only the variants the implemented
 /// phases act on are produced; the rest of the surface (separators, the tabline,
 /// the panel) grows here as later phases wire those regions.
@@ -101,6 +115,16 @@ impl Editor {
             }
             (MouseButton::Left, MouseAction::Drag | MouseAction::Release)
                 if self.mode == Mode::MultiCursor => {}
+            // A press on a shown tabline switches to the clicked tab (vim's
+            // tabline click). Resolved before the text-press arms so a tab click
+            // never places a cursor or starts a selection, and it doesn't go
+            // through the window hit-test at all (the tabline is chrome, not a
+            // window). Drag/release on the tabline do nothing.
+            (MouseButton::Left, MouseAction::Press)
+                if self.tabline_tab_at(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_click_tab(ev.row, ev.col)
+            }
             // A press on a split divider (a separator or a status line with a
             // window below it) grabs that edge; drags resize, release lets go.
             // Checked before the text-press arms so a divider click never places
@@ -129,11 +153,20 @@ impl Editor {
             // Release ends the drag but keeps `mouse_select` so the next press can
             // still see this one for multi-click counting; vim keeps the selection.
             (MouseButton::Left, MouseAction::Release) => {}
+            // Right-press is dispatched by `'mousemodel'` (extend the selection, or
+            // move the cursor / pop a — deferred — menu). Drag/release do nothing.
+            (MouseButton::Right, MouseAction::Press) => {
+                self.mouse_right_press(ev.row, ev.col, ev.stamp_ms)
+            }
+            (MouseButton::Right, MouseAction::Drag | MouseAction::Release) => {}
+            // Middle-press pastes the `"*` clipboard register at the click (vim's
+            // `gP`). Drag/release do nothing.
+            (MouseButton::Middle, MouseAction::Press) => self.mouse_middle_press(ev.row, ev.col),
+            (MouseButton::Middle, MouseAction::Drag | MouseAction::Release) => {}
             // The wheel scrolls the window *under the pointer* without moving focus
             // or (unless a line scrolls off) the cursor.
             (MouseButton::Wheel, action) => self.mouse_wheel(action, ev.row, ev.col, ev.shift),
-            // The other buttons and bare moves are wired in later phases; ignore
-            // them for now.
+            // The remaining buttons (X1/X2) and bare moves have no binding; ignore.
             _ => {}
         }
     }
@@ -180,6 +213,50 @@ impl Editor {
             count,
             anchor,
         });
+    }
+
+    /// If the global cell `(row, col)` lands on a built-in tabline cell, the
+    /// 0-based index (in tabline order) of the tab whose cell contains it.
+    /// `None` when:
+    ///
+    /// - the tabline isn't shown ([`Editor::tabline_visible`]) or the cell isn't
+    ///   on its row;
+    /// - a custom `'tabline'` is in effect — its cells carry no built-in click
+    ///   regions (vim needs explicit `%nT` items there, which we don't model), so
+    ///   clicking it is a no-op;
+    /// - the cell is on the blank fill past the last tab (vim's `TabLineFill`).
+    ///
+    /// The cell widths must stay in lockstep with what the client paints in
+    /// `render_tabline` (`nxvim-tui`): one cell per tab, ` {count}{name}{+} ` —
+    /// the window count (with a trailing space) only when >1, a `+` when the tab's
+    /// buffer is modified, a space on each side — so a click lands on the tab it
+    /// visually covers.
+    fn tabline_tab_at(&self, row: usize, col: usize) -> Option<usize> {
+        if row >= self.tabline_rows() {
+            return None; // no tabline shown, or the cell is below it (a window).
+        }
+        if !self.global_options().tabline.is_empty() {
+            return None; // a custom tabline has no built-in click regions.
+        }
+        let mut x = 0;
+        for (i, label) in self.tab_labels().into_iter().enumerate() {
+            let width = tab_cell_width(&label);
+            if (x..x + width).contains(&col) {
+                return Some(i);
+            }
+            x += width;
+        }
+        None
+    }
+
+    /// Switch to the tab whose tabline cell holds the click. Focus moves to that
+    /// tab's focused window (vim's tabline click); a click on the already-active
+    /// tab is a no-op. No cursor is placed in any text window — the press is
+    /// consumed by the tabline.
+    fn mouse_click_tab(&mut self, row: usize, col: usize) {
+        if let Some(idx) = self.tabline_tab_at(row, col) {
+            self.set_current_tabpage(self.tab_ids()[idx]);
+        }
     }
 
     /// Resolve a **global** screen cell to the split divider it grabs, as the
@@ -323,6 +400,105 @@ impl Editor {
             count: 1,
             anchor: SelectAnchor::Char(anchor),
         });
+    }
+
+    /// Right-press, dispatched by `'mousemodel'`:
+    /// - `extend` — extend the selection to the click, exactly like
+    ///   `<S-LeftMouse>` ([`Editor::mouse_left_extend`]).
+    /// - `popup_setpos` (default) — move the cursor to the click, ending any
+    ///   Visual selection, *unless* the click lands inside the current selection,
+    ///   which is kept so a (deferred) popup menu could act on it.
+    /// - `popup` — pop a context menu without moving the cursor; the menu widget
+    ///   isn't built yet, so this is a no-op (tracked as its own feature).
+    fn mouse_right_press(&mut self, row: usize, col: usize, stamp_ms: u64) {
+        match self.mousemodel() {
+            MouseModel::Extend => self.mouse_left_extend(row, col, stamp_ms),
+            MouseModel::PopupSetpos => {
+                let Some(MouseTarget::Text {
+                    win,
+                    line,
+                    col: bcol,
+                }) = self.hit_test(row, col)
+                else {
+                    return;
+                };
+                // A click inside the active selection keeps it (the menu would act
+                // on the selection); elsewhere move the cursor and end Visual.
+                if win == self.current_window_id() && self.pos_in_visual(line, bcol) {
+                    return;
+                }
+                self.set_current_window(win);
+                if self.mode.is_visual() {
+                    self.record_visual_marks();
+                    self.mode = Mode::Normal;
+                }
+                self.set_window_cursor(win, line, bcol);
+            }
+            MouseModel::Popup => {}
+        }
+    }
+
+    /// Middle-press: paste the `"*` clipboard (primary-selection) register at the
+    /// click — vim's `gP`: move the cursor to the clicked cell, splice the
+    /// register in, and leave the cursor just past the pasted text. A no-op when
+    /// the click misses a text cell or the `"*` register is empty / has no
+    /// provider — nothing to paste, exactly like middle-clicking with an empty
+    /// primary selection.
+    fn mouse_middle_press(&mut self, row: usize, col: usize) {
+        let Some(MouseTarget::Text {
+            win,
+            line,
+            col: bcol,
+        }) = self.hit_test(row, col)
+        else {
+            return;
+        };
+        let Some((text, kind)) = self.register_text(Some('*')) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.set_current_window(win);
+        if self.mode.is_visual() {
+            self.record_visual_marks();
+            self.mode = Mode::Normal;
+        }
+        self.set_window_cursor(win, line, bcol);
+        self.paste_text(&text, kind == RegKind::Line, 1, true);
+    }
+
+    /// The active `'mousemodel'`. Unknown values fall back to the `popup_setpos`
+    /// default — the option layer stores the string without validation (like its
+    /// `'mouse'` / `'mousescroll'` siblings), so the interpretation is here.
+    fn mousemodel(&self) -> MouseModel {
+        match self.options.mousemodel.as_str() {
+            "extend" => MouseModel::Extend,
+            "popup" => MouseModel::Popup,
+            _ => MouseModel::PopupSetpos,
+        }
+    }
+
+    /// Whether buffer position `(line, col)` lies within the active Visual
+    /// selection (inclusive of both ends, the cells vim paints). `false` when not
+    /// in a Visual mode. Charwise compares `(line, col)` against the ordered
+    /// endpoints; linewise tests the line range only.
+    fn pos_in_visual(&self, line: usize, col: usize) -> bool {
+        if !self.mode.is_visual() {
+            return false;
+        }
+        let a = self.visual_anchor;
+        let b = self.cursor;
+        let (lo, hi) = if (a.line, a.col) <= (b.line, b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        if self.mode == Mode::VisualLine {
+            (lo.line..=hi.line).contains(&line)
+        } else {
+            (lo.line, lo.col) <= (line, col) && (line, col) <= (hi.line, hi.col)
+        }
     }
 
     /// Left-click in [`Mode::MultiCursor`]: move the primary to the clicked cell
@@ -776,4 +952,20 @@ impl Editor {
             .chain(self.windows.leaves())
             .find_map(probe)
     }
+}
+
+/// Display width of one built-in tabline cell — the screen columns the client's
+/// `render_tabline` paints for this tab. Mirrors that formatter exactly:
+/// ` {count}{name}{+} ` — a leading and trailing space, the window count (with a
+/// trailing space) only when the tab holds more than one window, and a `+` when
+/// its buffer is modified. The two must stay in lockstep so [`Editor::tabline_tab_at`]
+/// maps a click to the tab it visually covers.
+fn tab_cell_width(label: &TabLabel) -> usize {
+    let count = if label.window_count > 1 {
+        format!("{} ", label.window_count)
+    } else {
+        String::new()
+    };
+    let modified = if label.modified { "+" } else { "" };
+    crate::unicode::display_width(&format!(" {count}{}{modified} ", label.name))
 }

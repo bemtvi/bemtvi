@@ -1,14 +1,17 @@
 # Mouse support — server-owned hit-testing plan
 
-> **Status: IN PROGRESS.** Phases 0–5 have landed: the `nvim_input_mouse` RPC,
+> **Status: IN PROGRESS.** Phases 0–6 have landed: the `nvim_input_mouse` RPC,
 > the `MouseEvent` core type, the four `'mouse*'` options, server-side hit-testing,
 > left-click to place the cursor + focus the window, left-drag to make a charwise
 > Visual selection (TUI forwards press/drag/release), multi-click (double = word,
 > triple = line) timed by `'mousetime'` against an injectable server clock, the
 > scroll wheel scrolling the window under the pointer (`'mousescroll'` step, Shift =
-> page, vertical + horizontal) without moving focus, and dragging a separator /
-> status line to resize splits. Phases 6–8 remain. This is a design spec and a
-> phased build order; the ✅/⬜ markers below track what is built.
+> page, vertical + horizontal) without moving focus, dragging a separator /
+> status line to resize splits, clicking a tabline cell to switch tabs, and the
+> right-click `'mousemodel'` branch + middle-click paste + insert-mode click. Only
+> Phase 8 (wrap-aware hit-testing) remains; the right-click context-menu *widget*
+> is tracked separately. This is a design spec and a phased build order; the ✅/⬜
+> markers below track what is built.
 
 ## Status legend
 
@@ -397,7 +400,7 @@ divider-drag gesture.
 
 ---
 
-## Phase 6 — Tabline click switches tabs ⬜
+## Phase 6 — Tabline click switches tabs ✅
 
 **Goal.** With a tabline shown, clicking a tab label switches to that tab;
 clicking the (optional) close affordance closes it.
@@ -414,9 +417,32 @@ switches the current tab.
 **Test.** Three tabs; click the 2nd label's column → `nvim_get_current_tabpage`
 is tab 2.
 
+**Landed as:** `Editor::tabline_tab_at` + `mouse_click_tab` (a dedicated arm in
+`Editor::mouse`, mirroring Phase 5's `resize_handle_at` rather than adding a
+`MouseTarget` variant — the tabline is chrome, not a window, so it short-circuits
+ahead of the window hit-test) in `nxvim-core/src/editor/mouse.rs`. Because
+hit-testing is fully server-side here, the click regions are **computed in core at
+hit-test time** rather than emitted into the View (no wire change): `tabline_tab_at`
+walks `tab_labels()` accumulating each cell's display width via the free
+`tab_cell_width`, which replicates the client's `render_tabline` formatter exactly
+(` {count}{name}{+} ` — window count only when >1, `+` when modified, a space each
+side; measured with the new `unicode::display_width`) and is documented as the
+shared contract so the two can't drift. The press arm runs before the text-press
+arms so a tab click never places a cursor; it switches via the existing
+`set_current_tabpage(self.tab_ids()[idx])`. A custom `'tabline'` (option non-empty)
+opts out — its cells carry no built-in click regions (vim needs explicit `%nT`
+items), so a click there is a faithful no-op; likewise the blank `TabLineFill` past
+the last cell. **No TUI change** — the client already forwards every non-overlay
+left press as a raw cell. Tests (`nxvim-server/tests/mouse.rs`):
+`click_tab_switches_to_it`, `click_first_tab_switches_back`,
+`click_active_tab_is_noop`, `click_past_last_tab_is_noop`,
+`click_custom_tabline_is_noop`, `row0_click_is_text_when_tabline_hidden` (row 0 is
+text, not a tab strip, when the tabline is hidden). **Deferred:** the close
+affordance (nxvim's tabline draws no close button yet, so there's nothing to hit).
+
 ---
 
-## Phase 7 — Right-click model, middle-click paste, insert-mode click ⬜
+## Phase 7 — Right-click model, middle-click paste, insert-mode click ✅
 
 **Goal.** Fill in the remaining default gestures:
 - **Right click** per `'mousemodel'`: `popup_setpos` (default) moves the cursor
@@ -439,19 +465,49 @@ gate; paste reuses the register path.
 click. Middle-click pastes the `*` register at the click. Click in insert mode
 moves the caret, mode stays Insert.
 
-**Partially landed — `<S-LeftMouse>` extend.** The shift-click extend half of the
-`popup*` model shipped early (it's the natural completion of the selection work):
-shift+left-press keeps the existing anchor and moves the live end to the click —
-starting a charwise Visual from the cursor when none is active, extending in place
-when one is (charwise or linewise, matching the current mode), and a following
-plain drag keeps extending from the same anchor. Landed as `Editor::mouse_left_extend`
-(`nxvim-core/src/editor/mouse.rs`), gated on `MouseEvent.shift`; the TUI now
-forwards crossterm modifiers via `mouse_modifier` (`nxvim-tui/src/lib.rs`) instead
-of a hardcoded empty string. Tests: `shift_click_starts_selection_to_click`,
-`shift_click_extends_active_visual`, `shift_click_extends_backward`,
-`shift_click_extends_linewise_visual`, `drag_after_shift_click_keeps_extending`.
-**Still in this phase:** right-click (`'mousemodel'` branch + cursor-move/act),
-middle-click paste, insert-mode click.
+**Landed as:** the right/middle arms in `Editor::mouse` plus `mouse_right_press` /
+`mouse_middle_press` and the `MouseModel` enum + `mousemodel()` / `pos_in_visual()`
+helpers (`nxvim-core/src/editor/mouse.rs`).
+
+- **Right-click** branches on `'mousemodel'` (`mousemodel()` maps the option string,
+  defaulting unknown values to `popup_setpos` to match the permissive `:set` of the
+  sibling mouse options): `extend` reuses `mouse_left_extend` (the same machinery as
+  `<S-LeftMouse>`); `popup_setpos` moves the cursor to the click and ends any Visual
+  — *unless* the click lands inside the active selection (`pos_in_visual`), which is
+  kept so a context menu could act on it; `popup` only pops a menu, so with no menu
+  widget it's an observable no-op.
+- **Middle-click** pastes the `"*` clipboard register at the click with `gP`
+  semantics — `mouse_middle_press` moves the cursor, reads `register_text(Some('*'))`,
+  and calls `paste_text(.., after = true)`. An empty / provider-less `"*` is a no-op
+  (nothing to paste), not a loud failure.
+- **Insert-mode click** needed no new code: a left press in Insert already routes to
+  `mouse_left_press`, which skips the Visual teardown (not visual) and places the
+  caret via `set_window_cursor`, whose Insert clamp allows the one-past-EOL column —
+  so the caret moves and the mode stays Insert. Covered by a guard test.
+
+Tests (`nxvim-server/tests/mouse.rs`): `right_click_popup_setpos_moves_cursor`,
+`right_click_popup_setpos_keeps_selection_inside`,
+`right_click_popup_setpos_outside_ends_selection`,
+`right_click_extend_model_extends_selection`, `right_click_popup_model_is_noop`,
+`middle_click_pastes_clipboard`, `middle_click_empty_clipboard_is_noop`,
+`insert_click_moves_caret_and_stays_insert` (plus a `start_with_clipboard` helper
+injecting a `FakeClipboard`). **No TUI change** — the client already forwards every
+non-overlay press as a raw cell with its real modifiers.
+
+**Earlier — `<S-LeftMouse>` extend.** The shift-click extend half of the `popup*`
+model shipped ahead of this phase: shift+left-press keeps the existing anchor and
+moves the live end to the click — starting a charwise Visual from the cursor when
+none is active, extending in place when one is (charwise or linewise, matching the
+current mode), and a following plain drag keeps extending from the same anchor.
+Landed as `Editor::mouse_left_extend` (`nxvim-core/src/editor/mouse.rs`), gated on
+`MouseEvent.shift`; the TUI forwards crossterm modifiers via `mouse_modifier`
+(`nxvim-tui/src/lib.rs`) instead of a hardcoded empty string. Tests:
+`shift_click_starts_selection_to_click`, `shift_click_extends_active_visual`,
+`shift_click_extends_backward`, `shift_click_extends_linewise_visual`,
+`drag_after_shift_click_keeps_extending`.
+
+**Deferred:** the context-menu **widget** itself (the `popup`/`popup_setpos` menu UI)
+— `popup` right-click is inert until it exists; tracked as its own feature.
 
 ---
 

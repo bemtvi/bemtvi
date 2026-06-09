@@ -58,6 +58,13 @@ pub fn floor_grapheme(line: &str, byte: usize) -> usize {
     last
 }
 
+/// Display width of `s` in screen cells — wide characters count as two (via
+/// `unicode-width`), with no tab handling (callers use it for short tab-free
+/// strings like tabline cells, where there are no tabs to expand).
+pub fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
 /// Virtual (screen-cell) column of byte offset `byte`: the cells occupied by
 /// `line[..byte]`, with tabs expanding to the next multiple of `tabstop` and
 /// wide characters counting as two (via `unicode-width`). If `byte` is not on a

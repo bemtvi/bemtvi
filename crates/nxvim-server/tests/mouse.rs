@@ -10,12 +10,14 @@
 //! escalates the unit (double = word, triple = line), timed by `'mousetime'`
 //! against a fake clock. Phase 4 — the wheel scrolls the window under the pointer
 //! (`'mousescroll'` step, `Shift` = page) without moving focus or the cursor.
+//! Phase 6 — clicking a tabline cell switches to that tab. Phase 7 — the
+//! right-click `'mousemodel'` branch, middle-click paste, and insert-mode click.
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_at,
-    lines, message, mode, spawn, temp_dir, write_temp, TestClock,
+    lines, message, mode, spawn, temp_dir, write_temp, FakeClipboard, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -852,4 +854,241 @@ async fn mouse_example_config_runs() {
     // And nothing errored on the way (the notify, the user command, the sets).
     let banner = message(&map);
     assert!(!banner.contains("Error"), "example errored: {banner:?}");
+}
+
+// ── Phase 6: tabline click switches tabs ───────────────────────────────────
+
+/// Start a server with three tab pages over files `aaa.txt` / `bbb.txt` /
+/// `ccc.txt` (contents `alpha` / `beta` / `gamma`) in a shared temp dir, each a
+/// single unmodified window. Three 7-char names with the default ` {name} ` cell
+/// (no window-count, no `+`) make the tabline read
+/// `[ aaa.txt ][ bbb.txt ][ ccc.txt ]` — nine columns per cell, so tab 0 covers
+/// cols 0..9, tab 1 cols 9..18, tab 2 cols 18..27. The last-opened tab
+/// (`ccc.txt`) is current.
+async fn start_tabs() -> (Rpc, UnboundedReceiver<Incoming>) {
+    let dir = temp_dir("mouse_tabs");
+    for (name, body) in [
+        ("aaa.txt", "alpha"),
+        ("bbb.txt", "beta"),
+        ("ccc.txt", "gamma"),
+    ] {
+        std::fs::write(dir.join(name), body).expect("write tab file");
+    }
+    let init = ServerInit {
+        file: Some(dir.join("aaa.txt").to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    command(&rpc, &format!("tabnew {}", dir.join("bbb.txt").display())).await;
+    command(&rpc, &format!("tabnew {}", dir.join("ccc.txt").display())).await;
+    (rpc, incoming)
+}
+
+#[tokio::test]
+async fn click_tab_switches_to_it() {
+    let (rpc, _incoming) = start_tabs().await;
+    // The last :tabnew left ccc.txt current.
+    assert_eq!(lines(&rpc).await, vec!["gamma"]);
+    // Click inside tab 1's cell (cols 9..18) on the tabline row.
+    feed_mouse(&rpc, "left", "press", 0, 11);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["beta"],
+        "switched to the bbb.txt tab"
+    );
+    assert_eq!(mode(&rpc).await, "n", "the click didn't start a selection");
+}
+
+#[tokio::test]
+async fn click_first_tab_switches_back() {
+    let (rpc, _incoming) = start_tabs().await;
+    // Click inside tab 0's cell (cols 0..9).
+    feed_mouse(&rpc, "left", "press", 0, 3);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha"],
+        "switched to the aaa.txt tab"
+    );
+}
+
+#[tokio::test]
+async fn click_active_tab_is_noop() {
+    let (rpc, _incoming) = start_tabs().await;
+    // ccc.txt is current; clicking inside its own cell (cols 18..27) stays put
+    // and must not fall through to placing a cursor on the tabline row.
+    feed_mouse(&rpc, "left", "press", 0, 20);
+    assert_eq!(lines(&rpc).await, vec!["gamma"], "stayed on the active tab");
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+#[tokio::test]
+async fn click_past_last_tab_is_noop() {
+    let (rpc, _incoming) = start_tabs().await;
+    // The blank fill past the last cell (col 27+) is vim's `TabLineFill` — inert.
+    feed_mouse(&rpc, "left", "press", 0, 40);
+    assert_eq!(lines(&rpc).await, vec!["gamma"], "the fill strip is inert");
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+#[tokio::test]
+async fn click_custom_tabline_is_noop() {
+    let (rpc, _incoming) = start_tabs().await;
+    // A custom `'tabline'` renders arbitrary text with no built-in click regions
+    // (vim needs explicit `%nT` items), so the same column that would switch tabs
+    // with the built-in cells is now inert.
+    command(&rpc, "set tabline=MYTABLINE").await;
+    feed_mouse(&rpc, "left", "press", 0, 3);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["gamma"],
+        "a custom tabline isn't clickable"
+    );
+}
+
+#[tokio::test]
+async fn row0_click_is_text_when_tabline_hidden() {
+    let path = write_temp("mouse", "txt", "alphabet here\nsecond line");
+    let init = ServerInit {
+        file: Some(path),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // With a single tab the tabline is hidden, so row 0 is the first *text* line:
+    // the click must place the cursor there, not be swallowed as a tab switch.
+    feed_mouse(&rpc, "left", "press", 0, 5);
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 5),
+        "row 0 placed the text cursor when no tabline is shown"
+    );
+}
+
+// ── Phase 7: right-click model, middle-click paste, insert-mode click ───────
+
+/// Like [`start`], but inject an in-memory clipboard so middle-click paste has a
+/// `"*` register to read. Returns the [`FakeClipboard`] handle to seed/peek.
+async fn start_with_clipboard(content: &str) -> (Rpc, FakeClipboard, UnboundedReceiver<Incoming>) {
+    let path = write_temp("mouse", "txt", content);
+    let fake = FakeClipboard::default();
+    let init = ServerInit {
+        file: Some(path),
+        clipboard: nxvim_server::ClipboardProvider::Custom(Box::new(fake.clone())),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, fake, incoming)
+}
+
+/// `mousemodel=popup_setpos` (the default): a right-click moves the cursor to the
+/// click without starting a selection.
+#[tokio::test]
+async fn right_click_popup_setpos_moves_cursor() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "right", "press", 1, 3); // row 1 → line 2, col 3
+    assert_eq!(cursor(&rpc).await, (2, 3));
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "right-click didn't start a selection"
+    );
+}
+
+/// `popup_setpos`: a right-click *inside* the active Visual selection keeps it
+/// (so a context menu could act on it) and leaves the cursor put.
+#[tokio::test]
+async fn right_click_popup_setpos_keeps_selection_inside() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "vlll"); // Visual, anchor (1,0), cursor (1,3): covers cols 0..=3
+    assert_eq!(mode(&rpc).await, "v");
+    feed_mouse(&rpc, "right", "press", 0, 2); // col 2 is inside the selection
+    assert_eq!(mode(&rpc).await, "v", "click inside the selection keeps it");
+    assert_eq!(cursor(&rpc).await, (1, 3), "and doesn't move the cursor");
+}
+
+/// `popup_setpos`: a right-click *outside* the selection ends Visual and moves
+/// the cursor to the click.
+#[tokio::test]
+async fn right_click_popup_setpos_outside_ends_selection() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "vlll"); // cursor (1,3)
+    feed_mouse(&rpc, "right", "press", 0, 8); // col 8 is past the selection
+    assert_eq!(mode(&rpc).await, "n", "click outside ends Visual");
+    assert_eq!(cursor(&rpc).await, (1, 8));
+}
+
+/// `mousemodel=extend`: a right-click extends the selection toward the click,
+/// like `<S-LeftMouse>`.
+#[tokio::test]
+async fn right_click_extend_model_extends_selection() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set mousemodel=extend").await;
+    feed(&rpc, "vl"); // Visual, anchor (1,0), cursor (1,1)
+    feed_mouse(&rpc, "right", "press", 0, 8); // extend out to col 8
+    assert_eq!(cursor(&rpc).await, (1, 8));
+    assert_eq!(mode(&rpc).await, "v");
+    feed(&rpc, "d"); // delete cols 0..=8 of "hello world" → "ld"
+    assert_eq!(lines(&rpc).await[0], "ld");
+}
+
+/// `mousemodel=popup`: a right-click only pops a (not-yet-built) menu, so with no
+/// menu it's an observable no-op — the cursor and mode are untouched.
+#[tokio::test]
+async fn right_click_popup_model_is_noop() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set mousemodel=popup").await;
+    feed_mouse(&rpc, "right", "press", 1, 5);
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "popup model doesn't move the cursor"
+    );
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+/// Middle-click pastes the `"*` clipboard register at the click position with
+/// `gP` semantics (spliced after the clicked grapheme).
+#[tokio::test]
+async fn middle_click_pastes_clipboard() {
+    let (rpc, clip, _incoming) = start_with_clipboard("hello").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    clip.seed("XX", false); // a charwise primary selection
+    feed_mouse(&rpc, "middle", "press", 0, 0); // click on 'h'
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hXXello"],
+        "pasted after the clicked char"
+    );
+}
+
+/// Middle-click with nothing on the clipboard (no provider) is a silent no-op —
+/// nothing to paste, exactly like middle-clicking with an empty primary selection.
+#[tokio::test]
+async fn middle_click_empty_clipboard_is_noop() {
+    let (rpc, _incoming) = start("hello").await; // default: no clipboard provider
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "middle", "press", 0, 2);
+    assert_eq!(lines(&rpc).await, vec!["hello"], "nothing pasted");
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+/// An insert-mode left-click moves the caret to the click and stays in Insert
+/// (the default `'mouse'` includes `i`); the caret may sit one past the last char.
+#[tokio::test]
+async fn insert_click_moves_caret_and_stays_insert() {
+    let (rpc, _incoming) = start("hello world").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "i"); // enter Insert at col 0
+    assert_eq!(mode(&rpc).await, "i");
+    feed_mouse(&rpc, "left", "press", 0, 6); // click on 'w'
+    assert_eq!(mode(&rpc).await, "i", "the click didn't leave Insert");
+    assert_eq!(cursor(&rpc).await, (1, 6));
 }

@@ -31,19 +31,23 @@ use tokio::sync::mpsc::UnboundedReceiver;
 const REF: &str = "testref";
 const REV: &str = "deadbeef0000";
 
-/// A minimal `parsers.lua` in nvim-treesitter's exact shape, naming only `rust`.
-const PARSERS_LUA: &str = "\
-return {
-  rust = {
-    install_info = {
-      revision = 'deadbeef0000',
+/// A minimal `parsers.lua` in nvim-treesitter's exact shape, naming only `rust`
+/// at `revision`.
+fn parsers_lua(revision: &str) -> String {
+    format!(
+        "return {{
+  rust = {{
+    install_info = {{
+      revision = '{revision}',
       url = 'https://github.com/tree-sitter/tree-sitter-rust',
-    },
-    maintainers = { '@amaanq' },
+    }},
+    maintainers = {{ '@amaanq' }},
     tier = 2,
-  },
+  }},
+}}
+"
+    )
 }
-";
 
 /// nvim-treesitter's Rust `indents.scm`, trimmed to the captures this test needs
 /// (block open indents, closing brace dedents) — enough to drive `o` / `<CR>`.
@@ -62,8 +66,17 @@ const RUST_INDENTS: &str = "\
 // ----- fixture --------------------------------------------------------------
 
 /// Build a fresh `$NXVIM_DATA_DIR` + `$NXVIM_TS_MIRROR` for one test and export
-/// the env the installer reads. Returns the (data_dir, mirror) roots.
+/// the env the installer reads. Returns the (data_dir, mirror) roots. The grammar
+/// is pinned at the default sha-style revision whose archive dir is the obvious
+/// `tree-sitter-rust-<rev>`.
 fn fixture(tag: &str) -> (PathBuf, PathBuf) {
+    fixture_rev(tag, REV, &format!("tree-sitter-rust-{REV}"))
+}
+
+/// Like [`fixture`] but with an explicit grammar `revision` and the archive's
+/// top-level directory name — which GitHub does *not* always make
+/// `tree-sitter-rust-<revision>` (a `vX.Y.Z` tag's dir drops the `v`).
+fn fixture_rev(tag: &str, revision: &str, archive_top_dir: &str) -> (PathBuf, PathBuf) {
     let base = std::env::temp_dir().join(format!("nxvim-tsinstall-{tag}"));
     let _ = std::fs::remove_dir_all(&base);
     let data_dir = base.join("data");
@@ -76,7 +89,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
         .join(REF);
     write_under(
         &nt.join("lua/nvim-treesitter/parsers.lua"),
-        PARSERS_LUA.as_bytes(),
+        parsers_lua(revision).as_bytes(),
     );
     // runtime/queries/rust/{indents,highlights}.scm
     let q = nt.join("runtime/queries/rust");
@@ -88,8 +101,8 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     // github.com/tree-sitter/tree-sitter-rust/archive/<rev>.tar.gz
     let tarball = mirror
         .join("github.com/tree-sitter/tree-sitter-rust/archive")
-        .join(format!("{REV}.tar.gz"));
-    build_source_tarball(&tarball);
+        .join(format!("{revision}.tar.gz"));
+    build_source_tarball(&tarball, archive_top_dir);
 
     std::env::set_var("NXVIM_DATA_DIR", &data_dir);
     std::env::set_var("NXVIM_TS_MIRROR", &mirror);
@@ -107,18 +120,19 @@ fn write_under(path: &Path, bytes: &[u8]) {
 }
 
 /// Pack the cargo-unpacked `tree-sitter-rust` `src/` into a `.tar.gz` whose top
-/// dir is `tree-sitter-rust-<rev>/` — exactly what GitHub's archive endpoint
-/// serves, so the installer's untar + `src/parser.c` discovery hit the same
-/// layout as production. Uses the system `tar` (the harness already shells out to
-/// `cc`), staging via `cp -R` to keep the headers under `src/tree_sitter/`.
-fn build_source_tarball(out: &Path) {
+/// dir is `top_dir/` — exactly what GitHub's archive endpoint serves, so the
+/// installer's untar + `src/parser.c` discovery hit the same layout as
+/// production. `top_dir` is a parameter because GitHub mangles it (a `vX.Y.Z` tag
+/// becomes `…-X.Y.Z`), which the installer must not assume. Uses the system `tar`
+/// (the harness already shells out to `cc`), staging via `cp -R`.
+fn build_source_tarball(out: &Path, top_dir: &str) {
     std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     let stage = out.parent().unwrap().join(format!(
         "stage-{}",
         out.file_name().unwrap().to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&stage);
-    let pkg = stage.join(format!("tree-sitter-rust-{REV}"));
+    let pkg = stage.join(top_dir);
     std::fs::create_dir_all(&pkg).unwrap();
     let status = std::process::Command::new("cp")
         .arg("-R")
@@ -132,7 +146,7 @@ fn build_source_tarball(out: &Path) {
         .arg(out)
         .arg("-C")
         .arg(&stage)
-        .arg(format!("tree-sitter-rust-{REV}"))
+        .arg(top_dir)
         .status()
         .expect("tar czf");
     assert!(status.success(), "building source tarball failed");
@@ -271,6 +285,24 @@ async fn ts_install_compiles_grammar_and_enables_indent() {
         joined.contains("rust") && joined.contains("indents"),
         "TSInstallInfo panel missing rust/indents: {info:?}"
     );
+}
+
+#[tokio::test]
+async fn ts_install_handles_a_version_tag_revision() {
+    let _guard = test_lock().lock().await;
+    // Revision is a version tag `v9.9.9`; GitHub serves the archive with its top
+    // dir as `tree-sitter-rust-9.9.9` (leading `v` stripped). The installer must
+    // discover that dir, not assume `tree-sitter-rust-v9.9.9` — the python bug.
+    let (data_dir, _m) = fixture_rev("vtag", "v9.9.9", "tree-sitter-rust-9.9.9");
+    let (rpc, mut incoming) = start(None).await;
+
+    feed(&rpc, ":TSInstall rust<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "installed rust").await;
+    assert!(
+        msg.contains("installed rust"),
+        "tag install failed: {msg:?}"
+    );
+    assert!(data_dir.join("parser/rust.so").exists());
 }
 
 /// The real thing: no mirror, hit GitHub + the pinned nvim-treesitter ref live,

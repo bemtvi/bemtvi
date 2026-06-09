@@ -83,7 +83,16 @@ pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
         entry.revision
     ))?;
     unpack_tar_gz(&tarball, &build_dir).with_context(|| format!("unpack {repo} source tarball"))?;
-    let mut src_root = build_dir.join(format!("{repo}-{}", entry.revision));
+    // The archive's single top-level directory — *discovered*, not computed.
+    // GitHub names it `<repo>-<ref>` but mangles `<ref>`: a version-like tag
+    // `v0.25.0` becomes `…-0.25.0` (leading `v` stripped), so `{repo}-{revision}`
+    // would miss it. Reading the one extracted dir is robust to tag vs sha.
+    let mut src_root = single_subdir(&build_dir).with_context(|| {
+        format!(
+            "locating unpacked {repo} source under {}",
+            build_dir.display()
+        )
+    })?;
     if let Some(loc) = &entry.location {
         src_root = src_root.join(loc);
     }
@@ -425,6 +434,21 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     resp.into_reader().read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// The single sub-directory of `dir` (a freshly-unpacked GitHub source archive
+/// always has exactly one top-level dir). Errors if there are zero or several, so
+/// a malformed archive fails loud rather than building from the wrong place.
+fn single_subdir(dir: &Path) -> Result<PathBuf> {
+    let mut dirs = std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir());
+    let first = dirs.next().context("archive contained no directory")?;
+    if dirs.next().is_some() {
+        bail!("archive had more than one top-level directory");
+    }
+    Ok(first)
 }
 
 /// Unpack a gzip-compressed tarball into `dest`.

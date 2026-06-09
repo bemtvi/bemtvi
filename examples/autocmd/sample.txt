@@ -1,0 +1,16 @@
+autocmd / augroup / doautocmd playground
+=========================================
+
+Opening this .txt file fires the Demo augroup's BufReadPost autocmd (§2) —
+watch the message line for "Read a .txt file".
+
+Try these (each prints to the message line):
+
+  :doautocmd User Greet              fire the User Greet autocmd (§4)
+  :Greet                             same, via the user command (§3)
+  :autocmd User                      list the User autocmds
+  :autocmd User Hi echo "hi there"   register another, then :doautocmd User Hi
+  :autocmd! User                     clear every User autocmd
+  i  (then <Esc>)                    InsertEnter announces itself (§1)
+
+Run :messages to see the whole log.

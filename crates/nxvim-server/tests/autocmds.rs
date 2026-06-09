@@ -684,3 +684,165 @@ async fn examples_tabs_config_loads_and_drives_the_tab_api() {
     let cur = exec_lua(&rpc, r#"return vim.api.nvim_get_current_tabpage()"#).await;
     assert_eq!(cur.as_u64(), Some(1), ":TabFirst switched to the first tab");
 }
+
+// ----- :autocmd / :augroup / :doautocmd ex-commands --------------------------
+// The Vimscript front-end (vim._ex_autocmd / _ex_augroup / _ex_doautocmd) drives
+// the same store the nvim_* API uses. These feed the `:`-command forms over RPC
+// and observe firing through a command-string autocmd's `print` / a counter.
+
+#[tokio::test]
+async fn ex_autocmd_defines_a_command_autocmd_that_doautocmd_fires() {
+    // `:autocmd {event} {pat} {cmd}` registers a command-string autocmd;
+    // `:doautocmd {event} {pat}` fires it, running the command (here a `:lua
+    // print`). Uses the `:au` / `:doau` abbreviations to prove those resolve too.
+    let dir = temp_dir("ex_au_define");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        ":au User Marker lua print('fired')<CR>",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":doau User Marker<CR>").await);
+    assert_eq!(msg, "fired");
+}
+
+#[tokio::test]
+async fn ex_augroup_block_assigns_the_current_group() {
+    // `:augroup Foo` … `:augroup END` groups the autocmds defined between them, so
+    // nvim_get_autocmds reports the group name — exactly as the API's `group=`.
+    let dir = temp_dir("ex_aug_block");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    redraw_after(&rpc, &mut incoming, ":augroup Foo<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":autocmd User M lua print('x')<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":augroup END<CR>").await;
+    let name = exec_lua(
+        &rpc,
+        "local a = vim.api.nvim_get_autocmds({ event = 'User' }) return a[1].group_name",
+    )
+    .await;
+    assert_eq!(
+        name.as_str(),
+        Some("Foo"),
+        "the autocmd landed in group Foo"
+    );
+}
+
+#[tokio::test]
+async fn ex_autocmd_bang_clears_matching_autocmds() {
+    // `:autocmd! {event}` removes every autocmd for that event, so a later
+    // `:doautocmd` fires nothing. The sentinel printed by the fire line itself is
+    // what lands on the message line — never the (now-cleared) callback.
+    let dir = temp_dir("ex_au_bang");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        ":autocmd User M lua print('should-not-fire')<CR>",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, ":autocmd! User<CR>").await;
+    let gone = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_get_autocmds({ event = 'User' })",
+    )
+    .await;
+    assert_eq!(gone.as_u64(), Some(0), ":autocmd! User cleared the autocmd");
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "vim.cmd('doautocmd User M') print('done')",
+    )
+    .await;
+    assert_eq!(msg, "done", "the cleared autocmd did not fire");
+}
+
+#[tokio::test]
+async fn ex_augroup_bang_deletes_the_group_and_its_autocmds() {
+    // `:augroup! Foo` deletes the group and every autocmd in it.
+    let dir = temp_dir("ex_aug_bang");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    redraw_after(&rpc, &mut incoming, ":augroup Foo<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":autocmd User M lua print('x')<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":augroup END<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":augroup! Foo<CR>").await;
+    let gone = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_get_autocmds({ event = 'User' })",
+    )
+    .await;
+    assert_eq!(gone.as_u64(), Some(0), "the group's autocmd was removed");
+    let id = exec_lua(&rpc, "return vim._augroups.Foo == nil").await;
+    assert_eq!(id.as_bool(), Some(true), "the group name was deleted");
+}
+
+#[tokio::test]
+async fn ex_autocmd_once_fires_exactly_once() {
+    // `++once` self-removes after the first fire: firing the event twice runs the
+    // command (a counter bump) only once.
+    let dir = temp_dir("ex_au_once");
+    let (rpc, mut incoming) = start_with_config(&dir, "_G.n = 0\n").await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        ":autocmd User M ++once lua _G.n = _G.n + 1<CR>",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, ":doautocmd User M<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":doautocmd User M<CR>").await;
+    let n = exec_lua(&rpc, "return _G.n").await;
+    assert_eq!(n.as_u64(), Some(1), "++once autocmd fired exactly once");
+}
+
+#[tokio::test]
+async fn examples_autocmd_config_loads_and_drives_the_ex_commands() {
+    // End-to-end check of the shipped `examples/autocmd/` config: source its real
+    // init.lua (which uses the :augroup / :autocmd / :doautocmd ex-commands via
+    // vim.cmd), then exercise the same surfaces interactively. Proves the example
+    // is runnable (no Lua / unknown-command errors) and that the ex-commands drive
+    // the shared autocmd store.
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/autocmd/init.lua");
+    let init = std::fs::read_to_string(&example).expect("read examples/autocmd/init.lua");
+    let dir = temp_dir("examples_autocmd");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    // §2 + §4 registered a Demo-group BufReadPost autocmd and a User Greet one
+    // through `:autocmd` — both live in the same store nvim_get_autocmds reads.
+    let demo = exec_lua(
+        &rpc,
+        "local a = vim.api.nvim_get_autocmds({ event = 'BufReadPost' }) \
+         for _, au in ipairs(a) do if au.group_name == 'Demo' then return au.command end end \
+         return ''",
+    )
+    .await;
+    assert!(
+        demo.as_str().unwrap_or("").contains("echo"),
+        "the Demo augroup's BufReadPost command-string autocmd is registered"
+    );
+
+    // §4's `User Greet` autocmd runs `echo "Hello from the Greet autocmd"`; firing
+    // it puts that text on the message line (the command-string + :echo path).
+    let greet = message(&redraw_after(&rpc, &mut incoming, ":doautocmd User Greet<CR>").await);
+    assert_eq!(greet, "Hello from the Greet autocmd", ":echo autocmd fired");
+
+    // The interactive path: define another User autocmd via `:autocmd`, fire it
+    // with `:doautocmd`, and see its `:echo` land on the message line.
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        ":autocmd User Hi echo \"hi there\"<CR>",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":doautocmd User Hi<CR>").await);
+    assert_eq!(msg, "hi there", ":autocmd + :doautocmd drove a fire");
+
+    // `:autocmd! User` clears every User autocmd (the one just added and §4's).
+    redraw_after(&rpc, &mut incoming, ":autocmd! User<CR>").await;
+    let left = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_get_autocmds({ event = 'User' })",
+    )
+    .await;
+    assert_eq!(left.as_u64(), Some(0), ":autocmd! User cleared them all");
+}

@@ -26,6 +26,7 @@ mod command;
 mod cursor;
 mod ex;
 mod explorer;
+mod expr;
 mod insert;
 mod marks;
 mod motions;

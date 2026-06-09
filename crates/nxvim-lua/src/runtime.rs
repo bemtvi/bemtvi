@@ -1072,6 +1072,33 @@ impl LuaRuntime {
         fire.call((event, pattern, buf, file, data))
     }
 
+    /// Run a `:au[tocmd][!]` ex-command through the prelude driver
+    /// (`vim._ex_autocmd`), which parses the Vimscript argument line and drives
+    /// the same `vim._autocmds` store the `nvim_create_autocmd` API uses. `bang`
+    /// is the `!`; `args` is the remainder after the command name. Returns the
+    /// text to surface: `""` (nothing), a one-line message/error, or a multi-line
+    /// autocmd listing.
+    pub fn ex_autocmd(&self, bang: bool, args: &str) -> mlua::Result<String> {
+        let f: mlua::Function = self.vim()?.get("_ex_autocmd")?;
+        f.call((bang, args))
+    }
+
+    /// Run a `:aug[roup][!]` ex-command through the prelude driver
+    /// (`vim._ex_augroup`): enter / leave / report the current augroup, or, with
+    /// a bang, delete a group and its autocmds. Returns the text to surface.
+    pub fn ex_augroup(&self, bang: bool, args: &str) -> mlua::Result<String> {
+        let f: mlua::Function = self.vim()?.get("_ex_augroup")?;
+        f.call((bang, args))
+    }
+
+    /// Run a `:doau[tocmd]` ex-command through the prelude driver
+    /// (`vim._ex_doautocmd`), firing an event now (the manual analogue of
+    /// `nvim_exec_autocmds`). Returns the text to surface.
+    pub fn ex_doautocmd(&self, args: &str) -> mlua::Result<String> {
+        let f: mlua::Function = self.vim()?.get("_ex_doautocmd")?;
+        f.call(args)
+    }
+
     /// Refresh the `vim._cur_buf` snapshot the prelude reads back through
     /// `nvim_buf_get_name(0)` / `expand('%')`. The server pushes this immediately
     /// before firing a buffer/mode autocmd so a callback can resolve the buffer

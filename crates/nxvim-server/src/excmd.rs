@@ -19,6 +19,12 @@ impl Server {
     pub(crate) fn resolve_command(&mut self, cmd: &str) {
         let name = cmd.split_whitespace().next().unwrap_or("");
         let args = cmd.get(name.len()..).unwrap_or("").trim_start();
+        // A trailing `!` is the command's bang, not part of its name; split it off
+        // so the abbreviation match below sees the bare name (`au!` → `au`).
+        let (base, bang) = match name.strip_suffix('!') {
+            Some(b) => (b, true),
+            None => (name, false),
+        };
         match name {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
             // Phase-1 LSP observability: dump server/document state into the panel.
@@ -60,6 +66,26 @@ impl Server {
             }
             "LspRename" => self.request_lsp_rename(args),
             "LspCodeAction" => self.request_lsp_code_action(),
+            // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
+            // an optional `!`) drive the Lua autocmd registry. The core defers
+            // them here; the prelude parses the argument line so the `:`-command
+            // and the `nvim_*` API share one store.
+            _ if is_autocmd(base) => match self.lua.ex_autocmd(bang, args) {
+                Ok(out) => self.surface_autocmd_output("Autocommands", &out),
+                Err(e) => self.editor.echo(format!("E5108: Error in :autocmd: {e}")),
+            },
+            _ if is_augroup(base) => match self.lua.ex_augroup(bang, args) {
+                Ok(out) => self.surface_autocmd_output("Autocommands", &out),
+                Err(e) => self.editor.echo(format!("E5108: Error in :augroup: {e}")),
+            },
+            _ if is_doautocmd(base) => {
+                match self.lua.ex_doautocmd(args) {
+                    Ok(out) => self.surface_autocmd_output("Autocommands", &out),
+                    Err(e) => self.editor.echo(format!("E5108: Error in :doautocmd: {e}")),
+                }
+                // A fired autocmd may have queued `vim.cmd(...)` / callbacks.
+                self.apply_lua_effects();
+            }
             _ if self.lua.has_user_command(name) => {
                 if let Err(e) = self.lua.run_user_command(name, args) {
                     self.editor
@@ -118,4 +144,38 @@ impl Server {
             candidate.is_file().then_some(candidate)
         })
     }
+
+    /// Surface the text a `vim._ex_*` autocmd driver returned: empty is nothing,
+    /// a multi-line listing opens a panel (like `:LspInfo`), and a single line is
+    /// echoed (a message or an `E…` error).
+    fn surface_autocmd_output(&mut self, title: &str, out: &str) {
+        if out.is_empty() {
+            return;
+        }
+        if out.contains('\n') {
+            let lines = out.lines().map(str::to_string).collect();
+            self.editor.open_panel(title, lines, false, 0);
+        } else {
+            self.editor.echo(out);
+        }
+    }
+}
+
+/// `:au[tocmd]` and its abbreviations (`au`, `aut`, … `autocmd`). The minimal
+/// form is `au` — `aug…` is `:augroup`, a different command.
+fn is_autocmd(base: &str) -> bool {
+    matches!(base, "au" | "aut" | "auto" | "autoc" | "autocm" | "autocmd")
+}
+
+/// `:aug[roup]` and its abbreviations (`aug`, `augr`, … `augroup`).
+fn is_augroup(base: &str) -> bool {
+    matches!(base, "aug" | "augr" | "augro" | "augrou" | "augroup")
+}
+
+/// `:doau[tocmd]` and its abbreviations (`doau`, `doaut`, … `doautocmd`).
+fn is_doautocmd(base: &str) -> bool {
+    matches!(
+        base,
+        "doau" | "doaut" | "doauto" | "doautoc" | "doautocm" | "doautocmd"
+    )
 }

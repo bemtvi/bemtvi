@@ -306,7 +306,11 @@ end
 -- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
 -- case `file` falls back to `pattern` (the old behavior). `data` is the optional
 -- `args.data` payload (LspAttach/LspDetach carry `{ client_id = … }`); nil otherwise.
+-- An autocmd registered with `opts.once` (`:autocmd … ++once`) fires once and is
+-- then dropped — collected during the pass and removed after it, so the live
+-- iteration isn't mutated underneath `ipairs`.
 function vim._fire(event, pattern, buf, file, data)
+  local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
   for _, au in ipairs(vim._autocmds) do
     local ev = au.event
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
@@ -322,8 +326,15 @@ function vim._fire(event, pattern, buf, file, data)
         elseif type(au.opts.command) == "string" then
           vim.cmd(au.opts.command)
         end
+        if au.opts.once then
+          fired = fired or {}
+          fired[au.id] = true
+        end
       end
     end
+  end
+  if fired then
+    vim._autocmds = vim.tbl_filter(function(au) return not fired[au.id] end, vim._autocmds)
   end
 end
 
@@ -386,6 +397,195 @@ function vim.api.nvim_get_autocmds(opts)
     end
   end
   return out
+end
+
+-- ----- :autocmd / :augroup / :doautocmd ex-commands --------------------------
+-- The Vimscript front-end onto the autocmd registry above. The core ex-command
+-- dispatch doesn't recognize these, so it defers them to the server, which parses
+-- the argument line here and drives the same vim._autocmds / vim._augroups store
+-- the nvim_* API uses — one store, two front-ends. Each `vim._ex_*` returns the
+-- text the server surfaces: "" (nothing), a one-line message/error (echoed), or a
+-- multi-line listing (shown in a panel).
+
+-- The "current augroup" set by `:augroup {name}` and cleared by `:augroup END`.
+-- It persists across command invocations, exactly like Vim's parser state, so a
+-- block of `:autocmd`s between the two lands in that group.
+vim._cur_augroup = nil
+
+-- Does `au` match the group / event-list / pattern-list filter? A nil filter
+-- field means "any" (so a bare `:autocmd!` clears everything in scope). Events
+-- and patterns are lists; a "*" event matches any event. A pattern-less autocmd
+-- is treated as "*" for matching, mirroring vim._fire's pattern rule.
+local function au_matches(au, group, events, patterns)
+  if group ~= nil and au.group ~= group then return false end
+  if events ~= nil and not vim.tbl_contains(events, "*") then
+    local evs = type(au.event) == "table" and au.event or { au.event }
+    local hit = false
+    for _, w in ipairs(events) do
+      if vim.tbl_contains(evs, w) then hit = true break end
+    end
+    if not hit then return false end
+  end
+  if patterns ~= nil then
+    local pat = au.opts.pattern
+    if pat == nil then pat = "*" end
+    local pats = type(pat) == "table" and pat or { pat }
+    local hit = false
+    for _, w in ipairs(patterns) do
+      if vim.tbl_contains(pats, w) then hit = true break end
+    end
+    if not hit then return false end
+  end
+  return true
+end
+
+-- Render the autocmds matching the filter as a `:autocmd`-style listing.
+local function au_list(group, events, patterns)
+  local gname = {}
+  for nm, id in pairs(vim._augroups) do gname[id] = nm end
+  local lines = { "--- Autocommands ---" }
+  for _, au in ipairs(vim._autocmds) do
+    if au_matches(au, group, events, patterns) then
+      local evs = type(au.event) == "table" and table.concat(au.event, ",") or tostring(au.event)
+      local pat = au.opts.pattern
+      pat = type(pat) == "table" and table.concat(pat, ",") or (pat or "*")
+      local g = au.group and (gname[au.group] or ("group#" .. au.group)) or ""
+      local body = au.opts.command or "<callback>"
+      lines[#lines + 1] = string.format("%-10s %-12s %-16s %s", g, evs, pat, body)
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+-- Pull the first whitespace-delimited word off `s`, returning the word and the
+-- trimmed remainder (both "" when `s` is empty).
+local function take_word(s)
+  local w = s:match("^(%S+)")
+  if not w then return "", "" end
+  return w, vim.trim(s:sub(#w + 1))
+end
+
+-- :aug[roup][!] {name} | END. Without a bang: `END`/`end` leaves the current
+-- group, an empty arg reports it, and any other name enters that group (creating
+-- it without clearing — `:augroup` is not destructive). With a bang,
+-- `:augroup! {name}` deletes the group and every autocmd in it.
+function vim._ex_augroup(bang, args)
+  args = vim.trim(args)
+  if bang then
+    if args == "" then return "E471: Argument required" end
+    local id = vim._augroups[args]
+    if id then
+      vim._autocmds = vim.tbl_filter(function(au) return au.group ~= id end, vim._autocmds)
+      vim._augroups[args] = nil
+      if vim._cur_augroup == args then vim._cur_augroup = nil end
+    end
+    return ""
+  end
+  if args == "" then
+    return vim._cur_augroup and ("augroup " .. vim._cur_augroup) or ""
+  end
+  if args == "END" or args == "end" then
+    vim._cur_augroup = nil
+    return ""
+  end
+  vim.api.nvim_create_augroup(args, { clear = false })
+  vim._cur_augroup = args
+  return ""
+end
+
+-- :au[tocmd][!] [group] [event[,event…]] [pat[,pat…]] [++once] [++nested] [cmd]
+-- A leading word that names an existing augroup is the group; otherwise the
+-- current `:augroup` (if any) applies. With a bang, the autocmds matching the
+-- group/event/pattern filter are removed first; with a trailing command, a new
+-- autocmd is then registered. With no command and no bang it lists the matching
+-- autocmds. `<buffer>` as the pattern registers a buffer-local autocmd for the
+-- current buffer. `++once` fires once then self-removes (honored by vim._fire);
+-- `++nested` is accepted (nxvim already lets events nest).
+function vim._ex_autocmd(bang, args)
+  local rest = vim.trim(args)
+
+  -- Optional leading group: only when the first word names an existing augroup.
+  local group = vim._cur_augroup and vim._augroups[vim._cur_augroup] or nil
+  local first = rest:match("^(%S+)")
+  if first and vim._augroups[first] then
+    group = vim._augroups[first]
+    rest = vim.trim(rest:sub(#first + 1))
+  end
+
+  -- Event list (comma-separated). Absent only on a bare `:au` / `:au!`.
+  local ev_word
+  ev_word, rest = take_word(rest)
+  local events = ev_word ~= "" and vim.split(ev_word, ",", { plain = true, trimempty = true }) or nil
+
+  -- Pattern list (comma-separated), or `<buffer>` for a buffer-local autocmd.
+  local pat_word
+  pat_word, rest = take_word(rest)
+  local patterns, buffer
+  if pat_word == "<buffer>" then
+    buffer = 0 -- nvim_create_autocmd resolves 0 → current buffer
+  elseif pat_word ~= "" then
+    patterns = vim.split(pat_word, ",", { plain = true, trimempty = true })
+  end
+
+  -- ++once / ++nested flags precede the command body.
+  local once, nested = false, false
+  while true do
+    local flag = rest:match("^(%+%+%S+)")
+    if flag == "++once" then
+      once = true
+    elseif flag == "++nested" then
+      nested = true
+    else
+      break
+    end
+    rest = vim.trim(rest:sub(#flag + 1))
+  end
+
+  local cmd = rest -- the remainder is the ex-command body (may contain spaces)
+
+  if bang then
+    -- A bang clears matching autocmds before any (re)definition. The scope is
+    -- the resolved group (the current/explicit augroup, or any when none), the
+    -- event list (nil/"*" = any), and the pattern list (nil = any).
+    vim._autocmds = vim.tbl_filter(
+      function(au) return not au_matches(au, group, events, patterns) end,
+      vim._autocmds
+    )
+  end
+
+  if cmd ~= "" then
+    if not events then
+      return "E216: No such event: a {event} is required to define an autocmd"
+    end
+    vim.api.nvim_create_autocmd(#events == 1 and events[1] or events, {
+      group = group,
+      pattern = patterns and (#patterns == 1 and patterns[1] or patterns) or nil,
+      buffer = buffer,
+      command = cmd,
+      once = once,
+      nested = nested,
+    })
+    return ""
+  end
+
+  -- No command: a bang was a pure clear (nothing to show); otherwise list.
+  if bang then return "" end
+  return au_list(group, events, patterns)
+end
+
+-- :doau[tocmd] {event} [pattern]: fire `event` now (optionally for a pattern),
+-- the manual analogue of nvim_exec_autocmds. The optional [group] argument vim
+-- accepts is not supported — vim._fire has no group filter — so the first word
+-- is always the event; pass the event directly.
+function vim._ex_doautocmd(args)
+  args = vim.trim(args):gsub("^<nomodeline>%s*", "")
+  local event, rest = take_word(args)
+  if event == "" then
+    return "E217: Can't execute autocommands for ALL events"
+  end
+  local pattern = rest ~= "" and rest or nil
+  vim.api.nvim_exec_autocmds(event, { pattern = pattern })
+  return ""
 end
 
 -- nvim_buf_get_name(bufnr): the snapshot buffer's name when `bufnr` is 0/nil or

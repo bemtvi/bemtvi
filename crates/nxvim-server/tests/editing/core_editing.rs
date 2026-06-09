@@ -462,3 +462,66 @@ async fn visual_linewise_change_at_eof_replaces_in_place() {
     feed(&rpc, "VjcX<Esc>"); // change the last two lines (c, d)
     assert_eq!(lines(&rpc).await, vec!["a", "b", "X"]);
 }
+
+// ----- :echo / :echomsg / :echoerr -------------------------------------------
+
+#[tokio::test]
+async fn echo_shows_a_string_literal_on_the_message_line() {
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo \"hello world\"<CR>").await);
+    assert_eq!(msg, "hello world");
+}
+
+#[tokio::test]
+async fn echo_evaluates_concatenation_and_arithmetic() {
+    // `.` concatenates; arithmetic respects precedence (1 + 2*3 = 7).
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo \"n=\" . (1 + 2 * 3)<CR>").await);
+    assert_eq!(msg, "n=7");
+}
+
+#[tokio::test]
+async fn echo_joins_multiple_expressions_with_a_space() {
+    // Space-separated top-level expressions are joined with a single space.
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo 'a' 'b' 1<CR>").await);
+    assert_eq!(msg, "a b 1");
+}
+
+#[tokio::test]
+async fn echo_integer_division_truncates_like_vim() {
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo 7 / 2<CR>").await);
+    assert_eq!(msg, "3", "integer division truncates toward zero");
+}
+
+#[tokio::test]
+async fn echo_is_transient_but_echomsg_is_recorded() {
+    // `:echo` shows on the message line without joining `:messages`; `:echomsg`
+    // records. The history panel must hold the echomsg line, not the echo one.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":echo \"transient-line\"<CR>");
+    feed(&rpc, ":echomsg \"kept-line\"<CR>");
+    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
+    let history = panel_lines(&map);
+    assert!(
+        history.contains(&"kept-line".to_string()),
+        ":echomsg is recorded; history was {history:?}"
+    );
+    assert!(
+        !history.contains(&"transient-line".to_string()),
+        ":echo must not be recorded; history was {history:?}"
+    );
+}
+
+#[tokio::test]
+async fn echo_of_an_undefined_variable_fails_loud() {
+    // Variables/functions aren't evaluable in core; rather than echoing an empty
+    // string (making a typo look fine), :echo reports the unevaluable reference.
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo somevar<CR>").await);
+    assert!(
+        msg.contains("E121") && msg.contains("somevar"),
+        "expected an E121 naming the variable, got {msg:?}"
+    );
+}

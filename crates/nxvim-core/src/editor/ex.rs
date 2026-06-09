@@ -16,6 +16,18 @@ fn next_char_boundary(line: &str, byte: usize) -> usize {
         .map_or(line.len(), |c| byte + c.len_utf8())
 }
 
+/// Which `:echo`-family command is running — they differ only in where the
+/// evaluated text lands.
+#[derive(Clone, Copy)]
+enum EchoKind {
+    /// `:echo` — message line only, *not* recorded in `:messages`.
+    Transient,
+    /// `:echomsg` — message line *and* the `:messages` history.
+    Message,
+    /// `:echoerr` — surfaced as an error (and recorded), like a failed command.
+    Error,
+}
+
 /// A resolved, 0-based, inclusive line range parsed from the head of an
 /// ex-command. `explicit` is false when no address was present and the range
 /// defaulted to the current line (so a bare range can be told from none).
@@ -287,6 +299,13 @@ impl Editor {
                 Err(e) => self.echo(e),
             },
             "mes" | "messages" | "message" => self.ex_messages(),
+            // `:ec[ho]` evaluates its argument as a Vim expression and shows the
+            // result on the message line *without* recording it in `:messages`;
+            // `:echom[sg]` records it (the history-keeping form); `:echoe[rr]`
+            // shows it as an error (also recorded).
+            "ec" | "ech" | "echo" => self.ex_echo(args, EchoKind::Transient),
+            "echom" | "echoms" | "echomsg" => self.ex_echo(args, EchoKind::Message),
+            "echoe" | "echoer" | "echoerr" => self.ex_echo(args, EchoKind::Error),
             "reg" | "registers" | "di" | "dis" | "display" => self.ex_registers(args),
             "marks" => self.ex_marks(args),
             "panelopen" | "panelo" => {
@@ -333,6 +352,21 @@ impl Editor {
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
             _ => self.deferred_commands.push(rest.to_string()),
+        }
+    }
+
+    /// `:echo` / `:echomsg` / `:echoerr` — evaluate the argument as a Vim
+    /// expression and surface the result per `kind`. A `:echo` sets only the
+    /// message line (not the history); `:echomsg`/`:echoerr` go through
+    /// [`Editor::echo`], which records them. An evaluation error is always shown
+    /// (and recorded) as the error it is.
+    fn ex_echo(&mut self, args: &str, kind: EchoKind) {
+        match expr::eval_echo(args) {
+            Ok(text) => match kind {
+                EchoKind::Transient => self.message = text,
+                EchoKind::Message | EchoKind::Error => self.echo(text),
+            },
+            Err(e) => self.echo(e),
         }
     }
 

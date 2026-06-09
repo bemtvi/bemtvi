@@ -28,10 +28,13 @@ use nxvim_view::{encode_paste, notation as view_notation, Key as ViewKey};
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
+mod remote;
+pub use remote::RemoteClient;
+
 /// Map a neutral key `name` (from the JS frontend) to the shared [`ViewKey`]: a
 /// single character, or one of the named keys the encoder understands. `None` for
 /// an unrecognized name (a dead key, a modifier-only press).
-fn neutral_key(name: &str) -> Option<ViewKey> {
+pub(crate) fn neutral_key(name: &str) -> Option<ViewKey> {
     Some(match name {
         "Esc" => ViewKey::Esc,
         "CR" => ViewKey::Enter,
@@ -54,6 +57,24 @@ fn neutral_key(name: &str) -> Option<ViewKey> {
             }
         }
     })
+}
+
+/// Encode one neutral key press (modifier flags + key `name`) into vim key-notation
+/// through the **shared** `nxvim-view` encoder — the same contract the TUI/GUI clients
+/// use. `None` for an unrecognized `name`. Shared by [`WebEditor::key`] (which feeds the
+/// notation to the local core) and `RemoteClient::key` (which wraps it in an `nvim_input`
+/// frame), so both encode keys identically.
+pub(crate) fn key_notation(ctrl: bool, alt: bool, shift: bool, name: &str) -> Option<String> {
+    let key = neutral_key(name)?;
+    let mut notation = view_notation(ctrl, alt, key);
+    // `nxvim_view::notation` is shift-agnostic — a character already carries its shifted
+    // form, and the TUI/GUI add `S-` for *named* keys themselves. Do the same for the
+    // common bare-shift case (e.g. `<S-Tab>`); a named key with shift *and* ctrl/alt is
+    // rare enough to fall through unshifted.
+    if shift && !ctrl && !alt && !matches!(key, ViewKey::Char(_)) {
+        notation = format!("<S-{}", &notation[1..]);
+    }
+    Some(notation)
 }
 
 /// The clipboard register (`"+`/`"*`) for the browser. The core's [`Clipboard`]
@@ -177,18 +198,9 @@ impl WebEditor {
     /// the winit/crossterm front ends do before calling `nxvim_view::notation`. An
     /// unrecognized `name` is ignored.
     pub fn key(&mut self, ctrl: bool, alt: bool, shift: bool, name: &str) {
-        let Some(key) = neutral_key(name) else {
-            return;
-        };
-        let mut notation = view_notation(ctrl, alt, key);
-        // `nxvim_view::notation` is shift-agnostic — a character already carries its
-        // shifted form, and the TUI/GUI add `S-` for *named* keys themselves. Do the
-        // same for the common bare-shift case (e.g. `<S-Tab>`); a named key with
-        // shift *and* ctrl/alt is rare enough to fall through unshifted.
-        if shift && !ctrl && !alt && !matches!(key, ViewKey::Char(_)) {
-            notation = format!("<S-{}", &notation[1..]);
+        if let Some(notation) = key_notation(ctrl, alt, shift, name) {
+            self.input(&notation);
         }
-        self.input(&notation);
     }
 
     /// Encode a bracketed paste through the shared `nxvim-view` encoder and feed it
@@ -389,7 +401,7 @@ fn border_name(border: BorderStyle) -> Option<&'static str> {
 /// Forward Rust panics to the browser console so a wasm trap isn't silent. A tiny
 /// inline version of the `console_error_panic_hook` crate (avoids the dependency):
 /// set once, it formats each panic and logs it via `console.error`.
-fn console_error_panic_hook() {
+pub(crate) fn console_error_panic_hook() {
     use std::sync::Once;
     static SET: Once = Once::new();
     SET.call_once(|| {

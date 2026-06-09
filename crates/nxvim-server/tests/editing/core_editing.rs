@@ -348,6 +348,37 @@ async fn lua_vim_cmd_drives_the_editor() {
 }
 
 #[tokio::test]
+async fn insert_delete_at_end_of_line_joins_the_next_line() {
+    // `<Del>` in insert mode is a forward delete; at the end of a line there's no
+    // character ahead of the cursor, so it must delete the line break and pull the
+    // next line up — the mirror of `<BS>` at column 0.
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"foo", "bar"})"#,
+    )
+    .await;
+    // `A` enters insert mode at the end of "foo"; `<Del>` then has nothing ahead
+    // of it on the line, so it must join "bar".
+    feed(&rpc, "A<Del>");
+    assert_eq!(lines(&rpc).await, vec!["foobar"]);
+    // The cursor stays put at the join column (insert mode, 0-based col 3).
+    feed(&rpc, "baz<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["foobazbar"]);
+}
+
+#[tokio::test]
+async fn insert_delete_at_end_of_last_line_is_a_noop() {
+    // At the end of the final line there is no following line to join, so a
+    // forward `<Del>` must do nothing rather than eat the phantom trailing newline.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo");
+    feed(&rpc, "<Del>");
+    feed(&rpc, "<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["foo"]);
+}
+
+#[tokio::test]
 async fn vertical_motion_preserves_desired_column() {
     let (rpc, _incoming) = start(None).await;
     // Long, short, long — the classic case where j/k must remember the column.

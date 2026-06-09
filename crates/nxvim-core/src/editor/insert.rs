@@ -93,6 +93,15 @@ impl Editor {
                         + unicode::next_grapheme(&s, self.cursor.col);
                     self.buffer_mut().remove(at..end);
                     self.buffer_mut().modified = true;
+                } else if self.cursor.line + 1 < self.buffer().line_count() {
+                    // At the end of the line `<Del>` has no character ahead of it,
+                    // so it deletes the line break and pulls the next line up — the
+                    // forward mirror of `<BS>` at column 0. The final line has only
+                    // the phantom trailing newline after it, so this is a no-op
+                    // there (guarded by the `line + 1 < line_count` check).
+                    let join_at = self.cursor_char();
+                    self.buffer_mut().remove(join_at..join_at + 1);
+                    self.buffer_mut().modified = true;
                 }
             }
             // A typed character lands at every cursor (the primary and any

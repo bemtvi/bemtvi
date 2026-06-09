@@ -311,6 +311,38 @@ as a whole one. You can enumerate exactly what a given config trips at runtime.
 
 ---
 
+## Vide-coded
+
+I started this project on a whim just to test the limits of current day vibe-coding.
+I wanted to see how far I could go, I didn't expect the answer to turn out to be
+as far as I wanted. I got so excited I decided to speed run it for enough features
+to use it as my daily driver. I love neovim and I use(d?) it as my daily driver, and I
+was not ready to give up on its plugins ecosystem, so I decided to implement the lua
+API surface enough to be as compatible as possible. Just for the fun of it, I also
+decided to implement a major feature that has been in the community wishlist for a 
+long time, multiple cursors (see a previous section). That turned out to be much cooler
+than I expected!
+
+I've been using Claude Code with Opus 4.8 on the high effort most of the time and the
+experience has been pretty frustration free. Claude only ever got stuck in one specific
+feature, but I switched to max effort and asked it to refine the plan, then it
+managed to advance. Of course Claude didn't do all of it by itself, I'm a pretty
+seasoned software engineer, so I constantly steered it in the "right" direction and
+I also made all architecture decisions, although with Claude's help. I also didn't
+review the code, apart from skimming it while it was being generated as a coarse
+sanity check, and interrupting and correcting Claude on eggregious mistakes. At times
+I had 4 Claude Code instances implementing 4 features in parallel, thankfully Claude
+doesn't care about conflicts. lol. I had to signup for the Max 20x plan and almost
+maxed out the weekly limit, that's how fast I was going.
+
+I intend to keep this code-base entirely 100% free of human written code. Create an
+issue if you have feature requests or bug reports. Claude doesn't care about the quality of
+your message, so write whatever you want. lol
+
+I won't accept PRs, only feature requests and bug reports by text description.
+
+---
+
 ## License
 
 [Apache License 2.0](LICENSE).

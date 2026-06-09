@@ -125,8 +125,8 @@ impl Editor {
     }
 
     /// Apply one resolved string `:set` operation. The string options are the
-    /// global `statusline` / `tabline` and the mouse strings (`mouse` /
-    /// `mousemodel` / `mousescroll`); each routes through the shared
+    /// global `statusline` / `tabline` / `guifont` and the mouse strings
+    /// (`mouse` / `mousemodel` / `mousescroll`); each routes through the shared
     /// [`Editor::set_global_option_str`] setter so the `:set` and `vim.o` paths
     /// share one home. `&` resets to the default (empty); `?` echoes the value.
     fn apply_set_str(&mut self, name: &str, op: StrOp) {
@@ -137,6 +137,7 @@ impl Editor {
                 let value = match name {
                     "statusline" => self.options.statusline.clone(),
                     "tabline" => self.options.tabline.clone(),
+                    "guifont" => self.options.guifont.clone(),
                     "mouse" => self.options.mouse.clone(),
                     "mousemodel" => self.options.mousemodel.clone(),
                     "mousescroll" => self.options.mousescroll.clone(),

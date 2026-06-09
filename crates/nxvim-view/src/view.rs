@@ -129,6 +129,11 @@ pub struct WindowView {
     pub border: Option<Border>,
     /// The float's title, drawn on the top border. `None` when untitled.
     pub title: Option<String>,
+    /// Whether this window's buffer has no file path yet (a fresh `[No Name]`
+    /// buffer), so a write needs a target. An explicit flag from the server, so a
+    /// client need not match the displayed name; an older server omitting it
+    /// defaults to `false`.
+    pub unnamed: bool,
 }
 
 /// A window's rect in windows-area cells (mirrors `nxvim_core::ViewRect`).
@@ -186,6 +191,10 @@ pub struct View {
     /// the terminal cursor mid-line after `<Left>`/`<Right>` edits.
     pub cmdline_cursor: usize,
     pub message: String,
+    /// The `'guifont'` value (`"Fira Code:h14"`, neovim/neovide syntax), relayed
+    /// from the server. A GUI client parses it for the font family and `:h` size;
+    /// empty means the client's own default. Frontend-agnostic — the TUI ignores it.
+    pub guifont: String,
     /// The per-frame style palette the server resolved from the active
     /// colorscheme; per-window `highlights`/chrome ids index into it. Global.
     pub styles: Vec<Style>,
@@ -270,6 +279,7 @@ impl View {
         self.cmdline_prompt = map_str(map, "cmdline_prompt");
         self.cmdline_cursor = map_u64(map, "cmdline_cursor") as usize;
         self.message = map_str(map, "message");
+        self.guifont = map_str(map, "guifont");
         // The style palette must land before windows (their scroll bands snapshot
         // it) and chrome (which indexes into it).
         self.styles = parse_styles(map_get(map, "styles"));
@@ -453,6 +463,9 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             let t = map_str(m, "title");
             (!t.is_empty()).then_some(t)
         },
+        unnamed: map_get(m, "unnamed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 

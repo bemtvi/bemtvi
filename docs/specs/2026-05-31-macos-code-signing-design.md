@@ -206,3 +206,33 @@ CI configuration — validated by running it, not the Rust test harness:
 - **`security set-key-partition-list`** is the historically finicky step; the recipe above is
   the established one for non-interactive CI signing.
 ```
+
+## Revision — 2026-06-08 (GUI added + macOS artifact shapes changed)
+
+The pipeline now builds **two** binaries per release — the TUI (`nxvim`) and the GUI
+(`nxvim-gui`, winit + wgpu) — and the macOS artifacts changed shape. The sections above
+describe the original TUI-only, bare-`.tar.gz` design; the differences now in `build.yml`:
+
+- **macOS TUI → stapled `.pkg`.** Instead of a notarized-but-unstapled bare binary in a
+  `.tar.gz`, the TUI now ships as a Developer ID Installer–signed `.pkg` (installs to
+  `/usr/local/bin`), notarized **and stapled** (`xcrun stapler staple`) — a `.pkg` supports
+  stapling, so Gatekeeper no longer needs a network check on first launch.
+- **macOS GUI → stapled `.app` in a `.dmg`.** The GUI is bundled as `nxvim.app`
+  (Developer ID Application–signed, hardened runtime), placed in a drag-to-Applications
+  `.dmg`; the `.dmg` is signed, notarized, and stapled.
+- **Two new secrets (precondition).** Signing a `.pkg` requires a **Developer ID Installer**
+  certificate — distinct from the Developer ID Application cert. Add:
+  `MACOS_INSTALLER_CERT_P12` (base64 of the Developer ID Installer `.p12`) and, optionally,
+  `MACOS_INSTALLER_CERT_PASSWORD` (defaults to `MACOS_CERT_PASSWORD` if unset). The macOS
+  **TUI** job fails loud if the Installer identity is missing.
+- **Entitlements: NOT none (correcting the "Entitlements: None" decision above).** The default
+  Lua backend is **LuaJIT**, which allocates executable memory at runtime; under the hardened
+  runtime that needs `com.apple.security.cs.allow-jit` +
+  `com.apple.security.cs.allow-unsigned-executable-memory`, applied via `--entitlements` to
+  both the binary and the `.app`. Without them notarization still *passes* (it only checks the
+  signature) but running compiled Lua crashes on the user's machine. The original "no
+  entitlements" reasoning assumed a no-JIT Lua 5.1 build; the shipped default is LuaJIT.
+
+Linux is unaffected by the signing logic: the TUI stays static-musl, and the GUI ships on new
+glibc (`*-unknown-linux-gnu`) targets because the X11/Wayland/wgpu stack does not link against
+static musl.

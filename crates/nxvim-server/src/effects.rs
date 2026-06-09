@@ -874,6 +874,7 @@ impl Server {
             laststatus: go.laststatus,
             statusline: go.statusline.clone(),
             tabline: go.tabline.clone(),
+            guifont: go.guifont.clone(),
             columns: columns as u64,
             lines: lines as u64,
         });

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{buf_lines, command, cursor, feed, lines, start_attached};
+use nxvim_test_harness::{buf_lines, command, cursor, feed, field, lines, start_attached};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -41,6 +41,26 @@ async fn message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Strin
         }
     }
     msg
+}
+
+/// Whether the focused window's buffer is unnamed (`windows[0].unnamed`), read off
+/// the latest `redraw` like [`message`]. This is the explicit flag a GUI uses to
+/// route a bare `:w` to its save dialog, rather than matching the display name.
+async fn unnamed(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let mut flag = false;
+    while let Ok(inc) = incoming.try_recv() {
+        if let Incoming::Notification { method, params } = inc {
+            if method == "redraw" {
+                if let Some(Value::Map(map)) = params.into_iter().next() {
+                    if let Some(v) = field(&map, "unnamed") {
+                        flag = v.as_bool().unwrap_or(false);
+                    }
+                }
+            }
+        }
+    }
+    flag
 }
 
 /// The bottom panel's `(title, content lines, selected row)`, read off the
@@ -146,6 +166,27 @@ async fn buf_name(rpc: &Rpc, handle: u64) -> String {
         .as_str()
         .unwrap_or("")
         .to_string()
+}
+
+#[tokio::test]
+async fn unnamed_flag_tracks_whether_the_buffer_has_a_file() {
+    // The redraw carries an explicit `unnamed` flag per window — the signal the GUI
+    // uses to send a bare `:w` to its save dialog. A fresh buffer is unnamed;
+    // opening a real file clears it; writing to a new path (save-as) names it.
+    let a = temp_file("a", "a1\na2\n");
+    let (rpc, mut incoming) = start().await;
+    assert!(
+        unnamed(&rpc, &mut incoming).await,
+        "a fresh [No Name] buffer reports unnamed"
+    );
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    assert!(
+        !unnamed(&rpc, &mut incoming).await,
+        "after :e <file> the buffer is named"
+    );
+
+    std::fs::remove_file(&a).ok();
 }
 
 #[tokio::test]

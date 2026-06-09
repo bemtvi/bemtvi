@@ -1,0 +1,946 @@
+//! The native (winit + wgpu) GUI client.
+//!
+//! A thin RPC client that owns no editor state — the GUI sibling of `nxvim-tui`.
+//! It attaches to the server, sends keystrokes as vim key-notation
+//! (`nvim_input`), and paints the server's [`View`] (the same `redraw` model the
+//! TUI consumes) onto a GPU surface as a monospace cell grid.
+//!
+//! **Threading.** winit owns the main thread (its event loop is not async), so
+//! the RPC lives on a separate IO thread running a current-thread tokio runtime:
+//! it drives [`nxvim_rpc::connect`], decodes each `redraw` into a [`View`], and
+//! forwards it to the event loop as a [`UserEvent`] via an
+//! [`winit::event_loop::EventLoopProxy`]. Input flows the other way without a
+//! runtime — [`nxvim_rpc::Rpc`] is `Clone + Send` and its `notify` is synchronous,
+//! so the winit thread fires `nvim_input` / `nvim_ui_*` directly on a cloned
+//! handle.
+//!
+//! The focused window scrolls pixel-smoothly: a redraw's scroll gesture arms a
+//! [`ScrollAnim`] the client clock interpolates, and `about_to_wait` paces the
+//! per-frame repaint. See [`render`] for the rendering scope.
+//!
+//! **Native file dialogs.** Pressing `<CR>` over certain `:` command lines pops a
+//! system dialog instead of running the command as typed — a GUI-only affordance;
+//! the server stays unaware (the dialog is the client's to show, then it issues
+//! the real command):
+//!
+//! - The `…o` open family ([`open_dialog_verb`]) — `:eo`, `:spo`, `:vso`,
+//!   `:tabeo`, `:newo`, `:vnewo` (and bare `:e`, an alias of `:eo`) — pops the
+//!   **open** dialog and re-runs the base command (`:e`/`:sp`/`:vs`/`:tabe`/…)
+//!   with the chosen file, preserving its edit / split / tab semantics.
+//! - `:wn`, and a bare `:w` on an unnamed buffer ([`save_dialog_needed`]), pop the
+//!   **save** dialog and write the buffer to the chosen path (`:w <file>`, which
+//!   also binds the buffer to it).
+
+mod input;
+mod mouse;
+mod render;
+
+pub use input::{encode_key, is_paste};
+pub use mouse::{
+    cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
+    panel_content_rect, vertical_action, within,
+};
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use nxvim_rpc::{connect, Incoming, Rpc};
+use nxvim_view::{encode_paste, HlSpan, ScrollData, Style, View};
+use rmpv::Value;
+use tokio::io::{AsyncRead, AsyncWrite};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+use winit::window::{Window, WindowId};
+
+use render::{Renderer, ScrollFrame};
+
+/// How long the client waits after a keystroke, with no further input, before
+/// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`
+/// (default 1000ms). The server has no input timer, so a trailing key that is a
+/// live *prefix* of a mapping stays withheld in the matcher until something
+/// flushes it; this idle nudge is that something (mirrors the TUI's `TIMEOUT_LEN`).
+const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
+
+/// Client-side rendering configuration. The font family and point size are a
+/// purely client concern — the server works in cells, not pixels — so they're set
+/// here (CLI flags / environment), not through a server option. An unavailable
+/// font name falls back to the system monospace.
+#[derive(Clone, Debug)]
+pub struct GuiConfig {
+    /// Font family name (e.g. `"JetBrains Mono"`); `None` uses the system monospace.
+    pub font: Option<String>,
+    /// Font point size, before the display's scale factor is applied.
+    pub font_size: f32,
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            font: None,
+            font_size: 15.0,
+        }
+    }
+}
+
+impl GuiConfig {
+    /// Overrides from the environment: `NXVIM_GUI_FONT` (family) and
+    /// `NXVIM_GUI_FONT_SIZE` (points). Absent/blank/invalid values keep the default;
+    /// CLI flags layered on top take precedence (see `main`).
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        if let Some(name) = std::env::var_os("NXVIM_GUI_FONT") {
+            c.set_font(&name.to_string_lossy());
+        }
+        if let Ok(size) = std::env::var("NXVIM_GUI_FONT_SIZE") {
+            if let Ok(pt) = size.trim().parse::<f32>() {
+                c.set_font_size(pt);
+            }
+        }
+        c
+    }
+
+    /// Set the font family, ignoring a blank name (which keeps the monospace
+    /// default rather than asking the font system for `""`).
+    pub fn set_font(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() {
+            self.font = Some(name.to_string());
+        }
+    }
+
+    /// Set the point size, clamped to `[4, 200]` so a typo can't produce a zero,
+    /// negative, or absurd cell. A non-finite or non-positive value is ignored.
+    pub fn set_font_size(&mut self, pt: f32) {
+        if pt.is_finite() && pt > 0.0 {
+            self.font_size = pt.clamp(4.0, 200.0);
+        }
+    }
+}
+
+/// Events the IO thread injects into the winit event loop.
+pub enum UserEvent {
+    /// A decoded `redraw`: replace the view and repaint.
+    Redraw(Box<View>),
+    /// The server asked the UI to exit (`nxvim_exit`), or the connection closed.
+    Exit,
+}
+
+/// Run the GUI client over a connected stream until the window closes or the
+/// server disconnects, rendering with `config`'s font. Must be called on the main
+/// thread (winit's requirement).
+pub fn run<S>(stream: S, config: GuiConfig) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+
+    // Shutdown signal: when the event loop exits — the window's close button, or a
+    // server-sent `nxvim_exit` — the main thread notifies the IO thread so it
+    // drops the RPC connection. The IO thread (not `run`) owns `stream`, so unless
+    // it closes that, the embedded server never sees EOF, never winds down, and
+    // `main`'s `server_thread.join()` hangs forever — the close-button freeze.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let io_shutdown = shutdown.clone();
+
+    // Hand the `Rpc` handle from the IO thread back to the main thread once the
+    // connection is up, so the winit side can fire input synchronously.
+    let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Rpc>();
+    let io = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build client IO runtime");
+        runtime.block_on(async move {
+            let (reader, writer) = tokio::io::split(stream);
+            let (rpc, mut incoming) = connect(reader, writer);
+            let _ = rpc_tx.send(rpc.clone());
+            loop {
+                tokio::select! {
+                    message = incoming.recv() => match message {
+                        Some(Incoming::Notification { method, params }) => match method.as_str() {
+                            "redraw" => {
+                                let view = View::from_redraw(&params);
+                                if proxy.send_event(UserEvent::Redraw(Box::new(view))).is_err() {
+                                    break; // event loop gone
+                                }
+                            }
+                            "nxvim_exit" => {
+                                let _ = proxy.send_event(UserEvent::Exit);
+                                break;
+                            }
+                            _ => {}
+                        },
+                        // Answer server-initiated requests with nil, like the TUI.
+                        Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
+                        None => break, // connection closed
+                    },
+                    // The UI exited: stop, so dropping the runtime below closes the
+                    // connection and the server winds down.
+                    _ = io_shutdown.notified() => break,
+                }
+            }
+            // Tell the UI to exit if it hasn't already. Returning from this block
+            // drops the runtime, which aborts the connect tasks and closes
+            // `stream` — the EOF that lets the server (and `main`) finish.
+            let _ = proxy.send_event(UserEvent::Exit);
+        });
+    });
+
+    let rpc = rpc_rx.recv()?;
+    let mut app = App::new(rpc, config);
+    event_loop.run_app(&mut app)?;
+
+    // The UI is done: stop the IO thread and wait for it, so `stream` is dropped
+    // (server sees EOF) before `main` joins the server thread.
+    shutdown.notify_one();
+    let _ = io.join();
+    Ok(())
+}
+
+/// An in-flight scroll slide, driven by the client clock. Mirrors the TUI's
+/// `Animation`, but the GUI keeps `top`/`cursor` fractional (no rounding) for
+/// sub-pixel smoothness. The band (`lines`/`numbers`/`highlights`, palette
+/// `styles`) is the server's gesture snapshot, anchored at `base_line`.
+struct ScrollAnim {
+    from_top: f32,
+    to_top: f32,
+    from_cursor: f32,
+    to_cursor: f32,
+    start: Instant,
+    duration: Duration,
+    base_line: usize,
+    lines: Vec<String>,
+    numbers: Vec<Option<usize>>,
+    highlights: Vec<Vec<HlSpan>>,
+    styles: Vec<Style>,
+}
+
+impl ScrollAnim {
+    fn new(s: &ScrollData) -> Self {
+        Self {
+            from_top: s.from_top,
+            to_top: s.to_top,
+            from_cursor: s.from_cursor,
+            to_cursor: s.to_cursor,
+            start: Instant::now(),
+            duration: s.duration,
+            base_line: s.base_line,
+            lines: s.lines.clone(),
+            numbers: s.numbers.clone(),
+            highlights: s.highlights.clone(),
+            styles: s.styles.clone(),
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.start.elapsed() >= self.duration
+    }
+
+    /// The interpolated frame at the current instant (ease-out cubic, matching
+    /// the TUI's feel).
+    fn frame(&self) -> ScrollFrame<'_> {
+        let raw = if self.duration.is_zero() {
+            1.0
+        } else {
+            (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0)
+        };
+        let t = 1.0 - (1.0 - raw).powi(3);
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        ScrollFrame {
+            top: lerp(self.from_top, self.to_top),
+            cursor: lerp(self.from_cursor, self.to_cursor),
+            base_line: self.base_line,
+            lines: &self.lines,
+            numbers: &self.numbers,
+            highlights: &self.highlights,
+            styles: &self.styles,
+        }
+    }
+}
+
+/// Decide the scroll slide to run after a `redraw`, given any slide already in
+/// flight — the GUI port of the TUI's `arm_animation`. A gesture (re)arms a fresh
+/// slide; a scroll-less redraw that merely repaints the slide's destination (a
+/// delayed highlight reply) lets it play out; any other scroll-less redraw is a
+/// real change and interrupts the slide.
+fn arm_scroll(view: &View, current: Option<ScrollAnim>) -> Option<ScrollAnim> {
+    if let Some(s) = view.focused().and_then(|w| w.scroll.as_ref()) {
+        // A zero-duration gesture has no slide; show the static destination.
+        if s.duration.is_zero() {
+            return None;
+        }
+        return Some(ScrollAnim::new(s));
+    }
+    current.filter(|a| repaints_destination(view, a))
+}
+
+/// Whether `view` merely repaints the destination `anim` is sliding toward (same
+/// first visible line and cursor line), so a delayed redraw must not abort it.
+fn repaints_destination(view: &View, anim: &ScrollAnim) -> bool {
+    let dest_top = anim.to_top as usize + 1; // first visible line, 1-based
+    let dest_cursor = anim.to_cursor as usize + 1; // cursor line, 1-based
+    let Some(win) = view.focused() else {
+        return false;
+    };
+    win.numbers.first().copied().flatten() == Some(dest_top) && win.cursor_line == dest_cursor
+}
+
+/// The winit application: holds the window, the renderer, and the latest view.
+struct App {
+    rpc: Rpc,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    view: View,
+    /// The in-flight scroll slide, if any (drives the per-frame repaint loop).
+    scroll: Option<ScrollAnim>,
+    mods: ModifiersState,
+    /// Latest pointer position in physical pixels (winit's button and wheel events
+    /// don't carry it, so `CursorMoved` is tracked here for the next press/wheel).
+    cursor_px: (f64, f64),
+    /// Whether the left mouse button is held — winit has no "drag" event, so a
+    /// `CursorMoved` while this is set synthesizes one (server extends the Visual
+    /// selection from the press anchor).
+    mouse_down: bool,
+    /// The cell the last left-drag was reported at, so motion within one cell is
+    /// coalesced to a single drag (the server works in cells, not pixels).
+    last_drag_cell: Option<(u16, u16)>,
+    /// Fractional wheel remainder per axis `(horizontal, vertical)`, so a
+    /// pixel-precise trackpad still scrolls one whole line at a time (see
+    /// [`mouse::drain_notches`]).
+    wheel_accum: (f32, f32),
+    /// Client-side scroll offset for the completion doc preview (a pure UI gesture
+    /// — the server owns no notion of the box's pixel height). Reset to 0 whenever
+    /// the previewed docs change (a new selection, or the menu closing).
+    doc_scroll: u16,
+    /// Last `(cols, windows_rows)` reported to the server, to suppress
+    /// no-op resize notifications.
+    reported: (u16, u16),
+    /// When set, fire one `nxvim_input_flush` once this instant passes with no
+    /// further input — the GUI's `timeoutlen` timer (see [`TIMEOUT_LEN`]). Armed by
+    /// each keystroke and re-armed by the next, so it measures idle-since-last-key.
+    flush_deadline: Option<Instant>,
+    /// Font config (CLI flags / environment) used as the renderer's startup default
+    /// and the fallback for any field a `guifont` doesn't set.
+    config: GuiConfig,
+    /// The last `view.guifont` applied to the renderer, so a redraw only re-shapes
+    /// when it actually changed (`:set guifont=…` / the init-time value).
+    applied_guifont: String,
+}
+
+impl App {
+    fn new(rpc: Rpc, config: GuiConfig) -> Self {
+        Self {
+            rpc,
+            window: None,
+            renderer: None,
+            view: View::default(),
+            scroll: None,
+            mods: ModifiersState::empty(),
+            cursor_px: (0.0, 0.0),
+            mouse_down: false,
+            last_drag_cell: None,
+            wheel_accum: (0.0, 0.0),
+            doc_scroll: 0,
+            reported: (0, 0),
+            flush_deadline: None,
+            config,
+            applied_guifont: String::new(),
+        }
+    }
+
+    /// Compute the grid, and if it changed since last time, tell the server. The
+    /// reported height reserves the bottom row for the command line (like the
+    /// TUI's one chrome row), so the windows area is `total_rows - 1`.
+    fn report_size(&mut self, attach: bool) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let (cols, total_rows) = renderer.grid_size();
+        let win_rows = total_rows.saturating_sub(1).max(1);
+        if !attach && self.reported == (cols, win_rows) {
+            return;
+        }
+        self.reported = (cols, win_rows);
+        let method = if attach {
+            "nvim_ui_attach"
+        } else {
+            "nvim_ui_try_resize"
+        };
+        self.rpc.notify(
+            method,
+            vec![Value::from(cols), Value::from(win_rows), Value::Map(vec![])],
+        );
+    }
+
+    /// Read the system clipboard and feed it to the server as one `nvim_input` via
+    /// [`encode_paste`] — the GUI analogue of the TUI's bracketed paste (one
+    /// notify, one redraw, no per-character trickle). A missing, empty, or
+    /// non-text clipboard is a silent no-op (nothing to paste).
+    fn paste_clipboard(&self) {
+        let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) else {
+            return;
+        };
+        let notation = encode_paste(&text);
+        if !notation.is_empty() {
+            self.rpc
+                .notify("nvim_input", vec![Value::from(notation.as_str())]);
+        }
+    }
+
+    /// Apply the relayed `view.guifont` to the renderer: parse the family and `:h`
+    /// size, fall back to the CLI/env [`GuiConfig`] for any unset field, re-shape,
+    /// and re-report the grid (the cell size changed). Called whenever `guifont`
+    /// changes — including its first non-empty value from `init.lua` — so a
+    /// `:set guifont=…` takes effect live. A no-op before the renderer exists; it's
+    /// applied from `resumed` once the renderer is built.
+    fn apply_guifont(&mut self) {
+        let (family, size) = parse_guifont(&self.view.guifont);
+        let font = family.or_else(|| self.config.font.clone());
+        let size = size.unwrap_or(self.config.font_size);
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        renderer.set_font(font.as_deref(), size);
+        self.applied_guifont = self.view.guifont.clone();
+        // The cell size changed, so the grid in cells did too — re-report it (the
+        // server re-lays out for the new dimensions) and repaint.
+        self.report_size(false);
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+    }
+
+    /// Pop the native **open** dialog for an `…o` open command, then run `<base>
+    /// <file>` with the chosen path. Returns `true` once it has handled the `<CR>`
+    /// (so the caller swallows the key).
+    ///
+    /// On a pick it aborts the half-typed command line (`<Esc>`) and runs the base
+    /// command; on cancel it just aborts. nxvim's `:edit`-family parser takes the
+    /// whole argument tail as the filename (no backslash unescaping, unlike vim),
+    /// so the path is passed **raw** — a leading `fnameescape` would wrongly bake
+    /// its `\ ` escapes into the name. The dialog is modal on the main thread
+    /// (winit's requirement; on Linux rfd blocks on the portal call via pollster,
+    /// safe here since the winit thread is outside the tokio runtime), which
+    /// briefly blocks the event loop — fine for a file picker.
+    fn pick_open(&self, base: &str) -> bool {
+        let picked = rfd::FileDialog::new().set_title("Open").pick_file();
+        self.run_picked(base, picked);
+        true
+    }
+
+    /// Pop the native **save** dialog for `:wn` / a bare `:w` on an unnamed buffer,
+    /// then `:w <file>` to the chosen path (which also binds the buffer to it).
+    /// Same key-swallowing contract and raw-path rationale as [`Self::pick_open`].
+    fn pick_save(&self) -> bool {
+        let picked = rfd::FileDialog::new().set_title("Save As").save_file();
+        self.run_picked("w", picked);
+        true
+    }
+
+    /// Abort the half-typed command line, then run `<verb> <path>` for a picked
+    /// file (nothing further on cancel). Shared by the open and save pickers.
+    fn run_picked(&self, verb: &str, picked: Option<std::path::PathBuf>) {
+        self.rpc.notify("nvim_input", vec![Value::from("<Esc>")]);
+        if let Some(path) = picked {
+            let path = path.to_string_lossy();
+            self.rpc
+                .notify("nvim_command", vec![Value::from(format!("{verb} {path}"))]);
+        }
+    }
+
+    /// The absolute screen cell the pointer is currently over, or `None` before
+    /// the renderer exists.
+    fn pointer_cell(&self) -> Option<(u16, u16)> {
+        let r = self.renderer.as_ref()?;
+        Some(r.cell_at(self.cursor_px.0, self.cursor_px.1))
+    }
+
+    /// Fire one `nvim_input_mouse(button, action, modifier, grid=0, row, col)` —
+    /// a mouse gesture at a global screen cell. The server owns the hit-test back
+    /// to a window + buffer position; `grid` is always 0 (nxvim is single-grid).
+    fn send_mouse(&self, button: &str, action: &str, col: u16, row: u16) {
+        self.rpc.notify(
+            "nvim_input_mouse",
+            vec![
+                Value::from(button),
+                Value::from(action),
+                Value::from(mouse::mouse_modifier(self.mods)),
+                Value::from(0u64),
+                Value::from(row as u64),
+                Value::from(col as u64),
+            ],
+        );
+    }
+
+    /// Left button pressed. A client-owned overlay claims the click when the
+    /// pointer is over it — the panel's `[X]` / content (close, select, activate)
+    /// or a completion row (select / accept) — exactly like the TUI; otherwise it
+    /// is a text-area press the server turns into focus-follows-click + a Visual
+    /// anchor. Arms drag tracking either way (a stray drag the server no-ops).
+    fn mouse_left_press(&mut self) {
+        let Some((col, row)) = self.pointer_cell() else {
+            return;
+        };
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
+        let (cols, total_rows) = r.grid_size();
+        self.mouse_down = true;
+        self.last_drag_cell = Some((col, row));
+
+        // 1. The bottom panel (`:messages`/`:ls`) swallows every click while open:
+        // its `[X]` (or `q`) closes it, a content row selects that entry, and the
+        // already-selected entry activates (`<CR>`) — the TUI's select-then-confirm.
+        if let Some(panel) = self.view.panel.as_ref() {
+            if let Some((brow, bcols)) = mouse::panel_close_button(cols, total_rows, panel.height) {
+                if row == brow && bcols.contains(&col) {
+                    self.rpc.notify("nvim_input", vec![Value::from("q")]);
+                    return;
+                }
+            }
+            if let Some((cx, cy, cw, ch)) =
+                mouse::panel_content_rect(cols, total_rows, panel.height)
+            {
+                if mouse::within(col, row, cx, cy, cw, ch) {
+                    let prow = row - cy; // row within the content area
+                    if (prow as usize) < panel.lines.len() {
+                        let sel_end = panel.cursor_row + panel.cursor_span.max(1);
+                        if prow >= panel.cursor_row && prow < sel_end {
+                            self.rpc.notify("nvim_input", vec![Value::from("<CR>")]);
+                        } else {
+                            self.rpc
+                                .notify("nxvim_panel_click", vec![Value::from(prow as u64)]);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // 2. The completion popup: a click on a row selects it, and clicking the
+        // already-selected row accepts it (<C-n> then <C-y>). A click off the popup
+        // is swallowed (no text-area fallthrough), matching the TUI.
+        if let Some(hit) = render::pmenu_hit(&self.view, cols) {
+            let (ix, iy, iw, ih) = hit.item;
+            if mouse::within(col, row, ix, iy, iw, ih) {
+                if let Some(pmenu) = self.view.pmenu.as_ref() {
+                    let idx = hit.start + (row - iy) as usize;
+                    if idx < pmenu.items.len() {
+                        if pmenu.selected == Some(idx) {
+                            self.rpc.notify("nxvim_complete_accept", vec![]);
+                        } else {
+                            self.rpc
+                                .notify("nxvim_complete_select", vec![Value::from(idx as u64)]);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // 3. No overlay: a text-area press, forwarded to the server (single-grid).
+        self.send_mouse("left", "press", col, row);
+    }
+
+    /// A `CursorMoved` while the left button is held: extend the Visual selection
+    /// by reporting a drag, but only when the pointer crosses into a new cell (the
+    /// server works in cells, so within-cell motion is noise).
+    fn mouse_drag(&mut self) {
+        if !self.mouse_down {
+            return;
+        }
+        let Some(cell) = self.pointer_cell() else {
+            return;
+        };
+        if self.last_drag_cell == Some(cell) {
+            return;
+        }
+        self.last_drag_cell = Some(cell);
+        self.send_mouse("left", "drag", cell.0, cell.1);
+    }
+
+    /// Left button released: finalize the Visual selection (the server keeps it)
+    /// and end drag tracking. Forwarded unconditionally like the TUI — the server
+    /// no-ops it unless a text press set an anchor.
+    fn mouse_left_release(&mut self) {
+        self.mouse_down = false;
+        self.last_drag_cell = None;
+        if let Some((col, row)) = self.pointer_cell() {
+            self.send_mouse("left", "release", col, row);
+        }
+    }
+
+    /// The mouse wheel. A client-owned overlay under the pointer claims *vertical*
+    /// notches — the completion doc preview scrolls its docs client-side, the popup
+    /// list moves its selection, the message panel moves its cursor — mirroring the
+    /// TUI. Everything else (all horizontal notches, and any vertical notch not over
+    /// an overlay) is a text-area scroll the server hit-tests to the window under
+    /// the pointer. A trackpad's fractional pixels accumulate into whole lines.
+    fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
+        let (cell_w, cell_h) = r.cell_size();
+        let (ax, ay) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (x, y),
+            MouseScrollDelta::PixelDelta(p) => (p.x as f32 / cell_w, p.y as f32 / cell_h),
+        };
+        let hnotch = mouse::drain_notches(ax, &mut self.wheel_accum.0);
+        let vnotch = mouse::drain_notches(ay, &mut self.wheel_accum.1);
+        let Some((col, row)) = self.pointer_cell() else {
+            return;
+        };
+        let (cols, total_rows) = r.grid_size();
+
+        // Cap the per-event repeat so a flung trackpad can't flood the server.
+        const MAX_STEPS: i32 = 10;
+        if let Some(action) = mouse::vertical_action(vnotch) {
+            let down = vnotch < 0;
+            let steps = vnotch.unsigned_abs().min(MAX_STEPS as u32);
+            if !self.wheel_vertical_overlay(col, row, cols, total_rows, down, steps) {
+                for _ in 0..steps {
+                    self.send_mouse("wheel", action, col, row);
+                }
+            }
+        }
+        // Horizontal notches never hit an overlay — always a text-area scroll.
+        if let Some(action) = mouse::horizontal_action(hnotch) {
+            let steps = hnotch.unsigned_abs().min(MAX_STEPS as u32);
+            for _ in 0..steps {
+                self.send_mouse("wheel", action, col, row);
+            }
+        }
+    }
+
+    /// Route `steps` vertical wheel notches to whichever overlay the pointer is
+    /// over — the completion doc preview (client-side scroll), the popup list
+    /// (move the selection), or the message panel (move its cursor). Returns
+    /// `true` when an overlay claimed them; `false` to fall through to a text scroll.
+    fn wheel_vertical_overlay(
+        &mut self,
+        col: u16,
+        row: u16,
+        cols: u16,
+        total_rows: u16,
+        down: bool,
+        steps: u32,
+    ) -> bool {
+        // The completion popup's doc preview and item list.
+        if let Some(hit) = render::pmenu_hit(&self.view, cols) {
+            if let Some((dx, dy, dw, dh, max_scroll)) = hit.doc {
+                if mouse::within(col, row, dx, dy, dw, dh) {
+                    const STEP: u16 = 3;
+                    for _ in 0..steps {
+                        self.doc_scroll = if down {
+                            (self.doc_scroll + STEP).min(max_scroll)
+                        } else {
+                            self.doc_scroll.saturating_sub(STEP)
+                        };
+                    }
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                    return true;
+                }
+            }
+            let (ix, iy, iw, ih) = hit.item;
+            if mouse::within(col, row, ix, iy, iw, ih) {
+                if let Some(pmenu) = self.view.pmenu.as_ref() {
+                    let n = pmenu.items.len();
+                    if n > 0 {
+                        // Move the selection one item per notch, non-wrapping (like a
+                        // scrollbar); an unselected list lands on the first item.
+                        let mut sel = pmenu.selected;
+                        for _ in 0..steps {
+                            sel = Some(match sel {
+                                Some(i) if down => (i + 1).min(n - 1),
+                                Some(i) => i.saturating_sub(1),
+                                None => 0,
+                            });
+                        }
+                        if let Some(idx) = sel {
+                            self.rpc
+                                .notify("nxvim_complete_select", vec![Value::from(idx as u64)]);
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+        // The bottom panel: the server owns its (word-wrapped) cursor, so feed the
+        // navigation keys it already handles.
+        if let Some(panel) = self.view.panel.as_ref() {
+            if let Some((cx, cy, cw, ch)) =
+                mouse::panel_content_rect(cols, total_rows, panel.height)
+            {
+                if mouse::within(col, row, cx, cy, cw, ch) {
+                    let key = if down { "<Down>" } else { "<Up>" };
+                    for _ in 0..steps {
+                        self.rpc.notify("nvim_input", vec![Value::from(key)]);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// The base ex verb to run after the native **open** dialog, if `cmdline` is one
+/// of the `…o` open commands — `:eo`→`e`, `:spo`→`sp`, `:vso`→`vs`, `:tabeo`→`tabe`,
+/// `:newo`→`new`, `:vnewo`→`vnew` — or bare `:e`/`:edit`, an alias of `:eo`. `None`
+/// for anything else (including bare `:sp`/`:vs`/`:tabe`, which keep their usual
+/// no-argument behavior). Pure, so it is unit-tested in `tests/keys.rs`.
+pub fn open_dialog_verb(cmdline: &str) -> Option<&'static str> {
+    match cmdline.trim() {
+        // Bare `:e`/`:edit` aliases `:eo`; `:eo` is the explicit form.
+        "e" | "ed" | "edi" | "edit" | "eo" => Some("e"),
+        "spo" => Some("sp"),
+        "vso" => Some("vs"),
+        "tabeo" => Some("tabe"),
+        "newo" => Some("new"),
+        "vnewo" => Some("vnew"),
+        _ => None,
+    }
+}
+
+/// Whether `<CR>` over `cmdline` should pop the native **save** dialog: `:wn`
+/// (save to a new file) always, or a bare `:w`/`:write` when the focused buffer is
+/// `unnamed` (so a plain `:w` has no file to write to). `None`/false leaves the
+/// command to run as typed. Pure, so it is unit-tested in `tests/keys.rs`.
+pub fn save_dialog_needed(cmdline: &str, unnamed: bool) -> bool {
+    matches!(cmdline.trim(), "wn")
+        || (unnamed && matches!(cmdline.trim(), "w" | "wr" | "wri" | "writ" | "write"))
+}
+
+/// Parse a vim / Neovide `guifont` value into `(family, point size)`. The family is
+/// the first of the comma-separated fonts (the font system handles fallback on its
+/// own); a backslash-escaped space (`Fira\ Code`, the `:set` form) is unescaped. A
+/// `:h<n>` field sets the size; other `:` options (`:w`, `:b`, `:i`, `:#e-…`) are
+/// accepted but ignored. Either component is `None` when absent, so the caller can
+/// fall back to its configured default. Pure, so it's unit-tested in `tests/keys.rs`.
+pub fn parse_guifont(guifont: &str) -> (Option<String>, Option<f32>) {
+    let mut parts = guifont.split(':');
+    let family = parts
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .replace("\\ ", " ");
+    let family = family.trim();
+    let family = (!family.is_empty()).then(|| family.to_string());
+
+    let size = parts.find_map(|opt| {
+        let pt = opt.strip_prefix('h')?.trim().parse::<f32>().ok()?;
+        (pt.is_finite() && pt > 0.0).then_some(pt)
+    });
+    (family, size)
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return; // already initialized (e.g. resumed after suspend)
+        }
+        let attrs = Window::default_attributes()
+            .with_title("nxvim")
+            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                eprintln!("nxvim-gui: failed to create window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        match Renderer::new(window.clone(), &self.config) {
+            Ok(r) => self.renderer = Some(r),
+            Err(e) => {
+                eprintln!("nxvim-gui: failed to init renderer: {e}");
+                event_loop.exit();
+                return;
+            }
+        }
+        self.window = Some(window);
+        self.report_size(true);
+        // Apply any `guifont` already received before the renderer existed (a
+        // redraw can beat `resumed`); a no-op for the default empty value.
+        self.apply_guifont();
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Redraw(view) => {
+                // The previewed completion docs changing (a new selection, or the
+                // menu closing) resets the client-side doc scroll to the top.
+                let prev_doc = self.view.pmenu.as_ref().map(|p| p.doc.clone());
+                self.view = *view;
+                if self.view.pmenu.as_ref().map(|p| &p.doc) != prev_doc.as_ref() {
+                    self.doc_scroll = 0;
+                }
+                // A changed `guifont` re-shapes the renderer (and re-reports the
+                // grid) before this frame paints.
+                if self.view.guifont != self.applied_guifont {
+                    self.apply_guifont();
+                }
+                // (Re)arm or clear the scroll slide from this frame's gesture.
+                self.scroll = arm_scroll(&self.view, self.scroll.take());
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+            UserEvent::Exit => event_loop.exit(),
+        }
+    }
+
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            // Don't exit on the close button directly — that would discard a
+            // modified buffer silently. Route through the server's `:qa`, which
+            // quits a clean editor (it then sends `nxvim_exit`, arriving as
+            // `UserEvent::Exit`) but refuses with `E37` when a buffer is unsaved,
+            // keeping the window open. `nvim_command` runs the ex-command
+            // regardless of the current mode (unlike injecting `:qa<CR>` keys).
+            WindowEvent::CloseRequested => {
+                self.rpc.notify("nvim_command", vec![Value::from("qa")]);
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.resize(size.width, size.height);
+                }
+                self.report_size(false);
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // The renderer measures cells in device pixels; a DPI change is
+                // surfaced as a following `Resized`, which re-reports the grid.
+            }
+            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
+            // Track the pointer (winit's button/wheel events carry no position) and,
+            // while the left button is held, synthesize a drag when the cell changes.
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_px = (position.x, position.y);
+                self.mouse_drag();
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.mouse_left_press(),
+                ElementState::Released => self.mouse_left_release(),
+            },
+            WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // Paste from the system clipboard (Cmd+V / Ctrl+Shift+V /
+                // Shift+Insert), fed through the same `encode_paste` the TUI uses
+                // for terminal bracketed paste. Claimed before key encoding so the
+                // gesture's base key isn't also typed.
+                if input::is_paste(&event.logical_key, self.mods) {
+                    self.paste_clipboard();
+                    self.flush_deadline = Some(Instant::now() + TIMEOUT_LEN);
+                    return;
+                }
+                // `<CR>` over a dialog-triggering `:` command line pops a native
+                // file dialog and runs the real command with the chosen path, in
+                // place of the keystroke. Only for a true `:` ex command (not a
+                // search or a `vim.ui.input` prompt). A `pick_*` returns `true` when
+                // it handled the key (so it is swallowed); otherwise the keystroke
+                // is encoded as usual.
+                if matches!(event.logical_key, Key::Named(NamedKey::Enter))
+                    && self.view.command_mode
+                    && self.view.cmdline_prefix == ':'
+                    && self.view.cmdline_prompt.is_empty()
+                {
+                    if let Some(base) = open_dialog_verb(&self.view.cmdline) {
+                        if self.pick_open(base) {
+                            return;
+                        }
+                    } else {
+                        let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
+                        if save_dialog_needed(&self.view.cmdline, unnamed) && self.pick_save() {
+                            return;
+                        }
+                    }
+                }
+                // macOS composes Option(Alt)+key into a character — Option+c yields
+                // `logical_key` "ç", not "c" — so a `<A-c>`-style binding (e.g.
+                // multi-cursor) would otherwise arrive as `<A-ç>` and never match.
+                // For a ctrl/alt combo take `key_without_modifiers`, the un-composed
+                // base key (it also drops Shift, fine for a chord like `<A-c>`); plain
+                // typing keeps `logical_key`, where the platform has folded Shift into
+                // the character so `A` stays `A`.
+                let key = if self.mods.control_key() || self.mods.alt_key() {
+                    event.key_without_modifiers()
+                } else {
+                    event.logical_key.clone()
+                };
+                if let Some(notation) = input::encode_key(&key, self.mods) {
+                    self.rpc
+                        .notify("nvim_input", vec![Value::from(notation.as_str())]);
+                    // Arm the `timeoutlen` flush; the next key re-arms it, so it
+                    // measures idle-since-last-key (see `about_to_wait`).
+                    self.flush_deadline = Some(Instant::now() + TIMEOUT_LEN);
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                // Settle a finished slide before painting, so the final frame is
+                // the live (destination) view rather than a clamped band.
+                if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
+                    self.scroll = None;
+                }
+                let frame = self.scroll.as_ref().map(ScrollAnim::frame);
+                let doc_scroll = self.doc_scroll;
+                if let Some(r) = self.renderer.as_mut() {
+                    if let Err(e) = r.render(&self.view, frame.as_ref(), doc_scroll) {
+                        eprintln!("nxvim-gui: render error: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Between event batches, drive the slide and the `timeoutlen` flush. While a
+    /// slide is active, wake on a short timer and request a frame; `present` (Fifo
+    /// vsync) then paces the actual paint to the display refresh. `WaitUntil` (not
+    /// `Poll`) means we don't busy-spin if the OS withholds `RedrawRequested` (e.g.
+    /// an occluded or off-screen window) — and the time-based `done` check here is
+    /// the backstop that clears the slide even if no frame ever paints. When no
+    /// slide is running but a flush is armed, wake at the flush deadline instead.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Idle `timeoutlen` reached: nudge the server to resolve any withheld
+        // mapped prefix (harmless when nothing is pending), and disarm.
+        if self.flush_deadline.is_some_and(|d| Instant::now() >= d) {
+            self.rpc.notify("nxvim_input_flush", vec![]);
+            self.flush_deadline = None;
+        }
+        if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
+            self.scroll = None;
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw(); // settle to the live view
+            }
+        }
+        if self.scroll.is_some() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(8),
+            ));
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+        } else if let Some(deadline) = self.flush_deadline {
+            // No slide, but a flush is pending: sleep exactly until it's due.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+}

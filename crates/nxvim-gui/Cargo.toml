@@ -1,0 +1,38 @@
+[package]
+name = "nxvim-gui"
+description = "Native (winit + wgpu) GUI client for nxvim (a thin RPC client; renders the server's View)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nxvim-gui"
+path = "src/main.rs"
+
+# Lua backend, threaded down to nxvim-server exactly as the `nxvim` (TUI) binary
+# does it. Default is LuaJIT; `--no-default-features --features lua51` builds on
+# vendored PUC Lua 5.1. nxvim-server inherits `default-features = false` from
+# [workspace.dependencies], so a backend must be selected here.
+[features]
+default = ["luajit"]
+lua51 = ["nxvim-server/lua51"]
+luajit = ["nxvim-server/luajit"]
+
+[dependencies]
+anyhow.workspace = true
+rmpv.workspace = true
+tokio.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+pollster.workspace = true
+nxvim-rpc.workspace = true
+nxvim-view.workspace = true
+nxvim-server.workspace = true
+arboard.workspace = true
+# Native open/save dialog for the `:eo`/`:wn`/… pickers, on all three desktop
+# platforms (no GTK — see the rfd note in the workspace Cargo.toml).
+rfd.workspace = true

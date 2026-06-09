@@ -851,6 +851,79 @@ async fn q_on_the_last_modified_window_refuses_with_e37() {
     assert_eq!(frame.windows.len(), 1, "still one window, still running");
 }
 
+/// Send an ex-command as a fire-and-forget `nvim_command` notify (the path the
+/// GUI's window-close button takes), then report whether the server quit — same
+/// `nxvim_exit` / closed-channel signal as [`quit_observed`].
+async fn command_quit_observed(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    cmd: &str,
+) -> bool {
+    rpc.notify("nvim_command", vec![Value::from(cmd)]);
+    let timeout = std::time::Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout(timeout, incoming.recv()).await {
+            Ok(None) => return true,
+            Ok(Some(Incoming::Notification { method, .. })) if method == "nxvim_exit" => {
+                return true
+            }
+            Ok(Some(_)) => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Run `cmd` via `nvim_command` and return the resulting frame — the
+/// command-driven analogue of [`windows_after`], used to read the message a
+/// refused quit leaves behind.
+async fn command_frame(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, cmd: &str) -> Frame {
+    while incoming.try_recv().is_ok() {} // discard buffered frames from earlier
+    rpc.notify("nvim_command", vec![Value::from(cmd)]);
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    if let Some(frame) = drain_to_latest(incoming) {
+        return frame;
+    }
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(frame) = drain_to_latest(incoming) {
+            return frame;
+        }
+    }
+    panic!("no redraw arrived for command {cmd:?}");
+}
+
+#[tokio::test]
+async fn close_window_via_qa_quits_a_clean_editor() {
+    // The GUI's window-close button routes through `nvim_command("qa")` rather
+    // than exiting unconditionally; with a clean buffer that still quits.
+    let (rpc, mut incoming) = start(None).await;
+    assert!(
+        command_quit_observed(&rpc, &mut incoming, "qa").await,
+        "closing a clean editor via `qa` quits"
+    );
+}
+
+#[tokio::test]
+async fn close_window_via_qa_refuses_a_modified_buffer() {
+    // The contract the close button relies on: with unsaved changes, the same
+    // `qa` path must refuse (E37) and keep the editor — and its window — alive,
+    // not discard the buffer.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iunsaved<Esc>");
+    let frame = command_frame(&rpc, &mut incoming, "qa").await;
+    assert!(
+        frame.message.starts_with("E37"),
+        "`qa` on a modified buffer warns E37 instead of quitting: {:?}",
+        frame.message
+    );
+    assert_eq!(frame.windows.len(), 1, "still one window, still running");
+    // And it really did not quit (no `nxvim_exit` / closed channel).
+    assert!(
+        !command_quit_observed(&rpc, &mut incoming, "echo ''").await,
+        "the editor stays alive after a refused close"
+    );
+}
+
 #[tokio::test]
 async fn q_closes_a_modified_non_last_window_without_complaint() {
     let (rpc, mut incoming) = start(None).await;

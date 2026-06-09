@@ -35,7 +35,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: nxvim-edge-*
+          pattern: nxvim-*
           path: dist
           merge-multiple: true
 
@@ -43,12 +43,12 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum nxvim-edge-* > SHA256SUMS
+          sha256sum nxvim-* > SHA256SUMS
 
       - name: Attest provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: "dist/nxvim-edge-*"
+          subject-path: "dist/nxvim-*"
 
       - name: Build release notes
         shell: bash

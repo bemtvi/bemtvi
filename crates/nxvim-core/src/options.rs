@@ -46,6 +46,12 @@ pub struct Options {
     /// (`mouse`/`mousemodel`/`mousescroll`/`mousetime`) follow this block. A whole-line
     /// `%!v:lua.…()` is the usual form. Global by nature (there is one tabline).
     pub tabline: String,
+    /// The `'guifont'` value (`"Fira Code:h14"`, neovim/neovide syntax). The core
+    /// doesn't use it — fonts are a pixel concern the server has no notion of — but
+    /// it's stored here so `:set guifont=…` / `vim.o.guifont` are accepted and the
+    /// value is relayed to a GUI client (which parses and applies it). Empty means
+    /// the client's own default font.
+    pub guifont: String,
     /// Which modes mouse input is acted on (`'mouse'`): a set of mode chars —
     /// `n`ormal, `v`isual, `i`nsert, `c`mdline, `a`ll, plus `r`/`h` (unused yet).
     /// A gesture is honored only if the current mode's char (or `a`) is present;
@@ -85,6 +91,8 @@ impl Default for Options {
             statusline: String::new(),
             // No custom tabline by default — the built-in tab cells are used.
             tabline: String::new(),
+            // No custom GUI font by default — the client uses its own.
+            guifont: String::new(),
             // Mouse defaults match neovim exactly. `mouse` is `"nvi"` (not `"a"`):
             // cmdline-mode mouse is off by default. `mousemodel` is `popup_setpos`,
             // so right-click pops a menu and `<S-LeftMouse>` is the extend gesture.
@@ -434,6 +442,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "laststatus" | "ls" => Some(("laststatus", Num)),
         "statusline" | "stl" => Some(("statusline", Str)),
         "tabline" | "tal" => Some(("tabline", Str)),
+        "guifont" | "gfn" => Some(("guifont", Str)),
         "mouse" => Some(("mouse", Str)),
         "mousemodel" | "mousem" => Some(("mousemodel", Str)),
         "mousescroll" => Some(("mousescroll", Str)),

@@ -193,6 +193,7 @@ pub struct GoMirror {
     pub laststatus: u8,
     pub statusline: String,
     pub tabline: String,
+    pub guifont: String,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
     /// float-positioning plugin (telescope) can center its windows.
     pub columns: u64,

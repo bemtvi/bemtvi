@@ -136,6 +136,10 @@ pub struct WindowView {
     pub secondary_cursors: Vec<(usize, usize)>,
     /// File name for this window's status line (`"[No Name]"` when unset).
     pub file_name: String,
+    /// Whether this window's buffer has no file path yet (a fresh `[No Name]`
+    /// buffer), so a write needs a target. Sent to clients as an explicit flag so
+    /// a GUI can route a bare `:w` to its save dialog without matching `file_name`.
+    pub unnamed: bool,
     pub modified: bool,
     /// 1-based cursor line, for this window's status-line ruler.
     pub cursor_line: usize,
@@ -459,6 +463,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         cursor_screen_col,
         secondary_cursors,
         file_name,
+        unnamed: buf.path.is_none(),
         modified: buf.modified,
         cursor_line: cur_line + 1,
         selection,

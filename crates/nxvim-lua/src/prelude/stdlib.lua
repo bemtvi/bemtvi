@@ -93,6 +93,7 @@ local O_GLOBAL = {
   laststatus = "laststatus", ls = "laststatus",
   statusline = "statusline", stl = "statusline",
   tabline = "tabline", tal = "tabline",
+  guifont = "guifont", gfn = "guifont",
   -- The editor screen extent (the server pushes the live size into the mirror);
   -- read-mostly here — a float-positioning plugin (telescope) reads them to
   -- center its windows, and `:set columns=` is not honored (the client owns the
@@ -107,6 +108,7 @@ local O_GLOBAL_DEFAULT = {
   laststatus = 2,
   statusline = "",
   tabline = "",
+  guifont = "",
   columns = 80, lines = 24,
 }
 

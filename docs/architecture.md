@@ -686,10 +686,46 @@ IPC.
 
 The terminal client is built on [ratatui](https://ratatui.rs) (over crossterm).
 Because every front end is just a client of nxvim's own RPC, a **native GUI** —
-notably a non-terminal GUI on Windows — is a future client crate (e.g.
-`nxvim-gui`) consuming the same `View` protocol, with zero changes to the server
-or core. **For now nxvim is terminal-only;** the GUI is explicitly deferred, but
-the architecture is built so it slots in without a rewrite.
+notably a non-terminal GUI on Windows — is just another client crate consuming
+the same `View` protocol, with zero changes to the server or core.
+
+That claim is now load-bearing: **`nxvim-gui` is a prototype native GUI client**
+([`crates/nxvim-gui`](../crates/nxvim-gui)) on **winit + wgpu + glyphon**. It is
+the GUI sibling of `nxvim-tui` and reuses the same frontend-neutral
+[`nxvim-view`](../crates/nxvim-view) decode/input layer (`View`, `Style`, `Key`,
+`notation`, `encode_paste`) — the seam the view crate was extracted for. The
+`nxvim-gui` *binary* embeds a server on its own thread exactly like the `nxvim`
+binary, joined by the same in-process duplex RPC; the only difference is the
+client. winit owns the main thread (its loop is not async), so the RPC runs on a
+separate IO thread that decodes each `redraw` into a `View` and forwards it to
+the event loop via an `EventLoopProxy`, while input goes the other way on a cloned
+`Rpc` handle (`notify` is synchronous, no runtime). Rendering is a monospace
+**cell grid**: a tiny solid-quad wgpu pipeline paints the backgrounds, selection,
+search, status bars and cursor, with a glyphon text layer (syntax-colored from the
+server's resolved `styles`) on top; the cell size is measured once from the font.
+
+**Scope.** It now paints essentially the whole `View` the TUI does — the tiled
+windows (text, number/relativenumber gutter with `CursorLineNr`, the diagnostic
+sign column), floats with borders + titles, the split separators, the tabline
+(built-in or custom), per-window and global (`laststatus=3`) status lines, the
+completion pmenu (with its doc preview), the `:messages`/`:ls` panel, the
+command/message line, visual + secondary (multi-cursor) selections, search /
+incsearch, LSP diagnostic underlines + signs + inline virtual text, the
+secondary multi-cursors, and the text style attributes (bold/italic via bold and
+italic faces, underline/strikethrough/reverse as quads) — plus **pixel-smooth
+scrolling**: the focused window slides the server's scroll-gesture band at a
+fractional (sub-pixel) line offset driven by the client clock, paced per frame from
+winit's `about_to_wait` (where the TUI animates at whole-row granularity, the GPU
+client interpolates `top` without rounding). Input reaches parity too: vim-notation
+keys, system-clipboard paste, native open/save dialogs, and **mouse** — click /
+drag-select / release, wheel scroll, and the pmenu / panel overlay gestures, sent
+as the same `nvim_input_mouse` the TUI uses (the server owns the hit-test). Still
+deferred: wide-char column fidelity (a char index stands in for a screen column),
+and undercurl is drawn as a plain underline. Because the GUI can't be black-box
+tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
+frontend-specific translation layers have Tier-1 tests — the winit→notation input
+(`crates/nxvim-gui/tests/keys.rs`) and the pointer/overlay math
+(`crates/nxvim-gui/tests/mouse.rs`); the rendered frame is validated by running it.
 
 ---
 

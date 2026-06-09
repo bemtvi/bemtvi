@@ -57,6 +57,9 @@ impl Server {
         // look), read once and shared across the window status + tabline projection.
         let statusline_fmt = self.editor.global_options().statusline;
         let tabline_fmt = self.editor.global_options().tabline;
+        // The `'guifont'` value, relayed verbatim for a GUI client to parse and
+        // apply; empty (the default) leaves the client on its own font.
+        let guifont = self.editor.global_options().guifont;
 
         // A `%{}`/`%!` statusline *or* tabline expression evaluates Lua that reads
         // live editor state through the `vim.fn.*` surface (mode/cursor/buffer/
@@ -163,6 +166,7 @@ impl Server {
                 Value::from(view.cmdline_cursor as u64),
             ),
             (Value::from("message"), Value::from(message.as_str())),
+            (Value::from("guifont"), Value::from(guifont.as_str())),
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
             (Value::from("panel"), panel),
@@ -225,6 +229,7 @@ impl Server {
                 Value::from("file_name"),
                 Value::from(win.file_name.as_str()),
             ),
+            (Value::from("unnamed"), Value::from(win.unnamed)),
             (Value::from("modified"), Value::from(win.modified)),
             (
                 Value::from("cursor_line"),

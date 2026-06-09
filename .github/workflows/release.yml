@@ -59,7 +59,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: nxvim-${{ needs.tag.outputs.version }}-*
+          pattern: nxvim-*
           path: dist
           merge-multiple: true
 
@@ -72,7 +72,7 @@ jobs:
       - name: Attest provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: "dist/nxvim-${{ needs.tag.outputs.version }}-*"
+          subject-path: "dist/nxvim-*"
 
       - name: Build release notes
         shell: bash

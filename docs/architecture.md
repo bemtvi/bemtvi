@@ -654,9 +654,15 @@ split — a small bespoke C-equivalent layer with neovim's real Lua on top:
   the primitives.
 - **The snapshot seam.** Unlike neovim's live buffer handle, nxvim's Lua bridge is
   a snapshot + effect queue. `TSParser:parse(bufnr)` reads the pushed
-  `vim._bufs[bufnr]` lines, and a buffer-sourced `LanguageTree` re-reads that
-  snapshot on every `:parse()` (a full reparse — there is no `nvim_buf_attach`).
-  String parsers (`get_string_parser`) keep their incremental trees.
+  `vim._bufs[bufnr]` lines. A buffer-sourced `LanguageTree` still reads that
+  snapshot, but reparses **incrementally**: it attaches through the vendored
+  `_create_parser`, and nxvim's `nvim_buf_attach` is real — the server fires
+  `on_bytes` from each buffer's byte-delta journal (the same `BufferEdit` stream
+  the native engine reparses from) for core edits, and the `nvim_buf_set_lines`
+  write-through fires `on_bytes` synchronously for in-entry plugin edits (the
+  server then suppresses its own fire so the tree is edited exactly once). Undo /
+  redo / `:e` arrive as `on_reload` (a full reparse). String parsers
+  (`get_string_parser`) keep their incremental trees.
 
 This is **additive**: a `LanguageTree` is created only when a plugin calls
 `get_parser`, so buffers without a treesitter consumer pay nothing; one that has a

@@ -250,6 +250,73 @@ function vim._buf_changed(buf, tick, first, last, new_last)
   vim._buf_attached[buf] = (#survivors > 0) and survivors or nil
 end
 
+-- vim._buf_bytes_changed(buf, tick, start_row, start_col, start_byte, old_row,
+-- old_col, old_byte, new_row, new_col, new_byte): invoke each attached on_bytes
+-- callback with neovim's on_bytes argument tuple (the "bytes" event name, the
+-- bufnr/changedtick, then the relative row/col/byte deltas). The dominant consumer
+-- is the vendored vim.treesitter LanguageTree, whose on_bytes edits its trees so
+-- the next :parse() reparses incrementally. Detach-on-error / detach-on-true match
+-- neovim, exactly as vim._buf_changed does for on_lines. The server fires this (for
+-- every edit since the last frame, in order) before any plugin Lua runs.
+function vim._buf_bytes_changed(
+  buf, tick, start_row, start_col, start_byte, old_row, old_col, old_byte, new_row, new_col, new_byte
+)
+  local list = vim._buf_attached[buf]
+  if not list then return end
+  local survivors = {}
+  for _, cbs in ipairs(list) do
+    local detach = false
+    if cbs.on_bytes then
+      local ok, ret = pcall(
+        cbs.on_bytes, "bytes", buf, tick,
+        start_row, start_col, start_byte,
+        old_row, old_col, old_byte,
+        new_row, new_col, new_byte
+      )
+      if not ok then
+        vim.notify("nxvim: nvim_buf_attach on_bytes errored and was detached: " .. tostring(ret))
+        detach = true
+      elseif ret == true then
+        detach = true
+      end
+    end
+    if detach then
+      if cbs.on_detach then pcall(cbs.on_detach, "detach", buf) end
+    else
+      survivors[#survivors + 1] = cbs
+    end
+  end
+  vim._buf_attached[buf] = (#survivors > 0) and survivors or nil
+end
+
+-- vim._buf_reloaded(buf): invoke each attached on_reload callback ("reload", buf) —
+-- fired when the whole rope was replaced (undo/redo, :e), where byte deltas are
+-- meaningless. The treesitter LanguageTree's on_reload invalidates its tree so the
+-- next :parse() is a full reparse of the current snapshot.
+function vim._buf_reloaded(buf)
+  local list = vim._buf_attached[buf]
+  if not list then return end
+  local survivors = {}
+  for _, cbs in ipairs(list) do
+    local detach = false
+    if cbs.on_reload then
+      local ok, ret = pcall(cbs.on_reload, "reload", buf)
+      if not ok then
+        vim.notify("nxvim: nvim_buf_attach on_reload errored and was detached: " .. tostring(ret))
+        detach = true
+      elseif ret == true then
+        detach = true
+      end
+    end
+    if detach then
+      if cbs.on_detach then pcall(cbs.on_detach, "detach", buf) end
+    else
+      survivors[#survivors + 1] = cbs
+    end
+  end
+  vim._buf_attached[buf] = (#survivors > 0) and survivors or nil
+end
+
 -- Fire on_detach for every callback attached to `buf` and clear them — run when
 -- the buffer is deleted (below).
 function vim._fire_on_detach(buf)

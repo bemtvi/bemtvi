@@ -1199,6 +1199,24 @@ function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
   for i = e + 1, n do updated[#updated + 1] = lines[i] end
   buf.lines = updated
   vim._buf_set_lines(id, start, end_, repl)
+  -- Fire on_bytes synchronously for any attached parser, matching neovim: an
+  -- edit-then-:parse() within one entry must see the edit (the vim.treesitter
+  -- LanguageTree's on_bytes edits its trees). The server suppresses its own
+  -- on_bytes for this same edit (apply_buf_op truncates the buffer's treesitter
+  -- journal after applying), so the tree is edited exactly once. Byte offsets come
+  -- from the *old* line bytes (`lines`, captured before the splice); each editable
+  -- line carries its trailing newline, so the trailing-`\n` line model and the
+  -- server's byte math agree. The on_bytes row/col fields are relative deltas
+  -- (start at the replaced range's first line, column 0 — set_lines is linewise).
+  if vim._buf_attached[id] then
+    local start_byte = 0
+    for i = 1, s do start_byte = start_byte + #lines[i] + 1 end
+    local old_byte = 0
+    for i = s + 1, e do old_byte = old_byte + #lines[i] + 1 end
+    local new_byte = 0
+    for i = 1, #repl do new_byte = new_byte + #repl[i] + 1 end
+    vim._buf_bytes_changed(id, 0, s, 0, start_byte, e - s, 0, old_byte, #repl, 0, new_byte)
+  end
 end
 
 -- ===== Extmarks / decoration layer =====================================

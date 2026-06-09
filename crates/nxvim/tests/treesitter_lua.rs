@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, serial_lock as test_lock, start_attached};
+use nxvim_test_harness::{exec_lua, feed, serial_lock as test_lock, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const COLS: u16 = 80;
@@ -422,6 +422,186 @@ async fn real_consumer_collects_function_names() {
     .await;
 
     assert_eq!(v.as_str(), Some("alpha,beta"));
+}
+
+/// The acceptance test for incremental buffer parsing: a parser kept **across
+/// entries** is driven only by the server's `nvim_buf_attach` `on_bytes` stream
+/// (core keystroke edits, which never touch the Lua write-through), and after a
+/// spread of edit shapes — append at EOF, a mid-line change, an inserted line, a
+/// deleted line — its incrementally-maintained tree is identical (`sexpr`) to a
+/// from-scratch parse of the same text. A divergence would mean a dropped or
+/// miswritten `on_bytes` corrupted the incremental tree (tree-sitter does not
+/// self-heal an under-reported edit), so this is the guard the whole wiring rests
+/// on. It would fail outright if buffer parsers still full-reparsed without
+/// `on_bytes`, or if a delta were off.
+#[tokio::test]
+async fn buffer_parser_incremental_matches_full_reparse_across_keystroke_edits() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    // A persistent parser (`_G.p`) and an oracle (`_G.eq`) comparing its
+    // incremental tree to a from-scratch parse of the *current* buffer text. The
+    // oracle text joins the snapshot lines exactly as the buffer parser reads them
+    // (no trailing newline), so the two parses see byte-identical source.
+    exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'fn a() {}' })
+        _G.p = vim.treesitter.get_parser(0, 'rust')
+        _G.p:parse()
+        -- A fingerprint that captures BOTH structure (sexpr) and every named node's
+        -- byte range, so a divergence in ranges — not just shape — is caught (e.g. an
+        -- off-by-one edit delta at end-of-buffer that left a node's span stale).
+        local function fingerprint(root)
+          local parts = { root:sexpr() }
+          local function walk(node)
+            local sr, sc, er, ec = node:range()
+            parts[#parts + 1] = node:type() .. '@' .. sr .. ',' .. sc .. '-' .. er .. ',' .. ec
+            for child in node:iter_children() do walk(child) end
+          end
+          walk(root)
+          return table.concat(parts, ';')
+        end
+        _G.eq = function()
+          local inc = fingerprint(_G.p:parse()[1]:root())
+          local text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
+          local full = fingerprint(vim.treesitter.get_string_parser(text, 'rust'):parse()[1]:root())
+          if inc == full then return 'OK:' .. inc end
+          return 'DIFF\ninc =[' .. inc .. ']\nfull=[' .. full .. ']'
+        end
+        "#,
+    )
+    .await;
+
+    // Each edit is a core keystroke edit (no Lua API), so the server is the *only*
+    // on_bytes source; the parser must track every one. Edit shapes are chosen to
+    // span the awkward cases: `Go…` appends a line at end-of-buffer (the start byte
+    // sits at the buffer end), `A` changes a line in place, `O` splices a line into
+    // the middle (shifting everything below), `dd` removes one.
+    for (keys, note) in [
+        ("Gofn b() {}<Esc>", "append fn at EOF"),
+        ("ggA // c<Esc>", "mid-line comment on line 1"),
+        ("jOfn c() {}<Esc>", "insert fn line in the middle"),
+        ("dd", "delete the inserted line"),
+    ] {
+        feed(&rpc, keys);
+        let v = exec_lua(&rpc, "return _G.eq()").await;
+        let s = v.as_str().unwrap_or("<not a string>");
+        assert!(
+            s.starts_with("OK:"),
+            "incremental tree diverged from a full reparse after {note}:\n{s}"
+        );
+    }
+
+    // Oracle sanity: the final tree really reflects the edits (two functions left
+    // after the delete, and the line comment from the `A` edit), so the equality
+    // above isn't two identically-broken trees agreeing. Count the walk's per-node
+    // entries (`<type>@…`) rather than the bare type, which also appears in sexpr.
+    let v = exec_lua(&rpc, "return _G.eq()").await;
+    let s = v.as_str().unwrap();
+    assert_eq!(
+        s.matches("function_item@").count(),
+        2,
+        "expected two function_items in the final tree:\n{s}"
+    );
+    assert!(
+        s.contains("line_comment@"),
+        "expected the `// c` line comment in the final tree:\n{s}"
+    );
+}
+
+/// A whole-rope replacement (here, undo) reaches the parser as `on_reload`, not as
+/// byte deltas — so the tree is fully reparsed against the reverted snapshot rather
+/// than incrementally edited from meaningless deltas. Without the `on_reload`
+/// wiring the parser would keep the pre-undo (two-function) tree while the buffer
+/// shows one, and the oracle would diverge.
+#[tokio::test]
+async fn buffer_parser_reloads_on_undo_resync() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'fn a() {}' })
+        _G.p = vim.treesitter.get_parser(0, 'rust')
+        _G.p:parse()
+        _G.fns = function()
+          local text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
+          local inc = _G.p:parse()[1]:root():sexpr()
+          local full = vim.treesitter.get_string_parser(text, 'rust'):parse()[1]:root():sexpr()
+          local n = 0
+          for _ in inc:gmatch('function_item') do n = n + 1 end
+          return (inc == full) and ('OK:' .. n) or 'DIFF'
+        end
+        "#,
+    )
+    .await;
+
+    // Add a function by keystroke (incremental on_bytes), then undo it (resync).
+    feed(&rpc, "Gofn b() {}<Esc>");
+    let v = exec_lua(&rpc, "return _G.fns()").await;
+    assert_eq!(
+        v.as_str(),
+        Some("OK:2"),
+        "after adding a function via keystroke"
+    );
+
+    feed(&rpc, "u");
+    let v = exec_lua(&rpc, "return _G.fns()").await;
+    assert_eq!(
+        v.as_str(),
+        Some("OK:1"),
+        "after undo the parser must reload to the one-function tree"
+    );
+}
+
+/// `nvim_buf_attach`'s `on_bytes` fires for an edit, *alongside* the existing
+/// `on_lines` channel — locking that adding the byte-delta stream didn't displace
+/// the line-change callbacks telescope drives its prompt filtering off of.
+#[tokio::test]
+async fn buf_attach_fires_on_bytes_and_on_lines_together() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let (rpc, _rx) = start().await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'abc' })
+        _G.nb, _G.nl, _G.last = 0, 0, nil
+        vim.api.nvim_buf_attach(0, false, {
+          on_bytes = function(_, _, _, sr, sc, sb, orow, ocol, ob, nrow, ncol, nb)
+            _G.nb = _G.nb + 1
+            _G.last = { sr, sc, sb, orow, ocol, ob, nrow, ncol, nb }
+          end,
+          on_lines = function() _G.nl = _G.nl + 1 end,
+        })
+        "#,
+    )
+    .await;
+
+    // Append a character to the single line: one byte inserted, no new line.
+    feed(&rpc, "A!<Esc>");
+
+    let v = exec_lua(
+        &rpc,
+        r#"
+        local L = _G.last or {}
+        -- one byte inserted at row 0, col 3 (end of "abc"), no rows added/removed.
+        return string.format('%d,%d,%d,%d,%d', _G.nb >= 1 and 1 or 0,
+          _G.nl >= 1 and 1 or 0, L[1] or -1, L[7] or -1, L[9] or -1)
+        "#,
+    )
+    .await;
+    // fired_on_bytes, fired_on_lines, start_row, new_row, new_byte
+    assert_eq!(
+        v.as_str(),
+        Some("1,1,0,0,1"),
+        "expected both callbacks to fire and on_bytes to report a 1-byte same-line insert"
+    );
 }
 
 /// `vim.treesitter.get_node` resolves the smallest named node at a position —

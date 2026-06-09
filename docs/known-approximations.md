@@ -96,9 +96,20 @@ gap. Recorded here so the sweep doesn't lose them.
     language; a drift oracle test asserts the engine's paint agrees with the vendored
     `_get_injections`. A missing child grammar degrades to the host's flat paint. See
     [the injections design](specs/2026-06-08-treesitter-injections-design.md).
-  - **Live incremental buffer updates.** There is no `nvim_buf_attach`; a
-    buffer-sourced parser re-reads the snapshot and **fully reparses** on each
-    `:parse()` (correct, but pays the full cost — the "two parsers" tradeoff).
+  - **Live incremental buffer updates — built** (`nvim_buf_attach` `on_bytes`).
+    A buffer-sourced `LanguageTree` attaches through the vendored `_create_parser`
+    and edits its trees from real `on_bytes`/`on_reload` callbacks, so `:parse()`
+    reparses **incrementally** (re-lexing only the changed ranges) instead of
+    re-reading and fully reparsing the snapshot. Two `on_bytes` sources keep the
+    tree in lockstep with the snapshot the parser reads: the server drains each
+    buffer's byte-delta journal (the same `BufferEdit` stream the native engine
+    reparses from) and fires `on_bytes` before any plugin Lua runs, for core edits
+    (keystrokes, ex commands); and the Lua `nvim_buf_set_lines` write-through fires
+    `on_bytes` synchronously for plugin edits within an entry (the server then
+    suppresses its own fire for that edit so the tree is never double-edited). A
+    whole-rope replacement (undo/redo, `:e`) arrives as `on_reload` (a full
+    reparse), not as meaningless deltas. String parsers keep their cached trees as
+    before.
   - **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) fights the
     snapshot bridge (it wants the live buffer mid-keystroke); the Rust indent
     stays. `query.get` needs `io` for on-disk `queries/<lang>/*.scm`; a missing

@@ -48,6 +48,18 @@ impl Editor {
             .map(|ob| ob.buffer.take_lsp_edits())
     }
 
+    /// Drain buffer `id`'s **Lua-treesitter** edit journal — the byte-delta stream
+    /// the server forwards to the `vim.treesitter` platform parser as
+    /// `nvim_buf_attach` `on_bytes` (so the Lua `LanguageTree` reparses
+    /// incrementally instead of re-reading the whole snapshot). Parallel to
+    /// [`Editor::take_lsp_edits_of`]; `None` if no such buffer is open.
+    pub fn take_lua_ts_edits_of(&mut self, id: BufferId) -> Option<EditBatch> {
+        self.buffers
+            .map
+            .get_mut(&id)
+            .map(|ob| ob.buffer.take_lua_ts_edits())
+    }
+
     /// All open buffer ids, ascending (the `nvim_list_bufs` order).
     pub fn buffer_ids(&self) -> Vec<BufferId> {
         self.buffers.map.keys().copied().collect()

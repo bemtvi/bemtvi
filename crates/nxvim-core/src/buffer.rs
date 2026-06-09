@@ -97,6 +97,19 @@ pub struct Buffer {
     lsp_edits: Vec<BufferEdit>,
     /// `resync` for the LSP journal (whole-rope replacement: undo/redo/reload).
     lsp_resync: bool,
+    /// A **third** independent edit journal drained by
+    /// [`Buffer::take_lua_ts_edits`], feeding the Lua `vim.treesitter` platform's
+    /// `nvim_buf_attach` `on_bytes` channel (the second, plugin-facing parser a
+    /// `get_parser` call builds — distinct from the native highlight engine, which
+    /// drains [`Buffer::take_edits`]). Kept separate for the same reason `lsp_edits`
+    /// is: the consumers drain at different moments (the native engine on the sync
+    /// editor path, the Lua parser on the async server side before any Lua runs), so
+    /// one destructive journal would let whichever drains first starve the other and
+    /// silently corrupt the Lua-side incremental tree.
+    lua_ts_edits: Vec<BufferEdit>,
+    /// `resync` for the Lua-treesitter journal (whole-rope replacement → the Lua
+    /// `LanguageTree` must fully reparse via `on_reload`, not edit its trees).
+    lua_ts_resync: bool,
     /// Buffer-anchored extmarks (highlight-layering marks set via
     /// `nvim_buf_set_extmark`), partitioned by namespace. Their byte anchors are
     /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
@@ -141,6 +154,8 @@ impl Buffer {
             resync: false,
             lsp_edits: Vec::new(),
             lsp_resync: false,
+            lua_ts_edits: Vec::new(),
+            lua_ts_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
@@ -184,6 +199,8 @@ impl Buffer {
             resync: false,
             lsp_edits: Vec::new(),
             lsp_resync: false,
+            lua_ts_edits: Vec::new(),
+            lua_ts_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
@@ -236,6 +253,8 @@ impl Buffer {
             resync: false,
             lsp_edits: Vec::new(),
             lsp_resync: false,
+            lua_ts_edits: Vec::new(),
+            lua_ts_resync: false,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
         })
@@ -364,8 +383,10 @@ impl Buffer {
     pub fn mark_resync(&mut self) {
         self.edits.clear();
         self.lsp_edits.clear();
+        self.lua_ts_edits.clear();
         self.resync = true;
         self.lsp_resync = true;
+        self.lua_ts_resync = true;
         // Byte anchors are meaningless against the wholesale-new rope, and an
         // extmark has no source of truth to rebuild from (unlike the treesitter
         // / LSP journals, which re-derive from the full text), so drop them all —
@@ -400,6 +421,34 @@ impl Buffer {
         }
     }
 
+    /// Drain the **Lua-treesitter** edit journal — the independent `on_bytes`
+    /// stream feeding the `vim.treesitter` platform parser (parallel to
+    /// [`Buffer::take_edits`] / [`Buffer::take_lsp_edits`]). A `resync` batch means
+    /// the Lua `LanguageTree` should fully reparse (`on_reload`) rather than edit
+    /// its trees with now-meaningless deltas.
+    pub fn take_lua_ts_edits(&mut self) -> EditBatch {
+        EditBatch {
+            edits: std::mem::take(&mut self.lua_ts_edits),
+            resync: std::mem::replace(&mut self.lua_ts_resync, false),
+        }
+    }
+
+    /// Length of the Lua-treesitter journal — paired with
+    /// [`Buffer::truncate_lua_ts_edits`] to drop exactly the edits a single
+    /// operation appended (the server uses it to suppress its own `on_bytes` for a
+    /// `nvim_buf_set_lines` the Lua write-through already fired, without disturbing
+    /// other pending deltas in the journal). See the server's `apply_buf_op`.
+    pub fn lua_ts_edits_len(&self) -> usize {
+        self.lua_ts_edits.len()
+    }
+
+    /// Drop the Lua-treesitter journal back to `len` (the value
+    /// [`Buffer::lua_ts_edits_len`] returned before an operation), discarding only
+    /// the edits that operation appended.
+    pub fn truncate_lua_ts_edits(&mut self, len: usize) {
+        self.lua_ts_edits.truncate(len);
+    }
+
     fn record(&mut self, edit: BufferEdit) {
         self.extmarks
             .shift(edit.start_byte, edit.old_end_byte, edit.new_end_byte);
@@ -417,7 +466,8 @@ impl Buffer {
         // `normalize` saves and restores `'.'` around it (see there).
         self.marks.insert('.', edit.start_point);
         self.edits.push(edit.clone());
-        self.lsp_edits.push(edit);
+        self.lsp_edits.push(edit.clone());
+        self.lua_ts_edits.push(edit);
         self.changedtick += 1;
         self.modified = true;
     }

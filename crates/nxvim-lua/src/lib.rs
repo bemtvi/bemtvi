@@ -35,6 +35,6 @@ pub use ops::{
     RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
 };
 pub use runtime::{
-    BoMirror, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror, LuaRuntime, TabMirror,
-    WindowMirror,
+    BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
+    LuaRuntime, TabMirror, WindowMirror,
 };

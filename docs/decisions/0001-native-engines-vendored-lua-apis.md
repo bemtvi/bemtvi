@@ -134,9 +134,13 @@ so a missing or slow server degrades to "syntactic but correct," never to blank.
 
 **Costs (accepted).**
 - **Opt-in double parse.** A buffer a plugin queries from Lua is parsed by both
-  the native engine and the Lua `LanguageTree`. Acceptable for v1; sharing the
-  native tree into the Lua API is a *later* optimization (phase-1 already solved
-  node lifetime across the boundary), gated on the cost actually biting.
+  the native engine and the Lua `LanguageTree`. The Lua half now reparses
+  *incrementally* — it attaches via `nvim_buf_attach` and edits its trees from the
+  buffer's byte-delta journal (the same `BufferEdit` stream the native engine
+  consumes), so it re-lexes only changed ranges instead of re-reading the whole
+  snapshot. The two parsers stay independent, though: *sharing the native tree*
+  into the Lua API remains the untaken optimization (phase-1 already solved node
+  lifetime across the boundary), gated on the cost actually biting.
 - **Vendoring couples us to upstream internals.** The vendored Lua reaches for
   `vim.func._memoize`, `vim.validate`, `vim.iter`, `vim.regex`, `nvim_buf_attach`,
   decoration providers; each must be supplied or fail loud. That is the prelude's

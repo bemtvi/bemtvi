@@ -83,39 +83,24 @@ function vim.treesitter.stop(buf)
   vim.treesitter.highlighter.active[buf] = nil
   vim._ts_stop(buf)
 end
-
-do
-  local LanguageTree = require('vim.treesitter.languagetree')
-
-  -- Snapshot seam #1 — re-read the buffer on every parse.
-  --
-  -- neovim attaches to the buffer (nvim_buf_attach) so byte edits invalidate the
-  -- tree incrementally. nxvim's Lua bridge is a snapshot + effect queue, not a
-  -- live handle: there is nothing to attach to. Instead, a buffer-sourced parser
-  -- invalidates itself before each :parse(), so it re-parses the *current*
-  -- snapshot (vim._bufs[bufnr], refreshed by the server before any Lua runs).
-  -- This is a full reparse per parse — the "two parsers" cost the design accepts
-  -- for v1; incremental reuse from buffer deltas is a later optimization. String
-  -- parsers are immutable, so they keep their cached / incremental trees.
-  local orig_parse = LanguageTree.parse
-  function LanguageTree:parse(range, on_parse)
-    if type(self._source) == 'number' then
-      self:invalidate(true)
-    end
-    return orig_parse(self, range, on_parse)
-  end
-
-  -- Snapshot seam #2 — create a parser without nvim_buf_attach.
-  --
-  -- Upstream's _create_parser registers on_bytes/on_detach/on_reload via
-  -- nvim_buf_attach. nxvim drives invalidation through the snapshot re-read above
-  -- instead, so there is no live buffer to attach to. Overriding this one
-  -- function is the honest seam: nxvim does not ship a no-op nvim_buf_attach that
-  -- registers callbacks which would never fire.
-  function vim.treesitter._create_parser(buf, lang, opts)
-    return LanguageTree.new(vim._resolve_bufnr(buf), lang, opts)
-  end
-end
+-- Buffer parsers reparse INCREMENTALLY, driven by nvim_buf_attach on_bytes.
+--
+-- A buffer-sourced LanguageTree attaches to its buffer through the *vendored*
+-- `_create_parser` (which calls nvim_buf_attach with on_bytes/on_reload/on_detach),
+-- and nxvim's nvim_buf_attach is real: the server drains the buffer's byte-delta
+-- journal each frame and fires `vim._buf_bytes_changed` (→ on_bytes → the tree's
+-- `_on_bytes`, which edits its trees) before any plugin Lua runs, then a whole-rope
+-- replacement (undo/redo/`:e`) fires `vim._buf_reloaded` (→ on_reload, a full
+-- reparse). So `:parse()` edits the existing tree and re-lexes only the changed
+-- ranges against the current snapshot (`vim._bufs[bufnr]`), exactly as neovim does
+-- — no per-parse full invalidate, and no override of `_create_parser`. String
+-- parsers are immutable and keep their cached / incremental trees as before.
+--
+-- This is correct only because on_bytes reports *every* edit, in order, between two
+-- parses (tree-sitter corrupts the tree otherwise): the server's journal is the
+-- same byte-delta stream the native engine reparses from, and a freshly created
+-- parser's first `:parse()` is a full parse (it has no tree yet), so it can never
+-- start from a stale incremental base.
 
 -- ~~~ Query-resolution bridge (ADR 0001, #4): Lua resolves, the engine executes.
 --

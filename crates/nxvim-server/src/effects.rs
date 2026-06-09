@@ -11,9 +11,9 @@ use nxvim_core::{
     UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BoMirror, BufMirror, BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror,
-    HlDefMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, TsOp, WindowMirror,
-    WindowOp,
+    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror,
+    GoMirror, HlDefMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, TsOp,
+    WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -38,6 +38,37 @@ fn byte_rowcol(buf: &nxvim_core::Buffer, byte: usize) -> (u64, u64) {
     let row = buf.byte_to_line(byte);
     let col = byte - buf.line_start(row);
     (row as u64, col as u64)
+}
+
+/// Project a core [`BufferEdit`] (absolute byte offsets + `(row, byte-col)`
+/// points) into neovim's `on_bytes` argument tuple, whose row/col fields are
+/// *relative* deltas: `start_*` is the absolute start, the `old_*`/`new_*` triples
+/// are `(rows spanned, col on the last spanned row, byte count)`. This is the
+/// inverse of the vendored `LanguageTree:_on_bytes` reconstruction
+/// (`old_end_col = old_col + (old_row == 0 ? start_col : 0)`, etc.), so a round
+/// trip through it recovers the original absolute edit.
+fn on_bytes_edit(bufnr: u64, tick: u64, e: &nxvim_core::BufferEdit) -> BufBytesEdit {
+    let (sr, sc) = e.start_point;
+    let (or_, oc) = e.old_end_point;
+    let (nr, nc) = e.new_end_point;
+    let old_row = or_ - sr;
+    let new_row = nr - sr;
+    BufBytesEdit {
+        bufnr,
+        tick,
+        start_row: sr as u64,
+        start_col: sc as u64,
+        start_byte: e.start_byte as u64,
+        old_row: old_row as u64,
+        // On the same row as the start, the column the deleted/inserted region ends
+        // at is relative to `start_col`; spanning rows, it's the absolute column on
+        // the last row (matching `_on_bytes`'s `old_end_col` reconstruction).
+        old_col: (if old_row == 0 { oc - sc } else { oc }) as u64,
+        old_byte: (e.old_end_byte - e.start_byte) as u64,
+        new_row: new_row as u64,
+        new_col: (if new_row == 0 { nc - sc } else { nc }) as u64,
+        new_byte: (e.new_end_byte - e.start_byte) as u64,
+    }
 }
 
 /// Serialize a [`UndoTreeView`] into the msgpack map `vim.fn.undotree()` returns.
@@ -341,9 +372,27 @@ impl Server {
             s.push('\n');
             s
         };
+        // Snapshot the Lua-treesitter journal length so the edit this op is about to
+        // append can be dropped from it afterwards: the Lua `nvim_buf_set_lines`
+        // write-through already fired `on_bytes` for this change synchronously (so an
+        // attached `vim.treesitter` parser saw it within the same entry), and the
+        // server must not fire it a *second* time from `push_buf_mirror` — that would
+        // double-edit and corrupt the incremental tree. Truncating back (rather than
+        // draining the whole journal) preserves any *other* pending deltas, e.g. a
+        // deferred `:s` that journaled earlier in the same `run_pending` fixpoint and
+        // still needs its own server-fired `on_bytes`. The native-engine and LSP
+        // journals keep the edit untouched.
+        let lua_ts_len = self
+            .editor
+            .buffer_of(id)
+            .map(|b| b.lua_ts_edits_len())
+            .unwrap_or(0);
         self.editor
             .apply_edits_to(id, vec![(start_byte..end_byte, repl_text)]);
         self.sync_lsp_buffer(id);
+        if let Some(b) = self.editor.buffer_of_mut(id) {
+            b.truncate_lua_ts_edits(lua_ts_len);
+        }
     }
 
     /// Apply one [`ExtmarkOp`] to the target buffer's `ExtmarkStore`, converting
@@ -655,6 +704,12 @@ impl Server {
         // *after* every mirror is consistent (below), so a callback reading
         // `nvim_buf_get_lines` sees the new content.
         let mut changed: Vec<(u64, u64, usize, usize)> = Vec::new();
+        // Buffers whose text changed since the last mirror, paired with whether they
+        // were `known` last push, so the byte-delta drain below (the `nvim_buf_attach`
+        // `on_bytes` channel for the `vim.treesitter` parser) can fire for the ones a
+        // plugin could be attached to and discard a first-seen buffer's pre-attach
+        // deltas. Carries the changedtick to stamp the `on_bytes` callback with.
+        let mut fresh_ids: Vec<(BufferId, bool, u64)> = Vec::new();
         for id in self.editor.buffer_ids() {
             let tick = self
                 .editor
@@ -665,6 +720,7 @@ impl Server {
             let fresh = self.buf_mirror_ticks.get(&id) != Some(&tick);
             let lines = if fresh {
                 self.buf_mirror_ticks.insert(id, tick);
+                fresh_ids.push((id, known, tick));
                 Some(self.editor.lines_of(id).unwrap_or_default())
             } else {
                 None
@@ -735,6 +791,29 @@ impl Server {
         let live: HashSet<BufferId> = self.editor.buffer_ids().into_iter().collect();
         self.buf_mirror_ticks.retain(|id, _| live.contains(id));
         self.buf_mirror_lines.retain(|id, _| live.contains(id));
+
+        // Drain each changed buffer's Lua-treesitter byte-delta journal and project
+        // it into neovim's `on_bytes` tuple for the `vim.treesitter` parser to edit
+        // its trees with (fired below, once the mirrors are consistent). A `resync`
+        // batch (undo/redo/`:e`) can't be replayed as deltas — signal a reload so the
+        // Lua `LanguageTree` fully reparses instead. A first-seen (`!known`) buffer's
+        // pre-attach deltas are discarded: no parser is attached yet, and its tree
+        // (built later, on the first `get_parser`) starts from a full parse anyway.
+        let mut byte_edits: Vec<BufBytesEdit> = Vec::new();
+        let mut byte_reloads: Vec<u64> = Vec::new();
+        for (id, known, tick) in fresh_ids {
+            let Some(batch) = self.editor.take_lua_ts_edits_of(id) else {
+                continue;
+            };
+            if !known {
+                continue;
+            }
+            if batch.resync {
+                byte_reloads.push(id.0);
+            } else {
+                byte_edits.extend(batch.edits.iter().map(|e| on_bytes_edit(id.0, tick, e)));
+            }
+        }
 
         let cursor = (
             (self.editor.cursor.line + 1) as u64, // 1-based row, neovim convention
@@ -901,11 +980,18 @@ impl Server {
         // synchronously (the buffer analogue of the window mirror's `next_win`).
         let _ = self.lua.set_next_buf(self.editor.next_buffer_id().0);
         self.push_undotree_mirror();
-        // Now that every mirror is consistent, fire the `nvim_buf_attach` `on_lines`
-        // callbacks for the buffers that changed. A callback reads the buffer via
-        // `nvim_buf_get_lines` (the mirror just refreshed) and typically schedules
-        // follow-up work (telescope re-runs its finder) — drained by the enclosing
-        // `run_pending` fixpoint, since this runs at its entry.
+        // Now that every mirror is consistent, fire the `nvim_buf_attach` callbacks.
+        // `on_bytes` (and `on_reload`) go first — they edit the `vim.treesitter`
+        // parser's trees so the next `:parse()` reparses incrementally — then
+        // `on_lines`, whose callbacks read the refreshed buffer via
+        // `nvim_buf_get_lines` and schedule follow-up work (telescope re-runs its
+        // finder), drained by the enclosing `run_pending` fixpoint.
+        if !byte_reloads.is_empty() {
+            let _ = self.lua.fire_buf_reloads(&byte_reloads);
+        }
+        if !byte_edits.is_empty() {
+            let _ = self.lua.fire_buf_bytes(&byte_edits);
+        }
         if !changed.is_empty() {
             let _ = self.lua.fire_buf_changes(&changed);
         }

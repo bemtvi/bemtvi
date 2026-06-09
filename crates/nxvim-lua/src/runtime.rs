@@ -179,6 +179,27 @@ pub struct BoMirror {
     pub modified: bool,
 }
 
+/// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`
+/// argument tuple, fired through [`LuaRuntime::fire_buf_bytes`] so the
+/// `vim.treesitter` parser edits its trees and reparses incrementally. The
+/// row/col fields are *relative* deltas exactly as neovim's `on_bytes` reports
+/// them (see the server's `on_bytes_edit`, which builds these); the runtime
+/// forwards them verbatim to the prelude's `vim._buf_bytes_changed`.
+#[derive(Clone, Debug)]
+pub struct BufBytesEdit {
+    pub bufnr: u64,
+    pub tick: u64,
+    pub start_row: u64,
+    pub start_col: u64,
+    pub start_byte: u64,
+    pub old_row: u64,
+    pub old_col: u64,
+    pub old_byte: u64,
+    pub new_row: u64,
+    pub new_col: u64,
+    pub new_byte: u64,
+}
+
 /// The wired global options (`vim._go_mirror`) read by `vim.o`. Serialized as one
 /// flat table, so the awkward positional signature the hand-rolled setter carried
 /// becomes a single struct the caller fills by field name.
@@ -1034,6 +1055,47 @@ impl LuaRuntime {
         let fire: mlua::Function = vim.get("_buf_changed")?;
         for &(buf, tick, old, new) in changes {
             fire.call::<()>((buf, tick, 0u64, old as u64, new as u64))?;
+        }
+        Ok(())
+    }
+
+    /// Fire the `nvim_buf_attach` `on_bytes` callbacks for a batch of byte-level
+    /// edits (the `vim.treesitter` parser's incremental-reparse channel). Each edit
+    /// carries its bufnr/changedtick and neovim's relative `on_bytes` tuple; the
+    /// prelude's `vim._buf_bytes_changed` dispatches it to that buffer's attached
+    /// callbacks (the vendored `LanguageTree:_on_bytes` among them, which edits its
+    /// trees). Edits are forwarded in order — tree-sitter requires every edit
+    /// between two parses, in sequence, or the incremental tree corrupts.
+    pub fn fire_buf_bytes(&self, edits: &[BufBytesEdit]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let fire: mlua::Function = vim.get("_buf_bytes_changed")?;
+        for e in edits {
+            fire.call::<()>((
+                e.bufnr,
+                e.tick,
+                e.start_row,
+                e.start_col,
+                e.start_byte,
+                e.old_row,
+                e.old_col,
+                e.old_byte,
+                e.new_row,
+                e.new_col,
+                e.new_byte,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Fire the `nvim_buf_attach` `on_reload` callbacks for buffers whose whole rope
+    /// was replaced (undo/redo, `:e`), where byte deltas are meaningless. The
+    /// vendored `LanguageTree`'s reload handler invalidates the tree so the next
+    /// `:parse()` is a full reparse of the current snapshot.
+    pub fn fire_buf_reloads(&self, bufs: &[u64]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let fire: mlua::Function = vim.get("_buf_reloaded")?;
+        for &buf in bufs {
+            fire.call::<()>(buf)?;
         }
         Ok(())
     }

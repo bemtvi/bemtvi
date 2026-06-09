@@ -106,11 +106,14 @@ tree-sitter-md = "=0.5.3"
 # runtime-no-compiler goal is about the end user, so this is fine, and it avoids
 # the manual TLS-connector wiring `native-tls` would need. GitHub source tarballs
 # are `.tar.gz` (`flate2` + `tar`); the fetched Zig toolchain ships `.tar.xz`
-# (`xz2`). `sha2` verifies the pinned Zig checksum before we execute it.
+# on macOS/Linux (`xz2`) and a `.zip` on Windows (`zip`, reusing `flate2` for
+# deflate via its `deflate-flate2` feature so we don't pull a second inflate
+# stack). `sha2` verifies the pinned Zig checksum before we execute it.
 ureq = { version = "=2.12.0", default-features = false, features = ["tls"] }
 tar = "=0.4.46"
 flate2 = "=1.1.9"
 xz2 = "=0.1.7"
+zip = { version = "=4.2.0", default-features = false, features = ["deflate-flate2"] }
 sha2 = "=0.10.9"
 
 # LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP

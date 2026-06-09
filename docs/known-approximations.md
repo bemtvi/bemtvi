@@ -48,75 +48,22 @@ raise). If it's one of the subsystems below, update this file too.
 
 These have **no single call site to tag** because the subsystem itself is
 absent — a config touching them hits a nil index or a generic error, not a named
-gap. Recorded here so the sweep doesn't lose them.
+gap. Recorded here so the sweep doesn't lose them. Subsystems that are now
+**fully built** (the treesitter platform — `start`/`stop`, customized/on-disk
+queries, injections, incremental `on_bytes` updates; `:TSInstall` fetch/compile;
+synchronous `vim.fn.input`/`confirm`) are no longer listed here — only the edges
+that still diverge are.
 
-- **Treesitter Lua API — now a real platform, with a few deferred edges.** The
-  `vim.treesitter` plugin API is implemented: `get_parser(buf):parse()`,
-  `get_string_parser`, `get_node`/`get_node_text`, and `query.parse` +
-  `iter_captures`/`iter_matches` with predicates/directives all run neovim's
-  vendored Lua on bespoke Rust primitives (see the
-  [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md)). Remaining
-  gaps, each a *deliberate* deferral rather than a silent stub:
-  - **`vim.treesitter.start` / `stop` bridge to the native engine** (ADR 0001,
-    bridge #1 — *implemented*). nxvim does not run neovim's decoration-provider
-    highlighter on the redraw hot path; instead `start(buf, lang)` enables the
-    in-core Rust engine for that buffer at `lang` (forcing highlighting even for an
-    extension the built-in table misses), and `stop(buf)` disables it (even for a
-    recognized extension). `vim.treesitter.highlighter` stays a small shim —
-    legacy-API probes (`hl_map`) read nil, `active[buf]` reflects the bridge's
-    on/off state, and the real decoration-provider entry point `highlighter.new`
-    still fails loud (`vim._notimpl`). The one approximation that remains: a
-    highlight-only `start` does not create a Lua-side `LanguageTree`, so a config
-    that calls `start` and then reaches for `vim.treesitter.highlighter.active[buf]
-    .tree` (rare) won't find one until something calls `get_parser`.
-  - **Customized queries — `query.set` *and* on-disk overlays both change the
-    paint.** The query-resolution bridge (ADR 0001, #4 — Lua resolves, the engine
-    executes) is **built**, via two triggers. (1) `vim.treesitter.query.set(lang,
-    name, text)`: the server pulls the merged string back through the vendored
-    `query.get` (so a `;extends` modeline in the set text merges onto the base) and
-    pushes it to the engine, which recompiles in place. (2) The **buffer-open
-    trigger**: the first time a buffer of some language is highlighted, the server
-    resolves `highlights`/`indents` through the same `query.get` and offers them to
-    the engine, which keeps the override only when it differs from the base file —
-    so a *pure on-disk* `after/queries/<lang>/*.scm` overlay or a `;extends` /
-    `;inherits` file dropped in with **no** `query.set` call also reaches the paint,
-    while an un-customized language stays byte-identical on the disk-read path. The
-    engine's data dir is on the Lua runtimepath, so the resolver sees the same base
-    `queries/<lang>/` the engine reads. A broken query echoes loud and keeps the
-    prior paint. See
-    [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and
-    [the query-bridge design](specs/2026-06-08-treesitter-query-bridge-design.md).
-  - **Injections — built** (ADR 0001, #5 — Lua resolves the injection query, the
-    engine executes the layers). The engine runs the resolved `injections` query
-    over the root tree each parse, parses each injected region with its child grammar
-    through `included_ranges` (buffer-coordinate child trees, incremental reparse,
-    a per-frame parse budget), and paints child captures over the host — single,
-    combined (`#set! injection.combined`), and nested (to a depth bound) injections,
-    with the full `injection.language` / `self` / `parent` / `include-children`
-    directive vocabulary. On the platform side the vendored `LanguageTree` builds the
-    same injected child trees over nxvim's snapshot primitives, so `children()` /
-    `language_for_range` / `get_node(…, ignore_injections=false)` resolve the injected
-    language; a drift oracle test asserts the engine's paint agrees with the vendored
-    `_get_injections`. A missing child grammar degrades to the host's flat paint. See
-    [the injections design](specs/2026-06-08-treesitter-injections-design.md).
-  - **Live incremental buffer updates — built** (`nvim_buf_attach` `on_bytes`).
-    A buffer-sourced `LanguageTree` attaches through the vendored `_create_parser`
-    and edits its trees from real `on_bytes`/`on_reload` callbacks, so `:parse()`
-    reparses **incrementally** (re-lexing only the changed ranges) instead of
-    re-reading and fully reparsing the snapshot. Two `on_bytes` sources keep the
-    tree in lockstep with the snapshot the parser reads: the server drains each
-    buffer's byte-delta journal (the same `BufferEdit` stream the native engine
-    reparses from) and fires `on_bytes` before any plugin Lua runs, for core edits
-    (keystrokes, ex commands); and the Lua `nvim_buf_set_lines` write-through fires
-    `on_bytes` synchronously for plugin edits within an entry (the server then
-    suppresses its own fire for that edit so the tree is never double-edited). A
-    whole-rope replacement (undo/redo, `:e`) arrives as `on_reload` (a full
-    reparse), not as meaningless deltas. String parsers keep their cached trees as
-    before.
-  - **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) fights the
-    snapshot bridge (it wants the live buffer mid-keystroke); the Rust indent
-    stays. `query.get` needs `io` for on-disk `queries/<lang>/*.scm`; a missing
-    query file returns nil.
+- **Treesitter — two edges remain.** The `vim.treesitter` platform is built (see
+  the [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md) and
+  [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md)). What still
+  diverges: (1) the decoration-provider highlighter `highlighter.new` fails loud
+  (`vim._notimpl`) — nxvim's `start`/`stop` drives the in-core Rust engine
+  instead, so a highlight-only `start` never builds a Lua-side `LanguageTree` and
+  `highlighter.active[buf].tree` reads nil until something calls `get_parser`;
+  (2) **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
+  wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
+  Rust indent stays. `query.get` returns nil for a missing on-disk query file.
 - **`vim.uv` / `vim.loop` beyond timers.** `new_pipe`, TCP (`new_tcp` — the
   TCP transport behind the skipped gdscript `vim.lsp.rpc.connect`), and
   event-based `fs_*` watchers are absent.
@@ -128,78 +75,38 @@ gap. Recorded here so the sweep doesn't lose them.
   the one `tabstop` knob drives the whole indent width. `tabstop`, `softtabstop`,
   and `expandtab` drive rendering and `<Tab>`; `shiftwidth` only feeds the LSP
   indent width until the `>>`/`<<` operators land. The rest of vim's hundreds of
-  options are still missing. Also: folds and macros (registers — named/numbered/
-  special + the system clipboard — and marks — buffer-local, global, and the
-  special marks — are both implemented). (`:s` substitution *is* implemented — ex-range parsing, the
-  `g`/`i`/`I`/`n`/`c` flags with confirm, pattern/replacement reuse and repeat;
-  it speaks the same canonical-regex dialect as `/` search, not vim magic. See
-  `docs/plans/2026-06-07-substitute-command.md`.)
+  options are still missing, as are **folds** and **macros**.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written compatibility shim, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to
   build an evaluator.
-- **`:TSInstall <lang>` grammar fetch/compile — implemented, with approximations.**
-  `:TSInstall` (and `:TSUpdate`, an alias; `:TSInstallInfo` lists what's
-  installed) fetches a grammar's source + queries
-  from **nvim-treesitter pinned to one commit** (`nxvim_ts::install`), compiles
-  `src/parser.c` (+ a `scanner.{c,cc}`) in-process, and drops `parser/<lang>.so`
-  + `queries/<lang>/` into the data dir; open buffers re-highlight/indent without
-  a manual `:e`. Approximations: (1) the compiler is `$NXVIM_CC` → a system
-  `cc`/`clang`/`gcc`/`zig` → a **pinned Zig** fetched + checksum-verified on
-  demand, so a user with no toolchain still works (Windows Zig — a `.zip` — isn't
-  auto-fetched yet; install a compiler or set `$NXVIM_CC`). (2) Grammars that need
-  `tree-sitter generate` (no committed `src/parser.c`) fail loud rather than
-  generating. (3) The nvim-treesitter ref is pinned in source (reproducible);
-  there's no `:TSInstall`-from-`HEAD`. A loaded real nvim-treesitter plugin keeps
-  its own `:TSInstall` — the native command defers to a registered user command.
-  An existing neovim `site/` is also searched read-only, so parsers you already
-  installed for nvim work with no `:TSInstall` at all.
-- **LSP semantic tokens — complete (Phases 1–3), with approximations.** A server
-  that advertises `semanticTokensProvider` has its whole-buffer
-  `textDocument/semanticTokens/full`(/`delta`) set decoded and painted *over* the
-  treesitter floor (ADR 0001 bridge #2 — `crates/nxvim-server/src/lsp/semantic.rs`),
-  and the `vim.lsp.semantic_tokens` control surface
-  (`start`/`stop`/`force_refresh`/`get_at_pos`/`enable`) plus
-  `client.server_capabilities.semanticTokensProvider` are live. The approximations:
-  **one resolvable group per cell** — a token paints its most-specific `@lsp.*`
-  capture that resolves, not neovim's stack of `@lsp.type.<t>` + per-modifier
-  `@lsp.mod.<m>`/`@lsp.typemod.<t>.<m>` (the merge layer picks one winner, it doesn't
-  blend); **theme-gated** — a token whose group is undefined is dropped so the floor
-  shows (no semantic paint without `@lsp.*` definitions); **no `range`** — only
-  `full`/`full/delta`, the whole document is tokenized; **`highlight_token` is a loud
-  gap** (`vim._notimpl` — it would put a Lua callback on the decode hot path);
-  `get_at_pos` reads the cached mirror even for a `stop`ped buffer (the cache
-  survives a stop), and the per-buffer `start`/`stop` has no per-client granularity
-  (one semantic cache per buffer); repaints on every reply including mid-insert
-  (`update_in_insert` always on). See
-  `docs/plans/2026-06-08-lsp-semantic-tokens.md` and `examples/semantic-tokens/`.
-- **LSP inlay hints — Phase 1 complete, with approximations.** A buffer with
-  `vim.lsp.inlay_hint.enable(true)` requests `textDocument/inlayHint` from a server
-  that advertises the provider (on enable + after each change), decodes the hints
-  against the negotiated encoding, and paints each one **inline** at its column —
-  shifting the real glyphs and the cursor right
-  (`crates/nxvim-server/src/lsp/inlay.rs`, the splice in
-  `crates/nxvim-tui/src/render.rs::highlight_line` and, for the GUI client, in
-  `crates/nxvim-gui/src/render.rs::splice_inlay`). Unlike semantic tokens it is
-  **opt-in** (off by default). The approximations: **string labels only** — label
-  *parts* are joined to their `value`s, dropping the per-part `location` (go-to on
-  click) / `tooltip` / `textEdits`-on-accept (these need `inlayHint/resolve`,
-  Phase 2); **one `LspInlayHint` group** for all kinds (no
-  `LspInlayHintType`/`Parameter` split), with a dim built-in fallback when the
-  group is undefined; **whole document, no `range`** (the viewport-scoped request
-  is Phase 2 — the whole buffer is requested on every change); **per-buffer enable
-  only** (no per-client granularity; `vim.lsp.inlay_hint.get` is Phase 2);
-  horizontal-scroll (`leftcol>0`) + inline hints is best-effort (the cursor shift
-  ignores scrolled-off hints); repaints on every reply including mid-insert
-  (`update_in_insert` always on). See `docs/plans/2026-06-08-lsp-inlay-hints.md`
-  and `examples/inlay-hints/`.
-- **Synchronous prompts — now implemented.** `vim.fn.input` / `vim.fn.confirm`
-  return the user's answer *inline*: a pumped Lua entry (`:lua` chunk, keymap, or
-  user command) runs inside a coroutine via `vim._pump`, so the prompt
-  `coroutine.yield`s to park the chunk on the command line and the result resumes
-  it. See `examples/sync-prompts/`. (The remaining caveat: only *pumped* entry
-  points can prompt — Lua sourced at startup or off a bare callback has no
-  coroutine to yield from.)
+- **`:TSInstall` approximations.** The command fetches/compiles grammars
+  (`nxvim_ts::install`), with a pinned, checksum-verified Zig fetched on demand
+  when no system `cc`/`clang`/`gcc`/`zig` (or `$NXVIM_CC`) is found — on macOS,
+  Linux, and Windows alike. Remaining: (1) grammars needing `tree-sitter
+  generate` (no committed `src/parser.c`) fail loud rather than generating;
+  (2) the nvim-treesitter ref is pinned in source — no `:TSInstall`-from-`HEAD`.
+- **LSP semantic tokens approximations.** Painted over the treesitter floor
+  (`crates/nxvim-server/src/lsp/semantic.rs`): **one resolvable group per cell**
+  (the merge picks the most-specific `@lsp.*` winner, it doesn't blend neovim's
+  `@lsp.type.<t>` + per-modifier stack); **theme-gated** (an undefined group is
+  dropped so the floor shows); **no `range`** (only `full`/`full/delta`);
+  **`highlight_token` is a loud gap** (`vim._notimpl` — a Lua callback on the
+  decode hot path); `get_at_pos` reads the cached mirror even for a `stop`ped
+  buffer; no per-client granularity (one cache per buffer); repaints mid-insert
+  (`update_in_insert` always on). See `docs/plans/2026-06-08-lsp-semantic-tokens.md`.
+- **LSP inlay hints approximations.** Painted inline, opt-in
+  (`crates/nxvim-server/src/lsp/inlay.rs`): **string labels only** (per-part
+  `location`/`tooltip`/`textEdits` need `inlayHint/resolve`, Phase 2); **one
+  `LspInlayHint` group** for all kinds (no Type/Parameter split); **whole
+  document, no `range`** (Phase 2); **per-buffer enable only** (no per-client
+  granularity; `vim.lsp.inlay_hint.get` is Phase 2); horizontal-scroll
+  (`leftcol>0`) + inline hints is best-effort; repaints mid-insert. See
+  `docs/plans/2026-06-08-lsp-inlay-hints.md`.
+- **Synchronous prompts — one caveat.** `vim.fn.input`/`confirm` return inline
+  via a pumped coroutine (`vim._pump`), but only *pumped* entry points (`:lua`
+  chunk, keymap, user command) can prompt — Lua sourced at startup or off a bare
+  callback has no coroutine to yield from. See `examples/sync-prompts/`.
 
 ## Cross-cutting root causes
 

@@ -231,6 +231,10 @@ fn compile(cc: &[String], src_dir: &Path, parser_c: &Path, out: &Path) -> Result
         .is_some_and(|p| p.extension().is_some_and(|e| e != "c"));
 
     let (prog, prefix) = cc.split_first().context("empty compiler command")?;
+    // We drive Zig as `<zig> cc …` (a `cc` subcommand) — true whether Zig is on
+    // PATH (`prog == "zig"`) or a fetched binary (`prog` is a path / `zig.exe`),
+    // so key off the subcommand, not the program name.
+    let is_zig = prefix.first().is_some_and(|a| a == "cc");
     let mut cmd = Command::new(prog);
     cmd.args(prefix)
         .args(["-shared", "-fPIC", "-O2"])
@@ -243,7 +247,7 @@ fn compile(cc: &[String], src_dir: &Path, parser_c: &Path, out: &Path) -> Result
     cmd.arg("-o").arg(out);
     // A C++ scanner built by a non-zig `cc` needs the C++ runtime linked; `zig cc`
     // links it itself, so only add the flag otherwise.
-    if cpp_scanner && prog != "zig" {
+    if cpp_scanner && !is_zig {
         cmd.arg(if cfg!(target_os = "macos") {
             "-lc++"
         } else {
@@ -314,8 +318,10 @@ fn program_exists(name: &str, args: &[&str]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Pinned Zig archive name + SHA-256 for the host target, or `Err` on an
-/// unsupported platform. Windows ships a `.zip` (no extractor wired up yet), so
-/// it's a loud "install a compiler yourself" error rather than a silent skip.
+/// unsupported platform. macOS/Linux ship a `.tar.xz`, Windows a `.zip`;
+/// [`ensure_zig`] dispatches the extractor on the extension. Bump all the names +
+/// shas together with [`ZIG_VERSION`] (they come from `ziglang.org`'s
+/// `download/index.json`).
 fn zig_target() -> Result<(&'static str, &'static str)> {
     let t = match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => (
@@ -334,6 +340,14 @@ fn zig_target() -> Result<(&'static str, &'static str)> {
             "zig-aarch64-linux-0.15.2.tar.xz",
             "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f",
         ),
+        ("x86_64", "windows") => (
+            "zig-x86_64-windows-0.15.2.zip",
+            "3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c",
+        ),
+        ("aarch64", "windows") => (
+            "zig-aarch64-windows-0.15.2.zip",
+            "b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370",
+        ),
         (arch, os) => bail!(
             "no pinned Zig for {arch}-{os}; install a C compiler (cc/clang/gcc) \
              or set $NXVIM_CC"
@@ -344,13 +358,19 @@ fn zig_target() -> Result<(&'static str, &'static str)> {
 
 /// Ensure a pinned Zig is unpacked under `<data>/zig/<version>/` and return the
 /// path to its `zig` binary, downloading + checksum-verifying it on first use.
+/// Both archive shapes unpack to a single `<stem>/` dir holding `zig`
+/// (`zig.exe` on Windows).
 fn ensure_zig(data_dir: &Path) -> Result<PathBuf> {
     let (archive, sha) = zig_target()?;
+    let is_zip = archive.ends_with(".zip");
     let stem = archive
         .strip_suffix(".tar.xz")
+        .or_else(|| archive.strip_suffix(".zip"))
         .context("zig archive name")?;
     let root = data_dir.join("zig").join(ZIG_VERSION);
-    let bin = root.join(stem).join("zig");
+    let bin = root
+        .join(stem)
+        .join(format!("zig{}", std::env::consts::EXE_SUFFIX));
     if bin.exists() {
         return Ok(bin);
     }
@@ -360,10 +380,13 @@ fn ensure_zig(data_dir: &Path) -> Result<PathBuf> {
     verify_sha256(&bytes, sha).context("Zig download failed checksum verification")?;
 
     std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-    let xz = xz2::read::XzDecoder::new(&bytes[..]);
-    tar::Archive::new(xz)
-        .unpack(&root)
-        .with_context(|| format!("unpack Zig into {}", root.display()))?;
+    if is_zip {
+        unpack_zig_zip(&bytes, &root)
+    } else {
+        let xz = xz2::read::XzDecoder::new(&bytes[..]);
+        tar::Archive::new(xz).unpack(&root).map_err(Into::into)
+    }
+    .with_context(|| format!("unpack Zig into {}", root.display()))?;
     if !bin.exists() {
         bail!(
             "Zig archive did not contain the expected binary at {}",
@@ -371,6 +394,40 @@ fn ensure_zig(data_dir: &Path) -> Result<PathBuf> {
         );
     }
     Ok(bin)
+}
+
+/// Unpack the Windows Zig `.zip` into `dest`, preserving the archive's directory
+/// layout and re-applying each entry's Unix mode (the `zig.exe` bit is moot on
+/// Windows but we honor it for parity with the tar path). Entry names are checked
+/// to stay under `dest` (no `..`/absolute escape) before anything is written.
+fn unpack_zig_zip(bytes: &[u8], dest: &Path) -> Result<()> {
+    use std::io::Cursor;
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).context("read Zig zip")?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).with_context(|| format!("zip entry {i}"))?;
+        let rel = entry
+            .enclosed_name()
+            .with_context(|| format!("unsafe path in Zig zip: {}", entry.name()))?;
+        let out = dest.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).with_context(|| format!("mkdir {}", out.display()))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        let mut file =
+            std::fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
+        std::io::copy(&mut entry, &mut file).with_context(|| format!("write {}", out.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("chmod {}", out.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Verify `bytes` hash to the hex `expected` SHA-256, else fail loud.

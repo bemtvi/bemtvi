@@ -320,6 +320,35 @@ impl Editor {
         }
     }
 
+    /// Turn `buffer` into a read-only **directory listing** of `dir` from an off-tick
+    /// remote `read_dir` — the explorer analogue of [`Editor::load_str_into`] (daemon /
+    /// edit-host split, Phase 3g). In a daemon session core can't read a directory
+    /// through the synchronous [`HostFs`](crate::HostFs) without blocking the editor
+    /// thread on the network, so `:edit <dir>` / descending into a sub-directory enqueue
+    /// a [`PendingOpen`] and the server fetches the entries off-tick; when they land it
+    /// calls this to build the listing (via [`Buffer::from_dir_entries`]) into the
+    /// already-created buffer. Replaces the buffer in place (preserving its id), roots a
+    /// fresh undo tree at the listing, and — when `buffer` is current — resets the
+    /// window to the top, as opening a directory does. A no-op if `buffer` was closed
+    /// before the fetch landed.
+    pub fn load_dir_into(&mut self, buffer: BufferId, dir: PathBuf, entries: Vec<crate::DirEntry>) {
+        if !self.buffers.map.contains_key(&buffer) {
+            return;
+        }
+        let listing = Buffer::from_dir_entries(dir, entries);
+        let is_current = buffer == self.cur_buffer();
+        let ob = self.buffers.get_mut(buffer);
+        ob.buffer = listing;
+        ob.undo = UndoTree::new(&ob.buffer);
+        ob.saved_seq = Some(ob.undo.cur_seq());
+        ob.buffer.mark_resync();
+        if is_current {
+            self.cursor = Cursor::default();
+            self.top = 0;
+            self.leftcol = 0;
+        }
+    }
+
     /// Make `id` the current buffer: stash the outgoing window position with its
     /// buffer, record the alternate (`#`), and restore the incoming buffer's
     /// saved position. A no-op if `id` is already current or not in the store.

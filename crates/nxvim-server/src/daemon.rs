@@ -42,12 +42,13 @@
 //!
 //! | direction | method | reply |
 //! | --- | --- | --- |
-//! | edit-host → daemon | `fs_read [path]`         | `["file", bytes]` / `["new"]`, or an RPC error |
+//! | edit-host → daemon | `fs_read [path]`         | `["file", bytes]` / `["new"]` / `["dir", path, entries]`, or an RPC error |
 //! | edit-host → daemon | `fs_write [path, bytes]` | `["ok", stat?]`, or an RPC error                |
 //!
-//! `serve_fs_daemon` reads an existing file (`file`) or reports a not-yet-existing one
-//! as a new-file buffer (`new`); a directory or any other read error comes back as a
-//! loud RPC error (remote directory/explorer open is a later sub-slice). `fs_write`
+//! `serve_fs_daemon` reads an existing file (`file`), reports a not-yet-existing one as a
+//! new-file buffer (`new`), or lists a directory (`dir` — the remote explorer, Phase 3g:
+//! the daemon's canonical path plus its raw `[is_dir, name]` entries, which the edit-host
+//! sorts and renders); any other read error comes back as a loud RPC error. `fs_write`
 //! does the atomic write through the same sync [`HostFs`] and replies with the new
 //! [`FileStat`](nxvim_core::FileStat) (so the edit-host can stamp its `disk` snapshot
 //! without a remote stat round-trip), or a loud error.
@@ -57,8 +58,8 @@
 //! daemon session — it snapshots the buffer at command time and enqueues a
 //! [`PendingSave`](nxvim_core::PendingSave); the server pushes those bytes over
 //! `fs_write` off the editor tick and finalizes the buffer's saved-state only on the
-//! daemon's ack, so a slow remote write never freezes typing. (`:edit` / `:read` and
-//! remote directory listing still use the sync [`HostFs`], on local disk, for now.)
+//! daemon's ack, so a slow remote write never freezes typing. (`:read` still uses the
+//! sync [`HostFs`], on local disk, for now.)
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -74,7 +75,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use nxvim_core::{FileStat, HostFs};
+use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
@@ -423,16 +424,24 @@ fn decode_exited(mut params: Vec<Value>) -> Option<(u64, DaemonEvent)> {
 
 // ===== the filesystem leg =====================================================
 
-/// What a daemon `fs_read` resolves a path to, for an initial buffer open. A read
-/// error (a directory, a permission failure, a dead connection) is *not* one of
-/// these — it surfaces as an `Err` the server echoes loudly, never a silent empty
-/// buffer.
+/// What a daemon `fs_read` resolves a path to — a file's bytes, a new-file marker, or a
+/// directory listing. A genuine read error (a permission failure, a dead connection) is
+/// *not* one of these — it surfaces as an `Err` the server echoes loudly, never a silent
+/// empty buffer.
 pub enum FsRead {
     /// An existing file's bytes — load them into the buffer (a replica of the remote).
     File(Vec<u8>),
     /// The path doesn't exist yet — open an empty new-file buffer named for it (the
     /// `:e newfile` case), so a first `:w` would create it.
     New,
+    /// The path is a **directory** — open it as the in-window file explorer (Phase 3g).
+    /// `path` is the daemon's *canonical* directory path (so `../`/descend navigation is
+    /// unambiguous on the edit-host side); `entries` are its immediate, unsorted entries
+    /// (the edit-host sorts them via [`Buffer::from_dir_entries`](nxvim_core::Buffer)).
+    Dir {
+        path: String,
+        entries: Vec<DirEntry>,
+    },
 }
 
 /// The **async** filesystem seam the server fetches buffer contents through, off the
@@ -445,10 +454,12 @@ pub enum FsRead {
 ///
 /// Object-safe (returns a boxed `Send` future, no `async fn`) to match the
 /// `Box<dyn …>` DI style the rest of the server uses without an `async-trait`
-/// dependency. Scoped to `read` for the initial-open slice; `stat` / `write` /
-/// `read_dir` join it as the save and explorer paths cross the wire.
+/// dependency. `read` resolves the path to a file, a new-file marker, or a directory
+/// listing (the [`FsRead`] variants — so it covers buffer opens *and* the remote
+/// explorer); `write` is the save path.
 pub trait HostFsAsync: Send + Sync {
-    /// Fetch `path`'s contents for an initial buffer open (or report it new).
+    /// Fetch `path` for a buffer open: its bytes (a file), a new-file marker (absent), or
+    /// the directory listing (the remote explorer) — whichever the path resolves to.
     fn read(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<FsRead>> + Send>>;
 
     /// Atomically write `bytes` to `path` (the off-tick `:w`). Resolves to the file's
@@ -541,11 +552,34 @@ fn decode_fs_read(a: &mut [Value]) -> io::Result<FsRead> {
             )),
         },
         Some("new") => Ok(FsRead::New),
+        Some("dir") => {
+            let path = a
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let entries = match a.get_mut(2).map(|v| std::mem::replace(v, Value::Nil)) {
+                Some(Value::Array(items)) => {
+                    items.into_iter().filter_map(decode_dir_entry).collect()
+                }
+                _ => Vec::new(),
+            };
+            Ok(FsRead::Dir { path, entries })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "fs_read: unknown reply tag",
         )),
     }
+}
+
+/// One `[is_dir, name]` wire pair → a [`DirEntry`]; `None` on a malformed pair (dropped
+/// — a peer is the same build, so this only guards corruption).
+fn decode_dir_entry(v: Value) -> Option<DirEntry> {
+    let a = v.as_array()?;
+    let is_dir = a.first()?.as_bool()?;
+    let name = a.get(1)?.as_str()?.to_string();
+    Some(DirEntry { is_dir, name })
 }
 
 /// `["ok", stat?]` → the post-write [`FileStat`] (or `None`); any other tag is a
@@ -626,7 +660,8 @@ where
 }
 
 /// Serve one `fs_read [path]` against `fs`, projecting [`classify`]'s result onto the
-/// `["file", bytes]` / `["new"]` wire shape (or a loud error reply).
+/// `["file", bytes]` / `["new"]` / `["dir", path, entries]` wire shape (or a loud error
+/// reply).
 fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
     let Some(path) = params.first().and_then(Value::as_str).map(PathBuf::from) else {
         return Err(Value::from("fs_read: missing path"));
@@ -637,8 +672,24 @@ fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
             Value::Binary(bytes),
         ])),
         Ok(FsRead::New) => Ok(Value::Array(vec![Value::from("new")])),
+        Ok(FsRead::Dir { path, entries }) => Ok(Value::Array(vec![
+            Value::from("dir"),
+            Value::from(path),
+            encode_dir_entries(entries),
+        ])),
         Err(e) => Err(Value::from(e.to_string())),
     }
+}
+
+/// `[[is_dir, name], …]` — a directory's entries on the wire. The edit-host sorts and
+/// renders them; the daemon only reports the raw `(is_dir, name)` pairs.
+fn encode_dir_entries(entries: Vec<DirEntry>) -> Value {
+    Value::Array(
+        entries
+            .into_iter()
+            .map(|e| Value::Array(vec![Value::from(e.is_dir), Value::from(e.name)]))
+            .collect(),
+    )
 }
 
 /// Serve one `fs_write [path, bytes]` against `fs`: do the atomic write through the
@@ -667,11 +718,18 @@ fn serve_write(fs: &dyn HostFs, params: &mut [Value]) -> Result<Value, Value> {
 
 /// Resolve `path` against `fs` to a [`FsRead`], using only the sync [`HostFs`]
 /// surface (so a fake test backend and the real disk behave identically). A readable
-/// directory is a loud error — remote explorer open is a later slice; a `NotFound`
-/// is the legitimate new-file case; any other read error propagates loudly.
+/// directory becomes a `Dir` listing (the remote explorer); a `NotFound` is the
+/// legitimate new-file case; any other read error propagates loudly.
 fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
-    if fs.read_dir(path).is_ok() {
-        return Err(io::Error::other("remote directory open not yet supported"));
+    if let Ok(entries) = fs.read_dir(path) {
+        // A directory: list it for the remote explorer (Phase 3g). Canonicalize so the
+        // edit-host's `../`/descend navigation is unambiguous; fall back to the given
+        // path if it can't be resolved.
+        let dir = fs.canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        return Ok(FsRead::Dir {
+            path: dir.to_string_lossy().into_owned(),
+            entries,
+        });
     }
     match fs.open_read(path) {
         Ok(mut reader) => {

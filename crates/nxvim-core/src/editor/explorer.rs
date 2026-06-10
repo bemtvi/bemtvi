@@ -27,6 +27,25 @@ impl Editor {
     /// to it, keeping the current buffer in the list. An unreadable directory fails
     /// loud — its OS error is echoed rather than leaving a blank buffer behind.
     pub(crate) fn enter_dir(&mut self, path: &Path) {
+        // Off-tick (daemon session): the directory lives on the remote, so its
+        // listing can't be read through the synchronous `host_fs` without blocking
+        // the editor thread on the network. Set up the destination buffer — reuse
+        // the window in place when it's a throwaway/explorer (netrw-style descend),
+        // else a fresh listing buffer keeping the current one open — and enqueue an
+        // off-tick fetch. The server reads the entries over `HostFsAsync` and fills
+        // the buffer via `load_dir_into`; the old listing shows until then.
+        if self.host_fs_offtick {
+            let buf = if self.current_is_throwaway() || self.is_explorer_buffer() {
+                self.cur_buffer()
+            } else {
+                let id = self.add_buffer(Buffer::named(path.to_path_buf()));
+                self.switch_buffer(id);
+                id
+            };
+            self.enqueue_open(buf, path.to_path_buf());
+            return;
+        }
+
         // Path-based dedup: an already-open listing of the same directory is
         // reused (and reset to the top), matching the file open-or-switch path.
         let fs = self.host_fs.clone();
@@ -148,7 +167,15 @@ impl Editor {
             return;
         }
         let target = dir.join(entry);
-        if target.is_dir() {
+        // The listing already encodes whether each entry is a directory (the trailing
+        // `/` the listing builder appends), so off-tick we route on that — no remote
+        // stat round-trip. Locally we stat directly, as before (a fresh `is_dir`).
+        let is_dir = if self.host_fs_offtick {
+            self.buffer().line(self.cursor.line).ends_with('/')
+        } else {
+            target.is_dir()
+        };
+        if is_dir {
             self.enter_dir(&target);
         } else {
             self.explorer_open_file(&target);
@@ -176,6 +203,13 @@ impl Editor {
         let explorer = self.cur_buffer();
         if let Some(id) = self.find_buffer_by_path(path) {
             self.switch_buffer(id);
+        } else if self.host_fs_offtick {
+            // Off-tick (daemon session): the file is on the remote. Open an empty
+            // buffer named for it, switch, and enqueue the fetch — the server fills it
+            // over the wire (`load_str_into`). The empty buffer shows until then.
+            let id = self.add_buffer(Buffer::named(path.to_path_buf()));
+            self.switch_buffer(id);
+            self.enqueue_open(id, path.to_path_buf());
         } else {
             let fs = self.host_fs.clone();
             match Buffer::from_file(path, &*fs) {

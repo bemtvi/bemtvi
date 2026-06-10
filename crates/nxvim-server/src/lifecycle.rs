@@ -4,16 +4,17 @@
 use crate::filetype_of;
 use crate::FsRead;
 use crate::{Server, WindowRect};
-use nxvim_core::{BufferId, TabId, WindowId};
+use nxvim_core::{BufferId, DirEntry, TabId, WindowId};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 impl Server {
     /// Apply the result of an off-tick fetch (`docs/plans/2026-06-09-edit-host-and-browser-lua.md`
     /// → Phase 3, fs leg) into `buffer` — the deferred startup file (which fills the
     /// initial `[No Name]` buffer) or a later `:edit`. An existing file's bytes or a
-    /// new-file marker load into the named replica buffer; a read error (a directory, a
-    /// transport failure) is echoed loudly rather than left as a silent empty buffer.
+    /// new-file marker load into the named replica buffer; a directory becomes the
+    /// in-window file explorer (Phase 3g); a genuine read error (a transport failure) is
+    /// echoed loudly rather than left as a silent empty buffer.
     /// While the fetch was in flight the editor served the client with the (empty)
     /// buffer — the whole point of fetching the remote file off the editor tick.
     pub(crate) fn apply_open(
@@ -27,6 +28,11 @@ impl Server {
                 self.load_replica(buffer, path, &String::from_utf8_lossy(&bytes))
             }
             Ok(FsRead::New) => self.load_replica(buffer, path, ""),
+            // A directory: build the in-window file explorer listing into the buffer
+            // (Phase 3g). The daemon's canonical `dir` path supersedes the requested one
+            // (`:e somedir` resolves to its absolute form), so the listing names and
+            // navigates from it.
+            Ok(FsRead::Dir { path: dir, entries }) => self.load_dir_replica(buffer, dir, entries),
             Err(e) => self
                 .editor
                 .echo(format!("nxvim: could not open {path} over the daemon: {e}")),
@@ -46,6 +52,22 @@ impl Server {
         self.announced.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
+        self.push_buf_mirror();
+        self.emit_lifecycle_events();
+        self.run_pending();
+    }
+
+    /// Build the file-explorer listing of remote directory `dir` into `buffer` from the
+    /// off-tick `read_dir` reply (Phase 3g — the directory analogue of [`load_replica`]).
+    /// `load_dir_into` replaces the buffer with the listing (its `dir` marker routes
+    /// keys to the explorer); clearing `announced` lets the now-named buffer's
+    /// `BufReadPost` fire. A directory has no filetype, so no `FileType`/LSP work — just
+    /// refresh the Lua snapshot/mirror and drive the queued autocmd work.
+    fn load_dir_replica(&mut self, buffer: BufferId, dir: String, entries: Vec<DirEntry>) {
+        self.editor
+            .load_dir_into(buffer, PathBuf::from(&dir), entries);
+        self.announced.remove(&buffer);
+        let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "");
         self.push_buf_mirror();
         self.emit_lifecycle_events();
         self.run_pending();

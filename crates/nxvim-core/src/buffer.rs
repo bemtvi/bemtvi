@@ -262,10 +262,21 @@ impl Buffer {
         // unambiguous however the path was spelled (`.`, a relative dir, a
         // symlink). Fall back to the given path if it can't be resolved.
         let dir = fs.canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut entries: Vec<(bool, String)> = Vec::new();
-        for entry in fs.read_dir(&dir)? {
-            entries.push((entry.is_dir, entry.name));
-        }
+        let entries = fs.read_dir(&dir)?;
+        Ok(Self::from_dir_entries(dir, entries))
+    }
+
+    /// Build the directory-listing buffer for `dir` from an already-fetched, unsorted
+    /// entry list — the [`HostFs`]-free core of [`Buffer::from_dir`]. The daemon /
+    /// edit-host split (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3g)
+    /// reads a *remote* directory off the editor tick (over `HostFsAsync`, not the sync
+    /// [`HostFs`]) and hands the entries here, so the listing is built the same way
+    /// whether the directory was read from local disk or across the wire. `dir` is taken
+    /// as the canonical path (the caller canonicalized it — locally via [`HostFs`], or on
+    /// the daemon side of the wire), so `../`/`join` navigation is unambiguous.
+    pub fn from_dir_entries(dir: PathBuf, entries: Vec<crate::host::DirEntry>) -> Self {
+        let mut entries: Vec<(bool, String)> =
+            entries.into_iter().map(|e| (e.is_dir, e.name)).collect();
         // Directories first, then case-insensitive by name (netrw's default sort).
         entries.sort_by(|a, b| {
             b.0.cmp(&a.0)
@@ -279,7 +290,7 @@ impl Buffer {
             }
             text.push('\n');
         }
-        Ok(Buffer {
+        Buffer {
             text: Rope::from_str(&text),
             path: Some(dir.clone()),
             dir: Some(dir),
@@ -298,7 +309,7 @@ impl Buffer {
             // A directory listing is never written back to disk, so it needs no
             // change tracking.
             disk: None,
-        })
+        }
     }
 
     /// Number of editable lines (excludes the phantom final line).

@@ -483,12 +483,12 @@ not block startup. Regression-clean — full `nxvim-server` suite (now 19 binari
 `nxvim`/`nxvim-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
 `-D warnings` all green.
 
-**Still to do on the fs leg (after 3e/3f):** remote **directory/explorer** listing
-(`read_dir` over the wire — currently a loud error), `:tabnew {file}` / LSP go-to (still
+**Still to do on the fs leg (after 3e/3f/3g):** `:tabnew {file}` / LSP go-to (still
 sync), and `FileChangedShell` from a daemon `watch`. The async seam + replica pattern
-these slices established is what those extend. (The **save** path landed in Phase 3e and
-`:edit` in Phase 3f, both below. `:read`/`:r` is *not implemented* in nxvim at all, so
-there is nothing to route over the wire — it would be a new feature, not a wire slice.)
+these slices established is what those extend. (The **save** path landed in Phase 3e,
+`:edit` in Phase 3f, and the **remote explorer** — `read_dir` over the wire — in Phase 3g,
+all below. `:read`/`:r` is *not implemented* in nxvim at all, so there is nothing to
+route over the wire — it would be a new feature, not a wire slice.)
 
 **The save slice must define its semantics up front — write is the hard half of
 off-tick** (read got done first for a reason: it's idempotent and cancelable;
@@ -626,6 +626,67 @@ binaries, incl. the unchanged `daemon_fs` initial-open suite proving the unifica
 didn't regress 3d), fmt + clippy `-D warnings` clean; local binaries leave off-tick mode
 off and open synchronously, unchanged.
 
+### Phase 3g — the daemon wire protocol (filesystem half, the remote explorer) — ✅ DONE (2026-06-10)
+
+The listing companion to 3d/3f's file open: where those fetch a *file's bytes*, this
+fetches a *directory's entries* over the wire so nxvim's in-window file explorer (vim's
+netrw) shows the **remote** project tree instead of the edit-host's local disk. Until
+this slice a remote directory came back as a loud `fs_read` error ("remote directory open
+not yet supported", the placeholder 3d left); now it lists, navigates, and opens entries.
+Reuses 3d/3f's `HostFsAsync` + `PendingOpen` + replica machinery — **no new seam, no new
+channel** — by adding a third reply shape to the existing `fs_read` request.
+
+The off-tick shape is forced by the same constraint as the rest of the fs leg: core's
+[`HostFs`] is **synchronous** and reading a directory through it would block the one
+editor thread on the network. So a directory open is *also* an off-tick `PendingOpen`,
+and the **reply type** — not a local `is_dir()` stat — decides file vs. directory. That
+inverts a synchronous assumption the explorer baked in: `ex_edit`'s `path.is_dir()` and
+the explorer's `target.is_dir()` both stat *local* disk, which is meaningless for a
+remote path. In a daemon session the decision moves to the daemon (it has the files) and
+comes back on the wire.
+
+Shipped:
+- **The wire** — a third `fs_read` reply variant alongside `["file", bytes]` / `["new"]`:
+  `["dir", canonical_path, [[is_dir, name], …]]`. The daemon's `classify` now returns
+  `FsRead::Dir { path, entries }` for a readable directory (canonicalizing the path so the
+  edit-host's `../`/descend navigation is unambiguous) instead of the old loud error; the
+  entries ride raw and **unsorted** — the edit-host sorts/renders them, keeping the netrw
+  sort in one place. (`crates/nxvim-server/src/daemon.rs`.)
+- **Core, off-tick directory listing** (`nxvim-core`): `Buffer::from_dir_entries(dir,
+  entries)` factors the [`HostFs`]-free sort-and-render core out of `Buffer::from_dir`
+  (which now just `read_dir`s then calls it), and `Editor::load_dir_into(buffer, dir,
+  entries)` is the directory analogue of `load_str_into` — it builds the listing into an
+  already-created buffer (preserving its id, rooting a fresh undo tree, resetting the
+  window to the top when current). The explorer's three entry points learned an off-tick
+  branch: `enter_dir` (and so `:e dir`, descend, `-`-up) sets up the destination buffer
+  and `enqueue_open`s instead of reading sync; `explorer_open_entry` decides dir-vs-file
+  from the **listing's trailing `/`** (already authoritative — no remote stat round-trip)
+  rather than `target.is_dir()`; `explorer_open_file` opens an empty named buffer and
+  enqueues the fetch. `ex_edit` needed no change — a remote dir already isn't a *local*
+  `is_dir()`, so it flowed to the enqueue path; only the reply handler is new.
+- **Server** (`lifecycle.rs`): `apply_open` gained a `Dir` arm → `load_dir_replica`, the
+  directory sibling of `load_replica` — `load_dir_into` + clear `announced` (so the
+  now-named buffer's `BufReadPost` fires) + refresh the Lua snapshot/mirror + drive the
+  queued autocmds. A directory has no filetype, so no `FileType`/LSP work.
+- **Rides for free:** the startup `nxvim <remote-dir>` open (the deferred startup fetch
+  hits the same `apply_open`) and `:split`/`:vsplit <remote-dir>` (delegate to `ex_edit`).
+  **Still sync (documented):** `:tabnew {file}`; and remote directory **canonicalization**
+  beyond what the daemon resolves on the open is not re-statted per navigation (the
+  listing's trailing-slash and the daemon's canonical path carry it).
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_explorer.rs`: a server whose
+`host_fs_async` is a `RemoteHostFs` over an in-process duplex, backed by a daemon-side
+fake that models *directories* (a `read_dir` that succeeds only for registered dirs).
+`nxvim /virtual/proj` (startup) and `:edit /virtual/proj` both list the remote dir's
+entries — dirs-first, then files by name — a `/virtual/...` tree the edit-host's local
+disk can't hold, so the listing crossed the wire (the 3d/3f faithfulness argument);
+`<CR>` on `src/` descends into the remote sub-directory and `-` lists the remote parent
+again (two more remote `read_dir`s); and `<CR>` on a file row opens that remote file's
+bytes over the wire (destroying the listing, as netrw does). Regression-clean — the
+unchanged local-disk `editing::explorer` suite (10 tests) proves the sync path didn't
+regress; full `cargo test --workspace` green (now 22 server test binaries), fmt + clippy
+`-D warnings` clean; local binaries leave off-tick mode off and list synchronously.
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -680,8 +741,9 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
   `Editor::load_str`; save = snapshot the rope and push the bytes back off-tick,
   finalizing the saved-state on the ack. The rope is authoritative for open
   buffers; core sees a normal local buffer. (Initial open landed in Phase 3d, the
-  single-buffer **save** in Phase 3e, and **`:edit`** in Phase 3f; multi-buffer `:wall`,
-  `:tabnew {file}` / LSP go-to, and explorer listing are the remaining fs-leg slices.)
+  single-buffer **save** in Phase 3e, **`:edit`** in Phase 3f, and the **remote explorer**
+  listing in Phase 3g; multi-buffer `:wall` and `:tabnew {file}` / LSP go-to are the
+  remaining fs-leg slices.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call

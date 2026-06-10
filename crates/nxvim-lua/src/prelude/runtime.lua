@@ -37,9 +37,7 @@ end
 -- pcall the call; it cannot rely on the field being nil (neither can it in neovim).
 setmetatable(vim.fn, {
   __index = function(_, name)
-    local fn = function(...)
-      return vim._notimpl("vim.fn." .. name)
-    end
+    local fn = function() return vim._notimpl("vim.fn." .. name) end
     return fn
   end,
 })
@@ -188,4 +186,3 @@ function vim.inspect(value)
   end
   return ins(value, "")
 end
-

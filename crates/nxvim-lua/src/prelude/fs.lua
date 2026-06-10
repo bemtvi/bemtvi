@@ -13,9 +13,7 @@ local vim = vim
 vim.fs = vim.fs or {}
 
 -- Join path segments with `/`, collapsing duplicate separators.
-function vim.fs.joinpath(...)
-  return (table.concat({ ... }, "/"):gsub("//+", "/"))
-end
+function vim.fs.joinpath(...) return (table.concat({ ... }, "/"):gsub("//+", "/")) end
 
 -- Expand a leading `~` and collapse duplicate / trailing slashes. (Minimal: no
 -- `..` resolution — the config files don't need it.)
@@ -56,14 +54,14 @@ function vim.fs.parents(start)
     local parent = vim.fs.dirname(dir)
     if parent == dir then return nil end
     return parent
-  end, nil, start
+  end,
+    nil,
+    start
 end
 
 -- Does `path` exist on disk (file or directory)? `getftime` stats both and
 -- returns -1 only when the path can't be stat'd.
-local function fs_exists(path)
-  return vim.fn.getftime(path) ~= -1
-end
+local function fs_exists(path) return vim.fn.getftime(path) ~= -1 end
 
 -- vim.fs.find(names, opts): find paths matching `names` (a name, list of names,
 -- or `function(name, path)` predicate). `opts.upward` walks ancestors of
@@ -82,9 +80,7 @@ function vim.fs.find(names, opts)
   local limit = opts.limit or 1
   local results = {}
   local function consider(dir, entry)
-    if matches(entry, dir) then
-      results[#results + 1] = vim.fs.joinpath(dir, entry)
-    end
+    if matches(entry, dir) then results[#results + 1] = vim.fs.joinpath(dir, entry) end
   end
   if opts.upward then
     local dir = path
@@ -200,9 +196,7 @@ function vim.uri_to_fname(uri)
   return (path:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
 end
 
-function vim.uri_from_bufnr(bufnr)
-  return vim.uri_from_fname(vim.api.nvim_buf_get_name(bufnr))
-end
+function vim.uri_from_bufnr(bufnr) return vim.uri_from_fname(vim.api.nvim_buf_get_name(bufnr)) end
 
 -- ----- additional vim.fn -----------------------------------------------------
 
@@ -223,8 +217,11 @@ function vim.fn.fnamemodify(fname, mods)
   while i <= n do
     local m = mods:sub(i, i + 1)
     if m == ":p" then
-      if fname == "" then fname = vim.fn.getcwd()
-      elseif fname:sub(1, 1) ~= "/" then fname = vim.fn.getcwd() .. "/" .. fname end
+      if fname == "" then
+        fname = vim.fn.getcwd()
+      elseif fname:sub(1, 1) ~= "/" then
+        fname = vim.fn.getcwd() .. "/" .. fname
+      end
       i = i + 2
     elseif m == ":~" then
       local home = os.getenv("HOME") or ""
@@ -234,15 +231,17 @@ function vim.fn.fnamemodify(fname, mods)
       i = i + 2
     elseif m == ":." then
       local cwd = vim.fn.getcwd()
-      if cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then
-        fname = fname:sub(#cwd + 2)
-      end
+      if cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then fname = fname:sub(#cwd + 2) end
       i = i + 2
     elseif m == ":h" then
       local head = fname:match("^(.*)/[^/]*$")
-      if head == nil then fname = "."
-      elseif head == "" then fname = "/"
-      else fname = head end
+      if head == nil then
+        fname = "."
+      elseif head == "" then
+        fname = "/"
+      else
+        fname = head
+      end
       i = i + 2
     elseif m == ":t" then
       fname = fname:match("[^/]*$") or ""
@@ -250,9 +249,14 @@ function vim.fn.fnamemodify(fname, mods)
     elseif m == ":r" then
       -- Strip the last extension of the tail component (a leading dot isn't one).
       local dir, tail = fname:match("^(.*/)([^/]*)$")
-      if not tail then dir, tail = "", fname end
+      if not tail then
+        dir, tail = "", fname
+      end
       for p = #tail, 2, -1 do
-        if tail:sub(p, p) == "." then tail = tail:sub(1, p - 1); break end
+        if tail:sub(p, p) == "." then
+          tail = tail:sub(1, p - 1)
+          break
+        end
       end
       fname = dir .. tail
       i = i + 2
@@ -260,7 +264,10 @@ function vim.fn.fnamemodify(fname, mods)
       -- Count the run of consecutive `:e`; k of them widen the extension to its
       -- last k dot-separated components (capped at the count of extensions).
       local k = 0
-      while mods:sub(i, i + 1) == ":e" do k = k + 1; i = i + 2 end
+      while mods:sub(i, i + 1) == ":e" do
+        k = k + 1
+        i = i + 2
+      end
       local tail = fname:match("[^/]*$") or ""
       local dots = {}
       for p = 2, #tail do
@@ -286,7 +293,8 @@ end
 -- buffer mirror; the register/quickfix/prompt ones can't be honored without those
 -- UIs, so they raise via vim._notimpl rather than silently dropping the write.
 function vim.fn.finddir(name, path)
-  local hit = vim.fs.find(name, { path = path or vim.fn.getcwd(), upward = true, type = "directory" })[1]
+  local hit =
+    vim.fs.find(name, { path = path or vim.fn.getcwd(), upward = true, type = "directory" })[1]
   return hit or ""
 end
 
@@ -305,9 +313,7 @@ function vim.fn.bufnr(expr)
     end
     return max
   end
-  if type(expr) == "number" then
-    return vim._bufs[expr] and expr or -1
-  end
+  if type(expr) == "number" then return vim._bufs[expr] and expr or -1 end
   for bufnr, buf in pairs(vim._bufs) do
     local name = buf.name or ""
     if name == expr or name:sub(-#expr) == expr then return bufnr end
@@ -330,7 +336,12 @@ end
 -- state), so it errors loud rather than storing a cell that the read path would
 -- silently shadow.
 local SETREG_READONLY = {
-  ["/"] = true, ["."] = true, ["%"] = true, [":"] = true, ["="] = true, ["#"] = true,
+  ["/"] = true,
+  ["."] = true,
+  ["%"] = true,
+  [":"] = true,
+  ["="] = true,
+  ["#"] = true,
 }
 
 -- vim.fn.setreg(name, value [, options]): write a register. `name` "" / "@" means
@@ -346,9 +357,7 @@ function vim.fn.setreg(name, value, options)
   name = tostring(name)
   if name == "" or name == "@" then name = '"' end
   local reg = name:sub(1, 1)
-  if SETREG_READONLY[reg] then
-    error("E354: Invalid register name: '" .. reg .. "'")
-  end
+  if SETREG_READONLY[reg] then error("E354: Invalid register name: '" .. reg .. "'") end
 
   local linewise, append = false, false
   local text
@@ -380,9 +389,7 @@ function vim.fn.setreg(name, value, options)
   if reg:match("%u") then append = true end
   -- A trailing newline on a plain string makes it linewise (vim), unless a flag
   -- already decided the type.
-  if type(value) ~= "table" and not type_given and text:sub(-1) == "\n" then
-    linewise = true
-  end
+  if type(value) ~= "table" and not type_given and text:sub(-1) == "\n" then linewise = true end
 
   local lower = reg:lower()
   vim._registers = vim._registers or {}
@@ -453,7 +460,9 @@ local function await_prompt(open)
   -- Resuming the root lets that chain forward the value back to `co`. Without any
   -- co_pcall on the stack the map is empty and the root IS `co` — unchanged.
   local root, drivers = co, vim._co_driver
-  while drivers and drivers[root] do root = drivers[root] end
+  while drivers and drivers[root] do
+    root = drivers[root]
+  end
   local cb = vim._next_cb_id()
   vim._cb_fns[cb] = function(value)
     local ok, err = coroutine.resume(root, value)
@@ -511,9 +520,6 @@ end
 --   none. nxvim exposes no typeahead between input batches, so this is always ""
 --   (an honest "nothing is pending", not a faked value), and it never blocks.
 function vim.fn.getcharstr(expr)
-  if expr == 1 then
-    return ""
-  end
+  if expr == 1 then return "" end
   return await_prompt(function(cb) vim._getchar(cb) end) or ""
 end
-

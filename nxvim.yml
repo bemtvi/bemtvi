@@ -1,0 +1,27 @@
+# selene standard library for nxvim's Lua prelude.
+# Layers the globals nxvim injects on top of the base PUC Lua 5.1 runtime so
+# selene doesn't flag them as undefined / unscoped. `any: true` permits
+# arbitrary field reads, writes, and calls (the `vim.*` API is open-ended).
+#
+# Referenced as `std = "lua51+nxvim"` from selene.toml — selene resolves the
+# `nxvim` segment to this file (nxvim.yml, alongside selene.toml at the repo root).
+base: lua51
+name: nxvim
+globals:
+  # The editor API root. Open-ended: vim.keymap.set, vim.api.*, vim.fn.*, etc.,
+  # plus assignment of new submodules (vim.treesitter = require("vim.treesitter")).
+  vim:
+    any: true
+  # LuaJIT's bit library. neovim ships it; the prelude polyfills it on PUC 5.1
+  # (stdlib.lua) and plugins reach for `bit` / `bit32`.
+  bit:
+    any: true
+  bit32:
+    any: true
+  # LuaJIT introspection global, referenced for runtime feature detection.
+  jit:
+    any: true
+  # Lua 5.2+ moved unpack to table.unpack; the prelude guards with
+  # `table.unpack or unpack`, so the field must be a known (optional) member.
+  table.unpack:
+    any: true

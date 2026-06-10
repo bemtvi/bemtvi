@@ -16,7 +16,9 @@ local vim = vim
 -- keeps its native (faster) version.
 if not bit then
   local POW = {}
-  for i = 0, 32 do POW[i] = 2 ^ i end
+  for i = 0, 32 do
+    POW[i] = 2 ^ i
+  end
   local M32 = POW[32]
 
   -- Wrap to the unsigned 32-bit range [0, 2^32).
@@ -42,9 +44,15 @@ if not bit then
 
   bit = {
     tobit = tobit,
-    band = function(a, b) return bitwise(a, b, function(x, y) return x * y end) end,
-    bor = function(a, b) return bitwise(a, b, function(x, y) return (x + y > 0) and 1 or 0 end) end,
-    bxor = function(a, b) return bitwise(a, b, function(x, y) return (x ~= y) and 1 or 0 end) end,
+    band = function(a, b)
+      return bitwise(a, b, function(x, y) return x * y end)
+    end,
+    bor = function(a, b)
+      return bitwise(a, b, function(x, y) return (x + y > 0) and 1 or 0 end)
+    end,
+    bxor = function(a, b)
+      return bitwise(a, b, function(x, y) return (x ~= y) and 1 or 0 end)
+    end,
     bnot = function(a) return tobit(-1 - u32(a)) end,
     lshift = function(a, n) return tobit(u32(a) * POW[n % 32]) end,
     rshift = function(a, n) return tobit(math.floor(u32(a) / POW[n % 32])) end,
@@ -71,7 +79,10 @@ local function scoped_vars(store, current)
       if type(k) == "number" then
         local h = (k == 0) and current() or k
         local t = store[h]
-        if not t then t = {}; store[h] = t end
+        if not t then
+          t = {}
+          store[h] = t
+        end
         return t
       end
       -- bare `vim.w.name`: the current handle's var.
@@ -84,7 +95,10 @@ local function scoped_vars(store, current)
       end
       local h = current()
       local t = store[h]
-      if not t then t = {}; store[h] = t end
+      if not t then
+        t = {}
+        store[h] = t
+      end
       t[k] = v
     end,
   })
@@ -116,40 +130,65 @@ vim.b = scoped_vars(vim._b_vars, function() return vim.api.nvim_get_current_buf(
 -- both the full name and its abbreviation (the delegate canonicalizes again).
 local O_WIN = { number = true, nu = true, relativenumber = true, rnu = true }
 local O_BUF = {
-  tabstop = true, ts = true, shiftwidth = true, sw = true,
-  softtabstop = true, sts = true, expandtab = true, et = true,
+  tabstop = true,
+  ts = true,
+  shiftwidth = true,
+  sw = true,
+  softtabstop = true,
+  sts = true,
+  expandtab = true,
+  et = true,
 }
 -- Global (editor-wide) options: canonical name keyed by name and abbreviation.
 local O_GLOBAL = {
-  ignorecase = "ignorecase", ic = "ignorecase",
-  smartcase = "smartcase", scs = "smartcase",
-  wrapscan = "wrapscan", ws = "wrapscan",
-  hlsearch = "hlsearch", hls = "hlsearch",
-  incsearch = "incsearch", is = "incsearch",
-  autoread = "autoread", ar = "autoread",
-  showtabline = "showtabline", stal = "showtabline",
-  laststatus = "laststatus", ls = "laststatus",
-  statusline = "statusline", stl = "statusline",
-  tabline = "tabline", tal = "tabline",
-  guifont = "guifont", gfn = "guifont",
-  regexsyntax = "regexsyntax", rxs = "regexsyntax",
+  ignorecase = "ignorecase",
+  ic = "ignorecase",
+  smartcase = "smartcase",
+  scs = "smartcase",
+  wrapscan = "wrapscan",
+  ws = "wrapscan",
+  hlsearch = "hlsearch",
+  hls = "hlsearch",
+  incsearch = "incsearch",
+  is = "incsearch",
+  autoread = "autoread",
+  ar = "autoread",
+  showtabline = "showtabline",
+  stal = "showtabline",
+  laststatus = "laststatus",
+  ls = "laststatus",
+  statusline = "statusline",
+  stl = "statusline",
+  tabline = "tabline",
+  tal = "tabline",
+  guifont = "guifont",
+  gfn = "guifont",
+  regexsyntax = "regexsyntax",
+  rxs = "regexsyntax",
   -- The editor screen extent (the server pushes the live size into the mirror);
   -- read-mostly here — a float-positioning plugin (telescope) reads them to
   -- center its windows, and `:set columns=` is not honored (the client owns the
   -- terminal size), but a write still lands in the mirror so a read-back agrees.
-  columns = "columns", co = "columns",
+  columns = "columns",
+  co = "columns",
   lines = "lines",
 }
 -- Core defaults, the safety net before the server has pushed the mirror.
 local O_GLOBAL_DEFAULT = {
-  ignorecase = false, smartcase = false, wrapscan = true,
-  hlsearch = true, incsearch = true, autoread = true, showtabline = 1,
+  ignorecase = false,
+  smartcase = false,
+  wrapscan = true,
+  hlsearch = true,
+  incsearch = true,
+  autoread = true,
+  showtabline = 1,
   laststatus = 2,
   statusline = "",
   tabline = "",
   guifont = "",
   regexsyntax = "pcre",
-  columns = 80, lines = 24,
+  columns = 80,
+  lines = 24,
 }
 
 -- Rust→Lua mirror of the core's global option values, refreshed by the server
@@ -171,25 +210,26 @@ function vim._set_reg_mirror(t) vim._registers = t or {} end
 -- Arbitrary (Lua-only) global options plugins set via vim.o; the wired options
 -- live in their scope (vim.wo / vim.bo / vim._go_mirror) instead. Seeded with
 -- the few defaults colorschemes read (termguicolors / background / *blend).
-vim._o_store = vim._o_store or {
-  background = "dark",
-  termguicolors = false,
-  winblend = 0,
-  pumblend = 0,
-  -- Read-mostly editor options plugins (telescope, plenary.popup) read to lay out
-  -- floats and gate behavior. Observable defaults matching neovim's; not yet
-  -- honored by the core (the client owns the cmdline / message regions), but a
-  -- read returns a sane value instead of nil (which a `- cmdheight` arithmetic or
-  -- a `.. report` concat would choke on).
-  cmdheight = 1,
-  report = 2,
-  eventignore = "",
-  ambiwidth = "single",
-  helplang = "en",
-  mouse = "",
-  guicursor = "",
-  shell = os.getenv("SHELL") or "/bin/sh",
-}
+vim._o_store = vim._o_store
+  or {
+    background = "dark",
+    termguicolors = false,
+    winblend = 0,
+    pumblend = 0,
+    -- Read-mostly editor options plugins (telescope, plenary.popup) read to lay out
+    -- floats and gate behavior. Observable defaults matching neovim's; not yet
+    -- honored by the core (the client owns the cmdline / message regions), but a
+    -- read returns a sane value instead of nil (which a `- cmdheight` arithmetic or
+    -- a `.. report` concat would choke on).
+    cmdheight = 1,
+    report = 2,
+    eventignore = "",
+    ambiwidth = "single",
+    helplang = "en",
+    mouse = "",
+    guicursor = "",
+    shell = os.getenv("SHELL") or "/bin/sh",
+  }
 
 local function o_get(k)
   if O_WIN[k] then return vim.wo[k] end
@@ -203,8 +243,14 @@ local function o_get(k)
   return vim._o_store[k]
 end
 local function o_set(k, v)
-  if O_WIN[k] then vim.wo[k] = v; return end
-  if O_BUF[k] then vim.bo[k] = v; return end
+  if O_WIN[k] then
+    vim.wo[k] = v
+    return
+  end
+  if O_BUF[k] then
+    vim.bo[k] = v
+    return
+  end
   local canon = O_GLOBAL[k]
   if canon then
     -- Queue the change for the core and write through the mirror so a
@@ -226,8 +272,11 @@ vim.o = setmetatable({}, {
 -- global options plus the read-mostly catch-all store. Used by vim.fn.exists to
 -- answer the `&opt` / `+opt` probe honestly — 1 only for options we really have.
 local function option_known(name)
-  return O_WIN[name] or O_BUF[name] or O_GLOBAL[name] ~= nil
-    or O_GLOBAL_DEFAULT[name] ~= nil or vim._o_store[name] ~= nil
+  return O_WIN[name]
+    or O_BUF[name]
+    or O_GLOBAL[name] ~= nil
+    or O_GLOBAL_DEFAULT[name] ~= nil
+    or vim._o_store[name] ~= nil
 end
 
 -- vim.fn.exists(expr): does the vim entity named by `expr` exist? (1 / 0). nxvim
@@ -260,9 +309,7 @@ end
 -- both count). LuaSnip probes this to drop ext-mark highlight groups that aren't
 -- defined (`vim.fn.hlexists(group) == 1 and group or nil`), so a missing builtin
 -- errored its setup; an undefined group correctly answers 0, leaving it unstyled.
-function vim.fn.hlexists(name)
-  return (vim._hl_defs or {})[name] ~= nil and 1 or 0
-end
+function vim.fn.hlexists(name) return (vim._hl_defs or {})[name] ~= nil and 1 or 0 end
 
 -- Sign *definitions* registry. nvim-dap defines its breakpoint/stopped signs at
 -- module load (`sign_getdefined(name)` then `sign_define(name, opts)` for each
@@ -277,7 +324,9 @@ vim._sign_defs = vim._sign_defs or {}
 local SIGN_DEF_KEYS = { "text", "texthl", "linehl", "numhl", "culhl", "icon" }
 local function copy_sign_def(d)
   local out = { name = d.name }
-  for _, k in ipairs(SIGN_DEF_KEYS) do out[k] = d[k] end
+  for _, k in ipairs(SIGN_DEF_KEYS) do
+    out[k] = d[k]
+  end
   return out
 end
 
@@ -294,7 +343,9 @@ function vim.fn.sign_define(name, opts)
   end
   local def = { name = name }
   if type(opts) == "table" then
-    for _, k in ipairs(SIGN_DEF_KEYS) do def[k] = opts[k] end
+    for _, k in ipairs(SIGN_DEF_KEYS) do
+      def[k] = opts[k]
+    end
   end
   vim._sign_defs[name] = def
   return 0
@@ -308,7 +359,9 @@ function vim.fn.sign_getdefined(name)
     return d and { copy_sign_def(d) } or {}
   end
   local out = {}
-  for _, d in pairs(vim._sign_defs) do out[#out + 1] = copy_sign_def(d) end
+  for _, d in pairs(vim._sign_defs) do
+    out[#out + 1] = copy_sign_def(d)
+  end
   return out
 end
 
@@ -317,7 +370,9 @@ function vim.fn.sign_undefine(name)
   if name == nil then
     vim._sign_defs = {}
   elseif type(name) == "table" then
-    for _, n in ipairs(name) do vim._sign_defs[n] = nil end
+    for _, n in ipairs(name) do
+      vim._sign_defs[n] = nil
+    end
   else
     vim._sign_defs[name] = nil
   end
@@ -333,13 +388,19 @@ function vim.fn.trim(text, mask, dir)
   if mask == nil or mask == "" then mask = " \t\n\r\f\v" end
   dir = dir or 0
   local set = {}
-  for i = 1, #mask do set[mask:sub(i, i)] = true end
+  for i = 1, #mask do
+    set[mask:sub(i, i)] = true
+  end
   local from, to = 1, #text
   if dir == 0 or dir == 1 then
-    while from <= to and set[text:sub(from, from)] do from = from + 1 end
+    while from <= to and set[text:sub(from, from)] do
+      from = from + 1
+    end
   end
   if dir == 0 or dir == 2 then
-    while to >= from and set[text:sub(to, to)] do to = to - 1 end
+    while to >= from and set[text:sub(to, to)] do
+      to = to - 1
+    end
   end
   return text:sub(from, to)
 end
@@ -437,20 +498,26 @@ end
 
 function vim.tbl_keys(t)
   local keys = {}
-  for k in pairs(t) do keys[#keys + 1] = k end
+  for k in pairs(t) do
+    keys[#keys + 1] = k
+  end
   return keys
 end
 
 function vim.tbl_values(t)
   local values = {}
-  for _, v in pairs(t) do values[#values + 1] = v end
+  for _, v in pairs(t) do
+    values[#values + 1] = v
+  end
   return values
 end
 
 -- vim.tbl_count(t): number of entries in `t` (any keys, not just the sequence).
 function vim.tbl_count(t)
   local n = 0
-  for _ in pairs(t) do n = n + 1 end
+  for _ in pairs(t) do
+    n = n + 1
+  end
   return n
 end
 
@@ -483,9 +550,7 @@ function vim.nonnil(...)
   local nargs = select("#", ...)
   for i = 1, nargs do
     local v = select(i, ...)
-    if v ~= nil then
-      return v
-    end
+    if v ~= nil then return v end
   end
   return nil
 end
@@ -495,9 +560,7 @@ end
 -- spec; _assert_integer raises on a non-integer, _tointeger returns nil.
 function vim._tointeger(x, base)
   local nx = tonumber(x, base)
-  if nx and nx == math.floor(nx) then
-    return nx
-  end
+  if nx and nx == math.floor(nx) then return nx end
 end
 
 function vim._assert_integer(x, base)
@@ -511,7 +574,7 @@ end
 function vim.tbl_get(o, ...)
   local keys = { ... }
   if #keys == 0 then return nil end
-  for i, k in ipairs(keys) do
+  for _, k in ipairs(keys) do
     if type(o) ~= "table" then return nil end
     o = o[k]
     if o == nil then return nil end
@@ -529,7 +592,9 @@ end
 
 function vim.tbl_map(f, t)
   local out = {}
-  for k, v in pairs(t) do out[k] = f(v) end
+  for k, v in pairs(t) do
+    out[k] = f(v)
+  end
   return out
 end
 
@@ -539,7 +604,11 @@ function vim.tbl_flatten(t)
   local out = {}
   local function flatten(list)
     for _, v in ipairs(list) do
-      if type(v) == "table" then flatten(v) else out[#out + 1] = v end
+      if type(v) == "table" then
+        flatten(v)
+      else
+        out[#out + 1] = v
+      end
     end
   end
   flatten(t)
@@ -549,7 +618,9 @@ end
 function vim.deepcopy(orig)
   if type(orig) ~= "table" then return orig end
   local copy = {}
-  for k, v in pairs(orig) do copy[vim.deepcopy(k)] = vim.deepcopy(v) end
+  for k, v in pairs(orig) do
+    copy[vim.deepcopy(k)] = vim.deepcopy(v)
+  end
   return setmetatable(copy, getmetatable(orig))
 end
 
@@ -568,7 +639,9 @@ function vim.tbl_deep_extend(behavior, ...)
       end -- "keep": leave dst[k] as-is
     end
   end
-  for i = 1, select("#", ...) do merge(result, (select(i, ...))) end
+  for i = 1, select("#", ...) do
+    merge(result, (select(i, ...)))
+  end
   return result
 end
 
@@ -590,7 +663,9 @@ end
 function vim.list_extend(dst, src, start, finish)
   start = start or 1
   finish = finish or #src
-  for i = start, finish do dst[#dst + 1] = src[i] end
+  for i = start, finish do
+    dst[#dst + 1] = src[i]
+  end
   return dst
 end
 
@@ -629,8 +704,12 @@ function vim.split(s, sep, opts)
     pos = to + 1
   end
   if opts.trimempty then
-    while #parts > 0 and parts[#parts] == "" do parts[#parts] = nil end
-    while #parts > 0 and parts[1] == "" do table.remove(parts, 1) end
+    while #parts > 0 and parts[#parts] == "" do
+      parts[#parts] = nil
+    end
+    while #parts > 0 and parts[1] == "" do
+      table.remove(parts, 1)
+    end
   end
   return parts
 end
@@ -655,9 +734,7 @@ local function utf8_decode(s, i)
     end
   elseif b >= 0xE0 then
     local b2, b3 = s:byte(i + 1), s:byte(i + 2)
-    if b2 and b3 then
-      return (b % 0x10) * 0x1000 + (b2 % 0x40) * 0x40 + (b3 % 0x40), 3
-    end
+    if b2 and b3 then return (b % 0x10) * 0x1000 + (b2 % 0x40) * 0x40 + (b3 % 0x40), 3 end
   elseif b >= 0xC0 then
     local b2 = s:byte(i + 1)
     if b2 then return (b % 0x20) * 0x40 + (b2 % 0x40), 2 end
@@ -671,17 +748,20 @@ end
 -- width 0) count as 1 — close enough for popup grid layout, wrong for dense CJK
 -- with combining marks. A real impl would consult a generated width table.
 local function char_width(cp)
-  if cp >= 0x1100 and (
-        cp <= 0x115F                            -- Hangul Jamo
-        or (cp >= 0x2E80 and cp <= 0xA4CF and cp ~= 0x303F) -- CJK … Yi
-        or (cp >= 0xAC00 and cp <= 0xD7A3)      -- Hangul Syllables
-        or (cp >= 0xF900 and cp <= 0xFAFF)      -- CJK Compat Ideographs
-        or (cp >= 0xFE30 and cp <= 0xFE4F)      -- CJK Compat Forms
-        or (cp >= 0xFF00 and cp <= 0xFF60)      -- Fullwidth Forms
-        or (cp >= 0xFFE0 and cp <= 0xFFE6)      -- Fullwidth signs
-        or (cp >= 0x1F300 and cp <= 0x1FAFF)    -- emoji & pictographs
-        or (cp >= 0x20000 and cp <= 0x3FFFD)    -- CJK Ext B+
-      ) then
+  if
+    cp >= 0x1100
+    and (
+      cp <= 0x115F -- Hangul Jamo
+      or (cp >= 0x2E80 and cp <= 0xA4CF and cp ~= 0x303F) -- CJK … Yi
+      or (cp >= 0xAC00 and cp <= 0xD7A3) -- Hangul Syllables
+      or (cp >= 0xF900 and cp <= 0xFAFF) -- CJK Compat Ideographs
+      or (cp >= 0xFE30 and cp <= 0xFE4F) -- CJK Compat Forms
+      or (cp >= 0xFF00 and cp <= 0xFF60) -- Fullwidth Forms
+      or (cp >= 0xFFE0 and cp <= 0xFFE6) -- Fullwidth signs
+      or (cp >= 0x1F300 and cp <= 0x1FAFF) -- emoji & pictographs
+      or (cp >= 0x20000 and cp <= 0x3FFFD) -- CJK Ext B+
+    )
+  then
     return 2
   end
   return 1
@@ -731,9 +811,7 @@ end
 -- vim.fn.nr2char(nr[, utf8]): the string for codepoint `nr` (`nr2char(65) == "A"`).
 -- The inverse of one `str2list` element; nxvim is always UTF-8 so `utf8` is
 -- accepted and ignored.
-function vim.fn.nr2char(nr, _utf8)
-  return utf8_encode(nr)
-end
+function vim.fn.nr2char(nr, _utf8) return utf8_encode(nr) end
 
 -- vim.fn.strchars(s[, skipcc]): number of characters (codepoints) in `s`.
 -- INCOMPLETE: `skipcc` (skip composing characters) is ignored — every codepoint
@@ -781,7 +859,11 @@ end
 -- outside the BMP (4-byte UTF-8) is one utf-32 unit but two utf-16 units.
 local function utf_unit_counts(s, byteidx)
   byteidx = byteidx or #s
-  if byteidx < 0 then byteidx = 0 elseif byteidx > #s then byteidx = #s end
+  if byteidx < 0 then
+    byteidx = 0
+  elseif byteidx > #s then
+    byteidx = #s
+  end
   local u32, u16, i = 0, 0, 1
   while i <= byteidx do
     local _, len = utf8_decode(s, i)
@@ -827,9 +909,7 @@ end
 
 function vim.str_byteindex(s, a, b)
   s = tostring(s or "")
-  if type(a) == "string" then
-    return byteindex_for(s, b, a == "utf-16")
-  end
+  if type(a) == "string" then return byteindex_for(s, b, a == "utf-16") end
   return byteindex_for(s, a, false)
 end
 
@@ -863,11 +943,13 @@ end
 -- built from raw bytes displays readably. Multibyte UTF-8 is left intact.
 function vim.fn.strtrans(s)
   s = tostring(s or "")
-  return (s:gsub("[%z\1-\31\127]", function(c)
-    local b = c:byte()
-    if b == 127 then return "^?" end
-    return "^" .. string.char(b + 64)
-  end))
+  return (
+    s:gsub("[%z\1-\31\127]", function(c)
+      local b = c:byte()
+      if b == 127 then return "^?" end
+      return "^" .. string.char(b + 64)
+    end)
+  )
 end
 
 -- vim.fn.keytrans(s): translate the internal form of a key sequence to readable
@@ -876,9 +958,7 @@ end
 -- nvim_replace_termcodes returns its input unchanged), so the internal form
 -- already IS the notation — this returns `s` unchanged, the inverse of
 -- nvim_replace_termcodes exactly as in vim.
-function vim.fn.keytrans(s)
-  return tostring(s or "")
-end
+function vim.fn.keytrans(s) return tostring(s or "") end
 
 -- nvim_strwidth(text): the display cells `text` occupies (wide chars count as
 -- two). Unlike strdisplaywidth it does not expand tabs — it measures the raw
@@ -907,7 +987,9 @@ function vim.fn.reg_executing() return "" end
 -- a custom `'tabline'`/`str_join` uses it so output order is deterministic.
 function vim.spairs(t)
   local keys = {}
-  for k in pairs(t) do keys[#keys + 1] = k end
+  for k in pairs(t) do
+    keys[#keys + 1] = k
+  end
   table.sort(keys)
   local i = 0
   return function()
@@ -952,7 +1034,9 @@ function vim.iter(src, state, ctrl)
       items[#items + 1] = v
     end
   elseif type(src) == "table" then
-    for _, v in ipairs(src) do items[#items + 1] = v end
+    for _, v in ipairs(src) do
+      items[#items + 1] = v
+    end
   end
   return setmetatable({ _items = items }, Iter)
 end
@@ -983,7 +1067,9 @@ function Iter:flatten()
   local out = {}
   for _, v in ipairs(self._items) do
     if type(v) == "table" then
-      for _, inner in ipairs(v) do out[#out + 1] = inner end
+      for _, inner in ipairs(v) do
+        out[#out + 1] = inner
+      end
     else
       out[#out + 1] = v
     end
@@ -1012,13 +1098,16 @@ function Iter:filter(f)
 end
 
 function Iter:each(f)
-  for _, v in ipairs(self._items) do f(v) end
+  for _, v in ipairs(self._items) do
+    f(v)
+  end
 end
 
 function Iter:fold(acc, f)
-  for _, v in ipairs(self._items) do acc = f(acc, v) end
+  for _, v in ipairs(self._items) do
+    acc = f(acc, v)
+  end
   return acc
 end
 
 function Iter:totable() return self._items end
-

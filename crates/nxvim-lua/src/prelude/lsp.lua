@@ -45,8 +45,16 @@ function vim.lsp.protocol.make_client_capabilities() return {} end
 -- may name it as a literal value (smithy_ls sets `message_level =
 -- vim.lsp.protocol.MessageType.Log`), so the table must exist at load time.
 vim.lsp.protocol.MessageType = {
-  Error = 1, Warning = 2, Info = 3, Log = 4, Debug = 5,
-  [1] = "Error", [2] = "Warning", [3] = "Info", [4] = "Log", [5] = "Debug",
+  Error = 1,
+  Warning = 2,
+  Info = 3,
+  Log = 4,
+  Debug = 5,
+  [1] = "Error",
+  [2] = "Warning",
+  [3] = "Info",
+  [4] = "Log",
+  [5] = "Debug",
 }
 
 -- vim.lsp.protocol.Methods: the request/notification method-name table. Real
@@ -95,10 +103,15 @@ function vim._byte_to_position_char(line, byte_col, encoding)
   while i <= limit do
     local b = string.byte(line, i)
     local size, units
-    if b < 0x80 then size, units = 1, 1
-    elseif b < 0xE0 then size, units = 2, 1
-    elseif b < 0xF0 then size, units = 3, 1
-    else size, units = 4, utf16 and 2 or 1 end
+    if b < 0x80 then
+      size, units = 1, 1
+    elseif b < 0xE0 then
+      size, units = 2, 1
+    elseif b < 0xF0 then
+      size, units = 3, 1
+    else
+      size, units = 4, utf16 and 2 or 1
+    end
     count = count + units
     i = i + size
   end
@@ -114,10 +127,15 @@ function vim._position_char_to_byte(line, character, encoding)
   while i <= #line and count < character do
     local b = string.byte(line, i)
     local size, units
-    if b < 0x80 then size, units = 1, 1
-    elseif b < 0xE0 then size, units = 2, 1
-    elseif b < 0xF0 then size, units = 3, 1
-    else size, units = 4, utf16 and 2 or 1 end
+    if b < 0x80 then
+      size, units = 1, 1
+    elseif b < 0xE0 then
+      size, units = 2, 1
+    elseif b < 0xF0 then
+      size, units = 3, 1
+    else
+      size, units = 4, utf16 and 2 or 1
+    end
     count = count + units
     i = i + size
   end
@@ -131,9 +149,7 @@ end
 function vim._line_text_for_uri(uri, row)
   local fname = vim.uri_to_fname(uri)
   for _, buf in pairs(vim._bufs) do
-    if buf.lines and buf.name == fname then
-      return buf.lines[row + 1]
-    end
+    if buf.lines and buf.name == fname then return buf.lines[row + 1] end
   end
   return nil
 end
@@ -310,9 +326,7 @@ function vim.lsp.util.convert_input_to_markdown_lines(input, contents)
     error("convert_input_to_markdown_lines: expected string or table, got " .. type(input))
   end
   -- A single empty line means "no content".
-  if #contents == 1 and (contents[1] == "" or contents[1] == nil) then
-    return {}
-  end
+  if #contents == 1 and (contents[1] == "" or contents[1] == nil) then return {} end
   return contents
 end
 
@@ -330,15 +344,15 @@ end
 function vim.lsp.omnifunc(_findstart, _base) vim._notimpl("vim.lsp.omnifunc") end
 
 vim._lsp_user_config = vim._lsp_user_config or {} -- name -> user override layer
-vim._lsp_base_cache = vim._lsp_base_cache or {}   -- name -> lsp/<name>.lua result (false = none)
-vim._lsp_enabled = vim._lsp_enabled or {}         -- name -> enabled?
+vim._lsp_base_cache = vim._lsp_base_cache or {} -- name -> lsp/<name>.lua result (false = none)
+vim._lsp_enabled = vim._lsp_enabled or {} -- name -> enabled?
 
 -- Phase 1 visibility surfaces: a config that errors at load, and a server skipped
 -- at start, are recorded here (keyed by name, so a re-resolve never duplicates)
 -- instead of silently degrading to `{}` / a bare `return`. `vim._report`
 -- reads them back. See docs/plans/2026-06-05-lsp-completion.md (Phase 1).
 vim._lsp_load_errors = vim._lsp_load_errors or {} -- name -> load error message
-vim._lsp_skipped = vim._lsp_skipped or {}         -- name -> skip reason
+vim._lsp_skipped = vim._lsp_skipped or {} -- name -> skip reason
 
 -- Record that `name`'s lsp/<name>.lua failed to load, and echo a one-line
 -- warning. One broken config must not wedge startup — the editor keeps running
@@ -366,7 +380,9 @@ vim._lsp_hook_errors = vim._lsp_hook_errors or {}
 local function lsp_record_hook_error(name, hook, err)
   local key = (name or "?") .. ":" .. hook
   vim._lsp_hook_errors[key] = tostring(err)
-  vim.api.nvim_echo("nxvim LSP: " .. hook .. " for '" .. (name or "?") .. "' errored: " .. tostring(err))
+  vim.api.nvim_echo(
+    "nxvim LSP: " .. hook .. " for '" .. (name or "?") .. "' errored: " .. tostring(err)
+  )
 end
 
 -- The client registry: id -> { id, name, server_capabilities }, mirrored from
@@ -400,7 +416,10 @@ function vim.lsp._client_request(self, method, params, handler, bufnr)
   vim._cb_fns[cb] = function(err, result)
     if handler then
       handler(err, result, {
-        method = method, client_id = client_id, client_name = client_name, bufnr = bufnr,
+        method = method,
+        client_id = client_id,
+        client_name = client_name,
+        bufnr = bufnr,
       })
     end
   end
@@ -425,9 +444,7 @@ end
 -- server as `workspace/executeCommand`. A missing command name or client is loud.
 function vim.lsp._dispatch_command(client_id, command)
   local name = type(command) == "table" and command.command
-  if type(name) ~= "string" then
-    error("vim.lsp: execute_command needs a command string", 2)
-  end
+  if type(name) ~= "string" then error("vim.lsp: execute_command needs a command string", 2) end
   local ctx = { client_id = client_id, bufnr = vim.api.nvim_get_current_buf() }
   local handler = vim.lsp.commands[name]
   if handler then
@@ -438,8 +455,12 @@ function vim.lsp._dispatch_command(client_id, command)
   if not client then
     error("vim.lsp: no client " .. tostring(client_id) .. " for command " .. name, 2)
   end
-  client:request("workspace/executeCommand",
-    { command = name, arguments = command.arguments }, nil, ctx.bufnr)
+  client:request(
+    "workspace/executeCommand",
+    { command = name, arguments = command.arguments },
+    nil,
+    ctx.bufnr
+  )
 end
 
 -- Build a client table carrying the real request/notify methods. Shared by
@@ -533,7 +554,9 @@ function vim._report()
   end
   table.sort(enabled)
   local started = {}
-  for _, c in pairs(vim.lsp._clients) do started[#started + 1] = c.name end
+  for _, c in pairs(vim.lsp._clients) do
+    started[#started + 1] = c.name
+  end
   table.sort(started)
   local notimpl = vim.tbl_keys(vim._notimpl_hits)
   table.sort(notimpl)
@@ -696,7 +719,9 @@ local function lsp_resolve_cmd(cfg, root)
     -- `joinpath(config.root_dir, …)` would join against a function. With it nil,
     -- those builders fall back to the global binary, which is correct.
     local config = {}
-    for k, v in pairs(cfg) do config[k] = v end
+    for k, v in pairs(cfg) do
+      config[k] = v
+    end
     config.root_dir = root
     local ok, result = pcall(cmd, {}, config)
     if not ok then return nil, "cmd builder errored: " .. tostring(result) end
@@ -716,22 +741,19 @@ local function lsp_start_resolved(name, cfg, bufnr, ft, root)
     lsp_record_skip(name, reason or lsp_argv_reason(cmd))
     return
   end
-  vim.lsp.start(
-    {
-      name = name,
-      cmd = cmd,
-      root_dir = root,
-      filetypes = cfg.filetypes,
-      -- Carry what the config configures so the server runs configured, not on
-      -- defaults (Phase 2): vim.lsp.start reads these and forwards them to Rust.
-      settings = cfg.settings,
-      init_options = cfg.init_options,
-      capabilities = cfg.capabilities,
-      -- The lifecycle hook run just before initialize (Phase 3).
-      before_init = cfg.before_init,
-    },
-    { bufnr = bufnr, filetype = ft }
-  )
+  vim.lsp.start({
+    name = name,
+    cmd = cmd,
+    root_dir = root,
+    filetypes = cfg.filetypes,
+    -- Carry what the config configures so the server runs configured, not on
+    -- defaults (Phase 2): vim.lsp.start reads these and forwards them to Rust.
+    settings = cfg.settings,
+    init_options = cfg.init_options,
+    capabilities = cfg.capabilities,
+    -- The lifecycle hook run just before initialize (Phase 3).
+    before_init = cfg.before_init,
+  }, { bufnr = bufnr, filetype = ft })
 end
 
 -- Resolve `cfg`'s root_dir (string | `function(bufnr, on_dir)` | `root_markers`
@@ -786,9 +808,7 @@ local function lsp_ensure_dispatcher()
       local client = vim.lsp.get_client_by_id(args.data and args.data.client_id)
       if not client then return end
       local cfg = vim.lsp.config[client.name]
-      if cfg and type(cfg.on_attach) == "function" then
-        cfg.on_attach(client, args.buf)
-      end
+      if cfg and type(cfg.on_attach) == "function" then cfg.on_attach(client, args.buf) end
     end,
   })
 end
@@ -826,7 +846,9 @@ function vim.lsp.start(config, opts)
   opts = opts or {}
   local bufnr = opts.bufnr or (vim._cur_buf and vim._cur_buf.bufnr) or 0
   local cmd, reason = config.cmd or {}, nil
-  if type(cmd) == "function" then cmd, reason = lsp_resolve_cmd(config, config.root_dir) end
+  if type(cmd) == "function" then
+    cmd, reason = lsp_resolve_cmd(config, config.root_dir)
+  end
   -- Only queue a spawnable argv (see lsp_is_argv): a non-stdio/empty cmd would
   -- otherwise fail at the Rust `vim._lsp_start` boundary. A skip is recorded
   -- (vim._lsp_skipped) rather than returning silently.
@@ -838,7 +860,11 @@ function vim.lsp.start(config, opts)
   -- init_options / settings / capabilities the server applies at initialize.
   local init_options, settings, capabilities = lsp_before_init(config)
   vim._lsp_start(
-    config.name, cmd, config.root_dir, opts.filetype or "", bufnr,
+    config.name,
+    cmd,
+    config.root_dir,
+    opts.filetype or "",
+    bufnr,
     lsp_nonempty(init_options),
     lsp_nonempty(settings),
     lsp_nonempty(capabilities)
@@ -902,8 +928,12 @@ function vim.lsp._cursor_word()
   local b = col + 1 -- 1-based byte index of the char under the cursor
   if not line:sub(b, b):match("[%w_]") then return "" end
   local s, e = b, b
-  while s > 1 and line:sub(s - 1, s - 1):match("[%w_]") do s = s - 1 end
-  while e < #line and line:sub(e + 1, e + 1):match("[%w_]") do e = e + 1 end
+  while s > 1 and line:sub(s - 1, s - 1):match("[%w_]") do
+    s = s - 1
+  end
+  while e < #line and line:sub(e + 1, e + 1):match("[%w_]") do
+    e = e + 1
+  end
   return line:sub(s, e)
 end
 
@@ -918,9 +948,7 @@ function vim.lsp.buf.rename(new_name, _opts)
     return
   end
   vim.ui.input({ prompt = "New Name: ", default = vim.lsp._cursor_word() }, function(name)
-    if type(name) == "string" and name ~= "" then
-      vim._lsp_buf_rename(name)
-    end
+    if type(name) == "string" and name ~= "" then vim._lsp_buf_rename(name) end
   end)
 end
 
@@ -937,9 +965,7 @@ vim.lsp.semantic_tokens = vim.lsp.semantic_tokens or {}
 -- keyed by bufnr → list of `{ line, start_col, end_col, type, modifiers, client_id }`
 -- (0-based, byte columns). `get_at_pos` reads it; nothing else should write it.
 vim._semantic_tokens = vim._semantic_tokens or {}
-function vim._set_semantic_tokens(bufnr, list)
-  vim._semantic_tokens[bufnr or 0] = list or {}
-end
+function vim._set_semantic_tokens(bufnr, list) vim._semantic_tokens[bufnr or 0] = list or {} end
 
 -- Resolve a `0`/`nil` bufnr to the current buffer (the id the mirror is keyed by),
 -- matching how the diagnostics surface resolves its buffer.
@@ -980,9 +1006,7 @@ function vim.lsp.semantic_tokens.get_at_pos(bufnr, row, col)
   end
   local out = {}
   for _, t in ipairs(vim._semantic_tokens[bufnr] or {}) do
-    if t.line == row and col >= t.start_col and col < t.end_col then
-      out[#out + 1] = t
-    end
+    if t.line == row and col >= t.start_col and col < t.end_col then out[#out + 1] = t end
   end
   return out
 end
@@ -990,9 +1014,7 @@ end
 -- enable(enabled): nxvim's editor-wide gate for the whole feature (neovim has only
 -- the per-buffer start/stop). `false` hides all semantic paint and stops refresh
 -- requests; `true` (the default) restores it, re-requesting every attached buffer.
-function vim.lsp.semantic_tokens.enable(enabled)
-  vim._lsp_semantic_config(enabled ~= false)
-end
+function vim.lsp.semantic_tokens.enable(enabled) vim._lsp_semantic_config(enabled ~= false) end
 
 -- highlight_token: the per-token highlight-customization hook stays a loud gap — it
 -- would put a Lua callback on the decode hot path, out of scope for Phase 3.
@@ -1042,9 +1064,7 @@ end
 -- `{ line, col, label, kind, client_id }` (0-based; `col` is a byte column).
 -- `get` reads it; nothing else should write it.
 vim._inlay_hints = vim._inlay_hints or {}
-function vim._set_inlay_hints(bufnr, list)
-  vim._inlay_hints[bufnr or 0] = list or {}
-end
+function vim._set_inlay_hints(bufnr, list) vim._inlay_hints[bufnr or 0] = list or {} end
 
 -- get(filter): the cached inlay hints for a buffer (`filter.bufnr`, default
 -- current), optionally narrowed to `filter.range` (a `{ start = { line, character },
@@ -1103,4 +1123,3 @@ for name, mod in pairs({
 }) do
   package.loaded[name] = mod
 end
-

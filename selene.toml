@@ -1,0 +1,16 @@
+# selene linting for nxvim's first-party Lua (crates/nxvim-lua/src/prelude/).
+# std = base Lua 5.1 + the nxvim globals declared in selene/nxvim.yml.
+std = "lua51+nxvim"
+
+[rules]
+# stylua deliberately collapses simple statements onto one line (the prelude's
+# `if x then return end` / `for _, v in ... do f(v) end` idiom). Keeping this
+# rule would fight the formatter, so allow it.
+multiple_statements = "allow"
+# selene's arg-count check is imprecise when a local is reassigned to a
+# different function before the call (fs.lua's `matches`), yielding false
+# positives. Disable rather than contort the code.
+mismatched_arg_count = "allow"
+# The prelude has intentional branches that share a body under distinct
+# conditions (keymap precedence, lsp hover filtering), each documented inline.
+if_same_then_else = "allow"

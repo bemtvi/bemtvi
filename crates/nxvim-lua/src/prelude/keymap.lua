@@ -43,9 +43,10 @@ local function keymap_expand_leader(lhs)
   local localleader = vim.g.maplocalleader
   if localleader == nil then localleader = "\\" end
   lhs = lhs:gsub("<[lL][eE][aA][dD][eE][rR]>", function() return leader end)
-  lhs = lhs:gsub("<[lL][oO][cC][aA][lL][lL][eE][aA][dD][eE][rR]>", function()
-    return localleader
-  end)
+  lhs = lhs:gsub(
+    "<[lL][oO][cC][aA][lL][lL][eE][aA][dD][eE][rR]>",
+    function() return localleader end
+  )
   return lhs
 end
 
@@ -64,7 +65,9 @@ end
 -- caller holds, and treats any mode overlap as a clash.
 local function keymap_clashes(modes, lhs, buffer)
   local want = {}
-  for _, m in ipairs(modes) do want[m] = true end
+  for _, m in ipairs(modes) do
+    want[m] = true
+  end
   for _, e in ipairs(vim._keymaps) do
     if e.lhs == lhs and e.buffer == buffer then
       for _, m in ipairs(e.modes) do
@@ -127,7 +130,9 @@ end
 local function keymap_remove(modes, lhs, buffer)
   lhs = keymap_expand_leader(lhs)
   local want = {}
-  for _, m in ipairs(modes) do want[m] = true end
+  for _, m in ipairs(modes) do
+    want[m] = true
+  end
   local kept = {}
   for _, e in ipairs(vim._keymaps) do
     if e.lhs == lhs and e.buffer == buffer then
@@ -212,9 +217,7 @@ function vim.api.nvim_buf_set_keymap(buffer, mode, lhs, rhs, opts)
   })
 end
 
-function vim.api.nvim_del_keymap(mode, lhs)
-  keymap_remove({ mode }, lhs, nil)
-end
+function vim.api.nvim_del_keymap(mode, lhs) keymap_remove({ mode }, lhs, nil) end
 
 function vim.api.nvim_buf_del_keymap(buffer, mode, lhs)
   keymap_remove({ mode }, lhs, keymap_resolve_buffer(buffer))
@@ -248,9 +251,7 @@ function vim._run_keymap_expr(id)
   vim._expr_lock = true
   local ok, result = pcall(fn)
   vim._expr_lock = false
-  if not ok then
-    error(result, 0)
-  end
+  if not ok then error(result, 0) end
   if result == nil or result == false then return "" end
   return tostring(result)
 end
@@ -358,4 +359,3 @@ function vim._panel_select_buffer(line)
     vim.cmd("buffer " .. n)
   end
 end
-

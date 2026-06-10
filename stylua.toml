@@ -1,0 +1,12 @@
+# stylua formatting for nxvim's first-party Lua (crates/nxvim-lua/src/prelude/).
+# Matches the existing prelude style: 2-space indents, double-quote strings.
+# Scope is the prelude only — the pre-commit hook passes just those files, and
+# `.styluaignore` keeps a bare `stylua .` from touching the vendored neovim
+# copies (src/vendor/nvim/) or the examples/.
+column_width = 100
+line_endings = "Unix"
+indent_type = "Spaces"
+indent_width = 2
+quote_style = "AutoPreferDouble"
+call_parentheses = "Always"
+collapse_simple_statement = "Always"

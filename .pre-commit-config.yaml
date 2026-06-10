@@ -5,6 +5,8 @@
 # Bypass in an emergency:  git commit --no-verify
 #
 # Install the runner with one of:  pipx install pre-commit | brew install pre-commit
+# The Lua hooks need stylua + selene on PATH:  brew install stylua selene
+# (or `cargo install stylua selene`).
 repos:
   - repo: local
     hooks:
@@ -28,3 +30,23 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+
+      # --- First-party Lua (the nxvim prelude) -------------------------------
+      # Scoped to crates/nxvim-lua/src/prelude/ only: the vendored neovim copies
+      # under src/vendor/nvim/ and the examples/ are intentionally left alone.
+      # Config: stylua.toml / selene.toml + the nxvim.yml selene std at the root.
+      - id: stylua
+        name: stylua
+        description: Check Lua formatting (stylua)
+        entry: stylua --check
+        language: system
+        types: [lua]
+        files: ^crates/nxvim-lua/src/prelude/.*\.lua$
+
+      - id: selene
+        name: selene
+        description: Lint Lua, failing on warnings (selene)
+        entry: selene
+        language: system
+        types: [lua]
+        files: ^crates/nxvim-lua/src/prelude/.*\.lua$

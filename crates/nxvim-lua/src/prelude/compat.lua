@@ -19,9 +19,7 @@ local api = vim.api
 function api.nvim_buf_set_option(buf, name, value)
   api.nvim_set_option_value(name, value, { buf = buf })
 end
-function api.nvim_buf_get_option(buf, name)
-  return api.nvim_get_option_value(name, { buf = buf })
-end
+function api.nvim_buf_get_option(buf, name) return api.nvim_get_option_value(name, { buf = buf }) end
 
 -- nvim_set_option / nvim_get_option(name[, value]): the global-scope deprecated
 -- forms. Route through vim.o, which canonicalizes the scope the name implies.
@@ -47,7 +45,9 @@ function api.nvim_buf_set_text(buf, sr, sc, er, ec, repl)
   local last = (er == sr) and first or (api.nvim_buf_get_lines(id, er, er + 1, false)[1] or "")
   local prefix, suffix = first:sub(1, sc), last:sub(ec + 1)
   local newlines = {}
-  for i = 1, #repl do newlines[i] = repl[i] end
+  for i = 1, #repl do
+    newlines[i] = repl[i]
+  end
   if #newlines == 0 then newlines = { "" } end
   newlines[1] = prefix .. newlines[1]
   newlines[#newlines] = newlines[#newlines] .. suffix
@@ -79,7 +79,9 @@ function api.nvim_buf_add_highlight(buf, ns, hl_group, line, col_start, col_end)
   -- An ungrouped highlight (ns -1/0) still needs a real namespace to live in.
   local nsid = (ns == nil or ns == -1 or ns == 0) and api.nvim_create_namespace("") or ns
   api.nvim_buf_set_extmark(id, nsid, line, col_start or 0, {
-    end_row = line, end_col = ec, hl_group = hl_group,
+    end_row = line,
+    end_col = ec,
+    hl_group = hl_group,
   })
   return nsid
 end
@@ -117,7 +119,9 @@ end
 -- nvim_list_bufs(): every buffer handle the snapshot mirror knows, ascending.
 function api.nvim_list_bufs()
   local ids = {}
-  for id in pairs(vim._bufs or {}) do ids[#ids + 1] = id end
+  for id in pairs(vim._bufs or {}) do
+    ids[#ids + 1] = id
+  end
   table.sort(ids)
   return ids
 end
@@ -127,13 +131,23 @@ end
 -- fields a layout calculation reads. The ext_* feature flags are all false
 -- (nxvim's redraw protocol carries no external-UI widgets).
 function api.nvim_list_uis()
-  return { {
-    width = vim.o.columns, height = vim.o.lines, rgb = true,
-    ext_cmdline = false, ext_popupmenu = false, ext_tabline = false,
-    ext_wildmenu = false, ext_messages = false, ext_linegrid = true,
-    ext_multigrid = false, ext_hlstate = false, ext_termcolors = false,
-    chan = 1,
-  } }
+  return {
+    {
+      width = vim.o.columns,
+      height = vim.o.lines,
+      rgb = true,
+      ext_cmdline = false,
+      ext_popupmenu = false,
+      ext_tabline = false,
+      ext_wildmenu = false,
+      ext_messages = false,
+      ext_linegrid = true,
+      ext_multigrid = false,
+      ext_hlstate = false,
+      ext_termcolors = false,
+      chan = 1,
+    },
+  }
 end
 
 -- nvim_cmd(cmd, opts): the structured ex-command form. nxvim's command engine
@@ -158,13 +172,17 @@ function api.nvim_clear_autocmds(opts)
   local want_events = opts.event and (type(opts.event) == "table" and opts.event or { opts.event })
   local want_group = opts.group
   if type(want_group) == "string" then want_group = vim._augroups[want_group] end
-  local want_pats = opts.pattern and (type(opts.pattern) == "table" and opts.pattern or { opts.pattern })
+  local want_pats = opts.pattern
+    and (type(opts.pattern) == "table" and opts.pattern or { opts.pattern })
   vim._autocmds = vim.tbl_filter(function(au)
     if want_events then
       local evs = type(au.event) == "table" and au.event or { au.event }
       local hit = false
       for _, w in ipairs(want_events) do
-        if vim.tbl_contains(evs, w) then hit = true break end
+        if vim.tbl_contains(evs, w) then
+          hit = true
+          break
+        end
       end
       if not hit then return true end -- keep: event doesn't match the filter
     end
@@ -190,8 +208,12 @@ local function commands_map()
     out[name] = {
       name = name,
       definition = type(def) == "string" and def or "",
-      nargs = "*", bang = false, bar = false, register = false,
-      complete = nil, range = nil,
+      nargs = "*",
+      bang = false,
+      bar = false,
+      register = false,
+      complete = nil,
+      range = nil,
     }
   end
   return out
@@ -259,7 +281,17 @@ end
 -- neovim, exactly as vim._buf_changed does for on_lines. The server fires this (for
 -- every edit since the last frame, in order) before any plugin Lua runs.
 function vim._buf_bytes_changed(
-  buf, tick, start_row, start_col, start_byte, old_row, old_col, old_byte, new_row, new_col, new_byte
+  buf,
+  tick,
+  start_row,
+  start_col,
+  start_byte,
+  old_row,
+  old_col,
+  old_byte,
+  new_row,
+  new_col,
+  new_byte
 )
   local list = vim._buf_attached[buf]
   if not list then return end
@@ -268,10 +300,19 @@ function vim._buf_bytes_changed(
     local detach = false
     if cbs.on_bytes then
       local ok, ret = pcall(
-        cbs.on_bytes, "bytes", buf, tick,
-        start_row, start_col, start_byte,
-        old_row, old_col, old_byte,
-        new_row, new_col, new_byte
+        cbs.on_bytes,
+        "bytes",
+        buf,
+        tick,
+        start_row,
+        start_col,
+        start_byte,
+        old_row,
+        old_col,
+        old_byte,
+        new_row,
+        new_col,
+        new_byte
       )
       if not ok then
         vim.notify("nxvim: nvim_buf_attach on_bytes errored and was detached: " .. tostring(ret))
@@ -379,9 +420,7 @@ end
 function fn.shellescape(str, special)
   str = tostring(str)
   local escaped = "'" .. str:gsub("'", "'\\''") .. "'"
-  if special then
-    escaped = escaped:gsub("[!%%#]", "\\%0")
-  end
+  if special then escaped = escaped:gsub("[!%%#]", "\\%0") end
   return escaped
 end
 
@@ -404,9 +443,7 @@ function fn.prompt_setprompt(buf, text)
   if old ~= "" and line0:sub(1, #old) == old then line0 = line0:sub(#old + 1) end
   api.nvim_buf_set_lines(id, 0, 1, false, { new .. line0 })
 end
-function fn.prompt_getprompt(buf)
-  return vim._prompt_prefix[vim._resolve_bufnr(buf)] or ""
-end
+function fn.prompt_getprompt(buf) return vim._prompt_prefix[vim._resolve_bufnr(buf)] or "" end
 
 -- vim.fn.pumvisible(): whether the insert-mode completion popup is showing.
 -- nxvim doesn't surface the popup-menu state to Lua, so this is truthfully 0 in
@@ -477,20 +514,36 @@ function fn.getwininfo(winid)
     local w = (vim._wins or {})[id] or {}
     local pos = fn.win_screenpos(winnr)
     return {
-      winid = id, winnr = winnr, bufnr = w.buffer or 0,
-      width = w.width or 0, height = w.height or 0, tabnr = vim._cur_tab or 1,
-      winrow = pos[1], wincol = pos[2],
-      topline = 1, botline = (w.height or 0), terminal = 0,
-      quickfix = 0, loclist = 0, variables = {},
+      winid = id,
+      winnr = winnr,
+      bufnr = w.buffer or 0,
+      width = w.width or 0,
+      height = w.height or 0,
+      tabnr = vim._cur_tab or 1,
+      winrow = pos[1],
+      wincol = pos[2],
+      topline = 1,
+      botline = (w.height or 0),
+      terminal = 0,
+      quickfix = 0,
+      loclist = 0,
+      variables = {},
     }
   end
   if winid and winid ~= 0 then
     local idx = 0
-    for i, id in ipairs(vim._win_order or {}) do if id == winid then idx = i break end end
+    for i, id in ipairs(vim._win_order or {}) do
+      if id == winid then
+        idx = i
+        break
+      end
+    end
     return idx > 0 and { info(winid, idx) } or {}
   end
   local out = {}
-  for i, id in ipairs(vim._win_order or {}) do out[#out + 1] = info(id, i) end
+  for i, id in ipairs(vim._win_order or {}) do
+    out[#out + 1] = info(id, i)
+  end
   return out
 end
 
@@ -502,10 +555,17 @@ function fn.getbufinfo(arg)
   local function info(id, buf)
     local windows = fn.win_findbuf(id)
     return {
-      bufnr = id, name = buf.name or "", changed = 0, changedtick = 0,
-      hidden = #windows == 0 and 1 or 0, listed = 1, loaded = 1,
-      lnum = 1, linecount = (buf.lines and #buf.lines) or 0,
-      variables = {}, windows = windows,
+      bufnr = id,
+      name = buf.name or "",
+      changed = 0,
+      changedtick = 0,
+      hidden = #windows == 0 and 1 or 0,
+      listed = 1,
+      loaded = 1,
+      lnum = 1,
+      linecount = (buf.lines and #buf.lines) or 0,
+      variables = {},
+      windows = windows,
     }
   end
   if type(arg) == "number" then
@@ -541,9 +601,7 @@ end
 -- position nxvim models); `pos` is `{bufnr, lnum, col, off}`. Other marks are
 -- accepted but not stored (no writable-mark mirror), returning 0 either way.
 function fn.setpos(expr, pos)
-  if expr == "." then
-    api.nvim_win_set_cursor(0, { pos[2], math.max(0, (pos[3] or 1) - 1) })
-  end
+  if expr == "." then api.nvim_win_set_cursor(0, { pos[2], math.max(0, (pos[3] or 1) - 1) }) end
   return 0
 end
 
@@ -592,7 +650,9 @@ function fn.clearmatches(win)
 end
 function fn.getmatches(win)
   local out = {}
-  for _, m in pairs(match_store(win)) do out[#out + 1] = m end
+  for _, m in pairs(match_store(win)) do
+    out[#out + 1] = m
+  end
   table.sort(out, function(a, b) return a.id < b.id end)
   return out
 end
@@ -681,9 +741,13 @@ local function cursor_word(big)
     col = s
   end
   local b = col
-  while b > 1 and line:sub(b - 1, b - 1):match(class) do b = b - 1 end
+  while b > 1 and line:sub(b - 1, b - 1):match(class) do
+    b = b - 1
+  end
   local e = col
-  while e < #line and line:sub(e + 1, e + 1):match(class) do e = e + 1 end
+  while e < #line and line:sub(e + 1, e + 1):match(class) do
+    e = e + 1
+  end
   return line:sub(b, e)
 end
 local function expand_path(p)
@@ -699,16 +763,18 @@ function fn.expand(expr, nosuf, list)
   local kw, mods = expr:match("^(<c%a+>)(.*)$")
   if kw then
     local word
-    if kw == "<cword>" then word = cursor_word(false)
-    elseif kw == "<cWORD>" or kw == "<cfile>" then word = cursor_word(true)
-    else word = "" end
+    if kw == "<cword>" then
+      word = cursor_word(false)
+    elseif kw == "<cWORD>" or kw == "<cfile>" then
+      word = cursor_word(true)
+    else
+      word = ""
+    end
     if mods ~= "" then word = fn.fnamemodify(word, mods) end
     return word
   end
   -- Wildcard expansion → glob.
-  if expr:find("[*?]") then
-    return fn.glob(expand_path(expr), nosuf, list)
-  end
+  if expr:find("[*?]") then return fn.glob(expand_path(expr), nosuf, list) end
   -- A plain string: home / env expansion, returned verbatim (vim's behavior for a
   -- path with no wildcards).
   return expand_path(expr)
@@ -731,7 +797,9 @@ end
 if uv.os_environ == nil then
   function uv.os_environ()
     local out = {}
-    for k, v in pairs(vim._env_shadow or {}) do out[k] = v end
+    for k, v in pairs(vim._env_shadow or {}) do
+      out[k] = v
+    end
     return out
   end
 end

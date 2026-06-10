@@ -53,9 +53,7 @@ vim._bo_store = vim._bo_store or {}
 -- the `:set` ex path, not just one written from Lua.
 vim._bo_mirror = vim._bo_mirror or {}
 
-function vim._set_bo_mirror(entries)
-  vim._bo_mirror = entries or {}
-end
+function vim._set_bo_mirror(entries) vim._bo_mirror = entries or {} end
 
 vim._wins = vim._wins or {}
 vim._win_order = vim._win_order or { 1000 }
@@ -107,9 +105,12 @@ function vim._set_extmark_mirror(entries)
     for _, m in ipairs(list) do
       by_ns[m.ns] = by_ns[m.ns] or {}
       by_ns[m.ns][m.id] = {
-        row = m.row, col = m.col,
-        end_row = m.end_row, end_col = m.end_col,
-        hl_group = m.hl_group, priority = m.priority,
+        row = m.row,
+        col = m.col,
+        end_row = m.end_row,
+        end_col = m.end_col,
+        hl_group = m.hl_group,
+        priority = m.priority,
       }
     end
     marks[bufnr] = by_ns
@@ -130,7 +131,9 @@ vim._call_ctx_lock = false
 function vim._assert_call_ctx(what)
   if vim._call_ctx_lock then
     error(
-      "nvim_buf_call/nvim_win_call: " .. what .. " inside the callback would run "
+      "nvim_buf_call/nvim_win_call: "
+        .. what
+        .. " inside the callback would run "
         .. "against the real current buffer/window, not the one passed to the "
         .. "call — nxvim cannot retarget a queued mutation. Run it outside the "
         .. "call, or use an explicit-handle API.",
@@ -238,16 +241,16 @@ end
 function vim._norm_line_index(i, n, strict)
   local orig = i
   if i < 0 then i = n + i + 1 end
-  if strict and (orig > n or i < 0) then
-    error("Index out of bounds", 3)
+  if strict and (orig > n or i < 0) then error("Index out of bounds", 3) end
+  if i < 0 then
+    i = 0
+  elseif i > n then
+    i = n
   end
-  if i < 0 then i = 0 elseif i > n then i = n end
   return i
 end
 
-function vim.api.nvim_create_user_command(name, command, _opts)
-  vim._user_commands[name] = command
-end
+function vim.api.nvim_create_user_command(name, command, _opts) vim._user_commands[name] = command end
 
 -- nvim_buf_create_user_command(buffer, name, command, opts): in neovim this
 -- registers a *buffer-local* command; nxvim has no per-buffer command registry
@@ -322,13 +325,22 @@ function vim._fire(event, pattern, buf, file, data)
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
     if ev_ok then
       local pat = au.opts.pattern
-      local pat_ok = pat == nil or pat == "*" or pat == pattern
+      local pat_ok = pat == nil
+        or pat == "*"
+        or pat == pattern
         or (type(pat) == "table" and vim.tbl_contains(pat, pattern))
       local buf_ok = au.buffer == nil or au.buffer == buf
       if pat_ok and buf_ok then
         local cb = au.opts.callback
         if type(cb) == "function" then
-          cb({ id = au.id, event = event, match = pattern, buf = buf, file = file or pattern, data = data })
+          cb({
+            id = au.id,
+            event = event,
+            match = pattern,
+            buf = buf,
+            file = file or pattern,
+            data = data,
+          })
         elseif type(au.opts.command) == "string" then
           vim.cmd(au.opts.command)
         end
@@ -358,7 +370,9 @@ function vim.api.nvim_exec_autocmds(event, opts)
   local patterns = opts.pattern
   for _, ev in ipairs(events) do
     if type(patterns) == "table" then
-      for _, p in ipairs(patterns) do vim._fire(ev, p, buf, file) end
+      for _, p in ipairs(patterns) do
+        vim._fire(ev, p, buf, file)
+      end
     else
       vim._fire(ev, patterns, buf, file)
     end
@@ -377,7 +391,9 @@ function vim.api.nvim_get_autocmds(opts)
   if type(want_group) == "string" then want_group = vim._augroups[want_group] end
   -- reverse map: group id → its registered name, for human-readable output
   local group_name = {}
-  for nm, id in pairs(vim._augroups) do group_name[id] = nm end
+  for nm, id in pairs(vim._augroups) do
+    group_name[id] = nm
+  end
   local out = {}
   for _, au in ipairs(vim._autocmds) do
     -- match if any requested event is among the autocmd's events
@@ -386,7 +402,10 @@ function vim.api.nvim_get_autocmds(opts)
       ev_ok = false
       local evs = type(au.event) == "table" and au.event or { au.event }
       for _, w in ipairs(want_events) do
-        if vim.tbl_contains(evs, w) then ev_ok = true break end
+        if vim.tbl_contains(evs, w) then
+          ev_ok = true
+          break
+        end
       end
     end
     local group_ok = want_group == nil or au.group == want_group
@@ -428,7 +447,10 @@ local function au_matches(au, group, events, patterns)
     local evs = type(au.event) == "table" and au.event or { au.event }
     local hit = false
     for _, w in ipairs(events) do
-      if vim.tbl_contains(evs, w) then hit = true break end
+      if vim.tbl_contains(evs, w) then
+        hit = true
+        break
+      end
     end
     if not hit then return false end
   end
@@ -438,7 +460,10 @@ local function au_matches(au, group, events, patterns)
     local pats = type(pat) == "table" and pat or { pat }
     local hit = false
     for _, w in ipairs(patterns) do
-      if vim.tbl_contains(pats, w) then hit = true break end
+      if vim.tbl_contains(pats, w) then
+        hit = true
+        break
+      end
     end
     if not hit then return false end
   end
@@ -448,7 +473,9 @@ end
 -- Render the autocmds matching the filter as a `:autocmd`-style listing.
 local function au_list(group, events, patterns)
   local gname = {}
-  for nm, id in pairs(vim._augroups) do gname[id] = nm end
+  for nm, id in pairs(vim._augroups) do
+    gname[id] = nm
+  end
   local lines = { "--- Autocommands ---" }
   for _, au in ipairs(vim._autocmds) do
     if au_matches(au, group, events, patterns) then
@@ -487,9 +514,7 @@ function vim._ex_augroup(bang, args)
     end
     return ""
   end
-  if args == "" then
-    return vim._cur_augroup and ("augroup " .. vim._cur_augroup) or ""
-  end
+  if args == "" then return vim._cur_augroup and ("augroup " .. vim._cur_augroup) or "" end
   if args == "END" or args == "end" then
     vim._cur_augroup = nil
     return ""
@@ -521,7 +546,8 @@ function vim._ex_autocmd(bang, args)
   -- Event list (comma-separated). Absent only on a bare `:au` / `:au!`.
   local ev_word
   ev_word, rest = take_word(rest)
-  local events = ev_word ~= "" and vim.split(ev_word, ",", { plain = true, trimempty = true }) or nil
+  local events = ev_word ~= "" and vim.split(ev_word, ",", { plain = true, trimempty = true })
+    or nil
 
   -- Pattern list (comma-separated), or `<buffer>` for a buffer-local autocmd.
   local pat_word
@@ -560,9 +586,7 @@ function vim._ex_autocmd(bang, args)
   end
 
   if cmd ~= "" then
-    if not events then
-      return "E216: No such event: a {event} is required to define an autocmd"
-    end
+    if not events then return "E216: No such event: a {event} is required to define an autocmd" end
     vim.api.nvim_create_autocmd(#events == 1 and events[1] or events, {
       group = group,
       pattern = patterns and (#patterns == 1 and patterns[1] or patterns) or nil,
@@ -586,9 +610,7 @@ end
 function vim._ex_doautocmd(args)
   args = vim.trim(args):gsub("^<nomodeline>%s*", "")
   local event, rest = take_word(args)
-  if event == "" then
-    return "E217: Can't execute autocommands for ALL events"
-  end
+  if event == "" then return "E217: Can't execute autocommands for ALL events" end
   local pattern = rest ~= "" and rest or nil
   vim.api.nvim_exec_autocmds(event, { pattern = pattern })
   return ""
@@ -601,9 +623,15 @@ end
 -- output from; everything else runs through the queued vim.cmd path, whose output
 -- (if any) is asynchronous and not readable back here.
 local AUTOCMD_HEADS = {}
-for _, w in ipairs({ "au", "aut", "auto", "autoc", "autocm", "autocmd" }) do AUTOCMD_HEADS[w] = "au" end
-for _, w in ipairs({ "aug", "augr", "augro", "augrou", "augroup" }) do AUTOCMD_HEADS[w] = "aug" end
-for _, w in ipairs({ "doau", "doaut", "doauto", "doautoc", "doautocm", "doautocmd" }) do AUTOCMD_HEADS[w] = "doau" end
+for _, w in ipairs({ "au", "aut", "auto", "autoc", "autocm", "autocmd" }) do
+  AUTOCMD_HEADS[w] = "au"
+end
+for _, w in ipairs({ "aug", "augr", "augro", "augrou", "augroup" }) do
+  AUTOCMD_HEADS[w] = "aug"
+end
+for _, w in ipairs({ "doau", "doaut", "doauto", "doautoc", "doautocm", "doautocmd" }) do
+  AUTOCMD_HEADS[w] = "doau"
+end
 
 -- nvim_exec(src, output): run the ex-command(s) in `src` (one or more newline-
 -- separated lines) and, when `output` is truthy, return the text they produced as
@@ -645,9 +673,7 @@ local function exec_capture(src, output)
   return output and table.concat(captured, "\n") or ""
 end
 
-function vim.api.nvim_exec(src, output)
-  return exec_capture(src, output)
-end
+function vim.api.nvim_exec(src, output) return exec_capture(src, output) end
 
 -- nvim_exec2(src, opts): the 0.9+ replacement for nvim_exec — same execution, but
 -- the captured text is returned under `.output` (only when `opts.output` is set).
@@ -685,9 +711,7 @@ function vim.api.nvim_get_current_buf() return (vim._cur_buf or {}).bufnr or 0 e
 -- snapshot the server refreshes before each Lua entry. `blocking` is always
 -- false — the in-VM Lua bindings only run when the server is between keys, so it
 -- is never blocked on input here. (The dedicated RPC method serves remote clients.)
-function vim.api.nvim_get_mode()
-  return { mode = vim._cur_mode or "n", blocking = false }
-end
+function vim.api.nvim_get_mode() return { mode = vim._cur_mode or "n", blocking = false } end
 
 -- Window API (Phase 5). Reads resolve against the `vim._wins` mirror the server
 -- refreshes before running Lua; mutations queue a WindowOp (the `vim._win_*` /
@@ -734,7 +758,9 @@ function vim.api.nvim_win_set_cursor(win, pos)
   vim._win_set_cursor(win, row - 1, col) -- queue (server takes a 0-based line)
   -- Write-through the mirror so a read-after-write within this chunk agrees.
   local w = (vim._wins or {})[win]
-  if w then w.row, w.col = row, col end
+  if w then
+    w.row, w.col = row, col
+  end
   if win == (vim._cur_win or 1000) then vim._cur_cursor = { row = row, col = col } end
 end
 
@@ -812,17 +838,13 @@ end
 function vim.fn.winrestview(view)
   view = view or {}
   local win = vim._cur_win or 1000
-  if view.lnum then
-    vim.api.nvim_win_set_cursor(win, { view.lnum, view.col or 0 })
-  end
+  if view.lnum then vim.api.nvim_win_set_cursor(win, { view.lnum, view.col or 0 }) end
   local w = (vim._wins or {})[win]
   if view.topline then
     vim._win_set_topline(win, math.max(0, view.topline - 1))
     if w then w.topline = view.topline end -- write-through for read-after-set
   end
-  if view.leftcol and w then
-    w.leftcol = view.leftcol
-  end
+  if view.leftcol and w then w.leftcol = view.leftcol end
 end
 
 -- vim.fn.screenrow() / screencol(): the cursor's 1-based position on the whole
@@ -904,9 +926,7 @@ function vim.api.nvim_get_current_tabpage() return vim._cur_tab or 1 end
 
 function vim.api.nvim_list_tabpages() return vim._tab_order or { vim._cur_tab or 1 } end
 
-function vim.api.nvim_tabpage_is_valid(tab)
-  return (vim._tabs or {})[resolve_tab(tab)] ~= nil
-end
+function vim.api.nvim_tabpage_is_valid(tab) return (vim._tabs or {})[resolve_tab(tab)] ~= nil end
 
 function vim.api.nvim_tabpage_get_number(tab)
   tab = resolve_tab(tab)
@@ -942,7 +962,11 @@ end
 local FLOAT_RELATIVE = { editor = true, cursor = true, win = true }
 local FLOAT_ANCHOR = { NW = true, NE = true, SW = true, SE = true }
 local FLOAT_BORDER = {
-  none = true, single = true, rounded = true, double = true, solid = true,
+  none = true,
+  single = true,
+  rounded = true,
+  double = true,
+  solid = true,
 }
 
 -- Flatten neovim's `title` (a string, or a list of `{text, hl}` chunks) to the
@@ -988,8 +1012,7 @@ function vim.api.nvim_open_win(buffer, enter, config)
     if type(border) ~= "string" or not FLOAT_BORDER[border] then
       error("nvim_open_win: 'border' style '" .. tostring(border) .. "' is not supported yet", 2)
     end
-    if not config.width or not config.height
-        or config.width <= 0 or config.height <= 0 then
+    if not config.width or not config.height or config.width <= 0 or config.height <= 0 then
       error("nvim_open_win: 'width' and 'height' must be positive", 2)
     end
     float_record = {
@@ -1021,8 +1044,7 @@ function vim.api.nvim_open_win(buffer, enter, config)
       title = float_record.title,
     })
   else
-    local vertical = config.vertical == true
-      or config.split == "left" or config.split == "right"
+    local vertical = config.vertical == true or config.split == "left" or config.split == "right"
     vim._open_win(buffer or 0, vertical, enters)
   end
 
@@ -1039,8 +1061,15 @@ function vim.api.nvim_open_win(buffer, enter, config)
   local relativenumber = src.relativenumber
   if relativenumber == nil then relativenumber = true end
   vim._wins[id] = {
-    id = id, buffer = buf, row = 1, col = 0, width = 0, height = 0,
-    number = number, relativenumber = relativenumber, float = float_record,
+    id = id,
+    buffer = buf,
+    row = 1,
+    col = 0,
+    width = 0,
+    height = 0,
+    number = number,
+    relativenumber = relativenumber,
+    float = float_record,
   }
   vim._win_order[#vim._win_order + 1] = id
   if enters then vim._cur_win = id end
@@ -1057,9 +1086,15 @@ function vim.api.nvim_win_get_config(win)
   if not f then return { relative = "" } end
   -- Return a fresh table so a caller mutating the result can't corrupt the mirror.
   local cfg = {
-    relative = f.relative, anchor = f.anchor, row = f.row, col = f.col,
-    width = f.width, height = f.height, zindex = f.zindex,
-    focusable = f.focusable, border = f.border,
+    relative = f.relative,
+    anchor = f.anchor,
+    row = f.row,
+    col = f.col,
+    width = f.width,
+    height = f.height,
+    zindex = f.zindex,
+    focusable = f.focusable,
+    border = f.border,
   }
   if f.win then cfg.win = f.win end
   if f.title then cfg.title = f.title end
@@ -1083,9 +1118,14 @@ function vim.api.nvim_win_set_config(win, config)
   if config.anchor ~= nil and not FLOAT_ANCHOR[config.anchor] then
     error("nvim_win_set_config: invalid 'anchor': '" .. tostring(config.anchor) .. "'", 2)
   end
-  if config.border ~= nil
-      and (type(config.border) ~= "string" or not FLOAT_BORDER[config.border]) then
-    error("nvim_win_set_config: 'border' style '" .. tostring(config.border) .. "' is not supported yet", 2)
+  if
+    config.border ~= nil
+    and (type(config.border) ~= "string" or not FLOAT_BORDER[config.border])
+  then
+    error(
+      "nvim_win_set_config: 'border' style '" .. tostring(config.border) .. "' is not supported yet",
+      2
+    )
   end
   local floor = function(v) return v and math.floor(v) or nil end
   vim._win_set_config(win, {
@@ -1108,8 +1148,18 @@ function vim.api.nvim_win_set_config(win, config)
     if make_tiled then
       w.float = nil
     else
-      local f = w.float or { relative = "editor", anchor = "NW", row = 0, col = 0,
-        width = 1, height = 1, zindex = 50, focusable = true, border = "none" }
+      local f = w.float
+        or {
+          relative = "editor",
+          anchor = "NW",
+          row = 0,
+          col = 0,
+          width = 1,
+          height = 1,
+          zindex = 50,
+          focusable = true,
+          border = "none",
+        }
       if type(relative) == "string" then f.relative = relative end
       if config.win and config.win ~= 0 then f.win = config.win end
       if config.anchor then f.anchor = config.anchor end
@@ -1136,8 +1186,10 @@ end
 -- falls back to the plain `vim._wo_store` (observable, not yet honored). A bare
 -- `vim.wo.<opt>` (no window id) targets the current window.
 local WIN_OPT_CANON = {
-  number = "number", nu = "number",
-  relativenumber = "relativenumber", rnu = "relativenumber",
+  number = "number",
+  nu = "number",
+  relativenumber = "relativenumber",
+  rnu = "relativenumber",
 }
 local WIN_OPT_DEFAULT = { number = true, relativenumber = true }
 
@@ -1182,20 +1234,14 @@ vim.wo = setmetatable({}, {
 })
 
 function vim.api.nvim_win_get_option(win, name) return vim.wo[resolve_win(win)][name] end
-function vim.api.nvim_win_set_option(win, name, value)
-  vim.wo[resolve_win(win)][name] = value
-end
+function vim.api.nvim_win_set_option(win, name, value) vim.wo[resolve_win(win)][name] = value end
 
-function vim.api.nvim_buf_is_loaded(bufnr)
-  return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil
-end
+function vim.api.nvim_buf_is_loaded(bufnr) return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil end
 
 -- nvim_buf_is_valid: whether the handle names a buffer nxvim knows about. With no
 -- separate "valid but unloaded" notion in the snapshot mirror yet, this matches
 -- is_loaded (every mirrored buffer is loaded).
-function vim.api.nvim_buf_is_valid(bufnr)
-  return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil
-end
+function vim.api.nvim_buf_is_valid(bufnr) return vim._bufs[vim._resolve_bufnr(bufnr)] ~= nil end
 
 -- nvim_buf_line_count: number of lines in the buffer snapshot.
 function vim.api.nvim_buf_line_count(bufnr)
@@ -1274,9 +1320,15 @@ function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
   -- Write-through: splice the mirror so a read-after-write within this chunk is
   -- consistent, then queue the real edit (the server re-derives the byte range).
   local updated = {}
-  for i = 1, s do updated[#updated + 1] = lines[i] end
-  for i = 1, #repl do updated[#updated + 1] = repl[i] end
-  for i = e + 1, n do updated[#updated + 1] = lines[i] end
+  for i = 1, s do
+    updated[#updated + 1] = lines[i]
+  end
+  for i = 1, #repl do
+    updated[#updated + 1] = repl[i]
+  end
+  for i = e + 1, n do
+    updated[#updated + 1] = lines[i]
+  end
   buf.lines = updated
   vim._buf_set_lines(id, start, end_, repl)
   -- Fire on_bytes synchronously for any attached parser, matching neovim: an
@@ -1290,11 +1342,17 @@ function vim.api.nvim_buf_set_lines(bufnr, start, end_, strict, repl)
   -- (start at the replaced range's first line, column 0 — set_lines is linewise).
   if vim._buf_attached[id] then
     local start_byte = 0
-    for i = 1, s do start_byte = start_byte + #lines[i] + 1 end
+    for i = 1, s do
+      start_byte = start_byte + #lines[i] + 1
+    end
     local old_byte = 0
-    for i = s + 1, e do old_byte = old_byte + #lines[i] + 1 end
+    for i = s + 1, e do
+      old_byte = old_byte + #lines[i] + 1
+    end
     local new_byte = 0
-    for i = 1, #repl do new_byte = new_byte + #repl[i] + 1 end
+    for i = 1, #repl do
+      new_byte = new_byte + #repl[i] + 1
+    end
     vim._buf_bytes_changed(id, 0, s, 0, start_byte, e - s, 0, old_byte, #repl, 0, new_byte)
   end
 end
@@ -1309,9 +1367,7 @@ end
 -- the call returns synchronously; the server only ever sees the id on a mark.
 function vim.api.nvim_create_namespace(name)
   name = name or ""
-  if name ~= "" and vim._namespaces[name] then
-    return vim._namespaces[name]
-  end
+  if name ~= "" and vim._namespaces[name] then return vim._namespaces[name] end
   local id = vim._namespace_next
   vim._namespace_next = id + 1
   if name ~= "" then vim._namespaces[name] = id end
@@ -1322,8 +1378,13 @@ end
 -- is neovim's deprecated alias for `end_row` (cmp's decoration provider uses it);
 -- `ephemeral` marks a single-frame decoration a provider places during redraw.
 local EXTMARK_OPT_OK = {
-  id = true, end_row = true, end_line = true, end_col = true, hl_group = true,
-  priority = true, ephemeral = true,
+  id = true,
+  end_row = true,
+  end_line = true,
+  end_col = true,
+  hl_group = true,
+  priority = true,
+  ephemeral = true,
 }
 -- Decoration options nxvim ACCEPTS and STORES (so nvim_buf_get_extmarks(…,
 -- {details=true}) returns them) but does NOT yet render — virtual text, virtual
@@ -1335,14 +1396,30 @@ local EXTMARK_OPT_OK = {
 -- extmark store still tracks the mark's POSITION (for get_extmarks), only the
 -- decoration payload is unrendered.
 local EXTMARK_OPT_DECORATION = {
-  virt_text = true, virt_text_pos = true, virt_text_win_col = true,
-  virt_text_hide = true, virt_text_repeat_linebreak = true, hl_mode = true,
-  hl_eol = true, virt_lines = true, virt_lines_above = true,
-  virt_lines_leftcol = true, sign_text = true, sign_hl_group = true,
-  number_hl_group = true, line_hl_group = true, cursorline_hl_group = true,
-  conceal = true, spell = true, ui_watched = true, url = true,
-  right_gravity = true, end_right_gravity = true, strict = true,
-  undo_restore = true, invalidate = true,
+  virt_text = true,
+  virt_text_pos = true,
+  virt_text_win_col = true,
+  virt_text_hide = true,
+  virt_text_repeat_linebreak = true,
+  hl_mode = true,
+  hl_eol = true,
+  virt_lines = true,
+  virt_lines_above = true,
+  virt_lines_leftcol = true,
+  sign_text = true,
+  sign_hl_group = true,
+  number_hl_group = true,
+  line_hl_group = true,
+  cursorline_hl_group = true,
+  conceal = true,
+  spell = true,
+  ui_watched = true,
+  url = true,
+  right_gravity = true,
+  end_right_gravity = true,
+  strict = true,
+  undo_restore = true,
+  invalidate = true,
 }
 
 -- nvim_buf_set_extmark(buffer, ns, line, col, opts) -> id. `line`/`col` are
@@ -1382,7 +1459,10 @@ function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
   -- into the per-frame ephemeral store it clears each redraw.
   if opts.ephemeral then
     if not vim._in_decoration then
-      error("nvim_buf_set_extmark: ephemeral marks are only valid inside a decoration provider callback", 2)
+      error(
+        "nvim_buf_set_extmark: ephemeral marks are only valid inside a decoration provider callback",
+        2
+      )
     end
     vim._extmark_set_ephemeral(b, ns, line, col, end_row, opts.end_col, hl_group, priority)
     return -1
@@ -1397,9 +1477,12 @@ function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
   vim._extmarks[b] = vim._extmarks[b] or {}
   vim._extmarks[b][ns] = vim._extmarks[b][ns] or {}
   vim._extmarks[b][ns][mark_id] = {
-    row = line, col = col,
-    end_row = end_row, end_col = opts.end_col,
-    hl_group = hl_group, priority = priority,
+    row = line,
+    col = col,
+    end_row = end_row,
+    end_col = opts.end_col,
+    hl_group = hl_group,
+    priority = priority,
     decoration = decoration,
   }
   vim._extmark_set(b, ns, mark_id, line, col, end_row, opts.end_col, hl_group, priority)
@@ -1430,9 +1513,7 @@ function vim.api.nvim_buf_clear_namespace(buffer, ns, line_start, line_end)
   local marks = vim._extmarks[b] and vim._extmarks[b][ns]
   if marks then
     for id, m in pairs(marks) do
-      if line_end == -1 or (m.row >= line_start and m.row < line_end) then
-        marks[id] = nil
-      end
+      if line_end == -1 or (m.row >= line_start and m.row < line_end) then marks[id] = nil end
     end
   end
   vim._extmark_clear(b, ns, line_start, line_end)
@@ -1472,9 +1553,7 @@ end
 
 -- Whether any provider is registered — the server's per-frame fast-path gate, so
 -- a redraw with no provider skips the whole drive (and its buffer-mirror push).
-function vim._has_decoration_providers()
-  return next(vim._decoration_providers) ~= nil
-end
+function vim._has_decoration_providers() return next(vim._decoration_providers) ~= nil end
 
 -- Begin a decoration frame: each provider's on_start(tick).
 function vim._decor_frame_start(tick)
@@ -1499,7 +1578,9 @@ function vim._decor_on_win(win, buf, top, bot)
       local ok, ret = pcall(p.on_win, "win", ns, win, buf, top, bot)
       if not ok then
         err = err or tostring(ret)
-        dead = dead or {}; dead[ns] = true; disabled = true
+        dead = dead or {}
+        dead[ns] = true
+        disabled = true
       elseif ret == false then
         disabled = true -- provider opted this window out of per-line callbacks
       end
@@ -1509,7 +1590,8 @@ function vim._decor_on_win(win, buf, top, bot)
         local ok, e = pcall(p.on_line, "line", ns, win, buf, row)
         if not ok then
           err = err or tostring(e)
-          dead = dead or {}; dead[ns] = true
+          dead = dead or {}
+          dead[ns] = true
           break
         end
       end
@@ -1517,7 +1599,9 @@ function vim._decor_on_win(win, buf, top, bot)
   end
   vim._in_decoration = false
   if dead then
-    for ns in pairs(dead) do vim._decoration_providers[ns] = nil end
+    for ns in pairs(dead) do
+      vim._decoration_providers[ns] = nil
+    end
   end
   return err or ""
 end
@@ -1560,13 +1644,18 @@ function vim.api.nvim_buf_get_extmarks(buffer, ns, start, end_, opts)
         local e = { id, m.row, m.col }
         if opts.details then
           local d = {
-            ns_id = nsid, end_row = m.end_row, end_col = m.end_col,
-            hl_group = m.hl_group, priority = m.priority,
+            ns_id = nsid,
+            end_row = m.end_row,
+            end_col = m.end_col,
+            hl_group = m.hl_group,
+            priority = m.priority,
           }
           -- Spread any accepted-but-unrendered decoration payload (virt_text, …)
           -- into the details dict at top level, matching neovim's shape.
           if m.decoration then
-            for k, v in pairs(m.decoration) do d[k] = v end
+            for k, v in pairs(m.decoration) do
+              d[k] = v
+            end
           end
           e[4] = d
         end
@@ -1576,7 +1665,9 @@ function vim.api.nvim_buf_get_extmarks(buffer, ns, start, end_, opts)
   end
   local bufmarks = vim._extmarks[b] or {}
   if ns == -1 then
-    for nsid, marks in pairs(bufmarks) do collect(nsid, marks) end
+    for nsid, marks in pairs(bufmarks) do
+      collect(nsid, marks)
+    end
   else
     collect(ns, bufmarks[ns] or {})
   end
@@ -1587,7 +1678,9 @@ function vim.api.nvim_buf_get_extmarks(buffer, ns, start, end_, opts)
   end)
   if opts.limit and #out > opts.limit then
     local trimmed = {}
-    for i = 1, opts.limit do trimmed[i] = out[i] end
+    for i = 1, opts.limit do
+      trimmed[i] = out[i]
+    end
     out = trimmed
   end
   return out
@@ -1632,9 +1725,7 @@ end
 -- INCOMPLETE: `expanded` is ignored — the core has a flat Mode (no operator-pending
 -- / sub-state), so mode(1)'s multi-char forms ("no", "niI", …) don't exist here;
 -- the short code is returned for both. Faithful for the modes nxvim has.
-function vim.fn.mode(_expanded)
-  return vim._cur_mode or "n"
-end
+function vim.fn.mode(_expanded) return vim._cur_mode or "n" end
 
 -- vim.fn.line(expr): a buffer line number. "." is the cursor line (1-based), "$"
 -- the last line (the line count). The window-relative forms ("w0"/"w$") need the
@@ -1697,9 +1788,7 @@ end
 -- nodes), not wall-clock unix epoch, so `localtime() - node.time` elapsed math
 -- (e.g. the undotree visualizer's "N minutes ago") stays correct and non-negative
 -- across NTP steps and manual clock changes. Only differences are meaningful.
-function vim.fn.localtime()
-  return vim._mono_secs or 0
-end
+function vim.fn.localtime() return vim._mono_secs or 0 end
 
 -- vim.fn.undotree([bufnr]): the buffer's undo tree, in neovim's shape
 -- ({ seq_last, seq_cur, save_last, save_cur, time_cur, synced, entries }, each
@@ -1868,7 +1957,9 @@ end
 -- attaches (`default`, `cterm*`) is absent — nxvim's registry is truecolor-only.
 local function copy_hl_def(d)
   local out = {}
-  for k, v in pairs(d) do out[k] = v end
+  for k, v in pairs(d) do
+    out[k] = v
+  end
   return out
 end
 
@@ -1889,7 +1980,9 @@ function vim.api.nvim_get_hl(_ns, opts)
     return d and copy_hl_def(d) or {}
   end
   local out = {}
-  for name, d in pairs(defs) do out[name] = copy_hl_def(d) end
+  for name, d in pairs(defs) do
+    out[name] = copy_hl_def(d)
+  end
   return out
 end
 
@@ -1902,7 +1995,10 @@ end
 -- returning RGB ints mislabeled as cterm indices. An unknown group returns `{}`.
 function vim.api.nvim_get_hl_by_name(name, rgb)
   if rgb ~= true then
-    error("nvim_get_hl_by_name: nxvim is truecolor-only; cterm output (rgb=false) is not modelled", 0)
+    error(
+      "nvim_get_hl_by_name: nxvim is truecolor-only; cterm output (rgb=false) is not modelled",
+      0
+    )
   end
   local d = vim.api.nvim_get_hl(0, { name = name, link = false })
   local out = {}
@@ -1949,7 +2045,9 @@ do
       return raw(s)
     end
     local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    for i = 1, select("#", ...) do
+      parts[i] = tostring((select(i, ...)))
+    end
     local s = name
     if #parts > 0 then s = s .. " " .. table.concat(parts, " ") end
     return raw(s)
@@ -1961,4 +2059,3 @@ do
     end,
   })
 end
-

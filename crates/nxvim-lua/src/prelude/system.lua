@@ -41,8 +41,11 @@ function vim.system(cmd, opts, on_exit)
           return function(_, signal) vim._system_kill(id, signal) end
         elseif key == "wait" then
           return function()
-            error("nxvim: vim.system():wait() is unavailable on a handle spawned "
-              .. "with on_exit; call vim.system without on_exit for a synchronous result", 2)
+            error(
+              "nxvim: vim.system():wait() is unavailable on a handle spawned "
+                .. "with on_exit; call vim.system without on_exit for a synchronous result",
+              2
+            )
           end
         end
         return nil
@@ -86,7 +89,9 @@ function vim.trim(s) return (tostring(s):gsub("^%s+", ""):gsub("%s+$", "")) end
 function vim.islist(t)
   if type(t) ~= "table" then return false end
   local n = 0
-  for _ in pairs(t) do n = n + 1 end
+  for _ in pairs(t) do
+    n = n + 1
+  end
   return n == #t
 end
 vim.tbl_islist = vim.islist -- the pre-0.10 name
@@ -117,11 +122,16 @@ vim.version = setmetatable({
     return 0
   end,
 }, {
-  __call = function() return version_tbl({ major = NVIM_VERSION.major, minor = NVIM_VERSION.minor, patch = NVIM_VERSION.patch }) end,
+  __call = function()
+    return version_tbl({
+      major = NVIM_VERSION.major,
+      minor = NVIM_VERSION.minor,
+      patch = NVIM_VERSION.patch,
+    })
+  end,
 })
 vim.version.lt = function(a, b) return vim.version.cmp(a, b) < 0 end
 vim.version.gt = function(a, b) return vim.version.cmp(a, b) > 0 end
 vim.version.eq = function(a, b) return vim.version.cmp(a, b) == 0 end
 vim.version.ge = function(a, b) return vim.version.cmp(a, b) >= 0 end
 vim.version.le = function(a, b) return vim.version.cmp(a, b) <= 0 end
-

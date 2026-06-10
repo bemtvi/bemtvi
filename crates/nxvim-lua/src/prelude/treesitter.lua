@@ -14,10 +14,8 @@
 function vim._defer_require(root, mod)
   return setmetatable({ _submodules = mod }, {
     __index = function(t, k)
-      if not mod[k] then
-        return
-      end
-      local name = string.format('%s.%s', root, k)
+      if not mod[k] then return end
+      local name = string.format("%s.%s", root, k)
       t[k] = require(name)
       return t[k]
     end,
@@ -26,15 +24,15 @@ end
 
 -- vim.F: upstream helpers (pack_len/unpack_len) the memoizer uses to cache
 -- multi-return values.
-vim.F = require('vim.F')
+vim.F = require("vim.F")
 
 -- vim.func: upstream module providing vim.func._memoize, through which
 -- query.lua memoizes query.get / query.parse. Required (not assigned a stub) so
 -- the real memoizer — with its :clear() cache control — is used.
-vim.func = require('vim.func')
+vim.func = require("vim.func")
 
 -- The high-level API itself, now that the globals it reads at load time exist.
-vim.treesitter = require('vim.treesitter')
+vim.treesitter = require("vim.treesitter")
 
 -- vim.treesitter.highlighter: nxvim does NOT run neovim's decoration-provider
 -- highlighter on the redraw hot path — the Rust engine owns redraw highlighting.
@@ -50,7 +48,7 @@ vim.treesitter = require('vim.treesitter')
 vim.treesitter.highlighter = {
   active = {},
   new = function()
-    vim._notimpl('vim.treesitter.highlighter.new (decoration-provider highlighting)')
+    vim._notimpl("vim.treesitter.highlighter.new (decoration-provider highlighting)")
   end,
 }
 
@@ -68,10 +66,12 @@ vim.treesitter.highlighter = {
 function vim.treesitter.start(buf, lang)
   buf = vim._resolve_bufnr(buf)
   lang = lang or vim.treesitter.language.get_lang(vim.bo[buf].filetype) or vim.bo[buf].filetype
-  if not lang or lang == '' then
+  if not lang or lang == "" then
     error(
-      ('vim.treesitter.start: could not determine language for buffer %d '
-      .. '(set filetype or pass an explicit lang)'):format(buf)
+      (
+        "vim.treesitter.start: could not determine language for buffer %d "
+        .. "(set filetype or pass an explicit lang)"
+      ):format(buf)
     )
   end
   vim.treesitter.highlighter.active[buf] = { bufnr = buf, lang = lang }
@@ -111,16 +111,14 @@ end
 -- and only moves *execution* to the engine: when a paint-driving query changes,
 -- the server pulls the merged string from here and pushes it to the engine.
 do
-  local tsquery = require('vim.treesitter.query')
+  local tsquery = require("vim.treesitter.query")
 
   -- Track which (lang, name) currently have a non-empty explicit `query.set`, so
   -- the resolve seam below can fail loud if it ever stops capturing (e.g. a
   -- re-vendor changes how `get` reaches `parse`) rather than silently dropping the
   -- override.
   local was_set = {}
-  local function key(lang, name)
-    return lang .. '\0' .. name
-  end
+  local function key(lang, name) return lang .. "\0" .. name end
 
   -- Resolve the *merged* query string the engine should compile — exactly what
   -- `vim.treesitter.query.get(lang, name)` builds right before it parses. `get`
@@ -144,12 +142,14 @@ do
     tsquery.parse = orig_parse
     tsquery.get:clear(lang, name) -- drop our throwaway result from the memo
     if not ok then
-      error(('treesitter: resolving query %s/%s failed: %s'):format(lang, name, err))
+      error(("treesitter: resolving query %s/%s failed: %s"):format(lang, name, err))
     end
     if captured == nil and was_set[key(lang, name)] then
       error(
-        ('treesitter query bridge: the resolve seam captured nothing for the '
-          .. 'set query %s/%s — the vendored query.get/parse contract changed'):format(lang, name)
+        (
+          "treesitter query bridge: the resolve seam captured nothing for the "
+          .. "set query %s/%s — the vendored query.get/parse contract changed"
+        ):format(lang, name)
       )
     end
     return captured
@@ -163,12 +163,12 @@ do
   local orig_set = tsquery.set
   function tsquery.set(lang, name, text)
     orig_set(lang, name, text)
-    if text ~= nil and text ~= '' then
+    if text ~= nil and text ~= "" then
       was_set[key(lang, name)] = true
     else
       was_set[key(lang, name)] = nil
     end
-    if name == 'highlights' or name == 'indents' or name == 'injections' then
+    if name == "highlights" or name == "indents" or name == "injections" then
       vim._ts_set_query(lang, name)
     end
   end

@@ -66,9 +66,7 @@ for _, name in ipairs(ASYNC_FS) do
         -- deliver its (value, err) to the callback as luv's (err, value).
         local args = { ... }
         local value, err = sync(unpack(args, 1, n - 1))
-        vim.schedule(function()
-          last(err, value)
-        end)
+        vim.schedule(function() last(err, value) end)
         return -- luv returns a uv_fs_t request handle here; callers ignore it.
       end
       -- Sync form: tail-call so both return values (value, err) propagate, e.g.

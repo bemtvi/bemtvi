@@ -49,12 +49,8 @@ function uv_timer:is_active() vim._notimpl("vim.uv.timer:is_active") end
 -- vim.uv.new_timer_handle(id): wrap an existing callback id in a handle (used by
 -- defer_fn, whose fn is already registered). vim.uv.new_timer(): a fresh handle.
 -- vim.uv and vim.loop are the same table, so this lands on both.
-function vim.uv.new_timer_handle(id)
-  return setmetatable({ _id = id, _repeat = 0 }, uv_timer)
-end
-function vim.uv.new_timer()
-  return vim.uv.new_timer_handle(vim._next_cb_id())
-end
+function vim.uv.new_timer_handle(id) return setmetatable({ _id = id, _repeat = 0 }, uv_timer) end
+function vim.uv.new_timer() return vim.uv.new_timer_handle(vim._next_cb_id()) end
 
 -- luv's *function-form* timer API: uv.timer_start(handle, timeout, repeat, cb) /
 -- uv.timer_stop(handle) / uv.timer_again(handle). luv exposes both the handle
@@ -63,9 +59,7 @@ end
 -- timer is `vim.loop.timer_start(handle, …)` / `timer_stop(handle)`). vim.uv and
 -- vim.loop are the same table, so these land on both. Each just delegates to the
 -- handle method, so the event-loop bridge and no-leak guarantees are unchanged.
-function vim.uv.timer_start(handle, timeout, rep, cb)
-  return handle:start(timeout, rep, cb)
-end
+function vim.uv.timer_start(handle, timeout, rep, cb) return handle:start(timeout, rep, cb) end
 function vim.uv.timer_stop(handle) return handle:stop() end
 function vim.uv.timer_again(handle) return handle:again() end
 
@@ -83,9 +77,7 @@ function uv_fs_event:start(path, flags, cb)
   if type(path) ~= "string" or path == "" then
     error("fs_event:start: path must be a non-empty string", 2)
   end
-  if type(cb) ~= "function" then
-    error("fs_event:start: callback must be a function", 2)
-  end
+  if type(cb) ~= "function" then error("fs_event:start: callback must be a function", 2) end
   vim._cb_fns[self._id] = cb
   self._path = path
   vim._fs_event_start(self._id, path, type(flags) == "table" and flags.recursive or false)
@@ -102,9 +94,7 @@ function uv_fs_event:close(cb)
   if cb then cb() end
 end
 
-function vim.uv.new_fs_event()
-  return setmetatable({ _id = vim._next_cb_id() }, uv_fs_event)
-end
+function vim.uv.new_fs_event() return setmetatable({ _id = vim._next_cb_id() }, uv_fs_event) end
 
 -- vim.defer_fn(fn, timeout): run `fn` once, `timeout` ms from now, on the loop —
 -- the off-tick deferral configs use for retry patterns. Returns a timer handle so
@@ -137,7 +127,10 @@ function vim.fn.timer_start(timeout, callback, opts)
     vim._cb_fns[id] = function()
       callback(id)
       remaining = remaining - 1
-      if remaining <= 0 then vim._timer_stop(id); vim._cb_fns[id] = nil end
+      if remaining <= 0 then
+        vim._timer_stop(id)
+        vim._cb_fns[id] = nil
+      end
     end
     vim._timer_start(id, timeout, timeout)
   end
@@ -171,7 +164,9 @@ function vim.ui.select(items, opts, on_choice)
   items = items or {}
   local format_item = opts.format_item or tostring
   local lines = {}
-  for i, item in ipairs(items) do lines[i] = tostring(format_item(item)) end
+  for i, item in ipairs(items) do
+    lines[i] = tostring(format_item(item))
+  end
   vim.panel.open(opts.prompt or "Select one of:", lines, function(_line, idx)
     vim.panel.close()
     if on_choice then on_choice(items[idx], idx) end
@@ -226,20 +221,26 @@ end
 
 -- Canonical name of a *wired* (core-honored) buffer option, or nil for the rest.
 local BUF_OPT_CANON = {
-  tabstop = "tabstop", ts = "tabstop",
-  shiftwidth = "shiftwidth", sw = "shiftwidth",
-  softtabstop = "softtabstop", sts = "softtabstop",
-  expandtab = "expandtab", et = "expandtab",
+  tabstop = "tabstop",
+  ts = "tabstop",
+  shiftwidth = "shiftwidth",
+  sw = "shiftwidth",
+  softtabstop = "softtabstop",
+  sts = "softtabstop",
+  expandtab = "expandtab",
+  et = "expandtab",
   -- The buffer-local override of the global `regexsyntax` dialect for `/` and
   -- `:s`. `vim.bo.regexsyntax = "vim"` pins this buffer; reads return the
   -- *effective* dialect (the override resolved against the global).
-  regexsyntax = "regexsyntax", rxs = "regexsyntax",
+  regexsyntax = "regexsyntax",
+  rxs = "regexsyntax",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
 -- their sentinels (0 = follow tabstop, -1 = follow shiftwidth); regexsyntax
 -- "pcre" (the buffer follows the global, whose default is pcre).
-local BUF_OPT_DEFAULT = { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false, regexsyntax = "pcre" }
+local BUF_OPT_DEFAULT =
+  { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false, regexsyntax = "pcre" }
 
 local function bo_get(bufnr, opt)
   local canon = BUF_OPT_CANON[opt]
@@ -301,7 +302,6 @@ function vim.uri_to_bufnr(_uri) vim._notimpl("vim.uri_to_bufnr") end
 -- so bad opts surface later (or never) rather than at the validate call. A real
 -- impl would parse the {name = {value, type/pred, optional}} spec and raise on
 -- mismatch. vim.deprecate likewise swallows every deprecation notice silently.
-function vim.validate(...) end
+function vim.validate() end
 
-function vim.deprecate(...) end
-
+function vim.deprecate() end

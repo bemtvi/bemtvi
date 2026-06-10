@@ -34,9 +34,7 @@ local uv = vim.uv -- == vim.loop (aliased in install.rs)
 -- path `expand` branches on it). Defined here because the process surface is the
 -- first consumer; it is a general vim.* function.
 if vim.in_fast_event == nil then
-  function vim.in_fast_event()
-    return false
-  end
+  function vim.in_fast_event() return false end
 end
 
 -- ----- handle helpers --------------------------------------------------------
@@ -44,13 +42,9 @@ end
 -- uv.is_closing(handle) / uv.is_active(handle): the module-function forms plenary
 -- uses (alongside the method forms). Every handle this module hands out carries
 -- `_closing` / `_active` booleans; a nil handle reads as closed / inactive.
-function uv.is_closing(handle)
-  return handle == nil or handle._closing == true
-end
+function uv.is_closing(handle) return handle == nil or handle._closing == true end
 
-function uv.is_active(handle)
-  return handle ~= nil and handle._active == true
-end
+function uv.is_active(handle) return handle ~= nil and handle._active == true end
 
 -- ----- pipes -----------------------------------------------------------------
 -- A libuv pipe stream. stdout/stderr pipes carry a read callback (read_start);
@@ -84,23 +78,17 @@ end
 -- common idiom is `stdin:write(data, function() stdin:close() end)`).
 function Pipe:write(data, cb)
   self._write_buf[#self._write_buf + 1] = data
-  if cb then
-    self._write_cbs[#self._write_cbs + 1] = cb
-  end
+  if cb then self._write_cbs[#self._write_cbs + 1] = cb end
   return 0
 end
 
 function Pipe:close(cb)
   self._closing = true
   self._read_cb = nil
-  if cb then
-    vim.schedule(cb)
-  end
+  if cb then vim.schedule(cb) end
 end
 
-function Pipe:is_closing()
-  return self._closing
-end
+function Pipe:is_closing() return self._closing end
 
 -- ----- check handles ---------------------------------------------------------
 -- libuv's "check" phase handle: a callback run on each loop iteration until
@@ -115,13 +103,9 @@ function uv.new_check()
   return setmetatable({ _kind = "check", _closing = false, _active = false, _cb = nil }, Check)
 end
 
-function Check:is_active()
-  return self._active
-end
+function Check:is_active() return self._active end
 
-function Check:is_closing()
-  return self._closing
-end
+function Check:is_closing() return self._closing end
 
 function Check:close()
   self._closing = true
@@ -133,15 +117,11 @@ function uv.check_start(check, cb)
   check._active = true
   check._cb = cb
   local function poll()
-    if not check._active or not check._cb then
-      return
-    end
+    if not check._active or not check._cb then return end
     check._cb()
     -- Re-arm only if the callback did not stop the check (its condition not yet
     -- met). The convergence fixpoint (run_pending) runs each re-schedule.
-    if check._active then
-      vim.schedule(poll)
-    end
+    if check._active then vim.schedule(poll) end
   end
   vim.schedule(poll)
   return 0
@@ -158,34 +138,24 @@ end
 local Handle = {}
 Handle.__index = Handle
 
-function Handle:is_closing()
-  return self._closing
-end
+function Handle:is_closing() return self._closing end
 
 function Handle:close(cb)
   self._closing = true
-  if cb then
-    vim.schedule(cb)
-  end
+  if cb then vim.schedule(cb) end
 end
 
-function Handle:kill(signal)
-  vim._system_kill(self._cbid, signal)
-end
+function Handle:kill(signal) vim._system_kill(self._cbid, signal) end
 
 -- luv's options.env is an array of "NAME=VALUE" strings; the Rust spawn bridge
 -- (vim._system_async → env_pairs) wants a { NAME = "VALUE" } map. Convert a list;
 -- pass a map (or nil) through unchanged.
 local function env_to_map(env)
-  if env == nil or env[1] == nil then
-    return env
-  end
+  if env == nil or env[1] == nil then return env end
   local map = {}
   for _, kv in ipairs(env) do
     local key, value = string.match(kv, "^([^=]+)=(.*)$")
-    if key then
-      map[key] = value
-    end
+    if key then map[key] = value end
   end
   return map
 end
@@ -212,9 +182,7 @@ function uv.spawn(cmd, options, on_exit)
   local function deliver(pipe, data)
     if pipe then
       if pipe._read_cb then
-        if data and #data > 0 then
-          pipe._read_cb(nil, data)
-        end
+        if data and #data > 0 then pipe._read_cb(nil, data) end
         pipe._read_cb(nil, nil) -- EOF
       end
       pipe._closing = true
@@ -226,13 +194,9 @@ function uv.spawn(cmd, options, on_exit)
   vim._cb_fns[id] = function(result)
     deliver(stdout_pipe, result.stdout)
     deliver(stderr_pipe, result.stderr)
-    if stdin_pipe then
-      stdin_pipe._closing = true
-    end
+    if stdin_pipe then stdin_pipe._closing = true end
     handle._closing = true
-    if on_exit then
-      on_exit(result.code, 0)
-    end
+    if on_exit then on_exit(result.code, 0) end
   end
 
   -- Defer the real launch to convergence so the synchronous stdin writes that

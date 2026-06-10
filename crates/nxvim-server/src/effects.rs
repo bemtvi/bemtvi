@@ -1136,6 +1136,22 @@ impl Server {
                 }
                 self.apply_lua_effects();
             }
+            LoopEvent::FsEvent { id, error, .. } if id >= crate::INTERNAL_WATCH_BASE => {
+                // An *internal* per-buffer file watch (not a Lua `vim.uv.fs_event`):
+                // the watch leg's auto-trigger. The file under buffer `id - BASE`
+                // changed, so reconcile it (autoreload / W11 / W12 / E211) exactly as
+                // `:checktime` would, then re-arm — a reload re-stamps the disk
+                // snapshot, so the watch key changed and `sync_buffer_watches` must
+                // re-point it at the (possibly new) inode. `error` (the watch failed
+                // to arm) just drops the watch state so a later tick re-arms.
+                let buf = BufferId(id - crate::INTERNAL_WATCH_BASE);
+                if error.is_some() {
+                    self.buf_watches.remove(&buf);
+                } else {
+                    self.editor.checktime_buffer(buf);
+                }
+                self.sync_buffer_watches();
+            }
             LoopEvent::FsEvent {
                 id,
                 filename,

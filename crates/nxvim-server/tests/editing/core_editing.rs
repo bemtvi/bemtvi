@@ -290,14 +290,27 @@ async fn ex_write_refuses_to_clobber_a_file_changed_on_disk() {
     std::fs::write(&path, "one\ntwo\n").unwrap();
 
     let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
-    // An in-buffer edit, so there's something we'd be saving.
+    // An in-buffer edit, so there's something we'd be saving. Round-trip so the edit
+    // is applied server-side before the external change — a *modified* buffer is not
+    // autoreloaded by the file watch (only the clobber guard speaks here), but the
+    // edit must land first or the watch reloads a still-unmodified buffer (a test-only
+    // ordering race; a real edit precedes the external write).
     feed(&rpc, "Gomine<Esc>");
+    assert!(lines(&rpc).await.contains(&"mine".to_string()));
 
     // Someone else rewrites the file on disk behind our back.
     std::fs::write(&path, "EXTERNALLY CHANGED\n").unwrap();
 
-    // `:w` must refuse rather than silently clobber their changes...
-    let msg = message(&redraw_after(&rpc, &mut incoming, ":w<CR>").await);
+    // `:w` must refuse rather than silently clobber their changes. Target the
+    // clobber frame specifically: the live buffer watch also fires a W12 conflict
+    // for this same modified-and-changed file, and which message is *latest* on the
+    // line is timing-dependent — so match the `:w`'s own frame rather than the tail.
+    let msg = message(
+        &redraw_after_matching(&rpc, &mut incoming, ":w<CR>", |m| {
+            message(m).contains("changed on disk")
+        })
+        .await,
+    );
     assert!(
         msg.contains("changed on disk") && msg.contains("add ! to override"),
         "expected a clobber warning, got: {msg:?}"
@@ -367,8 +380,11 @@ async fn checktime_warns_on_conflict_when_both_disk_and_buffer_changed() {
     std::fs::write(&path, "one\ntwo\n").unwrap();
     let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
 
-    // Our own unsaved edit...
+    // Our own unsaved edit — round-trip so it's applied server-side *before* the
+    // external change, else the buffer watch could autoreload a still-unmodified
+    // buffer (a test-only ordering race; real edits land before an external write).
     feed(&rpc, "Gomine<Esc>");
+    assert!(lines(&rpc).await.contains(&"mine".to_string()));
     // ...colliding with an external rewrite of the same file.
     std::fs::write(&path, "EXTERNALLY REWRITTEN CONTENT\n").unwrap();
 
@@ -391,7 +407,14 @@ async fn checktime_warns_without_reloading_when_autoread_is_off() {
     std::fs::write(&path, "one\ntwo\n").unwrap();
     let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
 
+    // Round-trip so `'noautoread'` is in effect server-side before the external
+    // change — otherwise the startup-armed watch could autoreload under the default
+    // `autoread` before the option lands (a test-only ordering race).
     feed(&rpc, ":set noautoread<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.autoread").await.as_bool(),
+        Some(false)
+    );
     std::fs::write(&path, "REPLACED EXTERNALLY ENTIRELY\n").unwrap();
 
     let msg = message(&redraw_after(&rpc, &mut incoming, ":checktime<CR>").await);
@@ -420,6 +443,42 @@ async fn checktime_reports_a_deleted_file() {
         msg.contains("E211"),
         "a vanished file must report E211, got: {msg:?}"
     );
+}
+
+#[tokio::test]
+async fn an_external_change_autoreloads_via_the_buffer_watch() {
+    // The auto-trigger: with no explicit `:checktime`, the server's per-buffer
+    // native file watch (reusing the `vim.uv.fs_event` machinery) must notice an
+    // external change and run checktime on its own — reloading under `'autoread'`.
+    let path = temp_path("watch-autoreload");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    // Give the watcher actor a beat to arm the watch (armed at startup, async), so
+    // the change below isn't written before the watch exists.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // External in-place change — note: NO `:checktime`.
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+    // Poll until the off-tick watch event lands and autoreloads (notify has
+    // platform latency, so this is a bounded wait, not a fixed sleep).
+    let mut got = vec![];
+    for _ in 0..100 {
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        got = lines(&rpc).await;
+        if got == vec!["one", "two", "three"] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        got,
+        vec!["one", "two", "three"],
+        "the buffer watch must autoreload an external change with no :checktime"
+    );
+    std::fs::remove_file(&path).ok();
 }
 
 #[tokio::test]

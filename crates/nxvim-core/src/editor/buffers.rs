@@ -545,30 +545,58 @@ impl Editor {
                 None => return,
             },
         };
-        let fs = self.host_fs.clone();
-        let autoread = self.options.autoread;
         for id in ids {
-            let name = self.buffer_name(id).unwrap_or_default();
-            match self.buffers.get(id).buffer.disk_change(&*fs) {
-                DiskChange::Unchanged => {}
-                DiskChange::Vanished => {
-                    self.echo(format!("E211: File \"{name}\" no longer available"))
-                }
-                DiskChange::Changed => {
-                    if self.buffers.get(id).buffer.modified {
-                        self.echo(format!(
-                            "W12: Warning: File \"{name}\" has changed and the buffer was changed in Vim as well"
-                        ));
-                    } else if autoread {
-                        self.reload_buffer(id);
-                    } else {
-                        self.echo(format!(
-                            "W11: Warning: File \"{name}\" has changed since editing started"
-                        ));
-                    }
+            self.checktime_one(id);
+        }
+    }
+
+    /// `:checktime` for a single buffer — the entry point the **watcher** uses (the
+    /// server's per-buffer file watch fires this on a change). A no-op for an
+    /// unknown buffer or in a daemon session (the remote stat is the `HostWatch`
+    /// slice, not yet wired).
+    pub fn checktime_buffer(&mut self, id: BufferId) {
+        if self.host_fs_offtick || !self.buffers.map.contains_key(&id) {
+            return;
+        }
+        self.checktime_one(id);
+    }
+
+    /// Reconcile one buffer against its file on disk (the shared body of
+    /// `:checktime` and the watcher trigger): autoreload an externally-changed,
+    /// unmodified buffer under `'autoread'` (W11 otherwise), W12 on a conflict, E211
+    /// on a vanished file. Unchanged is silent.
+    fn checktime_one(&mut self, id: BufferId) {
+        let fs = self.host_fs.clone();
+        let name = self.buffer_name(id).unwrap_or_default();
+        match self.buffers.get(id).buffer.disk_change(&*fs) {
+            DiskChange::Unchanged => {}
+            DiskChange::Vanished => self.echo(format!("E211: File \"{name}\" no longer available")),
+            DiskChange::Changed => {
+                if self.buffers.get(id).buffer.modified {
+                    self.echo(format!(
+                        "W12: Warning: File \"{name}\" has changed and the buffer was changed in Vim as well"
+                    ));
+                } else if self.options.autoread {
+                    self.reload_buffer(id);
+                } else {
+                    self.echo(format!(
+                        "W11: Warning: File \"{name}\" has changed since editing started"
+                    ));
                 }
             }
         }
+    }
+
+    /// The server's file-watch key for buffer `id`: its on-disk path and the disk
+    /// snapshot we last reconciled to, or `None` for a buffer with no file (scratch,
+    /// or a new-file buffer not yet written — nothing to watch). The server arms one
+    /// native watch per file-backed buffer and re-arms when this key changes, so the
+    /// watch follows the file across reloads/saves (a fresh inode after an atomic
+    /// replace gets a fresh watch).
+    pub fn buffer_watch_key(&self, id: BufferId) -> Option<(PathBuf, Option<FileStat>)> {
+        let ob = self.buffers.map.get(&id)?;
+        let path = ob.buffer.path.clone()?;
+        Some((path, ob.buffer.disk_stat()))
     }
 
     /// Load a **fresh** buffer for `path` and return its id — the load atom shared by

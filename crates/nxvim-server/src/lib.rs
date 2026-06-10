@@ -55,7 +55,9 @@ use lsp::{
     CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
 };
-use nxvim_core::{BufferId, Editor, HostFs, Key, Mode, PendingSave, StdHostFs, TabId, WindowId};
+use nxvim_core::{
+    BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, StdHostFs, TabId, WindowId,
+};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
@@ -384,7 +386,24 @@ struct Server {
     /// fetch and each `:edit`-spawned read deliver their `(buffer, path, result)` here;
     /// the matching `select!` arm fills the named buffer with the fetched bytes.
     open_tx: UnboundedSender<(BufferId, String, std::io::Result<FsRead>)>,
+    /// The native file watch armed for each file-backed buffer, keyed by buffer and
+    /// holding the `(path, disk-stat)` it was armed against. [`Server::sync_buffer_watches`]
+    /// reconciles this against the live buffers every tick: a new file-backed buffer
+    /// arms a watch, a closed one disarms, and a changed key (a reload/save gave the
+    /// file a new identity) re-arms — so the watch follows the file across atomic
+    /// replaces. Each watch's loop id is [`INTERNAL_WATCH_BASE`]` + buffer.0`, which
+    /// the [`LoopEvent::FsEvent`] arm uses to route a change back to `checktime` for
+    /// that buffer (vs. running a Lua `vim.uv.fs_event` callback). Local sessions
+    /// only — the remote `HostWatch` push is a later slice.
+    buf_watches: HashMap<BufferId, (PathBuf, Option<FileStat>)>,
 }
+
+/// Base for the loop ids of the server's **internal** per-buffer file watches, set
+/// far above any Lua-allocated `vim.uv.fs_event` callback id so a [`LoopEvent::FsEvent`]
+/// can be classified by `id >= INTERNAL_WATCH_BASE` alone. Buffer `b`'s watch id is
+/// `INTERNAL_WATCH_BASE + b.0`, so the change routes straight back to the buffer with
+/// no side table. (Lua callback ids are monotonic from 1 and never approach `1 << 48`.)
+pub(crate) const INTERNAL_WATCH_BASE: u64 = 1 << 48;
 
 /// A finished `:TSInstall` job: the requested language and the install result
 /// (the report, or a loud error). Delivered from the blocking worker to the
@@ -569,6 +588,7 @@ where
         saves_inflight: HashSet::new(),
         saves_queued: HashMap::new(),
         open_tx,
+        buf_watches: HashMap::new(),
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),

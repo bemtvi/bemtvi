@@ -597,6 +597,14 @@ impl Buffer {
         self.save_tick += 1;
     }
 
+    /// The disk snapshot (mtime+size) from the last read/write, or `None` for a
+    /// buffer with no file on disk (scratch, or a `:e new-file` not yet written).
+    /// The server keys its per-buffer file watch on `(path, this)` so the watch
+    /// re-arms whenever the file we track changes identity (a load/reload/save).
+    pub fn disk_stat(&self) -> Option<FileStat> {
+        self.disk
+    }
+
     /// Whether the bound file changed on disk since nxvim last read or wrote it —
     /// i.e. something *other* than this buffer touched it. Re-stats the file and
     /// compares its mtime/size against the snapshot from the last read/write.

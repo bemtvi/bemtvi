@@ -525,8 +525,58 @@ deleted file reports E211 — plus a `vim.o.autoread` default-on + round-trip te
 `options.rs`. Regression-clean; fmt + clippy `-D warnings` green.
 
 **`:checktime` is both the user command and the watcher's entry point** — the remote
-`HostWatch` push and any local auto-trigger (a `notify` watch / `FocusGained`) will call
-`Editor::checktime` / `reload_buffer` rather than re-deriving the reconcile logic.
+`HostWatch` push and any local auto-trigger call `Editor::checktime` / `reload_buffer`
+rather than re-deriving the reconcile logic.
+
+### Phase 3j — the watch leg's local auto-trigger (reuse the `vim.uv.fs_event` watcher) — ✅ DONE (2026-06-10)
+
+The reconciliation with the recent `vim.uv.fs_event` work (commit `f7bae73`), built.
+The server *already had* a native `notify`-backed watcher actor (`evloop.rs`:
+`FsEventStart`/`FsEventStop` → `LoopEvent::FsEvent`), driven only by Lua
+(`vim.uv.new_fs_event`, lualine watches `.git/HEAD`). That watcher is the **trigger**
+primitive; Phase 3i's `checktime`/`autoread` is the **policy** — complementary layers,
+exactly as neovim splits libuv fs_event from `FileChangedShell`, and **non-overlapping**
+(3i added a stat-based reconcile, not a second watcher). So the auto-trigger **reuses** the
+existing watcher rather than standing up another.
+
+Shipped:
+- **One internal (non-Lua) watch per file-backed buffer.** `Server::sync_buffer_watches`
+  (called at the tail of `emit_lifecycle_events`, the per-tick chokepoint) declaratively
+  reconciles a `buf_watches: HashMap<BufferId, (PathBuf, Option<FileStat>)>` against the live
+  buffers: arm new file-backed buffers (`LoopCommand::FsEventStart` on the file path),
+  disarm closed ones, and **re-arm on a changed key** — a reload/save re-stamps the disk
+  snapshot, so the watch re-points at the (possibly new) inode after an atomic replace.
+  Declarative off the buffer set, not hooked into every open/close/rename site.
+- **Id space, no side table.** Buffer `b`'s watch id is `INTERNAL_WATCH_BASE (1<<48) + b.0`,
+  far above any Lua callback id, so the `LoopEvent::FsEvent` arm classifies by
+  `id >= INTERNAL_WATCH_BASE` and routes straight to `editor.checktime_buffer(BufferId(id - BASE))`
+  (vs. `lua.run_callback`) — the change reconciles (autoreload / W11 / W12 / E211) and the
+  watch re-arms.
+- **`Editor::checktime_buffer` / `buffer_watch_key`** — the single-buffer reconcile entry the
+  watcher fires, and the `(path, disk-stat)` key the server watches on. `checktime`'s body was
+  refactored into a shared `checktime_one(id)` both the ex-command and the watcher use.
+- **Local sessions only** — `sync_buffer_watches` no-ops when a daemon `host_fs_async` is set
+  (remote watching is the `HostWatch` slice).
+
+Two properties fall out for free: a buffer's own `:w` is **self-suppressed** (`Buffer::write`
+updates the disk snapshot synchronously, so the watcher event it triggers makes `checktime`
+see `Unchanged`), and **no debounce** is needed (`notify` may emit several events per save, but
+after the first autoreload the snapshot is fresh and the rest are no-ops — idempotent by
+construction).
+
+**Exit criteria — met.** `core_editing.rs`'s `an_external_change_autoreloads_via_the_buffer_watch`
+opens a file, makes an external in-place change with **no `:checktime`**, and polls until the
+buffer autoreloads — proving the watch fired and reconciled on its own. Full suite green
+(`nxvim-server` 559 in `editing`, all binaries; `nxvim`); fmt + clippy clean.
+
+**Test-determinism note (recorded so it isn't rediscovered):** an always-on watch fires
+`checktime` *asynchronously* around the test's own actions, so three existing disk-change
+tests needed a synchronizing round-trip to make their precondition (a modified buffer /
+`noautoread`) land server-side **before** the external write — otherwise the watch reconciles a
+still-unmodified buffer first (a fire-and-forget `feed` race; real edits precede an external
+write). And the clobber test now matches the `:w` frame by predicate, because the watch's W12
+conflict competes with the clobber message on the line and which is *latest* is timing-dependent.
+The product behavior is correct in every case; these are test-ordering fixes.
 
 **Deferred to the next watch-leg slices (deliberately, not stubbed):**
 - **The `FileChangedShell`/`FileChangedShellPost` autocmds + `v:fcs_reason`/`v:fcs_choice`.**

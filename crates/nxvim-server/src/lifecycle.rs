@@ -1,10 +1,12 @@
 //! Buffer/mode lifecycle autocmd emission: the server-side diff that fires
 //! `BufReadPost`/`FileType`/`BufEnter`/`InsertEnter`, and `init.lua` sourcing.
 
+use crate::evloop::LoopCommand;
 use crate::filetype_of;
 use crate::FsRead;
-use crate::{Server, WindowRect};
-use nxvim_core::{BufferId, DirEntry, TabId, WindowId};
+use crate::{Server, WindowRect, INTERNAL_WATCH_BASE};
+use nxvim_core::{BufferId, DirEntry, FileStat, TabId, WindowId};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -263,6 +265,61 @@ impl Server {
             self.fire_tab("TabClosed", *t);
         }
         self.known_tabs = tabs;
+
+        // Keep the native per-buffer file watches in step with the live buffer set
+        // (arm new file-backed buffers, disarm closed ones, re-arm on a reload/save).
+        self.sync_buffer_watches();
+    }
+
+    /// Reconcile the server's internal per-buffer file watches against the live
+    /// buffers — the watch leg's local auto-trigger. For every file-backed buffer
+    /// it arms one native watch (reusing the `vim.uv.fs_event` machinery: a
+    /// [`LoopCommand::FsEventStart`] on the file's path) keyed on `(path, disk-stat)`;
+    /// a buffer whose key changed (a reload/save re-stamped its disk snapshot, so the
+    /// file may be a fresh inode after an atomic replace) is **re-armed** on the same
+    /// loop id (which replaces the old watch), and a closed buffer is disarmed
+    /// ([`LoopCommand::FsEventStop`]). When the watch fires, the [`LoopEvent::FsEvent`]
+    /// arm routes it to `editor.checktime_buffer` (see [`INTERNAL_WATCH_BASE`]), which
+    /// autoreloads or warns. Declarative (driven off the current buffer set each tick)
+    /// rather than hooked into every open/close/rename site. A daemon session arms
+    /// nothing — remote watching is the `HostWatch` slice.
+    pub(crate) fn sync_buffer_watches(&mut self) {
+        if self.host_fs_async.is_some() {
+            return;
+        }
+        // Desired: one watch per file-backed buffer, keyed on (path, disk snapshot).
+        let want: HashMap<BufferId, (PathBuf, Option<FileStat>)> = self
+            .editor
+            .buffer_ids()
+            .into_iter()
+            .filter_map(|id| self.editor.buffer_watch_key(id).map(|k| (id, k)))
+            .collect();
+
+        // Arm or re-arm anything new or whose key changed (FsEventStart on an
+        // existing id replaces its watch, so a re-arm needs no explicit stop).
+        for (id, key) in &want {
+            if self.buf_watches.get(id) != Some(key) {
+                self.evloop.send(LoopCommand::FsEventStart {
+                    id: INTERNAL_WATCH_BASE + id.0,
+                    path: key.0.to_string_lossy().into_owned(),
+                    recursive: false,
+                });
+                self.buf_watches.insert(*id, key.clone());
+            }
+        }
+        // Disarm watches for buffers that are gone (or lost their file).
+        let stale: Vec<BufferId> = self
+            .buf_watches
+            .keys()
+            .filter(|id| !want.contains_key(id))
+            .copied()
+            .collect();
+        for id in stale {
+            self.evloop.send(LoopCommand::FsEventStop {
+                id: INTERNAL_WATCH_BASE + id.0,
+            });
+            self.buf_watches.remove(&id);
+        }
     }
 
     /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.

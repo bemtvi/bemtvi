@@ -221,6 +221,9 @@ pub struct GoMirror {
     pub guifont: String,
     /// The `'regexsyntax'` dialect (`"pcre"`/`"vim"`) backing `vim.o.regexsyntax`.
     pub regexsyntax: String,
+    /// `'autoread'` — whether `:checktime` silently reloads an externally-changed,
+    /// unmodified buffer. Backs `vim.o.autoread`.
+    pub autoread: bool,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
     /// float-positioning plugin (telescope) can center its windows.
     pub columns: u64,

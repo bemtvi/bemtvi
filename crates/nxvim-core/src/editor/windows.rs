@@ -953,6 +953,7 @@ impl Editor {
             "wrapscan" => self.options.wrapscan = value,
             "hlsearch" => self.options.hlsearch = value,
             "incsearch" => self.options.incsearch = value,
+            "autoread" => self.options.autoread = value,
             _ => {}
         }
     }

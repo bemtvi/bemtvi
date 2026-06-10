@@ -78,6 +78,12 @@ pub struct Options {
     /// [`crate::Editor::search_engine`]; the only accepted values are `"pcre"`
     /// and `"vim"` (validated in `apply_set_str`).
     pub regexsyntax: String,
+    /// Re-read a file from disk when it changed outside nxvim and the buffer has
+    /// no unsaved edits (`'autoread'`). On (neovim's default), `:checktime`
+    /// silently reloads such a buffer; off, it warns (W11) and leaves the buffer
+    /// for the user to `:edit!`. A *modified* buffer is never autoreloaded — that
+    /// is the W12 conflict — regardless of this flag.
+    pub autoread: bool,
 }
 
 impl Default for Options {
@@ -110,6 +116,9 @@ impl Default for Options {
             // Canonical/PCRE regex for `/` and `:s` out of the box; opt into vim's
             // magic dialect with `:set regexsyntax=vim`.
             regexsyntax: "pcre".to_string(),
+            // Reload externally-changed, unmodified buffers on `:checktime`
+            // (neovim's default — vim's is off).
+            autoread: true,
         }
     }
 }
@@ -464,6 +473,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "wrapscan" | "ws" => Some(("wrapscan", Bool)),
         "hlsearch" | "hls" => Some(("hlsearch", Bool)),
         "incsearch" | "is" => Some(("incsearch", Bool)),
+        "autoread" | "ar" => Some(("autoread", Bool)),
         "tabstop" | "ts" => Some(("tabstop", Num)),
         "shiftwidth" | "sw" => Some(("shiftwidth", Num)),
         "softtabstop" | "sts" => Some(("softtabstop", Num)),

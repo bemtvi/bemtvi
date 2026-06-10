@@ -606,11 +606,37 @@ impl Buffer {
     /// buffer expected none (a `:e new-file` whose name another process then
     /// created), both register — in each case a blind `:w` would clobber.
     pub fn disk_changed(&self, fs: &dyn HostFs) -> bool {
-        match self.path.as_deref() {
-            Some(path) => fs.stat(path) != self.disk,
-            None => false,
+        !matches!(self.disk_change(fs), DiskChange::Unchanged)
+    }
+
+    /// Classify how the bound file's on-disk state compares to the snapshot from
+    /// the last read/write — the richer form of [`disk_changed`](Buffer::disk_changed)
+    /// that `:checktime` needs to pick between a reload, a warning, and "file gone".
+    /// A path-less (scratch) buffer is always [`DiskChange::Unchanged`].
+    pub fn disk_change(&self, fs: &dyn HostFs) -> DiskChange {
+        let Some(path) = self.path.as_deref() else {
+            return DiskChange::Unchanged;
+        };
+        match fs.stat(path) {
+            stat if stat == self.disk => DiskChange::Unchanged,
+            // Snapshot said the file existed (or was just written); now it doesn't.
+            None => DiskChange::Vanished,
+            // Present but its mtime/size no longer match our snapshot.
+            Some(_) => DiskChange::Changed,
         }
     }
+}
+
+/// How a buffer's bound file on disk compares to the snapshot nxvim took when it
+/// last read or wrote it. Drives `:checktime`'s reload-vs-warn decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskChange {
+    /// The file's mtime/size still match the snapshot — nothing touched it.
+    Unchanged,
+    /// The file is still present but was modified by something other than us.
+    Changed,
+    /// The file the buffer was bound to no longer exists on disk.
+    Vanished,
 }
 
 /// Strip a single trailing line break (`\n` or `\r\n`) from `s`, leaving any

@@ -987,6 +987,7 @@ impl Server {
             tabline: go.tabline.clone(),
             guifont: go.guifont.clone(),
             regexsyntax: go.regexsyntax.clone(),
+            autoread: go.autoread,
             columns: columns as u64,
             lines: lines as u64,
         });

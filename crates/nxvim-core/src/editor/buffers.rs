@@ -2,7 +2,7 @@
 //! (`:buffers`/`:b`/`:bnext`/`:bdelete`/…).
 
 use super::*;
-use crate::buffer::{Buffer, EditBatch};
+use crate::buffer::{Buffer, DiskChange, EditBatch};
 use crate::host::FileStat;
 use crate::mode::Mode;
 use std::path::Path;
@@ -470,6 +470,104 @@ impl Editor {
                 ob.buffer.modified = false;
             }
             Err(e) => self.echo(e.to_string()),
+        }
+    }
+
+    /// Re-read `buffer` from disk in place — the reload primitive `:checktime`'s
+    /// autoread path uses (and the building block the remote-watch slice reuses).
+    /// Replaces the rope with the file's current bytes, re-roots the undo tree at
+    /// the reloaded (saved) state, refreshes the disk snapshot — so a following
+    /// `:checktime` no longer reports a change — and clamps the cursor (the live
+    /// one when `buffer` is current, the saved one otherwise) into the new extent
+    /// so a now-shorter file can't strand it past the end. On a read failure the
+    /// buffer is left untouched and the error echoed. Local-only (synchronous
+    /// `host_fs`); the daemon reload is part of the remote-watch slice.
+    pub(crate) fn reload_buffer(&mut self, buffer: BufferId) {
+        let Some(path) = self.buffers.get(buffer).buffer.path.clone() else {
+            return;
+        };
+        let fs = self.host_fs.clone();
+        let new_buf = match Buffer::from_file(&path, &*fs) {
+            Ok(b) => b,
+            Err(e) => {
+                self.echo(e.to_string());
+                return;
+            }
+        };
+        let is_current = buffer == self.cur_buffer();
+        {
+            let ob = self.buffers.get_mut(buffer);
+            ob.buffer = new_buf;
+            // Reloaded from disk: discard the old history and start a fresh tree
+            // rooted at the reloaded text, a state that is by definition saved.
+            // Undo cannot cross the reload (as `load_into_current` / `:e!` do).
+            ob.undo = UndoTree::new(&ob.buffer);
+            ob.saved_seq = Some(ob.undo.cur_seq());
+            ob.buffer.mark_resync();
+        }
+        if is_current {
+            self.clamp_cursor();
+            let last = self.last_line();
+            self.top = self.top.min(last);
+        } else {
+            let last = self
+                .buffers
+                .get(buffer)
+                .buffer
+                .line_count()
+                .saturating_sub(1);
+            let ob = self.buffers.get_mut(buffer);
+            ob.saved_cursor.line = ob.saved_cursor.line.min(last);
+            ob.saved_top = ob.saved_top.min(last);
+        }
+    }
+
+    /// `:checktime` — re-stat every loaded file-backed buffer (or just `target`)
+    /// and reconcile it with what nxvim last read or wrote, mirroring neovim:
+    /// an externally-changed but *unmodified* buffer is silently reloaded when
+    /// `'autoread'` is on (else a **W11** warning, no reload); a buffer changed on
+    /// disk **and** in nxvim is a **W12** conflict (never clobbered); a file that
+    /// vanished is **E211**. This is the local behavior the remote `HostWatch`
+    /// push (a later slice) triggers over the wire — `:checktime` is both the user
+    /// command and the watcher's entry point.
+    pub(crate) fn checktime(&mut self, target: &str) {
+        // A remote stat would have to cross the wire off the editor tick — exactly
+        // the `HostWatch` slice we haven't built. Fail loud rather than stat the
+        // edit-host's *local* disk for a remote path (which would misreport E211).
+        if self.host_fs_offtick {
+            self.echo("checktime: remote file watching is not yet wired (daemon session)");
+            return;
+        }
+        let ids = match target.trim() {
+            "" => self.buffer_ids(),
+            arg => match self.resolve_buffer(arg) {
+                Some(id) => vec![id],
+                None => return,
+            },
+        };
+        let fs = self.host_fs.clone();
+        let autoread = self.options.autoread;
+        for id in ids {
+            let name = self.buffer_name(id).unwrap_or_default();
+            match self.buffers.get(id).buffer.disk_change(&*fs) {
+                DiskChange::Unchanged => {}
+                DiskChange::Vanished => {
+                    self.echo(format!("E211: File \"{name}\" no longer available"))
+                }
+                DiskChange::Changed => {
+                    if self.buffers.get(id).buffer.modified {
+                        self.echo(format!(
+                            "W12: Warning: File \"{name}\" has changed and the buffer was changed in Vim as well"
+                        ));
+                    } else if autoread {
+                        self.reload_buffer(id);
+                    } else {
+                        self.echo(format!(
+                            "W11: Warning: File \"{name}\" has changed since editing started"
+                        ));
+                    }
+                }
+            }
         }
     }
 

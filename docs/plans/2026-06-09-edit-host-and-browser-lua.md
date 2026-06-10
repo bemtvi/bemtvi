@@ -491,6 +491,57 @@ the wire — in Phase 3g, and **`:tabnew` / LSP go-to** in Phase 3h, all below. 
 is *not implemented* in nxvim at all, so there is nothing to route over the wire — it
 would be a new feature, not a wire slice.)
 
+### Phase 3i — the watch leg, local behavior (`:checktime` / `'autoread'`) — ✅ DONE (2026-06-10)
+
+The watch leg's foundation, done **local-first** exactly as the read leg was (sync-local
+behavior in 3a → remote async in 3d): before the daemon can *push* "a remote file
+changed under you," the editor has to know what to *do* when a file changes. That
+behavior didn't exist — the only external-change detection was the `:w` clobber guard.
+
+Shipped (all in `nxvim-core`, with the `vim.o` mirror plumbing):
+- **`Buffer::disk_change` → `DiskChange { Unchanged, Changed, Vanished }`** — the richer
+  form of `disk_changed` that distinguishes a modified file from a deleted one, by
+  comparing a fresh stat against the read/write snapshot (the same mtime+size snapshot
+  the clobber guard uses).
+- **`'autoread'`** — global bool, default **on** (neovim; vim's is off), wired through
+  `:set`, `set_global_option_bool`, and the `vim.o` mirror (`GoMirror.autoread`,
+  `stdlib.lua` `O_GLOBAL`/`O_GLOBAL_DEFAULT`).
+- **`Editor::checktime(target)`** (`:checkt[ime]`) — re-stats every loaded file-backed
+  buffer (or one resolved buffer) and reconciles it the way neovim does: an
+  externally-changed but *unmodified* buffer is silently reloaded when `'autoread'` is on
+  (**W11** warning + no reload when off); a buffer changed on disk **and** in nxvim is a
+  **W12** conflict (never clobbered); a vanished file is **E211**.
+- **`Editor::reload_buffer(id)`** — the in-place disk re-read `:checktime`'s autoread path
+  uses (generalizing `load_into_current` to any buffer): replaces the rope, re-roots the
+  undo tree at the reloaded state, **refreshes the disk snapshot** (so the next
+  `:checktime` is quiet), and clamps the cursor (live for the current buffer, saved
+  otherwise) into the new extent.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/editing/core_editing.rs`: four
+black-box tests drive `:checktime` after an external `std::fs::write`/`remove_file` and
+assert each branch — autoreload picks up the new content, a modified buffer warns W12
+without losing the in-buffer edit, `:set noautoread` warns W11 without reloading, and a
+deleted file reports E211 — plus a `vim.o.autoread` default-on + round-trip test in
+`options.rs`. Regression-clean; fmt + clippy `-D warnings` green.
+
+**`:checktime` is both the user command and the watcher's entry point** — the remote
+`HostWatch` push and any local auto-trigger (a `notify` watch / `FocusGained`) will call
+`Editor::checktime` / `reload_buffer` rather than re-deriving the reconcile logic.
+
+**Deferred to the next watch-leg slices (deliberately, not stubbed):**
+- **The `FileChangedShell`/`FileChangedShellPost` autocmds + `v:fcs_reason`/`v:fcs_choice`.**
+  Honoring the choice contract (a handler sets `v:fcs_choice` to redirect reload/ask/edit)
+  needs core to *defer* the decision to the server, fire the autocmd, read the choice, and
+  call back — a synchronous Lua round-trip mid-tick the current one-way `emit_lifecycle_events`
+  doesn't do. Firing the event while silently ignoring its documented contract would make
+  broken look working (a `:checktime`-driven auto-reload plugin would observe the event but
+  its choice would be a no-op), so it's intentionally *not* fired yet.
+- **The remote `HostWatch` push wire** — the daemon-side `notify` watcher (`serve_daemon`
+  currently drops `LoopEvent::FsEvent`) forwarding change events the server turns into a
+  `checktime`. `checktime` fails loud in a daemon session today (it can't stat off-tick).
+- **Cursor preservation across reload** is line/col-clamped, not view-stable (vim keeps the
+  exact screen position); acceptable and consistent with `:e!`.
+
 **The save slice must define its semantics up front — write is the hard half of
 off-tick** (read got done first for a reason: it's idempotent and cancelable;
 write is neither). The contract for an async `:w`:

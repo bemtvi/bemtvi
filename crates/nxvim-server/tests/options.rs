@@ -43,3 +43,24 @@ async fn guifont_defaults_empty() {
     let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
     assert_eq!(field_str(&frame, "guifont"), "");
 }
+
+#[tokio::test]
+async fn autoread_defaults_on_and_round_trips_through_vim_o() {
+    let (rpc, _incoming) = start().await;
+
+    // neovim's default is on, so the mirror reflects the core default before any set.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.autoread").await.as_bool(),
+        Some(true),
+        "vim.o.autoread defaults on (neovim)"
+    );
+
+    // A write through `vim.o` reaches the core and reads back (the `:checktime`
+    // reload-vs-warn decision reads this exact flag).
+    exec_lua(&rpc, "vim.o.autoread = false").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.autoread").await.as_bool(),
+        Some(false),
+        "vim.o.autoread = false round-trips"
+    );
+}

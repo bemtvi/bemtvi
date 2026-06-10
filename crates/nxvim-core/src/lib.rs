@@ -25,7 +25,7 @@ pub mod syntax;
 pub mod unicode;
 pub mod view;
 
-pub use buffer::{Buffer, BufferEdit, EditBatch};
+pub use buffer::{Buffer, BufferEdit, DiskChange, EditBatch};
 pub use clipboard::Clipboard;
 pub use editor::{
     command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,

@@ -492,6 +492,9 @@ impl Editor {
             }
             "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
             "vert" | "vertical" | "ver" => self.ex_vertical(args),
+            // `:checkt[ime]` re-stats loaded buffers against disk and reloads
+            // (autoread) or warns (W11/W12/E211) on an external change.
+            "checkt" | "checkti" | "checktim" | "checktime" => self.checktime(args),
             "ls" | "buffers" | "files" => self.ex_buffers(),
             "b" | "bu" | "buf" | "buffer" => {
                 if let Some(id) = self.resolve_buffer(args) {

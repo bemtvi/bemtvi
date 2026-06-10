@@ -331,6 +331,97 @@ async fn ex_write_refuses_to_clobber_a_file_changed_on_disk() {
     std::fs::remove_file(&path).ok();
 }
 
+// --- `:checktime` / `'autoread'` / `FileChangedShell` (the watch leg) ----------
+//
+// `:checktime` re-stats every loaded file-backed buffer and reconciles it with
+// what nxvim last read or wrote. The four outcomes mirror neovim exactly:
+//   - file changed, buffer unmodified, `'autoread'` on  → silent reload
+//   - file changed, buffer unmodified, `'autoread'` off → W11 warning, no reload
+//   - file changed *and* buffer modified                → W12 conflict, no reload
+//   - file vanished                                      → E211, no reload
+// This is the local behavior the remote `HostWatch` push (a later slice) triggers
+// over the wire; `:checktime` is both the user command and the watcher's entry.
+
+#[tokio::test]
+async fn checktime_reloads_an_unmodified_buffer_when_the_file_changed() {
+    let path = temp_path("checktime-reload");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    // Someone else rewrites the file; our buffer is untouched. `'autoread'` is on
+    // by default (neovim), so `:checktime` silently picks up the new content.
+    std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+    feed(&rpc, ":checktime<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "four"],
+        "an unmodified buffer must autoreload the external change"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn checktime_warns_on_conflict_when_both_disk_and_buffer_changed() {
+    let path = temp_path("checktime-conflict");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    // Our own unsaved edit...
+    feed(&rpc, "Gomine<Esc>");
+    // ...colliding with an external rewrite of the same file.
+    std::fs::write(&path, "EXTERNALLY REWRITTEN CONTENT\n").unwrap();
+
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":checktime<CR>").await);
+    assert!(
+        msg.contains("W12") && msg.contains("changed"),
+        "expected a W12 conflict warning, got: {msg:?}"
+    );
+    // The conflict must NOT clobber our in-buffer edit.
+    assert!(
+        lines(&rpc).await.contains(&"mine".to_string()),
+        "a conflict must leave the modified buffer untouched"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn checktime_warns_without_reloading_when_autoread_is_off() {
+    let path = temp_path("checktime-noar");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    feed(&rpc, ":set noautoread<CR>");
+    std::fs::write(&path, "REPLACED EXTERNALLY ENTIRELY\n").unwrap();
+
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":checktime<CR>").await);
+    assert!(
+        msg.contains("W11"),
+        "with 'autoread' off, a changed file must warn (W11), got: {msg:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two"],
+        "with 'autoread' off, `:checktime` must not reload"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn checktime_reports_a_deleted_file() {
+    let path = temp_path("checktime-gone");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    std::fs::remove_file(&path).unwrap();
+
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":checktime<CR>").await);
+    assert!(
+        msg.contains("E211"),
+        "a vanished file must report E211, got: {msg:?}"
+    );
+}
+
 #[tokio::test]
 async fn lua_vim_cmd_drives_the_editor() {
     // A Lua chunk that opens a file should change what the buffer shows.

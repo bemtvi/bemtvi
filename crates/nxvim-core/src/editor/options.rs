@@ -59,6 +59,7 @@ impl Editor {
             "wrapscan" => &mut self.options.wrapscan,
             "hlsearch" => &mut self.options.hlsearch,
             "incsearch" => &mut self.options.incsearch,
+            "autoread" => &mut self.options.autoread,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             _ => return,
         };

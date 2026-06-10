@@ -276,6 +276,46 @@ function vim.lsp.util.show_document(location, encoding, _opts)
   return true
 end
 
+-- convert_input_to_markdown_lines(input, contents): flatten an LSP hover/doc value
+-- into a list of markdown lines, the shape `open_floating_preview` and completion
+-- sources (cmp_luasnip) feed to a preview. `input` is a string, a `MarkupContent`
+-- ({ kind, value }), a `MarkedString` ({ language, value } — fenced as a code
+-- block), or an array of any of those (recursed in order). `contents` is an
+-- optional accumulator. Mirrors neovim's algorithm so plugins get identical lines.
+local function split_md_lines(s)
+  -- Normalize CRLF/CR to LF, then split on newlines (each element is one line).
+  return vim.split((s:gsub("\r\n?", "\n")), "\n", { plain = true })
+end
+
+function vim.lsp.util.convert_input_to_markdown_lines(input, contents)
+  contents = contents or {}
+  if type(input) == "string" then
+    vim.list_extend(contents, split_md_lines(input))
+  elseif type(input) == "table" then
+    if input.kind then
+      -- MarkupContent (markdown / plaintext) — take its value verbatim.
+      vim.list_extend(contents, split_md_lines(input.value or ""))
+    elseif input.language then
+      -- MarkedString — a fenced code block in the given language.
+      contents[#contents + 1] = "```" .. input.language
+      vim.list_extend(contents, split_md_lines(input.value or ""))
+      contents[#contents + 1] = "```"
+    else
+      -- An array of the above, in order.
+      for _, item in ipairs(input) do
+        vim.lsp.util.convert_input_to_markdown_lines(item, contents)
+      end
+    end
+  else
+    error("convert_input_to_markdown_lines: expected string or table, got " .. type(input))
+  end
+  -- A single empty line means "no content".
+  if #contents == 1 and (contents[1] == "" or contents[1] == nil) then
+    return {}
+  end
+  return contents
+end
+
 -- vim.lsp.omnifunc: the legacy `i_CTRL-X_CTRL-O` (Vimscript-era omni-completion)
 -- entry point. nxvim has no omnifunc path yet; returning -1 ("no completion")
 -- masked the gap, so it raises via vim._notimpl.
@@ -1044,5 +1084,23 @@ function vim.lsp.inlay_hint.get(filter)
     end
   end
   return out
+end
+
+-- Make the `vim.lsp` namespaces requirable by module name. In neovim each of these
+-- is its own file (`vim/lsp/util.lua`, …) so plugins `require("vim.lsp.util")`
+-- rather than reaching through the global; nxvim builds them all in this prelude,
+-- so we seed `package.loaded` to return the already-built tables (cmp_luasnip's
+-- `require("vim.lsp.util")` is what surfaced this). No new behavior — just the
+-- module-path alias for tables that already exist.
+for name, mod in pairs({
+  ["vim.lsp"] = vim.lsp,
+  ["vim.lsp.util"] = vim.lsp.util,
+  ["vim.lsp.protocol"] = vim.lsp.protocol,
+  ["vim.lsp.buf"] = vim.lsp.buf,
+  ["vim.lsp.handlers"] = vim.lsp.handlers,
+  ["vim.lsp.semantic_tokens"] = vim.lsp.semantic_tokens,
+  ["vim.lsp.inlay_hint"] = vim.lsp.inlay_hint,
+}) do
+  package.loaded[name] = mod
 end
 

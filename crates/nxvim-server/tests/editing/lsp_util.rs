@@ -199,6 +199,63 @@ async fn show_document_external_location_raises() {
     );
 }
 
+#[tokio::test]
+async fn vim_lsp_util_is_requirable_as_a_module() {
+    let (rpc, _incoming) = start(None).await;
+    // In neovim `vim.lsp.util` is a real module file, so plugins `require` it by
+    // path rather than reaching through the global (cmp_luasnip does exactly this at
+    // load). The require must return the same table as the global.
+    let same = exec_lua(
+        &rpc,
+        r#"local util = require("vim.lsp.util")
+           return type(util) == "table"
+             and util == vim.lsp.util
+             and require("vim.lsp") == vim.lsp"#,
+    )
+    .await;
+    assert_eq!(
+        same.as_bool(),
+        Some(true),
+        "require('vim.lsp.util') returns the live vim.lsp.util table"
+    );
+}
+
+#[tokio::test]
+async fn convert_input_to_markdown_lines_flattens_nested_input() {
+    let (rpc, _incoming) = start(None).await;
+    // The exact shape cmp_luasnip builds: an array mixing plain strings (each split
+    // on its newlines), a MarkupContent ({kind,value}), a MarkedString ({language,
+    // value} -> fenced), and a nested array — all flattened, in order, to one list.
+    let out = exec_lua(
+        &rpc,
+        r#"local lines = vim.lsp.util.convert_input_to_markdown_lines({
+             "title\n---",
+             { kind = "markdown", value = "para line1\npara line2" },
+             { language = "lua", value = "return 1" },
+             { "tail" },
+           })
+           return table.concat(lines, "|")"#,
+    )
+    .await;
+    assert_eq!(
+        out.as_str(),
+        Some("title|---|para line1|para line2|```lua|return 1|```|tail"),
+        "nested hover input flattens to markdown lines in order"
+    );
+}
+
+#[tokio::test]
+async fn convert_input_to_markdown_lines_empty_input_is_empty() {
+    let (rpc, _incoming) = start(None).await;
+    // A single empty line means "no content" -> empty list (neovim's contract).
+    let out = exec_lua(
+        &rpc,
+        r#"return #vim.lsp.util.convert_input_to_markdown_lines("")"#,
+    )
+    .await;
+    assert_eq!(out.as_u64(), Some(0));
+}
+
 // ---- Phase 0: ex range parsing -------------------------------------------
 //
 // A bare range (no command) resolves and moves the cursor to the *last*

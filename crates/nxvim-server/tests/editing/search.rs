@@ -98,6 +98,101 @@ async fn substitute_fails_loud_on_unsupported_constructs() {
     );
 }
 
+// ----- vim.regex match-position anchors ( \zs / \ze ) -----------------------
+//
+// These are #[ignore]d for now: nxvim's RE2-backed `vim.regex` rejects `\zs`/`\ze`
+// (no RE2 equivalent), and rather than reimplement the translation we plan to bring
+// in vim's native regex module. They specify the behavior cmp-path relies on
+// (`…/\zePAT*$`); un-ignore them once that module backs `vim.regex`.
+
+/// `\ze` resets the match END: `match_str` reports the span up to `\ze`, while the
+/// text after it must still match. This is the exact construct cmp-path builds
+/// (`…/\zePAT*$`), so getting it right is what unblocks cmp-path.
+#[tokio::test]
+#[ignore = "vim.regex \\ze support pending the native vim regex module"]
+async fn regex_ze_sets_match_end() {
+    let (rpc, _incoming) = start(None).await;
+    // `foo/\zebar` against "foo/bar": the whole pattern matches "foo/bar", but the
+    // reported match is just "foo/" (offsets 0..4) — `bar` is matched-but-excluded.
+    let span = exec_lua(
+        &rpc,
+        r#"local s, e = vim.regex([==[foo/\zebar]==]):match_str("foo/bar")
+           return { s, e }"#,
+    )
+    .await;
+    let span = span.as_array().expect("a {start, end} array");
+    assert_eq!(span[0].as_i64(), Some(0), "match starts at 0");
+    assert_eq!(
+        span[1].as_i64(),
+        Some(4),
+        "\\ze ends the match before 'bar'"
+    );
+}
+
+/// `\zs` resets the match START: everything before it must match but is excluded
+/// from the reported span.
+#[tokio::test]
+#[ignore = "vim.regex \\zs support pending the native vim regex module"]
+async fn regex_zs_sets_match_start() {
+    let (rpc, _incoming) = start(None).await;
+    // `foo\zsbar` against "foobar": matches the whole, reports just "bar" (3..6).
+    let span = exec_lua(
+        &rpc,
+        r#"local s, e = vim.regex([==[foo\zsbar]==]):match_str("foobar")
+           return { s, e }"#,
+    )
+    .await;
+    let span = span.as_array().expect("a {start, end} array");
+    assert_eq!(span[0].as_i64(), Some(3), "\\zs starts the match at 'bar'");
+    assert_eq!(span[1].as_i64(), Some(6), "match runs to the end");
+}
+
+/// A non-matching pattern still returns nil (not the zone group span), and `\zs`
+/// combined with `\ze` reports exactly the span between them.
+#[tokio::test]
+#[ignore = "vim.regex \\zs/\\ze support pending the native vim regex module"]
+async fn regex_zs_ze_zone_and_no_match() {
+    let (rpc, _incoming) = start(None).await;
+    let out = exec_lua(
+        &rpc,
+        r#"local both_s, both_e = vim.regex([==[a\zsbc\zed]==]):match_str("abcd")
+           local nomatch = vim.regex([==[x\zsy]==]):match_str("ab")
+           return { both_s, both_e, nomatch == nil }"#,
+    )
+    .await;
+    let out = out.as_array().expect("a result array");
+    assert_eq!(out[0].as_i64(), Some(1), "zone starts after 'a'");
+    assert_eq!(out[1].as_i64(), Some(3), "zone ends before 'd'");
+    assert_eq!(out[2].as_bool(), Some(true), "no overall match -> nil");
+}
+
+/// cmp-path's actual PATH_REGEX — built with `\%(…\)` groups, `\|` alternation and
+/// a `\ze` boundary — must compile (it was rejected outright before `\ze` support)
+/// and locate a path: `match_str` returns a real byte offset, not nil.
+#[tokio::test]
+#[ignore = "cmp-path PATH_REGEX (\\ze) support pending the native vim regex module"]
+async fn regex_cmp_path_pattern_compiles_and_matches() {
+    let (rpc, _incoming) = start(None).await;
+    let out = exec_lua(
+        &rpc,
+        r#"local NAME = [==[\%([^/\\:\*?<>'"`\|]\)]==]
+           local pat = ([==[\%(\%(/PAT*[^/\\:\*?<>'"`\| .~]\)\|\%(/\.\.\)\)*/\zePAT*$]==]):gsub('PAT', NAME)
+           local ok, re = pcall(vim.regex, pat)
+           if not ok then return "compile-error: " .. tostring(re) end
+           -- cmp-path feeds the text left of the cursor; `s` is the boundary it uses.
+           local s = re:match_str("cd /usr/local/bi")
+           return s"#,
+    )
+    .await;
+    // The pattern matches at the first `/` of the path run (leftmost start). The
+    // point is it compiled and matched at all — what cmp-path needs.
+    assert_eq!(
+        out.as_i64(),
+        Some(3),
+        "cmp-path PATH_REGEX compiles and match_str finds the path boundary"
+    );
+}
+
 // ----- search ( `/`, `?`, `n`, `N` ) ----------------------------------------
 
 #[tokio::test]

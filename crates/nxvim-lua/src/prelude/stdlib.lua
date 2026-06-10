@@ -57,6 +57,43 @@ end
 -- vim.g: global variables. Plain storage; reading an unset key yields nil.
 vim.g = vim.g or {}
 
+-- vim.w / vim.b: window- and buffer-scoped variables. In neovim each is indexed
+-- first by a window/buffer handle (`vim.w[win].name`) and bare access targets the
+-- *current* window/buffer (`vim.w.name`). nxvim backs them with a per-handle Lua
+-- store rather than a core var dict — enough for plugins that stash a marker on a
+-- window/buffer and read it back (trouble.nvim tags its own windows with
+-- `vim.w[win].trouble` and skips them when picking a target window; a missing
+-- `vim.w` made that an index-of-nil at setup). `vim.w[0]` / `vim.b[0]` resolve to
+-- the current handle, like the rest of the API.
+local function scoped_vars(store, current)
+  return setmetatable({}, {
+    __index = function(_, k)
+      if type(k) == "number" then
+        local h = (k == 0) and current() or k
+        local t = store[h]
+        if not t then t = {}; store[h] = t end
+        return t
+      end
+      -- bare `vim.w.name`: the current handle's var.
+      local t = store[current()]
+      return t and t[k]
+    end,
+    __newindex = function(_, k, v)
+      if type(k) == "number" then
+        error("vim.w/vim.b: assign fields on vim.w[handle], not the handle itself", 2)
+      end
+      local h = current()
+      local t = store[h]
+      if not t then t = {}; store[h] = t end
+      t[k] = v
+    end,
+  })
+end
+vim._w_vars = vim._w_vars or {}
+vim._b_vars = vim._b_vars or {}
+vim.w = scoped_vars(vim._w_vars, function() return vim.api.nvim_get_current_win() end)
+vim.b = scoped_vars(vim._b_vars, function() return vim.api.nvim_get_current_buf() end)
+
 -- vim.o: editor options with neovim's set-semantics — a write reaches the
 -- option's real home and a read returns the core's current value (the default
 -- until set, and a value set through the `:set` ex path, not just one written

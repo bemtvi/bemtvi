@@ -155,3 +155,21 @@ async fn nvim_treesitter_loads() {
     )
     .await;
 }
+
+/// trouble.nvim: `view/main.lua` tags its own windows with `vim.w[win].trouble`
+/// and reads it back to skip them when choosing a target window. nxvim had no
+/// `vim.w`, so that was an index-of-nil and `require('trouble').setup{}` errored.
+#[tokio::test]
+async fn trouble_loads() {
+    assert_plugin_ok(
+        &["trouble.nvim"],
+        r#"
+        -- vim.w round-trips a window-scoped var.
+        vim.w.compat_marker = "x"
+        assert(vim.w.compat_marker == "x", "vim.w round-trip")
+        local ok, err = pcall(function() require('trouble').setup({}) end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+}

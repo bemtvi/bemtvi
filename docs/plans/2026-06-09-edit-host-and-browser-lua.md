@@ -99,7 +99,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | --- | --- | --- | --- |
 | 0 | Feasibility spikes (compile / interop / blocking read) | — | ✅ |
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
-| 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ⬜ |
+| 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ⬜ |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | ⬜ |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
@@ -165,7 +165,7 @@ worker can't compile). Zero behavior change; pure inversion. Server unchanged
 
 ---
 
-## Phase 2 — An opt-in yieldable `pcall` primitive (`vim.co_pcall`)
+## Phase 2 — An opt-in yieldable `pcall` primitive (`vim.co_pcall`) — ✅ DONE
 
 **Independent of everything else; smallest, testable today.**
 
@@ -227,12 +227,37 @@ document the gap. Available on both backends (harmless on LuaJIT, where the glob
 **Files.** `crates/nxvim-lua/.../prelude/` (alongside `stdlib.lua` /
 `runtime.lua`); document `vim.co_pcall` for plugin authors.
 
-**Exit criteria.** A black-box test (`crates/nxvim-server/tests/blockers.rs`, the
-existing which-key regression home) drives a Lua snippet that wraps
+**The relay needed one more piece than the sketch above (found in
+implementation).** nxvim's blocking reads do *not* "bubble a yield up to the pump
+which resumes the top coroutine" — the model the plan's relay was written for.
+Instead `fs.lua`'s `await_prompt` (the single funnel for `getcharstr` / `input` /
+`confirm`) registers a server callback that resumes **`coroutine.running()`
+directly** and then yields. Under a `vim.co_pcall` the running coroutine is the
+*inner* protected one, so a direct resume bypasses the relay and the relay's
+coroutine — which holds the protected call's continuation — never wakes; the
+sketch's relay alone hangs. The fix is a small, backend-shared change at that one
+chokepoint: a `vim._co_driver` map (coroutine → its driver, weak keys) records
+the resume chain, and `await_prompt` walks it to resume the **outermost** driver
+so the relay chain forwards the resume value back down to the blocked inner
+coroutine. With no `co_pcall` on the stack the map is empty, the root *is* the
+running coroutine, and `await_prompt` is byte-for-byte its old self — zero
+regression (the 18 `editing::prompts` + existing `getcharstr` tests stay green on
+both backends). Shipped in `prelude/copcall.lua` (the `vim.co_pcall` /
+`co_xpcall` / `co_wrap` family + the driver map) and the `await_prompt` edit.
+
+**Exit criteria — met.** A black-box test (`crates/nxvim-server/tests/blockers.rs`,
+the existing which-key regression home) drives a Lua snippet that wraps
 `vim.fn.getcharstr` in `vim.co_pcall` through several keystrokes on a
 `--features lua51` build and asserts it reads them — proving the relay reads input,
-not merely that it doesn't error. The memory's "unmodified which-key live popup"
-case stays a documented limitation, distinct from this passing opt-in test.
+not merely that it doesn't error. Six tests landed: a single protected read, a
+loop relaying several reads then feeding a resolved sequence (the which-key
+shape), error/args/return passthrough, and `co_xpcall` / `co_wrap`. A throwaway
+negative control confirmed the *global* `pcall(getcharstr)` still raises *"attempt
+to yield across metamethod/C-call boundary"* on `lua51` where `co_pcall` succeeds —
+so the test proves the relay does real work, not a no-op. Full `blockers` suite
+green on **both** backends (34 tests, `luajit` + `lua51`); fmt + clippy clean. The
+memory's "unmodified which-key live popup" case stays a documented limitation,
+distinct from this passing opt-in test.
 
 ---
 

@@ -447,9 +447,16 @@ local function await_prompt(open)
       0
     )
   end
+  -- Resume the OUTERMOST driver, not `co` directly: under a `vim.co_pcall` the
+  -- running coroutine is the inner protected one, and the relay chain (which
+  -- holds the protected call's continuation) drives it from the root down.
+  -- Resuming the root lets that chain forward the value back to `co`. Without any
+  -- co_pcall on the stack the map is empty and the root IS `co` — unchanged.
+  local root, drivers = co, vim._co_driver
+  while drivers and drivers[root] do root = drivers[root] end
   local cb = vim._next_cb_id()
   vim._cb_fns[cb] = function(value)
-    local ok, err = coroutine.resume(co, value)
+    local ok, err = coroutine.resume(root, value)
     if not ok then error(err, 0) end
   end
   open(cb)

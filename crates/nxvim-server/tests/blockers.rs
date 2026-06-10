@@ -602,6 +602,159 @@ async fn getcharstr_loop_walks_a_sequence_then_feeds_keys() {
     assert_eq!(buf_lines(&rpc, 0).await, vec!["hi"]);
 }
 
+// ===================== vim.co_pcall (yieldable protected call) ==============
+// Phase 2 of docs/plans/2026-06-09-edit-host-and-browser-lua.md: the opt-in
+// yieldable `pcall` primitive. On PUC Lua 5.1 the global `pcall` is a C frame
+// and `pcall(getcharstr)` raises "attempt to yield across a C-call boundary";
+// `vim.co_pcall` runs the protected fn in its own coroutine and relays the yield
+// through a pure-Lua path so the blocking read actually parks and resumes.
+
+#[tokio::test]
+async fn co_pcall_wraps_a_blocking_getcharstr_and_reads_the_key() {
+    // The which-key live-popup shape made opt-in: a protected blocking read.
+    // Proves the relay reads input — that the parked getcharstr resumes with the
+    // next key and co_pcall returns (true, key) — not merely that it doesn't error.
+    let dir = temp_dir("co_pcall");
+    let init = r#"
+        vim.g.mapleader = " "
+        _G.ok, _G.got = nil, nil
+        vim.keymap.set("n", "<leader>g", function()
+          _G.ok, _G.got = vim.co_pcall(vim.fn.getcharstr)
+        end)
+    "#;
+    let (rpc, _incoming) = start_with_config(&dir, init).await;
+
+    feed(&rpc, " g"); // fires the map; the protected getcharstr parks
+    assert_eq!(
+        exec_lua(&rpc, "return _G.got == nil").await,
+        Value::Boolean(true)
+    );
+
+    feed(&rpc, "x"); // resumes the parked read through the relay with "x"
+    assert_eq!(exec_lua(&rpc, "return _G.ok").await, Value::Boolean(true));
+    assert_eq!(as_str(&exec_lua(&rpc, "return _G.got").await), "x");
+    // The "x" was consumed by the read, not typed into the buffer.
+    assert_eq!(buf_lines(&rpc, 0).await, vec![""]);
+}
+
+#[tokio::test]
+async fn co_pcall_relays_several_blocking_reads_in_a_loop() {
+    // Several keystrokes through one protected call: a getchar loop inside
+    // vim.co_pcall accumulates two keys, then feeds a resolved sequence — proving
+    // the relay forwards each resume down to the inner coroutine, repeatedly.
+    let dir = temp_dir("co_pcall_loop");
+    let init = r#"
+        vim.g.mapleader = " "
+        vim.keymap.set("n", "<leader>k", function()
+          vim.co_pcall(function()
+            local acc = ""
+            for _ = 1, 2 do acc = acc .. vim.fn.getcharstr() end
+            if acc == "ab" then
+              vim.api.nvim_feedkeys(
+                vim.api.nvim_replace_termcodes("ihi<Esc>", true, true, true), "n", false)
+            end
+          end)
+        end)
+    "#;
+    let (rpc, _incoming) = start_with_config(&dir, init).await;
+
+    feed(&rpc, " k"); // fire the trigger; parks on the 1st protected read
+    feed(&rpc, "a"); // resumes; parks again on the 2nd
+    feed(&rpc, "b"); // resumes; loop ends, feeds `ihi<Esc>`
+    assert_eq!(buf_lines(&rpc, 0).await, vec!["hi"]);
+}
+
+#[tokio::test]
+async fn co_pcall_returns_false_and_the_error_on_a_throwing_fn() {
+    // Without blocking, co_pcall is plain pcall: it catches an error and returns
+    // (false, message) rather than propagating.
+    let dir = temp_dir("co_pcall_err");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local ok = vim.co_pcall(function() error('boom') end) return ok"
+        )
+        .await,
+        Value::Boolean(false)
+    );
+    // The error value carries a "chunk:line:" prefix; assert the tail we control.
+    assert_eq!(
+        as_str(
+            &exec_lua(
+                &rpc,
+                "local _, e = vim.co_pcall(function() error('boom') end)
+                 return tostring(e):match('boom$')"
+            )
+            .await
+        ),
+        "boom"
+    );
+}
+
+#[tokio::test]
+async fn co_pcall_forwards_args_and_returns_on_success() {
+    // Args reach the protected fn and its return values come back after the ok flag.
+    let dir = temp_dir("co_pcall_ret");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local ok, a, b = vim.co_pcall(function(x, y) return x + y, x * y end, 3, 4)
+             return ok and (a == 7) and (b == 12)"
+        )
+        .await,
+        Value::Boolean(true)
+    );
+}
+
+#[tokio::test]
+async fn co_xpcall_runs_the_message_handler_on_error() {
+    // co_xpcall routes the error through msgh and returns (false, msgh-result).
+    // The error value carries a "chunk:line:" prefix, so msgh normalizes it to a
+    // marker we can assert exactly.
+    let dir = temp_dir("co_xpcall");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    assert_eq!(
+        as_str(
+            &exec_lua(
+                &rpc,
+                "local ok, r = vim.co_xpcall(function() error('boom') end,
+                   function(e) return 'h:' .. tostring(e):match('boom$') end)
+                 return (ok == false) and r or 'NOPE'",
+            )
+            .await
+        ),
+        "h:boom"
+    );
+}
+
+#[tokio::test]
+async fn co_wrap_reraises_errors_and_returns_results() {
+    // co_wrap re-raises (no ok flag) and otherwise yields the results.
+    let dir = temp_dir("co_wrap");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    // success path: results pass straight through.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local g = vim.co_wrap(function(n) return n * 2 end) return g(21)"
+        )
+        .await,
+        Value::from(42),
+    );
+    // error path: the wrapped call raises, so a guarding pcall catches it.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local g = vim.co_wrap(function() error('boom') end)
+             local ok = pcall(g) return ok"
+        )
+        .await,
+        Value::Boolean(false),
+    );
+}
+
 // ============================ which-key display surface =====================
 // The APIs which-key.nvim drives to *render* its popup: highlight reads
 // (nvim_get_hl), context callbacks (nvim_buf_call / nvim_win_call), scratch-buffer

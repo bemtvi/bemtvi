@@ -15,6 +15,10 @@ rather than a C transliteration.
 > floating windows, treesitter highlighting, a real Lua plugin runtime, and LSP
 > all work. Good enough to be a daily driver.
 
+Test the client-only (no lua) live demo at https://nxvim-demo.netlify.app.
+Use :setf LANG to activate treesitter if not auto detected. Don't forget to
+checkout out the [multicursor mode](#notable-additions)!
+
 ---
 
 ## Quick start
@@ -274,7 +278,7 @@ highlights:
   highlighter — all highlighting comes from treesitter grammars.
 - **No visual-block mode** (`<C-v>`). Charwise and linewise visual modes are
   supported; blockwise selection is a deliberate non-goal, not a roadmap item.
-  Use the multicursor mode instead.
+  Use the [multicursor mode](#notable-additions) instead.
 - **Different indent defaults.** `tabstop` defaults to **4**, with
   `shiftwidth=0` and `softtabstop=-1` (both "follow tabstop"), so one knob drives
   the indent width.

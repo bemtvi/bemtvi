@@ -1348,7 +1348,7 @@ impl Editor {
         // off the editor tick. The guard can't run here anyway: it needs a remote
         // stat, which we've sworn off on the tick (a `HostWatch`-driven check is a
         // later slice); a deferred quit rides the pending save until its ack.
-        if self.host_save_offtick {
+        if self.host_fs_offtick {
             match path.or_else(|| self.buffer().path.clone()) {
                 Some(target) => self.enqueue_save(target, then_quit),
                 None => self.echo("E32: No file name"),
@@ -1486,7 +1486,16 @@ impl Editor {
                 self.echo("E37: No write since last change (add ! to override)");
                 return;
             }
-            self.load_into_current(&path);
+            // Off-tick (daemon session): defer the re-read to the server, which
+            // fetches over the wire and replaces this buffer's content when it lands
+            // (`load_str_into`). The old content shows until then — a slow remote
+            // reload never freezes the editor.
+            if self.host_fs_offtick {
+                let buf = self.cur_buffer();
+                self.enqueue_open(buf, path);
+            } else {
+                self.load_into_current(&path);
+            }
             return;
         }
 
@@ -1501,6 +1510,24 @@ impl Editor {
         // A new file. Reuse a throwaway `[No Name]` buffer if that's all we have
         // (so the first `:e` doesn't strand an empty buffer 1); otherwise open it
         // in a fresh buffer and switch, keeping the current one open.
+        //
+        // Off-tick (daemon session): set up an *empty* buffer named for the file —
+        // reusing the throwaway, or a fresh one switched to — and enqueue the fetch.
+        // The server reads the bytes over the wire and fills the buffer off-tick, so
+        // the keystroke path keeps serving the (briefly empty) buffer meanwhile.
+        if self.host_fs_offtick {
+            let buf = if self.current_is_throwaway() {
+                let id = self.cur_buffer();
+                self.buffer_mut().set_path(Some(path.clone()));
+                id
+            } else {
+                let id = self.add_buffer(Buffer::named(path.clone()));
+                self.switch_buffer(id);
+                id
+            };
+            self.enqueue_open(buf, path);
+            return;
+        }
         if self.current_is_throwaway() {
             self.load_into_current(&path);
         } else {
@@ -1695,7 +1722,7 @@ impl Editor {
         // `host_fs`) in a remote session — which would scatter saves onto the wrong
         // machine — fail loud (per the project's no-silent-stubs rule) until a later
         // slice serializes the whole set over the wire.
-        if self.host_save_offtick {
+        if self.host_fs_offtick {
             self.echo("E5555: :wall over the daemon is not supported yet");
             return;
         }

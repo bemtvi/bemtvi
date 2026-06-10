@@ -9,39 +9,68 @@ use std::io;
 use std::path::Path;
 
 impl Server {
-    /// Apply the result of the off-tick fetch of the deferred startup file
-    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3, fs leg): an
-    /// existing file's bytes or a new-file marker load into a replica buffer; a read
-    /// error (a directory, a transport failure) is echoed loudly rather than left as
-    /// a silent empty buffer. The editor was already serving the client with an empty
-    /// `[No Name]` buffer while this fetch was in flight — that is the whole point of
-    /// fetching the remote file off the editor tick.
-    pub(crate) fn apply_initial_open(&mut self, path: String, result: io::Result<FsRead>) {
+    /// Apply the result of an off-tick fetch (`docs/plans/2026-06-09-edit-host-and-browser-lua.md`
+    /// → Phase 3, fs leg) into `buffer` — the deferred startup file (which fills the
+    /// initial `[No Name]` buffer) or a later `:edit`. An existing file's bytes or a
+    /// new-file marker load into the named replica buffer; a read error (a directory, a
+    /// transport failure) is echoed loudly rather than left as a silent empty buffer.
+    /// While the fetch was in flight the editor served the client with the (empty)
+    /// buffer — the whole point of fetching the remote file off the editor tick.
+    pub(crate) fn apply_open(
+        &mut self,
+        buffer: BufferId,
+        path: String,
+        result: io::Result<FsRead>,
+    ) {
         match result {
-            Ok(FsRead::File(bytes)) => self.load_replica(path, &String::from_utf8_lossy(&bytes)),
-            Ok(FsRead::New) => self.load_replica(path, ""),
+            Ok(FsRead::File(bytes)) => {
+                self.load_replica(buffer, path, &String::from_utf8_lossy(&bytes))
+            }
+            Ok(FsRead::New) => self.load_replica(buffer, path, ""),
             Err(e) => self
                 .editor
                 .echo(format!("nxvim: could not open {path} over the daemon: {e}")),
         }
     }
 
-    /// Load `contents` into the startup buffer as a replica of the remote file named
-    /// `path`, then fire the events a fresh read implies. `load_str` reuses the
-    /// throwaway `[No Name]` buffer (which already announced its file-less `BufEnter`
-    /// at startup), so clear it from `announced` to let the now-named buffer's
-    /// `BufReadPost`/`FileType` fire — `FileType` is what drives syntax and LSP. Then
-    /// refresh the Lua buffer snapshot/mirror and drive the queued autocmd work.
-    fn load_replica(&mut self, path: String, contents: &str) {
-        self.editor.load_str(Some(path), contents);
-        let buf = self.editor.current_buffer_id();
-        self.announced.remove(&buf);
-        let name = self.editor.buffer_name(buf).unwrap_or_default();
-        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
-        let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
+    /// Load `contents` into `buffer` as a replica of the remote file named `path`, then
+    /// fire the events a fresh read implies. `load_str_into` replaces the named buffer's
+    /// content in place; clearing it from `announced` lets the now-named buffer's
+    /// `BufReadPost`/`FileType` fire — `FileType` is what drives syntax and LSP. The
+    /// filetype comes from `path` directly (the buffer is named for it), so this works
+    /// whether or not `buffer` is current. Then refresh the Lua snapshot/mirror and
+    /// drive the queued autocmd work.
+    fn load_replica(&mut self, buffer: BufferId, path: String, contents: &str) {
+        self.editor
+            .load_str_into(buffer, Some(path.clone()), contents);
+        self.announced.remove(&buffer);
+        let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
         self.emit_lifecycle_events();
         self.run_pending();
+    }
+
+    /// Dispatch the buffer opens core deferred this convergence (off-tick `:edit` over
+    /// the daemon wire): each is fetched over `HostFsAsync` on a spawned task that
+    /// delivers `(buffer, path, result)` back to the `open_rx` arm, which fills the
+    /// named buffer. Called at the tail of [`run_pending`](Server::run_pending), so an
+    /// `:edit` from a keystroke, `vim.cmd('edit ...')`, or a user command is caught
+    /// after the editor converges. A no-op when off-tick mode is off or none ran.
+    pub(crate) fn drain_pending_opens(&mut self) {
+        let Some(fs) = self.host_fs_async.clone() else {
+            return;
+        };
+        for open in self.editor.take_pending_opens() {
+            let fs = fs.clone();
+            let tx = self.open_tx.clone();
+            let buffer = open.buffer;
+            let path = open.path.display().to_string();
+            tokio::spawn(async move {
+                let result = fs.read(path.clone()).await;
+                let _ = tx.send((buffer, path, result));
+            });
+        }
     }
 
     /// Diff the editor's current buffer against what was last announced and fire

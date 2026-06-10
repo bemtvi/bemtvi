@@ -116,8 +116,9 @@ pub struct ServerInit {
     /// bytes over the wire *after* the loop begins, then loads them into a replica
     /// buffer — so a slow remote read never freezes startup. `Send` (boxed) to ride
     /// onto the server thread, where it is rebuilt into an `Arc<dyn HostFsAsync>`.
-    /// (Only the initial open crosses this seam in this slice; `:edit` / `:write` /
-    /// the explorer still use the sync `host_fs`.)
+    /// (When set, the initial open, `:edit` (Phase 3f), and `:write` (Phase 3e) all
+    /// cross this seam off-tick; the explorer and `:tabnew`/LSP go-to still use the
+    /// sync `host_fs`.)
     pub host_fs_async: Option<Box<dyn HostFsAsync + Send>>,
 }
 
@@ -379,6 +380,10 @@ struct Server {
     /// buffer, dispatched in order as each ack frees the slot. A failed write fails
     /// (and drops) the rest of its buffer's queue loudly.
     saves_queued: HashMap<BufferId, VecDeque<PendingSave>>,
+    /// Sender half for off-tick buffer opens (the daemon `:edit` path). The startup
+    /// fetch and each `:edit`-spawned read deliver their `(buffer, path, result)` here;
+    /// the matching `select!` arm fills the named buffer with the fetched bytes.
+    open_tx: UnboundedSender<(BufferId, String, std::io::Result<FsRead>)>,
 }
 
 /// A finished `:TSInstall` job: the requested language and the install result
@@ -439,13 +444,14 @@ where
     let deferred_open = host_fs_async.as_ref().and(init.file.clone());
     let mut editor = match (&host_fs_async, init.file) {
         // Daemon fs: start empty regardless of `file`; the fetch task below loads it.
-        // A daemon session also writes off-tick — `:w` snapshots and enqueues a
-        // `PendingSave` (the save path, `save.rs`) instead of blocking the editor
-        // thread on the network — so turn on off-tick save mode here.
+        // A daemon session also does buffer I/O off-tick — `:w` snapshots and enqueues
+        // a `PendingSave` (the save path, `save.rs`) and `:edit` enqueues a
+        // `PendingOpen` fetch — instead of blocking the editor thread on the network,
+        // so turn on off-tick filesystem mode here.
         (Some(_), _) => {
             let mut editor = Editor::new();
             editor.set_host_fs(host_fs);
-            editor.set_host_save_offtick(true);
+            editor.set_host_fs_offtick(true);
             editor
         }
         (None, Some(path)) => Editor::open_or_named_with(path, host_fs),
@@ -457,14 +463,17 @@ where
     };
     // The off-tick fetch of the deferred startup file: read its bytes over the wire
     // and deliver them (or a read error) into the loop, where they load into a
-    // replica buffer. A bare/local session leaves this channel idle.
-    let (initial_tx, mut initial_open_rx) =
-        unbounded_channel::<(String, std::io::Result<FsRead>)>();
+    // replica buffer. The same channel carries later `:edit` opens (each tagged with
+    // the buffer to fill); a bare/local session leaves it idle. The startup file fills
+    // the editor's initial `[No Name]` buffer, so tag it with that buffer's id.
+    let (open_tx, mut open_rx) = unbounded_channel::<(BufferId, String, std::io::Result<FsRead>)>();
     if let (Some(fs), Some(path)) = (host_fs_async.as_ref(), deferred_open) {
         let fs = fs.clone();
+        let startup_buf = editor.current_buffer_id();
+        let open_tx = open_tx.clone();
         tokio::spawn(async move {
             let result = fs.read(path.clone()).await;
-            let _ = initial_tx.send((path, result));
+            let _ = open_tx.send((startup_buf, path, result));
         });
     }
     // The editor owns the in-process treesitter engine and queries it
@@ -559,6 +568,7 @@ where
         save_done_tx,
         saves_inflight: HashSet::new(),
         saves_queued: HashMap::new(),
+        open_tx,
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -688,12 +698,15 @@ where
                 }
                 server.settle_events(true);
             }
-            // The deferred startup file's bytes arrived from the daemon's fs — the
-            // off-tick fetch that kept a slow remote read from freezing startup. Load
-            // them into a replica buffer (or echo a read error) and repaint. Fires at
-            // most once; idle for a bare/local session.
-            Some((path, result)) = initial_open_rx.recv() => {
-                server.apply_initial_open(path, result);
+            // Bytes for an off-tick open arrived from the daemon's fs — the startup
+            // file (kept from freezing startup) or a later `:edit`. Load them into the
+            // named replica buffer (or echo a read error) and repaint. Idle for a
+            // bare/local session.
+            Some((buffer, path, result)) = open_rx.recv() => {
+                server.apply_open(buffer, path, result);
+                while let Ok((buffer, path, result)) = open_rx.try_recv() {
+                    server.apply_open(buffer, path, result);
+                }
                 server.settle_events(true);
             }
             // A `:TSInstall` background job finished (grammar fetched + compiled, or

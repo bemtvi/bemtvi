@@ -40,6 +40,21 @@ pub struct PendingSave {
     pub then_quit: Option<bool>,
 }
 
+/// A buffer open the editor **deferred** off the keystroke tick — `:edit` over the
+/// daemon wire (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3f). In a
+/// daemon session core does *not* read through the synchronous [`HostFs`](crate::HostFs)
+/// (that would block the one editor thread on the network); `:edit` creates an empty
+/// buffer named for the file, switches to it, and enqueues one of these. The server
+/// fetches the bytes over `HostFsAsync` off-tick and fills the buffer with
+/// [`Editor::load_str_into`] — the read companion to [`PendingSave`].
+pub struct PendingOpen {
+    /// The (already-created, empty) buffer to fill once the fetch lands. Targeted by id
+    /// so the load is correct even if the user switched away while it was in flight.
+    pub buffer: BufferId,
+    /// The file to fetch — the `:edit {path}` argument (or the reloaded buffer's path).
+    pub path: PathBuf,
+}
+
 impl Editor {
     /// Set a buffer-local option on buffer `id` from outside the editor (the Lua
     /// `vim.bo` / `nvim_set_option_value` bridge). `value` is the option's scalar:
@@ -200,14 +215,15 @@ impl Editor {
         buf.mark_clean();
     }
 
-    /// Turn on **off-tick save mode**: `:w` (and the write half of `:wq` / `:x`)
-    /// snapshots the buffer and enqueues a [`PendingSave`] instead of writing through
-    /// the synchronous [`HostFs`](crate::HostFs). The orchestration layer (the server
-    /// in a daemon session) performs the write off the editor tick and calls
-    /// [`Editor::finalize_save`] on the ack. Off by default — local builds write
-    /// synchronously through `host_fs` exactly as before.
-    pub fn set_host_save_offtick(&mut self, on: bool) {
-        self.host_save_offtick = on;
+    /// Turn on **off-tick filesystem mode**: `:w` (and the write half of `:wq` / `:x`)
+    /// snapshots the buffer and enqueues a [`PendingSave`], and `:edit` enqueues a
+    /// [`PendingOpen`] fetch, instead of touching the synchronous
+    /// [`HostFs`](crate::HostFs). The orchestration layer (the server in a daemon
+    /// session) performs the read/write off the editor tick — `finalize_save` on a
+    /// write ack, `load_str_into` on a read reply. Off by default — local builds do
+    /// buffer I/O synchronously through `host_fs` exactly as before.
+    pub fn set_host_fs_offtick(&mut self, on: bool) {
+        self.host_fs_offtick = on;
     }
 
     /// Drain the writes the editor deferred this tick (off-tick save mode). The
@@ -253,6 +269,55 @@ impl Editor {
         }
         self.buffers.get_mut(buffer).buffer.mark_written(path, stat);
         self.mark_undo_saved(buffer);
+    }
+
+    /// Drain the opens the editor deferred this tick (off-tick mode — `:edit` over the
+    /// daemon wire). The server fetches each over `HostFsAsync` and fills the named
+    /// buffer with [`Editor::load_str_into`]. Empty (a cheap no-op) when off-tick mode
+    /// is off or no `:edit` ran.
+    pub fn take_pending_opens(&mut self) -> Vec<PendingOpen> {
+        std::mem::take(&mut self.pending_opens)
+    }
+
+    /// Enqueue an off-tick fetch of `path` into `buffer` (an already-created, empty
+    /// buffer the caller has set up and, for `:edit`, switched to). The server reads
+    /// the bytes off the editor tick and loads them into `buffer` via
+    /// [`Editor::load_str_into`] — the read analogue of [`Editor::enqueue_save`].
+    pub(crate) fn enqueue_open(&mut self, buffer: BufferId, path: PathBuf) {
+        self.pending_opens.push(PendingOpen { buffer, path });
+    }
+
+    /// Load `contents` into `buffer` as a freshly-read replica of the file named
+    /// `name` — the buffer-targeted form of [`Editor::load_str`], used by the server
+    /// when an off-tick fetch (initial open or `:edit`) lands. Replaces the buffer's
+    /// text in place (preserving its id), binds the name, marks it unmodified, and
+    /// rebuilds the undo tree rooted at the read state (undo cannot cross the read).
+    /// When `buffer` is the current one, the window's cursor/scroll reset to the top,
+    /// as opening a file does; when it isn't (the user switched away mid-fetch), only
+    /// that buffer's content changes and the live window is left untouched. A no-op if
+    /// `buffer` was closed before the fetch landed.
+    pub fn load_str_into(&mut self, buffer: BufferId, name: Option<String>, contents: &str) {
+        if !self.buffers.map.contains_key(&buffer) {
+            return;
+        }
+        let is_current = buffer == self.cur_buffer();
+        let ob = self.buffers.get_mut(buffer);
+        let len = ob.buffer.len_bytes();
+        ob.buffer.remove(0..len);
+        ob.buffer.insert(0, contents);
+        ob.buffer.normalize();
+        ob.buffer.set_path(name.map(std::path::PathBuf::from));
+        ob.buffer.mark_clean();
+        // The whole rope was replaced — flag a syntax re-sync (as `load_into_current`
+        // does), then root a fresh undo tree at this saved state.
+        ob.buffer.mark_resync();
+        ob.undo = UndoTree::new(&ob.buffer);
+        ob.saved_seq = Some(ob.undo.cur_seq());
+        if is_current {
+            self.cursor = Cursor::default();
+            self.top = 0;
+            self.leftcol = 0;
+        }
     }
 
     /// Make `id` the current buffer: stash the outgoing window position with its

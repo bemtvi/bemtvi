@@ -483,11 +483,12 @@ not block startup. Regression-clean — full `nxvim-server` suite (now 19 binari
 `nxvim`/`nxvim-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
 `-D warnings` all green.
 
-**Still to do on the fs leg (after 3e):** `:edit` / `:read` over the wire (still use
-the sync `host_fs`, i.e. local disk, in a remote session today), remote
-**directory/explorer** listing (`read_dir` over the wire — currently a loud error), and
-`FileChangedShell` from a daemon `watch`. The async seam + replica pattern this slice
-established is what those extend. (The **save** path landed next — Phase 3e below.)
+**Still to do on the fs leg (after 3e/3f):** remote **directory/explorer** listing
+(`read_dir` over the wire — currently a loud error), `:tabnew {file}` / LSP go-to (still
+sync), and `FileChangedShell` from a daemon `watch`. The async seam + replica pattern
+these slices established is what those extend. (The **save** path landed in Phase 3e and
+`:edit` in Phase 3f, both below. `:read`/`:r` is *not implemented* in nxvim at all, so
+there is nothing to route over the wire — it would be a new feature, not a wire slice.)
 
 **The save slice must define its semantics up front — write is the hard half of
 off-tick** (read got done first for a reason: it's idempotent and cancelable;
@@ -574,6 +575,57 @@ and surfaces the failure **loudly** on the message line — proving the quit is 
 local binaries (`nxvim`, `nxvim-gui`) leave off-tick mode off and write synchronously
 through the sync `host_fs`, unchanged.
 
+### Phase 3f — the daemon wire protocol (filesystem half, `:edit` over the wire) — ✅ DONE (2026-06-10)
+
+The runtime-open companion to 3d's *initial* open: where 3d fetched the startup file
+off-tick, this routes `:edit {file}` through the **same async `HostFsAsync` + replica
+path** so opening a second file at runtime crosses the wire instead of reading the
+edit-host's local disk. Reuses 3d's read leg verbatim — **no new wire** — and unifies the
+two open paths onto one channel and one applier.
+
+The off-tick shape is the read mirror of 3e's save: core does **not** read through the
+synchronous [`HostFs`] in a daemon session (that would block the one editor thread on the
+network). `:edit` instead **creates an empty buffer named for the file, switches to it,
+and enqueues a [`PendingOpen`]**; the server fetches the bytes over `HostFsAsync` off the
+editor tick and fills that buffer with [`Editor::load_str_into`]. The keystroke path keeps
+serving the (briefly empty) buffer the whole time — a slow remote `:e` never freezes
+typing, the exact failure mode Open Decision #5 ruled out for buffer opens.
+
+Shipped:
+- **Core** (`nxvim-core`): the off-tick flag generalized `host_save_offtick` →
+  `host_fs_offtick` (it now gates reads *and* writes). A `PendingOpen { buffer, path }`
+  queue drained with `take_pending_opens`, `enqueue_open`, and **`load_str_into(buffer,
+  name, contents)`** — the buffer-*targeted* form of `load_str` (replaces the named
+  buffer's text in place, binds the name, marks clean, flags a syntax re-sync, roots a
+  fresh undo tree; resets the window's cursor/scroll only when that buffer is current, so
+  a mid-fetch buffer switch can't disturb the live window). `ex_edit`'s file cases
+  (reload-current, new-file via throwaway reuse or a fresh switched-to buffer) enqueue an
+  off-tick open instead of `Buffer::from_file` when the flag is set; `:e dir` (explorer)
+  stays sync.
+- **Server**: the startup and `:edit` opens were **unified** onto one channel
+  (`(BufferId, String, io::Result<FsRead>)`) and one applier — `apply_initial_open` →
+  buffer-targeted **`apply_open`** + a shared `load_replica` (now keyed by buffer id, the
+  filetype taken from the path so it works whether or not the buffer is current).
+  `drain_pending_opens` (tail of `run_pending`, beside `drain_pending_saves`) spawns a
+  `HostFsAsync::read` per `PendingOpen` and delivers the result to the `open_rx` arm.
+- **Rides for free:** `:split {file}` / `:vsplit {file}` delegate to `ex_edit`, so they
+  cross the wire too. **Still sync (documented):** `:tabnew {file}` (its own
+  `from_file`), LSP go-to / `jump_to`, and the explorer — later micro-slices on the same
+  pattern.
+- **`:read`/`:r` is *not implemented* in nxvim** (confirmed: no dispatch arm), so there
+  was nothing to route — it would be a new feature, out of this slice.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_edit.rs`: `:edit
+/virtual/other.txt` fills a new buffer with a *second* file's bytes fetched over the wire
+(a `/virtual/...` path the local disk can't hold — the 3d/3e faithfulness argument);
+`:edit` of a not-yet-existing path opens an empty new-file buffer named for it; and `:e!`
+reload-in-place **refetches** over the wire (a content change made on the daemon after
+the open shows up after the reload — proving a real re-read, not just a local-edit
+discard). Regression-clean — full `cargo test --workspace` green (now 21 server test
+binaries, incl. the unchanged `daemon_fs` initial-open suite proving the unification
+didn't regress 3d), fmt + clippy `-D warnings` clean; local binaries leave off-tick mode
+off and open synchronously, unchanged.
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -627,9 +679,9 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
   async `HostFsAsync` seam (Open Decision #5, resolved) → populate the rope via
   `Editor::load_str`; save = snapshot the rope and push the bytes back off-tick,
   finalizing the saved-state on the ack. The rope is authoritative for open
-  buffers; core sees a normal local buffer. (Initial open landed in Phase 3d and the
-  single-buffer **save** in Phase 3e; `:edit` / `:read`, multi-buffer `:wall`, and
-  explorer listing are the remaining fs-leg slices.)
+  buffers; core sees a normal local buffer. (Initial open landed in Phase 3d, the
+  single-buffer **save** in Phase 3e, and **`:edit`** in Phase 3f; multi-buffer `:wall`,
+  `:tabnew {file}` / LSP go-to, and explorer listing are the remaining fs-leg slices.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call

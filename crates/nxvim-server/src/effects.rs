@@ -1290,6 +1290,9 @@ impl Server {
         // batch boundary, after everything has settled. Idempotent: a no-op when
         // nothing changed since the last per-key diff (the common case).
         self.emit_lifecycle_events();
+        // Route any writes core deferred this convergence onto the daemon wire
+        // (off-tick save mode). A no-op when off-tick saves are off or no `:w` ran.
+        self.drain_pending_saves();
     }
 }
 

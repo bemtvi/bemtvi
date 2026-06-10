@@ -428,17 +428,19 @@ impl Editor {
         match name {
             "w" | "write" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
-                    self.ex_write(&a, bang);
+                    self.ex_write(&a, bang, None);
                 }
             }
             "q" | "quit" => self.ex_quit(bang),
             "wq" | "x" | "xit" | "exit" => {
                 // Write the current buffer, then `:q` it (close the window, or
                 // quit on the last window). A failed write leaves the buffer
-                // modified, so a last-window quit then reports it.
+                // modified, so a last-window quit then reports it. `ex_write`
+                // performs the quit itself (synchronously after the write, or
+                // deferred to the daemon ack in off-tick save mode) so the two
+                // stay coupled across both paths.
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
-                    self.ex_write(&a, bang);
-                    self.ex_quit(bang);
+                    self.ex_write(&a, bang, Some(bang));
                 }
             }
             "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
@@ -1330,12 +1332,29 @@ impl Editor {
         }
     }
 
-    fn ex_write(&mut self, args: &str, bang: bool) {
+    /// `:w` (and the write half of `:wq` / `:x`, which pass `then_quit`). In a daemon
+    /// session (off-tick save mode) this *snapshots and enqueues* the write instead of
+    /// touching the filesystem — the server pushes the bytes over the wire and
+    /// finalizes the saved-state on the ack — so a slow remote write never freezes the
+    /// editor; otherwise it writes synchronously through `host_fs` exactly as before.
+    fn ex_write(&mut self, args: &str, bang: bool, then_quit: Option<bool>) {
         let path = if args.is_empty() {
             None
         } else {
             Some(PathBuf::from(args))
         };
+        // Off-tick save (daemon session): resolve the target (arg, else bound path),
+        // snapshot, and enqueue — the disk-change guard and the actual write happen
+        // off the editor tick. The guard can't run here anyway: it needs a remote
+        // stat, which we've sworn off on the tick (a `HostWatch`-driven check is a
+        // later slice); a deferred quit rides the pending save until its ack.
+        if self.host_save_offtick {
+            match path.or_else(|| self.buffer().path.clone()) {
+                Some(target) => self.enqueue_save(target, then_quit),
+                None => self.echo("E32: No file name"),
+            }
+            return;
+        }
         // Refuse to overwrite a file that changed on disk since we read or last
         // saved it, unless forced with `:w!`. The guard only applies to a write to
         // the buffer's *own* file — `:w other-name` targets a different file the
@@ -1367,6 +1386,13 @@ impl Editor {
                 self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
             }
             Err(e) => self.echo(e.to_string()),
+        }
+        // The synchronous companion to a deferred quit: `:wq` / `:x` close the
+        // window (or quit) right after the write, exactly as the old call site did.
+        // (A failed write leaves the buffer modified, so a last-window quit reports
+        // E37 — same as before.)
+        if let Some(bang) = then_quit {
+            self.ex_quit(bang);
         }
     }
 
@@ -1663,6 +1689,16 @@ impl Editor {
     /// quit — so the user lands on the file at risk rather than silently losing
     /// the outside edit.
     fn ex_write_all(&mut self, bang: bool) {
+        // Multi-buffer write over the daemon wire isn't wired yet: the off-tick save
+        // path (Phase 3e) covers the single-buffer `:w` / `:wq` / `:x`. Rather than
+        // silently writing every modified buffer to the *local* disk (the sync
+        // `host_fs`) in a remote session — which would scatter saves onto the wrong
+        // machine — fail loud (per the project's no-silent-stubs rule) until a later
+        // slice serializes the whole set over the wire.
+        if self.host_save_offtick {
+            self.echo("E5555: :wall over the daemon is not supported yet");
+            return;
+        }
         let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
         let fs = self.host_fs.clone();
         let mut written = 0;

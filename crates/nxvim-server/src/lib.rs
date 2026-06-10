@@ -29,6 +29,7 @@ mod keymap;
 mod lifecycle;
 mod lsp;
 mod redraw;
+mod save;
 mod treesitter;
 
 /// The process-spawning seam (`vim.system` / `jobstart` / `:!`) and its types,
@@ -54,7 +55,7 @@ use lsp::{
     CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
 };
-use nxvim_core::{BufferId, Editor, HostFs, Key, Mode, StdHostFs, TabId, WindowId};
+use nxvim_core::{BufferId, Editor, HostFs, Key, Mode, PendingSave, StdHostFs, TabId, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
@@ -361,6 +362,23 @@ struct Server {
     /// Monotonic redraw counter handed to decoration providers as the frame `tick`
     /// (neovim's display tick). Incremented once per [`Server::run_decoration_providers`].
     decor_tick: u64,
+    /// The async daemon filesystem, when a daemon session injected one. Buffer opens
+    /// are fetched through it off-tick (`apply_initial_open`); `:w` writes are pushed
+    /// through it off-tick too (the save path, `save.rs`). `None` for a local session
+    /// (the editor writes synchronously through its sync `host_fs`).
+    host_fs_async: Option<Arc<dyn HostFsAsync>>,
+    /// Sender half for finished off-tick writes (the daemon save path). Each spawned
+    /// `fs_write` task delivers its [`SaveDone`](crate::save) here; the matching
+    /// `select!` arm finalizes the buffer's saved-state and replays any deferred quit.
+    save_done_tx: UnboundedSender<save::SaveDone>,
+    /// Buffers with an off-tick write currently on the wire — at most one per buffer,
+    /// so a buffer's overlapping `:w`s serialize (snapshot order = wire order) rather
+    /// than racing. Cleared when the write acks.
+    saves_inflight: HashSet<BufferId>,
+    /// Off-tick writes waiting their turn behind an in-flight write to the *same*
+    /// buffer, dispatched in order as each ack frees the slot. A failed write fails
+    /// (and drops) the rest of its buffer's queue loudly.
+    saves_queued: HashMap<BufferId, VecDeque<PendingSave>>,
 }
 
 /// A finished `:TSInstall` job: the requested language and the install result
@@ -421,9 +439,13 @@ where
     let deferred_open = host_fs_async.as_ref().and(init.file.clone());
     let mut editor = match (&host_fs_async, init.file) {
         // Daemon fs: start empty regardless of `file`; the fetch task below loads it.
+        // A daemon session also writes off-tick — `:w` snapshots and enqueues a
+        // `PendingSave` (the save path, `save.rs`) instead of blocking the editor
+        // thread on the network — so turn on off-tick save mode here.
         (Some(_), _) => {
             let mut editor = Editor::new();
             editor.set_host_fs(host_fs);
+            editor.set_host_save_offtick(true);
             editor
         }
         (None, Some(path)) => Editor::open_or_named_with(path, host_fs),
@@ -484,6 +506,10 @@ where
     // `:TSInstall` runs the fetch+compile off-thread (`spawn_blocking`); results
     // come back here and are applied on the one server thread.
     let (install_tx, mut install_events) = unbounded_channel::<InstallOutcome>();
+    // Off-tick `:w`s (the daemon save path) push their bytes over the wire from a
+    // spawned task; the finished write comes back here and finalizes on the one
+    // server thread. Idle for a local/bare session (no daemon fs → no off-tick saves).
+    let (save_done_tx, mut save_done_rx) = unbounded_channel::<save::SaveDone>();
 
     let mut server = Server {
         editor,
@@ -529,6 +555,10 @@ where
         install_tx,
         ephemeral_extmarks: HashMap::new(),
         decor_tick: 0,
+        host_fs_async: host_fs_async.clone(),
+        save_done_tx,
+        saves_inflight: HashSet::new(),
+        saves_queued: HashMap::new(),
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -675,6 +705,21 @@ where
                     server.on_install_done(outcome);
                 }
                 server.settle_events(true);
+            }
+            // An off-tick `:w` finished on the daemon (the save path): finalize the
+            // buffer's saved-state, echo `written`, and replay any deferred `:wq`/`:x`
+            // quit. The replayed quit can ask the editor to exit, so check `should_quit`
+            // here too — this is the one non-input arm that can set it.
+            Some(done) = save_done_rx.recv() => {
+                server.apply_save_done(done);
+                while let Ok(done) = save_done_rx.try_recv() {
+                    server.apply_save_done(done);
+                }
+                server.settle_events(true);
+                if server.editor.should_quit {
+                    server.rpc.notify("nxvim_exit", vec![]);
+                    break;
+                }
             }
         }
     }

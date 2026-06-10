@@ -483,11 +483,11 @@ not block startup. Regression-clean — full `nxvim-server` suite (now 19 binari
 `nxvim`/`nxvim-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
 `-D warnings` all green.
 
-**Still to do on the fs leg:** `:edit` / `:read` and the **save** path over the wire
-(both still use the sync `host_fs`, i.e. local disk, in a remote session today), remote
+**Still to do on the fs leg (after 3e):** `:edit` / `:read` over the wire (still use
+the sync `host_fs`, i.e. local disk, in a remote session today), remote
 **directory/explorer** listing (`read_dir` over the wire — currently a loud error), and
 `FileChangedShell` from a daemon `watch`. The async seam + replica pattern this slice
-established is what those extend.
+established is what those extend. (The **save** path landed next — Phase 3e below.)
 
 **The save slice must define its semantics up front — write is the hard half of
 off-tick** (read got done first for a reason: it's idempotent and cancelable;
@@ -506,6 +506,73 @@ write is neither). The contract for an async `:w`:
 - **Per-buffer serialization.** Overlapping `:w`s on one buffer queue in order
   (snapshot order = wire order); a failed earlier write fails the queue loudly
   rather than letting a later snapshot paper over it.
+
+### Phase 3e — the daemon wire protocol (filesystem half, the save path) — ✅ DONE (2026-06-10)
+
+The symmetric companion to 3d's off-tick *read*, and the **hard half** the contract
+above warned about: read is idempotent and cancelable, write is neither. Scoped to the
+**single-buffer save** (`:w` / `:w {name}` / `:wq` / `:x` / `:exit`) — the same "prove
+the path, defer the rest" discipline 3d used for the initial open. (Slice direction
+confirmed with the requester, 2026-06-10.)
+
+The shape mirrors 3d's read: core's [`HostFs`] is **synchronous** and a daemon-backed
+write must *not* block the single editor thread on the network (Open Decision #5 —
+exactly the frozen-screen-on-`:w` failure this plan exists to kill). So the write goes
+**off-tick** too: core does not write through the sync `HostFs` in a daemon session — it
+**snapshots the buffer at command time** into a [`PendingSave`] and the server pushes
+those bytes over the wire, finalizing the buffer's saved-state only on the daemon's ack.
+
+Shipped:
+- **The wire** — one `nxvim-rpc` **request** added alongside 3c/3d in `daemon.rs`:
+  `fs_write [path, bytes]` → `["ok", stat?]` (the post-write [`FileStat`] the edit-host
+  stamps as its `disk` baseline — no remote stat round-trip) or a loud RPC **error** (a
+  permission/transport failure; never a silent success). `serve_fs_daemon` does the
+  atomic write through the *same* sync [`HostFs`] the local server uses, so a fake and
+  the real disk behave identically.
+- **The off-tick save seam in core** (`nxvim-core`): an opt-in `host_save_offtick` flag
+  (the server sets it whenever a daemon fs is present), a `PendingSave` queue the server
+  drains with `take_pending_saves`, and `finalize_save(buffer, path, stat)` — the
+  deferred half of a synchronous `:w` (bind name, stamp `disk`, clear `[+]`, bump
+  `save_tick`, record the saved undo node), run only on the ack. `ex_write` enqueues a
+  snapshot instead of writing when the flag is set; the disk-change guard is skipped on
+  this path (it needs a remote stat we've sworn off the tick — a `HostWatch`-driven
+  check is a later slice). `Buffer::to_save_bytes` / `Buffer::mark_written` keep the
+  buffer invariants encapsulated.
+- **The server orchestration** (`save.rs`): `drain_pending_saves` (at the tail of
+  `run_pending`, so a `:w` from a keystroke, `vim.cmd('w')`, or a user command is all
+  caught) dispatches each snapshot over `fs_write` on a spawned task, **serialized per
+  buffer** (at most one write in flight per buffer; the rest queue in snapshot order). A
+  new `select!` arm applies each ack: `finalize_save` + the `"{name}" {lines}L, {bytes}B
+  written` echo + dispatch the buffer's next queued write. On failure it surfaces loudly
+  and **fails the buffer's whole queue** rather than letting a later snapshot paper over
+  the gap.
+- **Quit waits for the ack.** `:wq` / `:x` carry a `then_quit` on the pending save; core
+  does *not* run the synchronous quit in off-tick mode. The server **replays** the quit
+  (`:q` / `:q!`) only after the write finalizes — a clean buffer, so no spurious E37 — and
+  a **failed** write *cancels* the quit (the buffer stays modified, the editor stays up).
+  An unflushed write is never silently abandoned by an exiting editor.
+
+**Scoped out (fail loud, not silent):** multi-buffer `:wall` / `:wqa` / `:xa` echo
+`E5555: :wall over the daemon is not supported yet` in off-tick mode rather than
+silently writing every modified buffer to the *local* disk (the wrong machine) — the
+all-buffers-ack-then-quit machinery is a later slice. `BufWritePre`/`BufWritePost`
+autocmds aren't emitted anywhere in nxvim yet (the contract's snapshot-after-`BufWritePre`
+point is moot until they exist); the observable saved-state is `modified` / `save_tick` /
+the `written` echo, all ack-gated here.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_save.rs`: an editor whose
+`host_fs_async` is a `RemoteHostFs` talking to a `serve_fs_daemon` over an in-process
+duplex edits a `/virtual/...` buffer (a path its *local* disk can't hold) and `:w`s it —
+the **edited** bytes appear in the daemon fake, so they can only have crossed the wire
+(the faithfulness argument 3d makes), and `vim.bo.modified` clears **only after** the
+ack. A second test proves `:wq` defers its quit until the write acks, then exits with the
+bytes already on the daemon. A third proves a **failing** daemon write *cancels* the
+`:wq` quit (the editor stays running, the buffer stays modified, the daemon gets nothing)
+and surfaces the failure **loudly** on the message line — proving the quit is gated on a
+*successful* ack, not fired optimistically. Regression-clean — full `cargo test
+--workspace` green (now 20 server test binaries), fmt + clippy `-D warnings` clean; the
+local binaries (`nxvim`, `nxvim-gui`) leave off-tick mode off and write synchronously
+through the sync `host_fs`, unchanged.
 
 ### The full split
 
@@ -558,9 +625,11 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
 
 - **Buffers are local replicas** (Monaco-style). Open = off-tick fetch via the
   async `HostFsAsync` seam (Open Decision #5, resolved) → populate the rope via
-  `Editor::load_str`; save = push bytes back. The rope is authoritative for open
-  buffers; core sees a normal local buffer. (Landed for the *initial* open in
-  Phase 3d; `:edit` / save / explorer listing are the remaining fs-leg slices.)
+  `Editor::load_str`; save = snapshot the rope and push the bytes back off-tick,
+  finalizing the saved-state on the ack. The rope is authoritative for open
+  buffers; core sees a normal local buffer. (Initial open landed in Phase 3d and the
+  single-buffer **save** in Phase 3e; `:edit` / `:read`, multi-buffer `:wall`, and
+  explorer listing are the remaining fs-leg slices.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call

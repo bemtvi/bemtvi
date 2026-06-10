@@ -564,6 +564,28 @@ impl Buffer {
         Ok((contents.len(), lines))
     }
 
+    /// The exact bytes [`Buffer::write`] would persist — the rope's contents,
+    /// including the maintained trailing newline. For an *off-core* write that
+    /// pushes the bytes elsewhere (the daemon save path snapshots them at command
+    /// time and sends them over the wire; the browser writes via the File System
+    /// Access API), paired with [`Buffer::mark_written`] once the write lands.
+    pub fn to_save_bytes(&self) -> Vec<u8> {
+        self.text.to_string().into_bytes()
+    }
+
+    /// Record a completed *external* write of this buffer to `path` (the in-buffer
+    /// half of [`Buffer::write`], minus the I/O): bind the name, stamp `stat` as the
+    /// new [`disk_changed`](Buffer::disk_changed) baseline so the next check doesn't
+    /// false-positive on our own write, clear `[+]`, and bump `save_tick`. The daemon
+    /// save path calls this on the ack — never optimistically at send time — so the
+    /// saved-state reflects bytes that are actually on the remote.
+    pub fn mark_written(&mut self, path: PathBuf, stat: Option<FileStat>) {
+        self.disk = stat;
+        self.path = Some(path);
+        self.modified = false;
+        self.save_tick += 1;
+    }
+
     /// Whether the bound file changed on disk since nxvim last read or wrote it —
     /// i.e. something *other* than this buffer touched it. Re-stats the file and
     /// compares its mtime/size against the snapshot from the last read/write.

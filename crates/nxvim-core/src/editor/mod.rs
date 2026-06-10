@@ -50,6 +50,8 @@ pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
 pub(crate) use self::multicursor::PlacementSnapshot;
+// The off-tick save request (the daemon / edit-host save path, Phase 3e).
+pub use self::buffers::PendingSave;
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
@@ -701,6 +703,20 @@ pub struct Editor {
     /// can still lend it without aliasing `self`; core is single-threaded, so the
     /// non-atomic refcount is free.
     host_fs: Rc<dyn HostFs>,
+    /// Off-tick save mode (the daemon / edit-host save path,
+    /// `docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3e): when set,
+    /// `:w` snapshots the buffer into [`Editor::pending_saves`] instead of writing
+    /// through [`Editor::host_fs`], so a remote write never blocks the editor thread.
+    /// Off by default — local builds write synchronously. Set via
+    /// [`Editor::set_host_save_offtick`].
+    host_save_offtick: bool,
+    /// Writes deferred this tick under off-tick save mode, drained by the server with
+    /// [`Editor::take_pending_saves`] (the save analogue of [`Editor::prompt_results`]
+    /// / [`Editor::panel_selects`]). Always empty when off-tick mode is off.
+    pending_saves: Vec<PendingSave>,
+    /// Monotonic id for the next [`PendingSave`], so the server can correlate acks and
+    /// keep a buffer's overlapping writes ordered.
+    next_save_seq: u64,
 }
 
 impl Editor {
@@ -862,6 +878,9 @@ impl Editor {
             ts_override: HashMap::new(),
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
+            host_save_offtick: false,
+            pending_saves: Vec::new(),
+            next_save_seq: 0,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

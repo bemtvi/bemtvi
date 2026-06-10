@@ -42,13 +42,23 @@
 //!
 //! | direction | method | reply |
 //! | --- | --- | --- |
-//! | edit-host → daemon | `fs_read [path]` | `["file", bytes]` / `["new"]`, or an RPC error |
+//! | edit-host → daemon | `fs_read [path]`         | `["file", bytes]` / `["new"]`, or an RPC error |
+//! | edit-host → daemon | `fs_write [path, bytes]` | `["ok", stat?]`, or an RPC error                |
 //!
-//! **Scope (this slice): the initial buffer open only.** `serve_fs_daemon` reads an
-//! existing file (`file`) or reports a not-yet-existing one as a new-file buffer
-//! (`new`); a directory or any other error comes back as a loud RPC error (remote
-//! directory/explorer open, the save path, and `:edit` are later sub-slices — the
-//! sync [`HostFs`] still backs those, on local disk).
+//! `serve_fs_daemon` reads an existing file (`file`) or reports a not-yet-existing one
+//! as a new-file buffer (`new`); a directory or any other read error comes back as a
+//! loud RPC error (remote directory/explorer open is a later sub-slice). `fs_write`
+//! does the atomic write through the same sync [`HostFs`] and replies with the new
+//! [`FileStat`](nxvim_core::FileStat) (so the edit-host can stamp its `disk` snapshot
+//! without a remote stat round-trip), or a loud error.
+//!
+//! **The save path is off-tick, like the read** (`docs/plans/…` → Phase 3e, *the save
+//! slice*): core does *not* write through the sync [`HostFs`](nxvim_core::HostFs) in a
+//! daemon session — it snapshots the buffer at command time and enqueues a
+//! [`PendingSave`](nxvim_core::PendingSave); the server pushes those bytes over
+//! `fs_write` off the editor tick and finalizes the buffer's saved-state only on the
+//! daemon's ack, so a slow remote write never freezes typing. (`:edit` / `:read` and
+//! remote directory listing still use the sync [`HostFs`], on local disk, for now.)
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -57,19 +67,21 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, UNIX_EPOCH};
 
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use nxvim_core::HostFs;
+use nxvim_core::{FileStat, HostFs};
 use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
 use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 
 const FS_READ: &str = "fs_read";
+const FS_WRITE: &str = "fs_write";
 
 // Wire method names. Kept as constants so the two halves can never drift on a typo.
 const PROC_SPAWN: &str = "proc_spawn";
@@ -438,6 +450,18 @@ pub enum FsRead {
 pub trait HostFsAsync: Send + Sync {
     /// Fetch `path`'s contents for an initial buffer open (or report it new).
     fn read(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<FsRead>> + Send>>;
+
+    /// Atomically write `bytes` to `path` (the off-tick `:w`). Resolves to the file's
+    /// new [`FileStat`] on success — which the editor stamps as its `disk` baseline so
+    /// a later change check doesn't false-positive on our own write — or a loud error
+    /// (a failed write is never silently dropped; the contract is that the editor's
+    /// saved-state clears *only* on this ack). `None` stat means the write succeeded
+    /// but the daemon could not stat the result.
+    fn write(
+        &self,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Option<FileStat>>> + Send>>;
 }
 
 /// A [`HostFsAsync`] that reads files from a remote daemon over the wire. `read`
@@ -481,6 +505,29 @@ impl HostFsAsync for RemoteHostFs {
             }
         })
     }
+
+    fn write(
+        &self,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Option<FileStat>>> + Send>> {
+        let rpc = self.rpc.clone();
+        Box::pin(async move {
+            match rpc
+                .request(FS_WRITE, vec![Value::from(path), Value::Binary(bytes)])
+                .await
+            {
+                Ok(Value::Array(a)) => decode_fs_write(&a),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fs_write: malformed reply",
+                )),
+                // A daemon error (permission, transport gone) is a loud write
+                // failure the editor surfaces — the saved-state never clears on it.
+                Err(e) => Err(io::Error::other(e.to_string())),
+            }
+        })
+    }
 }
 
 /// `["file", bytes]` / `["new"]` → [`FsRead`]; anything else is a malformed reply.
@@ -501,6 +548,47 @@ fn decode_fs_read(a: &mut [Value]) -> io::Result<FsRead> {
     }
 }
 
+/// `["ok", stat?]` → the post-write [`FileStat`] (or `None`); any other tag is a
+/// malformed reply. A daemon *error* never reaches here — it comes back as the RPC
+/// `Err` arm in [`RemoteHostFs::write`], a loud failure, not an `["ok", …]`.
+fn decode_fs_write(a: &[Value]) -> io::Result<Option<FileStat>> {
+    match a.first().and_then(Value::as_str) {
+        Some("ok") => Ok(a.get(1).and_then(decode_stat)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fs_write: unknown reply tag",
+        )),
+    }
+}
+
+/// A [`FileStat`] on the wire: `[secs, nanos, size]`, where `secs`/`nanos` are the
+/// mtime as a duration past the Unix epoch (a `nil` mtime — platform reports none —
+/// becomes a nil `secs`). Kept self-contained so both legs agree on the shape.
+fn encode_stat(stat: &FileStat) -> Value {
+    let (secs, nanos) = match stat.mtime.and_then(|t| t.duration_since(UNIX_EPOCH).ok()) {
+        Some(d) => (Value::from(d.as_secs()), Value::from(d.subsec_nanos())),
+        None => (Value::Nil, Value::from(0u32)),
+    };
+    Value::Array(vec![secs, nanos, Value::from(stat.size)])
+}
+
+/// Inverse of [`encode_stat`]: `[secs, nanos, size]` → [`FileStat`], or `None` if the
+/// value isn't a well-formed stat triple (so a missing/garbled stat degrades to "no
+/// baseline" rather than erroring the whole write).
+fn decode_stat(v: &Value) -> Option<FileStat> {
+    let a = v.as_array()?;
+    let size = a.get(2)?.as_u64()?;
+    let mtime = match a.first() {
+        Some(secs) if !secs.is_nil() => {
+            let secs = secs.as_u64()?;
+            let nanos = a.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Some(UNIX_EPOCH + Duration::new(secs, nanos))
+        }
+        _ => None,
+    };
+    Some(FileStat { mtime, size })
+}
+
 /// Run the daemon end of the *filesystem* wire over `reader`/`writer`, serving
 /// `fs_read` requests from `fs` (the daemon's real backend — [`StdHostFs`] in the
 /// binary, a fake in tests). Returns when the connection closes. Reads run inline
@@ -519,28 +607,62 @@ where
 {
     let (rpc, mut incoming) = connect(reader, writer);
     while let Some(msg) = incoming.recv().await {
-        let Incoming::Request { id, method, params } = msg else {
+        let Incoming::Request {
+            id,
+            method,
+            mut params,
+        } = msg
+        else {
             continue; // the edit-host drives the fs daemon with requests only
         };
-        if method != FS_READ {
-            rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
-            continue;
-        }
-        let Some(path) = params.first().and_then(Value::as_str).map(PathBuf::from) else {
-            rpc.respond(id, Err(Value::from("fs_read: missing path")));
-            continue;
-        };
-        let reply = match classify(&*fs, &path) {
-            Ok(FsRead::File(bytes)) => Ok(Value::Array(vec![
-                Value::from("file"),
-                Value::Binary(bytes),
-            ])),
-            Ok(FsRead::New) => Ok(Value::Array(vec![Value::from("new")])),
-            Err(e) => Err(Value::from(e.to_string())),
+        let reply = match method.as_str() {
+            FS_READ => serve_read(&*fs, &params),
+            FS_WRITE => serve_write(&*fs, &mut params),
+            other => Err(Value::from(format!("unknown method: {other}"))),
         };
         rpc.respond(id, reply);
     }
     Ok(())
+}
+
+/// Serve one `fs_read [path]` against `fs`, projecting [`classify`]'s result onto the
+/// `["file", bytes]` / `["new"]` wire shape (or a loud error reply).
+fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
+    let Some(path) = params.first().and_then(Value::as_str).map(PathBuf::from) else {
+        return Err(Value::from("fs_read: missing path"));
+    };
+    match classify(fs, &path) {
+        Ok(FsRead::File(bytes)) => Ok(Value::Array(vec![
+            Value::from("file"),
+            Value::Binary(bytes),
+        ])),
+        Ok(FsRead::New) => Ok(Value::Array(vec![Value::from("new")])),
+        Err(e) => Err(Value::from(e.to_string())),
+    }
+}
+
+/// Serve one `fs_write [path, bytes]` against `fs`: do the atomic write through the
+/// same sync [`HostFs`] the local server uses, then re-stat so the reply carries the
+/// new [`FileStat`] the edit-host stamps as its `disk` baseline. A write failure is a
+/// loud error reply — the edit-host's saved-state clears *only* on the `["ok", …]`.
+fn serve_write(fs: &dyn HostFs, params: &mut [Value]) -> Result<Value, Value> {
+    let Some(path) = params.first().and_then(Value::as_str).map(PathBuf::from) else {
+        return Err(Value::from("fs_write: missing path"));
+    };
+    let bytes = match params.get_mut(1).map(|v| std::mem::replace(v, Value::Nil)) {
+        Some(Value::Binary(b)) => b,
+        _ => return Err(Value::from("fs_write: missing bytes")),
+    };
+    match fs.write_atomic(&path, &bytes) {
+        Ok(()) => {
+            let stat = fs
+                .stat(&path)
+                .map(|s| encode_stat(&s))
+                .unwrap_or(Value::Nil);
+            Ok(Value::Array(vec![Value::from("ok"), stat]))
+        }
+        Err(e) => Err(Value::from(e.to_string())),
+    }
 }
 
 /// Resolve `path` against `fs` to a [`FsRead`], using only the sync [`HostFs`]

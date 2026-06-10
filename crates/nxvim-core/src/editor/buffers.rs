@@ -3,8 +3,42 @@
 
 use super::*;
 use crate::buffer::{Buffer, EditBatch};
+use crate::host::FileStat;
 use crate::mode::Mode;
 use std::path::Path;
+
+/// A buffer write the editor **deferred** off the keystroke tick — the daemon /
+/// edit-host save path (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` →
+/// Phase 3e). In a daemon session core does *not* write through the synchronous
+/// [`HostFs`](crate::HostFs) (that would block the one editor thread on the
+/// network); instead `:w` snapshots the buffer into one of these at command time
+/// and the orchestration layer (the server) pushes the bytes over the wire,
+/// finalizing the buffer's saved-state only on the daemon's ack via
+/// [`Editor::finalize_save`]. The server drains the queue with
+/// [`Editor::take_pending_saves`].
+pub struct PendingSave {
+    /// Monotonic id minted per enqueue, so the server can correlate an ack back to
+    /// its request and keep one buffer's overlapping writes ordered.
+    pub seq: u64,
+    /// The buffer being saved. The ack targets *this* buffer specifically, so a
+    /// finalize lands correctly even if the user switched away while it was in flight.
+    pub buffer: BufferId,
+    /// The resolved write target: the `:w {name}` argument, else the buffer's bound
+    /// path. (`mark_written` binds the buffer to this on the ack, as `:w` does.)
+    pub path: PathBuf,
+    /// The bytes snapshotted at command time — so edits made while the write is in
+    /// flight can never tear into what gets persisted.
+    pub bytes: Vec<u8>,
+    /// Line count of the snapshot, for the `"{name}" {lines}L, {bytes}B written`
+    /// echo the server emits on the ack (vim reports what was *written*, not the
+    /// buffer's possibly-since-edited current state).
+    pub lines: usize,
+    /// A quit to replay once this write acks: `Some(bang)` for `:wq` / `:x` (run
+    /// `:q` / `:q!`), `None` for a plain `:w`. The editor defers the quit until the
+    /// bytes are safely on the remote — an unflushed write is never silently
+    /// abandoned by an exiting editor.
+    pub then_quit: Option<bool>,
+}
 
 impl Editor {
     /// Set a buffer-local option on buffer `id` from outside the editor (the Lua
@@ -164,6 +198,61 @@ impl Editor {
             buf.set_path(Some(std::path::PathBuf::from(name)));
         }
         buf.mark_clean();
+    }
+
+    /// Turn on **off-tick save mode**: `:w` (and the write half of `:wq` / `:x`)
+    /// snapshots the buffer and enqueues a [`PendingSave`] instead of writing through
+    /// the synchronous [`HostFs`](crate::HostFs). The orchestration layer (the server
+    /// in a daemon session) performs the write off the editor tick and calls
+    /// [`Editor::finalize_save`] on the ack. Off by default — local builds write
+    /// synchronously through `host_fs` exactly as before.
+    pub fn set_host_save_offtick(&mut self, on: bool) {
+        self.host_save_offtick = on;
+    }
+
+    /// Drain the writes the editor deferred this tick (off-tick save mode). The
+    /// server takes these after each input, pushes their bytes over the daemon wire,
+    /// and finalizes each on its ack. Empty (a cheap no-op) when off-tick mode is off
+    /// or no `:w` ran.
+    pub fn take_pending_saves(&mut self) -> Vec<PendingSave> {
+        std::mem::take(&mut self.pending_saves)
+    }
+
+    /// Snapshot the current buffer for an off-tick write to `path` (the `:w` target,
+    /// already resolved) and enqueue it. The saved-state is **not** touched here —
+    /// `modified`, `save_tick`, and the `disk` baseline change only on the ack
+    /// ([`Editor::finalize_save`]), so a write that fails or never acks leaves the
+    /// buffer honestly dirty. `then_quit` carries a deferred `:wq` / `:x`.
+    pub(crate) fn enqueue_save(&mut self, path: PathBuf, then_quit: Option<bool>) {
+        let buffer = self.cur_buffer();
+        let (bytes, lines) = {
+            let buf = self.buffer();
+            (buf.to_save_bytes(), buf.line_count())
+        };
+        let seq = self.next_save_seq;
+        self.next_save_seq += 1;
+        self.pending_saves.push(PendingSave {
+            seq,
+            buffer,
+            path,
+            bytes,
+            lines,
+            then_quit,
+        });
+    }
+
+    /// Apply a daemon write ack to the buffer it saved: bind the name, stamp the new
+    /// on-disk `stat` baseline, clear `[+]`, bump `save_tick`, and record the written
+    /// state as the saved undo node — the deferred half of a synchronous `:w`, run
+    /// only once the bytes are confirmed on the remote. A no-op if the buffer was
+    /// closed while the write was in flight (nothing to finalize). The server emits
+    /// the `written` echo and replays any deferred quit; this only touches core state.
+    pub fn finalize_save(&mut self, buffer: BufferId, path: PathBuf, stat: Option<FileStat>) {
+        if !self.buffers.map.contains_key(&buffer) {
+            return;
+        }
+        self.buffers.get_mut(buffer).buffer.mark_written(path, stat);
+        self.mark_undo_saved(buffer);
     }
 
     /// Make `id` the current buffer: stash the outgoing window position with its

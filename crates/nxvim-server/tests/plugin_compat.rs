@@ -293,9 +293,9 @@ async fn lualine_extracts_colorscheme_palette_same_turn() {
 /// loop-timer function-forms lualine's refresh timer uses, are proven firing
 /// end-to-end in `async_runtime.rs`.)
 ///
-/// Note: a *full* `lualine.setup{}` still needs `vim.api.nvim_exec` with output
-/// capture (lualine reads the `:au` listing to dedupe its autocmds) — a separate
-/// vimscript-exec subsystem, outside the two watcher/timer gaps this change closes.
+/// (A *full* `lualine.setup{}` — exercised by `lualine_loads` below — additionally
+/// needs `vim.api.nvim_exec` output capture for lualine's autocmd dedupe; that gap
+/// is now closed too, outside the two watcher/timer gaps this change targets.)
 #[tokio::test]
 async fn lualine_branch_component_builds_its_fs_watcher() {
     assert_plugin_ok(
@@ -311,6 +311,71 @@ async fn lualine_branch_component_builds_its_fs_watcher() {
           assert(type(ev.start) == 'function' and type(ev.stop) == 'function',
             "fs_event handle missing start/stop")
           ev:close()
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+}
+
+/// `vim.api.nvim_exec(src, output)` runs ex-command(s) and, when `output` is true,
+/// returns their captured text as a string (else `""`). lualine's `define_autocmd`
+/// dedupes via `nvim_exec('au lualine <event> <pat>', true):find(cmd)` — it reads
+/// the `:au` listing back to decide whether its autocmd is already registered, so a
+/// missing `nvim_exec` (or one that can't capture the listing) breaks `setup{}`.
+/// The listing itself is produced in-Lua by the `vim._ex_autocmd` driver, so
+/// `nvim_exec` must route the autocmd family there and capture its return — not
+/// queue it like `vim.cmd` (whose output would surface async, uncapturable).
+#[tokio::test]
+async fn nvim_exec_captures_autocmd_listing() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        r#"
+        local ok, err = pcall(function()
+          -- Register a string-command autocmd in group 'lualine' synchronously
+          -- (in-VM registry), exactly the shape lualine's define_autocmd lands.
+          local grp = vim.api.nvim_create_augroup('lualine', { clear = true })
+          vim.api.nvim_create_autocmd('BufEnter', {
+            group = grp, pattern = '*', command = 'echo "branch"' })
+
+          -- capture=true: the :au listing for that group/event, the string lualine
+          -- :find's its command body in.
+          local out = vim.api.nvim_exec('au lualine BufEnter *', true)
+          assert(type(out) == 'string', 'nvim_exec(.., true) must return a string')
+          assert(out:find('echo "branch"', 1, true),
+            'listing is missing the registered command body:\n' .. out)
+          assert(not out:find('NOPE_unregistered', 1, true), 'false-positive find')
+
+          -- capture=false: runs but yields no value to read back ("" not nil).
+          assert(vim.api.nvim_exec('au lualine BufEnter *', false) == '',
+            'nvim_exec(.., false) must return ""')
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+    assert_eq!(
+        report.as_str(),
+        Some("OK"),
+        "nvim_exec autocmd-listing capture"
+    );
+}
+
+/// The headline lualine proof: with the highlight read-after-write, the fs_event /
+/// luv-timer fixes, *and* `nvim_exec` output capture all in place, a full
+/// `require('lualine').setup{}` completes in the same chunk a colorscheme loads —
+/// the realistic `init.lua` path. `setup{}` reaches `define_autocmd`, which calls
+/// `nvim_exec('au lualine …', true)` to dedupe; before this it errored on the
+/// absent `nvim_exec`.
+#[tokio::test]
+async fn lualine_loads() {
+    assert_plugin_ok(
+        &["lualine.nvim", "tokyonight.nvim"],
+        r#"
+        local ok, err = pcall(function()
+          require('tokyonight').load()
+          require('lualine').setup{}
         end)
         if ok then return "OK" else return tostring(err) end
         "#,

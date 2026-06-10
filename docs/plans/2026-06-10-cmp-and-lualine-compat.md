@@ -165,11 +165,28 @@ regressions in the no-provider path.
 >   handle methods (`prelude/timer.lua`). Proven in
 >   `async_runtime.rs::loop_timer_function_forms_fire_and_stop`.
 >
-> **Full `lualine.setup{}` still surfaces one more, unrelated gap:**
-> `vim.api.nvim_exec` with output capture — lualine reads the `:au` listing to
-> dedupe its autocmds (`utils.lua:84`). That's a vimscript-exec + autocmd-listing
-> subsystem (can't be faithfully stubbed: empty output would make its "already
-> defined?" check silently wrong), and is its own work, not a watcher/timer gap.
+> **The last gap — `vim.api.nvim_exec` with output capture — is now DONE, so a
+> full `require('lualine').setup{}` completes.** lualine's `define_autocmd` reads
+> the `:au` listing back to dedupe its autocmds
+> (`utils.lua:84` — `nvim_exec('au lualine <event> <pat>', true):find(cmd)`). The
+> autocmd listing/report text is already generated synchronously in the Lua layer
+> (the `vim._ex_autocmd` / `_ex_augroup` / `_ex_doautocmd` drivers), so `nvim_exec`
+> routes the autocmd-family commands to those drivers and **captures** their return
+> rather than queuing them like `vim.cmd` (whose output is async and uncapturable).
+> Any other command, when `output` is requested, **fails loud** instead of faking an
+> empty capture — an empty string would make lualine's "already defined?" `:find`
+> silently wrong (the "quietly succeeds" failure nxvim forbids). Added in
+> `prelude/api.lua` (`vim.api.nvim_exec` + the 0.9 `nvim_exec2` form sharing one
+> `exec_capture` helper). Proven by `plugin_compat.rs::nvim_exec_captures_autocmd_listing`
+> (surface: the listing capture + the `""`-on-no-capture and fail-loud contracts)
+> and `::lualine_loads` (the real `require('lualine').setup{}` after
+> `tokyonight.load()`, in one chunk).
+>
+> **lualine.nvim now works end-to-end.** All four subsystems (highlight
+> read-after-write, native fs_event, luv loop-timers, autocmd-listing capture) have
+> landed; the only item not taken is default highlight groups (option 3a/3b below),
+> deliberately left so bare no-colorscheme `setup{}` stays unsupported per nxvim's
+> no-default-theme stance.
 
 ### Where it stands
 

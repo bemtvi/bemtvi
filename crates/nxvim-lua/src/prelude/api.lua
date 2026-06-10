@@ -588,6 +588,69 @@ function vim._ex_doautocmd(args)
   return ""
 end
 
+-- The three command families whose report/listing text is produced synchronously
+-- in *this* Lua layer (the vim._ex_* drivers above), keyed by every abbreviation
+-- the core ex-dispatch accepts (excmd.rs is_autocmd / is_augroup / is_doautocmd —
+-- kept in lock-step). These are the only commands nvim_exec can faithfully capture
+-- output from; everything else runs through the queued vim.cmd path, whose output
+-- (if any) is asynchronous and not readable back here.
+local AUTOCMD_HEADS = {}
+for _, w in ipairs({ "au", "aut", "auto", "autoc", "autocm", "autocmd" }) do AUTOCMD_HEADS[w] = "au" end
+for _, w in ipairs({ "aug", "augr", "augro", "augrou", "augroup" }) do AUTOCMD_HEADS[w] = "aug" end
+for _, w in ipairs({ "doau", "doaut", "doauto", "doautoc", "doautocm", "doautocmd" }) do AUTOCMD_HEADS[w] = "doau" end
+
+-- nvim_exec(src, output): run the ex-command(s) in `src` (one or more newline-
+-- separated lines) and, when `output` is truthy, return the text they produced as
+-- a single string; otherwise return "". This is the legacy (pre-0.9) form lualine
+-- calls — `nvim_exec('au lualine <event> <pat>', true):find(cmd)` — to read the
+-- `:au` listing back and dedupe its autocmds.
+--
+-- nxvim can only *capture* output from the command families whose listing/report
+-- text is generated synchronously in Lua (the autocmd group). Any other command is
+-- still run, via the normal queued `vim.cmd` path, but its message-line output is
+-- asynchronous and cannot be read back here. So requesting `output` capture of a
+-- non-capturable command FAILS LOUD rather than returning a misleading "" — a stub
+-- that faked an empty capture would make a caller's `:find` on the result silently
+-- wrong, exactly the "quietly succeeds" failure nxvim forbids.
+local function exec_capture(src, output)
+  local captured = {}
+  for line in (tostring(src) .. "\n"):gmatch("([^\n]*)\n") do
+    local cmd = vim.trim(line):gsub("^:+%s*", "") -- tolerate a leading ':'
+    if cmd ~= "" and cmd:sub(1, 1) ~= '"' then -- skip blanks and " comment lines
+      local head, rest = cmd:match("^(%S+)%s*(.*)$")
+      local bang = head:sub(-1) == "!"
+      if bang then head = head:sub(1, -2) end
+      local kind = AUTOCMD_HEADS[head]
+      local text
+      if kind == "au" then
+        text = vim._ex_autocmd(bang, rest)
+      elseif kind == "aug" then
+        text = vim._ex_augroup(bang, rest)
+      elseif kind == "doau" then
+        text = vim._ex_doautocmd(rest)
+      elseif output then
+        error("nvim_exec: output capture is unsupported for ':" .. head .. "'", 0)
+      else
+        vim.cmd(cmd) -- run it the normal (queued) way; nothing to capture
+      end
+      if text and text ~= "" then captured[#captured + 1] = text end
+    end
+  end
+  return output and table.concat(captured, "\n") or ""
+end
+
+function vim.api.nvim_exec(src, output)
+  return exec_capture(src, output)
+end
+
+-- nvim_exec2(src, opts): the 0.9+ replacement for nvim_exec — same execution, but
+-- the captured text is returned under `.output` (only when `opts.output` is set).
+function vim.api.nvim_exec2(src, opts)
+  opts = opts or {}
+  local out = exec_capture(src, opts.output)
+  return opts.output and { output = out } or {}
+end
+
 -- nvim_buf_get_name(bufnr): the snapshot buffer's name when `bufnr` is 0/nil or
 -- matches the snapshot, else "". Snapshot-backed (vim._cur_buf) as an interim
 -- until a real per-bufnr registry exists. (A separate, core-backed

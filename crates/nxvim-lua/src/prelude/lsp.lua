@@ -164,17 +164,19 @@ function vim.lsp.util.make_text_document_params(bufnr)
 end
 
 -- make_position_params(window, encoding): the `{ textDocument, position }` a
--- cursor-relative request (definition, hover, …) carries. The cursor comes from
--- the real editor (Phase-6 mirror); its byte column is converted to `encoding`
--- (utf-16 default). `window` is ignored — always the current window's cursor.
--- INCOMPLETE: `window` is ignored — this helper always reads the *current*
--- window (`nvim_win_get_cursor(0)`), so a config passing a specific window
--- handle gets the current one's position instead. (nxvim has multiple windows
--- now; the helper just isn't window-arg-aware.)
-function vim.lsp.util.make_position_params(_window, encoding)
+-- cursor-relative request (definition, hover, …) carries, for `window` (`0`/nil →
+-- the current window). The cursor and the buffer are read from *that* window — its
+-- buffer's URI and its cursor's byte column, converted to `encoding` (utf-16
+-- default). A config that captures a specific window at the start of a request and
+-- passes it here gets that window's position, not whatever is current when the
+-- reply lands.
+-- NOTE: a `window` showing a *non-current* buffer still gets an empty
+-- `textDocument.uri` — that is the separate "no multi-buffer name registry"
+-- approximation (`make_text_document_params`), not this helper's window-awareness.
+function vim.lsp.util.make_position_params(window, encoding)
   encoding = encoding or "utf-16"
-  local bufnr = vim.api.nvim_get_current_buf()
-  local c = vim.api.nvim_win_get_cursor(0) -- { row (1-based), col (0-based byte) }
+  local bufnr = vim.api.nvim_win_get_buf(window or 0)
+  local c = vim.api.nvim_win_get_cursor(window or 0) -- { row (1-based), col (0-based byte) }
   local line = vim.api.nvim_buf_get_lines(bufnr, c[1] - 1, c[1], false)[1] or ""
   return {
     textDocument = vim.lsp.util.make_text_document_params(bufnr),
@@ -248,19 +250,83 @@ function vim.lsp.util.get_effective_tabstop(bufnr)
   return bo.tabstop or 8
 end
 
+-- The window id of the live preview float, if any. nxvim keeps a single preview
+-- open at a time (neovim dedups via a `b:lsp_floating_preview` buffer var): a new
+-- `open_floating_preview` closes the previous one first, and the auto-close
+-- autocmd clears it when the cursor moves off.
+vim.lsp.util._floating_preview_win = nil
+
+-- Close the live preview float (if it is still a valid window) and forget it.
+local function close_floating_preview()
+  local win = vim.lsp.util._floating_preview_win
+  vim.lsp.util._floating_preview_win = nil
+  if win and vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+end
+
 -- open_floating_preview(contents, syntax, opts): show `contents` (a list of lines)
--- in nxvim's panel — the surface that stands in for neovim's floating window.
--- neovim returns `(float_bufnr, win_id)`; nxvim has one panel and no per-float
--- handle, so it returns `0` and the current window handle for call-site shape.
--- INCOMPLETE: returns `(0, curwin)` placeholders, not a real float buffer/window
--- pair — a config that closes/relocates/styles the returned float by its handles
--- can't (there's one shared panel, no per-float identity). `syntax` is ignored
--- (the panel has no per-preview filetype). Faithful once floats are real windows.
-function vim.lsp.util.open_floating_preview(contents, _syntax, opts)
+-- in a real cursor-anchored floating window — neovim's hover / signature / doc
+-- preview surface, now that nxvim has real floats. Returns the float's
+-- `(float_bufnr, win_id)`: a scratch buffer holding the lines and a
+-- `relative="cursor"` float bound to it, so a caller can close / relocate / style
+-- the preview by those real handles (e.g. `vim.api.nvim_win_close(win_id, true)`),
+-- exactly as neovim. `syntax` (or `opts.syntax`) sets the preview buffer's
+-- filetype so a markdown / code preview highlights. The previous preview is closed
+-- first, and the float auto-closes when the cursor moves or the mode changes (the
+-- neovim CursorMoved / InsertEnter / BufLeave close triggers). `opts.border` /
+-- `opts.title` / `opts.focusable` / `opts.relative` / `opts.max_width` /
+-- `opts.max_height` are honored.
+-- NOTE: sizing is the content extent clamped to `max_width`/`max_height` (default
+-- 80x20), not neovim's full wrap/pad matrix; markdown is shown verbatim (no
+-- `stylize_markdown` fenced-block concealing), and the preview is never entered
+-- (so neovim's "focus the float on a repeat invocation" is not modelled).
+function vim.lsp.util.open_floating_preview(contents, syntax, opts)
   opts = opts or {}
   local lines = type(contents) == "table" and contents or { tostring(contents) }
-  vim.panel.open(opts.title or "Preview", lines)
-  return 0, vim.api.nvim_get_current_win()
+  if #lines == 0 then lines = { "" } end
+  close_floating_preview()
+
+  local bufnr = vim.api.nvim_create_buf(false, true) -- scratch (unlisted, no file)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  local ft = opts.syntax or syntax
+  if type(ft) == "string" and ft ~= "" then vim.bo[bufnr].filetype = ft end
+
+  -- Size to the content: the widest line's display width and the line count, each
+  -- clamped so a large doc does not blanket the screen.
+  local width = 1
+  for _, l in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(l))
+  end
+  width = math.max(1, math.min(width, opts.max_width or 80))
+  local height = math.max(1, math.min(#lines, opts.max_height or 20))
+
+  -- enter=false: the preview pops up without stealing focus from the editor.
+  local win = vim.api.nvim_open_win(bufnr, false, {
+    relative = opts.relative or "cursor",
+    anchor = "NW",
+    row = 1,
+    col = 0,
+    width = width,
+    height = height,
+    focusable = opts.focusable ~= false,
+    border = opts.border or "none",
+    title = opts.title,
+    zindex = opts.zindex,
+  })
+  -- Preview floats have no gutter (neovim's `style="minimal"`).
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.lsp.util._floating_preview_win = win
+
+  -- Auto-close on the neovim triggers: the cursor moving in the parent window or
+  -- the mode/buffer changing. `once` so the autocmd self-removes after it fires.
+  local group = vim.api.nvim_create_augroup("nxvim.lsp.float_preview", { clear = true })
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "InsertEnter", "BufLeave" }, {
+    group = group,
+    once = true,
+    callback = close_floating_preview,
+  })
+
+  return bufnr, win
 end
 
 -- apply_workspace_edit(workspace_edit, encoding): apply a `WorkspaceEdit` across

@@ -33,6 +33,34 @@ async fn make_position_params_reflects_the_cursor_and_encoding() {
 }
 
 #[tokio::test]
+async fn make_position_params_honors_the_window_arg() {
+    // Two windows on the same buffer with distinct cursors: the helper must read
+    // the *passed* window's cursor, not the current one. If `window` were ignored
+    // (the old behavior), `make_position_params(other_win)` would return the
+    // current window's position instead.
+    let (rpc, _incoming) = start(None).await;
+    let got = exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { "alpha", "bravo charlie", "delta" })
+        local win_a = vim.api.nvim_get_current_win()
+        local win_b = vim.api.nvim_open_win(0, true, {}) -- horizontal split, enters win_b
+        vim.api.nvim_win_set_cursor(win_a, { 2, 6 }) -- row 2 (line 1), byte col 6 -> 'c'
+        vim.api.nvim_win_set_cursor(win_b, { 1, 0 })
+        -- Current window is win_b; ask for win_a's position explicitly.
+        local a = vim.lsp.util.make_position_params(win_a, "utf-8")
+        local b = vim.lsp.util.make_position_params(win_b, "utf-8")
+        -- Encode both: a -> line 1, char 6; b -> line 0, char 0.
+        return a.position.line * 1000 + a.position.character * 10
+             + b.position.line + b.position.character
+        "#,
+    )
+    .await;
+    // win_a -> line 1, char 6 => 1*1000 + 6*10 = 1060;  win_b -> line 0, char 0 => 0.
+    assert_eq!(got.as_u64(), Some(1060), "win_a -> (1,6), win_b -> (0,0)");
+}
+
+#[tokio::test]
 async fn byte_to_position_char_handles_surrogate_pairs() {
     let (rpc, _incoming) = start(None).await;
     // A 4-byte char (😀) is a surrogate pair — 2 code units — under UTF-16, but a
@@ -117,19 +145,34 @@ async fn get_effective_tabstop_prefers_shiftwidth_then_tabstop() {
 }
 
 #[tokio::test]
-async fn open_floating_preview_shows_content_in_the_panel() {
-    let (rpc, mut incoming) = start(None).await;
-    let map = latest_after(
+async fn open_floating_preview_opens_a_real_float() {
+    // The preview is a real cursor-anchored float now (not the panel placeholder):
+    // it returns the float's (bufnr, winid) — real handles a caller can close /
+    // relocate — with the contents in the buffer and the window a `relative=cursor`
+    // float bound to that buffer.
+    let (rpc, _incoming) = start(None).await;
+    let got = exec_lua(
         &rpc,
-        &mut incoming,
-        r#":lua vim.lsp.util.open_floating_preview({"preview one", "preview two"}, "markdown", {title = "Docs"})<CR>"#,
+        r#"
+        local buf, win = vim.lsp.util.open_floating_preview(
+          { "preview one", "preview two" }, "markdown", { title = "Docs" }
+        )
+        local cfg = vim.api.nvim_win_get_config(win)
+        local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+        return table.concat({
+          tostring(vim.api.nvim_win_is_valid(win)), -- real window
+          cfg.relative, -- a cursor-anchored float
+          tostring(vim.api.nvim_win_get_buf(win) == buf), -- bound to the returned buffer
+          lines[1] or "",
+          lines[2] or "",
+        }, "|")
+        "#,
     )
     .await;
-    assert_eq!(panel_title(&map), "Docs");
-    let lines = panel_lines(&map);
-    assert!(
-        lines.contains(&"preview one".to_string()) && lines.contains(&"preview two".to_string()),
-        "panel content was: {lines:?}"
+    assert_eq!(
+        got.as_str(),
+        Some("true|cursor|true|preview one|preview two"),
+        "open_floating_preview should return a real float showing the contents"
     );
 }
 

@@ -115,7 +115,7 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 
 | Root cause | Approximations it clears |
 |---|---|
-| LSP helpers not window-arg-aware (always use the current window) | `make_position_params(window)` ignores its `window` arg, `open_floating_preview` returns placeholder handles, the single completion-doc preview box (no separate preview-window handle / `completeopt` matrix). Note: splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*; it's these LSP-side helpers that still assume the current window. |
+| LSP helpers not window-arg-aware (always use the current window) | `make_position_params(window)` is now window-aware (reads the passed window's buffer + cursor), and `open_floating_preview` returns real float handles (a `relative="cursor"` float over a scratch buffer, auto-closing on cursor move). **Remaining:** the completion-doc preview box is still a single bespoke box with no separate preview-window handle / `completeopt` matrix (the completion menu is server-owned chrome, not a window). Note: splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*. |
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
 | Core honors only the indentation buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `expandtab` are recorded but inert |
 | No per-buffer command registry | `nvim_buf_create_user_command` registers globally |

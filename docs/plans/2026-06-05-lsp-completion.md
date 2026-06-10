@@ -403,7 +403,8 @@ cursor, byte→UTF-16 vs UTF-8 distinguished), `byte_to_position_char_handles_su
 `make_given_range_params_converts_marks_to_an_exclusive_range`,
 `locations_to_items_builds_sorted_loclist_items` (sorted, `text` from the open
 buffer), `get_effective_tabstop_prefers_shiftwidth_then_tabstop`,
-`open_floating_preview_shows_content_in_the_panel`,
+`open_floating_preview_opens_a_real_float` (was a panel placeholder; now a real
+cursor float — see `make_position_params_honors_the_window_arg` too),
 `apply_workspace_edit_edits_the_open_buffer` (native RPC `lines` confirms the
 rope), `show_document_jumps_the_cursor_to_the_location`,
 `show_document_external_location_raises`.

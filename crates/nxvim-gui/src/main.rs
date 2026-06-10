@@ -18,6 +18,13 @@ use nxvim_gui::GuiConfig;
 use nxvim_server::{run as run_server, ServerInit};
 
 fn main() -> Result<()> {
+    // SSH askpass helper mode: when ssh re-invokes this binary as its
+    // `$SSH_ASKPASS` (see `remote::connect`), pop the prompt dialog and exit —
+    // never start the editor. Must be the first thing `main` does.
+    if let Some(result) = nxvim_gui::remote::run_askpass_if_invoked() {
+        return result;
+    }
+
     // The positional arguments (first is the file *or* an SSH target; for a remote
     // target the second is the remote file) plus the font config (`--font` /
     // `--font-size`, overriding the `NXVIM_GUI_FONT*` environment).

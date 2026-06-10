@@ -108,9 +108,12 @@ driving the child's stdio as the transport (`crates/nxvim-gui/src/remote.rs`);
 the editor, Lua, LSP, and treesitter all run on the remote host, only the thin
 client is local. The GUI's IO thread runs a session loop that can swap the
 transport in place, so `:connect` tears the current connection down and brings a
-new one up without recreating the window. The connector hardens the spawn against
-argv/shell injection (rejects `-`-leading host/user, shell-quotes the remote
-command, `--`-terminates ssh options). See
+new one up without recreating the window. Interactive auth (password / passphrase
+/ host-key acceptance) is routed to a native dialog by pointing ssh's
+`SSH_ASKPASS` at this binary re-invoked as the helper, so it works from a desktop
+launch with no terminal. The connector also hardens the spawn against argv/shell
+injection (rejects `-`-leading host/user, shell-quotes the remote command,
+`--`-terminates ssh options). See
 [the remote-SSH plan](plans/2026-06-09-remote-ssh-client.md).
 
 ### Async design

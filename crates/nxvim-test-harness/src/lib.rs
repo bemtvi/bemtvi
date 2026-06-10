@@ -28,7 +28,7 @@
 //! Per-window fields (lines, cursor, highlights, diagnostics, scroll, …) live
 //! under `windows[0]`; the `field`/`window0_*` helpers know to look there.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -455,6 +455,137 @@ pub fn write_n_lines(tag: &str, n: usize) -> String {
     let body: String = (1..=n).map(|i| format!("line{i}\n")).collect();
     std::fs::write(&path, body).expect("write temp file");
     path.to_string_lossy().into_owned()
+}
+
+// ===== plugin fixtures (hermetic clones of real upstream plugins) ============
+
+/// Pinned upstream plugin repos the load/behavior tests run against: `(name, git
+/// URL, commit)`. The commit is a revision verified to run on nxvim, so a test
+/// pins to a known-good version rather than whatever a developer happens to have
+/// installed locally — hermetic and reproducible across machines. Bump a pin
+/// deliberately (and re-verify) rather than tracking upstream `HEAD`.
+const PLUGIN_PINS: &[(&str, &str, &str)] = &[
+    (
+        "telescope.nvim",
+        "https://github.com/nvim-telescope/telescope.nvim.git",
+        "a0bbec21143c7bc5f8bb02e0005fa0b982edc026",
+    ),
+    (
+        "plenary.nvim",
+        "https://github.com/nvim-lua/plenary.nvim.git",
+        "74b06c6c75e4eeb3108ec01852001636d85a932b",
+    ),
+    (
+        "nvim-cmp",
+        "https://github.com/hrsh7th/nvim-cmp.git",
+        "a1d504892f2bc56c2e79b65c6faded2fd21f3eca",
+    ),
+    (
+        "lualine.nvim",
+        "https://github.com/nvim-lualine/lualine.nvim.git",
+        "221ce6b2d999187044529f49da6554a92f740a96",
+    ),
+    (
+        "tokyonight.nvim",
+        "https://github.com/folke/tokyonight.nvim.git",
+        "cdc07ac78467a233fd62c493de29a17e0cf2b2b6",
+    ),
+    (
+        "LuaSnip",
+        "https://github.com/L3MON4D3/LuaSnip.git",
+        "458560534a73f7f8d7a11a146c801db00b081df0",
+    ),
+    (
+        "nvim-dap",
+        "https://github.com/mfussenegger/nvim-dap.git",
+        "531771530d4f82ad2d21e436e3cc052d68d7aebb",
+    ),
+    (
+        "nvim-dap-python",
+        "https://github.com/mfussenegger/nvim-dap-python.git",
+        "1808458eba2b18f178f990e01376941a42c7f93b",
+    ),
+    (
+        "nvim-dap-virtual-text",
+        "https://github.com/theHamsta/nvim-dap-virtual-text.git",
+        "fbdb48c2ed45f4a8293d0d483f7730d24467ccb6",
+    ),
+    (
+        "nvim-treesitter",
+        "https://github.com/nvim-treesitter/nvim-treesitter.git",
+        "cf12346a3414fa1b06af75c79faebe7f76df080a",
+    ),
+    (
+        "trouble.nvim",
+        "https://github.com/folke/trouble.nvim.git",
+        "bd67efe408d4816e25e8491cc5ad4088e708a69a",
+    ),
+];
+
+/// Clone the pinned `name` plugin into a shared cache and return its checkout
+/// path, or `None` when it can't be fetched (no `git` / no network) so the caller
+/// SKIPS — the hermetic replacement for "is it installed under `~/.local/share` /
+/// `~/.config`". Tests must not read the developer's real plugin install.
+///
+/// The clone is done once and reused, keyed by the pinned commit (a re-pin clears
+/// the stale checkout). Concurrent `cargo test` binaries publish atomically via a
+/// temp-dir rename, so parallel runs never observe a half-clone.
+pub fn clone_plugin(name: &str) -> Option<PathBuf> {
+    let &(_, url, rev) = PLUGIN_PINS.iter().find(|(n, _, _)| *n == name)?;
+    let cache = std::env::temp_dir().join("nxvim-test-plugins");
+    let target = cache.join(name);
+    if plugin_at_rev(&target, rev) {
+        return Some(target);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    // A leftover checkout at a different (older) pin: clear it before re-fetching.
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(&target);
+    }
+    let tmp = cache.join(format!(".tmp-{name}-{}", unique()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let t = tmp.to_string_lossy().into_owned();
+    // Fetch exactly the pinned commit (GitHub serves arbitrary SHAs), shallow.
+    let ok = git(&["init", "--quiet", &t])
+        && git(&["-C", &t, "remote", "add", "origin", url])
+        && git(&["-C", &t, "fetch", "--quiet", "--depth", "1", "origin", rev])
+        && git(&["-C", &t, "checkout", "--quiet", "FETCH_HEAD"]);
+    if !ok {
+        let _ = std::fs::remove_dir_all(&tmp);
+        // A concurrent process may have published a good checkout meanwhile.
+        return plugin_at_rev(&target, rev).then_some(target);
+    }
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => Some(target),
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            plugin_at_rev(&target, rev).then_some(target)
+        }
+    }
+}
+
+/// True when `dir` is a git checkout sitting exactly at `rev`.
+fn plugin_at_rev(dir: &Path, rev: &str) -> bool {
+    if !dir.join(".git").exists() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == rev)
+}
+
+/// Run `git` with `args`, suppressing its output; return whether it exited 0.
+fn git(args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ===== serialization =========================================================

@@ -8,38 +8,24 @@
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_test_harness::{exec_lua, temp_dir};
+use nxvim_test_harness::{clone_plugin, exec_lua, temp_dir};
 use rmpv::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// The `pack/plugins/start` directory of the user's nxvim config, or `None`.
-fn pack_start() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home).join(".config/nxvim/pack/plugins/start");
-    p.is_dir().then_some(p)
-}
-
-/// Resolve the given plugin dir names under `pack/plugins/start`, returning `None`
-/// (so the caller skips) if any is missing — each must have a `lua/` subtree.
+/// Clone each named plugin (pinned, via the harness) into the shared cache and
+/// return their checkout paths for the runtimepath, or `None` (so the caller skips)
+/// when any can't be fetched — hermetic, independent of the developer's local
+/// install.
 fn plugin_rtp(names: &[&str]) -> Option<Vec<PathBuf>> {
-    let start = pack_start()?;
-    let mut dirs = vec![];
-    for n in names {
-        let d = start.join(n);
-        if !d.join("lua").is_dir() {
-            return None;
-        }
-        dirs.push(d);
-    }
-    Some(dirs)
+    names.iter().map(|n| clone_plugin(n)).collect()
 }
 
 /// Run `code` (which must `return` a status string) through a server with `names`
-/// on the runtimepath; assert it returned exactly `"OK"`. Skips if a dir is absent.
+/// on the runtimepath; assert it returned exactly `"OK"`. Skips if a clone fails.
 async fn assert_plugin_ok(names: &[&str], code: &str) {
     let Some(rtp) = plugin_rtp(names) else {
-        eprintln!("skip: missing one of {names:?} under pack/plugins/start");
+        eprintln!("skip: could not clone one of {names:?} (no git / no network)");
         return;
     };
     let (rpc, _incoming) = start(rtp).await;

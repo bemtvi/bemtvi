@@ -5,28 +5,21 @@
 //! the prompt scratch buffer, insert-mode typing, `nvim_buf_attach`'s `on_lines`
 //! firing the finder, the sorter, and the results-buffer render.
 //!
-//! telescope/plenary live in the user's `~/.local/share/nvim/lazy` install (they
-//! are not vendored), so this test SKIPS when they are absent — like the
-//! lspconfig submodule test. With them present it is a hard behavioral assertion.
+//! telescope/plenary are cloned (pinned) into a shared cache by the harness'
+//! `clone_plugin`, so this runs against a known-good upstream revision rather than
+//! the developer's local install — hermetic. It SKIPS only when the clone can't
+//! happen (no `git` / no network), like the lspconfig submodule test. With the
+//! plugins present it is a hard behavioral assertion.
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_test_harness::{exec_lua, feed, temp_dir};
+use nxvim_test_harness::{clone_plugin, exec_lua, feed, temp_dir};
 use rmpv::Value;
-use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-fn lazy_plugin(name: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home)
-        .join(".local/share/nvim/lazy")
-        .join(name);
-    (p.join("lua").is_dir()).then_some(p)
-}
-
 async fn start(dir: &std::path::Path) -> Option<(Rpc, UnboundedReceiver<Incoming>)> {
-    let telescope = lazy_plugin("telescope.nvim")?;
-    let plenary = lazy_plugin("plenary.nvim")?;
+    let telescope = clone_plugin("telescope.nvim")?;
+    let plenary = clone_plugin("plenary.nvim")?;
     std::fs::write(dir.join("init.lua"), "require('telescope').setup{}\n").ok()?;
     let init = ServerInit {
         config_dir: Some(dir.to_path_buf()),

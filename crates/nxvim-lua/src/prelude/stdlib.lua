@@ -261,6 +261,86 @@ function vim.fn.hlexists(name)
   return (vim._hl_defs or {})[name] ~= nil and 1 or 0
 end
 
+-- Sign *definitions* registry. nvim-dap defines its breakpoint/stopped signs at
+-- module load (`sign_getdefined(name)` then `sign_define(name, opts)` for each
+-- that's absent), so the define/query pair must work for `require('dap')` to
+-- load. nxvim has no sign-column rendering yet, so the *placement* family
+-- (sign_place / sign_getplaced / sign_unplace) deliberately stays unimplemented
+-- and fails loud through vim.fn's not-impl funnel when a breakpoint is actually
+-- set — the definitions are real (stored and queryable), only the gutter render
+-- is the tracked gap. Each definition is { name, text, texthl, linehl, numhl,
+-- culhl, icon }; only the keys the caller supplied are kept.
+vim._sign_defs = vim._sign_defs or {}
+local SIGN_DEF_KEYS = { "text", "texthl", "linehl", "numhl", "culhl", "icon" }
+local function copy_sign_def(d)
+  local out = { name = d.name }
+  for _, k in ipairs(SIGN_DEF_KEYS) do out[k] = d[k] end
+  return out
+end
+
+-- vim.fn.sign_define(name, opts) or sign_define(list): define one sign (or a list
+-- of {name=…, …} dicts). Returns 0 on success / -1 on a malformed list entry,
+-- matching neovim.
+function vim.fn.sign_define(name, opts)
+  if type(name) == "table" then
+    for _, d in ipairs(name) do
+      if type(d) ~= "table" or d.name == nil then return -1 end
+      vim.fn.sign_define(d.name, d)
+    end
+    return 0
+  end
+  local def = { name = name }
+  if type(opts) == "table" then
+    for _, k in ipairs(SIGN_DEF_KEYS) do def[k] = opts[k] end
+  end
+  vim._sign_defs[name] = def
+  return 0
+end
+
+-- vim.fn.sign_getdefined([name]): the list of defined signs (all, or just `name`
+-- as a one-element list — empty when undefined). Copies guard the registry.
+function vim.fn.sign_getdefined(name)
+  if name ~= nil then
+    local d = vim._sign_defs[name]
+    return d and { copy_sign_def(d) } or {}
+  end
+  local out = {}
+  for _, d in pairs(vim._sign_defs) do out[#out + 1] = copy_sign_def(d) end
+  return out
+end
+
+-- vim.fn.sign_undefine([name]): drop one sign, a list of names, or (no arg) all.
+function vim.fn.sign_undefine(name)
+  if name == nil then
+    vim._sign_defs = {}
+  elseif type(name) == "table" then
+    for _, n in ipairs(name) do vim._sign_defs[n] = nil end
+  else
+    vim._sign_defs[name] = nil
+  end
+  return 0
+end
+
+-- vim.fn.trim(text[, mask[, dir]]): strip the characters in `mask` (default the
+-- whitespace set) from `text`. `dir` 0 trims both ends (default), 1 leading only,
+-- 2 trailing only. `mask` is a *set* of characters, not a pattern. nvim-dap-python
+-- trims interpreter-path command output through this at setup.
+function vim.fn.trim(text, mask, dir)
+  text = tostring(text or "")
+  if mask == nil or mask == "" then mask = " \t\n\r\f\v" end
+  dir = dir or 0
+  local set = {}
+  for i = 1, #mask do set[mask:sub(i, i)] = true end
+  local from, to = 1, #text
+  if dir == 0 or dir == 1 then
+    while from <= to and set[text:sub(from, from)] do from = from + 1 end
+  end
+  if dir == 0 or dir == 2 then
+    while to >= from and set[text:sub(to, to)] do to = to - 1 end
+  end
+  return text:sub(from, to)
+end
+
 -- vim.opt: in neovim each field is a rich Option object, but the colorscheme
 -- load path only uses scalar get/set, so a thin proxy over vim.o suffices — and
 -- it inherits vim.o's scope routing for free.

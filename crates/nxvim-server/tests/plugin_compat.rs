@@ -173,3 +173,30 @@ async fn trouble_loads() {
     )
     .await;
 }
+
+/// nvim-dap: defines its breakpoint/stopped signs at module load via
+/// sign_getdefined + sign_define, so the definition registry must work for
+/// `require('dap')` (and its dependents dap-python / nvim-dap-virtual-text) to
+/// load. Sign *placement* stays unimplemented (no sign-column render) and is not
+/// exercised here. nvim-dap-python additionally needs vim.fn.trim at setup.
+#[tokio::test]
+async fn nvim_dap_loads() {
+    assert_plugin_ok(
+        &["nvim-dap", "nvim-dap-python", "nvim-dap-virtual-text"],
+        r#"
+        -- The exact define/query round-trip dap relies on at load.
+        assert(#vim.fn.sign_getdefined("Nope") == 0, "undefined sign -> empty")
+        vim.fn.sign_define("CompatBp", { text = "B", texthl = "SignColumn" })
+        local got = vim.fn.sign_getdefined("CompatBp")
+        assert(#got == 1 and got[1].text == "B" and got[1].texthl == "SignColumn", "define round-trip")
+        assert(vim.fn.trim("  hi \t") == "hi", "trim both ends")
+        local ok, err = pcall(function()
+          require('dap')
+          require('nvim-dap-virtual-text').setup()
+          require('dap-python').setup("python")
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+}

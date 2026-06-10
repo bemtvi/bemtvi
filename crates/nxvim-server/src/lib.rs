@@ -640,6 +640,11 @@ where
     if let Some(config_dir) = &init.config_dir {
         server.source_init(&config_dir.join("init.lua"));
     }
+    // Then source the package `plugin/` / `after/plugin/` Lua scripts across the
+    // runtimepath — neovim's startup package load, after `init.lua` and before the
+    // first buffer's lifecycle events, so a plugin's autocmds/registration are in
+    // place (this is what initializes nvim-cmp's engine, cmp-buffer's source, etc.).
+    server.source_plugins();
 
     // Startup seed: the initial buffer and the config's autocmds both exist now,
     // so fire the first buffer's lifecycle events (`BufReadPost`→`FileType`→

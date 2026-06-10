@@ -349,4 +349,63 @@ impl Server {
         self.apply_lua_effects();
         self.run_pending();
     }
+
+    /// Source the package `plugin/` Lua scripts found across the runtimepath, then
+    /// every entry's `after/plugin/` last — neovim's startup package-load order
+    /// (`pack/*/start/*` plugins included), run *after* `init.lua`. This is what
+    /// lets a plugin's `plugin/` script wire its autocmds / register itself (e.g.
+    /// nvim-cmp's engine, cmp-buffer's `register_source`) — without it a plugin that
+    /// merely `require`s cleanly still never initializes. Each entry's
+    /// `plugin/**/*.lua` is sourced sorted (recursing); a script error surfaces on
+    /// the message line and does not abort the rest. Effects drain through the same
+    /// path as `:lua`. Runs before the first buffer's lifecycle events fire, so a
+    /// plugin's `FileType` / `BufReadPost` autocmds catch the initial buffer.
+    pub(crate) fn source_plugins(&mut self) {
+        // Clone the paths so the immutable runtimepath borrow doesn't outlive the
+        // mutable `self` use while sourcing.
+        let runtimepath: Vec<PathBuf> = self.lua.runtimepath().to_vec();
+        for sub in ["plugin", "after/plugin"] {
+            for rt in &runtimepath {
+                for file in collect_lua_scripts(&rt.join(sub)) {
+                    let src = match std::fs::read_to_string(&file) {
+                        Ok(src) => src,
+                        Err(_) => continue,
+                    };
+                    let name = format!("@{}", file.display());
+                    if let Err(e) = self.lua.exec_named(&src, &name) {
+                        self.editor
+                            .echo(format!("Error sourcing {}: {e}", file.display()));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
+        }
+        self.run_pending();
+    }
+}
+
+/// Every `*.lua` file under `dir` (recursing into subdirectories), sorted by path
+/// for a deterministic, neovim-like load order. A missing/unreadable directory
+/// yields nothing.
+fn collect_lua_scripts(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_lua_into(dir, &mut out);
+    out.sort();
+    out
+}
+
+/// Recursive helper for [`collect_lua_scripts`]: append every `*.lua` file under
+/// `dir` to `out`.
+fn collect_lua_into(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_lua_into(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+            out.push(path);
+        }
+    }
 }

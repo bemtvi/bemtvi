@@ -491,6 +491,13 @@ impl LuaRuntime {
         self.lua.load(chunk).exec()
     }
 
+    /// Run a Lua chunk read from a file, naming it `name` (use `@<path>`) so an
+    /// error/traceback points at the source file — the entry for sourcing the
+    /// package `plugin/` scripts at startup.
+    pub fn exec_named(&self, chunk: &str, name: &str) -> mlua::Result<()> {
+        self.lua.load(chunk).set_name(name).exec()
+    }
+
     /// Compile `chunk` to a callable function, trying the expression form
     /// (`return <chunk>`) first and falling back to statements — the same
     /// dual-mode load `Chunk::eval` does, so both an expression and a statement

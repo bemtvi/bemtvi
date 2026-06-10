@@ -404,3 +404,76 @@ async fn lualine_loads() {
     )
     .await;
 }
+
+/// A package's `plugin/` and `after/plugin/` Lua scripts must be sourced at startup
+/// — neovim's `pack/*/start` package behavior. nvim-cmp wires its autocmd engine in
+/// `plugin/cmp.lua` and cmp-buffer registers its source in
+/// `after/plugin/cmp_buffer.lua`; neither runs without this, so cmp can't work.
+/// Verifies: `plugin/` runs (recursively), `after/plugin/` runs *after* it, and the
+/// scripts can see state `init.lua` set (init.lua is sourced first).
+#[tokio::test]
+async fn pack_plugin_scripts_are_sourced_at_startup() {
+    let dir = temp_dir("plugin_scripts");
+    // init.lua runs before plugins; leave a marker the plugin scripts can observe.
+    std::fs::write(dir.join("init.lua"), "vim.g.from_init = 'init'\n").unwrap();
+    // A fake plugin on the runtimepath: a top-level plugin script, a nested one
+    // (proving the walk recurses), and an after/plugin script (loaded last).
+    let plug = temp_dir("fake_plugin");
+    std::fs::create_dir_all(plug.join("plugin/nested")).unwrap();
+    std::fs::create_dir_all(plug.join("after/plugin")).unwrap();
+    std::fs::write(
+        plug.join("plugin/a.lua"),
+        "vim.g.plugin_ran = (vim.g.plugin_ran or 0) + 1\nvim.g.plugin_saw_init = vim.g.from_init\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plug.join("plugin/nested/b.lua"),
+        "vim.g.nested_ran = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plug.join("after/plugin/z.lua"),
+        // Runs after plugin/, so it sees the count plugin/a.lua set.
+        "vim.g.after_saw_plugin = vim.g.plugin_ran\n",
+    )
+    .unwrap();
+
+    let init = ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir, plug],
+        ..Default::default()
+    };
+    let (server_end, client_end) = tokio::io::duplex(1 << 18);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("server runtime");
+        let _ = runtime.block_on(run_server(server_end, init));
+    });
+    let (reader, writer) = tokio::io::split(client_end);
+    let (rpc, _incoming) = connect(reader, writer);
+    rpc.request(
+        "nvim_ui_attach",
+        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
+    )
+    .await
+    .expect("ui attach");
+
+    let out = exec_lua(
+        &rpc,
+        r#"return string.format("%s|%s|%s|%s",
+             tostring(vim.g.plugin_ran),
+             tostring(vim.g.nested_ran),
+             tostring(vim.g.plugin_saw_init),
+             tostring(vim.g.after_saw_plugin))"#,
+    )
+    .await;
+    // plugin/a.lua ran once; nested ran; it saw init.lua's marker; after/plugin saw
+    // the plugin count (so after/plugin sourced strictly after plugin/).
+    assert_eq!(
+        out.as_str(),
+        Some("1|true|init|1"),
+        "plugin/ + after/plugin/ scripts must be sourced at startup (after init.lua)"
+    );
+}

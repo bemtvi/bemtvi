@@ -16,13 +16,14 @@
 //! next to the syntax and LSP arms.
 
 use std::collections::HashMap;
-use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::process::Command;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+use crate::host::{HostProc, ProcEvents, ProcSpec};
 
 /// A command from the server thread to the event-loop actor. Fire-and-forget: the
 /// server never awaits a reply (any result returns later as a [`LoopEvent`]),
@@ -91,18 +92,24 @@ pub struct EventLoop {
     cmd_tx: UnboundedSender<LoopCommand>,
     /// Taken when the actor is first started.
     start: Option<(UnboundedReceiver<LoopCommand>, UnboundedSender<LoopEvent>)>,
+    /// The seam child processes are spawned through — the local disk's
+    /// [`StdHostProc`](crate::host::StdHostProc) by default, or an injected
+    /// daemon-backed [`HostProc`]. Cloned into the actor when it starts.
+    host_proc: Arc<dyn HostProc>,
     started: bool,
 }
 
 impl EventLoop {
-    /// Create the event loop and the receiver the server loop selects on. No task
-    /// is spawned until the first [`EventLoop::send`].
-    pub fn new() -> (EventLoop, UnboundedReceiver<LoopEvent>) {
+    /// Create the event loop and the receiver the server loop selects on. Spawns
+    /// child processes through `host_proc`. No task is spawned until the first
+    /// [`EventLoop::send`].
+    pub fn new(host_proc: Arc<dyn HostProc>) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (event_tx, event_rx) = unbounded_channel();
         let evloop = EventLoop {
             cmd_tx,
             start: Some((cmd_rx, event_tx)),
+            host_proc,
             started: false,
         };
         (evloop, event_rx)
@@ -114,7 +121,7 @@ impl EventLoop {
             return;
         }
         if let Some((cmd_rx, event_tx)) = self.start.take() {
-            tokio::spawn(run_evloop(cmd_rx, event_tx));
+            tokio::spawn(run_evloop(cmd_rx, event_tx, self.host_proc.clone()));
             self.started = true;
         }
     }
@@ -135,6 +142,7 @@ impl EventLoop {
 async fn run_evloop(
     mut cmd_rx: UnboundedReceiver<LoopCommand>,
     event_tx: UnboundedSender<LoopEvent>,
+    host_proc: Arc<dyn HostProc>,
 ) {
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
@@ -184,8 +192,14 @@ async fn run_evloop(
             } => {
                 let (kill_tx, kill_rx) = oneshot::channel();
                 procs.insert(id, kill_tx);
-                let event_tx = event_tx.clone();
-                tokio::spawn(run_process(id, argv, cwd, env, stdin, kill_rx, event_tx));
+                let spec = ProcSpec {
+                    argv,
+                    cwd,
+                    env,
+                    stdin,
+                };
+                let events = ProcEvents::new(id, event_tx.clone());
+                tokio::spawn(host_proc.run(spec, kill_rx, events));
             }
             LoopCommand::Kill { id } => {
                 // Dropping the kill sender (or sending on it) wakes the process
@@ -196,113 +210,8 @@ async fn run_evloop(
             }
         }
         // Forget kill channels whose process tasks have closed them (the child
-        // exited and `run_process` dropped the receiver) — the leak guard for
-        // procs, mirroring the timer prune above.
+        // exited and the `HostProc` future dropped the receiver) — the leak guard
+        // for procs, mirroring the timer prune above.
         procs.retain(|_, tx| !tx.is_closed());
     }
-}
-
-/// Run one child process to completion (or until killed) and report it. Spawns
-/// `argv` with piped stdout/stderr and `kill_on_drop`, sends [`LoopEvent::ProcessSpawned`]
-/// with its pid, then races the child's completion against the kill signal: on a
-/// natural exit it reports the real status and captured output; on a kill it lets
-/// the output future drop (terminating the child) and reports `code = -1`. Either
-/// way exactly one [`LoopEvent::ProcessExit`] is sent, so the one-shot `on_exit`
-/// callback always fires and is dropped (never leaked).
-async fn run_process(
-    id: u64,
-    argv: Vec<String>,
-    cwd: Option<String>,
-    env: Vec<(String, String)>,
-    stdin: Vec<u8>,
-    mut kill_rx: oneshot::Receiver<()>,
-    event_tx: UnboundedSender<LoopEvent>,
-) {
-    let Some((program, args)) = argv.split_first() else {
-        let _ = event_tx.send(LoopEvent::ProcessSpawned { id, pid: None });
-        let _ = event_tx.send(LoopEvent::ProcessExit {
-            id,
-            code: -1,
-            stdout: Vec::new(),
-            stderr: b"vim.system: cmd must be a non-empty list".to_vec(),
-        });
-        return;
-    };
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        // A child fed stdin gets a real pipe (closed after the bytes are written,
-        // so it sees EOF); one with no input keeps `/dev/null` so a process that
-        // reads stdin doesn't block waiting on a tty.
-        .stdin(if stdin.is_empty() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    for (k, v) in env {
-        command.env(k, v);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            // Mirror the blocking `vim._system`: a missing tool degrades to
-            // `code = -1` with the message on stderr rather than raising, so an
-            // async `vim.system` can never break a config on a machine lacking it.
-            let _ = event_tx.send(LoopEvent::ProcessSpawned { id, pid: None });
-            let _ = event_tx.send(LoopEvent::ProcessExit {
-                id,
-                code: -1,
-                stdout: Vec::new(),
-                stderr: format!("vim.system: failed to spawn {program}: {e}").into_bytes(),
-            });
-            return;
-        }
-    };
-    let _ = event_tx.send(LoopEvent::ProcessSpawned {
-        id,
-        pid: child.id(),
-    });
-    // Feed stdin (if any) from a detached task and close it, so the write runs
-    // concurrently with reading stdout/stderr — a child that echoes a large input
-    // back would otherwise deadlock (both sides blocked on full pipes).
-    if !stdin.is_empty() {
-        if let Some(mut sink) = child.stdin.take() {
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let _ = sink.write_all(&stdin).await;
-                let _ = sink.shutdown().await; // close → the child reads EOF
-            });
-        }
-    }
-    let exit = tokio::select! {
-        result = child.wait_with_output() => match result {
-            Ok(out) => LoopEvent::ProcessExit {
-                id,
-                code: out.status.code().unwrap_or(-1),
-                stdout: out.stdout,
-                stderr: out.stderr,
-            },
-            Err(e) => LoopEvent::ProcessExit {
-                id,
-                code: -1,
-                stdout: Vec::new(),
-                stderr: e.to_string().into_bytes(),
-            },
-        },
-        _ = &mut kill_rx => LoopEvent::ProcessExit {
-            // The `wait_with_output` future is dropped here, dropping the child,
-            // whose `kill_on_drop` terminates it. `on_exit` still fires (code -1).
-            id,
-            code: -1,
-            stdout: Vec::new(),
-            stderr: b"vim.system: process killed".to_vec(),
-        },
-    };
-    let _ = event_tx.send(exit);
 }

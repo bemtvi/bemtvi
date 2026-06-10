@@ -21,12 +21,19 @@ mod effects;
 mod evloop;
 mod excmd;
 mod extmarks;
+mod host;
 mod input;
 mod keymap;
 mod lifecycle;
 mod lsp;
 mod redraw;
 mod treesitter;
+
+/// The process-spawning seam (`vim.system` / `jobstart` / `:!`) and its types,
+/// re-exported for [`ServerInit::host_proc`] — the edit-host split injects a
+/// daemon-backed [`HostProc`] here (the process-side companion to
+/// [`nxvim_core::HostFs`]).
+pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
@@ -77,6 +84,16 @@ pub struct ServerInit {
     /// `Send` (boxed) because [`ServerInit`] is moved onto the server's own thread;
     /// it is rebuilt into the editor's single-threaded `Rc<dyn HostFs>` there.
     pub host_fs: Option<Box<dyn HostFs + Send>>,
+    /// The seam child processes (`vim.system` / `jobstart` / `:!`) are spawned
+    /// through. `None` (the default) spawns real local processes
+    /// ([`StdHostProc`](host::StdHostProc)); the edit-host split will inject a
+    /// daemon-backed [`HostProc`](host::HostProc) here so processes run on the
+    /// remote while editing stays local
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3). `Send`
+    /// (boxed) so it rides [`ServerInit`] onto the server's own thread; it is
+    /// rebuilt into the shared `Arc<dyn HostProc>` the event-loop actor holds
+    /// there.
+    pub host_proc: Option<Box<dyn HostProc + Send>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -382,7 +399,21 @@ where
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     let (lsp, mut lsp_events) = LspManager::new();
-    let (evloop, mut loop_events) = EventLoop::new();
+    // Child processes are spawned through this seam — real local processes by
+    // default, or an injected (eventually daemon-backed) backend. Rebuilt here,
+    // on the server thread, into the shared `Arc<dyn HostProc>` the event-loop
+    // actor holds (`ServerInit` carried it `Send` across the thread boundary).
+    let host_proc: Arc<dyn HostProc> = match init.host_proc {
+        // `Arc::from` yields `Arc<dyn HostProc + Send>`; returning it into the
+        // `Arc<dyn HostProc>` binding drops the `Send` bound by unsize coercion
+        // (the same two-step the `host_fs` rebuild above uses for `Rc`).
+        Some(proc) => {
+            let proc: Arc<dyn HostProc + Send> = Arc::from(proc);
+            proc
+        }
+        None => Arc::new(StdHostProc),
+    };
+    let (evloop, mut loop_events) = EventLoop::new(host_proc);
     // `:TSInstall` runs the fetch+compile off-thread (`spawn_blocking`); results
     // come back here and are applied on the one server thread.
     let (install_tx, mut install_events) = unbounded_channel::<InstallOutcome>();

@@ -73,6 +73,9 @@ fn main() -> Result<()> {
         // The local GUI reads/writes through the real disk (the default); a
         // daemon-backed fs is injected here by the edit-host split.
         host_fs: None,
+        // The local GUI spawns real local processes (the default); a daemon-backed
+        // process host is injected here by the edit-host split.
+        host_proc: None,
     };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

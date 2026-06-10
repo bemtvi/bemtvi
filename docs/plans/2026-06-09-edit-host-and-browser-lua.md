@@ -292,14 +292,56 @@ fake genuinely round-trips bytes the editor read and wrote. Regression-clean —
 `editing` (536), `buffers` (27), `nxvim` crate, fmt + clippy all green; the local
 binaries (`nxvim`, `nxvim-gui`) pass `host_fs: None` and are unchanged.
 
-**Still to do in Phase 3:** the `HostProc` seam (below), the daemon wire protocol +
-`nxvim --daemon`, the local edit-host as a `HostServices` client over ssh stdio,
-and the buffer-replica / `FileChangedShell` / remote-path / clipboard semantics.
-The remote `HostFs` impl is *not* a drop-in here: core's `HostFs` is **sync**, so a
-daemon-backed read can't block the single editor thread on the network — the open
-must become an async off-tick fetch that hands core populated bytes (the
-"buffers are local replicas" note below), with the sync trait reserved for local
-disk. The injection seam this slice built is the anchor that lands plugs into.
+**Still to do in Phase 3:** the daemon wire protocol + `nxvim --daemon`, the local
+edit-host as a `HostServices` client over ssh stdio, and the buffer-replica /
+`FileChangedShell` / remote-path / clipboard semantics. The remote `HostFs` impl is
+*not* a drop-in here: core's `HostFs` is **sync**, so a daemon-backed read can't
+block the single editor thread on the network — the open must become an async
+off-tick fetch that hands core populated bytes (the "buffers are local replicas"
+note below), with the sync trait reserved for local disk. The injection seam this
+slice built is the anchor that lands plugs into.
+
+### Phase 3b — the `HostProc` seam (process spawning) — ✅ DONE (2026-06-10)
+
+The process-side companion to Phase 3a's fs consumption, kept to the **one spawn
+site whose shape already matches the daemon's event-routed contract** — the same
+"don't guess the wire ahead of need" discipline that scoped Phase 1 to fs-only.
+Of the three spawn sites the full-split note lists, only the event loop's
+`run_process` (the async, one-shot `vim.system` / `jobstart` / `:!` path) is
+run-to-completion with pid + exit reported as loop events; the **clipboard** is a
+*synchronous* `Clipboard` provider returning a value, and the **LSP** servers are
+long-lived bidirectional raw-pipe transports living in `nxvim-lsp` — both diverge
+from the sketch, so folding them in is a later slice matched to the wire rather
+than guessed now. (Scope confirmed with the requester, 2026-06-10.)
+
+Shipped (`crates/nxvim-server/src/host.rs` — server-side, **not** core, because the
+trait is async + event-routing and is consumed by the async server, never by the
+pure-sync core):
+- **`trait HostProc { fn run(&self, spec, kill, events) -> Pin<Box<dyn Future + Send>> }`**
+  — one method owning a child's whole lifecycle. It returns a boxed future (not
+  `async fn`) to stay object-safe for `dyn HostProc` and match the existing
+  `Box<dyn HostFs>` DI style **without** pulling in an `async-trait` dependency (the
+  codebase hand-rolls its async actors). `Send + Sync`; the future is `Send +
+  'static` so the event-loop actor can `tokio::spawn` it.
+- **`ProcSpec`** (argv / cwd / env / stdin) and **`ProcEvents`** — a handle that
+  hides the crate-internal `LoopEvent` enum behind `spawned(pid)` then `exited(code,
+  stdout, stderr)`; `exited` consumes the handle so the exactly-one-exit contract is
+  enforced by the type. `StdHostProc` (the default) is today's `run_process` verbatim.
+- **`ServerInit::host_proc: Option<Box<dyn HostProc + Send>>`** — `Send` so it rides
+  `ServerInit` onto the server thread, where `run_io` rebuilds it into the shared
+  `Arc<dyn HostProc>` the `EventLoop` actor holds (`Arc::from` → drop `Send` by
+  unsize coercion, mirroring the `host_fs` rebuild). `None` = real local processes.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/host_proc.rs`: an in-memory fake
+`HostProc` (shared `Arc<Mutex<…>>`) both **records** the argv it is asked to run and
+**serves** a result the editor's `on_exit` observes. Faithful, not a no-op — the
+fake echoes the *actual* argv back as stdout for a program on no PATH, so the
+observed `code = 0` + echoed argv proves the injected host intercepted the spawn (a
+real spawn would be `code = -1`); a second test proves each `vim.system` reaches the
+host with its own argv (reacts to input, not a canned constant). Regression-clean —
+full `nxvim-server` suite (17 binaries incl. `editing` 536, `uv_process`,
+`async_runtime`, `blockers` 34), `nxvim` crate, fmt + clippy all green; the local
+binaries (`nxvim`, `nxvim-gui`) pass `host_proc: None` and are unchanged.
 
 ### The full split
 
@@ -320,11 +362,12 @@ the fs/process daemon on the remote, and the local edit-host is a `HostServices`
 client over the ssh stdio transport (reusing the `nxvim-rpc` plumbing and the
 hardened ssh connector from `crates/nxvim-gui/src/remote.rs`).
 
-**The `HostProc` seam (folded in from Phase 1).** Define the process-spawning
-trait here, where its shape can match the daemon wire protocol rather than being
-guessed ahead of it. Unlike `HostFs` it is **async + event-routing** — a spawn
-returns an id, and stdout/exit arrive as loop events (exactly as `vim.system`
-already works via `evloop.rs`):
+**The `HostProc` seam (folded in from Phase 1).** Phase 3b **landed the trait and
+its in-process default** for the one-shot spawn path (see above) — async +
+event-routing, a `run` per child that reports pid + exit as loop events (exactly as
+`vim.system` already works via `evloop.rs`). The shape there is run-to-completion
+(`ProcSpec` → `ProcEvents::spawned`/`exited`); the daemon-bound, *interactive* shape
+the original sketch reached for —
 
 ```rust
 // the daemon's other half; consumed by the async server, not by core.
@@ -336,11 +379,14 @@ trait HostProc {
 }
 ```
 
-Re-point the three spawn sites at it: `evloop.rs::run_process`, `lsp/manager.rs`
-(a language server *is* "spawn + pipe stdio" — no special LSP protocol needed),
-and `clipboard.rs`. The in-process impl wraps today's `tokio::process`; the remote
-impl forwards to the daemon. **LSP needs no special protocol** — it collapses into
-`HostProc`.
+— is what the **remaining two spawn sites** need and is best resolved against the
+actual wire: `lsp/manager.rs` (a language server *is* "spawn + pipe stdio" — no
+special LSP protocol needed, but it does need raw bidirectional pipe handles, i.e.
+the `write_stdin` + stdout-as-events shape, not run-to-completion) and
+`clipboard.rs` (today a *synchronous* `Clipboard` provider — either an async
+clipboard or a sync sub-seam). The in-process impl wraps today's `tokio::process`;
+the remote impl forwards to the daemon. **LSP needs no special protocol** — it
+collapses into `HostProc`.
 
 **Cross-cutting semantics this phase must define:**
 

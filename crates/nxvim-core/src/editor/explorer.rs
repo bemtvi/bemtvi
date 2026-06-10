@@ -29,7 +29,8 @@ impl Editor {
     pub(crate) fn enter_dir(&mut self, path: &Path) {
         // Path-based dedup: an already-open listing of the same directory is
         // reused (and reset to the top), matching the file open-or-switch path.
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let fs = self.host_fs.clone();
+        let canon = fs.canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if self.buffer().dir.as_deref() != Some(canon.as_path()) {
             if let Some(id) = self.find_buffer_by_path(&canon) {
                 self.switch_buffer(id);
@@ -37,7 +38,7 @@ impl Editor {
                 return;
             }
         }
-        match Buffer::from_dir(&canon) {
+        match Buffer::from_dir(&canon, &*fs) {
             Ok(buf) => {
                 if self.current_is_throwaway() || self.is_explorer_buffer() {
                     // Replace in place, preserving the buffer id (netrw reuses the
@@ -176,7 +177,8 @@ impl Editor {
         if let Some(id) = self.find_buffer_by_path(path) {
             self.switch_buffer(id);
         } else {
-            match Buffer::from_file(path) {
+            let fs = self.host_fs.clone();
+            match Buffer::from_file(path, &*fs) {
                 Ok(buf) => {
                     let id = self.add_buffer(buf);
                     self.switch_buffer(id);

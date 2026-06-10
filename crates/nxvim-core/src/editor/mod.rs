@@ -13,6 +13,7 @@ use std::rc::Rc;
 use crate::buffer::Buffer;
 use crate::clipboard::Clipboard;
 use crate::highlight::Highlights;
+use crate::host::{HostFs, StdHostFs};
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::Options;
@@ -693,6 +694,13 @@ pub struct Editor {
     /// selecting `"+` / `"*` errors loudly instead of touching the unnamed
     /// register.
     clipboard: Option<Box<dyn Clipboard>>,
+    /// The filesystem the editor reads and writes through — the local disk
+    /// ([`StdHostFs`]) by default, swappable for a remote/daemon backend via
+    /// [`Editor::set_host_fs`] (the edit-host split). An `Rc` rather than a `Box`
+    /// so a `&mut`-borrowing buffer write (`self.buffer_mut().write(.., &*fs)`)
+    /// can still lend it without aliasing `self`; core is single-threaded, so the
+    /// non-atomic refcount is free.
+    host_fs: Rc<dyn HostFs>,
 }
 
 impl Editor {
@@ -700,8 +708,21 @@ impl Editor {
         Editor::with_buffer(Buffer::empty())
     }
 
+    /// Install the filesystem backend the editor reads/writes through. The server
+    /// can hand over a remote (daemon-backed) [`HostFs`]; the default is the local
+    /// [`StdHostFs`]. Mirrors [`Editor::set_syntax_engine`] / [`Editor::set_clipboard`].
+    /// (Phase 3 note: the initial-file constructors below still load through the
+    /// default `StdHostFs`; once a remote fs is injectable the startup open should
+    /// move *after* injection so the first buffer is fetched through it too.)
+    pub fn set_host_fs(&mut self, fs: Rc<dyn HostFs>) {
+        self.host_fs = fs;
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        Ok(Editor::with_buffer(Buffer::from_file(path.into())?))
+        Ok(Editor::with_buffer(Buffer::from_file(
+            path.into(),
+            &StdHostFs,
+        )?))
     }
 
     /// Open `path`, falling back to a buffer *named after* `path` (rather than an
@@ -718,7 +739,7 @@ impl Editor {
         // text. An unreadable directory (no permission) still fails loud, the same
         // way an unreadable file does below.
         if path.is_dir() {
-            return match Buffer::from_dir(&path) {
+            return match Buffer::from_dir(&path, &StdHostFs) {
                 Ok(buffer) => Editor::with_buffer(buffer),
                 Err(e) => {
                     let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
@@ -727,7 +748,7 @@ impl Editor {
                 }
             };
         }
-        match Buffer::from_file(&path) {
+        match Buffer::from_file(&path, &StdHostFs) {
             Ok(buffer) => Editor::with_buffer(buffer),
             Err(e) => {
                 let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
@@ -821,6 +842,7 @@ impl Editor {
             syntax_failed: HashSet::new(),
             ts_override: HashMap::new(),
             clipboard: None,
+            host_fs: Rc::new(StdHostFs),
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

@@ -4,10 +4,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::Result;
 use ropey::{LineType, Rope};
+
+use crate::host::{FileStat, HostFs};
 
 /// The line-break convention nxvim tracks. `LF_CR` recognizes both Unix (`\n`)
 /// and DOS (`\r\n`) breaks, so files of either `fileformat` split into lines
@@ -53,32 +54,12 @@ impl EditBatch {
     }
 }
 
-/// A snapshot of the buffer's file as nxvim last saw it on disk — captured when
-/// the file is read ([`Buffer::from_file`]) and refreshed after every successful
-/// [`Buffer::write`]. Comparing the live filesystem against it tells whether the
-/// file was changed by something *other* than this editor in the interim, so `:w`
-/// can refuse to clobber an outside edit (vim's `b_mtime` / `b_orig_size` pair).
-/// We track both mtime and size because either alone can miss a change (a same-
-/// length edit keeps the size; a coarse-resolution clock can repeat an mtime).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DiskState {
-    /// Last-modified time, when the platform/filesystem reports one.
-    mtime: Option<SystemTime>,
-    /// File length in bytes.
-    size: u64,
-}
-
-/// Stat `path` into a [`DiskState`], or `None` if it can't be stat'd (the file
-/// doesn't exist, or is otherwise inaccessible). A `None` here is itself a
-/// meaningful state — distinct from any `Some` — so a file that vanishes or
-/// appears registers as a change.
-fn disk_state(path: &Path) -> Option<DiskState> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some(DiskState {
-        mtime: meta.modified().ok(),
-        size: meta.len(),
-    })
-}
+// The buffer's last-seen on-disk snapshot is a [`crate::host::FileStat`],
+// captured at [`Buffer::from_file`] and refreshed after every successful
+// [`Buffer::write`]. Comparing the live filesystem against it ([`Buffer::disk_changed`])
+// tells whether something *other* than this editor touched the file, so `:w` can
+// refuse to clobber an outside edit (vim's `b_mtime` / `b_orig_size` pair). The
+// stat itself is taken through the injected [`HostFs`], not `std::fs`.
 
 /// A text buffer.
 ///
@@ -166,7 +147,7 @@ pub struct Buffer {
     /// [`Buffer::disk_changed`], which lets the editor refuse to overwrite a file
     /// that changed underneath us. `None` until we observe an on-disk file (a
     /// scratch buffer, or a `:e new-file` whose target doesn't exist yet).
-    disk: Option<DiskState>,
+    disk: Option<FileStat>,
 }
 
 impl Default for Buffer {
@@ -230,22 +211,22 @@ impl Buffer {
 
     /// Load a buffer from `path`. A missing file yields an empty buffer bound to
     /// that path (written on first save), matching `vim file-that-does-not-exist`.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_file(path: impl AsRef<Path>, fs: &dyn HostFs) -> Result<Self> {
         let path = path.as_ref();
-        let mut text = if path.exists() {
+        let mut text = if fs.exists(path) {
             // Stream the file straight into the rope rather than reading it into
             // an intermediate `String` first. `from_reader` pulls through a small
             // fixed buffer, so peak memory at open is ~1x the file size (just the
             // rope) instead of ~2x (transient `String` + rope). It still validates
             // UTF-8 and errors on invalid input, matching `read_to_string`.
-            Rope::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?
+            Rope::from_reader(fs.open_read(path)?)?
         } else {
             Rope::new()
         };
         ensure_trailing_newline(&mut text);
         // Record what's on disk right now (mtime + size), so a later `:w` can tell
         // if the file changed underneath us. `None` for a not-yet-existing file.
-        let disk = disk_state(path);
+        let disk = fs.stat(path);
         Ok(Buffer {
             text,
             path: Some(path.to_path_buf()),
@@ -275,17 +256,15 @@ impl Buffer {
     /// path as its `path` so its name shows the directory (matching netrw).
     /// Errors only when the directory can't be read (e.g. no permission); an empty
     /// directory yields just the `../` line.
-    pub fn from_dir(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_dir(path: impl AsRef<Path>, fs: &dyn HostFs) -> Result<Self> {
         let path = path.as_ref();
         // Canonicalize so going up (`../`) and descending (`join`) are
         // unambiguous however the path was spelled (`.`, a relative dir, a
         // symlink). Fall back to the given path if it can't be resolved.
-        let dir = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let dir = fs.canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut entries: Vec<(bool, String)> = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            entries.push((is_dir, entry.file_name().to_string_lossy().into_owned()));
+        for entry in fs.read_dir(&dir)? {
+            entries.push((entry.is_dir, entry.name));
         }
         // Directories first, then case-insensitive by name (netrw's default sort).
         entries.sort_by(|a, b| {
@@ -566,17 +545,17 @@ impl Buffer {
     }
 
     /// Write the buffer to `path` (or its bound path). Returns `(bytes, lines)`.
-    pub fn write(&mut self, path: Option<PathBuf>) -> Result<(usize, usize)> {
+    pub fn write(&mut self, path: Option<PathBuf>, fs: &dyn HostFs) -> Result<(usize, usize)> {
         let target = path
             .or_else(|| self.path.clone())
             .ok_or_else(|| anyhow::anyhow!("E32: No file name"))?;
         let contents = self.text.to_string();
-        write_atomic(&target, contents.as_bytes())?;
+        fs.write_atomic(&target, contents.as_bytes())?;
         let lines = self.line_count();
         // Re-stat the file we just wrote so its mtime/size become the new baseline
         // for [`disk_changed`]: after a save, *we* are what's on disk, so the very
         // next `:w` shouldn't think the file changed underneath us.
-        self.disk = disk_state(&target);
+        self.disk = fs.stat(&target);
         self.path = Some(target);
         self.modified = false;
         // Only on a successful write, so a consumer mirroring `save_tick` sees a
@@ -593,83 +572,12 @@ impl Buffer {
     /// transition counts: a file that was deleted, or one that appeared where the
     /// buffer expected none (a `:e new-file` whose name another process then
     /// created), both register — in each case a blind `:w` would clobber.
-    pub fn disk_changed(&self) -> bool {
+    pub fn disk_changed(&self, fs: &dyn HostFs) -> bool {
         match self.path.as_deref() {
-            Some(path) => disk_state(path) != self.disk,
+            Some(path) => fs.stat(path) != self.disk,
             None => false,
         }
     }
-}
-
-/// Write `contents` to `path` atomically: stream into a temp file in the same
-/// directory, fsync it, then `rename` it over the target. A crash, `SIGKILL`,
-/// full disk, or power loss mid-save can lose the *new* write but never
-/// truncates or half-writes the file the way `std::fs::write`'s `O_TRUNC` would —
-/// the rename either fully publishes the new contents or leaves the old file
-/// untouched. (Atomicity holds within one filesystem, which is why the temp sits
-/// next to the final file.)
-///
-/// If `path` is a symlink it is resolved first, so the rename replaces the file
-/// the link points at — keeping the link rather than clobbering it with a regular
-/// file — and the temp lands on the same filesystem as that real file. An
-/// existing target's permissions (and, best-effort, its ownership) are carried
-/// onto the replacement so a save never silently downgrades them.
-///
-/// Trade-off vs. the old in-place write: an atomic save needs to *create* a temp
-/// entry in the target's directory, so a writable file inside a read-only
-/// directory can no longer be saved — it fails loudly (which the editor surfaces)
-/// instead of silently truncating. That matches nxvim's "fail loud" posture.
-fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    // Resolve a symlink (and any `..`) to the real file so we replace *it*, not
-    // the link, and so the temp shares its filesystem. A path that doesn't exist
-    // yet (a brand-new file) has no canonical form — keep it as given.
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let dir = real.parent().unwrap_or_else(|| Path::new("."));
-    let existing = std::fs::metadata(&real).ok();
-
-    // Temp lives in the target's directory (same filesystem → atomic rename),
-    // hidden and pid-tagged so it neither collides with a concurrent process nor
-    // shows up as a stray visible file if a later step fails.
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(real.file_name().unwrap_or(std::ffi::OsStr::new("nxvim")));
-    tmp_name.push(format!(".nxvim-tmp.{}", std::process::id()));
-    let tmp = dir.join(tmp_name);
-
-    let write = || -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(contents)?;
-        // Durability: the bytes (and the file's metadata) must reach disk before
-        // the rename publishes the temp under the target's name.
-        file.sync_all()?;
-        drop(file);
-        // Carry the prior file's mode (and best-effort owner) onto the temp so a
-        // save preserves them; a fresh file keeps `File::create`'s default mode.
-        if let Some(meta) = &existing {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
-            #[cfg(unix)]
-            preserve_owner(&tmp, meta);
-        }
-        std::fs::rename(&tmp, &real)
-    };
-
-    let result = write();
-    if result.is_err() {
-        // Never leave a partial temp behind on failure.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-/// Best-effort: carry `meta`'s owner/group onto `path`. Only the super-user can
-/// `chown` to an arbitrary owner, so for a normal user saving their own file this
-/// is a no-op; a failure (e.g. `EPERM` when an unprivileged user saves a file
-/// owned by someone else) must not fail the save, so the result is ignored.
-#[cfg(unix)]
-fn preserve_owner(path: &Path, meta: &std::fs::Metadata) {
-    use std::os::unix::fs::MetadataExt;
-    let _ = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()));
 }
 
 /// Strip a single trailing line break (`\n` or `\r\n`) from `s`, leaving any

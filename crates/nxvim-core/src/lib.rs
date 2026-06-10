@@ -15,6 +15,7 @@ pub mod clipboard;
 pub mod editor;
 pub mod extmark;
 pub mod highlight;
+pub mod host;
 pub mod input;
 pub mod mode;
 pub mod options;
@@ -33,6 +34,7 @@ pub use editor::{
 };
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
+pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
 pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent};
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};

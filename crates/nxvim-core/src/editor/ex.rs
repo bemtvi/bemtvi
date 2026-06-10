@@ -1345,13 +1345,14 @@ impl Editor {
             None => true,
             Some(p) => self.buffer().path.as_deref() == Some(p.as_path()),
         };
-        if !bang && writes_own_file && self.buffer().disk_changed() {
+        let fs = self.host_fs.clone();
+        if !bang && writes_own_file && self.buffer().disk_changed(&*fs) {
             self.echo(
                 "WARNING: The file has changed on disk since editing started (add ! to override)",
             );
             return;
         }
-        match self.buffer_mut().write(path) {
+        match self.buffer_mut().write(path, &*fs) {
             Ok((bytes, lines)) => {
                 // The current state is now what's on disk — undoing/redoing back
                 // to it should read as clean, and the saved node carries a save
@@ -1477,7 +1478,8 @@ impl Editor {
         if self.current_is_throwaway() {
             self.load_into_current(&path);
         } else {
-            match Buffer::from_file(&path) {
+            let fs = self.host_fs.clone();
+            match Buffer::from_file(&path, &*fs) {
                 Ok(buf) => {
                     let id = self.add_buffer(buf);
                     self.switch_buffer(id);
@@ -1521,9 +1523,10 @@ impl Editor {
             self.add_buffer(Buffer::empty())
         } else {
             let path = PathBuf::from(file);
+            let fs = self.host_fs.clone();
             match self.find_buffer_by_path(&path) {
                 Some(id) => id,
-                None => match Buffer::from_file(&path) {
+                None => match Buffer::from_file(&path, &*fs) {
                     Ok(b) => self.add_buffer(b),
                     Err(e) => {
                         self.echo(e.to_string());
@@ -1661,6 +1664,7 @@ impl Editor {
     /// the outside edit.
     fn ex_write_all(&mut self, bang: bool) {
         let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
+        let fs = self.host_fs.clone();
         let mut written = 0;
         let mut conflict = None;
         for id in ids {
@@ -1668,13 +1672,13 @@ impl Editor {
             if !(ob.buffer.modified && ob.buffer.path.is_some()) {
                 continue;
             }
-            if !bang && ob.buffer.disk_changed() {
+            if !bang && ob.buffer.disk_changed(&*fs) {
                 // Don't clobber an outside edit; remember the first such buffer (ids
                 // ascend, so this is the lowest-numbered conflict) to surface below.
                 conflict.get_or_insert(id);
                 continue;
             }
-            if self.buffers.get_mut(id).buffer.write(None).is_ok() {
+            if self.buffers.get_mut(id).buffer.write(None, &*fs).is_ok() {
                 // The written state is now the saved node (carries a save number).
                 self.mark_undo_saved(id);
                 written += 1;

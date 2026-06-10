@@ -251,7 +251,8 @@ impl Editor {
     /// re-sync (`mark_resync` bumps `changedtick`, but we keep `modified` clear
     /// because it is freshly read from disk).
     pub(crate) fn load_into_current(&mut self, path: &Path) {
-        match Buffer::from_file(path) {
+        let fs = self.host_fs.clone();
+        match Buffer::from_file(path, &*fs) {
             Ok(buf) => {
                 self.cursor = Cursor::default();
                 self.top = 0;
@@ -289,7 +290,8 @@ impl Editor {
             } else if self.current_is_throwaway() {
                 self.load_into_current(path);
             } else {
-                match Buffer::from_file(path) {
+                let fs = self.host_fs.clone();
+                match Buffer::from_file(path, &*fs) {
                     Ok(buf) => {
                         let id = self.add_buffer(buf);
                         self.switch_buffer(id);

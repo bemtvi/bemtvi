@@ -80,9 +80,9 @@ async fn start(rtp: Vec<PathBuf>) -> (Rpc, UnboundedReceiver<Incoming>) {
 /// The small `vim.*` surface nvim-cmp reaches for while building a completion
 /// context and its float windows — each was missing and broke cmp at load (and
 /// thus every cmp source). They are general primitives, so this asserts their
-/// behavior directly (no plugin needed) rather than the full cmp load, which is
-/// still blocked on `nvim_set_decoration_provider` (a redraw subsystem, tracked
-/// separately). Covers: vim.uv.now (ms monotonic), vim.api.nvim_get_current_line,
+/// behavior directly (no plugin needed); the full cmp load is now covered by
+/// `nvim_cmp_loads` above (the decoration-provider subsystem closed the last gap).
+/// Covers: vim.uv.now (ms monotonic), vim.api.nvim_get_current_line,
 /// vim.str_utfindex / vim.str_byteindex (both signatures), and vim.fn.exists.
 #[tokio::test]
 async fn cmp_vim_surface_primitives() {
@@ -123,6 +123,28 @@ async fn cmp_vim_surface_primitives() {
     )
     .await;
     assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
+}
+
+/// nvim-cmp: `cmp.setup{}` builds the default *custom entries* view, which calls
+/// `vim.api.nvim_set_decoration_provider` to highlight each entry's matched chars.
+/// That API (and the ephemeral extmarks its callbacks place) was the last gap —
+/// without it the view errored at construction, failing cmp's load and every cmp
+/// source that `require('cmp')`. With the decoration-provider subsystem in place,
+/// `require('cmp')` + `cmp.setup{}` completes. (The provider *firing* — ephemeral
+/// highlights reaching the projection — is proven directly in `decoration.rs`.)
+#[tokio::test]
+async fn nvim_cmp_loads() {
+    assert_plugin_ok(
+        &["nvim-cmp"],
+        r#"
+        local ok, err = pcall(function()
+          local cmp = require('cmp')
+          cmp.setup({})
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
 }
 
 /// LuaSnip: `luasnip/util/ext_opts.lua` calls vim.fn.hlexists to drop undefined

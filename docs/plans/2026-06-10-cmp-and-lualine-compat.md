@@ -29,7 +29,33 @@ Two remain. Both are blocked on subsystems nxvim does not yet have.
 
 ## 1. nvim-cmp — needs a decoration-provider redraw hook
 
-### Where it stands
+> **Status: DONE.** The decoration-provider subsystem landed, so
+> `require('cmp')` + `cmp.setup{}` completes (`plugin_compat.rs::nvim_cmp_loads`)
+> and a provider's `on_win` ephemeral highlights reach the projection and clear
+> the next frame (`decoration.rs::decoration_provider_ephemeral_highlight_appears_then_clears`).
+> What shipped, matching the proposal below:
+> - **Lua surface** (`prelude/api.lua`): `nvim_set_decoration_provider(ns, opts)` +
+>   a `vim._decoration_providers` registry, the `vim._decor_*` drivers (frame
+>   start/end + per-window `on_win`→`on_line`), and `nvim_buf_set_extmark` now
+>   accepts the `end_line` alias and routes `ephemeral = true` to a dedicated
+>   funnel (rejected loud outside a provider callback, per neovim).
+> - **Ephemeral op** (`ops.rs` `ExtmarkOp::SetEphemeral`, its own
+>   `ephemeral_extmark_ops` queue + `runtime.rs` driver methods + `install.rs`
+>   funnel).
+> - **Server** (`decoration.rs` `run_decoration_providers`): driven from
+>   `redraw()` *between* the view snapshot and the projection — the borrow-safe
+>   "Lua queues, server drains" split the proposal called for. Ephemeral marks
+>   fold into a per-frame `Server::ephemeral_extmarks` store (cleared each frame),
+>   which `extmarks.rs::extmark_intervals` layers above the persistent set.
+> - **Scope taken**: `on_win` + `on_line` drive real work; `on_start` / `on_buf`
+>   (currently not driven) / `on_end` are invoked as no-ops. `hl_mode = 'combine'`
+>   rides the existing accepted-but-unrendered decoration path (matched chars are
+>   highlighted, replace-style not blend — the same v1 fidelity gap persistent
+>   extmarks already have), not a load failure. Driving the *real* cmp menu
+>   end-to-end (the completion pipeline opening its float) is left to a follow-up;
+>   the firing path itself is proven directly in `decoration.rs`.
+
+### Where it stood
 
 `705fd61` already added the four primitives cmp reaches for while building a
 completion `context` and its float windows (`vim.uv.now`,

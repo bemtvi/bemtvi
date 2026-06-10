@@ -319,6 +319,15 @@ pub(crate) struct Shared {
     /// `_clear_namespace`, drained by the server into the target buffer's
     /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) after the chunk.
     pub(crate) extmark_ops: Vec<ExtmarkOp>,
+    /// **Ephemeral** extmark placements ([`ExtmarkOp::SetEphemeral`]) emitted by a
+    /// decoration provider's `on_win` / `on_line` callback while the server drives
+    /// it during redraw. Kept in their own queue (not [`extmark_ops`]) because the
+    /// server drains them at a different point — into the per-frame ephemeral store
+    /// it reads while projecting, then clears — rather than into the persistent
+    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) after a chunk.
+    ///
+    /// [`extmark_ops`]: Shared::extmark_ops
+    pub(crate) ephemeral_extmark_ops: Vec<ExtmarkOp>,
     /// Window mutations from the `vim.api.nvim_win_*` / `nvim_open_win` /
     /// `nvim_set_current_win` API, drained by the server into the live editor
     /// after the chunk (Phase 5).
@@ -729,6 +738,13 @@ impl LuaRuntime {
         /// since the last drain, for the server to apply to the target buffers'
         /// [`ExtmarkStore`](nxvim_core::ExtmarkStore).
         take_extmark_ops -> Vec<ExtmarkOp> = extmark_ops
+    }
+
+    take_queue! {
+        /// Take the ephemeral extmark placements a decoration provider emitted while
+        /// the server drove it this frame ([`ExtmarkOp::SetEphemeral`]), for the
+        /// server to fold into its per-frame ephemeral store before projecting.
+        take_ephemeral_extmark_ops -> Vec<ExtmarkOp> = ephemeral_extmark_ops
     }
 
     take_queue! {
@@ -1186,6 +1202,41 @@ impl LuaRuntime {
     pub fn ex_doautocmd(&self, args: &str) -> mlua::Result<String> {
         let f: mlua::Function = self.vim()?.get("_ex_doautocmd")?;
         f.call(args)
+    }
+
+    /// Whether any decoration provider is registered
+    /// (`nvim_set_decoration_provider`). The server checks this once per redraw to
+    /// skip the whole provider-driving path (and its buffer-mirror push) on the
+    /// common frame where none is active.
+    pub fn has_decoration_providers(&self) -> mlua::Result<bool> {
+        let f: mlua::Function = self.vim()?.get("_has_decoration_providers")?;
+        f.call(())
+    }
+
+    /// Begin a decoration frame: invoke every registered provider's `on_start(tick)`.
+    /// `tick` is the server's monotonic redraw counter (neovim's display tick).
+    pub fn decor_frame_start(&self, tick: u64) -> mlua::Result<()> {
+        let f: mlua::Function = self.vim()?.get("_decor_frame_start")?;
+        f.call(tick)
+    }
+
+    /// Drive the registered decoration providers for one window: each provider's
+    /// `on_win('win', ns, win, buf, top, bot)` and then, unless `on_win` returned
+    /// `false`, its `on_line('line', ns, win, buf, row)` for each row in
+    /// `[top, bot]` (0-based buffer lines). The callbacks place ephemeral extmarks
+    /// (`nvim_buf_set_extmark(…, { ephemeral = true })`) which queue as
+    /// [`ExtmarkOp::SetEphemeral`] for the server to drain. Returns any provider
+    /// error text (empty when all ran clean) so the server can surface it loud
+    /// rather than let a broken provider fail silently.
+    pub fn decor_on_win(&self, win: u64, bufnr: u64, top: i64, bot: i64) -> mlua::Result<String> {
+        let f: mlua::Function = self.vim()?.get("_decor_on_win")?;
+        f.call((win, bufnr, top, bot))
+    }
+
+    /// End a decoration frame: invoke every registered provider's `on_end(tick)`.
+    pub fn decor_frame_end(&self, tick: u64) -> mlua::Result<()> {
+        let f: mlua::Function = self.vim()?.get("_decor_frame_end")?;
+        f.call(tick)
     }
 
     /// Refresh the `vim._cur_buf` snapshot the prelude reads back through

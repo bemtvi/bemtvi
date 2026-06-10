@@ -90,6 +90,12 @@ vim._namespace_next = vim._namespace_next or 1
 vim._extmarks = vim._extmarks or {}
 vim._extmark_next = vim._extmark_next or {}
 
+-- Registered decoration providers, keyed by namespace id:
+-- `{ on_start, on_buf, on_win, on_line, on_end }`. Populated by
+-- `nvim_set_decoration_provider`; the server drives the entries each redraw (see
+-- the `vim._decor_*` drivers below).
+vim._decoration_providers = vim._decoration_providers or {}
+
 -- Receive the extmark mirror: `entries[bufnr]` is the array of that buffer's
 -- marks the server pushed from core (positions already shifted for any edits).
 -- Rebuilds `vim._extmarks` from the authoritative state; the persistent
@@ -1312,9 +1318,12 @@ function vim.api.nvim_create_namespace(name)
   return id
 end
 
--- The extmark options v1 RENDERS: position, span, highlight, priority.
+-- The extmark options v1 RENDERS: position, span, highlight, priority. `end_line`
+-- is neovim's deprecated alias for `end_row` (cmp's decoration provider uses it);
+-- `ephemeral` marks a single-frame decoration a provider places during redraw.
 local EXTMARK_OPT_OK = {
-  id = true, end_row = true, end_col = true, hl_group = true, priority = true,
+  id = true, end_row = true, end_line = true, end_col = true, hl_group = true,
+  priority = true, ephemeral = true,
 }
 -- Decoration options nxvim ACCEPTS and STORES (so nvim_buf_get_extmarks(…,
 -- {details=true}) returns them) but does NOT yet render — virtual text, virtual
@@ -1359,10 +1368,25 @@ function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
   if hl_group ~= nil and type(hl_group) ~= "string" then
     error("nvim_buf_set_extmark: hl_group must be a string (group lists not supported yet)", 2)
   end
-  if (opts.end_row == nil) ~= (opts.end_col == nil) then
-    error("nvim_buf_set_extmark: end_row and end_col must be given together", 2)
+  -- `end_line` is the deprecated alias for `end_row`; honor either.
+  local end_row = opts.end_row
+  if end_row == nil then end_row = opts.end_line end
+  if (end_row == nil) ~= (opts.end_col == nil) then
+    error("nvim_buf_set_extmark: end_row/end_line and end_col must be given together", 2)
   end
   local priority = opts.priority or 4096
+
+  -- An ephemeral mark is a single-frame decoration: it is only valid while the
+  -- server is driving a decoration provider (neovim errors otherwise), carries no
+  -- id, and bypasses the persistent store/mirror entirely — the server folds it
+  -- into the per-frame ephemeral store it clears each redraw.
+  if opts.ephemeral then
+    if not vim._in_decoration then
+      error("nvim_buf_set_extmark: ephemeral marks are only valid inside a decoration provider callback", 2)
+    end
+    vim._extmark_set_ephemeral(b, ns, line, col, end_row, opts.end_col, hl_group, priority)
+    return -1
+  end
 
   vim._extmark_next[b] = vim._extmark_next[b] or {}
   local mark_id = opts.id or vim._extmark_next[b][ns] or 1
@@ -1374,11 +1398,11 @@ function vim.api.nvim_buf_set_extmark(buffer, ns, line, col, opts)
   vim._extmarks[b][ns] = vim._extmarks[b][ns] or {}
   vim._extmarks[b][ns][mark_id] = {
     row = line, col = col,
-    end_row = opts.end_row, end_col = opts.end_col,
+    end_row = end_row, end_col = opts.end_col,
     hl_group = hl_group, priority = priority,
     decoration = decoration,
   }
-  vim._extmark_set(b, ns, mark_id, line, col, opts.end_row, opts.end_col, hl_group, priority)
+  vim._extmark_set(b, ns, mark_id, line, col, end_row, opts.end_col, hl_group, priority)
   return mark_id
 end
 
@@ -1412,6 +1436,97 @@ function vim.api.nvim_buf_clear_namespace(buffer, ns, line_start, line_end)
     end
   end
   vim._extmark_clear(b, ns, line_start, line_end)
+end
+
+-- ----- Decoration providers --------------------------------------------------
+-- A decoration provider is a per-redraw callback set. The server drives it each
+-- frame: on_start(tick) once, then for every window on_win and (unless on_win
+-- returned false) on_line per visible row, then on_end(tick). Inside on_win /
+-- on_line the provider places EPHEMERAL extmarks — single-frame highlights that
+-- the server folds into a store it clears before the next redraw. nvim-cmp uses
+-- this to highlight the matched characters of each completion entry.
+
+-- nvim_set_decoration_provider(ns, opts): register a provider for namespace `ns`
+-- ({ on_start, on_buf, on_win, on_line, on_end }, each a function). An empty
+-- `opts` deregisters it (neovim's clear form). Each callback must be a function;
+-- an unknown key is rejected loud rather than silently dropped.
+function vim.api.nvim_set_decoration_provider(ns, opts)
+  opts = opts or {}
+  if next(opts) == nil then
+    vim._decoration_providers[ns] = nil
+    return
+  end
+  local KNOWN = { on_start = true, on_buf = true, on_win = true, on_line = true, on_end = true }
+  local prov = {}
+  for k, v in pairs(opts) do
+    if not KNOWN[k] then
+      error("nvim_set_decoration_provider: unknown option '" .. tostring(k) .. "'", 2)
+    end
+    if type(v) ~= "function" then
+      error("nvim_set_decoration_provider: '" .. k .. "' must be a function", 2)
+    end
+    prov[k] = v
+  end
+  vim._decoration_providers[ns] = prov
+end
+
+-- Whether any provider is registered — the server's per-frame fast-path gate, so
+-- a redraw with no provider skips the whole drive (and its buffer-mirror push).
+function vim._has_decoration_providers()
+  return next(vim._decoration_providers) ~= nil
+end
+
+-- Begin a decoration frame: each provider's on_start(tick).
+function vim._decor_frame_start(tick)
+  for _, p in pairs(vim._decoration_providers) do
+    if p.on_start then p.on_start("start", tick) end
+  end
+end
+
+-- Drive every provider for one window: on_win("win", ns, win, buf, top, bot),
+-- then — unless on_win returned false — on_line("line", ns, win, buf, row) for
+-- each 0-based buffer row in [top, bot]. Ephemeral extmarks the callbacks place
+-- are only accepted while `vim._in_decoration` is set. A provider that errors is
+-- surfaced (its message returned for the server to echo) and dropped, matching
+-- neovim — so a broken provider fails loud once instead of every frame. Returns
+-- "" when all ran clean.
+function vim._decor_on_win(win, buf, top, bot)
+  vim._in_decoration = true
+  local err, dead
+  for ns, p in pairs(vim._decoration_providers) do
+    local disabled = false
+    if p.on_win then
+      local ok, ret = pcall(p.on_win, "win", ns, win, buf, top, bot)
+      if not ok then
+        err = err or tostring(ret)
+        dead = dead or {}; dead[ns] = true; disabled = true
+      elseif ret == false then
+        disabled = true -- provider opted this window out of per-line callbacks
+      end
+    end
+    if p.on_line and not disabled then
+      for row = top, bot do
+        local ok, e = pcall(p.on_line, "line", ns, win, buf, row)
+        if not ok then
+          err = err or tostring(e)
+          dead = dead or {}; dead[ns] = true
+          break
+        end
+      end
+    end
+  end
+  vim._in_decoration = false
+  if dead then
+    for ns in pairs(dead) do vim._decoration_providers[ns] = nil end
+  end
+  return err or ""
+end
+
+-- End a decoration frame: each provider's on_end(tick).
+function vim._decor_frame_end(tick)
+  for _, p in pairs(vim._decoration_providers) do
+    if p.on_end then p.on_end("end", tick) end
+  end
 end
 
 -- Normalize a `get_extmarks` position argument to an inclusive (row, col) bound.

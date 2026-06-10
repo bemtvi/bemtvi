@@ -17,6 +17,7 @@
 
 mod clipboard;
 mod daemon;
+mod decoration;
 mod dispatch;
 mod effects;
 mod evloop;
@@ -348,6 +349,18 @@ struct Server {
     /// on the matching `select!` arm, where the editor reloads the grammar and
     /// echoes the result — see [`Server::on_install_done`].
     install_tx: UnboundedSender<InstallOutcome>,
+    /// Per-frame **ephemeral** extmarks placed by decoration providers, keyed by
+    /// buffer. Rebuilt from scratch every redraw: cleared at the start of the
+    /// provider drive ([`Server::run_decoration_providers`]), populated as each
+    /// provider's `on_win` / `on_line` emits `ephemeral = true` marks, read by
+    /// [`Server::extmark_intervals`] while projecting, and left until the next
+    /// frame clears it. Separate from each buffer's persistent
+    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) so single-frame decorations never
+    /// touch undo/redo or the `nvim_buf_get_extmarks` mirror.
+    ephemeral_extmarks: HashMap<BufferId, nxvim_core::ExtmarkStore>,
+    /// Monotonic redraw counter handed to decoration providers as the frame `tick`
+    /// (neovim's display tick). Incremented once per [`Server::run_decoration_providers`].
+    decor_tick: u64,
 }
 
 /// A finished `:TSInstall` job: the requested language and the install result
@@ -514,6 +527,8 @@ where
         pending_getchar: None,
         feed_buffer: VecDeque::new(),
         install_tx,
+        ephemeral_extmarks: HashMap::new(),
+        decor_tick: 0,
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),

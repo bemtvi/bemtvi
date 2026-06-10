@@ -52,29 +52,43 @@ impl Server {
             return Vec::new();
         };
         let line_end = line_start + line_len;
-        buf.extmarks
+        // Clip one mark's byte range to this line's content; a multi-line mark
+        // contributes its overlap with each line it crosses. Point marks and marks
+        // with no `hl_group` render nothing and are dropped.
+        let clip = move |m: &'a nxvim_core::Extmark, order: u32| -> Option<HlInterval<'a>> {
+            let group = m.hl_group.as_deref()?;
+            let end = m.end?.min(line_end);
+            let start = m.start.max(line_start);
+            // Lazy `.then(|| …)`, not `.then_some(…)`: when the mark doesn't touch
+            // this line (`start >= end`) the byte subtractions below would
+            // underflow, so they must not be evaluated.
+            (start < end).then(|| HlInterval {
+                start: start - line_start,
+                end: end - line_start,
+                group,
+                priority: m.priority,
+                order,
+                capture: false,
+            })
+        };
+        let mut out: Vec<HlInterval<'a>> = buf
+            .extmarks
             .iter_all()
             .enumerate()
-            .filter_map(|(i, m)| {
-                let group = m.hl_group.as_deref()?;
-                let end = m.end?;
-                // Clip the mark's byte range to this line's content; a multi-line
-                // mark contributes its overlap with each line it crosses.
-                let start = m.start.max(line_start);
-                let end = end.min(line_end);
-                if start >= end {
-                    return None;
-                }
-                Some(HlInterval {
-                    start: start - line_start,
-                    end: end - line_start,
-                    group,
-                    priority: m.priority,
-                    order: base_order + i as u32,
-                    capture: false,
-                })
-            })
-            .collect()
+            .filter_map(|(i, m)| clip(m, base_order + i as u32))
+            .collect();
+        // The per-frame ephemeral marks a decoration provider placed this redraw
+        // layer *above* the persistent set: continue the `order` past the
+        // persistent marks so an ephemeral mark wins ties at equal priority.
+        if let Some(eph) = self.ephemeral_extmarks.get(&buffer) {
+            let off = base_order + buf.extmarks.iter_all().count() as u32;
+            out.extend(
+                eph.iter_all()
+                    .enumerate()
+                    .filter_map(|(j, m)| clip(m, off + j as u32)),
+            );
+        }
+        out
     }
 }
 

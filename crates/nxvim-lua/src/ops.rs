@@ -344,6 +344,23 @@ pub enum ExtmarkOp {
         hl_group: Option<String>,
         priority: u32,
     },
+    /// Place an **ephemeral** mark — a single-frame decoration a registered
+    /// decoration provider's `on_win` / `on_line` callback emits during redraw
+    /// (`nvim_buf_set_extmark(…, { ephemeral = true })`). It is not addressable
+    /// (no id) and never enters the persistent [`ExtmarkStore`] or the
+    /// `vim._extmarks` mirror: the server drains these into a per-frame ephemeral
+    /// store that is cleared before each redraw, so they live for exactly the
+    /// frame that produced them.
+    SetEphemeral {
+        bufnr: u64,
+        ns: u32,
+        row: i64,
+        col: i64,
+        end_row: Option<i64>,
+        end_col: Option<i64>,
+        hl_group: Option<String>,
+        priority: u32,
+    },
     /// Delete mark `(bufnr, ns, id)`.
     Del { bufnr: u64, ns: u32, id: u64 },
     /// Clear namespace `ns` over lines `[line_start, line_end)` (neovim's range:

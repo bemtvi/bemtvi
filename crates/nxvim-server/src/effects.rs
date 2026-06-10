@@ -428,6 +428,35 @@ impl Server {
                         .set(ns, Some(id), start, end, hl_group, priority);
                 }
             }
+            ExtmarkOp::SetEphemeral {
+                bufnr,
+                ns,
+                row,
+                col,
+                end_row,
+                end_col,
+                hl_group,
+                priority,
+            } => {
+                // A single-frame decoration mark: convert its position the same way
+                // a persistent set does, but fold it into the server's per-frame
+                // ephemeral store (cleared each redraw) rather than the buffer's
+                // persistent `ExtmarkStore`. A missing buffer (deleted between the
+                // provider callback and this drain) is a no-op.
+                let bid = BufferId(bufnr);
+                let Some(buf) = self.editor.buffer_of(bid) else {
+                    return;
+                };
+                let start = byte_of(buf, row, col);
+                let end = match (end_row, end_col) {
+                    (Some(r), Some(c)) => Some(byte_of(buf, r, c).max(start)),
+                    _ => None,
+                };
+                self.ephemeral_extmarks
+                    .entry(bid)
+                    .or_default()
+                    .set(ns, None, start, end, hl_group, priority);
+            }
             ExtmarkOp::Del { bufnr, ns, id } => {
                 if let Some(buf) = self.editor.buffer_of_mut(BufferId(bufnr)) {
                     buf.extmarks.del(ns, id);

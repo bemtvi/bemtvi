@@ -30,6 +30,10 @@ impl Server {
         self.refresh_highlights(h);
         // Drive LSP document sync for the current buffer (non-blocking).
         self.sync_lsp();
+        // Drive any registered decoration providers, populating the per-frame
+        // ephemeral extmark store the projection below reads (a no-op, save the
+        // gate check, when none is registered).
+        self.run_decoration_providers(&view);
 
         // Resolve every highlight span and chrome region to a concrete style here
         // on the server (the registry lives in the core). Spans carry an index

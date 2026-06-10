@@ -98,9 +98,9 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | phase | title | depends on | status |
 | --- | --- | --- | --- |
 | 0 | Feasibility spikes (compile / interop / blocking read) | — | ✅ |
-| 1 | The `HostServices` I/O seam (dependency inversion) | 0 | ⬜ |
+| 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ⬜ |
-| 3 | Native edit-host / daemon split (invert the SSH topology) | 1 | ⬜ |
+| 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ⬜ |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | ⬜ |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
@@ -112,55 +112,56 @@ its dependencies loaded.
 
 ---
 
-## The keystone: the `HostServices` seam (Phase 1)
+## The keystone: the `HostFs` seam (Phase 1) — ✅ DONE
 
 Every later phase pivots on **dependency-inverting `nxvim-core`'s I/O**. Core
-defines the interface it needs; two implementations exist (in-process, and
-over-the-wire), and the editing logic never knows which it's talking to.
+defines the interface it needs; the default implementation wraps the local disk,
+and Phase 3 swaps in a daemon-backed one — the editing logic never knows which.
+
+**Scope decision (2026-06-10): Phase 1 is the filesystem seam only.** Process
+spawning (`HostProc`) is *already* isolated server-side in an async actor
+(`evloop.rs`) and its trait shape is coupled to Phase 3's daemon wire protocol
+(it's async + event-routing — stdout/exit come back as loop events, not a return
+value). Guessing that shape ahead of the daemon invites rework, so it moves to
+**Phase 3**. The high-value, core-touching half — the part that made the "pure
+core" thesis real — is the fs seam, and it landed here.
+
+Shipped (`crates/nxvim-core/src/host.rs`), a **synchronous** trait + a real-disk
+default:
 
 ```rust
-// in nxvim-core — the ONLY surface core/edit-host uses to touch the outside world.
-// Kept minimal: the daemon's entire job is fs + process + watch.
 pub trait HostFs {
-    fn read(&self, path: &str) -> io::Result<Vec<u8>>;
-    fn write(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
-    fn stat(&self, path: &str) -> io::Result<Stat>;
-    fn list(&self, dir: &str) -> io::Result<Vec<DirEntry>>;
-    fn watch(&self, path: &str) -> WatchId;   // → FileChanged events on the loop
+    fn exists(&self, path: &Path) -> bool;
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>>; // streaming → rope at ~1× size
+    fn stat(&self, path: &Path) -> Option<FileStat>;               // mtime + size, for disk_changed
+    fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()>;
+    fn read_dir(&self, dir: &Path) -> io::Result<Vec<DirEntry>>;   // explorer listing
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
 }
-
-pub trait HostProc {
-    fn spawn(&self, cmd: &Command) -> io::Result<ProcId>;  // jobstart / vim.system / LSP / :!
-    fn write_stdin(&self, id: ProcId, bytes: &[u8]) -> io::Result<()>;
-    fn signal(&self, id: ProcId, sig: Signal) -> io::Result<()>;
-    // stdout/exit arrive as loop events (evloop.rs), as vim.system already does today.
-}
+pub struct StdHostFs; // the default; owns the atomic-write / owner-preserve logic
 ```
 
-Two crucial points keep this honest against `nxvim-core stays pure and
-synchronous`:
+`Buffer::{from_file,from_dir,write,disk_changed}` take `&dyn HostFs` instead of
+calling `std::fs`. `Editor` holds an `Rc<dyn HostFs>` (Rc so a `&mut`-borrowing
+buffer write can still lend it without aliasing `self`; core is single-threaded)
+with `set_host_fs` for Phase 3's remote injection.
 
-1. **Core stays sync.** The methods core calls directly are not on the keystroke
-   path — file read happens at *buffer open*, write at *save*. In the
-   inverted/browser model, the **async** part (waiting on the network) happens in
-   the edit-host *orchestration* layer (the server, already async via
-   `evloop.rs`), which fetches bytes and hands core a populated buffer. So
-   `Buffer`'s direct file read/write (the one I/O CLAUDE.md allows in core) gets
-   **lifted up** into the edit-host: core operates on in-memory bytes
-   (`Buffer::from_bytes`/`to_bytes`), the host does the actual fs. For the
-   in-process impl this is behavior-identical; it makes core *purer*, not less so.
-2. **LSP needs no special protocol.** A language server *is* "spawn a process and
-   pipe its stdio" → it collapses into `HostProc`. The whole `lsp/` subtree keeps
-   working; only its transport's process-spawn goes through `HostProc`.
+Two points that keep this honest against `nxvim-core stays pure and synchronous`:
 
-**Exit criteria.** The full `cargo test --workspace` passes unchanged with core
-routed through an in-process `HostFs`/`HostProc` (the default impl wrapping
-today's std calls). Zero behavior change; this phase is pure inversion.
+1. **Core stays sync.** The methods are called at *buffer open* / *save*, never on
+   the keystroke path. When Phase 3 needs the actual wait-on-the-network to be
+   async, that happens in the edit-host *orchestration* layer (the server, already
+   async via `evloop.rs`), which fetches bytes off-tick and hands core a populated
+   buffer — `Editor::load_str` / `mark_saved` already do exactly this in-memory
+   open/save for the web build, so the pattern exists.
+2. **The trait stayed synchronous on purpose** — see the module docs in `host.rs`.
 
-**Files.** New trait + in-process impl in `nxvim-core` (or a thin
-`nxvim-core::host` module); `Buffer` file I/O lifted into `nxvim-server`
-(`lifecycle.rs` / `buffers` path); `vim.system`/`jobstart` (`evloop.rs`,
-`prelude.lua`) and the LSP transport (`lsp/`) re-pointed at `HostProc`.
+**Exit criteria — met.** Full `cargo test --workspace --no-fail-fast` green
+(incl. the 536-test editing suite, buffers, windows, tabs, explorer); fmt +
+clippy clean. The only failures are two pre-existing tree-sitter-grammar tests
+that fail identically on a stashed clean tree (a sandbox limitation — the grammar
+worker can't compile). Zero behavior change; pure inversion. Server unchanged
+(default `StdHostFs` = today's behavior). Committed as `a378c16`.
 
 ---
 
@@ -254,11 +255,36 @@ the fs/process daemon on the remote, and the local edit-host is a `HostServices`
 client over the ssh stdio transport (reusing the `nxvim-rpc` plumbing and the
 hardened ssh connector from `crates/nxvim-gui/src/remote.rs`).
 
+**The `HostProc` seam (folded in from Phase 1).** Define the process-spawning
+trait here, where its shape can match the daemon wire protocol rather than being
+guessed ahead of it. Unlike `HostFs` it is **async + event-routing** — a spawn
+returns an id, and stdout/exit arrive as loop events (exactly as `vim.system`
+already works via `evloop.rs`):
+
+```rust
+// the daemon's other half; consumed by the async server, not by core.
+trait HostProc {
+    async fn spawn(&self, cmd: &Command) -> io::Result<ProcId>; // jobstart / vim.system / LSP / :!
+    async fn write_stdin(&self, id: ProcId, bytes: &[u8]) -> io::Result<()>;
+    async fn signal(&self, id: ProcId, sig: Signal) -> io::Result<()>;
+    // stdout/exit → loop events on the existing evloop channel.
+}
+```
+
+Re-point the three spawn sites at it: `evloop.rs::run_process`, `lsp/manager.rs`
+(a language server *is* "spawn + pipe stdio" — no special LSP protocol needed),
+and `clipboard.rs`. The in-process impl wraps today's `tokio::process`; the remote
+impl forwards to the daemon. **LSP needs no special protocol** — it collapses into
+`HostProc`.
+
 **Cross-cutting semantics this phase must define:**
 
 - **Buffers are local replicas** (Monaco-style). Open = async-fetch bytes via
   `HostFs` → populate the rope; save = push bytes back. The rope is authoritative
-  for open buffers; core sees a normal local buffer.
+  for open buffers; core sees a normal local buffer. (Lift the initial-file open
+  in `lib.rs` to *after* `set_host_fs`, per the Phase 3 note on
+  `Editor::open_or_named` — so the first buffer is fetched through the injected fs
+  too, not the default `StdHostFs`.)
 - **`FileChangedShell`** — the daemon's `watch` reports a remote file changed
   under us; surface neovim's reload/conflict prompt.
 - **LSP buffer sync** — the server runs remotely (via `HostProc`); feed it

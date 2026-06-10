@@ -7,6 +7,26 @@
 
 use mlua::{Lua, Table};
 
+/// `mlua::Integer` is the Lua VM's integer width: `i64` on 64-bit native, but `i32`
+/// on wasm32 (`lua_Integer` is `ptrdiff_t`, and wasm32 pointers are 32-bit). nxvim's
+/// values are `i64`-centric, so these two helpers are the single portable bridge
+/// between the widths — each an *identity* on native (which is what the `allow`
+/// silences; the lint only fires there) and a real widen/narrow on the wasm edit-host
+/// build. Use them instead of a bare `i64::from` / `as mlua::Integer` so a 32-bit-VM
+/// build compiles unchanged. (Values crossing here — fds, indices, option numbers —
+/// fit `i32`, so the wasm narrow never loses data.)
+#[inline]
+#[allow(clippy::useless_conversion)] // identity i64→i64 on native; sign-extend on wasm32
+pub(crate) fn lua_i64(i: mlua::Integer) -> i64 {
+    i64::from(i)
+}
+
+#[inline]
+#[allow(clippy::unnecessary_cast)] // no-op i64→i64 on native; narrow to i32 on wasm32
+pub(crate) fn lua_int(n: i64) -> mlua::Integer {
+    n as mlua::Integer
+}
+
 /// Read a color field (`fg`/`bg`/`sp`) from an `nvim_set_hl` opts table. A
 /// string (`"#rrggbb"` / `"NONE"` / a name) is kept verbatim; an integer color
 /// is normalized to `#rrggbb`; anything else (incl. absent) is `None`. The core
@@ -97,7 +117,9 @@ fn classify_table<V>(
         let (k, v) = pair?;
         let cv = conv(&v)?;
         match &k {
-            mlua::Value::Integer(i) if *i >= 1 && *i <= len => entries.push((*i, cv)),
+            mlua::Value::Integer(i) if lua_i64(*i) >= 1 && lua_i64(*i) <= len => {
+                entries.push((lua_i64(*i), cv))
+            }
             _ => {
                 is_seq = false;
                 map.push((k, cv));
@@ -112,7 +134,7 @@ fn classify_table<V>(
     } else {
         // Re-emit the integer-keyed entries we provisionally treated as sequence.
         for (i, v) in entries {
-            map.push((mlua::Value::Integer(i), v));
+            map.push((mlua::Value::Integer(lua_int(i)), v));
         }
         Ok(LuaTable::Map(map))
     }
@@ -157,7 +179,7 @@ pub(crate) fn rmpv_to_lua(lua: &Lua, value: &rmpv::Value) -> mlua::Result<mlua::
         R::Nil => mlua::Value::Nil,
         R::Boolean(b) => mlua::Value::Boolean(*b),
         R::Integer(i) => match i.as_i64() {
-            Some(n) => mlua::Value::Integer(n),
+            Some(n) => mlua::Value::Integer(lua_int(n)),
             None => mlua::Value::Number(i.as_f64().unwrap_or(0.0)),
         },
         R::F32(n) => mlua::Value::Number(*n as f64),
@@ -197,7 +219,7 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<
         J::Null => mlua::Value::Nil,
         J::Bool(b) => mlua::Value::Boolean(*b),
         J::Number(n) => match n.as_i64() {
-            Some(i) => mlua::Value::Integer(i),
+            Some(i) => mlua::Value::Integer(lua_int(i)),
             None => mlua::Value::Number(n.as_f64().unwrap_or(0.0)),
         },
         J::String(s) => mlua::Value::String(lua.create_string(s)?),

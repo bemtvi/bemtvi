@@ -423,10 +423,18 @@ impl LuaRuntime {
         // neovim's parser/query install dir (`stdpath('data')/site`) being on the
         // rtp. Without it, the query-resolution bridge could not merge an
         // `after/queries` overlay or a `;extends` base onto the engine's grammar.
+        // `mut` is used only by the `cfg(not(wasm))` data-dir push below.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut runtimepath = runtimepath;
-        let data_dir = nxvim_ts::data_dir();
-        if !runtimepath.contains(&data_dir) {
-            runtimepath.push(data_dir);
+        // The native treesitter engine (`nxvim-ts` → `libloading`) is compiled out
+        // on wasm (edit-host plan, Phase 4); the browser highlights in JS instead.
+        // Its data dir / `vim.treesitter` primitives are gated out there to match.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let data_dir = nxvim_ts::data_dir();
+            if !runtimepath.contains(&data_dir) {
+                runtimepath.push(data_dir);
+            }
         }
         // Load the full safe stdlib *plus* `debug`. Real plugins (catppuccin
         // among them) call `debug.getinfo` to locate their own install path, and
@@ -452,6 +460,7 @@ impl LuaRuntime {
         // highlight engine already loads. Registering them is cheap and lazy — no
         // grammar is touched until a plugin actually calls one — so it is always
         // installed; the data dir is resolved the same way the engine resolves it.
+        #[cfg(not(target_arch = "wasm32"))]
         nxvim_ts::lua::install(&lua, &nxvim_ts::data_dir())?;
         seed_package_path(&lua, &runtimepath)?;
         // Register the vendored `vim.treesitter` Lua into `package.preload` so a
@@ -467,7 +476,10 @@ impl LuaRuntime {
         }
         // Wire the vendored `vim.treesitter` onto the primitives + snapshot bridge.
         // Loaded last: it `require`s the high-level API, which calls back into the
-        // `vim.api`/autocmd surface the prelude above installs.
+        // `vim.api`/autocmd surface the prelude above installs. Gated off wasm — it
+        // wires onto the `vim._create_ts_*` primitives that `nxvim_ts::lua::install`
+        // (above) registers, which are absent on wasm; the browser highlights in JS.
+        #[cfg(not(target_arch = "wasm32"))]
         lua.load(include_str!("prelude/treesitter.lua"))
             .set_name("nxvim:prelude/treesitter")
             .exec()?;

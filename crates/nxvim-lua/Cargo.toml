@@ -21,10 +21,6 @@ luajit = ["mlua/luajit"]
 [dependencies]
 anyhow.workspace = true
 mlua.workspace = true
-# The treesitter crate, with its `vim.treesitter` Lua binding enabled. nxvim-lua
-# owns the Lua VM, so it installs the binding (`nxvim_ts::lua::install`) and
-# selects the shared mlua backend (`lua51`/`luajit`) the binding links against.
-nxvim-ts = { workspace = true, features = ["lua"] }
 # The real vim regexp engine backing `vim.fn.substitute` and `vim.regex` — vim's
 # magic dialect including `\zs`/`\ze`, look-around and in-pattern back-references,
 # which the previous RE2 translator could not represent.
@@ -32,3 +28,15 @@ nxvim-regex.workspace = true
 rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# The treesitter crate, with its `vim.treesitter` Lua binding enabled. nxvim-lua
+# owns the Lua VM, so it installs the binding (`nxvim_ts::lua::install`) and
+# selects the shared mlua backend (`lua51`/`luajit`) the binding links against.
+#
+# Gated off wasm: nxvim-ts pulls `libloading` (dynamic library loading), which has
+# no wasm implementation, and the browser highlights in JS via web-tree-sitter
+# anyway — so the `vim.treesitter` Rust binding is compiled out there (edit-host
+# plan, Phase 4). The two call sites in `runtime.rs` are `cfg(not(wasm))`-gated to
+# match.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nxvim-ts = { workspace = true, features = ["lua"] }

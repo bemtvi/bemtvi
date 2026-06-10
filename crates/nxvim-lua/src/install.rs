@@ -14,8 +14,8 @@ use std::rc::Rc;
 use mlua::{Lua, Table, UserData, UserDataMethods, Variadic};
 
 use crate::convert::{
-    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_to_json, opt_table_to_json,
-    stringify,
+    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_i64, lua_to_json,
+    opt_table_to_json, stringify,
 };
 use crate::host::{
     create_dir_all_mode, find_executable, get_runtime_file, getftime, glob_paths, parse_mode,
@@ -685,7 +685,7 @@ pub(crate) fn install_runtime_api(
         lua.create_function(move |_, (bufnr, name, value): (u64, String, mlua::Value)| {
             let value = match value {
                 mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
                 mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
                 mlua::Value::String(s) => {
                     s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
@@ -712,7 +712,7 @@ pub(crate) fn install_runtime_api(
         lua.create_function(move |_, (name, value): (String, mlua::Value)| {
             let value = match value {
                 mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
                 mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
                 // `statusline` and other string globals (the prelude forwards
                 // only the canonical wired set).
@@ -800,7 +800,7 @@ pub(crate) fn install_runtime_api(
         lua.create_function(move |_, (win, name, value): (u64, String, mlua::Value)| {
             let value = match value {
                 mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
                 mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
                 _ => None,
             };

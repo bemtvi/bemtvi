@@ -31,6 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mlua::{Lua, Table, Value};
 
+use crate::convert::lua_int;
 use crate::host::parse_mode;
 
 thread_local! {
@@ -132,7 +133,7 @@ pub(crate) fn install(lua: &Lua, uv: &Table) -> mlua::Result<()> {
                             t.open.insert(fd, file);
                             fd
                         });
-                        Ok(ret_ok(Value::Integer(fd)))
+                        Ok(ret_ok(Value::Integer(lua_int(fd))))
                     }
                     Err(e) => Ok(ret_err(lua, &path, &e)),
                 }
@@ -187,7 +188,7 @@ pub(crate) fn install(lua: &Lua, uv: &Table) -> mlua::Result<()> {
                     Ok(bytes.len())
                 });
                 match res {
-                    Ok(n) => Ok(ret_ok(Value::Integer(n as i64))),
+                    Ok(n) => Ok(ret_ok(Value::Integer(lua_int(n as i64)))),
                     Err(e) => Ok(ret_err(lua, &format!("fd {fd}"), &e)),
                 }
             },
@@ -278,7 +279,7 @@ pub(crate) fn install(lua: &Lua, uv: &Table) -> mlua::Result<()> {
                     t.open.insert(h, rd);
                     h
                 });
-                Ok(ret_ok(Value::Integer(h)))
+                Ok(ret_ok(Value::Integer(lua_int(h))))
             }
             Err(e) => Ok(ret_err(lua, &path, &e)),
         })?,

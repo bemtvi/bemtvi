@@ -109,7 +109,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | 🚧 |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | ⬜ |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | 🚧 |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
@@ -896,6 +896,15 @@ hop has **no per-keystroke latency** (the whole point — verify, don't assume).
 Bring the Lua-bearing edit-host to `wasm32-unknown-emscripten` (Phase 0 proved the
 VM compiles; this compiles the *real* stack).
 
+**Scope (per Open Decision #3, resolved): one web build.** This emscripten edit-host
+*replaces* the `wasm32-unknown-unknown` `nxvim-web` — the serverless `WebEditor` and
+the `RemoteClient`/Socket.IO bridge both retire into it (see Open Decision #3). The
+gating below is the first slice: make `nxvim-lua` (the C-heavy VM, the real risk)
+compile under emscripten with `nxvim-ts`/`libloading` and the process/fs hatches gated
+on `target_arch = "wasm32"`. **Prerequisite:** the emsdk toolchain (`emcc`) must be
+installed and sourced — the Rust `wasm32-unknown-emscripten` *target* alone can't build
+the vendored Lua/regex C.
+
 - **Gate out `nxvim-ts` + `libloading`.** Dynamic library loading doesn't exist in
   wasm. `nxvim-lua` pulls `nxvim-ts` (tree-sitter + `libloading`) for the
   `vim.treesitter` binding; feature-gate that binding **out** of the wasm build.
@@ -924,6 +933,37 @@ VM compiles; this compiles the *real* stack).
 feeds a vim key sequence, and reads back buffer lines / a redraw — i.e. the *real*
 editor runs in wasm, proven by behavior, not just a clean link (cf. project memory
 `dont-conflate-loads-with-works`).
+
+**Progress (2026-06-10) — concept VALIDATED via a throwaway demo.** The
+risky-unknown half of Phase 4 is green, proven by behavior in a real wasm engine:
+
+1. **`nxvim-lua` compiles to `wasm32-unknown-emscripten` (`lua51`).** Gated
+   `nxvim-ts`/`libloading` off wasm (a `cfg(not(wasm32))` dependency + three gated
+   call sites in `runtime.rs`; the browser highlights in JS). Hit and fixed a
+   portability bug the plan hadn't called out: **`mlua::Integer` is `i32` on wasm32**
+   (`lua_Integer` = `ptrdiff_t`), not `i64` — 11 type errors fixed with the
+   `lua_int`/`lua_i64` helpers in `convert.rs` (identity on native, so host
+   `clippy -D warnings` + the full `nxvim-server` suite stay green). Project memory:
+   `wasm32-mlua-integer-is-i32`.
+2. **core + Lua run *together* in one wasm module.** A throwaway demo crate —
+   `crates/nxvim-edithost-demo/` (workspace-excluded, **marked TEMPORARY/DELETE-ME**
+   in every file) — wires `nxvim_core::Editor` + `nxvim_lua::LuaRuntime` with the
+   crudest sync tick (`editor.input` + `lua.eval` + drain `take_commands` →
+   `editor.command`, mirroring `effects.rs`), links via `emcc` (staticlib + the
+   `mlua-sys`/`nxvim-regex` C archives) into an ES module, and a node harness asserts:
+   vim-key insert → buffer; `return 1+41` → `42`; `#vim.split("a,b,c",",")` → `3`
+   (the `vim.*` prelude runs in wasm); `vim.cmd("%s/hello/LUA/")` mutates the buffer
+   (Lua → editor). All pass. (It also confirmed the **fail-loud** convention survives
+   wasm — an unimplemented `vim.fn.abs` raised loudly rather than returning junk.)
+
+**Still to do for Phase 4 proper** (the demo deliberately skips these — it is *not*
+the edit-host): the real edit-host reuses `nxvim-server`'s synchronous tick
+(`apply_lua_effects` + the buffer/option/register **mirrors** that let Lua *read*
+editor state, autocmds, redraw projection) behind an async-effect seam — which is the
+larger "extract the sync edit-host" refactor (Open Decision #6 below). The throwaway
+demo gets **deleted** when that lands. The fail-loud process/fs/clipboard hatches
+(this phase's third bullet) are also still to wire — deferred until the wasm runtime
+exists to exercise them (Phase 5).
 
 ---
 
@@ -1078,10 +1118,27 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    native the same independent-stream story Phase 6's browser path gets. Decide
    whether that's worth a second native transport or whether app-level framing over
    ssh stdio is enough.
-3. **One web build or two** (Phase 4): does the emscripten edit-host *replace*
-   today's `wasm32-unknown-unknown` `nxvim-web`, or do both ship (a tiny
-   no-Lua core-only build + a full Lua build)? Replacing is simpler; keeping both
-   preserves the smallest-possible demo.
+3. **One web build or two** (Phase 4) — **RESOLVED (2026-06-10): one build,
+   emscripten only.** The emscripten edit-host *replaces* today's
+   `wasm32-unknown-unknown` `nxvim-web` outright — no second no-Lua core-only demo
+   build. **Both** of today's web clients fold into the single edit-host:
+   - the **serverless `WebEditor`** (`crates/nxvim-web/src/lib.rs`, core-only, no
+     Lua) and its bespoke *local* paint path in `index.html` (the
+     `serverStyled === false` branches) are deleted — the edit-host *is* the local
+     editor now, with Lua;
+   - the **`RemoteClient` + Socket.IO bridge** (`remote.rs` + `nxvim-web-bridge`)
+     is superseded too: it is the whole-editor-*remote* topology this plan exists
+     to kill (one round-trip per keystroke). The editor moves *into* the browser
+     Worker; only fs/process stay remote, behind the daemon (Phase 6). `remote.rs`'s
+     *synchronous* msgpack framing is reusable for the new browser↔daemon link, but
+     the boundary flips, and `nxvim-web-bridge`'s per-connection `nxvim --server`
+     relay retires with the Socket.IO client.
+
+   The trade: we give up the smallest-possible no-Lua demo for **one** web client
+   to maintain and a single feature ceiling (`lua51`). The size cost is accepted
+   (the Lua VM alone is ~387 KB, Phase 0; the full edit-host is larger but still a
+   one-time download). Resolving this *down* to one build is the whole point of the
+   "I don't need two web clients" simplification that prompted this decision.
 4. **Redraw transport in the browser** (Phase 5): pull (redraw = return value of
    the input call) vs. push (`EM_JS` notification). Pull is simpler and matches
    the single-threaded Worker; push matches the existing notification model.
@@ -1108,4 +1165,21 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    starve the reader carrying its reply (the deadlock trap — see *Still to do
    in Phase 3* under Phase 3a), plus the short-TTL stat/exists cache to damp
    per-call round-trips.
+6. **How the wasm edit-host gets the editor+Lua sync tick** (Phase 4/5) — the
+   tick (`dispatch` → `run_pending` → `apply_lua_effects` + the mirrors) is
+   synchronous but lives in `impl Server`, entangled with the async fields
+   (`tokio` net→`mio`, `notify`, `nxvim-lsp` subprocess, `nxvim-ts`). Three shapes:
+   **(a) extract a reusable sync `EditHost`** from `Server` with async effects
+   behind a trait — the blessed architecture (it *is* the "full split" seam, serving
+   both native latency in Phase 3 and wasm here), but the largest refactor;
+   **(b) gate `nxvim-server` itself to wasm** (target-off `net`/`process`, native
+   deps non-wasm, current-thread tokio in the Worker) — reuses all glue but keeps
+   tokio in the Worker, against this plan's grain; **(c) a minimal fresh cdylib**
+   reimplementing a crude tick. **Interim decision (2026-06-10): (c), as a
+   throwaway, to de-risk first** — `crates/nxvim-edithost-demo` (above) proved
+   core+Lua-in-wasm by behavior. The empirical finding that makes (a)/(b) tractable:
+   the wasm blocker is the **dependency tree** (`mio`/net, `notify`, lsp, ts), not
+   `nxvim-server`'s own source, which produced *zero* errors before the build died
+   at `mio`. **Still to resolve: (a) vs (b) for the real edit-host.** (a) is
+   recommended — no tokio in the Worker, one sync core for native + wasm.
 ```

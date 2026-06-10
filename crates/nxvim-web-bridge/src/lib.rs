@@ -15,8 +15,11 @@
 //! 2. **Relays each connection to its own editor.** Every browser Socket.IO connection
 //!    spawns one `nxvim --server` child (the single binary's headless role — RPC over
 //!    its stdin/stdout) and **byte-pumps** raw msgpack frames between the child's stdio
-//!    and the socket's binary `"rpc"` events. There is no re-framing here: the wire is
-//!    opaque bytes, and the browser's [`RemoteClient::feed`] reassembles frames.
+//!    and the socket's `"rpc"` events. There is no re-framing of the RPC stream itself:
+//!    the wire is opaque bytes, and the browser's [`RemoteClient::feed`] reassembles
+//!    frames. Each chunk is **base64-encoded** as a Socket.IO *text* event at the socket
+//!    boundary, because the `socket.io-client` ↔ `socketioxide` *binary*-attachment path
+//!    doesn't interoperate (binary placeholders are never paired) while text events do.
 //!
 //! Transport is **Socket.IO** ([`socketioxide`] here, `socket.io-client` in the
 //! browser) for reconnection / heartbeat / named-event framing over a single channel.
@@ -38,6 +41,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use base64::Engine;
 use bytes::Bytes;
 use serde_json::json;
 use socketioxide::{
@@ -180,10 +184,10 @@ fn content_type(path: &str) -> String {
 /// editor relay.
 ///
 /// The transport-specific glue lives here; the byte pump itself is [`relay_connection`]
-/// (so it is testable without a live socket). Each binary `"rpc"` event feeds the
-/// relay's inbound channel; `on_disconnect` signals shutdown; the relay's outbound
-/// chunks are emitted back as `"rpc"` events. When the relay ends (editor exit,
-/// disconnect, or a send failure) the socket is torn down.
+/// (so it is testable without a live socket). Each base64 `"rpc"` event is decoded and
+/// fed to the relay's inbound channel; `on_disconnect` signals shutdown; the relay's
+/// outbound chunks are base64-encoded and emitted back as `"rpc"` events. When the
+/// relay ends (editor exit, disconnect, or a send failure) the socket is torn down.
 async fn on_connect(socket: SocketRef, spec: Arc<ServerSpec>) {
     // client → server: the `"rpc"` handler sends frames here; the relay drains them
     // into the editor's stdin. Unbounded is fine — input frames are tiny.
@@ -191,10 +195,19 @@ async fn on_connect(socket: SocketRef, spec: Arc<ServerSpec>) {
     // Disconnect → tear the relay (and its child) down.
     let shutdown = Arc::new(Notify::new());
 
-    socket.on("rpc", move |Data(frame): Data<Bytes>| {
+    // client → server: each `"rpc"` event carries one base64-encoded chunk of the
+    // browser's msgpack-RPC stream (see the module docs on why it's text, not binary).
+    // Decode and forward the raw bytes to the editor's stdin; a malformed payload is
+    // dropped with a log rather than tearing the whole connection down.
+    socket.on("rpc", move |Data(b64): Data<String>| {
         let to_child_tx = to_child_tx.clone();
         async move {
-            let _ = to_child_tx.send(frame);
+            match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                Ok(bytes) => {
+                    let _ = to_child_tx.send(Bytes::from(bytes));
+                }
+                Err(err) => eprintln!("nxvim-web-bridge: dropping malformed rpc frame: {err}"),
+            }
         }
     });
 
@@ -211,9 +224,11 @@ async fn on_connect(socket: SocketRef, spec: Arc<ServerSpec>) {
         // Editor stdout chunk → client, raw (no re-framing — the browser's
         // `RemoteClient::feed` reassembles). A send error means the socket is gone.
         let emit = move |chunk: &[u8]| {
-            emit_socket
-                .emit("rpc", &Bytes::copy_from_slice(chunk))
-                .is_ok()
+            // Editor stdout chunk → client as a base64 text `"rpc"` event (the browser's
+            // RemoteClient base64-decodes and reassembles frames). A send error means
+            // the socket is gone.
+            let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+            emit_socket.emit("rpc", &b64).is_ok()
         };
         if let Err(err) = relay_connection(&spec, to_child_rx, emit, shutdown).await {
             eprintln!("nxvim-web-bridge: relay error: {err}");

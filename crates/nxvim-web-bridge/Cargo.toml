@@ -15,10 +15,14 @@ anyhow.workspace = true
 # process/io-util/net/sync/time/macros; this only adds the multi-thread runtime.
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 # HTTP server (static assets + `/config.json`) and the Socket.IO transport layered
-# on top of it. socketioxide rides axum's router; binary frames flow as `bytes`.
+# on top of it. socketioxide rides axum's router; RPC frames are byte buffers
+# (`bytes`) internally, base64-encoded only at the socket boundary.
 axum.workspace = true
 socketioxide.workspace = true
 bytes.workspace = true
+# msgpack frames cross the Socket.IO wire as base64 text (the binary-attachment path
+# between socket.io-client and socketioxide doesn't interoperate; text events do).
+base64.workspace = true
 # The built web frontend (`../nxvim-web/web`) is embedded in release builds and read
 # from disk in debug; `mime_guess` resolves each asset's Content-Type.
 rust-embed.workspace = true

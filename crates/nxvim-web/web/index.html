@@ -52,13 +52,27 @@
   .panel { position: absolute; left: 0; background: #21252b; }
   .panel-title { background: #2c313a; color: var(--accent); }
   .panel-cur { background: var(--sel); }
+  /* Remote (server-styled) mode only. The server resolves a colorscheme palette
+     and projects per-cell decorations; these render the bits the local CSS lacks. */
+  /* Diagnostic underline — wavy, keeps the cell's syntax foreground (like the TUI's
+     Undercurl). The squiggle color rides on an inline text-decoration-color. */
+  .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  /* Inlay hints: dim + italic by default (LspInlayHint fallback); a palette style,
+     when present, overrides the color inline. Virtual cells, never selectable. */
+  .inlay { color: #5c6370; font-style: italic; }
+  /* Completion popup (pmenu) + its optional documentation box. */
+  .pmenu { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; }
+  .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
+  .pmenu-sel { background: var(--sel); color: #e6e6e6; }
+  .pmenu-doc { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; color: var(--status-fg); }
+  .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
 </style>
 </head>
 <body class="bg-[#1e2127] text-[#abb2bf]">
   <!-- Toolbar: discoverable open/save (also reachable as :eo / :wo). -->
   <div class="flex items-center gap-2 px-3 py-1.5 bg-[#181a1f] border-b border-[#2c313a] text-sm select-none">
     <span class="font-semibold text-[#e5c07b]">nxvim</span>
-    <span class="text-[#5c6370]">· runs entirely in your browser (WebAssembly)</span>
+    <span id="subtitle" class="text-[#5c6370]">· runs entirely in your browser (WebAssembly)</span>
     <div class="flex-1"></div>
     <button id="btn-open" class="px-2.5 py-1 rounded bg-[#2c313a] hover:bg-[#3e4451] text-[#abb2bf]">Open file <span class="text-[#5c6370]">:eo</span></button>
     <button id="btn-save" class="px-2.5 py-1 rounded bg-[#2c313a] hover:bg-[#3e4451] text-[#abb2bf]">Save <span class="text-[#5c6370]">:w</span></button>
@@ -73,17 +87,21 @@
   <input id="file-input" type="file" class="hidden" />
 
   <script type="module">
-    import init, { WebEditor } from "./pkg/nxvim_web.js";
-    import { createHighlighter } from "./highlight.js";
+    import init, { WebEditor, RemoteClient } from "./pkg/nxvim_web.js";
+    import { createHighlighter, colorFor } from "./highlight.js";
 
     const FONT_PX = 15, LINE = 1.4;
     const gridEl = document.getElementById("grid");
     const noticeEl = document.getElementById("notice");
     const fileInput = document.getElementById("file-input");
 
-    let editor = null;
+    let editor = null;     // the local serverless editor (null in remote mode)
+    let client = null;     // the remote RemoteClient (null in local mode)
+    let socket = null;     // the Socket.IO transport (remote mode only)
     let view = null;
     let ts = null; // tree-sitter highlighter (loaded lazily by language)
+    // True once a remote socket exists: the single branch the input shims key on.
+    const remote = () => socket != null;
     let cw = 9, ch = 21;
     let cols = 80, editorRows = 24; // editorRows = grid rows minus the command row
     // File System Access handles, keyed by the buffer's file name, so :w writes
@@ -138,8 +156,66 @@
       return null;
     }
 
-    function feed(notationStr) { editor.input(notationStr); refresh(); }
+    function feed(notationStr) { sendInput(notationStr); }
     function refresh() { flushClipboard(); view = JSON.parse(editor.view_json()); render(); }
+
+    // ---- input shims: one path for both modes ----
+    // Local mode mutates the in-page editor and re-renders synchronously. Remote
+    // mode encodes the same gesture (via the shared nxvim-view encoders inside
+    // RemoteClient) and emits it over Socket.IO; the server's redraw round-trips
+    // and re-renders in onRpc, so these do NOT render. Key/paste also arm the idle
+    // flush, mirroring the TUI's timeoutlen flush so a pending mapping resolves.
+    // The msgpack RPC stream crosses the Socket.IO wire as base64 *text* events: the
+    // socket.io-client ↔ bridge (socketioxide) binary-attachment path doesn't
+    // interoperate, but text events do. Encode/decode at the socket boundary; the
+    // RemoteClient still works in raw bytes (Uint8Array) on both sides.
+    function bytesToB64(bytes) {
+      let s = "";
+      const CHUNK = 0x8000; // avoid String.fromCharCode arg-count limits on large frames
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      return btoa(s);
+    }
+    function b64ToBytes(b64) {
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    function emit(bytes) { if (socket && bytes && bytes.length) socket.emit("rpc", bytesToB64(bytes)); }
+    function sendInput(notation) {
+      if (remote()) { emit(client.input(notation)); armFlush(); }
+      else { editor.input(notation); refresh(); }
+    }
+    function sendKey(ctrl, alt, shift, name) {
+      if (remote()) { emit(client.key(ctrl, alt, shift, name)); armFlush(); }
+      else { editor.key(ctrl, alt, shift, name); refresh(); }
+    }
+    function sendPaste(text) {
+      if (remote()) { emit(client.paste(text)); armFlush(); }
+      else { editor.paste(text); refresh(); }
+    }
+    function sendMouse(button, action, modifier, row, col) {
+      if (remote()) emit(client.input_mouse(button, action, modifier, row, col));
+      else { editor.mouse(button, action, modifier, row, col, Date.now()); refresh(); }
+    }
+    function sendCommand(cmd) {
+      if (remote()) emit(client.command(cmd));
+      else { editor.command(cmd); refresh(); }
+    }
+    function sendResize(w, h) {
+      if (remote()) emit(client.try_resize(w, h));
+      else { editor.resize(w, h); refresh(); }
+    }
+    // The idle flush (remote only): after a quiet gap re-send nxvim_input_flush so
+    // the server resolves a pending mapping prefix, like the TUI's armed flush.
+    let flushTimer = null;
+    function armFlush() {
+      if (!remote()) return;
+      clearTimeout(flushTimer);
+      flushTimer = setTimeout(() => emit(client.flush()), 1000);
+    }
 
     // ---- clipboard register ("+ / "*) ----
     // The editor (nxvim-core) reads/writes the clipboard register synchronously
@@ -189,20 +265,42 @@
     }
 
     // ---- render the View as HTML ----
+    // serverStyled: a real server projected a resolved colorscheme palette + per-cell
+    // decorations (highlights/diagnostics/inlay hints) into this frame. We paint those
+    // directly instead of running the in-page tree-sitter highlighter (which is null in
+    // remote mode anyway). Keyed on the palette's presence so the renderer never branches
+    // on transport — only on what the frame carries.
+    let serverStyled = false;
     function render() {
       if (!view) return;
+      serverStyled = (view.styles?.length ?? 0) > 0;
       gridEl.innerHTML = "";
-      const tablineRows = view.tabline.length ? 1 : 0;
-      const panelRows = view.panel ? view.panel.height + 1 : 0;
+      if (serverStyled) applyChrome();
+      const hasTabline = serverStyled
+        ? (view.tabline_segments?.length || view.tabline.length)
+        : view.tabline.length;
+      const tablineRows = hasTabline ? 1 : 0;
       const cmdRow = editorRows; // command line sits just past the editor area
-      const hl = highlightContext();
+      // The in-page highlighter only feeds the local paint path.
+      const hl = serverStyled ? null : highlightContext();
 
-      if (tablineRows) renderTabline(0);
+      if (tablineRows) {
+        if (serverStyled && view.tabline_segments?.length) renderTablineSegments(0);
+        else renderTabline(0);
+      }
       for (const w of view.windows) if (!w.floating) renderWindow(w, tablineRows, hl);
       renderSeparators(tablineRows);
       for (const w of view.windows) if (w.floating) renderFloat(w, tablineRows, hl);
+      if (serverStyled && view.global_status?.length) renderGlobalStatus(cmdRow - 1);
       if (view.panel) renderPanel(view.panel, cmdRow);
+      if (serverStyled && view.pmenu) renderPmenu(view.pmenu, tablineRows);
       renderCommand(cmdRow);
+    }
+
+    // The window's rect, synthesizing the whole windows area for a null rect (the
+    // legacy flat redraw / a single full-area window). Local frames always have one.
+    function winRect(w) {
+      return w.rect || { x: 0, y: 0, width: cols, height: editorRows };
     }
 
     function place(el, x, y, wCells, hCells) {
@@ -213,30 +311,43 @@
     }
 
     function renderWindow(w, tablineRows, hl) {
+      const rect = winRect(w);
       const box = document.createElement("div");
       box.className = "win";
-      place(box, w.rect.x, tablineRows + w.rect.y, w.rect.width, w.rect.height);
+      place(box, rect.x, tablineRows + rect.y, rect.width, rect.height);
       gridEl.appendChild(box);
 
       const textRows = w.lines.length;
-      const statusRows = Math.max(0, w.rect.height - textRows);
-      const signW = 0; // diagnostics live in the server build only
+      const statusRows = Math.max(0, rect.height - textRows);
       const gutterW = w.number_width || 0;
-      // This window shares the highlighted buffer iff it shows the same file.
+      // This window shares the highlighted buffer iff it shows the same file (local only).
       const winSpans = hl && w.file_name === hl.file ? hl.spans : null;
 
       for (let r = 0; r < textRows; r++) {
         const rowEl = document.createElement("div");
         rowEl.className = "row";
         rowEl.style.top = r * ch + "px";
-        rowEl.style.width = w.rect.width * cw + "px";
-        // numbers[r] is the 1-based buffer line; spans are indexed 0-based.
-        const bufLine = w.numbers[r];
-        const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
-        rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans);
+        rowEl.style.width = rect.width * cw + "px";
+        if (serverStyled) {
+          rowEl.innerHTML = renderLineServer(w, r, gutterW, rect);
+        } else {
+          // numbers[r] is the 1-based buffer line; spans are indexed 0-based.
+          const bufLine = w.numbers[r];
+          const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
+          rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans);
+        }
         box.appendChild(rowEl);
       }
-      if (statusRows > 0) renderStatus(box, w, textRows);
+      // The server projects its own status segments (per 'laststatus'); a window with
+      // status_visible===false gave its bottom row to text, so paint none. Local mode
+      // synthesizes a status line from the window fields.
+      if (serverStyled) {
+        if (statusRows > 0 && w.status_visible !== false) {
+          renderStatusSegments(box, w.status || [], textRows, rect.width, w.focused);
+        }
+      } else if (statusRows > 0) {
+        renderStatus(box, w, textRows);
+      }
     }
 
     // One text row: gutter + content spans. Cells are built from the ORIGINAL line
@@ -322,8 +433,201 @@
       return "cur-block";
     }
 
-    // Number gutter (mirrors the TUI's gutter_cell: absolute / relative / hybrid).
+    // ---- server-styled (remote) paint helpers ----
+    // A resolved palette Style → an inline CSS string the renderer drops on a span.
+    // Colors already arrive as `#rrggbb` strings (or null) from the wire.
+    function styleToCss(s) {
+      if (!s) return "";
+      let fg = s.fg, bg = s.bg;
+      if (s.reverse) { const t = fg; fg = bg || "var(--bg)"; bg = t || "var(--fg)"; }
+      let css = "";
+      if (fg) css += `color:${fg};`;
+      if (bg) css += `background:${bg};`;
+      if (s.bold) css += "font-weight:700;";
+      if (s.italic) css += "font-style:italic;";
+      if (s.strikethrough) css += "text-decoration:line-through;";
+      else if (s.underline) css += "text-decoration:underline;";
+      else if (s.undercurl) css += `text-decoration:underline wavy;${s.sp ? `text-decoration-color:${s.sp};` : ""}`;
+      return css;
+    }
+    function paletteStyle(id) { return id == null ? null : (view.styles[id] || null); }
+    // A chrome region Style → inline CSS (background/foreground), or "" when unstyled.
+    function chromeCss(style) { return style ? styleToCss(style) : ""; }
+
+    // Push the server's colorscheme into the CSS vars the existing chrome classes
+    // (.gutter, .eob, .sel, .search, .statusline) already key on, plus #grid's own
+    // bg/fg. Every region is nullable: a null leaves today's default in place.
+    function applyChrome() {
+      const c = view.chrome || {};
+      const root = document.documentElement.style;
+      if (c.normal?.bg) gridEl.style.background = c.normal.bg;
+      if (c.normal?.fg) gridEl.style.color = c.normal.fg;
+      const setVar = (name, color) => { if (color) root.setProperty(name, color); };
+      setVar("--eob", c.end_of_buffer?.fg);
+      setVar("--gutter", c.line_nr?.fg);
+      setVar("--gutter-cur", c.cursor_line_nr?.fg);
+      setVar("--status-bg", c.status_line?.bg);
+      setVar("--status-fg", c.status_line?.fg);
+      setVar("--sel", c.visual?.bg);
+      setVar("--search", c.search?.bg);
+    }
+
+    // The base foreground (+ diagnostic underline) for one screen cell, from the
+    // server's per-row highlight / diagnostic spans (both keyed on absolute screen
+    // column). A span with a resolved `style_id` uses the palette; otherwise the
+    // group falls back to the local theme (colorFor), so an un-themed group still
+    // colors. The diagnostic squiggle is layered as inline text-decoration so it
+    // survives whatever fg/bg the cell already carries.
+    function cellBaseCss(col, hlSpans, diagSpans) {
+      let css = "";
+      for (const [s, e, group, id] of hlSpans) {
+        if (col >= s && col < e) {
+          if (id != null) css = styleToCss(paletteStyle(id));
+          else { const fg = colorFor(group); if (fg) css = `color:${fg};`; }
+          break;
+        }
+      }
+      for (const [s, e, sev, id] of diagSpans) {
+        if (col >= s && col < e) {
+          const sp = (id != null && paletteStyle(id)?.sp) || severityColor(sev);
+          css += `text-decoration:underline wavy;text-decoration-color:${sp};text-underline-offset:2px;`;
+          break;
+        }
+      }
+      return css;
+    }
+    // Diagnostic severity → squiggle/virt color when no palette style resolved.
+    // 1=Error 2=Warn 3=Info 4=Hint (the LSP DiagnosticSeverity order the server uses).
+    function severityColor(sev) {
+      return sev === 1 ? "#e06c75" : sev === 2 ? "#e5c07b" : sev === 4 ? "#56b6c2" : "#61afef";
+    }
+
+    // One text row, server-styled. Mirrors the TUI's highlight_line: expand tabs to
+    // screen cells, key every decoration on the ABSOLUTE screen column, splice each
+    // inlay hint in before the glyph at its anchor column (pushing later glyphs
+    // right), and move only the cursor by that splice. The base foreground is the
+    // server's palette; selection / search / incsearch / cursor are layered as
+    // classes, exactly like the local renderer.
+    function renderLineServer(w, row, gutterW, rect) {
+      const line = w.lines[row] ?? "";
+      const isFiller = w.numbers[row] === null;
+      let html = (gutterW > 0 || w.sign_column) ? renderGutterCell(w, row, gutterW) : "";
+      if (isFiller) {
+        const css = chromeCss(view.chrome?.end_of_buffer);
+        return html + `<span class="eob"${css ? ` style="${css}"` : ""}>${escapeHtml(line)}</span>`;
+      }
+
+      const tabstop = w.tabstop || 8;
+      const leftcol = w.leftcol || 0;
+      const hints = w.inlay_hints?.[row] || [];   // [[hcol, text, id], …] sorted by col
+      const hlSpans = w.highlights?.[row] || [];
+      const diagSpans = w.diagnostics?.[row] || [];
+      const sel = w.selection?.[row] || null;
+      const secSel = w.secondary_selection?.[row] || [];
+      const search = w.search?.[row] || [];
+      const inc = w.incsearch?.[row] || null;
+      const secCols = new Set((w.secondary_cursors || []).filter(([r]) => r === row).map(([, c]) => c));
+      const inSpan = (sp, c) => c >= sp[0] && c < sp[1];
+
+      // Expand tabs → screen cells (one char per screen column; width-1 per code
+      // point, matching the local renderer — wide-char alignment is a known v1 gap).
+      const expanded = [];
+      let c0 = 0;
+      for (const cp of line) {
+        if (cp === "\t") { const n = tabstop - (c0 % tabstop); for (let k = 0; k < n; k++) expanded.push(" "); c0 += n; }
+        else { expanded.push(cp); c0 += 1; }
+      }
+
+      // Build the painted-cell list: real glyphs (carrying their absolute column for
+      // overlay lookup) with inlay-hint cells (abs = -1) spliced in at their anchor.
+      const cells = [];
+      let hi = 0;
+      const emitHints = (anchor) => {
+        while (hi < hints.length && hints[hi][0] <= anchor) {
+          const [hcol, text, id] = hints[hi++];
+          if (hcol < leftcol) continue; // scrolled off the left edge
+          const css = id != null ? styleToCss(paletteStyle(id)) : "";
+          for (const cp of text) cells.push({ ch: cp, abs: -1, base: css });
+        }
+      };
+      for (let c = 0; c < expanded.length; c++) {
+        emitHints(c); // hints anchored at/before this glyph go in first
+        if (c >= leftcol) cells.push({ ch: expanded[c], abs: c, base: cellBaseCss(c, hlSpans, diagSpans) });
+      }
+      emitHints(Infinity); // trailing hints anchored at/past end-of-text
+
+      const isFocused = w.focused && !view.command_mode && !view.panel;
+      const cursorRow = w.cursor_row;
+      // The cursor's painted column = its screen column shifted by the width of every
+      // inlay hint spliced at or before it (leftcol ≤ hcol ≤ cursor col; a hint AT the
+      // cursor col is inserted before the cursor glyph, so it counts). Mirrors the
+      // TUI's inlay_cursor_shift.
+      let inlayShift = 0;
+      for (const [hcol, text] of hints) {
+        if (hcol >= leftcol && hcol <= w.cursor_screen_col) inlayShift += [...text].length;
+      }
+      const cursorPainted = w.cursor_screen_col + inlayShift;
+
+      // Overlay classes set their own foreground; don't let the palette fg override.
+      const COLOR_OWNED = new Set(["cur-block", "cur-bar", "cur-underline", "cur-mc", "seccur", "search", "incsearch"]);
+      let run = "", runCls = "", runStyle = "", out = "";
+      const flush = () => {
+        if (!run) return;
+        out += `<span class="${runCls}"${runStyle ? ` style="${runStyle}"` : ""}>${escapeHtml(run)}</span>`;
+        run = "";
+      };
+      let painted = leftcol; // absolute painted screen column of the next cell
+      for (const cell of cells) {
+        const a = cell.abs;
+        let cls = "";
+        if (a >= 0) {
+          if (search.some((s) => inSpan(s, a))) cls = "search";
+          if (inc && inSpan(inc, a)) cls = "incsearch";
+          if ((sel && inSpan(sel, a)) || secSel.some((s) => inSpan(s, a))) cls = "sel";
+          if (secCols.has(a)) cls = "seccur";
+        } else {
+          cls = "inlay"; // dim default; an inline palette style (cell.base) overrides
+        }
+        if (isFocused && cursorRow === row && painted === cursorPainted) cls = cursorClass();
+        else if (!w.focused && cursorRow === row && painted === cursorPainted && !view.command_mode && !view.panel) cls = "cur-hollow";
+        const style = (a < 0) ? cell.base : (COLOR_OWNED.has(cls) ? "" : cell.base);
+        if (cls !== runCls || style !== runStyle) { flush(); runCls = cls; runStyle = style; }
+        run += cell.ch;
+        painted += 1;
+      }
+      flush();
+      // Cursor past the painted text (empty line / append): draw a trailing cell.
+      if (isFocused && cursorRow === row && cursorPainted >= painted) {
+        out += `<span class="${cursorClass()}"> </span>`;
+      } else if (!w.focused && cursorRow === row && cursorPainted >= painted && !view.command_mode && !view.panel) {
+        out += `<span class="cur-hollow"> </span>`;
+      }
+      // Inline diagnostic virtual text after the line's end.
+      const virt = w.diagnostics_virt?.[row];
+      if (virt) {
+        const [text, sev, id] = virt;
+        const vcss = (id != null) ? styleToCss(paletteStyle(id)) : `color:${severityColor(sev)};`;
+        out += `<span${vcss ? ` style="${vcss}"` : ""}> ${escapeHtml(text)}</span>`;
+      }
+      return html + out;
+    }
+
+    // Number gutter (mirrors the TUI's gutter_cell: absolute / relative / hybrid),
+    // preceded — server-styled only — by a 2-cell diagnostic sign column when the
+    // window reserves one (vim's signcolumn=auto once a buffer has a diagnostic).
     function renderGutterCell(w, row, width) {
+      let html = "";
+      if (serverStyled && w.sign_column) {
+        const sign = w.diagnostics_signs?.[row]; // [glyph, severity, style_id] | null
+        if (sign) {
+          const [glyph, sev, id] = sign;
+          const css = (id != null) ? styleToCss(paletteStyle(id)) : `color:${severityColor(sev)};`;
+          html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml((glyph + " ").slice(0, 2).padEnd(2))}</span>`;
+        } else {
+          html += `<span class="gutter">  </span>`;
+        }
+      }
+      if (width <= 0) return html;
       const n = w.numbers[row];
       const cur = w.cursor_line;
       let cell, cls = "gutter";
@@ -337,7 +641,85 @@
         cell = String(v).padStart(width - 1) + " ";
         if (n === cur) cls = "gutter-cur";
       }
-      return `<span class="${cls}">${escapeHtml(cell)}</span>`;
+      return html + `<span class="${cls}">${escapeHtml(cell)}</span>`;
+    }
+
+    // Paint a server status/tabline line from its rendered segments (`text` + a
+    // resolved palette `style`, or null for the base look). The bar's own
+    // background comes from the `.statusline` class (chrome-driven CSS var); each
+    // segment overlays its style. An empty segment list falls back to a bare bar.
+    function renderSegmentBar(segments, width, cls) {
+      let html = "";
+      for (const { text, style } of (segments || [])) {
+        const css = styleToCss(style);
+        html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
+      }
+      const el = document.createElement("div");
+      el.className = cls;
+      el.style.width = width * cw + "px";
+      el.innerHTML = html;
+      return el;
+    }
+    function renderStatusSegments(box, segments, atRow, width, focused) {
+      const el = renderSegmentBar(segments, width, "row statusline" + (focused ? " focused" : ""));
+      el.style.top = atRow * ch + "px";
+      box.appendChild(el);
+    }
+    // The global status line (laststatus=3): one full-width bar above the command row.
+    function renderGlobalStatus(atRow) {
+      const el = renderSegmentBar(view.global_status, cols, "row statusline focused");
+      el.style.top = atRow * ch + "px";
+      gridEl.appendChild(el);
+    }
+    function renderTablineSegments(y) {
+      const el = renderSegmentBar(view.tabline_segments, cols, "row statusline");
+      el.style.top = y * ch + "px";
+      gridEl.appendChild(el);
+    }
+
+    // The completion popup (pmenu), positioned over the focused window's text in
+    // screen cells. Mirrors the TUI's pmenu: a list of `[label, kind, detail]`
+    // items, the selected row reverse-highlighted, scrolled to keep it in view.
+    function renderPmenu(pmenu, tablineRows) {
+      const fw = view.windows.find((w) => w.focused) || view.windows[0];
+      const rect = fw ? winRect(fw) : { x: 0, y: 0 };
+      const x = rect.x + pmenu.col;
+      const y = tablineRows + rect.y + pmenu.row;
+      const rows = Math.max(1, Math.min(pmenu.height, pmenu.items.length));
+      const first = Math.max(0, Math.min(pmenu.selected - rows + 1, pmenu.items.length - rows));
+      const start = pmenu.selected >= rows ? first : 0;
+      const box = document.createElement("div");
+      box.className = "pmenu";
+      place(box, x, y, pmenu.width, rows);
+      for (let i = 0; i < rows; i++) {
+        const idx = start + i;
+        const [label, , detail] = pmenu.items[idx] || ["", 0, ""];
+        const left = String(label);
+        const right = detail ? String(detail) : "";
+        const pad = Math.max(1, pmenu.width - left.length - right.length);
+        const text = (left + " ".repeat(pad) + right).slice(0, pmenu.width).padEnd(pmenu.width);
+        const rowEl = document.createElement("div");
+        rowEl.className = "row" + (idx === pmenu.selected ? " pmenu-sel" : "");
+        rowEl.style.width = pmenu.width * cw + "px";
+        rowEl.textContent = text;
+        box.appendChild(rowEl);
+      }
+      gridEl.appendChild(box);
+      // Optional documentation box, drawn to the right of the popup.
+      if (pmenu.doc && pmenu.doc.length) {
+        const docW = Math.max(...pmenu.doc.map((l) => l.length), 1);
+        const docBox = document.createElement("div");
+        docBox.className = "pmenu-doc";
+        place(docBox, x + pmenu.width, y, docW, pmenu.doc.length);
+        for (const l of pmenu.doc) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "row";
+          rowEl.style.width = docW * cw + "px";
+          rowEl.textContent = l;
+          docBox.appendChild(rowEl);
+        }
+        gridEl.appendChild(docBox);
+      }
     }
 
     // A synthesized status line (the core build has no %-format engine / Lua):
@@ -347,7 +729,7 @@
       const mod = w.modified ? " [+]" : "";
       const left = `${name}${mod}`;
       const right = `${w.cursor_line},${w.cursor_col + 1}`;
-      const width = w.rect.width;
+      const width = winRect(w).width;
       const pad = Math.max(1, width - left.length - right.length - 1);
       const text = (" " + left + " ".repeat(pad) + right + " ").slice(0, width).padEnd(width);
       const el = document.createElement("div");
@@ -533,9 +915,9 @@
       if ((e.metaKey || e.ctrlKey) && (e.key === "v" || e.key === "V")) return; // paste event
       // Cmd/Ctrl+C with an active visual selection copies it to the system clipboard,
       // GUI-style: yank to "+, which the post-keystroke flush pushes to
-      // navigator.clipboard. Outside visual mode it falls through (Cmd+C = browser
-      // copy; Ctrl+C = <C-c>/Esc in the editor).
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "c" || e.key === "C") &&
+      // navigator.clipboard. Local-only — a remote server owns its own clipboard
+      // register (the host's), so we leave Cmd/Ctrl+C to fall through there.
+      if (!remote() && (e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "c" || e.key === "C") &&
           view && (view.mode === "VISUAL" || view.mode === "V-LINE")) {
         e.preventDefault();
         editor.input('"+y'); // yank the selection to the clipboard register
@@ -543,21 +925,23 @@
         return;
       }
       if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
-      // Intercept Enter on a file command before it reaches the editor.
-      if (e.key === "Enter" && view && maybeHandleCommand()) { e.preventDefault(); return; }
+      // Intercept Enter on a file command before it reaches the editor — local only.
+      // A remote server has a real filesystem, so :e/:w/:wq run server-side; <CR>
+      // must flow through as an ordinary keystroke.
+      if (!remote() && e.key === "Enter" && view && maybeHandleCommand()) { e.preventDefault(); return; }
       const name = keyName(e);
       if (name === null) return;
       e.preventDefault();
       // Starting a register sequence (`"`) — prime the system clipboard so an
-      // imminent "+p sees what was copied in another app (readText is async).
-      if (name === '"') refreshSystemClipboard();
-      editor.key(e.ctrlKey, e.altKey, e.shiftKey, name); // shared nxvim-view encoder
-      refresh();
+      // imminent "+p sees what was copied in another app (readText is async). Local
+      // only (the system clipboard cache lives in the in-page editor).
+      if (!remote() && name === '"') refreshSystemClipboard();
+      sendKey(e.ctrlKey, e.altKey, e.shiftKey, name); // shared nxvim-view encoder
     });
     gridEl.addEventListener("paste", (e) => {
       e.preventDefault();
       const text = (e.clipboardData || window.clipboardData).getData("text");
-      if (text) { editor.paste(text); refresh(); } // shared nxvim-view encoder
+      if (text) sendPaste(text); // shared nxvim-view encoder
     });
 
     // Mouse. The editor (nxvim-core) owns the hit-test from a global screen cell back
@@ -600,8 +984,7 @@
     function autoscrollTick() {
       if (!dragBtn || !autoscrollCell) { disarmAutoscroll(); return; }
       // No modifiers on the repeated drag, as the native clients do.
-      editor.mouse("left", "drag", "", autoscrollCell.row, autoscrollCell.col, Date.now());
-      refresh();
+      sendMouse("left", "drag", "", autoscrollCell.row, autoscrollCell.col);
     }
 
     gridEl.addEventListener("mousedown", (e) => {
@@ -612,14 +995,12 @@
       disarmAutoscroll(); // safety: clear any stale pump from a missed mouseup
       const { row, col } = cellAt(e);
       if (button === "left") dragBtn = "left";
-      editor.mouse(button, "press", mods(e), row, col, Date.now());
-      refresh();
+      sendMouse(button, "press", mods(e), row, col);
     });
     gridEl.addEventListener("mousemove", (e) => {
       if (!dragBtn) return;
       const { row, col } = cellAt(e);
-      editor.mouse(dragBtn, "drag", mods(e), row, col, Date.now());
-      refresh();
+      sendMouse(dragBtn, "drag", mods(e), row, col);
       // Arm/refresh (or disarm) the pump based on where the drag now sits.
       armAutoscroll(row, col);
     });
@@ -627,17 +1008,15 @@
       if (!dragBtn) return;
       disarmAutoscroll();
       const { row, col } = cellAt(e);
-      editor.mouse(dragBtn, "release", mods(e), row, col, Date.now());
+      sendMouse(dragBtn, "release", mods(e), row, col);
       dragBtn = null;
-      refresh();
     });
     gridEl.addEventListener("wheel", (e) => {
       e.preventDefault();
       const { row, col } = cellAt(e);
       const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX);
       const action = vertical ? (e.deltaY > 0 ? "down" : "up") : (e.deltaX > 0 ? "right" : "left");
-      editor.mouse("wheel", action, mods(e), row, col, Date.now());
-      refresh();
+      sendMouse("wheel", action, mods(e), row, col);
     }, { passive: false });
     gridEl.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -652,7 +1031,7 @@
     });
     function doResize() {
       layout();
-      if (editor) { editor.resize(cols, editorRows); refresh(); }
+      if (editor || client) sendResize(cols, editorRows);
     }
 
     // ---- boot ----
@@ -660,11 +1039,28 @@
       const top = gridEl.getBoundingClientRect().top;
       gridEl.style.height = (window.innerHeight - top) + "px";
     }
+    // Pick the editor mode. `?mode=local|remote` forces it (the test/escape hatch);
+    // otherwise the bridge's /config.json advertises remote. A page served statically
+    // (no bridge) has no /config.json, so it boots local — today's behavior verbatim.
+    async function detectMode() {
+      const override = new URLSearchParams(location.search).get("mode");
+      if (override === "local" || override === "remote") return override;
+      try {
+        const cfg = await fetch("/config.json").then((r) => (r.ok ? r.json() : null));
+        return cfg?.mode === "remote" ? "remote" : "local";
+      } catch { return "local"; }
+    }
     async function boot() {
       await init();
       fitGrid();
       measureCell();
       layout();
+      if ((await detectMode()) === "remote") await bootRemote();
+      else bootLocal();
+    }
+
+    // The fully client-side editor: WebEditor + the in-page tree-sitter highlighter.
+    function bootLocal() {
       editor = new WebEditor(cols, editorRows);
       // Tree-sitter highlighting: loads the runtime + each grammar lazily and asks
       // for a repaint (tsRefresh) as they become ready. Fully client-side.
@@ -686,6 +1082,62 @@
         clipSeed: (t) => editor.set_clipboard_text(t),
         clipTake: () => editor.take_clipboard_write(),
       };
+    }
+
+    // A thin client of a real remote nxvim-server, over Socket.IO. The RemoteClient
+    // (wasm) does the msgpack framing / encoding; this page owns the socket and the
+    // paint. The server emits full redraw frames (palette + highlights + chrome),
+    // which renderLineServer paints — no in-page highlighter (ts stays null).
+    let redrawWaiters = [];
+    function resolveRedraw() { const ws = redrawWaiters; redrawWaiters = []; ws.forEach((r) => r()); }
+    function onRpc(b64) {
+      // Each "rpc" event is one base64 chunk of the server's msgpack stream.
+      client.feed(b64ToBytes(b64));
+      if (client.closed()) { socket.disconnect(); notify("Connection to the server closed."); return; }
+      const resp = client.take_response();   // owed reply to a server→client request
+      if (resp) emit(resp);
+      if (client.dirty()) {
+        view = JSON.parse(client.view_json());
+        render();
+        resolveRedraw();
+      }
+    }
+    async function bootRemote() {
+      client = new RemoteClient(cols, editorRows);
+      ts = null; // the server highlights; never load the in-page tree-sitter runtime
+      applyRemoteChrome();
+      const mod = await import("/vendor/socket.io/socket.io.esm.min.js");
+      const io = mod.io ?? mod.default;
+      // Websocket transport only: the bridge (engineioxide) and socket.io-client don't
+      // interoperate over the HTTP long-polling handshake, but the direct websocket
+      // upgrade does — and ws is the better transport for a binary RPC stream anyway
+      // (lower latency, no base64 polling overhead). socket.io still gives us
+      // reconnection + heartbeat + the named "rpc" event framing on top.
+      socket = io({ transports: ["websocket"] });
+      socket.on("connect", () => emit(client.attach()));
+      socket.on("rpc", onRpc);
+      socket.on("disconnect", () => notify("Disconnected — reconnecting…"));
+      gridEl.focus();
+      // The remote test hook mirrors the local one: drive the client, await the
+      // next applied server redraw, then read the decoded rich view.
+      window.__nxvim = {
+        feed: (n) => sendInput(n),
+        key: (ctrl, alt, shift, name) => sendKey(ctrl, alt, shift, name),
+        mouse: (button, action, modifier, row, col) => sendMouse(button, action, modifier, row, col),
+        command: (cmd) => sendCommand(cmd),
+        view: () => view,
+        nextRedraw: () => new Promise((res) => redrawWaiters.push(res)),
+      };
+    }
+    // Remote mode: the server owns the filesystem and clipboard, so hide the local
+    // file toolbar + FS-Access notice and re-label the header.
+    function applyRemoteChrome() {
+      for (const id of ["btn-open", "btn-save", "btn-saveas"]) {
+        const el = document.getElementById(id);
+        if (el) el.classList.add("hidden");
+      }
+      const sub = document.getElementById("subtitle");
+      if (sub) sub.textContent = "· connected to a remote nxvim-server";
     }
     window.addEventListener("resize", fitGrid);
     boot();

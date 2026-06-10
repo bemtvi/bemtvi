@@ -152,6 +152,10 @@ socketioxide = "=0.18.3"
 bytes = "=1.11.1"
 rust-embed = "=8.11.0"
 mime_guess = "=2.0.5"
+# msgpack RPC frames cross the Socket.IO wire as base64 text events: the
+# socket.io-client ↔ socketioxide binary-attachment path doesn't interoperate, but
+# string events do. The bridge encodes/decodes at the socket boundary.
+base64 = "=0.22.1"
 
 [profile.release]
 lto = "thin"

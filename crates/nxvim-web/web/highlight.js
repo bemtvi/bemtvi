@@ -63,7 +63,9 @@ const FG = {
 
 // Resolve a (possibly dotted) capture name to a CSS color, walking the fallback
 // chain `a.b.c` → `a.b` → `a`. Returns null when nothing in the theme matches.
-function colorFor(group) {
+// Exported so the remote (server-styled) renderer can reuse this theme as its
+// fallback for highlight spans the server sent without a resolved palette style.
+export function colorFor(group) {
   let g = group;
   for (;;) {
     const c = FG[g];

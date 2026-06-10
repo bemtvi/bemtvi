@@ -181,7 +181,40 @@ emitting a canned redraw), connect a Socket.IO client, emit an encoded `nvim_ui_
 assert a binary `rpc` event returns and decodes via `rmpv`; assert chunked/partial
 forwarding reassembles.
 
-## Phase 3 — frontend dual mode + socket.io-client + rich renderer (`web/index.html`)
+## Phase 3 — frontend dual mode + socket.io-client + rich renderer (`web/index.html`) — ✅ DONE
+
+> **Status: implemented & verified end-to-end.** `web/index.html` now dual-boots
+> (`detectMode()` → `bootLocal()` / `bootRemote()`); `RemoteClient` drives a Socket.IO
+> socket; the rich render path (`renderLineServer` + `applyChrome`/`styleToCss`/
+> `paletteStyle`, segment status/tabline/global-status, pmenu, sign column, nullable
+> rect) paints the server's resolved palette + per-cell decorations. socket.io-client
+> 4.8.1 is vendored into `web/vendor/socket.io/` (build.sh `build:socketio` step +
+> `scripts/vendor-socketio.mjs`); `highlight.js` now exports `colorFor` as the un-themed
+> highlight fallback. Verified via Playwright against the running bridge: remote boot +
+> connect, `ihello world<Esc>` round-trips through the server and renders, mode
+> transitions, `:e! <file>` opens a real server-side file, the segment status line and
+> chrome palette paint, the toolbar is hidden and the header re-labeled; `?mode=local`
+> still boots the serverless `WebEditor` unchanged. Two deviations from the sketch below,
+> both forced by a real socket.io-client ↔ socketioxide interop gap discovered here:
+>
+> 1. **Transport is websocket-only** (`io({ transports: ["websocket"] })`). The HTTP
+>    long-polling handshake between socket.io-client 4.8.1 and the bridge's engineioxide
+>    drops the session immediately after the open handshake ("Session ID unknown" on the
+>    first follow-up poll), so the default polling-first connect never establishes. The
+>    direct websocket upgrade works cleanly. ws is also the better transport for a binary
+>    RPC stream (no base64 polling overhead, lower latency); socket.io still provides
+>    reconnection + heartbeat + the named `"rpc"` event on top.
+> 2. **RPC frames cross the wire as base64 *text* events, not binary** (revises the
+>    locked "binary frames only" decision and risk #3). socket.io-client emits a binary
+>    attachment whose placeholder socketioxide never pairs over the ws transport
+>    (`Data<Bytes>` fails with "expected a binary placeholder"); string events deliver
+>    fine. So the bridge (`base64 =0.22.1`, new pin) base64-decodes each inbound `"rpc"`
+>    string to bytes for the child's stdin and base64-encodes each stdout chunk back; the
+>    browser does the same with `btoa`/`atob` helpers around `RemoteClient`. The
+>    `relay_connection` byte-pump and its tests are unchanged — only the socket boundary
+>    in `on_connect` encodes/decodes.
+>
+> The original implementation sketch follows.
 
 **Vendor `socket.io-client`** — add to `package.json` devDeps and a `build.sh` step copying
 its dist bundle into `web/vendor/` (gitignored like the tree-sitter vendor + `pkg`), so no

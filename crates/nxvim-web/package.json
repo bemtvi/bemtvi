@@ -4,11 +4,13 @@
   "description": "Build tooling for the nxvim web demo: the Tailwind stylesheet, plus the tree-sitter runtime/grammars/queries vendored into web/vendor/. Only used at build time (build.sh); the demo itself ships static assets and loads no runtime CDN.",
   "scripts": {
     "build:css": "tailwindcss -i tailwind.input.css -o web/tailwind.css --minify",
-    "build:treesitter": "node scripts/gen-treesitter.mjs"
+    "build:treesitter": "node scripts/gen-treesitter.mjs",
+    "build:socketio": "node scripts/vendor-socketio.mjs"
   },
   "devDependencies": {
     "@tailwindcss/cli": "4.3.0",
     "tailwindcss": "4.3.0",
+    "socket.io-client": "4.8.1",
     "web-tree-sitter": "0.26.9",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-javascript": "0.25.0",

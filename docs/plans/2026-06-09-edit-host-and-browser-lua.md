@@ -1,0 +1,397 @@
+# The local edit-host, the remote daemon, and Lua in the browser — implementation plan
+
+## Why this document exists
+
+Remote nxvim is **laggy**, and the lag is structural, not tunable. Today's
+client–server split (`docs/architecture.md` → *Embedded vs. remote*) puts the
+**whole editor on the far side of the wire**:
+
+```
+UI client (local)  ──NETWORK──▶  server = core + Lua + LSP + treesitter + fs  (remote)
+```
+
+Every keystroke round-trips to the remote before the cursor moves, because the
+editing state machine lives on the server. No amount of protocol tuning fixes
+one-round-trip-per-keystroke — it's where the boundary *is*.
+
+This plan moves the network boundary **below** the editing engine instead of
+above it — the same trick VS Code Remote uses (the Monaco editor is local; only
+the lag-tolerant work — fs, LSP, terminals — is remote):
+
+```
+UI client (local) ──cheap──▶ EDIT HOST = core + Lua + treesitter (local) ──NETWORK──▶ DAEMON = fs + process + watch (remote)
+```
+
+The keystroke → core → redraw path becomes entirely local: zero round-trips for
+typing, motions, operators, undo. The wire only carries things that were always
+going to feel like a spinner.
+
+The **same edit-host concept** then unlocks a long-standing goal: **running the
+real editor — Lua plugins and all — entirely in the browser**. The browser is
+just the edit-host compiled to wasm in a Web Worker, with the daemon either
+absent (serverless) or reached over WebSocket. `nxvim-web` today is core+view
+only (no Lua); this plan brings the Lua-bearing edit-host to wasm.
+
+### What this changes about the thesis
+
+Principle #3 ("Client-server, always; thin clients, headless server") bends — but
+only in *topology*, not semantics:
+
+- **"Identical editing behavior everywhere"** — *kept*. `nxvim-core` is unchanged
+  in its editing logic; we only swap its I/O dependency.
+- **"Thin clients, headless server"** — becomes **"thin daemon, thick clients."**
+  The laptop/browser runs the full edit-host; the remote runs only fs + process +
+  watch. That's the deliberate trade VS Code makes, and it's the right one for
+  latency.
+
+---
+
+## What's already de-risked (feasibility spikes, 2026-06-09)
+
+The three "will it even work" unknowns for the browser path were spiked **and run**
+before this plan was written. All green. (Throwaway crates at
+`~/work/lua-{wasm,interop,worker}-spike`; results captured in the project memory
+`puc-lua-compiles-to-wasm-emscripten`.)
+
+| # | Question | Result |
+| --- | --- | --- |
+| 1 | Does PUC Lua 5.1 compile **and run** in wasm? | ✅ `wasm32-unknown-emscripten`, `_VERSION=Lua 5.1`, `pcall(error)` caught (**setjmp/longjmp survives wasm** — the real risk), coroutines work. ~387 KB release wasm. |
+| 2 | Can one wasm module hold the VM **and** do JS interop without wasm-bindgen? | ✅ JS→Rust via `ccall`/`cwrap`, Rust→JS via `EM_JS`/`emscripten_run_script`, a `thread_local` VM keeps **state persistent across calls** (buffer survives between keystrokes). |
+| 3 | Can a **synchronous blocking read** work without freezing the page? | ✅ Lua `getcharstr()` parks on `Atomics.wait` against a `SharedArrayBuffer` in a Worker, fed by the UI thread; wakes in ~0–1 ms, no spin. **Confirms Worker+SAB → no Asyncify needed.** |
+
+Two facts these pin down, both load-bearing for the plan:
+
+- **LuaJIT is permanently out in wasm** (mlua: WASM supports all versions *excluding
+  JIT*). The browser is forever on the `lua51` backend (PUC Lua 5.1), so it
+  inherits the `lua51` plugin ceiling — see Phase 2.
+- **The emscripten EH gotcha:** rust 1.96 links the emscripten target with new
+  wasm exceptions (`-fwasm-exceptions`) but `cc` compiles vendored Lua with the
+  legacy EH → `undefined symbol: __cxa_find_matching_catch_3`. Fix:
+  `EMCC_CFLAGS=-fwasm-exceptions` so both halves agree.
+
+Everything past the spikes is **engineering with known shapes**, not feasibility.
+
+---
+
+## The one constraint that shapes everything
+
+**`nxvim-core` and the Lua VM are `!Send` and live on a single thread** (same as
+neovim; concurrency comes from async I/O, not parallel mutation —
+`docs/architecture.md` → *Async design*). The plan never violates this:
+
+- Native: the edit-host keeps its own OS thread + single-threaded runtime, exactly
+  as the embedded server does today.
+- Browser: the edit-host owns the **Web Worker** thread. The Worker *is* the
+  single thread; the UI thread never touches editor/Lua state — it only ferries
+  input over the SAB and renders redraws. This maps the existing model onto the
+  browser with no change in shape.
+
+So the keystroke path is sync-and-local in both worlds; only the I/O dependency
+(`HostServices`, Phase 1) ever reaches async/remote, and never on the edit tick.
+
+---
+
+## Status legend
+
+- ✅ done   🚧 in progress   ⬜ not started
+
+| phase | title | depends on | status |
+| --- | --- | --- | --- |
+| 0 | Feasibility spikes (compile / interop / blocking read) | — | ✅ |
+| 1 | The `HostServices` I/O seam (dependency inversion) | 0 | ⬜ |
+| 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ⬜ |
+| 3 | Native edit-host / daemon split (invert the SSH topology) | 1 | ⬜ |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | ⬜ |
+| 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
+| 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
+
+Phases 1 and 2 are independent and small; tackle either first. Phase 3 is the
+native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
+the one daemon. Each phase is sized to be picked up in a focused session with only
+its dependencies loaded.
+
+---
+
+## The keystone: the `HostServices` seam (Phase 1)
+
+Every later phase pivots on **dependency-inverting `nxvim-core`'s I/O**. Core
+defines the interface it needs; two implementations exist (in-process, and
+over-the-wire), and the editing logic never knows which it's talking to.
+
+```rust
+// in nxvim-core — the ONLY surface core/edit-host uses to touch the outside world.
+// Kept minimal: the daemon's entire job is fs + process + watch.
+pub trait HostFs {
+    fn read(&self, path: &str) -> io::Result<Vec<u8>>;
+    fn write(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
+    fn stat(&self, path: &str) -> io::Result<Stat>;
+    fn list(&self, dir: &str) -> io::Result<Vec<DirEntry>>;
+    fn watch(&self, path: &str) -> WatchId;   // → FileChanged events on the loop
+}
+
+pub trait HostProc {
+    fn spawn(&self, cmd: &Command) -> io::Result<ProcId>;  // jobstart / vim.system / LSP / :!
+    fn write_stdin(&self, id: ProcId, bytes: &[u8]) -> io::Result<()>;
+    fn signal(&self, id: ProcId, sig: Signal) -> io::Result<()>;
+    // stdout/exit arrive as loop events (evloop.rs), as vim.system already does today.
+}
+```
+
+Two crucial points keep this honest against `nxvim-core stays pure and
+synchronous`:
+
+1. **Core stays sync.** The methods core calls directly are not on the keystroke
+   path — file read happens at *buffer open*, write at *save*. In the
+   inverted/browser model, the **async** part (waiting on the network) happens in
+   the edit-host *orchestration* layer (the server, already async via
+   `evloop.rs`), which fetches bytes and hands core a populated buffer. So
+   `Buffer`'s direct file read/write (the one I/O CLAUDE.md allows in core) gets
+   **lifted up** into the edit-host: core operates on in-memory bytes
+   (`Buffer::from_bytes`/`to_bytes`), the host does the actual fs. For the
+   in-process impl this is behavior-identical; it makes core *purer*, not less so.
+2. **LSP needs no special protocol.** A language server *is* "spawn a process and
+   pipe its stdio" → it collapses into `HostProc`. The whole `lsp/` subtree keeps
+   working; only its transport's process-spawn goes through `HostProc`.
+
+**Exit criteria.** The full `cargo test --workspace` passes unchanged with core
+routed through an in-process `HostFs`/`HostProc` (the default impl wrapping
+today's std calls). Zero behavior change; this phase is pure inversion.
+
+**Files.** New trait + in-process impl in `nxvim-core` (or a thin
+`nxvim-core::host` module); `Buffer` file I/O lifted into `nxvim-server`
+(`lifecycle.rs` / `buffers` path); `vim.system`/`jobstart` (`evloop.rs`,
+`prelude.lua`) and the LSP transport (`lsp/`) re-pointed at `HostProc`.
+
+---
+
+## Phase 2 — An opt-in yieldable `pcall` primitive (`vim.co_pcall`)
+
+**Independent of everything else; smallest, testable today.**
+
+PUC Lua 5.1 can't `coroutine.yield` across a C-call boundary, and `pcall` is a C
+function — so `pcall(vim.fn.getcharstr)` (which-key's live-popup loop) raises
+*"attempt to yield across metamethod/C-call boundary"* instead of reading a key
+(project memory `pcall-yield-blocks-on-puc-lua51`,
+`whichkey-needs-vim-split-and-str2list`). LuaJIT (today's default) has a yieldable
+pcall, so this only bites `lua51` — including the browser, which is permanently
+`lua51` (Phase 0).
+
+**Decision (2026-06-10): expose the fix as a named, opt-in primitive — do NOT
+replace the global `pcall`.** Globally swapping `pcall` would impose a per-call
+coroutine allocation on *every* protected call and risk subtle fidelity
+regressions across unrelated code, for the benefit of the handful of plugins that
+block-read inside `pcall`. Instead we ship `vim.co_pcall` (and `vim.co_xpcall` /
+`vim.co_wrap`) that plugin authors targeting nxvim call explicitly when they need
+a yieldable protected call. This fits nxvim's existing posture — plugins run
+through a compat layer (`prelude/compat.lua`), not byte-for-byte unmodified.
+
+**The trade we are accepting:** plugins that wrap a blocking read in the *global*
+`pcall` — foremost **which-key's live popup** — will **not** read keys on
+`lua51`/browser builds unless they switch to `vim.co_pcall`. This is a deliberate
+carve-out from principle #1's "run the ecosystem unmodified," scoped to the narrow
+blocking-read-in-pcall pattern. (On the default LuaJIT native build the global
+pcall is already yieldable, so nothing regresses there.) See *Known limitations*.
+
+**The implementation.** Run the protected fn in its own coroutine and *relay*
+yields through a pure-Lua path (no C frame in the way) — exposed under
+`vim.co_pcall`, not as a global:
+
+```lua
+function vim.co_pcall(f, ...)
+  local co = coroutine.create(f)
+  local function step(ok, ...)
+    if not ok then return false, ... end
+    if coroutine.status(co) == 'dead' then return true, ... end
+    return step(coroutine.resume(co, coroutine.yield(...)))
+  end
+  return step(coroutine.resume(co, ...))
+end
+```
+
+It composes with nxvim's pump-coroutine model: the inner yield is caught by
+`coroutine.resume`, re-emitted by the relay to park the pumped coroutine, and the
+server's key resumes the whole chain (verified logically; Phase 0 spike #1
+confirmed coroutines work on the wasm build, and `lua51` natively already runs
+them).
+
+**Scope.** Ship `vim.co_pcall`, `vim.co_xpcall`, and `vim.co_wrap` in the prelude.
+Match varargs, non-string error values, `error` level, and `xpcall`'s
+message-handler semantics as closely as possible. Because it's opt-in, the
+per-call coroutine cost falls only on calls a plugin author deliberately routes
+through it. **Does not** cover yields from genuinely C-level callbacks
+(`table.sort` comparator, `string.gsub` replacer, raw metamethods) — rare;
+document the gap. Available on both backends (harmless on LuaJIT, where the global
+`pcall` is already yieldable) so plugin authors can target a single name.
+
+**Files.** `crates/nxvim-lua/.../prelude/` (alongside `stdlib.lua` /
+`runtime.lua`); document `vim.co_pcall` for plugin authors.
+
+**Exit criteria.** A black-box test (`crates/nxvim-server/tests/blockers.rs`, the
+existing which-key regression home) drives a Lua snippet that wraps
+`vim.fn.getcharstr` in `vim.co_pcall` through several keystrokes on a
+`--features lua51` build and asserts it reads them — proving the relay reads input,
+not merely that it doesn't error. The memory's "unmodified which-key live popup"
+case stays a documented limitation, distinct from this passing opt-in test.
+
+---
+
+## Phase 3 — Native edit-host / daemon split (invert the SSH topology)
+
+The native latency payoff. Carve today's `nxvim-server` into two roles connected
+by `HostServices` (Phase 1) over RPC:
+
+- **Edit host** (runs *locally* in the remote case): `nxvim-core` + `nxvim-lua` +
+  `nxvim-ts` + redraw projection + the input/keymap/excmd/evloop machinery.
+  Everything in `dispatch.rs` / `redraw.rs` / `input.rs` / `keymap.rs` /
+  `excmd.rs` / `evloop.rs` / `lsp/` stays here.
+- **Daemon** (runs *remotely*): fs + process + watch only — the `HostFs`/`HostProc`
+  server half. Tiny.
+
+The network boundary moves from *above* the editor (today's `nxvim --server` over
+ssh stdio, `docs/plans/2026-06-09-remote-ssh-client.md`) to *below* it: the GUI/TUI
+client and edit-host are co-located and local; `ssh … nxvim --daemon` runs just
+the fs/process daemon on the remote, and the local edit-host is a `HostServices`
+client over the ssh stdio transport (reusing the `nxvim-rpc` plumbing and the
+hardened ssh connector from `crates/nxvim-gui/src/remote.rs`).
+
+**Cross-cutting semantics this phase must define:**
+
+- **Buffers are local replicas** (Monaco-style). Open = async-fetch bytes via
+  `HostFs` → populate the rope; save = push bytes back. The rope is authoritative
+  for open buffers; core sees a normal local buffer.
+- **`FileChangedShell`** — the daemon's `watch` reports a remote file changed
+  under us; surface neovim's reload/conflict prompt.
+- **LSP buffer sync** — the server runs remotely (via `HostProc`); feed it
+  incremental `didChange` over the wire (lag-tolerant, already async in `lsp/`).
+- **Paths are remote paths** — buffer names, cwd, statusline operate in the
+  remote's path-space (as VS Code Remote does).
+- **Clipboard** — supersedes the remote-ssh v1 limitation: with the edit-host
+  local, `"+`/`"*` can target the *local* OS clipboard directly.
+
+**Exit criteria.** `nxvim --daemon` over stdio passes a black-box suite mirroring
+`crates/nxvim/tests/stdio_server.rs` but for the `HostServices` protocol; an
+end-to-end test drives a local edit-host against a daemon over an in-process
+duplex and asserts edit/save/reload round-trips. Manually: typing over a real ssh
+hop has **no per-keystroke latency** (the whole point — verify, don't assume).
+
+---
+
+## Phase 4 — wasm edit-host: compile
+
+Bring the Lua-bearing edit-host to `wasm32-unknown-emscripten` (Phase 0 proved the
+VM compiles; this compiles the *real* stack).
+
+- **Gate out `nxvim-ts` + `libloading`.** Dynamic library loading doesn't exist in
+  wasm. `nxvim-lua` pulls `nxvim-ts` (tree-sitter + `libloading`) for the
+  `vim.treesitter` binding; feature-gate that binding **out** of the wasm build.
+  The browser already does highlighting in JS via web-tree-sitter (project memory
+  `web-treesitter-highlighting`, `docs/architecture.md` → *The web build*), so no
+  capability is lost — the redraw just omits server-side highlight spans and the
+  JS layer paints them, as `nxvim-web` does today.
+- **Emscripten toolchain in the build.** The web build moves from
+  `wasm32-unknown-unknown` (`crates/nxvim-web`, wasm-bindgen, `build.sh`) to
+  `wasm32-unknown-emscripten`. Wire `EMCC_CFLAGS=-fwasm-exceptions` and the
+  emsdk-sourced `emcc` into the build script. `nxvim-core` is pure Rust and
+  compiles to the new target unchanged.
+- **Backend = `lua51`** (LuaJIT excluded from wasm). Phase 2's `vim.co_pcall` ships
+  here, but the global `pcall` is *not* swapped — so plugins that block-read inside
+  the global `pcall` (unmodified which-key live popup) don't read keys unless they
+  opt in. Known limitation, by design.
+
+**Exit criteria.** A headless node harness loads the compiled edit-host module,
+feeds a vim key sequence, and reads back buffer lines / a redraw — i.e. the *real*
+editor runs in wasm, proven by behavior, not just a clean link (cf. project memory
+`dont-conflate-loads-with-works`).
+
+---
+
+## Phase 5 — wasm edit-host: Worker + blocking input + JS interop
+
+Make it a real browser editor (Phase 0 spikes #2/#3 proved the mechanisms; this
+integrates them).
+
+- **Interop replaces wasm-bindgen glue.** JS→Rust via `ccall`/`cwrap` on
+  `#[no_mangle] extern "C"` exports (feed input, query lines); Rust→JS via a
+  `--js-library` / `EM_JS` binding (push redraws) — the production form of the
+  spike's `emscripten_run_script`. Required link flags (from the spikes):
+  `-sMODULARIZE=1 -sEXIT_RUNTIME=0 -sALLOW_MEMORY_GROWTH=1
+  -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString` plus the explicit
+  `EXPORTED_FUNCTIONS`.
+- **Edit-host in a Web Worker.** UI thread renders + ferries input; Worker owns
+  core+Lua (the single `!Send` thread). Redraws post back to the UI.
+- **Blocking input over SAB.** `getcharstr` / the pump-coroutine park on
+  `Atomics.wait` against a `SharedArrayBuffer` keyboard channel the UI fills — no
+  Asyncify. Plugins that opt into Phase 2's `vim.co_pcall` get yieldable blocking
+  reads on top of this; unmodified global-`pcall` block-readers stay blocked (see
+  *Known limitations*).
+- **COOP/COEP serving.** `SharedArrayBuffer` needs cross-origin isolation
+  (`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
+  require-corp`). Add to the dev server + ship docs.
+
+**Exit criteria.** Driveable via Playwright through the `window.__nxvim` hook
+(project memory `web-client-driveable-via-playwright`): type vim commands, assert
+buffer/cursor/redraw, and drive a `vim.co_pcall(vim.fn.getcharstr)`-based snippet
+(the opt-in blocking-read path) to prove SAB-backed blocking reads work end-to-end
+in a real browser.
+
+---
+
+## Phase 6 — Browser fs/process: the daemon over WebSocket (or serverless)
+
+Tie the browser edit-host to actual files/processes, reusing the Phase 1 trait and
+the Phase 3 daemon.
+
+- **The good path:** the browser edit-host is a `HostServices` client over
+  **WebSocket** to a remote daemon — the browser analog of Phase 3, and the
+  *inverse* of today's Socket.IO mode (`docs/architecture.md` → *connecting to a
+  real server over Socket.IO*), which puts the whole server (editing included)
+  remote and laggy. Here, editing is in the browser Worker; only fs/process cross
+  the wire. Telescope's `rg`/`fd` run on the remote daemon via `HostProc`.
+- **The serverless path:** `HostFs` backed by OPFS / the File System Access API;
+  in-memory rope authoritative. `HostProc` has no processes — per
+  `No silent stubs or skips`, `system()`/`jobstart` must **fail loud**, not fake
+  success. So serverless = real editing + plugins that don't shell out.
+
+**Exit criteria.** Browser edit-host opens/edits/saves a file served by a daemon
+over WebSocket; a shell-out plugin path runs the process on the daemon. Serverless
+mode edits an OPFS file and raises a clear error on a `system()` call.
+
+---
+
+## Non-goals / known limitations
+
+- **No protocol negotiation** (inherited): edit-host and daemon must be the same
+  build; mismatch surfaces as a dropped connection, not a clean version error.
+- **wasm plugin ceiling = `lua51`, not LuaJIT.** The browser runs the PUC 5.1
+  dialect; plugins relying on LuaJIT-only behavior (e.g. `ffi`, `bit`) won't run.
+  `Luau` (faster non-JIT, 5.1-ish, yieldable pcall, wasm-capable per mlua) is a
+  possible future pivot but a different dialect bet — out of scope here.
+- **Blocking reads inside the global `pcall` need opt-in.** `vim.co_pcall` is
+  available but the global `pcall` is *not* replaced (Phase 2 decision). So plugins
+  that wrap a blocking read in the global `pcall` — the canonical case is
+  **which-key's live popup** — do not read keys on `lua51`/browser builds unless
+  they switch to `vim.co_pcall`. A plugin author targeting nxvim opts in; we do not
+  emulate LuaJIT's yieldable global pcall. (Native LuaJIT builds are unaffected —
+  their global pcall is already yieldable.)
+- **Yields from C-level callbacks** (sort/gsub/metamethods) remain un-yieldable on
+  `lua51` even via `vim.co_pcall` (Phase 2 scope note).
+- **Vimscript** stays a non-goal (`docs/architecture.md` → principle #2).
+
+---
+
+## Open decisions (resolve before the phase that needs them)
+
+1. **`HostServices` granularity** (Phase 1): one combined trait vs. split
+   `HostFs`/`HostProc`/`HostWatch`. Leaning split — smaller daemon surface, easier
+   to stub the serverless `HostProc`.
+2. **Daemon discovery/launch** (Phase 3): `ssh … nxvim --daemon` mirrors today's
+   `--server`; do we also want a standalone `--daemon --listen` for non-ssh? (The
+   remote-ssh plan deferred generic TCP; same call here.)
+3. **One web build or two** (Phase 4): does the emscripten edit-host *replace*
+   today's `wasm32-unknown-unknown` `nxvim-web`, or do both ship (a tiny
+   no-Lua core-only build + a full Lua build)? Replacing is simpler; keeping both
+   preserves the smallest-possible demo.
+4. **Redraw transport in the browser** (Phase 5): pull (redraw = return value of
+   the input call) vs. push (`EM_JS` notification). Pull is simpler and matches
+   the single-threaded Worker; push matches the existing notification model.
+```

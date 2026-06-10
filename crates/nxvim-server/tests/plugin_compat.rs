@@ -138,3 +138,20 @@ async fn luasnip_loads() {
     )
     .await;
 }
+
+/// nvim-treesitter: `utils.lua` calls `vim.split(path, '.', true)` (the legacy
+/// positional `plain` flag). Without backward-compat for a boolean 3rd arg,
+/// vim.split indexed a boolean and `require('nvim-treesitter').setup()` errored.
+#[tokio::test]
+async fn nvim_treesitter_loads() {
+    assert_plugin_ok(
+        &["nvim-treesitter"],
+        r#"
+        -- The exact legacy call shape, plus the real setup it broke.
+        assert(#vim.split("a.b.c", ".", true) == 3, "legacy plain split")
+        local ok, err = pcall(function() require('nvim-treesitter').setup() end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+}

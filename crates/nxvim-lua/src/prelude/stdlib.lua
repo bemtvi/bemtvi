@@ -478,6 +478,11 @@ function vim.startswith(s, prefix) return s:sub(1, #prefix) == prefix end
 function vim.endswith(s, suffix) return suffix == "" or s:sub(-#suffix) == suffix end
 
 function vim.split(s, sep, opts)
+  -- Legacy positional form `vim.split(s, sep, plain)`: neovim keeps this
+  -- backward-compat (a boolean third arg is the `plain` flag), and nvim-treesitter
+  -- still calls `vim.split(path, '.', true)`. Without this it indexed a boolean as
+  -- `opts.plain` and errored, breaking `require('nvim-treesitter').setup`.
+  if type(opts) == "boolean" then opts = { plain = opts } end
   opts = opts or {}
   -- Empty separator: split into individual characters, matching neovim
   -- (`vim.split("nxso", "") == { "n", "x", "s", "o" }`, `vim.split("", "") == {}`)

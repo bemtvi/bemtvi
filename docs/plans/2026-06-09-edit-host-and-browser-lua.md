@@ -483,12 +483,13 @@ not block startup. Regression-clean — full `nxvim-server` suite (now 19 binari
 `nxvim`/`nxvim-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
 `-D warnings` all green.
 
-**Still to do on the fs leg (after 3e/3f/3g):** `:tabnew {file}` / LSP go-to (still
-sync), and `FileChangedShell` from a daemon `watch`. The async seam + replica pattern
-these slices established is what those extend. (The **save** path landed in Phase 3e,
-`:edit` in Phase 3f, and the **remote explorer** — `read_dir` over the wire — in Phase 3g,
-all below. `:read`/`:r` is *not implemented* in nxvim at all, so there is nothing to
-route over the wire — it would be a new feature, not a wire slice.)
+**Still to do on the fs leg (after 3e/3f/3g/3h):** `FileChangedShell` from a daemon
+`watch` (a genuinely new wire leg — server-push, the `HostWatch` traffic class). The
+async seam + replica pattern these slices established is what it extends. (The **save**
+path landed in Phase 3e, `:edit` in Phase 3f, the **remote explorer** — `read_dir` over
+the wire — in Phase 3g, and **`:tabnew` / LSP go-to** in Phase 3h, all below. `:read`/`:r`
+is *not implemented* in nxvim at all, so there is nothing to route over the wire — it
+would be a new feature, not a wire slice.)
 
 **The save slice must define its semantics up front — write is the hard half of
 off-tick** (read got done first for a reason: it's idempotent and cancelable;
@@ -687,6 +688,65 @@ unchanged local-disk `editing::explorer` suite (10 tests) proves the sync path d
 regress; full `cargo test --workspace` green (now 22 server test binaries), fmt + clippy
 `-D warnings` clean; local binaries leave off-tick mode off and list synchronously.
 
+### Phase 3h — finish the buffer-open leg (`:tabnew` / LSP go-to over the wire) — ✅ DONE (2026-06-10)
+
+The remaining sync `from_file` sites. 3a/3d/3f/3g routed `:edit`, the startup open, and the
+explorer onto the off-tick wire, but **`:tabnew {file}`** and **`jump_to`** (LSP go-to /
+diagnostics / the location-list panel) still read the edit-host's *local* disk — so in a
+daemon session they'd open the wrong machine's files. The reason they lagged is structural,
+and worth recording: nxvim had **four near-identical file-open paths** (`ex_edit`,
+`ex_tabnew`, `jump_to`, `explorer_open_file`), each inlining its own
+`find_buffer_by_path` → `Buffer::from_file` because the *load* step was never separated from
+the *placement* policy (current window in place / a new tab / cursor jump / wipe the
+listing). All the off-tick investment landed in `:edit`'s copy; the other three silently
+stayed sync.
+
+So this slice **extracts the shared kernel** rather than bolting a fourth and fifth copy of
+the off-tick enqueue on:
+- **`Editor::load_new_buffer(path) -> Option<BufferId>`** (`nxvim-core`) — the load atom: off-tick
+  it creates an empty named buffer and enqueues a `PendingOpen` the server fills over the
+  wire; locally it reads `Buffer::from_file`. No find, no placement. `None` = a *synchronous*
+  load failed (echoed); off-tick never fails here (errors surface later in `apply_open`).
+- **`Editor::open_buffer(path)`** = find-or-`load_new_buffer` (no placement) — for `:tabnew`
+  (hands the id to `new_tab`) and `explorer_open_file` (switch, then wipe the listing).
+- **`Editor::edit_in_current_window(path)`** = find-or-switch / throwaway-reuse-in-place /
+  load-and-switch, off-tick aware throughout — the `:e file` / go-to core, for `ex_edit` and
+  `jump_to`.
+
+All four callers now route through this one kernel: `ex_edit`'s open-or-switch tail →
+`edit_in_current_window`; `ex_tabnew` → `open_buffer`; `jump_to` → `edit_in_current_window`
+(bailing if a sync load fails, so the cursor never lands in a phantom buffer);
+`explorer_open_file` → `open_buffer` (replacing the bespoke off-tick branch 3g had added).
+`ex_edit`'s **reload-current** (`:e!` re-read) stays its own case — it must re-read even when
+the path is already current, which the find-or-switch kernel deliberately does not. The
+explorer's dir-navigation (`enter_dir`) keeps its own placement (descend reuses the listing
+window — distinct from the four file-open callers) and was left as-is.
+
+**Rides for free:** off-tick **`:tabnew <remote-dir>`** now lists the directory as the
+explorer in a new tab (the unified kernel composes with 3g's `FsRead::Dir`); `:split`/
+`:vsplit` already delegate to `ex_edit`. **Still sync (local-only, documented):** the
+synchronous `:tabnew <dir>` fallback (a local dir errors → empty buffer, unchanged — only
+the off-tick path gets the listing).
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_edit.rs` gains
+`tabnew_fetches_a_file_over_the_wire`: `:tabnew /virtual/other.txt` fills the *new tab's*
+buffer with a `/virtual/...` file the edit-host's local disk can't hold (so it crossed the
+wire — the 3d/3f faithfulness argument), and `nvim_list_tabpages` confirms a *second* tab
+really opened (not an in-place `:edit`). `daemon_explorer.rs` gains
+`tabnew_lists_a_remote_directory_in_a_new_tab`, proving the kernel composes with the remote
+explorer. `jump_to` (LSP go-to) routes through the **same** `edit_in_current_window` /
+`load_new_buffer` atom these tests exercise over the wire end-to-end; driving it *itself*
+over the wire needs a live LSP server or a populated cross-file location list, which the
+daemon harness doesn't stand up, so it's proven off-tick **by construction** (shared atom)
+with its unchanged cursor/placement logic covered by the local `editing::marks` /
+`editing::panel` / LSP suites — a precise weaker claim, not a behavior test asserted but not
+run. Regression-clean: the four-way unification left every local suite green —
+`editing::explorer` (10), `tabs` (35), `buffers` (27), `host_fs` (3), and the marks/panel/
+LSP suites that exercise `jump_to`; the lib/server/core run is 1040 green; fmt + clippy
+`-D warnings` clean. (The only red anywhere is pre-existing and environmental — the
+`nxvim-web-bridge` relay test times out identically on a clean tree, and the `nxvim` e2e PTY
+tests flake under the full-`--workspace` parallel storm but pass in isolation.)
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -741,9 +801,10 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
   `Editor::load_str`; save = snapshot the rope and push the bytes back off-tick,
   finalizing the saved-state on the ack. The rope is authoritative for open
   buffers; core sees a normal local buffer. (Initial open landed in Phase 3d, the
-  single-buffer **save** in Phase 3e, **`:edit`** in Phase 3f, and the **remote explorer**
-  listing in Phase 3g; multi-buffer `:wall` and `:tabnew {file}` / LSP go-to are the
-  remaining fs-leg slices.)
+  single-buffer **save** in Phase 3e, **`:edit`** in Phase 3f, the **remote explorer**
+  listing in Phase 3g, and **`:tabnew` / LSP go-to** in Phase 3h — every buffer-open path is
+  now off-tick, behind one shared kernel; multi-buffer `:wall` is the remaining fs-leg
+  slice.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call

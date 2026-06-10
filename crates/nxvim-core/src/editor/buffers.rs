@@ -473,6 +473,74 @@ impl Editor {
         }
     }
 
+    /// Load a **fresh** buffer for `path` and return its id — the load atom shared by
+    /// every file-open path (`:e`, `:tabnew`, LSP go-to, the explorer). Off-tick aware: in
+    /// a daemon session it creates an empty buffer named for `path` and enqueues a
+    /// [`PendingOpen`] the server fills over the wire; locally it reads `path`
+    /// synchronously via [`Buffer::from_file`]. Does **not** check whether `path` is
+    /// already open, switch to it, or place it — callers own placement (current window, a
+    /// new tab, …). `None` means a *synchronous* load failed and was already echoed
+    /// (off-tick never fails here — the fetch's errors surface later in `apply_open`).
+    fn load_new_buffer(&mut self, path: &Path) -> Option<BufferId> {
+        if self.host_fs_offtick {
+            let id = self.add_buffer(Buffer::named(path.to_path_buf()));
+            self.enqueue_open(id, path.to_path_buf());
+            Some(id)
+        } else {
+            let fs = self.host_fs.clone();
+            match Buffer::from_file(path, &*fs) {
+                Ok(buf) => Some(self.add_buffer(buf)),
+                Err(e) => {
+                    self.echo(e.to_string());
+                    None
+                }
+            }
+        }
+    }
+
+    /// Find the buffer already open for `path`, or [load](Editor::load_new_buffer) a fresh
+    /// one — the find-or-load open kernel. Returns its id **without** switching or placing
+    /// it (the caller decides where it goes). Used by `:tabnew` (it hands the id to a new
+    /// tab) and the explorer (it switches, then wipes the listing); `:e` / go-to layer
+    /// throwaway-reuse on top via [`Editor::edit_in_current_window`]. `None` only on a
+    /// synchronous load failure (already echoed).
+    pub(crate) fn open_buffer(&mut self, path: &Path) -> Option<BufferId> {
+        if let Some(id) = self.find_buffer_by_path(path) {
+            return Some(id);
+        }
+        self.load_new_buffer(path)
+    }
+
+    /// Open `path` as the **current window's** buffer — the `:e file` / go-to core. Reuses
+    /// an already-open buffer, reuses a throwaway `[No Name]` in place (so the first open
+    /// doesn't strand an empty buffer 1), or loads a new buffer and switches to it.
+    /// Off-tick aware throughout: the throwaway-reuse names the buffer now and fills it
+    /// over the wire, and the new-buffer load defers to [`Editor::load_new_buffer`].
+    /// Returns the buffer now shown, or `None` if a synchronous load failed (echoed) — the
+    /// caller then leaves the current buffer in place rather than navigating into nothing.
+    pub(crate) fn edit_in_current_window(&mut self, path: &Path) -> Option<BufferId> {
+        if let Some(id) = self.find_buffer_by_path(path) {
+            self.switch_buffer(id);
+            return Some(id);
+        }
+        if self.current_is_throwaway() {
+            // Reuse the throwaway in place, preserving its id. Off-tick: bind the name now
+            // and enqueue the fetch (the empty buffer shows until the bytes land); locally:
+            // read it in place.
+            let id = self.cur_buffer();
+            if self.host_fs_offtick {
+                self.buffer_mut().set_path(Some(path.to_path_buf()));
+                self.enqueue_open(id, path.to_path_buf());
+            } else {
+                self.load_into_current(path);
+            }
+            return Some(id);
+        }
+        let id = self.load_new_buffer(path)?;
+        self.switch_buffer(id);
+        Some(id)
+    }
+
     /// Open or switch to the buffer for `path`, then place the cursor at the
     /// 0-based `(line, byte_col)`, clamped to the buffer and a grapheme
     /// boundary. Reuses the `:e` open-or-switch logic (so the jump reuses an
@@ -486,24 +554,12 @@ impl Editor {
     /// location list share one navigation primitive.
     pub fn jump_to(&mut self, path: &Path, line: usize, col: usize) {
         let already_current = self.buffer().path.as_deref() == Some(path);
-        if !already_current {
-            if let Some(id) = self.find_buffer_by_path(path) {
-                self.switch_buffer(id);
-            } else if self.current_is_throwaway() {
-                self.load_into_current(path);
-            } else {
-                let fs = self.host_fs.clone();
-                match Buffer::from_file(path, &*fs) {
-                    Ok(buf) => {
-                        let id = self.add_buffer(buf);
-                        self.switch_buffer(id);
-                    }
-                    Err(e) => {
-                        self.echo(e.to_string());
-                        return;
-                    }
-                }
-            }
+        // Open-or-switch into the current window through the shared kernel (so a go-to
+        // reuses an already-open buffer, records the alternate `#`, and — in a daemon
+        // session — fetches the target over the wire off-tick). A failed *synchronous*
+        // load returns `None`; bail rather than land the cursor in a phantom buffer.
+        if !already_current && self.edit_in_current_window(path).is_none() {
+            return;
         }
 
         // Land the cursor at (line, byte col), clamped to the buffer. The whole

@@ -201,27 +201,13 @@ impl Editor {
     /// listing is kept, so a failed open leaves you back in the explorer.
     fn explorer_open_file(&mut self, path: &Path) {
         let explorer = self.cur_buffer();
-        if let Some(id) = self.find_buffer_by_path(path) {
-            self.switch_buffer(id);
-        } else if self.host_fs_offtick {
-            // Off-tick (daemon session): the file is on the remote. Open an empty
-            // buffer named for it, switch, and enqueue the fetch — the server fills it
-            // over the wire (`load_str_into`). The empty buffer shows until then.
-            let id = self.add_buffer(Buffer::named(path.to_path_buf()));
-            self.switch_buffer(id);
-            self.enqueue_open(id, path.to_path_buf());
-        } else {
-            let fs = self.host_fs.clone();
-            match Buffer::from_file(path, &*fs) {
-                Ok(buf) => {
-                    let id = self.add_buffer(buf);
-                    self.switch_buffer(id);
-                }
-                Err(e) => {
-                    self.echo(e.to_string());
-                    return;
-                }
-            }
+        // Open the picked file through the shared kernel — switch to it if already open,
+        // else load a fresh buffer (off-tick over the wire in a daemon session, else from
+        // local disk). A failed synchronous load is echoed; keep the listing so you land
+        // back in the explorer rather than on a blank buffer.
+        match self.open_buffer(path) {
+            Some(id) => self.switch_buffer(id),
+            None => return,
         }
         // Wipe the listing buffer now that we've left it. Forced because it is a
         // read-only listing that is never "modified", so the `E89` guard is moot.

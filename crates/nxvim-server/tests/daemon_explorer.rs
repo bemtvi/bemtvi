@@ -244,3 +244,20 @@ async fn enter_on_a_file_opens_it_over_the_wire() {
         "`<CR>` on a file row opens the remote file's bytes over the wire"
     );
 }
+
+/// `:tabnew /virtual/proj/src` opens the remote *directory* as the explorer in a **new
+/// tab** — the unified off-tick open kernel (Phase 3h) composes with the remote-explorer
+/// listing (Phase 3g): a directory routed through `:tabnew` lists over the wire just as
+/// `:edit` does, in its own tab.
+#[tokio::test]
+async fn tabnew_lists_a_remote_directory_in_a_new_tab() {
+    let (rpc, _incoming) = spawn_with_daemon_fs(fixture(), "/virtual/proj").await;
+    await_lines(&rpc, &["../", "src/", "notes.txt", "README.md"]).await;
+
+    feed(&rpc, ":tabnew /virtual/proj/src<CR>");
+    assert_eq!(
+        await_lines(&rpc, &["../", "main.rs"]).await,
+        vec!["../", "main.rs"],
+        "`:tabnew <remote-dir>` lists the directory as the explorer in a new tab"
+    );
+}

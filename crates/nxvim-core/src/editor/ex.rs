@@ -1503,47 +1503,13 @@ impl Editor {
             return;
         }
 
-        // The file is already open in another buffer: just switch to it. The
-        // current buffer stays in the list (vim's `hidden` behavior), so there is
-        // nothing to lose and no modified guard.
-        if let Some(id) = self.find_buffer_by_path(&path) {
-            self.switch_buffer(id);
-            return;
-        }
-
-        // A new file. Reuse a throwaway `[No Name]` buffer if that's all we have
-        // (so the first `:e` doesn't strand an empty buffer 1); otherwise open it
-        // in a fresh buffer and switch, keeping the current one open.
-        //
-        // Off-tick (daemon session): set up an *empty* buffer named for the file —
-        // reusing the throwaway, or a fresh one switched to — and enqueue the fetch.
-        // The server reads the bytes over the wire and fills the buffer off-tick, so
-        // the keystroke path keeps serving the (briefly empty) buffer meanwhile.
-        if self.host_fs_offtick {
-            let buf = if self.current_is_throwaway() {
-                let id = self.cur_buffer();
-                self.buffer_mut().set_path(Some(path.clone()));
-                id
-            } else {
-                let id = self.add_buffer(Buffer::named(path.clone()));
-                self.switch_buffer(id);
-                id
-            };
-            self.enqueue_open(buf, path);
-            return;
-        }
-        if self.current_is_throwaway() {
-            self.load_into_current(&path);
-        } else {
-            let fs = self.host_fs.clone();
-            match Buffer::from_file(&path, &*fs) {
-                Ok(buf) => {
-                    let id = self.add_buffer(buf);
-                    self.switch_buffer(id);
-                }
-                Err(e) => self.echo(e.to_string()),
-            }
-        }
+        // Otherwise open or switch into the current window through the shared open
+        // kernel: switch to it if already open (the current buffer stays in the list —
+        // vim's `hidden` — so no modified guard), reuse a throwaway `[No Name]` in place
+        // (so the first `:e` doesn't strand an empty buffer 1), or load a fresh buffer and
+        // switch. The kernel routes the load off-tick in a daemon session and synchronously
+        // otherwise — the same `:tabnew` / go-to / explorer share.
+        self.edit_in_current_window(&path);
     }
 
     /// `:split [file]` / `:vsplit [file]` — split the focused window, then (with a
@@ -1579,18 +1545,12 @@ impl Editor {
         let buf = if file.is_empty() {
             self.add_buffer(Buffer::empty())
         } else {
-            let path = PathBuf::from(file);
-            let fs = self.host_fs.clone();
-            match self.find_buffer_by_path(&path) {
-                Some(id) => id,
-                None => match Buffer::from_file(&path, &*fs) {
-                    Ok(b) => self.add_buffer(b),
-                    Err(e) => {
-                        self.echo(e.to_string());
-                        self.add_buffer(Buffer::empty())
-                    }
-                },
-            }
+            // Share the open kernel — but a new tab must get its *own* buffer (never reuse
+            // the current window's the way `:e` does), so this is `open_buffer`
+            // (find-or-load), not `edit_in_current_window`. Off-tick aware via the kernel.
+            // A failed synchronous load falls back to an empty buffer so the tab still opens.
+            self.open_buffer(&PathBuf::from(file))
+                .unwrap_or_else(|| self.add_buffer(Buffer::empty()))
         };
         self.new_tab(buf, options);
     }

@@ -207,3 +207,32 @@ async fn edit_reload_refetches_over_the_wire() {
          not just discard the local edit"
     );
 }
+
+/// `:tabnew /virtual/other.txt` opens the remote file in a **new tab**, fetched over the
+/// wire — `:tabnew` was the last user-command `from_file` site that bypassed the off-tick
+/// path (Phase 3h unifies it onto the shared open kernel). The `/virtual/...` path can't
+/// be read from the edit-host's local disk, so the new tab's content crossed the wire.
+#[tokio::test]
+async fn tabnew_fetches_a_file_over_the_wire() {
+    let fake = DaemonFs::default();
+    fake.set("/virtual/note.txt", "alpha\n")
+        .set("/virtual/other.txt", "tab\ncontent\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/note.txt").await;
+    await_lines(&rpc, &["alpha"]).await;
+
+    feed(&rpc, ":tabnew /virtual/other.txt<CR>");
+    // The new (now-current) tab's buffer fills with the remote file's bytes...
+    assert_eq!(
+        await_lines(&rpc, &["tab", "content"]).await,
+        vec!["tab", "content"],
+        "`:tabnew` fills the new tab's buffer with the remote file's bytes over the wire"
+    );
+    // ...there really are two tab pages now (not an in-place `:edit`)...
+    let tab_count = exec_lua(&rpc, "return #vim.api.nvim_list_tabpages()")
+        .await
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(tab_count, 2, "`:tabnew` opened a second tab page");
+    // ...and the new tab's buffer is named for the remote path.
+    assert_eq!(buf_name(&rpc).await, "/virtual/other.txt");
+}

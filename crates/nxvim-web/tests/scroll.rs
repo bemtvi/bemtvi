@@ -36,6 +36,15 @@ fn long_buffer(lines: usize) -> String {
         + "\n"
 }
 
+/// The 1-based buffer line currently at the top of the focused window (its first
+/// visible line number), so a wheel scroll's *distance* is checkable.
+fn top_line(ed: &mut WebEditor) -> u64 {
+    let w = focused_window(ed);
+    w["numbers"][0]
+        .as_u64()
+        .expect("top row carries its 1-based buffer line number")
+}
+
 #[test]
 fn ctrl_d_projects_a_scroll_band_into_the_view() {
     let mut ed = WebEditor::new(80, 24);
@@ -146,6 +155,61 @@ fn a_single_line_scroll_emits_no_band() {
         w["scroll"].is_null(),
         "a one-line scroll is below the animation threshold; no band"
     );
+}
+
+/// The cell height the JS frontend measures and passes to `wheel` (FONT_PX * LINE,
+/// rounded — see `web/index.html`). Pixel deltas below this are sub-line.
+const CELL_H: f64 = 21.0;
+const CELL_W: f64 = 9.0;
+
+#[test]
+fn pixel_wheel_accumulates_sub_line_deltas_before_scrolling() {
+    let mut ed = WebEditor::new(80, 24);
+    let _ = std::panic::take_hook();
+    ed.load_file("big.txt", &long_buffer(500));
+
+    assert_eq!(top_line(&mut ed), 1, "view starts at the first line");
+
+    // A pixel-precise device (trackpad / hi-res wheel) fires many small deltas, each
+    // a fraction of a line. The bug: every such event scrolled a full `'mousescroll'`
+    // step, so a gentle swipe flew down the buffer. A 7px delta over a 21px cell is a
+    // third of a line — two of them must not move the viewport at all.
+    ed.wheel(0.0, 7.0, 0, CELL_W, CELL_H, "", 5, 5, 1.0);
+    assert_eq!(
+        top_line(&mut ed),
+        1,
+        "a third-of-a-line wheel delta must not scroll yet"
+    );
+    ed.wheel(0.0, 7.0, 0, CELL_W, CELL_H, "", 5, 5, 1.0);
+    assert_eq!(
+        top_line(&mut ed),
+        1,
+        "two thirds of a line is still below one notch"
+    );
+
+    // The third delta crosses a whole line → exactly one notch, which scrolls the
+    // default `'mousescroll'` (3 lines): top goes line 1 → line 4. The old
+    // notch-per-event behavior would already be three notches (line 10) deep here.
+    ed.wheel(0.0, 7.0, 0, CELL_W, CELL_H, "", 5, 5, 1.0);
+    assert_eq!(
+        top_line(&mut ed),
+        4,
+        "the third sub-line delta completes one notch = one mousescroll step (3 lines)"
+    );
+}
+
+#[test]
+fn line_mode_wheel_scrolls_one_mousescroll_step_per_notch() {
+    let mut ed = WebEditor::new(80, 24);
+    let _ = std::panic::take_hook();
+    ed.load_file("big.txt", &long_buffer(500));
+
+    // A classic wheel reports whole-line deltas (deltaMode 1): one detent = one notch
+    // = one `'mousescroll'` step of 3 lines. Down then back up returns to the top.
+    ed.wheel(0.0, 1.0, 1, CELL_W, CELL_H, "", 5, 5, 1.0);
+    assert_eq!(top_line(&mut ed), 4, "one down notch scrolls 3 lines");
+    ed.wheel(0.0, -1.0, 1, CELL_W, CELL_H, "", 5, 5, 1.0);
+    assert_eq!(top_line(&mut ed), 1, "one up notch scrolls back");
 }
 
 #[test]

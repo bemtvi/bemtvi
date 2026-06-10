@@ -129,6 +129,13 @@ pub struct WebEditor {
     /// holds as its [`Clipboard`] provider, so the JS-facing methods below can read
     /// and seed it.
     clip: WebClipboard,
+    /// Fractional wheel remainder per axis `(horizontal, vertical)`, in whole-line
+    /// units. A pixel-precise trackpad or a hi-res mouse wheel fires many small
+    /// sub-line `wheel` deltas; without accumulation each one would emit a full
+    /// `'mousescroll'` notch and the view would fly. The remainder carries between
+    /// events so a slow drag still scrolls one row at a time. Mirrors the GUI
+    /// client's `wheel_accum` (`nxvim-gui`). See [`WebEditor::wheel`].
+    wheel_accum: (f32, f32),
 }
 
 #[wasm_bindgen]
@@ -150,6 +157,7 @@ impl WebEditor {
             width: width.max(1),
             height: height.max(1),
             clip,
+            wheel_accum: (0.0, 0.0),
         }
     }
 
@@ -241,6 +249,63 @@ impl WebEditor {
         }
     }
 
+    /// Forward a browser `wheel` event, converting its raw `delta_x`/`delta_y` into
+    /// whole scroll **notches** before handing them to the editor. The browser
+    /// reports the delta in `delta_mode` units — `0` pixels, `1` lines, `2` pages —
+    /// so pixels are divided by the cell size (`cell_w`/`cell_h`, the measured
+    /// monospace cell in CSS px) to lines, and pages by the viewport. The fractional
+    /// remainder is kept per axis ([`wheel_accum`](WebEditor)) so a pixel-precise
+    /// trackpad or a hi-res wheel — which fire a burst of sub-line deltas — sum to
+    /// the right distance instead of emitting a full `'mousescroll'` notch on every
+    /// micro-event (which made the web view scroll far too fast). Each whole notch
+    /// is one `wheel` gesture, capped per event so a flung wheel can't flood the
+    /// core. The browser's positive `delta_y` scrolls the content up (a scroll
+    /// *down*); positive `delta_x` scrolls right. This mirrors the GUI client
+    /// (`nxvim-gui`'s `mouse_wheel`) exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wheel(
+        &mut self,
+        delta_x: f64,
+        delta_y: f64,
+        delta_mode: u32,
+        cell_w: f64,
+        cell_h: f64,
+        modifier: &str,
+        row: usize,
+        col: usize,
+        stamp_ms: f64,
+    ) {
+        let (lines_x, lines_y) = match delta_mode {
+            1 => (delta_x as f32, delta_y as f32), // already line units
+            2 => (
+                delta_x as f32 * self.width.max(1) as f32,
+                delta_y as f32 * self.height.saturating_sub(1).max(1) as f32,
+            ),
+            _ => (
+                (delta_x / cell_w.max(1.0)) as f32,
+                (delta_y / cell_h.max(1.0)) as f32,
+            ),
+        };
+        let hnotch = drain_notches(lines_x, &mut self.wheel_accum.0);
+        let vnotch = drain_notches(lines_y, &mut self.wheel_accum.1);
+
+        // Cap the per-event repeat so a flung wheel (or a coarse page-mode delta)
+        // can't flood the core with notches in one go.
+        const MAX_STEPS: u32 = 10;
+        if vnotch != 0 {
+            let action = if vnotch > 0 { "down" } else { "up" };
+            for _ in 0..vnotch.unsigned_abs().min(MAX_STEPS) {
+                self.mouse("wheel", action, modifier, row, col, stamp_ms);
+            }
+        }
+        if hnotch != 0 {
+            let action = if hnotch > 0 { "right" } else { "left" };
+            for _ in 0..hnotch.unsigned_abs().min(MAX_STEPS) {
+                self.mouse("wheel", action, modifier, row, col, stamp_ms);
+            }
+        }
+    }
+
     /// Load `contents` into the editor as the file named `name` — the browser open
     /// path. The bytes come from the File System Access API (or a file input), not a
     /// filesystem, so this is the in-memory analogue of `:e {name}`: reuse the empty
@@ -329,6 +394,20 @@ fn view_cols(view: &View) -> usize {
         .map(|w| w.rect.x + w.rect.width)
         .max()
         .unwrap_or(0)
+}
+
+/// Add `amount` line-notches to the running `accum` and return the whole notches
+/// to emit now, leaving the sub-line remainder in `accum`. A wheel mouse sends
+/// roughly one line per detent (emitted at once); a trackpad sends many fractional
+/// lines that accumulate until they cross a whole line, so a slow drag still
+/// scrolls one row at a time rather than not at all. Truncation is toward zero, so
+/// the scroll direction never flips from rounding. Mirrors `nxvim-gui`'s
+/// `drain_notches`. See [`WebEditor::wheel`].
+fn drain_notches(amount: f32, accum: &mut f32) -> i32 {
+    *accum += amount;
+    let whole = accum.trunc();
+    *accum -= whole;
+    whole as i32
 }
 
 fn window_to_json(w: &WindowView) -> Value {

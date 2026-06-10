@@ -1162,12 +1162,48 @@
       sendMouse(dragBtn, "release", mods(e), row, col);
       dragBtn = null;
     });
+    // The browser fires many `wheel` events per physical scroll — a trackpad or a
+    // hi-res mouse reports a burst of sub-line deltas — so a notch per raw event
+    // scrolls a full `'mousescroll'` step each time and the view flies. Convert the
+    // delta to whole-line notches, carrying the fractional remainder between events,
+    // exactly like the GUI client. Local mode does this in the wasm core
+    // (`WebEditor::wheel`, which the scroll tests cover); remote mode has no such
+    // batching API, so accumulate here and send discrete notches.
+    const remoteWheelAccum = { x: 0, y: 0 };
+    function wheelToLines(e) {
+      switch (e.deltaMode) {
+        case 1: return { x: e.deltaX, y: e.deltaY };                                 // already lines
+        case 2: return { x: e.deltaX * Math.max(1, cols), y: e.deltaY * Math.max(1, editorRows) }; // pages
+        default: return { x: e.deltaX / Math.max(1, cw), y: e.deltaY / Math.max(1, ch) };          // pixels
+      }
+    }
+    function drainNotch(amount, axis) {
+      remoteWheelAccum[axis] += amount;
+      const whole = Math.trunc(remoteWheelAccum[axis]);
+      remoteWheelAccum[axis] -= whole;
+      return whole;
+    }
     gridEl.addEventListener("wheel", (e) => {
       e.preventDefault();
       const { row, col } = cellAt(e);
-      const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX);
-      const action = vertical ? (e.deltaY > 0 ? "down" : "up") : (e.deltaX > 0 ? "right" : "left");
-      sendMouse("wheel", action, mods(e), row, col);
+      if (!remote()) {
+        editor.wheel(e.deltaX, e.deltaY, e.deltaMode, cw, ch, mods(e), row, col, Date.now());
+        refresh();
+        return;
+      }
+      // Remote: convert + accumulate here, then send each whole notch as its own gesture.
+      const { x, y } = wheelToLines(e);
+      const MAX_STEPS = 10;
+      let vnotch = drainNotch(y, "y");
+      if (vnotch !== 0) {
+        const action = vnotch > 0 ? "down" : "up";
+        for (let i = 0, n = Math.min(Math.abs(vnotch), MAX_STEPS); i < n; i++) sendMouse("wheel", action, mods(e), row, col);
+      }
+      let hnotch = drainNotch(x, "x");
+      if (hnotch !== 0) {
+        const action = hnotch > 0 ? "right" : "left";
+        for (let i = 0, n = Math.min(Math.abs(hnotch), MAX_STEPS); i < n; i++) sendMouse("wheel", action, mods(e), row, col);
+      }
     }, { passive: false });
     gridEl.addEventListener("contextmenu", (e) => e.preventDefault());
 

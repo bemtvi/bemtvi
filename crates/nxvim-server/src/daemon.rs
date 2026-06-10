@@ -1,28 +1,22 @@
-//! The daemon wire protocol for the edit-host split (process half).
+//! The daemon wire protocol for the edit-host split (process + filesystem).
 //!
 //! `docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3 moves the
 //! network boundary *below* the editor: the edit-host (core + Lua + treesitter)
 //! runs **local** for a zero-round-trip keystroke path, and only fs + process +
-//! watch — the lag-tolerant work — run on a remote **daemon**. This module is the
-//! process leg of that wire: the daemon-side server ([`serve_daemon`]) that runs
-//! children on behalf of a far edit-host, and the edit-host-side [`RemoteHostProc`]
-//! that forwards spawns to it instead of running them locally.
+//! watch — the lag-tolerant work — run on a remote **daemon**. This module holds
+//! both legs of that wire — the daemon-side servers ([`serve_daemon`],
+//! [`serve_fs_daemon`]) and the edit-host-side clients ([`RemoteHostProc`],
+//! [`RemoteHostFs`]) — over any [`AsyncRead`]/[`AsyncWrite`] transport: an
+//! in-process `tokio::io::duplex` (how the tests drive it), or — in the real split —
+//! ssh stdio to `nxvim --daemon`.
 //!
-//! It is the first slice of the *full split* to actually carry traffic over a
-//! wire, kept to the process seam because [`HostProc`] is already async +
-//! event-routed (pid then exit come back as separate events, not a return value),
-//! so it maps onto a wire with no impedance mismatch — unlike core's *synchronous*
-//! [`HostFs`](nxvim_core::HostFs), whose remote backing has to become an off-tick
-//! fetch (a later slice). The transport is any [`AsyncRead`]/[`AsyncWrite`] pair:
-//! an in-process `tokio::io::duplex` (how the tests drive it), or — in the real
-//! split — ssh stdio to `nxvim --daemon`.
+//! ## The process leg (notifications)
 //!
-//! ## The wire
-//!
-//! Four notifications over nxvim's own msgpack-RPC ([`nxvim_rpc`]), correlated by a
-//! per-spawn `id` the edit-host mints and the daemon echoes back. Notifications
-//! (not request/response) because a child's life is two events at different times —
-//! `spawned` then `exited` — which a single reply can't model:
+//! [`HostProc`] is already async + event-routed (pid then exit come back as separate
+//! events, not a return value), so it maps onto a wire with no impedance mismatch.
+//! Four notifications correlated by a per-spawn `id` the edit-host mints and the
+//! daemon echoes back — notifications (not request/response) because a child's life
+//! is two events at different times, which a single reply can't model:
 //!
 //! | direction | method | params |
 //! | --- | --- | --- |
@@ -34,9 +28,32 @@
 //! The daemon runs each child through the *same* [`StdHostProc`] the local server
 //! uses today — it relays that machinery's [`LoopEvent`]s straight onto the wire —
 //! so a process behaves identically whether it ran here or across the network.
+//!
+//! ## The filesystem leg (request/response)
+//!
+//! Core's [`HostFs`](nxvim_core::HostFs) is *synchronous* — a daemon-backed read
+//! can't block the single editor thread on the network (the latency thesis) — so the
+//! remote fs is **not** that sync trait. It is a small *async* seam, [`HostFsAsync`],
+//! the server consumes **off the editor tick**: it fetches a buffer's bytes over the
+//! wire, then hands core a populated replica via `Editor::load_str` (the in-memory
+//! open the web build already uses). Unlike the process leg, a file read is naturally
+//! request/response, so this needs no `id`/demux — `nxvim_rpc`'s `request` routes the
+//! reply directly:
+//!
+//! | direction | method | reply |
+//! | --- | --- | --- |
+//! | edit-host → daemon | `fs_read [path]` | `["file", bytes]` / `["new"]`, or an RPC error |
+//!
+//! **Scope (this slice): the initial buffer open only.** `serve_fs_daemon` reads an
+//! existing file (`file`) or reports a not-yet-existing one as a new-file buffer
+//! (`new`); a directory or any other error comes back as a loud RPC error (remote
+//! directory/explorer open, the save path, and `:edit` are later sub-slices — the
+//! sync [`HostFs`] still backs those, on local disk).
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,10 +63,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use nxvim_core::HostFs;
 use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
 use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
+
+const FS_READ: &str = "fs_read";
 
 // Wire method names. Kept as constants so the two halves can never drift on a typo.
 const PROC_SPAWN: &str = "proc_spawn";
@@ -386,4 +406,157 @@ fn decode_exited(mut params: Vec<Value>) -> Option<(u64, DaemonEvent)> {
             stderr,
         },
     ))
+}
+
+// ===== the filesystem leg =====================================================
+
+/// What a daemon `fs_read` resolves a path to, for an initial buffer open. A read
+/// error (a directory, a permission failure, a dead connection) is *not* one of
+/// these — it surfaces as an `Err` the server echoes loudly, never a silent empty
+/// buffer.
+pub enum FsRead {
+    /// An existing file's bytes — load them into the buffer (a replica of the remote).
+    File(Vec<u8>),
+    /// The path doesn't exist yet — open an empty new-file buffer named for it (the
+    /// `:e newfile` case), so a first `:w` would create it.
+    New,
+}
+
+/// The **async** filesystem seam the server fetches buffer contents through, off the
+/// editor tick — the daemon/remote analog of core's *synchronous*
+/// [`HostFs`](nxvim_core::HostFs). Where the sync trait reads local disk at the open
+/// call (and must, since it runs on the single editor thread), this returns a future
+/// the server awaits *off-tick* and then hands core populated bytes, so a slow remote
+/// read never freezes typing. [`RemoteHostFs`] is the over-the-wire implementation;
+/// a test can supply a fake.
+///
+/// Object-safe (returns a boxed `Send` future, no `async fn`) to match the
+/// `Box<dyn …>` DI style the rest of the server uses without an `async-trait`
+/// dependency. Scoped to `read` for the initial-open slice; `stat` / `write` /
+/// `read_dir` join it as the save and explorer paths cross the wire.
+pub trait HostFsAsync: Send + Sync {
+    /// Fetch `path`'s contents for an initial buffer open (or report it new).
+    fn read(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<FsRead>> + Send>>;
+}
+
+/// A [`HostFsAsync`] that reads files from a remote daemon over the wire. `read`
+/// issues an `fs_read` request and awaits the reply — a file read is naturally
+/// request/response, so (unlike [`RemoteHostProc`]) there is no per-call demux:
+/// [`nxvim_rpc`] routes each response to its awaiting `request` by msgid.
+pub struct RemoteHostFs {
+    rpc: Rpc,
+}
+
+impl RemoteHostFs {
+    /// Connect to a daemon over `reader`/`writer`. The daemon sends only `fs_read`
+    /// *responses* (which `nxvim_rpc` routes internally), never notifications, so a
+    /// tiny drain task keeps the `Incoming` stream consumed — dropping the receiver
+    /// would tear the connection down. RPC tasks live on the runtime this is called
+    /// from, as for any [`nxvim_rpc::connect`].
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteHostFs
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (rpc, mut incoming) = connect(reader, writer);
+        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+        RemoteHostFs { rpc }
+    }
+}
+
+impl HostFsAsync for RemoteHostFs {
+    fn read(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<FsRead>> + Send>> {
+        let rpc = self.rpc.clone();
+        Box::pin(async move {
+            match rpc.request(FS_READ, vec![Value::from(path)]).await {
+                Ok(Value::Array(mut a)) => decode_fs_read(&mut a),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fs_read: malformed reply",
+                )),
+                // A transport failure (daemon gone) is a loud read error, not a
+                // silent empty buffer.
+                Err(e) => Err(io::Error::other(e.to_string())),
+            }
+        })
+    }
+}
+
+/// `["file", bytes]` / `["new"]` → [`FsRead`]; anything else is a malformed reply.
+fn decode_fs_read(a: &mut [Value]) -> io::Result<FsRead> {
+    match a.first().and_then(Value::as_str) {
+        Some("file") => match a.get_mut(1).map(|v| std::mem::replace(v, Value::Nil)) {
+            Some(Value::Binary(bytes)) => Ok(FsRead::File(bytes)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fs_read: file reply missing bytes",
+            )),
+        },
+        Some("new") => Ok(FsRead::New),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fs_read: unknown reply tag",
+        )),
+    }
+}
+
+/// Run the daemon end of the *filesystem* wire over `reader`/`writer`, serving
+/// `fs_read` requests from `fs` (the daemon's real backend — [`StdHostFs`] in the
+/// binary, a fake in tests). Returns when the connection closes. Reads run inline
+/// (the daemon serves one request at a time); an initial open is a single fetch, so
+/// no concurrency is needed yet.
+///
+/// [`StdHostFs`]: nxvim_core::StdHostFs
+pub async fn serve_fs_daemon<R, W>(
+    reader: R,
+    writer: W,
+    fs: Box<dyn HostFs + Send>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, mut incoming) = connect(reader, writer);
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Request { id, method, params } = msg else {
+            continue; // the edit-host drives the fs daemon with requests only
+        };
+        if method != FS_READ {
+            rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
+            continue;
+        }
+        let Some(path) = params.first().and_then(Value::as_str).map(PathBuf::from) else {
+            rpc.respond(id, Err(Value::from("fs_read: missing path")));
+            continue;
+        };
+        let reply = match classify(&*fs, &path) {
+            Ok(FsRead::File(bytes)) => Ok(Value::Array(vec![
+                Value::from("file"),
+                Value::Binary(bytes),
+            ])),
+            Ok(FsRead::New) => Ok(Value::Array(vec![Value::from("new")])),
+            Err(e) => Err(Value::from(e.to_string())),
+        };
+        rpc.respond(id, reply);
+    }
+    Ok(())
+}
+
+/// Resolve `path` against `fs` to a [`FsRead`], using only the sync [`HostFs`]
+/// surface (so a fake test backend and the real disk behave identically). A readable
+/// directory is a loud error — remote explorer open is a later slice; a `NotFound`
+/// is the legitimate new-file case; any other read error propagates loudly.
+fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
+    if fs.read_dir(path).is_ok() {
+        return Err(io::Error::other("remote directory open not yet supported"));
+    }
+    match fs.open_read(path) {
+        Ok(mut reader) => {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            Ok(FsRead::File(bytes))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FsRead::New),
+        Err(e) => Err(e),
+    }
 }

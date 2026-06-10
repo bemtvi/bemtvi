@@ -2,11 +2,48 @@
 //! `BufReadPost`/`FileType`/`BufEnter`/`InsertEnter`, and `init.lua` sourcing.
 
 use crate::filetype_of;
+use crate::FsRead;
 use crate::{Server, WindowRect};
 use nxvim_core::{BufferId, TabId, WindowId};
+use std::io;
 use std::path::Path;
 
 impl Server {
+    /// Apply the result of the off-tick fetch of the deferred startup file
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3, fs leg): an
+    /// existing file's bytes or a new-file marker load into a replica buffer; a read
+    /// error (a directory, a transport failure) is echoed loudly rather than left as
+    /// a silent empty buffer. The editor was already serving the client with an empty
+    /// `[No Name]` buffer while this fetch was in flight — that is the whole point of
+    /// fetching the remote file off the editor tick.
+    pub(crate) fn apply_initial_open(&mut self, path: String, result: io::Result<FsRead>) {
+        match result {
+            Ok(FsRead::File(bytes)) => self.load_replica(path, &String::from_utf8_lossy(&bytes)),
+            Ok(FsRead::New) => self.load_replica(path, ""),
+            Err(e) => self
+                .editor
+                .echo(format!("nxvim: could not open {path} over the daemon: {e}")),
+        }
+    }
+
+    /// Load `contents` into the startup buffer as a replica of the remote file named
+    /// `path`, then fire the events a fresh read implies. `load_str` reuses the
+    /// throwaway `[No Name]` buffer (which already announced its file-less `BufEnter`
+    /// at startup), so clear it from `announced` to let the now-named buffer's
+    /// `BufReadPost`/`FileType` fire — `FileType` is what drives syntax and LSP. Then
+    /// refresh the Lua buffer snapshot/mirror and drive the queued autocmd work.
+    fn load_replica(&mut self, path: String, contents: &str) {
+        self.editor.load_str(Some(path), contents);
+        let buf = self.editor.current_buffer_id();
+        self.announced.remove(&buf);
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
+        self.push_buf_mirror();
+        self.emit_lifecycle_events();
+        self.run_pending();
+    }
+
     /// Diff the editor's current buffer against what was last announced and fire
     /// the buffer-lifecycle autocmds the transition implies — the central,
     /// server-side emission point (design D1) that keeps `nxvim-core` free of

@@ -36,12 +36,16 @@ mod treesitter;
 /// [`nxvim_core::HostFs`]).
 pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 
-/// The daemon wire protocol for the edit-host split (process half): the daemon-side
-/// [`serve_daemon`] that runs children for a far edit-host, and the edit-host-side
-/// [`RemoteHostProc`] that forwards spawns to it over any
-/// [`AsyncRead`](tokio::io::AsyncRead)/[`AsyncWrite`](tokio::io::AsyncWrite) wire
-/// (a duplex, or ssh stdio to `nxvim --daemon`).
-pub use daemon::{serve_daemon, RemoteHostProc};
+/// The daemon wire protocol for the edit-host split: the daemon-side servers
+/// ([`serve_daemon`] for child processes, [`serve_fs_daemon`] for file reads) and the
+/// edit-host-side clients ([`RemoteHostProc`], [`RemoteHostFs`]) that forward to them
+/// over any [`AsyncRead`](tokio::io::AsyncRead)/[`AsyncWrite`](tokio::io::AsyncWrite)
+/// wire (a duplex, or ssh stdio to `nxvim --daemon`). [`HostFsAsync`] is the async fs
+/// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
+/// what one fetch resolves to.
+pub use daemon::{
+    serve_daemon, serve_fs_daemon, FsRead, HostFsAsync, RemoteHostFs, RemoteHostProc,
+};
 
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
@@ -102,6 +106,17 @@ pub struct ServerInit {
     /// rebuilt into the shared `Arc<dyn HostProc>` the event-loop actor holds
     /// there.
     pub host_proc: Option<Box<dyn HostProc + Send>>,
+    /// The **async** filesystem the *initial buffer* is fetched through, off the
+    /// editor tick — the daemon-backed analog of the sync [`host_fs`](Self::host_fs)
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3). `None` (the
+    /// default) opens the startup file synchronously through `host_fs` as before;
+    /// when set, the editor starts empty and the server fetches [`file`](Self::file)'s
+    /// bytes over the wire *after* the loop begins, then loads them into a replica
+    /// buffer — so a slow remote read never freezes startup. `Send` (boxed) to ride
+    /// onto the server thread, where it is rebuilt into an `Arc<dyn HostFsAsync>`.
+    /// (Only the initial open crosses this seam in this slice; `:edit` / `:write` /
+    /// the explorer still use the sync `host_fs`.)
+    pub host_fs_async: Option<Box<dyn HostFsAsync + Send>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -375,17 +390,48 @@ where
         }
         None => Rc::new(StdHostFs),
     };
-    // Open the startup file *through* `host_fs` (not the default disk), so the
-    // first buffer is fetched the same way every later `:edit` is; a bare session
-    // still installs the fs so a later `:edit` / `:write` routes through it too.
-    let mut editor = match init.file {
-        Some(path) => Editor::open_or_named_with(path, host_fs),
-        None => {
+    // The async (daemon) fs the *initial* buffer is fetched through, off the editor
+    // tick. Rebuilt here into a shared `Arc<dyn HostFsAsync>` (Send dropped by unsize
+    // coercion), mirroring the `host_proc` rebuild below. `None` = no daemon fs.
+    let host_fs_async: Option<Arc<dyn HostFsAsync>> = init.host_fs_async.map(|fs| {
+        // `Arc::from` yields `Arc<dyn HostFsAsync + Send>`; rebinding to the
+        // `Arc<dyn HostFsAsync>` type drops the `Send` bound by unsize coercion.
+        let fs: Arc<dyn HostFsAsync + Send> = Arc::from(fs);
+        let fs: Arc<dyn HostFsAsync> = fs;
+        fs
+    });
+    // When a daemon fs is present, defer the startup file: fetch its bytes *after*
+    // the loop begins (so a slow remote read never freezes startup) and start with an
+    // empty buffer. Otherwise open it synchronously through `host_fs` exactly as
+    // before — the first buffer fetched the same way every later `:edit` is; a bare
+    // session still installs the fs so a later `:edit` / `:write` routes through it.
+    let deferred_open = host_fs_async.as_ref().and(init.file.clone());
+    let mut editor = match (&host_fs_async, init.file) {
+        // Daemon fs: start empty regardless of `file`; the fetch task below loads it.
+        (Some(_), _) => {
+            let mut editor = Editor::new();
+            editor.set_host_fs(host_fs);
+            editor
+        }
+        (None, Some(path)) => Editor::open_or_named_with(path, host_fs),
+        (None, None) => {
             let mut editor = Editor::new();
             editor.set_host_fs(host_fs);
             editor
         }
     };
+    // The off-tick fetch of the deferred startup file: read its bytes over the wire
+    // and deliver them (or a read error) into the loop, where they load into a
+    // replica buffer. A bare/local session leaves this channel idle.
+    let (initial_tx, mut initial_open_rx) =
+        unbounded_channel::<(String, std::io::Result<FsRead>)>();
+    if let (Some(fs), Some(path)) = (host_fs_async.as_ref(), deferred_open) {
+        let fs = fs.clone();
+        tokio::spawn(async move {
+            let result = fs.read(path.clone()).await;
+            let _ = initial_tx.send((path, result));
+        });
+    }
     // The editor owns the in-process treesitter engine and queries it
     // synchronously for highlights (and, later, indentation). It loads
     // installable grammars from the data dir at runtime; a buffer with no grammar
@@ -595,6 +641,14 @@ where
                 while let Ok(event) = loop_events.try_recv() {
                     server.on_loop_event(event);
                 }
+                server.settle_events(true);
+            }
+            // The deferred startup file's bytes arrived from the daemon's fs — the
+            // off-tick fetch that kept a slow remote read from freezing startup. Load
+            // them into a replica buffer (or echo a read error) and repaint. Fires at
+            // most once; idle for a bare/local session.
+            Some((path, result)) = initial_open_rx.recv() => {
+                server.apply_initial_open(path, result);
                 server.settle_events(true);
             }
             // A `:TSInstall` background job finished (grammar fetched + compiled, or

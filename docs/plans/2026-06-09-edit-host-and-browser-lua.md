@@ -392,10 +392,70 @@ the harness already makes for its client connection.
 **Still to do in the full split:** the remaining process consumers the original sketch
 reached for — `lsp/manager.rs` (long-lived bidirectional raw-pipe transport: needs the
 `write_stdin` + stdout-as-events shape, not run-to-completion) and `clipboard.rs` (a
-sync provider) — plus the `HostFs` half (async off-tick fetch / buffer replicas), the
-`nxvim --daemon` binary, and the local edit-host as a client over ssh stdio. This slice
-is the wire those plug into; the trait the wire satisfies (`HostProc`) and its routing
-are now proven end-to-end.
+sync provider) — plus the `nxvim --daemon` binary and the local edit-host as a client
+over ssh stdio. This slice is the wire those plug into; the trait the wire satisfies
+(`HostProc`) and its routing are now proven end-to-end. (The `HostFs` half landed
+next — Phase 3d.)
+
+### Phase 3d — the daemon wire protocol (filesystem half, initial open) — ✅ DONE (2026-06-10)
+
+The symmetric companion to 3c, and the first time a *buffer* — not just a process —
+crosses the wire. Scoped to the **initial open only**, mirroring how 3a scoped the
+`HostFs` *consumption* to the startup file: prove the off-tick fetch end-to-end on the
+simplest path, leave `:edit` / `:write` / the explorer for later sub-slices. (Slice
+direction confirmed with the requester, 2026-06-10.)
+
+The shape differs from 3c by necessity. Core's [`HostFs`] is **synchronous**, and the
+plan is explicit that a daemon-backed read must *not* block the single editor thread on
+the network — so the remote fs is **not** a `HostFs` impl. It is a new *async* seam the
+**server** consumes off the editor tick (the sync `HostFs` stays reserved for local
+disk). A file read is also naturally request/response (one reply, not a two-event
+lifecycle), so unlike the process leg it needs no `id`/demux.
+
+Shipped (alongside 3c in `crates/nxvim-server/src/daemon.rs`; the module now carries
+*both* legs):
+- **The wire** — one `nxvim-rpc` **request**: `fs_read [path]` → `["file", bytes]`,
+  `["new"]` (path doesn't exist → a new-file buffer), or a loud RPC **error** (a
+  directory — remote explorer is a later slice — or a transport/permission failure;
+  never a silent empty buffer). `nxvim_rpc::request` routes the reply by msgid, so the
+  edit-host side has no demux.
+- **`HostFsAsync` (server-side async seam)** + **`RemoteHostFs`** (its over-the-wire
+  impl: `read` issues `fs_read` and awaits the reply). `ServerInit::host_fs_async:
+  Option<Box<dyn HostFsAsync + Send>>` rides onto the server thread and is rebuilt into
+  an `Arc<dyn HostFsAsync>`, mirroring the `host_proc` rebuild. `None` = today's
+  behavior (open the startup file synchronously through the sync `host_fs`).
+- **Off-tick open in `run_io`** — when a daemon fs is present, the editor **starts
+  empty** and the startup file is fetched by a task spawned *before* the loop; its bytes
+  (or error) arrive on a new `tokio::select!` arm that loads them into a **replica**
+  buffer via `Editor::load_str` (the in-memory open the web build already uses) and
+  repaints. So a slow remote read never freezes startup — the keystroke/redraw path is
+  serving the empty buffer the whole time.
+- **`serve_fs_daemon` (daemon side)** — answers `fs_read` from an injected sync
+  [`HostFs`] ([`StdHostFs`] in the binary, a fake in tests), classifying file / new /
+  directory through the existing trait surface (`read_dir` probe + `open_read`), so a
+  fake and the real disk behave identically.
+- **Replica lifecycle** — `load_str` reuses the throwaway `[No Name]` buffer, which
+  already announced its file-less `BufEnter` at startup, so the apply clears it from
+  `announced` to let the now-named buffer's `BufReadPost`/`FileType` fire as a fresh
+  read (`FileType` drives syntax + LSP), then refreshes the Lua snapshot/mirror.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_fs.rs`: an editor whose
+`host_fs_async` is a `RemoteHostFs` talking to a `serve_fs_daemon` over an in-process
+duplex opens a `/virtual/...` path — one the edit-host's *local* disk cannot read — and
+its bytes (`fetched / over / the / wire`) appear in the first buffer, named for the
+path; the content can only have crossed the wire (the same faithfulness argument 3a's
+`host_fs.rs` makes for the sync seam). A second test proves a not-yet-existing path
+opens as an empty **new-file** buffer (not an error) with its name bound for a later
+`:w`. The `attach` handshake completes before the file loads — evidence the fetch did
+not block startup. Regression-clean — full `nxvim-server` suite (now 19 binaries),
+`nxvim`/`nxvim-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
+`-D warnings` all green.
+
+**Still to do on the fs leg:** `:edit` / `:read` and the **save** path over the wire
+(both still use the sync `host_fs`, i.e. local disk, in a remote session today), remote
+**directory/explorer** listing (`read_dir` over the wire — currently a loud error), and
+`FileChangedShell` from a daemon `watch`. The async seam + replica pattern this slice
+established is what those extend.
 
 ### The full split
 

@@ -67,6 +67,9 @@ fn main() -> Result<()> {
         // The local binary spawns real local processes (the default); a
         // daemon-backed process host is injected here by the edit-host split.
         host_proc: None,
+        // The local binary opens the startup file synchronously through the disk;
+        // the async (daemon) fs is injected here by the edit-host split.
+        host_fs_async: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -121,6 +124,7 @@ fn run_headless(file: Option<String>) -> Result<()> {
         mouse_clock: None,
         host_fs: None,
         host_proc: None,
+        host_fs_async: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()

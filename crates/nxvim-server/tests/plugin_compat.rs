@@ -13,6 +13,41 @@ use rmpv::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+/// The `pack/plugins/start` directory of the user's nxvim config, or `None`.
+fn pack_start() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let p = PathBuf::from(home).join(".config/nxvim/pack/plugins/start");
+    p.is_dir().then_some(p)
+}
+
+/// Resolve the given plugin dir names under `pack/plugins/start`, returning `None`
+/// (so the caller skips) if any is missing — each must have a `lua/` subtree.
+fn plugin_rtp(names: &[&str]) -> Option<Vec<PathBuf>> {
+    let start = pack_start()?;
+    let mut dirs = vec![];
+    for n in names {
+        let d = start.join(n);
+        if !d.join("lua").is_dir() {
+            return None;
+        }
+        dirs.push(d);
+    }
+    Some(dirs)
+}
+
+/// Run `code` (which must `return` a status string) through a server with `names`
+/// on the runtimepath; assert it returned exactly `"OK"`. Skips if a dir is absent.
+async fn assert_plugin_ok(names: &[&str], code: &str) {
+    let Some(rtp) = plugin_rtp(names) else {
+        eprintln!("skip: missing one of {names:?} under pack/plugins/start");
+        return;
+    };
+    let (rpc, _incoming) = start(rtp).await;
+    let report = exec_lua(&rpc, code).await;
+    let report = report.as_str().unwrap_or("<non-string>").to_string();
+    assert_eq!(report, "OK", "plugin load/setup failed:\n{report}");
+}
+
 async fn start(rtp: Vec<PathBuf>) -> (Rpc, UnboundedReceiver<Incoming>) {
     let dir = temp_dir("plugin_compat");
     std::fs::write(dir.join("init.lua"), "").ok();
@@ -88,4 +123,18 @@ async fn cmp_vim_surface_primitives() {
     )
     .await;
     assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
+}
+
+/// LuaSnip: `luasnip/util/ext_opts.lua` calls vim.fn.hlexists to drop undefined
+/// ext-mark highlight groups; without it `require('luasnip').setup{}` errored.
+#[tokio::test]
+async fn luasnip_loads() {
+    assert_plugin_ok(
+        &["LuaSnip"],
+        r#"
+        local ok, err = pcall(function() require('luasnip').setup({}) end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
 }

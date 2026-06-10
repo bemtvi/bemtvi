@@ -215,6 +215,15 @@ function vim.fn.exists(expr)
   return 0
 end
 
+-- vim.fn.hlexists(name): is the highlight group `name` defined? (1 / 0). Backed by
+-- the same `vim._hl_defs` registry nvim_get_hl reads (concrete groups and links
+-- both count). LuaSnip probes this to drop ext-mark highlight groups that aren't
+-- defined (`vim.fn.hlexists(group) == 1 and group or nil`), so a missing builtin
+-- errored its setup; an undefined group correctly answers 0, leaving it unstyled.
+function vim.fn.hlexists(name)
+  return (vim._hl_defs or {})[name] ~= nil and 1 or 0
+end
+
 -- vim.opt: in neovim each field is a rich Option object, but the colorscheme
 -- load path only uses scalar get/set, so a thin proxy over vim.o suffices — and
 -- it inherits vim.o's scope routing for free.

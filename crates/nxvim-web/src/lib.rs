@@ -358,6 +358,7 @@ fn window_to_json(w: &WindowView) -> Value {
         "number_width": w.number_width,
         "tabstop": w.tabstop,
         "file_name": w.file_name,
+        "filetype": w.filetype,
         "unnamed": w.unnamed,
         "modified": w.modified,
     })

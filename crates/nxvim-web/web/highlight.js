@@ -39,6 +39,14 @@ const EXT = {
   c: 'cpp', h: 'cpp', cu: 'cpp', cuh: 'cpp',
 };
 
+// nxvim filetype name → vendored grammar, for buffers whose language the editor
+// resolved itself (an extension the core table knows, or an explicit `:set
+// filetype=…` / `vim.treesitter.start`, both projected into the view as
+// `window.filetype`). Only the names that *differ* from the grammar need an entry;
+// everything else (rust, python, typescript, …) is assumed identical and falls
+// through. `c` highlights with the C++ grammar, matching `EXT` above.
+const FT = { c: 'cpp' };
+
 // Capture group → CSS, in the One Dark family the demo's chrome already uses. Keys
 // are matched most-specific first, then by trimming dotted suffixes (`function.call`
 // → `function`), so only the distinctive sub-cases need their own entry.
@@ -125,6 +133,17 @@ export function createHighlighter({ onReady } = {}) {
     return lang && manifest.has(lang) ? lang : null;
   }
 
+  // The vendored grammar for an editor filetype (`window.filetype` in the view),
+  // or null if none is vendored / the runtime isn't ready. This is how `:set
+  // filetype=…` and `vim.treesitter.start` highlight a buffer whose extension the
+  // file-name path misses (or has none): the override-aware language the core
+  // resolved wins over the extension.
+  function langForFiletype(ft) {
+    if (!ft || !manifest) return null;
+    const lang = FT[ft] || ft;
+    return manifest.has(lang) ? lang : null;
+  }
+
   // Per-buffer-line capture spans for `text` in `lang`: an array indexed by 0-based
   // buffer line, each entry a list of `[startU16, endU16, group]`. Returns null when
   // the grammar isn't loaded yet — and kicks off the async load, after which onReady
@@ -183,6 +202,7 @@ export function createHighlighter({ onReady } = {}) {
   return {
     isReady: () => runtimeReady,
     langForName,
+    langForFiletype,
     spansForBuffer,
     colorsForLine,
   };

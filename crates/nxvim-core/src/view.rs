@@ -11,9 +11,7 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{
-    language_of_path, BorderStyle, BufferId, Cursor, Editor, TabLabel, WindowLayout,
-};
+use crate::editor::{BorderStyle, BufferId, Cursor, Editor, TabLabel, WindowLayout};
 use crate::mode::Mode;
 use crate::statusline::StatuslineCtx;
 use crate::unicode;
@@ -136,6 +134,13 @@ pub struct WindowView {
     pub secondary_cursors: Vec<(usize, usize)>,
     /// File name for this window's status line (`"[No Name]"` when unset).
     pub file_name: String,
+    /// The buffer's **effective** treesitter filetype/language — the override
+    /// (`:set filetype=…`, `vim.treesitter.start`) when set, otherwise the
+    /// extension-derived language, otherwise empty. The server highlights
+    /// in-process so it ignores this, but the serverless web build picks its
+    /// front-end grammar from it (preferring it over the file extension), which
+    /// is how `:set ft=…` highlights a buffer the extension table misses.
+    pub filetype: String,
     /// Whether this window's buffer has no file path yet (a fresh `[No Name]`
     /// buffer), so a write needs a target. Sent to clients as an explicit flag so
     /// a GUI can route a bare `:w` to its save dialog without matching `file_name`.
@@ -411,6 +416,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "[No Name]".to_string());
 
+    // Effective filetype: the treesitter override (`:set ft=…`) if any, else the
+    // extension-derived language. Drives `%y` and the web build's grammar choice.
+    let filetype = ed.ts_language_for(w.buffer).unwrap_or_default();
+
     let cursor_screen_col = {
         let line = buf.line(cur_line);
         unicode::virtcol(&line, w.cursor.col, buf.options.effective_tabstop())
@@ -440,6 +449,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         buf,
         w,
         file_name: &file_name,
+        filetype: &filetype,
         cur_line,
         line_count,
         cursor_screen_col,
@@ -463,6 +473,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         cursor_screen_col,
         secondary_cursors,
         file_name,
+        filetype,
         unnamed: buf.path.is_none(),
         modified: buf.modified,
         cursor_line: cur_line + 1,
@@ -491,6 +502,9 @@ struct StatusCtxInputs<'a> {
     buf: &'a Buffer,
     w: &'a WindowLayout,
     file_name: &'a str,
+    /// The buffer's effective treesitter filetype (override or extension), for
+    /// `%y` — so `:set ft=…` shows in the status line, not just the extension.
+    filetype: &'a str,
     /// Clamped cursor line (0-based) — the rendered line, matching the ruler.
     cur_line: usize,
     line_count: usize,
@@ -522,7 +536,7 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
         modifiable: true,
         readonly: false,
         help: false,
-        filetype: language_of_path(path).unwrap_or("").to_string(),
+        filetype: inp.filetype.to_string(),
         bufnr: inp.w.buffer.0 as usize,
         line: inp.cur_line + 1,
         line_count: inp.line_count,

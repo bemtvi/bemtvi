@@ -30,9 +30,12 @@ pub(crate) struct ByteSpan {
 /// that the engine answers synchronously.
 #[derive(Default)]
 pub(crate) struct SyntaxState {
-    /// `(changedtick, first_line, last_line)` the cached spans were computed for,
-    /// or `None` before the first fetch.
-    key: Option<(u64, usize, usize)>,
+    /// `(changedtick, first_line, last_line, language)` the cached spans were
+    /// computed for, or `None` before the first fetch. The language is part of
+    /// the key so a filetype change that leaves the text untouched (`:set
+    /// filetype=…`, `vim.treesitter.start/stop`) still invalidates the memo and
+    /// re-queries the engine — those don't bump `changedtick`.
+    key: Option<(u64, usize, usize, Option<String>)>,
     /// Latest spans from the engine, keyed by absolute buffer line.
     spans: HashMap<usize, Vec<ByteSpan>>,
 }
@@ -59,10 +62,15 @@ impl Server {
         // during the smooth-scroll animation (whose band spans up to ~2 screens).
         let first = self.editor.top.saturating_sub(height).min(line_count);
         let last = (self.editor.top + 2 * height).min(line_count);
-        let key = (self.editor.buffer().changedtick, first, last);
+        let key = (
+            self.editor.buffer().changedtick,
+            first,
+            last,
+            self.editor.ts_language_for(buffer),
+        );
 
         // Memo hit: the spans are already current for this content + viewport.
-        if self.syntax_states.get(&buffer).and_then(|s| s.key) == Some(key) {
+        if self.syntax_states.get(&buffer).and_then(|s| s.key.as_ref()) == Some(&key) {
             return;
         }
 

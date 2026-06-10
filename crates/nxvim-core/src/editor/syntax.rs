@@ -152,6 +152,28 @@ impl Editor {
         self.ts_override.insert(buf, Some(lang));
     }
 
+    /// Clear any treesitter language override for `buf`, restoring the
+    /// extension-derived default — the `:set filetype&` ("reset to default")
+    /// path. Unlike [`Self::ts_stop`] (which records an explicit "stay dark"),
+    /// this *removes* the override entirely, so a recognized extension highlights
+    /// again. Drops the "opened in this language" marker so the next sync re-opens
+    /// the buffer against whatever language the extension now resolves to.
+    pub fn ts_reset(&mut self, buf: BufferId) {
+        self.ts_override.remove(&buf);
+        self.syntax_opened.remove(&buf);
+        // If the buffer now resolves to *no* language (an extension the table
+        // misses), drop the engine's parse so a query returns nothing — otherwise
+        // the tree from the just-removed override would keep coloring it (the same
+        // close `ts_stop` does, minus recording an explicit "stopped"). When it
+        // resolves to a *different* language, the dropped `syntax_opened` marker
+        // above makes the next sync re-open it.
+        if self.ts_language_for(buf).is_none() {
+            if let Some(engine) = self.syntax.as_mut() {
+                engine.close(buf);
+            }
+        }
+    }
+
     /// Disable native treesitter highlighting for `buf`, the bridge behind
     /// `vim.treesitter.stop(buf)`. Records an explicit "stopped" override (so the
     /// buffer stays dark even with a known extension) and drops the engine's

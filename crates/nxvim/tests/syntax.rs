@@ -846,6 +846,85 @@ async fn treesitter_stop_clears_highlighting_even_for_a_known_extension() {
     );
 }
 
+// ----- `:set filetype` / `:setfiletype` (no-Lua treesitter override) --------
+
+#[tokio::test]
+async fn set_filetype_highlights_a_buffer_the_extension_table_misses() {
+    // `:set filetype=rust` is the no-Lua way to force a treesitter language onto a
+    // buffer the extension floor misses — the same `ts_override` seam as
+    // `vim.treesitter.start`, driven from the ex line so the serverless web build
+    // (which has no Lua) can reach it too. A `.txt` buffer starts dark; after the
+    // `:set`, the `fn` keyword is rust-highlighted. This also guards the server's
+    // highlight memo: `:set` leaves `changedtick` untouched, so the memo key must
+    // include the language or the stale (empty) frame would persist.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("set-ft", "txt", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Before: a `.txt` buffer is never highlighted.
+    for _ in 0..6 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let before = drain_latest_redraw(&mut incoming).expect("a redraw");
+    assert!(
+        highlights_of(&before).iter().all(|row| row.is_empty()),
+        "a .txt buffer must not be highlighted before :set filetype"
+    );
+
+    feed(&rpc, ":set filetype=rust<CR>");
+
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    let fn_span = hl[0]
+        .iter()
+        .find(|(s, _, _)| *s == 0)
+        .expect("a span at column 0 (the `fn` keyword) after :set filetype");
+    assert_eq!(
+        fn_span.2.split('.').next().unwrap(),
+        "keyword",
+        "`fn` is a keyword, got group {:?}",
+        fn_span.2
+    );
+}
+
+#[tokio::test]
+async fn setfiletype_command_highlights_then_reset_darkens() {
+    // `:setfiletype rust` is the idiomatic alias for `:set filetype=rust`; it must
+    // highlight a `.txt` the same way. Then `:set filetype&` resets to the
+    // extension-derived default — which for `.txt` is *no* language — so the buffer
+    // goes dark again (distinct from `:set ft=`'s explicit stop).
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("setf-cmd", "txt", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    feed(&rpc, ":setfiletype rust<CR>");
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    assert!(
+        hl[0]
+            .iter()
+            .any(|(s, _, g)| *s == 0 && g.split('.').next() == Some("keyword")),
+        ":setfiletype rust must highlight the `fn` keyword"
+    );
+
+    feed(&rpc, ":set filetype&<CR>");
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.iter().all(|row| row.is_empty())
+    })
+    .await;
+    assert!(
+        hl.iter().all(|row| row.is_empty()),
+        ":set filetype& must restore the .txt extension default (no highlighting)"
+    );
+}
+
 // ----- query-resolution bridge (ADR 0001, #4) -------------------------------
 
 /// Does row 0 carry a span of capture group `group` (major part before any `.`)?

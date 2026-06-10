@@ -251,14 +251,20 @@
 
     // Syntax-highlight context for this frame: the focused buffer's per-line capture
     // spans, plus the file it belongs to. Returns null when there's nothing to
-    // highlight (runtime not ready, unsupported/unnamed file, or grammar still
-    // loading — in which case the highlighter has kicked off the load and will call
-    // tsRefresh when it's ready). Other windows showing the SAME file reuse this.
+    // highlight (runtime not ready, unsupported file, or grammar still loading — in
+    // which case the highlighter has kicked off the load and will call tsRefresh
+    // when it's ready). Other windows showing the SAME file reuse this.
+    //
+    // The editor's effective filetype (`:set filetype=…`, `vim.treesitter.start`,
+    // or the core extension table) wins; only when it resolves nothing do we fall
+    // back to mapping the file name's extension ourselves. That ordering is what
+    // lets `:set ft=rust` highlight a `.txt` — or an unnamed scratch buffer.
     function highlightContext() {
       if (!ts || !ts.isReady()) return null;
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
-      if (!fw || fw.unnamed) return null;
-      const lang = ts.langForName(fw.file_name);
+      if (!fw) return null;
+      const lang =
+        ts.langForFiletype(fw.filetype) || (fw.unnamed ? null : ts.langForName(fw.file_name));
       if (!lang) return null;
       const spans = ts.spansForBuffer(lang, editor.buffer_text());
       return spans ? { file: fw.file_name, spans } : null;

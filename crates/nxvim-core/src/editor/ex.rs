@@ -525,6 +525,11 @@ impl Editor {
             // (tabstop/shiftwidth/expandtab) live on the current buffer, which is
             // exactly what `:set` already targets for them.
             "set" | "se" | "setlocal" | "setl" => self.ex_set(args),
+            // `:setf[iletype] {ft}` forces the buffer's filetype (and thus its
+            // treesitter language), equivalent to `:set filetype={ft}`. The
+            // no-Lua way to highlight a buffer the extension table misses.
+            "setf" | "setfi" | "setfil" | "setfile" | "setfilet" | "setfilety" | "setfiletyp"
+            | "setfiletype" => self.ex_setfiletype(args),
             // `:u[ndo]` undoes one change; `:undo {N}` jumps to the state with
             // sequence number N (anywhere in the tree). `:red[o]` redoes one.
             "u" | "un" | "und" | "undo" => match args.trim() {

@@ -31,6 +31,19 @@ impl Editor {
         }
     }
 
+    /// Handle `:setf[iletype] {ft}` — force the current buffer's filetype, i.e.
+    /// its treesitter language. Equivalent to `:set filetype={ft}`; an empty
+    /// argument is an error (vim's `:setf` requires one), unlike `:set ft=`.
+    pub(crate) fn ex_setfiletype(&mut self, args: &str) {
+        let ft = args.trim();
+        if ft.is_empty() {
+            self.echo("E471: Argument required".to_string());
+            return;
+        }
+        let buf = self.current_buffer_id();
+        self.ts_start(buf, ft.to_string());
+    }
+
     /// Apply one resolved boolean `:set` operation. `number` / `relativenumber`
     /// are window-local (they live on the focused window); `expandtab` is
     /// buffer-local (on the current buffer); the rest are global search options on
@@ -130,6 +143,29 @@ impl Editor {
     /// [`Editor::set_global_option_str`] setter so the `:set` and `vim.o` paths
     /// share one home. `&` resets to the default (empty); `?` echoes the value.
     fn apply_set_str(&mut self, name: &str, op: StrOp) {
+        // `filetype` is buffer-local and special: it drives the per-buffer
+        // treesitter language override (the same seam as `vim.treesitter.start`/
+        // `stop`), not a global string slot. This is the no-Lua way to force a
+        // language onto a buffer the extension table misses — e.g. on the web
+        // build, where there is no Lua at all.
+        if name == "filetype" {
+            let buf = self.current_buffer_id();
+            match op {
+                // `:set ft=` to empty is vim's "no filetype → no syntax": an
+                // explicit off, like `vim.treesitter.stop`.
+                StrOp::Set(value) if value.is_empty() => self.ts_stop(buf),
+                StrOp::Set(value) => self.ts_start(buf, value),
+                // `:set ft&` resets to the default, which in nxvim is the
+                // extension-derived language (more useful than vim's literal "").
+                StrOp::Reset => self.ts_reset(buf),
+                // `:set ft?` echoes the *effective* filetype (override or extension).
+                StrOp::Query => {
+                    let ft = self.ts_language_for(buf).unwrap_or_default();
+                    self.echo(format!("filetype={ft}"));
+                }
+            }
+            return;
+        }
         match op {
             StrOp::Set(value) => self.set_global_option_str(name, &value),
             StrOp::Reset => self.set_global_option_str(name, ""),

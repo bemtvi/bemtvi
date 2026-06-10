@@ -447,6 +447,9 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "mousemodel" | "mousem" => Some(("mousemodel", Str)),
         "mousescroll" => Some(("mousescroll", Str)),
         "mousetime" | "mouset" => Some(("mousetime", Num)),
+        // Buffer-local: drives the treesitter language override rather than a
+        // global string slot (handled specially in `apply_set_str`).
+        "filetype" | "ft" => Some(("filetype", Str)),
         _ => None,
     }
 }

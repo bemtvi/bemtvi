@@ -427,25 +427,72 @@ in a real browser.
 
 ---
 
-## Phase 6 — Browser fs/process: the daemon over WebSocket (or serverless)
+## Phase 6 — Browser fs/process: the daemon over WebTransport (or serverless)
 
-Tie the browser edit-host to actual files/processes, reusing the Phase 1 trait and
+Tie the browser edit-host to actual files/processes, reusing the Phase 1 traits and
 the Phase 3 daemon.
 
 - **The good path:** the browser edit-host is a `HostServices` client over
-  **WebSocket** to a remote daemon — the browser analog of Phase 3, and the
-  *inverse* of today's Socket.IO mode (`docs/architecture.md` → *connecting to a
-  real server over Socket.IO*), which puts the whole server (editing included)
-  remote and laggy. Here, editing is in the browser Worker; only fs/process cross
-  the wire. Telescope's `rg`/`fd` run on the remote daemon via `HostProc`.
+  **WebTransport (HTTP/3 / QUIC)** to a remote daemon — the browser analog of
+  Phase 3, and the *inverse* of today's Socket.IO mode (`docs/architecture.md` →
+  *connecting to a real server over Socket.IO*), which puts the whole server
+  (editing included) remote and laggy. Here, editing is in the browser Worker;
+  only fs/process cross the wire. Telescope's `rg`/`fd` run on the remote daemon
+  via `HostProc`. **Why WebTransport over a single WebSocket** — see *Transport &
+  stream multiplexing* below: the daemon carries three independent traffic classes
+  (`HostFs` blobs, per-process `HostProc` stdio, `HostWatch` pushes), and a single
+  WebSocket is one TCP stream, so a heavy `HostProc` flood (telescope's `rg`, an
+  `npm install`'s output) head-of-line-blocks an LSP `didChange` or a file save
+  queued behind it. QUIC's independent streams remove that coupling at the protocol
+  level. The Rust daemon uses `wtransport` (on `quinn`); WebTransport mandates TLS
+  even on localhost, so dev uses a self-signed cert (`wtransport`'s generator) with
+  its hash passed to the browser `WebTransport` constructor.
 - **The serverless path:** `HostFs` backed by OPFS / the File System Access API;
   in-memory rope authoritative. `HostProc` has no processes — per
   `No silent stubs or skips`, `system()`/`jobstart` must **fail loud**, not fake
-  success. So serverless = real editing + plugins that don't shell out.
+  success. So serverless = real editing + plugins that don't shell out. (No
+  transport at all — `HostServices` is satisfied in-Worker.)
 
 **Exit criteria.** Browser edit-host opens/edits/saves a file served by a daemon
-over WebSocket; a shell-out plugin path runs the process on the daemon. Serverless
-mode edits an OPFS file and raises a clear error on a `system()` call.
+over WebTransport (each `HostServices` class on its own QUIC stream); a shell-out
+plugin path runs the process on the daemon and its stdout streams back without
+stalling a concurrent fs save. Serverless mode edits an OPFS file and raises a
+clear error on a `system()` call.
+
+### Transport & stream multiplexing (Phase 3 native + Phase 6 browser)
+
+The daemon wire carries **three independent traffic classes**, and cramming them
+down one ordered byte stream couples them through head-of-line (HOL) blocking:
+
+| class | shape | hazard if shared |
+| --- | --- | --- |
+| `HostFs` | request/response, bursty binary blobs | a large read/write stalls behind other traffic |
+| `HostProc` | long-lived stdio, **one pipe per process** (LSP servers, `rg`/`fd`, `:!`, future PTY) | a flood (`npm install`, `rg` over a huge tree) is the worst offender |
+| `HostWatch` | server-*push* file-change events (`FileChangedShell`) | small, but must not wait behind a flood to surface a conflict |
+
+This is the *application-layer* case for splitting `HostServices` into
+`HostFs`/`HostProc`/`HostWatch` (Open Decision #1): distinct traits → distinct
+logical channels → distinct streams.
+
+**One nxvim-specific correction to the usual "remote editor" framing:** because the
+edit-host moved the editor *local* (the whole thesis), the latency-critical
+keystroke → core → redraw path **never crosses the wire**. So HOL blocking here can
+delay *completion results*, *saves*, and *diagnostics* — all already-async,
+spinner-tolerant surfaces — but it **cannot** stall typing/motions/operators/undo.
+That makes stream-splitting a *responsiveness* win on async paths, not a fix for
+typing lag (unlike the Monaco-remote topology, where the editor itself round-trips).
+
+**The native (Phase 3) vs browser (Phase 6) transport asymmetry — they differ:**
+
+- **Browser (Phase 6):** WebTransport/QUIC gives independent reliable streams over
+  one authenticated connection — map one stream per `HostServices` class (and one
+  per live `HostProc`). This is the right tool and the reason Phase 6 moved off the
+  single WebSocket above.
+- **Native (Phase 3):** `ssh … nxvim --daemon` is a **single ordered stdio stream** —
+  QUIC can't go under it, so HOL blocking is intrinsic at the transport. Mitigate by
+  multiplexing logical channels in the framing (nxvim's msgpack-RPC already frames
+  concurrent requests) and/or opening separate ssh channels per `HostProc`; a true
+  QUIC escape would require the non-ssh listener of Open Decision #2.
 
 ---
 
@@ -474,10 +521,18 @@ mode edits an OPFS file and raises a clear error on a `system()` call.
 
 1. **`HostServices` granularity** (Phase 1): one combined trait vs. split
    `HostFs`/`HostProc`/`HostWatch`. Leaning split — smaller daemon surface, easier
-   to stub the serverless `HostProc`.
+   to stub the serverless `HostProc`, **and** the prerequisite for per-class stream
+   multiplexing (distinct traits → distinct logical channels → distinct transport
+   streams, so a `HostProc` flood can't HOL-block an `HostFs` save; see *Transport &
+   stream multiplexing* under Phase 6).
 2. **Daemon discovery/launch** (Phase 3): `ssh … nxvim --daemon` mirrors today's
    `--server`; do we also want a standalone `--daemon --listen` for non-ssh? (The
-   remote-ssh plan deferred generic TCP; same call here.)
+   remote-ssh plan deferred generic TCP; same call here.) This is also the only
+   native path that could adopt **WebTransport/QUIC** — over ssh stdio (a single
+   ordered stream) HOL blocking is intrinsic; a non-ssh QUIC listener would give
+   native the same independent-stream story Phase 6's browser path gets. Decide
+   whether that's worth a second native transport or whether app-level framing over
+   ssh stdio is enough.
 3. **One web build or two** (Phase 4): does the emscripten edit-host *replace*
    today's `wasm32-unknown-unknown` `nxvim-web`, or do both ship (a tiny
    no-Lua core-only build + a full Lua build)? Replacing is simpler; keeping both

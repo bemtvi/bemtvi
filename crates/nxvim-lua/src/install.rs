@@ -1342,6 +1342,21 @@ pub(crate) fn install_runtime_api(
             Ok(BASE.get_or_init(Instant::now).elapsed().as_nanos() as i64)
         })?,
     )?;
+    // `vim.uv.now()`: the libuv event-loop "now" timestamp in **milliseconds**.
+    // In real libuv this is the loop time cached at the start of each iteration;
+    // nxvim has no such cached tick, so we report the live monotonic clock (the
+    // same `BASE` epoch as `hrtime`, divided to ms). Only differences are
+    // meaningful, which is all callers use it for — nvim-cmp stamps each
+    // completion `context` with `vim.loop.now()` and diffs two stamps to debounce.
+    uv.set(
+        "now",
+        lua.create_function(|_, ()| {
+            use std::sync::OnceLock;
+            use std::time::Instant;
+            static BASE: OnceLock<Instant> = OnceLock::new();
+            Ok(BASE.get_or_init(Instant::now).elapsed().as_millis() as i64)
+        })?,
+    )?;
     // `vim.uv.fs_realpath(path)`: the canonical path (symlinks resolved), or nil.
     uv.set(
         "fs_realpath",

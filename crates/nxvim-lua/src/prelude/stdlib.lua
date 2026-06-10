@@ -182,6 +182,39 @@ vim.o = setmetatable({}, {
   __newindex = function(_, k, v) o_set(k, v) end,
 })
 
+-- An option name nxvim actually models (any scope): the routed window/buffer/
+-- global options plus the read-mostly catch-all store. Used by vim.fn.exists to
+-- answer the `&opt` / `+opt` probe honestly — 1 only for options we really have.
+local function option_known(name)
+  return O_WIN[name] or O_BUF[name] or O_GLOBAL[name] ~= nil
+    or O_GLOBAL_DEFAULT[name] ~= nil or vim._o_store[name] ~= nil
+end
+
+-- vim.fn.exists(expr): does the vim entity named by `expr` exist? (1 / 0). nxvim
+-- answers the forms it can verify and reports 0 for the rest (rather than a fake
+-- 1) so feature-probing stays honest:
+--   * '&opt' / '&l:opt' / '&g:opt' / '+opt'  -> an option nxvim models. nvim-cmp
+--     gates every window-option write on `exists('+'..key)`, so an unknown option
+--     is skipped instead of erroring the float setup.
+--   * 'g:'/'b:'/'w:'/'t:'/'v:' prefixed name -> that scoped variable is set.
+--   * everything else ('*func', ':Cmd', bare names) -> 0 (can't confirm).
+function vim.fn.exists(expr)
+  expr = tostring(expr or "")
+  local lead = expr:sub(1, 1)
+  if lead == "&" or lead == "+" then
+    local name = expr:sub(2):gsub("^[gl]:", "")
+    return option_known(name) and 1 or 0
+  end
+  local scope, name = expr:match("^([gbwtv]):(.+)$")
+  if scope then
+    local tbl = ({ g = vim.g, b = vim.b, w = vim.w, t = vim.t, v = vim.v })[scope]
+    if tbl == nil then return 0 end
+    local ok, val = pcall(function() return tbl[name] end)
+    return (ok and val ~= nil) and 1 or 0
+  end
+  return 0
+end
+
 -- vim.opt: in neovim each field is a rich Option object, but the colorscheme
 -- load path only uses scalar get/set, so a thin proxy over vim.o suffices — and
 -- it inherits vim.o's scope routing for free.
@@ -602,6 +635,68 @@ function vim.fn.strdisplaywidth(s, col)
     i = i + len
   end
   return w - base
+end
+
+-- vim.str_utfindex(s, [encoding,] index): convert a *byte* offset into `s` to a
+-- UTF code-unit count, supporting both neovim signatures (nvim-cmp probes the
+-- version and uses whichever the running editor offers):
+--   * pre-0.11  vim.str_utfindex(s [, byteidx])        -> utf32, utf16  (two values)
+--   * 0.11+     vim.str_utfindex(s, encoding, byteidx) -> single index for encoding
+-- `byteidx` defaults to #s (end of string) and is clamped into range. The count is
+-- whole codepoints whose start byte falls at or before `byteidx`; a codepoint
+-- outside the BMP (4-byte UTF-8) is one utf-32 unit but two utf-16 units.
+local function utf_unit_counts(s, byteidx)
+  byteidx = byteidx or #s
+  if byteidx < 0 then byteidx = 0 elseif byteidx > #s then byteidx = #s end
+  local u32, u16, i = 0, 0, 1
+  while i <= byteidx do
+    local _, len = utf8_decode(s, i)
+    if len == 0 then break end
+    u32 = u32 + 1
+    u16 = u16 + (len == 4 and 2 or 1)
+    i = i + len
+  end
+  return u32, u16
+end
+
+function vim.str_utfindex(s, a, b)
+  s = tostring(s or "")
+  if type(a) == "string" then
+    -- 0.11+ form: (s, encoding, index). utf-8 reports the codepoint count.
+    local u32, u16 = utf_unit_counts(s, b)
+    if a == "utf-16" then return u16 end
+    return u32
+  end
+  -- legacy form: (s [, index]) -> utf32, utf16.
+  return utf_unit_counts(s, a)
+end
+
+-- vim.str_byteindex(s, [encoding,] index): the inverse — the byte offset of the
+-- `index`-th UTF code unit. Mirrors str_utfindex's dual signature; the legacy form
+-- counts utf-32 units (a 4-byte codepoint is one unit), the 0.11+ form honors the
+-- requested encoding (utf-16 lets `index` land mid-astral, snapping to the
+-- codepoint start). Clamps past-the-end indices to #s.
+local function byteindex_for(s, index, utf16)
+  if index == nil or index <= 0 then return 0 end
+  local i, units = 1, 0
+  while i <= #s do
+    local _, len = utf8_decode(s, i)
+    if len == 0 then break end
+    local step = (utf16 and len == 4) and 2 or 1
+    if units + step > index then return i - 1 end
+    units = units + step
+    i = i + len
+    if units >= index then return i - 1 end
+  end
+  return #s
+end
+
+function vim.str_byteindex(s, a, b)
+  s = tostring(s or "")
+  if type(a) == "string" then
+    return byteindex_for(s, b, a == "utf-16")
+  end
+  return byteindex_for(s, a, false)
 end
 
 -- vim.fn.strcharpart(s, start[, len]): the substring of `s` starting at character

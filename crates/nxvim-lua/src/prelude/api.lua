@@ -669,6 +669,17 @@ function vim.api.nvim_win_set_cursor(win, pos)
   if win == (vim._cur_win or 1000) then vim._cur_cursor = { row = row, col = col } end
 end
 
+-- nvim_get_current_line(): the text of the line the cursor is on in the current
+-- window/buffer (no trailing newline). Composed from the cursor row and the
+-- buffer's lines — nvim-cmp reads this when it builds a completion `context`
+-- (cmp.utils.api.get_current_line), which runs as soon as `cmp.setup` spins up
+-- its core, so a missing builtin broke cmp (and every cmp source) at load.
+function vim.api.nvim_get_current_line()
+  local row = vim.api.nvim_win_get_cursor(0)[1] -- 1-based
+  local lines = vim.api.nvim_buf_get_lines(0, row - 1, row, false)
+  return lines[1] or ""
+end
+
 function vim.api.nvim_win_get_width(win)
   win = resolve_win(win)
   local w = (vim._wins or {})[win]

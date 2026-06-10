@@ -200,3 +200,120 @@ async fn nvim_dap_loads() {
     )
     .await;
 }
+
+/// nvim_set_hl must write through to the `vim._hl_defs` mirror *immediately*, so a
+/// same-turn `nvim_get_hl` / `hlexists` sees the group — the mirror is otherwise
+/// only refreshed between turns (gated on the registry generation). This is the
+/// read-after-write guarantee that lets an `init.lua` set a colorscheme and then
+/// configure a statusline plugin (lualine) in one chunk. Also covers the legacy
+/// `nvim_get_hl_by_name` reader lualine calls. No plugin needed — pure surface.
+#[tokio::test]
+async fn nvim_set_hl_writes_through_same_turn() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        r#"
+        -- read-after-write, same chunk: set then get with no turn boundary.
+        vim.api.nvim_set_hl(0, 'X', { fg = '#112233', bg = '#445566', bold = true })
+        assert(vim.fn.hlexists('X') == 1, "hlexists sees same-turn group")
+        local d = vim.api.nvim_get_hl(0, { name = 'X' })
+        assert(d.fg == 0x112233, "fg int: " .. tostring(d.fg))
+        assert(d.bg == 0x445566, "bg int: " .. tostring(d.bg))
+        assert(d.bold == true, "bold attr set")
+        assert(d.italic == nil, "unset attr absent, not false")
+
+        -- named color + NONE parse exactly as the core parser does.
+        vim.api.nvim_set_hl(0, 'Named', { fg = 'red', bg = 'NONE' })
+        local n = vim.api.nvim_get_hl(0, { name = 'Named' })
+        assert(n.fg == 0xff0000, "named red -> 0xff0000")
+        assert(n.bg == nil, "NONE -> no color")
+
+        -- a link group round-trips and resolves through link = false.
+        vim.api.nvim_set_hl(0, 'L', { link = 'X' })
+        assert(vim.api.nvim_get_hl(0, { name = 'L' }).link == 'X', "link stored")
+        assert(vim.api.nvim_get_hl(0, { name = 'L', link = false }).fg == 0x112233, "link resolved")
+
+        -- a blank def clears the group (removes the key), matching core.
+        vim.api.nvim_set_hl(0, 'X', {})
+        assert(vim.fn.hlexists('X') == 0, "blank def clears the group")
+        assert(next(vim.api.nvim_get_hl(0, { name = 'X' })) == nil, "cleared group reads {}")
+
+        -- legacy nvim_get_hl_by_name shape (foreground/background ints) lualine reads.
+        local legacy = vim.api.nvim_get_hl_by_name('Named', true)
+        assert(legacy.foreground == 0xff0000, "legacy .foreground int")
+        assert(legacy.background == nil, "legacy .background absent")
+        assert(not pcall(vim.api.nvim_get_hl_by_name, 'Named', false), "cterm read fails loud")
+        return "OK"
+        "#,
+    )
+    .await;
+    assert_eq!(report.as_str(), Some("OK"), "set_hl write-through surface");
+}
+
+/// lualine.nvim derives its statusline palette from the `Normal` (and friends)
+/// highlight groups, in the *same chunk* a typical `init.lua` loads the
+/// colorscheme — so it only works once `nvim_set_hl` writes through to the mirror
+/// immediately. This drives lualine's *real* `extract_highlight_colors('Normal')`
+/// (`utils/utils.lua` — the `hlexists` + `nvim_get_hl_by_name` reader whose
+/// `nil` return was the exact crash the plan diagnosed at `highlight.lua:54`)
+/// right after loading tokyonight, and asserts it now yields concrete colors.
+///
+/// This is the focused proof of the highlight read-after-write specifically.
+#[tokio::test]
+async fn lualine_extracts_colorscheme_palette_same_turn() {
+    assert_plugin_ok(
+        &["lualine.nvim", "tokyonight.nvim"],
+        r#"
+        local ok, err = pcall(function()
+          -- Colorscheme and palette read in one chunk: pre-fix, hlexists('Normal')
+          -- was 0 (stale mirror) and nvim_get_hl_by_name absent, so this returned
+          -- nil and lualine crashed indexing it.
+          require('tokyonight').load()
+          local utils = require('lualine.utils.utils')
+          local normal = utils.extract_highlight_colors('Normal')
+          assert(normal ~= nil, "extract_highlight_colors('Normal') is nil")
+          assert(normal.fg and normal.fg:match('^#%x%x%x%x%x%x$'),
+            "no fg hex: " .. tostring(normal.fg))
+          assert(normal.bg and normal.bg:match('^#%x%x%x%x%x%x$'),
+            "no bg hex: " .. tostring(normal.bg))
+          -- scope form returns a single channel (what lualine's theme builder uses).
+          assert(utils.extract_highlight_colors('Normal', 'fg') == normal.fg, "scope read")
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+}
+
+/// The `vim.uv.new_fs_event` fix unblocks lualine's git-branch component, which at
+/// module load builds the watcher handle that previously crashed (`attempt to call
+/// field 'new_fs_event'`). Requiring it now succeeds, and the handle it builds —
+/// via the same `vim.loop` table lualine uses — supports the start/stop/close
+/// lifecycle the component drives on `.git/HEAD`. (The watcher itself, and the luv
+/// loop-timer function-forms lualine's refresh timer uses, are proven firing
+/// end-to-end in `async_runtime.rs`.)
+///
+/// Note: a *full* `lualine.setup{}` still needs `vim.api.nvim_exec` with output
+/// capture (lualine reads the `:au` listing to dedupe its autocmds) — a separate
+/// vimscript-exec subsystem, outside the two watcher/timer gaps this change closes.
+#[tokio::test]
+async fn lualine_branch_component_builds_its_fs_watcher() {
+    assert_plugin_ok(
+        &["lualine.nvim", "tokyonight.nvim"],
+        r#"
+        local ok, err = pcall(function()
+          -- Module load builds a vim.uv.new_fs_event handle (git_branch.lua:20) —
+          -- the exact call that used to crash require of the branch component.
+          local branch = require('lualine.components.branch.git_branch')
+          assert(branch ~= nil, "branch component failed to load")
+          -- The handle type the component builds, exercised through lualine's path.
+          local ev = vim.loop.new_fs_event()
+          assert(type(ev.start) == 'function' and type(ev.stop) == 'function',
+            "fs_event handle missing start/stop")
+          ev:close()
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+}

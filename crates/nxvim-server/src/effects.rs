@@ -1053,6 +1053,16 @@ impl Server {
                 stdin,
             }),
             LoopOp::Kill { id } => self.evloop.send(LoopCommand::Kill { id }),
+            LoopOp::FsEventStart {
+                id,
+                path,
+                recursive,
+            } => self.evloop.send(LoopCommand::FsEventStart {
+                id,
+                path,
+                recursive,
+            }),
+            LoopOp::FsEventStop { id } => self.evloop.send(LoopCommand::FsEventStop { id }),
         }
     }
 
@@ -1091,6 +1101,27 @@ impl Server {
                 if let Err(e) = self.lua.run_callback(id, false, args) {
                     self.editor
                         .echo(format!("E5108: Error in vim.system on_exit: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::FsEvent {
+                id,
+                filename,
+                change,
+                rename,
+                error,
+            } => {
+                let args = CallbackArgs::FsEvent {
+                    filename,
+                    change,
+                    rename,
+                    error,
+                };
+                // `keep = true`: a watch fires repeatedly until `:stop`/`:close`, so
+                // its callback stays registered (unlike a one-shot timer/on_exit).
+                if let Err(e) = self.lua.run_callback(id, true, args) {
+                    self.editor
+                        .echo(format!("E5108: Error in fs_event callback: {e}"));
                 }
                 self.apply_lua_effects();
             }

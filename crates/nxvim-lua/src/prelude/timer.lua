@@ -56,6 +56,56 @@ function vim.uv.new_timer()
   return vim.uv.new_timer_handle(vim._next_cb_id())
 end
 
+-- luv's *function-form* timer API: uv.timer_start(handle, timeout, repeat, cb) /
+-- uv.timer_stop(handle) / uv.timer_again(handle). luv exposes both the handle
+-- methods (handle:start(...)) and these table-level functions taking the handle as
+-- the first argument; some plugins use the latter (lualine's statusline refresh
+-- timer is `vim.loop.timer_start(handle, …)` / `timer_stop(handle)`). vim.uv and
+-- vim.loop are the same table, so these land on both. Each just delegates to the
+-- handle method, so the event-loop bridge and no-leak guarantees are unchanged.
+function vim.uv.timer_start(handle, timeout, rep, cb)
+  return handle:start(timeout, rep, cb)
+end
+function vim.uv.timer_stop(handle) return handle:stop() end
+function vim.uv.timer_again(handle) return handle:again() end
+
+-- ----- vim.uv.new_fs_event: filesystem change watcher ------------------------
+-- A libuv-style fs-event handle: watch a path and fire callback(err, filename,
+-- events) when it changes. nxvim backs this with a native watcher (inotify /
+-- FSEvents / kqueue, via the `notify` crate) in the event-loop actor (evloop.rs).
+-- :start arms the watch, :stop cancels it (the handle can be re-started), :close
+-- cancels and drops the callback. `flags` is luv's { watch_entry, stat, recursive }
+-- table; `recursive` (watch a subtree) is honored, the others are accepted for
+-- call-compatibility (they don't change what's reported).
+local uv_fs_event = {}
+uv_fs_event.__index = uv_fs_event
+function uv_fs_event:start(path, flags, cb)
+  if type(path) ~= "string" or path == "" then
+    error("fs_event:start: path must be a non-empty string", 2)
+  end
+  if type(cb) ~= "function" then
+    error("fs_event:start: callback must be a function", 2)
+  end
+  vim._cb_fns[self._id] = cb
+  self._path = path
+  vim._fs_event_start(self._id, path, type(flags) == "table" and flags.recursive or false)
+  return 0
+end
+function uv_fs_event:stop()
+  vim._fs_event_stop(self._id)
+  return 0
+end
+function uv_fs_event:getpath() return self._path end
+function uv_fs_event:close(cb)
+  vim._fs_event_stop(self._id)
+  vim._cb_fns[self._id] = nil -- drop the callback so the registry can't leak
+  if cb then cb() end
+end
+
+function vim.uv.new_fs_event()
+  return setmetatable({ _id = vim._next_cb_id() }, uv_fs_event)
+end
+
 -- vim.defer_fn(fn, timeout): run `fn` once, `timeout` ms from now, on the loop —
 -- the off-tick deferral configs use for retry patterns. Returns a timer handle so
 -- the caller can :stop() it before it fires (neovim returns a uv timer).

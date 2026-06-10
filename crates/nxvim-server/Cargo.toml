@@ -24,6 +24,9 @@ luajit = ["nxvim-lua/luajit", "nxvim-test-harness/luajit"]
 anyhow.workspace = true
 rmpv.workspace = true
 tokio.workspace = true
+# Native filesystem watching backing `vim.uv.fs_event` (driven from the event-loop
+# actor in evloop.rs).
+notify.workspace = true
 nxvim-core.workspace = true
 nxvim-rpc.workspace = true
 nxvim-lua.workspace = true

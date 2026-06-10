@@ -270,8 +270,9 @@ where
                         Value::Binary(stderr),
                     ],
                 ),
-                // The daemon sets no timers, so no other variant can reach here.
-                LoopEvent::Timer { .. } => {}
+                // The daemon only spawns processes — it arms no timers and no
+                // filesystem watches — so no other variant can reach here.
+                LoopEvent::Timer { .. } | LoopEvent::FsEvent { .. } => {}
             }
         }
     });

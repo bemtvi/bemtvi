@@ -1715,6 +1715,28 @@ function vim.api.nvim_get_hl(_ns, opts)
   return out
 end
 
+-- nvim_get_hl_by_name(name, rgb): the pre-0.9 highlight reader (lualine and other
+-- older plugins still call it). Returns the *resolved* group (link chain followed)
+-- in the legacy shape — `foreground`/`background`/`special` truecolor ints plus
+-- the set boolean attrs — rather than nvim_get_hl's `fg`/`bg`/`sp`. nxvim's
+-- registry is truecolor-only, so only `rgb == true` (RGB output) can be honored; a
+-- cterm read (`rgb` false/nil) has no backing model and fails loud rather than
+-- returning RGB ints mislabeled as cterm indices. An unknown group returns `{}`.
+function vim.api.nvim_get_hl_by_name(name, rgb)
+  if rgb ~= true then
+    error("nvim_get_hl_by_name: nxvim is truecolor-only; cterm output (rgb=false) is not modelled", 0)
+  end
+  local d = vim.api.nvim_get_hl(0, { name = name, link = false })
+  local out = {}
+  if d.fg ~= nil then out.foreground = d.fg end
+  if d.bg ~= nil then out.background = d.bg end
+  if d.sp ~= nil then out.special = d.sp end
+  for _, attr in ipairs({ "bold", "italic", "underline", "undercurl", "strikethrough", "reverse" }) do
+    if d[attr] then out[attr] = true end
+  end
+  return out
+end
+
 -- nvim__redraw(opts): in neovim, force a UI repaint mid-execution (flushing the
 -- screen before the current chunk returns). nxvim's server repaints at the end
 -- of every input / RPC / event turn the Lua ran under (see `Server::handle` /

@@ -26,6 +26,43 @@ pub(crate) fn flag_field(opts: &Table, key: &str) -> mlua::Result<bool> {
     Ok(opts.get::<Option<bool>>(key)?.unwrap_or(false))
 }
 
+/// Parse a color spec — as already normalized by [`color_field`] to `"#rrggbb"`,
+/// a named color, or `"NONE"` — into the `0xRRGGBB` integer `nvim_get_hl` reports
+/// colors as. Returns `None` for `NONE` / empty / unrecognized (all "no color").
+///
+/// This is a deliberate, parity-exact port of `nxvim_core::highlight::parse_color`
+/// (+ its `named_color` table): the `nvim_set_hl` write-through uses it to build
+/// the *same-turn* `vim._hl_defs` mirror row, which must match byte-for-byte the
+/// row the server's between-turn push derives by sending the same string through
+/// the core parser. Keep the two in lockstep — if core gains a color form, mirror
+/// it here. nxvim-lua intentionally carries no `nxvim-core` dependency (it stays
+/// free of color/registry types so the server pattern-matches the wire ops
+/// directly), hence the small port rather than a shared call.
+pub(crate) fn color_to_u32(spec: &str) -> Option<u32> {
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("none") || spec.is_empty() {
+        return None;
+    }
+    if let Some(hex) = spec.strip_prefix('#') {
+        return (hex.len() == 6)
+            .then(|| u32::from_str_radix(hex, 16).ok())
+            .flatten();
+    }
+    let (r, g, b) = match spec.to_ascii_lowercase().as_str() {
+        "black" => (0, 0, 0),
+        "white" => (255, 255, 255),
+        "red" => (255, 0, 0),
+        "green" => (0, 128, 0),
+        "blue" => (0, 0, 255),
+        "yellow" => (255, 255, 0),
+        "cyan" => (0, 255, 255),
+        "magenta" => (255, 0, 255),
+        "gray" | "grey" => (128, 128, 128),
+        _ => return None,
+    };
+    Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32)
+}
+
 /// Stringify a Lua value for `print` capture: prefer Lua's own `tostring`
 /// (honors `__tostring`), fall back to a debug form.
 pub(crate) fn stringify(lua: &Lua, value: &mlua::Value) -> String {

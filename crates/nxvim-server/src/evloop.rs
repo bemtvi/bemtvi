@@ -16,9 +16,11 @@
 //! next to the syntax and LSP arms.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -58,6 +60,18 @@ pub enum LoopCommand {
     /// still fires with `code = -1` (the signal is not honored — see
     /// [`LoopOp::Kill`](nxvim_lua::LoopOp::Kill)).
     Kill { id: u64 },
+    /// Begin watching `path` for changes (native — inotify/FSEvents/kqueue via
+    /// `notify`), firing the watcher callback `id` each time it changes until
+    /// [`LoopCommand::FsEventStop`]. `recursive` watches a whole subtree (libuv's
+    /// `recursive` fs_event flag). Re-arming an `id` replaces its watch.
+    FsEventStart {
+        id: u64,
+        path: String,
+        recursive: bool,
+    },
+    /// Cancel the filesystem watch armed under `id` (a no-op if it was never
+    /// armed).
+    FsEventStop { id: u64 },
 }
 
 /// An event from the actor back to the server thread, delivered to the main
@@ -81,6 +95,19 @@ pub enum LoopEvent {
         code: i32,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+    },
+    /// A path watched via [`LoopCommand::FsEventStart`] changed (or the watch failed
+    /// to arm). Carries the changed entry's filename and libuv's `{ change, rename }`
+    /// flags (`rename` when the path was created/deleted/renamed, `change` for a
+    /// content/attribute edit), or `error` when the watch couldn't be established
+    /// (the path doesn't exist, a watch limit was hit). The callback is retained — a
+    /// watch fires until explicitly stopped.
+    FsEvent {
+        id: u64,
+        filename: Option<String>,
+        change: bool,
+        rename: bool,
+        error: Option<String>,
     },
 }
 
@@ -147,9 +174,14 @@ async fn run_evloop(
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
     let mut procs: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    // Live filesystem watchers (`notify`), keyed by callback id. Each owns its
+    // native backend thread; dropping it (on `FsEventStop`, a re-arm, or actor
+    // shutdown) stops the watch.
+    let mut fs_watchers: HashMap<u64, RecommendedWatcher> = HashMap::new();
     while let Some(cmd) = cmd_rx.recv().await {
         // Drop handles whose tasks have finished, so a long run of one-shot timers
-        // / processes can't accumulate dead entries.
+        // / processes can't accumulate dead entries. (fs watchers are dropped
+        // explicitly on `FsEventStop`, not pruned here.)
         timers.retain(|_, h| !h.is_finished());
         match cmd {
             LoopCommand::TimerStart { id, delay, repeat } => {
@@ -208,10 +240,119 @@ async fn run_evloop(
                     let _ = kill_tx.send(());
                 }
             }
+            LoopCommand::FsEventStart {
+                id,
+                path,
+                recursive,
+            } => {
+                // Re-arming an id replaces its watch: drop the old watcher first
+                // (a fresh :start on a handle).
+                fs_watchers.remove(&id);
+                match start_fs_watch(id, &path, recursive, event_tx.clone()) {
+                    Ok(watcher) => {
+                        fs_watchers.insert(id, watcher);
+                    }
+                    Err(e) => {
+                        // The watch couldn't arm (path missing, watch limit). The
+                        // async :start already returned 0 to Lua, so the only place
+                        // to surface this is the callback's `err` arg — never a
+                        // silent drop. (libuv reports it from :start; the async
+                        // bridge defers it one hop to the callback.)
+                        let _ = event_tx.send(LoopEvent::FsEvent {
+                            id,
+                            filename: None,
+                            change: false,
+                            rename: false,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            }
+            LoopCommand::FsEventStop { id } => {
+                fs_watchers.remove(&id); // dropping the watcher stops it
+            }
         }
         // Forget kill channels whose process tasks have closed them (the child
         // exited and the `HostProc` future dropped the receiver) — the leak guard
         // for procs, mirroring the timer prune above.
         procs.retain(|_, tx| !tx.is_closed());
+    }
+}
+
+/// Arm a native filesystem watch on `path` (inotify/FSEvents/kqueue via `notify`),
+/// translating each change into a [`LoopEvent::FsEvent`] for callback `id`. The
+/// returned [`RecommendedWatcher`] owns the backend thread; the caller keeps it
+/// alive in the watcher map and drops it to stop. `recursive` watches a subtree
+/// (libuv's `recursive` flag); the default is the single named path (a file like
+/// lualine's `.git/HEAD`, or a directory). The `notify` callback runs on the
+/// backend thread and only sends on the channel, so no Lua/editor state crosses
+/// the boundary — same discipline as the timer/process tasks.
+fn start_fs_watch(
+    id: u64,
+    path: &str,
+    recursive: bool,
+    event_tx: UnboundedSender<LoopEvent>,
+) -> notify::Result<RecommendedWatcher> {
+    // The path's final component — what luv hands the callback as `filename` when
+    // an event doesn't carry its own (e.g. a watch on a single file).
+    let watched_name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let event = match res {
+            Ok(event) => event,
+            // A backend error mid-watch (e.g. the inotify queue overflowed): report
+            // it to the callback's `err` rather than dropping it silently.
+            Err(e) => {
+                let _ = event_tx.send(LoopEvent::FsEvent {
+                    id,
+                    filename: None,
+                    change: false,
+                    rename: false,
+                    error: Some(e.to_string()),
+                });
+                return;
+            }
+        };
+        let Some((change, rename)) = classify_fs_event(&event.kind) else {
+            return; // an access/metadata-only event libuv wouldn't report
+        };
+        let filename = event
+            .paths
+            .first()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| watched_name.clone());
+        let _ = event_tx.send(LoopEvent::FsEvent {
+            id,
+            filename,
+            change,
+            rename,
+            error: None,
+        });
+    })?;
+    let mode = if recursive {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    };
+    watcher.watch(Path::new(path), mode)?;
+    Ok(watcher)
+}
+
+/// Map a `notify` [`EventKind`] onto libuv's two `fs_event` flags — `(change,
+/// rename)` — or `None` for the one kind libuv doesn't surface (pure file access).
+/// A create / remove / rename is a `rename`; everything else that mutates is a
+/// `change`. The coarse `Any` / `Other` kinds (which macOS FSEvents emits when it
+/// can't classify) default to `change` rather than being dropped, so a real edit
+/// is never silently missed.
+fn classify_fs_event(kind: &EventKind) -> Option<(bool, bool)> {
+    use notify::event::ModifyKind;
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => {
+            Some((false, true))
+        }
+        EventKind::Access(_) => None,
+        _ => Some((true, false)),
     }
 }

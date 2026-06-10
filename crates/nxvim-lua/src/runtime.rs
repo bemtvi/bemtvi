@@ -883,6 +883,32 @@ impl LuaRuntime {
                 let result = json_to_lua(&self.lua, &result)?;
                 run.call::<()>((id, keep, err, result))
             }
+            CallbackArgs::FsEvent {
+                filename,
+                change,
+                rename,
+                error,
+            } => {
+                // `callback(err, filename, events)` — `err` set only when the watch
+                // failed to arm / the backend errored; `events` carries the set
+                // flags, matching luv.
+                let err = match error {
+                    Some(msg) => mlua::Value::String(self.lua.create_string(&msg)?),
+                    None => mlua::Value::Nil,
+                };
+                let filename = match filename {
+                    Some(s) => mlua::Value::String(self.lua.create_string(&s)?),
+                    None => mlua::Value::Nil,
+                };
+                let events = self.lua.create_table()?;
+                if change {
+                    events.set("change", true)?;
+                }
+                if rename {
+                    events.set("rename", true)?;
+                }
+                run.call::<()>((id, keep, err, filename, events))
+            }
         }
     }
 

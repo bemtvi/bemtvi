@@ -136,6 +136,41 @@ regressions in the no-provider path.
 
 ## 2. lualine.nvim — needs highlight read-after-write + defaults
 
+> **Status: highlight fix DONE (items 1 + 2 landed).** `nvim_set_hl` now
+> write-throughs to the `vim._hl_defs` mirror so a same-turn `nvim_get_hl` /
+> `hlexists` sees a just-set group, and the legacy `nvim_get_hl_by_name` reader
+> exists. Proven by `plugin_compat.rs::nvim_set_hl_writes_through_same_turn`
+> (surface) and `::lualine_extracts_colorscheme_palette_same_turn` (lualine's real
+> `extract_highlight_colors('Normal')` after `tokyonight.load()`). Item 3 (default
+> highlight groups) was **not** taken, per the recommendation below.
+>
+> **Two further subsystems (outside the highlight scope) now also DONE.** Fixing
+> highlights moved the first error past `highlight.lua:54` and surfaced two more
+> blockers, both since fixed (each a real subsystem, no stubs):
+> - `vim.uv.new_fs_event` — the git-branch component watches `.git/HEAD`. Added a
+>   real **native** filesystem watcher (the `notify` crate: inotify on Linux, kqueue
+>   on macOS, ReadDirectoryChangesW on Windows) in the event-loop actor (`evloop.rs`
+>   — `start_fs_watch` / `classify_fs_event` / `LoopCommand::FsEventStart` /
+>   `LoopEvent::FsEvent`), the `vim.uv` handle (`prelude/timer.lua`, honoring the
+>   `recursive` flag), and the bridge/op/callback plumbing. macOS deliberately uses
+>   the **kqueue** backend (`macos_kqueue` feature), not FSEvents: FSEvents' `watch()`
+>   blocks on the `fseventsd` daemon (seconds in a sandbox), which would freeze the
+>   single-threaded server on every arm; kqueue arms with a sub-ms syscall. Proven
+>   firing + stopping in `async_runtime.rs::fs_event_fires_on_change_then_stop_silences_it`,
+>   and lualine's branch component loads in
+>   `plugin_compat.rs::lualine_branch_component_builds_its_fs_watcher`.
+> - the luv **loop-timer function-forms** (`vim.loop.timer_start(handle, …)` /
+>   `timer_stop(handle)`, distinct from `vim.fn.timer_*` / the handle-method timers)
+>   — lualine's statusline refresh timer. Added as thin delegators to the existing
+>   handle methods (`prelude/timer.lua`). Proven in
+>   `async_runtime.rs::loop_timer_function_forms_fire_and_stop`.
+>
+> **Full `lualine.setup{}` still surfaces one more, unrelated gap:**
+> `vim.api.nvim_exec` with output capture — lualine reads the `:au` listing to
+> dedupe its autocmds (`utils.lua:84`). That's a vimscript-exec + autocmd-listing
+> subsystem (can't be faithfully stubbed: empty output would make its "already
+> defined?" check silently wrong), and is its own work, not a watcher/timer gap.
+
 ### Where it stands
 
 `require('lualine').setup{}` errors at:

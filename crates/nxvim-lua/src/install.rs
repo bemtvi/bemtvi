@@ -14,7 +14,8 @@ use std::rc::Rc;
 use mlua::{Lua, Table, UserData, UserDataMethods, Variadic};
 
 use crate::convert::{
-    color_field, env_pairs, flag_field, json_to_lua, lua_to_json, opt_table_to_json, stringify,
+    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_to_json, opt_table_to_json,
+    stringify,
 };
 use crate::host::{
     create_dir_all_mode, find_executable, get_runtime_file, getftime, glob_paths, parse_mode,
@@ -92,26 +93,36 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     let sh = shared.clone();
     api.set(
         "nvim_set_hl",
-        lua.create_function(move |_, (_ns, name, opts): (i64, String, Option<Table>)| {
-            let mut def = HlSet {
-                name,
-                ..Default::default()
-            };
-            if let Some(opts) = &opts {
-                def.fg = color_field(opts, "fg")?;
-                def.bg = color_field(opts, "bg")?;
-                def.sp = color_field(opts, "sp")?;
-                def.bold = flag_field(opts, "bold")?;
-                def.italic = flag_field(opts, "italic")?;
-                def.underline = flag_field(opts, "underline")?;
-                def.undercurl = flag_field(opts, "undercurl")?;
-                def.strikethrough = flag_field(opts, "strikethrough")?;
-                def.reverse = flag_field(opts, "reverse")?;
-                def.link = opts.get::<Option<String>>("link")?;
-            }
-            sh.borrow_mut().highlights.push(def);
-            Ok(())
-        })?,
+        lua.create_function(
+            move |lua, (_ns, name, opts): (i64, String, Option<Table>)| {
+                let mut def = HlSet {
+                    name,
+                    ..Default::default()
+                };
+                if let Some(opts) = &opts {
+                    def.fg = color_field(opts, "fg")?;
+                    def.bg = color_field(opts, "bg")?;
+                    def.sp = color_field(opts, "sp")?;
+                    def.bold = flag_field(opts, "bold")?;
+                    def.italic = flag_field(opts, "italic")?;
+                    def.underline = flag_field(opts, "underline")?;
+                    def.undercurl = flag_field(opts, "undercurl")?;
+                    def.strikethrough = flag_field(opts, "strikethrough")?;
+                    def.reverse = flag_field(opts, "reverse")?;
+                    def.link = opts.get::<Option<String>>("link")?;
+                }
+                // Write through to the `vim._hl_defs` mirror *now*, so a same-turn
+                // `nvim_get_hl` / `hlexists` sees this group. The core fold only
+                // refreshes the mirror between turns (gated on the registry
+                // generation), so without this an `init.lua` doing
+                // `colorscheme(...)` then `require('lualine').setup{}` in one chunk
+                // reads a stale, empty `Normal` and errors. Mirrors the write-through
+                // `vim.o` / `setreg` already do for the same reason.
+                write_hl_mirror_row(lua, &def)?;
+                sh.borrow_mut().highlights.push(def);
+                Ok(())
+            },
+        )?,
     )?;
     vim.set("api", api)?;
 
@@ -270,6 +281,33 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "_system_kill",
         lua.create_function(move |_, (id, _signal): (u64, Option<i32>)| {
             sh.borrow_mut().loop_ops.push(LoopOp::Kill { id });
+            Ok(())
+        })?,
+    )?;
+    // `vim._fs_event_start(id, path, recursive)`: begin watching `path` in the
+    // event-loop actor (native — inotify/FSEvents/kqueue), firing callback `id`
+    // (err, filename, events) on each change. `recursive` watches a subtree
+    // (libuv's `recursive` flag). Backs `vim.uv.new_fs_event():start`.
+    let sh = shared.clone();
+    vim.set(
+        "_fs_event_start",
+        lua.create_function(
+            move |_, (id, path, recursive): (u64, String, Option<bool>)| {
+                sh.borrow_mut().loop_ops.push(LoopOp::FsEventStart {
+                    id,
+                    path,
+                    recursive: recursive.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `vim._fs_event_stop(id)`: cancel the watch armed under `id`.
+    let sh = shared.clone();
+    vim.set(
+        "_fs_event_stop",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::FsEventStop { id });
             Ok(())
         })?,
     )?;
@@ -1468,4 +1506,76 @@ fn store_panel_callback(lua: &Lua, cb: Option<mlua::Function>) -> mlua::Result<(
         Some(f) => lua.set_named_registry_value(PANEL_ON_SELECT, f),
         None => lua.set_named_registry_value(PANEL_ON_SELECT, mlua::Value::Nil),
     }
+}
+
+/// Write (or clear) the `vim._hl_defs[name]` mirror row for a highlight group
+/// `nvim_set_hl` just defined, so a *same-turn* `nvim_get_hl` / `hlexists` reads
+/// it. The row must match byte-for-byte the one the server's between-turn push
+/// derives ([`crate::runtime::HlDefMirror`] → `set_hl_mirror`): colors as
+/// `0xRRGGBB` ints, boolean attrs present only when `true`, and a *blank* def
+/// (no colors after parsing, no attrs, no link — what neovim treats as a clear)
+/// *removing* the key, matching `nxvim_core::highlight::Highlights::set`, which
+/// drops a cleared group from the registry. Attrs are mirrored even alongside a
+/// `link` (parity with the server fold, which copies every field unconditionally).
+fn write_hl_mirror_row(lua: &Lua, hl: &HlSet) -> mlua::Result<()> {
+    let fg = hl.fg.as_deref().and_then(color_to_u32);
+    let bg = hl.bg.as_deref().and_then(color_to_u32);
+    let sp = hl.sp.as_deref().and_then(color_to_u32);
+    let blank = fg.is_none()
+        && bg.is_none()
+        && sp.is_none()
+        && !hl.bold
+        && !hl.italic
+        && !hl.underline
+        && !hl.undercurl
+        && !hl.strikethrough
+        && !hl.reverse
+        && hl.link.is_none();
+
+    let vim: Table = lua.globals().get("vim")?;
+    let defs: Table = match vim.get::<Option<Table>>("_hl_defs")? {
+        Some(t) => t,
+        None => {
+            let t = lua.create_table()?;
+            vim.set("_hl_defs", &t)?;
+            t
+        }
+    };
+    if blank {
+        defs.set(hl.name.as_str(), mlua::Value::Nil)?;
+        return Ok(());
+    }
+    let row = lua.create_table()?;
+    if let Some(c) = fg {
+        row.set("fg", c)?;
+    }
+    if let Some(c) = bg {
+        row.set("bg", c)?;
+    }
+    if let Some(c) = sp {
+        row.set("sp", c)?;
+    }
+    if hl.bold {
+        row.set("bold", true)?;
+    }
+    if hl.italic {
+        row.set("italic", true)?;
+    }
+    if hl.underline {
+        row.set("underline", true)?;
+    }
+    if hl.undercurl {
+        row.set("undercurl", true)?;
+    }
+    if hl.strikethrough {
+        row.set("strikethrough", true)?;
+    }
+    if hl.reverse {
+        row.set("reverse", true)?;
+    }
+    if let Some(l) = &hl.link {
+        row.set("link", l.as_str())?;
+    }
+    defs.set(hl.name.as_str(), row)?;
+    Ok(())
 }

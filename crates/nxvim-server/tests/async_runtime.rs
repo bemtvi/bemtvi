@@ -332,3 +332,105 @@ async fn async_fs_open_error_reaches_the_callback_not_a_raise() {
         "a failed open delivers no fd"
     );
 }
+
+// ----- Phase 5: luv loop-timer function-forms + vim.uv.fs_event --------------
+// The function-form luv timer API (`vim.loop.timer_start(handle, …)`, what
+// lualine's statusline refresh uses) and the `vim.uv.fs_event` filesystem watcher
+// (lualine watches `.git/HEAD`). Both ride the same event-loop actor; fs_event is
+// poll-backed there (the strategy luv's own new_fs_poll uses).
+
+#[tokio::test]
+async fn loop_timer_function_forms_fire_and_stop() {
+    let (rpc, _incoming) = start().await;
+    // vim.loop.timer_start(handle, timeout, repeat, cb) — the function form (handle
+    // as first arg), not handle:start(...). Same table as vim.uv, so this is the
+    // exact shape lualine calls.
+    exec_lua(
+        &rpc,
+        "_G.count = 0\n\
+         _G.t = vim.loop.new_timer()\n\
+         vim.loop.timer_start(_G.t, 20, 20, function() _G.count = _G.count + 1 end)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    let fired = lua_u64(&rpc, "return _G.count").await.unwrap();
+    assert!(
+        fired >= 2,
+        "function-form timer_start should fire repeatedly, got {fired}"
+    );
+    // vim.loop.timer_stop(handle) must halt it (the count stops growing).
+    exec_lua(&rpc, "vim.loop.timer_stop(_G.t)").await;
+    let at_stop = lua_u64(&rpc, "return _G.count").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.count").await.unwrap(),
+        at_stop,
+        "function-form timer_stop must halt the timer"
+    );
+}
+
+#[tokio::test]
+async fn fs_event_fires_on_change_then_stop_silences_it() {
+    let (rpc, _incoming) = start().await;
+    let path = tmp_path("fsevent");
+    let disk = path.replace('/', std::path::MAIN_SEPARATOR_STR);
+    std::fs::write(&disk, "one\n").expect("seed the watched file");
+    let basename = std::path::Path::new(&disk)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Watch the file: the callback records how many times it fired, the filename it
+    // was handed, and the event flags. lualine wraps this in schedule_wrap; here we
+    // record directly so the assertion is on the watcher itself.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.fired = 0\n\
+             _G.name = nil\n\
+             _G.change = nil\n\
+             _G.ev = vim.uv.new_fs_event()\n\
+             _G.ev:start('{path}', {{}}, function(err, filename, events)\n\
+               assert(not err, tostring(err))\n\
+               _G.fired = _G.fired + 1\n\
+               _G.name = filename\n\
+               _G.change = events.change\n\
+             end)"
+        ),
+    )
+    .await;
+    // Let the watcher capture its baseline (one poll interval), then confirm it has
+    // NOT fired — nothing changed yet (it didn't fire spuriously on :start).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(lua_u64(&rpc, "return _G.fired").await, Some(0));
+
+    // Modify the watched file (different length, so the stat signature moves even
+    // at coarse mtime resolution); the poll detects it and fires off-tick.
+    std::fs::write(&disk, "two two two\n").expect("modify the watched file");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let fired = lua_u64(&rpc, "return _G.fired").await.unwrap();
+    assert!(fired >= 1, "fs_event should fire on change, got {fired}");
+    // An in-place edit is a `change`, and the callback gets the file's basename.
+    assert_eq!(
+        lua_bool(&rpc, "return _G.change == true").await,
+        Some(true),
+        "an edit is reported as a change event"
+    );
+    assert_eq!(
+        lua_bool(&rpc, &format!("return _G.name == '{basename}'")).await,
+        Some(true),
+        "the callback is handed the watched entry's filename"
+    );
+
+    // Stop the watch; further changes must not fire it.
+    exec_lua(&rpc, "_G.ev:stop()").await;
+    let at_stop = lua_u64(&rpc, "return _G.fired").await.unwrap();
+    std::fs::write(&disk, "three three three three\n").expect("modify after stop");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.fired").await.unwrap(),
+        at_stop,
+        "a stopped fs_event watch must not fire again"
+    );
+}

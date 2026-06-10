@@ -466,6 +466,11 @@ pub fn write_n_lines(tag: &str, n: usize) -> String {
 /// deliberately (and re-verify) rather than tracking upstream `HEAD`.
 const PLUGIN_PINS: &[(&str, &str, &str)] = &[
     (
+        "lazy.nvim",
+        "https://github.com/folke/lazy.nvim.git",
+        "85c7ff3711b730b4030d03144f6db6375044ae82",
+    ),
+    (
         "telescope.nvim",
         "https://github.com/nvim-telescope/telescope.nvim.git",
         "a0bbec21143c7bc5f8bb02e0005fa0b982edc026",

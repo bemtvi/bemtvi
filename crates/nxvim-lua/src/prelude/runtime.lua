@@ -172,6 +172,30 @@ end
 -- to dedup against during a one-shot colorscheme load, so route to notify.
 function vim.notify_once(msg, level, opts) return vim.notify(msg, level, opts) end
 
+-- vim.health: the checkhealth reporting API plugins call from their `check()`
+-- functions (and bind into locals at load time — lazy.nvim does
+-- `local start = vim.health.start or vim.health.report_start` when its health
+-- module is required, so the table must exist with callable members or the
+-- require errors). nxvim has no :checkhealth report buffer yet, so each call
+-- accumulates into vim._health_report (observable / inspectable) instead of
+-- rendering. The deprecated `report_*` names alias the current ones.
+vim._health_report = vim._health_report or {}
+local function health_push(level, msg)
+  vim._health_report[#vim._health_report + 1] = { level = level, msg = tostring(msg) }
+end
+vim.health = {
+  start = function(name) health_push("start", name) end,
+  ok = function(msg) health_push("ok", msg) end,
+  info = function(msg) health_push("info", msg) end,
+  warn = function(msg, _adv) health_push("warn", msg) end,
+  error = function(msg, _adv) health_push("error", msg) end,
+}
+vim.health.report_start = vim.health.start
+vim.health.report_ok = vim.health.ok
+vim.health.report_info = vim.health.info
+vim.health.report_warn = vim.health.warn
+vim.health.report_error = vim.health.error
+
 function vim.inspect(value)
   local function ins(v, indent)
     if type(v) ~= "table" then

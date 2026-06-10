@@ -463,3 +463,146 @@ async fn pack_plugin_scripts_are_sourced_at_startup() {
         "plugin/ + after/plugin/ scripts must be sourced at startup (after init.lua)"
     );
 }
+
+/// `vim.opt.<x>` must be neovim's rich Option object — list/flag/map aware, with
+/// `:get`/`:append`/`:prepend`/`:remove` and the `+` operator — not a thin scalar
+/// proxy. lazy.nvim drives its runtimepath entirely through this (`vim.opt.rtp =
+/// {..}` then `vim.opt.rtp:append(dir)`), and crucially an appended rtp entry must
+/// become `require`-able (package.path sync), the way neovim makes rtp drive Lua
+/// module search.
+#[tokio::test]
+async fn vim_opt_is_a_rich_option_object() {
+    let plug = temp_dir("vimopt_plugin");
+    std::fs::create_dir_all(plug.join("lua")).unwrap();
+    std::fs::write(plug.join("lua/optmod.lua"), "return { ok = true }\n").unwrap();
+
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            local function eq(a,b,m) if a~=b then error(m..": "..tostring(a).." ~= "..tostring(b)) end end
+            -- list option: assign / append / prepend / remove / get
+            vim.opt.rtp = {{ "/a", "/b" }}
+            eq(vim.o.rtp, "/a,/b", "list assign")
+            vim.opt.rtp:append("/c"); eq(vim.o.rtp, "/a,/b,/c", "list append")
+            vim.opt.rtp:prepend("/z"); eq(vim.o.rtp, "/z,/a,/b,/c", "list prepend")
+            vim.opt.rtp:remove("/b"); eq(vim.o.rtp, "/z,/a,/c", "list remove")
+            local got = vim.opt.rtp:get()
+            eq(type(got), "table", "get is table"); eq(got[1], "/z", "get[1]")
+            -- operator form
+            vim.opt.rtp = vim.opt.rtp + "/op"
+            eq(vim.o.rtp, "/z,/a,/c,/op", "plus operator")
+            -- flag option (shortmess): char set
+            vim.o.shortmess = "fi"
+            vim.opt.shortmess:append("c"); eq(vim.opt.shortmess:get().c, true, "flag append c")
+            vim.opt.shortmess:remove("f"); eq(vim.opt.shortmess:get().f, nil, "flag remove f")
+            -- map option (listchars): key:val
+            vim.opt.listchars = {{ eol = "x", tab = ">>" }}
+            local lc = vim.opt.listchars:get()
+            eq(lc.eol, "x", "map eol"); eq(lc.tab, ">>", "map tab")
+            -- appended rtp dir becomes require-able (package.path sync)
+            vim.opt.rtp:append("{plug}")
+            eq(require("optmod").ok, true, "appended rtp dir is require-able")
+            return "OK"
+            "#,
+            plug = plug.to_string_lossy()
+        ),
+    )
+    .await;
+    assert_eq!(
+        report.as_str(),
+        Some("OK"),
+        "vim.opt rich Option object: {report:?}"
+    );
+}
+
+/// The `vim.*` primitives a plugin manager needs at load before any plugin is
+/// touched, asserted directly so they stay covered even when lazy.nvim can't be
+/// cloned: `loadplugins` defaults on (lazy bails out of setup when it's falsy),
+/// `vim.health.*` exists and records (lazy binds these into locals at load), and
+/// `vim.env.VIMRUNTIME` is a non-nil string (lazy concatenates it unconditionally).
+#[tokio::test]
+async fn plugin_manager_load_primitives() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let out = exec_lua(
+        &rpc,
+        r#"
+        local function eq(a,b,m) if a~=b then error(m..": "..tostring(a).." ~= "..tostring(b)) end end
+        eq(vim.go.loadplugins, true, "loadplugins defaults on")
+        eq(type(vim.health), "table", "vim.health exists")
+        eq(type(vim.health.start), "function", "health.start")
+        eq(vim.health.report_ok, vim.health.ok, "report_ok aliases ok")
+        vim.health.start("grp"); vim.health.ok("good")
+        eq(#vim._health_report, 2, "health calls recorded")
+        eq(type(vim.env.VIMRUNTIME), "string", "VIMRUNTIME is a string")
+        vim.env.FOO_SHADOW = "bar"; eq(vim.env.FOO_SHADOW, "bar", "env write shadows")
+        return "OK"
+        "#,
+    )
+    .await;
+    assert_eq!(out.as_str(), Some("OK"), "load primitives: {out:?}");
+}
+
+/// lazy.nvim loads, completes `setup()`, and manages + loads a local (`dir`)
+/// plugin end-to-end on nxvim — config function runs, plugin marked loaded. All of
+/// lazy's writes are redirected under a temp dir via its own root/state/lockfile
+/// opts, so the test is hermetic without touching the real stdpath. Skips when the
+/// clone can't be fetched (matching the other plugin tests).
+#[tokio::test]
+async fn lazy_nvim_loads_and_manages_a_plugin() {
+    let Some(lazy) = clone_plugin("lazy.nvim") else {
+        eprintln!("skip: could not clone lazy.nvim (no git / no network)");
+        return;
+    };
+    // A local plugin for lazy to manage; unique module name to avoid require-cache
+    // collisions with the other plugins loaded in this shared test binary.
+    let plug = temp_dir("lazy_local_plugin");
+    std::fs::create_dir_all(plug.join("lua/lazyhello")).unwrap();
+    std::fs::write(
+        plug.join("lua/lazyhello/init.lua"),
+        "return { setup = function() _G.LAZYHELLO = true end }\n",
+    )
+    .unwrap();
+    let state = temp_dir("lazy_state");
+
+    let (rpc, _incoming) = start(vec![lazy]).await;
+    let report = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            local plug, state = "{plug}", "{state}"
+            local ok, err = pcall(function()
+              require("lazy").setup({{
+                {{ dir = plug, name = "lazyhello", lazy = false,
+                   config = function() require("lazyhello").setup() end }},
+              }}, {{
+                root = state .. "/plugins",
+                lockfile = state .. "/lazy-lock.json",
+                state = state .. "/state.json",
+                readme = {{ root = state .. "/readme" }},
+                install = {{ missing = false }},
+                change_detection = {{ enabled = false }},
+                checker = {{ enabled = false }},
+                performance = {{ rtp = {{ reset = false }} }},
+              }})
+            end)
+            if not ok then return "ERR: " .. tostring(err) end
+            local p = require("lazy.core.config").plugins["lazyhello"]
+            return table.concat({{
+              "setup_ran=" .. tostring(_G.LAZYHELLO == true),
+              "managed=" .. tostring(p ~= nil),
+              "loaded=" .. tostring(p ~= nil and p._ ~= nil and p._.loaded ~= nil),
+            }}, "|")
+            "#,
+            plug = plug.to_string_lossy(),
+            state = state.to_string_lossy()
+        ),
+    )
+    .await;
+    assert_eq!(
+        report.as_str(),
+        Some("setup_ran=true|managed=true|loaded=true"),
+        "lazy.nvim should load and manage a local plugin: {report:?}"
+    );
+}

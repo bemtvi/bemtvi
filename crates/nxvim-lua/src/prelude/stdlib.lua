@@ -229,6 +229,10 @@ vim._o_store = vim._o_store
     mouse = "",
     guicursor = "",
     shell = os.getenv("SHELL") or "/bin/sh",
+    -- On by default in vim/neovim. Plugin managers gate their own startup on it
+    -- (lazy.nvim bails out of setup() entirely when `not vim.go.loadplugins`), so a
+    -- nil default would silently abort them before they ever run.
+    loadplugins = true,
   }
 
 local function o_get(k)
@@ -405,13 +409,283 @@ function vim.fn.trim(text, mask, dir)
   return text:sub(from, to)
 end
 
--- vim.opt: in neovim each field is a rich Option object, but the colorscheme
--- load path only uses scalar get/set, so a thin proxy over vim.o suffices — and
--- it inherits vim.o's scope routing for free.
+-- vim.opt: neovim's rich Option object. Reading a field yields an Option wrapping
+-- the option's current value; the methods (:get / :append / :prepend / :remove)
+-- and the +/-/^ operators mutate list / char-flag / key:val-map options the way
+-- plugin configs (and plugin managers) expect, and a table assignment
+-- (`vim.opt.rtp = { ... }`) encodes back to the option's comma string. Scope
+-- routing is inherited from vim.o. For the runtimepath family a mutation also
+-- feeds Lua's package.path, so a freshly-added plugin dir becomes require-able —
+-- matching neovim, where runtimepath drives module search. (The earlier thin
+-- scalar proxy sufficed for colorscheme get/set but broke `vim.opt.rtp:append`.)
+
+-- Option "kinds": list (comma-separated <-> Lua array), map (comma-separated
+-- key:val <-> Lua table), flag (concatenated single chars <-> char set). Keyed by
+-- full name and abbreviation; everything else is a plain scalar.
+local OPT_LIST = {
+  runtimepath = true,
+  rtp = true,
+  packpath = true,
+  pp = true,
+  path = true,
+  pa = true,
+  tags = true,
+  tag = true,
+  wildignore = true,
+  wig = true,
+  backupdir = true,
+  bdir = true,
+  directory = true,
+  dir = true,
+  undodir = true,
+  udir = true,
+  diffopt = true,
+  dip = true,
+  completeopt = true,
+  cot = true,
+  sessionoptions = true,
+  ssop = true,
+  viewoptions = true,
+  vop = true,
+  switchbuf = true,
+  swb = true,
+  clipboard = true,
+  cb = true,
+  spelllang = true,
+  spl = true,
+  errorformat = true,
+  efm = true,
+  grepformat = true,
+  gfm = true,
+  comments = true,
+  com = true,
+  whichwrap = true,
+  ww = true,
+  virtualedit = true,
+  ve = true,
+  complete = true,
+  cpt = true,
+  wildmode = true,
+  wim = true,
+}
+local OPT_MAP = {
+  listchars = true,
+  lcs = true,
+  fillchars = true,
+  fcs = true,
+}
+local OPT_FLAG = {
+  shortmess = true,
+  shm = true,
+  formatoptions = true,
+  fo = true,
+  cpoptions = true,
+  cpo = true,
+  guioptions = true,
+  go = true,
+  mouse = true,
+  concealcursor = true,
+  cocu = true,
+}
+
+-- The kind of `name`. `assigning_table` biases an unknown option toward "list"
+-- (a plugin passing a table almost always means a comma list); otherwise unknown
+-- options are scalars.
+local function opt_kind(name, assigning_table)
+  if OPT_LIST[name] then return "list" end
+  if OPT_MAP[name] then return "map" end
+  if OPT_FLAG[name] then return "flag" end
+  return assigning_table and "list" or "scalar"
+end
+
+local function opt_split_comma(raw)
+  local out = {}
+  for piece in tostring(raw or ""):gmatch("[^,]+") do
+    out[#out + 1] = piece
+  end
+  return out
+end
+
+-- Decode the option's stored string form into its kind's Lua value.
+local function opt_decode(kind, raw)
+  if kind == "list" then
+    return opt_split_comma(raw)
+  elseif kind == "map" then
+    local m = {}
+    for _, piece in ipairs(opt_split_comma(raw)) do
+      local key, val = piece:match("^(.-):(.*)$")
+      if key then
+        m[key] = val
+      else
+        m[piece] = true
+      end
+    end
+    return m
+  elseif kind == "flag" then
+    local m, s = {}, tostring(raw or "")
+    for i = 1, #s do
+      m[s:sub(i, i)] = true
+    end
+    return m
+  end
+  return raw
+end
+
+-- Encode a kind's Lua value back to the option's string form.
+local function opt_encode(kind, val)
+  if kind == "list" then
+    local parts = {}
+    for _, v in ipairs(val) do
+      parts[#parts + 1] = tostring(v)
+    end
+    return table.concat(parts, ",")
+  elseif kind == "map" then
+    local parts = {}
+    for k, v in pairs(val) do
+      if v == true then
+        parts[#parts + 1] = k
+      elseif v then
+        parts[#parts + 1] = k .. ":" .. tostring(v)
+      end
+    end
+    return table.concat(parts, ",")
+  elseif kind == "flag" then
+    local parts = {}
+    if vim.islist(val) then
+      for _, c in ipairs(val) do
+        parts[#parts + 1] = c
+      end
+    else
+      for k, v in pairs(val) do
+        if v then parts[#parts + 1] = k end
+      end
+    end
+    return table.concat(parts)
+  end
+  return val
+end
+
+-- Appending to the runtimepath family must make the new dir's lua/ require-able,
+-- the way neovim drives module search off runtimepath. Mirror the pattern
+-- seed_package_path uses on the host side.
+local OPT_RTP = { runtimepath = true, rtp = true, packpath = true, pp = true }
+local function opt_seed_require(name, entries)
+  if not OPT_RTP[name] then return end
+  for _, e in ipairs(entries) do
+    e = tostring(e)
+    package.path = package.path .. ";" .. e .. "/lua/?.lua;" .. e .. "/lua/?/init.lua"
+  end
+end
+
+local Option = {}
+Option.__index = Option
+
+local function opt_new(name, kind, value)
+  return setmetatable({ _name = name, _kind = kind, _value = value }, Option)
+end
+
+-- A scalar option being list-mutated (an unknown comma option) promotes to a list.
+local function opt_promote(self)
+  if self._kind == "scalar" then
+    self._kind = "list"
+    self._value = opt_split_comma(self._value)
+  end
+end
+
+-- Apply op ∈ {append, prepend, remove} to `self._value`, writing through unless
+-- `noflush` (the +/-/^ operators build a value that the assignment flushes).
+local function opt_mutate(self, op, v, noflush)
+  opt_promote(self)
+  local kind = self._kind
+  if kind == "flag" then
+    local s = tostring(v)
+    for i = 1, #s do
+      self._value[s:sub(i, i)] = (op ~= "remove") or nil
+    end
+  elseif kind == "map" then
+    if op == "remove" then
+      local keys = type(v) == "table" and (vim.islist(v) and v or vim.tbl_keys(v)) or { v }
+      for _, k in ipairs(keys) do
+        self._value[k] = nil
+      end
+    else
+      for k, val in pairs(v) do
+        if op == "append" or self._value[k] == nil then self._value[k] = val end
+      end
+    end
+  else -- list
+    local items = {}
+    if type(v) == "table" then
+      for _, x in ipairs(v) do
+        items[#items + 1] = x
+      end
+    else
+      items[1] = v
+    end
+    if op == "remove" then
+      local drop = {}
+      for _, x in ipairs(items) do
+        drop[x] = true
+      end
+      local keep = {}
+      for _, x in ipairs(self._value) do
+        if not drop[x] then keep[#keep + 1] = x end
+      end
+      self._value = keep
+    elseif op == "prepend" then
+      for i = #items, 1, -1 do
+        table.insert(self._value, 1, items[i])
+      end
+      opt_seed_require(self._name, items)
+    else -- append
+      for _, x in ipairs(items) do
+        self._value[#self._value + 1] = x
+      end
+      opt_seed_require(self._name, items)
+    end
+  end
+  if not noflush then o_set(self._name, opt_encode(self._kind, self._value)) end
+  return self
+end
+
+function Option:append(v) return opt_mutate(self, "append", v, false) end
+function Option:prepend(v) return opt_mutate(self, "prepend", v, false) end
+function Option:remove(v) return opt_mutate(self, "remove", v, false) end
+function Option:get()
+  if self._kind == "scalar" then return self._value end
+  return vim.deepcopy(self._value)
+end
+
+local function opt_clone(self) return opt_new(self._name, self._kind, vim.deepcopy(self._value)) end
+Option.__add = function(self, v) return opt_mutate(opt_clone(self), "append", v, true) end
+Option.__pow = function(self, v) return opt_mutate(opt_clone(self), "prepend", v, true) end
+Option.__sub = function(self, v) return opt_mutate(opt_clone(self), "remove", v, true) end
+Option.__tostring = function(self) return tostring(opt_encode(self._kind, self._value)) end
+
+local function opt_assign(name, v)
+  if getmetatable(v) == Option then
+    o_set(name, opt_encode(v._kind, v._value))
+    if v._kind == "list" then opt_seed_require(name, v._value) end
+  elseif type(v) == "table" then
+    local kind = opt_kind(name, true)
+    o_set(name, opt_encode(kind, v))
+    if kind == "list" then opt_seed_require(name, v) end
+  else
+    o_set(name, v)
+  end
+end
+
 vim.opt = setmetatable({}, {
-  __index = function(_, k) return vim.o[k] end,
-  __newindex = function(_, k, v) vim.o[k] = v end,
+  __index = function(_, k)
+    local kind = opt_kind(k, false)
+    return opt_new(k, kind, opt_decode(kind, o_get(k)))
+  end,
+  __newindex = function(_, k, v) opt_assign(k, v) end,
 })
+-- nxvim's vim.o already routes by scope, so opt_local / opt_global share the
+-- same Option machinery (the forced-scope distinction neovim draws is collapsed).
+vim.opt_local = vim.opt
+vim.opt_global = vim.opt
 
 -- vim.go: the *global* value of options (neovim's editor-wide scope). Unlike
 -- vim.o it never delegates to the window/buffer scope — reading a window/buffer
@@ -478,9 +752,24 @@ vim.v = setmetatable({}, {
   __newindex = function(_, k, v) vim._v_mirror[k] = v end,
 })
 
--- vim.env: process environment, read through to the host (writes shadow locally).
+-- vim.env: process environment, read through to the host; writes shadow locally
+-- (a Lua-only override that wins over the host on the next read). nxvim ships its
+-- runtime embedded in the binary rather than as an on-disk $VIMRUNTIME tree, but
+-- plugins concatenate `vim.env.VIMRUNTIME .. "/..."` unconditionally (lazy.nvim
+-- sources `$VIMRUNTIME/filetype.lua` at startup), so a nil there is a load-time
+-- crash. Fall back to the data-dir runtime path: it need not be populated (nxvim
+-- does its own filetype detection), and a `:source` of a missing file under it
+-- fails soft.
+vim._env_shadow = vim._env_shadow or {}
 vim.env = setmetatable({}, {
-  __index = function(_, k) return os.getenv(k) end,
+  __index = function(_, k)
+    if vim._env_shadow[k] ~= nil then return vim._env_shadow[k] end
+    local v = os.getenv(k)
+    if v ~= nil then return v end
+    if k == "VIMRUNTIME" then return vim.fn.stdpath("data") .. "/runtime" end
+    return nil
+  end,
+  __newindex = function(_, k, v) vim._env_shadow[k] = v end,
 })
 
 vim.log = { levels = { TRACE = 0, DEBUG = 1, INFO = 2, WARN = 3, ERROR = 4, OFF = 5 } }

@@ -31,19 +31,26 @@ use crate::vimregex;
 /// Lua registry key under which the panel's `on_select` callback is stored.
 pub(crate) const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
 
-/// `vim.regex(pat)` userdata: a compiled vim pattern. Its `:match_str(text)`
-/// returns the match's `(start, end)` byte offsets or `nil` — the shape neovim's
-/// regex object exposes, consumed by `vim.treesitter.query`'s `#match?`.
+/// `vim.regex(pat)` userdata: a vim pattern compiled by the real vim regexp engine
+/// ([`nxvim_regex`]). Its `:match_str(text)` returns the match's `(start, end)`
+/// byte offsets or `nil` — the shape neovim's regex object exposes, consumed by
+/// `vim.treesitter.query`'s `#match?`. The reported span honours `\zs`/`\ze`.
 struct LuaRegex {
-    re: regex::Regex,
+    re: nxvim_regex::VimRegex,
 }
 
 impl UserData for LuaRegex {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("match_str", |_, this, text: mlua::String| {
             let text = text.to_str()?;
-            Ok(match this.re.find(&text) {
-                Some(m) => (Some(m.start() as i64), Some(m.end() as i64)),
+            // A compile error is already caught by `vim.regex`; a match-time error
+            // (interrupt/timeout) is rare but raised rather than swallowed.
+            let m = this
+                .re
+                .exec_line(&text, 0, false)
+                .map_err(|e| mlua::Error::RuntimeError(format!("vim.regex match_str: {e}")))?;
+            Ok(match m {
+                Some(m) => (Some(m.start as i64), Some(m.end as i64)),
                 None => (None, None),
             })
         });
@@ -669,7 +676,8 @@ pub(crate) fn install_runtime_api(
     // the server to apply to the live editor's buffer (Phase 6). The prelude
     // (`vim.bo` / `nvim_set_option_value`) has canonicalized `name` and updated
     // its option mirror (write-through); a number value rides as `Number`, a
-    // boolean as `Bool`. Other Lua types are ignored (the option set is typed:
+    // boolean as `Bool`, and the one string buffer option (`regexsyntax`) as
+    // `String`. Other Lua types are ignored (the option set is typed:
     // tabstop/shiftwidth are numbers, expandtab a boolean).
     let sh = shared.clone();
     vim.set(
@@ -679,6 +687,9 @@ pub(crate) fn install_runtime_api(
                 mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
                 mlua::Value::Integer(n) => Some(OptionValue::Number(n)),
                 mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                mlua::Value::String(s) => {
+                    s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
+                }
                 _ => None,
             };
             if let Some(value) = value {

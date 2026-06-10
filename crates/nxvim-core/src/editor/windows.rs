@@ -1002,11 +1002,12 @@ impl Editor {
 
     /// Set a string global option from outside the editor (the Lua `vim.o`
     /// bridge), the string analogue of [`Editor::set_global_option_bool`]. The
-    /// wired string globals are `statusline`, `tabline`, `guifont`, and the mouse
-    /// strings (`mouse`/`mousemodel`/`mousescroll`); an unknown
+    /// wired string globals are `statusline`, `tabline`, `guifont`, the mouse
+    /// strings (`mouse`/`mousemodel`/`mousescroll`), and `regexsyntax`; an unknown
     /// name is a no-op (the Lua side forwards only the canonical wired set). This is
     /// the same state the `:set statusline=…` / `:set guifont=…` ex path writes —
-    /// the two routes share one home.
+    /// the two routes share one home. (The `:set` path additionally *validates*
+    /// `regexsyntax`; a raw `vim.o` write of a bad value reads back as `pcre`.)
     pub fn set_global_option_str(&mut self, name: &str, value: &str) {
         match name {
             "statusline" => self.options.statusline = value.to_string(),
@@ -1015,6 +1016,7 @@ impl Editor {
             "mouse" => self.options.mouse = value.to_string(),
             "mousemodel" => self.options.mousemodel = value.to_string(),
             "mousescroll" => self.options.mousescroll = value.to_string(),
+            "regexsyntax" => self.options.regexsyntax = value.to_string(),
             _ => {}
         }
     }

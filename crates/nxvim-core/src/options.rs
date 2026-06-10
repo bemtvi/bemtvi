@@ -71,6 +71,13 @@ pub struct Options {
     /// multi-click (`'mousetime'`). Default `500`. Honored from the multi-click
     /// phase; stored here so `:set` accepts it now.
     pub mousetime: usize,
+    /// Which regex dialect `/` search and `:substitute` speak (nxvim's
+    /// `'regexsyntax'`, not a standard vim option): `"pcre"` (the default) for
+    /// canonical/PCRE regular expressions, or `"vim"` for vim's "magic" dialect
+    /// matched by the embedded vim regexp engine. Read by
+    /// [`crate::Editor::search_engine`]; the only accepted values are `"pcre"`
+    /// and `"vim"` (validated in `apply_set_str`).
+    pub regexsyntax: String,
 }
 
 impl Default for Options {
@@ -100,6 +107,9 @@ impl Default for Options {
             mousemodel: "popup_setpos".to_string(),
             mousescroll: "ver:3,hor:6".to_string(),
             mousetime: 500,
+            // Canonical/PCRE regex for `/` and `:s` out of the box; opt into vim's
+            // magic dialect with `:set regexsyntax=vim`.
+            regexsyntax: "pcre".to_string(),
         }
     }
 }
@@ -141,11 +151,27 @@ impl Default for WindowOptions {
     }
 }
 
+/// A buffer-local `'regexsyntax'` value: an explicit dialect for this buffer, or
+/// [`Inherit`](RegexSyntax::Inherit) to follow the global [`Options::regexsyntax`].
+/// This is what makes `regexsyntax` a *global-local* option — a buffer can pin its
+/// own dialect (`:setlocal regexsyntax=vim` / `vim.bo.regexsyntax`) while every
+/// other buffer keeps following the global default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegexSyntax {
+    /// Follow the global `Options::regexsyntax`.
+    #[default]
+    Inherit,
+    /// Canonical/PCRE regex for this buffer.
+    Pcre,
+    /// Vim's magic dialect for this buffer.
+    Vim,
+}
+
 /// Buffer-local options, the rust-native analogue of neovim's per-buffer scope.
 /// Unlike [`Options`] (one global copy on the editor), a [`BufferOptions`] lives
 /// on each [`crate::Buffer`], so two buffers can indent differently. These are
-/// the indentation options nxvim honors today; they grow alongside the features
-/// that read them.
+/// the indentation options nxvim honors today, plus the buffer-local
+/// `regexsyntax` override; they grow alongside the features that read them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferOptions {
     /// Number of screen cells a `\t` occupies, and the grid the cursor snaps to
@@ -180,6 +206,10 @@ pub struct BufferOptions {
     ///
     /// [`effective_softtabstop`]: BufferOptions::effective_softtabstop
     pub expandtab: bool,
+    /// This buffer's `'regexsyntax'` override for `/` search and `:substitute`, or
+    /// [`Inherit`](RegexSyntax::Inherit) (the default) to follow the global
+    /// [`Options::regexsyntax`]. Resolved by [`crate::Editor::search_engine`].
+    pub regexsyntax: RegexSyntax,
 }
 
 impl Default for BufferOptions {
@@ -192,6 +222,8 @@ impl Default for BufferOptions {
             shiftwidth: 0,
             softtabstop: -1,
             expandtab: false,
+            // No buffer-local override out of the box: follow the global option.
+            regexsyntax: RegexSyntax::Inherit,
         }
     }
 }
@@ -447,6 +479,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "mousemodel" | "mousem" => Some(("mousemodel", Str)),
         "mousescroll" => Some(("mousescroll", Str)),
         "mousetime" | "mouset" => Some(("mousetime", Num)),
+        "regexsyntax" | "rxs" => Some(("regexsyntax", Str)),
         // Buffer-local: drives the treesitter language override rather than a
         // global string slot (handled specially in `apply_set_str`).
         "filetype" | "ft" => Some(("filetype", Str)),

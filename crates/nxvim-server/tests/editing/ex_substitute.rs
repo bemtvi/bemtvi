@@ -585,3 +585,130 @@ async fn substitute_confirm_all_skipped_pushes_no_undo() {
         "u undoes the insert, not the :s"
     );
 }
+
+// ---- `regexsyntax`: the real vim regex engine in :substitute -----------------
+//
+// `:set regexsyntax=vim` swaps the editor's `:s` pattern + replacement dialect
+// from the default canonical-regex (`(\w+)` / `$1`) to vim's "magic" dialect
+// (`\(\w\+\)` groups, `\1` / `&` back-refs, case modifiers, `\<`/`\>`), backed by
+// the embedded `nxvim-regex` engine. `pcre` keeps the historical behavior.
+
+#[tokio::test]
+async fn substitute_vim_engine_uses_backslash_capture_refs() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    // Vim magic: `\(\)` groups + `\1`/`\2` refs — the opposite of the PCRE default.
+    feed(&rpc, ":s/\\(\\w\\+\\) \\(\\w\\+\\)/\\2 \\1/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["world hello"]);
+}
+
+#[tokio::test]
+async fn substitute_vim_engine_ampersand_is_whole_match() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "icat<Esc>");
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    // `&` in a vim replacement is the whole match (a literal `&` under PCRE).
+    feed(&rpc, ":s/a/[&]/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["c[a]t"]);
+}
+
+#[tokio::test]
+async fn substitute_vim_engine_case_modifier_title_cases() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    // `\u&` upper-cases the first letter of each match.
+    feed(&rpc, ":s/\\w\\+/\\u&/g<CR>");
+    assert_eq!(lines(&rpc).await, vec!["Hello World"]);
+}
+
+#[tokio::test]
+async fn substitute_vim_engine_non_greedy_group() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ia::b::c<Esc>");
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    // `\{-}` is vim's non-greedy `*` — stops at the FIRST `::`, not the last.
+    feed(&rpc, ":s/\\(.\\{-}\\)::.*/\\1/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["a"]);
+}
+
+#[tokio::test]
+async fn substitute_pcre_default_keeps_dollar_refs() {
+    // Regression guard: with the option unset the canonical-regex default still
+    // uses `(\w+)` / `$1`, exactly as before this engine existed.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, ":s/(\\w+) (\\w+)/$2 $1/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["world hello"]);
+}
+
+#[tokio::test]
+async fn regexsyntax_query_defaults_to_pcre() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":set regexsyntax?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("regexsyntax=pcre")
+    );
+}
+
+#[tokio::test]
+async fn regexsyntax_rejects_unknown_value() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":set regexsyntax=perl<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        msg.contains("E474"),
+        "expected E474 invalid-argument, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn regexsyntax_is_buffer_local() {
+    // `:set regexsyntax` sets a BUFFER-LOCAL override (like `:set tabstop`): one
+    // buffer can use vim's dialect while another keeps the pcre default.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "isome text<Esc>"); // make buffer 1 non-throwaway so :enew opens a new one
+    feed(&rpc, ":set regexsyntax=vim<CR>"); // buffer 1 -> vim
+    feed(&rpc, ":enew<CR>"); // buffer 2 -> follows the global (pcre)
+    let map = redraw_after(&rpc, &mut incoming, ":set regexsyntax?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("regexsyntax=pcre"),
+        "a fresh buffer follows the global pcre default"
+    );
+    feed(&rpc, ":bp<CR>"); // back to buffer 1
+    let map = redraw_after(&rpc, &mut incoming, ":set regexsyntax?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("regexsyntax=vim"),
+        "buffer 1 kept its own vim override"
+    );
+}
+
+#[tokio::test]
+async fn regexsyntax_settable_via_vim_bo() {
+    // `vim.bo.regexsyntax` pins the dialect on the current buffer (e.g. from a
+    // FileType autocmd). With "vim", `\<foo\>` word boundaries work in `/` search.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifoo foobar foo<Esc>gg0");
+    exec_lua(&rpc, "vim.bo.regexsyntax = 'vim'").await;
+    feed(&rpc, "/\\<foo\\><CR>");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 11),
+        "vim.bo override makes `/` skip the foo inside foobar"
+    );
+}
+
+#[tokio::test]
+async fn regexsyntax_global_default_via_vim_o() {
+    // `vim.o.regexsyntax` sets the GLOBAL default; a buffer with no local override
+    // follows it, so `:s` speaks vim's dialect.
+    let (rpc, _i) = start(None).await;
+    exec_lua(&rpc, "vim.o.regexsyntax = 'vim'").await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, ":s/\\(\\w\\+\\) \\(\\w\\+\\)/\\2 \\1/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["world hello"]);
+}

@@ -17,7 +17,12 @@ use crate::host::{HostFs, StdHostFs};
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::options::Options;
-use crate::search::SearchRegex;
+use crate::search::{RegexEngine, SearchRegex};
+
+/// Memoized search regex for the highlight path, keyed by the
+/// `(pattern, ignorecase, engine)` it was compiled from (see
+/// [`Editor::search_re_cache`]).
+type SearchReCache = Option<(String, bool, RegexEngine, Rc<SearchRegex>)>;
 use crate::syntax::SyntaxEngine;
 use crate::view::View;
 
@@ -466,11 +471,13 @@ pub struct Editor {
     /// search.
     last_search: Option<(String, SearchDir, SearchOffset)>,
     /// Memoized compiled search regex for the redraw highlight path, keyed by
-    /// `(pattern, ignorecase)`. The `hlsearch` pattern is stable across many
-    /// frames, so this skips recompiling the regex (an expensive
-    /// `RegexBuilder::build`) on every repaint of every window. `RefCell` for
-    /// interior mutability behind the `&self` highlight projection.
-    search_re_cache: RefCell<Option<(String, bool, Rc<SearchRegex>)>>,
+    /// `(pattern, ignorecase, engine)`. The `hlsearch` pattern is stable across
+    /// many frames, so this skips recompiling the regex (an expensive
+    /// `RegexBuilder::build` / vim-engine compile) on every repaint of every
+    /// window. The engine is part of the key so toggling `'regexsyntax'`
+    /// recompiles. `RefCell` for interior mutability behind the `&self` highlight
+    /// projection.
+    search_re_cache: RefCell<SearchReCache>,
     /// The last `:substitute` as `(pattern, replacement, flag letters)`, for
     /// bare `:s` / `:&` / `:&&` repeats and the `~` replacement recall. The flag
     /// letters exclude any trailing count. `None` until the first substitute.

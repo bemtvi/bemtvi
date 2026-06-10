@@ -1,7 +1,9 @@
 //! The `:set` command and its bool/number option-application helpers.
 
 use super::*;
-use crate::options::{resolve_set, split_set_args, NumOp, SetCmd, SetOp, StrOp, WindowOptions};
+use crate::options::{
+    resolve_set, split_set_args, NumOp, RegexSyntax, SetCmd, SetOp, StrOp, WindowOptions,
+};
 
 /// Number of decimal digits in `n` (at least 1, so `0` is one digit).
 fn digit_count(n: usize) -> usize {
@@ -163,6 +165,29 @@ impl Editor {
                     let ft = self.ts_language_for(buf).unwrap_or_default();
                     self.echo(format!("filetype={ft}"));
                 }
+            }
+            return;
+        }
+        // `regexsyntax` is an enumerated string: only `"pcre"`/`"vim"` are valid,
+        // and a bad value must fail loud (E474) rather than silently sticking the
+        // buffer on the wrong dialect. `:set`/`:setlocal` set the *buffer-local*
+        // override (like `tabstop`); `&` resets it to follow the global. (The
+        // global itself is set via `vim.o.regexsyntax`.)
+        if name == "regexsyntax" {
+            match op {
+                StrOp::Set(value) => {
+                    let choice = match value.as_str() {
+                        "pcre" => RegexSyntax::Pcre,
+                        "vim" => RegexSyntax::Vim,
+                        _ => {
+                            self.echo(format!("E474: Invalid argument: regexsyntax={value}"));
+                            return;
+                        }
+                    };
+                    self.buffer_mut().options.regexsyntax = choice;
+                }
+                StrOp::Reset => self.buffer_mut().options.regexsyntax = RegexSyntax::Inherit,
+                StrOp::Query => self.echo(format!("regexsyntax={}", self.effective_regexsyntax())),
             }
             return;
         }

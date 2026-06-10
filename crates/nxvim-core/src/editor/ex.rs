@@ -822,7 +822,7 @@ impl Editor {
             }
         };
         let ignorecase = icase.unwrap_or_else(|| self.search_ignorecase(&pattern));
-        let re = match SearchRegex::compile(&pattern, ignorecase) {
+        let re = match SearchRegex::compile(&pattern, ignorecase, self.search_engine()) {
             Ok(re) => re,
             Err(e) => {
                 self.echo(e);
@@ -965,7 +965,11 @@ impl Editor {
         } else {
             pat
         };
-        let re = match SearchRegex::compile(&pattern, self.search_ignorecase(&pattern)) {
+        let re = match SearchRegex::compile(
+            &pattern,
+            self.search_ignorecase(&pattern),
+            self.search_engine(),
+        ) {
             Ok(re) => re,
             Err(e) => {
                 self.echo(e);

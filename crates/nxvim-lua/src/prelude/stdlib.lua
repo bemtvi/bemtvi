@@ -131,6 +131,7 @@ local O_GLOBAL = {
   statusline = "statusline", stl = "statusline",
   tabline = "tabline", tal = "tabline",
   guifont = "guifont", gfn = "guifont",
+  regexsyntax = "regexsyntax", rxs = "regexsyntax",
   -- The editor screen extent (the server pushes the live size into the mirror);
   -- read-mostly here — a float-positioning plugin (telescope) reads them to
   -- center its windows, and `:set columns=` is not honored (the client owns the
@@ -146,6 +147,7 @@ local O_GLOBAL_DEFAULT = {
   statusline = "",
   tabline = "",
   guifont = "",
+  regexsyntax = "pcre",
   columns = 80, lines = 24,
 }
 

@@ -86,6 +86,25 @@ impl Editor {
         }
     }
 
+    /// Set a string buffer-local option (currently `regexsyntax`) on buffer `id` —
+    /// the `vim.bo` string companion to [`Editor::set_buffer_option_num`]. An
+    /// unknown option, an unknown buffer, or (for `regexsyntax`) a value other than
+    /// `"pcre"`/`"vim"` is ignored; the `:set` ex path is where a bad value fails
+    /// loud (`E474`), so a raw `vim.bo` write of garbage leaves the override
+    /// untouched (the buffer keeps following the global).
+    pub fn set_buffer_option_str(&mut self, id: BufferId, name: &str, value: &str) {
+        let Some(ob) = self.buffers.map.get_mut(&id) else {
+            return;
+        };
+        if name == "regexsyntax" {
+            ob.buffer.options.regexsyntax = match value {
+                "pcre" => crate::options::RegexSyntax::Pcre,
+                "vim" => crate::options::RegexSyntax::Vim,
+                _ => return,
+            };
+        }
+    }
+
     /// Drain buffer `id`'s LSP edit journal — the buffer-addressed form of the
     /// drain `sync_lsp` does on the current buffer via `take_lsp_edits`, so the
     /// server can flush a `didChange` for a *non-current* buffer a workspace edit

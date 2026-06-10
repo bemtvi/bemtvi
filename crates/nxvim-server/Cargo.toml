@@ -27,7 +27,11 @@ tokio.workspace = true
 # Native filesystem watching backing `vim.uv.fs_event` (driven from the event-loop
 # actor in evloop.rs).
 notify.workspace = true
-nxvim-core.workspace = true
+# `vim-regex` pulls the real vim regexp engine into the core's `:s`/`/` search
+# (`:set regexsyntax=vim`). Enabled here so the whole host workspace — and the
+# integration tests — build it in via feature unification; the wasm `nxvim-web`
+# client, which depends on the core directly, stays on the C-free default.
+nxvim-core = { workspace = true, features = ["vim-regex"] }
 nxvim-rpc.workspace = true
 nxvim-lua.workspace = true
 nxvim-lsp.workspace = true

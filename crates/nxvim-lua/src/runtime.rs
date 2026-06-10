@@ -176,6 +176,10 @@ pub struct BoMirror {
     pub shiftwidth: usize,
     pub softtabstop: isize,
     pub expandtab: bool,
+    /// The buffer's *effective* `'regexsyntax'` dialect (`"pcre"`/`"vim"`) — its
+    /// local override resolved against the global, so `vim.bo.regexsyntax` reads
+    /// what `/`/`:s` actually use in this buffer.
+    pub regexsyntax: String,
     pub modified: bool,
 }
 
@@ -215,6 +219,8 @@ pub struct GoMirror {
     pub statusline: String,
     pub tabline: String,
     pub guifont: String,
+    /// The `'regexsyntax'` dialect (`"pcre"`/`"vim"`) backing `vim.o.regexsyntax`.
+    pub regexsyntax: String,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
     /// float-positioning plugin (telescope) can center its windows.
     pub columns: u64,

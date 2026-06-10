@@ -230,11 +230,16 @@ local BUF_OPT_CANON = {
   shiftwidth = "shiftwidth", sw = "shiftwidth",
   softtabstop = "softtabstop", sts = "softtabstop",
   expandtab = "expandtab", et = "expandtab",
+  -- The buffer-local override of the global `regexsyntax` dialect for `/` and
+  -- `:s`. `vim.bo.regexsyntax = "vim"` pins this buffer; reads return the
+  -- *effective* dialect (the override resolved against the global).
+  regexsyntax = "regexsyntax", rxs = "regexsyntax",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
--- their sentinels (0 = follow tabstop, -1 = follow shiftwidth).
-local BUF_OPT_DEFAULT = { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false }
+-- their sentinels (0 = follow tabstop, -1 = follow shiftwidth); regexsyntax
+-- "pcre" (the buffer follows the global, whose default is pcre).
+local BUF_OPT_DEFAULT = { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false, regexsyntax = "pcre" }
 
 local function bo_get(bufnr, opt)
   local canon = BUF_OPT_CANON[opt]

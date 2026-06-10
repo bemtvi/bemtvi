@@ -81,35 +81,29 @@ async fn substitute_very_magic_and_case_modifiers() {
 }
 
 #[tokio::test]
-async fn substitute_fails_loud_on_unsupported_constructs() {
+async fn substitute_handles_zs_and_lookaround() {
     let (rpc, _incoming) = start(None).await;
-    // `\zs` has no RE2 equivalent — it must raise (named), not silently mis-match.
-    // pcall captures the error so we can assert on its message.
-    let err = exec_lua(
-        &rpc,
-        r"local ok, e = pcall(vim.fn.substitute, 'xy', [==[x\zsy]==], 'z', '')
-          return tostring(e)",
-    )
-    .await;
-    let err = err.as_str().expect("a string error from the raise");
-    assert!(
-        err.contains("substitute") && err.contains(r"\zs"),
-        "the error names the unsupported construct (fail loud): {err:?}"
+    // `\zs` (match-start reset) — previously unrepresentable in RE2, now native:
+    // `x\zsy` against "xy" matches just "y", so only the `y` is replaced.
+    assert_eq!(substitute(&rpc, "xy", r"x\zsy", "z", "").await, "xz");
+    // Look-around: `foo\(bar\)\@=` matches "foo" only when followed by "bar"
+    // (the `\@=` look-ahead is consumed, not replaced).
+    assert_eq!(
+        substitute(&rpc, "foobar foobaz", r"foo\(bar\)\@=", "X", "g").await,
+        "Xbar foobaz"
     );
 }
 
 // ----- vim.regex match-position anchors ( \zs / \ze ) -----------------------
 //
-// These are #[ignore]d for now: nxvim's RE2-backed `vim.regex` rejects `\zs`/`\ze`
-// (no RE2 equivalent), and rather than reimplement the translation we plan to bring
-// in vim's native regex module. They specify the behavior cmp-path relies on
-// (`…/\zePAT*$`); un-ignore them once that module backs `vim.regex`.
+// `vim.regex` is backed by the real vim regexp engine (`nxvim-regex`), so `\zs`
+// (reset match start) and `\ze` (reset match end) report exactly the span vim
+// does — the construct cmp-path relies on (`…/\zePAT*$`).
 
 /// `\ze` resets the match END: `match_str` reports the span up to `\ze`, while the
 /// text after it must still match. This is the exact construct cmp-path builds
 /// (`…/\zePAT*$`), so getting it right is what unblocks cmp-path.
 #[tokio::test]
-#[ignore = "vim.regex \\ze support pending the native vim regex module"]
 async fn regex_ze_sets_match_end() {
     let (rpc, _incoming) = start(None).await;
     // `foo/\zebar` against "foo/bar": the whole pattern matches "foo/bar", but the
@@ -132,7 +126,6 @@ async fn regex_ze_sets_match_end() {
 /// `\zs` resets the match START: everything before it must match but is excluded
 /// from the reported span.
 #[tokio::test]
-#[ignore = "vim.regex \\zs support pending the native vim regex module"]
 async fn regex_zs_sets_match_start() {
     let (rpc, _incoming) = start(None).await;
     // `foo\zsbar` against "foobar": matches the whole, reports just "bar" (3..6).
@@ -150,7 +143,6 @@ async fn regex_zs_sets_match_start() {
 /// A non-matching pattern still returns nil (not the zone group span), and `\zs`
 /// combined with `\ze` reports exactly the span between them.
 #[tokio::test]
-#[ignore = "vim.regex \\zs/\\ze support pending the native vim regex module"]
 async fn regex_zs_ze_zone_and_no_match() {
     let (rpc, _incoming) = start(None).await;
     let out = exec_lua(
@@ -170,7 +162,6 @@ async fn regex_zs_ze_zone_and_no_match() {
 /// a `\ze` boundary — must compile (it was rejected outright before `\ze` support)
 /// and locate a path: `match_str` returns a real byte offset, not nil.
 #[tokio::test]
-#[ignore = "cmp-path PATH_REGEX (\\ze) support pending the native vim regex module"]
 async fn regex_cmp_path_pattern_compiles_and_matches() {
     let (rpc, _incoming) = start(None).await;
     let out = exec_lua(
@@ -249,6 +240,22 @@ async fn greedy_pattern_steps_to_the_next_match_not_into_itself() {
     assert_eq!(cursor(&rpc).await, (2, 0));
     feed(&rpc, "n");
     assert_eq!(cursor(&rpc).await, (3, 0));
+}
+
+#[tokio::test]
+async fn search_vim_engine_word_boundary() {
+    // `:set regexsyntax=vim` makes `/` speak vim's magic dialect, so `\<`/`\>`
+    // word boundaries work — matching the standalone "foo", never the one inside
+    // "foobar". (Under the PCRE default `\<foo\>` is an invalid pattern.)
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo foobar foo<Esc>gg0");
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    feed(&rpc, "/\\<foo\\><CR>");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 11),
+        "\\<foo\\> skips the 'foo' inside 'foobar'"
+    );
 }
 
 #[tokio::test]

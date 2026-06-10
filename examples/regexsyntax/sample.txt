@@ -1,0 +1,5 @@
+foo foobar foo
+hello world
+key: value
+zipfile:///path/to/a::b::c
+the quick brown fox

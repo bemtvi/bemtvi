@@ -325,10 +325,10 @@ impl Server {
                 match value {
                     OptionValue::Number(n) => self.editor.set_buffer_option_num(id, &name, n),
                     OptionValue::Bool(b) => self.editor.set_buffer_option_bool(id, &name, b),
-                    // No buffer-local string option is wired (only the global
-                    // `statusline` is). The `_buf_set_option` bridge never emits
-                    // a `String`, so this is unreachable in practice.
-                    OptionValue::String(_) => {}
+                    // `regexsyntax` is the one wired buffer-local string option
+                    // (`vim.bo.regexsyntax`); the `_buf_set_option` bridge forwards
+                    // it as a `String`.
+                    OptionValue::String(s) => self.editor.set_buffer_option_str(id, &name, &s),
                 }
                 return;
             }
@@ -772,6 +772,7 @@ impl Server {
                     shiftwidth: o.shiftwidth,
                     softtabstop: o.softtabstop,
                     expandtab: o.expandtab,
+                    regexsyntax: self.editor.resolve_regexsyntax(o.regexsyntax).to_string(),
                     modified: b.modified,
                 });
                 if !b.extmarks.is_empty() {
@@ -985,6 +986,7 @@ impl Server {
             statusline: go.statusline.clone(),
             tabline: go.tabline.clone(),
             guifont: go.guifont.clone(),
+            regexsyntax: go.regexsyntax.clone(),
             columns: columns as u64,
             lines: lines as u64,
         });

@@ -25,7 +25,10 @@ mlua.workspace = true
 # owns the Lua VM, so it installs the binding (`nxvim_ts::lua::install`) and
 # selects the shared mlua backend (`lua51`/`luajit`) the binding links against.
 nxvim-ts = { workspace = true, features = ["lua"] }
-regex.workspace = true
+# The real vim regexp engine backing `vim.fn.substitute` and `vim.regex` — vim's
+# magic dialect including `\zs`/`\ze`, look-around and in-pattern back-references,
+# which the previous RE2 translator could not represent.
+nxvim-regex.workspace = true
 rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true

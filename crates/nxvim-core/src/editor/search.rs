@@ -4,7 +4,8 @@
 use super::*;
 use crate::buffer::Buffer;
 use crate::mode::Mode;
-use crate::search::SearchRegex;
+use crate::options::RegexSyntax;
+use crate::search::{RegexEngine, SearchRegex};
 use crate::unicode;
 
 /// A search match as whole-buffer byte offsets, `(start, end)` (end exclusive).
@@ -254,26 +255,65 @@ impl Editor {
             && !(self.options.smartcase && pattern.chars().any(|c| c.is_uppercase()))
     }
 
-    /// Compile `pattern` (a standard regex) with this editor's case options.
+    /// Which regex dialect `/` search and `:substitute` speak — the current
+    /// buffer's `'regexsyntax'` override if it pinned one, else the global
+    /// `'regexsyntax'`. `"vim"` → the native vim engine, anything else (the
+    /// default `"pcre"`) → the canonical-regex engine. Both layers are validated
+    /// to those two values, so an unexpected global string safely reads as `Pcre`.
+    pub(crate) fn search_engine(&self) -> RegexEngine {
+        match self.resolve_regexsyntax(self.buffer().options.regexsyntax) {
+            "vim" => RegexEngine::Vim,
+            _ => RegexEngine::Pcre,
+        }
+    }
+
+    /// Resolve a buffer-local `'regexsyntax'` value to the effective dialect name
+    /// (`"pcre"`/`"vim"`): an explicit local override wins, else the global
+    /// `'regexsyntax'` (itself validated, so an unexpected string reads as
+    /// `"pcre"`). The one place the global-local fallback lives — used by
+    /// [`search_engine`](Self::search_engine), `:set regexsyntax?`, and the
+    /// `vim.bo` mirror.
+    pub fn resolve_regexsyntax(&self, local: RegexSyntax) -> &'static str {
+        match local {
+            RegexSyntax::Pcre => "pcre",
+            RegexSyntax::Vim => "vim",
+            RegexSyntax::Inherit if self.options.regexsyntax == "vim" => "vim",
+            RegexSyntax::Inherit => "pcre",
+        }
+    }
+
+    /// The effective `'regexsyntax'` dialect for the current buffer — its override
+    /// resolved against the global — for `:set regexsyntax?`.
+    pub(crate) fn effective_regexsyntax(&self) -> &'static str {
+        self.resolve_regexsyntax(self.buffer().options.regexsyntax)
+    }
+
+    /// Compile `pattern` with this editor's case options and active regex engine.
     fn compile_search(&self, pattern: &str) -> Result<SearchRegex, String> {
-        SearchRegex::compile(pattern, self.search_ignorecase(pattern))
+        SearchRegex::compile(
+            pattern,
+            self.search_ignorecase(pattern),
+            self.search_engine(),
+        )
     }
 
     /// Like [`compile_search`](Self::compile_search), but reuses the last
-    /// compiled regex when the `(pattern, ignorecase)` pair is unchanged. Used
-    /// on the redraw highlight path, where the `hlsearch` pattern is stable
-    /// across many frames and recompiling it every repaint (per window) is the
-    /// dominant cost. Returns a shared handle so the cache can keep its copy.
+    /// compiled regex when the `(pattern, ignorecase, engine)` triple is
+    /// unchanged. Used on the redraw highlight path, where the `hlsearch` pattern
+    /// is stable across many frames and recompiling it every repaint (per window)
+    /// is the dominant cost. Returns a shared handle so the cache can keep its
+    /// copy.
     fn compile_search_cached(&self, pattern: &str) -> Result<Rc<SearchRegex>, String> {
         let ignorecase = self.search_ignorecase(pattern);
-        if let Some((p, ic, re)) = self.search_re_cache.borrow().as_ref() {
-            if p == pattern && *ic == ignorecase {
+        let engine = self.search_engine();
+        if let Some((p, ic, eng, re)) = self.search_re_cache.borrow().as_ref() {
+            if p == pattern && *ic == ignorecase && *eng == engine {
                 return Ok(Rc::clone(re));
             }
         }
-        let re = Rc::new(SearchRegex::compile(pattern, ignorecase)?);
+        let re = Rc::new(SearchRegex::compile(pattern, ignorecase, engine)?);
         *self.search_re_cache.borrow_mut() =
-            Some((pattern.to_string(), ignorecase, Rc::clone(&re)));
+            Some((pattern.to_string(), ignorecase, engine, Rc::clone(&re)));
         Ok(re)
     }
 

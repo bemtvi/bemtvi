@@ -160,11 +160,13 @@ fn shell_quote(s: &str) -> String {
 /// path; `--` stops ssh parsing the destination as an option (belt-and-suspenders
 /// with the `-`-leading rejection in [`RemoteSpec::parse_target`]).
 ///
-/// stderr is **inherited**, so ssh's own diagnostics (auth failures, host-key
-/// prompts, a "nxvim: command not found" from the remote shell) reach the user's
-/// terminal — without them a failed connection would just look like an instant
-/// disconnect. The returned [`SshTransport`] owns the child with `kill_on_drop`,
-/// so closing the window tears the remote process down.
+/// Interactive prompts (host-key acceptance, password / key passphrase) are
+/// routed to a GUI dialog via `SSH_ASKPASS` (see [`run_askpass_if_invoked`]), so
+/// auth works from a desktop launch with no terminal. stderr is **inherited**, so
+/// ssh's non-interactive diagnostics (a "Permission denied", a "nxvim: command not
+/// found" from the remote shell) still reach the user's terminal if there is one.
+/// The returned [`SshTransport`] owns the child with `kill_on_drop`, so closing
+/// the window tears the remote process down.
 ///
 /// Must be called from within a tokio runtime — the child's pipes are bound to
 /// the runtime that polls them (the GUI's IO thread).
@@ -187,6 +189,19 @@ pub async fn connect(spec: &RemoteSpec) -> Result<SshTransport> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+
+    // Route ssh's interactive prompts — host-key acceptance, password / key
+    // passphrase — to a GUI dialog by re-invoking *this* binary as ssh's askpass
+    // helper (see [`run_askpass_if_invoked`]). Without this they go to the
+    // controlling terminal, so a desktop launch (no tty) couldn't authenticate or
+    // accept a new host key at all. `SSH_ASKPASS_REQUIRE=force` (OpenSSH 8.4+) uses
+    // the helper even when a tty exists, so the dialog is consistent either way.
+    // (Key-agent auth with a known host needs no prompt, so nothing pops then.)
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("SSH_ASKPASS", &exe)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env(ASKPASS_ENV, "1");
+    }
 
     let mut child = cmd
         .spawn()
@@ -233,4 +248,229 @@ impl AsyncWrite for SshTransport {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSH askpass helper
+// ---------------------------------------------------------------------------
+//
+// `connect` points `$SSH_ASKPASS` at this very binary (plus `ASKPASS_ENV` as the
+// "you are the helper" marker, inherited by the program ssh execs). ssh runs the
+// helper once per prompt with the prompt text as `argv[1]`, reads the answer from
+// its stdout, and treats a non-zero exit as cancel. So `main` checks
+// `run_askpass_if_invoked` first thing: in helper mode it pops a native dialog and
+// exits, never starting the editor. This makes host-key acceptance and
+// password/passphrase entry work from a desktop launch with no controlling
+// terminal — the dialogs shell out to the platform's prompt tool (no winit), so
+// the helper process needs no GPU/window.
+
+/// Env var `connect` sets on the spawned `ssh`, inherited by the askpass program
+/// it execs, marking a re-invoked `nxvim-gui` as the askpass helper.
+const ASKPASS_ENV: &str = "NXVIM_GUI_ASKPASS";
+
+/// If this process was re-invoked by ssh as its `SSH_ASKPASS` helper, pop a dialog
+/// for the prompt in `argv[1]`, print the answer to stdout, and return
+/// `Some(result)` so `main` exits without starting the editor. `None` on a normal
+/// launch. A cancelled/declined dialog returns `Err`, so `main` exits non-zero and
+/// ssh aborts the connection rather than retrying with an empty answer.
+pub fn run_askpass_if_invoked() -> Option<Result<()>> {
+    std::env::var_os(ASKPASS_ENV)?;
+    let prompt = std::env::args().nth(1).unwrap_or_default();
+    Some(answer_askpass(&prompt))
+}
+
+/// Show the right dialog for `prompt` and write the answer (one line) to stdout.
+fn answer_askpass(prompt: &str) -> Result<()> {
+    let answer = if is_confirmation(prompt) {
+        confirm_dialog(prompt)?
+    } else {
+        secret_dialog(prompt)?
+    };
+    println!("{answer}");
+    Ok(())
+}
+
+/// Whether `prompt` is ssh's host-key *confirmation* (a yes/no question) rather
+/// than a secret to type — keyed off the stable phrasing OpenSSH uses. Exposed for
+/// testing (the dialogs themselves need a display).
+pub fn is_confirmation(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    p.contains("continue connecting")
+        || p.contains("authenticity of host")
+        || p.contains("(yes/no")
+        || p.contains("yes/no/")
+}
+
+// --- macOS: osascript -------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn secret_dialog(prompt: &str) -> Result<String> {
+    osascript(
+        "on run argv\n\
+         return text returned of (display dialog (item 1 of argv) default answer \"\" \
+         with hidden answer with title \"nxvim - SSH\")\n\
+         end run",
+        prompt,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn confirm_dialog(prompt: &str) -> Result<String> {
+    // Only "Connect" succeeds; "Cancel" raises osascript's user-cancelled error,
+    // which `osascript` maps to an abort (so ssh gets a non-zero exit = decline).
+    let button = osascript(
+        "on run argv\n\
+         return button returned of (display dialog (item 1 of argv) \
+         buttons {\"Cancel\", \"Connect\"} default button \"Connect\" \
+         with title \"nxvim - SSH\" with icon caution)\n\
+         end run",
+        prompt,
+    )?;
+    Ok(if button.eq_ignore_ascii_case("connect") {
+        "yes".into()
+    } else {
+        "no".into()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn osascript(body: &str, prompt: &str) -> Result<String> {
+    // The prompt is passed as an argv item (not interpolated into the script), so
+    // an attacker-controlled prompt can't inject AppleScript.
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(body)
+        .arg(prompt)
+        .output()
+        .context("run osascript for the SSH dialog")?;
+    if !output.status.success() {
+        anyhow::bail!("SSH dialog cancelled");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+// --- Linux/BSD: zenity or kdialog -------------------------------------------
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn secret_dialog(prompt: &str) -> Result<String> {
+    if let Some(answer) = dialog_stdout("zenity", &["--password", "--title=nxvim - SSH"])? {
+        return Ok(answer);
+    }
+    if let Some(answer) = dialog_stdout("kdialog", &["--title=nxvim - SSH", "--password", prompt])?
+    {
+        return Ok(answer);
+    }
+    anyhow::bail!(
+        "no GUI password helper found — install `zenity` or `kdialog`, or use \
+         key-based auth with a loaded ssh-agent"
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn confirm_dialog(prompt: &str) -> Result<String> {
+    let text = format!("--text={prompt}");
+    if let Some(yes) = dialog_status(
+        "zenity",
+        &["--question", "--title=nxvim - SSH", text.as_str()],
+    )? {
+        return Ok(if yes { "yes".into() } else { "no".into() });
+    }
+    if let Some(yes) = dialog_status("kdialog", &["--title=nxvim - SSH", "--yesno", prompt])? {
+        return Ok(if yes { "yes".into() } else { "no".into() });
+    }
+    anyhow::bail!("no GUI dialog helper found — install `zenity` or `kdialog`")
+}
+
+/// Run a dialog tool, returning its stdout on success, `Ok(None)` if the tool
+/// isn't installed (try the next), or `Err` if the user cancelled.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn dialog_stdout(prog: &str, args: &[&str]) -> Result<Option<String>> {
+    match std::process::Command::new(prog).args(args).output() {
+        Ok(o) if o.status.success() => Ok(Some(
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+        )),
+        Ok(_) => anyhow::bail!("SSH dialog cancelled"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("run {prog}"))),
+    }
+}
+
+/// Like [`dialog_stdout`] but the answer is the exit status (yes/no question):
+/// `Some(true)` accepted, `Some(false)` declined, `None` tool not installed.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn dialog_status(prog: &str, args: &[&str]) -> Result<Option<bool>> {
+    match std::process::Command::new(prog).args(args).status() {
+        Ok(s) if s.success() => Ok(Some(true)),
+        Ok(_) => Ok(Some(false)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("run {prog}"))),
+    }
+}
+
+// --- Windows: PowerShell + WinForms -----------------------------------------
+
+#[cfg(windows)]
+fn secret_dialog(prompt: &str) -> Result<String> {
+    // A masked WinForms text box; the prompt arrives via env (no script injection).
+    powershell(
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;\
+         $f=New-Object System.Windows.Forms.Form;\
+         $f.Text='nxvim - SSH';$f.Width=440;$f.Height=170;$f.TopMost=$true;\
+         $l=New-Object System.Windows.Forms.Label;$l.Text=$env:NXVIM_ASKPASS_PROMPT;\
+         $l.Left=10;$l.Top=10;$l.Width=410;$l.Height=50;\
+         $t=New-Object System.Windows.Forms.TextBox;$t.UseSystemPasswordChar=$true;\
+         $t.Left=10;$t.Top=70;$t.Width=410;\
+         $b=New-Object System.Windows.Forms.Button;$b.Text='OK';$b.Left=345;$b.Top=100;\
+         $b.DialogResult=[System.Windows.Forms.DialogResult]::OK;\
+         $f.Controls.AddRange(@($l,$t,$b));$f.AcceptButton=$b;\
+         if($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($t.Text)}else{exit 1}",
+        prompt,
+    )
+}
+
+#[cfg(windows)]
+fn confirm_dialog(prompt: &str) -> Result<String> {
+    powershell(
+        "Add-Type -AssemblyName System.Windows.Forms;\
+         $r=[System.Windows.Forms.MessageBox]::Show($env:NXVIM_ASKPASS_PROMPT,'nxvim - SSH',\
+         [System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning);\
+         if($r -eq [System.Windows.Forms.DialogResult]::Yes){[Console]::Out.Write('yes')}else{[Console]::Out.Write('no')}",
+        prompt,
+    )
+}
+
+#[cfg(windows)]
+fn powershell(script: &str, prompt: &str) -> Result<String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .env("NXVIM_ASKPASS_PROMPT", prompt)
+        .output()
+        .context("run powershell for the SSH dialog")?;
+    if !output.status.success() {
+        anyhow::bail!("SSH dialog cancelled");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+// --- Other targets: no GUI prompt -------------------------------------------
+
+#[cfg(not(any(unix, windows)))]
+fn secret_dialog(_prompt: &str) -> Result<String> {
+    anyhow::bail!("no GUI askpass on this platform; use key-based auth with an ssh-agent")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn confirm_dialog(_prompt: &str) -> Result<String> {
+    anyhow::bail!("no GUI askpass on this platform")
 }

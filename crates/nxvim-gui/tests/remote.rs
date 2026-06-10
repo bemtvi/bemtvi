@@ -2,7 +2,7 @@
 //! GUI's other Tier-1 logic (no window). The live SSH hop and the window itself
 //! can't run headless (see `docs/plans/2026-06-09-remote-ssh-client.md`).
 
-use nxvim_gui::remote::{connect_command, RemoteSpec};
+use nxvim_gui::remote::{connect_command, is_confirmation, RemoteSpec};
 
 #[test]
 fn parses_user_host_port() {
@@ -98,6 +98,21 @@ fn rejects_dash_leading_host_or_user_to_block_ssh_flag_injection() {
     assert_eq!(RemoteSpec::parse_target("-oProxyCommand=evil@host"), None);
     assert_eq!(RemoteSpec::parse_target("-lh:22"), None);
     assert_eq!(connect_command("connect -oProxyCommand=evil@host"), None);
+}
+
+#[test]
+fn askpass_classifies_host_key_confirmation_vs_secret() {
+    // ssh's host-key prompt is a yes/no confirmation (→ a Yes/No dialog)…
+    assert!(is_confirmation(
+        "The authenticity of host 'h (1.2.3.4)' can't be established.\n\
+         ED25519 key fingerprint is SHA256:abc.\n\
+         Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+    ));
+    // …while passwords and key passphrases are secrets to type (→ a masked input).
+    assert!(!is_confirmation("user@host's password: "));
+    assert!(!is_confirmation(
+        "Enter passphrase for key '/home/me/.ssh/id_ed25519': "
+    ));
 }
 
 #[test]

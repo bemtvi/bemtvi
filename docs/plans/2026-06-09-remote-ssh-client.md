@@ -62,6 +62,19 @@ an `ssh` child process's stdin/stdout. Nothing in the editor or protocol changes
    connection down and brings the new one up, and the App swaps its live `Rpc`
    handle and re-attaches the UI on a `Connected` event.
 
+5. **Interactive auth via `SSH_ASKPASS`** (`crates/nxvim-gui/src/remote.rs`,
+   `main.rs`). ssh reads passwords/passphrases and host-key confirmation from the
+   controlling terminal, so a desktop launch (no tty) couldn't authenticate or
+   accept a new host key. `connect` points `$SSH_ASKPASS` at *this* binary (with
+   `SSH_ASKPASS_REQUIRE=force`, OpenSSH 8.4+, and a marker env var); when ssh
+   re-invokes it for a prompt, `run_askpass_if_invoked` pops a native dialog
+   instead of starting the editor — a Yes/No for host-key acceptance, a masked
+   input for secrets — and writes the answer to stdout. The dialogs shell out to
+   the platform's prompt tool (macOS `osascript`; Linux `zenity`/`kdialog`;
+   Windows PowerShell + WinForms), so the askpass process needs no GPU/window. A
+   cancelled dialog exits non-zero, which ssh treats as abort. Key-agent auth with
+   a known host needs no prompt, so nothing pops in the smooth case.
+
 ## Testing
 
 - **`nxvim --server` stdio role** — black-box, end-to-end: spawn the *real*
@@ -70,12 +83,14 @@ an `ssh` child process's stdin/stdout. Nothing in the editor or protocol changes
   (`crates/nxvim/tests/stdio_server.rs`). Exercises the exact transport `ssh`
   uses, minus the network hop.
 - **SSH target parsing + hardening** — `crates/nxvim-gui/tests/remote.rs` covers
-  `[user@]host[:port][/file]`, the `:connect` command, and the `-`-leading
-  rejection that blocks ssh-flag injection.
+  `[user@]host[:port][/file]`, the `:connect` command, the `-`-leading rejection
+  that blocks ssh-flag injection, and the askpass prompt classifier.
 - The **SSH hop itself** is not covered by automated tests (no remote host / ssh
-  in CI); the stdio-binary test covers the mechanism, and the GUI window can't be
-  asserted headlessly (see the GUI-screencapture limitation). The ssh-argv build
-  is kept trivial and obviously correct.
+  in CI); the stdio-binary test covers the mechanism, and the GUI window + askpass
+  dialogs can't be asserted headlessly (see the GUI-screencapture limitation). The
+  ssh-argv build is kept trivial and obviously correct. The askpass dialogs are
+  built only on macOS in local dev (the Linux/Windows branches are `cfg`'d out of
+  a macOS build, so they're eyeballed, not compiled here — CI compiles them).
 
 ## Known limitations (v1)
 

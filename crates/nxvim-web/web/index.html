@@ -157,7 +157,7 @@
     }
 
     function feed(notationStr) { sendInput(notationStr); }
-    function refresh() { flushClipboard(); view = JSON.parse(editor.view_json()); render(); }
+    function refresh() { flushClipboard(); view = JSON.parse(editor.view_json()); applyView(); }
 
     // ---- input shims: one path for both modes ----
     // Local mode mutates the in-page editor and re-renders synchronously. Remote
@@ -277,6 +277,145 @@
     // remote mode anyway). Keyed on the palette's presence so the renderer never branches
     // on transport — only on what the frame carries.
     let serverStyled = false;
+
+    // ---- smooth scrolling ----
+    // A scroll command that moved the focused window's viewport more than a line
+    // arrives with a `scroll` band on that window (see scroll_to_json): the slide's
+    // endpoints plus a self-contained strip of rows — anchored at base_line —
+    // covering everything visible during the slide. We render that strip once and
+    // translate it sub-pixel against the client clock, true smooth scrolling the
+    // static cell grid can't express. The band row for buffer line `base_line + i`
+    // sits at y = (base_line + i − topF)·ch, topF being the fractionally
+    // interpolated first visible line; mirrors the native GUI/TUI animators.
+    let scrollAnim = null; // in-flight slide, or null
+    let scrollRAF = 0;
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+    // Apply a freshly produced `view`: (re)arm or cancel the scroll slide, then
+    // paint. Mirrors the native clients' arm_animation — a fresh gesture (re)arms;
+    // a scroll-less view that merely repaints the in-flight slide's *destination* (a
+    // delayed highlight reply) is left to play out rather than snapping; any other
+    // scroll-less view is a real change that cancels the slide and paints statically.
+    function applyView() {
+      const w = focusedWindow();
+      const s = w?.scroll;
+      if (s && s.duration_ms > 0) { armScroll(w, s); return; }
+      if (scrollAnim && repaintsDestination(w)) return; // let the slide finish
+      cancelScroll();
+      render();
+    }
+
+    // Whether `w` just repaints the destination the in-flight slide is heading to
+    // (same first visible line and cursor line) — so a delayed repaint mustn't abort
+    // it. `numbers[0]`/`cursor_line` are 1-based; the endpoints are 0-based.
+    function repaintsDestination(w) {
+      if (!w || !scrollAnim) return false;
+      const a = scrollAnim;
+      return w.numbers?.[0] === Math.round(a.to_top) + 1
+        && w.cursor_line === Math.round(a.to_cursor) + 1;
+    }
+
+    function armScroll(w, s) {
+      cancelScroll();
+      scrollAnim = {
+        from_top: s.from_top, to_top: s.to_top,
+        from_cursor: s.from_cursor, to_cursor: s.to_cursor,
+        duration: s.duration_ms, base_line: s.base_line,
+        band: bandWindow(w, s), start: performance.now(), strip: null,
+      };
+      render(); // paints chrome + other windows + the focused band strip (sets .strip)
+      scrollRAF = requestAnimationFrame(stepScroll);
+    }
+
+    // Linear progress 0→1 of slide `a` at clock `now`, clamped at BOTH ends. The
+    // lower clamp matters: a rAF timestamp can predate `a.start` by a frame, and an
+    // unclamped negative `t` eases to a negative offset — a one-frame upward flash
+    // before the slide proper begins (mirrors the native animators' `clamp(0,1)`).
+    function scrollProgress(a, now) {
+      return Math.min(1, Math.max(0, (now - a.start) / a.duration));
+    }
+
+    // Drive one animation frame: just translate the pre-built strip (cheap, GPU
+    // composited), no DOM rebuild. On completion, settle to the static destination.
+    function stepScroll(now) {
+      const a = scrollAnim;
+      if (!a) return;
+      const t = scrollProgress(a, now);
+      if (a.strip) a.strip.style.transform = `translate3d(0, ${stripOffset(a, easeOutCubic(t))}px, 0)`;
+      if (t < 1) { scrollRAF = requestAnimationFrame(stepScroll); return; }
+      scrollAnim = null;
+      scrollRAF = 0;
+      render();
+    }
+
+    // Pixel y of band row 0 (buffer line base_line) within the window text area for
+    // eased progress `e`: the fractional top line slides from_top→to_top, and
+    // base_line ≤ both endpoints, so the offset is ≤ 0 (strip shifted up).
+    function stripOffset(a, e) {
+      const topF = a.from_top + (a.to_top - a.from_top) * e;
+      return (a.base_line - topF) * ch;
+    }
+
+    // A synthetic window whose per-row arrays are the scroll band's, so the existing
+    // row renderers paint the band rows unchanged. The band carries text, numbers,
+    // selection (and server highlights); overlays it doesn't carry — search,
+    // secondary cursors, diagnostics, inlay hints — are blanked for the brief slide.
+    // The cursor is pinned to its destination buffer line so its cell rides the strip
+    // to exactly where it settles.
+    function bandWindow(w, s) {
+      const n = s.lines.length;
+      const blanks = Array.from({ length: n }, () => []);
+      return Object.assign({}, w, {
+        lines: s.lines,
+        numbers: s.numbers,
+        selection: s.selection,
+        search: blanks,
+        incsearch: Array.from({ length: n }, () => null),
+        secondary_selection: blanks,
+        secondary_cursors: [],
+        highlights: s.highlights || [],
+        diagnostics: [], diagnostics_virt: [], diagnostics_signs: [], inlay_hints: [],
+        cursor_row: Math.round(s.to_cursor) - s.base_line,
+      });
+    }
+
+    function cancelScroll() {
+      if (scrollRAF) cancelAnimationFrame(scrollRAF);
+      scrollRAF = 0;
+      scrollAnim = null;
+    }
+
+    // The focused window's animated body: the band rendered once into an absolutely
+    // positioned strip the rAF loop translates. Built with the same row renderers as
+    // a static window, so syntax/selection/gutter match exactly; the strip lives
+    // inside the window box (overflow:hidden), which clips it to the viewport.
+    function renderScrollBand(box, w, rect, winSpans) {
+      const a = scrollAnim;
+      const band = a.band;
+      const gutterW = w.number_width || 0;
+      const strip = document.createElement("div");
+      strip.className = "scroll-band";
+      strip.style.cssText = `position:absolute;left:0;top:0;width:${rect.width * cw}px;will-change:transform;`;
+      for (let i = 0; i < band.lines.length; i++) {
+        const rowEl = document.createElement("div");
+        rowEl.className = "row";
+        rowEl.style.top = i * ch + "px";
+        rowEl.style.width = rect.width * cw + "px";
+        if (serverStyled) {
+          rowEl.innerHTML = renderLineServer(band, i, gutterW, rect);
+        } else {
+          const bufLine = band.numbers[i];
+          const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
+          rowEl.innerHTML = renderLine(band, i, gutterW, lineSpans);
+        }
+        strip.appendChild(rowEl);
+      }
+      const t = scrollProgress(a, performance.now());
+      strip.style.transform = `translate3d(0, ${stripOffset(a, easeOutCubic(t))}px, 0)`;
+      box.appendChild(strip);
+      a.strip = strip;
+    }
+
     function render() {
       if (!view) return;
       serverStyled = (view.styles?.length ?? 0) > 0;
@@ -329,20 +468,26 @@
       // This window shares the highlighted buffer iff it shows the same file (local only).
       const winSpans = hl && w.file_name === hl.file ? hl.spans : null;
 
-      for (let r = 0; r < textRows; r++) {
-        const rowEl = document.createElement("div");
-        rowEl.className = "row";
-        rowEl.style.top = r * ch + "px";
-        rowEl.style.width = rect.width * cw + "px";
-        if (serverStyled) {
-          rowEl.innerHTML = renderLineServer(w, r, gutterW, rect);
-        } else {
-          // numbers[r] is the 1-based buffer line; spans are indexed 0-based.
-          const bufLine = w.numbers[r];
-          const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
-          rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans);
+      // The focused window animates a scroll slide: paint the band strip the rAF
+      // loop translates instead of the static rows (status line still painted below).
+      if (scrollAnim && w.focused) {
+        renderScrollBand(box, w, rect, winSpans);
+      } else {
+        for (let r = 0; r < textRows; r++) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "row";
+          rowEl.style.top = r * ch + "px";
+          rowEl.style.width = rect.width * cw + "px";
+          if (serverStyled) {
+            rowEl.innerHTML = renderLineServer(w, r, gutterW, rect);
+          } else {
+            // numbers[r] is the 1-based buffer line; spans are indexed 0-based.
+            const bufLine = w.numbers[r];
+            const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
+            rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans);
+          }
+          box.appendChild(rowEl);
         }
-        box.appendChild(rowEl);
       }
       // The server projects its own status segments (per 'laststatus'); a window with
       // status_visible===false gave its bottom row to text, so paint none. Local mode
@@ -1104,7 +1249,7 @@
       if (resp) emit(resp);
       if (client.dirty()) {
         view = JSON.parse(client.view_json());
-        render();
+        applyView();
         resolveRedraw();
       }
     }

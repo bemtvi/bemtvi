@@ -22,8 +22,8 @@
 use std::io::{self, Cursor};
 
 use nxvim_view::{
-    encode_paste, DiagSign, DiagSpan, DiagVirt, HlSpan, InlayHint, PmenuItem, StatusSegment, Style,
-    View,
+    encode_paste, DiagSign, DiagSpan, DiagVirt, HlSpan, InlayHint, PmenuItem, ScrollData,
+    StatusSegment, Style, View,
 };
 use rmpv::Value;
 use serde_json::{json, Value as Json};
@@ -379,6 +379,7 @@ fn window_to_json(w: &nxvim_view::WindowView) -> Json {
         "secondary_selection": multi_spans(&w.secondary_selection),
         "search": multi_spans(&w.search),
         "incsearch": opt_spans(&w.incsearch),
+        "scroll": w.scroll.as_ref().map(scroll_to_json),
         "highlights": highlights_to_json(&w.highlights),
         "diagnostics": diagnostics_to_json(&w.diagnostics),
         "diagnostics_virt": diag_virt_to_json(&w.diagnostics_virt),
@@ -395,6 +396,30 @@ fn window_to_json(w: &nxvim_view::WindowView) -> Json {
         "status": segments_to_json(&w.status),
         "status_visible": w.status_visible,
         "unnamed": w.unnamed,
+    })
+}
+
+/// A focused window's scroll gesture for the browser to animate: the slide's
+/// endpoints plus a self-contained band anchored at `base_line`. Unlike the
+/// serverless build, the band carries its own `highlights` (style ids into the live
+/// `view.styles` palette) so the server-styled rows keep their syntax colors as they
+/// slide instead of flashing unstyled until the view settles. `duration_ms` flattens
+/// the gesture's `Duration` to the integer milliseconds the JS clock interpolates over.
+fn scroll_to_json(s: &ScrollData) -> Json {
+    json!({
+        "from_top": s.from_top,
+        "to_top": s.to_top,
+        "from_cursor": s.from_cursor,
+        "to_cursor": s.to_cursor,
+        "duration_ms": s.duration.as_millis() as u64,
+        "base_line": s.base_line,
+        "lines": s.lines,
+        "selection": opt_spans(&s.selection),
+        "highlights": highlights_to_json(&s.highlights),
+        "numbers": s.numbers.iter().map(|n| match n {
+            Some(n) => json!(n),
+            None => Json::Null,
+        }).collect::<Vec<_>>(),
     })
 }
 

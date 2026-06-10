@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use nxvim_core::view::{Separator, View, WindowView};
+use nxvim_core::view::{ScrollAnim, Separator, View, WindowView};
 use nxvim_core::{parse_keys, BorderStyle, Clipboard, Editor, MouseEvent};
 use nxvim_view::{encode_paste, notation as view_notation, Key as ViewKey};
 use serde_json::{json, Value};
@@ -349,6 +349,7 @@ fn window_to_json(w: &WindowView) -> Value {
         "secondary_selection": spans_rows(&w.secondary_selection),
         "search": spans_rows(&w.search),
         "incsearch": spans_opt(&w.incsearch),
+        "scroll": w.scroll.as_ref().map(scroll_to_json),
         "numbers": w.numbers.iter().map(|n| match n {
             Some(n) => json!(n),
             None => Value::Null,
@@ -366,6 +367,27 @@ fn window_to_json(w: &WindowView) -> Value {
 
 fn separator_to_json(s: &Separator) -> Value {
     json!({ "vertical": s.vertical, "x": s.x, "y": s.y, "length": s.length })
+}
+
+/// A focused window's scroll gesture: the slide's endpoints plus the self-contained
+/// band (`base_line` + aligned `lines`/`numbers`/`selection`) the JS interpolates
+/// over per frame. Mirrors [`ScrollAnim`]; the browser highlights band rows by their
+/// 1-based `numbers`, so no per-row syntax data is projected here.
+fn scroll_to_json(s: &ScrollAnim) -> Value {
+    json!({
+        "from_top": s.from_top,
+        "to_top": s.to_top,
+        "from_cursor": s.from_cursor,
+        "to_cursor": s.to_cursor,
+        "duration_ms": s.duration_ms,
+        "base_line": s.base_line,
+        "lines": s.lines,
+        "selection": spans_opt(&s.selection),
+        "numbers": s.numbers.iter().map(|n| match n {
+            Some(n) => json!(n),
+            None => Value::Null,
+        }).collect::<Vec<_>>(),
+    })
 }
 
 /// A per-row list of optional `[start, end]` spans (selection / incsearch): each

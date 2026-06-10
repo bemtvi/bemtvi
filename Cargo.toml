@@ -11,6 +11,7 @@ members = [
     "crates/nxvim-ts",
     "crates/nxvim-lsp",
     "crates/nxvim-view",
+    "crates/nxvim-regex",
     "crates/nxvim-test-harness",
     "crates/nxvim-web-bridge",
 ]
@@ -42,6 +43,7 @@ nxvim-gui = { path = "crates/nxvim-gui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
 nxvim-lsp = { path = "crates/nxvim-lsp" }
 nxvim-view = { path = "crates/nxvim-view" }
+nxvim-regex = { path = "crates/nxvim-regex" }
 # Test-only harness. Inherits `default-features = false` so the lua51/luajit
 # backend toggle can be threaded through the crate under test (same pattern as
 # nxvim-server above); each consumer re-enables a backend via its own features.
@@ -85,6 +87,10 @@ arboard = { version = "=3.6.1", default-features = false }
 # Build-dependency (Windows host only): embeds the app icon + version info into
 # the nxvim-gui.exe via the Windows SDK's rc.exe. See crates/nxvim-gui/build.rs.
 winresource = "=0.1.31"
+# Build-dependency of nxvim-regex: compiles the vendored vim/neovim regexp
+# engine (csrc/) into the crate. Plain C99; also builds for
+# wasm32-unknown-emscripten (the nxvim-web target).
+cc = "=1.2.63"
 tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
 # Cross-platform filesystem notification backing `vim.uv.fs_event` in the server's
 # event-loop actor. `macos_kqueue` selects the kqueue backend on macOS instead of

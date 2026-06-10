@@ -2333,6 +2333,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxvim-regex"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "nxvim-rpc"
 version = "0.1.0"
 dependencies = [

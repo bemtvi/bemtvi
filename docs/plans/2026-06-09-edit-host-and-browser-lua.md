@@ -15,8 +15,16 @@ editing state machine lives on the server. No amount of protocol tuning fixes
 one-round-trip-per-keystroke — it's where the boundary *is*.
 
 This plan moves the network boundary **below** the editing engine instead of
-above it — the same trick VS Code Remote uses (the Monaco editor is local; only
-the lag-tolerant work — fs, LSP, terminals — is remote):
+above it — the same direction VS Code Remote takes (the Monaco editor and its
+text model are local; fs, LSP, terminals are remote). One honest divergence from
+that precedent, owned rather than glossed: VS Code runs its *extension host* on
+the **remote**, while nxvim keeps the plugin runtime (Lua) **local** —
+deliberately, because nvim plugins are latency-sensitive UI (statusline per
+keystroke, which-key popups, telescope sorters) and running them remote would
+reintroduce the very lag this plan removes. The cost is that the Lua VM's
+*native* view of the filesystem is the local machine's — see the *Lua-visible
+filesystem semantics* bullet under Phase 3, the hardest semantic the full split
+must define:
 
 ```
 UI client (local) ──cheap──▶ EDIT HOST = core + Lua + treesitter (local) ──NETWORK──▶ DAEMON = fs + process + watch (remote)
@@ -295,11 +303,24 @@ binaries (`nxvim`, `nxvim-gui`) pass `host_fs: None` and are unchanged.
 **Still to do in Phase 3:** the daemon wire protocol + `nxvim --daemon`, the local
 edit-host as a `HostServices` client over ssh stdio, and the buffer-replica /
 `FileChangedShell` / remote-path / clipboard semantics. The remote `HostFs` impl is
-*not* a drop-in here: core's `HostFs` is **sync**, so a daemon-backed read can't
-block the single editor thread on the network — the open must become an async
-off-tick fetch that hands core populated bytes (the "buffers are local replicas"
-note below), with the sync trait reserved for local disk. The injection seam this
-slice built is the anchor that lands plugs into.
+*not* a drop-in here — core's `HostFs` is **sync** — and it had two candidate
+shapes: a **blocking bridge** (a sync impl that blocks the editor thread on a
+channel until the daemon replies — keeps the Phase-1 seam at every call site,
+and blocking on an explicit `:e`/`:w` is what vim itself does on slow storage)
+vs. the **off-tick fetch** (the server fetches async and hands core a populated
+buffer via `Editor::load_str`, the sync trait reserved for local disk — keeps
+the editor thread live, but re-plumbs each fs-touching call site individually).
+**Resolved (2026-06-10): Phase 3d chose the off-tick fetch** for buffer opens
+(the `HostFsAsync` seam); see Open Decision #5 for the trade and the residual
+blocking-bridge need on *sync* surfaces. Two corollaries that still stand
+regardless of shape: a blocking bridge, wherever one is later needed (sync
+`vim._system`, sync Lua fs calls), requires the daemon link's RPC tasks to live
+on their **own** thread/runtime, *not* the server's single-threaded one — a
+blocked editor thread would otherwise starve the very reader task carrying its
+reply (deadlock); and **don't stat-poll over the wire** — `disk_changed`
+checks against a remote should be driven by `HostWatch` pushes (or a short-TTL
+stat cache they invalidate), never a per-check network round-trip. The
+injection seam this slice built is the anchor the remote fs plugs into.
 
 ### Phase 3b — the `HostProc` seam (process spawning) — ✅ DONE (2026-06-10)
 
@@ -389,13 +410,24 @@ binaries incl. `editing` 536, `async_runtime`, `uv_process`, `host_proc`, `block
 tasks live on the test runtime while the server keeps its own thread, exactly the split
 the harness already makes for its client connection.
 
-**Still to do in the full split:** the remaining process consumers the original sketch
-reached for — `lsp/manager.rs` (long-lived bidirectional raw-pipe transport: needs the
-`write_stdin` + stdout-as-events shape, not run-to-completion) and `clipboard.rs` (a
-sync provider) — plus the `nxvim --daemon` binary and the local edit-host as a client
-over ssh stdio. This slice is the wire those plug into; the trait the wire satisfies
-(`HostProc`) and its routing are now proven end-to-end. (The `HostFs` half landed
-next — Phase 3d.)
+**Still to do in the full split:** `lsp/manager.rs` (long-lived bidirectional
+raw-pipe transport: needs the `write_stdin` + stdout-as-events shape, not
+run-to-completion); the **blocking spawn path `vim._system`**
+(`nxvim-lua/src/install.rs`) — a *fourth* spawn site the original three-site list
+missed, which must route to the daemon and block on the round-trip, because a
+`root_dir` shell-out like `cargo metadata` must run *where the project files are*
+(the blocking-bridge mechanism of Open Decision #5's residual note);
+`HostWatch` (the daemon side of `FsEventStart`, today local-only via `notify` —
+`serve_daemon` currently drops `LoopEvent::FsEvent` on the floor); the `nxvim
+--daemon` binary; and the local edit-host as a client over ssh stdio. (The
+`HostFs` half landed next — Phase 3d, via the async `HostFsAsync` seam.)
+**`clipboard.rs` is struck from this list** — slating it for daemon-folding
+contradicted the plan's own clipboard semantics bullet: with the edit-host
+local, `pbcopy`/`xclip` already run on the right machine, so routing them
+through the daemon would actively move the clipboard to the *wrong* host. (The
+browser needs a different clipboard seam entirely — `navigator.clipboard` via
+JS interop, not `HostProc`.) This slice is the wire the rest plug into; the
+trait the wire satisfies (`HostProc`) and its routing are now proven end-to-end.
 
 ### Phase 3d — the daemon wire protocol (filesystem half, initial open) — ✅ DONE (2026-06-10)
 
@@ -457,6 +489,24 @@ not block startup. Regression-clean — full `nxvim-server` suite (now 19 binari
 `FileChangedShell` from a daemon `watch`. The async seam + replica pattern this slice
 established is what those extend.
 
+**The save slice must define its semantics up front — write is the hard half of
+off-tick** (read got done first for a reason: it's idempotent and cancelable;
+write is neither). The contract for an async `:w`:
+
+- **Snapshot at command time.** `BufWritePre` runs first (it may mutate the
+  buffer), then the rope bytes are snapshotted and *those* bytes cross the wire —
+  edits made while the write is in flight can never tear into it.
+- **Ack-gated state.** The `modified` flag clears, the new `FileStat` is stamped
+  (so `disk_changed` doesn't false-positive on our own write), and
+  `BufWritePost` fires only when the daemon acks the atomic write — never
+  optimistically at send time.
+- **Quit waits for the ack.** `:wq` / `:x` / `ZZ` defer their quit effect until
+  the write acks; a failure or timeout cancels the quit and surfaces loudly. An
+  unflushed write must never be silently abandoned by an exiting editor.
+- **Per-buffer serialization.** Overlapping `:w`s on one buffer queue in order
+  (snapshot order = wire order); a failed earlier write fails the queue loudly
+  rather than letting a later snapshot paper over it.
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -493,23 +543,42 @@ trait HostProc {
 }
 ```
 
-— is what the **remaining two spawn sites** need and is best resolved against the
-actual wire: `lsp/manager.rs` (a language server *is* "spawn + pipe stdio" — no
-special LSP protocol needed, but it does need raw bidirectional pipe handles, i.e.
-the `write_stdin` + stdout-as-events shape, not run-to-completion) and
-`clipboard.rs` (today a *synchronous* `Clipboard` provider — either an async
-clipboard or a sync sub-seam). The in-process impl wraps today's `tokio::process`;
-the remote impl forwards to the daemon. **LSP needs no special protocol** — it
-collapses into `HostProc`.
+— is what the **remaining daemon-bound spawn sites** need and is best resolved
+against the actual wire: `lsp/manager.rs` (a language server *is* "spawn + pipe
+stdio" — no special LSP protocol needed, but it does need raw bidirectional pipe
+handles, i.e. the `write_stdin` + stdout-as-events shape, not run-to-completion)
+and the blocking `vim._system` (a sync request/response over the same wire, via
+the blocking-bridge mechanism — see the *Still to do* note under Phase 3c).
+`clipboard.rs` stays **local-by-topology** and is *not* daemon-routed (same
+note). The in-process impl wraps today's `tokio::process`; the remote impl
+forwards to the daemon. **LSP needs no special protocol** — it collapses into
+`HostProc`.
 
 **Cross-cutting semantics this phase must define:**
 
-- **Buffers are local replicas** (Monaco-style). Open = async-fetch bytes via
-  `HostFs` → populate the rope; save = push bytes back. The rope is authoritative
-  for open buffers; core sees a normal local buffer. (Lift the initial-file open
-  in `lib.rs` to *after* `set_host_fs`, per the Phase 3 note on
-  `Editor::open_or_named` — so the first buffer is fetched through the injected fs
-  too, not the default `StdHostFs`.)
+- **Buffers are local replicas** (Monaco-style). Open = off-tick fetch via the
+  async `HostFsAsync` seam (Open Decision #5, resolved) → populate the rope via
+  `Editor::load_str`; save = push bytes back. The rope is authoritative for open
+  buffers; core sees a normal local buffer. (Landed for the *initial* open in
+  Phase 3d; `:edit` / save / explorer listing are the remaining fs-leg slices.)
+- **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
+  (the thesis), but plugins read the *project* through it, and today the bridge
+  reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call
+  sites), `vim.fn.readfile` / `readdir` / `glob` / `filereadable` /
+  `executable` (`install.rs` / `host.rs` in `nxvim-lua`), and the blocking
+  `vim.fn.system`. The proposed split-brain rule: **vim-level fs/process APIs
+  route through the host seams** (`HostFsAsync` / the blocking bridge /
+  `HostProc` — Open Decision #5's residual note) — so telescope previewers, root
+  detection, and gitsigns see the *remote* project — while **raw Lua `io.*` /
+  `os.*` and `require`/`package.path` stay local**: plugins and config live on
+  the local machine (a feature — no remote plugin install needed), and their
+  caches/state files are local. This is exactly the consequence of diverging
+  from VS Code's remote-extension-host topology; it must be decided and
+  documented up front, not discovered plugin-by-plugin. Two corollaries: (1)
+  it's an implementation lift — `nxvim-lua` has no `HostFs` handle today and
+  needs one threaded in; (2) per-call round-trips amplify (a root detector
+  stats a dozen ancestors), so pair the routing with a short-TTL stat/exists
+  cache invalidated by `HostWatch`.
 - **`FileChangedShell`** — the daemon's `watch` reports a remote file changed
   under us; surface neovim's reload/conflict prompt.
 - **LSP buffer sync** — the server runs remotely (via `HostProc`); feed it
@@ -539,6 +608,13 @@ VM compiles; this compiles the *real* stack).
   `web-treesitter-highlighting`, `docs/architecture.md` → *The web build*), so no
   capability is lost — the redraw just omits server-side highlight spans and the
   JS layer paints them, as `nxvim-web` does today.
+- **Gate the process/fs escape hatches.** `nxvim-lua` reaches `std::process`
+  directly (the blocking `vim._system`) and `std::fs` directly (`uvfs.rs`,
+  `vim.fn.readfile`/`readdir`/`glob`): there are no subprocesses in a browser,
+  and the Worker's "local fs" is meaningless. Per *No silent stubs or skips*
+  these must **fail loud** on wasm (until Phase 6 routes them to the daemon /
+  OPFS) — not link against emscripten's stubs and quietly return junk. The
+  clipboard likewise: `navigator.clipboard` via JS interop, not a shell-out.
 - **Emscripten toolchain in the build.** The web build moves from
   `wasm32-unknown-unknown` (`crates/nxvim-web`, wasm-bindgen, `build.sh`) to
   `wasm32-unknown-emscripten`. Wire `EMCC_CFLAGS=-fwasm-exceptions` and the
@@ -575,6 +651,13 @@ integrates them).
   Asyncify. Plugins that opt into Phase 2's `vim.co_pcall` get yieldable blocking
   reads on top of this; unmodified global-`pcall` block-readers stay blocked (see
   *Known limitations*).
+- **Timers in the Worker.** Native `vim.defer_fn` / `vim.uv` timers ride
+  `evloop.rs` (tokio), which doesn't exist in the wasm edit-host — the plan
+  needs a Worker-side analog of `LoopEvent::Timer`. The SAB park *is* the event
+  loop: `Atomics.wait` takes a timeout, so set it to the next-due timer's
+  deadline and the same park that wakes on input doubles as the timer wheel —
+  one mechanism, no busy loop. (Statusline refresh à la lualine depends on
+  timers firing.)
 - **COOP/COEP serving.** `SharedArrayBuffer` needs cross-origin isolation
   (`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
   require-corp`). Add to the dev server + ship docs.
@@ -606,7 +689,12 @@ the Phase 3 daemon.
   queued behind it. QUIC's independent streams remove that coupling at the protocol
   level. The Rust daemon uses `wtransport` (on `quinn`); WebTransport mandates TLS
   even on localhost, so dev uses a self-signed cert (`wtransport`'s generator) with
-  its hash passed to the browser `WebTransport` constructor.
+  its hash passed to the browser `WebTransport` constructor. **The cert buys
+  encryption, not authorization** — a daemon executes arbitrary processes, so an
+  unauthenticated listener is remote code execution by design. Ship auth from day
+  one: a bearer token minted at daemon launch and presented on connect (or mTLS).
+  The same requirement applies to Open Decision #2's native QUIC listener; only
+  the ssh-stdio path inherits its auth (from ssh) for free.
 - **The serverless path:** `HostFs` backed by OPFS / the File System Access API;
   in-memory rope authoritative. `HostProc` has no processes — per
   `No silent stubs or skips`, `system()`/`jobstart` must **fail loud**, not fake
@@ -679,12 +767,14 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
 
 ## Open decisions (resolve before the phase that needs them)
 
-1. **`HostServices` granularity** (Phase 1): one combined trait vs. split
-   `HostFs`/`HostProc`/`HostWatch`. Leaning split — smaller daemon surface, easier
-   to stub the serverless `HostProc`, **and** the prerequisite for per-class stream
-   multiplexing (distinct traits → distinct logical channels → distinct transport
-   streams, so a `HostProc` flood can't HOL-block an `HostFs` save; see *Transport &
-   stream multiplexing* under Phase 6).
+1. **`HostServices` granularity** — **RESOLVED (2026-06-10): split, by the shipped
+   code.** `HostFs` lives in core (sync, Phase 1) and `HostProc` in the server
+   (async + event-routed, Phase 3b) — separate traits, separate homes, and the
+   daemon wire (3c) is per-class; `HostWatch` follows the same pattern. The split
+   is also the prerequisite for per-class stream multiplexing (distinct traits →
+   distinct logical channels → distinct transport streams, so a `HostProc` flood
+   can't HOL-block an `HostFs` save; see *Transport & stream multiplexing* under
+   Phase 6).
 2. **Daemon discovery/launch** (Phase 3): `ssh … nxvim --daemon` mirrors today's
    `--server`; do we also want a standalone `--daemon --listen` for non-ssh? (The
    remote-ssh plan deferred generic TCP; same call here.) This is also the only
@@ -700,4 +790,27 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
 4. **Redraw transport in the browser** (Phase 5): pull (redraw = return value of
    the input call) vs. push (`EM_JS` notification). Pull is simpler and matches
    the single-threaded Worker; push matches the existing notification model.
+5. **Remote `HostFs` shape** — **RESOLVED (2026-06-10): off-tick fetch, by Phase
+   3d; affirmed on review.** Buffer opens go through the async `HostFsAsync`
+   seam (server-side, request/response, `Editor::load_str` replica) — the editor
+   thread never blocks on the network; the sync `HostFs` stays reserved for
+   local disk. The blocking-bridge alternative was rejected for buffer I/O
+   because a sync call parks the server thread — the thread that processes
+   input *and emits redraws* — so a slow remote `:e` would be a frozen screen
+   with queued keystrokes (not even a spinner is paintable), on the most common
+   operation in a remote session: exactly the failure mode this plan exists to
+   eliminate. The bridge survives only where semantics force it (the sync
+   surfaces in the residual note below). The
+   accepted cost: each remaining fs-touching call site (`:edit`/`:read`, save,
+   explorer `read_dir` — Phase 3d's *Still to do on the fs leg*) is re-plumbed
+   onto the async seam individually rather than swapped behind the Phase-1
+   trait. **Residual:** the *synchronous* surfaces — blocking `vim._system`,
+   and any Lua-visible sync fs calls routed remote (`vim.uv.fs_stat`,
+   `vim.fn.filereadable`, …) — cannot use an off-tick shape (the caller needs
+   the value *now*) and will still need the **blocking bridge**: a request over
+   a channel to the daemon link, editor thread parked until the reply, with the
+   link's RPC tasks on their **own** thread/runtime so the parked thread can't
+   starve the reader carrying its reply (the deadlock trap — see *Still to do
+   in Phase 3* under Phase 3a), plus the short-TTL stat/exists cache to damp
+   per-call round-trips.
 ```

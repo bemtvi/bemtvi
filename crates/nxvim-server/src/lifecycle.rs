@@ -3,10 +3,12 @@
 
 use crate::evloop::LoopCommand;
 use crate::filetype_of;
-use crate::FsRead;
+use crate::{FsRead, WatchEvent};
 use crate::{Server, WindowRect, INTERNAL_WATCH_BASE};
-use nxvim_core::{BufferId, DirEntry, FileStat, TabId, WindowId};
-use std::collections::HashMap;
+use nxvim_core::{
+    BufferId, DirEntry, FileChangeAction, FileChangeReason, FileStat, TabId, WindowId,
+};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -34,10 +36,18 @@ impl Server {
             // (Phase 3g). The daemon's canonical `dir` path supersedes the requested one
             // (`:e somedir` resolves to its absolute form), so the listing names and
             // navigates from it.
-            Ok(FsRead::Dir { path: dir, entries }) => self.load_dir_replica(buffer, dir, entries),
-            Err(e) => self
-                .editor
-                .echo(format!("nxvim: could not open {path} over the daemon: {e}")),
+            Ok(FsRead::Dir { path: dir, entries }) => {
+                // A reload can't resolve to a directory; drop a stale post marker.
+                self.reload_posts.remove(&buffer);
+                self.load_dir_replica(buffer, dir, entries)
+            }
+            Err(e) => {
+                // The off-tick re-fetch failed — surface it loudly; no reload happened,
+                // so no FileChangedShellPost (the buffer is untouched).
+                self.reload_posts.remove(&buffer);
+                self.editor
+                    .echo(format!("nxvim: could not open {path} over the daemon: {e}"))
+            }
         }
     }
 
@@ -56,6 +66,12 @@ impl Server {
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
         self.emit_lifecycle_events();
+        // A remote watch reload (the `HostWatch` leg) deferred its `FileChangedShellPost`
+        // to this landing point — fire it now, before `run_pending`, so a handler's
+        // queued work drains in the same convergence.
+        if self.reload_posts.remove(&buffer) {
+            self.fire_file_changed_post(buffer);
+        }
         self.run_pending();
     }
 
@@ -281,10 +297,38 @@ impl Server {
     /// ([`LoopCommand::FsEventStop`]). When the watch fires, the [`LoopEvent::FsEvent`]
     /// arm routes it to `editor.checktime_buffer` (see [`INTERNAL_WATCH_BASE`]), which
     /// autoreloads or warns. Declarative (driven off the current buffer set each tick)
-    /// rather than hooked into every open/close/rename site. A daemon session arms
-    /// nothing — remote watching is the `HostWatch` slice.
+    /// rather than hooked into every open/close/rename site. A **daemon** session arms
+    /// the watches on the *daemon* instead (the `HostWatch` leg — see below), since the
+    /// edit-host can't watch a remote file with a local `notify`.
     pub(crate) fn sync_buffer_watches(&mut self) {
-        if self.host_fs_async.is_some() {
+        if let Some(fs) = self.host_fs_async.clone() {
+            // The remote watch leg: one watch per file-backed buffer path, armed on the
+            // daemon (`HostFsAsync::watch`). The daemon owns change detection and pushes
+            // `fs_changed`, so this tracks only paths — no stat snapshot, no re-arm on a
+            // reload (the daemon re-baselines its own view). A `fs_changed` push lands on
+            // the `watch_rx` arm and reconciles via `on_remote_file_changed`.
+            let want: HashSet<String> = self
+                .editor
+                .buffer_ids()
+                .into_iter()
+                .filter_map(|id| self.editor.buffer_watch_key(id))
+                .map(|(path, _)| path.to_string_lossy().into_owned())
+                .collect();
+            for path in &want {
+                if self.remote_watches.insert(path.clone()) {
+                    fs.watch(path.clone());
+                }
+            }
+            let stale: Vec<String> = self
+                .remote_watches
+                .iter()
+                .filter(|p| !want.contains(*p))
+                .cloned()
+                .collect();
+            for path in stale {
+                self.remote_watches.remove(&path);
+                fs.unwatch(path);
+            }
             return;
         }
         // Desired: one watch per file-backed buffer, keyed on (path, disk snapshot).
@@ -389,6 +433,151 @@ impl Server {
                 .echo(format!("E5108: Error in {event} autocmd: {e}"));
         }
         self.apply_lua_effects();
+    }
+
+    /// Reconcile one file-backed buffer against its disk state — the server half of
+    /// `:checktime` and the per-buffer file watch, owning the `FileChangedShell`
+    /// round-trip the pure core can't drive. Core's [`Editor::begin_file_change`]
+    /// detects the change and applies the no-autocmd part (a silent autoread reload of
+    /// an unmodified buffer); this fires `FileChangedShell` for everything else, honors
+    /// the `v:fcs_choice` the handler set, and fires `FileChangedShellPost` after a
+    /// handled change — the structure of neovim's `buf_check_timestamp`:
+    ///
+    /// - **no handler** → the default warning (E211/W12/W11) via
+    ///   [`Editor::warn_file_change`], then `FileChangedShellPost`.
+    /// - **handler, `v:fcs_choice = "reload"`/`"edit"`** → [`Editor::reload_buffer`]
+    ///   (`"reload"` is refused for a deleted file, as in neovim), then the post event.
+    /// - **handler, `"ask"`** → fall through to the default warning, then the post event.
+    /// - **handler, choice left empty** → the handler took over: nothing further, and
+    ///   (matching neovim's early `return 2`) **no** `FileChangedShellPost`.
+    pub(crate) fn reconcile_file_change(&mut self, buf: BufferId) {
+        match self.editor.begin_file_change(buf) {
+            FileChangeAction::None => {}
+            FileChangeAction::Reloaded => self.fire_file_changed_post(buf),
+            FileChangeAction::Autocmd(reason) => {
+                let Some(file) = self.editor.buffer_name(buf) else {
+                    return;
+                };
+                // A `FileChangedShell` handler commonly reads buffer state and `vim.v`;
+                // refresh the mirror so it sees the live buffer before the round-trip.
+                self.push_buf_mirror();
+                let fired = match self.lua.fire_file_changed(reason.as_str(), buf.0, &file) {
+                    Ok(fired) => fired,
+                    Err(e) => {
+                        self.editor
+                            .echo(format!("E5108: Error in FileChangedShell autocmd: {e}"));
+                        false
+                    }
+                };
+                self.apply_lua_effects();
+                // A handler that left `v:fcs_choice` empty is the one case neovim fires
+                // no `FileChangedShellPost` for (it `return 2`s); every other path warns
+                // or reloads and then fires the post event.
+                let mut fire_post = true;
+                if fired {
+                    let choice = self.lua.fcs_choice().unwrap_or_default();
+                    match choice.as_str() {
+                        "reload" if reason != FileChangeReason::Deleted => {
+                            self.editor.reload_buffer(buf)
+                        }
+                        "edit" => self.editor.reload_buffer(buf),
+                        "ask" => self.editor.warn_file_change(buf, reason),
+                        _ => fire_post = false,
+                    }
+                } else {
+                    self.editor.warn_file_change(buf, reason);
+                }
+                if fire_post {
+                    self.fire_file_changed_post(buf);
+                }
+            }
+        }
+    }
+
+    /// Fire `FileChangedShellPost` for `buf` after a file change was handled — even
+    /// when nothing reloaded (a warning-only change still fires it, as neovim does).
+    /// A cheap no-op when no handler is registered; skipped if the buffer is gone.
+    fn fire_file_changed_post(&mut self, buf: BufferId) {
+        let Some(file) = self.editor.buffer_name(buf) else {
+            return;
+        };
+        self.push_buf_mirror();
+        if let Err(e) = self
+            .lua
+            .fire_autocmd_buf("FileChangedShellPost", &file, buf.0, &file)
+        {
+            self.editor
+                .echo(format!("E5108: Error in FileChangedShellPost autocmd: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Reconcile a daemon-pushed file change (the `HostWatch` leg's `fs_changed`) — the
+    /// remote analogue of [`Server::reconcile_file_change`]. The daemon owns change
+    /// detection and self-suppresses the edit-host's own writes, so a push always means
+    /// a real external change; the reason follows from the pushed stat (vanished ⇒
+    /// `"deleted"`) and the buffer's modified flag (unsaved ⇒ `"conflict"`). The
+    /// `FileChangedShell` round-trip is identical to the local path, but a reload can't
+    /// be synchronous (it crosses the wire), so it goes off-tick via [`Self::remote_reload`]
+    /// and the `FileChangedShellPost` fires when the re-fetch lands.
+    pub(crate) fn on_remote_file_changed(&mut self, ev: WatchEvent) {
+        let WatchEvent { path, stat } = ev;
+        let Some(buf) = self.editor.find_buffer_by_path(Path::new(&path)) else {
+            return; // the buffer was closed since the watch was armed
+        };
+        let reason = if stat.is_none() {
+            FileChangeReason::Deleted
+        } else if self.editor.buffer_modified(buf) {
+            FileChangeReason::Conflict
+        } else {
+            FileChangeReason::Changed
+        };
+        // 'autoread', unmodified, still-present file → silent reload (no FileChangedShell),
+        // then FileChangedShellPost once the re-fetch lands — the same pre-autocmd branch
+        // as the local path, just off-tick.
+        if reason == FileChangeReason::Changed && self.editor.autoread() {
+            self.remote_reload(buf);
+            return;
+        }
+        // A FileChangedShell handler may read buffer state and `vim.v`.
+        self.push_buf_mirror();
+        let fired = match self.lua.fire_file_changed(reason.as_str(), buf.0, &path) {
+            Ok(fired) => fired,
+            Err(e) => {
+                self.editor
+                    .echo(format!("E5108: Error in FileChangedShell autocmd: {e}"));
+                false
+            }
+        };
+        self.apply_lua_effects();
+        let mut do_reload = false;
+        let mut fire_post = true;
+        if fired {
+            let choice = self.lua.fcs_choice().unwrap_or_default();
+            match choice.as_str() {
+                "reload" if reason != FileChangeReason::Deleted => do_reload = true,
+                "edit" => do_reload = true,
+                "ask" => self.editor.warn_file_change(buf, reason),
+                _ => fire_post = false,
+            }
+        } else {
+            self.editor.warn_file_change(buf, reason);
+        }
+        if do_reload {
+            // The deferred FileChangedShellPost fires when the off-tick re-fetch lands.
+            self.remote_reload(buf);
+        } else if fire_post {
+            self.fire_file_changed_post(buf);
+        }
+    }
+
+    /// Drive an off-tick reload of `buf` over the daemon wire: enqueue a re-fetch of its
+    /// own file and mark it for a `FileChangedShellPost` once the bytes land in
+    /// [`Server::apply_open`]. A no-op for a buffer with no path (nothing to re-fetch).
+    fn remote_reload(&mut self, buf: BufferId) {
+        if self.editor.enqueue_reload(buf) {
+            self.reload_posts.insert(buf);
+        }
     }
 
     /// Source a startup Lua file (the user's `init.lua`). Missing files are

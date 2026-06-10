@@ -56,7 +56,7 @@ pub(crate) use self::command::{
 };
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
-pub use self::buffers::{PendingOpen, PendingSave};
+pub use self::buffers::{FileChangeAction, FileChangeReason, PendingOpen, PendingSave};
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
@@ -730,6 +730,13 @@ pub struct Editor {
     /// already-created (empty) buffer the server fills once the fetch lands. Always
     /// empty when off-tick mode is off.
     pending_opens: Vec<PendingOpen>,
+    /// File-backed buffers awaiting a `:checktime` reconcile this tick, drained by the
+    /// server with [`Editor::take_pending_checktime`]. The reconcile fires the
+    /// `FileChangedShell` autocmd (a Lua round-trip the pure core can't drive itself)
+    /// and honors `v:fcs_choice`, so the *decision* is deferred to the server even
+    /// though detection / reload live in core. Both `:checktime` and the per-buffer
+    /// file watch ([`Editor::checktime_buffer`]) enqueue here.
+    pending_checktime: Vec<BufferId>,
 }
 
 impl Editor {
@@ -895,6 +902,7 @@ impl Editor {
             pending_saves: Vec::new(),
             next_save_seq: 0,
             pending_opens: Vec::new(),
+            pending_checktime: Vec::new(),
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

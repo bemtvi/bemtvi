@@ -46,7 +46,7 @@ pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
 pub use daemon::{
-    serve_daemon, serve_fs_daemon, FsRead, HostFsAsync, RemoteHostFs, RemoteHostProc,
+    serve_daemon, serve_fs_daemon, FsRead, HostFsAsync, RemoteHostFs, RemoteHostProc, WatchEvent,
 };
 
 use evloop::EventLoop;
@@ -394,8 +394,20 @@ struct Server {
     /// replaces. Each watch's loop id is [`INTERNAL_WATCH_BASE`]` + buffer.0`, which
     /// the [`LoopEvent::FsEvent`] arm uses to route a change back to `checktime` for
     /// that buffer (vs. running a Lua `vim.uv.fs_event` callback). Local sessions
-    /// only — the remote `HostWatch` push is a later slice.
+    /// only — a daemon session uses [`Server::remote_watches`] instead.
     buf_watches: HashMap<BufferId, (PathBuf, Option<FileStat>)>,
+    /// The paths watched on the **daemon** (`HostWatch` leg) in a daemon session — the
+    /// remote analogue of [`Server::buf_watches`]. [`Server::sync_buffer_watches`] arms a
+    /// watch (`HostFsAsync::watch`) for each file-backed buffer's path and disarms a
+    /// closed one; a `fs_changed` push for one reconciles off-tick. Empty in a local
+    /// session (it arms `buf_watches` instead). The daemon owns change detection, so this
+    /// holds only paths — no stat snapshot (unlike `buf_watches`).
+    remote_watches: HashSet<String>,
+    /// Buffers whose off-tick reload (the remote watch leg) is in flight, awaiting a
+    /// `FileChangedShellPost` once the re-fetch lands in [`Server::apply_open`]. The
+    /// remote reload can't be synchronous (it crosses the wire), so the post event is
+    /// deferred to the fetch's completion rather than fired inline like the local path.
+    reload_posts: HashSet<BufferId>,
 }
 
 /// Base for the loop ids of the server's **internal** per-buffer file watches, set
@@ -538,6 +550,23 @@ where
     // spawned task; the finished write comes back here and finalizes on the one
     // server thread. Idle for a local/bare session (no daemon fs → no off-tick saves).
     let (save_done_tx, mut save_done_rx) = unbounded_channel::<save::SaveDone>();
+    // The `HostWatch` leg: the daemon pushes `fs_changed`, the [`RemoteHostFs`] demux
+    // forwards each into this channel, and the `watch_rx` `select!` arm reconciles it
+    // off the editor tick. Created unconditionally (idle for a local/bare session) so
+    // the arm is always valid; `watch_tx` stays bound here for the whole loop, keeping
+    // the channel open (so a daemon push that arrives before any local change can't
+    // close it). A daemon session spawns a forwarder from the fs's own receiver.
+    let (watch_tx, mut watch_rx) = unbounded_channel::<WatchEvent>();
+    if let Some(mut rx) = host_fs_async.as_ref().and_then(|fs| fs.take_watch_events()) {
+        let watch_tx = watch_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if watch_tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let mut server = Server {
         editor,
@@ -589,6 +618,8 @@ where
         saves_queued: HashMap::new(),
         open_tx,
         buf_watches: HashMap::new(),
+        remote_watches: HashSet::new(),
+        reload_posts: HashSet::new(),
     };
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
@@ -758,6 +789,16 @@ where
                     server.rpc.notify("nxvim_exit", vec![]);
                     break;
                 }
+            }
+            // The daemon's watch leg pushed a file change (`HostWatch`): reconcile it
+            // off the editor tick — the remote analogue of the local per-buffer watch's
+            // `FsEvent` arm. Idle for a local/bare session (nothing ever sends here).
+            Some(ev) = watch_rx.recv() => {
+                server.on_remote_file_changed(ev);
+                while let Ok(ev) = watch_rx.try_recv() {
+                    server.on_remote_file_changed(ev);
+                }
+                server.settle_events(true);
             }
         }
     }

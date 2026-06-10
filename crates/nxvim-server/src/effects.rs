@@ -1139,18 +1139,19 @@ impl Server {
             LoopEvent::FsEvent { id, error, .. } if id >= crate::INTERNAL_WATCH_BASE => {
                 // An *internal* per-buffer file watch (not a Lua `vim.uv.fs_event`):
                 // the watch leg's auto-trigger. The file under buffer `id - BASE`
-                // changed, so reconcile it (autoreload / W11 / W12 / E211) exactly as
-                // `:checktime` would, then re-arm — a reload re-stamps the disk
-                // snapshot, so the watch key changed and `sync_buffer_watches` must
-                // re-point it at the (possibly new) inode. `error` (the watch failed
-                // to arm) just drops the watch state so a later tick re-arms.
+                // changed, so enqueue its reconcile — the trailing `settle_events`
+                // → `run_pending` fires the `FileChangedShell` round-trip (autoreload
+                // / a handler's `v:fcs_choice` / W11 / W12 / E211) and re-arms the
+                // watch after any reload (a reload re-stamps the disk snapshot, so the
+                // watch key changed). `error` (the watch failed to arm) just drops the
+                // watch state so a later tick re-arms.
                 let buf = BufferId(id - crate::INTERNAL_WATCH_BASE);
                 if error.is_some() {
                     self.buf_watches.remove(&buf);
+                    self.sync_buffer_watches();
                 } else {
                     self.editor.checktime_buffer(buf);
                 }
-                self.sync_buffer_watches();
             }
             LoopEvent::FsEvent {
                 id,
@@ -1215,7 +1216,20 @@ impl Server {
         // consistent via the `nvim_buf_set_lines` write-through, so once-at-entry is
         // enough (Phase 6).
         self.push_buf_mirror();
+        // Whether any `:checktime` / watch reconcile reloaded a buffer this drain —
+        // a reload re-stamps the disk snapshot (a new inode after an atomic replace),
+        // so the per-buffer watch must re-arm against the new key once we settle.
+        let mut reconciled = false;
         loop {
+            // File-change reconciles core deferred (`:checktime`, or the per-buffer
+            // file watch): fire the `FileChangedShell` round-trip and apply the
+            // choice. Inside the fixpoint so a handler's queued `vim.cmd`/`:lua`
+            // drains in the same convergence (and a handler that re-runs `:checktime`
+            // keeps draining via the break check below).
+            for buf in self.editor.take_pending_checktime() {
+                reconciled = true;
+                self.reconcile_file_change(buf);
+            }
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 // `exec_pumped` (not `exec`) so a `vim.fn.input` / `vim.fn.confirm`
                 // in a `:lua` chunk can block on the command line and resume with
@@ -1286,6 +1300,7 @@ impl Server {
                 && self.editor.panel_selects.is_empty()
                 && self.editor.prompt_results.is_empty()
                 && self.scheduled.is_empty()
+                && !self.editor.has_pending_checktime()
             {
                 break;
             }
@@ -1297,6 +1312,7 @@ impl Server {
                 self.editor.deferred_commands.clear();
                 self.editor.panel_selects.clear();
                 self.editor.prompt_results.clear();
+                self.editor.take_pending_checktime();
                 self.scheduled.clear();
                 self.editor
                     .echo("E132: command recursion limit exceeded".to_string());
@@ -1309,6 +1325,12 @@ impl Server {
         // batch boundary, after everything has settled. Idempotent: a no-op when
         // nothing changed since the last per-key diff (the common case).
         self.emit_lifecycle_events();
+        // A reconcile that reloaded a buffer changed its `(path, disk-stat)` watch key
+        // (a fresh inode after an atomic replace); re-arm the per-buffer watch so it
+        // follows the file. Idempotent — `sync_buffer_watches` no-ops when keys match.
+        if reconciled {
+            self.sync_buffer_watches();
+        }
         // Route any buffer I/O core deferred this convergence onto the daemon wire
         // (off-tick mode): writes (`:w`) and opens (`:edit`). No-ops when off-tick mode
         // is off or none ran.

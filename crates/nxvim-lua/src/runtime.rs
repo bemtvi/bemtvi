@@ -1205,6 +1205,27 @@ impl LuaRuntime {
         fire.call((event, pattern, buf, file, data))
     }
 
+    /// Fire `FileChangedShell` for a buffer whose file changed on disk, setting
+    /// `v:fcs_reason` to `reason` and resetting `v:fcs_choice` to `""` first (neovim's
+    /// `buf_check_timestamp` contract). Returns whether any handler ran — `true` means
+    /// the server reads [`Self::fcs_choice`] to learn how the handler redirected the
+    /// reconcile; `false` means there was no handler and the server applies the default
+    /// warning / autoreload. `buf`/`file` give the buffer context a buffer-local
+    /// `FileChangedShell` autocmd matches against.
+    pub fn fire_file_changed(&self, reason: &str, buf: u64, file: &str) -> mlua::Result<bool> {
+        let f: mlua::Function = self.vim()?.get("_fire_file_changed")?;
+        f.call((reason, buf, file))
+    }
+
+    /// Read the `v:fcs_choice` a `FileChangedShell` handler set (`""` when none did) —
+    /// the reply half of [`Self::fire_file_changed`]. `"reload"` / `"edit"` reload the
+    /// buffer, `"ask"` falls through to the default warning, anything else (incl. `""`)
+    /// means the handler took over and the reconcile does nothing further.
+    pub fn fcs_choice(&self) -> mlua::Result<String> {
+        let f: mlua::Function = self.vim()?.get("_fcs_choice")?;
+        f.call(())
+    }
+
     /// Run a `:au[tocmd][!]` ex-command through the prelude driver
     /// (`vim._ex_autocmd`), which parses the Vimscript argument line and drives
     /// the same `vim._autocmds` store the `nvim_create_autocmd` API uses. `bang`

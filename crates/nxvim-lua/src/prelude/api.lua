@@ -318,7 +318,11 @@ end
 -- An autocmd registered with `opts.once` (`:autocmd … ++once`) fires once and is
 -- then dropped — collected during the pass and removed after it, so the live
 -- iteration isn't mutated underneath `ipairs`.
+-- Returns whether any autocmd actually ran — the `apply_autocmds()` boolean
+-- neovim's `buf_check_timestamp` branches on (an autocmd ran → honor v:fcs_choice;
+-- none → default warning). Callers that ignore the return value are unaffected.
 function vim._fire(event, pattern, buf, file, data)
+  local any = false
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
   for _, au in ipairs(vim._autocmds) do
     local ev = au.event
@@ -341,8 +345,10 @@ function vim._fire(event, pattern, buf, file, data)
             file = file or pattern,
             data = data,
           })
+          any = true
         elseif type(au.opts.command) == "string" then
           vim.cmd(au.opts.command)
+          any = true
         end
         if au.opts.once then
           fired = fired or {}
@@ -354,7 +360,25 @@ function vim._fire(event, pattern, buf, file, data)
   if fired then
     vim._autocmds = vim.tbl_filter(function(au) return not fired[au.id] end, vim._autocmds)
   end
+  return any
 end
+
+-- The `FileChangedShell` round-trip the server's file-change reconcile drives
+-- (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → the watch leg). Set
+-- `v:fcs_reason` to `reason` and reset `v:fcs_choice` to "" (neovim's defaults
+-- before the autocmd), fire `FileChangedShell` for `buf`/`file`, and return whether
+-- any handler ran. A handler reads `vim.v.fcs_reason` and may set `vim.v.fcs_choice`
+-- to "reload"/"edit"/"ask" to redirect the reconcile; the server reads it back via
+-- `vim._fcs_choice`.
+function vim._fire_file_changed(reason, buf, file)
+  vim._v_mirror.fcs_reason = reason
+  vim._v_mirror.fcs_choice = ""
+  return vim._fire("FileChangedShell", file, buf, file)
+end
+
+-- Read the `v:fcs_choice` a `FileChangedShell` handler set (or "" if none did) —
+-- the second half of the round-trip above.
+function vim._fcs_choice() return vim._v_mirror.fcs_choice or "" end
 
 -- nvim_exec_autocmds(event, opts): fire `event` (or a list of events) manually.
 -- `opts.pattern` (string or list) is matched as in registration; `opts.buffer`

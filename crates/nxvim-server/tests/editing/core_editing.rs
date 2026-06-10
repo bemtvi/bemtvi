@@ -481,6 +481,155 @@ async fn an_external_change_autoreloads_via_the_buffer_watch() {
     std::fs::remove_file(&path).ok();
 }
 
+// --- `FileChangedShell` / `v:fcs_reason` / `v:fcs_choice` ----------------------
+//
+// When a changed file is *not* silently autoreloaded, the reconcile fires the
+// `FileChangedShell` autocmd with `v:fcs_reason` set ("deleted"/"conflict"/"changed")
+// and reads back the `v:fcs_choice` the handler set: "reload"/"edit" reloads (even a
+// conflict), "ask" falls through to the W11/W12/E211 warning, and an empty choice
+// means the handler took over (no warning, no reload). `FileChangedShellPost` fires
+// after a handled change. (Mirrors neovim's `buf_check_timestamp`.)
+
+#[tokio::test]
+async fn file_changed_shell_reloads_a_conflict_via_fcs_choice() {
+    let path = temp_path("fcs-reload");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    // A handler that records `v:fcs_reason` and redirects the reconcile to a reload —
+    // even though the buffer has unsaved edits (a conflict vim would otherwise refuse
+    // to clobber with W12). Registered before the external change so it's in place
+    // whether the watch or `:checktime` fires first.
+    exec_lua(
+        &rpc,
+        r#"
+        vim.g.fcs_reason = ""
+        vim.api.nvim_create_autocmd("FileChangedShell", {
+          callback = function()
+            vim.g.fcs_reason = vim.v.fcs_reason
+            vim.v.fcs_choice = "reload"
+          end,
+        })
+        "#,
+    )
+    .await;
+
+    // Our own unsaved edit — round-trip so it's modified server-side before the write.
+    feed(&rpc, "Gomine<Esc>");
+    assert!(lines(&rpc).await.contains(&"mine".to_string()));
+    std::fs::write(&path, "fresh\n").unwrap();
+
+    // `:checktime` fires `FileChangedShell`; the handler's "reload" choice overrides
+    // the W12 default and reloads despite the in-buffer edit. (Poll: the always-on
+    // watch may drive the same reconcile.)
+    feed(&rpc, ":checktime<CR>");
+    let mut got = vec![];
+    for _ in 0..100 {
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        got = lines(&rpc).await;
+        if got == vec!["fresh"] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        got,
+        vec!["fresh"],
+        "a 'reload' v:fcs_choice must reload despite the conflict"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.fcs_reason").await.as_str(),
+        Some("conflict"),
+        "the handler must see v:fcs_reason = 'conflict' for a modified buffer"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn file_changed_shell_handler_suppresses_the_default_warning() {
+    let path = temp_path("fcs-handled");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    // 'noautoread' so a change would normally warn W11; a handler that records the
+    // reason but leaves `v:fcs_choice` empty "takes over" — neovim then shows no
+    // warning and reloads nothing.
+    feed(&rpc, ":set noautoread<CR>");
+    exec_lua(
+        &rpc,
+        r#"
+        vim.g.fcs_reason = ""
+        vim.api.nvim_create_autocmd("FileChangedShell", {
+          callback = function() vim.g.fcs_reason = vim.v.fcs_reason end,
+        })
+        "#,
+    )
+    .await;
+    // Round-trip the option + autocmd before the external write.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.autoread").await.as_bool(),
+        Some(false)
+    );
+    std::fs::write(&path, "REPLACED\n").unwrap();
+
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":checktime<CR>").await);
+    assert!(
+        !msg.contains("W11"),
+        "a handler that takes over (empty v:fcs_choice) must suppress the W11 warning, got: {msg:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.fcs_reason").await.as_str(),
+        Some("changed"),
+        "the handler must have run and seen v:fcs_reason = 'changed'"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two"],
+        "no reload when the handler leaves the choice empty"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn file_changed_shell_post_fires_after_an_autoread_reload() {
+    let path = temp_path("fcs-post");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        vim.g.fcs_post = false
+        vim.api.nvim_create_autocmd("FileChangedShellPost", {
+          callback = function() vim.g.fcs_post = true end,
+        })
+        "#,
+    )
+    .await;
+
+    // 'autoread' is on by default → the change reloads silently (no FileChangedShell),
+    // but FileChangedShellPost must still fire afterward.
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    feed(&rpc, ":checktime<CR>");
+    let mut posted = Some(false);
+    for _ in 0..100 {
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        if lines(&rpc).await == vec!["one", "two", "three"] {
+            posted = exec_lua(&rpc, "return vim.g.fcs_post").await.as_bool();
+            if posted == Some(true) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        posted,
+        Some(true),
+        "FileChangedShellPost must fire after an autoread reload"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 #[tokio::test]
 async fn lua_vim_cmd_drives_the_editor() {
     // A Lua chunk that opens a file should change what the buffer shows.

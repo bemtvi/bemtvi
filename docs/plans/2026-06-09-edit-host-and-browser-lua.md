@@ -580,17 +580,68 @@ The product behavior is correct in every case; these are test-ordering fixes.
 
 **Deferred to the next watch-leg slices (deliberately, not stubbed):**
 - **The `FileChangedShell`/`FileChangedShellPost` autocmds + `v:fcs_reason`/`v:fcs_choice`.**
-  Honoring the choice contract (a handler sets `v:fcs_choice` to redirect reload/ask/edit)
-  needs core to *defer* the decision to the server, fire the autocmd, read the choice, and
-  call back — a synchronous Lua round-trip mid-tick the current one-way `emit_lifecycle_events`
-  doesn't do. Firing the event while silently ignoring its documented contract would make
-  broken look working (a `:checktime`-driven auto-reload plugin would observe the event but
-  its choice would be a no-op), so it's intentionally *not* fired yet.
-- **The remote `HostWatch` push wire** — the daemon-side `notify` watcher (`serve_daemon`
-  currently drops `LoopEvent::FsEvent`) forwarding change events the server turns into a
-  `checktime`. `checktime` fails loud in a daemon session today (it can't stat off-tick).
+  ✅ DONE — Phase 3k below.
+- **The remote `HostWatch` push wire.** ✅ DONE — Phase 3l below.
 - **Cursor preservation across reload** is line/col-clamped, not view-stable (vim keeps the
-  exact screen position); acceptable and consistent with `:e!`.
+  exact screen position); acceptable and consistent with `:e!`. (Still deferred.)
+
+### Phase 3k — the `FileChangedShell` round-trip + `v:fcs_choice` — ✅ DONE (2026-06-10)
+
+Honoring the choice contract needs core to *defer* the decision to the server (the
+synchronous Lua round-trip the pure core can't drive), so the reconcile moved one layer up
+while detection/reload stayed in core — mirroring neovim's `buf_check_timestamp`:
+
+- **Core defers, doesn't decide.** `:checktime` / `checktime_buffer` now enqueue a
+  `pending_checktime` queue (the watch-leg analogue of `pending_saves`/`pending_opens`)
+  instead of reconciling inline. `Editor::begin_file_change(id)` does detection plus the
+  one part needing no autocmd — the silent `'autoread'` reload of an unmodified buffer
+  (neovim reloads *before*, and *without*, firing `FileChangedShell`) — returning a
+  `FileChangeAction` (`None` / `Reloaded` / `Autocmd(FileChangeReason)`).
+  `Editor::warn_file_change` echoes the default W11/W12/E211; `reload_buffer` is now `pub`.
+- **The server owns the round-trip.** `Server::reconcile_file_change` (drained in
+  `run_pending`'s fixpoint) fires `FileChangedShell` with `v:fcs_reason` set and
+  `v:fcs_choice` reset (the new `LuaRuntime::fire_file_changed` / `fcs_choice`; `vim._fire`
+  now returns whether any handler ran), then dispatches: `"reload"`/`"edit"` →
+  `reload_buffer` (`"reload"` refused for a deleted file), `"ask"` → the default warning,
+  an empty choice → the handler took over (neovim's `return 2`: no post). Every handled
+  change that isn't the empty-choice case fires `FileChangedShellPost`.
+- **Watch arm routes through the queue.** The internal-watch `FsEvent` arm enqueues via
+  `checktime_buffer`; the reconcile + watch re-arm happen in `run_pending` (one place).
+
+**Exit criteria — met.** `core_editing.rs` adds three tests: `FileChangedShell` redirects a
+*conflict* to a reload via `v:fcs_choice` (and the handler sees `v:fcs_reason = "conflict"`),
+an empty-choice handler suppresses the default W11, and `FileChangedShellPost` fires after an
+autoread reload — plus the four existing `:checktime` tests stay green. Found + fixed a latent
+bug along the way: `load_str_into` / `reload_buffer` left a freshly-read replica marked
+*modified* (`mark_resync` re-set the flag after `mark_clean`), which the reload-vs-conflict
+decision newly depends on.
+
+### Phase 3l — the remote `HostWatch` push wire — ✅ DONE (2026-06-10)
+
+Only the daemon can watch a remote file, so it **owns change detection** and the edit-host
+reacts to a push (it never stats the remote disk itself):
+
+- **The wire** (`daemon.rs`, the fs leg): `fs_watch [path]` / `fs_unwatch [path]`
+  (edit-host → daemon notifications) and `fs_changed [path, stat?]` (the one daemon → edit-host
+  *push*). `serve_fs_daemon` baselines each watched path at arm time and re-stats on a coarse
+  `WATCH_POLL` interval (the daemon is the lag-tolerant leg), pushing on a drift; a successful
+  `fs_write` refreshes the baseline so the edit-host's **own** save can't echo back as an
+  external change (self-suppression). `HostFsAsync` grew `watch`/`unwatch`/`take_watch_events`;
+  `RemoteHostFs` routes each `fs_changed` into a `WatchEvent` channel the server's new
+  `watch_rx` `select!` arm drains.
+- **Off-tick reconcile** (`Server::on_remote_file_changed`): the same `FileChangedShell`
+  round-trip as the local path, but the reason comes from the push (vanished ⇒ deleted, an
+  unsaved buffer ⇒ conflict, else changed) — no local stat — and a reload can't be synchronous,
+  so it re-fetches over `fs_read` (`enqueue_reload`) with `FileChangedShellPost` deferred to the
+  fetch landing in `apply_open` (`reload_posts`). `sync_buffer_watches` arms the watches on the
+  daemon (`remote_watches`) in a daemon session instead of the local `notify`. `:checktime` is a
+  no-op in a daemon session now (the always-on watch covers it), not the old "not wired" echo.
+
+**Exit criteria — met.** `daemon_watch.rs`: an external change to an unmodified buffer
+autoreloads **over the wire** (a `/virtual/...` path the edit-host's local disk can't hold, with
+no `:checktime`), and a `FileChangedShell` handler fires on the edit-host with `v:fcs_reason`
+set and its `v:fcs_choice = "reload"` drives the off-tick re-fetch. Full `cargo test --workspace`
+green (1255 tests, 60 binaries); fmt + clippy clean.
 
 **The save slice must define its semantics up front — write is the hard half of
 off-tick** (read got done first for a reason: it's idempotent and cancelable;

@@ -60,6 +60,27 @@
 //! `fs_write` off the editor tick and finalizes the buffer's saved-state only on the
 //! daemon's ack, so a slow remote write never freezes typing. (`:read` still uses the
 //! sync [`HostFs`], on local disk, for now.)
+//!
+//! ## The watch leg (`HostWatch` — server push)
+//!
+//! Only the daemon can watch a remote file, so it **owns change detection**: the
+//! edit-host arms a watch per open file-backed buffer and the daemon pushes a change.
+//! Unlike the read/write requests, a change is a server-initiated *notification* (the
+//! one daemon→edit-host push on the fs leg), so it can't be a reply:
+//!
+//! | direction | method | params |
+//! | --- | --- | --- |
+//! | edit-host → daemon | `fs_watch [path]`   | arm a watch on `path` |
+//! | edit-host → daemon | `fs_unwatch [path]` | drop the watch |
+//! | daemon → edit-host | `fs_changed [path, stat?]` | `path` changed (nil stat = vanished) |
+//!
+//! `serve_fs_daemon` baselines each watched path's stat at `fs_watch` time and re-stats
+//! on a coarse [`WATCH_POLL`] interval (the daemon is the lag-tolerant leg), pushing
+//! `fs_changed` whenever one drifts. A successful `fs_write` refreshes the baseline so
+//! the edit-host's **own** save doesn't echo back as an external change. The edit-host
+//! turns each push into a [`WatchEvent`] the server reconciles off the editor tick (the
+//! `FileChangedShell` round-trip; a reload re-fetches over `fs_read`) — the remote
+//! analogue of the local per-buffer file watch.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -83,6 +104,17 @@ use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 
 const FS_READ: &str = "fs_read";
 const FS_WRITE: &str = "fs_write";
+// The watch leg (`HostWatch`): the edit-host arms/disarms watches on the daemon, the
+// daemon pushes a change. Server-*push* — the only daemon→edit-host *notification* on
+// the fs leg (reads/writes are request/response).
+const FS_WATCH: &str = "fs_watch";
+const FS_UNWATCH: &str = "fs_unwatch";
+const FS_CHANGED: &str = "fs_changed";
+
+/// How often the daemon re-stats its watched paths. The daemon is the lag-tolerant
+/// leg (the whole reason the watch lives here, not on the editor tick), so a coarse
+/// poll is fine — it owns change detection and the edit-host only reacts to a push.
+const WATCH_POLL: Duration = Duration::from_millis(200);
 
 // Wire method names. Kept as constants so the two halves can never drift on a typo.
 const PROC_SPAWN: &str = "proc_spawn";
@@ -473,6 +505,36 @@ pub trait HostFsAsync: Send + Sync {
         path: String,
         bytes: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Option<FileStat>>> + Send>>;
+
+    /// Arm a remote watch on `path` (the `HostWatch` leg): the daemon stats it now as
+    /// the baseline and pushes a [`WatchEvent`] each time it changes thereafter.
+    /// Fire-and-forget — the change comes back asynchronously via [`Self::take_watch_events`].
+    /// The default is a no-op (an impl with no remote, e.g. a local fake that never
+    /// pushes).
+    fn watch(&self, _path: String) {}
+
+    /// Disarm the remote watch on `path` (the buffer closed / lost its file). The
+    /// default is a no-op, matching [`Self::watch`].
+    fn unwatch(&self, _path: String) {}
+
+    /// Take the receiver of server-pushed [`WatchEvent`]s — the edit-host side of the
+    /// `HostWatch` leg. Returns `Some` exactly once (the first call) for an impl that
+    /// pushes ([`RemoteHostFs`]); `None` for one that never watches. The server wires
+    /// the receiver as a `select!` arm and reconciles each push off the editor tick.
+    fn take_watch_events(&self) -> Option<UnboundedReceiver<WatchEvent>> {
+        None
+    }
+}
+
+/// A server-pushed file change from the daemon's watch leg (the `fs_changed`
+/// notification): the watched `path` and its new [`FileStat`] (`None` = the file
+/// vanished on the daemon). The edit-host turns it into a `FileChangedShell` reconcile
+/// off the editor tick — the remote analogue of the local per-buffer file watch.
+pub struct WatchEvent {
+    /// The watched path that changed (as the edit-host armed it — the buffer's name).
+    pub path: String,
+    /// The file's new stat, or `None` if it vanished (drives the `"deleted"` reason).
+    pub stat: Option<FileStat>,
 }
 
 /// A [`HostFsAsync`] that reads files from a remote daemon over the wire. `read`
@@ -481,22 +543,43 @@ pub trait HostFsAsync: Send + Sync {
 /// [`nxvim_rpc`] routes each response to its awaiting `request` by msgid.
 pub struct RemoteHostFs {
     rpc: Rpc,
+    /// The receiver of `fs_changed` pushes, handed to the server once via
+    /// [`HostFsAsync::take_watch_events`]. Behind a `Mutex<Option<…>>` because the
+    /// trait method is `&self` and the receiver can only be taken out once.
+    watch_rx: Mutex<Option<UnboundedReceiver<WatchEvent>>>,
 }
 
 impl RemoteHostFs {
-    /// Connect to a daemon over `reader`/`writer`. The daemon sends only `fs_read`
-    /// *responses* (which `nxvim_rpc` routes internally), never notifications, so a
-    /// tiny drain task keeps the `Incoming` stream consumed — dropping the receiver
-    /// would tear the connection down. RPC tasks live on the runtime this is called
-    /// from, as for any [`nxvim_rpc::connect`].
+    /// Connect to a daemon over `reader`/`writer`. The daemon sends `fs_read` /
+    /// `fs_write` *responses* (which `nxvim_rpc` routes internally) and `fs_changed`
+    /// *notifications* (the watch leg); a drain task consumes the `Incoming` stream —
+    /// dropping the receiver would tear the connection down — and forwards each
+    /// `fs_changed` to the watch channel the server drains. RPC tasks live on the
+    /// runtime this is called from, as for any [`nxvim_rpc::connect`].
     pub fn connect<R, W>(reader: R, writer: W) -> RemoteHostFs
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (rpc, mut incoming) = connect(reader, writer);
-        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-        RemoteHostFs { rpc }
+        let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
+        tokio::spawn(async move {
+            while let Some(msg) = incoming.recv().await {
+                if let Incoming::Notification { method, params } = msg {
+                    if method == FS_CHANGED {
+                        if let Some(ev) = decode_fs_changed(params) {
+                            // The server may not have taken the receiver yet at startup;
+                            // a send that finds no receiver is harmlessly dropped.
+                            let _ = watch_tx.send(ev);
+                        }
+                    }
+                }
+            }
+        });
+        RemoteHostFs {
+            rpc,
+            watch_rx: Mutex::new(Some(watch_rx)),
+        }
     }
 }
 
@@ -539,6 +622,26 @@ impl HostFsAsync for RemoteHostFs {
             }
         })
     }
+
+    fn watch(&self, path: String) {
+        self.rpc.notify(FS_WATCH, vec![Value::from(path)]);
+    }
+
+    fn unwatch(&self, path: String) {
+        self.rpc.notify(FS_UNWATCH, vec![Value::from(path)]);
+    }
+
+    fn take_watch_events(&self) -> Option<UnboundedReceiver<WatchEvent>> {
+        self.watch_rx.lock().unwrap().take()
+    }
+}
+
+/// `fs_changed [path, stat?]` → [`WatchEvent`]; `None` on a malformed frame (dropped —
+/// a peer is the same build). A nil/absent stat means the file vanished.
+fn decode_fs_changed(params: Vec<Value>) -> Option<WatchEvent> {
+    let path = params.first()?.as_str()?.to_string();
+    let stat = params.get(1).and_then(decode_stat);
+    Some(WatchEvent { path, stat })
 }
 
 /// `["file", bytes]` / `["new"]` → [`FsRead`]; anything else is a malformed reply.
@@ -640,21 +743,86 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (rpc, mut incoming) = connect(reader, writer);
-    while let Some(msg) = incoming.recv().await {
-        let Incoming::Request {
-            id,
-            method,
-            mut params,
-        } = msg
-        else {
-            continue; // the edit-host drives the fs daemon with requests only
-        };
-        let reply = match method.as_str() {
-            FS_READ => serve_read(&*fs, &params),
-            FS_WRITE => serve_write(&*fs, &mut params),
-            other => Err(Value::from(format!("unknown method: {other}"))),
-        };
-        rpc.respond(id, reply);
+    // The watch leg (`HostWatch`): watched path → last-seen stat. The daemon *owns*
+    // change detection — the edit-host arms a watch (`fs_watch`) and only reacts to a
+    // push, so it never stats the remote disk itself. A coarse poll (the daemon is the
+    // lag-tolerant leg) re-stats each watched path and pushes `fs_changed` on a diff.
+    let mut watches: HashMap<PathBuf, Option<FileStat>> = HashMap::new();
+    let mut poll = tokio::time::interval(WATCH_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            msg = incoming.recv() => {
+                let Some(msg) = msg else { break }; // the edit-host hung up
+                match msg {
+                    Incoming::Request { id, method, mut params } => {
+                        let reply = match method.as_str() {
+                            FS_READ => serve_read(&*fs, &params),
+                            FS_WRITE => {
+                                let reply = serve_write(&*fs, &mut params);
+                                // Self-suppress: a successful write changed the file, but
+                                // it was the edit-host's *own* `:w` — refresh the watch
+                                // baseline so the poll doesn't push it back as an external
+                                // change. Same task as the poll, so no race (it can't tick
+                                // mid-write). `serve_write` only takes the *bytes* out of
+                                // `params`, so the path is still readable here.
+                                if reply.is_ok() {
+                                    if let Some(path) =
+                                        params.first().and_then(Value::as_str).map(PathBuf::from)
+                                    {
+                                        if let Some(slot) = watches.get_mut(&path) {
+                                            *slot = fs.stat(&path);
+                                        }
+                                    }
+                                }
+                                reply
+                            }
+                            other => Err(Value::from(format!("unknown method: {other}"))),
+                        };
+                        rpc.respond(id, reply);
+                    }
+                    // The watch leg's arm/disarm — notifications, not requests (there is
+                    // no reply; the change comes back later as `fs_changed`).
+                    Incoming::Notification { method, params } => match method.as_str() {
+                        FS_WATCH => {
+                            if let Some(path) =
+                                params.first().and_then(Value::as_str).map(PathBuf::from)
+                            {
+                                // Baseline the current stat so the very next poll doesn't
+                                // misfire on a file that hasn't changed since the open.
+                                let stat = fs.stat(&path);
+                                watches.insert(path, stat);
+                            }
+                        }
+                        FS_UNWATCH => {
+                            if let Some(path) =
+                                params.first().and_then(Value::as_str).map(PathBuf::from)
+                            {
+                                watches.remove(&path);
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            // Re-stat the watched paths and push any that drifted from their baseline.
+            // Disabled while nothing is watched, so an idle fs daemon does no work.
+            _ = poll.tick(), if !watches.is_empty() => {
+                for (path, last) in watches.iter_mut() {
+                    let now = fs.stat(path);
+                    if now != *last {
+                        *last = now;
+                        rpc.notify(
+                            FS_CHANGED,
+                            vec![
+                                Value::from(path.to_string_lossy().into_owned()),
+                                now.map_or(Value::Nil, |s| encode_stat(&s)),
+                            ],
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -55,6 +55,51 @@ pub struct PendingOpen {
     pub path: PathBuf,
 }
 
+/// Why a file-backed buffer's on-disk state changed, as reported to a
+/// `FileChangedShell` handler through `v:fcs_reason` (and the warning
+/// [`Editor::warn_file_change`] echoes when no handler redirects it). A subset of
+/// neovim's reasons — nxvim's stat snapshot is mtime+size, so it can't distinguish
+/// `"mode"` / `"time"` from `"changed"`, and collapses them into `Changed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeReason {
+    /// The file the buffer was bound to no longer exists (`v:fcs_reason = "deleted"`).
+    Deleted,
+    /// The file changed on disk **and** the buffer has unsaved edits — a true
+    /// conflict, never silently clobbered (`v:fcs_reason = "conflict"`).
+    Conflict,
+    /// The file changed on disk and the buffer is unmodified, but it was not
+    /// autoreloaded (`'noautoread'`) (`v:fcs_reason = "changed"`).
+    Changed,
+}
+
+impl FileChangeReason {
+    /// The `v:fcs_reason` string neovim exposes to a `FileChangedShell` handler.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileChangeReason::Deleted => "deleted",
+            FileChangeReason::Conflict => "conflict",
+            FileChangeReason::Changed => "changed",
+        }
+    }
+}
+
+/// What [`Editor::begin_file_change`] decided about a file-change reconcile — the
+/// hand-off to the server, which owns the `FileChangedShell` Lua round-trip the pure
+/// core can't drive.
+pub enum FileChangeAction {
+    /// The file is unchanged — nothing to do.
+    None,
+    /// The buffer was silently autoreloaded (`'autoread'`, unmodified). No
+    /// `FileChangedShell` fires (neovim reloads before the autocmd), but the server
+    /// still fires `FileChangedShellPost`.
+    Reloaded,
+    /// The change needs the `FileChangedShell` round-trip: the server sets
+    /// `v:fcs_reason` to this reason, fires the autocmd, and honors `v:fcs_choice`
+    /// (`"reload"`/`"edit"` → [`Editor::reload_buffer`]; `"ask"`/none →
+    /// [`Editor::warn_file_change`]).
+    Autocmd(FileChangeReason),
+}
+
 impl Editor {
     /// Set a buffer-local option on buffer `id` from outside the editor (the Lua
     /// `vim.bo` / `nvim_set_option_value` bridge). `value` is the option's scalar:
@@ -326,10 +371,14 @@ impl Editor {
         ob.buffer.insert(0, contents);
         ob.buffer.normalize();
         ob.buffer.set_path(name.map(std::path::PathBuf::from));
-        ob.buffer.mark_clean();
         // The whole rope was replaced — flag a syntax re-sync (as `load_into_current`
-        // does), then root a fresh undo tree at this saved state.
+        // does), then root a fresh undo tree at this saved state. `mark_resync` sets
+        // `modified` (a rope swap via *editing* is a change), so `mark_clean` must come
+        // **after** it: a freshly-read replica is by definition unmodified (the
+        // documented contract, and what the watch leg's reload-vs-conflict decision
+        // depends on).
         ob.buffer.mark_resync();
+        ob.buffer.mark_clean();
         ob.undo = UndoTree::new(&ob.buffer);
         ob.saved_seq = Some(ob.undo.cur_seq());
         if is_current {
@@ -431,7 +480,7 @@ impl Editor {
     /// **without touching the filesystem** — the pure core never does the
     /// blocking `canonicalize` syscall this used to run on every `:e`. Symlinks
     /// are not resolved, matching vim's path-based (not inode-based) buffer dedup.
-    pub(crate) fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
+    pub fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
         let target = normalize_path(path);
         self.buffers.map.iter().find_map(|(id, ob)| {
             let stored = ob.buffer.path.as_ref()?;
@@ -481,8 +530,10 @@ impl Editor {
     /// one when `buffer` is current, the saved one otherwise) into the new extent
     /// so a now-shorter file can't strand it past the end. On a read failure the
     /// buffer is left untouched and the error echoed. Local-only (synchronous
-    /// `host_fs`); the daemon reload is part of the remote-watch slice.
-    pub(crate) fn reload_buffer(&mut self, buffer: BufferId) {
+    /// `host_fs`); the daemon reload is part of the remote-watch slice. `pub` so the
+    /// server can drive it from the `FileChangedShell` round-trip (a `v:fcs_choice`
+    /// of `"reload"`/`"edit"`).
+    pub fn reload_buffer(&mut self, buffer: BufferId) {
         let Some(path) = self.buffers.get(buffer).buffer.path.clone() else {
             return;
         };
@@ -504,6 +555,10 @@ impl Editor {
             ob.undo = UndoTree::new(&ob.buffer);
             ob.saved_seq = Some(ob.undo.cur_seq());
             ob.buffer.mark_resync();
+            // `mark_resync` sets `modified`; a reload is a fresh read of disk, so clear
+            // it back (as `load_into_current` does) — otherwise a reloaded buffer reports
+            // dirty and the next reconcile would misread it as a conflict.
+            ob.buffer.modified = false;
         }
         if is_current {
             self.clamp_cursor();
@@ -530,12 +585,19 @@ impl Editor {
     /// vanished is **E211**. This is the local behavior the remote `HostWatch`
     /// push (a later slice) triggers over the wire — `:checktime` is both the user
     /// command and the watcher's entry point.
+    ///
+    /// The reconcile itself is **deferred to the server** (enqueued here, drained by
+    /// `Server::run_pending`): firing the `FileChangedShell` autocmd and honoring
+    /// `v:fcs_choice` is a synchronous Lua round-trip the pure core can't drive, so
+    /// the *decision* lives one layer up. Detection and reload still run in core.
     pub(crate) fn checktime(&mut self, target: &str) {
-        // A remote stat would have to cross the wire off the editor tick — exactly
-        // the `HostWatch` slice we haven't built. Fail loud rather than stat the
-        // edit-host's *local* disk for a remote path (which would misreport E211).
+        // In a daemon session the edit-host can't stat the remote disk off the tick;
+        // change detection is the daemon's **always-on** `HostWatch` leg, which pushes
+        // every external change for the server to reconcile automatically. So an explicit
+        // `:checktime` is redundant here (the watch already covers it) — a no-op, rather
+        // than statting the edit-host's *local* disk for a remote path (which would
+        // misreport E211).
         if self.host_fs_offtick {
-            self.echo("checktime: remote file watching is not yet wired (daemon session)");
             return;
         }
         let ids = match target.trim() {
@@ -545,46 +607,120 @@ impl Editor {
                 None => return,
             },
         };
-        for id in ids {
-            self.checktime_one(id);
-        }
+        self.pending_checktime.extend(ids);
     }
 
     /// `:checktime` for a single buffer — the entry point the **watcher** uses (the
-    /// server's per-buffer file watch fires this on a change). A no-op for an
-    /// unknown buffer or in a daemon session (the remote stat is the `HostWatch`
-    /// slice, not yet wired).
+    /// server's per-buffer file watch fires this on a change). Enqueues the reconcile
+    /// like `:checktime`; a no-op for an unknown buffer or in a daemon session (the
+    /// remote stat is the `HostWatch` slice, not yet wired).
     pub fn checktime_buffer(&mut self, id: BufferId) {
         if self.host_fs_offtick || !self.buffers.map.contains_key(&id) {
             return;
         }
-        self.checktime_one(id);
+        self.pending_checktime.push(id);
     }
 
-    /// Reconcile one buffer against its file on disk (the shared body of
-    /// `:checktime` and the watcher trigger): autoreload an externally-changed,
-    /// unmodified buffer under `'autoread'` (W11 otherwise), W12 on a conflict, E211
-    /// on a vanished file. Unchanged is silent.
-    fn checktime_one(&mut self, id: BufferId) {
+    /// Drain the buffers awaiting a `:checktime` reconcile this tick. The server takes
+    /// these in `run_pending`, runs detection/reload through the core primitives below,
+    /// and fires the `FileChangedShell` round-trip for each. Empty (a cheap no-op) when
+    /// no `:checktime` ran and no watch fired.
+    pub fn take_pending_checktime(&mut self) -> Vec<BufferId> {
+        std::mem::take(&mut self.pending_checktime)
+    }
+
+    /// Whether any buffer is awaiting a `:checktime` reconcile — the server's
+    /// fixpoint loop checks this so a `FileChangedShell` handler that itself runs
+    /// `:checktime` keeps draining instead of stranding the new request.
+    pub fn has_pending_checktime(&self) -> bool {
+        !self.pending_checktime.is_empty()
+    }
+
+    /// Whether buffer `id` has unsaved edits — `false` for an unknown buffer. The
+    /// server reads this to classify a remote file change (modified ⇒ a `"conflict"`).
+    pub fn buffer_modified(&self, id: BufferId) -> bool {
+        self.buffers
+            .map
+            .get(&id)
+            .is_some_and(|ob| ob.buffer.modified)
+    }
+
+    /// The global `'autoread'` value — the server consults it on the remote watch leg,
+    /// where it can't route through core's (local-disk) [`Editor::begin_file_change`].
+    pub fn autoread(&self) -> bool {
+        self.options.autoread
+    }
+
+    /// Enqueue an off-tick re-fetch of buffer `id`'s own file into itself — the daemon
+    /// reload the remote watch leg drives (the off-tick analogue of
+    /// [`Editor::reload_buffer`], which reads the *local* disk synchronously). The
+    /// server drains it via [`Editor::take_pending_opens`] and loads the fetched bytes
+    /// with [`Editor::load_str_into`]. Returns whether it enqueued — `false` for a
+    /// buffer with no path (nothing to re-fetch).
+    pub fn enqueue_reload(&mut self, id: BufferId) -> bool {
+        let Some(path) = self
+            .buffers
+            .map
+            .get(&id)
+            .and_then(|ob| ob.buffer.path.clone())
+        else {
+            return false;
+        };
+        self.enqueue_open(id, path);
+        true
+    }
+
+    /// Detect how a buffer's file changed on disk and apply the part of the reconcile
+    /// that needs no autocmd — the first half of neovim's `buf_check_timestamp`. An
+    /// externally-changed, *unmodified* buffer under `'autoread'` is silently reloaded
+    /// here (neovim reloads *before*, and *without*, firing `FileChangedShell`); every
+    /// other change defers to the server's `FileChangedShell` round-trip via the
+    /// returned [`FileChangeAction::Autocmd`] reason. [`FileChangeAction::None`] means
+    /// nothing changed; [`FileChangeAction::Reloaded`] means the silent autoread reload
+    /// ran (the server still fires `FileChangedShellPost`).
+    pub fn begin_file_change(&mut self, id: BufferId) -> FileChangeAction {
+        if !self.buffers.map.contains_key(&id) {
+            return FileChangeAction::None;
+        }
         let fs = self.host_fs.clone();
-        let name = self.buffer_name(id).unwrap_or_default();
         match self.buffers.get(id).buffer.disk_change(&*fs) {
-            DiskChange::Unchanged => {}
-            DiskChange::Vanished => self.echo(format!("E211: File \"{name}\" no longer available")),
+            DiskChange::Unchanged => FileChangeAction::None,
+            // A vanished file never autoreloads — always the round-trip (E211 / a
+            // handler's choice). Reason `"deleted"`.
+            DiskChange::Vanished => FileChangeAction::Autocmd(FileChangeReason::Deleted),
             DiskChange::Changed => {
-                if self.buffers.get(id).buffer.modified {
-                    self.echo(format!(
-                        "W12: Warning: File \"{name}\" has changed and the buffer was changed in Vim as well"
-                    ));
-                } else if self.options.autoread {
+                let modified = self.buffers.get(id).buffer.modified;
+                if !modified && self.options.autoread {
+                    // 'autoread', unmodified, file present: reload silently with no
+                    // `FileChangedShell` (matching neovim's pre-autocmd branch).
                     self.reload_buffer(id);
+                    FileChangeAction::Reloaded
+                } else if modified {
+                    FileChangeAction::Autocmd(FileChangeReason::Conflict)
                 } else {
-                    self.echo(format!(
-                        "W11: Warning: File \"{name}\" has changed since editing started"
-                    ));
+                    FileChangeAction::Autocmd(FileChangeReason::Changed)
                 }
             }
         }
+    }
+
+    /// Echo the default warning for a file change the `FileChangedShell` round-trip did
+    /// **not** redirect (no handler, or a handler that left `v:fcs_choice` as `"ask"`):
+    /// **E211** (vanished), **W12** (conflict — changed on disk *and* in nxvim), or
+    /// **W11** (changed on disk, unmodified buffer, but no autoreload). The reload cases
+    /// never reach here (they call [`Editor::reload_buffer`] directly).
+    pub fn warn_file_change(&mut self, id: BufferId, reason: FileChangeReason) {
+        let name = self.buffer_name(id).unwrap_or_default();
+        let msg = match reason {
+            FileChangeReason::Deleted => format!("E211: File \"{name}\" no longer available"),
+            FileChangeReason::Conflict => format!(
+                "W12: Warning: File \"{name}\" has changed and the buffer was changed in Vim as well"
+            ),
+            FileChangeReason::Changed => {
+                format!("W11: Warning: File \"{name}\" has changed since editing started")
+            }
+        };
+        self.echo(msg);
     }
 
     /// The server's file-watch key for buffer `id`: its on-disk path and the disk

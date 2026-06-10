@@ -61,6 +61,9 @@ fn main() -> Result<()> {
         // The real binary uses the monotonic wall clock for mouse multi-click
         // timing; only tests inject a fake clock here.
         mouse_clock: None,
+        // The local binary reads/writes through the real disk (the default); a
+        // daemon-backed fs is injected here by the edit-host split.
+        host_fs: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -113,6 +116,7 @@ fn run_headless(file: Option<String>) -> Result<()> {
         runtimepath,
         clipboard: nxvim_server::ClipboardProvider::System,
         mouse_clock: None,
+        host_fs: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()

@@ -100,7 +100,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 0 | Feasibility spikes (compile / interop / blocking read) | — | ✅ |
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
-| 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ⬜ |
+| 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | 🚧 |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | ⬜ |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
@@ -262,6 +262,46 @@ distinct from this passing opt-in test.
 ---
 
 ## Phase 3 — Native edit-host / daemon split (invert the SSH topology)
+
+### Phase 3a — the server *consumes* the `HostFs` seam — ✅ DONE (2026-06-10)
+
+The first slice, kept deliberately free of any daemon-protocol guesswork (the same
+discipline that scoped Phase 1 to the fs seam alone). Phase 1 defined `HostFs` in
+core but the **server never drove it** — `Editor::open_or_named` baked in
+`StdHostFs` and opened the startup file in its constructor, so no injected fs
+could ever reach the *first* buffer (the gap flagged in `set_host_fs`'s own doc).
+
+Shipped:
+- **`Editor::open_or_named_with(path, fs)`** (core) — loads the initial buffer
+  *through* `fs` and installs it as the editor's `HostFs`, so the first buffer is
+  fetched the same way every later `:edit`/`:write` is. `open_or_named` is now just
+  this with `StdHostFs` (zero behavior change for existing callers). Directory
+  detection still uses `std::path::Path::is_dir` — a type-bearing remote stat is a
+  later daemon-wire concern; only the file read/write crosses the seam now.
+- **`ServerInit::host_fs: Option<Box<dyn HostFs + Send>>`** — `Send` so it rides
+  `ServerInit` onto the server's own thread, where `run_io` rebuilds it into the
+  single-threaded `Rc<dyn HostFs>` the editor holds (`Rc::from` → drop `Send` by
+  unsize coercion). `None` = today's local disk. The startup open lifts to *after*
+  injection, exactly as the Phase-3 note prescribed.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/host_fs.rs`: an in-memory fake
+`HostFs` (shared `Arc<Mutex<…>>` the test inspects) both **serves** the initial
+buffer (a `/virtual/...` path that never touches disk) and **captures** `:w` — and
+a bare-session `:write <path>` also lands in the fake. Faithful, not a no-op: the
+fake genuinely round-trips bytes the editor read and wrote. Regression-clean —
+`editing` (536), `buffers` (27), `nxvim` crate, fmt + clippy all green; the local
+binaries (`nxvim`, `nxvim-gui`) pass `host_fs: None` and are unchanged.
+
+**Still to do in Phase 3:** the `HostProc` seam (below), the daemon wire protocol +
+`nxvim --daemon`, the local edit-host as a `HostServices` client over ssh stdio,
+and the buffer-replica / `FileChangedShell` / remote-path / clipboard semantics.
+The remote `HostFs` impl is *not* a drop-in here: core's `HostFs` is **sync**, so a
+daemon-backed read can't block the single editor thread on the network — the open
+must become an async off-tick fetch that hands core populated bytes (the
+"buffers are local replicas" note below), with the sync trait reserved for local
+disk. The injection seam this slice built is the anchor that lands plugs into.
+
+### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
 by `HostServices` (Phase 1) over RPC:

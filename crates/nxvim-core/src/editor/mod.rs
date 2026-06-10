@@ -711,9 +711,9 @@ impl Editor {
     /// Install the filesystem backend the editor reads/writes through. The server
     /// can hand over a remote (daemon-backed) [`HostFs`]; the default is the local
     /// [`StdHostFs`]. Mirrors [`Editor::set_syntax_engine`] / [`Editor::set_clipboard`].
-    /// (Phase 3 note: the initial-file constructors below still load through the
-    /// default `StdHostFs`; once a remote fs is injectable the startup open should
-    /// move *after* injection so the first buffer is fetched through it too.)
+    /// To open a startup file *through* an injected fs (so the first buffer is
+    /// fetched through it, not the default disk), use [`Editor::open_or_named_with`]
+    /// instead of this on an already-built editor.
     pub fn set_host_fs(&mut self, fs: Rc<dyn HostFs>) {
         self.host_fs = fs;
     }
@@ -734,28 +734,47 @@ impl Editor {
     /// an unreadable startup file. (A *missing* file is not an error here:
     /// `from_file` already binds it as a new-file buffer.)
     pub fn open_or_named(path: impl Into<PathBuf>) -> Self {
+        Editor::open_or_named_with(path, Rc::new(StdHostFs))
+    }
+
+    /// [`Editor::open_or_named`], but the initial buffer is loaded through `fs`,
+    /// which is then installed as the editor's [`HostFs`] — so the first buffer is
+    /// fetched through the *same* backend as every later `:edit` / `:write`, and
+    /// the server can open the startup file through a daemon-backed fs rather than
+    /// the local disk (the edit-host split,
+    /// `docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3). The
+    /// default-fs [`Editor::open_or_named`] is just this with [`StdHostFs`].
+    ///
+    /// Directory detection still goes through `std::path::Path::is_dir`; a remote
+    /// fs would need a type-bearing stat, which arrives with the daemon wire
+    /// protocol. For now only the file *read* / *write* crosses the seam — which
+    /// is the part that has to be backend-agnostic.
+    pub fn open_or_named_with(path: impl Into<PathBuf>, fs: Rc<dyn HostFs>) -> Self {
         let path = path.into();
         // A directory opens as the in-window file explorer (vim's netrw), not as
         // text. An unreadable directory (no permission) still fails loud, the same
         // way an unreadable file does below.
-        if path.is_dir() {
-            return match Buffer::from_dir(&path, &StdHostFs) {
+        let mut editor = if path.is_dir() {
+            match Buffer::from_dir(&path, &*fs) {
                 Ok(buffer) => Editor::with_buffer(buffer),
                 Err(e) => {
                     let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
                     editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
                     editor
                 }
-            };
-        }
-        match Buffer::from_file(&path, &StdHostFs) {
-            Ok(buffer) => Editor::with_buffer(buffer),
-            Err(e) => {
-                let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
-                editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
-                editor
             }
-        }
+        } else {
+            match Buffer::from_file(&path, &*fs) {
+                Ok(buffer) => Editor::with_buffer(buffer),
+                Err(e) => {
+                    let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
+                    editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
+                    editor
+                }
+            }
+        };
+        editor.host_fs = fs;
+        editor
     }
 
     fn with_buffer(buffer: Buffer) -> Self {

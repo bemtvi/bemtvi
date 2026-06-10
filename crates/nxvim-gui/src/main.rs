@@ -70,6 +70,9 @@ fn main() -> Result<()> {
         // The real binary uses the monotonic wall clock for mouse multi-click
         // timing; only tests inject a fake clock here.
         mouse_clock: None,
+        // The local GUI reads/writes through the real disk (the default); a
+        // daemon-backed fs is injected here by the edit-host split.
+        host_fs: None,
     };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

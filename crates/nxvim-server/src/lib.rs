@@ -34,12 +34,13 @@ use lsp::{
     CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
 };
-use nxvim_core::{BufferId, Editor, Key, Mode, TabId, WindowId};
+use nxvim_core::{BufferId, Editor, HostFs, Key, Mode, StdHostFs, TabId, WindowId};
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
 use nxvim_rpc::{connect, Rpc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -68,6 +69,14 @@ pub struct ServerInit {
     /// and advances it between clicks to drive `'mousetime'` deterministically,
     /// without depending on wall-clock timing. See [`Server::mouse_stamp_ms`].
     pub mouse_clock: Option<Arc<AtomicU64>>,
+    /// The filesystem backend the editor reads and writes buffers through. `None`
+    /// (the default) uses the local disk ([`StdHostFs`]); the edit-host split will
+    /// inject a daemon-backed [`HostFs`] here so buffer I/O — including the initial
+    /// file — crosses the wire while editing stays local
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3). It is
+    /// `Send` (boxed) because [`ServerInit`] is moved onto the server's own thread;
+    /// it is rebuilt into the editor's single-threaded `Rc<dyn HostFs>` there.
+    pub host_fs: Option<Box<dyn HostFs + Send>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -328,9 +337,29 @@ where
 {
     let (rpc, mut incoming) = connect(reader, writer);
 
+    // The editor reads/writes buffers through this fs — the local disk by default,
+    // or an injected (eventually daemon-backed) backend. Rebuilt here, on the
+    // server thread, into the single-threaded `Rc<dyn HostFs>` the editor holds
+    // (`ServerInit` carried it `Send` across the thread boundary).
+    let host_fs: Rc<dyn HostFs> = match init.host_fs {
+        // `Rc::from` yields `Rc<dyn HostFs + Send>`; returning it into the
+        // `Rc<dyn HostFs>` binding drops the `Send` bound by unsize coercion.
+        Some(fs) => {
+            let fs: Rc<dyn HostFs + Send> = Rc::from(fs);
+            fs
+        }
+        None => Rc::new(StdHostFs),
+    };
+    // Open the startup file *through* `host_fs` (not the default disk), so the
+    // first buffer is fetched the same way every later `:edit` is; a bare session
+    // still installs the fs so a later `:edit` / `:write` routes through it too.
     let mut editor = match init.file {
-        Some(path) => Editor::open_or_named(path),
-        None => Editor::new(),
+        Some(path) => Editor::open_or_named_with(path, host_fs),
+        None => {
+            let mut editor = Editor::new();
+            editor.set_host_fs(host_fs);
+            editor
+        }
     };
     // The editor owns the in-process treesitter engine and queries it
     // synchronously for highlights (and, later, indentation). It loads

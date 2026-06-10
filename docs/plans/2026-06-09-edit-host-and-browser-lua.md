@@ -343,6 +343,60 @@ full `nxvim-server` suite (17 binaries incl. `editing` 536, `uv_process`,
 `async_runtime`, `blockers` 34), `nxvim` crate, fmt + clippy all green; the local
 binaries (`nxvim`, `nxvim-gui`) pass `host_proc: None` and are unchanged.
 
+### Phase 3c — the daemon wire protocol (process half) — ✅ DONE (2026-06-10)
+
+The first slice of the *full split* to actually **carry traffic over a wire**, kept
+to the process seam for the same "don't guess the wire ahead of need" reason 3b was:
+`HostProc` is already async + event-routed (pid then exit arrive as separate events,
+not a return value), so it maps onto a wire with **no impedance mismatch**. Core's
+*synchronous* `HostFs` does not — its remote backing has to become an off-tick fetch
+(buffer-as-replica), which is a later slice deliberately not guessed here. (Next-slice
+direction confirmed with the requester, 2026-06-10.)
+
+Shipped (`crates/nxvim-server/src/daemon.rs`, re-exported from the crate root):
+- **The wire** — four `nxvim-rpc` (msgpack) **notifications** correlated by a
+  per-spawn `id`: edit-host → daemon `proc_spawn [id, argv, cwd?, env, stdin]` /
+  `proc_kill [id]`; daemon → edit-host `proc_spawned [id, pid?]` / `proc_exited [id,
+  code, stdout, stderr]`. Notifications (not request/response) because a child's life
+  is two events at different times, which a single reply can't model. Transport is any
+  `AsyncRead`/`AsyncWrite` pair — an in-process `tokio::io::duplex` today, ssh stdio to
+  `nxvim --daemon` in the full split.
+- **`RemoteHostProc` (edit-host side, a `HostProc`)** — `connect(reader, writer)` wires
+  the RPC link and a **demux task** that fans the daemon's replies out to per-spawn
+  channels (an `Inflight` map, `id` → sender). Each `run` mints a wire `id`, registers
+  *before* sending `proc_spawn` (so a reply can't race ahead of its receiver), then
+  relays `proc_spawned`/`proc_exited` back to the editor's `ProcEvents`. The editor's
+  callback id never crosses the wire — routing is purely by the minted id. A dropped
+  daemon connection clears `Inflight`, so every in-flight `run` sees EOF and reports a
+  `-1` exit rather than leaking its one-shot `on_exit` (the same exactly-one-exit
+  contract `StdHostProc` upholds). A drop-in for `StdHostProc` on the local side.
+- **`serve_daemon` (daemon side)** — runs each requested child through the **same
+  `StdHostProc`** the local server uses today, relaying that machinery's `LoopEvent`s
+  straight onto the wire, so a process behaves identically remote and local. Holds a
+  per-child kill map mirroring the event-loop actor's `procs`.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_proc.rs` drives a real
+editor whose `host_proc` is a `RemoteHostProc` talking to a `serve_daemon` over an
+in-process duplex (the ssh-stdio stand-in): an async `vim.system` runs a **real** `sh`
+on the daemon and `on_exit` sees its *actual* stdout (`hello-from-daemon`) — output a
+stub can't invent; two concurrent spawns each see their own result (`AAA`/`BBB` —
+proving the per-`id` demux, not a shared constant); a non-zero `exit 7` round-trips
+faithfully; and `handle:kill()` on a `sleep 30` child fires `on_exit` with `code = -1`
+in well under a second (proving `proc_kill` crosses the wire and terminates the child,
+not that the sleep elapsed). Regression-clean — full `nxvim-server` suite (now 18
+binaries incl. `editing` 536, `async_runtime`, `uv_process`, `host_proc`, `blockers`
+34), fmt + clippy `-D warnings` all green; the duplex+daemon and the remote host's RPC
+tasks live on the test runtime while the server keeps its own thread, exactly the split
+the harness already makes for its client connection.
+
+**Still to do in the full split:** the remaining process consumers the original sketch
+reached for — `lsp/manager.rs` (long-lived bidirectional raw-pipe transport: needs the
+`write_stdin` + stdout-as-events shape, not run-to-completion) and `clipboard.rs` (a
+sync provider) — plus the `HostFs` half (async off-tick fetch / buffer replicas), the
+`nxvim --daemon` binary, and the local edit-host as a client over ssh stdio. This slice
+is the wire those plug into; the trait the wire satisfies (`HostProc`) and its routing
+are now proven end-to-end.
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected

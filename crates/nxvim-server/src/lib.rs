@@ -16,6 +16,7 @@
 //! [`lsp`] (language-server integration).
 
 mod clipboard;
+mod daemon;
 mod dispatch;
 mod effects;
 mod evloop;
@@ -34,6 +35,13 @@ mod treesitter;
 /// daemon-backed [`HostProc`] here (the process-side companion to
 /// [`nxvim_core::HostFs`]).
 pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
+
+/// The daemon wire protocol for the edit-host split (process half): the daemon-side
+/// [`serve_daemon`] that runs children for a far edit-host, and the edit-host-side
+/// [`RemoteHostProc`] that forwards spawns to it over any
+/// [`AsyncRead`](tokio::io::AsyncRead)/[`AsyncWrite`](tokio::io::AsyncWrite) wire
+/// (a duplex, or ssh stdio to `nxvim --daemon`).
+pub use daemon::{serve_daemon, RemoteHostProc};
 
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};

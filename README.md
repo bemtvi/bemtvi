@@ -43,28 +43,8 @@ Downloads ship with checksums and SLSA build provenance — see
 > modern terminal with truecolor support.
 
 The terminal editor is the whole thing in one binary: it embeds the server on
-its own thread and runs the client on the main thread, joined by the same RPC a
-remote client would use.
-
-### Run the editor on a remote host
-
-The same `nxvim` binary has a second, headless role — `nxvim --server` runs
-just the editor server, speaking RPC over stdin/stdout with no UI. That's what
-makes a remote client possible: point the GUI at a host and it edits *there*,
-with only the thin client running locally.
-
-```sh
-nxvim --server file.txt              # headless server on stdin/stdout (no UI)
-nxvim-gui user@host:22/path/file.txt # GUI here, editor on the remote host over SSH
-```
-
-`nxvim-gui [user@]host[:port][/file]` spawns `ssh … nxvim --server` on the host
-and drives its stdio as the transport — so the buffers, Lua, LSP, and treesitter
-all run remote while your window stays local. From a running window, `:connect
-[user@]host[:port][/file]` switches the open window to a remote host in place,
-without recreating it. This needs `nxvim` installed and on `PATH` on the remote
-host; `$NXVIM_SSH` / `$NXVIM_REMOTE_CMD` override the `ssh` program and the
-remote command.
+its own thread and runs the client on the main thread, joined over the same
+msgpack-RPC the UI clients speak.
 
 ---
 
@@ -174,13 +154,6 @@ Things nxvim has that neovim doesn't:
     preserving its edit / split / tab semantics.
   - `:wo` (and a bare `:w` on an unnamed buffer) pops a system **save** dialog
     and writes to the chosen path.
-- **Editing on a remote host over SSH.** `nxvim-gui [user@]host[:port][/file]`
-  runs the editor on a remote machine and the window locally: it spawns
-  `nxvim --server` there over SSH and drives its stdio. The buffers, Lua, LSP,
-  and treesitter all run remote — only the thin client is local — and `:connect`
-  switches an open window to another host without recreating it. This rides the
-  existing client/server split (the RPC already drives any stream pair), so the
-  editor and protocol are unchanged.
 - **A browsable message panel.** `:messages` and `:ls` open a navigable,
   bottom-docked panel (an nxvim-native surface, not a vim window) that plugins
   can also drive as a general output / picker surface. This was initially built
@@ -244,7 +217,7 @@ The short version:
 | `nxvim-gui`      | Native GUI client (winit + wgpu + glyphon).                                 |
 | `nxvim-web`      | Fully client-side WebAssembly build of the editor core (runs in the browser; no server). Excluded from the workspace. |
 | `nxvim-view`     | Frontend-neutral decode/input layer shared by the native clients.           |
-| `nxvim`          | The `nvim`-style entry point: wires an embedded server + the TUI client, or runs headless as the `nxvim --server` RPC server (the role a remote SSH client execs). |
+| `nxvim`          | The `nvim`-style entry point: wires an embedded server + the TUI client.    |
 
 The editor core is pure, synchronous, and `!Send`; all async, RPC, and Lua live
 above it, so every front end shares identical editing behavior.

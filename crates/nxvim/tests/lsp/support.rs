@@ -41,6 +41,83 @@ pub const SIGN: u16 = 2;
 /// Serializes the subprocess-spawning tests (shared env + server lifecycle).
 pub use nxvim_test_harness::serial_lock as test_lock;
 
+// ----- treesitter fixture ---------------------------------------------------
+
+/// Build (once) a `NXVIM_DATA_DIR` holding a compiled Rust grammar and its
+/// highlights query, then point `NXVIM_DATA_DIR` at it. The syntax worker (the
+/// real `nxvim` binary, see `configure_mock`) loads its grammars from here, so a
+/// `.rs` buffer in these tests actually paints treesitter highlights instead of
+/// silently relying on whatever the developer happens to have installed in their
+/// real data dir. Mirrors the syntax suite's hermetic fixture (see
+/// `tests/syntax.rs`). Env is process-global and inherited by the spawned worker,
+/// so setting it here propagates to the subprocess.
+fn fixture_data_dir() -> &'static Path {
+    static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+    DATA_DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("nxvim-lsp-ts-fixture");
+        std::fs::create_dir_all(dir.join("parser")).unwrap();
+
+        let rust_src = registry_crate_dir("tree-sitter-rust-0.24.2").join("src");
+        compile_grammar(&dir, "rust", &rust_src);
+        write_query(
+            &dir,
+            "rust",
+            "highlights",
+            tree_sitter_rust::HIGHLIGHTS_QUERY,
+        );
+
+        std::env::set_var("NXVIM_DATA_DIR", &dir);
+        dir
+    })
+}
+
+/// Compile a grammar's C sources (`parser.c` + the always-present `scanner.c`)
+/// from `src_dir` into `<data>/parser/<lang>.so` via the system C compiler —
+/// mirroring how a user installs a parser, but hermetic.
+fn compile_grammar(data_dir: &Path, lang: &str, src_dir: &Path) {
+    let out = data_dir.join("parser").join(format!("{lang}.so"));
+    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = std::process::Command::new(compiler)
+        .args(["-shared", "-fPIC", "-O1"])
+        .arg("-I")
+        .arg(src_dir)
+        .arg(src_dir.join("parser.c"))
+        .arg(src_dir.join("scanner.c"))
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .expect("run C compiler");
+    assert!(status.success(), "compiling {lang} grammar fixture failed");
+}
+
+/// Write `<data>/queries/<lang>/<name>.scm`.
+fn write_query(data_dir: &Path, lang: &str, name: &str, scm: &str) {
+    let dir = data_dir.join("queries").join(lang);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.scm")), scm).unwrap();
+}
+
+/// Locate an unpacked crate source directory in the cargo registry by its
+/// `<name>-<version>` folder name (a dev-dependency, so cargo guarantees it).
+fn registry_crate_dir(crate_dir: &str) -> PathBuf {
+    let cargo_home = std::env::var("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .expect("HOME");
+            PathBuf::from(home).join(".cargo")
+        });
+    let registry = cargo_home.join("registry").join("src");
+    for index in std::fs::read_dir(&registry).expect("read cargo registry src") {
+        let candidate = index.unwrap().path().join(crate_dir);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    panic!("{crate_dir} source not found under {registry:?}");
+}
+
 // ----- mock configuration ---------------------------------------------------
 
 /// Write a mock script with a unique record file and point `NXVIM_LSP_CMD` at
@@ -48,8 +125,10 @@ pub use nxvim_test_harness::serial_lock as test_lock;
 /// (the LSP analogue of `NXVIM_TS_WORKER`). `extra` merges script fields
 /// (`position_encoding`, `sync_kind`, `exit_after_initialize`). Returns the
 /// record file path. Also points the *syntax* worker env at the real binary so a
-/// `.rs` buffer doesn't try to re-spawn this test executable as a ts worker.
+/// `.rs` buffer doesn't try to re-spawn this test executable as a ts worker, and
+/// installs a hermetic Rust grammar so `.rs` highlights actually appear.
 pub fn configure_mock(tag: &str, extra: Json) -> PathBuf {
+    fixture_data_dir();
     let dir = std::env::temp_dir();
     let record = dir.join(format!("nxvim-lsp-rec-{}-{tag}.jsonl", std::process::id()));
     let script_path = dir.join(format!(

@@ -106,9 +106,11 @@ async fn semantic_tokens_paint_over_the_treesitter_floor() {
 #[tokio::test]
 async fn an_undefined_semantic_group_is_dropped_so_treesitter_shows() {
     let _guard = test_lock().lock().await;
-    // Same token, but the theme defines NO @lsp.type.function — the projection must
-    // drop it, leaving whatever the treesitter floor painted (never a blank cell,
-    // never an `lsp.type.*` span).
+    // The same `function` semantic token at col 0..6, but the theme defines NO
+    // @lsp.type.function — the projection must drop it, leaving whatever the
+    // treesitter floor painted (never a blank cell, never an `lsp.type.*` span).
+    // Real Rust here (not the bare `myfunc x` the other cases use) so the
+    // treesitter floor actually paints — the dropped group must reveal it.
     let record = configure_mock(
         "sem-drop",
         serde_json::json!({
@@ -119,7 +121,7 @@ async fn an_undefined_semantic_group_is_dropped_so_treesitter_shows() {
             },
         }),
     );
-    let file = temp_file("sem-drop", "rs", "myfunc x\n");
+    let file = temp_file("sem-drop", "rs", "fn main() {}\n");
     let (rpc, mut incoming) = start(Some(file)).await;
     wait_for_record(&rpc, &record, |r| has_method(r, "textDocument/didOpen")).await;
     wait_for_record(&rpc, &record, |r| {

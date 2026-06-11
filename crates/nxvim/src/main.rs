@@ -12,16 +12,28 @@
 //!   leg of the daemon wire over **stdin/stdout**. The editor (core + Lua) stays
 //!   *local* for a zero-round-trip keystroke path; only I/O runs here. This is what
 //!   the local edit-host spawns over SSH (`ssh host nxvim --daemon`).
+//! - **`--connect-daemon`** (`nxvim --connect-daemon [file]`): the *edit-host split*'s
+//!   **local** half — the full editor + terminal UI (exactly the default role), but
+//!   with its fs/process/watch/LSP host seams pointed at a `--daemon` child instead of
+//!   the local disk. It spawns that daemon (this same binary in `--daemon` mode by
+//!   default, or whatever `NXVIM_DAEMON_CMD` names — e.g. `ssh host nxvim --daemon`),
+//!   wraps the child's stdio in [`nxvim_server::connect_daemon`], and injects the five
+//!   resulting seams into [`ServerInit`]. Config (init.lua, plugins, runtimepath) and
+//!   the keystroke path stay local; only I/O crosses the wire.
 //!
 //! The first three roles run the *same* [`nxvim_server::run`]/[`run_io`] over the
 //! same RPC — the only difference is the transport (a duplex vs. this process's
 //! stdio), so the editor behaves identically whether embedded, headless, or remote.
 //! `--daemon` is the inverse: it runs [`nxvim_server::run_daemon_io`] (no editor),
-//! the remote half of the boundary moved *below* the editor.
+//! the remote half of the boundary moved *below* the editor. `--connect-daemon` is the
+//! matching local half — the default role plus the daemon seams.
+
+use std::process::Stdio;
 
 use anyhow::Result;
 use nxvim_server::{
-    run as run_server, run_daemon_io as run_server_daemon_io, run_io as run_server_io, ServerInit,
+    connect_daemon, run as run_server, run_daemon_io as run_server_daemon_io,
+    run_io as run_server_io, ServerInit,
 };
 
 /// Flag that runs this binary as the headless server over stdin/stdout (no UI) —
@@ -33,6 +45,18 @@ const SERVER_FLAG: &str = "--server";
 /// remotely (`ssh host nxvim --daemon`). Contrast `--server`, which runs the
 /// *whole* editor remotely.
 const DAEMON_FLAG: &str = "--daemon";
+
+/// Flag that runs the **local** edit-host half of the split: the full editor + UI
+/// (the default role) wired to a `--daemon` child for fs/process/watch/LSP. The
+/// daemon command defaults to this binary in `--daemon` mode; override it with
+/// [`DAEMON_CMD_ENV`].
+const CONNECT_DAEMON_FLAG: &str = "--connect-daemon";
+
+/// Env var naming the command to spawn as the daemon for `--connect-daemon`. Run
+/// through `sh -c`, so a full command line works verbatim — e.g.
+/// `NXVIM_DAEMON_CMD="ssh host nxvim --daemon"`. Unset = spawn this same binary
+/// (`current_exe --daemon`) for a local two-process split over stdio pipes.
+const DAEMON_CMD_ENV: &str = "NXVIM_DAEMON_CMD";
 
 /// Internal, debug-only flag that runs this binary as a scripted mock language
 /// server (see `nxvim_lsp::mock`), used by the LSP test suite as a hermetic
@@ -67,6 +91,13 @@ fn main() -> Result<()> {
     // client closing the pipe (EOF on stdin) winds the server down.
     if args.iter().any(|a| a == SERVER_FLAG) {
         return run_headless(file);
+    }
+
+    // Edit-host split, local half: the default editor + UI, but spawning a
+    // `--daemon` child and routing fs/process/watch/LSP to it over stdio. Checked
+    // before the plain embedded path so the flag selects the daemon-backed wiring.
+    if args.iter().any(|a| a == CONNECT_DAEMON_FLAG) {
+        return run_with_daemon(file);
     }
 
     // In-process, bidirectional transport between client and server.
@@ -190,6 +221,102 @@ fn run_daemon() -> Result<()> {
         tokio::io::stdin(),
         tokio::io::stdout(),
     ))
+}
+
+/// Build the [`tokio::process::Command`] for the daemon child. Defaults to *this*
+/// binary in `--daemon` mode (a local two-process split over stdio pipes); if
+/// [`DAEMON_CMD_ENV`] is set, run that command line through `sh -c` instead — so a
+/// remote daemon (`ssh host nxvim --daemon`) is just an env var, no code change.
+fn daemon_command() -> Result<tokio::process::Command> {
+    use tokio::process::Command;
+    if let Some(cmd) = std::env::var_os(DAEMON_CMD_ENV) {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd);
+        Ok(c)
+    } else {
+        let exe = std::env::current_exe()?;
+        let mut c = Command::new(exe);
+        c.arg(DAEMON_FLAG);
+        Ok(c)
+    }
+}
+
+/// Run the **local** edit-host (`--connect-daemon`): the same embedded server + TUI
+/// client as the default role, but with its host seams pointed at a `--daemon` child.
+///
+/// The server thread spawns the daemon (its stdio *is* the wire), wraps it in
+/// [`connect_daemon`] — the edit-host multiplexer, one connection for all five seams —
+/// and injects those seams into [`ServerInit`]. Config and the keystroke path stay
+/// local (`default_runtime`); only fs/process/watch/LSP cross to the daemon. The
+/// daemon's stderr is redirected to a temp log (it can't corrupt the TUI); `tail` it to
+/// debug the daemon. `kill_on_drop` reaps the child when the editor quits.
+fn run_with_daemon(file: Option<String>) -> Result<()> {
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("failed to build server runtime");
+        let result: Result<()> = runtime.block_on(async move {
+            // The daemon's stderr can't share the terminal with the TUI; send it to a
+            // log the user can tail to diagnose the daemon side.
+            let log_path = std::env::temp_dir().join("nxvim-daemon.log");
+            let stderr = std::fs::File::create(&log_path)
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null());
+            let mut child = daemon_command()?
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(stderr)
+                .kill_on_drop(true)
+                .spawn()?;
+            let stdout = child.stdout.take().expect("daemon stdout piped");
+            let stdin = child.stdin.take().expect("daemon stdin piped");
+
+            // One connection → all five host seams (the edit-host multiplexer).
+            let client = connect_daemon(stdout, stdin);
+            let (config_dir, runtimepath) = nxvim_server::default_runtime();
+            let init = ServerInit {
+                file,
+                config_dir,
+                runtimepath,
+                clipboard: nxvim_server::ClipboardProvider::System,
+                mouse_clock: None,
+                // The local disk is unused for buffers in a daemon session — every
+                // fs/process/LSP/Lua-fs path is routed to the daemon below.
+                host_fs: None,
+                host_proc: Some(Box::new(client.host_proc)),
+                host_fs_async: Some(Box::new(client.host_fs)),
+                blocking_system: Some(Box::new(client.blocking_system)),
+                lsp_transport: Some(Box::new(client.lsp_transport)),
+                lua_fs: Some(Box::new(client.lua_fs)),
+            };
+            // Hold the child for the whole session; dropping it (on quit) reaps the
+            // daemon via `kill_on_drop`.
+            let _child = child;
+            run_server(server_end, init).await
+        });
+        if let Err(err) = result {
+            eprintln!("nxvim: edit-host error: {err}");
+        }
+    });
+
+    // The client (terminal UI) runs on the main thread, exactly as the default role.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let result = runtime.block_on(nxvim_tui::run(client_end));
+
+    if let Err(payload) = server_thread.join() {
+        eprintln!(
+            "nxvim: server thread panicked: {}",
+            panic_message(payload.as_ref())
+        );
+        std::process::exit(101);
+    }
+    result
 }
 
 /// Best-effort human-readable text from a thread panic payload.

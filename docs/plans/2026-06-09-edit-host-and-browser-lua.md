@@ -1200,6 +1200,17 @@ What shipped in the **edit-host multiplexer** (`connect_daemon`, 2026-06-11):
   identically and covered by the daemon-side test above. Full `cargo test --workspace` green
   (0 failed); fmt + clippy `-D warnings` clean; local binaries (`ServerInit::default()` =
   every seam `None`) unchanged.
+- **`nxvim --connect-daemon [file]`** (`main.rs`) — the manual driver / local edit-host role,
+  so the split is runnable for real, not just in tests. It is the default editor+TUI role plus
+  the daemon seams: it spawns the daemon child (this binary's `--daemon` by default, or whatever
+  `NXVIM_DAEMON_CMD` names — e.g. `ssh host nxvim --daemon` — run through `sh -c`), wraps the
+  child's stdio in `connect_daemon`, and injects the five seams into `ServerInit`; config /
+  runtimepath / clipboard stay **local** (the thesis), only I/O crosses the wire. The daemon's
+  stderr is redirected to `$TMPDIR/nxvim-daemon.log` so it can't corrupt the TUI. **Verified by
+  hand over a PTY:** the startup buffer renders `[No Name]` then fills from the daemon (off-tick
+  `fs_read`) with its name bound, and an in-editor edit + `:w` lands the bytes on disk through the
+  daemon's off-tick `fs_write`. (This subsumes the listener slice's "drives a local edit-host
+  against a daemon" check for the *stdio* transport; the QUIC transport is what remains.)
 
 Still to do (the **listener slice**): the non-ssh **WebTransport/QUIC listener** wiring
 (`wtransport` on `quinn`, launch-minted bearer token, self-signed cert pinned TOFU — Open

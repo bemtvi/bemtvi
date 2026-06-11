@@ -9,11 +9,11 @@ use nxvim_lsp::{CompletionItemData, LspRequest, PositionEncoding};
 use rmpv::Value;
 
 use super::*;
-use crate::Server;
+use crate::EditHost;
 
-impl Server {
+impl EditHost {
     /// Handle a `textDocument/completion` reply (already past the generation /
-    /// buffer staleness checks in [`Server::on_lsp_reply`]). Builds the menu on
+    /// buffer staleness checks in [`EditHost::on_lsp_reply`]). Builds the menu on
     /// the initial trigger, or replaces its list on a live re-request, then
     /// re-ranks against the current prefix. Dropped if the user has left insert
     /// mode (the menu is unwanted) or nothing matches (nothing to show).
@@ -155,7 +155,7 @@ impl Server {
     /// rust_analyzer and most servers. Debounced by selection (it fires on settle,
     /// not per keystroke) and at-most-once per item (the `resolved` flag); a resolve
     /// already in flight for this same item is not re-issued. The reply merges back
-    /// in [`Server::merge_resolved_completion`], gated by the request generation so
+    /// in [`EditHost::merge_resolved_completion`], gated by the request generation so
     /// a navigation that supersedes it drops the stale reply.
     pub(crate) fn maybe_resolve_selected(&mut self) {
         // Decide and capture what's needed *before* taking the mutable borrows the

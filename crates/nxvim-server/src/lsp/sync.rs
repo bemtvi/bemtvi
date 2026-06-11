@@ -10,13 +10,13 @@ use nxvim_lsp::{LspEvent, LspNotify, LspReply, PositionEncoding, RefreshKind, Se
 use nxvim_lua::{LspClientData, LspOp};
 
 use super::*;
-use crate::Server;
+use crate::EditHost;
 
-impl Server {
+impl EditHost {
     /// Apply one [`LspOp`] drained from the Lua runtime — a `vim.lsp.start` queued
     /// by user Lua (directly, or through the `vim.lsp.enable` `FileType`
     /// dispatcher). Ensures the `(name, root)` server exists and binds `bufnr` to
-    /// it; the next [`Server::sync_lsp`] sends `didOpen`. Phase 7a's replacement
+    /// it; the next [`EditHost::sync_lsp`] sends `didOpen`. Phase 7a's replacement
     /// for the built-in auto-spawn: a server starts *only* via this path.
     pub(crate) fn apply_lsp_op(&mut self, op: LspOp) {
         let start = match op {
@@ -226,7 +226,7 @@ impl Server {
     /// Drive LSP document sync for the *current* buffer this frame: for a buffer a
     /// `vim.lsp.start` already bound to a server, send `didOpen`/`didChange`/
     /// `didSave` as its state requires. Called from `redraw()` alongside
-    /// `refresh_highlights`. Never spawns (that is [`Server::apply_lsp_op`]) and
+    /// `refresh_highlights`. Never spawns (that is [`EditHost::apply_lsp_op`]) and
     /// never blocks: every send is a fire-and-forget [`LspNotify`].
     pub(crate) fn sync_lsp(&mut self) {
         self.reap_closed_lsp_buffers();
@@ -432,7 +432,7 @@ impl Server {
     /// `client_id` as `args.data.client_id`. Pushes the buffer snapshot first (so
     /// the callback resolves the buffer), then folds in the Lua effects the
     /// `on_attach` left — buffer-local keymaps it set bump the keymap version and
-    /// are picked up on the next input. Mirrors [`Server::fire_lifecycle`].
+    /// are picked up on the next input. Mirrors [`EditHost::fire_lifecycle`].
     pub(crate) fn fire_lsp_attach(&mut self, buf: BufferId, file: &str, client_id: u64) {
         let ft = self
             .lsp_states
@@ -454,7 +454,7 @@ impl Server {
     }
 
     /// Fire `LspDetach` for `buf` with `client_id` as `args.data.client_id` — the
-    /// detach counterpart to [`Server::fire_lsp_attach`]. Unlike attach it does
+    /// detach counterpart to [`EditHost::fire_lsp_attach`]. Unlike attach it does
     /// not push a buffer snapshot: detach fires for a buffer being closed
     /// (`didClose`) or a server that exited, neither of which is necessarily the
     /// current buffer. User `LspDetach` callbacks still get `args.buf`/`data`.

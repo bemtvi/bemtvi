@@ -17,10 +17,15 @@
 //!
 //! Only **outbound** effects live here. The matching *inbound* events (a child exited,
 //! a timer fired, an LSP reply, a file fetched) are owned by the run loop's `select!`
-//! and fed into editor-tick methods — that inbound seam is a later slice. This is the
-//! first brick of the `EditHost` extraction: the off-tick async machinery moves behind
-//! the trait while the (large) editor/Lua surface stays put, so the seam grows from the
-//! small side, not by relocating hundreds of `self.editor` call sites at once.
+//! and fed into editor-tick methods through the [`inbound`](crate::inbound) translator.
+//! Between the two seams, the synchronous tick — now hoisted onto the standalone
+//! [`EditHost`](crate::EditHost) — holds no transport directly: every async edge is
+//! either an `fx` call (outbound, here) or a loop arm driving a tick method (inbound).
+//! The full outbound surface is the five effect classes the tick fires: the client wire
+//! (`notify` / `respond`), the event-loop command sink (`loop_command`), the off-tick fs
+//! (`fs_*`), the LSP command sink (`lsp_*`), and the `:TSInstall` grammar fetch
+//! (`ts_install`). [`NativeEffects`] implements all of them over today's tokio/RPC/LSP
+//! machinery; the wasm Worker (Phase 5) supplies its own implementor.
 
 use crate::daemon::{FsRead, HostFsAsync};
 use crate::evloop::{EventLoop, LoopCommand};
@@ -87,6 +92,14 @@ pub trait HostEffects {
     /// *inbound* as an `LspEvent::Reply` carrying `token` (the editor never awaits the
     /// round-trip). Dropped if no such server is running.
     fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest);
+
+    /// `:TSInstall` — fetch + compile `lang`'s treesitter grammar into the data dir off
+    /// the editor thread (network + a C compile, seconds long). Fire-and-forget; the
+    /// finished [`InstallReport`](nxvim_ts::install::InstallReport) (or a loud error)
+    /// returns *inbound* on the run loop's install arm, where the editor reloads the
+    /// grammar and echoes. The native impl runs the work on a `spawn_blocking` worker;
+    /// the wasm build (Phase 5) supplies its own grammar-fetch path.
+    fn ts_install(&mut self, lang: String);
 }
 
 /// The native implementation of [`HostEffects`]: the client wire is msgpack-RPC and
@@ -111,6 +124,10 @@ pub struct NativeEffects {
     /// `request` at. Its inbound event/reply stream (`lsp_events`) is owned by the run
     /// loop's `select!`, not here (the inbound seam is the 4d slice).
     lsp: LspManager,
+    /// Delivery for a finished `:TSInstall` job — the run loop's install arm drains it.
+    /// The effect spawns the fetch+compile on a `spawn_blocking` worker and forwards the
+    /// outcome here.
+    install_tx: UnboundedSender<crate::InstallOutcome>,
 }
 
 impl NativeEffects {
@@ -121,6 +138,7 @@ impl NativeEffects {
         open_tx: UnboundedSender<(BufferId, String, io::Result<FsRead>)>,
         save_done_tx: UnboundedSender<SaveDone>,
         lsp: LspManager,
+        install_tx: UnboundedSender<crate::InstallOutcome>,
     ) -> Self {
         Self {
             rpc,
@@ -129,6 +147,7 @@ impl NativeEffects {
             open_tx,
             save_done_tx,
             lsp,
+            install_tx,
         }
     }
 }
@@ -202,5 +221,16 @@ impl HostEffects for NativeEffects {
 
     fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest) {
         self.lsp.request(key, token, req);
+    }
+
+    fn ts_install(&mut self, lang: String) {
+        let dir = nxvim_ts::data_dir();
+        let tx = self.install_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = nxvim_ts::install::install(&dir, &lang);
+            // The receiver only drops at shutdown; a send error means we're exiting, so
+            // there's nothing to report to.
+            let _ = tx.send((lang, result));
+        });
     }
 }

@@ -2,10 +2,10 @@
 //! completion-popup key routing, and mapping (RHS) execution.
 
 use crate::keymap::{BuiltinAction, MappingRhs, Step};
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::{key_to_notation, parse_keys, Key, KeyCode, Mode};
 
-impl Server {
+impl EditHost {
     pub(crate) fn input(&mut self, keys: &str) {
         // Rebuild the keymap tries if the registry changed since the last batch —
         // once per `nvim_input`, not per key, so each keystroke only walks the

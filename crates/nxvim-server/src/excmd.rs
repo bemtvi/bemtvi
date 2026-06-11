@@ -3,10 +3,10 @@
 //! and runtime-file lookup.
 
 use crate::lsp::LspReqKind;
-use crate::Server;
+use crate::EditHost;
 use std::path::PathBuf;
 
-impl Server {
+impl EditHost {
     pub(crate) fn run_command(&mut self, cmd: &str) {
         self.editor.command(cmd);
         self.emit_lifecycle_events();
@@ -117,7 +117,7 @@ impl Server {
     /// `:TSInstall <lang>…` — fetch + compile each named grammar into the data dir
     /// off the editor thread. The work (network + a C compile) can take seconds, so
     /// each language runs on a `spawn_blocking` worker; its result returns on the
-    /// `install_events` `select!` arm ([`Server::on_install_done`]). We echo a
+    /// `install_events` `select!` arm ([`EditHost::on_install_done`]). We echo a
     /// "installing…" line now so the user sees the command took.
     fn ts_install(&mut self, args: &str) {
         let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
@@ -126,18 +126,12 @@ impl Server {
                 .echo("TSInstall: usage: :TSInstall <language> [<language>…]");
             return;
         }
-        let data_dir = nxvim_ts::data_dir();
         self.editor
             .echo(format!("TSInstall: installing {}…", langs.join(", ")));
         for lang in langs {
-            let tx = self.install_tx.clone();
-            let dir = data_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                let result = nxvim_ts::install::install(&dir, &lang);
-                // The receiver only drops at shutdown; a send error means we're
-                // exiting, so there's nothing to report to.
-                let _ = tx.send((lang, result));
-            });
+            // Off-tick fetch+compile through the effect seam; the outcome returns on the
+            // run loop's install arm ([`EditHost::on_install_done`]).
+            self.fx.ts_install(lang);
         }
     }
 

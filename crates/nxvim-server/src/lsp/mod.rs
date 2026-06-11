@@ -9,7 +9,7 @@
 //! features). This file holds the shared types, the request-kind enum, and the
 //! pure conversion/formatting helpers the submodules draw on.
 //!
-//! All [`Server`] methods here run on the single editor thread and only ever
+//! All [`EditHost`] methods here run on the single editor thread and only ever
 //! hand the manager fire-and-forget notifications, so a slow or hung server can
 //! never stall keystroke->buffer->redraw.
 
@@ -45,7 +45,7 @@ pub(crate) type PanelTarget = Option<(PathBuf, usize, usize)>;
 
 /// Per-buffer LSP document-sync bookkeeping, mirroring `SyntaxState`. One per
 /// open buffer that mapped to a configured server, keyed by [`BufferId`] in
-/// [`Server::lsp_states`].
+/// [`EditHost::lsp_states`].
 #[derive(Default)]
 pub(crate) struct LspDocState {
     /// Which server owns this buffer (`None` until a `vim.lsp.start` binds one).
@@ -91,7 +91,7 @@ pub(crate) struct LspDocState {
 impl LspDocState {
     /// Whether the semantic-token projection is active for this buffer: the auto
     /// default (on) unless explicitly stopped via `vim.lsp.semantic_tokens.stop`.
-    /// The editor-wide gate ([`Server::semantic_tokens_enabled`]) is checked
+    /// The editor-wide gate ([`EditHost::semantic_tokens_enabled`]) is checked
     /// separately by the projection.
     pub(crate) fn semantic_on(&self) -> bool {
         self.semantic_enabled.unwrap_or(true)
@@ -331,7 +331,7 @@ pub(crate) struct ServerRuntime {
 }
 
 /// The live insert-mode completion popup (Phase 5), server-owned like the
-/// diagnostics cache. Held in [`Server::completion`]; `None` when no menu is
+/// diagnostics cache. Held in [`EditHost::completion`]; `None` when no menu is
 /// open. It keeps the server's last candidate list verbatim plus the live
 /// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
 /// re-ranks (or re-requests) in place rather than closing and reopening.
@@ -386,13 +386,13 @@ pub(crate) fn encoding_label(encoding: PositionEncoding) -> &'static str {
 }
 
 /// The panel title for the `:LspCodeAction` list. The server recognizes a panel
-/// select by this title to route it to [`Server::apply_code_action`] instead of
+/// select by this title to route it to [`EditHost::apply_code_action`] instead of
 /// the generic scripting `on_select` path.
 pub(crate) const CODE_ACTION_PANEL_TITLE: &str = "LSP code actions";
 
 /// Convert an LSP [`Range`] (in `encoding`) to an absolute byte range in
 /// `buffer`, resolving each endpoint against its line — the buffer-addressed form
-/// of [`Server::lsp_range_to_bytes`], for a workspace edit that touches a
+/// of [`EditHost::lsp_range_to_bytes`], for a workspace edit that touches a
 /// non-current buffer.
 pub(crate) fn lsp_range_to_bytes_in(
     buffer: &Buffer,
@@ -427,7 +427,7 @@ pub(crate) fn lsp_pos_to_byte_in(
 /// A `(row, byte-column)` point in `buffer` as an LSP [`Position`] in `encoding`
 /// (Decision 4): UTF-8 is the identity (an LSP UTF-8 character *is* a byte
 /// offset), UTF-16/UTF-32 need column math over the line text. The buffer-
-/// addressed form of [`Server::lsp_position`].
+/// addressed form of [`EditHost::lsp_position`].
 pub(crate) fn lsp_position_in(
     buffer: &Buffer,
     encoding: PositionEncoding,
@@ -473,7 +473,7 @@ pub(crate) fn incremental_changes_in(
         .collect()
 }
 
-/// Byte offset of LSP `character` on `line`, the inverse of [`Server::lsp_position`]
+/// Byte offset of LSP `character` on `line`, the inverse of [`EditHost::lsp_position`]
 /// (Decision 4): UTF-8 is the identity (a character *is* a byte offset, clamped
 /// to the line), UTF-16/UTF-32 need column math. Clamped to the line length so a
 /// past-end character (a diagnostic whose range runs to EOL) lands at the end.

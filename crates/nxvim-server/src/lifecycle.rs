@@ -3,8 +3,8 @@
 
 use crate::evloop::LoopCommand;
 use crate::filetype_of;
+use crate::{EditHost, WindowRect, INTERNAL_WATCH_BASE};
 use crate::{FsRead, WatchEvent};
-use crate::{Server, WindowRect, INTERNAL_WATCH_BASE};
 use nxvim_core::{
     BufferId, DirEntry, FileChangeAction, FileChangeReason, FileStat, TabId, WindowId,
 };
@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-impl Server {
+impl EditHost {
     /// Apply the result of an off-tick fetch (`docs/plans/2026-06-09-edit-host-and-browser-lua.md`
     /// → Phase 3, fs leg) into `buffer` — the deferred startup file (which fills the
     /// initial `[No Name]` buffer) or a later `:edit`. An existing file's bytes or a
@@ -94,7 +94,7 @@ impl Server {
     /// Dispatch the buffer opens core deferred this convergence (off-tick `:edit` over
     /// the daemon wire): each is fetched over `HostFsAsync` on a spawned task that
     /// delivers `(buffer, path, result)` back to the `open_rx` arm, which fills the
-    /// named buffer. Called at the tail of [`run_pending`](Server::run_pending), so an
+    /// named buffer. Called at the tail of [`run_pending`](EditHost::run_pending), so an
     /// `:edit` from a keystroke, `vim.cmd('edit ...')`, or a user command is caught
     /// after the editor converges. A no-op when off-tick mode is off or none ran.
     pub(crate) fn drain_pending_opens(&mut self) {
@@ -110,7 +110,7 @@ impl Server {
     /// Diff the editor's current buffer against what was last announced and fire
     /// the buffer-lifecycle autocmds the transition implies — the central,
     /// server-side emission point (design D1) that keeps `nxvim-core` free of
-    /// event types. Called after each applied input (per key in [`Server::input`],
+    /// event types. Called after each applied input (per key in [`EditHost::input`],
     /// after `:`-commands and `nvim_set_current_buf`) and once at startup.
     ///
     /// Ordering on first opening a file mirrors neovim: `BufReadPost` → `FileType`
@@ -397,7 +397,7 @@ impl Server {
     /// Fire a window-lifecycle autocmd (`WinNew`/`WinEnter`/`WinLeave`/
     /// `WinClosed`/`WinResized`). The pattern / `<amatch>` is the window id (as a
     /// string, like neovim); the callback's buffer context is the window's buffer
-    /// when known. Mirrors [`Server::fire_lifecycle`] for buffer events.
+    /// when known. Mirrors [`EditHost::fire_lifecycle`] for buffer events.
     pub(crate) fn fire_window(&mut self, event: &str, win: WindowId, buf: Option<BufferId>) {
         let pattern = win.0.to_string();
         let (bufnr, file) = match buf {
@@ -417,7 +417,7 @@ impl Server {
     /// The pattern / `<amatch>` is the tab id (as a string, like the window
     /// events); the callback's buffer context is the tab's focused window's buffer
     /// when the tab still exists (`None` for a `TabClosed` tab, already gone).
-    /// Mirrors [`Server::fire_window`] for tab events.
+    /// Mirrors [`EditHost::fire_window`] for tab events.
     pub(crate) fn fire_tab(&mut self, event: &str, tab: TabId) {
         let pattern = tab.0.to_string();
         let buf = self
@@ -532,7 +532,7 @@ impl Server {
     }
 
     /// Reconcile a daemon-pushed file change (the `HostWatch` leg's `fs_changed`) — the
-    /// remote analogue of [`Server::reconcile_file_change`]. The daemon owns change
+    /// remote analogue of [`EditHost::reconcile_file_change`]. The daemon owns change
     /// detection and self-suppresses the edit-host's own writes, so a push always means
     /// a real external change; the reason follows from the pushed stat (vanished ⇒
     /// `"deleted"`) and the buffer's modified flag (unsaved ⇒ `"conflict"`). The
@@ -592,7 +592,7 @@ impl Server {
 
     /// Drive an off-tick reload of `buf` over the daemon wire: enqueue a re-fetch of its
     /// own file and mark it for a `FileChangedShellPost` once the bytes land in
-    /// [`Server::apply_open`]. A no-op for a buffer with no path (nothing to re-fetch).
+    /// [`EditHost::apply_open`]. A no-op for a buffer with no path (nothing to re-fetch).
     fn remote_reload(&mut self, buf: BufferId) {
         if self.editor.enqueue_reload(buf) {
             self.reload_posts.insert(buf);

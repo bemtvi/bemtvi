@@ -9,9 +9,9 @@ use nxvim_lsp::{
 };
 
 use super::*;
-use crate::Server;
+use crate::EditHost;
 
-impl Server {
+impl EditHost {
     /// Convert an LSP [`Range`] (in the negotiated `encoding`) to an absolute
     /// **current-buffer** byte range, resolving each endpoint against its line.
     pub(crate) fn lsp_range_to_bytes(
@@ -253,7 +253,7 @@ impl Server {
 
     /// Fire a `codeAction/resolve` for a lazy action, recording it as a pending
     /// apply request (content-version guarded, like format/rename); its resolved
-    /// edit is applied in [`Server::on_lsp_reply`].
+    /// edit is applied in [`EditHost::on_lsp_reply`].
     pub(crate) fn resolve_code_action(&mut self, action: Box<nxvim_lsp::lsp_types::CodeAction>) {
         self.sync_lsp();
         let Some((key, _uri, _encoding)) = self.current_lsp_target() else {

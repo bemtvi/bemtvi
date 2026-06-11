@@ -9,9 +9,9 @@ use rmpv::Value;
 
 use super::*;
 use crate::redraw::StyleTable;
-use crate::Server;
+use crate::EditHost;
 
-impl Server {
+impl EditHost {
     /// The current buffer's cached diagnostics together with its server's
     /// negotiated position encoding, or `None` when the buffer has no attached
     /// server (so callers project nothing). Both borrows are released before any
@@ -20,7 +20,7 @@ impl Server {
         self.diagnostics_of(self.editor.current_buffer_id())
     }
 
-    /// Buffer-addressed form of [`Server::current_diagnostics`], for projecting a
+    /// Buffer-addressed form of [`EditHost::current_diagnostics`], for projecting a
     /// non-focused window's own buffer. Same `(diagnostics, encoding)` or `None`
     /// when that buffer has no attached server.
     pub(crate) fn diagnostics_of(
@@ -36,7 +36,7 @@ impl Server {
     /// Build the per-row `diagnostics` redraw payload from a row→buffer-line
     /// mapping (`numbers`, 1-based, `None` for filler): each visible row's
     /// diagnostic underline spans as `[start_col, end_col, severity, style_id]`
-    /// in **screen columns**. Mirrors [`Server::highlights_for`] — the LSP
+    /// in **screen columns**. Mirrors [`EditHost::highlights_for`] — the LSP
     /// character offsets are converted to bytes through the negotiated encoding,
     /// then bytes to screen columns with the same tab/wide-char `virtcol` the
     /// highlights and selection use, so squiggles line up with the glyphs.
@@ -118,7 +118,7 @@ impl Server {
     /// the diagnostic's first message line; `severity` is `1`=error … `4`=hint;
     /// `style_id` indexes the per-frame `styles` palette when the matching
     /// `DiagnosticVirtualText*` group resolves (`Nil` otherwise, so the client
-    /// falls back to a built-in severity color). Mirrors [`Server::diagnostics_for`]
+    /// falls back to a built-in severity color). Mirrors [`EditHost::diagnostics_for`]
     /// but emits one optional decoration per row rather than a span list — the text
     /// is positioned after end-of-line by the client, so no column conversion runs.
     pub(crate) fn diagnostics_virt_text_for(
@@ -180,7 +180,7 @@ impl Server {
     /// is `1`=error … `4`=hint; `style_id` indexes the per-frame `styles` palette
     /// when the matching `DiagnosticSign*` group resolves (`Nil` otherwise, so the
     /// client falls back to a built-in severity color). Mirrors
-    /// [`Server::diagnostics_virt_text_for`] but addressed to the gutter.
+    /// [`EditHost::diagnostics_virt_text_for`] but addressed to the gutter.
     pub(crate) fn diagnostics_signs_for(
         &self,
         buffer: nxvim_core::BufferId,

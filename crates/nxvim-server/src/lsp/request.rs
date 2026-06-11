@@ -10,9 +10,9 @@ use nxvim_lsp::{LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken, Ser
 use nxvim_lua::CallbackArgs;
 
 use super::*;
-use crate::Server;
+use crate::EditHost;
 
-impl Server {
+impl EditHost {
     /// Issue a language-feature request of `kind` at the cursor, recording its
     /// generation so a stale reply is dropped (Decision 3): a newer request of
     /// the same kind, or the cursor moving before the reply lands, invalidates
@@ -98,7 +98,7 @@ impl Server {
 
     /// `client:request(method, params, handler)` (Phase 5): forward a generic LSP
     /// request to `client_id`'s server, tagging the reply with `cb_id` so it
-    /// routes to the Lua handler when it lands ([`Server::on_client_request_reply`]).
+    /// routes to the Lua handler when it lands ([`EditHost::on_client_request_reply`]).
     /// If the client has no running server, fail loud — run the handler now with an
     /// error rather than dropping it, so the caller learns the request didn't go.
     pub(crate) fn client_request(
@@ -145,7 +145,7 @@ impl Server {
 
     /// `:LspFormat` — request `textDocument/formatting` for the current buffer.
     /// On reply, the `TextEdit[]` is applied iff the buffer hasn't changed since
-    /// (the content-version guard in [`Server::on_lsp_reply`]).
+    /// (the content-version guard in [`EditHost::on_lsp_reply`]).
     pub(crate) fn request_lsp_format(&mut self) {
         self.sync_lsp();
         let Some((key, uri, _encoding)) = self.current_lsp_target() else {

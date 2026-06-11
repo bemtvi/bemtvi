@@ -9,7 +9,7 @@
 //! the byte→screen-column projection that the redraw needs.
 
 use crate::redraw::StyleTable;
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::{unicode, BufferId};
 use rmpv::Value;
 use std::collections::HashMap;
@@ -40,10 +40,10 @@ pub(crate) struct SyntaxState {
     spans: HashMap<usize, Vec<ByteSpan>>,
 }
 
-impl Server {
+impl EditHost {
     /// Refresh the current buffer's highlight memo from the editor's engine, if
     /// the content or viewport changed since the last fetch. Called from
-    /// [`Server::redraw`] just before projecting, so the spans painted this frame
+    /// [`EditHost::redraw`] just before projecting, so the spans painted this frame
     /// reflect the keypress that triggered it.
     pub(crate) fn refresh_highlights(&mut self, height: usize) {
         // Forget memos for buffers the editor has since deleted.

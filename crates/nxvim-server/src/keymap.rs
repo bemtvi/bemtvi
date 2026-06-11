@@ -347,7 +347,7 @@ impl Keymaps {
 
     /// Whether nothing is currently withheld in the prefix buffer. The server
     /// checks this before bypassing the matcher for a core literal-argument key
-    /// (see [`crate::Server::feed_matcher`]): a literal arg only arises after its
+    /// (see [`crate::EditHost::feed_matcher`]): a literal arg only arises after its
     /// lead key (`r`/`f`/`"`/…) already reached the editor, which leaves `pending`
     /// empty — the guard makes that invariant explicit so a bypass can never
     /// reorder past a genuinely-withheld prefix.

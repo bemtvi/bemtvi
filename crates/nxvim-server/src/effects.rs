@@ -4,7 +4,7 @@
 
 use crate::evloop::{LoopCommand, LoopEvent};
 use crate::lsp::CODE_ACTION_PANEL_TITLE;
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
     parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId, UndoEntry,
@@ -126,7 +126,7 @@ fn float_mirror(cfg: FloatConfig) -> FloatMirror {
     }
 }
 
-impl Server {
+impl EditHost {
     /// Apply the side effects the last Lua chunk left in the runtime: highlight
     /// definitions fold into the core registry, queued ex-commands run against
     /// the editor, and the final captured `print` / `nvim_echo` line becomes the
@@ -698,7 +698,7 @@ impl Server {
     }
 
     /// Apply one [`TabOp`] to the live editor (Phase 3) — the deferred form of
-    /// `nvim_set_current_tabpage`, the tab analogue of [`Server::apply_window_op`].
+    /// `nvim_set_current_tabpage`, the tab analogue of [`EditHost::apply_window_op`].
     pub(crate) fn apply_tab_op(&mut self, op: TabOp) {
         match op {
             TabOp::SetCurrent { tab } => {

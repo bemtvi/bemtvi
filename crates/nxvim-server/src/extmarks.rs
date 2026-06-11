@@ -15,7 +15,7 @@
 //! [`ExtmarkStore`](nxvim_core::ExtmarkStore) every frame: the set is small and
 //! always reflects the current marks, so there is no cache to stale.
 
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::BufferId;
 
 /// One highlight interval over a single line, in **byte offsets within that
@@ -32,7 +32,7 @@ pub(crate) struct HlInterval<'a> {
     pub capture: bool,
 }
 
-impl Server {
+impl EditHost {
     /// Every hl_group extmark of `buffer` clipped to line `line_idx` (whose
     /// content occupies byte range `[line_start, line_start + line_len)` in the
     /// rope), as line-relative intervals. Point marks (no `end`) and marks

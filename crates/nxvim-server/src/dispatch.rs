@@ -2,7 +2,7 @@
 //! the method dispatch table that defines the API clients call.
 
 use crate::redraw::{lines_value, style_value};
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::{
     BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, MouseEvent, TabId,
     WindowConfigSpec, WindowId,
@@ -10,7 +10,7 @@ use nxvim_core::{
 use nxvim_rpc::Incoming;
 use rmpv::Value;
 
-impl Server {
+impl EditHost {
     /// The current time in milliseconds for stamping a mouse event. Reads the
     /// injected fake clock ([`ServerInit::mouse_clock`](crate::ServerInit)) when a
     /// test supplies one — so `'mousetime'`-based multi-click detection is driven

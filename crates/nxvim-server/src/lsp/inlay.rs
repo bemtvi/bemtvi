@@ -23,7 +23,7 @@ use rmpv::Value;
 
 use super::{byte_col, InlayHintSpan, InlayHintsCache, InlayResolveTarget, LspReqKind};
 use crate::redraw::StyleTable;
-use crate::Server;
+use crate::EditHost;
 
 /// Flatten the decoded per-line [`InlayHintSpan`]s into the flat
 /// [`InlayHintMirrorData`] list the `vim._inlay_hints` mirror holds (one entry per
@@ -49,7 +49,7 @@ fn inlay_mirror(cache: &InlayHintsCache, client_id: u64) -> Vec<InlayHintMirrorD
         .collect()
 }
 
-impl Server {
+impl EditHost {
     /// Issue an inlay-hint request for `buffer`, if it has the feature enabled and
     /// its server is up, finished `initialize`, and advertised `inlayHintProvider`.
     /// A no-op otherwise (the buffer shows no hints). Whole-buffer, so — like

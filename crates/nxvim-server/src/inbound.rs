@@ -28,9 +28,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::daemon::{FsRead, WatchEvent};
 use crate::evloop::LoopEvent;
 use crate::save::SaveDone;
-use crate::{InstallOutcome, Server};
+use crate::{EditHost, InstallOutcome};
 
-impl Server {
+impl EditHost {
     /// Apply one client message (an `nvim_*` request or notification), then report whether
     /// it asked the editor to quit. The run loop breaks on `true`.
     pub(crate) async fn on_client_message(&mut self, message: Incoming) -> bool {

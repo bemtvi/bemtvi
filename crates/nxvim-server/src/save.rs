@@ -26,7 +26,7 @@ use std::io;
 
 use nxvim_core::{BufferId, FileStat, PendingSave};
 
-use crate::Server;
+use crate::EditHost;
 
 /// The server-side state for a deferred `:wqa` / `:xa` quit (the multi-buffer save
 /// slice): the bang carried from `:wqa!`, and the set of [`PendingSave::seq`]s the
@@ -70,11 +70,11 @@ impl SaveDone {
     }
 }
 
-impl Server {
+impl EditHost {
     /// Route this tick's deferred writes (core's `take_pending_saves`) onto the wire,
     /// serialized per buffer: a buffer with no write in flight dispatches immediately;
     /// a buffer that already has one queues this behind it (snapshot order = wire
-    /// order). Called at the tail of [`run_pending`](Server::run_pending), so every
+    /// order). Called at the tail of [`run_pending`](EditHost::run_pending), so every
     /// `:w` — typed, `vim.cmd('w')`, or from a user command — is caught after the
     /// editor converges.
     pub(crate) fn drain_pending_saves(&mut self) {

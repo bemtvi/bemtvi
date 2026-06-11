@@ -5,7 +5,7 @@
 //! `on_win` and (unless `on_win` returned false) `on_line` per visible row, then
 //! `on_end(tick)`. Inside `on_win` / `on_line` the provider places **ephemeral**
 //! extmarks — single-frame highlights — which the server folds into a per-frame
-//! store ([`Server::ephemeral_extmarks`]) that [`crate::extmarks`] reads while
+//! store ([`EditHost::ephemeral_extmarks`]) that [`crate::extmarks`] reads while
 //! projecting, then clears before the next frame. nvim-cmp uses this to highlight
 //! the matched characters of each completion entry in its menu buffer.
 //!
@@ -13,10 +13,10 @@
 //! queues, server drains" model: the callbacks only read window/buffer state (via
 //! the mirror) and queue ephemeral marks; they never mutate the editor mid-borrow.
 
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::view::View;
 
-impl Server {
+impl EditHost {
     /// Drive the registered decoration providers for this frame, rebuilding the
     /// per-frame ephemeral extmark store the projection then reads. Clears last
     /// frame's ephemeral marks first — unconditionally, so they never survive into

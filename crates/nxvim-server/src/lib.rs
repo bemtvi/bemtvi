@@ -8,7 +8,7 @@
 //! native GUI later) attach over the same RPC channel and are never blocked by
 //! the server's bookkeeping.
 //!
-//! [`run`] hosts the `select!` loop; the [`Server`] state and its behavior are
+//! [`run`] hosts the `select!` loop; the [`EditHost`] state and its behavior are
 //! split across focused sibling modules: [`dispatch`] (the RPC surface),
 //! [`input`] (keystrokes/mappings), [`excmd`] (ex-commands), [`lifecycle`]
 //! (autocmd emission), [`effects`] (draining queued Lua side effects),
@@ -90,7 +90,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::unbounded_channel;
 use treesitter::SyntaxState;
 
 /// Startup options for the server.
@@ -121,7 +121,7 @@ pub struct ServerInit {
     /// A fake millisecond clock for the mouse multi-click timestamp. `None` (the
     /// default) uses the real monotonic clock; a test injects a shared counter here
     /// and advances it between clicks to drive `'mousetime'` deterministically,
-    /// without depending on wall-clock timing. See [`Server::mouse_stamp_ms`].
+    /// without depending on wall-clock timing. See [`EditHost::mouse_stamp_ms`].
     pub mouse_clock: Option<Arc<AtomicU64>>,
     /// The filesystem backend the editor reads and writes buffers through. `None`
     /// (the default) uses the local disk ([`StdHostFs`]); the edit-host split will
@@ -260,10 +260,25 @@ fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// A window's `(id, (x, y, width, height))` rect snapshot, the unit of the
-/// [`Server::last_window_rects`] diff that fires `WinResized`.
+/// [`EditHost::last_window_rects`] diff that fires `WinResized`.
 type WindowRect = (WindowId, (usize, usize, usize, usize));
 
-struct Server {
+/// The synchronous editor tick — the keystroke → core → redraw machine plus the
+/// per-frame bookkeeping (highlight/LSP/lifecycle/mirror caches) the projection needs.
+/// It owns the [`Editor`] and [`LuaRuntime`] and runs entirely on one thread; the
+/// **only** thing that reaches async / off-thread / external machinery is [`fx`](Self::fx),
+/// the [`HostEffects`] seam. That single boundary is what lets the same edit-host run
+/// behind two transports: the native [`run`] loop (this file, [`NativeEffects`]) and,
+/// later, the wasm Worker (Phase 5) with a JS-interop + daemon-link `HostEffects`.
+///
+/// The inbound side is the loop's, not the host's: the `select!` arms in [`run`] own the
+/// transports an event arrives on (client RPC, LSP replies, timers, off-tick fs, watch
+/// pushes, `:TSInstall` completions) and hand each to a thin translator in [`inbound`]
+/// that drives one of the host's per-event tick methods. So `EditHost` holds no tokio
+/// channel or socket directly — every async edge is either `fx` (outbound) or a loop arm
+/// feeding a tick method (inbound). See the Phase 4 hoist in
+/// `docs/plans/2026-06-09-edit-host-and-browser-lua.md`.
+struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
     /// The outbound async-effect seam (Phase 4, Open Decision #6 (a)): the editor
@@ -320,7 +335,7 @@ struct Server {
     inlay_resolve_seq: u64,
     /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
     /// like the diagnostics cache; projected into the `pmenu` redraw key and
-    /// driven by the popup-open key routing in [`Server::completion_menu_key`].
+    /// driven by the popup-open key routing in [`EditHost::completion_menu_key`].
     completion: Option<CompletionMenu>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
@@ -368,7 +383,7 @@ struct Server {
     /// `TabNew`; ids gone fire `TabClosed`.
     known_tabs: Vec<TabId>,
     /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
-    /// `Server::input` runs every key through before `editor.input`. Rebuilt from
+    /// `EditHost::input` runs every key through before `editor.input`. Rebuilt from
     /// `vim._keymaps` when its version advances (checked once per input batch).
     keymaps: Keymaps,
     /// Callback ids queued by `vim.schedule`, drained inside `run_pending` so a
@@ -376,17 +391,17 @@ struct Server {
     /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
     scheduled: VecDeque<u64>,
     /// Per-buffer `changedtick` last copied into the `vim._bufs` Lua mirror
-    /// ([`Server::push_buf_mirror`]), so an unchanged buffer's line array isn't
+    /// ([`EditHost::push_buf_mirror`]), so an unchanged buffer's line array isn't
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
     /// refresh each time (Phase 6).
     buf_mirror_ticks: HashMap<BufferId, u64>,
-    /// Per-buffer line count last mirrored, so [`Server::push_buf_mirror`] can pass
+    /// Per-buffer line count last mirrored, so [`EditHost::push_buf_mirror`] can pass
     /// the old line count as `on_lines`' `lastline` when an attached buffer changes
     /// (`nvim_buf_attach`). Tracked only to fire faithful buffer-change callbacks —
     /// telescope drives its prompt filtering off `on_lines`.
     buf_mirror_lines: HashMap<BufferId, usize>,
     /// Per-buffer undo fingerprint last serialized into the `vim._undotree` Lua
-    /// mirror ([`Server::push_undotree_mirror`]), so an unchanged tree isn't
+    /// mirror ([`EditHost::push_undotree_mirror`]), so an unchanged tree isn't
     /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
     undo_mirror_versions: HashMap<BufferId, (u64, usize, u64, bool)>,
     /// Monotonic base for the editor's time: `start.elapsed()` seconds are stamped
@@ -394,10 +409,10 @@ struct Server {
     /// labels survive wall-clock jumps; see [`Editor::set_now_mono`].
     start: std::time::Instant,
     /// Optional fake clock for the mouse multi-click timestamp ([`ServerInit::mouse_clock`]);
-    /// when set, [`Server::mouse_stamp_ms`] reads it instead of `start.elapsed()`.
+    /// when set, [`EditHost::mouse_stamp_ms`] reads it instead of `start.elapsed()`.
     mouse_clock: Option<Arc<AtomicU64>>,
     /// The highlight-registry [`generation`](nxvim_core::highlight::Highlights::generation)
-    /// last folded into the `vim._hl_defs` Lua mirror ([`Server::push_buf_mirror`]).
+    /// last folded into the `vim._hl_defs` Lua mirror ([`EditHost::push_buf_mirror`]).
     /// The mirror (potentially hundreds of groups) is re-pushed only when this
     /// changes — a colorscheme load, a `:hi`/`nvim_set_hl` — so the common chunk
     /// pays nothing for `nvim_get_hl` support. `None` until the first push.
@@ -416,22 +431,17 @@ struct Server {
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
     feed_buffer: VecDeque<(Key, bool)>,
-    /// Sender half handed to each `:TSInstall` background job (a `spawn_blocking`
-    /// that fetches + compiles a grammar off the editor thread). Completions return
-    /// on the matching `select!` arm, where the editor reloads the grammar and
-    /// echoes the result — see [`Server::on_install_done`].
-    install_tx: UnboundedSender<InstallOutcome>,
     /// Per-frame **ephemeral** extmarks placed by decoration providers, keyed by
     /// buffer. Rebuilt from scratch every redraw: cleared at the start of the
-    /// provider drive ([`Server::run_decoration_providers`]), populated as each
+    /// provider drive ([`EditHost::run_decoration_providers`]), populated as each
     /// provider's `on_win` / `on_line` emits `ephemeral = true` marks, read by
-    /// [`Server::extmark_intervals`] while projecting, and left until the next
+    /// [`EditHost::extmark_intervals`] while projecting, and left until the next
     /// frame clears it. Separate from each buffer's persistent
     /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) so single-frame decorations never
     /// touch undo/redo or the `nvim_buf_get_extmarks` mirror.
     ephemeral_extmarks: HashMap<BufferId, nxvim_core::ExtmarkStore>,
     /// Monotonic redraw counter handed to decoration providers as the frame `tick`
-    /// (neovim's display tick). Incremented once per [`Server::run_decoration_providers`].
+    /// (neovim's display tick). Incremented once per [`EditHost::run_decoration_providers`].
     decor_tick: u64,
     /// Buffers with an off-tick write currently on the wire — at most one per buffer,
     /// so a buffer's overlapping `:w`s serialize (snapshot order = wire order) rather
@@ -448,24 +458,24 @@ struct Server {
     /// a failed multi-buffer save keeps the editor up exactly as a failed `:wq` does.
     quit_all_gate: Option<save::QuitAllGate>,
     /// The native file watch armed for each file-backed buffer, keyed by buffer and
-    /// holding the `(path, disk-stat)` it was armed against. [`Server::sync_buffer_watches`]
+    /// holding the `(path, disk-stat)` it was armed against. [`EditHost::sync_buffer_watches`]
     /// reconciles this against the live buffers every tick: a new file-backed buffer
     /// arms a watch, a closed one disarms, and a changed key (a reload/save gave the
     /// file a new identity) re-arms — so the watch follows the file across atomic
     /// replaces. Each watch's loop id is [`INTERNAL_WATCH_BASE`]` + buffer.0`, which
     /// the [`LoopEvent::FsEvent`] arm uses to route a change back to `checktime` for
     /// that buffer (vs. running a Lua `vim.uv.fs_event` callback). Local sessions
-    /// only — a daemon session uses [`Server::remote_watches`] instead.
+    /// only — a daemon session uses [`EditHost::remote_watches`] instead.
     buf_watches: HashMap<BufferId, (PathBuf, Option<FileStat>)>,
     /// The paths watched on the **daemon** (`HostWatch` leg) in a daemon session — the
-    /// remote analogue of [`Server::buf_watches`]. [`Server::sync_buffer_watches`] arms a
+    /// remote analogue of [`EditHost::buf_watches`]. [`EditHost::sync_buffer_watches`] arms a
     /// watch (`HostFsAsync::watch`) for each file-backed buffer's path and disarms a
     /// closed one; a `fs_changed` push for one reconciles off-tick. Empty in a local
     /// session (it arms `buf_watches` instead). The daemon owns change detection, so this
     /// holds only paths — no stat snapshot (unlike `buf_watches`).
     remote_watches: HashSet<String>,
     /// Buffers whose off-tick reload (the remote watch leg) is in flight, awaiting a
-    /// `FileChangedShellPost` once the re-fetch lands in [`Server::apply_open`]. The
+    /// `FileChangedShellPost` once the re-fetch lands in [`EditHost::apply_open`]. The
     /// remote reload can't be synchronous (it crosses the wire), so the post event is
     /// deferred to the fetch's completion rather than fired inline like the local path.
     reload_posts: HashSet<BufferId>,
@@ -661,7 +671,7 @@ where
         });
     }
 
-    let mut server = Server {
+    let mut host = EditHost {
         editor,
         lua,
         // The native outbound-effect seam: the client wire ([`Rpc`]), the event-loop
@@ -676,6 +686,7 @@ where
             open_tx,
             save_done_tx,
             lsp,
+            install_tx,
         )),
         ui: None,
         syntax_states: HashMap::new(),
@@ -713,7 +724,6 @@ where
         pending_ui_input: None,
         pending_getchar: None,
         feed_buffer: VecDeque::new(),
-        install_tx,
         ephemeral_extmarks: HashMap::new(),
         decor_tick: 0,
         saves_inflight: HashSet::new(),
@@ -733,7 +743,7 @@ where
     // editor the moment it completes a built-in, so `gg` fires whole instead of
     // being folded into `gd`. This retires the bespoke `lsp_pending_g` recognizer
     // (and, earlier, `lsp_pending_ctrl_x` — `<C-x><C-o>` is just a two-key map).
-    server.keymaps.set_native_defaults(vec![
+    host.keymaps.set_native_defaults(vec![
         NativeDefault {
             mode: "n",
             lhs: "gd",
@@ -779,25 +789,25 @@ where
     // emission refreshes it again before each autocmd fires; this makes it valid
     // earlier.
     {
-        let buf = server.editor.current_buffer_id();
-        let name = server.editor.buffer_name(buf).unwrap_or_default();
-        let ft = filetype_of(server.editor.buffer().path.as_deref()).unwrap_or("");
-        let _ = server.lua.set_buf_snapshot(buf.0, &name, ft);
+        let buf = host.editor.current_buffer_id();
+        let name = host.editor.buffer_name(buf).unwrap_or_default();
+        let ft = filetype_of(host.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = host.lua.set_buf_snapshot(buf.0, &name, ft);
     }
     // Seed the buffer mirror too, so `init.lua` can read buffer lines / the cursor.
-    server.push_buf_mirror();
+    host.push_buf_mirror();
 
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.
     if let Some(config_dir) = &init.config_dir {
-        server.source_init(&config_dir.join("init.lua"));
+        host.source_init(&config_dir.join("init.lua"));
     }
     // Then source the package `plugin/` / `after/plugin/` Lua scripts across the
     // runtimepath — neovim's startup package load, after `init.lua` and before the
     // first buffer's lifecycle events, so a plugin's autocmds/registration are in
     // place (this is what initializes nvim-cmp's engine, cmp-buffer's source, etc.).
-    server.source_plugins();
+    host.source_plugins();
 
     // Startup seed: the initial buffer and the config's autocmds both exist now,
     // so fire the first buffer's lifecycle events (`BufReadPost`→`FileType`→
@@ -805,15 +815,15 @@ where
     // Pre-seed the window set so the first window doesn't fire `WinNew` (neovim
     // skips it for the initial window); `last_window_id` stays `None` so the
     // first `WinEnter` still fires alongside `BufEnter`, the window analogue.
-    server.known_windows = server.editor.window_ids();
-    server.last_window_rects = Some(server.window_rects_snapshot());
+    host.known_windows = host.editor.window_ids();
+    host.last_window_rects = Some(host.window_rects_snapshot());
     // Pre-seed the tab set so the initial tab doesn't fire `TabNew` (neovim, like
     // for the first window, doesn't); `last_tab_id` stays `None` so a later switch
     // still fires the first `TabEnter`/`TabLeave` pair.
-    server.known_tabs = server.editor.tab_ids();
+    host.known_tabs = host.editor.tab_ids();
     // Seed the buffer set too, so the startup buffer isn't seen as "newly gone"
     // and a never-deleted buffer never triggers a spurious cleanup.
-    server.known_buffers = server.editor.buffer_ids();
+    host.known_buffers = host.editor.buffer_ids();
     // Load the shada (persistence) store before the first frame: it recency-merges
     // + compacts any sibling stores and returns this session's registers (later:
     // marks, history, jumplist) to seed, so a plugin reading them at `VimEnter`
@@ -823,66 +833,67 @@ where
     let mut shada = init.shada;
     if let Some(store) = shada.as_mut() {
         match store.load() {
-            Ok(state) => server.editor.import_persist(state),
+            Ok(state) => host.editor.import_persist(state),
             Err(e) => {
-                server
-                    .editor
+                host.editor
                     .echo(format!("shada: could not open store: {e}"));
                 shada = None;
             }
         }
     }
-    server.emit_lifecycle_events();
-    server.run_pending();
+    host.emit_lifecycle_events();
+    host.run_pending();
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a
     // plugin that gates "the editor has finished starting" reads it as true.
-    let _ = server.lua.set_vim_did_enter(true);
+    let _ = host.lua.set_vim_did_enter(true);
 
-    // The run loop is a thin translator: each arm receives one event off a transport and
-    // hands the whole batch to an inbound-seam handler (`inbound.rs`), which coalesces the
-    // channel, runs the per-event tick method, and settles. No arm touches editor / Lua
-    // state directly — that's the property the `EditHost` hoist (Phase 4e) needs.
+    // The run loop is a thin translator over the `host` (the standalone `EditHost`): each
+    // arm receives one event off a transport and hands the whole batch to an inbound-seam
+    // handler (`inbound.rs`), which coalesces the channel, runs the per-event tick method,
+    // and settles. No arm touches `host.editor` / `host.lua` directly, and `host` reaches
+    // back out only through its `fx` seam — so this loop + `NativeEffects` are the only
+    // native-specific pieces; a wasm Worker (Phase 5) supplies its own of each.
     loop {
         tokio::select! {
             // Editor input / API calls from the UI client.
             message = incoming.recv() => {
                 let Some(message) = message else { break };
-                if server.on_client_message(message).await {
+                if host.on_client_message(message).await {
                     break;
                 }
             }
             // Replies from the language servers (initialize handshakes, published
             // diagnostics, server exits, log messages). Selecting here keeps the
             // editor responsive regardless of any server's speed or health.
-            Some(event) = lsp_events.recv() => server.on_lsp_events(event, &mut lsp_events),
+            Some(event) = lsp_events.recv() => host.on_lsp_events(event, &mut lsp_events),
             // Timers and child-process completions from the event-loop actor — the
             // first thing that wakes the server on wall-clock time rather than RPC.
-            Some(event) = loop_events.recv() => server.on_loop_events(event, &mut loop_events),
+            Some(event) = loop_events.recv() => host.on_loop_events(event, &mut loop_events),
             // Bytes for an off-tick open arrived from the daemon's fs — the startup
             // file (kept from freezing startup) or a later `:edit`. Idle for a
             // bare/local session.
-            Some(open) = open_rx.recv() => server.on_opens(open, &mut open_rx),
+            Some(open) = open_rx.recv() => host.on_opens(open, &mut open_rx),
             // A `:TSInstall` background job finished (grammar fetched + compiled, or it
             // failed): reload the grammar so open buffers re-highlight/indent, echo.
-            Some(outcome) = install_events.recv() => server.on_installs(outcome, &mut install_events),
+            Some(outcome) = install_events.recv() => host.on_installs(outcome, &mut install_events),
             // An off-tick `:w` finished on the daemon (the save path): finalize the
             // buffer's saved-state and replay any deferred `:wq`/`:x` quit. The replayed
             // quit can ask the editor to exit — the one non-input arm that can.
             Some(done) = save_done_rx.recv() => {
-                if server.on_save_dones(done, &mut save_done_rx) {
+                if host.on_save_dones(done, &mut save_done_rx) {
                     break;
                 }
             }
             // The daemon's watch leg pushed a file change (`HostWatch`): reconcile it off
             // the editor tick. Idle for a local/bare session (nothing ever sends here).
-            Some(ev) = watch_rx.recv() => server.on_watch_events(ev, &mut watch_rx),
+            Some(ev) = watch_rx.recv() => host.on_watch_events(ev, &mut watch_rx),
         }
     }
     // The loop has exited (quit or client disconnect): flush the final snapshot to
     // this instance's store, then drop it (releasing the file lock) so the next
     // instance can merge this one's clean checkpoint. Best-effort — we're leaving.
     if let Some(store) = shada.as_mut() {
-        if let Err(e) = store.flush(&server.editor.export_persist()) {
+        if let Err(e) = store.flush(&host.editor.export_persist()) {
             eprintln!("shada: final flush failed: {e}");
         }
     }

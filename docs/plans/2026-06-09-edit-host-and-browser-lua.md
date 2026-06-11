@@ -1659,12 +1659,7 @@ lives on the trait):**
 - **4b — off-tick fs effects** ✅ DONE — Phase 4b below.
 - **4c — LSP effects** ✅ DONE — Phase 4c below.
 - **4d — the inbound seam** ✅ DONE — Phase 4d below.
-- **4e — hoist the tick onto `EditHost`**: move the sync state + tick methods off
-  `Server` onto a standalone `EditHost { editor, lua, … }` that holds
-  `&mut dyn HostEffects`; `Server` shrinks to *the* native `HostEffects` impl + the
-  transports + the `select!` loop. Then the wasm cdylib (Phase 5) constructs an
-  `EditHost` with a wasm `HostEffects` and **the throwaway `nxvim-edithost-demo` is
-  deleted**.
+- **4e — hoist the tick onto `EditHost`** ✅ DONE — Phase 4e below.
 
 #### Phase 4b — the `HostEffects` seam: off-tick fs effects — ✅ DONE (2026-06-11)
 
@@ -1776,6 +1771,46 @@ are each exercised by their existing suites (`editing`, the 114-test `nxvim` LSP
 `daemon_*`, `uv_process`). Only **4e** remains in Phase 4-proper: hoist the sync state +
 tick methods off `Server` onto a standalone `EditHost` holding `&mut dyn HostEffects` (and
 fold in the one trailing TSInstall outbound site).
+
+#### Phase 4e — hoist the tick onto the standalone `EditHost` — ✅ DONE (2026-06-11)
+
+The capstone of Phase 4-proper: the monolithic `Server` struct — which already held
+`editor` / `lua` / the per-frame caches and, since 4a–4c, `fx: Box<dyn HostEffects>` — *is*
+the synchronous edit-host, so the hoist is the renaming that makes that true and the
+removal of the one field that contradicted it. With the outbound effects (4a–4c) and the
+inbound translator (4d) both already off the struct, no tick code moved; the work was
+making the type *standalone* — coupled to async only through `fx`.
+
+Shipped:
+- **The trailing TSInstall outbound site folded onto the seam.** `:TSInstall`'s
+  fetch+compile was the **last** raw transport the struct still held:
+  `install_tx: UnboundedSender<InstallOutcome>` plus the `tokio::task::spawn_blocking` in
+  `excmd.rs`. A new `HostEffects::ts_install(lang)` method (the fifth and final outbound
+  class — wire / loop commands / off-tick fs / LSP / **TSInstall**) takes both;
+  `NativeEffects` now owns `install_tx` and runs the `spawn_blocking` verbatim, and the
+  `:TSInstall` loop is just `self.fx.ts_install(lang)`. The finished job still returns
+  *inbound* on the run loop's install arm. After this the struct holds **no tokio channel
+  or socket** — every async edge is `fx` (outbound) or a loop arm feeding a tick method
+  (inbound).
+- **`Server` → `EditHost`.** With the last transport gone, the struct is renamed to name
+  what it is: the portable synchronous tick. The run-loop binding becomes `host`, and the
+  decomposition the plan named is now literal — `EditHost` (the sync tick + `fx`),
+  `NativeEffects` (the native `HostEffects` impl + the outbound transports), and `run()`
+  (the inbound transports + the `select!` loop). There is no `Server` struct left: a wasm
+  Worker (Phase 5) will construct an `EditHost` with a wasm `HostEffects` and supply its
+  own loop, reusing this exact tick.
+
+**Exit criteria — met.** Pure relocation, zero behavior change: `cargo build` +
+`fmt --check` + `clippy -D warnings` clean across the workspace (incl. `nxvim` + `nxvim-gui`,
+the `run`/`run_io` consumers); the **full workspace** (`cargo test --workspace`, 1351 tests
+/ 78 binaries) green. The rename is exercised by *every* test (all drive the renamed
+`EditHost` through the loop); the TSInstall fold is proven *live* — not merely compiled — by
+the hermetic `nxvim` `ts_install` suite, which drives `:TSInstall` end to end through a local
+HTTPS mirror (real gunzip → untar → C compile → `dlopen`) and asserts the freshly-installed
+parser highlights/indents — exactly the `fx.ts_install` → `spawn_blocking` → install arm →
+`on_install_done` → reload path this slice reroutes. Phase 4-proper is complete: the
+reusable sync `EditHost` exists, coupled to the outside world only through `HostEffects`.
+The throwaway `nxvim-edithost-demo` stays until Phase 5's wasm cdylib replaces it.
 
 ---
 

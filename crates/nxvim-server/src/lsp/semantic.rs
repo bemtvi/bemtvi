@@ -6,7 +6,7 @@
 //! per-buffer and projected into nxvim's own highlight layer at the right
 //! priority — but it lands in the *highlight* layer rather than a sibling redraw
 //! key: the decoded spans become a third source of [`HlInterval`]s that
-//! [`Server::highlights_for`](crate::treesitter) merges, at
+//! [`EditHost::highlights_for`](crate::treesitter) merges, at
 //! [`SEMANTIC_HL_PRIORITY`](nxvim_core::SEMANTIC_HL_PRIORITY) — above the
 //! treesitter floor, below user extmarks. A token whose `@lsp.*` group does not
 //! resolve to a style in the active theme is **dropped** from the projection, so
@@ -23,7 +23,7 @@ use nxvim_lua::SemanticTokenData;
 
 use super::{byte_col, SemanticSpan};
 use crate::extmarks::HlInterval;
-use crate::Server;
+use crate::EditHost;
 
 /// Flatten the decoded per-line [`SemanticSpan`]s into the flat
 /// [`SemanticTokenData`] list the `vim._semantic_tokens` mirror holds (one entry
@@ -48,7 +48,7 @@ fn semantic_mirror(
         .collect()
 }
 
-impl Server {
+impl EditHost {
     /// Issue a semantic-tokens request for `buffer`, if its server is up, finished
     /// `initialize`, and advertised a legend. A no-op otherwise (the buffer keeps
     /// the treesitter floor alone). Whole-buffer, so — unlike the cursor-anchored
@@ -225,7 +225,7 @@ impl Server {
     }
 }
 
-impl Server {
+impl EditHost {
     /// Register a **buffer-scoped** pending semantic-tokens request (unlike the
     /// cursor-scoped position requests `register_lsp_request` issues for the
     /// *current* buffer): bump the generation and record the issuing `buffer` and

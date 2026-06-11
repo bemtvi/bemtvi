@@ -2,7 +2,7 @@
 //! render: lines, cursor, chrome styles, scroll band, panel, and the per-frame
 //! deduped style palette ([`StyleTable`]).
 
-use crate::Server;
+use crate::EditHost;
 use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
 use nxvim_core::view::{ScrollAnim, Separator, TabView, ViewRect, WindowView};
@@ -10,7 +10,7 @@ use nxvim_core::{BorderStyle, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;
 
-impl Server {
+impl EditHost {
     /// Push the current view to the client as a single `redraw` notification
     /// carrying an nxvim-native view map (no neovim grid protocol). The map holds
     /// the **global** chrome (mode, command line, message, panel, popup) plus a
@@ -291,7 +291,7 @@ impl Server {
     /// segment per highlighted run. Runs the [`statusline`] `%`-format engine over
     /// the global `'statusline'` (or the built-in default when empty) against the
     /// window's pre-computed `status_ctx`, evaluating `%{}`/`%!` expressions via
-    /// the (Lua-aware) [`Server::eval_statusline_expr`] callback, then resolves
+    /// the (Lua-aware) [`EditHost::eval_statusline_expr`] callback, then resolves
     /// each segment's highlight group to a palette style id.
     ///
     /// `style` is `Nil` for a segment with no group, or one whose group the

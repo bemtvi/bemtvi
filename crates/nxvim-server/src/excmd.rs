@@ -31,6 +31,9 @@ impl EditHost {
         let cur_buf = self.editor.current_buffer_id().0;
         match name {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
+            // `:so[urce] {file}` — run a script file (`.lua` executes through the
+            // runtime; vimscript is fail-loud, not a silent skip).
+            "so" | "sou" | "sour" | "sourc" | "source" => self.ex_source(args.trim()),
             // Phase-1 LSP observability: dump server/document state into the panel.
             "LspInfo" => {
                 let lines = self.lsp_info_lines();
@@ -82,6 +85,27 @@ impl EditHost {
                 Ok(out) => self.surface_autocmd_output("Autocommands", &out),
                 Err(e) => self.editor.echo(format!("E5108: Error in :augroup: {e}")),
             },
+            // `:sil[ent][!] {cmd}` — the silent command modifier. Run `{cmd}` to
+            // full convergence with its message-line output suppressed; the `!`
+            // form is the one plugins lean on to ignore a command that errors or
+            // doesn't exist (lazy.nvim: `silent! runtime plugin/rplugin.vim`). The
+            // core defers the whole `silent …` string here, so this is the one
+            // place it resolves. We snapshot the message line + history, run the
+            // inner command (it may defer further — `run_command` drains that), then
+            // restore: anything it echoed is dropped. nxvim doesn't yet distinguish
+            // error- from normal-level output, so a bare `:silent` suppresses errors
+            // too — a minor over-suppression versus neovim, where `:silent` keeps
+            // errors and only `:silent!` swallows them.
+            _ if is_silent(base) => {
+                let inner = args.trim().to_string();
+                if !inner.is_empty() {
+                    let saved_msg = self.editor.message.clone();
+                    let saved_len = self.editor.messages.len();
+                    self.run_command(&inner);
+                    self.editor.message = saved_msg;
+                    self.editor.messages.truncate(saved_len);
+                }
+            }
             _ if is_doautocmd(base) => {
                 match self.lua.ex_doautocmd(args) {
                     Ok(out) => self.surface_autocmd_output("Autocommands", &out),
@@ -228,6 +252,38 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
+    /// `:source {file}` — run a script file. A `.lua` file executes through the
+    /// runtime (its effects drain like a `:lua` chunk); a missing file is the
+    /// standard `E484`. Vimscript (`.vim`) has no interpreter yet, so it fails loud
+    /// rather than quietly skipping — a silent skip would make a colorscheme that
+    /// never applied look loaded (the no-silent-stubs rule).
+    fn ex_source(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.editor.echo("E471: Argument required");
+            return;
+        }
+        let path = PathBuf::from(arg);
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => {
+                self.editor.echo(format!("E484: Can't open file {arg}"));
+                return;
+            }
+        };
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("lua") => {
+                if let Err(e) = self.lua.exec_named(&src, &format!("@{arg}")) {
+                    self.editor
+                        .echo(format!("E5113: Error while sourcing {arg}: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            _ => self.editor.echo(format!(
+                "nxvim: :source of vimscript is not supported yet ({arg}); only .lua files can be sourced"
+            )),
+        }
+    }
+
     /// Find a runtime file (e.g. `colors/catppuccin.lua`) by searching each
     /// runtimepath entry in order; the first existing match wins. `None` if no
     /// entry holds it.
@@ -252,6 +308,12 @@ impl EditHost {
             self.editor.echo(out);
         }
     }
+}
+
+/// `:sil[ent]` and its abbreviations (`sil`, `sile`, `silen`, `silent`). The
+/// minimal form is `sil` — shorter prefixes are ambiguous with other commands.
+fn is_silent(base: &str) -> bool {
+    matches!(base, "sil" | "sile" | "silen" | "silent")
 }
 
 /// `:au[tocmd]` and its abbreviations (`au`, `aut`, … `autocmd`). The minimal

@@ -119,6 +119,15 @@ pub struct Buffer {
     /// `resync` for the Lua-treesitter journal (whole-rope replacement → the Lua
     /// `LanguageTree` must fully reparse via `on_reload`, not edit its trees).
     lua_ts_resync: bool,
+    /// A **fourth** edit journal, drained by [`Buffer::take_jump_edits`], feeding
+    /// the editor's per-window jumplist line-adjustment: a `<C-o>` target on a line
+    /// pushed down/up by an edit above it must move with the text (vim's
+    /// `mark_adjust`). The jumplist lives on the window (not the buffer), so it
+    /// can't ride [`Buffer::record`]'s `shift_marks` like the buffer-local marks do;
+    /// instead the editor drains these points and shifts the entries itself. Kept
+    /// separate from the other journals for the usual reason — independent drain
+    /// timing must not let one consumer starve another.
+    jump_edits: Vec<BufferEdit>,
     /// Buffer-anchored extmarks (highlight-layering marks set via
     /// `nvim_buf_set_extmark`), partitioned by namespace. Their byte anchors are
     /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
@@ -135,6 +144,19 @@ pub struct Buffer {
     /// undo/redo, exactly as `extmarks` are. (Routing/validation lives in
     /// [`crate::editor::marks`]; global `A`–`Z` marks live on the editor.)
     pub marks: HashMap<char, (usize, usize)>,
+    /// The **change list** — positions of the changes made in this buffer, oldest
+    /// first, navigated with `g;` (older) / `g,` (newer) and listed by `:changes`.
+    /// Per-buffer like vim's, and like the buffer-local marks it rides
+    /// [`Buffer::record`]: each entry shifts as later edits move its line, and an
+    /// entry whose line is deleted is dropped. Coalesced by line — editing the same
+    /// line repeatedly keeps one entry at the latest column — and capped at 100. Its
+    /// head is the `` `. `` last-change mark. Reset by [`Buffer::mark_resync`] and
+    /// snapshotted/restored across undo with [`marks`](Buffer::marks).
+    pub changelist: Vec<(usize, usize)>,
+    /// The `g;`/`g,` navigation pointer into [`changelist`](Buffer::changelist):
+    /// `changelist.len()` means "at the newest change / not navigating"; a new
+    /// change resets it there.
+    pub changelistidx: usize,
     /// When `Some(dir)`, this buffer is a **directory listing** — nxvim's
     /// in-window file explorer (vim's netrw), not an editable text file. `dir` is
     /// the canonical absolute path being listed; the editor routes `<CR>`/`-` to
@@ -171,6 +193,9 @@ impl Buffer {
             lsp_resync: false,
             lua_ts_edits: Vec::new(),
             lua_ts_resync: false,
+            jump_edits: Vec::new(),
+            changelist: Vec::new(),
+            changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
@@ -241,6 +266,9 @@ impl Buffer {
             lsp_resync: false,
             lua_ts_edits: Vec::new(),
             lua_ts_resync: false,
+            jump_edits: Vec::new(),
+            changelist: Vec::new(),
+            changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
@@ -304,6 +332,9 @@ impl Buffer {
             lsp_resync: false,
             lua_ts_edits: Vec::new(),
             lua_ts_resync: false,
+            jump_edits: Vec::new(),
+            changelist: Vec::new(),
+            changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             // A directory listing is never written back to disk, so it needs no
@@ -437,6 +468,10 @@ impl Buffer {
         self.edits.clear();
         self.lsp_edits.clear();
         self.lua_ts_edits.clear();
+        // The jumplist journal is moot too: positions against the old rope can't be
+        // shifted into the new one. The editor clears jumplist entries for a
+        // resync'd buffer on its own (mirroring marks), so just drop the deltas.
+        self.jump_edits.clear();
         self.resync = true;
         self.lsp_resync = true;
         self.lua_ts_resync = true;
@@ -451,6 +486,11 @@ impl Buffer {
         // reload (`:e!`) has nothing to restore from, so the marks are simply gone,
         // matching vim clearing them on a destructive reload.
         self.marks.clear();
+        // The change list's positions are against the old rope too; drop them. Undo
+        // restores them from the snapshot (see the editor's `restore_snapshot`); a
+        // genuine reload has nothing to restore, matching vim.
+        self.changelist.clear();
+        self.changelistidx = 0;
         self.changedtick += 1;
         self.modified = true;
     }
@@ -486,6 +526,14 @@ impl Buffer {
         }
     }
 
+    /// Drain the **jumplist** edit journal — the line-adjustment stream the editor
+    /// applies to per-window `<C-o>` targets (parallel to the others). `resync` is
+    /// irrelevant here (a resync'd buffer's entries are cleared outright), so this
+    /// returns the raw edits.
+    pub fn take_jump_edits(&mut self) -> Vec<BufferEdit> {
+        std::mem::take(&mut self.jump_edits)
+    }
+
     /// Length of the Lua-treesitter journal — paired with
     /// [`Buffer::truncate_lua_ts_edits`] to drop exactly the edits a single
     /// operation appended (the server uses it to suppress its own `on_bytes` for a
@@ -518,8 +566,20 @@ impl Buffer {
         // trailing-newline maintenance `insert` is *not* a user change, so
         // `normalize` saves and restores `'.'` around it (see there).
         self.marks.insert('.', edit.start_point);
+        // The change list rides edits the same way: shift the existing entries, then
+        // record this change's position as its new head. `normalize` saves/restores
+        // it around the phantom-newline insert, exactly as it does `'.'`.
+        shift_changelist(
+            &mut self.changelist,
+            edit.start_point,
+            edit.old_end_point,
+            edit.new_end_point,
+        );
+        add_to_changelist(&mut self.changelist, edit.start_point);
+        self.changelistidx = self.changelist.len();
         self.edits.push(edit.clone());
         self.lsp_edits.push(edit.clone());
+        self.jump_edits.push(edit.clone());
         self.lua_ts_edits.push(edit);
         self.changedtick += 1;
         self.modified = true;
@@ -542,6 +602,9 @@ impl Buffer {
         // across the insert; the phantom newline is always at the buffer's end,
         // after every real mark, so it never needs to *shift* one.
         let saved_dot = self.marks.get(&'.').copied();
+        // The maintenance insert must not enter the change list either: snapshot it
+        // (and its nav pointer) and put it back afterward, as we do for `'.'`.
+        let saved_changelist = (self.changelist.clone(), self.changelistidx);
         if n == 0 {
             self.insert(0, "\n");
         } else if self.text.get_char(n - 1).map(|c| c != '\n').unwrap_or(true) {
@@ -553,6 +616,7 @@ impl Buffer {
             Some(p) => self.marks.insert('.', p),
             None => self.marks.remove(&'.'),
         };
+        (self.changelist, self.changelistidx) = saved_changelist;
     }
 
     /// Write the buffer to `path` (or its bound path). Returns `(bytes, lines)`.
@@ -694,26 +758,85 @@ fn shift_marks(
     if s == oe && oe == ne {
         return; // no-op edit (e.g. an empty insert/remove that still records)
     }
-    marks.retain(|_, pos| {
-        if *pos < s {
-            // entirely before the edit — unaffected
-            true
-        } else if *pos >= oe {
-            let row = (pos.0 as isize + (ne.0 as isize - oe.0 as isize)) as usize;
-            let col = if pos.0 == oe.0 {
-                (pos.1 as isize + (ne.1 as isize - oe.1 as isize)) as usize
-            } else {
-                pos.1
-            };
-            *pos = (row, col);
-            true
-        } else if oe.0 > pos.0 {
-            // the mark's whole line was deleted (a newline beyond it went) — drop it
-            false
-        } else {
-            // within-line edit covering the mark column — collapse to the edit start
-            *pos = s;
+    marks.retain(|_, pos| match shift_point(*pos, s, oe, ne) {
+        Some(p) => {
+            *pos = p;
             true
         }
+        None => false,
     });
+}
+
+/// Shift one `(row, byte-col)` position across an edit that replaced the byte
+/// range `[s, oe)` with text ending at `ne` (tree-sitter `Point`s). Returns the
+/// new position, or `None` when the position sat on a line the edit deleted (so
+/// the owner — a mark, a jumplist entry — should be dropped). This is the single
+/// rule behind both [`shift_marks`] and the editor's jumplist line-adjustment, so
+/// marks and `<C-o>` targets ride edits identically (vim's `mark_adjust`).
+pub(crate) fn shift_point(
+    pos: (usize, usize),
+    s: (usize, usize),
+    oe: (usize, usize),
+    ne: (usize, usize),
+) -> Option<(usize, usize)> {
+    if pos < s {
+        // entirely before the edit — unaffected
+        Some(pos)
+    } else if pos >= oe {
+        let row = (pos.0 as isize + (ne.0 as isize - oe.0 as isize)) as usize;
+        let col = if pos.0 == oe.0 {
+            (pos.1 as isize + (ne.1 as isize - oe.1 as isize)) as usize
+        } else {
+            pos.1
+        };
+        Some((row, col))
+    } else if oe.0 > pos.0 {
+        // the position's whole line was deleted (a newline beyond it went) — drop it
+        None
+    } else {
+        // within-line edit covering the position's column — collapse to the edit start
+        Some(s)
+    }
+}
+
+/// vim's `JUMPLISTSIZE` applies to the change list too: at most 100 entries.
+const CHANGELIST_SIZE: usize = 100;
+
+/// Shift every change-list entry across an edit, dropping any whose line the edit
+/// deleted — the per-buffer analogue of [`shift_marks`], using the same rule so a
+/// change position tracks its text exactly like a mark does.
+fn shift_changelist(
+    list: &mut Vec<(usize, usize)>,
+    s: (usize, usize),
+    oe: (usize, usize),
+    ne: (usize, usize),
+) {
+    if s == oe && oe == ne {
+        return;
+    }
+    list.retain_mut(|pos| match shift_point(*pos, s, oe, ne) {
+        Some(p) => {
+            *pos = p;
+            true
+        }
+        None => false,
+    });
+}
+
+/// Add a change at `pos` to the change list (vim's `add_to_changelist`). A change
+/// on the same line as the newest entry just updates that entry's column rather
+/// than piling up (so typing a word leaves one entry, not one per keystroke); any
+/// other line appends. The list is capped at [`CHANGELIST_SIZE`], dropping the
+/// oldest on overflow.
+fn add_to_changelist(list: &mut Vec<(usize, usize)>, pos: (usize, usize)) {
+    if let Some(last) = list.last_mut() {
+        if last.0 == pos.0 {
+            *last = pos;
+            return;
+        }
+    }
+    if list.len() >= CHANGELIST_SIZE {
+        list.remove(0);
+    }
+    list.push(pos);
 }

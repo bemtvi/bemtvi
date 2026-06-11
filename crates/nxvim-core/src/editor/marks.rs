@@ -87,6 +87,10 @@ impl Editor {
     pub(crate) fn record_jump_context(&mut self) {
         let Cursor { line, col } = self.cursor;
         self.buffer_mut().marks.insert('\'', (line, col));
+        // The same pre-jump position also enters the focused window's jump list,
+        // which `<C-o>`/`<C-i>` walk. Sharing this one choke point keeps the list
+        // in lock-step with vim's definition of a jump (see `editor/jumps.rs`).
+        self.push_jump();
     }
 
     /// Record the cursor as the last-insert mark (`` `^ ``) — where Insert mode was

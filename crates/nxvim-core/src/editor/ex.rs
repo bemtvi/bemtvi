@@ -520,6 +520,8 @@ impl Editor {
             "echoe" | "echoer" | "echoerr" => self.ex_echo(args, EchoKind::Error),
             "reg" | "registers" | "di" | "dis" | "display" => self.ex_registers(args),
             "marks" => self.ex_marks(args),
+            "ju" | "jum" | "jump" | "jumps" => self.ex_jumps(args),
+            "changes" => self.ex_changes(args),
             "panelopen" | "panelo" => {
                 if !self.reopen_last_panel() {
                     self.echo("No panel to reopen");

@@ -28,6 +28,7 @@ impl UndoTree {
                 cursor: Cursor::default(),
                 extmarks: buffer.extmarks.clone(),
                 marks: buffer.marks.clone(),
+                changelist: (buffer.changelist.clone(), buffer.changelistidx),
                 cursor_window: None,
             },
         };
@@ -242,6 +243,7 @@ impl Editor {
             cursor,
             extmarks: ob.buffer.extmarks.clone(),
             marks: ob.buffer.marks.clone(),
+            changelist: (ob.buffer.changelist.clone(), ob.buffer.changelistidx),
             cursor_window,
         }
     }
@@ -405,6 +407,9 @@ impl Editor {
         // cursor ride back to where they were in the state we return to.
         self.buffer_mut().extmarks = snap.extmarks;
         self.buffer_mut().marks = snap.marks;
+        let (changelist, changelistidx) = snap.changelist;
+        self.buffer_mut().changelist = changelist;
+        self.buffer_mut().changelistidx = changelistidx;
         self.buffer_mut().modified = !clean;
         // The secondary multi-cursor set is window-local, but the undo tree is
         // shared by every window onto this buffer. Keep the baked `CURSOR_NS`/

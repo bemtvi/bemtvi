@@ -159,8 +159,8 @@ pub(crate) enum Motion {
     EndWord,                      // e / E
     Find(FindKind, char),         // f/t/F/T {char}
     FindRepeat { reverse: bool }, // ; (same) / , (reversed)
-    MarkJumpExact(char),          // `{mark}  (charwise exclusive)
-    MarkJumpLine(char),           // '{mark}  (linewise, first non-blank)
+    MarkJumpExact(char, bool),    // `{mark}  (charwise exclusive); bool = set jumplist
+    MarkJumpLine(char, bool),     // '{mark}  (linewise, first non-blank); bool = set jumplist
 }
 
 /// The four find-char motions. `f`/`t` search forward, `F`/`T` backward; `t`/`T`
@@ -276,9 +276,13 @@ enum NormalCmd {
     ScrollHalf(bool),                                // <C-d> (true) / <C-u> (false)
     ScrollPage(bool),                                // <C-f> (true) / <C-b> (false)
     ScrollLine(bool),                                // <C-e> (true) / <C-y> (false)
+    JumpBack,                                        // <C-o> (older jumplist position)
+    JumpForward,                                     // <C-i> / <Tab> (newer position)
     AltBuffer,                                       // <C-^> / <C-6>
     TabNext(Option<usize>),                          // gt  ({count}gt → tab number)
     TabPrev(Option<usize>),                          // gT  ({count}gT → count back)
+    ChangeOlder,                                     // g; (older change-list position)
+    ChangeNewer,                                     // g, (newer change-list position)
     AddCursor,                                       // <A-c> (enter MULTICURSOR + place)
     PlaceCursor,                                     // c (drop a cursor in MULTICURSOR)
     DotRepeat,                                       // .  (replay the last change)
@@ -306,8 +310,11 @@ pub(crate) enum Stage {
     RegisterPending,
     /// Saw `m`; the next key names the mark to set at the cursor.
     MarkSetPending,
-    /// Saw `` ` `` (`Exact`) or `'` (`Line`); the next key names the mark to jump to.
-    MarkJumpPending(MarkJumpKind),
+    /// Saw `` ` `` (`Exact`) or `'` (`Line`); the next key names the mark to jump
+    /// to. The `bool` is whether the jump sets the jumplist — `true` for plain
+    /// `` ` ``/`'`, `false` for the `` g` ``/`g'` spellings (vim's jump-without-
+    /// touching-the-jumplist).
+    MarkJumpPending(MarkJumpKind, bool),
 }
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
@@ -410,12 +417,15 @@ fn leading_count_len(keys: &[Key]) -> usize {
 /// previous-context mark (`` `` `` / `''`) before it moves: `gg`/`G` and the mark
 /// jumps themselves. Ordinary `h`/`j`/`k`/`l`/word/find motions are *not* jumps,
 /// so they don't stash the context (search and `:line` record it on their own
-/// paths). Used by [`Editor::execute`].
+/// paths). The `` g` ``/`g'` spellings carry `set_jump == false`, so they jump to
+/// the mark *without* touching the jumplist (vim's `g`` ` / `g'`). Used by
+/// [`Editor::execute`].
 fn is_jump_motion(m: Motion) -> bool {
-    matches!(
-        m,
-        Motion::GotoTop | Motion::GotoLine | Motion::MarkJumpExact(_) | Motion::MarkJumpLine(_)
-    )
+    match m {
+        Motion::GotoTop | Motion::GotoLine => true,
+        Motion::MarkJumpExact(_, set) | Motion::MarkJumpLine(_, set) => set,
+        _ => false,
+    }
 }
 
 /// The registers vim refuses to *write* (yank/delete into): the last-search
@@ -526,15 +536,15 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
                 None => Reset,
             };
         }
-        Stage::MarkJumpPending(kind) => {
+        Stage::MarkJumpPending(kind, set_jump) => {
             // The next key names the mark to jump to: a settable name or a read-only
             // automatic special (`` ` ``/`'`/`.`/`^`/`[`/`]`/`<`/`>`). An unsupported
             // name (a digit, untracked punctuation) is a loud dead-end (`Reset`).
             return match key.as_char() {
                 Some(name) if marks::is_jumpable_mark(name) => {
                     Complete(ResolvedCommand::Motion(match kind {
-                        MarkJumpKind::Exact => Motion::MarkJumpExact(name),
-                        MarkJumpKind::Line => Motion::MarkJumpLine(name),
+                        MarkJumpKind::Exact => Motion::MarkJumpExact(name, set_jump),
+                        MarkJumpKind::Line => Motion::MarkJumpLine(name, set_jump),
                     }))
                 }
                 _ => Reset,
@@ -575,7 +585,8 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
         return Prefix(next);
     }
 
-    // `g` prefix: a lone `g` arms it; a second `g` is `gg`; `gt`/`gT` cycle tabs.
+    // `g` prefix: a lone `g` arms it; a second `g` is `gg`; `gt`/`gT` cycle tabs;
+    // `` g` ``/`g'` jump to a mark *without* setting the jumplist.
     if gpending {
         match key.as_char() {
             Some('g') => return Complete(ResolvedCommand::Motion(Motion::GotoTop)),
@@ -584,6 +595,22 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             }
             Some('T') => {
                 return Complete(ResolvedCommand::Normal(NormalCmd::TabPrev(pending.count)))
+            }
+            // `g;` / `g,` walk the change list (older / newer change positions).
+            Some(';') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeOlder)),
+            Some(',') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeNewer)),
+            // `` g` `` / `g'` — like `` ` ``/`'` but they do not record the
+            // previous-context mark / jumplist (vim's quiet jump). The name follows;
+            // arm the same jump stage with `set_jump = false`.
+            Some('`') => {
+                let mut next = pending.clone();
+                next.stage = Stage::MarkJumpPending(MarkJumpKind::Exact, false);
+                return Prefix(next);
+            }
+            Some('\'') => {
+                let mut next = pending.clone();
+                next.stage = Stage::MarkJumpPending(MarkJumpKind::Line, false);
+                return Prefix(next);
             }
             _ => {}
         }
@@ -620,7 +647,7 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
         };
         if let Some(kind) = jump {
             let mut next = pending.clone();
-            next.stage = Stage::MarkJumpPending(kind);
+            next.stage = Stage::MarkJumpPending(kind, true);
             return Prefix(next);
         }
     }
@@ -691,6 +718,11 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             KeyCode::Char('e') => Complete(RC::Normal(N::ScrollLine(true))),
             KeyCode::Char('y') => Complete(RC::Normal(N::ScrollLine(false))),
             KeyCode::Char('r') => Complete(RC::Normal(N::Redo)),
+            // `<C-o>`/`<C-i>` walk the jump list (normal mode only — in visual,
+            // vim leaves them unbound). `<C-i>` and `<Tab>` are the same key in a
+            // terminal; the `<Tab>` spelling is caught below.
+            KeyCode::Char('o') if mode == Mode::Normal => Complete(RC::Normal(N::JumpBack)),
+            KeyCode::Char('i') if mode == Mode::Normal => Complete(RC::Normal(N::JumpForward)),
             KeyCode::Char('^') | KeyCode::Char('6') => Complete(RC::Normal(N::AltBuffer)),
             _ => Reset,
         };
@@ -700,6 +732,10 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
     match key.code {
         KeyCode::PageDown => return Complete(RC::Normal(N::ScrollHalf(true))),
         KeyCode::PageUp => return Complete(RC::Normal(N::ScrollHalf(false))),
+        // `<Tab>` is `<C-i>` in a terminal: jump forward in the list (normal mode).
+        KeyCode::Tab if mode == Mode::Normal && !key.shift => {
+            return Complete(RC::Normal(N::JumpForward))
+        }
         _ => {}
     }
 
@@ -957,13 +993,18 @@ impl Editor {
                 // to the ordinary motion path, so `` d`a `` still operates. An unset
                 // or closed-buffer mark resolves to `None` here and falls through to
                 // the loud *E20* miss below.
-                if let Motion::MarkJumpExact(name) | Motion::MarkJumpLine(name) = m {
+                if let Motion::MarkJumpExact(name, set_jump)
+                | Motion::MarkJumpLine(name, set_jump) = m
+                {
                     if let Some(loc) = self.mark_location(name) {
                         if loc.buf != self.cur_buffer() {
                             // A jump still records the pre-jump context in the source
-                            // buffer (so `` `` `` returns), then crosses over.
-                            self.record_jump_context();
-                            self.jump_to_mark_buffer(loc, matches!(m, Motion::MarkJumpLine(_)));
+                            // buffer (so `` `` `` returns), then crosses over — unless
+                            // it is the quiet `` g` ``/`g'` spelling (`set_jump`).
+                            if set_jump {
+                                self.record_jump_context();
+                            }
+                            self.jump_to_mark_buffer(loc, matches!(m, Motion::MarkJumpLine(..)));
                             self.reset_pending();
                             return;
                         }
@@ -991,7 +1032,7 @@ impl Editor {
                         // A jump to a mark that was never set: report it loudly
                         // (vim's *E20: Mark not set*) instead of silently leaving
                         // the cursor — and abort any pending operator with it.
-                        Motion::MarkJumpExact(_) | Motion::MarkJumpLine(_) => {
+                        Motion::MarkJumpExact(..) | Motion::MarkJumpLine(..) => {
                             self.echo("E20: Mark not set");
                             self.reset_pending();
                         }
@@ -1181,9 +1222,13 @@ impl Editor {
             NormalCmd::ScrollHalf(down) => self.scroll_half(down),
             NormalCmd::ScrollPage(down) => self.scroll_page(down),
             NormalCmd::ScrollLine(down) => self.scroll_line(down),
+            NormalCmd::JumpBack => self.jump_back(count),
+            NormalCmd::JumpForward => self.jump_forward(count),
             NormalCmd::AltBuffer => self.goto_alternate(),
             NormalCmd::TabNext(n) => self.goto_tab_next(n),
             NormalCmd::TabPrev(n) => self.goto_tab_prev(n),
+            NormalCmd::ChangeOlder => self.change_older(count),
+            NormalCmd::ChangeNewer => self.change_newer(count),
             NormalCmd::DotRepeat => self.repeat_change(),
         }
         self.reset_pending();

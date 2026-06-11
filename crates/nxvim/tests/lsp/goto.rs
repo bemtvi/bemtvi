@@ -26,6 +26,10 @@ async fn gd_jumps_to_a_definition_in_the_same_file() {
         has_method(&record_lines(&record), "textDocument/definition"),
         "gd should send a textDocument/definition request"
     );
+
+    // A go-to is a jump: `<C-o>` returns to the call site it was issued from.
+    feed(&rpc, "<C-o>");
+    wait_for_cursor(&rpc, (2, 0)).await;
 }
 
 #[tokio::test]

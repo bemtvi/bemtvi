@@ -17,6 +17,8 @@ mod support;
 
 #[path = "editing/buffer_window_api.rs"]
 mod buffer_window_api;
+#[path = "editing/changelist.rs"]
+mod changelist;
 #[path = "editing/clipboard.rs"]
 mod clipboard;
 #[path = "editing/core_editing.rs"]
@@ -31,6 +33,8 @@ mod explorer;
 mod global_cmd;
 #[path = "editing/highlights.rs"]
 mod highlights;
+#[path = "editing/jumplist.rs"]
+mod jumplist;
 #[path = "editing/lsp_util.rs"]
 mod lsp_util;
 #[path = "editing/lua_surface.rs"]

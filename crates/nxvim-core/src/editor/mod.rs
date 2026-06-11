@@ -27,6 +27,7 @@ use crate::syntax::SyntaxEngine;
 use crate::view::View;
 
 mod buffers;
+mod changelist;
 mod cmdline;
 mod command;
 mod cursor;
@@ -34,6 +35,7 @@ mod ex;
 mod explorer;
 mod expr;
 mod insert;
+mod jumps;
 mod marks;
 mod motions;
 mod mouse;
@@ -61,6 +63,7 @@ pub use self::buffers::{
 };
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
+pub(crate) use self::jumps::JumpEntry;
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
@@ -173,6 +176,10 @@ struct Snapshot {
     /// alongside `extmarks`, for the same reason: vim keeps marks across undo, and
     /// the wholesale-replace [`Buffer::mark_resync`] would otherwise clear them.
     marks: HashMap<char, (usize, usize)>,
+    /// The buffer's change list (and its `g;`/`g,` pointer) at this history point,
+    /// restored on undo/redo alongside `marks` so `g;` keeps working across an undo
+    /// (the wholesale-replace [`Buffer::mark_resync`] clears it otherwise).
+    changelist: (Vec<(usize, usize)>, usize),
     /// The window whose secondary multi-cursor set is baked into `extmarks`'s
     /// `CURSOR_NS`/`ANCHOR_NS` marks. The multi-cursor set is window-local but the
     /// undo tree is per-buffer and shared by every window onto it, so on undo/redo

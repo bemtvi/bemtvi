@@ -877,6 +877,17 @@ impl Editor {
     /// location list share one navigation primitive.
     pub fn jump_to(&mut self, path: &Path, line: usize, col: usize) {
         let already_current = self.buffer().path.as_deref() == Some(path);
+        // A go-to (LSP definition/references, a diagnostic, a location-list entry)
+        // is a *jump* in vim's sense: record the pre-jump position into the jump
+        // list / previous-context mark first, so `<C-o>` returns here. Done before
+        // any buffer switch, while the cursor still sits at the source — the switch
+        // rebinds `self.cursor` to the target buffer's saved position. Only on a
+        // *real* navigation, though: `jump_to_lsp_location` calls this twice (land,
+        // then refine the column on the same line), and a same-file same-line move
+        // is not a new jump — vim's jumplist dedups by line anyway.
+        if !already_current || line != self.cursor.line {
+            self.record_jump_context();
+        }
         // Open-or-switch into the current window through the shared kernel (so a go-to
         // reuses an already-open buffer, records the alternate `#`, and — in a daemon
         // session — fetches the target over the wire off-tick). A failed *synchronous*

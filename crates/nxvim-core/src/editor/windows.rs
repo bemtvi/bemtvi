@@ -228,6 +228,13 @@ pub(crate) struct Window {
     pub(crate) options: WindowOptions,
     /// `Some` for a floating window (its placement), `None` for a tiled one.
     pub(crate) float: Option<FloatConfig>,
+    /// This window's jump list — the positions jumped *from*, walked with
+    /// `<C-o>`/`<C-i>`. Per-window like vim's; a split inherits a copy of its
+    /// parent's. See [`crate::editor::JumpEntry`] and `editor/jumps.rs`.
+    pub(crate) jumps: Vec<JumpEntry>,
+    /// The navigation pointer into [`Window::jumps`]: `jumps.len()` means "at the
+    /// present, not navigating"; `<C-o>` walks it toward 0, `<C-i>` back up.
+    pub(crate) jump_idx: usize,
 }
 
 /// A node in the window layout tree: either a single window (`Leaf`) or a
@@ -303,6 +310,8 @@ impl WindowTree {
                 rect: Rect::default(),
                 options,
                 float: None,
+                jumps: Vec::new(),
+                jump_idx: 0,
             },
         );
         WindowTree {
@@ -335,6 +344,13 @@ impl WindowTree {
     pub(crate) fn cur_mut(&mut self) -> &mut Window {
         let id = self.current;
         self.get_mut(id)
+    }
+
+    /// Every window in this tree (tiled and floating), mutably — used by the
+    /// jumplist line-adjustment to shift `<C-o>` targets in all windows that show
+    /// an edited buffer, not just the focused one.
+    pub(crate) fn all_windows_mut(&mut self) -> impl Iterator<Item = &mut Window> {
+        self.windows.values_mut()
     }
 
     /// All window ids in layout order (the `nvim_list_wins` order).
@@ -1210,6 +1226,8 @@ impl Editor {
                 rect: Rect::default(),
                 options,
                 float: Some(config),
+                jumps: Vec::new(),
+                jump_idx: 0,
             },
         );
         self.windows.floats.push(id);
@@ -1420,6 +1438,10 @@ impl Editor {
         let buffer = self.windows.get(cur).buffer;
         // A split inherits the source window's window-local options, as vim does.
         let options = self.windows.get(cur).options;
+        // …and a copy of its jump list, so `<C-o>` history carries into the split
+        // (vim copies the jumplist to the new window).
+        let jumps = self.windows.get(cur).jumps.clone();
+        let jump_idx = self.windows.get(cur).jump_idx;
         let new_id = self.alloc_window_id();
         self.windows.windows.insert(
             new_id,
@@ -1432,6 +1454,8 @@ impl Editor {
                 rect: Rect::default(),
                 options,
                 float: None,
+                jumps,
+                jump_idx,
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);

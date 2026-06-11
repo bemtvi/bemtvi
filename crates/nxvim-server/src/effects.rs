@@ -719,6 +719,12 @@ impl Server {
     /// mirror is re-serialized — so the common cursor-moved-no-edit path only
     /// refreshes the O(1) cursor/window fields.
     pub(crate) fn push_buf_mirror(&mut self) {
+        // Shift every window's jumplist to follow the line edits each buffer
+        // recorded since the last pass (vim's `mark_adjust`). This runs on the same
+        // universal post-mutation hook that fires `on_lines`/`on_bytes`, so it
+        // covers keystroke and API edits and non-focused buffers; it drains the
+        // per-buffer journals, so a call with no pending edits is a cheap no-op.
+        self.editor.adjust_jumplists_for_edits();
         let mut bufs: Vec<BufMirror> = Vec::new();
         // Buffer-local option values, mirrored so `vim.bo` / `nvim_get_option_value`
         // read the core's current value (the default until set, and values set via

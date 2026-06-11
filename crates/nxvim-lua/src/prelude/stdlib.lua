@@ -824,6 +824,15 @@ vim.v = setmetatable({}, {
     if k == "register" then return m.register or '"' end
     if k == "operator" then return m.operator or "" end
     if k == "vim_did_enter" then return m.vim_did_enter or 0 end
+    -- `v:exiting` is `v:null` (→ vim.NIL in Lua) until the editor is actually
+    -- exiting, when it becomes the exit code. Plugins gate async work on it —
+    -- lazy.nvim's `Util.exiting()` is literally `vim.v.exiting ~= vim.NIL`, so a
+    -- plain `nil` here reads as "already exiting" and the whole async runner
+    -- (its git clone/install) silently refuses to start. Default to vim.NIL.
+    if k == "exiting" then
+      if m.exiting == nil then return vim.NIL end
+      return m.exiting
+    end
     return m[k]
   end,
   __newindex = function(_, k, v) vim._v_mirror[k] = v end,
@@ -948,9 +957,12 @@ function vim.tbl_get(o, ...)
   return o
 end
 
+-- Iterates with `pairs` (not `ipairs`) to match neovim: callers filter
+-- name-keyed maps too (lazy.nvim filters `Config.plugins`, keyed by plugin
+-- name), not just arrays. The result is always a fresh array.
 function vim.tbl_filter(f, t)
   local out = {}
-  for _, v in ipairs(t) do
+  for _, v in pairs(t) do
     if f(v) then out[#out + 1] = v end
   end
   return out

@@ -47,6 +47,11 @@ async fn start(rtp: Vec<PathBuf>) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 18);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
+            // `enable_io` (not just time): the async `vim.system` / `uv.spawn`
+            // path reaps real child processes through `tokio::process`, which
+            // needs the IO driver — without it a spawned `git` never delivers its
+            // exit (lazy.nvim's clone would hang forever).
+            .enable_io()
             .enable_time()
             .build()
             .expect("server runtime");
@@ -647,6 +652,11 @@ async fn pack_plugin_scripts_are_sourced_at_startup() {
     let (server_end, client_end) = tokio::io::duplex(1 << 18);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
+            // `enable_io` (not just time): the async `vim.system` / `uv.spawn`
+            // path reaps real child processes through `tokio::process`, which
+            // needs the IO driver — without it a spawned `git` never delivers its
+            // exit (lazy.nvim's clone would hang forever).
+            .enable_io()
             .enable_time()
             .build()
             .expect("server runtime");
@@ -819,5 +829,163 @@ async fn lazy_nvim_loads_and_manages_a_plugin() {
         report.as_str(),
         Some("setup_ran=true|managed=true|loaded=true"),
         "lazy.nvim should load and manage a local plugin: {report:?}"
+    );
+}
+
+/// Run `git` under `cwd` with a fixed, config-independent identity so the source
+/// repo is reproducible regardless of the developer's global git config. Panics on
+/// failure — the source repo is test scaffolding, not the thing under test.
+fn git_in(cwd: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "-c",
+            "user.email=test@nxvim",
+            "-c",
+            "user.name=nxvim test",
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?} failed in {cwd:?}");
+}
+
+/// lazy.nvim's **install pipeline** — its real `git clone` over `uv.spawn` — runs
+/// end-to-end on nxvim: `require("lazy").install({ wait = true })` synchronously
+/// drives the async runner (the `vim.loop.new_check` executor + a blocking
+/// `vim.wait` pump) through clone → checkout → load, and the freshly-cloned
+/// plugin's `config` then runs.
+///
+/// Unlike `lazy_nvim_loads_and_manages_a_plugin` (which manages an in-place `dir`
+/// plugin, never cloning), this exercises the git/uv machinery a plugin manager
+/// leans on hardest. To stay hermetic and deterministic it clones from a *local*
+/// source git repo built in the test (`file://…`), not the network — the clone
+/// path through nxvim is identical, but the bytes are fixed and offline.
+#[tokio::test]
+async fn lazy_nvim_clones_and_loads_a_plugin() {
+    let Some(lazy) = clone_plugin("lazy.nvim") else {
+        eprintln!("skip: could not clone lazy.nvim (no git / no network)");
+        return;
+    };
+
+    // A real git repo to clone *from*: a tiny plugin module on a `main` branch.
+    let source = temp_dir("lazy_clone_source");
+    std::fs::create_dir_all(source.join("lua/clonehello")).unwrap();
+    std::fs::write(
+        source.join("lua/clonehello/init.lua"),
+        "return { setup = function() _G.CLONEHELLO = true end }\n",
+    )
+    .unwrap();
+    git_in(&source, &["init", "--quiet"]);
+    git_in(&source, &["add", "-A"]);
+    git_in(&source, &["commit", "--quiet", "-m", "initial"]);
+    git_in(&source, &["branch", "-M", "main"]);
+
+    let state = temp_dir("lazy_clone_state");
+
+    let (rpc, _incoming) = start(vec![lazy]).await;
+
+    // Phase 1 — setup, then *kick off* the install without blocking. lazy's
+    // git clone runs on `uv.spawn` off the input tick and its async runner is
+    // driven by the `vim.loop.new_check` executor between ticks. A blocking
+    // `install({ wait = true })` would park the chunk (its `vim.wait` pump yields
+    // the coroutine) and hand `nvim_exec_lua` back `Nil` before the clone lands,
+    // so instead we register a done-callback that flips a global and poll for it
+    // from the Rust side — the same async shape `uv_process.rs` uses.
+    let kickoff = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            _G.LAZY_DONE = false
+            _G.LAZY_ERR = nil
+            local ok, err = pcall(function()
+              local source, state = "{source}", "{state}"
+              require("lazy").setup({{
+                {{ url = "file://" .. source, name = "clonehello", branch = "main",
+                   lazy = false, config = function() require("clonehello").setup() end }},
+              }}, {{
+                root = state .. "/plugins",
+                lockfile = state .. "/lazy-lock.json",
+                state = state .. "/state.json",
+                readme = {{ root = state .. "/readme" }},
+                -- Don't auto-install on startup; we drive the clone explicitly below.
+                install = {{ missing = false }},
+                -- Plain local clone: no partial-clone filter (file:// transport
+                -- doesn't advertise it).
+                git = {{ filter = false }},
+                pkg = {{ enabled = false }},
+                change_detection = {{ enabled = false }},
+                checker = {{ enabled = false }},
+                performance = {{ rtp = {{ reset = false }} }},
+              }})
+              -- The real clone: `git clone file://… <root>/clonehello` over uv.
+              -- Non-blocking — the async runner advances across ticks; the callback
+              -- fires once the whole pipeline (clone → checkout → load) settles.
+              local runner = require("lazy").install({{ show = false }})
+              runner:wait(function() _G.LAZY_DONE = true end)
+            end)
+            if not ok then _G.LAZY_ERR = tostring(err); _G.LAZY_DONE = true end
+            return "kicked"
+            "#,
+            source = source.to_string_lossy(),
+            state = state.to_string_lossy()
+        ),
+    )
+    .await;
+    assert_eq!(
+        kickoff.as_str(),
+        Some("kicked"),
+        "install kickoff: {kickoff:?}"
+    );
+
+    // Phase 2 — let the server advance the clone between polls (the runner's
+    // `vim.loop.new_check` executor steps the git task off the input tick, and the
+    // child's exit is reaped + delivered on a later tick).
+    let mut done = false;
+    for _ in 0..300 {
+        if exec_lua(&rpc, "return _G.LAZY_DONE == true")
+            .await
+            .as_bool()
+            == Some(true)
+        {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(done, "lazy.nvim install never completed (clone hung)");
+
+    // Phase 3 — finalize: surface any pipeline error, source the freshly-cloned
+    // `lazy = false` plugin (its config runs), and report what landed.
+    let report = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            if _G.LAZY_ERR then return "ERR: " .. _G.LAZY_ERR end
+            require("lazy").load({{ plugins = {{ "clonehello" }} }})
+            local p = require("lazy.core.config").plugins["clonehello"]
+            local cloned_dir = "{state}" .. "/plugins/clonehello"
+            return table.concat({{
+              "cloned=" .. tostring(vim.fn.isdirectory(cloned_dir .. "/.git") == 1),
+              "installed=" .. tostring(p ~= nil and p._ ~= nil and p._.installed == true),
+              "requireable=" .. tostring((pcall(require, "clonehello"))),
+              "config_ran=" .. tostring(_G.CLONEHELLO == true),
+            }}, "|")
+            "#,
+            state = state.to_string_lossy()
+        ),
+    )
+    .await;
+    assert_eq!(
+        report.as_str(),
+        Some("cloned=true|installed=true|requireable=true|config_ran=true"),
+        "lazy.nvim should git-clone and load a real plugin: {report:?}"
     );
 }

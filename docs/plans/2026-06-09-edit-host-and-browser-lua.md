@@ -1141,6 +1141,130 @@ a real temp dir (the refactor is behavior-preserving). Regression-clean — full
 --workspace` green (the plenary-heavy `plugin_compat`/`telescope_e2e` suites included), fmt +
 clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
 
+### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream)
+
+The slice that **ties every leg together**. Phases 3c–3p each built a wire leg and
+proved it over its *own* `tokio::io::duplex`; this one stands up the actual
+`nxvim --daemon` process and carries **all six legs over one ordered stdio stream** —
+the transport `ssh host nxvim --daemon` execs. It is the daemon counterpart to
+`--server` (`crates/nxvim/src/main.rs`), but inverted: `--server` runs the *whole
+editor* remotely (one round-trip per keystroke — the lag this plan exists to kill);
+`--daemon` runs *only* fs + process + watch + `sys_run` + LSP + `luafs` remotely while
+the editor stays local. No `Editor`, no `LuaRuntime`, no UI, and — unlike `--server` —
+**no config sourcing** (`default_runtime` / `init.lua` / runtimepath all stay on the
+local edit-host; the daemon is pure I/O).
+
+**The one genuinely new mechanism: a multiplexer, needed symmetrically on both ends.**
+Every `serve_*` (daemon side) *and* every `Remote*::connect` (edit-host side) currently
+calls `nxvim_rpc::connect(reader, writer)` itself and **assumes it owns the whole
+transport** — which is why the per-leg tests each hand it a private duplex. A real
+daemon has *one* ssh stdio stream for all six classes, so the legs must share a single
+connection. Two properties (verified in the code) make that a clean *router*, not a
+rework:
+
+- **The six method namespaces are disjoint** — `fs_*`, `proc_*`, `sys_run`, `lsp_*`,
+  `luafs` (and the `proc_`/`lsp_` daemon→edit-host pushes) — so an inbound stream
+  demuxes unambiguously on the method string.
+- **Request replies are routed by msgid *inside* `Rpc`, not by an embedded responder.**
+  `Incoming::Request` carries only `{id, method, params}` (`nxvim-rpc/src/lib.rs`); a
+  handler replies via `rpc.respond(id, …)` on any clone of the shared `Rpc`, and
+  request *responses* (`fs_read`/`fs_write`/`sys_run`/`luafs` results) are matched by the
+  `pending` map and never surface as `Incoming` at all. **So forwarding an `Incoming`
+  over an mpsc channel loses nothing**, and concurrent writes from all legs serialize
+  safely through `Rpc`'s single `out_tx`. This *is* the "msgpack-RPC already frames
+  concurrent requests over one ordered stream" the *Transport & stream multiplexing*
+  section counts on for the native (ssh-stdio) path.
+
+**Plan.**
+
+1. **Split each `serve_*` into `connect()` + a connection-agnostic core**
+   (`crates/nxvim-server/src/daemon.rs`). Each grows a `serve_*_on(rpc: Rpc, incoming:
+   UnboundedReceiver<Incoming>, deps…)` that is its existing loop *minus* the leading
+   `let (rpc, incoming) = connect(...)`. The current `serve_*(reader, writer, deps…)`
+   stay as thin wrappers (`let (rpc, incoming) = connect(reader, writer);
+   serve_*_on(rpc, incoming, deps…)`), so the six per-leg suites
+   (`daemon_proc`/`daemon_fs`/`daemon_save`/`daemon_watch`/`daemon_explorer`/
+   `daemon_system`/`daemon_luafs`) compile and pass **unchanged** — proving the
+   extraction is pure inversion. The watch-leg `fs_changed` push and the proc/lsp event
+   forwarders already write through a cloned `Rpc`, so they work identically off a
+   shared one.
+
+2. **The daemon-side multiplexer + the binary role.** A new
+   `nxvim_server::run_daemon_io(stdin, stdout)`: `connect` once, mint a per-leg
+   `unbounded_channel`, `tokio::spawn` each `serve_*_on(rpc.clone(), leg_rx, deps)` —
+   `StdHostFs` for `fs_*`, `StdHostProc` (internal to the proc leg), `StdBlockingSystem`
+   for `sys_run`, `LocalLspTransport` (internal to the lsp leg), `StdLuaFs` for `luafs`
+   — then a demux loop reading `incoming` and routing each message by method prefix
+   (`fs_` / `proc_` / `sys_run` / `lsp_` / `luafs`) to the matching `leg_tx`; unknown
+   methods drop (the peer is the same build). Then in `crates/nxvim/src/main.rs`, a
+   `const DAEMON_FLAG = "--daemon"` early branch → a `run_daemon()` mirroring
+   `run_headless` (a `current_thread` runtime, `enable_io().enable_time()`,
+   `block_on(run_daemon_io(tokio::io::stdin(), tokio::io::stdout()))`) but with **no
+   `ServerInit`, no `default_runtime`** — LSP/process discovery (program/args/cwd) and
+   the project tree arrive *on the wire* and resolve against the remote's real
+   PATH/filesystem.
+
+3. **The symmetric edit-host-side multiplexer.** A matching `Remote*::on(rpc,
+   incoming_rx)` split plus a `connect_daemon(reader, writer) -> (RemoteHostFs,
+   RemoteHostProc, RemoteBlockingSystem, RemoteLspTransport, RemoteLuaFs)` that does the
+   single `connect()` + a demux loop routing the daemon→edit-host **notifications**
+   (`proc_spawned`, `proc_exited`, `fs_changed`, `lsp_stdout`, `lsp_stderr`,
+   `lsp_exited`) to the right leg. The request/response legs (`fs_read`/`fs_write`/
+   `sys_run`/`luafs`) need no routing here — their replies are msgid-matched inside
+   `Rpc`. This is the piece that lets *one* `ServerInit` populate
+   `host_fs_async`/`host_proc`/`blocking_system`/`lsp_transport`/`lua_fs` from a *single*
+   connection to one `--daemon` child. (The `sys_run`/`luafs` blocking bridges keep
+   their dedicated link thread + own runtime so a parked Lua/editor thread can't starve
+   the reader carrying its reply — the deadlock trap from Phase 3a's note; that thread
+   now drives the *shared* demux rather than a private connection.)
+
+**Lifecycle / shutdown.** EOF on the daemon's stdin (the local editor quit, or ssh
+dropped) ends the demux loop (`incoming.recv()` → `None`); the per-leg senders drop,
+each leg's loop ends, the runtime is dropped, and the `tokio::process` children (procs +
+language servers, spawned `kill_on_drop`) are reaped — no orphaned `rust-analyzer`. On
+the edit-host side the ssh child is already `kill_on_drop` (the v1 `SshTransport`), so
+closing the window tears the remote down. (Abrupt parent-loss reaping of grandchildren —
+ssh `-tt` / process-group behavior — is the clean path tested and the abrupt path
+eyeballed.)
+
+**Testing (mirror `crates/nxvim/tests/stdio_server.rs`).** A new
+`crates/nxvim/tests/daemon_stdio.rs` spawns the **real** `CARGO_BIN_EXE_nxvim --daemon`
+with piped stdio, wraps the child in `connect_daemon`, hands those `Remote*` seams to a
+real in-process edit-host `Server`, and asserts a faithful round-trip over the *one*
+stream: a temp file the **daemon** holds (a path the edit-host's own disk can't serve)
+opens into the buffer; `:w` of an edit lands those bytes on the daemon and `modified`
+clears only after the ack; `vim.system{…}:wait()` on a tool *not on the edit-host PATH*
+returns the daemon's result; an external write autoreloads over the wire (the watch
+push); and `vim.uv.fs_stat`/`vim.fn.filereadable` resolve against the daemon (`luafs`).
+The point the per-leg duplex suites can't make: **all six classes coexist on one ordered
+stdio stream without cross-talk or head-of-line deadlock.**
+
+**Exit criteria.** `daemon_stdio.rs` green against the real `--daemon` binary; the six
+per-leg suites still green (the `connect` → `*_on` extraction was pure inversion); full
+`cargo test --workspace` green; fmt + clippy `-D warnings` clean; the local binaries
+(`nxvim`/`nxvim-gui`, no `--daemon`) byte-for-byte unchanged (all `Remote*`/`serve_*`
+wrappers retained). This is the concrete slice that fulfils *The full split*'s first two
+exit-criteria sentences below.
+
+**Deferred (explicitly, not stubbed):**
+- **The real ssh hop / CLI / `:connect` / askpass** — wiring `connect_daemon` onto an
+  `ssh … nxvim --daemon` child reuses the hardened connector in
+  `crates/nxvim-gui/src/remote.rs` (shell-quoting, `-`-flag rejection, `SSH_ASKPASS`)
+  and the `NXVIM_REMOTE_CMD` override. The *next* slice; this one proves the protocol
+  over real-binary stdio.
+- **Path-space** (`getcwd` / buffer names / statusline in the remote's path-space) and
+  the **short-TTL stat/exists cache** for `luafs` — both already deferred by Phase 3p.
+- **Transport HOL mitigation beyond app-level framing** (Open Decision #2: separate ssh
+  channels per `HostProc`, or a non-ssh QUIC listener) — one ordered stdio stream with
+  msgpack framing is the v1.
+
+**Open scoping question (settle before coding).** Whether 3q covers **both**
+multiplexers (daemon + edit-host, tested by the real-binary round-trip above —
+*recommended*, since the daemon demux can't be tested faithfully without an edit-host
+feeding it over one stream, and it directly delivers *The full split*'s "drives a local
+edit-host against a daemon" criterion) **or** the daemon side alone (tested by driving
+raw rpc frames like `stdio_server.rs`, pushing the edit-host demux into the ssh slice).
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected

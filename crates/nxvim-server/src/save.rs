@@ -53,6 +53,23 @@ pub(crate) struct SaveDone {
     result: io::Result<Option<FileStat>>,
 }
 
+impl SaveDone {
+    /// Build the delivery for a finished off-tick write. The fields stay module-private;
+    /// this is the one constructor the native [`HostEffects`](crate::edithost::HostEffects)
+    /// write task uses to report a finished `fs_write` back to the save arm.
+    pub(crate) fn new(
+        save: PendingSave,
+        bytes_len: usize,
+        result: io::Result<Option<FileStat>>,
+    ) -> Self {
+        Self {
+            save,
+            bytes_len,
+            result,
+        }
+    }
+}
+
 impl Server {
     /// Route this tick's deferred writes (core's `take_pending_saves`) onto the wire,
     /// serialized per buffer: a buffer with no write in flight dispatches immediately;
@@ -88,31 +105,20 @@ impl Server {
         }
     }
 
-    /// Push one snapshot over the `fs_write` wire off the editor tick: mark its buffer
-    /// in-flight, move the bytes into the async write, and deliver the result back to
-    /// the loop via `save_done_tx`. The editor thread returns immediately — it never
-    /// awaits the network here.
-    fn dispatch_save(&mut self, mut save: PendingSave) {
-        let Some(fs) = self.host_fs_async.clone() else {
+    /// Mark a buffer's snapshot in-flight and hand it to the off-tick write effect
+    /// ([`HostEffects::fs_save`](crate::edithost::HostEffects::fs_save)), which pushes
+    /// the bytes over the `fs_write` wire and delivers the ack back to the save arm. The
+    /// editor thread returns immediately — it never awaits the network here.
+    fn dispatch_save(&mut self, save: PendingSave) {
+        if !self.fx.has_remote_fs() {
             // Off-tick save mode is only ever enabled alongside a daemon fs, so this
             // is unreachable in practice; fail loud rather than drop the write.
             self.editor
                 .echo("nxvim: off-tick save with no daemon filesystem".to_string());
             return;
-        };
+        }
         self.saves_inflight.insert(save.buffer);
-        let bytes = std::mem::take(&mut save.bytes);
-        let bytes_len = bytes.len();
-        let path = save.path.display().to_string();
-        let tx = self.save_done_tx.clone();
-        tokio::spawn(async move {
-            let result = fs.write(path, bytes).await;
-            let _ = tx.send(SaveDone {
-                save,
-                bytes_len,
-                result,
-            });
-        });
+        self.fx.fs_save(save);
     }
 
     /// Apply a finished off-tick write: on success, finalize the buffer's saved-state

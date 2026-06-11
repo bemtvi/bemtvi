@@ -435,15 +435,6 @@ struct Server {
     /// Monotonic redraw counter handed to decoration providers as the frame `tick`
     /// (neovim's display tick). Incremented once per [`Server::run_decoration_providers`].
     decor_tick: u64,
-    /// The async daemon filesystem, when a daemon session injected one. Buffer opens
-    /// are fetched through it off-tick (`apply_initial_open`); `:w` writes are pushed
-    /// through it off-tick too (the save path, `save.rs`). `None` for a local session
-    /// (the editor writes synchronously through its sync `host_fs`).
-    host_fs_async: Option<Arc<dyn HostFsAsync>>,
-    /// Sender half for finished off-tick writes (the daemon save path). Each spawned
-    /// `fs_write` task delivers its [`SaveDone`](crate::save) here; the matching
-    /// `select!` arm finalizes the buffer's saved-state and replays any deferred quit.
-    save_done_tx: UnboundedSender<save::SaveDone>,
     /// Buffers with an off-tick write currently on the wire — at most one per buffer,
     /// so a buffer's overlapping `:w`s serialize (snapshot order = wire order) rather
     /// than racing. Cleared when the write acks.
@@ -458,10 +449,6 @@ struct Server {
     /// empties — and **cancels** the gate (drops it) if any write in the batch fails, so
     /// a failed multi-buffer save keeps the editor up exactly as a failed `:wq` does.
     quit_all_gate: Option<save::QuitAllGate>,
-    /// Sender half for off-tick buffer opens (the daemon `:edit` path). The startup
-    /// fetch and each `:edit`-spawned read deliver their `(buffer, path, result)` here;
-    /// the matching `select!` arm fills the named buffer with the fetched bytes.
-    open_tx: UnboundedSender<(BufferId, String, std::io::Result<FsRead>)>,
     /// The native file watch armed for each file-backed buffer, keyed by buffer and
     /// holding the `(path, disk-stat)` it was armed against. [`Server::sync_buffer_watches`]
     /// reconciles this against the live buffers every tick: a new file-backed buffer
@@ -679,10 +666,17 @@ where
     let mut server = Server {
         editor,
         lua,
-        // The native outbound-effect seam: the client wire ([`Rpc`]) and the
-        // event-loop actor ([`EventLoop`]) the editor tick fires commands at. The
-        // wasm build (Phase 5) swaps a JS-interop + daemon-link implementor here.
-        fx: Box::new(NativeEffects::new(rpc, evloop)),
+        // The native outbound-effect seam: the client wire ([`Rpc`]), the event-loop
+        // actor ([`EventLoop`]), and the off-tick daemon fs (read/write/watch + the
+        // `open_tx` / `save_done_tx` deliveries) the editor tick fires through. The wasm
+        // build (Phase 5) swaps a JS-interop + daemon-link implementor here.
+        fx: Box::new(NativeEffects::new(
+            rpc,
+            evloop,
+            host_fs_async,
+            open_tx,
+            save_done_tx,
+        )),
         ui: None,
         syntax_states: HashMap::new(),
         ts_resolved_langs: HashSet::new(),
@@ -723,12 +717,9 @@ where
         install_tx,
         ephemeral_extmarks: HashMap::new(),
         decor_tick: 0,
-        host_fs_async: host_fs_async.clone(),
-        save_done_tx,
         saves_inflight: HashSet::new(),
         saves_queued: HashMap::new(),
         quit_all_gate: None,
-        open_tx,
         buf_watches: HashMap::new(),
         remote_watches: HashSet::new(),
         reload_posts: HashSet::new(),

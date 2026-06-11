@@ -120,7 +120,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a done, 4b–4e remain) |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a–4b done, 4c–4e remain) |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
@@ -1656,9 +1656,7 @@ sync tick is hoisted off `Server` onto `EditHost` proper.
 
 **Deferred to the next 4-proper slices (deliberately, not stubbed — only what's wired
 lives on the trait):**
-- **4b — off-tick fs effects** (`host_fs_async` read/write/watch, the `open_tx` /
-  `save_done_tx` deliveries) behind `HostEffects` (the request/response + watch-push
-  legs Phase 3 built; here their *outbound* side joins the seam).
+- **4b — off-tick fs effects** ✅ DONE — Phase 4b below.
 - **4c — LSP effects** (the `lsp/` submodules' `self.lsp.*` command surface) behind the
   trait; the inbound `lsp_events` stays in the run loop.
 - **4d — the inbound seam**: editor-tick `on_*` methods consuming the `select!` arms'
@@ -1670,6 +1668,42 @@ lives on the trait):**
   transports + the `select!` loop. Then the wasm cdylib (Phase 5) constructs an
   `EditHost` with a wasm `HostEffects` and **the throwaway `nxvim-edithost-demo` is
   deleted**.
+
+#### Phase 4b — the `HostEffects` seam: off-tick fs effects — ✅ DONE (2026-06-11)
+
+The second brick: route the editor tick's **off-tick filesystem effects** — the
+request/response read leg, the write leg, and the `HostWatch` arm/disarm leg Phase 3
+built — through `HostEffects`, so the only thing reaching the daemon fs is the trait.
+Same "grow from the small side" discipline as 4a: the *outbound* side joins the seam;
+the *inbound* deliveries (the `open_rx` / `save_done_rx` / `watch_rx` arms that fill the
+buffer, finalize the save, and reconcile a remote change) stay owned by the run loop's
+`select!` for the 4d inbound slice.
+
+Shipped (`crates/nxvim-server/src/edithost.rs`):
+- **Five new `HostEffects` methods.** `fs_fetch(buffer, path)` (spawn an `fs_read`,
+  deliver `(buffer, path, result)` to the open arm), `fs_save(PendingSave)` (take the
+  command-time snapshot's bytes, spawn an `fs_write`, deliver the ack-gated [`SaveDone`]
+  to the save arm), `fs_watch(path)` / `fs_unwatch(path)` (arm/disarm the daemon watch),
+  and `has_remote_fs()` (the off-tick-mode predicate that gates the editor tick's remote
+  vs. local branches). The two channel-bearing types stay *inside* the trait impl — the
+  trait surface names only `BufferId` / `PendingSave` / `String`, never the senders.
+- **`NativeEffects` now owns the off-tick fs.** It holds the `Option<Arc<dyn HostFsAsync>>`
+  plus the `open_tx` / `save_done_tx` senders and does the `tokio::spawn` + the
+  `HostFsAsync::{read,write,watch,unwatch}` calls — today's behavior **verbatim**, just
+  relocated behind the trait. `Server` no longer holds `host_fs_async` / `open_tx` /
+  `save_done_tx`; its `drain_pending_opens`, `dispatch_save`, and `sync_buffer_watches`
+  call through `self.fx`, gating on `self.fx.has_remote_fs()` instead of an inline
+  `host_fs_async.is_some()`. The run loop's inbound arms and the startup-fetch bootstrap
+  (a native-only `run_io` one-shot) are untouched.
+
+**Exit criteria — met.** Pure indirection, zero behavior change, guarded by the existing
+suite: `cargo build` + `fmt --check` + `clippy -D warnings` clean; the **full workspace**
+(`cargo test --workspace`, 1341 tests across 78 binaries) green — including exactly the
+seam this slice routes: `daemon_fs` (the read leg), `daemon_save` (the write leg, incl.
+the ack-gated `:wq` and the failing-write-cancels-the-quit cases), `daemon_watch` (the
+`HostWatch` arm + push reconcile), and the local-session regressions (`editing`,
+`host_fs`, `host_proc`). The `HostEffects` surface grows once more (LSP, TSInstall)
+before the sync tick is hoisted off `Server` onto `EditHost` proper.
 
 ---
 

@@ -22,9 +22,15 @@
 //! the trait while the (large) editor/Lua surface stays put, so the seam grows from the
 //! small side, not by relocating hundreds of `self.editor` call sites at once.
 
+use crate::daemon::{FsRead, HostFsAsync};
 use crate::evloop::{EventLoop, LoopCommand};
+use crate::save::SaveDone;
+use nxvim_core::{BufferId, PendingSave};
 use nxvim_rpc::Rpc;
 use rmpv::Value;
+use std::io;
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// The async-effect boundary the synchronous editor tick emits through. See the
 /// module docs for why this is the seam that lets one sync core serve both the native
@@ -39,6 +45,33 @@ pub trait HostEffects {
     /// child, arm/disarm a native file watch). Fire-and-forget; completions return
     /// as inbound `LoopEvent`s on the run loop's `select!`, not here.
     fn loop_command(&mut self, cmd: LoopCommand);
+
+    /// Off-tick fs — fetch a buffer's bytes over the daemon read leg (a startup /
+    /// `:edit` open). Fire-and-forget: the fetched bytes (or a read error) return
+    /// *inbound* on the run loop's open arm, not here. A silent no-op when no daemon fs
+    /// is wired (the editor tick only enqueues opens in off-tick mode, so the gate at
+    /// the call site means this is never reached in a local session).
+    fn fs_fetch(&mut self, buffer: BufferId, path: String);
+
+    /// Off-tick fs — push a buffer snapshot over the daemon write leg (the `:w`). Takes
+    /// the snapshot's bytes out of `save` and writes them; the daemon's ack (the new
+    /// [`FileStat`](nxvim_core::FileStat)) or a loud error returns *inbound* on the save
+    /// arm — the buffer's saved-state clears only on that ack. A no-op without a daemon
+    /// fs (unreachable; the caller gates on [`Self::has_remote_fs`]).
+    fn fs_save(&mut self, save: PendingSave);
+
+    /// Off-tick fs — arm a daemon-side watch on `path` (the `HostWatch` leg); a change
+    /// returns *inbound* on the watch arm. A no-op without a daemon fs.
+    fn fs_watch(&mut self, path: String);
+
+    /// Off-tick fs — disarm the daemon watch on `path` (the buffer closed / lost its
+    /// file). A no-op without a daemon fs.
+    fn fs_unwatch(&mut self, path: String);
+
+    /// Whether a daemon (off-tick) filesystem is wired. Gates the editor tick's remote
+    /// vs. local branches — the remote watch arming in `sync_buffer_watches` and the
+    /// off-tick open/save drains.
+    fn has_remote_fs(&self) -> bool;
 }
 
 /// The native implementation of [`HostEffects`]: the client wire is msgpack-RPC and
@@ -48,11 +81,34 @@ pub trait HostEffects {
 pub struct NativeEffects {
     rpc: Rpc,
     evloop: EventLoop,
+    /// The daemon filesystem the off-tick read/write/watch legs route through (Phase 3's
+    /// [`RemoteHostFs`](crate::RemoteHostFs)); `None` for a local/bare session (no
+    /// off-tick fs), where [`Self::has_remote_fs`] is `false` and the editor tick takes
+    /// its local branches.
+    host_fs_async: Option<Arc<dyn HostFsAsync>>,
+    /// Delivery for a finished off-tick read — the run loop's open arm drains it. The
+    /// effect spawns the read and forwards `(buffer, path, result)` here.
+    open_tx: UnboundedSender<(BufferId, String, io::Result<FsRead>)>,
+    /// Delivery for a finished off-tick write — the run loop's save arm drains it. The
+    /// effect spawns the write and forwards the [`SaveDone`] (ack-gated saved-state) here.
+    save_done_tx: UnboundedSender<SaveDone>,
 }
 
 impl NativeEffects {
-    pub fn new(rpc: Rpc, evloop: EventLoop) -> Self {
-        Self { rpc, evloop }
+    pub fn new(
+        rpc: Rpc,
+        evloop: EventLoop,
+        host_fs_async: Option<Arc<dyn HostFsAsync>>,
+        open_tx: UnboundedSender<(BufferId, String, io::Result<FsRead>)>,
+        save_done_tx: UnboundedSender<SaveDone>,
+    ) -> Self {
+        Self {
+            rpc,
+            evloop,
+            host_fs_async,
+            open_tx,
+            save_done_tx,
+        }
     }
 }
 
@@ -70,5 +126,48 @@ impl HostEffects for NativeEffects {
         // it (rather than a bare cloned sender) preserves the "no task until first
         // command" property.
         self.evloop.send(cmd);
+    }
+
+    fn fs_fetch(&mut self, buffer: BufferId, path: String) {
+        let Some(fs) = self.host_fs_async.clone() else {
+            return;
+        };
+        let tx = self.open_tx.clone();
+        tokio::spawn(async move {
+            let result = fs.read(path.clone()).await;
+            let _ = tx.send((buffer, path, result));
+        });
+    }
+
+    fn fs_save(&mut self, mut save: PendingSave) {
+        let Some(fs) = self.host_fs_async.clone() else {
+            return;
+        };
+        // The bytes were snapshotted at command time; move them into the write and keep
+        // their length for the `written` echo (the buffer can't be read after the move).
+        let bytes = std::mem::take(&mut save.bytes);
+        let bytes_len = bytes.len();
+        let path = save.path.display().to_string();
+        let tx = self.save_done_tx.clone();
+        tokio::spawn(async move {
+            let result = fs.write(path, bytes).await;
+            let _ = tx.send(SaveDone::new(save, bytes_len, result));
+        });
+    }
+
+    fn fs_watch(&mut self, path: String) {
+        if let Some(fs) = &self.host_fs_async {
+            fs.watch(path);
+        }
+    }
+
+    fn fs_unwatch(&mut self, path: String) {
+        if let Some(fs) = &self.host_fs_async {
+            fs.unwatch(path);
+        }
+    }
+
+    fn has_remote_fs(&self) -> bool {
+        self.host_fs_async.is_some()
     }
 }

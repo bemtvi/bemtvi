@@ -98,18 +98,12 @@ impl Server {
     /// `:edit` from a keystroke, `vim.cmd('edit ...')`, or a user command is caught
     /// after the editor converges. A no-op when off-tick mode is off or none ran.
     pub(crate) fn drain_pending_opens(&mut self) {
-        let Some(fs) = self.host_fs_async.clone() else {
+        if !self.fx.has_remote_fs() {
             return;
-        };
+        }
         for open in self.editor.take_pending_opens() {
-            let fs = fs.clone();
-            let tx = self.open_tx.clone();
-            let buffer = open.buffer;
             let path = open.path.display().to_string();
-            tokio::spawn(async move {
-                let result = fs.read(path.clone()).await;
-                let _ = tx.send((buffer, path, result));
-            });
+            self.fx.fs_fetch(open.buffer, path);
         }
     }
 
@@ -326,9 +320,9 @@ impl Server {
     /// the watches on the *daemon* instead (the `HostWatch` leg — see below), since the
     /// edit-host can't watch a remote file with a local `notify`.
     pub(crate) fn sync_buffer_watches(&mut self) {
-        if let Some(fs) = self.host_fs_async.clone() {
+        if self.fx.has_remote_fs() {
             // The remote watch leg: one watch per file-backed buffer path, armed on the
-            // daemon (`HostFsAsync::watch`). The daemon owns change detection and pushes
+            // daemon (`HostEffects::fs_watch`). The daemon owns change detection and pushes
             // `fs_changed`, so this tracks only paths — no stat snapshot, no re-arm on a
             // reload (the daemon re-baselines its own view). A `fs_changed` push lands on
             // the `watch_rx` arm and reconciles via `on_remote_file_changed`.
@@ -341,7 +335,7 @@ impl Server {
                 .collect();
             for path in &want {
                 if self.remote_watches.insert(path.clone()) {
-                    fs.watch(path.clone());
+                    self.fx.fs_watch(path.clone());
                 }
             }
             let stale: Vec<String> = self
@@ -352,7 +346,7 @@ impl Server {
                 .collect();
             for path in stale {
                 self.remote_watches.remove(&path);
-                fs.unwatch(path);
+                self.fx.fs_unwatch(path);
             }
             return;
         }

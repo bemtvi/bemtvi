@@ -127,6 +127,10 @@ pub struct ExtmarkMirror {
 /// follows the chain when asked for the resolved form (`{ link = false }`).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct HlDefMirror {
+    /// The namespace this group lives in (`0` is global). Keys the per-namespace
+    /// mirror push, so it isn't part of the serialized row.
+    #[serde(skip)]
+    pub ns: u32,
     /// The group name keys the mirror table (`vim._hl_defs[name]`), so it isn't a
     /// field of the serialized entry.
     #[serde(skip)]
@@ -1376,6 +1380,30 @@ impl LuaRuntime {
         }
         let set: mlua::Function = vim.get("_set_hl_mirror")?;
         set.call(entries)
+    }
+
+    /// Refresh the per-namespace highlight mirror (`vim._hl_defs_ns[ns][name]`)
+    /// that `nvim_get_hl(ns, …)` reads for a non-zero namespace. Rebuilds the
+    /// whole `_hl_defs_ns` map from the core registry's non-zero namespaces (the
+    /// global table goes through [`set_hl_mirror`](Self::set_hl_mirror)), pushed
+    /// under the same generation gate. `defs` carries one [`HlDefMirror`] per
+    /// `(ns, name)`; rows are byte-identical to the global mirror's.
+    pub fn set_hl_mirror_ns(&self, defs: &[HlDefMirror]) -> mlua::Result<()> {
+        let vim = self.vim()?;
+        let by_ns = self.lua.create_table()?;
+        for d in defs {
+            let ns_table: mlua::Table = match by_ns.get::<Option<mlua::Table>>(d.ns)? {
+                Some(t) => t,
+                None => {
+                    let t = self.lua.create_table()?;
+                    by_ns.set(d.ns, &t)?;
+                    t
+                }
+            };
+            ns_table.set(self.lua.create_string(&d.name)?, self.to_lua(d)?)?;
+        }
+        let set: mlua::Function = vim.get("_set_hl_mirror_ns")?;
+        set.call(by_ns)
     }
 
     /// Refresh the Rust→Lua buffer-option mirror (`vim._bo_mirror[bufnr] =

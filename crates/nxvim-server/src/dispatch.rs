@@ -381,13 +381,16 @@ impl Server {
             }
             "nvim_get_hl" => {
                 // (ns, { name = "<group>" }) -> the group resolved through its
-                // link chain to concrete colors/attrs, or `{}` if unstyled.
+                // link chain to concrete colors/attrs, or `{}` if unstyled. A
+                // non-zero `ns` reads that namespace's own table (a group not
+                // defined there is `{}`, not the global fallback).
+                let ns = params.first().and_then(Value::as_u64).unwrap_or(0) as u32;
                 let name = params
                     .get(1)
                     .and_then(map_get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                Ok(match self.editor.highlights.resolve(name) {
+                Ok(match self.editor.highlights.resolve_ns(ns, name) {
                     Some(style) => style_value(&style),
                     None => Value::Map(vec![]),
                 })

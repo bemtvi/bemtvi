@@ -116,16 +116,26 @@ impl Style {
     }
 }
 
-/// The global highlight-group table (namespace `0` only, which is all
-/// catppuccin needs). Maps group name -> definition; resolution follows links.
+/// The highlight-group registry. Namespace `0` is the global table a
+/// colorscheme populates (`nvim_set_hl(0, …)`) and the renderer resolves
+/// against; non-zero namespaces (`nvim_set_hl(ns, …)`, keyed off
+/// `nvim_create_namespace`) live in their own tables so a plugin styling a
+/// group in *its* namespace never clobbers the global definition. Each table
+/// maps group name -> definition; resolution follows links within a table
+/// (a non-zero namespace falling back to the global table per hop).
 #[derive(Default)]
 pub struct Highlights {
+    /// The global namespace (`0`) — the table the renderer resolves against.
     groups: HashMap<String, HlDef>,
-    /// Bumped on every mutation ([`Highlights::set`] / [`Highlights::clear`]),
-    /// so the server can mirror the table into Lua only when it actually changed
-    /// (the Rust→Lua `nvim_get_hl` mirror is otherwise hundreds of entries to
-    /// re-serialize before every Lua chunk). Wraps harmlessly: only equality
-    /// against the last-pushed value matters.
+    /// Per-namespace tables for non-zero namespaces, keyed by namespace id.
+    /// Empty in the common single-colorscheme case, so the global path pays
+    /// nothing for namespace support.
+    namespaces: HashMap<u32, HashMap<String, HlDef>>,
+    /// Bumped on every mutation ([`Highlights::set`] / [`Highlights::set_ns`] /
+    /// [`Highlights::clear`]), so the server can mirror the tables into Lua only
+    /// when they actually changed (the Rust→Lua `nvim_get_hl` mirror is
+    /// otherwise hundreds of entries to re-serialize before every Lua chunk).
+    /// Wraps harmlessly: only equality against the last-pushed value matters.
     generation: u64,
 }
 
@@ -141,25 +151,42 @@ impl Highlights {
         Highlights::default()
     }
 
-    /// Define (or redefine) a group, as `nvim_set_hl(0, name, opts)` does. A
-    /// blank definition (empty opts table) clears the group, matching neovim.
+    /// Define (or redefine) a group in the global namespace, as
+    /// `nvim_set_hl(0, name, opts)` does. A blank definition (empty opts table)
+    /// clears the group, matching neovim.
     pub fn set(&mut self, name: &str, def: HlDef) {
-        if def.is_blank() {
-            self.groups.remove(name);
+        self.set_ns(0, name, def);
+    }
+
+    /// Define (or redefine) a group in namespace `ns`, as
+    /// `nvim_set_hl(ns, name, opts)` does. `ns == 0` writes the global table
+    /// (identical to [`set`](Self::set)); a non-zero `ns` writes that
+    /// namespace's own table, leaving the global definition untouched. A blank
+    /// definition clears the group from the target table, matching neovim.
+    pub fn set_ns(&mut self, ns: u32, name: &str, def: HlDef) {
+        let table = if ns == 0 {
+            &mut self.groups
         } else {
-            self.groups.insert(name.to_string(), def);
+            self.namespaces.entry(ns).or_default()
+        };
+        if def.is_blank() {
+            table.remove(name);
+        } else {
+            table.insert(name.to_string(), def);
         }
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// `:hi clear` — drop every group back to the empty default state.
+    /// `:hi clear` — drop every global group back to the empty default state.
+    /// (Non-zero namespaces are left as-is; `:hi clear` is a global operation.)
     pub fn clear(&mut self) {
         self.groups.clear();
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// The raw (unresolved) definition for `name`, if any. `link` is still
-    /// present — callers wanting a concrete style use [`Highlights::resolve`].
+    /// The raw (unresolved) definition for `name` in the global namespace, if
+    /// any. `link` is still present — callers wanting a concrete style use
+    /// [`Highlights::resolve`].
     pub fn get(&self, name: &str) -> Option<&HlDef> {
         self.groups.get(name)
     }
@@ -170,20 +197,57 @@ impl Highlights {
         self.generation
     }
 
-    /// Iterate the raw `(name, def)` definitions — the source the server folds
-    /// into the Lua `vim._hl_defs` mirror that backs `nvim_get_hl`. Links are
-    /// kept unresolved (the Lua side follows the chain when asked).
+    /// Iterate the raw `(name, def)` definitions of the global namespace — the
+    /// source the server folds into the Lua `vim._hl_defs` mirror that backs
+    /// `nvim_get_hl`. Links are kept unresolved (the Lua side follows the chain
+    /// when asked).
     pub fn iter(&self) -> impl Iterator<Item = (&str, &HlDef)> {
         self.groups.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Resolve a group to a concrete [`Style`], following its link chain
-    /// (cycle-guarded). Returns `None` when the group is absent, cleared, or
-    /// links to a dead end — i.e. when it contributes no highlight.
+    /// Iterate `(ns, name, def)` over every non-zero namespace's raw
+    /// definitions — the source for the per-namespace Lua mirror tables. The
+    /// global namespace is excluded (it has its own [`iter`](Self::iter)).
+    pub fn iter_namespaces(&self) -> impl Iterator<Item = (u32, &str, &HlDef)> {
+        self.namespaces
+            .iter()
+            .flat_map(|(&ns, table)| table.iter().map(move |(k, v)| (ns, k.as_str(), v)))
+    }
+
+    /// Resolve a group in the global namespace to a concrete [`Style`].
+    /// Equivalent to [`resolve_ns(0, name)`](Self::resolve_ns).
     pub fn resolve(&self, name: &str) -> Option<Style> {
+        self.resolve_ns(0, name)
+    }
+
+    /// Resolve a group within namespace `ns` to a concrete [`Style`], following
+    /// its link chain (cycle-guarded). Returns `None` when the group is absent,
+    /// cleared, or links to a dead end — i.e. when it contributes no highlight.
+    ///
+    /// For a non-zero `ns` the lookup is rooted in that namespace's table: a
+    /// group not defined there yields `None` (matching neovim's
+    /// `nvim_get_hl(ns, …)`, which returns the namespace's own table — render
+    /// time falls back to the global table separately). Once rooted, each link
+    /// hop is looked up in the namespace first, then the global table, so a
+    /// namespaced alias of a global base group still resolves.
+    pub fn resolve_ns(&self, ns: u32, name: &str) -> Option<Style> {
+        if ns != 0
+            && !self
+                .namespaces
+                .get(&ns)
+                .is_some_and(|t| t.contains_key(name))
+        {
+            return None;
+        }
+        let ns_table = (ns != 0).then(|| self.namespaces.get(&ns)).flatten();
+        let lookup = |n: &str| {
+            ns_table
+                .and_then(|t| t.get(n))
+                .or_else(|| self.groups.get(n))
+        };
         let mut current = name;
         for _ in 0..MAX_LINK_DEPTH {
-            let def = self.groups.get(current)?;
+            let def = lookup(current)?;
             if let Some(link) = &def.link {
                 current = link;
                 continue;

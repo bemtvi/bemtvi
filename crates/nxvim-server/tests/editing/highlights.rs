@@ -5,9 +5,15 @@ use crate::support::*;
 /// Resolve a highlight group via `nvim_get_hl(0, { name = group })`, returning
 /// its concrete-style map (empty when the group is unstyled/absent).
 async fn get_hl(rpc: &Rpc, group: &str) -> Vec<(Value, Value)> {
+    get_hl_ns(rpc, 0, group).await
+}
+
+/// Resolve a highlight group in a specific namespace via
+/// `nvim_get_hl(ns, { name = group })` (empty when absent in that namespace).
+async fn get_hl_ns(rpc: &Rpc, ns: u64, group: &str) -> Vec<(Value, Value)> {
     let opts = Value::Map(vec![(Value::from("name"), Value::from(group))]);
     let result = rpc
-        .request("nvim_get_hl", vec![Value::from(0u64), opts])
+        .request("nvim_get_hl", vec![Value::from(ns), opts])
         .await
         .expect("get_hl");
     match result {
@@ -54,6 +60,72 @@ async fn nvim_set_hl_stores_resolved_colors_and_attrs() {
     let comment = get_hl(&rpc, "Comment").await;
     assert_eq!(hl_color(&comment, "fg"), Some(hex("6c7086")));
     assert!(hl_flag(&comment, "italic"), "Comment should be italic");
+}
+
+#[tokio::test]
+async fn nonzero_namespace_set_hl_does_not_clobber_global() {
+    // `nvim_set_hl(ns, name, opts)` with `ns != 0` defines the group *in that
+    // namespace* — it must not fold into / overwrite the global (ns 0) table.
+    // A plugin that sets `Normal` in its own namespace must leave the
+    // colorscheme's global `Normal` intact, and the namespaced definition must
+    // be readable back via `nvim_get_hl(ns, ...)`.
+    let dir = temp_dir("hlns");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'Comment', { fg = '#6c7086' })\n\
+         vim.api.nvim_set_hl(5, 'Normal', { fg = '#f38ba8', bg = '#11111b' })\n",
+    )
+    .await;
+    // The global Normal is untouched by the ns-5 write.
+    let global = get_hl_ns(&rpc, 0, "Normal").await;
+    assert_eq!(hl_color(&global, "fg"), Some(hex("cdd6f4")));
+    assert_eq!(hl_color(&global, "bg"), Some(hex("1e1e2e")));
+    // Namespace 5 carries its own Normal.
+    let ns5 = get_hl_ns(&rpc, 5, "Normal").await;
+    assert_eq!(hl_color(&ns5, "fg"), Some(hex("f38ba8")));
+    assert_eq!(hl_color(&ns5, "bg"), Some(hex("11111b")));
+    // A group defined only in the global table is *not* visible from ns 5: a
+    // namespace read returns that namespace's own table (neovim's render-time
+    // fallback to the global table is a separate mechanism).
+    assert!(
+        get_hl_ns(&rpc, 5, "Comment").await.is_empty(),
+        "an undefined group in ns 5 reads empty, not the global def"
+    );
+}
+
+#[tokio::test]
+async fn nonzero_namespace_visible_to_lua_get_hl() {
+    // The Lua-side `vim.api.nvim_get_hl(ns, ...)` (backed by the Rust→Lua
+    // mirror) must also be namespace-aware: reading ns 0 sees the global
+    // `Normal`, reading ns 5 sees the namespaced one, with no cross-contamination.
+    let dir = temp_dir("hlnslua");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4' })\n\
+         vim.api.nvim_set_hl(5, 'Normal', { fg = '#f38ba8' })\n",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_get_hl(0, { name = 'Normal' }).fg"
+        )
+        .await
+        .as_u64(),
+        Some(hex("cdd6f4")),
+        "Lua nvim_get_hl(0, ...) reads the global Normal"
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_get_hl(5, { name = 'Normal' }).fg"
+        )
+        .await
+        .as_u64(),
+        Some(hex("f38ba8")),
+        "Lua nvim_get_hl(5, ...) reads the namespaced Normal"
+    );
 }
 
 #[tokio::test]

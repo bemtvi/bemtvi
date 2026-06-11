@@ -185,6 +185,14 @@ end
 vim._hl_defs = vim._hl_defs or {}
 function vim._set_hl_mirror(entries) vim._hl_defs = entries or {} end
 
+-- Per-namespace mirror for non-zero namespaces: vim._hl_defs_ns[ns][name] =
+-- def. Kept separate from the global vim._hl_defs so nvim_set_hl(ns, …) never
+-- clobbers a colorscheme's global group; nvim_get_hl(ns, …) reads it. Refreshed
+-- by the server (vim._set_hl_mirror_ns) under the same generation gate as the
+-- global push.
+vim._hl_defs_ns = vim._hl_defs_ns or {}
+function vim._set_hl_mirror_ns(by_ns) vim._hl_defs_ns = by_ns or {} end
+
 function vim._set_buf_mirror(entries, row, col, win, wins, next_win, mode)
   vim._cur_mode = mode or "n"
   -- The server omits `lines` for a buffer whose changedtick is unchanged (the
@@ -1964,9 +1972,12 @@ end
 -- for the server to fold into the core highlight registry), so it is not
 -- (re)defined here — doing so would shadow the Rust-backed version.
 
--- nvim_get_hl(ns, opts): read highlight group definitions from the `vim._hl_defs`
--- mirror the server refreshes when the registry changes. `ns` is accepted but
--- ignored (namespace 0 only, as nvim_set_hl). Forms:
+-- nvim_get_hl(ns, opts): read highlight group definitions from the mirror the
+-- server refreshes when the registry changes. `ns == 0` reads the global table
+-- (`vim._hl_defs`); a non-zero `ns` reads that namespace's own table
+-- (`vim._hl_defs_ns[ns]`), with no fallback to the global table — matching
+-- neovim, where a group not defined in the namespace reads `{}` and render-time
+-- fallback is a separate mechanism. Forms:
 --   * opts.name given          -> that group's definition. A link group returns
 --                                 `{ link = "Target" }`; a concrete group returns
 --                                 its colors (fg/bg/sp as 0xRRGGBB ints) and the
@@ -1976,9 +1987,9 @@ end
 --                                 blend popup colors).
 --   * no name                  -> every group keyed by name.
 -- A fresh table is returned each call so a caller mutating it can't corrupt the
--- mirror. INCOMPLETE: only namespace 0 is modelled (per-namespace highlights via
--- nvim_set_hl(ns, …) fold into the global table), and the extra metadata neovim
--- attaches (`default`, `cterm*`) is absent — nxvim's registry is truecolor-only.
+-- mirror. INCOMPLETE: `nvim_win_set_hl_ns` (render-time namespace selection) is
+-- not modelled, and the extra metadata neovim attaches (`default`, `cterm*`) is
+-- absent — nxvim's registry is truecolor-only.
 local function copy_hl_def(d)
   local out = {}
   for k, v in pairs(d) do
@@ -1987,9 +1998,9 @@ local function copy_hl_def(d)
   return out
 end
 
-function vim.api.nvim_get_hl(_ns, opts)
+function vim.api.nvim_get_hl(ns, opts)
   opts = opts or {}
-  local defs = vim._hl_defs or {}
+  local defs = ((ns == nil or ns == 0) and vim._hl_defs or (vim._hl_defs_ns or {})[ns]) or {}
   if opts.name ~= nil then
     local name = opts.name
     if opts.link == false then

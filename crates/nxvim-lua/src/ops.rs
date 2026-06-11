@@ -3,13 +3,16 @@
 //! are the wire between [`crate::LuaRuntime`] and the server, kept free of any
 //! `mlua` / transport types so the server can pattern-match on them directly.
 
-/// A highlight-group definition produced by `nvim_set_hl(0, name, opts)`, in
+/// A highlight-group definition produced by `nvim_set_hl(ns, name, opts)`, in
 /// the wire-ish form the server translates into `nxvim_core`'s `HlDef`. Colors
 /// are kept as the strings the opts table carried (`"#rrggbb"` / `"NONE"` /
 /// named, with integer colors normalized to `#rrggbb`); the core parses them,
 /// so this crate stays free of any color/registry types.
 #[derive(Clone, Debug, Default)]
 pub struct HlSet {
+    /// The namespace the group is defined in (`0` is the global table). A
+    /// non-zero namespace is kept separate by the core, never folded into global.
+    pub ns: u32,
     pub name: String,
     pub fg: Option<String>,
     pub bg: Option<String>,

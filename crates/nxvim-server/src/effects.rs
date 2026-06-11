@@ -133,7 +133,7 @@ impl Server {
     /// message.
     pub(crate) fn apply_lua_effects(&mut self) {
         for hl in self.lua.take_highlights() {
-            self.editor.highlights.set(&hl.name, hl_def(&hl));
+            self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
         }
         for cmd in self.lua.take_commands() {
             self.editor.command(&cmd);
@@ -920,25 +920,36 @@ impl Server {
         let hl_gen = self.editor.highlights.generation();
         if self.hl_mirror_gen != Some(hl_gen) {
             self.hl_mirror_gen = Some(hl_gen);
+            let mirror = |ns: u32, name: &str, def: &nxvim_core::highlight::HlDef| HlDefMirror {
+                ns,
+                name: name.to_string(),
+                fg: def.fg.map(|c| c.to_u32()),
+                bg: def.bg.map(|c| c.to_u32()),
+                sp: def.sp.map(|c| c.to_u32()),
+                bold: def.bold,
+                italic: def.italic,
+                underline: def.underline,
+                undercurl: def.undercurl,
+                strikethrough: def.strikethrough,
+                reverse: def.reverse,
+                link: def.link.clone(),
+            };
             let defs: Vec<HlDefMirror> = self
                 .editor
                 .highlights
                 .iter()
-                .map(|(name, def)| HlDefMirror {
-                    name: name.to_string(),
-                    fg: def.fg.map(|c| c.to_u32()),
-                    bg: def.bg.map(|c| c.to_u32()),
-                    sp: def.sp.map(|c| c.to_u32()),
-                    bold: def.bold,
-                    italic: def.italic,
-                    underline: def.underline,
-                    undercurl: def.undercurl,
-                    strikethrough: def.strikethrough,
-                    reverse: def.reverse,
-                    link: def.link.clone(),
-                })
+                .map(|(name, def)| mirror(0, name, def))
                 .collect();
             let _ = self.lua.set_hl_mirror(&defs);
+            // Non-zero namespaces ride a separate mirror (`vim._hl_defs_ns`) so
+            // `nvim_get_hl(ns, …)` reads them without touching the global table.
+            let ns_defs: Vec<HlDefMirror> = self
+                .editor
+                .highlights
+                .iter_namespaces()
+                .map(|(ns, name, def)| mirror(ns, name, def))
+                .collect();
+            let _ = self.lua.set_hl_mirror_ns(&ns_defs);
         }
         // The tab snapshot (Phase 3): one entry per tab page in tabline order, each
         // carrying its window ids and focused window, so `nvim_tabpage_*` reads from

@@ -37,23 +37,14 @@ assert(next(vim._cb_fns) ~= nil, "the scheduled callback should be registered fo
 assert(type(vim.api.nvim_get_current_buf()) == "number",
   "nvim_get_current_buf should stay real, not raise")
 
--- A uv timer handle's :is_active() / :is_closing() can't be answered faithfully
--- from Lua: a one-shot timer auto-expires inside the Rust actor with no callback
--- back to Lua, so any constant we return (the old `true` / `false`) is a lie about
--- the handle's real state. They raise via vim._notimpl instead of faking it.
+-- A uv timer handle's :is_active()/:is_closing() are now REAL (no longer loud
+-- gaps): faithful Lua-side lifecycle tracking, not a canned constant.
 local timer = vim.uv.new_timer()
-local ok_active, err_active = pcall(timer.is_active, timer)
-assert(not ok_active, "timer:is_active should raise, not return a canned bool")
-assert(err_active:find("nxvim: not implemented: vim.uv.timer:is_active", 1, true),
-  "is_active error should name itself, got: " .. tostring(err_active))
-local ok_closing, err_closing = pcall(timer.is_closing, timer)
-assert(not ok_closing, "timer:is_closing should raise, not return a canned bool")
-assert(err_closing:find("nxvim: not implemented: vim.uv.timer:is_closing", 1, true),
-  "is_closing error should name itself, got: " .. tostring(err_closing))
-assert(vim._notimpl_hits["vim.uv.timer:is_active"] == true, "is_active hit recorded")
-assert(vim._notimpl_hits["vim.uv.timer:is_closing"] == true, "is_closing hit recorded")
--- The faithful neighbours on the same handle stay real.
+assert(timer:is_active() == false, "fresh timer is not active")
+timer:start(1000, 0, function() end)
+assert(timer:is_active() == true, "started timer is active")
 assert(timer:stop() == 0, "timer:stop should stay real, returning 0")
+assert(timer:is_active() == false, "stopped timer is not active")
 
 return "ok"
 "#,

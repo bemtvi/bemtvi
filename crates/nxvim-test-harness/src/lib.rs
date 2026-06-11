@@ -486,6 +486,11 @@ const PLUGIN_PINS: &[(&str, &str, &str)] = &[
         "a1d504892f2bc56c2e79b65c6faded2fd21f3eca",
     ),
     (
+        "cmp-buffer",
+        "https://github.com/hrsh7th/cmp-buffer.git",
+        "b74fab3656eea9de20a9b8116afa3cfc4ec09657",
+    ),
+    (
         "lualine.nvim",
         "https://github.com/nvim-lualine/lualine.nvim.git",
         "221ce6b2d999187044529f49da6554a92f740a96",

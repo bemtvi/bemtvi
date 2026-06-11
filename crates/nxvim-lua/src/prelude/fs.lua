@@ -523,3 +523,77 @@ function vim.fn.getcharstr(expr)
   if expr == 1 then return "" end
   return await_prompt(function(cb) vim._getchar(cb) end) or ""
 end
+
+-- vim.wait(time, callback, interval, fast_only): block the calling chunk for up
+-- to `time` ms, polling `callback` every `interval` ms (default 200) and returning
+-- as soon as it is truthy. This is a REAL pump, not a sleep that ignores the
+-- condition: while parked, the server keeps draining its event loop — timers fire,
+-- scheduled work runs — so a condition driven by other async work (e.g. nvim-cmp's
+-- throttle timer flipping its `running` flag) is actually observed. We implement it
+-- on the same park/resume spine as the prompts above: a repeating poll timer ticks
+-- on the loop while the coroutine is suspended, and the first tick that satisfies
+-- the condition (or reaches the deadline) resumes us with the verdict.
+--
+-- Like input/getchar it suspends the running coroutine, so it only works inside a
+-- coroutine-pumped entry (a :lua chunk, keymap, or user command); a bare callback
+-- (timer/schedule/autocmd) has nothing to suspend and fails loud rather than
+-- busy-spinning the single server thread into a deadlock (the timers that would
+-- satisfy the condition can't fire while a callback monopolizes the thread).
+--
+-- Returns (true) when `callback` returned truthy within `time`; (false, -1) on
+-- timeout. With no `callback` it waits the full `time` then returns (false, -1) — a
+-- plain timed sleep. (`fast_only` is accepted and ignored: nxvim has no fast-event
+-- context to restrict to, so every wait already permits all work.)
+function vim.wait(time, callback, interval, _fast_only)
+  time = tonumber(time) or 0
+  interval = tonumber(interval) or 200
+  if interval < 1 then interval = 1 end
+
+  -- An already-satisfied condition never parks (matches neovim, and keeps a
+  -- `vim.wait(0, cond)` poll cheap). A non-positive timeout that isn't already
+  -- satisfied times out at once.
+  if callback and callback() then return true end
+  if time <= 0 then return false, -1 end
+
+  local co = coroutine.running()
+  if not co then
+    error(
+      "vim.wait requires a synchronous pumped context "
+        .. "(a :lua chunk, keymap, or command); it cannot block in a callback",
+      0
+    )
+  end
+  -- Resume the OUTERMOST driver (the await_prompt rationale): under a vim.co_pcall
+  -- the running coroutine is the inner protected one; the relay chain holds the
+  -- continuation and drives it from the root down.
+  local root, drivers = co, vim._co_driver
+  while drivers and drivers[root] do
+    root = drivers[root]
+  end
+
+  local deadline = vim.uv.now() + time
+  local id = vim._next_cb_id()
+  local result
+  local function finish(value)
+    if result ~= nil then return end -- guard against a double resume
+    result = value
+    vim._timer_active[id] = nil
+    vim._timer_stop(id)
+    vim._cb_fns[id] = nil
+    local ok, err = coroutine.resume(root, value)
+    if not ok then error(err, 0) end
+  end
+  vim._cb_fns[id] = function()
+    if callback and callback() then return finish(true) end
+    if vim.uv.now() >= deadline then return finish(false) end
+    -- otherwise leave the repeating poll timer armed for the next tick
+  end
+  vim._timer_active[id] = true
+  -- First tick no later than the deadline; thereafter every `interval` ms.
+  vim._timer_start(id, math.min(interval, time), interval)
+  if coroutine.yield() then
+    return true
+  else
+    return false, -1
+  end
+end

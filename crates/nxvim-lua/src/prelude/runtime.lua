@@ -64,7 +64,14 @@ end
 -- it; current callers ignore it.
 function vim._run_cb(id, keep, ...)
   local fn = vim._cb_fns[id]
-  if not keep then vim._cb_fns[id] = nil end
+  if not keep then
+    vim._cb_fns[id] = nil
+    -- A spent one-shot timer (defer_fn / uv timer) is no longer active. This is
+    -- the only place that transition is observable Lua-side; clearing it here
+    -- keeps a handle's :is_active() honest (a no-op for non-timer callbacks,
+    -- whose ids are never in this table). See prelude/timer.lua.
+    if vim._timer_active then vim._timer_active[id] = nil end
+  end
   if fn then return fn(...) end
 end
 

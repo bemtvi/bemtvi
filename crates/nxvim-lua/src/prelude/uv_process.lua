@@ -93,8 +93,12 @@ function Pipe:is_closing() return self._closing end
 -- ----- check handles ---------------------------------------------------------
 -- libuv's "check" phase handle: a callback run on each loop iteration until
 -- stopped. plenary uses one to poll for "all pipes closed" before finishing a
--- job. Modelled by re-scheduling the callback through vim.schedule until
--- check_stop — which the polling callback calls as soon as its condition holds.
+-- job; nvim-cmp's async Scheduler uses one as its executor — `:start(step)` drives
+-- the coroutine queue that runs the completion filter→menu pipeline, so the handle
+-- MUST expose both the function forms (uv.check_start/stop) and the *method* forms
+-- (handle:start/stop) luv offers, exactly like the timer handle. Modelled by
+-- re-scheduling the callback through vim.schedule until stopped — which the polling
+-- callback calls as soon as its condition holds.
 
 local Check = {}
 Check.__index = Check
@@ -113,25 +117,37 @@ function Check:close()
   self._cb = nil
 end
 
-function uv.check_start(check, cb)
-  check._active = true
-  check._cb = cb
+-- Arm the check: run `cb` once per convergence (modelled via vim.schedule
+-- re-arming) until :stop()/:close(). Starting an already-active check just swaps
+-- the callback (no second poll loop), matching luv's single-armed handle.
+function Check:start(cb)
+  local was_active = self._active
+  self._active = true
+  self._cb = cb
+  if was_active then return 0 end
   local function poll()
-    if not check._active or not check._cb then return end
-    check._cb()
+    if not self._active or not self._cb then return end
+    self._cb()
     -- Re-arm only if the callback did not stop the check (its condition not yet
     -- met). The convergence fixpoint (run_pending) runs each re-schedule.
-    if check._active then vim.schedule(poll) end
+    if self._active then vim.schedule(poll) end
   end
   vim.schedule(poll)
   return 0
 end
 
-function uv.check_stop(check)
-  check._active = false
-  check._cb = nil
+function Check:stop()
+  self._active = false
+  self._cb = nil
   return 0
 end
+
+-- luv's function forms: uv.check_start(handle, cb) / uv.check_stop(handle), the
+-- table-level twins of the handle methods (some callers use each). Delegate so the
+-- single-armed / re-schedule semantics stay identical.
+function uv.check_start(check, cb) return check:start(cb) end
+
+function uv.check_stop(check) return check:stop() end
 
 -- ----- spawn -----------------------------------------------------------------
 

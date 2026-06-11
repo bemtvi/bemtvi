@@ -12,7 +12,8 @@ async fn vim_opt_statusline_round_trips_through_core() {
     exec_lua(&rpc, r#"vim.opt.statusline = "%f %l,%c""#).await;
     let via_o = exec_lua(&rpc, r#"return vim.o.statusline"#).await;
     assert_eq!(via_o.as_str(), Some("%f %l,%c"));
-    let via_opt = exec_lua(&rpc, r#"return vim.opt.statusline"#).await;
+    // vim.opt.statusline is an Option object (as in neovim), read via :get().
+    let via_opt = exec_lua(&rpc, r#"return vim.opt.statusline:get()"#).await;
     assert_eq!(via_opt.as_str(), Some("%f %l,%c"));
     let via_abbrev = exec_lua(&rpc, r#"return vim.o.stl"#).await;
     assert_eq!(via_abbrev.as_str(), Some("%f %l,%c"));

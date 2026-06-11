@@ -315,6 +315,83 @@ end
 -- errored its setup; an undefined group correctly answers 0, leaving it unstyled.
 function vim.fn.hlexists(name) return (vim._hl_defs or {})[name] ~= nil and 1 or 0 end
 
+-- Highlight-group id registry for the legacy hlID / synID* family. vim addresses
+-- highlight groups by a small integer id; nxvim's registry is name-keyed, so we
+-- mint a stable id per name on first reference (vim auto-creates a group when its
+-- name is first used, so an id for an as-yet-undefined group is correct — its
+-- attributes simply read empty until something defines it).
+vim._hl_ids = vim._hl_ids or {} -- name -> id
+vim._hl_names = vim._hl_names or {} -- id   -> name
+vim._hl_id_seq = vim._hl_id_seq or 0
+local function hl_id_for(name)
+  if name == nil or name == "" then return 0 end
+  name = tostring(name)
+  local id = vim._hl_ids[name]
+  if not id then
+    vim._hl_id_seq = vim._hl_id_seq + 1
+    id = vim._hl_id_seq
+    vim._hl_ids[name] = id
+    vim._hl_names[id] = name
+  end
+  return id
+end
+
+-- vim.fn.hlID(name): the id of highlight group `name` (minted stably; 0 for the
+-- empty name). The companion vim.fn.synID* read it back. nvim-cmp's highlight
+-- inheritance does `synIDattr(hlID(group), key)` to derive its menu groups.
+function vim.fn.hlID(name) return hl_id_for(name) end
+
+-- vim.fn.synIDtrans(id): resolve `:highlight link`s to the final concrete group's
+-- id (so synIDattr reads the linked-to group's attributes). An unknown id passes
+-- through unchanged, matching vim.
+function vim.fn.synIDtrans(id)
+  local name = vim._hl_names[id]
+  if not name then return id end
+  local defs = vim._hl_defs or {}
+  local seen = 0
+  while defs[name] and defs[name].link ~= nil and seen < 32 do
+    name = defs[name].link
+    seen = seen + 1
+  end
+  return hl_id_for(name)
+end
+
+-- vim.fn.synIDattr(id, what [, mode]): an attribute of the highlight group with
+-- id `id`, as a string (vim's contract). `what`: "name" -> the group name;
+-- "fg"/"bg"/"sp" (and the "#"-suffixed gui forms) -> the truecolor value as
+-- "#rrggbb" ("" if unset); a boolean attr ("bold"/"italic"/"reverse"/"inverse"/
+-- "standout"/"underline"/"undercurl"/"strikethrough") -> "1" when set, "" when
+-- not. `mode` (cterm/gui/term) is accepted and ignored — nxvim is truecolor-only.
+-- An unknown id (never minted via hlID) yields "" for every attribute.
+function vim.fn.synIDattr(id, what, _mode)
+  local name = vim._hl_names[id]
+  if not name then return "" end
+  if what == "name" then return name end
+  local d = vim.api.nvim_get_hl(0, { name = name, link = false })
+  local color = { fg = true, bg = true, sp = true, ["fg#"] = "fg", ["bg#"] = "bg", ["sp#"] = "sp" }
+  local ck = color[what]
+  if ck then
+    local v = d[ck == true and what or ck]
+    if type(v) ~= "number" then return "" end
+    return ("#%06x"):format(v)
+  end
+  -- `inverse` is vim's alias for `reverse`.
+  local attr = (what == "inverse") and "reverse" or what
+  return d[attr] and "1" or ""
+end
+
+-- vim.fn.synstack(lnum, col): the stack of vim-regex *syntax* item ids at a
+-- position. nxvim highlights via tree-sitter and runs no vim-regex syntax engine,
+-- so there is never a legacy syntax stack — the faithful answer is an empty list
+-- (exactly what neovim returns under tree-sitter highlighting, where `:syntax` is
+-- off). Plugins that probe "is the cursor in syntax group X" (nvim-cmp's
+-- `in_syntax_group`) therefore correctly see "no", rather than a faked group.
+function vim.fn.synstack(_lnum, _col) return {} end
+
+-- vim.fn.synID(lnum, col, trans): the syntax id at a position (0 = none). Same
+-- rationale as synstack — no vim-regex syntax engine, so always 0.
+function vim.fn.synID(_lnum, _col, _trans) return 0 end
+
 -- Sign *definitions* registry. nvim-dap defines its breakpoint/stopped signs at
 -- module load (`sign_getdefined(name)` then `sign_define(name, opts)` for each
 -- that's absent), so the define/query pair must work for `require('dap')` to
@@ -956,6 +1033,22 @@ function vim.list_extend(dst, src, start, finish)
     dst[#dst + 1] = src[i]
   end
   return dst
+end
+
+-- vim.list_slice(list, start, finish): a copy of `list[start..finish]` (1-based,
+-- inclusive; negative indices count from the end, as neovim). nvim-cmp caps its
+-- menu with `vim.list_slice(entries, 1, max_view_entries)`.
+function vim.list_slice(list, start, finish)
+  local n = #list
+  start = start or 1
+  finish = finish or n
+  if start < 0 then start = n + start + 1 end
+  if finish < 0 then finish = n + finish + 1 end
+  local out = {}
+  for i = start, finish do
+    out[#out + 1] = list[i]
+  end
+  return out
 end
 
 function vim.startswith(s, prefix) return s:sub(1, #prefix) == prefix end

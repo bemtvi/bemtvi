@@ -8,7 +8,7 @@
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_test_harness::{clone_plugin, exec_lua, temp_dir};
+use nxvim_test_harness::{clone_plugin, exec_lua, feed, temp_dir};
 use rmpv::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -131,6 +131,221 @@ async fn nvim_cmp_loads() {
         "#,
     )
     .await;
+}
+
+/// `vim.wait(time, cb, interval)` is a REAL loop pump, not a sleep: while it is
+/// parked the server keeps draining timers, so a condition flipped by other async
+/// work (here a `vim.defer_fn`) is actually observed and the call returns `true`
+/// well before the timeout. (This is what nvim-cmp's `filter:sync` relies on.) The
+/// chunk parks, so its return is discarded — it stashes the verdict in a global
+/// that a later, non-parking chunk reads back.
+#[tokio::test]
+async fn vim_wait_pumps_loop_until_condition() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let _ = exec_lua(
+        &rpc,
+        r#"
+        _G.__wait = "pending"
+        local done = false
+        vim.defer_fn(function() done = true end, 40)
+        local t0 = vim.uv.now()
+        local ok, reason = vim.wait(2000, function() return done end, 5)
+        _G.__wait = ("ok=%s reason=%s done=%s under=%s"):format(
+          tostring(ok), tostring(reason), tostring(done), tostring(vim.uv.now() - t0 < 2000))
+        "#,
+    )
+    .await;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let r = exec_lua(&rpc, "return _G.__wait").await;
+        let s = r.as_str().unwrap_or("<nil>").to_string();
+        if s != "pending" {
+            assert_eq!(
+                s, "ok=true reason=nil done=true under=true",
+                "vim.wait verdict"
+            );
+            return;
+        }
+    }
+    panic!("vim.wait never resolved");
+}
+
+/// A `vim.uv` timer handle answers `:is_active()` / `:is_closing()` faithfully
+/// (they used to be loud `vim._notimpl` gaps): active once started, inactive after
+/// `:stop()`, and a one-shot goes inactive after it fires. cmp-buffer's indexing
+/// debounce gates on `:is_active()`, so a wrong answer silently zeroed completion.
+#[tokio::test]
+async fn uv_timer_is_active_tracks_lifecycle() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        r#"
+        local function eq(a, b, m) if a ~= b then error(m..": "..tostring(a).." ~= "..tostring(b)) end end
+        local ok, err = pcall(function()
+          local t = vim.uv.new_timer()
+          eq(t:is_active(), false, "fresh timer inactive")
+          eq(t:is_closing(), false, "fresh timer not closing")
+          t:start(10000, 0, function() end)  -- one-shot, far in the future
+          eq(t:is_active(), true, "started timer active")
+          t:stop()
+          eq(t:is_active(), false, "stopped timer inactive")
+          t:close()
+          eq(t:is_closing(), true, "closed timer is closing")
+
+          -- A one-shot goes inactive once it fires: stash and check after a tick.
+          _G.__after = nil
+          local s = vim.uv.new_timer()
+          s:start(5, 0, function() _G.__after = s:is_active() end)
+          eq(s:is_active(), true, "armed one-shot active")
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+    assert_eq!(report.as_str(), Some("OK"));
+    // After the one-shot fires, its is_active() (captured in the callback) is false.
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let r = exec_lua(&rpc, "return tostring(_G.__after)").await;
+        if r.as_str() == Some("false") {
+            return;
+        }
+        if r.as_str() == Some("true") {
+            panic!("a fired one-shot still reports is_active()");
+        }
+    }
+    panic!("one-shot timer never fired");
+}
+
+/// A libuv `check` handle exposes both the function forms (`uv.check_start/stop`)
+/// and the *method* forms (`handle:start/stop`). nvim-cmp's async Scheduler uses
+/// `_executor:start(step)` to drive the coroutine queue running its whole
+/// completion pipeline; the missing method form silently stalled every cmp menu.
+#[tokio::test]
+async fn uv_check_handle_has_start_stop_methods() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let _ = exec_lua(
+        &rpc,
+        r#"
+        _G.__chk = 0
+        local c = vim.loop.new_check()
+        assert(type(c.start) == "function", "Check:start method missing")
+        assert(type(c.stop) == "function", "Check:stop method missing")
+        assert(c:is_active() == false, "fresh check inactive")
+        c:start(function()
+          _G.__chk = _G.__chk + 1
+          if _G.__chk >= 3 then c:stop() end
+        end)
+        "#,
+    )
+    .await;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let r = exec_lua(&rpc, "return tostring(_G.__chk)").await;
+        if r.as_str() == Some("3") {
+            // It ran exactly to the self-stop and halted (didn't run away).
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let again = exec_lua(&rpc, "return _G.__chk").await;
+            assert_eq!(again.as_u64(), Some(3), "check should stop itself at 3");
+            return;
+        }
+    }
+    panic!("check handle :start never drove its callback");
+}
+
+/// The legacy highlight/syntax `vim.fn` family nvim-cmp reaches for while building
+/// its menu highlights: `hlID` mints a stable group id, `synIDattr` reads a group's
+/// attributes, `synIDtrans` follows `:hi link`s, and `synstack`/`synID` honestly
+/// report "no vim-regex syntax" (nxvim highlights via tree-sitter). All were loud
+/// gaps before.
+#[tokio::test]
+async fn vim_fn_highlight_and_syntax_helpers() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        r##"
+        local function eq(a, b, m) if a ~= b then error(m..": "..tostring(a).." ~= "..tostring(b)) end end
+        local ok, err = pcall(function()
+          vim.api.nvim_set_hl(0, "CmpProbe", { fg = "#112233", bold = true })
+          vim.api.nvim_set_hl(0, "CmpProbeLink", { link = "CmpProbe" })
+          local id = vim.fn.hlID("CmpProbe")
+          assert(id > 0, "hlID nonzero")
+          eq(vim.fn.hlID("CmpProbe"), id, "hlID stable")
+          eq(vim.fn.synIDattr(id, "name"), "CmpProbe", "synIDattr name")
+          eq(vim.fn.synIDattr(id, "fg"), "#112233", "synIDattr fg")
+          eq(vim.fn.synIDattr(id, "bold"), "1", "synIDattr bold set")
+          eq(vim.fn.synIDattr(id, "italic"), "", "synIDattr italic unset")
+          -- synIDtrans follows the link to the concrete group.
+          local linkid = vim.fn.hlID("CmpProbeLink")
+          eq(vim.fn.synIDattr(vim.fn.synIDtrans(linkid), "fg"), "#112233", "synIDtrans resolves link")
+          -- No vim-regex syntax engine: synstack empty, synID 0 (honest, not faked).
+          eq(#vim.fn.synstack(1, 1), 0, "synstack empty")
+          eq(vim.fn.synID(1, 1, 1), 0, "synID zero")
+          -- An unminted id reads empty for every attribute.
+          eq(vim.fn.synIDattr(999999, "name"), "", "unknown id empty")
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "##,
+    )
+    .await;
+    assert_eq!(report.as_str(), Some("OK"));
+}
+
+/// nvim-cmp + cmp-buffer, end-to-end and LIVE: type a prefix in a buffer that
+/// contains matching words, trigger completion, and assert cmp's menu actually
+/// opens with the matched entries. This exercises the whole chain that the
+/// `vim.*` fixes unblocked — the buffer source's debounced indexing
+/// (`uv.timer:is_active`), cmp's async Scheduler (`uv.check:start`) driving the
+/// filter→view pipeline, `vim.wait` in `filter:sync`, the menu's highlight
+/// derivation (`hlID`/`synIDattr`), `vim.opt.eventignore`, `vim.list_slice`, and
+/// `screenpos` positioning — none of which "loading" alone proves.
+#[tokio::test]
+async fn nvim_cmp_completes_buffer_source_live() {
+    let Some(rtp) = plugin_rtp(&["nvim-cmp", "cmp-buffer"]) else {
+        eprintln!("skip: could not clone nvim-cmp / cmp-buffer");
+        return;
+    };
+    let (rpc, _incoming) = start(rtp).await;
+    let setup = exec_lua(
+        &rpc,
+        r#"
+        local ok, err = pcall(function()
+          local cmp = require('cmp')
+          -- cmp-buffer's after/plugin already registered the 'buffer' source.
+          cmp.setup({ sources = { { name = 'buffer' } } })
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+    assert_eq!(setup.as_str(), Some("OK"), "cmp.setup failed");
+    // Buffer has the words; type a prefix on a new line, staying in INSERT mode.
+    feed(&rpc, "ihello helicopter world<CR>hel");
+    let _ = exec_lua(&rpc, "require('cmp').complete()").await;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        // PURE reads only (no cmp.sync, which would park on vim.wait): read the
+        // entries straight off the menu view and its visibility.
+        let probe = exec_lua(
+            &rpc,
+            r#"
+            local cmp = require('cmp')
+            local ev = cmp.core.view:_get_entries_view()
+            local words = {}
+            for _, e in ipairs(ev.entries or {}) do words[#words+1] = e:get_word() end
+            return ("vis=%s words=%s"):format(
+              tostring(cmp.core.view:visible()), table.concat(words, ","))
+            "#,
+        )
+        .await;
+        let s = probe.as_str().unwrap_or("");
+        if s.contains("vis=true") && s.contains("helicopter") {
+            // The menu is open and offers the matching word from the buffer.
+            assert!(s.contains("hello"), "menu should also match 'hello': {s}");
+            return;
+        }
+    }
+    panic!("cmp completion menu never opened with the buffer's matching words");
 }
 
 /// LuaSnip: `luasnip/util/ext_opts.lua` calls vim.fn.hlexists to drop undefined

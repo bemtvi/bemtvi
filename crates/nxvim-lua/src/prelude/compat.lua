@@ -547,6 +547,37 @@ function fn.getwininfo(winid)
   return out
 end
 
+-- vim.fn.screenpos(win, lnum, col): the 1-based screen cell {row, col, curscol,
+-- endcol} of buffer position [lnum, col] in window `win` (0/current). nvim-cmp
+-- reads it to anchor its completion menu at the cursor. Computed from the window
+-- mirror's origin + scroll: row counts down from the top text line; col is the
+-- display width of the line up to `col`, shifted by the horizontal scroll.
+-- INCOMPLETE: inherits win_screenpos's tiled-origin approximation ({1,1} when the
+-- mirror has no real screen origin) and does not add a number/sign textoff (the
+-- gutter width is client-side, not in the server's text geometry — see the
+-- diagnostics sign-column note in known-approximations). curscol/endcol collapse
+-- onto col (no multicell-char straddle modelled). Faithful for the common
+-- single-window, gutterless, unscrolled case cmp positions against.
+function fn.screenpos(win, lnum, col)
+  local id = (win == nil or win == 0) and (vim._cur_win or 1000) or win
+  local winnr = 1
+  for i, wid in ipairs(vim._win_order or {}) do
+    if wid == id then
+      winnr = i
+      break
+    end
+  end
+  local origin = fn.win_screenpos(winnr) -- {row, col}, 1-based
+  local w = (vim._wins or {})[id] or {}
+  local topline = w.topline or 1
+  local leftcol = w.leftcol or 0
+  local buf = w.buffer or vim._cur_buf or 0
+  local line = (vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false))[1] or ""
+  local dcol = vim.fn.strdisplaywidth(string.sub(line, 1, math.max(0, col - 1)))
+  local scol = origin[2] + dcol - leftcol
+  return { row = origin[1] + (lnum - topline), col = scol, curscol = scol, endcol = scol }
+end
+
 -- vim.fn.getbufinfo([arg]): per-buffer info dicts. `arg` is a bufnr (one buffer),
 -- an opts table ({buflisted=1, bufloaded=1, …} — filters), or absent (all
 -- buffers). nxvim's core models neither buflisted nor a changed flag yet, so every

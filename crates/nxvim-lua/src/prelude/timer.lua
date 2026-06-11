@@ -15,36 +15,47 @@ local vim = vim
 -- A libuv-style timer handle: a table carrying its callback id, with the
 -- start/stop/close/again methods plugins call. :start arms the actor timer;
 -- :stop / :close cancel it (and :close drops the callback, freeing the registry).
+-- Logical timer state, id-keyed, so :is_active() can answer faithfully. The
+-- event-loop actor (Rust) *runs* the timer, but the armed/expired transition is
+-- knowable Lua-side: a timer is active from :start until it is :stop/:close'd or
+-- (one-shot only) fires. The lone edge the actor owns alone — a one-shot
+-- auto-expiring with no Lua-side stop — is cleared at the single fire chokepoint
+-- vim._run_cb (runtime.lua), which sees `keep == false` for a spent one-shot.
+-- (Repeating timers stay active across fires until explicitly stopped.)
+vim._timer_active = vim._timer_active or {}
+
 local uv_timer = {}
 uv_timer.__index = uv_timer
 function uv_timer:start(timeout, rep, cb)
   if cb ~= nil then vim._cb_fns[self._id] = cb end
   self._repeat = rep or 0
+  vim._timer_active[self._id] = true
   vim._timer_start(self._id, timeout or 0, self._repeat)
   return 0
 end
 function uv_timer:stop()
+  vim._timer_active[self._id] = nil
   vim._timer_stop(self._id)
   return 0
 end
 function uv_timer:again()
   -- libuv: restart a repeating timer, using its stored repeat as the new delay.
+  vim._timer_active[self._id] = true
   vim._timer_start(self._id, self._repeat, self._repeat)
   return 0
 end
 function uv_timer:close(cb)
+  self._closing = true
+  vim._timer_active[self._id] = nil
   vim._timer_stop(self._id)
   vim._cb_fns[self._id] = nil -- drop the callback so the registry can't leak
   vim._proc_pids[self._id] = nil
   if cb then cb() end
 end
--- :is_active() / :is_closing() can't be answered faithfully from Lua: a one-shot
--- timer auto-expires inside the event-loop actor (Rust) with no callback back to
--- Lua, so the handle has no way to know it has fired. Any constant we return (the
--- old `true` / `false`) is a lie about real state that would make a "is this timer
--- still running?" check silently wrong, so they raise via vim._notimpl instead.
-function uv_timer:is_closing() vim._notimpl("vim.uv.timer:is_closing") end
-function uv_timer:is_active() vim._notimpl("vim.uv.timer:is_active") end
+-- libuv semantics: is_active() is true while the timer is armed and will still
+-- fire; is_closing() is true once :close() has begun tearing the handle down.
+function uv_timer:is_closing() return self._closing == true end
+function uv_timer:is_active() return vim._timer_active[self._id] == true end
 
 -- vim.uv.new_timer_handle(id): wrap an existing callback id in a handle (used by
 -- defer_fn, whose fn is already registered). vim.uv.new_timer(): a fresh handle.
@@ -102,6 +113,7 @@ function vim.uv.new_fs_event() return setmetatable({ _id = vim._next_cb_id() }, 
 function vim.defer_fn(fn, timeout)
   local id = vim._next_cb_id()
   vim._cb_fns[id] = fn
+  vim._timer_active[id] = true -- armed; the returned handle's :is_active() reads this
   vim._timer_start(id, timeout or 0, 0) -- one-shot
   return vim.uv.new_timer_handle(id)
 end

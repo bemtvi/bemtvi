@@ -7,17 +7,32 @@
 //!   msgpack-RPC over **stdin/stdout** and no UI. This is what a remote client
 //!   spawns over SSH (`ssh host nxvim --server`); the local `nxvim-gui` drives it
 //!   through the ssh pipe.
+//! - **`--daemon`** (`nxvim --daemon`): the *edit-host split*'s remote half — just
+//!   the fs + process + watch + LSP host, no editor and no UI, multiplexing every
+//!   leg of the daemon wire over **stdin/stdout**. The editor (core + Lua) stays
+//!   *local* for a zero-round-trip keystroke path; only I/O runs here. This is what
+//!   the local edit-host spawns over SSH (`ssh host nxvim --daemon`).
 //!
-//! Both roles run the *same* [`nxvim_server::run`]/[`run_io`] over the same RPC —
-//! the only difference is the transport (a duplex vs. this process's stdio), so
-//! the editor behaves identically whether embedded, headless, or remote.
+//! The first three roles run the *same* [`nxvim_server::run`]/[`run_io`] over the
+//! same RPC — the only difference is the transport (a duplex vs. this process's
+//! stdio), so the editor behaves identically whether embedded, headless, or remote.
+//! `--daemon` is the inverse: it runs [`nxvim_server::run_daemon_io`] (no editor),
+//! the remote half of the boundary moved *below* the editor.
 
 use anyhow::Result;
-use nxvim_server::{run as run_server, run_io as run_server_io, ServerInit};
+use nxvim_server::{
+    run as run_server, run_daemon_io as run_server_daemon_io, run_io as run_server_io, ServerInit,
+};
 
 /// Flag that runs this binary as the headless server over stdin/stdout (no UI) —
 /// the remote end of an SSH connection (`ssh host nxvim --server`).
 const SERVER_FLAG: &str = "--server";
+
+/// Flag that runs this binary as the **daemon** over stdin/stdout (no UI, no
+/// editor): just the fs + process + watch + LSP host the *edit-host split* drives
+/// remotely (`ssh host nxvim --daemon`). Contrast `--server`, which runs the
+/// *whole* editor remotely.
+const DAEMON_FLAG: &str = "--daemon";
 
 /// Internal, debug-only flag that runs this binary as a scripted mock language
 /// server (see `nxvim_lsp::mock`), used by the LSP test suite as a hermetic
@@ -39,6 +54,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // The file to open is the first non-flag argument (the same in either role).
     let file = args.iter().find(|a| !a.starts_with('-')).cloned();
+
+    // Daemon role: the edit-host split's remote half — fs/process/watch/LSP over
+    // this process's stdin/stdout, no editor and no UI. The edit-host closing the
+    // pipe (EOF on stdin) winds it down. Checked before `--server` so the two roles
+    // never collide on a malformed argv.
+    if args.iter().any(|a| a == DAEMON_FLAG) {
+        return run_daemon();
+    }
 
     // Headless server role: RPC over this process's stdin/stdout, no UI. The
     // client closing the pipe (EOF on stdin) winds the server down.
@@ -149,6 +172,24 @@ fn run_headless(file: Option<String>) -> Result<()> {
         .enable_time()
         .build()?;
     runtime.block_on(run_server_io(tokio::io::stdin(), tokio::io::stdout(), init))
+}
+
+/// Run the daemon (`--daemon`) over this process's stdin/stdout until the edit-host
+/// closes the pipe. No editor, no Lua, no UI, and — unlike `run_headless` — **no
+/// config sourcing**: the daemon is pure I/O. `run_daemon_io` connects once and
+/// multiplexes every leg of the wire (fs/process/watch/`sys_run`/LSP/`luafs`) onto
+/// this one stdio stream, serving each against the real local disk and processes;
+/// LSP/process discovery and the project tree arrive on the wire from the remote
+/// edit-host. The server owns the main thread's runtime directly.
+fn run_daemon() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(run_server_daemon_io(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    ))
 }
 
 /// Best-effort human-readable text from a thread panic payload.

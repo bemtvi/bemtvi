@@ -47,9 +47,10 @@ pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
 pub use daemon::{
-    serve_daemon, serve_fs_daemon, serve_luafs_daemon, serve_lsp_daemon, serve_sys_daemon, FsRead,
-    HostFsAsync, RemoteBlockingSystem, RemoteHostFs, RemoteHostProc, RemoteLspTransport,
-    RemoteLuaFs, WatchEvent,
+    serve_daemon, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on,
+    serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on, serve_sys_daemon,
+    serve_sys_daemon_on, FsRead, HostFsAsync, RemoteBlockingSystem, RemoteHostFs, RemoteHostProc,
+    RemoteLspTransport, RemoteLuaFs, WatchEvent,
 };
 
 use evloop::EventLoop;
@@ -63,7 +64,7 @@ use nxvim_core::{
 };
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
-use nxvim_rpc::{connect, Rpc};
+use nxvim_rpc::{connect, Incoming, Rpc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -886,6 +887,104 @@ where
                 server.settle_events(true);
             }
         }
+    }
+    Ok(())
+}
+
+/// Run the **daemon** role (`nxvim --daemon`) over separate read/write halves
+/// (this process's `stdin` + `stdout`): serve every leg of the edit-host wire — fs
+/// reads/writes, the watch push, child processes, the blocking `vim.system`
+/// shell-out, language servers, and the Lua-visible filesystem — against *this*
+/// host's real disk and processes. Unlike [`run_io`] there is **no editor, no Lua,
+/// and no config sourcing**: the daemon is pure I/O, and LSP/process discovery
+/// (program/args/cwd) plus the project tree all arrive on the wire from the local
+/// edit-host.
+///
+/// **The multiplexer (the one new mechanism).** Every `serve_*` leg was written
+/// assuming it owns the whole transport — each calls `connect` itself, which is how
+/// the per-leg tests drive it over a private duplex. Here all six classes share one
+/// ordered stdio stream (the ssh hop), so `connect` runs *once* and a demux loop fans
+/// each inbound message to its leg's connection-agnostic `*_on` core by method
+/// namespace (`fs_*` / `proc_*` / `sys_run` / `lsp_*` / `luafs` — disjoint, so the
+/// routing is unambiguous). Every leg writes back through a clone of the single shared
+/// [`Rpc`], whose one out-channel serializes the concurrent replies; request responses
+/// (`fs_read`/`fs_write`/`sys_run`/`luafs`) are msgid-routed *inside* `Rpc` and never
+/// surface here. EOF on `reader` (the edit-host hung up) ends the loop, drops the
+/// per-leg senders so each leg winds down and reaps its children, and awaits them.
+pub async fn run_daemon_io<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    use nxvim_lua::{StdBlockingSystem, StdLuaFs};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    let (rpc, mut incoming) = connect(reader, writer);
+
+    // One forwarding channel per leg; each leg runs its existing loop over its own
+    // demuxed inbound stream and a clone of the shared `Rpc`. The daemon backs every
+    // leg with the same `Std*` impl the local server uses, so a file/process/server
+    // behaves identically run here or across the wire.
+    let (fs_tx, fs_rx) = unbounded_channel();
+    let (proc_tx, proc_rx) = unbounded_channel();
+    let (sys_tx, sys_rx) = unbounded_channel();
+    let (lsp_tx, lsp_rx) = unbounded_channel();
+    let (luafs_tx, luafs_rx) = unbounded_channel();
+
+    let legs = [
+        tokio::spawn(daemon::serve_fs_daemon_on(
+            rpc.clone(),
+            fs_rx,
+            Box::new(StdHostFs),
+        )),
+        tokio::spawn(daemon::serve_proc_daemon_on(rpc.clone(), proc_rx)),
+        tokio::spawn(daemon::serve_sys_daemon_on(
+            rpc.clone(),
+            sys_rx,
+            Box::new(StdBlockingSystem),
+        )),
+        tokio::spawn(daemon::serve_lsp_daemon_on(rpc.clone(), lsp_rx)),
+        tokio::spawn(daemon::serve_luafs_daemon_on(
+            rpc.clone(),
+            luafs_rx,
+            Box::new(StdLuaFs::new()),
+        )),
+    ];
+
+    // The multiplexer: route each inbound message to its leg by method namespace.
+    while let Some(msg) = incoming.recv().await {
+        let leg = {
+            let method = match &msg {
+                Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
+                    method.as_str()
+                }
+            };
+            if method.starts_with("fs_") {
+                Some(&fs_tx)
+            } else if method.starts_with("proc_") {
+                Some(&proc_tx)
+            } else if method == "sys_run" {
+                Some(&sys_tx)
+            } else if method.starts_with("lsp_") {
+                Some(&lsp_tx)
+            } else if method == "luafs" {
+                Some(&luafs_tx)
+            } else {
+                None // unknown method: drop (the peer is the same build)
+            }
+        };
+        // A leg whose task has exited closes its receiver; ignore the send error and
+        // keep multiplexing the rest.
+        if let Some(tx) = leg {
+            let _ = tx.send(msg);
+        }
+    }
+
+    // The edit-host hung up: drop the senders so each leg sees EOF and winds down,
+    // then wait for them so child reaping completes before we return.
+    drop((fs_tx, proc_tx, sys_tx, lsp_tx, luafs_tx));
+    for leg in legs {
+        let _ = leg.await;
     }
     Ok(())
 }

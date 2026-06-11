@@ -359,8 +359,19 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, mut incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect(reader, writer);
+    serve_proc_daemon_on(rpc, incoming).await
+}
 
+/// The process leg's connection-agnostic core: drives the `proc_*` wire over a
+/// pre-built shared [`Rpc`] + its own demuxed inbound stream. The single-stdio
+/// daemon multiplexer ([`run_daemon_io`]) fans one connection across every leg's
+/// `*_on`; [`serve_daemon`] is the standalone wrapper (its own connection) the
+/// per-leg tests drive.
+pub async fn serve_proc_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
     // One forwarder turns the children's `LoopEvent`s — the same events the local
     // event-loop actor consumes — into wire notifications back to the edit-host.
     let (ev_tx, mut ev_rx) = unbounded_channel::<LoopEvent>();
@@ -816,7 +827,18 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, mut incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect(reader, writer);
+    serve_fs_daemon_on(rpc, incoming, fs).await
+}
+
+/// The filesystem + watch leg's connection-agnostic core (see [`serve_proc_daemon_on`]
+/// for why the `*_on` split exists). Drives `fs_read`/`fs_write`/`fs_watch` over a
+/// shared [`Rpc`] + its demuxed inbound stream.
+pub async fn serve_fs_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+    fs: Box<dyn HostFs + Send>,
+) -> anyhow::Result<()> {
     // The watch leg (`HostWatch`): watched path → last-seen stat. The daemon *owns*
     // change detection — the edit-host arms a watch (`fs_watch`) and only reacts to a
     // push, so it never stats the remote disk itself. A coarse poll (the daemon is the
@@ -1203,7 +1225,17 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, mut incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect(reader, writer);
+    serve_sys_daemon_on(rpc, incoming, sys).await
+}
+
+/// The blocking-system leg's connection-agnostic core (see [`serve_proc_daemon_on`]
+/// for the `*_on` split). Serves `sys_run` over a shared [`Rpc`] + its demuxed stream.
+pub async fn serve_sys_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+    sys: Box<dyn BlockingSystem + Send + Sync>,
+) -> anyhow::Result<()> {
     let sys: Arc<dyn BlockingSystem + Send + Sync> = Arc::from(sys);
     while let Some(msg) = incoming.recv().await {
         if let Incoming::Request { id, method, params } = msg {
@@ -1459,7 +1491,17 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, mut incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect(reader, writer);
+    serve_lsp_daemon_on(rpc, incoming).await
+}
+
+/// The LSP leg's connection-agnostic core (see [`serve_proc_daemon_on`] for the `*_on`
+/// split). Streams the `lsp_*` raw bidirectional pipe over a shared [`Rpc`] + its
+/// demuxed inbound stream.
+pub async fn serve_lsp_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
     // Per-child stdin channels and kill signals, keyed by the edit-host's spawn id, so
     // `lsp_stdin`/`lsp_kill` can reach the running child (mirrors the process leg's maps).
     let mut stdins: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
@@ -2066,7 +2108,17 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, mut incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect(reader, writer);
+    serve_luafs_daemon_on(rpc, incoming, fs).await
+}
+
+/// The Lua-visible-fs leg's connection-agnostic core (see [`serve_proc_daemon_on`] for
+/// the `*_on` split). Serves the `luafs` request over a shared [`Rpc`] + its demuxed stream.
+pub async fn serve_luafs_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+    fs: Box<dyn LuaFs + Send + Sync>,
+) -> anyhow::Result<()> {
     let fs: Arc<dyn LuaFs + Send + Sync> = Arc::from(fs);
     while let Some(msg) = incoming.recv().await {
         if let Incoming::Request { id, method, params } = msg {

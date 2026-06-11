@@ -8,12 +8,15 @@
 //!
 //! Phase 1 covers registers; Phase 2 the global file marks `A`–`Z`; Phase 3 the
 //! per-file marks (incl. the `` `" `` last-cursor) and search/ex history; Phase 4
-//! the numbered marks `'0`–`'9`, the jumplist, and the changelist. See
+//! the numbered marks `'0`–`'9`, the jumplist, and the changelist; Phase 5 the
+//! debounced live checkpoint (a flush fires mid-session, not just at exit). See
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use nxvim_server::{is_store_file, RedbFileStore, ServerInit};
+use nxvim_server::{is_store_file, PersistState, RedbFileStore, ServerInit, ShadaStore};
 use nxvim_test_harness::{cursor, feed, lines, start_attached, temp_dir, write_temp};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -32,6 +35,25 @@ fn init_with_store(dir: &Path, file: Option<String>) -> ServerInit {
 /// been written" barrier, with no reliance on wall-clock timing.
 async fn await_server_exit(mut incoming: UnboundedReceiver<nxvim_rpc::Incoming>) {
     while incoming.recv().await.is_some() {}
+}
+
+/// A probe [`ShadaStore`] that records every flushed snapshot in memory, so a test
+/// can prove a *live* checkpoint fired mid-session (not just the exit flush). `load`
+/// hands back an empty state — this exercises the flush cadence, not restore, which
+/// the redb-backed tests above already cover.
+#[derive(Clone, Default)]
+struct ProbeStore {
+    flushes: Arc<Mutex<Vec<PersistState>>>,
+}
+
+impl ShadaStore for ProbeStore {
+    fn load(&mut self) -> std::io::Result<PersistState> {
+        Ok(PersistState::default())
+    }
+    fn flush(&mut self, state: &PersistState) -> std::io::Result<()> {
+        self.flushes.lock().unwrap().push(state.clone());
+        Ok(())
+    }
 }
 
 /// Count the surviving shada store files in `dir`.
@@ -287,6 +309,52 @@ async fn changelist_survives_a_restart() {
         feed(&rpc, "g;");
         assert_eq!(cursor(&rpc).await.0, 3);
     }
+}
+
+#[tokio::test]
+async fn debounced_checkpoint_flushes_mid_session() {
+    // Phase 5: a yank is checkpointed by the debounced live flush *while the session
+    // is still running* — no quit, no exit flush involved — so a crash would lose at
+    // most the last debounce window rather than the whole session.
+    let file = write_temp("shada_debounce", "txt", "hello world\n");
+    let probe = ProbeStore::default();
+    let flushes = probe.flushes.clone();
+
+    let (rpc, _incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            shada: Some(Box::new(probe)),
+            ..Default::default()
+        },
+        80,
+        25,
+    )
+    .await;
+
+    // Yank "hello" into register `a`; the barrier ensures it is processed (and re-arms
+    // the debounce one last time).
+    feed(&rpc, "\"ayiw");
+    assert_eq!(lines(&rpc).await, vec!["hello world"]);
+
+    // Stay idle past the debounce window: the live checkpoint must fire on its own.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let snapshots = flushes.lock().unwrap();
+    assert!(
+        snapshots.iter().any(|s| s
+            .registers
+            .iter()
+            .any(|r| r.name == 'a' && r.text == "hello")),
+        "a live checkpoint should have flushed register `a` before any exit; \
+         saw {} flush(es)",
+        snapshots.len(),
+    );
+    // The live checkpoint must never write the clean-exit cursor — `'0` tracks clean
+    // exits only, so a crash leaves the prior session's `'0` intact.
+    assert!(
+        snapshots.iter().all(|s| s.exit_cursor.is_none()),
+        "live checkpoints must leave exit_cursor unset (only the exit flush sets it)",
+    );
 }
 
 #[tokio::test]

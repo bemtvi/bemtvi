@@ -283,15 +283,19 @@ intact (vim's own behavior: `'0` tracks *clean* exits).
    durable here) and **delete the absorbed siblings**. Return the merged
    `PersistState`; the server hands it to `editor.import_persist(..)` **before the
    first frame**, the same pre-first-frame slot `init.lua` already uses.
-2. **Run (debounced checkpoint).** Yank / mark-set / history-push set a `dirty`
-   flag on the server. ~150 ms after the last change the server calls
-   `editor.export_persist()` and hands the value to the store's `flush` to write
-   the changed tables into **my** redb in one write txn — driven off the editor
-   tick (via the **`HostEffects` off-tick fs slice** on native), so the sync core
-   never blocks on disk and the wasm Worker swaps its own backend. Single writer to
-   my own file ⇒ no contention, full ACID. This is the crash-safety win over
-   neovim: a crash loses at most the last debounce window, not the session.
-   *(Phase 1 ships only the startup + exit flush; the debounce is a later phase.)*
+2. **Run (debounced checkpoint).** Every handled message re-arms a one-shot ~150 ms
+   timer through the `HostEffects` timer seam; when it fires (the run loop's
+   `loop_events` arm) the server calls `editor.export_persist()` and hands the value
+   to the store's `flush` to write the snapshot into **my** redb in one write txn —
+   off the input tick, so the sync editor path never stalls on disk. The checkpoint
+   omits `exit_cursor` (that is the exit flush's alone, so `'0` stays clean-exit-only).
+   Single writer to my own file ⇒ no contention, full ACID. This is the crash-safety
+   win over neovim: a crash loses at most the last debounce window, not the session.
+   *(Implemented in Phase 5; Phases 1–4 shipped only the startup + exit flush. The
+   write executes in the run loop where the store lives rather than behind a
+   `HostEffects` fs-spawn — a native redb commit is fast and the wasm OPFS flush is
+   synchronous in a Worker, so neither needs a background task; only the **arming**
+   rides `HostEffects`, which is what lets the wasm Worker debounce on its own timer.)*
 3. **Exit (final flush).** When the server loop ends — `should_quit` **or** client
    disconnect — a last `export_persist` (including `meta.exit_cursor` for `'0`)
    flushes through the store, then the `Database` is dropped (releases the lock).
@@ -362,10 +366,22 @@ host, is being removed, so there is no "shada on the remote host" case.)
    tests (`tests/shada.rs`): `<C-o>` walks a restored jumplist; `` `0 `` lands at
    the last exit and `` `1 `` the one before; `g;` walks a restored changelist.
    The jumplist / changelist / numbered-mark tables clear-and-rewrite each flush.
-5. **Phase 5 — the debounced live checkpoint.** Move the flush off exit-only onto
-   a ~150 ms debounce via the `HostEffects` off-tick fs slice, so a crash loses at
-   most the last window. (Phase 1 already flushes correctly on exit; this adds the
-   live cadence.)
+5. **Phase 5 — the debounced live checkpoint. ✅ DONE.** Adds a ~150 ms debounced
+   flush *during* the session so a crash loses at most that window, not the whole
+   session. Every handled message **re-arms** a one-shot timer (`SHADA_FLUSH_TIMER_ID`,
+   reserved above `INTERNAL_WATCH_BASE`) through the `HostEffects` timer seam
+   (`loop_command` — so the wasm Worker can drive the same debounce off its own timer
+   wheel); the timer wakes the run loop's `loop_events` arm, where the flush executes
+   inline next to the exit flush (the store lives in `run()`, owning load-before-first-frame
+   and the lock, so the *write* stays there rather than moving behind `HostEffects` —
+   only the *arming* needs the seam; a native redb commit is fast and the wasm OPFS
+   flush is synchronous in a Worker, so neither blocks). The live checkpoint writes the
+   snapshot **without `exit_cursor`** — `'0` tracks *clean* exits only, so a crash leaves
+   the prior session's `'0` intact; the exit flush remains the sole writer of the
+   clean-exit cursor. Tested (`tests/shada.rs`): a probe `ShadaStore` records a flush
+   carrying register `a` *mid-session* (no quit, idle past the debounce), and asserts
+   every live checkpoint leaves `exit_cursor` unset. *(`shada: None` arms nothing, so
+   every other suite stays untouched.)*
 6. **Phase 6 — the OPFS backend (browser).** A second `ShadaStore`/`StorageBackend`
    impl over an OPFS sync access handle, landing with the wasm-Worker server
    (Phase 5 of the edit-host plan). The native `RedbFileStore` is unchanged.

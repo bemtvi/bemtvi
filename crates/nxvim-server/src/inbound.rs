@@ -35,7 +35,14 @@ impl EditHost {
     /// it asked the editor to quit. The run loop breaks on `true`.
     pub(crate) async fn on_client_message(&mut self, message: Incoming) -> bool {
         self.handle(message).await;
-        self.quitting()
+        if self.quitting() {
+            return true;
+        }
+        // Re-arm the debounced shada checkpoint after each message, so a crash loses at
+        // most that window rather than the whole session (Phase 5). Skipped when quitting
+        // — the clean-exit flush handles that case.
+        self.arm_shada_checkpoint();
+        false
     }
 
     /// Coalesce a burst of language-server events (initialize handshakes, published
@@ -59,11 +66,27 @@ impl EditHost {
         first: LoopEvent,
         rx: &mut UnboundedReceiver<LoopEvent>,
     ) {
-        self.on_loop_event(first);
-        while let Ok(event) = rx.try_recv() {
-            self.on_loop_event(event);
+        // The shada debounce-timer is multiplexed onto this arm too. Sort each event:
+        // its flush is handled here (it needs the store, not a Lua callback), every
+        // real event runs its callback via `on_loop_event`.
+        let mut had_real = false;
+        let mut shada_due = false;
+        for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            if crate::is_shada_flush_timer(&event) {
+                shada_due = true;
+            } else {
+                self.on_loop_event(event);
+                had_real = true;
+            }
         }
-        self.settle_events(true);
+        if shada_due {
+            self.shada_checkpoint();
+        }
+        // Only settle/repaint when a real event ran; a shada-only wake changed no
+        // editor state, so a redraw would be spurious.
+        if had_real {
+            self.settle_events(true);
+        }
     }
 
     /// Coalesce a burst of off-tick opens (the startup file kept from freezing startup, or

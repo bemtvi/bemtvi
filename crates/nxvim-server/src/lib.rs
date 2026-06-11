@@ -41,6 +41,14 @@ mod treesitter;
 /// daemon-backed [`HostProc`] here (the process-side companion to
 /// [`nxvim_core::HostFs`]).
 pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
+/// The cross-session snapshot the [`ShadaStore`] seam round-trips, re-exported so an
+/// out-of-crate store implementor (a test probe, the future wasm OPFS backend) can
+/// name the `load`/`flush` payload and its entries without depending on
+/// `nxvim-core` directly.
+pub use nxvim_core::{
+    FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
+    RegisterEntry,
+};
 /// The persistence (shada) seam and its native redb backend. The store sits
 /// behind [`ShadaStore`] so the platform layer injects it through
 /// [`ServerInit::shada`] — native binaries pass [`default_shada`] (redb over a
@@ -72,7 +80,7 @@ pub use daemon::{
 pub use quic::{bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo};
 
 use edithost::{HostEffects, NativeEffects};
-use evloop::EventLoop;
+use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
 use lsp::{
     CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
@@ -288,6 +296,13 @@ struct EditHost {
     /// today's behavior verbatim; the wasm build swaps in a JS-interop + daemon-link
     /// implementor. See [`edithost`].
     fx: Box<dyn HostEffects>,
+    /// The persistence (shada) store, or `None` when persistence is off (the test
+    /// default). Loaded before the first frame ([`EditHost::shada_load`]), written by
+    /// the debounced live checkpoint ([`EditHost::shada_checkpoint`]) and the
+    /// clean-exit flush ([`EditHost::shada_flush_final`]). A capability injected via
+    /// [`ServerInit::shada`], like [`fx`](EditHost::fx) — but `load`/`flush` only ever
+    /// run off the input tick (startup, the debounce arm, exit), never inside it.
+    shada: Option<Box<dyn ShadaStore + Send>>,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
     /// Per-buffer highlight memo, keyed by buffer id (created lazily on first
@@ -487,6 +502,95 @@ struct EditHost {
 /// `INTERNAL_WATCH_BASE + b.0`, so the change routes straight back to the buffer with
 /// no side table. (Lua callback ids are monotonic from 1 and never approach `1 << 48`.)
 pub(crate) const INTERNAL_WATCH_BASE: u64 = 1 << 48;
+
+/// The loop id of the shada **debounced-checkpoint** timer (Phase 5). Set above
+/// both the Lua-allocated callback ids (monotonic from 1) and the per-buffer watch
+/// ids ([`INTERNAL_WATCH_BASE`]` + buffer.0`), so a [`LoopEvent::Timer`] carrying it
+/// is unambiguously the shada flush and never collides with a real callback.
+pub(crate) const SHADA_FLUSH_TIMER_ID: u64 = 1 << 49;
+
+/// How long after the last handled message a debounced shada checkpoint fires. Each
+/// message re-arms the one-shot timer (replacing the pending one), so continuous
+/// activity pushes the flush forward to the next idle gap — a crash then loses at
+/// most this window, never the whole session.
+const SHADA_FLUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Whether `event` is the shada debounced-checkpoint timer firing (vs. a real Lua
+/// timer / process / watch event the run loop hands to [`EditHost::on_loop_event`]).
+pub(crate) fn is_shada_flush_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == SHADA_FLUSH_TIMER_ID)
+}
+
+/// The shada (persistence) glue on the [`EditHost`]: load before the first frame,
+/// the debounced live checkpoint, the clean-exit flush, and the per-message
+/// debounce arming. All run **off** the editor input tick — the store's I/O never
+/// blocks a keystroke. A no-op throughout when persistence is off (`shada: None`).
+impl EditHost {
+    /// Open + merge + compact the store before the first frame and seed the result
+    /// into the editor. A load error is surfaced to the user and persistence is then
+    /// disabled (the store dropped) — the editor runs on rather than dying.
+    pub(crate) fn shada_load(&mut self) {
+        // Take the `load` borrow and release it before touching `self.editor` /
+        // re-assigning `self.shada`, so the two field accesses don't overlap.
+        let result = match self.shada.as_mut() {
+            Some(store) => store.load(),
+            None => return,
+        };
+        match result {
+            Ok(state) => self.editor.import_persist(state),
+            Err(e) => {
+                self.editor
+                    .echo(format!("shada: could not open store: {e}"));
+                self.shada = None;
+            }
+        }
+    }
+
+    /// Arm (re-arm) the one-shot debounce timer through the [`HostEffects`] timer
+    /// seam, so the checkpoint fires `SHADA_FLUSH_DEBOUNCE` after the last message.
+    /// Re-arming replaces the pending timer, so a burst of activity defers the flush
+    /// to the next idle gap. Routed through `fx` (not the evloop directly) so the wasm
+    /// Worker can drive the same debounce off its own timer wheel.
+    pub(crate) fn arm_shada_checkpoint(&mut self) {
+        if self.shada.is_some() {
+            self.fx.loop_command(LoopCommand::TimerStart {
+                id: SHADA_FLUSH_TIMER_ID,
+                delay: SHADA_FLUSH_DEBOUNCE,
+                repeat: std::time::Duration::ZERO,
+            });
+        }
+    }
+
+    /// The debounce elapsed: checkpoint the cross-session state into this instance's
+    /// store. `exit_cursor` is deliberately left unset — `'0` tracks *clean* exits
+    /// only, so a crash must leave the previous session's `'0` intact ([`shada_flush_final`](EditHost::shada_flush_final)
+    /// is its sole writer). Best-effort: a write error is logged, never fatal.
+    pub(crate) fn shada_checkpoint(&mut self) {
+        if self.shada.is_none() {
+            return;
+        }
+        let mut snap = self.editor.export_persist();
+        snap.exit_cursor = None;
+        if let Some(store) = self.shada.as_mut() {
+            if let Err(e) = store.flush(&snap) {
+                eprintln!("shada: checkpoint flush failed: {e}");
+            }
+        }
+    }
+
+    /// The clean-exit flush: write the final snapshot — *with* `exit_cursor` (where
+    /// the cursor sits now), which the store turns into `'0` next launch — then let
+    /// the store drop (releasing its file lock) so the next instance can merge this
+    /// one's checkpoint. Best-effort; we're leaving.
+    pub(crate) fn shada_flush_final(&mut self) {
+        let snap = self.editor.export_persist();
+        if let Some(store) = self.shada.as_mut() {
+            if let Err(e) = store.flush(&snap) {
+                eprintln!("shada: final flush failed: {e}");
+            }
+        }
+    }
+}
 
 /// A finished `:TSInstall` job: the requested language and the install result
 /// (the report, or a loud error). Delivered from the blocking worker to the
@@ -688,6 +792,7 @@ where
             lsp,
             install_tx,
         )),
+        shada: init.shada,
         ui: None,
         syntax_states: HashMap::new(),
         ts_resolved_langs: HashSet::new(),
@@ -825,22 +930,13 @@ where
     // and a never-deleted buffer never triggers a spurious cleanup.
     host.known_buffers = host.editor.buffer_ids();
     // Load the shada (persistence) store before the first frame: it recency-merges
-    // + compacts any sibling stores and returns this session's registers (later:
-    // marks, history, jumplist) to seed, so a plugin reading them at `VimEnter`
-    // sees the restored state. `None` = persistence disabled (the test default,
-    // unless a test opts in). A store that won't load is surfaced and then dropped
-    // (no flush at exit) — the editor runs on without persistence rather than dying.
-    let mut shada = init.shada;
-    if let Some(store) = shada.as_mut() {
-        match store.load() {
-            Ok(state) => host.editor.import_persist(state),
-            Err(e) => {
-                host.editor
-                    .echo(format!("shada: could not open store: {e}"));
-                shada = None;
-            }
-        }
-    }
+    // + compacts any sibling stores and seeds this session's registers / marks /
+    // history / jumplist, so a plugin reading them at `VimEnter` sees the restored
+    // state. A no-op when persistence is disabled (`shada: None`, the test default);
+    // a store that won't load is surfaced and then dropped (the editor runs on
+    // without persistence rather than dying). The store lives on `host` from here,
+    // so the debounced checkpoint and the exit flush both reach it through the seam.
+    host.shada_load();
     host.emit_lifecycle_events();
     host.run_pending();
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a
@@ -867,7 +963,9 @@ where
             // editor responsive regardless of any server's speed or health.
             Some(event) = lsp_events.recv() => host.on_lsp_events(event, &mut lsp_events),
             // Timers and child-process completions from the event-loop actor — the
-            // first thing that wakes the server on wall-clock time rather than RPC.
+            // first thing that wakes the server on wall-clock time rather than RPC. The
+            // matching Lua callback runs here; the shada debounce-timer also wakes this
+            // arm, and `on_loop_events` sorts its flush out from the real callbacks.
             Some(event) = loop_events.recv() => host.on_loop_events(event, &mut loop_events),
             // Bytes for an off-tick open arrived from the daemon's fs — the startup
             // file (kept from freezing startup) or a later `:edit`. Idle for a
@@ -891,12 +989,11 @@ where
     }
     // The loop has exited (quit or client disconnect): flush the final snapshot to
     // this instance's store, then drop it (releasing the file lock) so the next
-    // instance can merge this one's clean checkpoint. Best-effort — we're leaving.
-    if let Some(store) = shada.as_mut() {
-        if let Err(e) = store.flush(&host.editor.export_persist()) {
-            eprintln!("shada: final flush failed: {e}");
-        }
-    }
+    // instance can merge this one's clean checkpoint. Unlike the debounced live
+    // checkpoint, this *clean-exit* flush carries `exit_cursor` (where the cursor sits
+    // now) — the store turns it into `'0` on the next launch, so `'0` only ever
+    // reflects a clean exit. Best-effort — we're leaving.
+    host.shada_flush_final();
     Ok(())
 }
 

@@ -147,9 +147,9 @@ fn main() -> Result<()> {
         file,
         config_dir,
         // Persist cross-session state (registers, marks, history, …) under
-        // `stdpath("state")/shada`. Editor state lives where the editor runs, so a
-        // daemon/remote session persists on whatever host runs this editor.
-        state_dir: Some(nxvim_server::shada_dir()),
+        // `stdpath("state")/shada`. Editor state lives where the editor runs, so the
+        // edit-host split persists locally (only fs/proc cross to the daemon).
+        shada: Some(nxvim_server::default_shada()),
         runtimepath,
         // The real editor wires the host clipboard for the `"+` / `"*` registers.
         clipboard: nxvim_server::ClipboardProvider::System,
@@ -225,9 +225,9 @@ fn run_headless(file: Option<String>) -> Result<()> {
         file,
         config_dir,
         // Persist cross-session state (registers, marks, history, …) under
-        // `stdpath("state")/shada`. Editor state lives where the editor runs, so a
-        // daemon/remote session persists on whatever host runs this editor.
-        state_dir: Some(nxvim_server::shada_dir()),
+        // `stdpath("state")/shada`. Editor state lives where the editor runs, so the
+        // edit-host split persists locally (only fs/proc cross to the daemon).
+        shada: Some(nxvim_server::default_shada()),
         runtimepath,
         clipboard: nxvim_server::ClipboardProvider::System,
         mouse_clock: None,
@@ -398,7 +398,7 @@ where
                 config_dir,
                 // Editor + Lua run locally in a daemon session, so shada is local
                 // too (only fs/proc/LSP cross to the daemon).
-                state_dir: Some(nxvim_server::shada_dir()),
+                shada: Some(nxvim_server::default_shada()),
                 runtimepath,
                 clipboard: nxvim_server::ClipboardProvider::System,
                 mouse_clock: None,

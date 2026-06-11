@@ -43,6 +43,18 @@ and `vim.g` globals.
 > longer "reserved slots" — they are real, persisted payloads; and the off-tick
 > writes now ride the `HostEffects` seam rather than calling the evloop/fs
 > directly (see *The store* below).
+>
+> **Update 2 (the server targets wasm).** The *server* — not just the core — runs
+> in the browser (a wasm Worker; the daemon is the remote fs/proc piece, and
+> classic remote-editor-over-SSH is being removed). So persistence must work in
+> the browser too, which forces two corrections, now folded in below: (1) the
+> store sits behind a **`ShadaStore` seam** the platform injects (native redb-over-file;
+> browser redb-over-**OPFS** via redb's `StorageBackend` — *same engine, different
+> bytes*), so it is never hardcoded into the server loop; and (2) the per-instance
+> files **compact** (carry-forward + delete) on every load, so file count is
+> bounded by *concurrent* instances, not total launches. SQLite was considered and
+> rejected: it would need a wasm OPFS-VFS in the browser *and* a C dependency on
+> native, whereas redb spans both in pure Rust.
 
 ---
 
@@ -58,25 +70,50 @@ redb's concurrency model, verified against its docs before planning:
   `Database::open`. A second process opening the *same* file fails/blocks. redb
   is a single-process store by design.
 
-So "one shared `main.redb` every daemon writes" is not available — it would
+So "one shared `main.redb` every instance writes" is not available — it would
 block or corrupt. The lock is not an obstacle, though; it *is* the merge
 boundary:
 
-- Each daemon owns **its own** file, `stdpath("state")/shada/<host>.<pid>.<rand>.redb`.
+- Each instance owns **its own** file, `stdpath("state")/shada/<pid>.<nanos>.<seq>.redb`.
   Single-process ⇒ redb's full ACID/crash-safety/incremental-write guarantees
   apply to each writer with zero contention.
-- A daemon reads every **other** sibling file it can open. A *live* instance
+- An instance reads every **other** sibling file it can open. A *live* instance
   holds its lock, so its file is skipped (invisible until it checkpoints/exits).
   A *cleanly-exited or crashed* instance released its lock (the OS drops advisory
-  locks on process death), so its file is openable read-only and redb's recovery
-  handles any uncommitted tail. The reader **recency-merges** those payloads into
-  its in-memory editor state, then writes only to its own file thereafter.
+  locks on process death), so its file is openable and redb's recovery handles any
+  uncommitted tail. The reader **recency-merges** those payloads into its in-memory
+  editor state.
 
 This reproduces neovim's exact observable contract — *you see another instance's
 data once it has written, not while it is live* — while adding crash-safety
 neovim lacks (neovim writes shada only on `:q`, losing everything on a crash).
 And it needs **no second file format**: the merge reads sibling redb files
 directly.
+
+**The same model runs in the browser.** redb is *not* tied to a filesystem — its
+[`StorageBackend`] trait abstracts the database to `len`/`read`/`write`/`set_len`/
+`sync_data` over bytes, and `Builder::create_with_backend` plugs any
+implementation in. The native build uses the default file backend; the wasm Worker
+build uses a backend over an **OPFS** sync access handle (`getSize`/`read`/`write`/
+`truncate`/`flush` — a 1:1 fit, available synchronously inside a Worker). OPFS
+files are exclusively locked too, so the *same* per-instance-file + merge model
+covers multiple browser tabs exactly as it covers multiple native processes. One
+engine, one design, two byte-backends — which is why the store sits behind a
+**`ShadaStore` seam** (`trait ShadaStore { load; flush }`) the platform injects via
+[`ServerInit::shada`], the same discipline as `HostFs` / `HostProc` / `HostEffects`.
+
+**Carry-forward compaction (why files don't accumulate).** Minting a new file per
+launch *without* cleanup would leave an ever-growing pile and an O(launches)
+startup. So `load` doesn't just merge — it **compacts**: after merging the dead
+siblings into memory it (1) **flushes the merged snapshot into its own file** so
+the absorbed data is durable here, then (2) **deletes the siblings it absorbed**.
+The only files surviving a load are this instance's plus any currently-*live*
+(locked) ones, so file count is bounded by *concurrent* instances and startup is
+O(live instances), not O(history) — a normal single-editor user always has exactly
+one file. It is crash-safe by ordering: a crash before the flush-commit leaves the
+siblings (re-absorbed next launch); a crash after the commit but before the deletes
+leaves redundant copies (likewise harmless). Compaction is payload-agnostic — it
+deletes whole absorbed files — so it never changes as the schema grows.
 
 ### Why this is feasible now (de-risking facts)
 
@@ -197,16 +234,19 @@ blindly.
 
 ### The store: `nxvim-server/src/shada.rs`
 
-A new server module, sibling to `save.rs`/`daemon.rs`, owns the redb file and
-the merge. It never holds the `!Send` editor; it takes a `PersistState` value
-in and hands one out.
+A server module, sibling to `save.rs`/`daemon.rs`, implementing the `ShadaStore`
+seam. It never holds the `!Send` editor; `load` hands a `PersistState` out,
+`flush` takes one in. The native impl is `RedbFileStore` (one redb `Database`
+over a file); a wasm impl over an OPFS `StorageBackend` lands in Phase 6.
 
 ```
 stdpath("state")/shada/
-├── arch.4711.a3f1.redb      ← this instance (locked while live)
-├── arch.4699.91bc.redb      ← a cleanly-exited instance (readable)
-└── arch.4702.0c5d.redb      ← a crashed instance (lock dropped by OS, readable)
+├── 4711.1749.0.redb      ← this instance (locked while live)
+├── 4699.1736.0.redb      ← a cleanly-exited instance  ┐ absorbed + deleted on
+└── 4702.1740.0.redb      ← a crashed instance          ┘ the next instance's load
 ```
+(`<pid>.<nanos>.<seq>`; only the live instance's file persists across a load —
+the rest are merged in and removed by carry-forward compaction.)
 
 **Tables** (one redb file, msgpack-encoded values via `rmp-serde`):
 
@@ -228,96 +268,107 @@ single yank rewrites one `registers` row in a tiny commit, not the whole store.
 in the final-flush txn at quit, so a crash leaves the previous session's `'0`
 intact (vim's own behavior: `'0` tracks *clean* exits).
 
-**Lifecycle**, driven from the server:
+**Lifecycle**, driven from the server through the `ShadaStore` seam:
 
-1. **Open (startup).** Mint `<host>.<pid>.<rand>.redb`, `Database::create` it
-   (acquire the lock). Glob sibling `*.redb`; for each, *try* `Database::open`
-   read-only — skip the ones that fail (a live instance holds the lock).
-   Recency-merge every readable sibling **plus** my own prior file (if the name
-   collides, which it won't with `rand`) into one `PersistState`:
+1. **`load` (startup) — merge + compact.** Mint `<pid>.<nanos>.<seq>.redb`,
+   `Database::create` it (acquire the lock). Glob sibling `*.redb`; for each, *try*
+   `Database::open` — skip the ones that fail (a live instance holds the lock),
+   record the ones that succeed (dead → absorbable). Recency-merge every absorbed
+   sibling into one `PersistState`:
    - registers / marks: group by key, **newest `ts` wins**;
    - history: union all entries, dedup by text keeping newest `ts`, sort, **cap**
      to the `shada`-history limit (default 10 000, neovim's `'1000`-ish but
      configurable later).
-   Hand that merged `PersistState` to `editor.import_persist(..)` **before the
+   Then **flush the merged snapshot into my own file** (so the absorbed data is
+   durable here) and **delete the absorbed siblings**. Return the merged
+   `PersistState`; the server hands it to `editor.import_persist(..)` **before the
    first frame**, the same pre-first-frame slot `init.lua` already uses.
-2. **Prune.** Delete the readable sibling files just merged whose `mtime` is
-   beyond retention — their surviving entries now live in my in-memory state and
-   will land in my own file on first checkpoint. (Compaction by carry-forward;
-   never touch a *locked* sibling.)
-3. **Run (debounced checkpoint).** Yank / mark-set / history-push set a `dirty`
+2. **Run (debounced checkpoint).** Yank / mark-set / history-push set a `dirty`
    flag on the server. ~150 ms after the last change the server calls
-   `editor.export_persist()` and hands the value to the **`HostEffects` off-tick
-   fs slice** to write the changed tables into **my** redb in one write txn —
-   the redb handle and the debounce live in `NativeEffects`, not on the editor
-   tick, so the sync core never blocks on disk and the wasm Worker can swap a
-   different backend. Single writer to my own file ⇒ no contention, full ACID.
-   This is the crash-safety win over neovim: a crash loses at most the last
-   debounce window, not the session.
-4. **Exit (final flush).** At the `should_quit` point (`lib.rs:819`), a last
-   `export_persist` (including `meta.exit_cursor` for `'0`) flushes through the
-   same seam, then the `Database` is dropped (releases the lock). My file remains
-   a clean checkpoint the next instance will merge.
+   `editor.export_persist()` and hands the value to the store's `flush` to write
+   the changed tables into **my** redb in one write txn — driven off the editor
+   tick (via the **`HostEffects` off-tick fs slice** on native), so the sync core
+   never blocks on disk and the wasm Worker swaps its own backend. Single writer to
+   my own file ⇒ no contention, full ACID. This is the crash-safety win over
+   neovim: a crash loses at most the last debounce window, not the session.
+   *(Phase 1 ships only the startup + exit flush; the debounce is a later phase.)*
+3. **Exit (final flush).** When the server loop ends — `should_quit` **or** client
+   disconnect — a last `export_persist` (including `meta.exit_cursor` for `'0`)
+   flushes through the store, then the `Database` is dropped (releases the lock).
+   My file remains a clean checkpoint the next instance will absorb.
 
-### Where the file lives under the split topologies
+### Where the store lives under each topology
 
-Shada is **editor** state, so it lives wherever the editor core runs:
+Shada is **editor** state, so it lives wherever the editor (= the server) runs —
+**never on the daemon**:
 
-- **Embedded / local:** `stdpath("state")/shada/` on the local machine.
+- **Local:** `stdpath("state")/shada/` on the local machine (redb-over-file).
 - **Edit-host split** (`nxvim --daemon` serves remote fs/proc, editor is local):
   **local** — consistent with the standing split-brain rule that editor state,
-  plugins, and caches stay local while only *project*-facing fs routes remote.
-  The marks' stored paths are remote-project paths, but the store is local.
-- **Remote-SSH client** (editor + Lua run on the remote host): on the **remote**
-  host's `stdpath("state")`. Several thin clients SSHing into one host spawn
-  several `nxvim --server`s sharing that host's state dir — the same per-machine
-  multi-writer case, resolved by the same per-instance-file merge.
+  plugins, and caches stay local while only *project*-facing fs routes remote. The
+  marks' stored paths are remote-project paths, but the store is local.
+- **Browser** (the server in a wasm Worker): browser storage (redb-over-OPFS), per
+  origin; multiple tabs are multiple instances under the same per-instance-file +
+  compaction model.
+
+(The classic remote-editor-over-SSH topology, where the editor ran on the remote
+host, is being removed, so there is no "shada on the remote host" case.)
 
 ---
 
 ## Build sequence (phased, each independently testable)
 
-1. **Phase 1 — the snapshot seam (core).** Add `persist.rs`: `PersistState` +
-   `export_persist`/`import_persist` for **registers and global marks only**.
-   No I/O yet. Tested in core's black-box style by round-tripping through a
-   second `Editor` (`export_persist` on A → `import_persist` on B → assert
-   registers/marks match). Proves the seam without touching disk.
-2. **Phase 2 — the redb store (server), single instance.** Add `shada.rs`: open
-   one file, write on the debounce + on quit, load on startup. No multi-writer
-   merge yet (one file). End-to-end test: harness spawns a server with a temp
-   `XDG_STATE_HOME`, feeds `"ayiw` / `mA`, quits, **respawns** against the same
-   dir, asserts `"ap` pastes and `` `A `` jumps. (Hermetic via the existing
-   temp-dir/`serial_lock` harness helpers.)
-3. **Phase 3 — per-file marks + history.** Extend `PersistState` and the tables
-   with `marks_file` (`a`–`z`, specials, `` `" `` last-cursor) and the two
-   history vecs. Test cross-session `` `" `` reopening a file at its cursor and
-   `/`-history recall after respawn.
+1. **Phase 1 — the seam, the store, registers, compaction. ✅ DONE.** Core gets
+   `persist.rs` (`PersistState` + `export_persist`/`import_persist`, registers
+   only). Server gets the `ShadaStore` seam + the native `RedbFileStore`
+   (per-instance file, recency-merge of siblings, **carry-forward compaction**,
+   load-before-first-frame + flush-on-exit), injected via `ServerInit::shada`.
+   Tested end-to-end (`tests/shada.rs`): a register survives a respawn; the store
+   compacts to **one file** across sessions with carry-forward intact; `None`
+   disables persistence so every other test stays hermetic. *(Because the project
+   forbids core unit tests, the seam is exercised through a real respawned server,
+   not an in-core round-trip — the original Phase 1/2 split is collapsed into this
+   one vertical slice.)*
+2. **Phase 2 — global marks.** Extend `PersistState` + the `marks_global` /
+   `marks_numbered` tables. Export resolves each global mark's `BufferId`→path;
+   import resolves path→buffer lazily on jump (clamp on restore). Respawn test:
+   `` `A `` jumps back into the marked file.
+3. **Phase 3 — per-file marks + history.** Add `marks_file` (`a`–`z`, specials,
+   `` `" `` last-cursor) and the two history tables. Test cross-session `` `" ``
+   reopening a file at its cursor and `/`-history recall after respawn.
 4. **Phase 4 — jumplist, changelist, numbered marks.** Export the focused
-   window's jumplist (ids→paths) + each buffer's changelist; on import seed them
-   back by path. Add the `'0`–`'9` shift at load (the new feature): `meta.exit_cursor`
-   from the clean-exit txn becomes `'0`, the prior `'0`–`'8` shift down one.
-   Test: `<C-o>` walks a restored jumplist after respawn; `` `0 `` lands where
-   the last session exited; `` `1 `` where the one before exited.
-5. **Phase 5 — the multi-writer merge.** Sibling glob, read-only open of unlocked
-   files, recency merge, carry-forward prune. Test: two servers, same temp state
-   dir; A yanks `"x` and exits, B yanks `"y` and exits, a third server sees the
-   **newest** of each by timestamp; a deliberately lock-held file is skipped
-   without error.
-6. **Phase 6 — caps, retention, and `:wshada`/`:rshada`.** History caps,
-   file-mark count caps (newest-N per neovim), retention-based prune, and the
-   explicit `:wshada`/`:rshada[!]` ex-commands (loud, real — they flush/reload
-   now, never a no-op).
+   window's jumplist (ids→paths) + each buffer's changelist; seed them back by
+   path on import. Add the `'0`–`'9` shift at load (the unlocked feature):
+   `meta.exit_cursor` from the clean-exit flush becomes `'0`, the prior `'0`–`'8`
+   shift down one. Test: `<C-o>` walks a restored jumplist; `` `0 `` lands where
+   the last session exited, `` `1 `` the one before.
+5. **Phase 5 — the debounced live checkpoint.** Move the flush off exit-only onto
+   a ~150 ms debounce via the `HostEffects` off-tick fs slice, so a crash loses at
+   most the last window. (Phase 1 already flushes correctly on exit; this adds the
+   live cadence.)
+6. **Phase 6 — the OPFS backend (browser).** A second `ShadaStore`/`StorageBackend`
+   impl over an OPFS sync access handle, landing with the wasm-Worker server
+   (Phase 5 of the edit-host plan). The native `RedbFileStore` is unchanged.
+7. **Phase 7 — caps, retention, `:wshada`/`:rshada`.** History caps, file-mark
+   count caps (newest-N per neovim), and the explicit `:wshada`/`:rshada[!]`
+   ex-commands (loud, real — they flush/reload now, never a no-op). A concurrent
+   two-*live*-instance test (both running at once, not just sequential) lands here.
 
 ---
 
 ## Open decisions
 
+- **SQLite was considered and rejected.** WAL-mode SQLite genuinely supports
+  multi-process concurrent writers (one shared file, no per-instance dance), which
+  is attractive on native. But the server targets the browser, where SQLite needs
+  a wasm OPFS-VFS (wa-sqlite) — and it is a C dependency on native. redb spans both
+  in pure Rust via `StorageBackend`, and carry-forward compaction makes the
+  per-instance-file cost a non-issue, so redb wins.
 - **Live cross-instance visibility.** The merge sees a sibling only once it has
   checkpointed (debounce) or exited — neovim's exact contract. If we ever want
-  *truly live* sharing (instance A's yank visible in B before A checkpoints),
-  the escape hatch is a small atomic-msgpack export read lock-free, or a single
-  broker daemon others RPC into (nxvim already has the wire machinery). Deferred:
-  shada does not need it, and the broker reintroduces a single point of failure.
+  *truly live* sharing (instance A's yank visible in B before A checkpoints), the
+  escape hatch is a single broker the others write through. Deferred: shada does
+  not need it, and a broker reintroduces a single point of failure.
 - **History cap default.** Start at 10 000 entries per history; expose as a
   `shada`/`'history'`-style option later.
 - **Schema evolution.** `meta.version` gates reads; an unknown future version is
@@ -326,12 +377,13 @@ Shada is **editor** state, so it lives wherever the editor core runs:
 
 ## Testing
 
-All black-box, per the harness convention: spawn a server against a temp
-`XDG_STATE_HOME`, drive via `nvim_input`/`feed`, **respawn** against the same
-dir, and assert the restored state through `nvim_buf_get_lines` / cursor / `"ap`
-paste / `` `A `` jump. The multi-writer phase spawns two servers under
-`serial_lock` against one temp dir. No unit tests; no dependence on the real
-`~/.local/state`.
+All black-box, per the harness convention: inject a `RedbFileStore` over a **temp
+dir** through `ServerInit::shada` (never the real `~/.local/state`), drive via
+`nvim_input`/`feed`, **respawn** against the same dir, and assert the restored
+state through `nvim_buf_get_lines` / cursor / `"ap` paste / `` `A `` jump. The
+exit/flush barrier is "drain the client channel until it closes" (the server
+returns only after the final flush). Compaction is asserted by counting surviving
+`*.redb` files. No unit tests; no dependence on the real state dir.
 
 ## Example config
 

@@ -1,4 +1,5 @@
-//! Shada persistence — cross-session state survives a server restart.
+//! Shada persistence — cross-session state survives a server restart, and the
+//! per-instance stores compact rather than accumulating.
 //!
 //! Black-box, per the harness convention: spawn a server against a **temp** state
 //! dir (so the real `~/.local/state` is never touched and the test stays
@@ -8,17 +9,17 @@
 //! Phase 1 covers registers only. See
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use nxvim_server::ServerInit;
+use nxvim_server::{is_store_file, RedbFileStore, ServerInit};
 use nxvim_test_harness::{feed, lines, start_attached, temp_dir, write_temp};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// A server wired to persist into `dir`. Everything else default.
-fn init_with_state(dir: &Path, file: Option<String>) -> ServerInit {
+/// A server that persists into `dir` via the native redb store.
+fn init_with_store(dir: &Path, file: Option<String>) -> ServerInit {
     ServerInit {
         file,
-        state_dir: Some(dir.to_path_buf()),
+        shada: Some(Box::new(RedbFileStore::new(dir.to_path_buf()))),
         ..Default::default()
     }
 }
@@ -31,6 +32,17 @@ async fn await_server_exit(mut incoming: UnboundedReceiver<nxvim_rpc::Incoming>)
     while incoming.recv().await.is_some() {}
 }
 
+/// Count the surviving shada store files in `dir`.
+fn store_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_store_file(p))
+        .collect()
+}
+
 #[tokio::test]
 async fn register_survives_a_restart() {
     let dir = temp_dir("shada_registers");
@@ -38,7 +50,7 @@ async fn register_survives_a_restart() {
 
     // Session 1: yank "hello" into register `a`, then quit.
     {
-        let (rpc, incoming) = start_attached(init_with_state(&dir, Some(file)), 80, 25).await;
+        let (rpc, incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
         feed(&rpc, "\"ayiw");
         // Barrier: ensure the yank is processed before we quit.
         assert_eq!(lines(&rpc).await, vec!["hello world"]);
@@ -50,15 +62,60 @@ async fn register_survives_a_restart() {
     // Session 2: a fresh server against the same store. Register `a` should hold
     // "hello" from the previous session, so `"ap` pastes it.
     {
-        let (rpc, _incoming) = start_attached(init_with_state(&dir, None), 80, 25).await;
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
         feed(&rpc, "\"ap");
         assert_eq!(lines(&rpc).await, vec!["hello"]);
     }
 }
 
 #[tokio::test]
-async fn no_state_dir_means_no_persistence() {
-    // With `state_dir: None` (the default), a register set in one session must NOT
+async fn stores_compact_instead_of_accumulating() {
+    let dir = temp_dir("shada_compaction");
+
+    // Session 1: yank into register `a`, exit. One store file is left behind.
+    {
+        let f = write_temp("shada_compaction", "txt", "alpha\n");
+        let (rpc, incoming) = start_attached(init_with_store(&dir, Some(f)), 80, 25).await;
+        feed(&rpc, "\"ayy");
+        assert_eq!(lines(&rpc).await, vec!["alpha"]);
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+    assert_eq!(
+        store_files(&dir).len(),
+        1,
+        "one store after the first session"
+    );
+
+    // Session 2: a new instance mints its own file but absorbs + deletes session
+    // 1's, so after it exits there is still exactly one file — count is bounded by
+    // live instances, not total launches.
+    {
+        let f = write_temp("shada_compaction", "txt", "beta\n");
+        let (rpc, incoming) = start_attached(init_with_store(&dir, Some(f)), 80, 25).await;
+        feed(&rpc, "\"byy");
+        assert_eq!(lines(&rpc).await, vec!["beta"]);
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+    assert_eq!(
+        store_files(&dir).len(),
+        1,
+        "still one store after the second session — the first was compacted away"
+    );
+
+    // Session 3: both registers survived the carry-forward (session 1's `a` was
+    // merged into session 2's store, which also holds session 2's `b`).
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
+        feed(&rpc, "\"ap\"bp");
+        assert_eq!(lines(&rpc).await, vec!["", "alpha", "beta"]);
+    }
+}
+
+#[tokio::test]
+async fn no_store_means_no_persistence() {
+    // With `shada: None` (the default), a register set in one session must NOT
     // bleed into the next — persistence is strictly opt-in, keeping every other
     // test hermetic.
     let file = write_temp("shada_off", "txt", "hello world\n");

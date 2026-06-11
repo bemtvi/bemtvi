@@ -77,6 +77,9 @@ fn main() -> Result<()> {
         // default); a daemon-backed LSP transport is injected here by the edit-host
         // split.
         lsp_transport: None,
+        // The local binary reads the project fs directly; a daemon-backed Lua fs
+        // bridge is injected here by the edit-host split.
+        lua_fs: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -137,6 +140,9 @@ fn run_headless(file: Option<String>) -> Result<()> {
         // default); a daemon-backed LSP transport is injected here by the edit-host
         // split.
         lsp_transport: None,
+        // The local binary reads the project fs directly; a daemon-backed Lua fs
+        // bridge is injected here by the edit-host split.
+        lua_fs: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()

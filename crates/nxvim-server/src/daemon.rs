@@ -145,7 +145,7 @@ use tokio::sync::oneshot;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_lsp::{LspChannel, LspProcess, LspTransport, ServerSpawn};
-use nxvim_lua::{BlockingSystem, SystemOutput, SystemSpec};
+use nxvim_lua::{BlockingSystem, FileKind, LuaDirEntry, LuaFs, LuaStat, SystemOutput, SystemSpec};
 use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
@@ -188,6 +188,13 @@ const LSP_KILL: &str = "lsp_kill"; // edit-host → daemon: [id]
 const LSP_STDOUT: &str = "lsp_stdout"; // daemon → edit-host: [id, bytes]
 const LSP_STDERR: &str = "lsp_stderr"; // daemon → edit-host: [id, bytes]
 const LSP_EXITED: &str = "lsp_exited"; // daemon → edit-host: [id, code?, signal?]
+
+// The Lua-filesystem leg (`luafs`): a request/response per project-facing `vim.uv.fs_*`
+// / `vim.fn` fs call, run to completion on the daemon. Like the sys leg it is a blocking
+// bridge — the edit-host's Lua thread parks on the reply (the calls are synchronous) —
+// but it carries the whole fs surface under one method, demuxed by an op tag in the
+// request. The whole `["op", args…]` request maps to `["ok", payload] | ["err", msg]`.
+const LUAFS: &str = "luafs";
 
 /// What the daemon reports back about one child, demuxed off the wire and handed to
 /// the [`RemoteHostProc::run`] future waiting on that spawn's `id`. Mirrors the two
@@ -1658,4 +1665,428 @@ fn decode_lsp_exited(params: &[Value]) -> Option<(u64, Option<i32>, Option<i32>)
     let code = params.get(1).and_then(Value::as_i64).map(|c| c as i32);
     let signal = params.get(2).and_then(Value::as_i64).map(|s| s as i32);
     Some((id, code, signal))
+}
+
+// ----- the Lua-filesystem leg (`luafs`) -------------------------------------------
+//
+// `RemoteLuaFs` (the edit-host side, a [`LuaFs`]) is the fs analogue of
+// [`RemoteBlockingSystem`]: a dedicated link thread owns the wire and its own
+// current-thread runtime, each call hands its `["op", args…]` request to that thread
+// over a `std` channel and **parks the Lua thread** on the reply. `serve_luafs_daemon`
+// runs each op through the daemon's real [`StdLuaFs`](nxvim_lua::StdLuaFs) on a blocking
+// pool thread, so the daemon — not the edit-host — owns the open-fd table the `i64`
+// tokens index, and a plugin reads the *remote* project byte-for-byte.
+
+/// One queued fs request on the link thread: the `["op", args…]` params and the `std`
+/// channel the parked editor thread waits on for the reply (`Ok` value or a transport
+/// error string).
+type LuaFsJob = (Vec<Value>, std::sync::mpsc::Sender<Result<Value, String>>);
+
+/// A [`LuaFs`] that runs the project-facing Lua fs surface on a remote daemon instead of
+/// locally — the edit-host side of the `luafs` leg. The blocking bridge mirrors
+/// [`RemoteBlockingSystem`]: synchronous calls park the editor thread on the daemon
+/// reply, with the wire's RPC tasks on their own thread so the park can't deadlock.
+///
+/// `Send` (it holds only a `std::sync::mpsc::Sender`) so it rides
+/// [`ServerInit`](crate::ServerInit) onto the server thread, where it is rebuilt into the
+/// editor's `Rc<dyn LuaFs>`.
+pub struct RemoteLuaFs {
+    req_tx: std::sync::mpsc::Sender<LuaFsJob>,
+}
+
+impl RemoteLuaFs {
+    /// Connect to a daemon over `reader`/`writer`, spawning the dedicated link thread
+    /// (its own current-thread runtime + the RPC link). Calls are serial by nature (the
+    /// edit-host parks until each returns), so the thread serves one job at a time,
+    /// driving each `luafs` request to completion on its runtime.
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteLuaFs
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<LuaFsJob>();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                // A runtime we can't build means the link is dead on arrival; `req_rx`
+                // drops, so every `call` sees the channel closed and degrades loudly.
+                Err(_) => return,
+            };
+            let rpc = rt.block_on(async move {
+                let (rpc, mut incoming) = connect(reader, writer);
+                // The luafs leg has no daemon→edit-host pushes; drain so the connection
+                // isn't torn down (dropping the receiver would).
+                tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+                rpc
+            });
+            while let Ok((params, reply_tx)) = req_rx.recv() {
+                let reply = rt.block_on(async {
+                    rpc.request(LUAFS, params).await.map_err(|e| e.to_string())
+                });
+                let _ = reply_tx.send(reply);
+            }
+        });
+        RemoteLuaFs { req_tx }
+    }
+
+    /// Send `params` (an `["op", args…]` request) to the link thread and park on the
+    /// reply, decoding the daemon's `["ok", payload] | ["err", msg]` envelope back into an
+    /// `io::Result`. A dropped link / transport failure degrades to a loud `io::Error`.
+    fn call(&self, params: Vec<Value>) -> io::Result<Value> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self.req_tx.send((params, reply_tx)).is_err() {
+            return Err(io::Error::other("luafs: daemon link is gone"));
+        }
+        match reply_rx.recv() {
+            Ok(Ok(v)) => decode_luafs_reply(v),
+            Ok(Err(e)) => Err(io::Error::other(format!("luafs: daemon error: {e}"))),
+            Err(_) => Err(io::Error::other("luafs: daemon link dropped the request")),
+        }
+    }
+}
+
+impl LuaFs for RemoteLuaFs {
+    fn open(&self, path: &str, flags: &str, mode: u32) -> io::Result<i64> {
+        self.call(vec![
+            Value::from("open"),
+            Value::from(path.to_string()),
+            Value::from(flags.to_string()),
+            Value::from(mode as u64),
+        ])
+        .map(|v| v.as_i64().unwrap_or(-1))
+    }
+
+    fn close(&self, fd: i64) -> io::Result<()> {
+        self.call(vec![Value::from("close"), Value::from(fd)])
+            .map(|_| ())
+    }
+
+    fn read(&self, fd: i64, size: usize, offset: Option<i64>) -> io::Result<Vec<u8>> {
+        self.call(vec![
+            Value::from("read"),
+            Value::from(fd),
+            Value::from(size as u64),
+            offset.map_or(Value::Nil, Value::from),
+        ])
+        .map(|v| value_bytes(&v))
+    }
+
+    fn write(&self, fd: i64, data: &[u8], offset: Option<i64>) -> io::Result<usize> {
+        self.call(vec![
+            Value::from("write"),
+            Value::from(fd),
+            Value::Binary(data.to_vec()),
+            offset.map_or(Value::Nil, Value::from),
+        ])
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+    }
+
+    fn fstat(&self, fd: i64) -> io::Result<LuaStat> {
+        self.call(vec![Value::from("fstat"), Value::from(fd)])
+            .and_then(|v| decode_lua_stat(&v))
+    }
+
+    fn stat(&self, path: &str) -> io::Result<LuaStat> {
+        self.call(vec![Value::from("stat"), Value::from(path.to_string())])
+            .and_then(|v| decode_lua_stat(&v))
+    }
+
+    fn lstat(&self, path: &str) -> io::Result<LuaStat> {
+        self.call(vec![Value::from("lstat"), Value::from(path.to_string())])
+            .and_then(|v| decode_lua_stat(&v))
+    }
+
+    fn scandir(&self, path: &str) -> io::Result<Vec<LuaDirEntry>> {
+        self.call(vec![Value::from("scandir"), Value::from(path.to_string())])
+            .map(|v| decode_lua_entries(&v))
+    }
+
+    fn mkdir(&self, path: &str, mode: u32, recursive: bool) -> io::Result<()> {
+        self.call(vec![
+            Value::from("mkdir"),
+            Value::from(path.to_string()),
+            Value::from(mode as u64),
+            Value::from(recursive),
+        ])
+        .map(|_| ())
+    }
+
+    fn rmdir(&self, path: &str) -> io::Result<()> {
+        self.call(vec![Value::from("rmdir"), Value::from(path.to_string())])
+            .map(|_| ())
+    }
+
+    fn unlink(&self, path: &str) -> io::Result<()> {
+        self.call(vec![Value::from("unlink"), Value::from(path.to_string())])
+            .map(|_| ())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.call(vec![
+            Value::from("rename"),
+            Value::from(from.to_string()),
+            Value::from(to.to_string()),
+        ])
+        .map(|_| ())
+    }
+
+    fn copyfile(&self, src: &str, dest: &str, excl: bool) -> io::Result<()> {
+        self.call(vec![
+            Value::from("copyfile"),
+            Value::from(src.to_string()),
+            Value::from(dest.to_string()),
+            Value::from(excl),
+        ])
+        .map(|_| ())
+    }
+
+    fn utime(&self, path: &str, atime: f64, mtime: f64) -> io::Result<()> {
+        self.call(vec![
+            Value::from("utime"),
+            Value::from(path.to_string()),
+            Value::F64(atime),
+            Value::F64(mtime),
+        ])
+        .map(|_| ())
+    }
+
+    fn access(&self, path: &str, modes: &str) -> bool {
+        // Never errors (libuv semantics); a transport failure degrades to `false`.
+        self.call(vec![
+            Value::from("access"),
+            Value::from(path.to_string()),
+            Value::from(modes.to_string()),
+        ])
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    }
+
+    fn realpath(&self, path: &str) -> io::Result<String> {
+        self.call(vec![Value::from("realpath"), Value::from(path.to_string())])
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| io::Error::other("luafs: malformed realpath reply"))
+            })
+    }
+
+    fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
+        self.call(vec![
+            Value::from("read_file"),
+            Value::from(path.to_string()),
+        ])
+        .map(|v| value_bytes(&v))
+    }
+
+    fn which(&self, name: &str) -> Option<String> {
+        // Never errors; a miss (or transport failure) is `None`.
+        self.call(vec![Value::from("which"), Value::from(name.to_string())])
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+    }
+}
+
+/// Decode the daemon's `["ok", payload] | ["err", msg]` envelope into an `io::Result`.
+fn decode_luafs_reply(v: Value) -> io::Result<Value> {
+    let Value::Array(a) = &v else {
+        return Err(io::Error::other("luafs: malformed reply"));
+    };
+    match a.first().and_then(Value::as_str) {
+        Some("ok") => Ok(a.get(1).cloned().unwrap_or(Value::Nil)),
+        Some("err") => Err(io::Error::other(
+            a.get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("luafs error")
+                .to_string(),
+        )),
+        _ => Err(io::Error::other("luafs: malformed reply tag")),
+    }
+}
+
+/// `LuaStat` → its flat wire array: `[kind, size, mode, mtime_sec, mtime_nsec,
+/// atime_sec, atime_nsec, ino, uid, gid, nlink, dev]`. A `None` time has a `Nil` sec.
+fn encode_lua_stat(st: &LuaStat) -> Value {
+    let time = |t: Option<(i64, u32)>| match t {
+        Some((sec, nsec)) => (Value::from(sec), Value::from(nsec as u64)),
+        None => (Value::Nil, Value::from(0u64)),
+    };
+    let (mts, mtn) = time(st.mtime);
+    let (ats, atn) = time(st.atime);
+    Value::Array(vec![
+        Value::from(st.kind.as_str()),
+        Value::from(st.size),
+        Value::from(st.mode as u64),
+        mts,
+        mtn,
+        ats,
+        atn,
+        Value::from(st.ino),
+        Value::from(st.uid as u64),
+        Value::from(st.gid as u64),
+        Value::from(st.nlink),
+        Value::from(st.dev),
+    ])
+}
+
+/// The inverse of [`encode_stat`]; a malformed array is a loud error.
+fn decode_lua_stat(v: &Value) -> io::Result<LuaStat> {
+    let a = v
+        .as_array()
+        .ok_or_else(|| io::Error::other("luafs: malformed stat reply"))?;
+    let kind = FileKind::from_wire(a.first().and_then(Value::as_str).unwrap_or("file"));
+    let u64_at = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0);
+    let time = |s: usize, n: usize| {
+        a.get(s)
+            .and_then(Value::as_i64)
+            .map(|sec| (sec, a.get(n).and_then(Value::as_u64).unwrap_or(0) as u32))
+    };
+    Ok(LuaStat {
+        kind,
+        size: u64_at(1),
+        mode: u64_at(2) as u32,
+        mtime: time(3, 4),
+        atime: time(5, 6),
+        ino: u64_at(7),
+        uid: u64_at(8) as u32,
+        gid: u64_at(9) as u32,
+        nlink: u64_at(10),
+        dev: u64_at(11),
+    })
+}
+
+/// Directory entries → an array of `[name, kind]` pairs.
+fn encode_lua_entries(entries: &[LuaDirEntry]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|e| {
+                Value::Array(vec![
+                    Value::from(e.name.clone()),
+                    Value::from(e.kind.as_str()),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// The inverse of [`encode_dir_entries`]; a malformed entry is skipped.
+fn decode_lua_entries(v: &Value) -> Vec<LuaDirEntry> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let e = e.as_array()?;
+                    Some(LuaDirEntry {
+                        name: e.first()?.as_str()?.to_string(),
+                        kind: FileKind::from_wire(
+                            e.get(1).and_then(Value::as_str).unwrap_or("file"),
+                        ),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run one `["op", args…]` request through `fs` and shape the `["ok", payload] |
+/// ["err", msg]` envelope. The op set is the whole [`LuaFs`] surface; `access`/`which`
+/// never error, so they always report `ok`.
+fn serve_luafs_op(fs: &dyn LuaFs, params: &[Value]) -> Value {
+    let op = params.first().and_then(Value::as_str).unwrap_or("");
+    let s = |i: usize| {
+        params
+            .get(i)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let i64_at = |i: usize| params.get(i).and_then(Value::as_i64).unwrap_or(0);
+    let u32_at = |i: usize| params.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
+    let opt_off = |i: usize| params.get(i).and_then(Value::as_i64);
+    let bool_at = |i: usize| params.get(i).and_then(Value::as_bool).unwrap_or(false);
+    let f64_at = |i: usize| params.get(i).and_then(Value::as_f64).unwrap_or(0.0);
+
+    // `access` / `which` are infallible (libuv semantics) — report them directly.
+    match op {
+        "access" => return luafs_ok(Value::from(fs.access(&s(1), &s(2)))),
+        "which" => return luafs_ok(fs.which(&s(1)).map_or(Value::Nil, Value::from)),
+        _ => {}
+    }
+
+    let result: io::Result<Value> = match op {
+        "open" => fs.open(&s(1), &s(2), u32_at(3)).map(Value::from),
+        "close" => fs.close(i64_at(1)).map(|_| Value::Nil),
+        "read" => fs
+            .read(i64_at(1), u32_at(2) as usize, opt_off(3))
+            .map(Value::Binary),
+        "write" => fs
+            .write(i64_at(1), &value_bytes(&params[2]), opt_off(3))
+            .map(|n| Value::from(n as u64)),
+        "fstat" => fs.fstat(i64_at(1)).map(|st| encode_lua_stat(&st)),
+        "stat" => fs.stat(&s(1)).map(|st| encode_lua_stat(&st)),
+        "lstat" => fs.lstat(&s(1)).map(|st| encode_lua_stat(&st)),
+        "scandir" => fs.scandir(&s(1)).map(|e| encode_lua_entries(&e)),
+        "mkdir" => fs.mkdir(&s(1), u32_at(2), bool_at(3)).map(|_| Value::Nil),
+        "rmdir" => fs.rmdir(&s(1)).map(|_| Value::Nil),
+        "unlink" => fs.unlink(&s(1)).map(|_| Value::Nil),
+        "rename" => fs.rename(&s(1), &s(2)).map(|_| Value::Nil),
+        "copyfile" => fs.copyfile(&s(1), &s(2), bool_at(3)).map(|_| Value::Nil),
+        "utime" => fs.utime(&s(1), f64_at(2), f64_at(3)).map(|_| Value::Nil),
+        "realpath" => fs.realpath(&s(1)).map(Value::from),
+        "read_file" => fs.read_file(&s(1)).map(Value::Binary),
+        other => Err(io::Error::other(format!("luafs: unknown op '{other}'"))),
+    };
+    match result {
+        Ok(payload) => luafs_ok(payload),
+        Err(e) => Value::Array(vec![Value::from("err"), Value::from(e.to_string())]),
+    }
+}
+
+/// Wrap a payload in the success envelope.
+fn luafs_ok(payload: Value) -> Value {
+    Value::Array(vec![Value::from("ok"), payload])
+}
+
+/// Run the daemon end of the *Lua-filesystem* wire over `reader`/`writer`, serving
+/// `luafs` requests through `fs` (the daemon's real backend —
+/// [`StdLuaFs`](nxvim_lua::StdLuaFs) in the binary, a virtual fs in tests). Each op is
+/// offloaded to a blocking-pool thread so a slow fs call can't stall the reader; the
+/// `fs` is shared (it owns the open-fd table the `i64` tokens index, so an `fs_open`
+/// here is read back by a later `fs_read`). Returns when the connection closes.
+pub async fn serve_luafs_daemon<R, W>(
+    reader: R,
+    writer: W,
+    fs: Box<dyn LuaFs + Send + Sync>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, mut incoming) = connect(reader, writer);
+    let fs: Arc<dyn LuaFs + Send + Sync> = Arc::from(fs);
+    while let Some(msg) = incoming.recv().await {
+        if let Incoming::Request { id, method, params } = msg {
+            if method == LUAFS {
+                let fs = fs.clone();
+                let rpc = rpc.clone();
+                tokio::spawn(async move {
+                    let reply =
+                        match tokio::task::spawn_blocking(move || serve_luafs_op(&*fs, &params))
+                            .await
+                        {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(Value::from(format!("luafs: join error: {e}"))),
+                        };
+                    rpc.respond(id, reply);
+                });
+            } else {
+                rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
+            }
+        }
+    }
+    Ok(())
 }

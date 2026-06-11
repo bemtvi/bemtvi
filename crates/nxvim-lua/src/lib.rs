@@ -22,16 +22,19 @@
 //! - [`convert`] — the Lua↔`rmpv`/`serde_json` value bridges and opts readers.
 //! - [`host`] — filesystem / process / glob / standard-path host primitives.
 //! - [`system`] — the blocking `vim._system` shell-out seam ([`BlockingSystem`]).
+//! - [`luafs`] — the project-facing Lua filesystem seam ([`LuaFs`]).
 
 mod convert;
 mod host;
 mod install;
+mod luafs;
 mod ops;
 mod runtime;
 mod system;
 mod uvfs;
 mod vimregex;
 
+pub use luafs::{FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
     InlayHintMirrorData, LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp,

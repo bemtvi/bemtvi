@@ -85,6 +85,9 @@ fn main() -> Result<()> {
         // The local GUI spawns language servers as real local children; a daemon-backed
         // LSP transport is injected here by the edit-host split.
         lsp_transport: None,
+        // The local GUI reads the project fs directly; a daemon-backed Lua fs bridge
+        // is injected here by the edit-host split.
+        lua_fs: None,
     };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

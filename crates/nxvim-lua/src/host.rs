@@ -5,44 +5,15 @@
 
 use std::path::PathBuf;
 
-/// Resolve `name` to an executable path: an explicit path is accepted when it is
-/// an executable file; a bare name is searched across `$PATH`. Backs
-/// `vim.fn.executable`/`vim.fn.exepath`.
-pub(crate) fn find_executable(name: &str) -> Option<String> {
-    if name.is_empty() {
-        return None;
-    }
-    if name.contains('/') {
-        let p = std::path::Path::new(name);
-        return is_executable_file(p).then(|| name.to_string());
-    }
-    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
-        let cand = dir.join(name);
-        if is_executable_file(&cand) {
-            return Some(cand.to_string_lossy().into_owned());
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable_file(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    p.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(p: &std::path::Path) -> bool {
-    p.is_file()
-}
+use crate::luafs::LuaFs;
 
 /// Expand a shell-style glob (only `*` and `?`, matched per path component) into
 /// the existing paths it matches. Enough for the `lib/python*/site-packages`-
 /// style patterns the config files build; a relative pattern resolves against the
-/// cwd. Backs `vim.fn.glob`.
-pub(crate) fn glob_paths(pattern: &str) -> Vec<String> {
+/// cwd. Backs `vim.fn.glob`. Directory listings + existence go through `fs` (the
+/// project-facing seam), so a daemon session globs the *remote* tree; the relative
+/// base is still the local cwd (the path-space split is a separate concern).
+pub(crate) fn glob_paths(pattern: &str, fs: &dyn LuaFs) -> Vec<String> {
     let absolute = pattern.starts_with('/');
     let mut frontier = vec![if absolute {
         String::from("/")
@@ -55,11 +26,10 @@ pub(crate) fn glob_paths(pattern: &str) -> Vec<String> {
         let mut next = Vec::new();
         if seg.contains('*') || seg.contains('?') {
             for base in &frontier {
-                if let Ok(rd) = std::fs::read_dir(base) {
-                    for entry in rd.flatten() {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if wildcard_match(seg, &name) {
-                            next.push(join_path(base, &name));
+                if let Ok(entries) = fs.scandir(base) {
+                    for entry in entries {
+                        if wildcard_match(seg, &entry.name) {
+                            next.push(join_path(base, &entry.name));
                         }
                     }
                 }
@@ -67,7 +37,8 @@ pub(crate) fn glob_paths(pattern: &str) -> Vec<String> {
         } else {
             for base in &frontier {
                 let cand = join_path(base, seg);
-                if std::path::Path::new(&cand).exists() {
+                // Existence test (empty access modes = F_OK).
+                if fs.access(&cand, "") {
                     next.push(cand);
                 }
             }
@@ -220,17 +191,6 @@ pub(crate) fn stdpath(what: &str) -> String {
         _ => xdg("XDG_CACHE_HOME", ".cache"),
     };
     path.to_string_lossy().into_owned()
-}
-
-/// `vim.fn.getftime(path)`: the file's mtime in whole seconds since the Unix
-/// epoch, or `-1` if it can't be stat'd (matching Vimscript).
-pub(crate) fn getftime(path: &str) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(-1)
 }
 
 /// Resolve `mkdir`'s `prot` argument to a permission mode. Accepts an octal

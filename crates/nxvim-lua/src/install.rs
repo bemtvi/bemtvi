@@ -17,15 +17,12 @@ use crate::convert::{
     color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_i64, lua_to_json,
     opt_table_to_json, stringify,
 };
-use crate::host::{
-    create_dir_all_mode, find_executable, get_runtime_file, getftime, glob_paths, parse_mode,
-    stdpath,
-};
+use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
     BufOp, ConfirmReq, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue,
     PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, WindowOp,
 };
-use crate::runtime::Shared;
+use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
 use crate::BlockingSystem;
 
@@ -329,18 +326,29 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "stdpath",
         lua.create_function(|_, what: String| Ok(stdpath(&what)))?,
     )?;
+    // `vim.fn.getftime(path)`: the file's mtime in whole seconds, or -1. Routed
+    // through the fs seam so it sees the *remote* project in a daemon session.
+    let sh = shared.clone();
     func.set(
         "getftime",
-        lua.create_function(|_, path: String| Ok(getftime(&path)))?,
+        lua.create_function(move |_, path: String| {
+            Ok(resolve_lua_fs(&sh)
+                .stat(&path)
+                .ok()
+                .and_then(|st| st.mtime)
+                .map(|(sec, _)| sec)
+                .unwrap_or(-1))
+        })?,
     )?;
+    let sh = shared.clone();
     func.set(
         "isdirectory",
-        lua.create_function(|_, path: String| {
-            Ok(if std::path::Path::new(&path).is_dir() {
-                1i64
-            } else {
-                0
-            })
+        lua.create_function(move |_, path: String| {
+            let is_dir = matches!(
+                resolve_lua_fs(&sh).stat(&path),
+                Ok(st) if st.kind == crate::FileKind::Dir
+            );
+            Ok(i64::from(is_dir))
         })?,
     )?;
     func.set(
@@ -458,16 +466,17 @@ pub(crate) fn install_runtime_api(
     )?;
 
     // `vim._readdir(path)`: the entry names directly under `path` (no `.`/`..`),
-    // or an empty list if it can't be read. Backs `vim.fs.find`/predicate markers.
+    // or an empty list if it can't be read. Backs `vim.fs.find`/predicate markers,
+    // which walk the *project* tree, so it routes through the fs seam (remote in a
+    // daemon session).
+    let sh = shared.clone();
     vim.set(
         "_readdir",
-        lua.create_function(|lua, path: String| {
-            let names: Vec<String> = std::fs::read_dir(&path)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
+        lua.create_function(move |lua, path: String| {
+            let names: Vec<String> = resolve_lua_fs(&sh)
+                .scandir(&path)
+                .map(|entries| entries.into_iter().map(|e| e.name).collect())
+                .unwrap_or_default();
             lua.create_sequence_from(names)
         })?,
     )?;
@@ -1379,7 +1388,7 @@ pub(crate) fn install_runtime_api(
     // module since it carries an fd table and the `std::fs` plumbing; it also
     // (re)defines `fs_stat` with the unix `st_mode` bits `plenary.path:is_dir()`
     // needs, which the old inline stub omitted.
-    crate::uvfs::install(lua, &uv)?;
+    crate::uvfs::install(lua, &uv, shared)?;
     // `vim.uv.os_homedir()`: the user's home directory.
     uv.set(
         "os_homedir",
@@ -1426,13 +1435,10 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
     // `vim.uv.fs_realpath(path)`: the canonical path (symlinks resolved), or nil.
+    let sh = shared.clone();
     uv.set(
         "fs_realpath",
-        lua.create_function(|_, path: String| {
-            Ok(std::fs::canonicalize(&path)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned()))
-        })?,
+        lua.create_function(move |_, path: String| Ok(resolve_lua_fs(&sh).realpath(&path).ok()))?,
     )?;
     // `vim.uv.os_uname()`: a uname table. `lspconfig.util` reads `.version` and
     // matches it against "Windows" to detect the platform, so `version` carries a
@@ -1468,14 +1474,20 @@ pub(crate) fn install_runtime_api(
     // `vim.fn.executable(name)`: 1 if `name` is an executable on $PATH (or an
     // executable file path), else 0. Configs use it to prefer a project-local
     // `node_modules/.bin/<server>` over the global one.
+    let sh = shared.clone();
     func.set(
         "executable",
-        lua.create_function(|_, name: String| Ok(i64::from(find_executable(&name).is_some())))?,
+        lua.create_function(move |_, name: String| {
+            Ok(i64::from(resolve_lua_fs(&sh).which(&name).is_some()))
+        })?,
     )?;
     // `vim.fn.exepath(name)`: the resolved path to `name` on $PATH, or "".
+    let sh = shared.clone();
     func.set(
         "exepath",
-        lua.create_function(|_, name: String| Ok(find_executable(&name).unwrap_or_default()))?,
+        lua.create_function(move |_, name: String| {
+            Ok(resolve_lua_fs(&sh).which(&name).unwrap_or_default())
+        })?,
     )?;
     // `vim.fn.getpid()`: this (editor) process's id.
     func.set(
@@ -1484,38 +1496,48 @@ pub(crate) fn install_runtime_api(
     )?;
     // `vim.fn.resolve(path)`: `path` with symlinks resolved, or unchanged if it
     // can't be canonicalized.
+    let sh = shared.clone();
     func.set(
         "resolve",
-        lua.create_function(|_, path: String| {
-            Ok(std::fs::canonicalize(&path)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(path))
+        lua.create_function(move |_, path: String| {
+            Ok(resolve_lua_fs(&sh).realpath(&path).unwrap_or(path))
         })?,
     )?;
-    // `vim.fn.filereadable(path)`: 1 if `path` is a readable regular file, else 0.
+    // `vim.fn.filereadable(path)`: 1 if `path` is a regular file, else 0.
+    let sh = shared.clone();
     func.set(
         "filereadable",
-        lua.create_function(|_, path: String| {
-            Ok(i64::from(std::path::Path::new(&path).is_file()))
+        lua.create_function(move |_, path: String| {
+            let is_file = matches!(
+                resolve_lua_fs(&sh).stat(&path),
+                Ok(st) if st.kind == crate::FileKind::File
+            );
+            Ok(i64::from(is_file))
         })?,
     )?;
     // `vim.fn.readblob(path)`: the file's raw bytes as a string; errors if
     // unreadable (callers `pcall` it).
+    let sh = shared.clone();
     func.set(
         "readblob",
-        lua.create_function(|lua, path: String| {
-            lua.create_string(std::fs::read(&path).map_err(mlua::Error::external)?)
+        lua.create_function(move |lua, path: String| {
+            lua.create_string(
+                resolve_lua_fs(&sh)
+                    .read_file(&path)
+                    .map_err(mlua::Error::external)?,
+            )
         })?,
     )?;
     // `vim.fn.glob(pattern[, nosuf, list])`: existing paths matching a shell-style
     // glob (`*`/`?` wildcards, per path component). Returns a list when `list` is
     // truthy (the form `lspconfig.util.root_pattern` uses), else the default
     // newline-joined string. `nosuf` is accepted and ignored.
+    let sh = shared.clone();
     func.set(
         "glob",
         lua.create_function(
-            |lua, (pattern, _nosuf, list): (String, Option<bool>, Option<bool>)| {
-                let paths = glob_paths(&pattern);
+            move |lua, (pattern, _nosuf, list): (String, Option<bool>, Option<bool>)| {
+                let paths = glob_paths(&pattern, resolve_lua_fs(&sh).as_ref());
                 if list.unwrap_or(false) {
                     Ok(mlua::Value::Table(lua.create_sequence_from(paths)?))
                 } else {

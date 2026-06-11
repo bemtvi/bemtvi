@@ -116,6 +116,19 @@ injection (rejects `-`-leading host/user, shell-quotes the remote command,
 `--`-terminates ssh options). See
 [the remote-SSH plan](plans/2026-06-09-remote-ssh-client.md).
 
+The **inverse** topology — the *edit-host / daemon split*, where the editor + Lua
+run locally and only an `nxvim --daemon` serving fs/process lives on the remote —
+is being built behind host seams (`nxvim_core::HostFs`, `nxvim_server::HostProc`,
+and the Lua-facing `nxvim_lua::LuaFs`); see
+[the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
+**split-brain filesystem rule** for the Lua bridge, decided up front: *project-facing*
+fs APIs (`vim.uv.fs_*`, `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
+through the `LuaFs` seam — local disk by default, the remote daemon in a split — so
+telescope previewers, root detection, and gitsigns see the *project*; while raw Lua
+`io.*`/`os.*`, `require`/`package.path`, the runtimepath (`nvim_get_runtime_file`), and
+`stdpath` stay **local** — plugins and their caches live on the local machine by design
+(the divergence from VS Code's remote-extension-host model).
+
 ### Async design
 
 Both sides run on single-threaded tokio runtimes (the editor core, like

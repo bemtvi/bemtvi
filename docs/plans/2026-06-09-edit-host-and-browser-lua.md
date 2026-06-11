@@ -1082,6 +1082,65 @@ breaker respawns, and the editor stays fully responsive throughout. Regression-c
 `nxvim-gui`) leave `lsp_transport: None` and spawn servers locally, unchanged. (`clipboard.rs`
 stays local-by-topology, struck under 3c.)
 
+### Phase 3p — the Lua-visible filesystem seam (`LuaFs`, the project-facing fs surface) — ✅ DONE (2026-06-11)
+
+The cross-cutting semantic the *Lua-visible filesystem semantics* bullet below named "the
+hardest one": plugins read the *project* through `vim.uv.fs_*` and a handful of `vim.fn` fs
+builtins, which bound **directly** to `std::fs` (~22 sites in `nxvim-lua/uvfs.rs`, plus
+`install.rs`/`host.rs`). In a daemon session that silently hits the *local* machine — the
+wrong filesystem — so telescope previewers, LSP `root_dir` detection, and gitsigns would
+see the wrong tree. This slice routes that surface through a synchronous **`LuaFs` seam**
+(the fs analogue of Phase 3n's `BlockingSystem`), with a daemon **blocking bridge** so a
+plugin reads the *remote* project. The **split-brain routing rule was decided up front, not
+plugin-by-plugin** (the bullet's demand).
+
+**The rule (now in `architecture.md` and the `luafs.rs` header):** vim-level *project-facing*
+fs APIs route through `LuaFs`; raw Lua `io.*`/`os.*`, `require`/`package.path`,
+`nvim_get_runtime_file` (runtimepath = local plugins), `vim._read_file` (sources an
+`lsp/<name>.lua` *config*), `vim.fn.mkdir` (overwhelmingly a `stdpath`-rooted local data/state
+dir), and `stdpath` all stay **local** — plugins and their caches live on the local machine
+by design (the divergence from VS Code's remote-extension-host topology).
+
+Shipped:
+- **The seam** (`nxvim-lua/src/luafs.rs`): a synchronous object-safe `trait LuaFs` covering the
+  whole surface — fd-level `open`/`read`/`write`/`close`/`fstat` (open files are opaque `i64`
+  **fd tokens** the impl mints and owns, so the *daemon* holds the real `File`), `stat`/`lstat`/
+  `scandir` (materialized in one call — the libuv iterator handle is reconstructed locally over
+  the `Vec`, one round-trip per dir), every mutation (`mkdir`/`rmdir`/`unlink`/`rename`/
+  `copyfile`/`utime`), `access`/`realpath`/`read_file`/`which`. `StdLuaFs` is today's `std::fs`
+  logic factored verbatim behind the seam (the fd table moved from a `uvfs.rs` `thread_local!`
+  into a `Mutex`-guarded instance field, so it is `Send + Sync` and doubles as the daemon-side
+  backend); a bare/local session is byte-for-byte unchanged.
+- **Wiring** (mirroring `blocking_system`): `Shared::lua_fs: Option<Rc<dyn LuaFs>>` resolved by
+  `resolve_lua_fs` (lazily installs the persistent local default so fd state outlives a call),
+  `LuaRuntime::set_lua_fs`, `ServerInit::lua_fs: Option<Box<dyn LuaFs + Send>>` rebuilt `Box → Rc`
+  on the server thread. `uvfs.rs` / `install.rs` / `host.rs` route their project-facing closures
+  through it.
+- **The wire** (`nxvim-server/daemon.rs`, alongside the sys leg): one `luafs` request carrying
+  `["op", args…]` → `["ok", payload] | ["err", msg]`, with `RemoteLuaFs` (the edit-host side, a
+  `LuaFs`) the blocking bridge — a dedicated link thread owns the wire + its own runtime, each
+  call parks the Lua thread on the reply (`std` channel, so the park can't starve the reader) —
+  and `serve_luafs_daemon` running each op through the daemon's real `StdLuaFs` on `spawn_blocking`
+  (it owns the fd table the tokens index).
+
+**Scoped out (next slices, not silent gaps):** the short-TTL stat/exists cache the bullet pairs
+with the routing (deferred — correctness first); the `nxvim --daemon` binary + ssh transport that
+ties every leg together; and the *paths-are-remote-paths* concern (`getcwd` stays the local cwd —
+the path-space split is its own bullet).
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_luafs.rs`: an editor whose `lua_fs` is a
+`RemoteLuaFs` talking to a `serve_luafs_daemon` over an in-process duplex, backed by a virtual
+in-memory fs serving `/virtual/...` content that exists on no real disk. `vim.uv.fs_stat` returns
+the daemon's size + sentinel mtime (a local stat would be nil); `fs_open`+`fs_read`+`fs_close`
+round-trips the remote fd token; `fs_scandir` enumerates the daemon dir; `vim.fn.readblob`/
+`filereadable`/`executable`/`exepath` resolve against the daemon (the tool is not on the local
+PATH); `fs_mkdir` mutates the daemon store, observable on a follow-up stat; distinct paths echo
+distinct sizes (reacts to input). Two controls: dropping the injection flips every `/virtual/...`
+probe to a local miss, and a local-`StdLuaFs` test round-trips write/read/stat/mkdir/scandir against
+a real temp dir (the refactor is behavior-preserving). Regression-clean — full `cargo test
+--workspace` green (the plenary-heavy `plugin_compat`/`telescope_e2e` suites included), fmt +
+clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -1144,10 +1203,12 @@ all three.
   listing in Phase 3g, **`:tabnew` / LSP go-to** in Phase 3h, and the multi-buffer
   **`:wall` / `:wqa` / `:xa`** in Phase 3m — every buffer-open path *and* every write path
   is now off-tick, behind one shared kernel. **The fs leg, the watch leg (3i–3l), the
-  blocking `vim._system` (Phase 3n), and the LSP leg (Phase 3o) are all complete**; what
-  remains for the full split is the daemon binary / ssh transport and the Lua-visible fs
-  semantics below.)
-- **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
+  blocking `vim._system` (Phase 3n), the LSP leg (Phase 3o), and the Lua-visible fs surface
+  (Phase 3p) are all complete**; what remains for the full split is the daemon binary / ssh
+  transport and the path-space + cache follow-ups noted below.)
+- **Lua-visible filesystem semantics — the hardest one. ✅ DONE — Phase 3p above** (the
+  `LuaFs` seam + `luafs` wire; the short-TTL stat/exists cache and the `getcwd`/path-space
+  half are deferred follow-ups). The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call
   sites), `vim.fn.readfile` / `readdir` / `glob` / `filereadable` /

@@ -47,8 +47,9 @@ pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
 pub use daemon::{
-    serve_daemon, serve_fs_daemon, serve_lsp_daemon, serve_sys_daemon, FsRead, HostFsAsync,
-    RemoteBlockingSystem, RemoteHostFs, RemoteHostProc, RemoteLspTransport, WatchEvent,
+    serve_daemon, serve_fs_daemon, serve_luafs_daemon, serve_lsp_daemon, serve_sys_daemon, FsRead,
+    HostFsAsync, RemoteBlockingSystem, RemoteHostFs, RemoteHostProc, RemoteLspTransport,
+    RemoteLuaFs, WatchEvent,
 };
 
 use evloop::EventLoop;
@@ -145,6 +146,19 @@ pub struct ServerInit {
     /// so it rides [`ServerInit`] onto the server's own thread, where it is rebuilt into
     /// the shared `Arc<dyn LspTransport>` the [`LspManager`] holds.
     pub lsp_transport: Option<Box<dyn nxvim_lsp::LspTransport + Send>>,
+    /// The backend the **project-facing** Lua filesystem surface (`vim.uv.fs_*`,
+    /// `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) runs through. `None`
+    /// (the default) hits the local disk via the persistent
+    /// [`StdLuaFs`](nxvim_lua::StdLuaFs); the edit-host split injects a daemon-backed
+    /// [`RemoteLuaFs`] here so a plugin reads the *remote* project (telescope previews,
+    /// LSP `root_dir` detection, gitsigns) instead of the local machine
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → *The full split*,
+    /// *Lua-visible filesystem semantics*). Like [`blocking_system`](Self::blocking_system)
+    /// it is a synchronous blocking bridge: each call parks the editor thread on the
+    /// daemon reply, its wire's RPC tasks on their own thread. `Send` (boxed) so it rides
+    /// [`ServerInit`] onto the server thread, where it is rebuilt into the Lua runtime's
+    /// `Rc<dyn LuaFs>`.
+    pub lua_fs: Option<Box<dyn nxvim_lua::LuaFs + Send>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -571,6 +585,16 @@ where
         let sys: Rc<dyn nxvim_lua::BlockingSystem + Send> = Rc::from(sys);
         let sys: Rc<dyn nxvim_lua::BlockingSystem> = sys;
         lua.set_blocking_system(sys);
+    }
+    // The project-facing Lua filesystem surface (`vim.uv.fs_*` / `vim.fn` fs builtins)
+    // runs through this seam — the local disk by default, or an injected daemon bridge
+    // so a plugin sees the *remote* project. Rebuilt here, on the server thread, into the
+    // Lua runtime's `Rc<dyn LuaFs>` (the same `Send`-dropping two-step). `None` leaves the
+    // default persistent local `StdLuaFs` in place — a bare/local session is unchanged.
+    if let Some(fs) = init.lua_fs {
+        let fs: Rc<dyn nxvim_lua::LuaFs + Send> = Rc::from(fs);
+        let fs: Rc<dyn nxvim_lua::LuaFs> = fs;
+        lua.set_lua_fs(fs);
     }
     // Language servers are spawned through this transport — real local children by
     // default, or an injected daemon-backed tunnel. Rebuilt here, on the server thread,

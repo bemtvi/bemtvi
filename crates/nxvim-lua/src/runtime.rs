@@ -382,6 +382,27 @@ pub(crate) struct Shared {
     /// returns the child's output inline, not on a later tick. `!Send`, like the rest
     /// of [`Shared`], which lives only on the server's single thread.
     pub(crate) blocking_system: Option<Rc<dyn crate::BlockingSystem>>,
+    /// The backend the **project-facing** Lua filesystem surface (`vim.uv.fs_*`,
+    /// `vim.fn.readfile`/`glob`/`filereadable`/…) runs through. `None` (the default)
+    /// resolves to a persistent local [`StdLuaFs`](crate::StdLuaFs) via
+    /// [`resolve_lua_fs`]; a daemon session injects a blocking bridge
+    /// ([`set_lua_fs`](LuaRuntime::set_lua_fs)) so those calls hit the *remote* project
+    /// where the files live. Held here (not a `LoopOp`) because the calls are
+    /// synchronous — they return their value inline on the Lua tick. `!Send`, like the
+    /// rest of [`Shared`]. The first resolve installs the default so fd state (an
+    /// `fs_open` handle read back by `fs_read`) persists across calls.
+    pub(crate) lua_fs: Option<Rc<dyn crate::LuaFs>>,
+}
+
+/// Resolve the active [`LuaFs`](crate::LuaFs): the injected daemon bridge, or a
+/// persistent local [`StdLuaFs`](crate::StdLuaFs) lazily installed on first use (so the
+/// open-fd table outlives a single call). Project-facing `vim.uv`/`vim.fn` fs closures
+/// call this, mirroring how `vim._system` resolves `blocking_system`.
+pub(crate) fn resolve_lua_fs(shared: &Rc<RefCell<Shared>>) -> Rc<dyn crate::LuaFs> {
+    let mut sh = shared.borrow_mut();
+    sh.lua_fs
+        .get_or_insert_with(|| Rc::new(crate::StdLuaFs::new()))
+        .clone()
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -522,6 +543,15 @@ impl LuaRuntime {
     /// runs on the remote where the project files live.
     pub fn set_blocking_system(&self, sys: Rc<dyn crate::BlockingSystem>) {
         self.shared.borrow_mut().blocking_system = Some(sys);
+    }
+
+    /// Inject the backend the **project-facing** Lua filesystem surface runs through —
+    /// the daemon's blocking fs bridge. Without this the default persistent local
+    /// [`StdLuaFs`](crate::StdLuaFs) is used (a bare/local session is unchanged). The
+    /// server calls this once at startup when a daemon is present, so `vim.uv.fs_*` /
+    /// `vim.fn.readfile` / root detection see the *remote* project, not the local disk.
+    pub fn set_lua_fs(&self, fs: Rc<dyn crate::LuaFs>) {
+        self.shared.borrow_mut().lua_fs = Some(fs);
     }
 
     /// Run a Lua chunk. Errors are returned for the server to surface.

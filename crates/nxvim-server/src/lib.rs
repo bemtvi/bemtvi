@@ -19,6 +19,7 @@ mod clipboard;
 mod daemon;
 mod decoration;
 mod dispatch;
+mod edithost;
 mod effects;
 mod evloop;
 mod excmd;
@@ -62,6 +63,7 @@ pub use daemon::{
 /// mints the identity/token and resolves the bound address (for an ephemeral `:0` port).
 pub use quic::{bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo};
 
+use edithost::{HostEffects, NativeEffects};
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};
 use lsp::{
@@ -73,7 +75,7 @@ use nxvim_core::{
 };
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
-use nxvim_rpc::{connect, Incoming, Rpc};
+use nxvim_rpc::{connect, Incoming};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -248,7 +250,13 @@ type WindowRect = (WindowId, (usize, usize, usize, usize));
 struct Server {
     editor: Editor,
     lua: LuaRuntime,
-    rpc: Rpc,
+    /// The outbound async-effect seam (Phase 4, Open Decision #6 (a)): the editor
+    /// tick pushes redraws / notifications / responses to the client and hands
+    /// timer / process / watch commands to the event-loop actor *through* this,
+    /// never touching the [`Rpc`] or [`EventLoop`] directly. [`NativeEffects`] is
+    /// today's behavior verbatim; the wasm build swaps in a JS-interop + daemon-link
+    /// implementor. See [`edithost`].
+    fx: Box<dyn HostEffects>,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
     /// Per-buffer highlight memo, keyed by buffer id (created lazily on first
@@ -350,10 +358,6 @@ struct Server {
     /// `Server::input` runs every key through before `editor.input`. Rebuilt from
     /// `vim._keymaps` when its version advances (checked once per input batch).
     keymaps: Keymaps,
-    /// The async Lua runtime's background actor (timers + child processes). Cheap
-    /// to hold; its task spawns lazily on the first timer/`vim.system`. Commands go
-    /// out fire-and-forget; completions return as [`LoopEvent`]s on a `select!` arm.
-    evloop: EventLoop,
     /// Callback ids queued by `vim.schedule`, drained inside `run_pending` so a
     /// scheduled fn runs at the end of the current convergence (not nested in its
     /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
@@ -661,7 +665,10 @@ where
     let mut server = Server {
         editor,
         lua,
-        rpc,
+        // The native outbound-effect seam: the client wire ([`Rpc`]) and the
+        // event-loop actor ([`EventLoop`]) the editor tick fires commands at. The
+        // wasm build (Phase 5) swaps a JS-interop + daemon-link implementor here.
+        fx: Box::new(NativeEffects::new(rpc, evloop)),
         ui: None,
         syntax_states: HashMap::new(),
         ts_resolved_langs: HashSet::new(),
@@ -689,7 +696,6 @@ where
         last_tab_id: None,
         known_tabs: Vec::new(),
         keymaps: Keymaps::default(),
-        evloop,
         scheduled: VecDeque::new(),
         buf_mirror_ticks: HashMap::new(),
         buf_mirror_lines: HashMap::new(),
@@ -817,7 +823,7 @@ where
                 let Some(message) = message else { break };
                 server.handle(message).await;
                 if server.editor.should_quit {
-                    server.rpc.notify("nxvim_exit", vec![]);
+                    server.fx.notify("nxvim_exit", vec![]);
                     break;
                 }
             }
@@ -881,7 +887,7 @@ where
                 }
                 server.settle_events(true);
                 if server.editor.should_quit {
-                    server.rpc.notify("nxvim_exit", vec![]);
+                    server.fx.notify("nxvim_exit", vec![]);
                     break;
                 }
             }

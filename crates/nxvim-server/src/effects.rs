@@ -1082,36 +1082,36 @@ impl Server {
                 id,
                 delay_ms,
                 repeat_ms,
-            } => self.evloop.send(LoopCommand::TimerStart {
+            } => self.fx.loop_command(LoopCommand::TimerStart {
                 id,
                 delay: std::time::Duration::from_millis(delay_ms),
                 repeat: std::time::Duration::from_millis(repeat_ms),
             }),
-            LoopOp::TimerStop { id } => self.evloop.send(LoopCommand::TimerStop { id }),
+            LoopOp::TimerStop { id } => self.fx.loop_command(LoopCommand::TimerStop { id }),
             LoopOp::Spawn {
                 id,
                 cmd,
                 cwd,
                 env,
                 stdin,
-            } => self.evloop.send(LoopCommand::Spawn {
+            } => self.fx.loop_command(LoopCommand::Spawn {
                 id,
                 argv: cmd,
                 cwd,
                 env,
                 stdin,
             }),
-            LoopOp::Kill { id } => self.evloop.send(LoopCommand::Kill { id }),
+            LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
             LoopOp::FsEventStart {
                 id,
                 path,
                 recursive,
-            } => self.evloop.send(LoopCommand::FsEventStart {
+            } => self.fx.loop_command(LoopCommand::FsEventStart {
                 id,
                 path,
                 recursive,
             }),
-            LoopOp::FsEventStop { id } => self.evloop.send(LoopCommand::FsEventStop { id }),
+            LoopOp::FsEventStop { id } => self.fx.loop_command(LoopCommand::FsEventStop { id }),
         }
     }
 
@@ -1274,7 +1274,7 @@ impl Server {
                 // Navigable LSP location lists (diagnostics, references) jump in
                 // the core itself when their target line is selected, so they
                 // never reach here — only scripted/RPC select panels do.
-                self.rpc.notify(
+                self.fx.notify(
                     "nxvim_panel_select",
                     vec![Value::Map(vec![
                         (Value::from("index"), Value::from(index as u64 + 1)),

@@ -177,7 +177,7 @@ impl Server {
             (Value::from("pmenu"), pmenu),
         ];
 
-        self.rpc.notify("redraw", vec![Value::Map(map)]);
+        self.fx.notify("redraw", vec![Value::Map(map)]);
     }
 
     /// Project one window into its redraw sub-map: the rect and focus flag, the

@@ -31,8 +31,8 @@ impl Server {
         match message {
             Incoming::Request { id, method, params } => {
                 match self.dispatch(&method, &params) {
-                    Ok(value) => self.rpc.respond(id, Ok(value)),
-                    Err(err) => self.rpc.respond(id, Err(Value::from(err))),
+                    Ok(value) => self.fx.respond(id, Ok(value)),
+                    Err(err) => self.fx.respond(id, Err(Value::from(err))),
                 }
                 // Typeahead a dispatched method queued via `nvim_feedkeys` (e.g. an
                 // `nvim_exec_lua` / `nvim_command` chunk that fed keys) is processed

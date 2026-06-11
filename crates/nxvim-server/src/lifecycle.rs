@@ -368,7 +368,7 @@ impl Server {
         // existing id replaces its watch, so a re-arm needs no explicit stop).
         for (id, key) in &want {
             if self.buf_watches.get(id) != Some(key) {
-                self.evloop.send(LoopCommand::FsEventStart {
+                self.fx.loop_command(LoopCommand::FsEventStart {
                     id: INTERNAL_WATCH_BASE + id.0,
                     path: key.0.to_string_lossy().into_owned(),
                     recursive: false,
@@ -384,7 +384,7 @@ impl Server {
             .copied()
             .collect();
         for id in stale {
-            self.evloop.send(LoopCommand::FsEventStop {
+            self.fx.loop_command(LoopCommand::FsEventStop {
                 id: INTERNAL_WATCH_BASE + id.0,
             });
             self.buf_watches.remove(&id);

@@ -109,7 +109,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | 🚧 |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a done, 4b–4e remain) |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
@@ -1597,6 +1597,69 @@ demo gets **deleted** when that lands. The fail-loud process/fs/clipboard hatche
 (this phase's third bullet) are also still to wire — deferred until the wasm runtime
 exists to exercise them (Phase 5).
 
+### Phase 4-proper — extract the reusable sync `EditHost` (Open Decision #6 (a))
+
+The "extract the sync edit-host" refactor, resolved to **option (a)** (2026-06-11):
+pull the synchronous tick out of `impl Server` into a reusable `EditHost` whose
+**only** reach into async/external machinery is through a `HostEffects` trait. Native
+`Server` becomes the trait's implementor (today's tokio/RPC/LSP machinery, verbatim);
+the wasm Worker (Phase 5) supplies a JS-interop + daemon-link implementor. The
+empirical anchor (Open Decision #6): the wasm blocker is the **dependency tree**, not
+`nxvim-server`'s own source — so the work is *moving the I/O behind a seam*, not
+rewriting the editor.
+
+**The seam, sliced from the small side.** `self.editor` / `self.lua` are touched at
+**~530 sites**; relocating them wholesale would be enormous churn with zero
+architectural payoff. So the extraction grows from the *small* side — the **bounded set
+of outbound async effects** the tick fires — not by moving the editor out of `Server`.
+The full effect surface, mapped from the code, is just five classes: the **client wire**
+(`rpc.notify`/`respond` — redraw + notifications + responses, ~5 sites), the
+**event-loop commands** (`evloop.send` — timers/proc/watch, ~8 sites, all in
+`apply_loop_op` + `sync_buffer_watches`), **off-tick fs** (`host_fs_async` / `open_tx` /
+`save_done_tx`), **LSP** (the `lsp/` submodules), and **TSInstall** (1 site). Each
+becomes a `HostEffects` method group in its own slice; the inbound events they generate
+(a child exited, a file fetched, an LSP reply) stay owned by the run loop's `select!`
+and feed editor-tick methods — that *inbound* seam is its own later slice.
+
+#### Phase 4a — the `HostEffects` seam: wire + event-loop commands — ✅ DONE (2026-06-11)
+
+The first brick: define `trait HostEffects` (`crates/nxvim-server/src/edithost.rs`) and
+route the two cleanest, fully self-contained **outbound** effects through it — the
+client wire (`notify` / `respond`) and the event-loop command sink (`loop_command`).
+`Server` no longer holds `rpc: Rpc` or `evloop: EventLoop`; it holds
+`fx: Box<dyn HostEffects>`, and every tick emit site goes through `self.fx`.
+`NativeEffects` (the sole implementor) owns the `Rpc` and the `EventLoop` and is today's
+behavior **verbatim** — routing `loop_command` through `EventLoop::send` (not a bare
+cloned sender) preserves the "no actor task until first command" laziness. The daemon
+link's own `Rpc` uses (the `Remote*` structs in `daemon.rs`) are a *different* transport
+and untouched.
+
+**Exit criteria — met.** Pure indirection, zero behavior change, guarded by the existing
+suite: `cargo build` + `fmt --check` + `clippy -D warnings` clean; the full
+`nxvim-server` + `nxvim` suites (41 binaries, **1179 tests**) green, including `editing`
+(570 — the redraw/respond wire path), `uv_process` (the evloop timer/process command
+path), and `daemon_proc` / `daemon_watch` (the proc/watch command path) — exactly the
+seam this slice routes; `nxvim-gui` (the other `run_io` consumer) builds. The
+`HostEffects` surface grows in the next slices (off-tick fs, LSP, TSInstall) before the
+sync tick is hoisted off `Server` onto `EditHost` proper.
+
+**Deferred to the next 4-proper slices (deliberately, not stubbed — only what's wired
+lives on the trait):**
+- **4b — off-tick fs effects** (`host_fs_async` read/write/watch, the `open_tx` /
+  `save_done_tx` deliveries) behind `HostEffects` (the request/response + watch-push
+  legs Phase 3 built; here their *outbound* side joins the seam).
+- **4c — LSP effects** (the `lsp/` submodules' `self.lsp.*` command surface) behind the
+  trait; the inbound `lsp_events` stays in the run loop.
+- **4d — the inbound seam**: editor-tick `on_*` methods consuming the `select!` arms'
+  events (`on_loop_event`, `apply_open`, `apply_save_done`, `on_lsp_event`,
+  `on_remote_file_changed`, `on_install_done`) so the run loop is a thin translator.
+- **4e — hoist the tick onto `EditHost`**: move the sync state + tick methods off
+  `Server` onto a standalone `EditHost { editor, lua, … }` that holds
+  `&mut dyn HostEffects`; `Server` shrinks to *the* native `HostEffects` impl + the
+  transports + the `select!` loop. Then the wasm cdylib (Phase 5) constructs an
+  `EditHost` with a wasm `HostEffects` and **the throwaway `nxvim-edithost-demo` is
+  deleted**.
+
 ---
 
 ## Phase 5 — wasm edit-host: Worker + blocking input + JS interop
@@ -1832,21 +1895,24 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    for the blocking `vim._system`** (the `BlockingSystem` seam + `sys_run` wire +
    dedicated-link-thread park, exactly this mechanism); the Lua-visible sync fs
    calls reuse the same bridge when the Lua-visible fs-semantics slice lands.
-6. **How the wasm edit-host gets the editor+Lua sync tick** (Phase 4/5) — the
-   tick (`dispatch` → `run_pending` → `apply_lua_effects` + the mirrors) is
-   synchronous but lives in `impl Server`, entangled with the async fields
-   (`tokio` net→`mio`, `notify`, `nxvim-lsp` subprocess, `nxvim-ts`). Three shapes:
+6. **How the wasm edit-host gets the editor+Lua sync tick** (Phase 4/5) —
+   **RESOLVED (2026-06-11): (a) — extract a reusable sync `EditHost` from `Server`,
+   async effects behind a `HostEffects` trait.** The tick (`dispatch` →
+   `run_pending` → `apply_lua_effects` + the mirrors) is synchronous but lived in
+   `impl Server`, entangled with the async fields (`tokio` net→`mio`, `notify`,
+   `nxvim-lsp` subprocess, `nxvim-ts`). Three shapes were on the table:
    **(a) extract a reusable sync `EditHost`** from `Server` with async effects
    behind a trait — the blessed architecture (it *is* the "full split" seam, serving
-   both native latency in Phase 3 and wasm here), but the largest refactor;
+   both native latency in Phase 3 and wasm here), the largest refactor but the only
+   one with **no tokio in the Worker** and **one sync core for native + wasm**;
    **(b) gate `nxvim-server` itself to wasm** (target-off `net`/`process`, native
    deps non-wasm, current-thread tokio in the Worker) — reuses all glue but keeps
    tokio in the Worker, against this plan's grain; **(c) a minimal fresh cdylib**
-   reimplementing a crude tick. **Interim decision (2026-06-10): (c), as a
-   throwaway, to de-risk first** — `crates/nxvim-edithost-demo` (above) proved
-   core+Lua-in-wasm by behavior. The empirical finding that makes (a)/(b) tractable:
-   the wasm blocker is the **dependency tree** (`mio`/net, `notify`, lsp, ts), not
-   `nxvim-server`'s own source, which produced *zero* errors before the build died
-   at `mio`. **Still to resolve: (a) vs (b) for the real edit-host.** (a) is
-   recommended — no tokio in the Worker, one sync core for native + wasm.
+   reimplementing a crude tick (the throwaway `crates/nxvim-edithost-demo`, which
+   proved core+Lua-in-wasm by behavior — the *interim* 2026-06-10 de-risking step,
+   now superseded). The empirical finding that makes (a) tractable: the wasm blocker
+   is the **dependency tree** (`mio`/net, `notify`, lsp, ts), not `nxvim-server`'s own
+   source, which produced *zero* errors before the build died at `mio`. **(a) chosen**
+   — the slice plan is *Phase 4-proper* below. The throwaway demo gets deleted when the
+   real `EditHost` lands.
 ```

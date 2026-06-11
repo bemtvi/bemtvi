@@ -1141,7 +1141,35 @@ a real temp dir (the refactor is behavior-preserving). Regression-clean — full
 --workspace` green (the plenary-heavy `plugin_compat`/`telescope_e2e` suites included), fmt +
 clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
 
-### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream)
+### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — 🚧 daemon side DONE (2026-06-11)
+
+**Status (2026-06-11): the daemon half shipped; the edit-host multiplexer + ssh hop
+are the next slice.** The scoping question at the foot of this section is resolved in
+favor of *daemon-side first*: `nxvim --daemon` + `run_daemon_io` + the `serve_*_on`
+extraction + an end-to-end test against the **real binary** landed; the edit-host-side
+multiplexer (which must collapse the `sys_run`/`luafs` blocking-bridge threads onto one
+shared link) lands with the ssh transport, since that's where a single real connection
+is first driven from a live editor. What shipped:
+- **The `serve_*_on` extraction** (`daemon.rs`): each `serve_*` is now `connect()` +
+  a connection-agnostic `serve_*_on(rpc, incoming, deps)` (its loop verbatim); the
+  `serve_*(reader, writer, deps)` wrappers stay, so the six per-leg suites (30 tests)
+  pass **unchanged** — the extraction is pure inversion.
+- **`run_daemon_io`** (`lib.rs`): `connect` once, fan each inbound message to its leg's
+  `*_on` by method namespace (`fs_*` / `proc_*` / `sys_run` / `lsp_*` / `luafs` —
+  disjoint), every leg backed by the same `Std*` impl the local server uses; EOF winds
+  the legs down and reaps children.
+- **`--daemon`** in `main.rs` → `run_daemon()` (a current-thread runtime over
+  stdin/stdout, no `ServerInit`, no config), checked before `--server`.
+- **`crates/nxvim/tests/daemon_stdio.rs`** drives the **real** `nxvim --daemon` binary,
+  exercising three namespaces over one connection (an `fs_read`/`fs_write` round-trip
+  issued *while a `proc_spawn` is in flight*, plus a `luafs read_file`) — proving the
+  classes coexist demuxed without cross-talk, with byte/stdout round-trips a stub
+  couldn't invent. Full `cargo test --workspace` green (83 binaries); fmt + clippy
+  `-D warnings` clean; local binaries unchanged.
+
+Still to do (the ssh slice): the edit-host-side multiplexer + `connect_daemon`, the
+`ssh … nxvim --daemon` wiring (reusing `crates/nxvim-gui/src/remote.rs`), and the
+manual no-per-keystroke-latency check. The design below stands.
 
 The slice that **ties every leg together**. Phases 3c–3p each built a wire leg and
 proved it over its *own* `tokio::io::duplex`; this one stands up the actual
@@ -1258,12 +1286,16 @@ exit-criteria sentences below.
   channels per `HostProc`, or a non-ssh QUIC listener) — one ordered stdio stream with
   msgpack framing is the v1.
 
-**Open scoping question (settle before coding).** Whether 3q covers **both**
-multiplexers (daemon + edit-host, tested by the real-binary round-trip above —
-*recommended*, since the daemon demux can't be tested faithfully without an edit-host
-feeding it over one stream, and it directly delivers *The full split*'s "drives a local
-edit-host against a daemon" criterion) **or** the daemon side alone (tested by driving
-raw rpc frames like `stdio_server.rs`, pushing the edit-host demux into the ssh slice).
+**Scoping question — RESOLVED (2026-06-11): daemon side alone, this slice.** The
+daemon demux *can* be tested faithfully without the edit-host multiplexer — a raw
+`nxvim_rpc` client over one stream drives three namespaces (request/response replies are
+msgid-routed inside `Rpc`, proc notifications arrive on `incoming`), which is exactly
+what `daemon_stdio.rs` does against the real binary. The edit-host-side multiplexer is
+deferred to the ssh slice not for testability but because it entails a real change to
+the blocking-bridge threading model (collapsing the `sys_run`/`luafs` dedicated link
+threads onto one shared connection), and that's first *exercised* by a live editor over
+ssh — so it belongs there, with *The full split*'s "drives a local edit-host against a
+daemon" criterion.
 
 ### The full split
 

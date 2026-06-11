@@ -1327,6 +1327,18 @@ impl LuaRuntime {
         f.call(args)
     }
 
+    /// Run a `:com[mand][!]` ex-command through the prelude driver
+    /// (`vim._ex_command`): parse the `[attrs] {Name} {repl}` line and register a
+    /// user command (global, or buffer-local with `-buffer`) into the same
+    /// `vim._user_commands` store the API uses. `bang` is the replace-existing
+    /// `!`; `args` is the remainder after the command name; `bufnr` is the current
+    /// buffer (for a `-buffer` command). Returns `""` on success, a one-line
+    /// `E…` error, or a newline-joined listing for a bare `:command`.
+    pub fn ex_command(&self, bang: bool, args: &str, bufnr: u64) -> mlua::Result<String> {
+        let f: mlua::Function = self.vim()?.get("_ex_command")?;
+        f.call((bang, args, bufnr))
+    }
+
     /// Whether any decoration provider is registered
     /// (`nvim_set_decoration_provider`). The server checks this once per redraw to
     /// skip the whole provider-driving path (and its buffer-mirror push) on the
@@ -1406,7 +1418,9 @@ impl LuaRuntime {
     /// return the new handle synchronously while the real window is created when
     /// the queued op drains). `mode` is the editor's current `mode()` short code
     /// (`"n"`/`"i"`/`"v"`/…), stored as `vim._cur_mode` so a `%{}` statusline
-    /// expression reading `vim.fn.mode()` reflects this frame.
+    /// expression reading `vim.fn.mode()` reflects this frame. `cmdtype` is the
+    /// open command line's type char (`:` / `/` / `?` / `@`, or `""` when none is
+    /// open), stored as `vim._cur_cmdtype` for `vim.fn.getcmdtype()`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,
@@ -1416,6 +1430,7 @@ impl LuaRuntime {
         wins: &[WindowMirror],
         next_win: u64,
         mode: &str,
+        cmdtype: &str,
     ) -> mlua::Result<()> {
         let vim = self.vim()?;
         let entries = self.lua.create_table()?;
@@ -1427,7 +1442,9 @@ impl LuaRuntime {
         // float included.
         let win_arr = self.to_lua(wins)?;
         let set: mlua::Function = vim.get("_set_buf_mirror")?;
-        set.call((entries, cursor.0, cursor.1, win, win_arr, next_win, mode))
+        set.call((
+            entries, cursor.0, cursor.1, win, win_arr, next_win, mode, cmdtype,
+        ))
     }
 
     /// Refresh the Rust→Lua extmark mirror (`vim._extmarks[bufnr][ns][id]`) that

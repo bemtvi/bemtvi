@@ -228,6 +228,94 @@ async fn unknown_command_still_reports_the_standard_error() {
     );
 }
 
+#[tokio::test]
+async fn getcmdtype_reflects_the_active_command_line() {
+    // `vim.fn.getcmdtype()` returns the type character of the open command line
+    // (`:` ex, `/`/`?` search) or `""` when none is open. nvim-treesitter-context
+    // calls it from a scheduled callback to skip work while the user is typing a
+    // command. The value is mirrored from the editor's live cmdline state each
+    // chunk, so a Lua read mid-command-line reflects this frame.
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getcmdtype()").await.as_str(),
+        Some(""),
+        "getcmdtype() is empty when no command line is open"
+    );
+
+    feed(&rpc, ":");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getcmdtype()").await.as_str(),
+        Some(":"),
+        "an open `:` ex command line reports ':'"
+    );
+
+    feed(&rpc, "<Esc>/");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getcmdtype()").await.as_str(),
+        Some("/"),
+        "an open `/` forward search reports '/'"
+    );
+
+    feed(&rpc, "<Esc>?");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getcmdtype()").await.as_str(),
+        Some("?"),
+        "an open `?` backward search reports '?'"
+    );
+
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getcmdtype()").await.as_str(),
+        Some(""),
+        "leaving the command line restores the empty getcmdtype()"
+    );
+}
+
+#[tokio::test]
+async fn ex_command_defines_a_user_command() {
+    // `:command! Name {repl}` registers a user command whose replacement runs as
+    // an ex-command on invocation — the way nvim-treesitter and most vimscript
+    // plugins define their commands. Before this, the line failed with
+    // `E492: Not an editor command: command!`, aborting the sourcing plugin.
+    let (rpc, mut incoming) = start(None).await;
+    command(&rpc, "command! Hello echo 'hi there'").await;
+    let map = redraw_after(&rpc, &mut incoming, ":Hello<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("hi there"),
+        ":command should register a user command that runs its replacement"
+    );
+}
+
+#[tokio::test]
+async fn ex_command_expands_q_args_in_the_replacement() {
+    // `<q-args>` in the replacement expands to the (quoted) argument text at
+    // invocation — the common form for forwarding an argument into the command.
+    let (rpc, mut incoming) = start(None).await;
+    command(&rpc, "command! -nargs=1 Say echo <q-args>").await;
+    let map = redraw_after(&rpc, &mut incoming, ":Say boom<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("boom"),
+        "<q-args> should expand to the quoted argument text"
+    );
+}
+
+#[tokio::test]
+async fn ex_command_without_bang_refuses_to_clobber() {
+    // Re-defining an existing command without `!` is E174, matching vim — the
+    // bang is the opt-in to replace. (Plugins always use `command!` for exactly
+    // this reason.)
+    let (rpc, mut incoming) = start(None).await;
+    command(&rpc, "command Once echo 1").await;
+    let map = redraw_after(&rpc, &mut incoming, ":command Once echo 2<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E174: Command already exists: add ! to replace it"),
+        "redefining a command without ! should report E174"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn mkdir_honors_the_permissions_argument() {

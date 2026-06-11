@@ -926,6 +926,7 @@ impl EditHost {
             &wins,
             next_win,
             self.editor.mode.short_code(),
+            self.editor.cmdline_type(),
         );
         let _ = self.lua.set_bo_mirror(&bo);
         let _ = self.lua.set_extmark_mirror(&extmarks);

@@ -114,6 +114,21 @@ impl EditHost {
                 // A fired autocmd may have queued `vim.cmd(...)` / callbacks.
                 self.apply_lua_effects();
             }
+            // `:com[mand][!] [attrs] {Name} {repl}` — define a user command. The
+            // prelude parses the attribute/name/replacement line and registers a
+            // command whose `{repl}` runs as an ex-command on invocation (reusing
+            // the same `vim._user_commands` store the `nvim_*` API uses), so the
+            // many vimscript plugins that define their commands this way load. A
+            // bare `:command` lists the defined commands (multi-line → panel).
+            _ if is_command_def(base) => match self.lua.ex_command(bang, args, cur_buf) {
+                Ok(out) if out.is_empty() => {}
+                Ok(out) if out.contains('\n') => {
+                    let lines = out.lines().map(str::to_string).collect();
+                    self.editor.open_panel("User commands", lines, false, 0);
+                }
+                Ok(out) => self.editor.echo(out),
+                Err(e) => self.editor.echo(format!("E5108: Error in :command: {e}")),
+            },
             // `:TSInstall <lang>…` / `:TSUpdate <lang>…` — fetch + compile a
             // treesitter grammar into the data dir (see `nxvim_ts::install`). The
             // guard defers to a real nvim-treesitter plugin: if the user loaded one
@@ -333,4 +348,10 @@ fn is_doautocmd(base: &str) -> bool {
         base,
         "doau" | "doaut" | "doauto" | "doautoc" | "doautocm" | "doautocmd"
     )
+}
+
+/// `:com[mand]` and its abbreviations (`com`, `comm`, … `command`) — the
+/// user-command *definition* command. The minimal form is `com`.
+fn is_command_def(base: &str) -> bool {
+    matches!(base, "com" | "comm" | "comma" | "comman" | "command")
 }

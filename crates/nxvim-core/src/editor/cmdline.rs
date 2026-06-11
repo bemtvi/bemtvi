@@ -46,6 +46,23 @@ impl Editor {
         self.reset_pending();
     }
 
+    /// The type character of the open command line, for `vim.fn.getcmdtype()`:
+    /// `:` for an ex command, `/` / `?` for a forward / backward search, `@` for
+    /// a scripted `input()` / `confirm()` prompt — and `""` when no command line
+    /// is open. `cmdline_kind` lingers after the line closes (it's set on entry,
+    /// not cleared on exit), so the open check gates on the mode, not the kind.
+    pub fn cmdline_type(&self) -> &'static str {
+        if self.mode != Mode::Command {
+            return "";
+        }
+        match self.cmdline_kind {
+            CmdlineKind::Ex => ":",
+            CmdlineKind::Search(SearchDir::Forward) => "/",
+            CmdlineKind::Search(SearchDir::Backward) => "?",
+            CmdlineKind::Prompt | CmdlineKind::Confirm => "@",
+        }
+    }
+
     pub(crate) fn handle_command(&mut self, key: Key) {
         // A `vim.fn.confirm` dialog resolves on a single keypress, not a typed
         // line, so it owns the key ahead of the line-editing path below.

@@ -45,6 +45,9 @@ vim._cur_win = vim._cur_win or 1000
 -- the buffer mirror so vim.fn.mode() (and a %{} statusline expression calling it)
 -- reflects the live mode.
 vim._cur_mode = vim._cur_mode or "n"
+-- The open command line's type char (":"/"/"/"?"/"@", or "" when none is open),
+-- refreshed alongside the buffer mirror so vim.fn.getcmdtype() reflects this frame.
+vim._cur_cmdtype = vim._cur_cmdtype or ""
 -- Per-buffer option store backing vim.bo / nvim_set_option_value (Phase 6); the
 -- table is created here so the earlier-defined setter can index it safely. This
 -- holds *arbitrary* (Lua-only) buffer options plugins set; the wired indentation
@@ -198,8 +201,9 @@ function vim._set_hl_mirror(entries) vim._hl_defs = entries or {} end
 vim._hl_defs_ns = vim._hl_defs_ns or {}
 function vim._set_hl_mirror_ns(by_ns) vim._hl_defs_ns = by_ns or {} end
 
-function vim._set_buf_mirror(entries, row, col, win, wins, next_win, mode)
+function vim._set_buf_mirror(entries, row, col, win, wins, next_win, mode, cmdtype)
   vim._cur_mode = mode or "n"
+  vim._cur_cmdtype = cmdtype or ""
   -- The server omits `lines` for a buffer whose changedtick is unchanged (the
   -- cheap cursor-moved-no-edit path); keep the prior `lines` in that case.
   for bufnr, entry in pairs(entries) do
@@ -675,6 +679,96 @@ function vim._ex_doautocmd(args)
   if event == "" then return "E217: Can't execute autocommands for ALL events" end
   local pattern = rest ~= "" and rest or nil
   vim.api.nvim_exec_autocmds(event, { pattern = pattern })
+  return ""
+end
+
+-- :com[mand][!] [attrs] {Name} {replacement} — define a user command. The
+-- replacement is a verbatim ex-command template, run on invocation with the
+-- common `<…>` escapes expanded against that call's args. It registers into the
+-- same vim._user_commands (or, with -buffer, the current buffer's local) store
+-- the nvim_create_user_command API uses, so a `:command`-defined command and an
+-- API-defined one dispatch identically — which is how most vimscript plugins
+-- define their commands. Returns "" on success, an `E…` error, or a newline-
+-- joined listing for a bare `:command`. `bang` is the replace-existing `!`.
+--
+-- INCOMPLETE vs neovim: attributes other than -buffer are parsed-and-ignored
+-- (the command still registers and runs, just without arg-count / completion
+-- enforcement); the range/count escapes (<line1>/<line2>/<count>) and an
+-- invocation-time <bang> aren't plumbed through user-command dispatch yet, so
+-- they expand to "".
+function vim._ex_command(bang, args, bufnr)
+  local s = vim.trim(args or "")
+  if s == "" then
+    -- Bare `:command`: list the defined command names (global + this buffer's
+    -- locals), one per line. Minimal but real — not a silent no-op.
+    local names = {}
+    for name in pairs(vim._user_commands) do
+      names[#names + 1] = name
+    end
+    local locals = (vim._buf_user_commands or {})[bufnr or 0]
+    if locals then
+      for name in pairs(locals) do
+        names[#names + 1] = name
+      end
+    end
+    if #names == 0 then return "No user commands are defined" end
+    table.sort(names)
+    return "Name\n" .. table.concat(names, "\n")
+  end
+
+  -- Consume leading `-attr[=val]` tokens; only -buffer changes behavior here.
+  local buffer_local = false
+  while true do
+    local attr, rest = s:match("^(%-%S+)%s+(.*)$")
+    if not attr then
+      attr = s:match("^(%-%S+)%s*$")
+      rest = ""
+    end
+    if not attr then break end
+    if attr == "-buffer" then buffer_local = true end
+    s = rest
+  end
+
+  -- The command name (vim requires it to start with an uppercase letter), then
+  -- the verbatim replacement (everything past the first run of whitespace).
+  local name, repl = s:match("^(%S+)%s+(.*)$")
+  if not name then
+    name = s:match("^(%S+)$")
+    repl = ""
+  end
+  if not name or not name:match("^%u") then return "E182: Invalid command name" end
+
+  -- Resolve the target store (global, or this buffer's local table for -buffer),
+  -- then refuse to clobber an existing command unless `!` was given (E174).
+  local store = vim._user_commands
+  if buffer_local then
+    if bufnr == nil or bufnr == 0 then bufnr = vim._cur_buf and vim._cur_buf.bufnr or 0 end
+    vim._buf_user_commands[bufnr] = vim._buf_user_commands[bufnr] or {}
+    store = vim._buf_user_commands[bufnr]
+  end
+  if not bang and store[name] ~= nil then
+    return "E174: Command already exists: add ! to replace it"
+  end
+
+  -- A function body (not a raw string) so the `<…>` escapes are expanded per
+  -- invocation before the resulting ex-command is queued via vim.cmd.
+  store[name] = function(o)
+    local a = o.args or ""
+    local function q(v) return "'" .. tostring(v):gsub("'", "''") .. "'" end
+    local fargs = {}
+    for _, w in ipairs(o.fargs or {}) do
+      fargs[#fargs + 1] = q(w)
+    end
+    local out = repl
+      :gsub("<q%-args>", function() return q(a) end)
+      :gsub("<f%-args>", function() return table.concat(fargs, ", ") end)
+      :gsub("<args>", function() return a end)
+      :gsub("<bang>", function() return o.bang and "!" or "" end)
+      :gsub("<line1>", function() return "" end)
+      :gsub("<line2>", function() return "" end)
+      :gsub("<count>", function() return "" end)
+    vim.cmd(out)
+  end
   return ""
 end
 
@@ -1788,6 +1882,11 @@ end
 -- / sub-state), so mode(1)'s multi-char forms ("no", "niI", …) don't exist here;
 -- the short code is returned for both. Faithful for the modes nxvim has.
 function vim.fn.mode(_expanded) return vim._cur_mode or "n" end
+
+-- vim.fn.getcmdtype(): the type char of the open command line — ":" (ex), "/" or
+-- "?" (search), "@" (a scripted input/confirm prompt) — or "" when none is open.
+-- Read from the vim._cur_cmdtype mirror the server refreshes each chunk.
+function vim.fn.getcmdtype() return vim._cur_cmdtype or "" end
 
 -- vim.fn.line(expr): a buffer line number. "." is the cursor line (1-based), "$"
 -- the last line (the line count). The window-relative forms ("w0"/"w$") need the

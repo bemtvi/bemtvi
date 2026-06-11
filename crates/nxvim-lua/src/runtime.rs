@@ -59,6 +59,27 @@ pub struct WindowMirror {
     pub leftcol: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub float: Option<FloatMirror>,
+    /// This window's jumplist for `vim.fn.getjumplist`, oldest-first. Omitted from
+    /// the table when empty (the common case), so an unused jumplist costs nothing
+    /// across the mirror.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jumps: Vec<JumpMirror>,
+    /// The jumplist navigation pointer (`getjumplist`'s `curidx`): a 0-based index
+    /// into `jumps`, equal to `jumps.len()` when sitting at the present (not
+    /// navigating with `<C-o>`/`<C-i>`).
+    pub jump_idx: u64,
+}
+
+/// One jumplist entry's row in a [`WindowMirror`], pre-shaped into the dict
+/// `vim.fn.getjumplist` returns: `bufnr`, `lnum` (1-based, the server adds the
+/// `+1`), `col` (0-based byte), and `coladd` (always `0` — nxvim has no
+/// `virtualedit`). Serialized by `to_value`, so the field names are the table keys.
+#[derive(Clone, Debug, Serialize)]
+pub struct JumpMirror {
+    pub bufnr: u64,
+    pub lnum: u64,
+    pub col: u64,
+    pub coladd: u64,
 }
 
 /// A floating window's placement for the [`WindowMirror`], pre-formatted into the

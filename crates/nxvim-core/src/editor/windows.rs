@@ -329,6 +329,12 @@ impl WindowTree {
             .expect("current window id is always valid")
     }
 
+    /// Fallible [`get`](Self::get) for an id that may not be open (a window handle
+    /// from outside, e.g. `vim.fn.getjumplist(winid)`).
+    pub(crate) fn try_get(&self, id: WindowId) -> Option<&Window> {
+        self.windows.get(&id)
+    }
+
     pub(crate) fn get_mut(&mut self, id: WindowId) -> &mut Window {
         self.windows
             .get_mut(&id)

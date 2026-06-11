@@ -28,6 +28,12 @@ use super::*;
 /// jump that would overflow drops the oldest entry.
 const JUMPLIST_SIZE: usize = 100;
 
+/// One jumplist entry as `vim.fn.getjumplist` reads it: `(bufnr, line, col)`
+/// with 0-based `line`/`col`. Returned by [`Editor::window_jumplist`] (a flat
+/// tuple rather than [`JumpEntry`], whose `BufferId` doesn't cross the crate
+/// boundary).
+pub type JumpView = (u64, usize, usize);
+
 /// One remembered jump position: which buffer, and the `(line, col)` within it.
 /// Stored per-window on [`Window`](super::Window). The buffer may differ from the
 /// window's current one — a jumplist entry survives a buffer switch — so
@@ -167,6 +173,19 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// Window `id`'s jumplist for `vim.fn.getjumplist`, oldest-first: each entry as
+    /// `(bufnr, line, col)` with 0-based `line`/`col` (the Lua bridge adds neovim's
+    /// 1-based `lnum`), paired with the navigation pointer `curidx` — the index
+    /// `<C-o>` walks back from, equal to `entries.len()` when sitting at the present
+    /// (not navigating), matching vim's `w_jumplistidx`. `None` for an unknown
+    /// window id. Only current-tab windows resolve here, the set the server
+    /// mirrors; an off-tab window is out of reach (as for every `nvim_win_*` read).
+    pub fn window_jumplist(&self, id: WindowId) -> Option<(Vec<JumpView>, usize)> {
+        let win = self.windows.try_get(id)?;
+        let entries = win.jumps.iter().map(|e| (e.buf.0, e.line, e.col)).collect();
+        Some((entries, win.jump_idx))
     }
 
     /// `:jumps` — list the focused window's jumplist into the bottom panel,

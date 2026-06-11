@@ -12,7 +12,7 @@ use nxvim_core::{
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror,
-    GoMirror, HlDefMirror, HlSet, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, TsOp,
+    GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, TsOp,
     WindowMirror, WindowOp,
 };
 use rmpv::Value;
@@ -869,6 +869,7 @@ impl Server {
                 let (cw, ch) = self.editor.window_content_size(id).unwrap_or((0, 0));
                 let opts = self.editor.window_options(id).unwrap_or_default();
                 let (top, leftcol) = self.editor.window_scroll(id).unwrap_or((0, 0));
+                let (jumps, jump_idx) = self.editor.window_jumplist(id).unwrap_or_default();
                 WindowMirror {
                     id: id.0,
                     buffer,
@@ -885,6 +886,16 @@ impl Server {
                     topline: (top + 1) as u64,
                     leftcol: leftcol as u64,
                     float: self.editor.window_float_config(id).map(float_mirror),
+                    jumps: jumps
+                        .into_iter()
+                        .map(|(bufnr, line, col)| JumpMirror {
+                            bufnr,
+                            lnum: (line + 1) as u64, // 1-based row, neovim convention
+                            col: col as u64,         // 0-based byte column
+                            coladd: 0,               // nxvim has no `virtualedit`
+                        })
+                        .collect(),
+                    jump_idx: jump_idx as u64,
                 }
             })
             .collect();

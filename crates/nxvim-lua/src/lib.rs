@@ -42,6 +42,6 @@ pub use ops::{
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
-    LuaRuntime, TabMirror, WindowMirror,
+    JumpMirror, LuaRuntime, TabMirror, WindowMirror,
 };
 pub use system::{BlockingSystem, StdBlockingSystem, SystemOutput, SystemSpec};

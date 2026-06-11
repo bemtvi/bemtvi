@@ -474,6 +474,32 @@ function fn.win_getid(winnr, _tabnr)
   return (vim._win_order or {})[winnr] or 0
 end
 
+-- vim.fn.getjumplist([winnr [, tabnr]]): the window's jumplist as
+-- `{ list, curidx }`. `list` is an array of `{ bufnr, lnum, col, coladd }` dicts
+-- oldest-first (lnum 1-based, col 0-based byte); `curidx` is the navigation
+-- pointer `<C-o>`/`<C-i>` walk — a 0-based index into `list`, equal to `#list`
+-- when sitting at the present (not navigating). `winnr` is a window-ID or a
+-- 1-based window number (default: the current window). `tabnr` is accepted but
+-- only the current tab's windows are mirrored, so an off-tab window yields
+-- `{ {}, 0 }`. Reads the window mirror the server pushes (`vim._wins`).
+function fn.getjumplist(winnr, _tabnr)
+  local id
+  if winnr == nil or winnr == 0 then
+    id = vim._cur_win or 1000
+  elseif (vim._wins or {})[winnr] then
+    id = winnr -- already a window-ID
+  else
+    id = (vim._win_order or {})[winnr] or 0
+  end
+  local w = (vim._wins or {})[id]
+  if not w then return { {}, 0 } end
+  local list = {}
+  for _, e in ipairs(w.jumps or {}) do
+    list[#list + 1] = { bufnr = e.bufnr, lnum = e.lnum, col = e.col, coladd = e.coladd or 0 }
+  end
+  return { list, w.jump_idx or #list }
+end
+
 -- vim.fn.win_gotoid(id): focus window `id`; returns 1 on success, 0 if unknown.
 function fn.win_gotoid(id)
   if not (vim._wins or {})[id] then return 0 end

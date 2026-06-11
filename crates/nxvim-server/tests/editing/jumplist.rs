@@ -236,6 +236,134 @@ async fn a_jump_target_follows_lines_deleted_above_it() {
     assert_eq!(all[line - 1], "8");
 }
 
+// ----- vim.fn.getjumplist ---------------------------------------------------
+//
+// `getjumplist([winnr [, tabnr]])` returns `[list, curidx]`: the jumplist as an
+// array of `{ bufnr, lnum, col, coladd }` dicts (lnum 1-based, col 0-based) and
+// the navigation pointer, equal to `#list` at the present. Mirrors neovim's
+// builtin; reads the window mirror the server pushes.
+
+#[tokio::test]
+async fn getjumplist_is_empty_on_a_fresh_window() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // edits, but no jumps recorded yet
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist()[1]").await,
+        Some(0),
+        "no jumps yet -> empty list"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[2]").await,
+        Some(0),
+        "curidx is 0 for an empty jumplist"
+    );
+}
+
+#[tokio::test]
+async fn getjumplist_reports_recorded_jumps_oldest_first() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // cursor on line 10
+    feed(&rpc, "gg"); // records 10 (line index 9), on line 1
+    feed(&rpc, "5G"); // records 1  (line index 0), on line 5
+
+    // Two entries, present pointer past the end.
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist()[1]").await,
+        Some(2)
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[2]").await,
+        Some(2),
+        "curidx == #list while sitting at the present"
+    );
+    // Oldest-first: the "10" jump (lnum 10) is entry 1, the "1" jump entry 2.
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[1][1].lnum").await,
+        Some(10)
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[1][2].lnum").await,
+        Some(1)
+    );
+    // The entry dict carries the neovim keys: a current-buffer bufnr and coladd 0.
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[1][1].coladd").await,
+        Some(0)
+    );
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "return vim.fn.getjumplist()[1][1].bufnr == vim.api.nvim_get_current_buf()"
+        )
+        .await,
+        Some(true),
+        "the entry's bufnr is the current buffer"
+    );
+}
+
+#[tokio::test]
+async fn getjumplist_curidx_tracks_ctrl_o_navigation() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // line 10
+    feed(&rpc, "5G"); // records 10, on line 5
+    feed(&rpc, "3G"); // records 5,  on line 3
+                      // At the present: two entries, curidx 2.
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[2]").await,
+        Some(2)
+    );
+    // `<C-o>` walks back one entry; the present is stashed at the list end and
+    // curidx steps off it, exactly as vim's `w_jumplistidx` moves.
+    feed(&rpc, "<C-o>"); // -> line 5
+    assert_eq!(cursor(&rpc).await.0, 5);
+    let curidx = lua_u64(&rpc, "return vim.fn.getjumplist()[2]").await;
+    assert!(
+        curidx.is_some() && curidx < Some(2),
+        "curidx steps back below the present after <C-o>, got {curidx:?}"
+    );
+    // The stashed present (line 3) is now an entry on the list.
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "local l = vim.fn.getjumplist()[1]; \
+             for _, e in ipairs(l) do if e.lnum == 3 then return true end end; return false"
+        )
+        .await,
+        Some(true),
+        "the position we <C-o>'d away from (line 3) was stashed onto the list"
+    );
+}
+
+#[tokio::test]
+async fn getjumplist_accepts_a_window_id_or_number() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await;
+    feed(&rpc, "gg"); // one recorded jump
+    feed(&rpc, "7G"); // two recorded jumps
+
+    // Explicit current-window id and window number 1 agree with the no-arg form.
+    assert_eq!(
+        lua_u64(
+            &rpc,
+            "return #vim.fn.getjumplist(vim.api.nvim_get_current_win())[1]"
+        )
+        .await,
+        Some(2),
+        "by window-ID"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist(1)[1]").await,
+        Some(2),
+        "by 1-based window number"
+    );
+    // An unknown window yields the empty result, not an error.
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist(9999)[1]").await,
+        Some(0),
+        "unknown window -> empty list"
+    );
+}
+
 #[tokio::test]
 async fn deleting_a_jump_targets_line_drops_it_from_the_list() {
     let (rpc, _incoming) = start(None).await;

@@ -955,7 +955,32 @@ where
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.
     if let Some(config_dir) = &init.config_dir {
-        host.source_init(&config_dir.join("init.lua"));
+        let complete = host.source_init(&config_dir.join("init.lua"));
+        // If init.lua parked on a blocking `vim.wait` / `vim.fn.input`, drive the
+        // event loop (timers firing, child processes exiting — e.g. lazy.nvim's
+        // git clones) until the script runs to completion, so config is fully
+        // applied before we source plugins and serve the UI, exactly as neovim
+        // sources init.lua to its end before the first frame. A `vim.wait` is
+        // self-bounding (its poll timer resumes the script at the timeout), so this
+        // terminates; the silence guard below is a fail-loud backstop for a script
+        // that parked on a read with no input source (e.g. `vim.fn.input` before a
+        // UI is attached), which would otherwise wait here forever.
+        if !complete {
+            // No loop event for this long while still parked ⇒ nothing is driving
+            // the script (a parked `vim.wait` keeps its poll timer ticking, so it
+            // never goes this quiet). Generous so even a slow clone never trips it.
+            const STARTUP_DRIVE_SILENCE: std::time::Duration = std::time::Duration::from_secs(30);
+            while !host.init_complete() {
+                match tokio::time::timeout(STARTUP_DRIVE_SILENCE, loop_events.recv()).await {
+                    Ok(Some(event)) => host.on_loop_events(event, &mut loop_events),
+                    Ok(None) => break, // event loop gone; stop waiting
+                    Err(_) => {
+                        host.echo_startup_stall();
+                        break;
+                    }
+                }
+            }
+        }
     }
     // Then source the package `plugin/` / `after/plugin/` Lua scripts across the
     // runtimepath — neovim's startup package load, after `init.lua` and before the

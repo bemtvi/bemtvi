@@ -8,7 +8,7 @@
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{run as run_server, ServerInit};
-use nxvim_test_harness::{clone_plugin, exec_lua, feed, temp_dir};
+use nxvim_test_harness::{clone_plugin, exec_lua, feed, spawn, temp_dir};
 use rmpv::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -990,6 +990,119 @@ async fn lazy_nvim_clones_and_loads_a_plugin() {
     );
 }
 
+/// The exact scenario from the user's bug report: lazy.nvim's **blocking startup
+/// auto-install**, driven from `init.lua`. With `install = { missing = true }` (the
+/// stock default), `require("lazy").setup(...)` SYNCHRONOUSLY installs any missing
+/// plugin during config sourcing — `setup → install → runner:wait → vim.wait` — the
+/// stack that raised `E5113: … vim.wait requires a synchronous pumped context`
+/// because `init.lua` used to run through a bare `exec` with no coroutine to park.
+///
+/// Now `init.lua` is pumped and the server nested-drives the loop until it finishes,
+/// so the clone runs to completion *before the UI is served*: by the time we read
+/// back, the plugin is cloned on disk and its `config` has already run. This is the
+/// end-to-end proof (not just the `vim.wait` primitive) that a real lazy bootstrap
+/// boots clean. Clones a local `file://` source repo to stay hermetic + offline.
+#[tokio::test]
+async fn lazy_nvim_blocking_startup_install_from_init_lua() {
+    let Some(lazy) = clone_plugin("lazy.nvim") else {
+        eprintln!("skip: could not clone lazy.nvim (no git / no network)");
+        return;
+    };
+
+    // A real git repo to clone *from*: a tiny plugin on a `main` branch.
+    let source = temp_dir("init_lazy_clone_source");
+    std::fs::create_dir_all(source.join("lua/initclonehello")).unwrap();
+    std::fs::write(
+        source.join("lua/initclonehello/init.lua"),
+        "return { setup = function() _G.INITCLONEHELLO = true end }\n",
+    )
+    .unwrap();
+    git_in(&source, &["init", "--quiet"]);
+    git_in(&source, &["add", "-A"]);
+    git_in(&source, &["commit", "--quiet", "-m", "initial"]);
+    git_in(&source, &["branch", "-M", "main"]);
+
+    let state = temp_dir("init_lazy_clone_state");
+    let cfg = temp_dir("init_lazy_cfg");
+    // init.lua: the stock bootstrap shape — setup() with the plugin missing and
+    // `install.missing` on, so lazy clones it synchronously while sourcing (the
+    // path that used to raise E5113). Flags record the outcome for the readback.
+    std::fs::write(
+        cfg.join("init.lua"),
+        format!(
+            r#"
+            local source, state = "{source}", "{state}"
+            local ok, err = pcall(function()
+              require("lazy").setup({{
+                {{ url = "file://" .. source, name = "initclonehello", branch = "main",
+                   lazy = false, config = function() require("initclonehello").setup() end }},
+              }}, {{
+                root = state .. "/plugins",
+                lockfile = state .. "/lazy-lock.json",
+                state = state .. "/state.json",
+                readme = {{ root = state .. "/readme" }},
+                -- The default: auto-install missing plugins on startup. This is the
+                -- synchronous `vim.wait` blocker the bug report hit.
+                install = {{ missing = true }},
+                git = {{ filter = false }},
+                pkg = {{ enabled = false }},
+                change_detection = {{ enabled = false }},
+                checker = {{ enabled = false }},
+                performance = {{ rtp = {{ reset = false }} }},
+              }})
+            end)
+            _G.LAZY_INIT_ERR = (not ok) and tostring(err) or nil
+            _G.LAZY_INIT_DONE = true
+            "#,
+            source = source.to_string_lossy(),
+            state = state.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let init = ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg, lazy],
+        ..Default::default()
+    };
+    let (server_end, client_end) = tokio::io::duplex(1 << 18);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("server runtime");
+        let _ = runtime.block_on(run_server(server_end, init));
+    });
+    let (reader, writer) = tokio::io::split(client_end);
+    let (rpc, _incoming) = connect(reader, writer);
+
+    // Read back after startup. Because the blocking install ran to completion before
+    // the server began serving, everything is already done — no polling needed.
+    let report = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            if _G.LAZY_INIT_ERR then return "ERR: " .. _G.LAZY_INIT_ERR end
+            local cloned_dir = "{state}" .. "/plugins/initclonehello"
+            return table.concat({{
+              "startup_done=" .. tostring(_G.LAZY_INIT_DONE == true),
+              "cloned=" .. tostring(vim.fn.isdirectory(cloned_dir .. "/.git") == 1),
+              "config_ran=" .. tostring(_G.INITCLONEHELLO == true),
+            }}, "|")
+            "#,
+            state = state.to_string_lossy()
+        ),
+    )
+    .await;
+    assert_eq!(
+        report.as_str(),
+        Some("startup_done=true|cloned=true|config_ran=true"),
+        "lazy.nvim's blocking startup auto-install from init.lua should clone + \
+         configure the plugin before serving (no E5113): {report:?}"
+    );
+}
+
 /// The stock lazy.nvim **bootstrap** snippet — the first thing a real user config
 /// runs on a fresh machine, before `require("lazy")` even exists — shells out to
 /// `git clone` through the *vimscript* builtin `vim.fn.system({...})` and branches
@@ -1126,4 +1239,50 @@ async fn vim_diagnostic_set_reset_roundtrip() {
     )
     .await;
     assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
+}
+
+/// `init.lua` is sourced through the coroutine PUMP (like `:lua` / `nvim_exec_lua`),
+/// not a bare `exec`, so a blocking `vim.wait` in it PARKS on the loop instead of
+/// erroring `"requires a synchronous pumped context"`. The server then NESTED-DRIVES
+/// the event loop until the parked script completes, matching neovim sourcing
+/// `init.lua` to completion before serving the UI. This is the keystone for
+/// lazy.nvim's startup auto-install, whose `setup()` blocks on `vim.wait` while it
+/// clones missing plugins — the path that produced the user's
+/// `E5113: … vim.wait requires a synchronous pumped context` at startup.
+///
+/// The condition (`done`) only flips once a `defer_fn` timer fires, so `vim.wait`
+/// can only return true if the loop kept draining while the script was parked —
+/// proving a real pump, not a no-op.
+#[tokio::test]
+async fn init_lua_vim_wait_pumps_during_startup() {
+    let dir = temp_dir("init_vim_wait");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+        local done = false
+        vim.defer_fn(function() done = true end, 1)
+        -- Blocks until the deferred timer flips `done`. Under the old bare `exec`
+        -- this errored immediately ("requires a synchronous pumped context") and
+        -- aborted the rest of the script; under the pump it parks and resumes.
+        _G.WAITED = vim.wait(2000, function() return done end, 5)
+        _G.REACHED_END = true
+        "#,
+    )
+    .unwrap();
+    let init = ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    let report = exec_lua(
+        &rpc,
+        "return tostring(_G.WAITED) .. '|' .. tostring(_G.REACHED_END)",
+    )
+    .await;
+    assert_eq!(
+        report.as_str().unwrap_or("<non-string>"),
+        "true|true",
+        "vim.wait in init.lua should pump to its condition and the script run to its end: {report:?}"
+    );
 }

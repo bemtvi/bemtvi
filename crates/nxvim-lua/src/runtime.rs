@@ -620,6 +620,30 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Source the user's `init.lua` through the coroutine pump — the
+    /// [`exec_pumped`](Self::exec_pumped) analogue for startup config, naming the
+    /// chunk `name` (use `@<path>`) so a traceback points at the file. A blocking
+    /// `vim.wait` / `vim.fn.input` in it PARKS the coroutine instead of erroring
+    /// "outside a coroutine" (the error the bare [`exec`](Self::exec) produced);
+    /// the server then drives the loop until [`init_complete`](Self::init_complete)
+    /// reports it finished. Returns `true` when the chunk ran straight through (no
+    /// park), `false` when it parked. A chunk error propagates for the server to
+    /// surface as `E5113`.
+    pub fn source_init_pumped(&self, chunk: &str, name: &str) -> mlua::Result<bool> {
+        let func = self.lua.load(chunk).set_name(name).into_function()?;
+        let source: mlua::Function = self.vim()?.get("_source_init")?;
+        source.call(func)
+    }
+
+    /// Whether the parked `init.lua` coroutine has finished (or there was none, or
+    /// it never parked). The server polls this while nested-driving the event loop
+    /// at startup, so it serves the UI only once config has fully run — matching
+    /// neovim, which sources `init.lua` to completion before the first frame.
+    pub fn init_complete(&self) -> mlua::Result<bool> {
+        let done: mlua::Function = self.vim()?.get("_init_done")?;
+        done.call(())
+    }
+
     /// [`eval_to_value`](Self::eval_to_value) under the prompt pump — the
     /// `nvim_exec_lua` entry. When the chunk parks on a prompt its return value is
     /// not available synchronously, so `Nil` is returned and the chunk's eventual

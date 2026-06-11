@@ -96,6 +96,36 @@ function vim._pump(fn, ...)
   return false -- suspended: parked on a prompt
 end
 
+-- vim._source_init(fn): run the user's init.lua chunk through the same coroutine
+-- pump as _pump, but RETAIN the coroutine (in vim._init_co) so the server can poll
+-- whether it has finished (vim._init_done). Like _pump it lets a blocking vim.wait
+-- / vim.fn.input in init.lua PARK on the loop instead of erroring "outside a
+-- coroutine"; the server then nested-drives the event loop (timers firing, child
+-- processes exiting — e.g. lazy.nvim's git clones) until the coroutine is dead,
+-- matching neovim sourcing init.lua to completion before serving the UI.
+--
+-- Returns true when the chunk ran straight through (no park), false when it parked.
+-- A chunk error is re-raised (level 0) for the server to surface as E5113.
+function vim._source_init(fn)
+  local co = coroutine.create(fn)
+  vim._init_co = co
+  local ok, a = coroutine.resume(co)
+  if not ok then
+    vim._init_co = nil
+    error(a, 0)
+  end
+  return coroutine.status(co) == "dead"
+end
+
+-- vim._init_done(): has the parked init.lua coroutine finished? True when there is
+-- no init coroutine (none sourced, or it ran straight through) or it is dead (it
+-- completed, or errored on a resumed continuation — either way nothing left to
+-- drive). The server polls this between nested loop drives during startup.
+function vim._init_done()
+  local co = vim._init_co
+  return co == nil or coroutine.status(co) == "dead"
+end
+
 -- vim.schedule(fn): defer `fn` to the end of the current convergence — it runs
 -- after the work that scheduled it settles, no longer nested in the caller's
 -- stack frame (the strict improvement over the old inline `fn()`), but still

@@ -486,6 +486,56 @@ function vim.fn.trim(text, mask, dir)
   return text:sub(from, to)
 end
 
+-- The argv for a `vim.fn.system`/`systemlist` call. `cmd` is either a List (an
+-- argv run *directly*, no shell — neovim's documented behavior for the list form)
+-- or a String (run through the shell). nxvim has no `&shell` option surface, so
+-- the string form goes through `/bin/sh -c <cmd>`, matching neovim's default
+-- `shell`/`shellcmdflag` on a POSIX host. The shared shell-out runs synchronously
+-- on the blocking `vim._system` seam and records the child's exit status in
+-- `v:shell_error` (the lazy.nvim bootstrap reads it to detect a failed clone).
+local function system_argv(cmd)
+  if type(cmd) == "table" then
+    local argv = {}
+    for i = 1, #cmd do
+      argv[i] = tostring(cmd[i])
+    end
+    return argv
+  end
+  return { "/bin/sh", "-c", tostring(cmd) }
+end
+local function system_run(cmd, input)
+  -- neovim's `{input}` feeds the child's stdin; the blocking `vim._system` seam
+  -- has no stdin channel, so honor it loudly rather than silently dropping it
+  -- (a quietly-ignored stdin would make a `system(cmd, data)` look like it piped
+  -- `data` when it never did). The common callers (the bootstrap clone, tool
+  -- version probes) pass no input and are unaffected.
+  if input ~= nil then vim._notimpl("vim.fn.system with an {input} argument") end
+  local result = vim._system(system_argv(cmd), nil, nil, true)
+  vim.v.shell_error = result.code
+  return result.stdout
+end
+
+-- vim.fn.system(cmd[, input]): run `cmd` (an argv List, or a String via the
+-- shell) to completion and return its stdout as a single string; sets
+-- `v:shell_error` to the exit code. This is the vimscript builtin — distinct from
+-- the `vim.system()` Lua API. The lazy.nvim bootstrap's first act on a fresh
+-- machine is `vim.fn.system({ "git", "clone", … })` guarded by `v:shell_error`.
+function vim.fn.system(cmd, input) return system_run(cmd, input) end
+
+-- vim.fn.systemlist(cmd[, input]): as `system`, but split stdout into a list of
+-- lines (one trailing newline dropped, matching neovim — `systemlist` does not
+-- keep the empty element a terminating "\n" would otherwise yield).
+function vim.fn.systemlist(cmd, input)
+  local out = system_run(cmd, input)
+  if out:sub(-1) == "\n" then out = out:sub(1, -2) end
+  if out == "" then return {} end
+  local lines = {}
+  for line in (out .. "\n"):gmatch("(.-)\n") do
+    lines[#lines + 1] = line
+  end
+  return lines
+end
+
 -- vim.opt: neovim's rich Option object. Reading a field yields an Option wrapping
 -- the option's current value; the methods (:get / :append / :prepend / :remove)
 -- and the +/-/^ operators mutate list / char-flag / key:val-map options the way
@@ -824,6 +874,11 @@ vim.v = setmetatable({}, {
     if k == "register" then return m.register or '"' end
     if k == "operator" then return m.operator or "" end
     if k == "vim_did_enter" then return m.vim_did_enter or 0 end
+    -- `v:shell_error` is the exit status of the last `:!`/`system()` shell-out,
+    -- 0 before any has run. `vim.fn.system`/`systemlist` write it; the lazy.nvim
+    -- bootstrap branches on it (`if vim.v.shell_error ~= 0 then …`), so a `nil`
+    -- default would read as "the clone failed" the very first time.
+    if k == "shell_error" then return m.shell_error or 0 end
     -- `v:exiting` is `v:null` (→ vim.NIL in Lua) until the editor is actually
     -- exiting, when it becomes the exit code. Plugins gate async work on it —
     -- lazy.nvim's `Util.exiting()` is literally `vim.v.exiting ~= vim.NIL`, so a

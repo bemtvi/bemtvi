@@ -989,3 +989,71 @@ async fn lazy_nvim_clones_and_loads_a_plugin() {
         "lazy.nvim should git-clone and load a real plugin: {report:?}"
     );
 }
+
+/// The stock lazy.nvim **bootstrap** snippet — the first thing a real user config
+/// runs on a fresh machine, before `require("lazy")` even exists — shells out to
+/// `git clone` through the *vimscript* builtin `vim.fn.system({...})` and branches
+/// on `vim.v.shell_error`. That path is distinct from `vim.system()` (the Lua API
+/// the install pipeline uses) and from the harness-driven clones the other lazy
+/// tests sideload through, so it went uncovered until a config was run e2e —
+/// `vim.fn.system` fell through to `vim._notimpl`. This pins the synchronous
+/// shell-out: the argv-list clone lands and reports `v:shell_error == 0`, a failing
+/// clone sets `v:shell_error != 0` (the branch the bootstrap guards with) while
+/// still returning the error text as a string, and `systemlist` splits to lines.
+#[tokio::test]
+async fn vim_fn_system_drives_the_lazy_bootstrap() {
+    // A real git repo to clone *from* — offline and deterministic (file://).
+    let source = temp_dir("fn_system_source");
+    std::fs::create_dir_all(source.join("lua/boothello")).unwrap();
+    std::fs::write(
+        source.join("lua/boothello/init.lua"),
+        "return { ok = true }\n",
+    )
+    .unwrap();
+    git_in(&source, &["init", "--quiet"]);
+    git_in(&source, &["add", "-A"]);
+    git_in(&source, &["commit", "--quiet", "-m", "initial"]);
+    git_in(&source, &["branch", "-M", "main"]);
+
+    let dest = temp_dir("fn_system_dest");
+    let lazypath = dest.join("lazy.nvim");
+
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            local function eq(a, b, msg) if a ~= b then error(msg..": "..tostring(a).." ~= "..tostring(b)) end end
+            local ok, err = pcall(function()
+              -- shell_error reads clean before any shell-out has run.
+              eq(vim.v.shell_error, 0, "shell_error defaults to 0")
+
+              -- The bootstrap clone: argv-list form (executed directly, no shell).
+              local out = vim.fn.system({{
+                "git", "clone", "--branch=main", "file://{source}", "{lazypath}",
+              }})
+              eq(type(out), "string", "system returns a string")
+              eq(vim.v.shell_error, 0, "successful clone -> shell_error 0")
+              eq(vim.fn.isdirectory("{lazypath}/.git"), 1, "clone landed on disk")
+
+              -- The failure branch the bootstrap guards with: cloning a repo that
+              -- doesn't exist sets shell_error != 0 and still returns git's text.
+              local fail = vim.fn.system({{ "git", "clone", "file:///no/such/nxvim/repo", "{lazypath}-x" }})
+              assert(vim.v.shell_error ~= 0, "failed clone -> shell_error != 0")
+              assert(type(fail) == "string", "a failed system still returns a string")
+
+              -- systemlist: the same shell-out, split into a list of lines.
+              local lines = vim.fn.systemlist({{ "git", "-C", "{lazypath}", "rev-parse", "--abbrev-ref", "HEAD" }})
+              eq(type(lines), "table", "systemlist returns a list")
+              eq(lines[1], "main", "systemlist split the branch name")
+              eq(vim.v.shell_error, 0, "systemlist success -> shell_error 0")
+            end)
+            if ok then return "OK" else return tostring(err) end
+            "#,
+            source = source.to_string_lossy(),
+            lazypath = lazypath.to_string_lossy(),
+        ),
+    )
+    .await;
+    assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
+}

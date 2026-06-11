@@ -1303,6 +1303,14 @@ impl LuaRuntime {
         set.call((bufnr, name, filetype))
     }
 
+    /// Drop the Lua-side state scoped to buffer `bufnr` — its buffer-local user
+    /// commands and keymaps — when the server detects the buffer was deleted, so a
+    /// later buffer that reuses the bufnr can't inherit them.
+    pub fn cleanup_buffer(&self, bufnr: u64) -> mlua::Result<()> {
+        let f: mlua::Function = self.vim()?.get("_cleanup_buffer")?;
+        f.call(bufnr)
+    }
+
     /// Serialize a mirror struct into the Lua table the `_set_*_mirror` receivers
     /// read. Disables mlua's array metatable so the result is a *plain* table —
     /// byte-identical to the hand-rolled `create_table()` tables these setters used
@@ -1509,20 +1517,24 @@ impl LuaRuntime {
         set.call((tab_arr, cur_tab))
     }
 
-    /// Whether `name` was registered via `nvim_create_user_command` (so the
-    /// server can route a deferred `:Name …` to its Lua callback).
-    pub fn has_user_command(&self, name: &str) -> bool {
-        self.user_command(name)
+    /// Whether `name` resolves to a user command visible from buffer `bufnr`
+    /// (the editor's current buffer) — a global registered via
+    /// `nvim_create_user_command`, or a buffer-local one registered for `bufnr`
+    /// via `nvim_buf_create_user_command`. Lets the server route a deferred
+    /// `:Name …` to its Lua callback (and only in the buffer that owns it).
+    pub fn has_user_command(&self, name: &str, bufnr: u64) -> bool {
+        self.user_command(name, bufnr)
             .map(|v| !v.is_nil())
             .unwrap_or(false)
     }
 
-    /// Invoke the user command `name` with `args` (the text after the name).
-    /// A function command is called with an opts table (`name`, `args`,
-    /// `fargs`, `bang`); a string command is queued as an ex-command. Effects
-    /// land in [`Shared`] and are drained by the server like any other chunk.
-    pub fn run_user_command(&self, name: &str, args: &str) -> mlua::Result<()> {
-        match self.user_command(name)? {
+    /// Invoke the user command `name` (resolved for buffer `bufnr`) with `args`
+    /// (the text after the name). A function command is called with an opts table
+    /// (`name`, `args`, `fargs`, `bang`); a string command is queued as an
+    /// ex-command. Effects land in [`Shared`] and are drained by the server like
+    /// any other chunk.
+    pub fn run_user_command(&self, name: &str, args: &str, bufnr: u64) -> mlua::Result<()> {
+        match self.user_command(name, bufnr)? {
             mlua::Value::Function(f) => {
                 let opts = self.lua.create_table()?;
                 opts.set("name", name)?;
@@ -1550,9 +1562,11 @@ impl LuaRuntime {
         }
     }
 
-    /// Look up the stored `vim._user_commands[name]` entry (function or string).
-    fn user_command(&self, name: &str) -> mlua::Result<mlua::Value> {
-        let commands: Table = self.vim()?.get("_user_commands")?;
-        commands.get(name)
+    /// Resolve `name` to its command entry (function or string) for buffer
+    /// `bufnr`, letting a buffer-local command for that buffer shadow a global of
+    /// the same name — `vim._resolve_user_command` owns the precedence.
+    fn user_command(&self, name: &str, bufnr: u64) -> mlua::Result<mlua::Value> {
+        let resolve: mlua::Function = self.vim()?.get("_resolve_user_command")?;
+        resolve.call((name, bufnr))
     }
 }

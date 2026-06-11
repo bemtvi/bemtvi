@@ -25,6 +25,10 @@ impl Server {
             Some(b) => (b, true),
             None => (name, false),
         };
+        // The editor's authoritative current buffer, for resolving a buffer-local
+        // user command (it shadows a global of the same name, and is unknown from
+        // any other buffer).
+        let cur_buf = self.editor.current_buffer_id().0;
         match name {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
             // Phase-1 LSP observability: dump server/document state into the panel.
@@ -91,12 +95,14 @@ impl Server {
             // guard defers to a real nvim-treesitter plugin: if the user loaded one
             // and it registered `:TSInstall`, this arm is skipped and the
             // user-command arm below runs the plugin's instead (no silent shadow).
-            "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name) => self.ts_install(args),
+            "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
+                self.ts_install(args)
+            }
             // `:TSInstallInfo` — list the parsers installed across the search path.
             // Same defer-to-plugin guard as the install commands.
-            "TSInstallInfo" if !self.lua.has_user_command(name) => self.ts_install_info(),
-            _ if self.lua.has_user_command(name) => {
-                if let Err(e) = self.lua.run_user_command(name, args) {
+            "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
+            _ if self.lua.has_user_command(name, cur_buf) => {
+                if let Err(e) = self.lua.run_user_command(name, args, cur_buf) {
                     self.editor
                         .echo(format!("E5108: Error executing command {name}: {e}"));
                 }

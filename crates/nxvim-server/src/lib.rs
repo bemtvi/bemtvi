@@ -273,6 +273,10 @@ struct Server {
     /// Buffers that have already had their fire-once events (`BufReadPost` /
     /// `FileType`) emitted, so re-entering them doesn't re-announce.
     announced: HashSet<BufferId>,
+    /// Every buffer id present at the last lifecycle diff. Ids gone since (a
+    /// `:bdelete` / `nvim_buf_delete`) have their Lua-side buffer-local state
+    /// (commands, keymaps) purged so a reused bufnr can't inherit it.
+    known_buffers: Vec<BufferId>,
     /// The editor mode at the last lifecycle diff. A transition *into* insert
     /// (from a non-insert mode) fires `InsertEnter`; tracked here so the per-key
     /// diff can spot the edge without touching the core's insert chokepoints.
@@ -597,6 +601,7 @@ where
         semantic_tokens_enabled: true,
         last_buffer_id: None,
         announced: HashSet::new(),
+        known_buffers: Vec::new(),
         last_mode: Mode::Normal,
         last_window_id: None,
         known_windows: Vec::new(),
@@ -716,6 +721,9 @@ where
     // for the first window, doesn't); `last_tab_id` stays `None` so a later switch
     // still fires the first `TabEnter`/`TabLeave` pair.
     server.known_tabs = server.editor.tab_ids();
+    // Seed the buffer set too, so the startup buffer isn't seen as "newly gone"
+    // and a never-deleted buffer never triggers a spurious cleanup.
+    server.known_buffers = server.editor.buffer_ids();
     server.emit_lifecycle_events();
     server.run_pending();
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a

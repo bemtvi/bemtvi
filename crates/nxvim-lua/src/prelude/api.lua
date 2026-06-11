@@ -10,6 +10,11 @@ local vim = vim
 -- reads them when it must (e.g. dispatching a user command typed as `:Foo`).
 
 vim._user_commands = vim._user_commands or {}
+-- vim._buf_user_commands[bufnr][name] = command: the buffer-local command
+-- registry (the analogue of the buffer-scoped `vim._keymaps` entries). A
+-- buffer-local command shadows a global one of the same name and is invisible
+-- from any other buffer — see vim._resolve_user_command.
+vim._buf_user_commands = vim._buf_user_commands or {}
 vim._autocmds = vim._autocmds or {}
 vim._augroups = vim._augroups or {}
 local augroup_seq, autocmd_seq = 0, 0
@@ -260,16 +265,41 @@ end
 
 function vim.api.nvim_create_user_command(name, command, _opts) vim._user_commands[name] = command end
 
--- nvim_buf_create_user_command(buffer, name, command, opts): in neovim this
--- registers a *buffer-local* command; nxvim has no per-buffer command registry
--- yet, so it registers globally (the buffer scope is ignored). Enough for an
--- `on_attach` that defines a convenience command (e.g. rust_analyzer's
--- `:LspCargoReload`) to load without error.
--- INCOMPLETE: `buffer` is ignored — the command exists everywhere, not only in
--- its buffer. A per-buffer command registry (the analogue of the buffer-local
--- keymap scoping `vim._keymaps` already does) is the fix.
-function vim.api.nvim_buf_create_user_command(_buffer, name, command, _opts)
-  vim._user_commands[name] = command
+-- nvim_buf_create_user_command(buffer, name, command, opts): register a
+-- *buffer-local* command (`buffer` 0 = current). It dispatches only while that
+-- buffer is current and shadows a global command of the same name there —
+-- everywhere else it's unknown. Lives in its own per-bufnr table so the global
+-- registry stays clean; vim._resolve_user_command consults both at dispatch.
+function vim.api.nvim_buf_create_user_command(buffer, name, command, _opts)
+  if buffer == nil or buffer == 0 then buffer = vim._cur_buf and vim._cur_buf.bufnr or 0 end
+  local cmds = vim._buf_user_commands[buffer]
+  if not cmds then
+    cmds = {}
+    vim._buf_user_commands[buffer] = cmds
+  end
+  cmds[name] = command
+end
+
+-- Resolve a typed `:Name` to its command definition for buffer `bufnr` (0 =
+-- current): a buffer-local command for that buffer wins over a global of the
+-- same name (matching neovim), and a buffer-local command is invisible from any
+-- other buffer. The server passes the editor's authoritative current bufnr, so
+-- this never relies on a possibly-stale vim._cur_buf. Returns the function /
+-- string body, or nil when no command matches.
+function vim._resolve_user_command(name, bufnr)
+  if bufnr == nil or bufnr == 0 then bufnr = vim._cur_buf and vim._cur_buf.bufnr or 0 end
+  local locals = vim._buf_user_commands[bufnr]
+  if locals and locals[name] ~= nil then return locals[name] end
+  return vim._user_commands[name]
+end
+
+-- Drop everything scoped to buffer `bufnr` when the server reports it deleted, so
+-- a later buffer reusing the bufnr can't inherit a stale buffer-local command or
+-- mapping (matching neovim's bufwipe cleanup). The keymap purge lives in
+-- keymap.lua, where the trie source / fn table are owned.
+function vim._cleanup_buffer(bufnr)
+  vim._buf_user_commands[bufnr] = nil
+  vim._purge_buf_keymaps(bufnr)
 end
 
 -- nvim_create_augroup(name[, {clear=…}]): define (or look up) an augroup. When

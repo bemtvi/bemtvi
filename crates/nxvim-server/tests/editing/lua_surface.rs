@@ -129,6 +129,95 @@ async fn user_command_registers_and_dispatches() {
 }
 
 #[tokio::test]
+async fn buf_local_user_command_is_scoped_to_its_buffer() {
+    // `nvim_buf_create_user_command(buf, …)` registers a *buffer-local* command:
+    // it dispatches only while `buf` is the current buffer, and is unknown
+    // (E492) from any other buffer. Before the per-buffer registry it leaked into
+    // `vim._user_commands` globally, so it fired everywhere.
+    let a = write_temp("a", "txt", "a1\n");
+    let b = write_temp("b", "txt", "b1\n");
+    let (rpc, mut incoming) = start(None).await;
+
+    command(&rpc, &format!("e {a}")).await; // buffer 1
+    command(&rpc, &format!("e {b}")).await; // buffer 2, current
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_buf_create_user_command(2, 'BufLocal', \
+         function() print('local hit') end, {})",
+    )
+    .await;
+
+    // In its own buffer the command dispatches.
+    let map = redraw_after(&rpc, &mut incoming, ":BufLocal<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("local hit"),
+        ":BufLocal should dispatch in the buffer it was registered for"
+    );
+
+    // Switch to buffer 1 (the alternate); the command must be unknown there.
+    feed(&rpc, "<C-^>");
+    let map = redraw_after(&rpc, &mut incoming, ":BufLocal<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("E492: Not an editor command: BufLocal"),
+        "a buffer-local command must not leak into other buffers"
+    );
+
+    // Back in buffer 2 it dispatches again.
+    feed(&rpc, "<C-^>");
+    let map = redraw_after(&rpc, &mut incoming, ":BufLocal<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("local hit"),
+        ":BufLocal should still dispatch back in its own buffer"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[tokio::test]
+async fn deleting_a_buffer_purges_its_buffer_local_commands_and_keymaps() {
+    // A deleted buffer's buffer-local registrations must not outlive it — else a
+    // later buffer that reuses the bufnr would inherit a stale `:Cmd` / mapping.
+    // Mirrors neovim, which drops buffer-local commands and maps on bufwipe.
+    let a = write_temp("a", "txt", "a1\n");
+    let b = write_temp("b", "txt", "b1\n");
+    let (rpc, _incoming) = start(None).await;
+
+    command(&rpc, &format!("e {a}")).await; // buffer 1
+    command(&rpc, &format!("e {b}")).await; // buffer 2, current
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_buf_create_user_command(2, 'BufLocal', function() end, {})\n\
+         vim.api.nvim_buf_set_keymap(2, 'n', '<leader>x', ':echo 1<CR>', {})",
+    )
+    .await;
+
+    // Probe both registries for a buffer-2 entry: "<has-command>,<keymap-count>".
+    let probe = "local kc = 0\n\
+         for _, e in ipairs(vim._keymaps) do if e.buffer == 2 then kc = kc + 1 end end\n\
+         return tostring(vim._buf_user_commands[2] ~= nil) .. ',' .. tostring(kc)";
+    assert_eq!(
+        exec_lua(&rpc, probe).await.as_str(),
+        Some("true,1"),
+        "buffer 2 should own one local command and one local keymap before deletion"
+    );
+
+    // Delete buffer 2 (switches to the alternate); its locals must be purged.
+    command(&rpc, "bdelete").await;
+    assert_eq!(
+        exec_lua(&rpc, probe).await.as_str(),
+        Some("false,0"),
+        "deleting a buffer must purge its buffer-local commands and keymaps"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[tokio::test]
 async fn unknown_command_still_reports_the_standard_error() {
     let (rpc, mut incoming) = start(None).await;
     let map = redraw_after(&rpc, &mut incoming, ":Frobnicate<CR>").await;

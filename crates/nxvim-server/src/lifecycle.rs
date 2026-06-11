@@ -167,6 +167,17 @@ impl Server {
         // switch changes the focused window; create/close add or drop windows), but
         // we still fold these into the fast-path guard so a tab event can never be
         // swallowed.
+        // Buffer diff: ids gone since the last emit (a `:bdelete` / `nvim_buf_delete`).
+        // Each one's Lua-side buffer-local state (commands, keymaps) is purged below so
+        // a later buffer reusing the bufnr can't inherit it.
+        let live_bufs = self.editor.buffer_ids();
+        let closed_bufs: Vec<BufferId> = self
+            .known_buffers
+            .iter()
+            .copied()
+            .filter(|b| !live_bufs.contains(b))
+            .collect();
+
         let cur_tab = self.editor.current_tab_id();
         let tabs = self.editor.tab_ids();
         let new_tabs: Vec<TabId> = tabs
@@ -192,6 +203,7 @@ impl Server {
             && new_tabs.is_empty()
             && closed_tabs.is_empty()
             && !tab_changed
+            && closed_bufs.is_empty()
         {
             return; // fast path: nothing transitioned
         }
@@ -281,6 +293,19 @@ impl Server {
             self.fire_tab("TabClosed", *t);
         }
         self.known_tabs = tabs;
+
+        // ----- buffer deletion cleanup -----
+        // A deleted buffer's Lua-side buffer-local commands / keymaps must not
+        // outlive it (else a reused bufnr inherits them). The `announced` /
+        // fire-once set is pruned in step so a reused id re-announces its events.
+        for b in &closed_bufs {
+            if let Err(e) = self.lua.cleanup_buffer(b.0) {
+                self.editor
+                    .echo(format!("E5108: Error cleaning up buffer {}: {e}", b.0));
+            }
+            self.announced.remove(b);
+        }
+        self.known_buffers = live_bufs;
 
         // Keep the native per-buffer file watches in step with the live buffer set
         // (arm new file-backed buffers, disarm closed ones, re-arm on a reload/save).

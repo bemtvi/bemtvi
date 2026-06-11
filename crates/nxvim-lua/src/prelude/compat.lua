@@ -200,26 +200,33 @@ end
 -- registry as neovim's introspection map (name -> definition record). nxvim's
 -- registry stores only the command body, so the record carries `name`/`definition`
 -- with permissive defaults for the rest — enough for telescope's `:commands`
--- picker to list and run them. Buffer-local commands aren't separately tracked, so
--- nvim_buf_get_commands returns the same global set.
-local function commands_map()
+-- picker to list and run them. `nvim_get_commands` returns the globals;
+-- `nvim_buf_get_commands(buf)` returns the buffer-local commands for `buf`
+-- (0 = current), matching neovim's split.
+local function command_record(name, def)
+  return {
+    name = name,
+    definition = type(def) == "string" and def or "",
+    nargs = "*",
+    bang = false,
+    bar = false,
+    register = false,
+    complete = nil,
+    range = nil,
+  }
+end
+local function commands_map(registry)
   local out = {}
-  for name, def in pairs(vim._user_commands or {}) do
-    out[name] = {
-      name = name,
-      definition = type(def) == "string" and def or "",
-      nargs = "*",
-      bang = false,
-      bar = false,
-      register = false,
-      complete = nil,
-      range = nil,
-    }
+  for name, def in pairs(registry or {}) do
+    out[name] = command_record(name, def)
   end
   return out
 end
-function api.nvim_get_commands(_opts) return commands_map() end
-function api.nvim_buf_get_commands(_buf, _opts) return commands_map() end
+function api.nvim_get_commands(_opts) return commands_map(vim._user_commands) end
+function api.nvim_buf_get_commands(buf, _opts)
+  if buf == nil or buf == 0 then buf = vim._cur_buf and vim._cur_buf.bufnr or 0 end
+  return commands_map((vim._buf_user_commands or {})[buf])
+end
 
 -- ----- nvim_buf_attach: the buffer-change callback channel --------------------
 -- telescope drives its prompt filtering off `on_lines`: it attaches to the prompt
@@ -703,9 +710,22 @@ function fn.getcompletion(pat, ctype, _filtered)
     end
     return hits
   elseif ctype == "command" then
-    local out = {}
+    -- Both the globals and the current buffer's local commands are reachable on
+    -- the command line, so completion offers both (a name in both registries is
+    -- listed once).
+    local seen, out = {}, {}
+    local function offer(name)
+      if not seen[name] and name:sub(1, #pat) == pat then
+        seen[name] = true
+        out[#out + 1] = name
+      end
+    end
+    local cur = vim._cur_buf and vim._cur_buf.bufnr or 0
+    for name in pairs((vim._buf_user_commands or {})[cur] or {}) do
+      offer(name)
+    end
     for name in pairs(vim._user_commands or {}) do
-      if name:sub(1, #pat) == pat then out[#out + 1] = name end
+      offer(name)
     end
     table.sort(out)
     return out

@@ -120,6 +120,26 @@ local function keymap_register(modes, lhs, rhs, opts)
   vim._keymaps_version = vim._keymaps_version + 1
 end
 
+-- Drop every buffer-local mapping bound to `bufnr` (and free any function RHS it
+-- held). Called when a buffer is deleted so its maps don't outlive it and leak
+-- onto a later buffer that reuses the bufnr. Bumps the version so the server
+-- rebuilds its tries without the dropped entries.
+function vim._purge_buf_keymaps(bufnr)
+  local kept, dropped = {}, false
+  for _, e in ipairs(vim._keymaps) do
+    if e.buffer == bufnr then
+      dropped = true
+      if e.rhs.kind == "lua" then vim._keymap_fns[e.id] = nil end
+    else
+      kept[#kept + 1] = e
+    end
+  end
+  if dropped then
+    vim._keymaps = kept
+    vim._keymaps_version = vim._keymaps_version + 1
+  end
+end
+
 -- Remove the mappings for `lhs` in `modes` at the given `buffer` scope (nil for
 -- global, a resolved number for buffer-local) — the shared core of vim.keymap.del
 -- and the nvim_*_del_keymap family. A matched entry loses only the requested

@@ -28,9 +28,6 @@ use nxvim_view::{encode_paste, notation as view_notation, Key as ViewKey};
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
-mod remote;
-pub use remote::RemoteClient;
-
 /// Map a neutral key `name` (from the JS frontend) to the shared [`ViewKey`]: a
 /// single character, or one of the named keys the encoder understands. `None` for
 /// an unrecognized name (a dead key, a modifier-only press).
@@ -61,9 +58,8 @@ pub(crate) fn neutral_key(name: &str) -> Option<ViewKey> {
 
 /// Encode one neutral key press (modifier flags + key `name`) into vim key-notation
 /// through the **shared** `nxvim-view` encoder — the same contract the TUI/GUI clients
-/// use. `None` for an unrecognized `name`. Shared by [`WebEditor::key`] (which feeds the
-/// notation to the local core) and `RemoteClient::key` (which wraps it in an `nvim_input`
-/// frame), so both encode keys identically.
+/// use. `None` for an unrecognized `name`. Used by [`WebEditor::key`] to feed the
+/// notation to the local core.
 pub(crate) fn key_notation(ctrl: bool, alt: bool, shift: bool, name: &str) -> Option<String> {
     let key = neutral_key(name)?;
     let mut notation = view_notation(ctrl, alt, key);

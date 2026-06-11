@@ -22,11 +22,6 @@ npm run build:css
 #     devDependencies, so web/vendor/ is gitignored like web/pkg and web/tailwind.css.
 npm run build:treesitter
 
-# 1c. socket.io-client browser ESM → web/vendor/socket.io/ (remote-mode transport).
-#     Vendored (not a runtime CDN) so the bridge serves it from its embedded web/
-#     tree; only index.html's remote boot path dynamic-imports it. Also gitignored.
-npm run build:socketio
-
 # 2. Compile the editor core to WebAssembly. nxvim-web is excluded from the
 #    workspace, so cargo treats it as standalone and uses this crate's own target/.
 cargo build --target wasm32-unknown-unknown --release

@@ -42,7 +42,7 @@ subsystems:
 | --------------- | ---------------------------------------------------- | -------------------------------------------------------------------- |
 | `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
-| `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library; the `nxvim --server` role drives it over stdin/stdout for a remote SSH client. |
+| `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library, embedded on its own thread by the `nxvim` / `nxvim-gui` binaries; the `--daemon` role reuses it as the remote fs/process half of the edit-host split. |
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime (LuaJIT by default, vendored PUC Lua 5.1 via the `lua51` feature) and the `vim.*` standard library. |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
 | `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
@@ -93,33 +93,26 @@ one server, without the server caring — exactly like neovim.
 
 The default `nxvim` invocation runs an **embedded** server: a headless editor on
 its own OS thread, and the TUI client on the main thread, connected by an
-in-process [`tokio::io::duplex`] pipe. Because the boundary is the same RPC used
-for remote clients, the embedded and remote cases are *one code path*. Putting
+in-process [`tokio::io::duplex`] pipe. The boundary is the same RPC every client
+speaks, so the embedded and edit-host-split cases are *one code path*. Putting
 the server on a separate thread (with its own single-threaded runtime) means UI
 rendering can never stall editor processing, and vice versa.
 
-The **remote** case is the same RPC over a process/network boundary instead of a
-duplex. The single `nxvim` binary has a headless role — `nxvim --server` runs
-just the server speaking RPC over stdin/stdout (`nxvim_server::run_io`, the
-read/write-half entry point that `run` is the single-stream convenience over).
-The GUI client connects to a host over SSH — `nxvim-gui [user@]host[:port][/file]`,
-or `:connect …` from a running window — by spawning `ssh … nxvim --server` and
-driving the child's stdio as the transport (`crates/nxvim-gui/src/remote.rs`);
-the editor, Lua, LSP, and treesitter all run on the remote host, only the thin
-client is local. The GUI's IO thread runs a session loop that can swap the
-transport in place, so `:connect` tears the current connection down and brings a
-new one up without recreating the window. Interactive auth (password / passphrase
-/ host-key acceptance) is routed to a native dialog by pointing ssh's
-`SSH_ASKPASS` at this binary re-invoked as the helper, so it works from a desktop
-launch with no terminal. The connector also hardens the spawn against argv/shell
-injection (rejects `-`-leading host/user, shell-quotes the remote command,
-`--`-terminates ssh options). See
-[the remote-SSH plan](plans/2026-06-09-remote-ssh-client.md).
+There is deliberately **no** "whole editor runs remote, thin client local" role.
+That topology — every keystroke round-tripping to a server on the far side of the
+wire — is structurally laggy, and nxvim has a better answer for editing on another
+machine: open an SSH session and run `nxvim` there (the editor is then fully local
+to that host), or use the edit-host split below.
 
-The **inverse** topology — the *edit-host / daemon split*, where the editor + Lua
-run locally and only an `nxvim --daemon` serving fs/process lives on the remote —
-is being built behind host seams (`nxvim_core::HostFs`, `nxvim_server::HostProc`,
-and the Lua-facing `nxvim_lua::LuaFs`); see
+The **inverse remote** topology — the *edit-host / daemon split*, where the editor +
+Lua run locally and only an `nxvim --daemon` serving fs/process lives on the remote
+— moves the network boundary *below* the editor, so typing, motions, operators, and
+undo are all local (zero round-trips) and only fs/process/watch/LSP traffic crosses
+the wire. The local half (`nxvim --connect-daemon [file]`, or a `nxvim://…` URI for
+the QUIC transport) is the same embedded editor as the default role, with its host
+seams (`nxvim_core::HostFs`, `nxvim_server::HostProc`, the async `HostFsAsync`, the
+LSP transport, and the Lua-facing `nxvim_lua::LuaFs`) pointed at the daemon instead
+of the local disk. See
 [the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
 **split-brain filesystem rule** for the Lua bridge, decided up front: *project-facing*
 fs APIs (`vim.uv.fs_*`, `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
@@ -740,10 +733,8 @@ the GUI sibling of `nxvim-tui` and reuses the same frontend-neutral
 [`nxvim-view`](../crates/nxvim-view) decode/input layer (`View`, `Style`, `Key`,
 `notation`, `encode_paste`) — the seam the view crate was extracted for. The
 `nxvim-gui` *binary* embeds a server on its own thread exactly like the default
-`nxvim` binary, joined by the same in-process duplex RPC — or, given a
-`[user@]host` argument (or `:connect`), drives a *remote* `nxvim --server` over
-SSH instead (see [*Embedded vs. remote*](#embedded-vs-remote) above); the only
-difference from the TUI is the client. winit owns the main thread (its loop is not async), so the RPC runs on a
+`nxvim` binary, joined by the same in-process duplex RPC; the only difference from
+the TUI is the client. winit owns the main thread (its loop is not async), so the RPC runs on a
 separate IO thread that decodes each `redraw` into a `View` and forwards it to
 the event loop via an `EventLoopProxy`, while input goes the other way on a cloned
 `Rpc` handle (`notify` is synchronous, no runtime). Rendering is a monospace
@@ -844,41 +835,12 @@ small `window.__nxvim` test hook — so a headless browser can drive open→edit
 without the native picker, which can't be scripted — alongside rendering and
 keyboard editing.
 
-### The web build — connecting to a real server over Socket.IO
-
-The serverless mode above is the editor *core* only. To get Lua, treesitter, and LSP
-in the browser, the **same WASM client** can instead drive a real `nxvim-server` over
-the network — without giving up the serverless mode. The browser can't open a tokio
-RPC connection (tokio's IO doesn't target wasm), so this rides two pieces:
-
-- **A second wasm handle, `RemoteClient`** (`crates/nxvim-web/src/remote.rs`), beside
-  `WebEditor` in the one cdylib. It does **synchronous** msgpack-RPC framing (no tokio):
-  outgoing encoders (`attach`/`key`/`input`/`paste`/`input_mouse`/`command`/`try_resize`/
-  `flush`) each return a `Vec<u8>` frame for JS to emit, and `feed(&[u8])` reassembles
-  inbound frames (mirroring `nxvim_rpc::reader_task`'s buffering, same `MAX_FRAME`/
-  `MAX_DEPTH`), decoding `redraw` into a `nxvim_view::View` — the same decoder the native
-  clients use, now brought to life (it's dead-stripped in serverless mode). `view_json()`
-  serializes the full server-styled `View` (palette, per-row highlights, diagnostics,
-  inlay hints, pmenu) so the renderer paints the *server's* highlighting, not the
-  client-side tree-sitter path.
-- **A bridge binary, `nxvim-web-bridge`** ([`crates/nxvim-web-bridge`](../crates/nxvim-web-bridge)),
-  a workspace member (unlike `nxvim-web` itself). It serves the built `web/` frontend —
-  **embedded into the binary** at compile time via `rust-embed` (read from disk in debug),
-  so one executable needs nothing else on disk — and carries the RPC. Transport is
-  **Socket.IO** (`socketioxide` on axum here, `socket.io-client` in the browser) for
-  reconnection / heartbeat / named-event framing over one channel. Each browser connection
-  spawns **its own `nxvim --server` child** (the single binary's headless role, §*Embedded
-  vs. remote*) and **byte-pumps** raw msgpack frames between the child's stdio and the
-  socket's binary `"rpc"` events — no re-framing on the wire; `RemoteClient::feed`
-  reassembles. The pump (`relay_connection`) is transport-agnostic — the Socket.IO layer
-  supplies an inbound channel and an `emit` callback — so it is tested against a real stub
-  child over real pipes, with the Socket.IO wire itself covered by a browser E2E. A
-  `/config.json` of `{"mode":"remote"}` (absent in a plain static host) is how the
-  frontend auto-detects which mode to boot; `?mode=local` forces serverless.
-
-A remote server has a real filesystem, so `:e`/`:w` are ordinary keystrokes there — no
-File System Access API needed in remote mode. The bridge is built in phases; see
-[`docs/plans/2026-06-09-remote-web-client-over-socketio.md`](plans/2026-06-09-remote-web-client-over-socketio.md).
+The web build is **serverless only** — the editor core in the browser, with no
+network back end. (Lua, treesitter, and LSP, which live in `nxvim-server`, are
+therefore absent in the browser; syntax highlighting is layered client-side via the
+WebAssembly build of tree-sitter — see above.) To use those features, run a native
+`nxvim` over an SSH session, or the edit-host split (§*Embedded vs. remote*), which
+keeps the keystroke path local.
 
 ---
 

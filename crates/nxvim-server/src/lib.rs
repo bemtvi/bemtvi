@@ -508,12 +508,11 @@ where
     run_io(reader, writer, init).await
 }
 
-/// Run the server over **separate** read/write halves — the entry point for a
-/// transport whose two directions are distinct objects (the `nxvim --server`
-/// role's `stdin` + `stdout`), so it needn't `join` them only for [`run`] to
-/// `split` them straight back apart. [`run`] is the single-stream convenience
-/// over this.
-pub async fn run_io<R, W>(reader: R, writer: W, init: ServerInit) -> anyhow::Result<()>
+/// Run the server over **separate** read/write halves. [`run`] (the public,
+/// single-stream entry every front end uses) splits its stream and delegates here;
+/// the two-half shape is kept so a transport whose directions are distinct objects
+/// needn't `join` them only to be `split` straight back apart.
+async fn run_io<R, W>(reader: R, writer: W, init: ServerInit) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -951,7 +950,7 @@ where
 /// (this process's `stdin` + `stdout`): serve every leg of the edit-host wire — fs
 /// reads/writes, the watch push, child processes, the blocking `vim.system`
 /// shell-out, language servers, and the Lua-visible filesystem — against *this*
-/// host's real disk and processes. Unlike [`run_io`] there is **no editor, no Lua,
+/// host's real disk and processes. Unlike [`run`] there is **no editor, no Lua,
 /// and no config sourcing**: the daemon is pure I/O, and LSP/process discovery
 /// (program/args/cwd) plus the project tree all arrive on the wire from the local
 /// edit-host.

@@ -1,49 +1,22 @@
 //! `nxvim-gui` entry point.
 //!
-//! Two ways to run, sharing one client:
+//! `nxvim-gui [file]` runs an *embedded* editor: a headless server on its own
+//! thread, joined to the UI client over an in-process duplex stream — the same
+//! msgpack-RPC the TUI binary uses. The client is a native winit + wgpu window
+//! ([`nxvim_gui::run`]).
 //!
-//! - **Embedded** (`nxvim-gui [file]`): like the `nxvim` TUI binary, a headless
-//!   server runs on its own thread, joined to the UI client over an in-process
-//!   duplex stream — the same msgpack-RPC a remote client uses.
-//! - **Remote** (`nxvim-gui [user@]host[:port] [file]`): the server runs on a
-//!   remote host reached over SSH ([`nxvim_gui::remote`]); only this thin client
-//!   is local. The editor state, Lua, LSP, and treesitter all live remote.
-//!
-//! Either way the client is the same native winit + wgpu window
-//! ([`nxvim_gui::run`]); only the transport it's handed differs.
+//! To edit on another machine, open an SSH session and run `nxvim` there. (The GUI
+//! has no built-in remote transport — the "whole editor runs remote, thin client
+//! local" role was removed.)
 
 use anyhow::Result;
-use nxvim_gui::remote::RemoteSpec;
 use nxvim_gui::GuiConfig;
 use nxvim_server::{run as run_server, ServerInit};
 
 fn main() -> Result<()> {
-    // SSH askpass helper mode: when ssh re-invokes this binary as its
-    // `$SSH_ASKPASS` (see `remote::connect`), pop the prompt dialog and exit —
-    // never start the editor. Must be the first thing `main` does.
-    if let Some(result) = nxvim_gui::remote::run_askpass_if_invoked() {
-        return result;
-    }
-
-    // The positional arguments (first is the file *or* an SSH target; for a remote
-    // target the second is the remote file) plus the font config (`--font` /
-    // `--font-size`, overriding the `NXVIM_GUI_FONT*` environment).
+    // The positional arguments (the first is the file to open) plus the font config
+    // (`--font` / `--font-size`, overriding the `NXVIM_GUI_FONT*` environment).
     let (positionals, config) = parse_args();
-
-    // A first positional shaped like `[user@]host[:port]` runs the editor on a
-    // remote host over SSH instead of embedding a local server. The second
-    // positional is then the file to open *there*.
-    if let Some(spec) = positionals.first().and_then(|a| RemoteSpec::parse(a)) {
-        let spec = spec.with_file(positionals.get(1).cloned());
-        // The transport is built inside the client's IO runtime (the ssh child's
-        // pipes must live on the runtime that polls them), so hand `run` a
-        // connector rather than a ready stream. No local server, no `open_dir`.
-        return nxvim_gui::run(
-            move || async move { nxvim_gui::remote::connect(&spec).await },
-            config,
-            None,
-        );
-    }
 
     let file = positionals.into_iter().next();
 
@@ -123,13 +96,11 @@ fn main() -> Result<()> {
     result
 }
 
-/// Parse the command line into `(file, config)`: the first non-flag argument is
-/// the file to open; `--font <name>` / `--font-size <pt>` (or the `=` form) set the
-/// font, taking precedence over the `NXVIM_GUI_FONT` / `NXVIM_GUI_FONT_SIZE`
-/// environment the config starts from. Unknown flags are ignored.
-///
-/// Positionals are returned in order: the first is the file *or* an SSH target,
-/// and (for a remote target) the second is the remote file — `main` decides which.
+/// Parse the command line into `(positionals, config)`: non-flag arguments (the
+/// first is the file to open) in order, plus the font config — `--font <name>` /
+/// `--font-size <pt>` (or the `=` form) set the font, taking precedence over the
+/// `NXVIM_GUI_FONT` / `NXVIM_GUI_FONT_SIZE` environment the config starts from.
+/// Unknown flags are ignored.
 fn parse_args() -> (Vec<String>, GuiConfig) {
     let mut positionals = Vec::new();
     let mut config = GuiConfig::from_env();

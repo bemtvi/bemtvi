@@ -37,11 +37,6 @@ wasm-bindgen = "=0.2.123"
 # Serializes the editor's `View` into the JSON the JS renderer consumes. Pure Rust,
 # wasm-clean; pinned to the same version the workspace uses elsewhere.
 serde_json = "=1.0.150"
-# msgpack values for the remote-mode client (`RemoteClient`): synchronous frame
-# (de)coding of the server's RPC wire. Pure Rust and wasm-clean; already pulled in
-# transitively by `nxvim-view`'s public `redraw` decoder, named here directly so
-# `remote.rs` can build and parse frames. Pinned to the workspace version.
-rmpv = "=1.3.1"
 
 # Small wasm with good runtime speed for the demo; `wasm-bindgen`'s recommended
 # release profile.

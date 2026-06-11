@@ -1,5 +1,16 @@
 # The local edit-host, the remote daemon, and Lua in the browser — implementation plan
 
+> **Update (2026-06-11): classic remote removed.** The "whole editor runs remote,
+> thin client local" topology this plan was written *against* has since been deleted
+> outright — `nxvim --server`, the `nxvim-gui` SSH client (`:connect`, askpass), and
+> the Socket.IO web bridge (`nxvim-web-bridge` + the wasm `RemoteClient`) are all
+> gone. The browser is **serverless only**. References below to `--server` as
+> "today's topology," and to the `RemoteClient`/Socket.IO path "retiring" into the
+> edit-host (Open Decision #3), are therefore historical: those pieces no longer
+> exist to retire, and the edit-host / daemon split is the *only* remote story. The
+> retired `docs/plans/2026-06-09-remote-ssh-client.md` and
+> `…-remote-web-client-over-socketio.md` plans were deleted with the code.
+
 ## Why this document exists
 
 Remote nxvim is **laggy**, and the lag is structural, not tunable. Today's
@@ -1433,8 +1444,8 @@ by `HostServices` (Phase 1) over RPC:
 - **Daemon** (runs *remotely*): fs + process + watch only — the `HostFs`/`HostProc`
   server half. Tiny.
 
-The network boundary moves from *above* the editor (today's `nxvim --server` over
-ssh stdio, `docs/plans/2026-06-09-remote-ssh-client.md`) to *below* it: the GUI/TUI
+The network boundary moves from *above* the editor (the former `nxvim --server` over
+ssh stdio, since removed) to *below* it: the GUI/TUI
 client and edit-host are co-located and local; `ssh … nxvim --daemon` runs just
 the fs/process daemon on the remote, and the local edit-host is a `HostServices`
 client over the ssh stdio transport (reusing the `nxvim-rpc` plumbing and the

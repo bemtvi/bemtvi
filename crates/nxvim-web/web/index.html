@@ -52,8 +52,9 @@
   .panel { position: absolute; left: 0; background: #21252b; }
   .panel-title { background: #2c313a; color: var(--accent); }
   .panel-cur { background: var(--sel); }
-  /* Remote (server-styled) mode only. The server resolves a colorscheme palette
-     and projects per-cell decorations; these render the bits the local CSS lacks. */
+  /* Server-styled (palette) rendering: used only when a frame carries a resolved
+     colorscheme palette + per-cell decorations. The serverless build never emits
+     those, so this path is currently dormant; kept for a palette-bearing frame. */
   /* Diagnostic underline — wavy, keeps the cell's syntax foreground (like the TUI's
      Undercurl). The squiggle color rides on an inline text-decoration-color. */
   .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
@@ -87,7 +88,7 @@
   <input id="file-input" type="file" class="hidden" />
 
   <script type="module">
-    import init, { WebEditor, RemoteClient } from "./pkg/nxvim_web.js";
+    import init, { WebEditor } from "./pkg/nxvim_web.js";
     import { createHighlighter, colorFor } from "./highlight.js";
 
     const FONT_PX = 15, LINE = 1.4;
@@ -95,13 +96,9 @@
     const noticeEl = document.getElementById("notice");
     const fileInput = document.getElementById("file-input");
 
-    let editor = null;     // the local serverless editor (null in remote mode)
-    let client = null;     // the remote RemoteClient (null in local mode)
-    let socket = null;     // the Socket.IO transport (remote mode only)
+    let editor = null;     // the client-side serverless editor (WebEditor)
     let view = null;
     let ts = null; // tree-sitter highlighter (loaded lazily by language)
-    // True once a remote socket exists: the single branch the input shims key on.
-    const remote = () => socket != null;
     let cw = 9, ch = 21;
     let cols = 80, editorRows = 24; // editorRows = grid rows minus the command row
     // File System Access handles, keyed by the buffer's file name, so :w writes
@@ -159,63 +156,18 @@
     function feed(notationStr) { sendInput(notationStr); }
     function refresh() { flushClipboard(); view = JSON.parse(editor.view_json()); applyView(); }
 
-    // ---- input shims: one path for both modes ----
-    // Local mode mutates the in-page editor and re-renders synchronously. Remote
-    // mode encodes the same gesture (via the shared nxvim-view encoders inside
-    // RemoteClient) and emits it over Socket.IO; the server's redraw round-trips
-    // and re-renders in onRpc, so these do NOT render. Key/paste also arm the idle
-    // flush, mirroring the TUI's timeoutlen flush so a pending mapping resolves.
-    // The msgpack RPC stream crosses the Socket.IO wire as base64 *text* events: the
-    // socket.io-client ↔ bridge (socketioxide) binary-attachment path doesn't
-    // interoperate, but text events do. Encode/decode at the socket boundary; the
-    // RemoteClient still works in raw bytes (Uint8Array) on both sides.
-    function bytesToB64(bytes) {
-      let s = "";
-      const CHUNK = 0x8000; // avoid String.fromCharCode arg-count limits on large frames
-      for (let i = 0; i < bytes.length; i += CHUNK) {
-        s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-      }
-      return btoa(s);
-    }
-    function b64ToBytes(b64) {
-      const bin = atob(b64);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    }
-    function emit(bytes) { if (socket && bytes && bytes.length) socket.emit("rpc", bytesToB64(bytes)); }
-    function sendInput(notation) {
-      if (remote()) { emit(client.input(notation)); armFlush(); }
-      else { editor.input(notation); refresh(); }
-    }
-    function sendKey(ctrl, alt, shift, name) {
-      if (remote()) { emit(client.key(ctrl, alt, shift, name)); armFlush(); }
-      else { editor.key(ctrl, alt, shift, name); refresh(); }
-    }
-    function sendPaste(text) {
-      if (remote()) { emit(client.paste(text)); armFlush(); }
-      else { editor.paste(text); refresh(); }
-    }
+    // ---- input shims ----
+    // Each gesture mutates the in-page editor and re-renders synchronously: the wasm
+    // core resolves mappings/motions itself, so there's no idle-flush round-trip.
+    function sendInput(notation) { editor.input(notation); refresh(); }
+    function sendKey(ctrl, alt, shift, name) { editor.key(ctrl, alt, shift, name); refresh(); }
+    function sendPaste(text) { editor.paste(text); refresh(); }
     function sendMouse(button, action, modifier, row, col) {
-      if (remote()) emit(client.input_mouse(button, action, modifier, row, col));
-      else { editor.mouse(button, action, modifier, row, col, Date.now()); refresh(); }
+      editor.mouse(button, action, modifier, row, col, Date.now());
+      refresh();
     }
-    function sendCommand(cmd) {
-      if (remote()) emit(client.command(cmd));
-      else { editor.command(cmd); refresh(); }
-    }
-    function sendResize(w, h) {
-      if (remote()) emit(client.try_resize(w, h));
-      else { editor.resize(w, h); refresh(); }
-    }
-    // The idle flush (remote only): after a quiet gap re-send nxvim_input_flush so
-    // the server resolves a pending mapping prefix, like the TUI's armed flush.
-    let flushTimer = null;
-    function armFlush() {
-      if (!remote()) return;
-      clearTimeout(flushTimer);
-      flushTimer = setTimeout(() => emit(client.flush()), 1000);
-    }
+    function sendCommand(cmd) { editor.command(cmd); refresh(); }
+    function sendResize(w, h) { editor.resize(w, h); refresh(); }
 
     // ---- clipboard register ("+ / "*) ----
     // The editor (nxvim-core) reads/writes the clipboard register synchronously
@@ -271,11 +223,12 @@
     }
 
     // ---- render the View as HTML ----
-    // serverStyled: a real server projected a resolved colorscheme palette + per-cell
-    // decorations (highlights/diagnostics/inlay hints) into this frame. We paint those
-    // directly instead of running the in-page tree-sitter highlighter (which is null in
-    // remote mode anyway). Keyed on the palette's presence so the renderer never branches
-    // on transport — only on what the frame carries.
+    // serverStyled: a frame carried a resolved colorscheme palette + per-cell
+    // decorations (highlights/diagnostics/inlay hints). We'd paint those directly
+    // instead of running the in-page tree-sitter highlighter. Keyed purely on the
+    // palette's presence — the serverless core never emits one, so this stays false
+    // and the in-page highlighter path is taken; the palette path is kept dormant
+    // for a future frame source that projects one.
     let serverStyled = false;
 
     // ---- smooth scrolling ----
@@ -1066,9 +1019,8 @@
       if ((e.metaKey || e.ctrlKey) && (e.key === "v" || e.key === "V")) return; // paste event
       // Cmd/Ctrl+C with an active visual selection copies it to the system clipboard,
       // GUI-style: yank to "+, which the post-keystroke flush pushes to
-      // navigator.clipboard. Local-only — a remote server owns its own clipboard
-      // register (the host's), so we leave Cmd/Ctrl+C to fall through there.
-      if (!remote() && (e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "c" || e.key === "C") &&
+      // navigator.clipboard.
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "c" || e.key === "C") &&
           view && (view.mode === "VISUAL" || view.mode === "V-LINE")) {
         e.preventDefault();
         editor.input('"+y'); // yank the selection to the clipboard register
@@ -1076,17 +1028,15 @@
         return;
       }
       if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
-      // Intercept Enter on a file command before it reaches the editor — local only.
-      // A remote server has a real filesystem, so :e/:w/:wq run server-side; <CR>
-      // must flow through as an ordinary keystroke.
-      if (!remote() && e.key === "Enter" && view && maybeHandleCommand()) { e.preventDefault(); return; }
+      // Intercept Enter on a file command before it reaches the editor: the in-page
+      // editor owns the (File System Access) filesystem, so :e/:w run here.
+      if (e.key === "Enter" && view && maybeHandleCommand()) { e.preventDefault(); return; }
       const name = keyName(e);
       if (name === null) return;
       e.preventDefault();
       // Starting a register sequence (`"`) — prime the system clipboard so an
-      // imminent "+p sees what was copied in another app (readText is async). Local
-      // only (the system clipboard cache lives in the in-page editor).
-      if (!remote() && name === '"') refreshSystemClipboard();
+      // imminent "+p sees what was copied in another app (readText is async).
+      if (name === '"') refreshSystemClipboard();
       sendKey(e.ctrlKey, e.altKey, e.shiftKey, name); // shared nxvim-view encoder
     });
     gridEl.addEventListener("paste", (e) => {
@@ -1164,46 +1114,15 @@
     });
     // The browser fires many `wheel` events per physical scroll — a trackpad or a
     // hi-res mouse reports a burst of sub-line deltas — so a notch per raw event
-    // scrolls a full `'mousescroll'` step each time and the view flies. Convert the
-    // delta to whole-line notches, carrying the fractional remainder between events,
-    // exactly like the GUI client. Local mode does this in the wasm core
-    // (`WebEditor::wheel`, which the scroll tests cover); remote mode has no such
-    // batching API, so accumulate here and send discrete notches.
-    const remoteWheelAccum = { x: 0, y: 0 };
-    function wheelToLines(e) {
-      switch (e.deltaMode) {
-        case 1: return { x: e.deltaX, y: e.deltaY };                                 // already lines
-        case 2: return { x: e.deltaX * Math.max(1, cols), y: e.deltaY * Math.max(1, editorRows) }; // pages
-        default: return { x: e.deltaX / Math.max(1, cw), y: e.deltaY / Math.max(1, ch) };          // pixels
-      }
-    }
-    function drainNotch(amount, axis) {
-      remoteWheelAccum[axis] += amount;
-      const whole = Math.trunc(remoteWheelAccum[axis]);
-      remoteWheelAccum[axis] -= whole;
-      return whole;
-    }
+    // scrolls a full `'mousescroll'` step each time and the view flies. The wasm core
+    // (`WebEditor::wheel`, which the scroll tests cover) converts the delta to
+    // whole-line notches, carrying the fractional remainder between events, exactly
+    // like the GUI client.
     gridEl.addEventListener("wheel", (e) => {
       e.preventDefault();
       const { row, col } = cellAt(e);
-      if (!remote()) {
-        editor.wheel(e.deltaX, e.deltaY, e.deltaMode, cw, ch, mods(e), row, col, Date.now());
-        refresh();
-        return;
-      }
-      // Remote: convert + accumulate here, then send each whole notch as its own gesture.
-      const { x, y } = wheelToLines(e);
-      const MAX_STEPS = 10;
-      let vnotch = drainNotch(y, "y");
-      if (vnotch !== 0) {
-        const action = vnotch > 0 ? "down" : "up";
-        for (let i = 0, n = Math.min(Math.abs(vnotch), MAX_STEPS); i < n; i++) sendMouse("wheel", action, mods(e), row, col);
-      }
-      let hnotch = drainNotch(x, "x");
-      if (hnotch !== 0) {
-        const action = hnotch > 0 ? "right" : "left";
-        for (let i = 0, n = Math.min(Math.abs(hnotch), MAX_STEPS); i < n; i++) sendMouse("wheel", action, mods(e), row, col);
-      }
+      editor.wheel(e.deltaX, e.deltaY, e.deltaMode, cw, ch, mods(e), row, col, Date.now());
+      refresh();
     }, { passive: false });
     gridEl.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -1218,7 +1137,7 @@
     });
     function doResize() {
       layout();
-      if (editor || client) sendResize(cols, editorRows);
+      if (editor) sendResize(cols, editorRows);
     }
 
     // ---- boot ----
@@ -1226,24 +1145,12 @@
       const top = gridEl.getBoundingClientRect().top;
       gridEl.style.height = (window.innerHeight - top) + "px";
     }
-    // Pick the editor mode. `?mode=local|remote` forces it (the test/escape hatch);
-    // otherwise the bridge's /config.json advertises remote. A page served statically
-    // (no bridge) has no /config.json, so it boots local — today's behavior verbatim.
-    async function detectMode() {
-      const override = new URLSearchParams(location.search).get("mode");
-      if (override === "local" || override === "remote") return override;
-      try {
-        const cfg = await fetch("/config.json").then((r) => (r.ok ? r.json() : null));
-        return cfg?.mode === "remote" ? "remote" : "local";
-      } catch { return "local"; }
-    }
     async function boot() {
       await init();
       fitGrid();
       measureCell();
       layout();
-      if ((await detectMode()) === "remote") await bootRemote();
-      else bootLocal();
+      bootLocal();
     }
 
     // The fully client-side editor: WebEditor + the in-page tree-sitter highlighter.
@@ -1271,61 +1178,6 @@
       };
     }
 
-    // A thin client of a real remote nxvim-server, over Socket.IO. The RemoteClient
-    // (wasm) does the msgpack framing / encoding; this page owns the socket and the
-    // paint. The server emits full redraw frames (palette + highlights + chrome),
-    // which renderLineServer paints — no in-page highlighter (ts stays null).
-    let redrawWaiters = [];
-    function resolveRedraw() { const ws = redrawWaiters; redrawWaiters = []; ws.forEach((r) => r()); }
-    function onRpc(b64) {
-      // Each "rpc" event is one base64 chunk of the server's msgpack stream.
-      client.feed(b64ToBytes(b64));
-      if (client.closed()) { socket.disconnect(); notify("Connection to the server closed."); return; }
-      const resp = client.take_response();   // owed reply to a server→client request
-      if (resp) emit(resp);
-      if (client.dirty()) {
-        view = JSON.parse(client.view_json());
-        applyView();
-        resolveRedraw();
-      }
-    }
-    async function bootRemote() {
-      client = new RemoteClient(cols, editorRows);
-      ts = null; // the server highlights; never load the in-page tree-sitter runtime
-      applyRemoteChrome();
-      const mod = await import("/vendor/socket.io/socket.io.esm.min.js");
-      const io = mod.io ?? mod.default;
-      // Websocket transport only: the bridge (engineioxide) and socket.io-client don't
-      // interoperate over the HTTP long-polling handshake, but the direct websocket
-      // upgrade does — and ws is the better transport for a binary RPC stream anyway
-      // (lower latency, no base64 polling overhead). socket.io still gives us
-      // reconnection + heartbeat + the named "rpc" event framing on top.
-      socket = io({ transports: ["websocket"] });
-      socket.on("connect", () => emit(client.attach()));
-      socket.on("rpc", onRpc);
-      socket.on("disconnect", () => notify("Disconnected — reconnecting…"));
-      gridEl.focus();
-      // The remote test hook mirrors the local one: drive the client, await the
-      // next applied server redraw, then read the decoded rich view.
-      window.__nxvim = {
-        feed: (n) => sendInput(n),
-        key: (ctrl, alt, shift, name) => sendKey(ctrl, alt, shift, name),
-        mouse: (button, action, modifier, row, col) => sendMouse(button, action, modifier, row, col),
-        command: (cmd) => sendCommand(cmd),
-        view: () => view,
-        nextRedraw: () => new Promise((res) => redrawWaiters.push(res)),
-      };
-    }
-    // Remote mode: the server owns the filesystem and clipboard, so hide the local
-    // file toolbar + FS-Access notice and re-label the header.
-    function applyRemoteChrome() {
-      for (const id of ["btn-open", "btn-save", "btn-saveas"]) {
-        const el = document.getElementById(id);
-        if (el) el.classList.add("hidden");
-      }
-      const sub = document.getElementById("subtitle");
-      if (sub) sub.textContent = "· connected to a remote nxvim-server";
-    }
     window.addEventListener("resize", fitGrid);
     boot();
   </script>

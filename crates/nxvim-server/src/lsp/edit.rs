@@ -261,7 +261,7 @@ impl Server {
             return;
         };
         let token = self.register_lsp_request(LspReqKind::ResolveCodeAction);
-        self.lsp
-            .request(key, token, LspRequest::ResolveCodeAction { action });
+        self.fx
+            .lsp_request(key, token, LspRequest::ResolveCodeAction { action });
     }
 }

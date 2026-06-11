@@ -88,8 +88,8 @@ impl Server {
             },
         };
         let token = self.register_inlay_request(buffer);
-        self.lsp
-            .request(key, token, nxvim_lsp::LspRequest::InlayHint { uri, range });
+        self.fx
+            .lsp_request(key, token, nxvim_lsp::LspRequest::InlayHint { uri, range });
     }
 
     /// Cache an `inlayHint` reply for the buffer it was requested for, decoding each
@@ -168,7 +168,7 @@ impl Server {
     /// dropped (the whole cache was already replaced by the newer request).
     fn issue_inlay_resolves(&mut self, buffer: BufferId, server_key: &ServerKey, tick: u64) {
         // Collect (line, idx, hint-json) for every placeholder first — issuing
-        // borrows `self.lsp` mutably, so the cache read must finish beforehand.
+        // borrows `self.fx` mutably, so the cache read must finish beforehand.
         let mut jobs: Vec<(usize, usize, nxvim_lsp::serde_json::Value)> = Vec::new();
         if let Some(state) = self.lsp_states.get(&buffer) {
             for (&line, spans) in &state.inlay.hints {
@@ -196,7 +196,7 @@ impl Server {
                 generation: 0,
                 cb_id,
             };
-            self.lsp.request(
+            self.fx.lsp_request(
                 server_key.clone(),
                 token,
                 nxvim_lsp::LspRequest::ResolveInlayHint { hint },

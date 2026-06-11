@@ -120,7 +120,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a–4b done, 4c–4e remain) |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a–4c done, 4d–4e remain) |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
@@ -1657,8 +1657,7 @@ sync tick is hoisted off `Server` onto `EditHost` proper.
 **Deferred to the next 4-proper slices (deliberately, not stubbed — only what's wired
 lives on the trait):**
 - **4b — off-tick fs effects** ✅ DONE — Phase 4b below.
-- **4c — LSP effects** (the `lsp/` submodules' `self.lsp.*` command surface) behind the
-  trait; the inbound `lsp_events` stays in the run loop.
+- **4c — LSP effects** ✅ DONE — Phase 4c below.
 - **4d — the inbound seam**: editor-tick `on_*` methods consuming the `select!` arms'
   events (`on_loop_event`, `apply_open`, `apply_save_done`, `on_lsp_event`,
   `on_remote_file_changed`, `on_install_done`) so the run loop is a thin translator.
@@ -1704,6 +1703,42 @@ the ack-gated `:wq` and the failing-write-cancels-the-quit cases), `daemon_watch
 `HostWatch` arm + push reconcile), and the local-session regressions (`editing`,
 `host_fs`, `host_proc`). The `HostEffects` surface grows once more (LSP, TSInstall)
 before the sync tick is hoisted off `Server` onto `EditHost` proper.
+
+#### Phase 4c — the `HostEffects` seam: LSP effects — ✅ DONE (2026-06-11)
+
+The third brick: route the editor tick's **LSP command surface** through `HostEffects`.
+The `lsp/` submodules touch the [`LspManager`] at exactly **17 sites**, and it is purely
+an *outbound command sink* — `ensure_server` / `notify` / `request`, no reads — so the
+whole field moves behind the trait with no read-path entanglement. Same discipline as
+4a/4b: only the outbound side joins the seam; the inbound `LspEvent` stream
+(`lsp_events`, the diagnostics/reply arm) stays owned by the run loop's `select!` for the
+4d inbound slice.
+
+Shipped (`crates/nxvim-server/src/edithost.rs`):
+- **Three new `HostEffects` methods** — `lsp_ensure(key, spawn)`, `lsp_notify(key, note)`,
+  `lsp_request(key, token, req)` — one per `LspManager` method the tick actually fires
+  (the fourth, `shutdown`, isn't called from the tick, so it stays off the trait per
+  "only what's wired lives on the seam"). `NativeEffects` now **owns the `LspManager`**
+  and delegates verbatim; `Server` no longer holds `lsp`. The 17 call sites across
+  `request.rs` / `sync.rs` / `inlay.rs` / `semantic.rs` / `edit.rs` / `completion.rs`
+  call `self.fx.lsp_*` instead of `self.lsp.*`. The manager's inbound `lsp_events`
+  receiver (created with it at startup) is untouched — it still feeds the run loop.
+
+**Exit criteria — met.** Pure delegation, zero behavior change: `cargo build` +
+`fmt --check` + `clippy -D warnings` clean; the **full workspace** (`cargo test
+--workspace`, 1341 tests / 78 binaries) green, and — the faithful proof this reroutes a
+*live* path, not just compiles — the **114-test `nxvim` LSP suite** (`crates/nxvim/tests/
+lsp/`) passes unchanged: it drives a real `--__lsp-mock` server through the whole
+`ensure → didOpen → request → reply` exchange (and the daemon `RemoteLspTransport` leg),
+exactly the `lsp_ensure` / `lsp_notify` / `lsp_request` methods this slice introduces. Four of
+the five outbound effect classes the 4a map named now ride the seam (wire + loop
+commands + off-tick fs + LSP); the lone holdout is **TSInstall** (the 1-site
+`:TSInstall` fetch+compile `spawn_blocking` → `install_tx`), still direct on `Server`. The
+remaining 4-proper slices are the **4d inbound seam** (the `select!` arms' `on_*`
+methods — `on_loop_event` / `apply_open` / `apply_save_done` / `on_lsp_event` /
+`on_remote_file_changed` / `on_install_done`) and **4e** (hoist the sync tick onto a
+standalone `EditHost`); the trailing TSInstall outbound site is small enough to fold into
+whichever of those reaches it first rather than carrying its own slice.
 
 ---
 

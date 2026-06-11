@@ -98,7 +98,7 @@ impl Server {
             _ => nxvim_lsp::LspRequest::SemanticTokensFull { uri },
         };
         let token = self.register_semantic_request(buffer);
-        self.lsp.request(key, token, request);
+        self.fx.lsp_request(key, token, request);
     }
 
     /// Cache a `semanticTokens/full` or `full/delta` reply for the buffer it was

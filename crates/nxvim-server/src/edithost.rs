@@ -26,6 +26,7 @@ use crate::daemon::{FsRead, HostFsAsync};
 use crate::evloop::{EventLoop, LoopCommand};
 use crate::save::SaveDone;
 use nxvim_core::{BufferId, PendingSave};
+use nxvim_lsp::{LspManager, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
 use nxvim_rpc::Rpc;
 use rmpv::Value;
 use std::io;
@@ -72,6 +73,20 @@ pub trait HostEffects {
     /// vs. local branches — the remote watch arming in `sync_buffer_watches` and the
     /// off-tick open/save drains.
     fn has_remote_fs(&self) -> bool;
+
+    /// LSP — ensure `key`'s language server is running (idempotent), spawning it via
+    /// `spawn` on first use. Fire-and-forget; the server's notifications and reply
+    /// stream return *inbound* on the run loop's `lsp_events` arm, not here.
+    fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn);
+
+    /// LSP — fire-and-forget a document-sync notification (`didOpen` / `didChange` /
+    /// `didSave` / `didClose`) at `key`'s server. Dropped if no such server is running.
+    fn lsp_notify(&mut self, key: ServerKey, note: LspNotify);
+
+    /// LSP — fire a language-feature request at `key`'s server; its reply returns later
+    /// *inbound* as an `LspEvent::Reply` carrying `token` (the editor never awaits the
+    /// round-trip). Dropped if no such server is running.
+    fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest);
 }
 
 /// The native implementation of [`HostEffects`]: the client wire is msgpack-RPC and
@@ -92,6 +107,10 @@ pub struct NativeEffects {
     /// Delivery for a finished off-tick write — the run loop's save arm drains it. The
     /// effect spawns the write and forwards the [`SaveDone`] (ack-gated saved-state) here.
     save_done_tx: UnboundedSender<SaveDone>,
+    /// The LSP command sink — the manager the editor tick fires `ensure` / `notify` /
+    /// `request` at. Its inbound event/reply stream (`lsp_events`) is owned by the run
+    /// loop's `select!`, not here (the inbound seam is the 4d slice).
+    lsp: LspManager,
 }
 
 impl NativeEffects {
@@ -101,6 +120,7 @@ impl NativeEffects {
         host_fs_async: Option<Arc<dyn HostFsAsync>>,
         open_tx: UnboundedSender<(BufferId, String, io::Result<FsRead>)>,
         save_done_tx: UnboundedSender<SaveDone>,
+        lsp: LspManager,
     ) -> Self {
         Self {
             rpc,
@@ -108,6 +128,7 @@ impl NativeEffects {
             host_fs_async,
             open_tx,
             save_done_tx,
+            lsp,
         }
     }
 }
@@ -169,5 +190,17 @@ impl HostEffects for NativeEffects {
 
     fn has_remote_fs(&self) -> bool {
         self.host_fs_async.is_some()
+    }
+
+    fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn) {
+        self.lsp.ensure_server(key, spawn);
+    }
+
+    fn lsp_notify(&mut self, key: ServerKey, note: LspNotify) {
+        self.lsp.notify(key, note);
+    }
+
+    fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest) {
+        self.lsp.request(key, token, req);
     }
 }

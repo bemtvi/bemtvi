@@ -207,7 +207,7 @@ impl Server {
         spawn.settings = settings;
         spawn.capabilities = capabilities;
         if !self.lsp_ensured.contains(&key) {
-            self.lsp.ensure_server(key.clone(), spawn);
+            self.fx.lsp_ensure(key.clone(), spawn);
             self.lsp_ensured.insert(key.clone());
         }
         let state = self.lsp_states.entry(buffer).or_default();
@@ -287,7 +287,7 @@ impl Server {
             let text = self.editor.buffer().text.to_string();
             state.version = 1;
             let language_id = state.language_id.clone();
-            self.lsp.notify(
+            self.fx.lsp_notify(
                 key.clone(),
                 LspNotify::DidOpen {
                     uri: uri.clone(),
@@ -317,7 +317,7 @@ impl Server {
             } else {
                 incremental_changes_in(self.editor.buffer(), &batch.edits, encoding)
             };
-            self.lsp.notify(
+            self.fx.lsp_notify(
                 key.clone(),
                 LspNotify::DidChange {
                     uri: uri.clone(),
@@ -332,7 +332,8 @@ impl Server {
         // Save: the buffer's write counter advanced since the last sync, so a `:w`
         // landed bytes on disk (a real hook, not a `modified`-flag heuristic).
         if state.opened && cur_save_tick != state.last_save_tick {
-            self.lsp.notify(key, LspNotify::DidSave { uri, text: None });
+            self.fx
+                .lsp_notify(key, LspNotify::DidSave { uri, text: None });
             state.last_save_tick = cur_save_tick;
         }
 
@@ -417,7 +418,7 @@ impl Server {
             state.last_tick = cur_tick;
             state.version
         };
-        self.lsp.notify(
+        self.fx.lsp_notify(
             key,
             LspNotify::DidChange {
                 uri,
@@ -490,7 +491,7 @@ impl Server {
                             .unwrap_or_default();
                         self.fire_lsp_detach(id, &file, client_id);
                     }
-                    self.lsp.notify(key, LspNotify::DidClose { uri });
+                    self.fx.lsp_notify(key, LspNotify::DidClose { uri });
                 }
             }
         }

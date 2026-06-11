@@ -285,9 +285,6 @@ struct Server {
     /// `after/queries` / `;extends` overlay is merged by Lua the first time a buffer
     /// of that language is about to be highlighted, never re-resolved per redraw.
     ts_resolved_langs: HashSet<String>,
-    /// The in-process LSP client: spawns/supervises N language servers and
-    /// bridges them to the [`LspEvent`] channel the main loop selects on.
-    lsp: LspManager,
     /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
     /// analogue).
     lsp_states: HashMap<BufferId, LspDocState>,
@@ -667,20 +664,21 @@ where
         editor,
         lua,
         // The native outbound-effect seam: the client wire ([`Rpc`]), the event-loop
-        // actor ([`EventLoop`]), and the off-tick daemon fs (read/write/watch + the
-        // `open_tx` / `save_done_tx` deliveries) the editor tick fires through. The wasm
-        // build (Phase 5) swaps a JS-interop + daemon-link implementor here.
+        // actor ([`EventLoop`]), the off-tick daemon fs (read/write/watch + the
+        // `open_tx` / `save_done_tx` deliveries), and the LSP command sink ([`LspManager`])
+        // the editor tick fires through. The wasm build (Phase 5) swaps a JS-interop +
+        // daemon-link implementor here.
         fx: Box::new(NativeEffects::new(
             rpc,
             evloop,
             host_fs_async,
             open_tx,
             save_done_tx,
+            lsp,
         )),
         ui: None,
         syntax_states: HashMap::new(),
         ts_resolved_langs: HashSet::new(),
-        lsp,
         lsp_states: HashMap::new(),
         lsp_servers: HashMap::new(),
         lsp_ensured: HashSet::new(),

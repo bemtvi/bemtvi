@@ -195,8 +195,8 @@ impl Server {
         if let Some(menu) = self.completion.as_mut() {
             menu.resolving = Some(raw_idx);
         }
-        self.lsp
-            .request(key, token, LspRequest::ResolveCompletion { item });
+        self.fx
+            .lsp_request(key, token, LspRequest::ResolveCompletion { item });
     }
 
     /// Merge a `completionItem/resolve` reply into the in-flight target item and

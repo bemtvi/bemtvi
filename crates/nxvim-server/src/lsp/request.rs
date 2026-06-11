@@ -61,7 +61,7 @@ impl Server {
             | LspReqKind::InlayHints
             | LspReqKind::ResolveInlayHint => return,
         };
-        self.lsp.request(key, token, req);
+        self.fx.lsp_request(key, token, req);
     }
 
     /// Bump the request generation and register the in-flight request for `kind`
@@ -121,8 +121,8 @@ impl Server {
             generation: 0,
             cb_id,
         };
-        self.lsp
-            .request(key, token, LspRequest::Raw { method, params });
+        self.fx
+            .lsp_request(key, token, LspRequest::Raw { method, params });
     }
 
     /// `client:notify(method, params)` (Phase 5): fire-and-forget a generic LSP
@@ -140,7 +140,7 @@ impl Server {
             ));
             return;
         };
-        self.lsp.notify(key, LspNotify::Raw { method, params });
+        self.fx.lsp_notify(key, LspNotify::Raw { method, params });
     }
 
     /// `:LspFormat` — request `textDocument/formatting` for the current buffer.
@@ -153,7 +153,7 @@ impl Server {
             return;
         };
         let token = self.register_lsp_request(LspReqKind::Formatting);
-        self.lsp.request(
+        self.fx.lsp_request(
             key,
             token,
             LspRequest::Formatting {
@@ -182,7 +182,7 @@ impl Server {
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
         let token = self.register_lsp_request(LspReqKind::Rename);
-        self.lsp.request(
+        self.fx.lsp_request(
             key,
             token,
             LspRequest::Rename {
@@ -206,7 +206,7 @@ impl Server {
         let position = self.lsp_position(encoding, row, col);
         let diagnostics = self.diagnostics_at_cursor();
         let token = self.register_lsp_request(LspReqKind::CodeAction);
-        self.lsp.request(
+        self.fx.lsp_request(
             key,
             token,
             LspRequest::CodeAction {

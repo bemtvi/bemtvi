@@ -47,10 +47,10 @@ pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
 pub use daemon::{
-    serve_daemon, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on,
-    serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on, serve_sys_daemon,
-    serve_sys_daemon_on, FsRead, HostFsAsync, RemoteBlockingSystem, RemoteHostFs, RemoteHostProc,
-    RemoteLspTransport, RemoteLuaFs, WatchEvent,
+    connect_daemon, serve_daemon, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
+    serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
+    serve_sys_daemon, serve_sys_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteBlockingSystem,
+    RemoteHostFs, RemoteHostProc, RemoteLspTransport, RemoteLuaFs, WatchEvent,
 };
 
 use evloop::EventLoop;

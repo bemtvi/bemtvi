@@ -1041,14 +1041,37 @@ fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
 /// [`ServerInit`](crate::ServerInit) onto the server thread, where it is rebuilt into
 /// the editor's `Rc<dyn BlockingSystem>`.
 pub struct RemoteBlockingSystem {
-    /// Into the dedicated link thread: a spec to run plus the one-shot reply channel
-    /// the caller parks on.
-    req_tx: std::sync::mpsc::Sender<SysJob>,
+    /// Into the link thread: a spec to run plus the one-shot reply channel the caller
+    /// parks on. A **tokio** sender (not `std`) so the job-server can `await` it on the
+    /// shared link runtime — the same channel feeds the dedicated-thread single-leg
+    /// [`connect`](Self::connect) and the multiplexed [`connect_daemon`].
+    req_tx: UnboundedSender<SysJob>,
 }
 
 /// One blocking shell-out queued onto the link thread: the spec, and the `std` channel
-/// the parked editor thread waits on for its [`SystemOutput`].
+/// the parked editor thread waits on for its [`SystemOutput`]. The reply stays `std`
+/// (not tokio) because the editor thread parks on it from *inside* the server runtime,
+/// where a tokio recv would panic — a plain OS-thread park is what's wanted.
 type SysJob = (SystemSpec, std::sync::mpsc::Sender<SystemOutput>);
+
+/// The sys leg's job server: pull each queued shell-out off `req_rx` and drive its
+/// `sys_run` request to completion over `rpc`, delivering the result to the parked
+/// caller. Runs on whichever runtime drives it — the single-leg [`RemoteBlockingSystem::
+/// connect`]'s dedicated thread, or the shared [`connect_daemon`] link thread — so the
+/// editor thread (parked on the `std` reply) is never the one polling the reply.
+async fn run_sys_jobs(rpc: Rpc, mut req_rx: UnboundedReceiver<SysJob>) {
+    while let Some((spec, reply_tx)) = req_rx.recv().await {
+        let out = match rpc.request(SYS_RUN, encode_sys_run(&spec)).await {
+            Ok(v) => decode_sys_output(v),
+            // A transport failure (daemon gone) degrades loudly to a `code = -1` result,
+            // never a panic — `vim.system` callers rely on a value.
+            Err(e) => SystemOutput::failed(format!("vim.system: daemon error: {e}")),
+        };
+        // The receiver is gone only if the caller was itself dropped mid-call; nothing
+        // to deliver to, so discard.
+        let _ = reply_tx.send(out);
+    }
+}
 
 impl RemoteBlockingSystem {
     /// Connect to a daemon over `reader`/`writer`, spawning the dedicated link thread.
@@ -1056,13 +1079,14 @@ impl RemoteBlockingSystem {
     /// and serves jobs one at a time (a blocking shell-out is serial by nature — the
     /// edit-host is parked until it returns), driving each `sys_run` request to
     /// completion on its runtime so the parked editor thread isn't the one that has to
-    /// poll the reply.
+    /// poll the reply. (The multiplexed [`connect_daemon`] runs [`run_sys_jobs`] as a
+    /// task on the *shared* link runtime instead of owning a thread here.)
     pub fn connect<R, W>(reader: R, writer: W) -> RemoteBlockingSystem
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<SysJob>();
+        let (req_tx, req_rx) = unbounded_channel::<SysJob>();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1074,33 +1098,15 @@ impl RemoteBlockingSystem {
                 // degrades loudly rather than hanging.
                 Err(_) => return,
             };
-            let rpc = rt.block_on(async move {
+            rt.block_on(async move {
                 let (rpc, mut incoming) = connect(reader, writer);
                 // Drain the incoming stream so the connection isn't torn down (dropping
                 // the receiver would). The sys leg has no daemon→edit-host pushes, so
                 // this only ever observes EOF — but the receiver must stay alive and
                 // consumed for the link to live.
                 tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                rpc
+                run_sys_jobs(rpc, req_rx).await;
             });
-            // Park on the `std` channel between jobs; drive each to completion on *this*
-            // thread's runtime. While we're parked here the runtime is idle (no pushes
-            // to miss); `block_on` below drives the wire's reader/writer tasks whenever a
-            // job is in flight, so the reply lands.
-            while let Ok((spec, reply_tx)) = req_rx.recv() {
-                let out = rt.block_on(async {
-                    match rpc.request(SYS_RUN, encode_sys_run(&spec)).await {
-                        Ok(v) => decode_sys_output(v),
-                        // A transport failure (daemon gone) degrades loudly to a
-                        // `code = -1` result, never a panic — `vim.system` callers rely
-                        // on a value.
-                        Err(e) => SystemOutput::failed(format!("vim.system: daemon error: {e}")),
-                    }
-                });
-                // The receiver is gone only if the caller was itself dropped mid-call;
-                // nothing to deliver to, so discard.
-                let _ = reply_tx.send(out);
-            }
         });
         RemoteBlockingSystem { req_tx }
     }
@@ -1386,36 +1392,43 @@ async fn run_lsp_demux(mut incoming: UnboundedReceiver<Incoming>, inflight: LspI
         let Incoming::Notification { method, params } = msg else {
             continue; // the daemon speaks only notifications; ignore stray requests
         };
-        match method.as_str() {
-            LSP_STDOUT => {
-                if let Some((id, bytes)) = decode_id_bytes(params) {
-                    if let Some(inf) = inflight.lock().unwrap().get(&id) {
-                        let _ = inf.stdout_tx.send(bytes);
-                    }
-                }
-            }
-            LSP_STDERR => {
-                if let Some((id, bytes)) = decode_id_bytes(params) {
-                    if let Some(inf) = inflight.lock().unwrap().get(&id) {
-                        let _ = inf.stderr_tx.send(bytes);
-                    }
-                }
-            }
-            LSP_EXITED => {
-                if let Some((id, code, signal)) = decode_lsp_exited(&params) {
-                    // Remove (and drop the stdout/stderr sinks) *after* firing exit.
-                    // All preceding `lsp_stdout` for this id were queued onto the
-                    // unbounded sinks already (we process the wire in order), so the
-                    // reader drains them before observing EOF.
-                    if let Some(inf) = inflight.lock().unwrap().remove(&id) {
-                        let _ = inf.exit_tx.send((code, signal));
-                    }
-                }
-            }
-            _ => {}
-        }
+        route_lsp_notification(&inflight, &method, params);
     }
     inflight.lock().unwrap().clear();
+}
+
+/// Route one daemon→edit-host LSP notification (`lsp_stdout` / `lsp_stderr` /
+/// `lsp_exited`) to the server it belongs to by `id`. Factored out of [`run_lsp_demux`]
+/// so the multiplexed [`connect_daemon`] demux — which fans *all* legs off one shared
+/// `incoming` — reuses the exact same routing. A method that isn't an LSP push is a
+/// no-op. (`stdout`/`stderr` chunks queue onto the unbounded sinks in wire order, so the
+/// `lsp_exited` remove-and-drop can't strand trailing output: the reader drains the
+/// queued chunks before observing the sink's EOF.)
+fn route_lsp_notification(inflight: &LspInflightMap, method: &str, params: Vec<Value>) {
+    match method {
+        LSP_STDOUT => {
+            if let Some((id, bytes)) = decode_id_bytes(params) {
+                if let Some(inf) = inflight.lock().unwrap().get(&id) {
+                    let _ = inf.stdout_tx.send(bytes);
+                }
+            }
+        }
+        LSP_STDERR => {
+            if let Some((id, bytes)) = decode_id_bytes(params) {
+                if let Some(inf) = inflight.lock().unwrap().get(&id) {
+                    let _ = inf.stderr_tx.send(bytes);
+                }
+            }
+        }
+        LSP_EXITED => {
+            if let Some((id, code, signal)) = decode_lsp_exited(&params) {
+                if let Some(inf) = inflight.lock().unwrap().remove(&id) {
+                    let _ = inf.exit_tx.send((code, signal));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Forward everything the manager writes to a server's stdin onto the wire as
@@ -1721,32 +1734,46 @@ fn decode_lsp_exited(params: &[Value]) -> Option<(u64, Option<i32>, Option<i32>)
 
 /// One queued fs request on the link thread: the `["op", args…]` params and the `std`
 /// channel the parked editor thread waits on for the reply (`Ok` value or a transport
-/// error string).
+/// error string). The reply stays `std` for the same reason as [`SysJob`] — the editor
+/// thread parks on it from inside the server runtime.
 type LuaFsJob = (Vec<Value>, std::sync::mpsc::Sender<Result<Value, String>>);
+
+/// The luafs leg's job server: pull each queued `["op", args…]` request off `req_rx`,
+/// drive it to completion over `rpc`, and deliver the raw reply (or a transport-error
+/// string) to the parked caller. Runs on whichever runtime drives it — the single-leg
+/// dedicated thread or the shared [`connect_daemon`] link runtime (mirrors
+/// [`run_sys_jobs`]).
+async fn run_luafs_jobs(rpc: Rpc, mut req_rx: UnboundedReceiver<LuaFsJob>) {
+    while let Some((params, reply_tx)) = req_rx.recv().await {
+        let reply = rpc.request(LUAFS, params).await.map_err(|e| e.to_string());
+        let _ = reply_tx.send(reply);
+    }
+}
 
 /// A [`LuaFs`] that runs the project-facing Lua fs surface on a remote daemon instead of
 /// locally — the edit-host side of the `luafs` leg. The blocking bridge mirrors
 /// [`RemoteBlockingSystem`]: synchronous calls park the editor thread on the daemon
 /// reply, with the wire's RPC tasks on their own thread so the park can't deadlock.
 ///
-/// `Send` (it holds only a `std::sync::mpsc::Sender`) so it rides
+/// `Send` (it holds only a tokio [`UnboundedSender`]) so it rides
 /// [`ServerInit`](crate::ServerInit) onto the server thread, where it is rebuilt into the
 /// editor's `Rc<dyn LuaFs>`.
 pub struct RemoteLuaFs {
-    req_tx: std::sync::mpsc::Sender<LuaFsJob>,
+    req_tx: UnboundedSender<LuaFsJob>,
 }
 
 impl RemoteLuaFs {
     /// Connect to a daemon over `reader`/`writer`, spawning the dedicated link thread
     /// (its own current-thread runtime + the RPC link). Calls are serial by nature (the
     /// edit-host parks until each returns), so the thread serves one job at a time,
-    /// driving each `luafs` request to completion on its runtime.
+    /// driving each `luafs` request to completion on its runtime. (The multiplexed
+    /// [`connect_daemon`] runs [`run_luafs_jobs`] on the *shared* link runtime instead.)
     pub fn connect<R, W>(reader: R, writer: W) -> RemoteLuaFs
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<LuaFsJob>();
+        let (req_tx, req_rx) = unbounded_channel::<LuaFsJob>();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1757,19 +1784,13 @@ impl RemoteLuaFs {
                 // drops, so every `call` sees the channel closed and degrades loudly.
                 Err(_) => return,
             };
-            let rpc = rt.block_on(async move {
+            rt.block_on(async move {
                 let (rpc, mut incoming) = connect(reader, writer);
                 // The luafs leg has no daemon→edit-host pushes; drain so the connection
                 // isn't torn down (dropping the receiver would).
                 tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                rpc
+                run_luafs_jobs(rpc, req_rx).await;
             });
-            while let Ok((params, reply_tx)) = req_rx.recv() {
-                let reply = rt.block_on(async {
-                    rpc.request(LUAFS, params).await.map_err(|e| e.to_string())
-                });
-                let _ = reply_tx.send(reply);
-            }
         });
         RemoteLuaFs { req_tx }
     }
@@ -2141,4 +2162,174 @@ pub async fn serve_luafs_daemon_on(
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// The edit-host-side multiplexer
+// ============================================================================
+//
+// Each `Remote*::connect` above opens its own connection — fine for the per-leg tests,
+// where each leg gets a private duplex, but the real edit-host talks to *one* daemon
+// over *one* transport. `connect_daemon` is the symmetric counterpart of the daemon's
+// `run_daemon_io` multiplexer: it `connect`s once and hands back all five seams sharing
+// that single link, so one `ServerInit` populates `host_fs_async` / `host_proc` /
+// `blocking_system` / `lsp_transport` / `lua_fs` from a single `--daemon` child.
+//
+// Two properties make this a clean router, not a rework (both verified in the code):
+// the daemon→edit-host *notifications* split into disjoint method namespaces
+// (`proc_spawned`/`proc_exited`, `fs_changed`, `lsp_stdout`/`lsp_stderr`/`lsp_exited`),
+// and request *responses* (`fs_read`/`fs_write`/`sys_run`/`luafs`) are msgid-routed
+// *inside* [`Rpc`] and never surface as an [`Incoming`] — so one demux over the shared
+// `incoming` covers every leg, and concurrent writes from all legs serialize through
+// `Rpc`'s single out-channel.
+
+/// The five edit-host seams of one daemon connection, all sharing a single link (see
+/// [`connect_daemon`]). Each field drops straight into the matching
+/// [`ServerInit`](crate::ServerInit) slot.
+pub struct DaemonClient {
+    /// The async filesystem seam (`fs_read`/`fs_write`) + the `fs_changed` watch push.
+    pub host_fs: RemoteHostFs,
+    /// The event-routed process seam (the async `vim.system` / `jobstart` / `:!`).
+    pub host_proc: RemoteHostProc,
+    /// The blocking-bridge `sys_run` seam (synchronous `vim.system(...):wait()`).
+    pub blocking_system: RemoteBlockingSystem,
+    /// The streaming-pipe LSP seam (`lsp_*`).
+    pub lsp_transport: RemoteLspTransport,
+    /// The blocking-bridge `luafs` seam (project-facing `vim.uv.fs_*` / `vim.fn` fs).
+    pub lua_fs: RemoteLuaFs,
+}
+
+/// Connect to a single daemon over `reader`/`writer` and return all five edit-host
+/// seams sharing that one link — the edit-host-side multiplexer (the symmetric twin of
+/// the daemon's [`run_daemon_io`](crate::run_daemon_io)). The transport is any
+/// [`AsyncRead`]/[`AsyncWrite`] pair: the real `--daemon` binary's stdio (how
+/// `daemon_stdio.rs` drives it), an in-process duplex, or the QUIC stream of the future
+/// listener.
+///
+/// **Why a dedicated link thread.** The connection runs on its *own* OS thread + a
+/// current-thread runtime — not the server runtime — because the two blocking bridges
+/// (`sys_run`, `luafs`) park the editor/Lua thread on a `std` reply channel, and that
+/// parked thread *is* the server runtime; the wire must be driven elsewhere or the park
+/// would starve the reader carrying its own reply (the deadlock trap from Open
+/// Decision #5). On this one shared thread we run both blocking-bridge job servers
+/// ([`run_sys_jobs`] / [`run_luafs_jobs`]) and the single [`run_client_demux`] that fans
+/// every daemon→edit-host notification to the right leg — collapsing what used to be a
+/// separate link thread per bridge plus a demux task per async leg onto one connection.
+/// The async legs (`host_fs`/`host_proc`/`lsp_transport`) hold clones of the shared
+/// [`Rpc`] and issue their requests/notifications from the server runtime; the actual
+/// wire I/O always happens here.
+pub fn connect_daemon<R, W>(reader: R, writer: W) -> DaemonClient
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // The link thread builds the seams (it owns the `Rpc` the async legs clone) and
+    // hands the `DaemonClient` back out; a `std` channel lets a non-async caller block
+    // briefly for it. Everything in `DaemonClient` is `Send`.
+    let (client_tx, client_rx) = std::sync::mpsc::channel::<DaemonClient>();
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            // A runtime we can't build leaves `client_tx` dropped; the caller's `recv`
+            // errors and `connect_daemon` fails loud (a basic OS-capability failure, not
+            // a recoverable daemon condition).
+            Err(_) => return,
+        };
+        rt.block_on(async move {
+            let (rpc, incoming) = connect(reader, writer);
+
+            // Notification-routed legs: shared state the demux forwards into.
+            let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+            let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
+            let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
+
+            // Blocking-bridge legs: the job channels their seams send onto and their job
+            // servers (below) pull from.
+            let (sys_tx, sys_rx) = unbounded_channel::<SysJob>();
+            let (luafs_tx, luafs_rx) = unbounded_channel::<LuaFsJob>();
+
+            let client = DaemonClient {
+                host_fs: RemoteHostFs {
+                    rpc: rpc.clone(),
+                    watch_rx: Mutex::new(Some(watch_rx)),
+                },
+                host_proc: RemoteHostProc {
+                    rpc: rpc.clone(),
+                    inflight: proc_inflight.clone(),
+                    next_id: AtomicU64::new(1),
+                },
+                blocking_system: RemoteBlockingSystem { req_tx: sys_tx },
+                lsp_transport: RemoteLspTransport {
+                    rpc: rpc.clone(),
+                    inflight: lsp_inflight.clone(),
+                    next_id: AtomicU64::new(1),
+                },
+                lua_fs: RemoteLuaFs { req_tx: luafs_tx },
+            };
+            // Hand the seams out before serving; if the caller already dropped, there's
+            // nothing to drive.
+            if client_tx.send(client).is_err() {
+                return;
+            }
+
+            // The two blocking bridges ride this shared runtime as tasks (each was its
+            // own thread+runtime in the single-leg `connect`); the demux is the main
+            // future. All three share the one `incoming`/`Rpc`.
+            tokio::spawn(run_sys_jobs(rpc.clone(), sys_rx));
+            tokio::spawn(run_luafs_jobs(rpc.clone(), luafs_rx));
+            run_client_demux(incoming, proc_inflight, lsp_inflight, watch_tx).await;
+        });
+    });
+
+    client_rx
+        .recv()
+        .expect("connect_daemon: the link thread could not build a tokio runtime")
+}
+
+/// The one demux for every daemon→edit-host notification, fanning each to its leg by
+/// method: `proc_spawned`/`proc_exited` to the in-flight spawn, `fs_changed` to the
+/// watch channel, and the LSP pushes to [`route_lsp_notification`] (which ignores any
+/// non-LSP method, so unknown notifications drop). Request *responses* never arrive here
+/// — [`Rpc`] msgid-routes them internally. On EOF (the daemon hung up) it clears the
+/// proc + LSP maps so every waiting child reports its synthesized exit instead of
+/// hanging, and drops `watch_tx` to end the server's watch arm.
+async fn run_client_demux(
+    mut incoming: UnboundedReceiver<Incoming>,
+    proc_inflight: Inflight,
+    lsp_inflight: LspInflightMap,
+    watch_tx: UnboundedSender<WatchEvent>,
+) {
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue; // the daemon speaks only notifications; ignore stray requests
+        };
+        match method.as_str() {
+            PROC_SPAWNED => {
+                if let Some((id, ev)) = decode_spawned(&params) {
+                    forward(&proc_inflight, id, ev);
+                }
+            }
+            PROC_EXITED => {
+                if let Some((id, ev)) = decode_exited(params) {
+                    forward(&proc_inflight, id, ev);
+                }
+            }
+            FS_CHANGED => {
+                if let Some(ev) = decode_fs_changed(params) {
+                    // The server may not have taken the watch receiver yet at startup; a
+                    // send that finds no receiver is harmlessly dropped.
+                    let _ = watch_tx.send(ev);
+                }
+            }
+            // Everything else routes through the LSP helper, which handles the three
+            // `lsp_*` pushes and no-ops any other (e.g. unknown) method.
+            other => route_lsp_notification(&lsp_inflight, other, params),
+        }
+    }
+    proc_inflight.lock().unwrap().clear();
+    lsp_inflight.lock().unwrap().clear();
 }

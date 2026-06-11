@@ -1142,17 +1142,17 @@ a real temp dir (the refactor is behavior-preserving). Regression-clean — full
 --workspace` green (the plenary-heavy `plugin_compat`/`telescope_e2e` suites included), fmt +
 clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
 
-### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — 🚧 daemon side DONE (2026-06-11)
+### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — 🚧 both multiplexers DONE; only the QUIC listener remains (2026-06-11)
 
-**Status (2026-06-11): the daemon half shipped; the edit-host multiplexer + the
-WebTransport/QUIC listener are the next slice.** (ssh was the originally-planned native
-transport; **dropped 2026-06-11** in favor of the non-ssh QUIC listener — see Open
-Decision #2.) The scoping question at the foot of this section is resolved in
-favor of *daemon-side first*: `nxvim --daemon` + `run_daemon_io` + the `serve_*_on`
-extraction + an end-to-end test against the **real binary** landed; the edit-host-side
-multiplexer (which must collapse the `sys_run`/`luafs` blocking-bridge threads onto one
-shared link) lands with the listener transport, since that's where a single real
-connection is first driven from a live editor. What shipped:
+**Status (2026-06-11): the daemon half *and* the edit-host multiplexer (`connect_daemon`)
+both shipped; only the WebTransport/QUIC listener transport remains.** (ssh was the
+originally-planned native transport; **dropped 2026-06-11** in favor of the non-ssh QUIC
+listener — see Open Decision #2.) The scoping question at the foot of this section was
+resolved *daemon-side first*; the edit-host-side multiplexer then landed as its own
+focused slice (2026-06-11, **multiplexer-over-stdio**), proven by driving a real
+in-process edit-host `Server` against the **real `--daemon` binary** over stdio — the
+transport-agnostic stand-in the listener slice will swap for QUIC. What shipped in the
+**daemon half** (2026-06-11):
 - **The `serve_*_on` extraction** (`daemon.rs`): each `serve_*` is now `connect()` +
   a connection-agnostic `serve_*_on(rpc, incoming, deps)` (its loop verbatim); the
   `serve_*(reader, writer, deps)` wrappers stay, so the six per-leg suites (30 tests)
@@ -1170,12 +1170,43 @@ connection is first driven from a live editor. What shipped:
   couldn't invent. Full `cargo test --workspace` green (83 binaries); fmt + clippy
   `-D warnings` clean; local binaries unchanged.
 
-Still to do (the listener slice): the edit-host-side multiplexer + `connect_daemon`, the
-non-ssh **WebTransport/QUIC listener** wiring (`wtransport` on `quinn`, launch-minted
-bearer token, self-signed cert pinned TOFU — Open Decision #2; **ssh is dropped**), and
-the manual no-per-keystroke-latency check. The design below stands (it is transport-
-agnostic — `connect_daemon` takes any `AsyncRead`/`AsyncWrite`, now fed by the QUIC
-stream rather than an ssh child's stdio).
+What shipped in the **edit-host multiplexer** (`connect_daemon`, 2026-06-11):
+- **The blocking bridges collapsed onto one shared link** (`daemon.rs`): `RemoteBlockingSystem`
+  / `RemoteLuaFs` each owned a *private* link thread + runtime in their single-leg `connect`;
+  their job-server loops were extracted into `run_sys_jobs` / `run_luafs_jobs` (the request
+  channel flipped `std::sync::mpsc` → tokio `unbounded` so the server can `await` it on a
+  shared runtime; the **reply** channel stays `std` — the editor thread still parks on an
+  OS-thread recv from inside the server runtime, the deadlock-avoidance property). The
+  single-leg `connect`s now just run those helpers, so the per-leg suites pass **unchanged**.
+- **`route_lsp_notification`** factored out of `run_lsp_demux` so one demux can route the LSP
+  pushes alongside the proc/fs ones.
+- **`connect_daemon(reader, writer) -> DaemonClient`**: one dedicated link thread + current-thread
+  runtime, `connect` **once**, then `run_sys_jobs` + `run_luafs_jobs` as tasks and a single
+  `run_client_demux` that fans every daemon→edit-host *notification* (`proc_spawned`/`proc_exited`
+  → the inflight spawn, `fs_changed` → the watch channel, `lsp_*` → `route_lsp_notification`) to
+  its leg. Request *responses* (`fs_read`/`fs_write`/`sys_run`/`luafs`) are msgid-routed inside
+  `Rpc` and never surface, so the one demux suffices. `DaemonClient`'s five fields drop straight
+  into the matching `ServerInit` slots — one connection populates every seam. The async legs hold
+  clones of the shared `Rpc` and issue from the server runtime; only wire I/O touches the link
+  thread. Re-exported from the crate root.
+- **`crates/nxvim/tests/daemon_stdio.rs`** gained `edit_host_drives_a_real_daemon_over_one_stream`:
+  it wraps the real `--daemon` child in `connect_daemon` and hands the five seams to a real
+  in-process edit-host `Server`, then exercises four classes through the running editor over the
+  **one** stdio stream — the off-tick **fs read** (startup open) and **write** (`:w`, with
+  `modified` clearing only on the daemon's ack), the **blocking `sys_run`** bridge
+  (`vim.system():wait()` — the case that would deadlock if the parked editor thread drove the
+  wire), the **watch** push (an external change autoreloads, a lever only the daemon's poller can
+  pull), and **`luafs`** (`vim.uv.fs_stat` / `vim.fn.filereadable`). The proc leg is wired
+  identically and covered by the daemon-side test above. Full `cargo test --workspace` green
+  (0 failed); fmt + clippy `-D warnings` clean; local binaries (`ServerInit::default()` =
+  every seam `None`) unchanged.
+
+Still to do (the **listener slice**): the non-ssh **WebTransport/QUIC listener** wiring
+(`wtransport` on `quinn`, launch-minted bearer token, self-signed cert pinned TOFU — Open
+Decision #2; **ssh is dropped**), the `--daemon --listen` role + a `:connect` CLI, and the
+manual no-per-keystroke-latency check. The design below stands and `connect_daemon` is ready
+for it: it takes any `AsyncRead`/`AsyncWrite`, so the listener just feeds it a QUIC bidi
+stream instead of the `--daemon` child's stdio — the stdio proof carries over verbatim.
 
 The slice that **ties every leg together**. Phases 3c–3p each built a wire leg and
 proved it over its *own* `tokio::io::duplex`; this one stands up the actual
@@ -1296,16 +1327,19 @@ exit-criteria sentences below.
   once for native + browser. (ssh is dropped — it was never going to escape HOL anyway,
   QUIC can't run under its single TCP stream.)
 
-**Scoping question — RESOLVED (2026-06-11): daemon side alone, this slice.** The
-daemon demux *can* be tested faithfully without the edit-host multiplexer — a raw
-`nxvim_rpc` client over one stream drives three namespaces (request/response replies are
-msgid-routed inside `Rpc`, proc notifications arrive on `incoming`), which is exactly
-what `daemon_stdio.rs` does against the real binary. The edit-host-side multiplexer is
-deferred to the listener slice not for testability but because it entails a real change to
-the blocking-bridge threading model (collapsing the `sys_run`/`luafs` dedicated link
-threads onto one shared connection), and that's first *exercised* by a live editor over
-the QUIC listener — so it belongs there, with *The full split*'s "drives a local edit-host against a
-daemon" criterion.
+**Scoping question — RESOLVED (2026-06-11): daemon side first, then the edit-host
+multiplexer as its own stdio slice.** The daemon demux was tested faithfully without the
+edit-host multiplexer — a raw `nxvim_rpc` client over one stream drives three namespaces
+(request/response replies are msgid-routed inside `Rpc`, proc notifications arrive on
+`incoming`) — which is what `daemon_stdio.rs`'s first test does against the real binary.
+The edit-host-side multiplexer (`connect_daemon`) then landed as a **second focused slice
+over the same stdio transport** (not deferred to the QUIC listener): it entailed the real
+change to the blocking-bridge threading model (collapsing the `sys_run`/`luafs` dedicated
+link threads onto one shared connection), and that change is *exercised by a live editor*
+against the real `--daemon` binary in `daemon_stdio.rs`'s second test — fulfilling *The
+full split*'s "drives a local edit-host against a daemon" criterion **without** waiting on
+the listener, because `connect_daemon` is transport-agnostic and the stdio proof carries
+to QUIC verbatim. Only the listener transport itself (QUIC wiring + auth + cert) remains.
 
 ### The full split
 

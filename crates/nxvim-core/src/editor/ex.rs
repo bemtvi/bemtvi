@@ -568,6 +568,16 @@ impl Editor {
                     self.highlights.clear();
                 }
             }
+            // `:helpt[ags]` — recognized but not implemented: nxvim has no help
+            // system yet (no `:help`, no `doc/tags` generation). Plugin managers
+            // (lazy.nvim, vim.pack) call this during install; rather than fail as an
+            // unknown command — which can abort the caller — we complete with a loud
+            // message so the install proceeds. NOT a silent no-op: it says plainly
+            // that no tags were written. Replace with a real generator if/when the
+            // help system lands.
+            "helpt" | "helpta" | "helptag" | "helptags" => {
+                self.echo("helptags: not supported — no help system yet, tags not generated");
+            }
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
             _ => self.deferred_commands.push(rest.to_string()),

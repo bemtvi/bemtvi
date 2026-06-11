@@ -7,7 +7,8 @@
 //! against the same dir and assert the first session's state was restored.
 //!
 //! Phase 1 covers registers; Phase 2 the global file marks `A`–`Z`; Phase 3 the
-//! per-file marks (incl. the `` `" `` last-cursor) and search/ex history. See
+//! per-file marks (incl. the `` `" `` last-cursor) and search/ex history; Phase 4
+//! the numbered marks `'0`–`'9`, the jumplist, and the changelist. See
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
@@ -191,6 +192,100 @@ async fn search_history_survives_a_restart() {
         assert_eq!(cursor(&rpc).await, (1, 0));
         feed(&rpc, "/<Up><CR>");
         assert_eq!(cursor(&rpc).await, (3, 0));
+    }
+}
+
+#[tokio::test]
+async fn numbered_marks_shift_across_sessions() {
+    let dir = temp_dir("shada_numbered");
+    let file = write_temp("shada_numbered", "txt", "L1\nL2\nL3\nL4\nL5\n");
+
+    // Session 1 exits with the cursor on line 4 — that becomes `'0` next launch.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "ggjjj");
+        assert_eq!(cursor(&rpc).await, (4, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: `'0` is session 1's exit (line 4). Then exit on line 2, which
+    // becomes the *next* launch's `'0` and pushes line 4 down to `'1`.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "`0");
+        assert_eq!(cursor(&rpc).await, (4, 0), "`0 is session 1's exit line");
+        feed(&rpc, "ggj");
+        assert_eq!(cursor(&rpc).await, (2, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 3: `'0` is session 2's exit (line 2); `'1` is the shifted line 4.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        feed(&rpc, "`0");
+        assert_eq!(cursor(&rpc).await, (2, 0), "`0 is the most recent exit");
+        feed(&rpc, "`1");
+        assert_eq!(
+            cursor(&rpc).await,
+            (4, 0),
+            "`1 is the prior exit, shifted down"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jumplist_survives_a_restart() {
+    let dir = temp_dir("shada_jumplist");
+    let file = write_temp("shada_jumplist", "txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+
+    // Session 1: `G` then `gg` records two jump-from positions (lines 1 and 10).
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "G"); // jump from line 1 -> line 10
+        feed(&rpc, "gg"); // jump from line 10 -> line 1
+        assert_eq!(cursor(&rpc).await, (1, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the restored jumplist materializes on the first `<C-o>`, which
+    // walks back to the most recent jump-from (line 10).
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 0));
+        feed(&rpc, "<C-o>");
+        assert_eq!(cursor(&rpc).await.0, 10);
+    }
+}
+
+#[tokio::test]
+async fn changelist_survives_a_restart() {
+    let dir = temp_dir("shada_changelist");
+    let file = write_temp("shada_changelist", "txt", "aaa\nbbb\nccc\nddd\neee\n");
+
+    // Session 1: edit line 1 and line 3 (two changelist entries), then quit
+    // discarding the edits — only the change *positions* persist.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "x"); // change on line 1
+        feed(&rpc, "3Gx"); // change on line 3
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: `g;` walks the restored changelist back to the newest change
+    // (line 3), proving the per-file changelist came back.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 0));
+        feed(&rpc, "g;");
+        assert_eq!(cursor(&rpc).await.0, 3);
     }
 }
 

@@ -71,13 +71,40 @@ impl Editor {
 
     /// `<C-o>` — move to an older position in the jumplist, `count` steps back.
     pub(crate) fn jump_back(&mut self, count: usize) {
+        self.materialize_pending_jumplist();
         self.jump_nav(true, count);
     }
 
     /// `<C-i>` / `<Tab>` — move to a newer position in the jumplist, `count` steps
     /// forward.
     pub(crate) fn jump_forward(&mut self, count: usize) {
+        self.materialize_pending_jumplist();
         self.jump_nav(false, count);
+    }
+
+    /// Turn a shada-restored jumplist (paths) into the focused window's live jump
+    /// entries, opening each file. Deferred to the first `<C-o>`/`<C-i>` so a
+    /// restored session doesn't bulk-load every jumped-to file at launch — only
+    /// when you actually start walking the list. A no-op once drained, or when the
+    /// session has already built its own jumplist (that one wins; the restored list
+    /// is dropped). Distinct files are opened once each (find-or-load).
+    fn materialize_pending_jumplist(&mut self) {
+        if self.pending_jumplist.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_jumplist);
+        if !self.windows.cur().jumps.is_empty() {
+            return;
+        }
+        let mut entries = Vec::with_capacity(pending.len());
+        for (path, line, col) in pending {
+            if let Some(buf) = self.open_buffer(&path) {
+                entries.push(JumpEntry { buf, line, col });
+            }
+        }
+        let win = self.windows.cur_mut();
+        win.jumps = entries;
+        win.jump_idx = win.jumps.len();
     }
 
     /// Walk the jumplist `count` entries in one direction, mirroring vim's

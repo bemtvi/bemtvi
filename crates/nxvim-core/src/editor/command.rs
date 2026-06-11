@@ -996,6 +996,20 @@ impl Editor {
                 if let Motion::MarkJumpExact(name, set_jump)
                 | Motion::MarkJumpLine(name, set_jump) = m
                 {
+                    // A numbered mark `'0`–`'9` is a cross-session position: resolve
+                    // it by opening its file, then make the cross-buffer jump (it
+                    // always points at a *past* session's location, never the live
+                    // buffer). An unresolved digit falls through to the E20 miss.
+                    if name.is_ascii_digit() {
+                        if let Some(loc) = self.resolve_numbered_mark(name) {
+                            if set_jump {
+                                self.record_jump_context();
+                            }
+                            self.jump_to_mark_buffer(loc, matches!(m, Motion::MarkJumpLine(..)));
+                            self.reset_pending();
+                            return;
+                        }
+                    }
                     // A global mark restored from shada is pending until its file
                     // is first reopened — promote it (opening the file) before the
                     // location lookup, so a cross-session `` `A `` lands.

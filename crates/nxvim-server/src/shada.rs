@@ -30,21 +30,30 @@
 //!
 //! Phase 1 persists **registers**; Phase 2 the global file marks `A`–`Z`; Phase 3
 //! the per-file marks (`a`–`z`, specials, the `"` last-cursor) and search/ex
-//! history. Later phases grow the schema (numbered marks, jumplist/changelist);
-//! compaction is payload-agnostic (it deletes whole absorbed files) so it does not
-//! change. Full design: `docs/plans/2026-06-11-shada-persistence.md`.
+//! history; Phase 4 the numbered marks `'0`–`'9` (shifted at load), the per-file
+//! changelist, the focused window's jumplist, and the `meta` row carrying the
+//! clean-exit cursor. Compaction is payload-agnostic (it deletes whole absorbed
+//! files) so it does not change. Full design:
+//! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nxvim_core::{FileMarkEntry, GlobalMarkEntry, PersistState, RegisterEntry};
+use nxvim_core::{
+    FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
+    RegisterEntry,
+};
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
 
 /// The per-history entry cap (newest-N kept) applied on merge, mirroring vim's
 /// `'history'`. A later phase exposes it as an option.
 const HISTORY_CAP: usize = 10_000;
+
+/// The persisted schema version, stamped into `meta`. Bumped when the on-disk
+/// layout changes; an unknown future version is read best-effort, never discarded.
+const SCHEMA_VERSION: u32 = 1;
 
 /// The persistence seam the server drives. `load` is called once before the first
 /// frame (it merges + compacts and returns the snapshot to import); `flush` writes
@@ -76,6 +85,23 @@ const MARKS_FILE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("m
 /// is a msgpack [`StoredHist`]. Rewritten wholesale each flush.
 const HIST_SEARCH: TableDefinition<u64, &[u8]> = TableDefinition::new("hist_search");
 const HIST_EX: TableDefinition<u64, &[u8]> = TableDefinition::new("hist_ex");
+
+/// `marks_numbered` table: key is the digit `0`–`9`, value a msgpack [`StoredMark`].
+/// The store *shifts* these at load (`'0` ← last-exit cursor, old `'0`→`'1`, …).
+const MARKS_NUMBERED: TableDefinition<&str, &[u8]> = TableDefinition::new("marks_numbered");
+
+/// `changelist_file` table: key is the file path, value a msgpack [`StoredChangelist`].
+const CHANGELIST_FILE: TableDefinition<&str, &[u8]> = TableDefinition::new("changelist_file");
+
+/// `jumplist` table: key is the entry's sequence index (`0`-based, oldest first),
+/// value a msgpack [`StoredPos`]. Rewritten wholesale each flush; the newest store's
+/// list wins on merge (a jumplist is an ordered sequence, not a union).
+const JUMPLIST: TableDefinition<u64, &[u8]> = TableDefinition::new("jumplist");
+
+/// `meta` table: a single `"meta"` row holding the schema version, this write's
+/// timestamp (the jumplist recency key), and the last clean-exit cursor that
+/// becomes `'0` next launch.
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 /// A register as stored on disk: its contents, paste kind, and the write
 /// timestamp that drives the cross-instance recency merge.
@@ -110,6 +136,33 @@ struct StoredFileMark {
 #[derive(Serialize, Deserialize)]
 struct StoredHist {
     text: String,
+}
+
+/// A bare file position as stored on disk — a jumplist entry or the exit cursor.
+#[derive(Serialize, Deserialize, Clone)]
+struct StoredPos {
+    path: String,
+    line: usize,
+    col: usize,
+}
+
+/// A per-file changelist as stored on disk: its `(line, col)` change positions
+/// (oldest first) and the write timestamp.
+#[derive(Serialize, Deserialize)]
+struct StoredChangelist {
+    entries: Vec<(usize, usize)>,
+    ts: u64,
+}
+
+/// The single `meta` row: schema version, this write's timestamp (jumplist recency
+/// key), and the last clean-exit cursor (`None` after the store consumes it into
+/// `'0`). `exit_ts` recency-orders the exit cursor across sibling stores.
+#[derive(Serialize, Deserialize)]
+struct StoredMeta {
+    version: u32,
+    flush_ts: u64,
+    exit: Option<StoredPos>,
+    exit_ts: u64,
 }
 
 /// The native (and, via a custom `StorageBackend`, browser) shada store: a
@@ -147,8 +200,16 @@ impl ShadaStore for RedbFileStore {
             std::collections::HashMap::new();
         let mut best_file_marks: std::collections::HashMap<(String, char), StoredFileMark> =
             std::collections::HashMap::new();
+        let mut best_numbered: std::collections::HashMap<char, StoredMark> =
+            std::collections::HashMap::new();
+        let mut best_changelist: std::collections::HashMap<String, StoredChangelist> =
+            std::collections::HashMap::new();
         let mut hist_search = HistMerge::default();
         let mut hist_ex = HistMerge::default();
+        // The jumplist is an ordered sequence, not a union: the newest store's whole
+        // list wins. The exit cursor likewise tracks the newest *clean* exit.
+        let mut best_jumplist: (u64, Vec<StoredPos>) = (0, Vec::new());
+        let mut best_exit: (u64, Option<StoredPos>) = (0, None);
         let mut absorbed: Vec<PathBuf> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&self.dir) {
             for entry in read_dir.flatten() {
@@ -163,13 +224,30 @@ impl ShadaStore for RedbFileStore {
                     merge_registers(&sibling, &mut best_regs);
                     merge_global_marks(&sibling, &mut best_marks);
                     merge_file_marks(&sibling, &mut best_file_marks);
+                    merge_numbered_marks(&sibling, &mut best_numbered);
+                    merge_changelists(&sibling, &mut best_changelist);
                     merge_history(&sibling, HIST_SEARCH, &mut hist_search);
                     merge_history(&sibling, HIST_EX, &mut hist_ex);
+                    if let Some(meta) = read_meta(&sibling) {
+                        if meta.flush_ts > best_jumplist.0 {
+                            best_jumplist = (meta.flush_ts, read_jumplist(&sibling));
+                        }
+                        if let Some(exit) = meta.exit {
+                            if meta.exit_ts > best_exit.0 {
+                                best_exit = (meta.exit_ts, Some(exit));
+                            }
+                        }
+                    }
                     drop(sibling);
                     absorbed.push(path);
                 }
             }
         }
+
+        // The numbered-mark shift: a consumed clean-exit cursor becomes `'0` and the
+        // prior `'0`–`'8` slide down one (`'9` drops). With no exit to consume the
+        // set passes through unchanged (e.g. after a crash, so `'0` stays put).
+        let numbered_marks = shift_numbered_marks(best_numbered, best_exit.1);
 
         let merged = PersistState {
             registers: best_regs
@@ -200,6 +278,25 @@ impl ShadaStore for RedbFileStore {
                 .collect(),
             search_history: hist_search.finish(),
             ex_history: hist_ex.finish(),
+            numbered_marks,
+            file_changelists: best_changelist
+                .into_iter()
+                .map(|(path, stored)| FileChangelist {
+                    path: path.into(),
+                    entries: stored.entries,
+                })
+                .collect(),
+            jumplist: best_jumplist
+                .1
+                .into_iter()
+                .map(|p| JumpPos {
+                    path: p.path.into(),
+                    line: p.line,
+                    col: p.col,
+                })
+                .collect(),
+            // Consumed into `'0` by the shift above — a merged snapshot carries none.
+            exit_cursor: None,
         };
 
         // Make the absorbed data durable in *our* file before deleting the
@@ -281,6 +378,79 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
                 .insert((path.as_str(), name.as_str()), bytes.as_slice())
                 .map_err(std::io::Error::other)?;
         }
+    }
+    {
+        // Numbered marks key on the digit (stable), but a shorter set must not
+        // leave stale higher digits behind — clear before rewrite.
+        let mut table = wtxn
+            .open_table(MARKS_NUMBERED)
+            .map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        for mark in &state.numbered_marks {
+            let stored = StoredMark {
+                path: mark.path.to_string_lossy().into_owned(),
+                line: mark.line,
+                col: mark.col,
+                ts,
+            };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            let key = mark.digit.to_string();
+            table
+                .insert(key.as_str(), bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    {
+        // Changelists key on path; clear so a file whose list emptied drops out.
+        let mut table = wtxn
+            .open_table(CHANGELIST_FILE)
+            .map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        for cl in &state.file_changelists {
+            let stored = StoredChangelist {
+                entries: cl.entries.clone(),
+                ts,
+            };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            let path = cl.path.to_string_lossy().into_owned();
+            table
+                .insert(path.as_str(), bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    {
+        // The jumplist is rewritten wholesale (keys 0..N), so clear first lest a
+        // now-shorter list leave stale tail rows.
+        let mut table = wtxn.open_table(JUMPLIST).map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        for (i, j) in state.jumplist.iter().enumerate() {
+            let stored = StoredPos {
+                path: j.path.to_string_lossy().into_owned(),
+                line: j.line,
+                col: j.col,
+            };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            table
+                .insert(i as u64, bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    {
+        let mut table = wtxn.open_table(META).map_err(std::io::Error::other)?;
+        let meta = StoredMeta {
+            version: SCHEMA_VERSION,
+            flush_ts: ts,
+            exit: state.exit_cursor.as_ref().map(|c| StoredPos {
+                path: c.path.to_string_lossy().into_owned(),
+                line: c.line,
+                col: c.col,
+            }),
+            exit_ts: if state.exit_cursor.is_some() { ts } else { 0 },
+        };
+        let bytes = rmp_serde::to_vec(&meta).map_err(std::io::Error::other)?;
+        table
+            .insert("meta", bytes.as_slice())
+            .map_err(std::io::Error::other)?;
     }
     write_history(&wtxn, HIST_SEARCH, &state.search_history, ts)?;
     write_history(&wtxn, HIST_EX, &state.ex_history, ts)?;
@@ -458,6 +628,128 @@ fn merge_history(db: &Database, def: TableDefinition<u64, &[u8]>, merge: &mut Hi
         };
         merge.observe(stored.text, key.value());
     }
+}
+
+/// Fold one store's `marks_numbered` table into the best-by-timestamp map, keyed by
+/// the digit `'0'`–`'9'`. Same recency discipline as the other marks.
+fn merge_numbered_marks(db: &Database, best: &mut std::collections::HashMap<char, StoredMark>) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(MARKS_NUMBERED) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let Some(digit) = key.value().chars().next() else {
+            continue;
+        };
+        let Ok(stored) = rmp_serde::from_slice::<StoredMark>(value.value()) else {
+            continue;
+        };
+        match best.get(&digit) {
+            Some(existing) if existing.ts >= stored.ts => {}
+            _ => {
+                best.insert(digit, stored);
+            }
+        }
+    }
+}
+
+/// Fold one store's `changelist_file` table into the best-by-timestamp map, keyed
+/// by path (newest `ts` per file wins — a changelist persists as one row).
+fn merge_changelists(
+    db: &Database,
+    best: &mut std::collections::HashMap<String, StoredChangelist>,
+) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(CHANGELIST_FILE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let path = key.value().to_string();
+        let Ok(stored) = rmp_serde::from_slice::<StoredChangelist>(value.value()) else {
+            continue;
+        };
+        match best.get(&path) {
+            Some(existing) if existing.ts >= stored.ts => {}
+            _ => {
+                best.insert(path, stored);
+            }
+        }
+    }
+}
+
+/// Read one store's `meta` row, or `None` if it has none (a store written before
+/// the meta table existed, or unreadable).
+fn read_meta(db: &Database) -> Option<StoredMeta> {
+    let rtxn = db.begin_read().ok()?;
+    let table = rtxn.open_table(META).ok()?;
+    let row = table.get("meta").ok()??;
+    rmp_serde::from_slice::<StoredMeta>(row.value()).ok()
+}
+
+/// Read one store's `jumplist` rows in sequence order (the table key is the
+/// 0-based index, and redb iterates a `u64` key ascending).
+fn read_jumplist(db: &Database) -> Vec<StoredPos> {
+    let Ok(rtxn) = db.begin_read() else {
+        return Vec::new();
+    };
+    let table = match rtxn.open_table(JUMPLIST) {
+        Ok(table) => table,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(iter) = table.iter() else {
+        return Vec::new();
+    };
+    iter.flatten()
+        .filter_map(|(_, value)| rmp_serde::from_slice::<StoredPos>(value.value()).ok())
+        .collect()
+}
+
+/// Apply vim's numbered-mark shift to the merged set. A consumed clean-exit cursor
+/// becomes `'0`, the prior `'0`–`'8` slide down one, and `'9` drops; with no exit
+/// (a crash left none) the set passes through unchanged. The result is the ten — or
+/// fewer — `(digit, path, line, col)` marks the editor seeds.
+fn shift_numbered_marks(
+    old: std::collections::HashMap<char, StoredMark>,
+    exit: Option<StoredPos>,
+) -> Vec<NumberedMark> {
+    let to_entry = |digit: char, m: &StoredMark| NumberedMark {
+        digit,
+        path: m.path.clone().into(),
+        line: m.line,
+        col: m.col,
+    };
+    let Some(exit) = exit else {
+        return old.iter().map(|(&d, m)| to_entry(d, m)).collect();
+    };
+    let mut out = vec![NumberedMark {
+        digit: '0',
+        path: exit.path.into(),
+        line: exit.line,
+        col: exit.col,
+    }];
+    for n in 1u8..=9 {
+        let from = (b'0' + n - 1) as char;
+        if let Some(m) = old.get(&from) {
+            out.push(to_entry((b'0' + n) as char, m));
+        }
+    }
+    out
 }
 
 /// A monotonic per-process counter so two instances minted in the same process and

@@ -273,7 +273,18 @@ impl Editor {
         else {
             return;
         };
-        let Some(marks) = self.pending_file_marks.remove(&normalize_path(&path)) else {
+        let key = normalize_path(&path);
+        // A restored changelist seeds the buffer's `g;`/`g,` history (only when the
+        // session hasn't already recorded changes of its own), with the navigation
+        // pointer parked at the newest entry.
+        if let Some(entries) = self.pending_changelists.remove(&key) {
+            let buf = &mut self.buffers.get_mut(id).buffer;
+            if buf.changelist.is_empty() {
+                buf.changelistidx = entries.len();
+                buf.changelist = entries;
+            }
+        }
+        let Some(marks) = self.pending_file_marks.remove(&key) else {
             return;
         };
         let buf = &mut self.buffers.get_mut(id).buffer;

@@ -62,7 +62,10 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
-pub use self::persist::{FileMarkEntry, GlobalMarkEntry, PersistState, RegisterEntry};
+pub use self::persist::{
+    FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
+    RegisterEntry,
+};
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;
@@ -451,6 +454,24 @@ pub struct Editor {
     /// file marks reattach when the file is reopened, not eagerly at launch. Drained
     /// by [`Editor::seed_pending_file_marks`].
     pending_file_marks: HashMap<PathBuf, HashMap<char, (usize, usize)>>,
+    /// The numbered marks `'0`–`'9` — a *pure persistence construct*: `'0` is the
+    /// cursor where the last session exited, `'1` the session before, etc. They
+    /// have no live capture point (the shada store mints them at load by shifting
+    /// the previous set down one), so they live here path-based and resolve to a
+    /// buffer lazily on the jump, exactly like [`Editor::pending_global_marks`].
+    /// Seeded by [`Editor::import_persist`]; read by `` `0 ``…`` `9 ``.
+    numbered_marks: HashMap<char, (PathBuf, Cursor)>,
+    /// Per-file changelists restored from a shada store, keyed by *normalized*
+    /// path. Seeded into a buffer's live `changelist` when it loads (alongside the
+    /// file marks), so `g;`/`g,` walk a reopened file's change history. Drained by
+    /// [`Editor::seed_pending_file_marks`].
+    pending_changelists: HashMap<PathBuf, Vec<(usize, usize)>>,
+    /// The focused window's jumplist restored from a shada store, as `(path, line,
+    /// col)` not yet resolved to buffers. Materialized into the live window jumps —
+    /// opening the files — on the first `<C-o>`/`<C-i>`, so a restored session can
+    /// walk its jump history without bulk-loading every jumped-to file at launch.
+    /// Drained by [`Editor::materialize_pending_jumplist`].
+    pending_jumplist: Vec<(PathBuf, usize, usize)>,
     pub mode: Mode,
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
@@ -861,6 +882,9 @@ impl Editor {
             global_marks: HashMap::new(),
             pending_global_marks: HashMap::new(),
             pending_file_marks: HashMap::new(),
+            numbered_marks: HashMap::new(),
+            pending_changelists: HashMap::new(),
+            pending_jumplist: Vec::new(),
             mode: Mode::Normal,
             cursor: Cursor::default(),
             top: 0,

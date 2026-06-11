@@ -29,9 +29,10 @@ pub use buffer::{Buffer, BufferEdit, DiskChange, EditBatch};
 pub use clipboard::Clipboard;
 pub use editor::{
     command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,
-    FileChangeAction, FileChangeReason, FileMarkEntry, FloatAnchor, FloatConfig, FloatRelative,
-    GlobalMarkEntry, PendingOpen, PendingQuitAll, PendingSave, PersistState, RegisterEntry, TabId,
-    UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    FileChangeAction, FileChangeReason, FileChangelist, FileMarkEntry, FloatAnchor, FloatConfig,
+    FloatRelative, GlobalMarkEntry, JumpPos, NumberedMark, PendingOpen, PendingQuitAll,
+    PendingSave, PersistState, RegisterEntry, TabId, UndoEntry, UndoTreeView, WindowConfigSpec,
+    WindowId,
 };
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};

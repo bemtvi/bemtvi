@@ -350,12 +350,18 @@ host, is being removed, so there is no "shada on the remote host" case.)
    `` `" `` reopens a file at its last cursor, and `/<Up>` recalls a search across
    sessions. The `marks_file` / history tables clear-and-rewrite each flush so a
    dropped mark or trimmed history never resurrects.
-4. **Phase 4 — jumplist, changelist, numbered marks.** Export the focused
-   window's jumplist (ids→paths) + each buffer's changelist; seed them back by
-   path on import. Add the `'0`–`'9` shift at load (the unlocked feature):
-   `meta.exit_cursor` from the clean-exit flush becomes `'0`, the prior `'0`–`'8`
-   shift down one. Test: `<C-o>` walks a restored jumplist; `` `0 `` lands where
-   the last session exited, `` `1 `` the one before.
+4. **Phase 4 — jumplist, changelist, numbered marks. ✅ DONE.** Exports the
+   focused window's jumplist (ids→paths, materialized back into live entries on
+   the first `<C-o>`/`<C-i>` so launch stays lazy) + each buffer's changelist
+   (seeded by path when the file reopens, alongside the marks). Adds the `'0`–`'9`
+   shift at load (the unlocked feature): a new `meta` row carries the clean-exit
+   cursor (`exit_cursor`), which the store consumes on the next load to become
+   `'0`, sliding the prior `'0`–`'8` down one (`'9` drops); with no exit to consume
+   (a crash) the set passes through unchanged. `'0`–`'9` are now jumpable marks
+   (resolved by path like a restored global mark) and list in `:marks`. Respawn
+   tests (`tests/shada.rs`): `<C-o>` walks a restored jumplist; `` `0 `` lands at
+   the last exit and `` `1 `` the one before; `g;` walks a restored changelist.
+   The jumplist / changelist / numbered-mark tables clear-and-rewrite each flush.
 5. **Phase 5 — the debounced live checkpoint.** Move the flush off exit-only onto
    a ~150 ms debounce via the `HostEffects` off-tick fs slice, so a crash loses at
    most the last window. (Phase 1 already flushes correctly on exit; this adds the

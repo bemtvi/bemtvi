@@ -24,13 +24,13 @@ pub(crate) fn is_settable_mark(c: char) -> bool {
     c.is_ascii_alphabetic()
 }
 
-/// Whether `` `{c} `` / `'{c}` may *jump* to mark `c`: the settable named marks
-/// plus the read-only automatic specials. `` ` `` and `'` both name the
-/// previous-context mark; `.` `^` `[` `]` `<` `>` name the change/insert/visual
-/// automatics. Any other name (a digit `'0`–`'9`, punctuation we don't track) is
-/// a grammar dead-end until its phase lands.
+/// Whether `` `{c} `` / `'{c}` may *jump* to mark `c`: the settable named marks,
+/// the read-only automatic specials, and the shada-restored numbered marks
+/// `'0`–`'9`. `` ` `` and `'` both name the previous-context mark; `.` `^` `[` `]`
+/// `<` `>` name the change/insert/visual automatics; `"` the last-cursor mark; a
+/// digit names a numbered mark. Untracked punctuation is a grammar dead-end.
 pub(crate) fn is_jumpable_mark(c: char) -> bool {
-    c.is_ascii_alphabetic() || matches!(c, '\'' | '`' | '.' | '^' | '[' | ']' | '<' | '>' | '"')
+    c.is_ascii_alphanumeric() || matches!(c, '\'' | '`' | '.' | '^' | '[' | ']' | '<' | '>' | '"')
 }
 
 /// The buffer-local store key a jump name reads. `` ` `` and `'` are two spellings
@@ -161,6 +161,22 @@ impl Editor {
         }
     }
 
+    /// Resolve a numbered mark `'0`–`'9` to a live [`MarkLocation`], opening (or
+    /// finding) the buffer for its stored file. Numbered marks are a pure
+    /// persistence construct that always point into a *past* session's file, so
+    /// they resolve by path exactly like a restored global mark — and like one,
+    /// `None` (the digit was never restored, or its file is gone / unopenable
+    /// off-tick) falls through to the loud *E20* miss. Read-only: `m0` never sets
+    /// one.
+    pub(crate) fn resolve_numbered_mark(&mut self, name: char) -> Option<MarkLocation> {
+        if !name.is_ascii_digit() {
+            return None;
+        }
+        let (path, cursor) = self.numbered_marks.get(&name)?.clone();
+        let buf = self.open_buffer(&path)?;
+        Some(MarkLocation { buf, cursor })
+    }
+
     /// The full location of mark `name` — its buffer and cursor — or `None` when
     /// the mark was never set, was dropped (its line deleted), or, for a global
     /// mark, the buffer it pointed at is no longer open. `None` makes the jump
@@ -258,6 +274,19 @@ impl Editor {
                 continue;
             };
             lines.push(format_mark_line(name, line, col, &detail));
+        }
+        // Numbered marks `'0`–`'9` — the shada-restored last-exit positions. They
+        // always point into a past session's file (never yet reopened), so they
+        // list by their stored path, like a pending global mark.
+        for name in ('0'..='9').filter(|&n| wanted(n)) {
+            if let Some((path, cur)) = self.numbered_marks.get(&name) {
+                lines.push(format_mark_line(
+                    name,
+                    cur.line,
+                    cur.col,
+                    &path.display().to_string(),
+                ));
+            }
         }
         self.open_panel("Marks", lines, false, 0);
     }

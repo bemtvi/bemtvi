@@ -11,8 +11,9 @@
 //!
 //! Phase 1 carries **registers**; Phase 2 the global file marks `A`–`Z`; Phase 3
 //! the per-file marks (`a`–`z`, specials, the `"` last-cursor) and search/ex
-//! history. Later phases grow the struct with numbered marks and the
-//! jumplist/changelist. See `docs/plans/2026-06-11-shada-persistence.md`.
+//! history; Phase 4 the numbered marks `'0`–`'9`, the per-file changelist, the
+//! focused window's jumplist, and the clean-exit cursor that seeds `'0`. See
+//! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::PathBuf;
 
@@ -42,6 +43,47 @@ pub struct PersistState {
     pub search_history: Vec<String>,
     /// The ex command-line (`:`) history, oldest entry first.
     pub ex_history: Vec<String>,
+    /// The numbered marks `'0`–`'9` (digit `'0'`–`'9'`), each a `(path, line,
+    /// col)`. A pure persistence construct — the *store* shifts them at load
+    /// (`'0` ← last exit cursor, old `'0`→`'1`, …) — so core only seeds whatever
+    /// the store hands it.
+    pub numbered_marks: Vec<NumberedMark>,
+    /// Per-file changelists (the `g;`/`g,` history), keyed by path, restored when
+    /// the file is reopened.
+    pub file_changelists: Vec<FileChangelist>,
+    /// The focused window's jumplist (`<C-o>`/`<C-i>`), oldest entry first, each a
+    /// `(path, line, col)`.
+    pub jumplist: Vec<JumpPos>,
+    /// Where the cursor sat at the last *clean* exit. Written only by the
+    /// exit-flush (not the carry-forward flush), and consumed by the store on the
+    /// next load to become `'0`. `None` in a merged snapshot (already consumed).
+    pub exit_cursor: Option<JumpPos>,
+}
+
+/// One persisted numbered mark `'0`–`'9`: the digit, the file, and the position.
+#[derive(Debug, Clone)]
+pub struct NumberedMark {
+    pub digit: char,
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+}
+
+/// One persisted per-file changelist: the file and its `(line, col)` change
+/// positions, oldest first.
+#[derive(Debug, Clone)]
+pub struct FileChangelist {
+    pub path: PathBuf,
+    pub entries: Vec<(usize, usize)>,
+}
+
+/// One position in a persisted jumplist or the exit cursor: a file path and a
+/// 0-based `(line, col)`.
+#[derive(Debug, Clone)]
+pub struct JumpPos {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
 }
 
 /// One persisted global mark: its name (`A`–`Z`), the file it points into, and
@@ -97,7 +139,100 @@ impl Editor {
             file_marks: self.export_file_marks(),
             search_history: self.search_history.clone(),
             ex_history: self.ex_history.clone(),
+            numbered_marks: self.export_numbered_marks(),
+            file_changelists: self.export_changelists(),
+            jumplist: self.export_jumplist(),
+            exit_cursor: self.export_exit_cursor(),
         }
+    }
+
+    /// The numbered marks `'0`–`'9` as `(digit, path, line, col)`. They never
+    /// change during a session (the store shifts them at load), so this just hands
+    /// back what was seeded so the next save carries them forward.
+    fn export_numbered_marks(&self) -> Vec<NumberedMark> {
+        self.numbered_marks
+            .iter()
+            .map(|(&digit, (path, cursor))| NumberedMark {
+                digit,
+                path: path.clone(),
+                line: cursor.line,
+                col: cursor.col,
+            })
+            .collect()
+    }
+
+    /// Each named open buffer's changelist (keyed by path), plus any restored
+    /// changelist for a file not reopened this session (carried forward).
+    fn export_changelists(&self) -> Vec<FileChangelist> {
+        let mut out: Vec<FileChangelist> = Vec::new();
+        for ob in self.buffers.map.values() {
+            let Some(path) = ob
+                .buffer
+                .path
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty())
+            else {
+                continue;
+            };
+            if ob.buffer.changelist.is_empty() {
+                continue;
+            }
+            out.push(FileChangelist {
+                path: path.clone(),
+                entries: ob.buffer.changelist.clone(),
+            });
+        }
+        for (path, entries) in &self.pending_changelists {
+            out.push(FileChangelist {
+                path: path.clone(),
+                entries: entries.clone(),
+            });
+        }
+        out
+    }
+
+    /// The focused window's jumplist as `(path, line, col)`, resolving each entry's
+    /// `BufferId` to a file path (an entry in an unnamed buffer is dropped — there
+    /// is nothing to reopen). If the restored jumplist was never materialized this
+    /// session, carry it forward untouched.
+    fn export_jumplist(&self) -> Vec<JumpPos> {
+        if self.windows.cur().jumps.is_empty() && !self.pending_jumplist.is_empty() {
+            return self
+                .pending_jumplist
+                .iter()
+                .map(|(path, line, col)| JumpPos {
+                    path: path.clone(),
+                    line: *line,
+                    col: *col,
+                })
+                .collect();
+        }
+        self.windows
+            .cur()
+            .jumps
+            .iter()
+            .filter_map(|e| {
+                let path = self.buffer_name(e.buf).filter(|p| !p.is_empty())?;
+                Some(JumpPos {
+                    path: PathBuf::from(path),
+                    line: e.line,
+                    col: e.col,
+                })
+            })
+            .collect()
+    }
+
+    /// Where the cursor sits now, as the *clean-exit* cursor the store turns into
+    /// `'0` next launch. `None` for an unnamed current buffer (nothing to reopen).
+    fn export_exit_cursor(&self) -> Option<JumpPos> {
+        let path = self
+            .buffer_name(self.cur_buffer())
+            .filter(|p| !p.is_empty())?;
+        Some(JumpPos {
+            path: PathBuf::from(path),
+            line: self.cursor.line,
+            col: self.cursor.col,
+        })
     }
 
     /// Resolve the per-file marks of every named open buffer — plus any restored
@@ -223,6 +358,13 @@ impl Editor {
                 .entry(entry.name)
                 .or_insert((entry.line, entry.col));
         }
+        // Per-file changelists seed the same pending-by-path map the marks use, so
+        // a reopened file gets its `g;`/`g,` history back when it loads.
+        for entry in state.file_changelists {
+            self.pending_changelists
+                .entry(super::normalize_path(&entry.path))
+                .or_insert(entry.entries);
+        }
         let cur = self.cur_buffer();
         self.seed_pending_file_marks(cur);
         // History restored from disk is older than anything typed this session;
@@ -230,6 +372,28 @@ impl Editor {
         // duplicates so a repeated entry keeps its newest position.
         merge_history(&mut self.search_history, state.search_history);
         merge_history(&mut self.ex_history, state.ex_history);
+        // Numbered marks `'0`–`'9` were already shifted by the store at load; seed
+        // them path-based (resolved to a buffer lazily on the `` `0 `` jump).
+        for entry in state.numbered_marks {
+            self.numbered_marks.insert(
+                entry.digit,
+                (
+                    entry.path,
+                    Cursor {
+                        line: entry.line,
+                        col: entry.col,
+                    },
+                ),
+            );
+        }
+        // The jumplist waits as pending paths; the first `<C-o>` materializes it
+        // (opening the files). `exit_cursor` is consumed by the store into `'0`, so
+        // a merged snapshot carries none — nothing to import here.
+        self.pending_jumplist = state
+            .jumplist
+            .into_iter()
+            .map(|j| (j.path, j.line, j.col))
+            .collect();
     }
 }
 

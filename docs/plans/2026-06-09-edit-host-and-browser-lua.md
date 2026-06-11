@@ -120,7 +120,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a–4c done, 4d–4e remain) |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | 🚧 (compile de-risked; `EditHost` extraction 4a–4d done, 4e remains) |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
@@ -1658,9 +1658,7 @@ sync tick is hoisted off `Server` onto `EditHost` proper.
 lives on the trait):**
 - **4b — off-tick fs effects** ✅ DONE — Phase 4b below.
 - **4c — LSP effects** ✅ DONE — Phase 4c below.
-- **4d — the inbound seam**: editor-tick `on_*` methods consuming the `select!` arms'
-  events (`on_loop_event`, `apply_open`, `apply_save_done`, `on_lsp_event`,
-  `on_remote_file_changed`, `on_install_done`) so the run loop is a thin translator.
+- **4d — the inbound seam** ✅ DONE — Phase 4d below.
 - **4e — hoist the tick onto `EditHost`**: move the sync state + tick methods off
   `Server` onto a standalone `EditHost { editor, lua, … }` that holds
   `&mut dyn HostEffects`; `Server` shrinks to *the* native `HostEffects` impl + the
@@ -1739,6 +1737,45 @@ methods — `on_loop_event` / `apply_open` / `apply_save_done` / `on_lsp_event` 
 `on_remote_file_changed` / `on_install_done`) and **4e** (hoist the sync tick onto a
 standalone `EditHost`); the trailing TSInstall outbound site is small enough to fold into
 whichever of those reaches it first rather than carrying its own slice.
+
+#### Phase 4d — the inbound seam: the run loop as a thin translator — ✅ DONE (2026-06-11)
+
+The mirror of 4a–4c's *outbound* `HostEffects` seam: the **inbound** events the tick
+reacts to — an LSP reply, a timer firing / child exiting, a file fetched or saved over the
+daemon wire, a remote file changed, a `:TSInstall` finishing, a client `nvim_*` call —
+arrive on the run loop's seven `select!` transports. Before this slice each arm inlined its
+own coalesce-drain + `settle_events` + (for the two quit-capable arms) a direct poke at
+`server.editor.should_quit` / `server.fx`, and the LSP arm reached into `server.lsp_dirty`.
+That direct reach into tick internals is exactly what the `EditHost` hoist (4e) can't have
+in the loop.
+
+Shipped (`crates/nxvim-server/src/inbound.rs`, a new module — the inbound counterpart to
+`edithost.rs`):
+- **One translator method per arm** — `on_client_message` (→ `handle`, returns whether to
+  quit), `on_lsp_events`, `on_loop_events`, `on_opens`, `on_installs`, `on_save_dones`
+  (returns whether to quit), `on_watch_events`. Each takes the first event plus `&mut` its
+  receiver, coalesces the burst (first + `try_recv` rest) through the **existing** per-event
+  handler (`on_lsp_event` / `on_loop_event` / `apply_open` / `on_install_done` /
+  `apply_save_done` / `on_remote_file_changed`), and settles — the LSP one keeping its
+  `lsp_dirty`-gated settle, verbatim.
+- **`quitting()` — the single quit funnel.** The `should_quit` check + the `nxvim_exit`
+  client notification, previously duplicated in the input and save arms, now live in one
+  private method both quit-capable handlers call. The loop no longer reads `editor` or `fx`.
+- **The loop body is now one line per arm.** `Some(event) = lsp_events.recv() =>
+  server.on_lsp_events(event, &mut lsp_events)`, etc.; the two quit-capable arms `break` on
+  the handler's `bool`. No arm touches editor / Lua / effect state directly — the property
+  4e needs to lift the tick onto a standalone `EditHost`.
+
+**Exit criteria — met.** Pure relocation, zero behavior change (the coalesce/settle/quit
+logic is byte-for-byte the same, just moved off the loop): `cargo build` + `fmt --check` +
+`clippy -D warnings` clean; the **full workspace** (`cargo test --workspace`, 1345 tests /
+78 binaries) green — and since the run loop is the one path *all* behavior flows through,
+that sweep is the proof: the quit path (`:q` / `:wq` ack-gated quit), the LSP
+`lsp_dirty`-coalesced settle, the daemon open/save/watch arms, and the timer/process arm
+are each exercised by their existing suites (`editing`, the 114-test `nxvim` LSP suite,
+`daemon_*`, `uv_process`). Only **4e** remains in Phase 4-proper: hoist the sync state +
+tick methods off `Server` onto a standalone `EditHost` holding `&mut dyn HostEffects` (and
+fold in the one trailing TSInstall outbound site).
 
 ---
 

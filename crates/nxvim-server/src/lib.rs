@@ -25,6 +25,7 @@ mod evloop;
 mod excmd;
 mod extmarks;
 mod host;
+mod inbound;
 mod input;
 mod keymap;
 mod lifecycle;
@@ -837,91 +838,44 @@ where
     // plugin that gates "the editor has finished starting" reads it as true.
     let _ = server.lua.set_vim_did_enter(true);
 
+    // The run loop is a thin translator: each arm receives one event off a transport and
+    // hands the whole batch to an inbound-seam handler (`inbound.rs`), which coalesces the
+    // channel, runs the per-event tick method, and settles. No arm touches editor / Lua
+    // state directly — that's the property the `EditHost` hoist (Phase 4e) needs.
     loop {
         tokio::select! {
             // Editor input / API calls from the UI client.
             message = incoming.recv() => {
                 let Some(message) = message else { break };
-                server.handle(message).await;
-                if server.editor.should_quit {
-                    server.fx.notify("nxvim_exit", vec![]);
+                if server.on_client_message(message).await {
                     break;
                 }
             }
             // Replies from the language servers (initialize handshakes, published
             // diagnostics, server exits, log messages). Selecting here keeps the
             // editor responsive regardless of any server's speed or health.
-            Some(event) = lsp_events.recv() => {
-                server.on_lsp_event(event);
-                // Coalesce a burst into a single repaint, as for syntax events.
-                while let Ok(event) = lsp_events.try_recv() {
-                    server.on_lsp_event(event);
-                }
-                // A reply handled by a Lua callback (Phase 4 seam) may defer work
-                // via `vim.cmd` / `vim.schedule`; drive it to convergence and
-                // repaint. Closes the latent gap where an `on_init`/`LspAttach`
-                // callback's deferred work wasn't driven off-tick.
-                let dirty = std::mem::take(&mut server.lsp_dirty);
-                server.settle_events(dirty);
-            }
+            Some(event) = lsp_events.recv() => server.on_lsp_events(event, &mut lsp_events),
             // Timers and child-process completions from the event-loop actor — the
             // first thing that wakes the server on wall-clock time rather than RPC.
-            // The matching Lua callback runs here, on the one server thread.
-            Some(event) = loop_events.recv() => {
-                server.on_loop_event(event);
-                // Coalesce a burst (a flurry of timers, several processes exiting)
-                // into one settle + repaint, like the syntax/LSP arms.
-                while let Ok(event) = loop_events.try_recv() {
-                    server.on_loop_event(event);
-                }
-                server.settle_events(true);
-            }
+            Some(event) = loop_events.recv() => server.on_loop_events(event, &mut loop_events),
             // Bytes for an off-tick open arrived from the daemon's fs — the startup
-            // file (kept from freezing startup) or a later `:edit`. Load them into the
-            // named replica buffer (or echo a read error) and repaint. Idle for a
+            // file (kept from freezing startup) or a later `:edit`. Idle for a
             // bare/local session.
-            Some((buffer, path, result)) = open_rx.recv() => {
-                server.apply_open(buffer, path, result);
-                while let Ok((buffer, path, result)) = open_rx.try_recv() {
-                    server.apply_open(buffer, path, result);
-                }
-                server.settle_events(true);
-            }
-            // A `:TSInstall` background job finished (grammar fetched + compiled, or
-            // it failed). Apply on the server thread: reload the grammar so open
-            // buffers re-highlight/indent, and echo the outcome.
-            Some(outcome) = install_events.recv() => {
-                server.on_install_done(outcome);
-                while let Ok(outcome) = install_events.try_recv() {
-                    server.on_install_done(outcome);
-                }
-                server.settle_events(true);
-            }
+            Some(open) = open_rx.recv() => server.on_opens(open, &mut open_rx),
+            // A `:TSInstall` background job finished (grammar fetched + compiled, or it
+            // failed): reload the grammar so open buffers re-highlight/indent, echo.
+            Some(outcome) = install_events.recv() => server.on_installs(outcome, &mut install_events),
             // An off-tick `:w` finished on the daemon (the save path): finalize the
-            // buffer's saved-state, echo `written`, and replay any deferred `:wq`/`:x`
-            // quit. The replayed quit can ask the editor to exit, so check `should_quit`
-            // here too — this is the one non-input arm that can set it.
+            // buffer's saved-state and replay any deferred `:wq`/`:x` quit. The replayed
+            // quit can ask the editor to exit — the one non-input arm that can.
             Some(done) = save_done_rx.recv() => {
-                server.apply_save_done(done);
-                while let Ok(done) = save_done_rx.try_recv() {
-                    server.apply_save_done(done);
-                }
-                server.settle_events(true);
-                if server.editor.should_quit {
-                    server.fx.notify("nxvim_exit", vec![]);
+                if server.on_save_dones(done, &mut save_done_rx) {
                     break;
                 }
             }
-            // The daemon's watch leg pushed a file change (`HostWatch`): reconcile it
-            // off the editor tick — the remote analogue of the local per-buffer watch's
-            // `FsEvent` arm. Idle for a local/bare session (nothing ever sends here).
-            Some(ev) = watch_rx.recv() => {
-                server.on_remote_file_changed(ev);
-                while let Ok(ev) = watch_rx.try_recv() {
-                    server.on_remote_file_changed(ev);
-                }
-                server.settle_events(true);
-            }
+            // The daemon's watch leg pushed a file change (`HostWatch`): reconcile it off
+            // the editor tick. Idle for a local/bare session (nothing ever sends here).
+            Some(ev) = watch_rx.recv() => server.on_watch_events(ev, &mut watch_rx),
         }
     }
     // The loop has exited (quit or client disconnect): flush the final snapshot to

@@ -48,6 +48,19 @@ impl DaemonFs {
         me
     }
 
+    /// Seed several `(path, contents)` files at once — for the multi-buffer `:wall` /
+    /// `:wqa` tests, which open and edit more than one remote file.
+    fn with_files(entries: &[(&str, &str)]) -> Self {
+        let me = DaemonFs::default();
+        {
+            let mut files = me.files.lock().unwrap();
+            for (path, contents) in entries {
+                files.insert(PathBuf::from(*path), contents.as_bytes().to_vec());
+            }
+        }
+        me
+    }
+
     /// The bytes currently stored at `path`, as a string (the daemon's view of the
     /// file the editor wrote across the wire). `None` if nothing is stored there.
     fn content(&self, path: &str) -> Option<String> {
@@ -140,6 +153,185 @@ async fn await_lines(rpc: &Rpc, want: &[&str]) {
 /// Whether the current buffer reports `modified` (the mirrored `vim.bo.modified`).
 async fn modified(rpc: &Rpc) -> bool {
     exec_lua(rpc, "return vim.bo.modified").await.as_bool() == Some(true)
+}
+
+/// Whether **any** loaded buffer reports `modified` — for the multi-buffer `:wall` /
+/// `:wqa` tests, where more than one buffer is in flight at once.
+async fn any_modified(rpc: &Rpc) -> bool {
+    exec_lua(
+        rpc,
+        "for _, b in ipairs(vim.api.nvim_list_bufs()) do \
+           if vim.bo[b].modified then return true end \
+         end \
+         return false",
+    )
+    .await
+    .as_bool()
+        == Some(true)
+}
+
+/// Poll until `fake` holds `want` at `path` (an off-tick write lands a moment after the
+/// command), then assert it — the multi-buffer analogue of the inline poll in
+/// `write_pushes_edited_bytes_…`.
+async fn await_daemon_content(fake: &DaemonFs, path: &str, want: &str) {
+    for _ in 0..100 {
+        if fake.content(path).as_deref() == Some(want) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        fake.content(path).as_deref(),
+        Some(want),
+        "the daemon never received the bytes for {path}"
+    );
+}
+
+/// Open `/virtual/a.txt`, edit it dirty, then `:edit /virtual/b.txt` and edit *it* dirty
+/// — leaving two modified file-backed buffers, both loaded over the wire. Returns the
+/// daemon fake and the live client. The edits prepend a marker so the written bytes are
+/// content a stub couldn't invent and the local disk can't hold (the `/virtual/...`
+/// faithfulness argument the rest of this suite makes).
+async fn two_edited_buffers(fail_writes: bool) -> (DaemonFs, Rpc, UnboundedReceiver<Incoming>) {
+    let fake = DaemonFs {
+        fail_writes,
+        ..DaemonFs::with_files(&[("/virtual/a.txt", "aaa\n"), ("/virtual/b.txt", "bbb\n")])
+    };
+    let (rpc, incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/a.txt").await;
+    await_lines(&rpc, &["aaa"]).await;
+    feed(&rpc, "ggIA <Esc>");
+    feed(&rpc, ":edit /virtual/b.txt<CR>");
+    await_lines(&rpc, &["bbb"]).await;
+    feed(&rpc, "ggIB <Esc>");
+    assert!(
+        any_modified(&rpc).await,
+        "both edited buffers should be modified before the write"
+    );
+    (fake, rpc, incoming)
+}
+
+/// `:wall` writes **every** modified file-backed buffer over the wire — each buffer's
+/// edited bytes land on the daemon (off-tick, concurrently), and every buffer reads
+/// clean once its ack arrives. The multi-buffer companion to the single-buffer `:w`.
+#[tokio::test]
+async fn wall_writes_every_modified_buffer_over_the_wire() {
+    let (fake, rpc, _incoming) = two_edited_buffers(false).await;
+
+    feed(&rpc, ":wall<CR>");
+
+    // Both files cross the wire with their own edits — a stub serving a constant couldn't
+    // produce two distinct bodies, and neither path lives on the edit-host's local disk.
+    await_daemon_content(&fake, "/virtual/a.txt", "A aaa\n").await;
+    await_daemon_content(&fake, "/virtual/b.txt", "B bbb\n").await;
+
+    // And every buffer reads clean once its write acked (ack-gated state, per buffer).
+    for _ in 0..100 {
+        if !any_modified(&rpc).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !any_modified(&rpc).await,
+        "no buffer stays modified after `:wall` acks every write"
+    );
+}
+
+/// `:wqa` writes every modified buffer over the wire **and then quits** — but only once
+/// *all* the writes have acked (the all-buffers-ack-then-quit contract). Both files hold
+/// their edited bytes on the daemon before the editor exits, proving the quit waited.
+#[tokio::test]
+async fn wqa_writes_all_buffers_then_quits() {
+    let (fake, rpc, mut incoming) = two_edited_buffers(false).await;
+
+    feed(&rpc, ":wqa<CR>");
+
+    // The editor quits — but only after *both* off-tick writes ack (the gate fires `:qa`
+    // when its seq-set drains). Either an `nxvim_exit` notification or the closed channel
+    // counts.
+    let quit = {
+        let timeout = Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(timeout, incoming.recv()).await {
+                Ok(None) => break true,
+                Ok(Some(Incoming::Notification { method, .. })) if method == "nxvim_exit" => {
+                    break true
+                }
+                Ok(Some(_)) => continue,
+                Err(_) => break false,
+            }
+        }
+    };
+    assert!(quit, "`:wqa` quits once every off-tick write acks");
+    // Both writes landed on the daemon before the quit fired (the quit waited for the
+    // whole batch, not just the first).
+    assert_eq!(
+        fake.content("/virtual/a.txt").as_deref(),
+        Some("A aaa\n"),
+        "the first buffer's `:wqa` write landed before the quit"
+    );
+    assert_eq!(
+        fake.content("/virtual/b.txt").as_deref(),
+        Some("B bbb\n"),
+        "the second buffer's `:wqa` write landed before the quit"
+    );
+}
+
+/// A **failing** write in a `:wqa` batch **cancels** the whole quit (the multi-buffer
+/// form of a failing `:wq` keeping the editor up): the editor stays running, the buffers
+/// stay modified, the daemon gets nothing, and the failure surfaces loudly.
+#[tokio::test]
+async fn wqa_with_a_failing_write_cancels_the_quit() {
+    let (fake, rpc, mut incoming) = two_edited_buffers(true).await;
+
+    feed(&rpc, ":wqa<CR>");
+
+    // A failed batch write must not exit the editor, and the failure must surface loudly
+    // on the message line. Classify both signals in one bounded drain.
+    let mut exited = false;
+    let mut saw_failure = false;
+    let deadline = Duration::from_millis(1200);
+    loop {
+        match tokio::time::timeout(deadline, incoming.recv()).await {
+            Ok(None) => {
+                exited = true;
+                break;
+            }
+            Ok(Some(Incoming::Notification { method, params })) => {
+                if method == "nxvim_exit" {
+                    exited = true;
+                    break;
+                }
+                if method == "redraw" && message_of(&params).contains("failed") {
+                    saw_failure = true;
+                }
+            }
+            Ok(Some(_)) => {}
+            // Quiet window elapsed: the editor is still running (the expected outcome).
+            Err(_) => break,
+        }
+    }
+    assert!(!exited, "a failing `:wqa` write must not quit the editor");
+    assert!(
+        saw_failure,
+        "the write failure must be surfaced loudly on the message line"
+    );
+
+    // The buffers stay dirty (no write cleared them) and the daemon holds neither edit.
+    assert!(
+        any_modified(&rpc).await,
+        "a failed `:wqa` leaves the buffers modified"
+    );
+    assert_eq!(
+        fake.content("/virtual/a.txt").as_deref(),
+        Some("aaa\n"),
+        "the daemon must not hold any bytes from the failed `:wqa`"
+    );
+    assert_eq!(
+        fake.content("/virtual/b.txt").as_deref(),
+        Some("bbb\n"),
+        "the daemon must not hold any bytes from the failed `:wqa`"
+    );
 }
 
 /// `:w` pushes the **edited** bytes to the daemon across the wire, and `modified`

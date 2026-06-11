@@ -444,11 +444,10 @@ impl Editor {
                 }
             }
             "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
-            "wa" | "wall" => self.ex_write_all(bang),
-            "wqa" | "xa" | "xall" => {
+            "wa" | "wall" => {
                 self.ex_write_all(bang);
-                self.ex_quit_all(bang);
             }
+            "wqa" | "xa" | "xall" => self.ex_write_quit_all(bang),
             "e" | "edit" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_edit(&a, bang);
@@ -1357,7 +1356,9 @@ impl Editor {
         // later slice); a deferred quit rides the pending save until its ack.
         if self.host_fs_offtick {
             match path.or_else(|| self.buffer().path.clone()) {
-                Some(target) => self.enqueue_save(target, then_quit),
+                Some(target) => {
+                    self.enqueue_save(target, then_quit);
+                }
                 None => self.echo("E32: No file name"),
             }
             return;
@@ -1674,7 +1675,9 @@ impl Editor {
         self.switch_buffer(id);
     }
 
-    /// `:wall` — write every modified buffer that has a file name.
+    /// `:wall` — write every modified buffer that has a file name. Returns the
+    /// [`PendingSave::seq`]s enqueued in off-tick mode (empty otherwise), so `:wqa`
+    /// can gate its quit on the whole batch; a bare `:wall` discards them.
     ///
     /// A buffer whose file changed on disk since we read it is *not* clobbered
     /// (unless forced with `:wall!`): the safe buffers are still written, and the
@@ -1682,16 +1685,25 @@ impl Editor {
     /// such buffer and warn — the same way `:q` surfaces the buffer blocking a
     /// quit — so the user lands on the file at risk rather than silently losing
     /// the outside edit.
-    fn ex_write_all(&mut self, bang: bool) {
-        // Multi-buffer write over the daemon wire isn't wired yet: the off-tick save
-        // path (Phase 3e) covers the single-buffer `:w` / `:wq` / `:x`. Rather than
-        // silently writing every modified buffer to the *local* disk (the sync
-        // `host_fs`) in a remote session — which would scatter saves onto the wrong
-        // machine — fail loud (per the project's no-silent-stubs rule) until a later
-        // slice serializes the whole set over the wire.
+    fn ex_write_all(&mut self, bang: bool) -> Vec<u64> {
+        // Off-tick (daemon session): snapshot every modified file-backed buffer into a
+        // `PendingSave` the server pushes over the wire — the multi-buffer companion to
+        // the single-buffer `:w` (`ex_write`). The disk-change/conflict guard is skipped
+        // here for the same reason `ex_write` skips it off-tick: it needs a remote stat
+        // we've sworn off the editor tick (a `HostWatch`-driven check is a later slice).
+        // Each save acks independently with its own `written` echo; per-buffer ordering
+        // and failure handling are the server's (the buffers are distinct, so they all
+        // dispatch concurrently). No summary echo — the per-ack echoes carry it.
         if self.host_fs_offtick {
-            self.echo("E5555: :wall over the daemon is not supported yet");
-            return;
+            let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
+            let mut seqs = Vec::new();
+            for id in ids {
+                let buf = &self.buffers.get(id).buffer;
+                if let (true, Some(path)) = (buf.modified, buf.path.clone()) {
+                    seqs.push(self.enqueue_save_of(id, path, None));
+                }
+            }
+            return seqs;
         }
         let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
         let fs = self.host_fs.clone();
@@ -1723,6 +1735,33 @@ impl Editor {
             );
         } else {
             self.echo(format!("{written} buffer(s) written"));
+        }
+        Vec::new()
+    }
+
+    /// `:wqa` / `:xa` — write every modified buffer, then quit the editor.
+    ///
+    /// Locally this is just `:wall` followed by `:qall` (the writes are synchronous, so
+    /// the buffers are clean by the time the quit runs). In a daemon session the writes
+    /// go *off-tick* over the wire, so the quit can't fire inline — the buffers are still
+    /// `[+]` until their acks land. Instead core hands the server a [`PendingQuitAll`]
+    /// naming the batch's writes; the server replays `:qa` only once every one has acked,
+    /// and **cancels** the quit if any fails (the multi-buffer form of `:wq`'s deferred,
+    /// ack-gated, failure-cancels quit). A `:wqa` with nothing to save still quits
+    /// immediately — there's no write to wait on — exactly as `:qa` would.
+    fn ex_write_quit_all(&mut self, bang: bool) {
+        let seqs = self.ex_write_all(bang);
+        if !self.host_fs_offtick {
+            self.ex_quit_all(bang);
+            return;
+        }
+        if seqs.is_empty() {
+            // Off-tick, but no modified file-backed buffer was enqueued: nothing to wait
+            // on, so quit now (a modified *no-name* buffer makes `:qa` report E37, as in
+            // vim — the gate would never let us, since it watches no writes).
+            self.ex_quit_all(bang);
+        } else {
+            self.pending_quit_all = Some(PendingQuitAll { bang, seqs });
         }
     }
 }

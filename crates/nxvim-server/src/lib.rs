@@ -382,6 +382,12 @@ struct Server {
     /// buffer, dispatched in order as each ack frees the slot. A failed write fails
     /// (and drops) the rest of its buffer's queue loudly.
     saves_queued: HashMap<BufferId, VecDeque<PendingSave>>,
+    /// A `:wqa` / `:xa` quit deferred until every write of its `:wall` batch has acked
+    /// (the multi-buffer save slice). `None` outside a pending batch-quit; while set, the
+    /// save ack handler removes each seq as it lands and replays `:qa` once the set
+    /// empties — and **cancels** the gate (drops it) if any write in the batch fails, so
+    /// a failed multi-buffer save keeps the editor up exactly as a failed `:wq` does.
+    quit_all_gate: Option<save::QuitAllGate>,
     /// Sender half for off-tick buffer opens (the daemon `:edit` path). The startup
     /// fetch and each `:edit`-spawned read deliver their `(buffer, path, result)` here;
     /// the matching `select!` arm fills the named buffer with the fetched bytes.
@@ -616,6 +622,7 @@ where
         save_done_tx,
         saves_inflight: HashSet::new(),
         saves_queued: HashMap::new(),
+        quit_all_gate: None,
         open_tx,
         buf_watches: HashMap::new(),
         remote_watches: HashSet::new(),

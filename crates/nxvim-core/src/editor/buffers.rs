@@ -40,6 +40,25 @@ pub struct PendingSave {
     pub then_quit: Option<bool>,
 }
 
+/// A `:wqa` / `:xa` quit the editor **deferred** until every write of a multi-buffer
+/// `:wall` batch has acked — the all-buffers-ack-then-quit machinery of the daemon
+/// save path (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3, the fs
+/// leg's multi-buffer write slice). The single-buffer `:wq` rides [`PendingSave::then_quit`]
+/// (one save, one `:q`); a batch quit can't, because it must wait for *all* of the
+/// batch's writes — so core hands the server this set of seqs to watch and the server
+/// fires `:qa` only once every one has acked (and **cancels** the quit if any fails,
+/// exactly as the single-buffer `:wq` does). The server drains it with
+/// [`Editor::take_pending_quit_all`].
+pub struct PendingQuitAll {
+    /// The `:qa!` bang — force-quit (discard any *other* still-modified buffer) once the
+    /// batch acks, vs. `:qa`'s `E37` guard. Carried verbatim from the `:wqa!` / `:xa!`.
+    pub bang: bool,
+    /// The [`PendingSave::seq`] of every write this `:wqa` enqueued. The server removes
+    /// each as it acks; when the set empties it replays the quit. Empty would mean
+    /// "nothing to save" — but core quits directly in that case and never enqueues this.
+    pub seqs: Vec<u64>,
+}
+
 /// A buffer open the editor **deferred** off the keystroke tick — `:edit` over the
 /// daemon wire (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3f). In a
 /// daemon session core does *not* read through the synchronous [`HostFs`](crate::HostFs)
@@ -302,11 +321,24 @@ impl Editor {
     /// already resolved) and enqueue it. The saved-state is **not** touched here —
     /// `modified`, `save_tick`, and the `disk` baseline change only on the ack
     /// ([`Editor::finalize_save`]), so a write that fails or never acks leaves the
-    /// buffer honestly dirty. `then_quit` carries a deferred `:wq` / `:x`.
-    pub(crate) fn enqueue_save(&mut self, path: PathBuf, then_quit: Option<bool>) {
-        let buffer = self.cur_buffer();
+    /// buffer honestly dirty. `then_quit` carries a deferred `:wq` / `:x`. Returns the
+    /// minted [`PendingSave::seq`] so a multi-buffer `:wqa` can gate its quit on the
+    /// whole batch (the single-buffer `:w` caller ignores it).
+    pub(crate) fn enqueue_save(&mut self, path: PathBuf, then_quit: Option<bool>) -> u64 {
+        self.enqueue_save_of(self.cur_buffer(), path, then_quit)
+    }
+
+    /// Snapshot a *specific* buffer for an off-tick write (the multi-buffer `:wall` path,
+    /// which writes every modified buffer, not just the current one). The single-buffer
+    /// [`Editor::enqueue_save`] is this for `cur_buffer()`.
+    pub(crate) fn enqueue_save_of(
+        &mut self,
+        buffer: BufferId,
+        path: PathBuf,
+        then_quit: Option<bool>,
+    ) -> u64 {
         let (bytes, lines) = {
-            let buf = self.buffer();
+            let buf = &self.buffers.get(buffer).buffer;
             (buf.to_save_bytes(), buf.line_count())
         };
         let seq = self.next_save_seq;
@@ -319,6 +351,14 @@ impl Editor {
             lines,
             then_quit,
         });
+        seq
+    }
+
+    /// Drain the deferred `:wqa` / `:xa` quit (off-tick mode), if one was set this tick.
+    /// The server stores the returned seq-set as a gate and replays `:qa` once every
+    /// write in it acks. Empty (a cheap `None`) when no batch quit ran.
+    pub fn take_pending_quit_all(&mut self) -> Option<PendingQuitAll> {
+        self.pending_quit_all.take()
     }
 
     /// Apply a daemon write ack to the buffer it saved: bind the name, stamp the new

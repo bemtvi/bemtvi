@@ -21,11 +21,25 @@
 //!   (snapshot order = wire order); a failed earlier write fails the queue loudly
 //!   rather than letting a later snapshot paper over it.
 
+use std::collections::HashSet;
 use std::io;
 
 use nxvim_core::{BufferId, FileStat, PendingSave};
 
 use crate::Server;
+
+/// The server-side state for a deferred `:wqa` / `:xa` quit (the multi-buffer save
+/// slice): the bang carried from `:wqa!`, and the set of [`PendingSave::seq`]s the
+/// batch's `:wall` enqueued and whose acks the quit waits on. The save ack handler
+/// removes each seq as it lands; when `waiting` empties it replays `:qa` (the
+/// all-buffers-ack-then-quit contract), and a failed write in the batch drops the gate
+/// (cancels the quit) — the multi-buffer form of `:wq`'s ack-gated, failure-cancels quit.
+pub(crate) struct QuitAllGate {
+    /// `:qa!` (true) vs `:qa` (false), replayed once `waiting` empties.
+    pub bang: bool,
+    /// Outstanding write seqs; the quit fires when this drains to empty.
+    pub waiting: HashSet<u64>,
+}
 
 /// A finished off-tick write, delivered from the spawned write task back to the
 /// server's `select!` loop. Carries the originating [`PendingSave`] (its `bytes` are
@@ -56,6 +70,21 @@ impl Server {
             } else {
                 self.dispatch_save(save);
             }
+        }
+    }
+
+    /// Record this tick's deferred `:wqa` / `:xa` quit (core's `take_pending_quit_all`)
+    /// as the server-side [`QuitAllGate`]. Called right after `drain_pending_saves`, so
+    /// the gate's seqs name writes already dispatched this tick; the save ack handler
+    /// then drains the gate. A no-op when no batch quit ran. (Core only sets the batch
+    /// quit when at least one write was enqueued — an empty `:wqa` quits inline — so the
+    /// gate's `waiting` is never empty at birth; it fires only as acks land.)
+    pub(crate) fn drain_pending_quit_all(&mut self) {
+        if let Some(pqa) = self.editor.take_pending_quit_all() {
+            self.quit_all_gate = Some(QuitAllGate {
+                bang: pqa.bang,
+                waiting: pqa.seqs.into_iter().collect(),
+            });
         }
     }
 
@@ -115,6 +144,12 @@ impl Server {
                 if let Some(bang) = save.then_quit {
                     self.run_command(if bang { "q!" } else { "q" });
                 }
+                // The multi-buffer companion: a `:wqa` / `:xa` waits for *every* write of
+                // its batch. Tick this seq off the gate; once the whole set has acked the
+                // editor is clean across the batch, so replay `:qa` (the
+                // all-buffers-ack-then-quit contract — like the single-buffer `:wq` above
+                // but gated on the set, not one save).
+                self.advance_quit_all_gate(save.seq);
                 // This buffer's slot freed: send its next queued write, if any.
                 if let Some(next) = self.next_queued_save(save.buffer) {
                     self.dispatch_save(next);
@@ -136,7 +171,43 @@ impl Server {
                         ));
                     }
                 }
+                // A failed write in a `:wqa` / `:xa` batch cancels the whole quit (the
+                // multi-buffer form of a failed `:wq` keeping the editor up): drop the
+                // gate so the editor stays running with the unsaved buffer intact.
+                self.cancel_quit_all_gate(save.seq);
             }
+        }
+    }
+
+    /// Tick a successfully-acked write's `seq` off the `:wqa` quit gate (if it belongs to
+    /// one). When the gate's set drains to empty, every write of the batch has landed and
+    /// the editor is clean across it, so replay `:qa` / `:qa!`. A no-op when no batch quit
+    /// is pending or this seq isn't part of it (a plain `:w` / `:wq`).
+    fn advance_quit_all_gate(&mut self, seq: u64) {
+        let Some(gate) = self.quit_all_gate.as_mut() else {
+            return;
+        };
+        if !gate.waiting.remove(&seq) || !gate.waiting.is_empty() {
+            return;
+        }
+        let bang = gate.bang;
+        self.quit_all_gate = None;
+        self.run_command(if bang { "qa!" } else { "qa" });
+    }
+
+    /// Cancel a pending `:wqa` quit because one of its batch's writes failed — drop the
+    /// gate so the editor stays up with the unsaved buffer intact (the failure itself is
+    /// already surfaced loudly by the caller). A no-op when this seq isn't part of a
+    /// pending batch quit.
+    fn cancel_quit_all_gate(&mut self, seq: u64) {
+        if self
+            .quit_all_gate
+            .as_ref()
+            .is_some_and(|g| g.waiting.contains(&seq))
+        {
+            self.quit_all_gate = None;
+            self.editor
+                .echo("nxvim: :wqa aborted (a write failed); editor stays open".to_string());
         }
     }
 

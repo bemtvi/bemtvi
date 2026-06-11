@@ -1346,6 +1346,7 @@ impl Server {
         // (off-tick mode): writes (`:w`) and opens (`:edit`). No-ops when off-tick mode
         // is off or none ran.
         self.drain_pending_saves();
+        self.drain_pending_quit_all();
         self.drain_pending_opens();
     }
 }

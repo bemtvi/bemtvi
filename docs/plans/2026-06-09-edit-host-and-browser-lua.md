@@ -706,10 +706,10 @@ Shipped:
   a **failed** write *cancels* the quit (the buffer stays modified, the editor stays up).
   An unflushed write is never silently abandoned by an exiting editor.
 
-**Scoped out (fail loud, not silent):** multi-buffer `:wall` / `:wqa` / `:xa` echo
-`E5555: :wall over the daemon is not supported yet` in off-tick mode rather than
-silently writing every modified buffer to the *local* disk (the wrong machine) — the
-all-buffers-ack-then-quit machinery is a later slice. `BufWritePre`/`BufWritePost`
+**Scoped out (fail loud, not silent) — now done in Phase 3m below:** multi-buffer
+`:wall` / `:wqa` / `:xa` echoed `E5555: :wall over the daemon is not supported yet` in
+off-tick mode rather than silently writing every modified buffer to the *local* disk
+(the wrong machine). `BufWritePre`/`BufWritePost`
 autocmds aren't emitted anywhere in nxvim yet (the contract's snapshot-after-`BufWritePre`
 point is moot until they exist); the observable saved-state is `modified` / `save_tick` /
 the `written` echo, all ack-gated here.
@@ -899,6 +899,70 @@ LSP suites that exercise `jump_to`; the lib/server/core run is 1040 green; fmt +
 `nxvim-web-bridge` relay test times out identically on a clean tree, and the `nxvim` e2e PTY
 tests flake under the full-`--workspace` parallel storm but pass in isolation.)
 
+### Phase 3m — the daemon wire protocol (filesystem half, multi-buffer `:wall` / `:wqa` / `:xa`) — ✅ DONE (2026-06-10)
+
+The last fs-leg write slice, and the one 3e explicitly deferred behind an `E5555` stub:
+where 3e proved the **single-buffer** off-tick save (`:w` / `:wq` / `:x`), this generalizes
+it to the **all-modified-buffers** forms. In a daemon session `:wall` / `:wqa` / `:xa` had
+been failing loud (`E5555: :wall over the daemon is not supported yet`) rather than
+silently scattering every modified buffer onto the edit-host's *local* disk (the wrong
+machine). Now they write every modified buffer over the wire, reusing 3e's per-buffer save
+machinery wholesale — **no new wire, no new seam**; the only new concept is the
+*all-buffers-ack-then-quit* gate the save contract named.
+
+The write half is trivial once 3e exists: `:wall` snapshots **each** modified file-backed
+buffer into its own [`PendingSave`] (the disk-change/conflict guard skipped for the same
+reason `:w` skips it off-tick — it needs a remote stat sworn off the tick), and the server's
+existing `drain_pending_saves` dispatches them. The buffers are distinct, so they ride the
+wire concurrently (the per-buffer serialization in `save.rs` only orders *overlapping* writes
+to the *same* buffer); each acks independently with its own `written` echo. No summary echo —
+the per-ack echoes carry it.
+
+The **quit** half is the real content. The single-buffer `:wq` rides `PendingSave::then_quit`
+(one save → one `:q`); a `:wqa` can't, because it must wait for *every* write of the batch
+before quitting — quit too early and the still-`[+]` buffers make `:qa` report `E37` and the
+editor never exits. So core hands the server a new [`PendingQuitAll`] (`take_pending_quit_all`):
+the `:qa!` bang plus the [`PendingSave::seq`]s of every write the batch enqueued. The server
+holds it as a `QuitAllGate`, ticks each seq off as its write acks, and replays `:qa` only when
+the set drains — the *all-buffers-ack-then-quit* contract. A **failed** write in the batch
+**cancels** the gate (drops it, surfaces loudly), so a failing `:wqa` keeps the editor up with
+the unsaved buffer intact — the multi-buffer form of 3e's failing-`:wq`-cancels-the-quit. A
+`:wqa` with nothing to save quits inline (no write to wait on), exactly as `:qa` would; a
+modified *no-name* buffer still makes the replayed `:qa` report `E37` (the gate watches no
+write for it), matching vim.
+
+Shipped:
+- **Core** (`nxvim-core`): `enqueue_save_of(buffer, …)` (the buffer-targeted form of
+  `enqueue_save`, returning the minted seq); `ex_write_all` grew an off-tick branch that
+  enqueues each modified file-backed buffer and returns the seqs; `ex_write_quit_all` (the
+  new `:wqa` / `:xa` entry) sets `pending_quit_all` from those seqs off-tick (or quits inline
+  when nothing was enqueued), and is plain `:wall` + `:qall` locally. `PendingQuitAll` +
+  `take_pending_quit_all`.
+- **Server** (`save.rs`): `QuitAllGate` + `drain_pending_quit_all` (records the gate right
+  after `drain_pending_saves`, in `run_pending`); `advance_quit_all_gate` (fires `:qa` when
+  the seq-set empties) and `cancel_quit_all_gate` (drops it on a batch write failure), woven
+  into `apply_save_done`'s success/failure arms.
+
+**Scoped out (unchanged, fail loud where relevant):** the local-disk `:wall` keeps its
+disk-change conflict guard + `"{n} buffer(s) written"` summary (off-tick can't stat the
+remote on-tick, so it skips the guard and emits the per-ack echoes instead, consistent with
+`:w`). `BufWritePre`/`BufWritePost` still aren't emitted anywhere in nxvim yet, so the
+snapshot-after-`BufWritePre` point stays moot; the observable saved-state is `modified` /
+the `written` echo, ack-gated per buffer.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_save.rs` gains three tests over an
+in-process duplex daemon (a `RemoteHostFs` ↔ `serve_fs_daemon`): two `/virtual/...` buffers
+edited then `:wall`ed both land their *distinct* edited bodies on the daemon (content a stub
+couldn't invent and the local disk can't hold — the 3d/3e faithfulness argument) and both read
+clean only on their acks; `:wqa` writes both **then quits**, with both files already on the
+daemon before the exit (the gate waited for the whole batch, not just the first); and a
+**failing** `:wqa` does *not* quit, leaves both buffers modified, leaves the daemon empty, and
+surfaces the failure loudly. Two negative controls confirmed the tests do real work (stubbing
+the off-tick `:wall` enqueue fails the write test; disabling `drain_pending_quit_all` fails the
+quit test). Regression-clean — full `cargo test --workspace` green (1019+ tests, the
+`daemon_save` suite now 6), fmt + clippy `-D warnings` clean; local binaries leave off-tick
+mode off and `:wall` / `:wqa` write synchronously, unchanged.
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -954,9 +1018,11 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
   finalizing the saved-state on the ack. The rope is authoritative for open
   buffers; core sees a normal local buffer. (Initial open landed in Phase 3d, the
   single-buffer **save** in Phase 3e, **`:edit`** in Phase 3f, the **remote explorer**
-  listing in Phase 3g, and **`:tabnew` / LSP go-to** in Phase 3h — every buffer-open path is
-  now off-tick, behind one shared kernel; multi-buffer `:wall` is the remaining fs-leg
-  slice.)
+  listing in Phase 3g, **`:tabnew` / LSP go-to** in Phase 3h, and the multi-buffer
+  **`:wall` / `:wqa` / `:xa`** in Phase 3m — every buffer-open path *and* every write path
+  is now off-tick, behind one shared kernel. **The fs leg and the watch leg (3i–3l) are
+  both complete**; what remains for the full split is the daemon binary / ssh transport,
+  LSP-over-`HostProc`, the blocking `vim._system`, and the Lua-visible fs semantics below.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call

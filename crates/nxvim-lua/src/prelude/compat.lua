@@ -763,6 +763,23 @@ function fn.getcompletion(pat, ctype, _filtered)
     end
     table.sort(out)
     return out
+  elseif ctype == "color" then
+    -- Colorscheme names: the basenames of `colors/*.{lua,vim}` across the
+    -- runtimepath, prefix-filtered, deduped (the same name in two rtp dirs lists
+    -- once). lazy.nvim's loader probes this to skip re-loading an already-available
+    -- colorscheme before searching its managed plugins for the file.
+    local seen, out = {}, {}
+    for _, ext in ipairs({ "lua", "vim" }) do
+      for _, path in ipairs(vim.api.nvim_get_runtime_file("colors/*." .. ext, true)) do
+        local name = path:match("([^/]+)%." .. ext .. "$")
+        if name and not seen[name] and name:sub(1, #pat) == pat then
+          seen[name] = true
+          out[#out + 1] = name
+        end
+      end
+    end
+    table.sort(out)
+    return out
   end
   vim._notimpl("vim.fn.getcompletion(type='" .. tostring(ctype) .. "')")
 end

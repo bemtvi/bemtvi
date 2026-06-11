@@ -1057,3 +1057,42 @@ async fn vim_fn_system_drives_the_lazy_bootstrap() {
     .await;
     assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
 }
+
+/// lazy.nvim's `colorscheme` loader probes `vim.fn.getcompletion("", "color")` to
+/// decide whether a colorscheme is already available before searching its managed
+/// plugins for one (`lazy/core/loader.lua` → `M.colorscheme`). The `color`
+/// completion kind fell through to `vim._notimpl`, so loading any plugin that
+/// declares a colorscheme aborted. It must enumerate `colors/*.{lua,vim}` across
+/// the runtimepath by basename, prefix-filtered.
+#[tokio::test]
+async fn getcompletion_color_lists_runtimepath_colorschemes() {
+    let rt = temp_dir("getcompletion_color");
+    std::fs::create_dir_all(rt.join("colors")).unwrap();
+    std::fs::write(rt.join("colors/mytheme.lua"), "").unwrap();
+    std::fs::write(rt.join("colors/myother.lua"), "").unwrap();
+    std::fs::write(rt.join("colors/legacy.vim"), "").unwrap();
+
+    let (rpc, _incoming) = start(vec![rt]).await;
+    let report = exec_lua(
+        &rpc,
+        r#"
+        local function eq(a, b, msg) if a ~= b then error(msg..": "..tostring(a).." ~= "..tostring(b)) end end
+        local ok, err = pcall(function()
+          local all = vim.fn.getcompletion("", "color")
+          eq(type(all), "table", "returns a list")
+          local has = {}
+          for _, n in ipairs(all) do has[n] = true end
+          assert(has["mytheme"], "lists a .lua colorscheme by basename")
+          assert(has["myother"], "lists every .lua colorscheme")
+          assert(has["legacy"], "lists a .vim colorscheme too")
+          -- A prefix narrows the list and returns basenames (no path, no extension).
+          local my = vim.fn.getcompletion("myo", "color")
+          eq(#my, 1, "prefix filters")
+          eq(my[1], "myother", "prefix match is the bare basename")
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+    assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
+}

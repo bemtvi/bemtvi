@@ -62,7 +62,7 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
-pub use self::persist::{GlobalMarkEntry, PersistState, RegisterEntry};
+pub use self::persist::{FileMarkEntry, GlobalMarkEntry, PersistState, RegisterEntry};
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;
@@ -444,6 +444,13 @@ pub struct Editor {
     /// pressed. Populated by [`Editor::import_persist`]; drained by
     /// [`Editor::resolve_pending_global_mark`].
     pending_global_marks: HashMap<char, (PathBuf, Cursor)>,
+    /// Per-file marks restored from a shada store, keyed by *normalized* path to
+    /// that file's `{a–z, specials, "}` marks. Seeded into a buffer's live
+    /// `marks` (and the path entry drained) the moment the buffer for that path is
+    /// loaded or — for the restored startup buffer — at import. Like vim, restored
+    /// file marks reattach when the file is reopened, not eagerly at launch. Drained
+    /// by [`Editor::seed_pending_file_marks`].
+    pending_file_marks: HashMap<PathBuf, HashMap<char, (usize, usize)>>,
     pub mode: Mode,
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
@@ -853,6 +860,7 @@ impl Editor {
             alternate: None,
             global_marks: HashMap::new(),
             pending_global_marks: HashMap::new(),
+            pending_file_marks: HashMap::new(),
             mode: Mode::Normal,
             cursor: Cursor::default(),
             top: 0,

@@ -30,7 +30,7 @@ pub(crate) fn is_settable_mark(c: char) -> bool {
 /// automatics. Any other name (a digit `'0`–`'9`, punctuation we don't track) is
 /// a grammar dead-end until its phase lands.
 pub(crate) fn is_jumpable_mark(c: char) -> bool {
-    c.is_ascii_alphabetic() || matches!(c, '\'' | '`' | '.' | '^' | '[' | ']' | '<' | '>')
+    c.is_ascii_alphabetic() || matches!(c, '\'' | '`' | '.' | '^' | '[' | ']' | '<' | '>' | '"')
 }
 
 /// The buffer-local store key a jump name reads. `` ` `` and `'` are two spellings
@@ -46,8 +46,10 @@ fn buffer_mark_key(name: char) -> char {
 
 /// The automatic special marks in vim's `:marks` display order. Each lives in the
 /// buffer `marks` store under this key, written at its capture point (a jump, an
-/// edit, an insert-exit, a yank/change, a visual selection) — never by `m`.
-const SPECIAL_MARKS: [char; 7] = ['\'', '.', '^', '[', ']', '<', '>'];
+/// edit, an insert-exit, a yank/change, a visual selection, or — for `"` — leaving
+/// the buffer) — never by `m`. `"` is the *last-cursor* mark shada restores so a
+/// reopened file lands where it was left.
+const SPECIAL_MARKS: [char; 8] = ['"', '\'', '.', '^', '[', ']', '<', '>'];
 
 /// Where a mark points: which buffer and the cursor within it. A buffer-local
 /// lowercase mark resolves into the *current* buffer; a global `A`–`Z` mark

@@ -251,7 +251,35 @@ impl Editor {
 
     /// Add a buffer to the store and return its id, without switching to it.
     pub(crate) fn add_buffer(&mut self, buffer: Buffer) -> BufferId {
-        self.buffers.insert(buffer)
+        let id = self.buffers.insert(buffer);
+        // A freshly opened file reattaches any shada-restored marks for its path.
+        self.seed_pending_file_marks(id);
+        id
+    }
+
+    /// Seed buffer `id`'s marks from any shada-restored pending set for its path,
+    /// draining that set (one-shot per path). Additive — a mark the running session
+    /// already placed on the buffer wins over the restored one. Called wherever a
+    /// buffer's path becomes bound (a fresh load, the throwaway-reuse in-place open,
+    /// the browser `load_str`, and the restored startup buffer at import), so a
+    /// reopened file gets its `a`–`z` / `"` marks back exactly as vim restores them
+    /// from shada when the file loads — never eagerly at launch.
+    pub(crate) fn seed_pending_file_marks(&mut self, id: BufferId) {
+        let Some(path) = self
+            .buffers
+            .map
+            .get(&id)
+            .and_then(|ob| ob.buffer.path.clone())
+        else {
+            return;
+        };
+        let Some(marks) = self.pending_file_marks.remove(&normalize_path(&path)) else {
+            return;
+        };
+        let buf = &mut self.buffers.get_mut(id).buffer;
+        for (name, pos) in marks {
+            buf.marks.entry(name).or_insert(pos);
+        }
     }
 
     /// Open `contents` into the window as if a file named `name` were edited — but
@@ -284,6 +312,9 @@ impl Editor {
         // edit. Mirrors `load_into_current` (the `:e` read path).
         ob.undo = UndoTree::new(&ob.buffer);
         ob.saved_seq = Some(ob.undo.cur_seq());
+        // The freshly named buffer reattaches any shada-restored marks for its path.
+        let id = self.cur_buffer();
+        self.seed_pending_file_marks(id);
     }
 
     /// Record that the current buffer was just saved to `name`: bind the name (when
@@ -476,6 +507,9 @@ impl Editor {
         out.saved_cursor = cursor;
         out.saved_top = top;
         out.saved_leftcol = leftcol;
+        // Leaving a buffer records its last-cursor mark `"` (vim's definition), so
+        // `` `" `` returns here and shada can persist where each file was left.
+        out.buffer.marks.insert('"', (cursor.line, cursor.col));
         self.alternate = Some(outgoing);
 
         self.enter_buffer(id);
@@ -560,6 +594,9 @@ impl Editor {
             }
             Err(e) => self.echo(e.to_string()),
         }
+        // Loading a file in place (`:e`, throwaway-reuse) reattaches its shada marks.
+        let id = self.cur_buffer();
+        self.seed_pending_file_marks(id);
     }
 
     /// Re-read `buffer` from disk in place — the reload primitive `:checktime`'s
@@ -853,6 +890,7 @@ impl Editor {
             let id = self.cur_buffer();
             if self.host_fs_offtick {
                 self.buffer_mut().set_path(Some(path.to_path_buf()));
+                self.seed_pending_file_marks(id);
                 self.enqueue_open(id, path.to_path_buf());
             } else {
                 self.load_into_current(path);

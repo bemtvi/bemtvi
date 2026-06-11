@@ -339,9 +339,17 @@ host, is being removed, so there is no "shada on the remote host" case.)
    fresh session that never loaded it at startup. *(The `marks_numbered` table
    lands with the numbered-mark feature in Phase 4, where it is actually
    populated — no unused table is written ahead of its behavior.)*
-3. **Phase 3 — per-file marks + history.** Add `marks_file` (`a`–`z`, specials,
-   `` `" `` last-cursor) and the two history tables. Test cross-session `` `" ``
-   reopening a file at its cursor and `/`-history recall after respawn.
+3. **Phase 3 — per-file marks + history. ✅ DONE.** Adds `marks_file`
+   (`a`–`z`, specials, and the `` `" `` last-cursor — a new jumpable mark recorded
+   on buffer-leave and stamped from the live cursor at export) keyed by
+   `(path, name)`, plus the `hist_search` / `hist_ex` tables (capped at
+   `HISTORY_CAP`, recency-merged by a per-flush time-ordered sequence key).
+   Restored file marks seed `Editor::pending_file_marks` and reattach to a buffer
+   the moment it loads (`seed_pending_file_marks`, hooked into every path-binding
+   point) — never eagerly at launch. Respawn tests (`tests/shada.rs`):
+   `` `" `` reopens a file at its last cursor, and `/<Up>` recalls a search across
+   sessions. The `marks_file` / history tables clear-and-rewrite each flush so a
+   dropped mark or trimmed history never resurrects.
 4. **Phase 4 — jumplist, changelist, numbered marks.** Export the focused
    window's jumplist (ids→paths) + each buffer's changelist; seed them back by
    path on import. Add the `'0`–`'9` shift at load (the unlocked feature):

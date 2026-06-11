@@ -6,7 +6,8 @@
 //! hermetic), drive it with `nvim_input`, quit, then **respawn** a second server
 //! against the same dir and assert the first session's state was restored.
 //!
-//! Phase 1 covers registers; Phase 2 adds the global file marks `A`–`Z`. See
+//! Phase 1 covers registers; Phase 2 the global file marks `A`–`Z`; Phase 3 the
+//! per-file marks (incl. the `` `" `` last-cursor) and search/ex history. See
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
@@ -139,6 +140,57 @@ async fn global_mark_survives_a_restart() {
         feed(&rpc, "`A");
         assert_eq!(lines(&rpc).await, vec!["alpha", "  beta", "gamma"]);
         assert_eq!(cursor(&rpc).await, (2, 4));
+    }
+}
+
+#[tokio::test]
+async fn last_cursor_mark_reopens_a_file_where_it_was_left() {
+    let dir = temp_dir("shada_quote_mark");
+    let file = write_temp("shada_quote_mark", "txt", "alpha\nbeta\ngamma\ndelta\n");
+
+    // Session 1: move the cursor to line 3, col 2 and quit (no edit). The current
+    // buffer's live cursor becomes its `"` last-cursor mark at the exit flush.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "ggjjll");
+        assert_eq!(cursor(&rpc).await, (3, 2));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: reopen the same file; the cursor starts at the top, and `` `" ``
+    // returns to the saved last-cursor spot.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 0));
+        feed(&rpc, "`\"");
+        assert_eq!(cursor(&rpc).await, (3, 2));
+    }
+}
+
+#[tokio::test]
+async fn search_history_survives_a_restart() {
+    let dir = temp_dir("shada_history");
+    let file = write_temp("shada_history", "txt", "alpha\nbeta\ngamma\n");
+
+    // Session 1: run a `/gamma` search (pushes the search history), then quit.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "/gamma<CR>");
+        assert_eq!(cursor(&rpc).await, (3, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: open `/`, recall the restored pattern with <Up>, run it — the
+    // cursor lands on `gamma`, proving the history came back.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 0));
+        feed(&rpc, "/<Up><CR>");
+        assert_eq!(cursor(&rpc).await, (3, 0));
     }
 }
 

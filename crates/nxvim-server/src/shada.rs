@@ -28,19 +28,23 @@
 //! O(live instances), not O(history). A normal single-editor user always has
 //! exactly one file.
 //!
-//! Phase 1 persists **registers**; Phase 2 adds the global file marks `A`–`Z`.
-//! Later phases grow the schema (per-file / numbered marks, jumplist/changelist,
-//! history); compaction is payload-agnostic (it deletes whole absorbed files) so
-//! it does not change. Full design:
-//! `docs/plans/2026-06-11-shada-persistence.md`.
+//! Phase 1 persists **registers**; Phase 2 the global file marks `A`–`Z`; Phase 3
+//! the per-file marks (`a`–`z`, specials, the `"` last-cursor) and search/ex
+//! history. Later phases grow the schema (numbered marks, jumplist/changelist);
+//! compaction is payload-agnostic (it deletes whole absorbed files) so it does not
+//! change. Full design: `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nxvim_core::{GlobalMarkEntry, PersistState, RegisterEntry};
+use nxvim_core::{FileMarkEntry, GlobalMarkEntry, PersistState, RegisterEntry};
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
+
+/// The per-history entry cap (newest-N kept) applied on merge, mirroring vim's
+/// `'history'`. A later phase exposes it as an option.
+const HISTORY_CAP: usize = 10_000;
 
 /// The persistence seam the server drives. `load` is called once before the first
 /// frame (it merges + compacts and returns the snapshot to import); `flush` writes
@@ -63,6 +67,16 @@ const REGISTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("registers"
 /// msgpack [`StoredMark`].
 const MARKS_GLOBAL: TableDefinition<&str, &[u8]> = TableDefinition::new("marks_global");
 
+/// `marks_file` table: key is `(path, mark-name)` — the per-file marks `a`–`z`,
+/// the specials, and `"`. Value is a msgpack [`StoredFileMark`].
+const MARKS_FILE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("marks_file");
+
+/// `hist_search` / `hist_ex` tables: key is a per-flush time-ordered sequence
+/// (so oldest→newest survives and cross-instance recency compares cleanly), value
+/// is a msgpack [`StoredHist`]. Rewritten wholesale each flush.
+const HIST_SEARCH: TableDefinition<u64, &[u8]> = TableDefinition::new("hist_search");
+const HIST_EX: TableDefinition<u64, &[u8]> = TableDefinition::new("hist_ex");
+
 /// A register as stored on disk: its contents, paste kind, and the write
 /// timestamp that drives the cross-instance recency merge.
 #[derive(Serialize, Deserialize)]
@@ -80,6 +94,22 @@ struct StoredMark {
     line: usize,
     col: usize,
     ts: u64,
+}
+
+/// A per-file mark as stored on disk: the 0-based `(line, col)` in its file and
+/// the write timestamp. The file path and mark name live in the table key.
+#[derive(Serialize, Deserialize)]
+struct StoredFileMark {
+    line: usize,
+    col: usize,
+    ts: u64,
+}
+
+/// One history entry as stored on disk: just its text (order and recency are
+/// carried by the table key, a per-flush time-ordered sequence).
+#[derive(Serialize, Deserialize)]
+struct StoredHist {
+    text: String,
 }
 
 /// The native (and, via a custom `StorageBackend`, browser) shada store: a
@@ -115,6 +145,10 @@ impl ShadaStore for RedbFileStore {
             std::collections::HashMap::new();
         let mut best_marks: std::collections::HashMap<char, StoredMark> =
             std::collections::HashMap::new();
+        let mut best_file_marks: std::collections::HashMap<(String, char), StoredFileMark> =
+            std::collections::HashMap::new();
+        let mut hist_search = HistMerge::default();
+        let mut hist_ex = HistMerge::default();
         let mut absorbed: Vec<PathBuf> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&self.dir) {
             for entry in read_dir.flatten() {
@@ -128,6 +162,9 @@ impl ShadaStore for RedbFileStore {
                 if let Ok(sibling) = Database::open(&path) {
                     merge_registers(&sibling, &mut best_regs);
                     merge_global_marks(&sibling, &mut best_marks);
+                    merge_file_marks(&sibling, &mut best_file_marks);
+                    merge_history(&sibling, HIST_SEARCH, &mut hist_search);
+                    merge_history(&sibling, HIST_EX, &mut hist_ex);
                     drop(sibling);
                     absorbed.push(path);
                 }
@@ -152,6 +189,17 @@ impl ShadaStore for RedbFileStore {
                     col: stored.col,
                 })
                 .collect(),
+            file_marks: best_file_marks
+                .into_iter()
+                .map(|((path, name), stored)| FileMarkEntry {
+                    path: path.into(),
+                    name,
+                    line: stored.line,
+                    col: stored.col,
+                })
+                .collect(),
+            search_history: hist_search.finish(),
+            ex_history: hist_ex.finish(),
         };
 
         // Make the absorbed data durable in *our* file before deleting the
@@ -215,7 +263,51 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
                 .map_err(std::io::Error::other)?;
         }
     }
+    {
+        // Cleared before rewrite: per-file marks key on `(path, name)`, so a mark
+        // dropped this session (its line deleted) must not linger and resurrect.
+        let mut table = wtxn.open_table(MARKS_FILE).map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        for entry in &state.file_marks {
+            let stored = StoredFileMark {
+                line: entry.line,
+                col: entry.col,
+                ts,
+            };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            let path = entry.path.to_string_lossy().into_owned();
+            let name = entry.name.to_string();
+            table
+                .insert((path.as_str(), name.as_str()), bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    write_history(&wtxn, HIST_SEARCH, &state.search_history, ts)?;
+    write_history(&wtxn, HIST_EX, &state.ex_history, ts)?;
     wtxn.commit().map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Rewrite one history table wholesale: clear it, then re-key each entry by a
+/// time-ordered sequence (`ts` scaled, plus the entry's index) so the row order is
+/// oldest→newest *and* a later instance's rows sort after an earlier one's. Clearing
+/// avoids stale rows accumulating, since every flush re-mints fresh keys.
+fn write_history(
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<u64, &[u8]>,
+    entries: &[String],
+    ts: u64,
+) -> std::io::Result<()> {
+    let mut table = wtxn.open_table(def).map_err(std::io::Error::other)?;
+    table.retain(|_, _| false).map_err(std::io::Error::other)?;
+    let base = ts.saturating_mul(HISTORY_CAP as u64);
+    for (i, text) in entries.iter().enumerate() {
+        let stored = StoredHist { text: text.clone() };
+        let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+        table
+            .insert(base + i as u64, bytes.as_slice())
+            .map_err(std::io::Error::other)?;
+    }
     Ok(())
 }
 
@@ -279,6 +371,92 @@ fn merge_global_marks(db: &Database, best: &mut std::collections::HashMap<char, 
                 best.insert(name, stored);
             }
         }
+    }
+}
+
+/// Fold one store's `marks_file` table into the running best-by-timestamp map,
+/// keyed `(path, mark-name)`. Same recency discipline as the other marks.
+fn merge_file_marks(
+    db: &Database,
+    best: &mut std::collections::HashMap<(String, char), StoredFileMark>,
+) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(MARKS_FILE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let (path, name_str) = key.value();
+        let Some(name) = name_str.chars().next() else {
+            continue;
+        };
+        let Ok(stored) = rmp_serde::from_slice::<StoredFileMark>(value.value()) else {
+            continue;
+        };
+        let composite = (path.to_string(), name);
+        match best.get(&composite) {
+            Some(existing) if existing.ts >= stored.ts => {}
+            _ => {
+                best.insert(composite, stored);
+            }
+        }
+    }
+}
+
+/// Accumulates history entries across sibling stores: text → the highest sequence
+/// key seen for it (most recent), so a duplicate keeps its newest position. The
+/// final ordered, capped list is produced by [`HistMerge::finish`].
+#[derive(Default)]
+struct HistMerge {
+    by_text: std::collections::HashMap<String, u64>,
+}
+
+impl HistMerge {
+    /// Record `text` at sequence `key`, keeping the newest occurrence.
+    fn observe(&mut self, text: String, key: u64) {
+        let slot = self.by_text.entry(text).or_insert(key);
+        *slot = (*slot).max(key);
+    }
+
+    /// The merged history oldest→newest, capped to the newest [`HISTORY_CAP`].
+    fn finish(self) -> Vec<String> {
+        let mut entries: Vec<(u64, String)> =
+            self.by_text.into_iter().map(|(t, k)| (k, t)).collect();
+        entries.sort_by_key(|(k, _)| *k);
+        if entries.len() > HISTORY_CAP {
+            entries.drain(0..entries.len() - HISTORY_CAP);
+        }
+        entries.into_iter().map(|(_, t)| t).collect()
+    }
+}
+
+/// Fold one store's history table (`hist_search` or `hist_ex`) into `merge`,
+/// preserving each entry's sequence key as its recency.
+fn merge_history(db: &Database, def: TableDefinition<u64, &[u8]>, merge: &mut HistMerge) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(def) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let Ok(stored) = rmp_serde::from_slice::<StoredHist>(value.value()) else {
+            continue;
+        };
+        merge.observe(stored.text, key.value());
     }
 }
 

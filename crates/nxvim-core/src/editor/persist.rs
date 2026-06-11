@@ -9,10 +9,10 @@
 //! and the storage out of here is deliberate — they are the *server's* merge
 //! concern, not the editor model's.
 //!
-//! Phase 1 carries **registers**; Phase 2 adds the global file marks `A`–`Z`.
-//! Later phases grow the struct with per-file / numbered marks, the
-//! jumplist/changelist, and history. See
-//! `docs/plans/2026-06-11-shada-persistence.md`.
+//! Phase 1 carries **registers**; Phase 2 the global file marks `A`–`Z`; Phase 3
+//! the per-file marks (`a`–`z`, specials, the `"` last-cursor) and search/ex
+//! history. Later phases grow the struct with numbered marks and the
+//! jumplist/changelist. See `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::PathBuf;
 
@@ -34,6 +34,14 @@ pub struct PersistState {
     /// restart; on import they seed [`Editor::pending_global_marks`] and the file
     /// opens lazily on the first jump.
     pub global_marks: Vec<GlobalMarkEntry>,
+    /// Per-file marks: the buffer-local `a`–`z`, the automatic specials, and the
+    /// `"` last-cursor mark, each keyed by the file it lives in. Restored when the
+    /// file is reopened, so `` `" `` lands where the file was last left.
+    pub file_marks: Vec<FileMarkEntry>,
+    /// The search (`/`) history, oldest entry first.
+    pub search_history: Vec<String>,
+    /// The ex command-line (`:`) history, oldest entry first.
+    pub ex_history: Vec<String>,
 }
 
 /// One persisted global mark: its name (`A`–`Z`), the file it points into, and
@@ -43,6 +51,16 @@ pub struct PersistState {
 pub struct GlobalMarkEntry {
     pub name: char,
     pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+}
+
+/// One persisted per-file mark: the file it lives in, the mark name (`a`–`z`, a
+/// special, or `"`), and the 0-based `(line, col)` within that file.
+#[derive(Debug, Clone)]
+pub struct FileMarkEntry {
+    pub path: PathBuf,
+    pub name: char,
     pub line: usize,
     pub col: usize,
 }
@@ -76,7 +94,55 @@ impl Editor {
         PersistState {
             registers,
             global_marks: self.export_global_marks(),
+            file_marks: self.export_file_marks(),
+            search_history: self.search_history.clone(),
+            ex_history: self.ex_history.clone(),
         }
+    }
+
+    /// Resolve the per-file marks of every named open buffer — plus any restored
+    /// marks for files not reopened this session — to `(path, name, line, col)`.
+    /// The *current* buffer's live cursor is stamped as its `"` last-cursor mark
+    /// (it is never "left", so its stored `"` would be stale), so reopening it next
+    /// session lands at the spot the editor was quit from.
+    fn export_file_marks(&self) -> Vec<FileMarkEntry> {
+        let mut out = Vec::new();
+        let current = self.cur_buffer();
+        for (&id, ob) in &self.buffers.map {
+            let Some(path) = ob
+                .buffer
+                .path
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty())
+            else {
+                continue;
+            };
+            let mut marks = ob.buffer.marks.clone();
+            if id == current {
+                marks.insert('"', (self.cursor.line, self.cursor.col));
+            }
+            for (name, (line, col)) in marks {
+                out.push(FileMarkEntry {
+                    path: path.clone(),
+                    name,
+                    line,
+                    col,
+                });
+            }
+        }
+        // Files marked in a previous session but never reopened in this one keep
+        // their restored marks so the next save carries them forward too.
+        for (path, marks) in &self.pending_file_marks {
+            for (&name, &(line, col)) in marks {
+                out.push(FileMarkEntry {
+                    path: path.clone(),
+                    name,
+                    line,
+                    col,
+                });
+            }
+        }
+        out
     }
 
     /// Resolve the global marks `A`–`Z` to `(path, line, col)` for persistence.
@@ -146,5 +212,35 @@ impl Editor {
                 ),
             );
         }
+        // Per-file marks seed the pending-by-path map keyed *normalized* (so the
+        // lookup at buffer-load matches regardless of how the path is spelled),
+        // then the already-open startup buffer is seeded immediately — later opens
+        // pick theirs up as the file loads.
+        for entry in state.file_marks {
+            self.pending_file_marks
+                .entry(super::normalize_path(&entry.path))
+                .or_default()
+                .entry(entry.name)
+                .or_insert((entry.line, entry.col));
+        }
+        let cur = self.cur_buffer();
+        self.seed_pending_file_marks(cur);
+        // History restored from disk is older than anything typed this session;
+        // merge it *ahead* of the (empty, at startup) live history, dropping older
+        // duplicates so a repeated entry keeps its newest position.
+        merge_history(&mut self.search_history, state.search_history);
+        merge_history(&mut self.ex_history, state.ex_history);
     }
+}
+
+/// Fold `restored` (older) history in front of `live` (newer), de-duplicating by
+/// text so a repeated entry survives only at its most-recent position. At startup
+/// `live` is empty, so this is just the restored list with dups collapsed.
+fn merge_history(live: &mut Vec<String>, restored: Vec<String>) {
+    let mut merged = restored;
+    for entry in live.drain(..) {
+        merged.retain(|e| e != &entry);
+        merged.push(entry);
+    }
+    *live = merged;
 }

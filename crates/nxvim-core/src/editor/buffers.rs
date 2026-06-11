@@ -773,6 +773,27 @@ impl Editor {
         self.load_new_buffer(path)
     }
 
+    /// Find the buffer already open for `path`, or load a fresh one into the buffer
+    /// list **without switching to it** — the find-or-load primitive a *workspace
+    /// edit* uses to bring an unopened file's buffer into existence so its edits can
+    /// be applied in memory (left modified, persisted by `:wa`, exactly as neovim's
+    /// `apply_text_edits` does — it never writes the edit straight to disk). Reuses
+    /// the shared [`Editor::open_buffer`] kernel for an already-open or local load.
+    ///
+    /// Returns `None` (and loads nothing) in a **daemon / off-tick** session: there
+    /// the load is an async fetch that would hand back an *empty* buffer to edit into,
+    /// so the caller reports the file as unhandled rather than silently corrupting it.
+    /// Also `None` on a synchronous local load failure (already echoed).
+    pub fn ensure_buffer_loaded(&mut self, path: &Path) -> Option<BufferId> {
+        if let Some(id) = self.find_buffer_by_path(path) {
+            return Some(id);
+        }
+        if self.host_fs_offtick {
+            return None;
+        }
+        self.open_buffer(path)
+    }
+
     /// Open `path` as the **current window's** buffer — the `:e file` / go-to core. Reuses
     /// an already-open buffer, reuses a throwaway `[No Name]` in place (so the first open
     /// doesn't strand an empty buffer 1), or loads a new buffer and switches to it.

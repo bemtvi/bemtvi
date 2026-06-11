@@ -108,22 +108,48 @@ impl Server {
     }
 
     /// Apply a normalized workspace edit (from rename or a code action) across the
-    /// open buffers it touches. Each URI that maps to an **open** buffer has its
-    /// edits converted to bytes against *that* buffer (its negotiated encoding),
-    /// applied as one undo step, and the buffer re-synced; URIs with no open
-    /// buffer are skipped (the unopened-file case is scoped out). An edit that
-    /// touches no open buffer reports a brief message.
+    /// files it touches. Each URI is resolved to a buffer: the **open** buffer it
+    /// names, else the file is loaded into a buffer on the spot
+    /// ([`Editor::ensure_buffer_loaded`]) so a project-wide rename reaches files you
+    /// haven't visited — the edit lands in memory (the buffer left modified, saved
+    /// with `:wa`), exactly as neovim's `apply_text_edits` does rather than writing
+    /// straight to disk. Each URI's edits convert to bytes against *its* buffer (a
+    /// freshly-loaded buffer has no negotiated encoding, so it falls back to the
+    /// originating — current — server's), apply as one undo step, and re-sync.
+    ///
+    /// A URI whose file can't be brought into a buffer (a load failure, or a
+    /// daemon/off-tick session where the load would be async) is collected and
+    /// reported loud rather than silently dropped (the no-silent-stubs rule). An
+    /// edit that touches nothing applicable reports a brief message.
     pub(crate) fn apply_workspace_edit(&mut self, changes: WorkspaceEditData) {
+        // The originating server's encoding (the current buffer's, where the rename /
+        // code action was requested): the WorkspaceEdit's positions are all in that
+        // one encoding, so a target buffer with no server of its own uses it.
+        let origin_encoding = self
+            .buffer_encoding(self.editor.current_buffer_id())
+            .unwrap_or(PositionEncoding::Utf8);
         let mut touched = 0usize;
+        let mut unresolved: Vec<String> = Vec::new();
         for (uri, edits) in changes {
             if edits.is_empty() {
                 continue;
             }
-            let Some(id) = self.buffer_id_for_uri(&uri) else {
-                // Not an open buffer: editing an unopened file is a follow-up.
-                continue;
+            // The open buffer for the URI, else load its file into one. A URI we
+            // can't resolve to a buffer (load failure / off-tick async fetch) is
+            // recorded so it can be reported, never silently skipped.
+            let id = match self.buffer_id_for_uri(&uri) {
+                Some(id) => id,
+                None => {
+                    match uri_to_path(&uri).and_then(|p| self.editor.ensure_buffer_loaded(&p)) {
+                        Some(id) => id,
+                        None => {
+                            unresolved.push(uri.to_string());
+                            continue;
+                        }
+                    }
+                }
             };
-            let encoding = self.buffer_encoding(id).unwrap_or(PositionEncoding::Utf8);
+            let encoding = self.buffer_encoding(id).unwrap_or(origin_encoding);
             let Some(buffer) = self.editor.buffer_of(id) else {
                 continue;
             };
@@ -140,7 +166,12 @@ impl Server {
             self.sync_lsp_buffer(id);
             touched += 1;
         }
-        if touched == 0 {
+        if !unresolved.is_empty() {
+            self.editor.echo(format!(
+                "apply_workspace_edit: could not open {}",
+                unresolved.join(", ")
+            ));
+        } else if touched == 0 {
             self.editor.echo("No applicable changes");
         }
     }

@@ -142,23 +142,35 @@ function vim._position_char_to_byte(line, character, encoding)
   return i - 1
 end
 
--- The text of 0-based `row` in the loaded buffer whose name maps to `uri`, or nil
--- when no open buffer backs it. Scans the Phase-6 mirror (`vim._bufs`, which
--- carries each buffer's name and line array) — the loclist `text` field for a
--- location in an unopened file is left empty rather than read off disk.
-function vim._line_text_for_uri(uri, row)
+-- The text of 0-based `row` in the file named by `uri`: from the open buffer
+-- backing it (the Phase-6 mirror `vim._bufs`, which carries each buffer's name
+-- and line array), else read off disk via `vim._read_file`. `cache` (optional) is
+-- a `fname -> lines | false` memo so a batch of lookups (a result list with many
+-- locations in one unopened file) reads each file once; `false` records an
+-- unreadable file so it isn't re-read. Returns nil only when the file is neither
+-- open nor readable.
+function vim._line_text_for_uri(uri, row, cache)
   local fname = vim.uri_to_fname(uri)
   for _, buf in pairs(vim._bufs) do
     if buf.lines and buf.name == fname then return buf.lines[row + 1] end
   end
-  return nil
+  -- Not open in any buffer: read its lines off disk (memoized per file).
+  local lines = cache and cache[fname]
+  if lines == nil then
+    local contents = vim._read_file(fname)
+    lines = contents and vim.split(contents, "\n", { plain = true }) or false
+    if cache then cache[fname] = lines end
+  end
+  return lines and lines[row + 1] or nil
 end
 
 -- make_text_document_params(bufnr): the `{ uri }` a request's `textDocument` field
--- carries, from the buffer's file path.
--- INCOMPLETE: a *non-current* bufnr yields an empty URI — `nvim_buf_get_name` is
--- backed by the current-buffer snapshot only, so it can't name another buffer's
--- file. Faithful once buffer names come from a real multi-buffer registry.
+-- carries, from the buffer's file path. Works for *any* open buffer, current or
+-- not: `nvim_buf_get_name` resolves a non-current bufnr from the full buffer
+-- mirror (`vim._bufs`, which carries every open buffer's name), so a request for a
+-- buffer shown in another window/tab gets that buffer's real URI. (An LSP request
+-- only ever targets an open, server-attached buffer, so the unknown-handle case —
+-- an empty name → `file:///` — doesn't arise in practice.)
 function vim.lsp.util.make_text_document_params(bufnr)
   return { uri = vim.uri_from_bufnr(bufnr or 0) }
 end
@@ -169,10 +181,8 @@ end
 -- buffer's URI and its cursor's byte column, converted to `encoding` (utf-16
 -- default). A config that captures a specific window at the start of a request and
 -- passes it here gets that window's position, not whatever is current when the
--- reply lands.
--- NOTE: a `window` showing a *non-current* buffer still gets an empty
--- `textDocument.uri` — that is the separate "no multi-buffer name registry"
--- approximation (`make_text_document_params`), not this helper's window-awareness.
+-- reply lands. A `window` showing a non-current buffer gets that buffer's real
+-- `textDocument.uri` too (`make_text_document_params` resolves any open buffer).
 function vim.lsp.util.make_position_params(window, encoding)
   encoding = encoding or "utf-16"
   local bufnr = vim.api.nvim_win_get_buf(window or 0)
@@ -208,21 +218,21 @@ end
 
 -- locations_to_items(locations, encoding): turn LSP `Location` / `LocationLink`s
 -- into loclist items (`{ filename, lnum, col, text }`), sorted by file then
--- position. The byte `col` and the `text` come from the open buffer backing each
--- location (empty `text` for an unopened file). `user_data` keeps the raw location.
--- INCOMPLETE: a location in an *unopened* file gets an empty `text` (and a `col`
--- computed against ""), because the line text is read from open buffers only — a
--- result list spanning files you haven't visited shows blank previews. Faithful
--- once line text can be read from disk for unopened files.
+-- position. The byte `col` and the `text` come from the buffer backing each
+-- location when open, else from the file on disk — so a result list spanning
+-- files you haven't visited still shows the real line previews. `user_data` keeps
+-- the raw location. The per-file line arrays are memoized across the batch
+-- (`cache`) so many hits in one file read it once.
 function vim.lsp.util.locations_to_items(locations, encoding)
   encoding = encoding or "utf-16"
   local items = {}
+  local cache = {} -- fname -> lines | false, so an unopened file is read once
   for _, loc in ipairs(locations or {}) do
     local uri = loc.uri or loc.targetUri
     local range = loc.range or loc.targetRange
     if uri and range then
       local row = range.start.line
-      local text = vim._line_text_for_uri(uri, row) or ""
+      local text = vim._line_text_for_uri(uri, row, cache) or ""
       items[#items + 1] = {
         filename = vim.uri_to_fname(uri),
         lnum = row + 1,
@@ -330,14 +340,13 @@ function vim.lsp.util.open_floating_preview(contents, syntax, opts)
 end
 
 -- apply_workspace_edit(workspace_edit, encoding): apply a `WorkspaceEdit` across
--- the open buffers it names, reusing the native rename / code-action path (queued
--- as an LspOp the server normalizes and applies). Edits to unopened files are a
--- follow-up (the native path edits open buffers only); `encoding` is carried by
--- the edit's positions and resolved server-side, so the arg is accepted here.
--- INCOMPLETE: edits land only in *open* buffers — a workspace edit that touches
--- files you haven't opened (a project-wide rename) silently skips them. Each call
--- is also its own undo step (no `undojoin` coalescing). Faithful once edits can
--- be applied to files on disk without opening them.
+-- every file it names, reusing the native rename / code-action path (queued as an
+-- LspOp the server normalizes and applies). A file already open is edited in its
+-- buffer; a file you haven't visited (a project-wide rename) is loaded into a
+-- buffer and edited there — the change lives in memory, left modified for `:wa`,
+-- as neovim's `apply_text_edits` does rather than writing straight to disk.
+-- `encoding` is carried by the edit's positions and resolved server-side, so the
+-- arg is accepted here. Each call is its own undo step (no `undojoin` coalescing).
 function vim.lsp.util.apply_workspace_edit(workspace_edit, _encoding)
   vim._lsp_apply_workspace_edit(workspace_edit or {})
 end

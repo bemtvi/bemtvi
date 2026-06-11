@@ -422,15 +422,20 @@ its lines in nxvim's panel; `apply_workspace_edit` queues `LspOp::ApplyWorkspace
 → the native `Server::apply_workspace_edit`; `show_document` queues
 `LspOp::ShowDocument` → `Server::jump_to_lsp_location` (open + cursor jump).
 
-*Known approximations:* `make_position_params`/`open_floating_preview` ignore the
-`window` arg and per-float handles (single-window nxvim, one panel — `(0, win)` is
-returned for call-site shape); `make_text_document_params` for a *non-current*
-bufnr yields an empty URI (Phase-6 `nvim_buf_get_name` is snapshot-backed);
-`apply_workspace_edit` edits only *open* buffers (an unopened-file edit is a
-follow-up, inherited from the native path) and `locations_to_items` leaves `text`
-empty for a location in an unopened buffer; an `external = true` `show_document`
-raises (no external-open surface); `vim.uri_to_bufnr` stays a Phase-0 raise (no
-Lua-side buffer-creating registry yet).
+*Multi-buffer / disk follow-up (now closed):* `make_text_document_params` names
+*any* open buffer, current or not (`nvim_buf_get_name` resolves a non-current
+bufnr from the full buffer mirror); `locations_to_items` reads a location's `text`
+from disk (memoized per file) when no buffer backs it, so a result list spanning
+unvisited files shows real previews; and `apply_workspace_edit` loads an unopened
+file into a buffer and applies the edit there (in memory, left modified for `:wa`,
+as neovim's `apply_text_edits` does — never a straight-to-disk write), reporting
+any URI it can't open rather than silently skipping it. A freshly-loaded target
+buffer (no server of its own) takes the originating — current — server's encoding.
+
+*Known approximations:* each `apply_workspace_edit` call is its own undo step (no
+`undojoin` coalescing); an `external = true` `show_document` raises (no
+external-open surface); `vim.uri_to_bufnr` stays a Phase-0 raise (no Lua-side
+buffer-creating registry yet).
 
 **Depends on.** Phase 6 (buffer/window), the panel surface.
 

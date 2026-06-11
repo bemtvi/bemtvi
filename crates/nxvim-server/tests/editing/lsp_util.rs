@@ -123,6 +123,127 @@ async fn locations_to_items_builds_sorted_loclist_items() {
 }
 
 #[tokio::test]
+async fn make_text_document_params_names_a_non_current_buffer() {
+    // The params builder must name *any* open buffer, not just the current one:
+    // a request captured for a buffer shown in another window/tab carries that
+    // buffer's real URI. Open a second file, switch away, then ask for its params
+    // by bufnr — the URI must be the second file's, resolved from the buffer mirror.
+    let a = temp_path("tdparams-a");
+    let b = temp_path("tdparams-b");
+    std::fs::write(&a, "aaa\n").unwrap();
+    std::fs::write(&b, "bbb\n").unwrap();
+    let (rpc, _incoming) = start(Some(a.to_string_lossy().into_owned())).await;
+    // Open b (now current), capture its bufnr, then switch back to a so b is a
+    // non-current buffer. Each command runs to completion before the next read.
+    command(&rpc, &format!("edit {}", b.display())).await;
+    let b_buf = exec_lua(&rpc, "return vim.api.nvim_get_current_buf()").await;
+    let b_buf = b_buf.as_u64().expect("b's bufnr");
+    command(&rpc, "buffer 1").await; // back to a; b_buf is now non-current
+                                     // Fresh chunk: the buffer mirror now carries both buffers, so the non-current
+                                     // bufnr resolves to b's name.
+    let uri = exec_lua(
+        &rpc,
+        &format!("return vim.lsp.util.make_text_document_params({b_buf}).uri"),
+    )
+    .await;
+    assert_eq!(
+        uri.as_str(),
+        Some(format!("file://{}", b.display()).as_str()),
+        "a non-current buffer's params name its own file"
+    );
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+#[tokio::test]
+async fn locations_to_items_reads_unopened_files_from_disk() {
+    // A location in a file open in no buffer still gets its real line preview: the
+    // text is read off disk (memoized per file), not left blank.
+    let open = temp_path("loc-open");
+    std::fs::write(&open, "current\n").unwrap();
+    let other = temp_path("loc-other");
+    std::fs::write(&other, "alpha\nbeta\ngamma\n").unwrap();
+    let (rpc, _incoming) = start(Some(open.to_string_lossy().into_owned())).await;
+    let out = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+        local uri = vim.uri_from_fname([[{other}]])
+        local items = vim.lsp.util.locations_to_items({{
+          {{ uri = uri, range = {{ start = {{ line = 2, character = 2 }}, ["end"] = {{ line = 2, character = 2 }} }} }},
+          {{ uri = uri, range = {{ start = {{ line = 1, character = 0 }}, ["end"] = {{ line = 1, character = 0 }} }} }},
+        }}, "utf-8")
+        -- Sorted by position: item 1 -> line 2 ("beta"), item 2 -> line 3 ("gamma").
+        return items[1].text .. "|" .. items[1].lnum .. "|" .. items[1].col
+             .. "||" .. items[2].text .. "|" .. items[2].lnum .. "|" .. items[2].col
+        "#,
+            other = other.display()
+        ),
+    )
+    .await;
+    // item1: "beta" lnum 2 col 1 (char 0 -> byte 0, +1); item2: "gamma" lnum 3 col 3
+    // (char 2 -> byte 2, +1).
+    assert_eq!(out.as_str(), Some("beta|2|1||gamma|3|3"));
+    let _ = std::fs::remove_file(&open);
+    let _ = std::fs::remove_file(&other);
+}
+
+#[tokio::test]
+async fn apply_workspace_edit_loads_and_edits_an_unopened_file() {
+    // A workspace edit naming a file open in no buffer must load it into a buffer
+    // and apply the edit there (in memory, left modified for `:wa`) — neovim's
+    // apply_text_edits behavior — rather than silently skipping it.
+    let open = temp_path("wsedit-open");
+    std::fs::write(&open, "current\n").unwrap();
+    let other = temp_path("wsedit-other");
+    std::fs::write(&other, "hello world\n").unwrap();
+    let (rpc, _incoming) = start(Some(open.to_string_lossy().into_owned())).await;
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"
+        local uri = vim.uri_from_fname([[{other}]])
+        vim.lsp.util.apply_workspace_edit({{
+          changes = {{
+            [uri] = {{
+              {{ range = {{ start = {{ line = 0, character = 6 }},
+                          ["end"] = {{ line = 0, character = 11 }} }},
+                newText = "neovim" }},
+            }},
+          }},
+        }})
+        "#,
+            other = other.display()
+        ),
+    )
+    .await;
+    // The file was loaded into a buffer and carries the edit (read from the mirror,
+    // refreshed before this chunk).
+    let loaded = exec_lua(
+        &rpc,
+        &format!(
+            r#"
+        for _, buf in pairs(vim._bufs) do
+          if buf.name == [[{other}]] then return buf.lines[1] end
+        end
+        return "NOTLOADED"
+        "#,
+            other = other.display()
+        ),
+    )
+    .await;
+    assert_eq!(loaded.as_str(), Some("hello neovim"));
+    // The change lives in the buffer only — disk is untouched until a write.
+    assert_eq!(
+        std::fs::read_to_string(&other).unwrap(),
+        "hello world\n",
+        "apply_workspace_edit edits in memory, never writes disk"
+    );
+    let _ = std::fs::remove_file(&open);
+    let _ = std::fs::remove_file(&other);
+}
+
+#[tokio::test]
 async fn get_effective_tabstop_prefers_shiftwidth_then_tabstop() {
     let (rpc, _incoming) = start(None).await;
     // Defaults: shiftwidth=0 ("follow tabstop") + tabstop=4 -> 4.

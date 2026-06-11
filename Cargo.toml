@@ -175,6 +175,17 @@ mime_guess = "=2.0.5"
 # string events do. The bridge encodes/decodes at the socket boundary.
 base64 = "=0.22.1"
 
+# The native daemon transport (edit-host split): WebTransport/QUIC, so native and
+# the future browser path share one stack (Open Decision #2). Default features keep
+# the `ring` crypto backend (no aws-lc-rs / cmake) and `self-signed` (rcgen) for the
+# dev cert the daemon mints + the client pins TOFU. `connect_daemon`/`run_daemon_io`
+# take any AsyncRead/AsyncWrite, so a QUIC bidi stream's halves drop straight in.
+wtransport = "=0.7.1"
+# CSPRNG for the launch-minted daemon bearer token (the sole auth gate — an
+# unauthenticated daemon listener is RCE by design, Open Decision #2). Already in the
+# tree transitively (ring/quinn); pulled in directly for `getrandom::fill`.
+getrandom = "=0.3.4"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

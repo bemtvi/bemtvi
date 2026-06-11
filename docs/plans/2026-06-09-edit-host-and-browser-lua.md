@@ -108,7 +108,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 0 | Feasibility spikes (compile / interop / blocking read) | — | ✅ |
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
-| 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | 🚧 |
+| 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) | 1, 2 | 🚧 |
 | 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | ⬜ |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
@@ -1142,12 +1142,13 @@ a real temp dir (the refactor is behavior-preserving). Regression-clean — full
 --workspace` green (the plenary-heavy `plugin_compat`/`telescope_e2e` suites included), fmt +
 clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
 
-### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — 🚧 both multiplexers DONE; only the QUIC listener remains (2026-06-11)
+### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — ✅ DONE — both multiplexers *and* the QUIC listener shipped (2026-06-11)
 
-**Status (2026-06-11): the daemon half *and* the edit-host multiplexer (`connect_daemon`)
-both shipped; only the WebTransport/QUIC listener transport remains.** (ssh was the
-originally-planned native transport; **dropped 2026-06-11** in favor of the non-ssh QUIC
-listener — see Open Decision #2.) The scoping question at the foot of this section was
+**Status (2026-06-11): the daemon half, the edit-host multiplexer (`connect_daemon`),
+*and* the WebTransport/QUIC listener transport are all shipped — the native full split
+runs end-to-end over real QUIC.** (ssh was the originally-planned native transport;
+**dropped 2026-06-11** in favor of the non-ssh QUIC listener — see Open Decision #2.) The
+listener slice is recorded as **Phase 3r** below. The scoping question at the foot of this section was
 resolved *daemon-side first*; the edit-host-side multiplexer then landed as its own
 focused slice (2026-06-11, **multiplexer-over-stdio**), proven by driving a real
 in-process edit-host `Server` against the **real `--daemon` binary** over stdio — the
@@ -1212,12 +1213,12 @@ What shipped in the **edit-host multiplexer** (`connect_daemon`, 2026-06-11):
   daemon's off-tick `fs_write`. (This subsumes the listener slice's "drives a local edit-host
   against a daemon" check for the *stdio* transport; the QUIC transport is what remains.)
 
-Still to do (the **listener slice**): the non-ssh **WebTransport/QUIC listener** wiring
-(`wtransport` on `quinn`, launch-minted bearer token, self-signed cert pinned TOFU — Open
-Decision #2; **ssh is dropped**), the `--daemon --listen` role + a `:connect` CLI, and the
-manual no-per-keystroke-latency check. The design below stands and `connect_daemon` is ready
-for it: it takes any `AsyncRead`/`AsyncWrite`, so the listener just feeds it a QUIC bidi
-stream instead of the `--daemon` child's stdio — the stdio proof carries over verbatim.
+The **listener slice landed as Phase 3r below** (2026-06-11): the non-ssh
+WebTransport/QUIC listener (`wtransport` on `quinn`), the launch-minted bearer token, the
+self-signed cert pinned TOFU, the `--daemon --listen` role and the `nxvim://…`
+`--connect-daemon` target. `connect_daemon`/`run_daemon_io` were ready for it exactly as
+predicted — they take any `AsyncRead`/`AsyncWrite`, so the listener just feeds them a QUIC
+bidi stream's halves and the stdio proof carried over verbatim (zero changes to the legs).
 
 The slice that **ties every leg together**. Phases 3c–3p each built a wire leg and
 proved it over its *own* `tokio::io::duplex`; this one stands up the actual
@@ -1323,20 +1324,22 @@ wrappers retained). This is the concrete slice that fulfils *The full split*'s f
 exit-criteria sentences below.
 
 **Deferred (explicitly, not stubbed):**
-- **The real listener hop / CLI / `:connect`** — wiring `connect_daemon` onto a
-  **WebTransport/QUIC** connection to a `nxvim --daemon --listen` process (`wtransport`
-  client, bearer token, TOFU cert pin — Open Decision #2). The *next* slice; this one
-  proves the protocol over real-binary stdio (the duplex/stdio stand-in is transport-
-  agnostic, so the proof carries to the QUIC wire). **(ssh is dropped — the earlier
+- ~~**The real listener hop / CLI / `:connect`**~~ ✅ DONE — **Phase 3r above** wired
+  `connect_quic`/`serve_quic` onto a **WebTransport/QUIC** connection (`wtransport` on
+  `quinn`, launch-minted bearer token, TOFU cert pin — Open Decision #2), the
+  `--daemon --listen` role, and the `nxvim://…` `--connect-daemon` target. (An in-editor
+  `:connect` ex-command — live seam re-pointing — is the one piece deferred from that
+  slice; the launch-time target shipped.) **(ssh is dropped — the earlier
   `ssh … nxvim --daemon` + askpass + `NXVIM_REMOTE_CMD` plan no longer applies.)**
 - **Path-space** (`getcwd` / buffer names / statusline in the remote's path-space) and
   the **short-TTL stat/exists cache** for `luafs` — both already deferred by Phase 3p.
-- **Transport HOL mitigation beyond app-level framing** — the shipped daemon-side
-  multiplexer is one ordered stream with msgpack framing (stdio, as `daemon_stdio.rs`
-  drives it); the real escape from HOL blocking is the **WebTransport/QUIC listener**,
-  now resolved as the native transport (Open Decision #2, RESOLVED 2026-06-11) and built
-  once for native + browser. (ssh is dropped — it was never going to escape HOL anyway,
-  QUIC can't run under its single TCP stream.)
+- **Transport HOL mitigation beyond app-level framing** — Phase 3r ships the QUIC listener
+  but still multiplexes all six legs over **one** ordered bidi stream (the stdio-equivalent,
+  so the `daemon_stdio.rs` proof carried over). The real escape from HOL blocking is the
+  per-`HostServices`-class **QUIC stream split** (one stream per class + one per live
+  `HostProc`); that is the remaining follow-up on this transport, built once for native +
+  browser. (ssh was never going to escape HOL anyway — QUIC can't run under its single TCP
+  stream — which is why it was dropped.)
 
 **Scoping question — RESOLVED (2026-06-11): daemon side first, then the edit-host
 multiplexer as its own stdio slice.** The daemon demux was tested faithfully without the
@@ -1351,6 +1354,72 @@ against the real `--daemon` binary in `daemon_stdio.rs`'s second test — fulfil
 full split*'s "drives a local edit-host against a daemon" criterion **without** waiting on
 the listener, because `connect_daemon` is transport-agnostic and the stdio proof carries
 to QUIC verbatim. Only the listener transport itself (QUIC wiring + auth + cert) remains.
+
+### Phase 3r — the WebTransport/QUIC listener transport (the native daemon hop) — ✅ DONE (2026-06-11)
+
+The last leg of the native full split: the real transport the Phase 3q stdio stand-in was
+standing in for. As predicted, this slice touched **none** of the six wire legs — they
+already take any `AsyncRead`/`AsyncWrite`, and a QUIC bidi stream's halves are exactly
+that, so the listener is pure transport wiring around the unchanged `run_daemon_io` /
+`connect_daemon` multiplexers. **ssh is dropped** (Open Decision #2), so the native and
+browser daemon transports unify on one stack — `wtransport` on `quinn`, default features
+(`ring` crypto, no aws-lc-rs/cmake; `self-signed`/`rcgen` for the dev cert).
+
+Shipped (`crates/nxvim-server/src/quic.rs`, re-exported from the crate root):
+- **The seam reuse** — `connect_daemon`'s link-thread body was extracted into a
+  `pub(crate) serve_daemon_link(rpc, incoming, client_tx)` (pure inversion; `connect_daemon`
+  now calls `connect(reader, writer)` then it). `connect_quic` reuses that body verbatim,
+  the QUIC `Endpoint` + `Connection` kept alive on the same dedicated link thread (the
+  blocking-bridge deadlock-avoidance property from Open Decision #5 is unchanged — the wire
+  is still driven off the parked editor thread).
+- **`serve_quic` / `bind_quic_listener`** (daemon side, `--daemon --listen`) — mint a
+  self-signed [`Identity`], bind a QUIC endpoint (`bind_quic_listener` splits bind from
+  serve so a `:0` port resolves before anyone connects), then accept connections forever;
+  each runs the full six-leg `run_daemon_io` multiplexer over its one client-opened bidi
+  stream. One ordered QUIC stream *this* slice — the per-`HostServices`-class stream split
+  (the real HOL escape) is the *Transport & stream multiplexing* follow-up; it builds on
+  this, it doesn't block it.
+- **Auth, the two mechanisms ssh gave for free** (Open Decision #2): a **launch-minted
+  bearer token** (`mint_token`, 32 CSPRNG bytes via `getrandom`) carried on the
+  WebTransport CONNECT *path* and compared constant-time — a mismatch replies **403**
+  (`request.forbidden()`) so the edit-host's `connect` fails *promptly and loudly*, never a
+  half-open session; and **TOFU server identity** — the daemon prints its self-signed
+  cert's SHA-256 hash, the edit-host pins it (`with_server_certificate_hashes`), the
+  known-hosts model, no CA. (The hash, not mTLS, because the browser passes the same hash
+  to its `WebTransport` constructor — native/browser auth stays unified.)
+- **The CLI** (`crates/nxvim/src/main.rs`) — `--daemon --listen [addr]` binds the listener
+  (default `127.0.0.1:8765`, loopback-only as defense-in-depth; pass `0.0.0.0:PORT` to
+  accept off-host) and prints the exact `nxvim --connect-daemon 'nxvim://HOST:PORT/TOKEN?cert=HASH'`
+  command. A `nxvim://…` argument selects the QUIC connect path (`connect_quic` → the same
+  five seams `connect_daemon` returns over stdio) over the default stdio-child split; the
+  stdio and QUIC edit-host roles now share one `run_edit_host_session` helper, so they can't
+  drift. Config / runtimepath / clipboard stay **local** (the thesis); only I/O crosses.
+
+**Exit criteria — met.** `crates/nxvim/tests/daemon_quic.rs`: a real in-process edit-host
+`Server` drives a QUIC daemon (an in-process listener on its own thread+runtime — a
+faithful stand-in for the separate daemon *process*, reached only over a loopback QUIC
+socket) over **one real QUIC connection**, exercising four wire classes through the running
+editor — the off-tick **fs read** (startup open) and **write** (`:w`, `modified` clearing
+only on the daemon's ack), the blocking **`sys_run`** bridge (`vim.system():wait()` — the
+deadlock case), the **watch** push (external-change autoreload, a lever only the daemon's
+poller can pull), and **`luafs`** (`vim.uv.fs_stat`/`filereadable`) — each carrying bytes a
+stub couldn't invent. A second test proves the **bearer token gates the connection**: a
+wrong token is rejected (403, under a timeout so a regression that *hangs* fails loud) and
+the right one connects. The six per-leg suites + `daemon_stdio.rs` stay green (the
+`serve_daemon_link` extraction was pure inversion); full `cargo test --workspace` green
+(one unrelated, load-only `mouse` redraw-race flake that passes standalone — the documented
+`drain_to_latest_redraw` timing issue, not this slice); fmt + clippy `-D warnings` clean.
+**Verified end-to-end as two real processes**: `nxvim --daemon --listen 127.0.0.1:0` +
+`nxvim --connect-daemon 'nxvim://…'` driven through a PTY — the file opens off-tick over the
+wire, an edit + `:wq` lands the edited bytes on the daemon's disk over real QUIC.
+
+**Deferred (explicitly, not stubbed):** the per-`HostServices`-class QUIC stream split (the
+actual HOL escape; one ordered stream here is the stdio-equivalent); an in-editor
+`:connect` ex-command (live seam re-pointing) vs. the launch-time `--connect-daemon`
+target shipped here; graceful client-initiated connection close on quit (today the process
+exit tears the QUIC link down, and the 30 s idle timeout + keep-alive bound any lingering
+daemon-side connection); path-space (`getcwd`/buffer names in the remote's path-space) and
+the short-TTL `luafs` stat/exists cache (both already deferred by Phase 3p).
 
 ### The full split
 

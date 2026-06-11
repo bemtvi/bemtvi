@@ -28,6 +28,7 @@ mod input;
 mod keymap;
 mod lifecycle;
 mod lsp;
+mod quic;
 mod redraw;
 mod save;
 mod treesitter;
@@ -52,6 +53,14 @@ pub use daemon::{
     serve_sys_daemon, serve_sys_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteBlockingSystem,
     RemoteHostFs, RemoteHostProc, RemoteLspTransport, RemoteLuaFs, WatchEvent,
 };
+
+/// The native daemon transport (Open Decision #2): a WebTransport/QUIC listener that
+/// runs the [`run_daemon_io`] multiplexer over one bidi stream ([`serve_quic`], the
+/// `--daemon --listen` role), and the edit-host-side [`connect_quic`] that pins the
+/// daemon's self-signed cert TOFU + presents the launch-minted bearer token and returns
+/// the same [`DaemonClient`] `connect_daemon` does over stdio. [`bind_quic_listener`]
+/// mints the identity/token and resolves the bound address (for an ephemeral `:0` port).
+pub use quic::{bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo};
 
 use evloop::EventLoop;
 use keymap::{BuiltinAction, Keymaps, NativeDefault};

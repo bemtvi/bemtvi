@@ -2241,53 +2241,69 @@ where
         };
         rt.block_on(async move {
             let (rpc, incoming) = connect(reader, writer);
-
-            // Notification-routed legs: shared state the demux forwards into.
-            let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
-            let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
-            let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
-
-            // Blocking-bridge legs: the job channels their seams send onto and their job
-            // servers (below) pull from.
-            let (sys_tx, sys_rx) = unbounded_channel::<SysJob>();
-            let (luafs_tx, luafs_rx) = unbounded_channel::<LuaFsJob>();
-
-            let client = DaemonClient {
-                host_fs: RemoteHostFs {
-                    rpc: rpc.clone(),
-                    watch_rx: Mutex::new(Some(watch_rx)),
-                },
-                host_proc: RemoteHostProc {
-                    rpc: rpc.clone(),
-                    inflight: proc_inflight.clone(),
-                    next_id: AtomicU64::new(1),
-                },
-                blocking_system: RemoteBlockingSystem { req_tx: sys_tx },
-                lsp_transport: RemoteLspTransport {
-                    rpc: rpc.clone(),
-                    inflight: lsp_inflight.clone(),
-                    next_id: AtomicU64::new(1),
-                },
-                lua_fs: RemoteLuaFs { req_tx: luafs_tx },
-            };
-            // Hand the seams out before serving; if the caller already dropped, there's
-            // nothing to drive.
-            if client_tx.send(client).is_err() {
-                return;
-            }
-
-            // The two blocking bridges ride this shared runtime as tasks (each was its
-            // own thread+runtime in the single-leg `connect`); the demux is the main
-            // future. All three share the one `incoming`/`Rpc`.
-            tokio::spawn(run_sys_jobs(rpc.clone(), sys_rx));
-            tokio::spawn(run_luafs_jobs(rpc.clone(), luafs_rx));
-            run_client_demux(incoming, proc_inflight, lsp_inflight, watch_tx).await;
+            serve_daemon_link(rpc, incoming, client_tx).await;
         });
     });
 
     client_rx
         .recv()
         .expect("connect_daemon: the link thread could not build a tokio runtime")
+}
+
+/// Build the five edit-host seams over an already-connected `(rpc, incoming)` pair,
+/// hand the [`DaemonClient`] out on `client_tx`, then drive the link — the two
+/// blocking-bridge job servers ([`run_sys_jobs`] / [`run_luafs_jobs`]) plus the single
+/// [`run_client_demux`] — until the daemon hangs up. This is the transport-agnostic
+/// heart of [`connect_daemon`]; the QUIC connector ([`crate::quic::connect_quic`]) calls
+/// it with the halves of a QUIC bidi stream, the link thread keeping the endpoint +
+/// connection alive in scope. Must run on the dedicated link thread's runtime (the
+/// blocking bridges park the editor thread on a `std` reply channel — see
+/// [`connect_daemon`]).
+pub(crate) async fn serve_daemon_link(
+    rpc: Rpc,
+    incoming: UnboundedReceiver<Incoming>,
+    client_tx: std::sync::mpsc::Sender<DaemonClient>,
+) {
+    // Notification-routed legs: shared state the demux forwards into.
+    let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+    let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
+    let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
+
+    // Blocking-bridge legs: the job channels their seams send onto and their job
+    // servers (below) pull from.
+    let (sys_tx, sys_rx) = unbounded_channel::<SysJob>();
+    let (luafs_tx, luafs_rx) = unbounded_channel::<LuaFsJob>();
+
+    let client = DaemonClient {
+        host_fs: RemoteHostFs {
+            rpc: rpc.clone(),
+            watch_rx: Mutex::new(Some(watch_rx)),
+        },
+        host_proc: RemoteHostProc {
+            rpc: rpc.clone(),
+            inflight: proc_inflight.clone(),
+            next_id: AtomicU64::new(1),
+        },
+        blocking_system: RemoteBlockingSystem { req_tx: sys_tx },
+        lsp_transport: RemoteLspTransport {
+            rpc: rpc.clone(),
+            inflight: lsp_inflight.clone(),
+            next_id: AtomicU64::new(1),
+        },
+        lua_fs: RemoteLuaFs { req_tx: luafs_tx },
+    };
+    // Hand the seams out before serving; if the caller already dropped, there's
+    // nothing to drive.
+    if client_tx.send(client).is_err() {
+        return;
+    }
+
+    // The two blocking bridges ride this shared runtime as tasks (each was its
+    // own thread+runtime in the single-leg `connect`); the demux is the main
+    // future. All three share the one `incoming`/`Rpc`.
+    tokio::spawn(run_sys_jobs(rpc.clone(), sys_rx));
+    tokio::spawn(run_luafs_jobs(rpc.clone(), luafs_rx));
+    run_client_demux(incoming, proc_inflight, lsp_inflight, watch_tx).await;
 }
 
 /// The one demux for every daemon→edit-host notification, fanning each to its leg by

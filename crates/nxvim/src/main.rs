@@ -28,12 +28,14 @@
 //! the remote half of the boundary moved *below* the editor. `--connect-daemon` is the
 //! matching local half — the default role plus the daemon seams.
 
+use std::net::SocketAddr;
 use std::process::Stdio;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use nxvim_server::{
-    connect_daemon, run as run_server, run_daemon_io as run_server_daemon_io,
-    run_io as run_server_io, ServerInit,
+    bind_quic_listener, connect_daemon, connect_quic, mint_token, run as run_server,
+    run_daemon_io as run_server_daemon_io, run_io as run_server_io, serve_quic, DaemonClient,
+    ServerInit,
 };
 
 /// Flag that runs this binary as the headless server over stdin/stdout (no UI) —
@@ -41,10 +43,28 @@ use nxvim_server::{
 const SERVER_FLAG: &str = "--server";
 
 /// Flag that runs this binary as the **daemon** over stdin/stdout (no UI, no
-/// editor): just the fs + process + watch + LSP host the *edit-host split* drives
-/// remotely (`ssh host nxvim --daemon`). Contrast `--server`, which runs the
-/// *whole* editor remotely.
+/// editor): just the fs + process + watch + LSP host the *edit-host split* drives.
+/// With [`LISTEN_FLAG`] it instead binds a WebTransport/QUIC listener (the native
+/// transport, Open Decision #2). Contrast `--server`, which runs the *whole* editor
+/// remotely.
 const DAEMON_FLAG: &str = "--daemon";
+
+/// With [`DAEMON_FLAG`], bind a QUIC listener instead of serving over stdin/stdout.
+/// An optional bind address follows (`--listen 0.0.0.0:8765`); absent, it binds
+/// [`DEFAULT_LISTEN_ADDR`]. This is the real native daemon transport — the stdio mode
+/// is the local two-process stand-in.
+const LISTEN_FLAG: &str = "--listen";
+
+/// Default daemon bind address when `--listen` is given no explicit address: loopback
+/// on a fixed port. Loopback-only is defense-in-depth (the bearer token is the actual
+/// auth gate); pass an explicit `0.0.0.0:PORT` to accept off-host connections.
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8765";
+
+/// URI scheme the daemon prints and `--connect-daemon` accepts to reach a QUIC
+/// listener: `nxvim://HOST:PORT/TOKEN?cert=HASH` — host/port to dial, the bearer
+/// TOKEN on the path, the TOFU cert HASH in the query. Presence of such an argument
+/// selects the QUIC connect path over the default stdio-child split.
+const CONNECT_URI_SCHEME: &str = "nxvim://";
 
 /// Flag that runs the **local** edit-host half of the split: the full editor + UI
 /// (the default role) wired to a `--daemon` child for fs/process/watch/LSP. The
@@ -76,14 +96,25 @@ fn main() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // The file to open is the first non-flag argument (the same in either role).
-    let file = args.iter().find(|a| !a.starts_with('-')).cloned();
+    // A `nxvim://…` connect URI (the QUIC daemon target) is not a file; pick the file
+    // from the remaining non-flag, non-URI arguments.
+    let connect_uri = args
+        .iter()
+        .find(|a| a.starts_with(CONNECT_URI_SCHEME))
+        .cloned();
+    let file = args
+        .iter()
+        .find(|a| !a.starts_with('-') && !a.starts_with(CONNECT_URI_SCHEME))
+        .cloned();
 
-    // Daemon role: the edit-host split's remote half — fs/process/watch/LSP over
-    // this process's stdin/stdout, no editor and no UI. The edit-host closing the
-    // pipe (EOF on stdin) winds it down. Checked before `--server` so the two roles
-    // never collide on a malformed argv.
+    // Daemon role: the edit-host split's remote half — fs/process/watch/LSP, no editor
+    // and no UI. With `--listen` it binds a QUIC listener (the real native transport);
+    // otherwise it serves over this process's stdin/stdout (the local stand-in), wound
+    // down by EOF on stdin. Checked before `--server` so the roles never collide.
     if args.iter().any(|a| a == DAEMON_FLAG) {
+        if args.iter().any(|a| a == LISTEN_FLAG) {
+            return run_daemon_listen(listen_addr(&args)?);
+        }
         return run_daemon();
     }
 
@@ -93,9 +124,15 @@ fn main() -> Result<()> {
         return run_headless(file);
     }
 
-    // Edit-host split, local half: the default editor + UI, but spawning a
-    // `--daemon` child and routing fs/process/watch/LSP to it over stdio. Checked
-    // before the plain embedded path so the flag selects the daemon-backed wiring.
+    // Edit-host split, local half, over QUIC: a `nxvim://…` target (with or without the
+    // `--connect-daemon` flag) connects to a `--daemon --listen` listener and routes
+    // fs/process/watch/LSP to it. Checked before the stdio-child split below.
+    if let Some(uri) = connect_uri {
+        return run_with_daemon_quic(file, &uri);
+    }
+
+    // Edit-host split, local half, over stdio: the default editor + UI, but spawning a
+    // `--daemon` child and routing fs/process/watch/LSP to it over stdio pipes.
     if args.iter().any(|a| a == CONNECT_DAEMON_FLAG) {
         return run_with_daemon(file);
     }
@@ -223,6 +260,49 @@ fn run_daemon() -> Result<()> {
     ))
 }
 
+/// Run the daemon as a **QUIC listener** (`--daemon --listen [addr]`): the real native
+/// transport (Open Decision #2). Mints a bearer token + self-signed cert, binds `addr`,
+/// prints the connect URI the edit-host needs, then accepts connections — each running
+/// the full six-leg multiplexer ([`serve_quic`] → `run_daemon_io`) over one QUIC bidi
+/// stream. Like `--daemon`, no editor / Lua / config: pure I/O.
+fn run_daemon_listen(addr: SocketAddr) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async move {
+        let (endpoint, info) = bind_quic_listener(addr, mint_token())?;
+        // The connect credentials (cert hash + token are the auth) go to stdout so a
+        // human can copy the command; if the bind address is non-loopback, the user
+        // substitutes the reachable host for the connecting machine.
+        println!("nxvim daemon listening on {}", info.addr);
+        println!(
+            "  connect with: nxvim --connect-daemon '{CONNECT_URI_SCHEME}{}/{}?cert={}'",
+            info.addr, info.token, info.cert_hash
+        );
+        serve_quic(endpoint, info.token).await
+    })
+}
+
+/// The bind address for `--daemon --listen`: the argument right after `--listen`
+/// (`--listen 0.0.0.0:8765`) or its `--listen=ADDR` form, else [`DEFAULT_LISTEN_ADDR`].
+fn listen_addr(args: &[String]) -> Result<SocketAddr> {
+    let raw = args.iter().position(|a| a == LISTEN_FLAG).and_then(|i| {
+        // The next argument, unless it's another flag (then `--listen` took no address).
+        args.get(i + 1).filter(|a| !a.starts_with('-')).cloned()
+    });
+    let raw = raw
+        .or_else(|| {
+            args.iter().find_map(|a| {
+                a.strip_prefix(&format!("{LISTEN_FLAG}="))
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
+    raw.parse()
+        .with_context(|| format!("invalid --listen address {raw:?}"))
+}
+
 /// Build the [`tokio::process::Command`] for the daemon child. Defaults to *this*
 /// binary in `--daemon` mode (a local two-process split over stdio pipes); if
 /// [`DAEMON_CMD_ENV`] is set, run that command line through `sh -c` instead — so a
@@ -241,16 +321,59 @@ fn daemon_command() -> Result<tokio::process::Command> {
     }
 }
 
-/// Run the **local** edit-host (`--connect-daemon`): the same embedded server + TUI
-/// client as the default role, but with its host seams pointed at a `--daemon` child.
-///
-/// The server thread spawns the daemon (its stdio *is* the wire), wraps it in
-/// [`connect_daemon`] — the edit-host multiplexer, one connection for all five seams —
-/// and injects those seams into [`ServerInit`]. Config and the keystroke path stay
-/// local (`default_runtime`); only fs/process/watch/LSP cross to the daemon. The
-/// daemon's stderr is redirected to a temp log (it can't corrupt the TUI); `tail` it to
-/// debug the daemon. `kill_on_drop` reaps the child when the editor quits.
+/// Run the **local** edit-host over a stdio-piped `--daemon` child (`--connect-daemon`,
+/// no `nxvim://` target): the local two-process split. The server thread spawns the
+/// daemon (its stdio *is* the wire), wraps it in [`connect_daemon`], and runs the editor
+/// against those seams. The daemon's stderr is redirected to a temp log (it can't corrupt
+/// the TUI); `tail` it to debug the daemon. `kill_on_drop` reaps the child on quit.
 fn run_with_daemon(file: Option<String>) -> Result<()> {
+    run_edit_host_session(file, || {
+        // The daemon's stderr can't share the terminal with the TUI; send it to a
+        // log the user can tail to diagnose the daemon side.
+        let log_path = std::env::temp_dir().join("nxvim-daemon.log");
+        let stderr = std::fs::File::create(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        let mut child = daemon_command()?
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take().expect("daemon stdout piped");
+        let stdin = child.stdin.take().expect("daemon stdin piped");
+
+        // One connection → all five host seams (the edit-host multiplexer). Hold the
+        // child for the whole session; dropping it (on quit) reaps the daemon via
+        // `kill_on_drop`.
+        let client = connect_daemon(stdout, stdin);
+        Ok((client, Box::new(child)))
+    })
+}
+
+/// Run the **local** edit-host over a QUIC connection to a `--daemon --listen` listener
+/// (a `nxvim://HOST:PORT/TOKEN?cert=HASH` target). Same editor + TUI as the stdio split;
+/// only the transport differs — [`connect_quic`] pins the daemon's cert TOFU and presents
+/// the bearer token, then returns the same five seams. The QUIC endpoint + connection are
+/// owned by `connect_quic`'s link thread, so there is no child to hold.
+fn run_with_daemon_quic(file: Option<String>, uri: &str) -> Result<()> {
+    let (url, cert_hash, token) = parse_connect_uri(uri)?;
+    run_edit_host_session(file, move || {
+        let client = connect_quic(&url, &cert_hash, &token)?;
+        Ok((client, Box::new(())))
+    })
+}
+
+/// The shared edit-host runtime: build the in-process editor↔TUI duplex, run the embedded
+/// server (with its host seams pointed at whatever `connect` returns) on its own thread,
+/// and drive the terminal UI on the main thread. `connect` runs inside the server runtime
+/// and yields the [`DaemonClient`] plus a guard kept alive for the whole session (the
+/// stdio child, so `kill_on_drop` reaps it on quit; `()` for QUIC). Config and the
+/// keystroke path stay local; only fs/process/watch/LSP cross to the daemon.
+fn run_edit_host_session<F>(file: Option<String>, connect: F) -> Result<()>
+where
+    F: FnOnce() -> Result<(DaemonClient, Box<dyn std::any::Any + Send>)> + Send + 'static,
+{
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
 
     let server_thread = std::thread::spawn(move || {
@@ -260,23 +383,7 @@ fn run_with_daemon(file: Option<String>) -> Result<()> {
             .build()
             .expect("failed to build server runtime");
         let result: Result<()> = runtime.block_on(async move {
-            // The daemon's stderr can't share the terminal with the TUI; send it to a
-            // log the user can tail to diagnose the daemon side.
-            let log_path = std::env::temp_dir().join("nxvim-daemon.log");
-            let stderr = std::fs::File::create(&log_path)
-                .map(Stdio::from)
-                .unwrap_or_else(|_| Stdio::null());
-            let mut child = daemon_command()?
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(stderr)
-                .kill_on_drop(true)
-                .spawn()?;
-            let stdout = child.stdout.take().expect("daemon stdout piped");
-            let stdin = child.stdin.take().expect("daemon stdin piped");
-
-            // One connection → all five host seams (the edit-host multiplexer).
-            let client = connect_daemon(stdout, stdin);
+            let (client, _guard) = connect()?;
             let (config_dir, runtimepath) = nxvim_server::default_runtime();
             let init = ServerInit {
                 file,
@@ -293,9 +400,7 @@ fn run_with_daemon(file: Option<String>) -> Result<()> {
                 lsp_transport: Some(Box::new(client.lsp_transport)),
                 lua_fs: Some(Box::new(client.lua_fs)),
             };
-            // Hold the child for the whole session; dropping it (on quit) reaps the
-            // daemon via `kill_on_drop`.
-            let _child = child;
+            // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await
         });
         if let Err(err) = result {
@@ -317,6 +422,38 @@ fn run_with_daemon(file: Option<String>) -> Result<()> {
         std::process::exit(101);
     }
     result
+}
+
+/// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces
+/// [`connect_quic`] needs: the `https://HOST:PORT` dial URL (WebTransport requires the
+/// `https` scheme), the bearer `TOKEN` (the path), and the TOFU cert `HASH` (the `cert`
+/// query). Fails loud on a malformed URI rather than dialing a half-specified target.
+fn parse_connect_uri(uri: &str) -> Result<(String, String, String)> {
+    let rest = uri.strip_prefix(CONNECT_URI_SCHEME).ok_or_else(|| {
+        anyhow!("daemon connect URI must start with {CONNECT_URI_SCHEME}: {uri:?}")
+    })?;
+    let (authority, after) = rest
+        .split_once('/')
+        .ok_or_else(|| anyhow!("daemon connect URI is missing the /TOKEN path: {uri:?}"))?;
+    if authority.is_empty() {
+        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
+    }
+    let (token, query) = after
+        .split_once('?')
+        .ok_or_else(|| anyhow!("daemon connect URI is missing the ?cert=HASH query: {uri:?}"))?;
+    if token.is_empty() {
+        return Err(anyhow!("daemon connect URI has an empty TOKEN: {uri:?}"));
+    }
+    let cert_hash = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("cert="))
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("daemon connect URI is missing cert=HASH: {uri:?}"))?;
+    Ok((
+        format!("https://{authority}"),
+        cert_hash.to_owned(),
+        token.to_owned(),
+    ))
 }
 
 /// Best-effort human-readable text from a thread panic payload.

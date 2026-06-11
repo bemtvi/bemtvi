@@ -1850,6 +1850,113 @@ buffer/cursor/redraw, and drive a `vim.co_pcall(vim.fn.getcharstr)`-based snippe
 (the opt-in blocking-read path) to prove SAB-backed blocking reads work end-to-end
 in a real browser.
 
+### Phase 5-proper — the slices
+
+Phase 4-proper extracted the reusable sync [`EditHost`] (core + Lua + the full tick),
+coupled to the outside world only through `HostEffects`. Phase 5 carries it into the
+browser. The work splits into five bricks; like Phase 4, the seam grows from the small,
+verifiable side, and **nothing is faked** — a browser-unavailable feature (LSP, native
+treesitter) must fail *loud* at runtime, not stub a success.
+
+**Binding decisions (set here so the slices don't re-litigate them):**
+- **Target `wasm32-unknown-emscripten`, not `wasm32-unknown-unknown`.** Forced, not
+  chosen: the edit-host contains Lua (PUC 5.1, C), and only the emscripten target links
+  the vendored C cleanly — exactly what `nxvim-edithost-demo` proved (Phase 0 spike #1,
+  the `-fwasm-exceptions` EH gotcha). The interop is therefore emscripten `ccall`/`cwrap`
+  (JS→Rust) + `EM_JS` (Rust→JS), **not** wasm-bindgen. This is a *separate* build from
+  today's `nxvim-web` (which is `unknown-unknown` + wasm-bindgen, **core only, no Lua**);
+  converging the two web builds is an explicit non-goal for now — `nxvim-web` stays the
+  lean serverless core editor, the Phase 5 build is the full Lua edit-host.
+- **A `native` feature on `nxvim-server` (default-on) is the wasm seam.** The blocker is
+  the *dependency tree*, not the tick's source (Open Decision #6): `EditHost`'s crate
+  hard-pulls `tokio`, `wtransport` (QUIC), `notify`, `redb`, `getrandom`, `rmp-serde`,
+  plus `nxvim-lsp` (process spawn) and `nxvim-ts` (C/`dlopen`) — none of which target
+  emscripten. `--no-default-features` (the wasm profile, `+ lua51`) must compile the tick
+  subset alone. So `native` gates: `lib.rs`'s `run`/`run_io`/`run_daemon_io`, `daemon.rs`,
+  `quic.rs`, `evloop.rs`, `inbound.rs`, `host.rs`, the `NativeEffects` impl in
+  `edithost.rs`, and the redb `shada` store — and the deps above leave the wasm build's
+  tree. What stays un-gated (wasm-eligible): the `EditHost` struct, the `HostEffects`
+  trait, and `dispatch`/`input`/`excmd`/`lifecycle`/`effects`/`redraw` + `clipboard` /
+  `decoration` / `extmarks` / `keymap` / `save` (snapshot side).
+- **v1 excludes LSP and native treesitter.** No language servers in a serverless browser
+  (that needs the Phase 6 daemon), and treesitter highlighting is already done JS-side in
+  `nxvim-web` (`web/highlight.js`). The catch the code map surfaced: LSP/TS coupling is
+  **threaded through `input.rs` / `excmd.rs` / `dispatch.rs`** (the `gd`/`K` keymap
+  actions, the `Lsp*` + `TSInstall` ex-commands, the `nvim_*` LSP API), not isolated to
+  `lsp/` + `treesitter.rs`. So gating them out is **per-arm `#[cfg(feature = "native")]`**
+  on those call sites, with the `lsp/` subtree and `treesitter.rs` gated whole. Per *no
+  silent stubs*: on the wasm build those arms don't vanish silently — where a user could
+  reach one (`:LspHover`, `:TSInstall`), it echoes a loud "not available in the browser
+  build yet", not a no-op. (A later `wasm`-side treesitter via `web-tree-sitter` and LSP
+  via the Phase 6 daemon can re-enable them; v1 is core editing + Lua + redraw.)
+
+#### Slice 5a — the `native` feature seam (the dependency-tree cut)
+
+Introduce `feature = "native"` (in `default`) and move the whole async/transport surface
++ the LSP/TS coupling behind it, so `nxvim-server` compiles with `--no-default-features
+--features lua51`. The largest slice; pure feature-gating, no logic change.
+
+- **Exit (native, verifiable now):** default-feature `build` + `clippy -D warnings` +
+  `cargo test --workspace` unchanged (1353 tests) — gating must not alter the native build.
+- **Exit (wasm-eligibility, partial proof without emscripten):** `cargo build -p
+  nxvim-server --no-default-features --features lua51` on the **host** target compiles —
+  proving the un-gated tick subset references no gated symbol (catches a stray `use
+  tokio::…` in a tick module). This does *not* prove emscripten-linkability (the C/EH
+  side); that needs the toolchain (below).
+- **Exit (wasm, needs toolchain):** `cargo build -p nxvim-server --no-default-features
+  --features lua51 --target wasm32-unknown-emscripten` compiles.
+
+#### Slice 5b — the wasm `HostEffects` + the `nxvim-edithost` cdylib
+
+New emscripten crate `nxvim-edithost` (the demo's successor), depending on `nxvim-server`
+(`default-features = false, features = ["lua51"]`). A `WasmEffects: HostEffects` that
+captures `notify` redraw frames into a buffer the UI drains, answers `respond` likewise,
+and queues `loop_command` timers for 5d (the off-tick fs / LSP / TSInstall methods
+`fail!`-loud — serverless v1). `extern "C"` exports mirror the demo but drive the **real**
+`EditHost` tick: construct, feed vim-notation input (→ `EditHost::input` → settle), drain
+the latest redraw as msgpack/JSON. Reuse `nxvim-edithost-demo/build.sh`'s emcc shape.
+
+- **Exit (needs toolchain):** emscripten build links; a node harness feeds `ihello<Esc>`
+  and reads back a redraw frame whose grid shows `hello` — the demo's `eh_lines` proof
+  upgraded to a real `redraw` through the real tick.
+
+#### Slice 5c — the Web Worker + redraw transport + `window.__nxvim`
+
+Edit-host runs in a Web Worker (the single `!Send` thread owning core+Lua); the UI thread
+renders the redraw and ferries input. Reuse `nxvim-web`'s grid renderer / `View`-JSON
+shape where the projections line up. Redraws `postMessage` UI-ward; the UI exposes
+`window.__nxvim` (type, read lines/cursor, read the last redraw) for Playwright.
+
+- **Exit (needs browser):** Playwright types vim commands through `window.__nxvim` and
+  asserts buffer / cursor / redraw — the first half of the Phase 5 exit criteria.
+
+#### Slice 5d — blocking input + timers over `SharedArrayBuffer`
+
+`vim.fn.getcharstr` / the pump-coroutine park on `Atomics.wait` against an SAB keyboard
+channel the UI fills (Phase 0 spike #3 — no Asyncify). The same park's `Atomics.wait`
+*timeout* is the next-due timer's deadline, so one mechanism is both the input wait and
+the `LoopEvent::Timer` wheel `evloop.rs` can't provide in-Worker (`vim.defer_fn` /
+`vim.uv` timers; lualine's refresh). The opt-in `vim.co_pcall(vim.fn.getcharstr)` (Phase 2)
+gets yieldable blocking reads on top; bare global-`pcall` block-readers stay blocked
+(*Known limitations* — PUC 5.1 can't yield across `pcall`).
+
+- **Exit (needs browser):** Playwright drives a `vim.co_pcall(vim.fn.getcharstr)` snippet
+  end to end — the second half of the exit criteria, proving SAB blocking reads work live.
+
+#### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo`
+
+The dev server sends `Cross-Origin-Opener-Policy: same-origin` +
+`Cross-Origin-Embedder-Policy: require-corp` (SAB needs cross-origin isolation); ship the
+serving + build docs. With `nxvim-edithost` now the real edit-host, **delete the throwaway
+`nxvim-edithost-demo`** (the Phase 4 promise).
+
+> **Toolchain prerequisite (not yet provisioned).** Slices 5b–5e — and the wasm half of
+> 5a — require the emscripten SDK (`emcc`), the `wasm32-unknown-emscripten` rustup target,
+> and (5c–5d) a browser + Playwright. None are installed in the current dev environment
+> (only Node is). The *native* half of 5a is fully verifiable without them; the wasm
+> compile and the browser exit criteria are **not**, and per *no silent stubs / don't
+> conflate loads with works* must not be claimed green until run against the real toolchain.
+
 ---
 
 ## Phase 6 — Browser fs/process: the daemon over WebTransport (or serverless)

@@ -1124,8 +1124,9 @@ Shipped:
   (it owns the fd table the tokens index).
 
 **Scoped out (next slices, not silent gaps):** the short-TTL stat/exists cache the bullet pairs
-with the routing (deferred — correctness first); the `nxvim --daemon` binary + ssh transport that
-ties every leg together; and the *paths-are-remote-paths* concern (`getcwd` stays the local cwd —
+with the routing (deferred — correctness first); the `nxvim --daemon` binary + WebTransport/QUIC
+listener transport that ties every leg together (ssh dropped — Open Decision #2); and the
+*paths-are-remote-paths* concern (`getcwd` stays the local cwd —
 the path-space split is its own bullet).
 
 **Exit criteria — met.** `crates/nxvim-server/tests/daemon_luafs.rs`: an editor whose `lua_fs` is a
@@ -1143,13 +1144,15 @@ clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk
 
 ### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — 🚧 daemon side DONE (2026-06-11)
 
-**Status (2026-06-11): the daemon half shipped; the edit-host multiplexer + ssh hop
-are the next slice.** The scoping question at the foot of this section is resolved in
+**Status (2026-06-11): the daemon half shipped; the edit-host multiplexer + the
+WebTransport/QUIC listener are the next slice.** (ssh was the originally-planned native
+transport; **dropped 2026-06-11** in favor of the non-ssh QUIC listener — see Open
+Decision #2.) The scoping question at the foot of this section is resolved in
 favor of *daemon-side first*: `nxvim --daemon` + `run_daemon_io` + the `serve_*_on`
 extraction + an end-to-end test against the **real binary** landed; the edit-host-side
 multiplexer (which must collapse the `sys_run`/`luafs` blocking-bridge threads onto one
-shared link) lands with the ssh transport, since that's where a single real connection
-is first driven from a live editor. What shipped:
+shared link) lands with the listener transport, since that's where a single real
+connection is first driven from a live editor. What shipped:
 - **The `serve_*_on` extraction** (`daemon.rs`): each `serve_*` is now `connect()` +
   a connection-agnostic `serve_*_on(rpc, incoming, deps)` (its loop verbatim); the
   `serve_*(reader, writer, deps)` wrappers stay, so the six per-leg suites (30 tests)
@@ -1167,9 +1170,12 @@ is first driven from a live editor. What shipped:
   couldn't invent. Full `cargo test --workspace` green (83 binaries); fmt + clippy
   `-D warnings` clean; local binaries unchanged.
 
-Still to do (the ssh slice): the edit-host-side multiplexer + `connect_daemon`, the
-`ssh … nxvim --daemon` wiring (reusing `crates/nxvim-gui/src/remote.rs`), and the
-manual no-per-keystroke-latency check. The design below stands.
+Still to do (the listener slice): the edit-host-side multiplexer + `connect_daemon`, the
+non-ssh **WebTransport/QUIC listener** wiring (`wtransport` on `quinn`, launch-minted
+bearer token, self-signed cert pinned TOFU — Open Decision #2; **ssh is dropped**), and
+the manual no-per-keystroke-latency check. The design below stands (it is transport-
+agnostic — `connect_daemon` takes any `AsyncRead`/`AsyncWrite`, now fed by the QUIC
+stream rather than an ssh child's stdio).
 
 The slice that **ties every leg together**. Phases 3c–3p each built a wire leg and
 proved it over its *own* `tokio::io::duplex`; this one stands up the actual
@@ -1275,26 +1281,30 @@ wrappers retained). This is the concrete slice that fulfils *The full split*'s f
 exit-criteria sentences below.
 
 **Deferred (explicitly, not stubbed):**
-- **The real ssh hop / CLI / `:connect` / askpass** — wiring `connect_daemon` onto an
-  `ssh … nxvim --daemon` child reuses the hardened connector in
-  `crates/nxvim-gui/src/remote.rs` (shell-quoting, `-`-flag rejection, `SSH_ASKPASS`)
-  and the `NXVIM_REMOTE_CMD` override. The *next* slice; this one proves the protocol
-  over real-binary stdio.
+- **The real listener hop / CLI / `:connect`** — wiring `connect_daemon` onto a
+  **WebTransport/QUIC** connection to a `nxvim --daemon --listen` process (`wtransport`
+  client, bearer token, TOFU cert pin — Open Decision #2). The *next* slice; this one
+  proves the protocol over real-binary stdio (the duplex/stdio stand-in is transport-
+  agnostic, so the proof carries to the QUIC wire). **(ssh is dropped — the earlier
+  `ssh … nxvim --daemon` + askpass + `NXVIM_REMOTE_CMD` plan no longer applies.)**
 - **Path-space** (`getcwd` / buffer names / statusline in the remote's path-space) and
   the **short-TTL stat/exists cache** for `luafs` — both already deferred by Phase 3p.
-- **Transport HOL mitigation beyond app-level framing** (Open Decision #2: separate ssh
-  channels per `HostProc`, or a non-ssh QUIC listener) — one ordered stdio stream with
-  msgpack framing is the v1.
+- **Transport HOL mitigation beyond app-level framing** — the shipped daemon-side
+  multiplexer is one ordered stream with msgpack framing (stdio, as `daemon_stdio.rs`
+  drives it); the real escape from HOL blocking is the **WebTransport/QUIC listener**,
+  now resolved as the native transport (Open Decision #2, RESOLVED 2026-06-11) and built
+  once for native + browser. (ssh is dropped — it was never going to escape HOL anyway,
+  QUIC can't run under its single TCP stream.)
 
 **Scoping question — RESOLVED (2026-06-11): daemon side alone, this slice.** The
 daemon demux *can* be tested faithfully without the edit-host multiplexer — a raw
 `nxvim_rpc` client over one stream drives three namespaces (request/response replies are
 msgid-routed inside `Rpc`, proc notifications arrive on `incoming`), which is exactly
 what `daemon_stdio.rs` does against the real binary. The edit-host-side multiplexer is
-deferred to the ssh slice not for testability but because it entails a real change to
+deferred to the listener slice not for testability but because it entails a real change to
 the blocking-bridge threading model (collapsing the `sys_run`/`luafs` dedicated link
 threads onto one shared connection), and that's first *exercised* by a live editor over
-ssh — so it belongs there, with *The full split*'s "drives a local edit-host against a
+the QUIC listener — so it belongs there, with *The full split*'s "drives a local edit-host against a
 daemon" criterion.
 
 ### The full split
@@ -1535,9 +1545,12 @@ the Phase 3 daemon.
   its hash passed to the browser `WebTransport` constructor. **The cert buys
   encryption, not authorization** — a daemon executes arbitrary processes, so an
   unauthenticated listener is remote code execution by design. Ship auth from day
-  one: a bearer token minted at daemon launch and presented on connect (or mTLS).
-  The same requirement applies to Open Decision #2's native QUIC listener; only
-  the ssh-stdio path inherits its auth (from ssh) for free.
+  one: a bearer token minted at daemon launch and presented on connect. The same
+  requirement applies to Open Decision #2's native QUIC listener — and since **ssh is
+  dropped** (no transport inherits auth for free anymore), the bearer token is the
+  single auth mechanism for both native and browser. (mTLS was considered and rejected:
+  the browser `WebTransport` client-cert story is awkward and would split native vs
+  browser auth.)
 - **The serverless path:** `HostFs` backed by OPFS / the File System Access API;
   in-memory rope authoritative. `HostProc` has no processes — per
   `No silent stubs or skips`, `system()`/`jobstart` must **fail loud**, not fake
@@ -1579,11 +1592,15 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
   one authenticated connection — map one stream per `HostServices` class (and one
   per live `HostProc`). This is the right tool and the reason Phase 6 moved off the
   single WebSocket above.
-- **Native (Phase 3):** `ssh … nxvim --daemon` is a **single ordered stdio stream** —
-  QUIC can't go under it, so HOL blocking is intrinsic at the transport. Mitigate by
-  multiplexing logical channels in the framing (nxvim's msgpack-RPC already frames
-  concurrent requests) and/or opening separate ssh channels per `HostProc`; a true
-  QUIC escape would require the non-ssh listener of Open Decision #2.
+- **Native (Phase 3):** the native transport is the **same WebTransport/QUIC listener**
+  (Open Decision #2, RESOLVED 2026-06-11) — **ssh is dropped**, not kept as a fallback.
+  An earlier draft carried the daemon over `ssh … nxvim --daemon` (a single ordered
+  stdio stream), but QUIC can't go under ssh's one TCP connection, so its HOL blocking
+  is intrinsic and app-level framing can't escape it. Rather than ship a second,
+  weaker native transport, native and browser unify on the QUIC listener — one stream
+  per `HostServices` class plus one per live `HostProc`. The cost ssh covered for free
+  (auth, server identity) moves into the listener: a launch-minted bearer token and a
+  self-signed cert pinned TOFU (see Open Decision #2).
 
 ---
 
@@ -1618,14 +1635,39 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    distinct logical channels → distinct transport streams, so a `HostProc` flood
    can't HOL-block an `HostFs` save; see *Transport & stream multiplexing* under
    Phase 6).
-2. **Daemon discovery/launch** (Phase 3): `ssh … nxvim --daemon` mirrors today's
-   `--server`; do we also want a standalone `--daemon --listen` for non-ssh? (The
-   remote-ssh plan deferred generic TCP; same call here.) This is also the only
-   native path that could adopt **WebTransport/QUIC** — over ssh stdio (a single
-   ordered stream) HOL blocking is intrinsic; a non-ssh QUIC listener would give
-   native the same independent-stream story Phase 6's browser path gets. Decide
-   whether that's worth a second native transport or whether app-level framing over
-   ssh stdio is enough.
+2. **Daemon discovery/launch** (Phase 3) — **RESOLVED (2026-06-11): yes, the native
+   transport is the non-ssh `--daemon --listen` WebTransport/QUIC listener — the same
+   transport Phase 6's browser path uses.** ssh stdio carries every leg over a single
+   ordered stream, so HOL blocking is intrinsic there (a `HostProc` flood stalls an
+   `HostFs` save queued behind it); app-level framing can't escape it because the bytes
+   are already committed to one socket's buffer. A non-ssh listener on **`wtransport`
+   (on `quinn`)** gives native the same independent-stream story as the browser — one
+   QUIC stream per `HostServices` class (`HostFs`/`HostProc`/`HostWatch`) plus one per
+   live `HostProc` — so the native and browser daemon transports **unify on one
+   stack** instead of diverging (ssh-stdio for native, WebTransport for browser).
+   **ssh is dropped** — not kept as a fallback. The single ordered stdio stream it
+   carries has intrinsic HOL blocking QUIC can't escape (QUIC can't run under ssh's one
+   TCP connection), so keeping it would mean shipping a second, strictly-weaker native
+   transport and splitting auth (ssh's vs the listener's). Instead there is one native
+   transport, the QUIC listener, and ssh's free conveniences (auth, identity, launch)
+   move into it explicitly below. The Phase 3 deferred ssh slice (the `ssh … nxvim
+   --daemon` connector, `:connect`, askpass) is therefore **dropped**, not deferred.
+
+   **Forced sub-decisions (ssh gave these for free; the listener must provide them):**
+   - **Auth — launch-minted bearer token.** Per Phase 6, "the cert buys encryption,
+     not authorization"; an unauthenticated daemon listener is RCE by design. The
+     listener mints a bearer token at `--daemon --listen` startup and requires it on
+     the WebTransport CONNECT; native and browser present it identically (token over
+     mTLS specifically because the browser `WebTransport` client-cert story is awkward
+     and would split native vs browser auth). A network boundary (WireGuard/Tailscale,
+     or binding a private interface) is **optional defense-in-depth, not a substitute**
+     — "network-trusted" alone contradicts this day-one requirement, and no off-the-
+     shelf reverse proxy (nginx et al.) can gate raw QUIC-carrying-msgpack anyway, so
+     the gate lives in the daemon.
+   - **Server identity — self-signed cert + TOFU pinning.** The daemon generates a
+     self-signed cert (`wtransport`'s generator); the client pins its hash on first
+     connect (the browser passes the hash to the `WebTransport` constructor, the known-
+     hosts model) and warns on change. No CA infrastructure.
 3. **One web build or two** (Phase 4) — **RESOLVED (2026-06-10): one build,
    emscripten only.** The emscripten edit-host *replaces* today's
    `wasm32-unknown-unknown` `nxvim-web` outright — no second no-Lua core-only demo

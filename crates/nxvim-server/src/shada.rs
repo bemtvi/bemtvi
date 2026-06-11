@@ -28,16 +28,17 @@
 //! O(live instances), not O(history). A normal single-editor user always has
 //! exactly one file.
 //!
-//! Phase 1 persists **registers** only. Later phases grow the schema (marks,
-//! jumplist/changelist, history, numbered marks); compaction is payload-agnostic
-//! (it deletes whole absorbed files) so it does not change. Full design:
+//! Phase 1 persists **registers**; Phase 2 adds the global file marks `A`–`Z`.
+//! Later phases grow the schema (per-file / numbered marks, jumplist/changelist,
+//! history); compaction is payload-agnostic (it deletes whole absorbed files) so
+//! it does not change. Full design:
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nxvim_core::{PersistState, RegisterEntry};
+use nxvim_core::{GlobalMarkEntry, PersistState, RegisterEntry};
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
 
@@ -58,12 +59,26 @@ pub trait ShadaStore {
 /// [`StoredRegister`].
 const REGISTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("registers");
 
+/// `marks_global` table: key is the one-char mark name (`A`–`Z`), value is a
+/// msgpack [`StoredMark`].
+const MARKS_GLOBAL: TableDefinition<&str, &[u8]> = TableDefinition::new("marks_global");
+
 /// A register as stored on disk: its contents, paste kind, and the write
 /// timestamp that drives the cross-instance recency merge.
 #[derive(Serialize, Deserialize)]
 struct StoredRegister {
     text: String,
     linewise: bool,
+    ts: u64,
+}
+
+/// A global mark as stored on disk: the file path it points into, the 0-based
+/// `(line, col)`, and the write timestamp driving the recency merge.
+#[derive(Serialize, Deserialize)]
+struct StoredMark {
+    path: String,
+    line: usize,
+    col: usize,
     ts: u64,
 }
 
@@ -96,7 +111,9 @@ impl ShadaStore for RedbFileStore {
 
         // Merge every sibling we can open; record the ones we absorbed so we can
         // delete them once our merged snapshot is durable.
-        let mut best: std::collections::HashMap<char, StoredRegister> =
+        let mut best_regs: std::collections::HashMap<char, StoredRegister> =
+            std::collections::HashMap::new();
+        let mut best_marks: std::collections::HashMap<char, StoredMark> =
             std::collections::HashMap::new();
         let mut absorbed: Vec<PathBuf> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&self.dir) {
@@ -109,7 +126,8 @@ impl ShadaStore for RedbFileStore {
                 // is simply not visible yet, exactly neovim's contract). A dead one
                 // opens; we read it, drop the handle, and mark it for deletion.
                 if let Ok(sibling) = Database::open(&path) {
-                    merge_registers(&sibling, &mut best);
+                    merge_registers(&sibling, &mut best_regs);
+                    merge_global_marks(&sibling, &mut best_marks);
                     drop(sibling);
                     absorbed.push(path);
                 }
@@ -117,12 +135,21 @@ impl ShadaStore for RedbFileStore {
         }
 
         let merged = PersistState {
-            registers: best
+            registers: best_regs
                 .into_iter()
                 .map(|(name, stored)| RegisterEntry {
                     name,
                     text: stored.text,
                     linewise: stored.linewise,
+                })
+                .collect(),
+            global_marks: best_marks
+                .into_iter()
+                .map(|(name, stored)| GlobalMarkEntry {
+                    name,
+                    path: stored.path.into(),
+                    line: stored.line,
+                    col: stored.col,
                 })
                 .collect(),
         };
@@ -170,6 +197,24 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
                 .map_err(std::io::Error::other)?;
         }
     }
+    {
+        let mut table = wtxn
+            .open_table(MARKS_GLOBAL)
+            .map_err(std::io::Error::other)?;
+        for entry in &state.global_marks {
+            let stored = StoredMark {
+                path: entry.path.to_string_lossy().into_owned(),
+                line: entry.line,
+                col: entry.col,
+                ts,
+            };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            let key = entry.name.to_string();
+            table
+                .insert(key.as_str(), bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
     wtxn.commit().map_err(std::io::Error::other)?;
     Ok(())
 }
@@ -194,6 +239,38 @@ fn merge_registers(db: &Database, best: &mut std::collections::HashMap<char, Sto
             continue;
         };
         let Ok(stored) = rmp_serde::from_slice::<StoredRegister>(value.value()) else {
+            continue;
+        };
+        match best.get(&name) {
+            Some(existing) if existing.ts >= stored.ts => {}
+            _ => {
+                best.insert(name, stored);
+            }
+        }
+    }
+}
+
+/// Fold one store's `marks_global` table into the running best-by-timestamp map.
+/// Identical recency discipline to [`merge_registers`]: newest `ts` per mark name
+/// wins; a store predating any global mark has no table, which is not an error.
+fn merge_global_marks(db: &Database, best: &mut std::collections::HashMap<char, StoredMark>) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(MARKS_GLOBAL) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let Some(name) = key.value().chars().next() else {
+            continue;
+        };
+        let Ok(stored) = rmp_serde::from_slice::<StoredMark>(value.value()) else {
             continue;
         };
         match best.get(&name) {

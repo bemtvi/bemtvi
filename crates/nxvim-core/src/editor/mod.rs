@@ -62,7 +62,7 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
-pub use self::persist::{PersistState, RegisterEntry};
+pub use self::persist::{GlobalMarkEntry, PersistState, RegisterEntry};
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;
@@ -437,6 +437,13 @@ pub struct Editor {
     /// as unset on lookup (the jump then errors *E20*) — see
     /// [`Editor::mark_location`].
     global_marks: HashMap<char, (BufferId, Cursor)>,
+    /// Global marks restored from a shada store whose target file isn't open yet.
+    /// Keyed `A`–`Z` to a `(path, cursor)`; promoted into [`Editor::global_marks`]
+    /// (the file opened) lazily on the first jump, so — like vim — a restored
+    /// session never loads every marked file at startup, only when `` `A `` is
+    /// pressed. Populated by [`Editor::import_persist`]; drained by
+    /// [`Editor::resolve_pending_global_mark`].
+    pending_global_marks: HashMap<char, (PathBuf, Cursor)>,
     pub mode: Mode,
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
@@ -845,6 +852,7 @@ impl Editor {
             next_tab_id: 2,
             alternate: None,
             global_marks: HashMap::new(),
+            pending_global_marks: HashMap::new(),
             mode: Mode::Normal,
             cursor: Cursor::default(),
             top: 0,

@@ -329,10 +329,16 @@ host, is being removed, so there is no "shada on the remote host" case.)
    forbids core unit tests, the seam is exercised through a real respawned server,
    not an in-core round-trip — the original Phase 1/2 split is collapsed into this
    one vertical slice.)*
-2. **Phase 2 — global marks.** Extend `PersistState` + the `marks_global` /
-   `marks_numbered` tables. Export resolves each global mark's `BufferId`→path;
-   import resolves path→buffer lazily on jump (clamp on restore). Respawn test:
-   `` `A `` jumps back into the marked file.
+2. **Phase 2 — global marks. ✅ DONE.** Extends `PersistState` + the
+   `marks_global` table with the global file marks `A`–`Z`. Export resolves each
+   live mark's `BufferId`→path (and carries through any still-pending restored
+   mark); import seeds `Editor::pending_global_marks`, and the first `` `A `` jump
+   resolves path→buffer lazily (opening the file) and clamps the restored cursor.
+   `:marks` lists a pending mark by its stored path. Respawn test
+   (`tests/shada.rs`): `` `A `` reopens the marked file at the saved spot in a
+   fresh session that never loaded it at startup. *(The `marks_numbered` table
+   lands with the numbered-mark feature in Phase 4, where it is actually
+   populated — no unused table is written ahead of its behavior.)*
 3. **Phase 3 — per-file marks + history.** Add `marks_file` (`a`–`z`, specials,
    `` `" `` last-cursor) and the two history tables. Test cross-session `` `" ``
    reopening a file at its cursor and `/`-history recall after respawn.

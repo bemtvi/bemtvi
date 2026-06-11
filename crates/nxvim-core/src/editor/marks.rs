@@ -138,6 +138,27 @@ impl Editor {
         marks.insert('>', (hi.line, hi.col));
     }
 
+    /// Promote a shada-restored global mark (`A`–`Z`) from its pending
+    /// `(path, cursor)` form into a live `(BufferId, cursor)` by opening or
+    /// finding the buffer for its file. Called on the jump path *before*
+    /// [`Editor::mark_location`], so a restored `` `A `` opens its file lazily on
+    /// the first jump — vim never bulk-loads marked files at startup. A no-op when
+    /// the mark is already live, isn't a pending restore, or its file can't be
+    /// opened (an off-tick/daemon load, or a vanished file); the jump then misses
+    /// loudly via the *E20* path, never landing in a phantom buffer.
+    pub(crate) fn resolve_pending_global_mark(&mut self, name: char) {
+        if !name.is_ascii_uppercase() || self.global_marks.contains_key(&name) {
+            return;
+        }
+        let Some((path, cursor)) = self.pending_global_marks.get(&name).cloned() else {
+            return;
+        };
+        if let Some(buf) = self.open_buffer(&path) {
+            self.global_marks.insert(name, (buf, cursor));
+            self.pending_global_marks.remove(&name);
+        }
+    }
+
     /// The full location of mark `name` — its buffer and cursor — or `None` when
     /// the mark was never set, was dropped (its line deleted), or, for a global
     /// mark, the buffer it pointed at is no longer open. `None` makes the jump
@@ -213,23 +234,28 @@ impl Editor {
             }
         }
         // Global marks: their stored line/col, and the file they point into (its
-        // text when that buffer is current, else its path).
-        let globals: Vec<(char, BufferId, Cursor)> = ('A'..='Z')
-            .filter(|&n| wanted(n))
-            .filter_map(|n| self.global_marks.get(&n).map(|&(b, c)| (n, b, c)))
-            .collect();
-        for (name, buf, cur) in globals {
-            let detail = if buf == self.cur_buffer() {
-                self.buffer()
-                    .line(cur.line.min(self.last_line()))
-                    .trim_end()
-                    .to_string()
+        // text when that buffer is current, else its path). A mark still *pending*
+        // from a shada restore (its file not yet reopened) lists by its stored
+        // path, exactly as vim shows a restored global mark before its file loads.
+        for name in ('A'..='Z').filter(|&n| wanted(n)) {
+            let (line, col, detail) = if let Some(&(buf, cur)) = self.global_marks.get(&name) {
+                let detail = if buf == self.cur_buffer() {
+                    self.buffer()
+                        .line(cur.line.min(self.last_line()))
+                        .trim_end()
+                        .to_string()
+                } else {
+                    self.buffer_name(buf)
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "[No Name]".to_string())
+                };
+                (cur.line, cur.col, detail)
+            } else if let Some((path, cur)) = self.pending_global_marks.get(&name) {
+                (cur.line, cur.col, path.display().to_string())
             } else {
-                self.buffer_name(buf)
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "[No Name]".to_string())
+                continue;
             };
-            lines.push(format_mark_line(name, cur.line, cur.col, &detail));
+            lines.push(format_mark_line(name, line, col, &detail));
         }
         self.open_panel("Marks", lines, false, 0);
     }

@@ -6,13 +6,13 @@
 //! hermetic), drive it with `nvim_input`, quit, then **respawn** a second server
 //! against the same dir and assert the first session's state was restored.
 //!
-//! Phase 1 covers registers only. See
+//! Phase 1 covers registers; Phase 2 adds the global file marks `A`–`Z`. See
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
 use std::path::{Path, PathBuf};
 
 use nxvim_server::{is_store_file, RedbFileStore, ServerInit};
-use nxvim_test_harness::{feed, lines, start_attached, temp_dir, write_temp};
+use nxvim_test_harness::{cursor, feed, lines, start_attached, temp_dir, write_temp};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A server that persists into `dir` via the native redb store.
@@ -110,6 +110,35 @@ async fn stores_compact_instead_of_accumulating() {
         let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
         feed(&rpc, "\"ap\"bp");
         assert_eq!(lines(&rpc).await, vec!["", "alpha", "beta"]);
+    }
+}
+
+#[tokio::test]
+async fn global_mark_survives_a_restart() {
+    let dir = temp_dir("shada_global_mark");
+    let file = write_temp("shada_global_mark", "txt", "alpha\n  beta\ngamma\n");
+
+    // Session 1: open the file, set global mark `A` on line 2, col 4, then quit.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "ggj04l");
+        assert_eq!(cursor(&rpc).await, (2, 4));
+        feed(&rpc, "mA");
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: a fresh server with an *empty* buffer (no file argument). Jumping
+    // to `` `A `` must lazily reopen the marked file and land at the saved spot —
+    // the file was never loaded at startup, only on the jump.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
+        // Precondition: the marked file is not open yet — the buffer is empty.
+        assert_eq!(lines(&rpc).await, vec![""]);
+        feed(&rpc, "`A");
+        assert_eq!(lines(&rpc).await, vec!["alpha", "  beta", "gamma"]);
+        assert_eq!(cursor(&rpc).await, (2, 4));
     }
 }
 

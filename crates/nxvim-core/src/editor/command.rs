@@ -996,6 +996,10 @@ impl Editor {
                 if let Motion::MarkJumpExact(name, set_jump)
                 | Motion::MarkJumpLine(name, set_jump) = m
                 {
+                    // A global mark restored from shada is pending until its file
+                    // is first reopened — promote it (opening the file) before the
+                    // location lookup, so a cross-session `` `A `` lands.
+                    self.resolve_pending_global_mark(name);
                     if let Some(loc) = self.mark_location(name) {
                         if loc.buf != self.cur_buffer() {
                             // A jump still records the pre-jump context in the source

@@ -26,6 +26,7 @@ mod log;
 mod manager;
 pub mod mock;
 mod protocol;
+mod transport;
 
 pub use lsp_types;
 // The editor↔manager data types (`crate::protocol`), the manager handle
@@ -41,3 +42,7 @@ pub use protocol::{
     ServerCaps, ServerKey, ServerSpawn, WorkspaceEditData,
 };
 pub use serde_json;
+// The transport seam (`crate::transport`): the manager spawns each server through
+// it. `nxvim-server` injects a daemon-backed implementation for the edit-host
+// split; the default is a real local child.
+pub use transport::{ExitFuture, LocalLspTransport, LspChannel, LspProcess, LspTransport};

@@ -100,22 +100,51 @@
 //! link thread; `serve_sys_daemon` runs each request through the *same*
 //! [`StdBlockingSystem`](nxvim_lua::StdBlockingSystem) the local editor uses, on a
 //! blocking-pool thread, so a process behaves identically run here or across the wire.
+//!
+//! ## The LSP leg (`lsp_*` — long-lived bidirectional pipes)
+//!
+//! A language server is neither run-to-completion (the `proc_*` leg) nor
+//! request/response (`fs_*`/`sys_run`): it is a *long-lived child whose stdio is a raw
+//! bidirectional pipe*, JSON-RPC flowing both ways for the server's whole life and
+//! stdout consumed incrementally. So this leg streams the pipe itself — raw stdin/stdout/
+//! stderr chunks correlated by a per-spawn `id`:
+//!
+//! | direction | method | params |
+//! | --- | --- | --- |
+//! | edit-host → daemon | `lsp_spawn` | `[id, program, args, cwd]` |
+//! | edit-host → daemon | `lsp_stdin` | `[id, bytes]` |
+//! | edit-host → daemon | `lsp_kill`  | `[id]` |
+//! | daemon → edit-host | `lsp_stdout` | `[id, bytes]` |
+//! | daemon → edit-host | `lsp_stderr` | `[id, bytes]` |
+//! | daemon → edit-host | `lsp_exited` | `[id, code?, signal?]` |
+//!
+//! [`RemoteLspTransport`] (the edit-host side, an [`LspTransport`]) hands the
+//! [`LspManager`](nxvim_lsp::LspManager) a [`LspChannel`] whose stdout/stderr are fed by
+//! demuxed `lsp_stdout`/`lsp_stderr` chunks and whose stdin is pumped onto the wire as
+//! `lsp_stdin` — so the manager drives its `async-lsp` loop unchanged, never knowing the
+//! server runs across the network. `serve_lsp_daemon` spawns the actual child (the *same*
+//! `tokio::process` machinery the local transport uses) and streams its pipes back; it
+//! joins the stdout/stderr pumps before signaling `lsp_exited`, so no trailing output is
+//! lost to the exit.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, UNIX_EPOCH};
 
 use rmpv::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
+use nxvim_lsp::{LspChannel, LspProcess, LspTransport, ServerSpawn};
 use nxvim_lua::{BlockingSystem, SystemOutput, SystemSpec};
 use nxvim_rpc::{connect, Incoming, Rpc};
 
@@ -147,6 +176,18 @@ const PROC_EXITED: &str = "proc_exited";
 // event-routed (the async `vim.system` / `jobstart`), this one blocks the edit-host's
 // Lua thread on the reply (the synchronous `vim.system(...):wait()`).
 const SYS_RUN: &str = "sys_run";
+
+// The LSP leg: a *long-lived bidirectional pipe* per language server. Unlike every
+// other leg (run-to-completion `proc_*`, request/response `fs_*`/`sys_run`), a
+// language server's stdio stays open for its whole life, with JSON-RPC flowing both
+// ways and stdout consumed incrementally — so the wire streams raw stdin/stdout/stderr
+// chunks correlated by a per-spawn `id`, never a single buffered result.
+const LSP_SPAWN: &str = "lsp_spawn"; // edit-host → daemon: [id, program, args, cwd]
+const LSP_STDIN: &str = "lsp_stdin"; // edit-host → daemon: [id, bytes]
+const LSP_KILL: &str = "lsp_kill"; // edit-host → daemon: [id]
+const LSP_STDOUT: &str = "lsp_stdout"; // daemon → edit-host: [id, bytes]
+const LSP_STDERR: &str = "lsp_stderr"; // daemon → edit-host: [id, bytes]
+const LSP_EXITED: &str = "lsp_exited"; // daemon → edit-host: [id, code?, signal?]
 
 /// What the daemon reports back about one child, demuxed off the wire and handed to
 /// the [`RemoteHostProc::run`] future waiting on that spawn's `id`. Mirrors the two
@@ -1176,4 +1217,445 @@ where
         }
     }
     Ok(())
+}
+
+// ===== the LSP leg (long-lived bidirectional pipes) ===========================
+
+/// Per-server routing on the edit-host side, keyed by the per-spawn `id`: where the
+/// demux delivers a server's stdout/stderr chunks and its eventual exit. The
+/// `stdout_tx`/`stderr_tx` feed the [`ChannelReader`]s the manager reads; dropping
+/// them (on exit, or a dead link) is what EOFs those readers.
+struct LspInflight {
+    stdout_tx: UnboundedSender<Vec<u8>>,
+    stderr_tx: UnboundedSender<Vec<u8>>,
+    exit_tx: oneshot::Sender<(Option<i32>, Option<i32>)>,
+}
+
+/// The table of live servers awaiting their daemon reports: `id` → its routing. The
+/// demux forwards each `lsp_stdout`/`lsp_stderr` to the matching sinks and fires
+/// `exit_tx` (removing the entry) on `lsp_exited`.
+type LspInflightMap = Arc<Mutex<HashMap<u64, LspInflight>>>;
+
+/// An [`LspTransport`] that runs language servers on a remote daemon instead of
+/// locally: each [`spawn`](LspTransport::spawn) tunnels the server's stdio over the
+/// wire to a [`serve_lsp_daemon`] holding the actual child, so the
+/// [`LspManager`](nxvim_lsp::LspManager) drives its `async-lsp` loop unchanged. The
+/// drop-in for [`LocalLspTransport`](nxvim_lsp::LocalLspTransport) on the edit-host
+/// side of the split — the long-lived bidirectional-pipe analogue of
+/// [`RemoteHostProc`]'s run-to-completion path.
+pub struct RemoteLspTransport {
+    rpc: Rpc,
+    inflight: LspInflightMap,
+    /// Per-spawn correlation id minted here; the demux routes purely by it.
+    next_id: AtomicU64,
+}
+
+impl RemoteLspTransport {
+    /// Connect to a daemon over `reader`/`writer` (a duplex, or ssh stdio). Spawns
+    /// the demux task that fans the daemon's stdout/stderr/exit out to per-server
+    /// sinks; call it from within a tokio runtime (its RPC tasks live there).
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteLspTransport
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (rpc, incoming) = connect(reader, writer);
+        let inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
+        tokio::spawn(run_lsp_demux(incoming, inflight.clone()));
+        RemoteLspTransport {
+            rpc,
+            inflight,
+            next_id: AtomicU64::new(1),
+        }
+    }
+}
+
+impl LspTransport for RemoteLspTransport {
+    fn spawn(
+        &self,
+        spec: &ServerSpawn,
+        root: &Path,
+    ) -> Pin<Box<dyn Future<Output = io::Result<LspChannel>> + Send>> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let rpc = self.rpc.clone();
+        let inflight = self.inflight.clone();
+        let program = spec.program.clone();
+        let args = spec.args.clone();
+        let cwd = root.to_string_lossy().into_owned();
+        Box::pin(async move {
+            let (stdout_tx, stdout_rx) = unbounded_channel::<Vec<u8>>();
+            let (stderr_tx, stderr_rx) = unbounded_channel::<Vec<u8>>();
+            let (exit_tx, exit_rx) = oneshot::channel();
+            // Register *before* the spawn request so a fast reply can't race ahead of
+            // its sinks (mirrors [`RemoteHostProc::run`]).
+            inflight.lock().unwrap().insert(
+                id,
+                LspInflight {
+                    stdout_tx,
+                    stderr_tx,
+                    exit_tx,
+                },
+            );
+            // client → server: the manager writes JSON-RPC into `stdin_writer`; a pump
+            // reads the other end of the duplex and forwards each chunk as `lsp_stdin`.
+            let (stdin_writer, stdin_reader) = tokio::io::duplex(1 << 16);
+            tokio::spawn(pump_lsp_stdin(id, stdin_reader, rpc.clone()));
+            rpc.notify(
+                LSP_SPAWN,
+                vec![
+                    Value::from(id),
+                    Value::from(program),
+                    Value::Array(args.into_iter().map(Value::from).collect()),
+                    Value::from(cwd),
+                ],
+            );
+            Ok(LspChannel {
+                stdout: Box::pin(ChannelReader::new(stdout_rx)),
+                stdin: Box::pin(stdin_writer),
+                stderr: Some(Box::pin(ChannelReader::new(stderr_rx))),
+                process: Box::new(RemoteLspProcess { id, rpc, exit_rx }),
+            })
+        })
+    }
+}
+
+/// The edit-host-side [`LspProcess`]: terminate the remote server (`lsp_kill`) and
+/// await its exit, which the demux fires off `lsp_exited`. A dropped daemon link
+/// drops the `exit_tx`, so `wait` resolves to `(None, None)` rather than hanging.
+struct RemoteLspProcess {
+    id: u64,
+    rpc: Rpc,
+    exit_rx: oneshot::Receiver<(Option<i32>, Option<i32>)>,
+}
+
+impl LspProcess for RemoteLspProcess {
+    fn start_kill(&mut self) {
+        self.rpc.notify(LSP_KILL, vec![Value::from(self.id)]);
+    }
+
+    fn wait(self: Box<Self>) -> nxvim_lsp::ExitFuture {
+        Box::pin(async move { self.exit_rx.await.unwrap_or((None, None)) })
+    }
+}
+
+/// Pump the daemon's per-server stdout/stderr/exit off the wire and route each to the
+/// server it belongs to. On teardown (`incoming` ends) it clears [`LspInflightMap`],
+/// dropping every sink (EOF the readers) and every `exit_tx` (so each waiting server
+/// reports `(None, None)` rather than hanging).
+async fn run_lsp_demux(mut incoming: UnboundedReceiver<Incoming>, inflight: LspInflightMap) {
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue; // the daemon speaks only notifications; ignore stray requests
+        };
+        match method.as_str() {
+            LSP_STDOUT => {
+                if let Some((id, bytes)) = decode_id_bytes(params) {
+                    if let Some(inf) = inflight.lock().unwrap().get(&id) {
+                        let _ = inf.stdout_tx.send(bytes);
+                    }
+                }
+            }
+            LSP_STDERR => {
+                if let Some((id, bytes)) = decode_id_bytes(params) {
+                    if let Some(inf) = inflight.lock().unwrap().get(&id) {
+                        let _ = inf.stderr_tx.send(bytes);
+                    }
+                }
+            }
+            LSP_EXITED => {
+                if let Some((id, code, signal)) = decode_lsp_exited(&params) {
+                    // Remove (and drop the stdout/stderr sinks) *after* firing exit.
+                    // All preceding `lsp_stdout` for this id were queued onto the
+                    // unbounded sinks already (we process the wire in order), so the
+                    // reader drains them before observing EOF.
+                    if let Some(inf) = inflight.lock().unwrap().remove(&id) {
+                        let _ = inf.exit_tx.send((code, signal));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    inflight.lock().unwrap().clear();
+}
+
+/// Forward everything the manager writes to a server's stdin onto the wire as
+/// `lsp_stdin` chunks, until the duplex closes (the manager's loop ended).
+async fn pump_lsp_stdin(id: u64, mut reader: DuplexStream, rpc: Rpc) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => rpc.notify(
+                LSP_STDIN,
+                vec![Value::from(id), Value::Binary(buf[..n].to_vec())],
+            ),
+        }
+    }
+}
+
+/// A [`tokio::io::AsyncRead`] fed by an unbounded channel of byte chunks — the bridge
+/// from the demux (which receives discrete `lsp_stdout`/`lsp_stderr` *messages*) to the
+/// streaming reader the manager's `async-lsp` loop expects. Buffers one chunk across
+/// reads; a closed channel reads as EOF.
+struct ChannelReader {
+    rx: UnboundedReceiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: UnboundedReceiver<Vec<u8>>) -> ChannelReader {
+        ChannelReader {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for ChannelReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if this.pos < this.chunk.len() {
+                let n = std::cmp::min(buf.remaining(), this.chunk.len() - this.pos);
+                buf.put_slice(&this.chunk[this.pos..this.pos + n]);
+                this.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    if chunk.is_empty() {
+                        continue; // a stray empty chunk would falsely read as EOF
+                    }
+                    this.chunk = chunk;
+                    this.pos = 0;
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())), // sinks dropped → EOF
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Run the daemon end of the LSP wire over `reader`/`writer`: spawn the language
+/// servers a far edit-host asks for and stream their stdio back. Returns when the
+/// connection closes. Each child runs through the *same* `tokio::process` machinery
+/// the local transport uses, so a server behaves identically remote and local.
+pub async fn serve_lsp_daemon<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, mut incoming) = connect(reader, writer);
+    // Per-child stdin channels and kill signals, keyed by the edit-host's spawn id, so
+    // `lsp_stdin`/`lsp_kill` can reach the running child (mirrors the process leg's maps).
+    let mut stdins: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
+    let mut kills: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue; // the edit-host drives the daemon with notifications only
+        };
+        match method.as_str() {
+            LSP_SPAWN => {
+                if let Some((id, program, args, cwd)) = decode_lsp_spawn(params) {
+                    let (stdin_tx, stdin_rx) = unbounded_channel::<Vec<u8>>();
+                    let (kill_tx, kill_rx) = oneshot::channel();
+                    stdins.insert(id, stdin_tx);
+                    kills.insert(id, kill_tx);
+                    tokio::spawn(serve_one_lsp(
+                        id,
+                        program,
+                        args,
+                        cwd,
+                        stdin_rx,
+                        kill_rx,
+                        rpc.clone(),
+                    ));
+                }
+            }
+            LSP_STDIN => {
+                if let Some((id, bytes)) = decode_id_bytes(params) {
+                    if let Some(tx) = stdins.get(&id) {
+                        let _ = tx.send(bytes);
+                    }
+                }
+            }
+            LSP_KILL => {
+                if let Some(id) = params.first().and_then(Value::as_u64) {
+                    if let Some(kill_tx) = kills.remove(&id) {
+                        let _ = kill_tx.send(());
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Forget channels whose child tasks have closed them (the child exited), the
+        // same leak guard the process leg applies.
+        stdins.retain(|_, tx| !tx.is_closed());
+        kills.retain(|_, tx| !tx.is_closed());
+    }
+    Ok(())
+}
+
+/// Run one language server to completion (or until killed) on the daemon, streaming its
+/// stdout/stderr onto the wire and feeding its stdin from `stdin_rx`. Joins the
+/// stdout/stderr pumps *before* sending `lsp_exited`, so the edit-host (which EOFs its
+/// reader on exit) never loses trailing output.
+async fn serve_one_lsp(
+    id: u64,
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+    mut stdin_rx: UnboundedReceiver<Vec<u8>>,
+    mut kill_rx: oneshot::Receiver<()>,
+    rpc: Rpc,
+) {
+    let mut command = tokio::process::Command::new(&program);
+    command
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !cwd.is_empty() {
+        command.current_dir(&cwd);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_e) => {
+            // A spawn failure reports a bare exit (no code) — the edit-host's reader
+            // EOFs and the manager reports the failure during initialize, the same way
+            // a local spawn error does.
+            rpc.notify(LSP_EXITED, vec![Value::from(id), Value::Nil, Value::Nil]);
+            return;
+        }
+    };
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut out_handle =
+        stdout.map(|out| tokio::spawn(pump_child_output(out, id, LSP_STDOUT, rpc.clone())));
+    let mut err_handle =
+        stderr.map(|err| tokio::spawn(pump_child_output(err, id, LSP_STDERR, rpc.clone())));
+    let stdin_task = tokio::spawn(async move {
+        if let Some(sink) = stdin.as_mut() {
+            while let Some(bytes) = stdin_rx.recv().await {
+                if sink.write_all(&bytes).await.is_err() || sink.flush().await.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.shutdown().await; // close → the server reads EOF
+        }
+    });
+    let mut killed = false;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.ok(),
+            // Disable the arm once fired (re-polling a consumed oneshot busy-loops);
+            // the child still exits via `child.wait()` after the kill takes effect.
+            _ = &mut kill_rx, if !killed => {
+                killed = true;
+                let _ = child.start_kill();
+            }
+        }
+    };
+    // Flush all stdout/stderr onto the wire *before* signaling exit.
+    if let Some(h) = out_handle.take() {
+        let _ = h.await;
+    }
+    if let Some(h) = err_handle.take() {
+        let _ = h.await;
+    }
+    stdin_task.abort();
+    let (code, signal) = lsp_exit_code_signal(status);
+    rpc.notify(
+        LSP_EXITED,
+        vec![
+            Value::from(id),
+            code.map_or(Value::Nil, Value::from),
+            signal.map_or(Value::Nil, Value::from),
+        ],
+    );
+}
+
+/// Stream a child's stdout (or stderr) onto the wire as `method` chunks until it
+/// closes (the child exited). Stops on the first read error or EOF.
+async fn pump_child_output<R>(mut src: R, id: u64, method: &'static str, rpc: Rpc)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    loop {
+        match src.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => rpc.notify(
+                method,
+                vec![Value::from(id), Value::Binary(buf[..n].to_vec())],
+            ),
+        }
+    }
+}
+
+/// Split a child's [`std::process::ExitStatus`] into `(code, signal)` for the
+/// `lsp_exited` wire (the daemon-side analogue of `nxvim-lsp`'s `exit_code_signal`).
+fn lsp_exit_code_signal(status: Option<std::process::ExitStatus>) -> (Option<i32>, Option<i32>) {
+    let Some(status) = status else {
+        return (None, None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        (status.code(), None)
+    }
+}
+
+/// `lsp_spawn` params → `(id, program, args, cwd)`, or `None` on a malformed frame.
+fn decode_lsp_spawn(mut params: Vec<Value>) -> Option<(u64, String, Vec<String>, String)> {
+    if params.len() < 4 {
+        return None;
+    }
+    let id = params[0].as_u64()?;
+    let program = params[1].as_str()?.to_string();
+    let args = match std::mem::replace(&mut params[2], Value::Nil) {
+        Value::Array(a) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => return None,
+    };
+    let cwd = params[3].as_str().unwrap_or("").to_string();
+    Some((id, program, args, cwd))
+}
+
+/// `[id, bytes]` → `(id, bytes)`, moving the (potentially large) payload out. Used by
+/// both `lsp_stdin` (daemon side) and `lsp_stdout`/`lsp_stderr` (edit-host side).
+fn decode_id_bytes(mut params: Vec<Value>) -> Option<(u64, Vec<u8>)> {
+    if params.len() < 2 {
+        return None;
+    }
+    let id = params[0].as_u64()?;
+    let bytes = match std::mem::replace(&mut params[1], Value::Nil) {
+        Value::Binary(b) => b,
+        Value::String(s) => s.into_bytes(),
+        _ => Vec::new(),
+    };
+    Some((id, bytes))
+}
+
+/// `lsp_exited` params → `(id, code?, signal?)`. A nil code/signal stays `None`.
+fn decode_lsp_exited(params: &[Value]) -> Option<(u64, Option<i32>, Option<i32>)> {
+    let id = params.first()?.as_u64()?;
+    let code = params.get(1).and_then(Value::as_i64).map(|c| c as i32);
+    let signal = params.get(2).and_then(Value::as_i64).map(|s| s as i32);
+    Some((id, code, signal))
 }

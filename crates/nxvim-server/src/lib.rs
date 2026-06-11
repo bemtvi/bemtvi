@@ -47,8 +47,8 @@ pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
 pub use daemon::{
-    serve_daemon, serve_fs_daemon, serve_sys_daemon, FsRead, HostFsAsync, RemoteBlockingSystem,
-    RemoteHostFs, RemoteHostProc, WatchEvent,
+    serve_daemon, serve_fs_daemon, serve_lsp_daemon, serve_sys_daemon, FsRead, HostFsAsync,
+    RemoteBlockingSystem, RemoteHostFs, RemoteHostProc, RemoteLspTransport, WatchEvent,
 };
 
 use evloop::EventLoop;
@@ -136,6 +136,15 @@ pub struct ServerInit {
     /// editor thread on the reply (the call is synchronous) — its wire's RPC tasks live
     /// on their own thread so that park can't deadlock.
     pub blocking_system: Option<Box<dyn nxvim_lua::BlockingSystem + Send>>,
+    /// The transport language servers are spawned through. `None` (the default) runs
+    /// them as real local children ([`LocalLspTransport`](nxvim_lsp::LocalLspTransport));
+    /// the edit-host split injects a daemon-backed [`RemoteLspTransport`] here so a
+    /// language server runs on the remote where the project files are, tunneling its
+    /// long-lived stdio over the wire while editing stays local
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3). `Send` (boxed)
+    /// so it rides [`ServerInit`] onto the server's own thread, where it is rebuilt into
+    /// the shared `Arc<dyn LspTransport>` the [`LspManager`] holds.
+    pub lsp_transport: Option<Box<dyn nxvim_lsp::LspTransport + Send>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -563,7 +572,18 @@ where
         let sys: Rc<dyn nxvim_lua::BlockingSystem> = sys;
         lua.set_blocking_system(sys);
     }
-    let (lsp, mut lsp_events) = LspManager::new();
+    // Language servers are spawned through this transport — real local children by
+    // default, or an injected daemon-backed tunnel. Rebuilt here, on the server thread,
+    // into the shared `Arc<dyn LspTransport>` the manager holds (`ServerInit` carried it
+    // `Send` across the thread boundary; the two-step drops `Send` by unsize coercion, as
+    // the `host_proc` rebuild does). `None` keeps the default local spawn.
+    let (lsp, mut lsp_events) = match init.lsp_transport {
+        Some(transport) => {
+            let transport: Arc<dyn nxvim_lsp::LspTransport + Send> = Arc::from(transport);
+            LspManager::with_transport(transport)
+        }
+        None => LspManager::new(),
+    };
     // Child processes are spawned through this seam — real local processes by
     // default, or an injected (eventually daemon-backed) backend. Rebuilt here,
     // on the server thread, into the shared `Arc<dyn HostProc>` the event-loop

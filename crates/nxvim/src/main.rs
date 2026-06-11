@@ -73,6 +73,10 @@ fn main() -> Result<()> {
         // the local binary spawns blocking `vim.system` shell-outs locally; a daemon
         // blocking bridge is injected here by the edit-host split.
         blocking_system: None,
+        // The local binary spawns language servers as real local children (the
+        // default); a daemon-backed LSP transport is injected here by the edit-host
+        // split.
+        lsp_transport: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -129,6 +133,10 @@ fn run_headless(file: Option<String>) -> Result<()> {
         host_proc: None,
         host_fs_async: None,
         blocking_system: None,
+        // The local binary spawns language servers as real local children (the
+        // default); a daemon-backed LSP transport is injected here by the edit-host
+        // split.
+        lsp_transport: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()

@@ -82,6 +82,9 @@ fn main() -> Result<()> {
         // The local GUI runs blocking `vim.system` shell-outs locally; a daemon
         // blocking bridge is injected here by the edit-host split.
         blocking_system: None,
+        // The local GUI spawns language servers as real local children; a daemon-backed
+        // LSP transport is injected here by the edit-host split.
+        lsp_transport: None,
     };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

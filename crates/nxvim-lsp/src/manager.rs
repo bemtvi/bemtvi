@@ -16,7 +16,6 @@
 //! client `MainLoop` and capability negotiation live in [`crate::client`].
 
 use std::collections::{HashMap, VecDeque};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,19 +24,19 @@ use lsp_types::{
     DidChangeConfigurationParams, InitializeParams, InitializeResult, InitializedParams, Url,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::client::{
-    encoding_of, exit_code_signal, merged_client_capabilities, new_client, provider_caps,
-    semantic_legend, semantic_tokens_delta, sync_kind_of,
+    encoding_of, merged_client_capabilities, new_client, provider_caps, semantic_legend,
+    semantic_tokens_delta, sync_kind_of,
 };
 use crate::dispatch::{apply_notify, issue_request};
 use crate::log::{LogLevel, LspLog};
 use crate::protocol::{
     LspEvent, LspNotify, LspRequest, ReqToken, ServerCaps, ServerKey, ServerSpawn,
 };
+use crate::transport::{LocalLspTransport, LspTransport};
 
 /// Commands from the editor to the supervisor, routed to per-server tasks by key.
 enum LspCommand {
@@ -82,18 +81,33 @@ pub struct LspManager {
     /// Taken when the supervisor is first started.
     start: Option<(UnboundedReceiver<LspCommand>, UnboundedSender<LspEvent>)>,
     started: bool,
+    /// How servers are spawned — a real local child by default, or a daemon-backed
+    /// transport injected for the edit-host split. Shared with every per-server
+    /// task the supervisor spawns.
+    transport: Arc<dyn LspTransport>,
 }
 
 impl LspManager {
-    /// Create the manager and the receiver the server loop selects on. No task is
-    /// spawned and no process launched until [`LspManager::ensure_server`].
+    /// Create the manager and the receiver the server loop selects on, spawning
+    /// servers as **local** children. No task is spawned and no process launched
+    /// until [`LspManager::ensure_server`].
     pub fn new() -> (LspManager, UnboundedReceiver<LspEvent>) {
+        Self::with_transport(Arc::new(LocalLspTransport))
+    }
+
+    /// Like [`LspManager::new`], but with an injected [`LspTransport`] — the
+    /// edit-host split passes a daemon-backed one so language servers run on the
+    /// remote (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3).
+    pub fn with_transport(
+        transport: Arc<dyn LspTransport>,
+    ) -> (LspManager, UnboundedReceiver<LspEvent>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (event_tx, event_rx) = unbounded_channel();
         let manager = LspManager {
             cmd_tx,
             start: Some((cmd_rx, event_tx)),
             started: false,
+            transport,
         };
         (manager, event_rx)
     }
@@ -104,7 +118,7 @@ impl LspManager {
             return;
         }
         if let Some((cmd_rx, event_tx)) = self.start.take() {
-            tokio::spawn(run_supervisor(cmd_rx, event_tx));
+            tokio::spawn(run_supervisor(cmd_rx, event_tx, self.transport.clone()));
             self.started = true;
         }
     }
@@ -142,6 +156,7 @@ impl LspManager {
 async fn run_supervisor(
     mut cmd_rx: UnboundedReceiver<LspCommand>,
     event_tx: UnboundedSender<LspEvent>,
+    transport: Arc<dyn LspTransport>,
 ) {
     // Created here (not in `LspManager::new`) so the log file is opened lazily —
     // only once a configured filetype is actually opened, never for an
@@ -159,7 +174,14 @@ async fn run_supervisor(
                 }
                 let (tx, rx) = unbounded_channel();
                 servers.insert(key.clone(), tx);
-                tokio::spawn(run_server(key, spawn, rx, event_tx.clone(), log.clone()));
+                tokio::spawn(run_server(
+                    key,
+                    spawn,
+                    rx,
+                    event_tx.clone(),
+                    log.clone(),
+                    transport.clone(),
+                ));
             }
             LspCommand::Notify { key, note } => {
                 if let Some(tx) = servers.get(&key) {
@@ -189,6 +211,7 @@ async fn run_server(
     mut rx: UnboundedReceiver<ServerMsg>,
     event_tx: UnboundedSender<LspEvent>,
     log: Arc<LspLog>,
+    transport: Arc<dyn LspTransport>,
 ) {
     // Recent failure timestamps drive the breaker (a window of repeated crashes
     // ⇒ persistently broken: stop respawning).
@@ -199,7 +222,7 @@ async fn run_server(
     const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
     loop {
-        match run_server_once(&key, &spawn, &mut rx, &event_tx, &log).await {
+        match run_server_once(&key, &spawn, &mut rx, &event_tx, &log, &transport).await {
             ServerOutcome::Shutdown => return,
             ServerOutcome::Failed => {}
         }
@@ -245,6 +268,7 @@ async fn run_server_once(
     rx: &mut UnboundedReceiver<ServerMsg>,
     event_tx: &UnboundedSender<LspEvent>,
     log: &Arc<LspLog>,
+    transport: &Arc<dyn LspTransport>,
 ) -> ServerOutcome {
     let name = key.name.as_str();
     log.log(
@@ -252,18 +276,11 @@ async fn run_server_once(
         name,
         &format!("starting {} in {}", spawn.program, key.root.display()),
     );
-    let mut child = match Command::new(&spawn.program)
-        .args(&spawn.args)
-        .current_dir(&key.root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Captured (not null'd) so the server's stderr — panics, RA_LOG output —
-        // reaches the log; a reader task below drains it so the pipe never blocks.
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
+    // Spawn through the transport: a real local child by default, or a daemon
+    // tunnel for the edit-host split. Either way it hands back the server's stdio
+    // streams and a kill/wait handle — the loop below is identical regardless.
+    let channel = match transport.spawn(spawn, &key.root).await {
+        Ok(channel) => channel,
         Err(e) => {
             let message = format!("failed to spawn {}: {e}", spawn.program);
             log.log(LogLevel::Error, name, &message);
@@ -276,25 +293,15 @@ async fn run_server_once(
             return ServerOutcome::Failed;
         }
     };
-    let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        log.log(
-            LogLevel::Error,
-            name,
-            "server stdio pipes unexpectedly missing",
-        );
-        let _ = event_tx.send(LspEvent::ServerExited {
-            key: key.clone(),
-            message: "server stdio pipes unexpectedly missing".to_string(),
-            code: None,
-            signal: None,
-        });
-        return ServerOutcome::Failed;
-    };
+    let crate::transport::LspChannel {
+        stdout,
+        stdin,
+        stderr,
+        mut process,
+    } = channel;
     // Drain the server's stderr into the log, one line at a time, until it closes
     // (server exit). Each line is logged at WARN so it shows at the default level.
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = stderr {
         let log = log.clone();
         let name = key.name.clone();
         tokio::spawn(async move {
@@ -306,8 +313,8 @@ async fn run_server_once(
     }
 
     // `async-lsp`'s `MainLoop` drives the `futures` AsyncRead/Write; bridge the
-    // tokio child pipes with tokio-util's compat shims. Input is the child's
-    // stdout (server→client), output its stdin (client→server).
+    // transport's stdio streams with tokio-util's compat shims. Input is the
+    // server's stdout (server→client), output its stdin (client→server).
     let (mainloop, mut socket) = new_client(
         key.clone(),
         event_tx.clone(),
@@ -345,8 +352,8 @@ async fn run_server_once(
     let init_result = tokio::select! {
         res = socket.initialize(init) => res,
         _ = &mut mainloop_fut => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            process.start_kill();
+            let _ = process.wait().await;
             log.log(LogLevel::Error, name, "server exited during initialize");
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
@@ -361,8 +368,8 @@ async fn run_server_once(
         Ok(r) => r,
         Err(e) => {
             mainloop_fut.abort();
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            process.start_kill();
+            let _ = process.wait().await;
             log.log(LogLevel::Error, name, &format!("initialize failed: {e}"));
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
@@ -432,8 +439,8 @@ async fn run_server_once(
                     let _ = socket.shutdown(()).await;
                     let _ = socket.exit(());
                     mainloop_fut.abort();
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    process.start_kill();
+                    let _ = process.wait().await;
                     return ServerOutcome::Shutdown;
                 }
             },
@@ -441,8 +448,8 @@ async fn run_server_once(
                 // The loop ended: the child closed its pipe or exited. Capture the
                 // exit status for the config's `on_exit(code, signal, client)` hook
                 // (Phase 3) — this is the one exit path with a registered client.
-                let _ = child.start_kill();
-                let (code, signal) = exit_code_signal(child.wait().await.ok());
+                process.start_kill();
+                let (code, signal) = process.wait().await;
                 log.log(LogLevel::Warn, name, "language server exited");
                 let _ = event_tx.send(LspEvent::ServerExited {
                     key: key.clone(),

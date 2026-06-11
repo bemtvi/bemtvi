@@ -29,6 +29,8 @@ mod buf_api;
 mod client_api;
 #[path = "lsp/completion.rs"]
 mod completion;
+#[path = "lsp/daemon.rs"]
+mod daemon;
 #[path = "lsp/diagnostic_api.rs"]
 mod diagnostic_api;
 #[path = "lsp/diagnostics.rs"]

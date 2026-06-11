@@ -1026,11 +1026,61 @@ confirming it genuinely depends on the wire. Regression-clean — full `cargo te
 isolation), the `daemon_system` suite is 3, fmt + clippy `-D warnings` clean; the local
 binaries (`nxvim`, `nxvim-gui`) leave `blocking_system: None` and spawn locally, unchanged.
 
-**Still to do on the process side of the full split:** `lsp/manager.rs` (the long-lived
-bidirectional raw-pipe transport — `write_stdin` + stdout-as-events, not run-to-completion)
-remains the one process-shaped seam not yet daemon-routed; the `nxvim --daemon` binary and
-the ssh-stdio transport tie all the legs together. (`clipboard.rs` stays local-by-topology,
-struck from this list under 3c.)
+**Still to do on the process side of the full split:** ~~`lsp/manager.rs` (the long-lived
+bidirectional raw-pipe transport)~~ ✅ DONE — Phase 3o below. The `nxvim --daemon` binary and
+the ssh-stdio transport tie all the legs together remain. (`clipboard.rs` stays
+local-by-topology, struck from this list under 3c.)
+
+### Phase 3o — LSP over the wire (the long-lived bidirectional-pipe leg) — ✅ DONE (2026-06-10)
+
+The **last** process-shaped seam, and the one whose shape diverges most from every leg
+before it. A language server is neither run-to-completion (the `proc_*` leg's pid-then-exit)
+nor request/response (`fs_*`/`sys_run`): it is a *long-lived child whose stdio is a raw
+bidirectional pipe* — JSON-RPC flowing both ways for the server's whole life, stdout consumed
+incrementally, never buffered to an exit. So it does **not** collapse into [`HostProc`] as the
+original sketch guessed (`HostProc`'s `run`-to-`exited(stdout)` contract can't model a stream);
+it gets its own seam matched to that shape, the same "don't fold a mismatched shape in" discipline
+that kept the clipboard local and gave the blocking `vim.system` its own bridge (3n).
+
+The seam is **in `nxvim-lsp`** (where the spawn lived), not the server, because the
+[`LspManager`] is what spawns servers. Shipped:
+- **`trait LspTransport`** (`crates/nxvim-lsp/src/transport.rs`): `spawn(spec, root) ->
+  io::Result<LspChannel>`, where an [`LspChannel`] hands back the server's `stdout`/`stdin`
+  (boxed `AsyncRead`/`AsyncWrite`), its `stderr`, and an [`LspProcess`] (`start_kill` + `wait
+  -> (code, signal)`). The manager drives its `async-lsp` `run_buffered` loop over whichever
+  streams it gets, knowing nothing of where the server runs. **`LocalLspTransport`** is the
+  default — today's `tokio::process` spawn lifted verbatim behind the seam (the inline
+  `Command`/pipe-take/stderr-drain `run_server_once` did is now its `spawn`). `LspManager::new`
+  uses it; `with_transport` injects another. **Zero behavior change** on the local path.
+- **The wire** (`crates/nxvim-server/src/daemon.rs`, a fifth leg): six notifications correlated
+  by a per-spawn `id` — edit-host → daemon `lsp_spawn [id, program, args, cwd]` / `lsp_stdin
+  [id, bytes]` / `lsp_kill [id]`; daemon → edit-host `lsp_stdout [id, bytes]` / `lsp_stderr [id,
+  bytes]` / `lsp_exited [id, code?, signal?]`. It streams the *pipe itself* (raw chunks), not a
+  result — the structural difference from every prior leg.
+- **`RemoteLspTransport`** (edit-host side, an `LspTransport`): each `spawn` mints an `id`,
+  registers per-server sinks, and hands the manager an `LspChannel` whose stdout/stderr are a
+  `ChannelReader` (an `AsyncRead` fed by demuxed `lsp_stdout`/`lsp_stderr` chunks) and whose
+  stdin is a duplex pumped onto the wire as `lsp_stdin`. A demux task fans the daemon's replies
+  to the right server by `id`; a dropped link EOFs every reader and resolves every `wait` to
+  `(None, None)` (no leaked server). **`serve_lsp_daemon`** (daemon side) spawns the actual
+  child through the *same* `tokio::process` machinery the local transport uses and streams its
+  pipes back — **joining the stdout/stderr pumps before signaling `lsp_exited`**, so the
+  edit-host (which EOFs its reader on exit) never loses trailing output.
+- **`ServerInit::lsp_transport`** rides onto the server thread and is rebuilt into the
+  `Arc<dyn LspTransport>` the manager holds (mirroring `host_proc`); `None` = local children.
+
+**Exit criteria — met.** `crates/nxvim/tests/lsp/daemon.rs` drives the **real** `nxvim
+--__lsp-mock` server through a `RemoteLspTransport` ↔ `serve_lsp_daemon` over an in-process
+duplex (the ssh-stdio stand-in): a scripted `publishDiagnostics` renders in the editor —
+proving the `didOpen` crossed as `lsp_stdin` to the child *and* its reply crossed back as
+`lsp_stdout` (faithful, not a stub — the diagnostic is state only a real round-trip produces);
+`gd` lands the cursor on the mock's scripted definition, proving the request/reply path; and a
+mock that exits after `initialize` makes the tunneled child die, `lsp_exited` round-trips, the
+breaker respawns, and the editor stays fully responsive throughout. Regression-clean — the full
+114-test local LSP suite passes unchanged (the `LocalLspTransport` lift didn't regress it), full
+`cargo test --workspace` green, fmt + clippy `-D warnings` clean; the local binaries (`nxvim`,
+`nxvim-gui`) leave `lsp_transport: None` and spawn servers locally, unchanged. (`clipboard.rs`
+stays local-by-topology, struck under 3c.)
 
 ### The full split
 
@@ -1068,17 +1118,20 @@ trait HostProc {
 }
 ```
 
-— is what the **remaining daemon-bound spawn sites** need and is best resolved
-against the actual wire: `lsp/manager.rs` (a language server *is* "spawn + pipe
-stdio" — no special LSP protocol needed, but it does need raw bidirectional pipe
-handles, i.e. the `write_stdin` + stdout-as-events shape, not run-to-completion).
-The blocking `vim._system` **landed in Phase 3n** — its own `BlockingSystem` seam +
-`sys_run` request/response wire (a blocking bridge, *not* `HostProc`: it's
-synchronous, the caller parks on the reply rather than routing pid/exit as loop
-events). `clipboard.rs` stays **local-by-topology** and is *not* daemon-routed (same
-note). The in-process impl wraps today's `tokio::process`; the remote impl
-forwards to the daemon. **LSP needs no special protocol** — it collapses into
-`HostProc`.
+— is the shape the original sketch reached for, and `lsp/manager.rs` was where it
+seemed to fit. **In practice it did not fold into `HostProc`** (resolved in Phase 3o):
+a language server's pipe stays open for its whole life with stdout consumed
+incrementally, which `HostProc`'s run-to-`exited(stdout)` contract cannot model. So
+LSP **landed in Phase 3o** with its own `LspTransport` seam (in `nxvim-lsp`, where the
+spawn lives) + the `lsp_*` wire that streams the raw bidirectional pipe — *not*
+`HostProc`. The blocking `vim._system` **landed in Phase 3n** — its own
+`BlockingSystem` seam + `sys_run` request/response wire (a blocking bridge, *not*
+`HostProc`: it's synchronous, the caller parks on the reply rather than routing
+pid/exit as loop events). `clipboard.rs` stays **local-by-topology** and is *not*
+daemon-routed (same note). The lesson across 3n/3o: each daemon-bound spawn site got
+the seam matched to *its* shape (run-to-completion `HostProc`, the blocking
+`sys_run` bridge, the streaming `lsp_*` pipe) rather than one trait stretched over
+all three.
 
 **Cross-cutting semantics this phase must define:**
 
@@ -1090,10 +1143,10 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
   single-buffer **save** in Phase 3e, **`:edit`** in Phase 3f, the **remote explorer**
   listing in Phase 3g, **`:tabnew` / LSP go-to** in Phase 3h, and the multi-buffer
   **`:wall` / `:wqa` / `:xa`** in Phase 3m — every buffer-open path *and* every write path
-  is now off-tick, behind one shared kernel. **The fs leg, the watch leg (3i–3l), and the
-  blocking `vim._system` (Phase 3n) are all complete**; what remains for the full split is
-  the daemon binary / ssh transport, LSP-over-`HostProc`, and the Lua-visible fs semantics
-  below.)
+  is now off-tick, behind one shared kernel. **The fs leg, the watch leg (3i–3l), the
+  blocking `vim._system` (Phase 3n), and the LSP leg (Phase 3o) are all complete**; what
+  remains for the full split is the daemon binary / ssh transport and the Lua-visible fs
+  semantics below.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call

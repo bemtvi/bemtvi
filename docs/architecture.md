@@ -1001,12 +1001,11 @@ screen," and that is exactly the shape of these tests.
   doc explains how to enumerate them straight from the code (`grep -rn
   'INCOMPLETE:'` for approximations, the `vim._notimpl` raises / runtime
   `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
-  that have no call site to tag — the
-  `vim.treesitter` Lua API, the bulk of vim's options beyond the handful nxvim
-  honors (window-local `number`/`relativenumber` + the horizontal-scroll
+  that have no call site to tag — the bulk of vim's options beyond the handful
+  nxvim honors (window-local `number`/`relativenumber` + the horizontal-scroll
   `sidescroll`/`sidescrolloff`, the buffer-local indentation options, and global
-  `showtabline` are wired; `wrap`/`cursorline`/… are not), a per-buffer command
-  registry, and richer diagnostic surfaces. (The **synchronous prompts**
+  `showtabline` are wired; `wrap`/`cursorline`/… are not) and richer diagnostic
+  surfaces. (The **synchronous prompts**
   `vim.fn.input` /
   `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,
   or user command — runs its Lua inside a coroutine via `vim._pump`, so the prompt
@@ -1031,14 +1030,14 @@ screen," and that is exactly the shape of these tests.
   shares search's canonical-regex engine, are both done; see
   [the search design](specs/2026-06-02-search-design.md) and
   `docs/plans/2026-06-07-substitute-command.md`.)
-- **Per-buffer user commands.** User commands live in one global registry, so
-  `nvim_buf_create_user_command(buffer, …)` currently registers *globally*
-  (the buffer argument is ignored) — enough for an `on_attach` that defines a
-  convenience command (e.g. rust_analyzer's `:LspCargoReload`) to load without
-  error, but the command then exists everywhere rather than only in its buffer.
-  A per-buffer command registry (the command analogue of the buffer-local
-  options on `Buffer` / buffer-local keymaps, which `vim._keymaps` already
-  scopes) is the fix.
+- **Per-buffer user commands.** *Done.* `nvim_buf_create_user_command(buffer, …)`
+  stores into a per-bufnr registry (`vim._buf_user_commands[bufnr][name]`, the
+  command analogue of the buffer-local `vim._keymaps`): `vim._resolve_user_command`
+  gives a buffer-local command precedence over a global of the same name and hides
+  it from other buffers, dispatch routes through the editor's authoritative current
+  bufnr, `nvim_buf_get_commands` returns a buffer's locals, and a wiped buffer's
+  locals (commands *and* keymaps) are purged via `vim._cleanup_buffer` so a reused
+  bufnr can't inherit them.
 - **An async Lua runtime (event loop).** *Landed* (see
   [the async-runtime plan](plans/2026-06-06-async-lua-runtime.md)). A `Send` background actor
   (`crates/nxvim-server/src/evloop.rs`, modeled on `LspManager`) owns timers and

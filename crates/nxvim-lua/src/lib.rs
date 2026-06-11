@@ -21,12 +21,14 @@
 //! - [`install`] — installing the `vim.*` Rust bridge into a fresh VM.
 //! - [`convert`] — the Lua↔`rmpv`/`serde_json` value bridges and opts readers.
 //! - [`host`] — filesystem / process / glob / standard-path host primitives.
+//! - [`system`] — the blocking `vim._system` shell-out seam ([`BlockingSystem`]).
 
 mod convert;
 mod host;
 mod install;
 mod ops;
 mod runtime;
+mod system;
 mod uvfs;
 mod vimregex;
 
@@ -39,3 +41,4 @@ pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
     LuaRuntime, TabMirror, WindowMirror,
 };
+pub use system::{BlockingSystem, StdBlockingSystem, SystemOutput, SystemSpec};

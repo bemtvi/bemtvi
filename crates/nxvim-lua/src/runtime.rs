@@ -373,6 +373,15 @@ pub(crate) struct Shared {
     /// of the parked coroutine the server resumes with the next key. Normally at
     /// most one is in flight (a getchar loop reads one key at a time).
     pub(crate) getchar_reqs: Vec<u64>,
+    /// The backend the **blocking** `vim._system` shell-out runs through. `None` (the
+    /// default) spawns the process locally
+    /// ([`StdBlockingSystem`](crate::StdBlockingSystem)); a daemon session injects a
+    /// blocking bridge ([`set_blocking_system`](LuaRuntime::set_blocking_system)) so a
+    /// `root_dir` shell-out (`cargo metadata`) runs on the remote where the project
+    /// files are. Held here (not a `LoopOp`) because the call is synchronous — it
+    /// returns the child's output inline, not on a later tick. `!Send`, like the rest
+    /// of [`Shared`], which lives only on the server's single thread.
+    pub(crate) blocking_system: Option<Rc<dyn crate::BlockingSystem>>,
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -503,6 +512,16 @@ impl LuaRuntime {
     /// machinery to locate `colors/<name>.lua` and friends).
     pub fn runtimepath(&self) -> &[PathBuf] {
         &self.runtimepath
+    }
+
+    /// Inject the backend the **blocking** `vim._system` runs through — the daemon's
+    /// blocking bridge. Without this the default local spawn
+    /// ([`StdBlockingSystem`](crate::StdBlockingSystem)) is used, so a bare/local
+    /// session is unchanged. The server calls this once at startup when a daemon is
+    /// present, so a synchronous `vim.system(...):wait()` (an LSP `root_dir` shell-out)
+    /// runs on the remote where the project files live.
+    pub fn set_blocking_system(&self, sys: Rc<dyn crate::BlockingSystem>) {
+        self.shared.borrow_mut().blocking_system = Some(sys);
     }
 
     /// Run a Lua chunk. Errors are returned for the server to surface.

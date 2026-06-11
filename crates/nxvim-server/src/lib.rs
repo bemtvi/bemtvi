@@ -39,14 +39,16 @@ mod treesitter;
 pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 
 /// The daemon wire protocol for the edit-host split: the daemon-side servers
-/// ([`serve_daemon`] for child processes, [`serve_fs_daemon`] for file reads) and the
-/// edit-host-side clients ([`RemoteHostProc`], [`RemoteHostFs`]) that forward to them
-/// over any [`AsyncRead`](tokio::io::AsyncRead)/[`AsyncWrite`](tokio::io::AsyncWrite)
+/// ([`serve_daemon`] for child processes, [`serve_fs_daemon`] for file reads,
+/// [`serve_sys_daemon`] for the blocking `vim.system` shell-out) and the edit-host-side
+/// clients ([`RemoteHostProc`], [`RemoteHostFs`], [`RemoteBlockingSystem`]) that forward
+/// to them over any [`AsyncRead`](tokio::io::AsyncRead)/[`AsyncWrite`](tokio::io::AsyncWrite)
 /// wire (a duplex, or ssh stdio to `nxvim --daemon`). [`HostFsAsync`] is the async fs
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
 pub use daemon::{
-    serve_daemon, serve_fs_daemon, FsRead, HostFsAsync, RemoteHostFs, RemoteHostProc, WatchEvent,
+    serve_daemon, serve_fs_daemon, serve_sys_daemon, FsRead, HostFsAsync, RemoteBlockingSystem,
+    RemoteHostFs, RemoteHostProc, WatchEvent,
 };
 
 use evloop::EventLoop;
@@ -122,6 +124,18 @@ pub struct ServerInit {
     /// cross this seam off-tick; the explorer and `:tabnew`/LSP go-to still use the
     /// sync `host_fs`.)
     pub host_fs_async: Option<Box<dyn HostFsAsync + Send>>,
+    /// The backend the **blocking** `vim.system(...):wait()` shell-out runs through.
+    /// `None` (the default) spawns the process locally
+    /// ([`StdBlockingSystem`](nxvim_lua::StdBlockingSystem)); the edit-host split injects
+    /// a daemon-backed [`RemoteBlockingSystem`] here so a synchronous `root_dir`
+    /// shell-out (`cargo metadata`) runs on the remote where the project files are
+    /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3, Open Decision
+    /// #5's blocking-bridge note). `Send` (boxed) so it rides [`ServerInit`] onto the
+    /// server's own thread, where it is rebuilt into the Lua runtime's
+    /// `Rc<dyn BlockingSystem>`. Unlike the off-tick fs/process seams, this one parks the
+    /// editor thread on the reply (the call is synchronous) — its wire's RPC tasks live
+    /// on their own thread so that park can't deadlock.
+    pub blocking_system: Option<Box<dyn nxvim_lua::BlockingSystem + Send>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -537,6 +551,18 @@ where
     }
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
+    // The blocking `vim.system(...):wait()` shell-out runs through this seam — a local
+    // spawn by default, or an injected daemon bridge so a `root_dir` shell-out runs on
+    // the remote where the project files live. Rebuilt here, on the server thread, into
+    // the Lua runtime's `Rc<dyn BlockingSystem>` (`ServerInit` carried it `Send` across
+    // the thread boundary; the two-step drops `Send` by unsize coercion, as `host_fs`
+    // does). `None` leaves the default local spawn in place — a bare/local session is
+    // unchanged.
+    if let Some(sys) = init.blocking_system {
+        let sys: Rc<dyn nxvim_lua::BlockingSystem + Send> = Rc::from(sys);
+        let sys: Rc<dyn nxvim_lua::BlockingSystem> = sys;
+        lua.set_blocking_system(sys);
+    }
     let (lsp, mut lsp_events) = LspManager::new();
     // Child processes are spawned through this seam — real local processes by
     // default, or an injected (eventually daemon-backed) backend. Rebuilt here,

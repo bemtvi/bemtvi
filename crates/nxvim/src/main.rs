@@ -70,6 +70,9 @@ fn main() -> Result<()> {
         // The local binary opens the startup file synchronously through the disk;
         // the async (daemon) fs is injected here by the edit-host split.
         host_fs_async: None,
+        // the local binary spawns blocking `vim.system` shell-outs locally; a daemon
+        // blocking bridge is injected here by the edit-host split.
+        blocking_system: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -125,6 +128,7 @@ fn run_headless(file: Option<String>) -> Result<()> {
         host_fs: None,
         host_proc: None,
         host_fs_async: None,
+        blocking_system: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()

@@ -27,6 +27,7 @@ use crate::ops::{
 };
 use crate::runtime::Shared;
 use crate::vimregex;
+use crate::BlockingSystem;
 
 /// Lua registry key under which the panel's `on_select` callback is stored.
 pub(crate) const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
@@ -1289,7 +1290,7 @@ pub(crate) fn install_runtime_api(
     )?;
 
     // `vim._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),
-    // block until it exits, and return `{ code, stdout, stderr }`. The pure-Lua
+    // block until it exits, and return `{ code, stdout, stderr, pid }`. The pure-Lua
     // `vim.system` wrapper layers neovim's object shape (`:wait()` / `on_exit`)
     // over it. It is synchronous because the Lua VM has no event loop yet (see
     // `vim.schedule`): an `lsp/<server>.lua` `root_dir` that shells out — e.g.
@@ -1300,65 +1301,46 @@ pub(crate) fn install_runtime_api(
     // the toolchain. stdout/stderr are returned as Lua byte strings (so non-UTF-8
     // output survives), independent of the `text` flag, which is accepted and
     // ignored.
+    //
+    // The actual spawn goes through the injected [`BlockingSystem`] seam
+    // (`Shared::blocking_system`): the default [`StdBlockingSystem`] spawns locally
+    // (today's behavior), while a daemon session injects a blocking bridge so the
+    // shell-out runs on the remote where the project files are (edit-host split,
+    // Phase 3, Open Decision #5's residual blocking-bridge note). The bridge parks
+    // this thread on the daemon's reply — the same as the local spawn blocks on its
+    // `wait` — so the call stays synchronous either way.
+    let sh = shared.clone();
     vim.set(
         "_system",
         lua.create_function(
-            |lua,
-             (cmd, cwd, env, _text): (
+            move |lua,
+                  (cmd, cwd, env, _text): (
                 Vec<String>,
                 Option<String>,
                 Option<Table>,
                 Option<bool>,
             )| {
-                let Some((program, args)) = cmd.split_first() else {
-                    return Err(mlua::Error::external(
-                        "vim.system: cmd must be a non-empty list",
-                    ));
+                let spec = crate::SystemSpec {
+                    cmd,
+                    cwd,
+                    env: crate::convert::env_pairs(env)?,
                 };
-                let mut command = std::process::Command::new(program);
-                command.args(args).stdin(std::process::Stdio::null());
-                if let Some(dir) = cwd {
-                    command.current_dir(dir);
-                }
-                if let Some(env_tbl) = env {
-                    for (k, v) in env_tbl.pairs::<String, String>().flatten() {
-                        command.env(k, v);
-                    }
-                }
+                // Take the injected backend out of `Shared` (cloning the `Rc`) and drop
+                // the borrow *before* running — the run blocks the thread (locally on
+                // `wait`, remotely on the daemon reply), and we must not hold a `RefCell`
+                // borrow across it.
+                let backend = sh.borrow().blocking_system.clone();
+                let out = match backend {
+                    Some(backend) => backend.run(spec),
+                    None => crate::StdBlockingSystem.run(spec),
+                };
                 let result = lua.create_table()?;
-                // Spawn (capturing the real pid) then wait, rather than `output()`,
-                // so the synchronous handle's `result.pid` is a real pid — parity
-                // with the async path. The wait is short by construction (a
-                // `root_dir` shell-out), so blocking here is acceptable.
-                match command
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(child) => {
-                        result.set("pid", child.id())?;
-                        match child.wait_with_output() {
-                            Ok(output) => {
-                                result.set("code", output.status.code().unwrap_or(-1))?;
-                                result.set("stdout", lua.create_string(&output.stdout)?)?;
-                                result.set("stderr", lua.create_string(&output.stderr)?)?;
-                            }
-                            Err(e) => {
-                                result.set("code", -1)?;
-                                result.set("stdout", "")?;
-                                result.set(
-                                    "stderr",
-                                    format!("vim.system: wait failed for {program}: {e}"),
-                                )?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        result.set("code", -1)?;
-                        result.set("stdout", "")?;
-                        result.set("stderr", format!("vim.system: failed to spawn {program}: {e}"))?;
-                    }
+                if let Some(pid) = out.pid {
+                    result.set("pid", pid)?;
                 }
+                result.set("code", out.code)?;
+                result.set("stdout", lua.create_string(&out.stdout)?)?;
+                result.set("stderr", lua.create_string(&out.stderr)?)?;
                 Ok(result)
             },
         )?,

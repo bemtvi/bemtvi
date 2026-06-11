@@ -412,11 +412,11 @@ the harness already makes for its client connection.
 
 **Still to do in the full split:** `lsp/manager.rs` (long-lived bidirectional
 raw-pipe transport: needs the `write_stdin` + stdout-as-events shape, not
-run-to-completion); the **blocking spawn path `vim._system`**
-(`nxvim-lua/src/install.rs`) — a *fourth* spawn site the original three-site list
-missed, which must route to the daemon and block on the round-trip, because a
-`root_dir` shell-out like `cargo metadata` must run *where the project files are*
-(the blocking-bridge mechanism of Open Decision #5's residual note);
+run-to-completion); ~~the **blocking spawn path `vim._system`**~~ ✅ DONE — Phase 3n
+below (the *fourth* spawn site the original three-site list missed; it now routes to
+the daemon over the `sys_run` wire and blocks on the round-trip via the blocking
+bridge, because a `root_dir` shell-out like `cargo metadata` must run *where the
+project files are*);
 `HostWatch` (the daemon side of `FsEventStart`, today local-only via `notify` —
 `serve_daemon` currently drops `LoopEvent::FsEvent` on the floor); the `nxvim
 --daemon` binary; and the local edit-host as a client over ssh stdio. (The
@@ -963,6 +963,75 @@ quit test). Regression-clean — full `cargo test --workspace` green (1019+ test
 `daemon_save` suite now 6), fmt + clippy `-D warnings` clean; local binaries leave off-tick
 mode off and `:wall` / `:wqa` write synchronously, unchanged.
 
+### Phase 3n — the blocking `vim.system` shell-out over the wire (`sys_run`, the blocking bridge) — ✅ DONE (2026-06-10)
+
+The *fourth* spawn site the original three-site list missed (called out under Phase 3c's
+*Still to do*), and the first wire leg whose shape is **neither** off-tick fetch (the fs
+leg) **nor** event-routed notifications (the process leg). The **synchronous**
+`vim.system(...):wait()` — the form an `lsp/<server>.lua` `root_dir` uses to run `cargo
+metadata` / `rustc --print sysroot` during `vim.lsp.enable` — runs *inline on the Lua
+tick*: the caller needs the value **now** and has nothing to hand back on a later tick, so
+it can't go off-tick like a buffer open. But it must still run **where the project files
+are** (the daemon), not the local machine where `Cargo.toml` is meaningless. That forces
+the **blocking bridge** Open Decision #5's residual note reserved for exactly the sync
+surfaces: a request/response over the wire on which the edit-host **parks its Lua thread**,
+with the wire's RPC tasks on their **own** OS thread so the parked thread can't starve the
+reader carrying its reply (the deadlock trap). (The *async* `vim.system` with `on_exit`
+already rides the Phase 3c `HostProc` wire off-tick — unchanged; only the blocking
+`:wait()` form is this slice.)
+
+The shape, kept to the one spawn site whose contract matches (the same "don't guess ahead
+of need" discipline as 3b/3c):
+- **The seam, in `nxvim-lua`** (`system.rs`): a synchronous `trait BlockingSystem { fn
+  run(&self, SystemSpec) -> SystemOutput }` with `SystemSpec` (argv / cwd / env) and
+  `SystemOutput` (code / stdout / stderr / pid). `StdBlockingSystem` is today's
+  `vim._system` spawn-and-wait logic **factored verbatim** behind the seam — the
+  editor-side default (no daemon) *and* the daemon-side backend in the real `nxvim
+  --daemon`, where "local" *is* where the project files live. `vim._system` now builds a
+  `SystemSpec` and runs it through `Shared::blocking_system` (an `Option<Rc<dyn
+  BlockingSystem>>`, `None` = the `StdBlockingSystem` default — a bare/local session is
+  byte-for-byte unchanged); `LuaRuntime::set_blocking_system` injects the daemon bridge.
+- **The wire** (`daemon.rs`, alongside the fs/process legs): one `nxvim-rpc` **request**
+  `sys_run [argv, cwd?, env]` → `[code, stdout, stderr, pid?]` (stdout/stderr as binary so
+  non-UTF-8 output survives), or a loud RPC error. Request/response, like the fs read — no
+  `id`/demux.
+- **`RemoteBlockingSystem` (edit-host side, a `BlockingSystem`)** — `connect(reader,
+  writer)` spawns a **dedicated link thread** that owns its *own* current-thread runtime
+  and the RPC link; `run` hands the spec to that thread over a plain `std::sync::mpsc`
+  channel and **parks the calling (Lua) thread** on a `std` reply channel. Parking with a
+  `std` recv — not a tokio primitive — is deliberate: `vim._system` runs *inside* the
+  server's tokio runtime, where a tokio `blocking_recv` would panic; a `std` recv just
+  parks the OS thread, and the link thread (a different thread) is free to drive the wire
+  that delivers the reply. `Send` (it holds only the channel sender) so it rides
+  `ServerInit` onto the server thread and is rebuilt into the Lua runtime's `Rc<dyn
+  BlockingSystem>`.
+- **`serve_sys_daemon` (daemon side)** — runs each `sys_run` through the *same*
+  `StdBlockingSystem` the local editor uses, on a `spawn_blocking` pool thread so a long
+  shell-out can't stall the reader, so a process behaves identically run here or across the
+  wire. `ServerInit::blocking_system: Option<Box<dyn BlockingSystem + Send>>` is the
+  injection point; `None` = today's local spawn.
+
+**Exit criteria — met.** `crates/nxvim-server/tests/daemon_system.rs`: an editor whose
+`blocking_system` is a `RemoteBlockingSystem` talking to a `serve_sys_daemon` over an
+in-process duplex runs `vim.system({...}):wait()` and sees the daemon's result inline — a
+tool name **not on the edit-host's `PATH`** comes back `code = 0` with the daemon fake's
+echoed argv and a sentinel pid, a result a real *local* spawn could not produce (it would
+be `-1`, "failed to spawn"), so the spawn was intercepted across the wire (the
+`/virtual/...` faithfulness argument the rest of the suite makes); a second test proves
+`cwd`/`env` cross intact; a third proves two distinct calls echo distinctly (reacts to
+input, not a canned constant). A **negative control** — dropping the daemon injection so
+the local `StdBlockingSystem` runs — flips the first test to `code = -1` (the missing tool),
+confirming it genuinely depends on the wire. Regression-clean — full `cargo test
+--workspace` green (the two `mouse` flakes are the documented test-shuffle race and pass in
+isolation), the `daemon_system` suite is 3, fmt + clippy `-D warnings` clean; the local
+binaries (`nxvim`, `nxvim-gui`) leave `blocking_system: None` and spawn locally, unchanged.
+
+**Still to do on the process side of the full split:** `lsp/manager.rs` (the long-lived
+bidirectional raw-pipe transport — `write_stdin` + stdout-as-events, not run-to-completion)
+remains the one process-shaped seam not yet daemon-routed; the `nxvim --daemon` binary and
+the ssh-stdio transport tie all the legs together. (`clipboard.rs` stays local-by-topology,
+struck from this list under 3c.)
+
 ### The full split
 
 The native latency payoff. Carve today's `nxvim-server` into two roles connected
@@ -1002,10 +1071,11 @@ trait HostProc {
 — is what the **remaining daemon-bound spawn sites** need and is best resolved
 against the actual wire: `lsp/manager.rs` (a language server *is* "spawn + pipe
 stdio" — no special LSP protocol needed, but it does need raw bidirectional pipe
-handles, i.e. the `write_stdin` + stdout-as-events shape, not run-to-completion)
-and the blocking `vim._system` (a sync request/response over the same wire, via
-the blocking-bridge mechanism — see the *Still to do* note under Phase 3c).
-`clipboard.rs` stays **local-by-topology** and is *not* daemon-routed (same
+handles, i.e. the `write_stdin` + stdout-as-events shape, not run-to-completion).
+The blocking `vim._system` **landed in Phase 3n** — its own `BlockingSystem` seam +
+`sys_run` request/response wire (a blocking bridge, *not* `HostProc`: it's
+synchronous, the caller parks on the reply rather than routing pid/exit as loop
+events). `clipboard.rs` stays **local-by-topology** and is *not* daemon-routed (same
 note). The in-process impl wraps today's `tokio::process`; the remote impl
 forwards to the daemon. **LSP needs no special protocol** — it collapses into
 `HostProc`.
@@ -1020,9 +1090,10 @@ forwards to the daemon. **LSP needs no special protocol** — it collapses into
   single-buffer **save** in Phase 3e, **`:edit`** in Phase 3f, the **remote explorer**
   listing in Phase 3g, **`:tabnew` / LSP go-to** in Phase 3h, and the multi-buffer
   **`:wall` / `:wqa` / `:xa`** in Phase 3m — every buffer-open path *and* every write path
-  is now off-tick, behind one shared kernel. **The fs leg and the watch leg (3i–3l) are
-  both complete**; what remains for the full split is the daemon binary / ssh transport,
-  LSP-over-`HostProc`, the blocking `vim._system`, and the Lua-visible fs semantics below.)
+  is now off-tick, behind one shared kernel. **The fs leg, the watch leg (3i–3l), and the
+  blocking `vim._system` (Phase 3n) are all complete**; what remains for the full split is
+  the daemon binary / ssh transport, LSP-over-`HostProc`, and the Lua-visible fs semantics
+  below.)
 - **Lua-visible filesystem semantics — the hardest one.** The Lua VM is local
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call
@@ -1326,12 +1397,15 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    trait. **Residual:** the *synchronous* surfaces — blocking `vim._system`,
    and any Lua-visible sync fs calls routed remote (`vim.uv.fs_stat`,
    `vim.fn.filereadable`, …) — cannot use an off-tick shape (the caller needs
-   the value *now*) and will still need the **blocking bridge**: a request over
+   the value *now*) and need the **blocking bridge**: a request over
    a channel to the daemon link, editor thread parked until the reply, with the
    link's RPC tasks on their **own** thread/runtime so the parked thread can't
    starve the reader carrying its reply (the deadlock trap — see *Still to do
    in Phase 3* under Phase 3a), plus the short-TTL stat/exists cache to damp
-   per-call round-trips.
+   per-call round-trips. **The bridge is now built and proven — Phase 3n shipped it
+   for the blocking `vim._system`** (the `BlockingSystem` seam + `sys_run` wire +
+   dedicated-link-thread park, exactly this mechanism); the Lua-visible sync fs
+   calls reuse the same bridge when the Lua-visible fs-semantics slice lands.
 6. **How the wasm edit-host gets the editor+Lua sync tick** (Phase 4/5) — the
    tick (`dispatch` → `run_pending` → `apply_lua_effects` + the mirrors) is
    synchronous but lives in `impl Server`, entangled with the async fields

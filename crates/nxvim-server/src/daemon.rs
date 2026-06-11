@@ -1,4 +1,4 @@
-//! The daemon wire protocol for the edit-host split (process + filesystem).
+//! The daemon wire protocol for the edit-host split (process + filesystem + blocking system).
 //!
 //! `docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3 moves the
 //! network boundary *below* the editor: the edit-host (core + Lua + treesitter)
@@ -81,6 +81,25 @@
 //! turns each push into a [`WatchEvent`] the server reconciles off the editor tick (the
 //! `FileChangedShell` round-trip; a reload re-fetches over `fs_read`) — the remote
 //! analogue of the local per-buffer file watch.
+//!
+//! ## The blocking-system leg (`sys_run` — a blocking bridge)
+//!
+//! The *synchronous* `vim.system(...):wait()` (an LSP `root_dir` shelling out to `cargo
+//! metadata`) must run **where the project files are** — the daemon — but unlike the
+//! async `vim.system` (which rides the process leg above off-tick) the caller needs the
+//! result *inline* on the Lua tick: it has no value to hand back later. So this leg is a
+//! **blocking bridge** — request/response on the wire, but the edit-host parks its Lua
+//! thread on the reply, with the wire's RPC tasks on their *own* OS thread so the parked
+//! thread can't starve the reader carrying that reply (Open Decision #5's residual note):
+//!
+//! | direction | method | reply |
+//! | --- | --- | --- |
+//! | edit-host → daemon | `sys_run [argv, cwd?, env]` | `[code, stdout, stderr, pid?]`, or an RPC error |
+//!
+//! [`RemoteBlockingSystem`] (the edit-host side, a [`BlockingSystem`]) owns that dedicated
+//! link thread; `serve_sys_daemon` runs each request through the *same*
+//! [`StdBlockingSystem`](nxvim_lua::StdBlockingSystem) the local editor uses, on a
+//! blocking-pool thread, so a process behaves identically run here or across the wire.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -97,6 +116,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
+use nxvim_lua::{BlockingSystem, SystemOutput, SystemSpec};
 use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
@@ -121,6 +141,12 @@ const PROC_SPAWN: &str = "proc_spawn";
 const PROC_KILL: &str = "proc_kill";
 const PROC_SPAWNED: &str = "proc_spawned";
 const PROC_EXITED: &str = "proc_exited";
+
+// The blocking-system leg (`sys_run`): a request/response shell-out that runs to
+// completion on the daemon. Distinct from the process leg above — that one is
+// event-routed (the async `vim.system` / `jobstart`), this one blocks the edit-host's
+// Lua thread on the reply (the synchronous `vim.system(...):wait()`).
+const SYS_RUN: &str = "sys_run";
 
 /// What the daemon reports back about one child, demuxed off the wire and handed to
 /// the [`RemoteHostProc::run`] future waiting on that spawn's `id`. Mirrors the two
@@ -908,4 +934,246 @@ fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FsRead::New),
         Err(e) => Err(e),
     }
+}
+
+// ===== the blocking-system leg (`sys_run`) ==================================
+//
+// `vim.system(...):wait()` (the *synchronous* form) shells out **on the edit-host's
+// Lua thread** and needs its result inline — an LSP `root_dir` running `cargo
+// metadata` must run *where the project files are* (the daemon), but the caller can't
+// go off-tick the way a buffer open does (it has no value to hand back later). So this
+// leg is a **blocking bridge**: the edit-host parks its Lua thread on the reply, and —
+// crucially — the wire's RPC tasks live on their *own* OS thread + runtime, so the
+// parked thread can never starve the reader carrying its reply (the deadlock trap the
+// plan's Open Decision #5 residual note calls out). The wire itself is a plain
+// request/response, like the fs read:
+//
+// | direction | method | reply |
+// | --- | --- | --- |
+// | edit-host → daemon | `sys_run [argv, cwd?, env]` | `[code, stdout, stderr, pid?]`, or an RPC error |
+//
+// `serve_sys_daemon` runs each request through the *same* [`StdBlockingSystem`] the
+// local editor uses today (on a blocking pool thread, so a long shell-out can't stall
+// the reader), so a process behaves identically whether it ran here or across the wire.
+
+/// A [`BlockingSystem`] that runs the synchronous `vim.system(...):wait()` shell-out on
+/// a remote daemon instead of locally — the edit-host side of the `sys_run` leg.
+///
+/// The blocking bridge: [`run`](BlockingSystem::run) hands the spec to a **dedicated
+/// link thread** (which owns the wire and its own current-thread runtime) over a plain
+/// `std` channel, then parks the calling (Lua) thread on the reply. Parking with a
+/// `std` channel — not a tokio primitive — is deliberate: `vim._system` runs *inside*
+/// the server's tokio runtime, where a tokio `blocking_recv` would panic; a `std` recv
+/// just parks the OS thread, and the link thread (a different thread entirely) is free
+/// to drive the wire that delivers the reply.
+///
+/// `Send` (it holds only a `std::sync::mpsc::Sender`) so it rides
+/// [`ServerInit`](crate::ServerInit) onto the server thread, where it is rebuilt into
+/// the editor's `Rc<dyn BlockingSystem>`.
+pub struct RemoteBlockingSystem {
+    /// Into the dedicated link thread: a spec to run plus the one-shot reply channel
+    /// the caller parks on.
+    req_tx: std::sync::mpsc::Sender<SysJob>,
+}
+
+/// One blocking shell-out queued onto the link thread: the spec, and the `std` channel
+/// the parked editor thread waits on for its [`SystemOutput`].
+type SysJob = (SystemSpec, std::sync::mpsc::Sender<SystemOutput>);
+
+impl RemoteBlockingSystem {
+    /// Connect to a daemon over `reader`/`writer`, spawning the dedicated link thread.
+    /// That thread builds its **own** current-thread runtime, opens the RPC link there,
+    /// and serves jobs one at a time (a blocking shell-out is serial by nature — the
+    /// edit-host is parked until it returns), driving each `sys_run` request to
+    /// completion on its runtime so the parked editor thread isn't the one that has to
+    /// poll the reply.
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteBlockingSystem
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<SysJob>();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                // A runtime we can't build means the link is dead on arrival; the
+                // `req_rx` is dropped, so every `run` sees the channel closed and
+                // degrades loudly rather than hanging.
+                Err(_) => return,
+            };
+            let rpc = rt.block_on(async move {
+                let (rpc, mut incoming) = connect(reader, writer);
+                // Drain the incoming stream so the connection isn't torn down (dropping
+                // the receiver would). The sys leg has no daemon→edit-host pushes, so
+                // this only ever observes EOF — but the receiver must stay alive and
+                // consumed for the link to live.
+                tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+                rpc
+            });
+            // Park on the `std` channel between jobs; drive each to completion on *this*
+            // thread's runtime. While we're parked here the runtime is idle (no pushes
+            // to miss); `block_on` below drives the wire's reader/writer tasks whenever a
+            // job is in flight, so the reply lands.
+            while let Ok((spec, reply_tx)) = req_rx.recv() {
+                let out = rt.block_on(async {
+                    match rpc.request(SYS_RUN, encode_sys_run(&spec)).await {
+                        Ok(v) => decode_sys_output(v),
+                        // A transport failure (daemon gone) degrades loudly to a
+                        // `code = -1` result, never a panic — `vim.system` callers rely
+                        // on a value.
+                        Err(e) => SystemOutput::failed(format!("vim.system: daemon error: {e}")),
+                    }
+                });
+                // The receiver is gone only if the caller was itself dropped mid-call;
+                // nothing to deliver to, so discard.
+                let _ = reply_tx.send(out);
+            }
+        });
+        RemoteBlockingSystem { req_tx }
+    }
+}
+
+impl BlockingSystem for RemoteBlockingSystem {
+    fn run(&self, spec: SystemSpec) -> SystemOutput {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self.req_tx.send((spec, reply_tx)).is_err() {
+            return SystemOutput::failed("vim.system: daemon link is gone");
+        }
+        // Park the editor thread until the link thread delivers the daemon's reply. This
+        // is the blocking bridge: `vim._system` is synchronous (the LSP `root_dir`
+        // caller needs the value inline), so the tick blocks here, the same as a local
+        // spawn blocks on `wait`. A `std` recv parks the OS thread without caring that
+        // it sits inside the server's tokio runtime; the link's reader is on its own
+        // thread, free to read the reply that unblocks us.
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| SystemOutput::failed("vim.system: daemon link dropped the request"))
+    }
+}
+
+/// `sys_run` request params: `[argv, cwd?, env]`, with `env` an array of `[k, v]`
+/// pairs. The inverse of [`decode_sys_run`].
+fn encode_sys_run(spec: &SystemSpec) -> Vec<Value> {
+    let cmd = Value::Array(spec.cmd.iter().map(|s| Value::from(s.clone())).collect());
+    let cwd = spec.cwd.clone().map_or(Value::Nil, Value::from);
+    let env = Value::Array(
+        spec.env
+            .iter()
+            .map(|(k, v)| Value::Array(vec![Value::from(k.clone()), Value::from(v.clone())]))
+            .collect(),
+    );
+    vec![cmd, cwd, env]
+}
+
+/// `sys_run` request params → a [`SystemSpec`]. Tolerant of a malformed frame (a peer
+/// is the same build): a missing argv yields an empty `cmd`, which the backend reports
+/// as the "non-empty list" degrade.
+fn decode_sys_run(params: &[Value]) -> SystemSpec {
+    let cmd = params
+        .first()
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd = params.get(1).and_then(Value::as_str).map(str::to_string);
+    let env = params
+        .get(2)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    let p = p.as_array()?;
+                    Some((
+                        p.first()?.as_str()?.to_string(),
+                        p.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SystemSpec { cmd, cwd, env }
+}
+
+/// `[code, stdout, stderr, pid?]` reply → a [`SystemOutput`]. The inverse of
+/// [`encode_sys_output`]; a malformed reply degrades loudly (`code = -1`).
+fn decode_sys_output(v: Value) -> SystemOutput {
+    let Value::Array(a) = v else {
+        return SystemOutput::failed("sys_run: malformed reply");
+    };
+    let code = a.first().and_then(Value::as_i64).unwrap_or(-1) as i32;
+    let stdout = a.get(1).map(value_bytes).unwrap_or_default();
+    let stderr = a.get(2).map(value_bytes).unwrap_or_default();
+    let pid = a.get(3).and_then(Value::as_u64).map(|p| p as u32);
+    SystemOutput {
+        code,
+        stdout,
+        stderr,
+        pid,
+    }
+}
+
+/// Raw bytes out of a wire value — `Binary` (the encoding we send) or, defensively, a
+/// `String`. Anything else is empty.
+fn value_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Binary(b) => b.clone(),
+        Value::String(s) => s.as_bytes().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// `[code, stdout, stderr, pid?]` reply for a [`SystemOutput`]. `stdout`/`stderr` ride
+/// as binary so non-UTF-8 output survives.
+fn encode_sys_output(out: &SystemOutput) -> Value {
+    Value::Array(vec![
+        Value::from(out.code),
+        Value::Binary(out.stdout.clone()),
+        Value::Binary(out.stderr.clone()),
+        out.pid.map_or(Value::Nil, Value::from),
+    ])
+}
+
+/// Run the daemon end of the *blocking-system* wire over `reader`/`writer`, serving
+/// `sys_run` requests through `sys` (the daemon's real backend —
+/// [`StdBlockingSystem`](nxvim_lua::StdBlockingSystem) in the binary, a fake in tests).
+/// Each run is offloaded to a blocking-pool thread so a long shell-out can't stall the
+/// reader (the edit-host can have at most one blocking run in flight — it's parked —
+/// but the offload keeps `incoming` responsive regardless). Returns when the connection
+/// closes.
+pub async fn serve_sys_daemon<R, W>(
+    reader: R,
+    writer: W,
+    sys: Box<dyn BlockingSystem + Send + Sync>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, mut incoming) = connect(reader, writer);
+    let sys: Arc<dyn BlockingSystem + Send + Sync> = Arc::from(sys);
+    while let Some(msg) = incoming.recv().await {
+        if let Incoming::Request { id, method, params } = msg {
+            if method == SYS_RUN {
+                let sys = sys.clone();
+                let rpc = rpc.clone();
+                tokio::spawn(async move {
+                    let spec = decode_sys_run(&params);
+                    let reply = match tokio::task::spawn_blocking(move || sys.run(spec)).await {
+                        Ok(out) => Ok(encode_sys_output(&out)),
+                        Err(e) => Err(Value::from(format!("sys_run: join error: {e}"))),
+                    };
+                    rpc.respond(id, reply);
+                });
+            } else {
+                rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
+            }
+        }
+    }
+    Ok(())
 }

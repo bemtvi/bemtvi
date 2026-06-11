@@ -79,6 +79,9 @@ fn main() -> Result<()> {
         // The local GUI opens the startup file synchronously through the disk; the
         // async (daemon) fs is injected here by the edit-host split.
         host_fs_async: None,
+        // The local GUI runs blocking `vim.system` shell-outs locally; a daemon
+        // blocking bridge is injected here by the edit-host split.
+        blocking_system: None,
     };
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

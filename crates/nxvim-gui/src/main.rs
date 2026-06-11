@@ -65,6 +65,9 @@ fn main() -> Result<()> {
     let init = ServerInit {
         file,
         config_dir,
+        // Persist cross-session state under `stdpath("state")/shada` (local; a
+        // remote session persists on whatever host runs the editor).
+        state_dir: Some(nxvim_server::shada_dir()),
         runtimepath,
         clipboard: nxvim_server::ClipboardProvider::System,
         // The real binary uses the monotonic wall clock for mouse multi-click

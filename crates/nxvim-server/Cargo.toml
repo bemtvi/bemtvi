@@ -30,6 +30,11 @@ tokio.workspace = true
 wtransport.workspace = true
 # CSPRNG for the daemon's launch-minted bearer token (`quic.rs`).
 getrandom.workspace = true
+# Persistence (shada): the per-instance redb store + its msgpack value encoding.
+# See `shada.rs` and docs/plans/2026-06-11-shada-persistence.md.
+redb.workspace = true
+rmp-serde.workspace = true
+serde = { workspace = true }
 # Native filesystem watching backing `vim.uv.fs_event` (driven from the event-loop
 # actor in evloop.rs).
 notify.workspace = true

@@ -43,6 +43,7 @@ mod multicursor;
 mod operators;
 mod options;
 mod panel;
+mod persist;
 mod registers;
 mod search;
 mod syntax;
@@ -61,6 +62,7 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
+pub use self::persist::{PersistState, RegisterEntry};
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;

@@ -32,6 +32,7 @@ mod lsp;
 mod quic;
 mod redraw;
 mod save;
+mod shada;
 mod treesitter;
 
 /// The process-spawning seam (`vim.system` / `jobstart` / `:!`) and its types,
@@ -39,6 +40,10 @@ mod treesitter;
 /// daemon-backed [`HostProc`] here (the process-side companion to
 /// [`nxvim_core::HostFs`]).
 pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
+/// The default shada (persistence) directory for the real binary —
+/// `stdpath("state")/shada`. Editor entrypoints pass `Some(shada_dir())` as
+/// [`ServerInit::state_dir`]; tests pass a temp dir or leave it `None`.
+pub use shada::shada_dir;
 
 /// The daemon wire protocol for the edit-host split: the daemon-side servers
 /// ([`serve_daemon`] for child processes, [`serve_fs_daemon`] for file reads,
@@ -96,6 +101,12 @@ pub struct ServerInit {
     pub file: Option<String>,
     /// Config directory whose `init.lua` is sourced at startup (`None` to skip).
     pub config_dir: Option<PathBuf>,
+    /// The shada (persistence) store directory. `None` (the default) disables
+    /// persistence entirely — so tests that don't opt in never touch the real
+    /// state dir and stay hermetic. The real binary sets it to
+    /// [`shada::shada_dir`] (`stdpath("state")/shada`); a test sets a temp dir.
+    /// See `docs/plans/2026-06-11-shada-persistence.md`.
+    pub state_dir: Option<PathBuf>,
     /// Directories Lua searches for modules and runtime files (the runtimepath).
     pub runtimepath: Vec<PathBuf>,
     /// What backs the system-clipboard registers `"+` / `"*`. Defaults to
@@ -810,6 +821,26 @@ where
     // Seed the buffer set too, so the startup buffer isn't seen as "newly gone"
     // and a never-deleted buffer never triggers a spurious cleanup.
     server.known_buffers = server.editor.buffer_ids();
+    // Load the shada (persistence) store before the first frame: recency-merge any
+    // sibling stores and seed this session's registers (later: marks, history,
+    // jumplist) so a plugin reading them at `VimEnter` sees the restored state.
+    // `None` = persistence disabled (the test default, unless a test opts in). A
+    // store that won't open is surfaced but never fatal — the editor runs on.
+    let shada = match init.state_dir.as_ref() {
+        Some(dir) => match shada::Shada::open(dir) {
+            Ok((state, handle)) => {
+                server.editor.import_persist(state);
+                Some(handle)
+            }
+            Err(e) => {
+                server
+                    .editor
+                    .echo(format!("shada: could not open store: {e}"));
+                None
+            }
+        },
+        None => None,
+    };
     server.emit_lifecycle_events();
     server.run_pending();
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a
@@ -901,6 +932,14 @@ where
                 }
                 server.settle_events(true);
             }
+        }
+    }
+    // The loop has exited (quit or client disconnect): flush the final snapshot to
+    // this instance's store, then drop it (releasing the file lock) so the next
+    // instance can merge this one's clean checkpoint. Best-effort — we're leaving.
+    if let Some(shada) = &shada {
+        if let Err(e) = shada.flush(&server.editor.export_persist()) {
+            eprintln!("shada: final flush failed: {e}");
         }
     }
     Ok(())

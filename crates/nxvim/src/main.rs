@@ -146,6 +146,10 @@ fn main() -> Result<()> {
     let init = ServerInit {
         file,
         config_dir,
+        // Persist cross-session state (registers, marks, history, …) under
+        // `stdpath("state")/shada`. Editor state lives where the editor runs, so a
+        // daemon/remote session persists on whatever host runs this editor.
+        state_dir: Some(nxvim_server::shada_dir()),
         runtimepath,
         // The real editor wires the host clipboard for the `"+` / `"*` registers.
         clipboard: nxvim_server::ClipboardProvider::System,
@@ -220,6 +224,10 @@ fn run_headless(file: Option<String>) -> Result<()> {
     let init = ServerInit {
         file,
         config_dir,
+        // Persist cross-session state (registers, marks, history, …) under
+        // `stdpath("state")/shada`. Editor state lives where the editor runs, so a
+        // daemon/remote session persists on whatever host runs this editor.
+        state_dir: Some(nxvim_server::shada_dir()),
         runtimepath,
         clipboard: nxvim_server::ClipboardProvider::System,
         mouse_clock: None,
@@ -388,6 +396,9 @@ where
             let init = ServerInit {
                 file,
                 config_dir,
+                // Editor + Lua run locally in a daemon session, so shada is local
+                // too (only fs/proc/LSP cross to the daemon).
+                state_dir: Some(nxvim_server::shada_dir()),
                 runtimepath,
                 clipboard: nxvim_server::ClipboardProvider::System,
                 mouse_clock: None,

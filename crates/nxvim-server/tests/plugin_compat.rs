@@ -1096,3 +1096,34 @@ async fn getcompletion_color_lists_runtimepath_colorschemes() {
     .await;
     assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
 }
+
+/// lazy.nvim's update view sets diagnostics in its own scratch buffer under its own
+/// namespace (`vim.diagnostic.set`) and clears them when the float closes
+/// (`vim.diagnostic.reset`). `reset` was nil — `float.lua` crashed on close with
+/// "attempt to call field 'reset'". Both must exist and round-trip per namespace.
+#[tokio::test]
+async fn vim_diagnostic_set_reset_roundtrip() {
+    let (rpc, _incoming) = start(vec![]).await;
+    let report = exec_lua(
+        &rpc,
+        r#"
+        local function eq(a, b, msg) if a ~= b then error(msg..": "..tostring(a).." ~= "..tostring(b)) end end
+        local ok, err = pcall(function()
+          local ns = vim.api.nvim_create_namespace("compat_diag")
+          local buf = vim.api.nvim_create_buf(false, true)
+          eq(type(vim.diagnostic.set), "function", "vim.diagnostic.set exists")
+          eq(type(vim.diagnostic.reset), "function", "vim.diagnostic.reset exists")
+          vim.diagnostic.set(ns, buf, {
+            { lnum = 0, col = 0, message = "hello", severity = vim.diagnostic.severity.INFO },
+          })
+          eq(#vim.diagnostic.get(buf, { namespace = ns }), 1, "set then get sees the entry")
+          -- reset clears that (namespace, buffer) — the call that used to crash.
+          vim.diagnostic.reset(ns, buf)
+          eq(#vim.diagnostic.get(buf, { namespace = ns }), 0, "reset clears the entry")
+        end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .await;
+    assert_eq!(report.as_str().unwrap_or("<non-string>"), "OK");
+}

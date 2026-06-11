@@ -29,7 +29,29 @@ vim.diagnostic.severity = {
 vim._diagnostics = vim._diagnostics or {}
 function vim._set_diagnostics(bufnr, list) vim._diagnostics[bufnr or 0] = list or {} end
 
+-- Client-set diagnostics (vim.diagnostic.set), keyed by bufnr → namespace → list.
+-- Kept apart from the LSP-pushed mirror above so a plugin that manages its own
+-- diagnostics (lazy.nvim's update view, in its own scratch buffer + namespace)
+-- never collides with a file buffer's LSP diagnostics. `get` merges both.
+-- INCOMPLETE: these are stored and read back by `get`, but not yet rendered —
+-- nxvim's underline / virtual-text / sign surfaces are driven from the server's
+-- LSP store, which Lua-set diagnostics don't reach. set→get→reset round-trips.
+vim._diagnostics_ns = vim._diagnostics_ns or {}
+
 local function diag_current_bufnr() return vim._cur_buf and vim._cur_buf.bufnr or 0 end
+
+-- Does namespace `ns` satisfy a `get`/`reset` `namespace` filter? `want` is nil
+-- (any), a single id, or a list of ids.
+local function diag_ns_wanted(ns, want)
+  if want == nil then return true end
+  if type(want) == "table" then
+    for _, w in ipairs(want) do
+      if w == ns then return true end
+    end
+    return false
+  end
+  return ns == want
+end
 
 -- vim.diagnostic.get([bufnr, [opts]]): diagnostics as plain tables. `nil` bufnr →
 -- every buffer; `0` → the current one. `opts.severity` (a number) filters. The
@@ -38,20 +60,43 @@ local function diag_current_bufnr() return vim._cur_buf and vim._cur_buf.bufnr o
 function vim.diagnostic.get(bufnr, opts)
   opts = opts or {}
   local out = {}
+  local function take(b, d)
+    if opts.severity == nil or d.severity == opts.severity then
+      local copy = { bufnr = b }
+      for k, v in pairs(d) do
+        copy[k] = v
+      end
+      out[#out + 1] = copy
+    end
+  end
   local function collect(b)
-    for _, d in ipairs(vim._diagnostics[b] or {}) do
-      if opts.severity == nil or d.severity == opts.severity then
-        local copy = { bufnr = b }
-        for k, v in pairs(d) do
-          copy[k] = v
+    -- `opts.namespace` (a single id or a list) restricts to client-set
+    -- diagnostics in those namespaces; absent, every source is merged (the
+    -- LSP-pushed mirror plus all client namespaces), matching neovim.
+    if opts.namespace == nil then
+      for _, d in ipairs(vim._diagnostics[b] or {}) do
+        take(b, d)
+      end
+    end
+    local byns = vim._diagnostics_ns[b]
+    if byns then
+      for ns, list in pairs(byns) do
+        if diag_ns_wanted(ns, opts.namespace) then
+          for _, d in ipairs(list) do
+            take(b, d)
+          end
         end
-        out[#out + 1] = copy
       end
     end
   end
   if bufnr == nil then
+    local seen = {}
     for b in pairs(vim._diagnostics) do
+      seen[b] = true
       collect(b)
+    end
+    for b in pairs(vim._diagnostics_ns) do
+      if not seen[b] then collect(b) end
     end
   else
     if bufnr == 0 then bufnr = diag_current_bufnr() end
@@ -122,4 +167,40 @@ function vim.diagnostic.config(opts, _namespace)
     signs ~= false and signs ~= nil,
     sign_text
   )
+end
+
+-- vim.diagnostic.set(namespace, bufnr, diagnostics[, opts]): replace the
+-- diagnostics for (namespace, bufnr). `bufnr` 0 means the current buffer. The
+-- entries are stored as given (each typically { lnum, col, message, severity });
+-- `opts` (display overrides) is accepted but not yet honored — see the INCOMPLETE
+-- note on vim._diagnostics_ns. A plugin (lazy.nvim's update view) drives its own
+-- buffer's diagnostics through this.
+function vim.diagnostic.set(namespace, bufnr, diagnostics, _opts)
+  if bufnr == 0 then bufnr = diag_current_bufnr() end
+  local byns = vim._diagnostics_ns[bufnr]
+  if not byns then
+    byns = {}
+    vim._diagnostics_ns[bufnr] = byns
+  end
+  byns[namespace] = diagnostics or {}
+end
+
+-- vim.diagnostic.reset([namespace, [bufnr]]): clear client-set diagnostics. With
+-- no args, every namespace in every buffer; with a namespace, that namespace in
+-- every buffer (or just `bufnr` when given). lazy.nvim calls this when its update
+-- float closes — it used to crash because the function was missing.
+function vim.diagnostic.reset(namespace, bufnr)
+  if namespace == nil then
+    vim._diagnostics_ns = {}
+    return
+  end
+  if bufnr ~= nil then
+    if bufnr == 0 then bufnr = diag_current_bufnr() end
+    local byns = vim._diagnostics_ns[bufnr]
+    if byns then byns[namespace] = nil end
+    return
+  end
+  for _, byns in pairs(vim._diagnostics_ns) do
+    byns[namespace] = nil
+  end
 end

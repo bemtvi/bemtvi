@@ -1366,6 +1366,9 @@ impl EditHost {
         self.drain_pending_saves();
         self.drain_pending_quit_all();
         self.drain_pending_opens();
+        // Explicit `:wshada` / `:rshada` raised this convergence: flush / re-merge the
+        // store. After the opens/saves drain so a `:rshada` sees the settled session.
+        self.drain_pending_shada();
     }
 }
 

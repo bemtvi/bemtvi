@@ -578,6 +578,11 @@ impl Editor {
             "helpt" | "helpta" | "helptag" | "helptags" => {
                 self.echo("helptags: not supported — no help system yet, tags not generated");
             }
+            // `:wsh[ada]` / `:rsh[ada][!]` — the explicit shada flush / reload. The
+            // store lives in the server (behind the `ShadaStore` seam), so these only
+            // *enqueue* a request the server drains after the tick; they never no-op.
+            "wsh" | "wsha" | "wshad" | "wshada" => self.ex_wshada(args),
+            "rsh" | "rsha" | "rshad" | "rshada" => self.ex_rshada(bang, args),
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
             _ => self.deferred_commands.push(rest.to_string()),
@@ -597,6 +602,36 @@ impl Editor {
             },
             Err(e) => self.echo(e),
         }
+    }
+
+    /// `:wshada` — flush this instance's shada store now. Core can't write the
+    /// store (it lives behind the server's `ShadaStore` seam), so this enqueues a
+    /// [`ShadaRequest::Write`] the server drains after the tick. A filename argument
+    /// (neovim's `:wshada {file}`) is not supported — we always write *this*
+    /// instance's store — and is rejected loudly rather than silently ignored.
+    fn ex_wshada(&mut self, args: &str) {
+        if !args.trim().is_empty() {
+            self.echo(
+                "E474: :wshada to a named file is not supported (writes this instance's store)",
+            );
+            return;
+        }
+        self.pending_shada.push(ShadaRequest::Write);
+    }
+
+    /// `:rshada[!]` — re-read the shada store(s) into the running session. Enqueues a
+    /// [`ShadaRequest::Read`] (the server re-merges every readable store and applies
+    /// it); the `!` overwrites conflicting live registers, otherwise empty slots are
+    /// filled. A filename argument is rejected loudly, as for `:wshada`.
+    fn ex_rshada(&mut self, bang: bool, args: &str) {
+        if !args.trim().is_empty() {
+            self.echo(
+                "E474: :rshada from a named file is not supported (reads this instance's store)",
+            );
+            return;
+        }
+        self.pending_shada
+            .push(ShadaRequest::Read { replace: bang });
     }
 
     /// Consume any leading range from `cmd`, resolving addresses against the

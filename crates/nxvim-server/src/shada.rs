@@ -66,6 +66,14 @@ pub trait ShadaStore {
     fn load(&mut self) -> std::io::Result<PersistState>;
     /// Persist `state` into this instance's store.
     fn flush(&mut self, state: &PersistState) -> std::io::Result<()>;
+    /// Re-read this instance's own store plus every readable sibling and return the
+    /// merged snapshot, **without** minting a file, shifting the numbered marks, or
+    /// compacting (the load-only steps). This is the `:rshada` read: it picks up any
+    /// sibling that has exited since startup (a still-live one is locked, hence
+    /// skipped — neovim's contract) and folds it into the running session. The
+    /// numbered marks come through un-shifted (the `'0` shift is a launch event,
+    /// not a re-read) and the snapshot carries no `exit_cursor`.
+    fn reload(&mut self) -> std::io::Result<PersistState>;
 }
 
 /// `registers` table: key is the one-char register name, value is a msgpack
@@ -171,8 +179,13 @@ struct StoredMeta {
 pub struct RedbFileStore {
     dir: PathBuf,
     /// This instance's database, opened lazily by [`load`](RedbFileStore::load) and
-    /// reused by [`flush`](RedbFileStore::flush).
+    /// reused by [`flush`](RedbFileStore::flush) / [`reload`](RedbFileStore::reload).
     db: Option<Database>,
+    /// This instance's own store path, set at [`load`](RedbFileStore::load) so
+    /// [`reload`](RedbFileStore::reload) can exclude it from the sibling glob (its
+    /// data is read through the live `db` handle, never re-opened — redb's exclusive
+    /// lock forbids a second open of our own file).
+    path: Option<PathBuf>,
 }
 
 impl RedbFileStore {
@@ -182,6 +195,7 @@ impl RedbFileStore {
         Self {
             dir: dir.into(),
             db: None,
+            path: None,
         }
     }
 }
@@ -192,24 +206,11 @@ impl ShadaStore for RedbFileStore {
         let my_path = self.dir.join(instance_filename());
         let db = Database::create(&my_path).map_err(std::io::Error::other)?;
 
-        // Merge every sibling we can open; record the ones we absorbed so we can
-        // delete them once our merged snapshot is durable.
-        let mut best_regs: std::collections::HashMap<char, StoredRegister> =
-            std::collections::HashMap::new();
-        let mut best_marks: std::collections::HashMap<char, StoredMark> =
-            std::collections::HashMap::new();
-        let mut best_file_marks: std::collections::HashMap<(String, char), StoredFileMark> =
-            std::collections::HashMap::new();
-        let mut best_numbered: std::collections::HashMap<char, StoredMark> =
-            std::collections::HashMap::new();
-        let mut best_changelist: std::collections::HashMap<String, StoredChangelist> =
-            std::collections::HashMap::new();
-        let mut hist_search = HistMerge::default();
-        let mut hist_ex = HistMerge::default();
-        // The jumplist is an ordered sequence, not a union: the newest store's whole
-        // list wins. The exit cursor likewise tracks the newest *clean* exit.
-        let mut best_jumplist: (u64, Vec<StoredPos>) = (0, Vec::new());
-        let mut best_exit: (u64, Option<StoredPos>) = (0, None);
+        // Open every sibling we can (a live instance holds the lock → `open` fails →
+        // skip it, its data simply not visible yet — neovim's contract). Keep the
+        // handles alive so we can read them, and the paths so we can delete the dead
+        // ones once our merged snapshot is durable.
+        let mut siblings: Vec<Database> = Vec::new();
         let mut absorbed: Vec<PathBuf> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&self.dir) {
             for entry in read_dir.flatten() {
@@ -217,99 +218,70 @@ impl ShadaStore for RedbFileStore {
                 if path == my_path || path.extension().and_then(|e| e.to_str()) != Some("redb") {
                     continue;
                 }
-                // A live instance holds the lock → `open` fails → skip it (its data
-                // is simply not visible yet, exactly neovim's contract). A dead one
-                // opens; we read it, drop the handle, and mark it for deletion.
                 if let Ok(sibling) = Database::open(&path) {
-                    merge_registers(&sibling, &mut best_regs);
-                    merge_global_marks(&sibling, &mut best_marks);
-                    merge_file_marks(&sibling, &mut best_file_marks);
-                    merge_numbered_marks(&sibling, &mut best_numbered);
-                    merge_changelists(&sibling, &mut best_changelist);
-                    merge_history(&sibling, HIST_SEARCH, &mut hist_search);
-                    merge_history(&sibling, HIST_EX, &mut hist_ex);
-                    if let Some(meta) = read_meta(&sibling) {
-                        if meta.flush_ts > best_jumplist.0 {
-                            best_jumplist = (meta.flush_ts, read_jumplist(&sibling));
-                        }
-                        if let Some(exit) = meta.exit {
-                            if meta.exit_ts > best_exit.0 {
-                                best_exit = (meta.exit_ts, Some(exit));
-                            }
-                        }
-                    }
-                    drop(sibling);
+                    siblings.push(sibling);
                     absorbed.push(path);
                 }
             }
         }
 
+        let mut merged = collect_merge(siblings.iter());
         // The numbered-mark shift: a consumed clean-exit cursor becomes `'0` and the
         // prior `'0`–`'8` slide down one (`'9` drops). With no exit to consume the
-        // set passes through unchanged (e.g. after a crash, so `'0` stays put).
-        let numbered_marks = shift_numbered_marks(best_numbered, best_exit.1);
-
-        let merged = PersistState {
-            registers: best_regs
-                .into_iter()
-                .map(|(name, stored)| RegisterEntry {
-                    name,
-                    text: stored.text,
-                    linewise: stored.linewise,
-                })
-                .collect(),
-            global_marks: best_marks
-                .into_iter()
-                .map(|(name, stored)| GlobalMarkEntry {
-                    name,
-                    path: stored.path.into(),
-                    line: stored.line,
-                    col: stored.col,
-                })
-                .collect(),
-            file_marks: best_file_marks
-                .into_iter()
-                .map(|((path, name), stored)| FileMarkEntry {
-                    path: path.into(),
-                    name,
-                    line: stored.line,
-                    col: stored.col,
-                })
-                .collect(),
-            search_history: hist_search.finish(),
-            ex_history: hist_ex.finish(),
-            numbered_marks,
-            file_changelists: best_changelist
-                .into_iter()
-                .map(|(path, stored)| FileChangelist {
-                    path: path.into(),
-                    entries: stored.entries,
-                })
-                .collect(),
-            jumplist: best_jumplist
-                .1
-                .into_iter()
-                .map(|p| JumpPos {
-                    path: p.path.into(),
-                    line: p.line,
-                    col: p.col,
-                })
-                .collect(),
-            // Consumed into `'0` by the shift above — a merged snapshot carries none.
-            exit_cursor: None,
-        };
+        // set passes through unchanged (e.g. after a crash, so `'0` stays put). This
+        // is the one load-only step — a `:rshada` re-read never re-shifts.
+        let numbered_marks =
+            shift_numbered_marks(std::mem::take(&mut merged.numbered), merged.exit.1.take());
+        let state = build_state(merged, numbered_marks);
 
         // Make the absorbed data durable in *our* file before deleting the
         // siblings. A crash before this commit leaves the siblings intact (the next
         // instance re-absorbs them); a crash after the commit but before the deletes
         // leaves redundant copies (likewise harmless). Either way: no data loss.
-        write_state(&db, &merged)?;
+        write_state(&db, &state)?;
+        // Release the sibling handles before unlinking their files (some platforms
+        // refuse to delete a still-open file).
+        drop(siblings);
         for path in absorbed {
             let _ = std::fs::remove_file(path);
         }
 
+        self.path = Some(my_path);
         self.db = Some(db);
-        Ok(merged)
+        Ok(state)
+    }
+
+    fn reload(&mut self) -> std::io::Result<PersistState> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("shada reload before load"))?;
+        let my_path = self.path.as_deref();
+
+        // Open every readable sibling (a still-live one is locked, hence skipped),
+        // but do NOT record them for deletion — a re-read is non-destructive;
+        // compaction stays a load-time concern.
+        let mut siblings: Vec<Database> = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&self.dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if Some(path.as_path()) == my_path
+                    || path.extension().and_then(|e| e.to_str()) != Some("redb")
+                {
+                    continue;
+                }
+                if let Ok(sibling) = Database::open(&path) {
+                    siblings.push(sibling);
+                }
+            }
+        }
+
+        // Merge our own live store (read through the existing handle — redb forbids a
+        // second open of it) together with the readable siblings. No shift, no exit
+        // consumption: the numbered marks come through as stored.
+        let mut merged = collect_merge(std::iter::once(db).chain(siblings.iter()));
+        let numbered_marks = numbered_passthrough(std::mem::take(&mut merged.numbered));
+        Ok(build_state(merged, numbered_marks))
     }
 
     fn flush(&mut self, state: &PersistState) -> std::io::Result<()> {
@@ -479,6 +451,129 @@ fn write_history(
             .map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+/// The raw recency-merge of one or more stores, before the numbered-mark shift and
+/// the projection into a [`PersistState`]. Shared by [`RedbFileStore::load`] (which
+/// shifts the numbered marks) and [`RedbFileStore::reload`] (which doesn't), so the
+/// fold logic lives in exactly one place.
+#[derive(Default)]
+struct MergedRaw {
+    regs: std::collections::HashMap<char, StoredRegister>,
+    global_marks: std::collections::HashMap<char, StoredMark>,
+    file_marks: std::collections::HashMap<(String, char), StoredFileMark>,
+    numbered: std::collections::HashMap<char, StoredMark>,
+    changelist: std::collections::HashMap<String, StoredChangelist>,
+    hist_search: HistMerge,
+    hist_ex: HistMerge,
+    /// The jumplist is an ordered sequence, not a union: the newest store's whole
+    /// list wins (keyed by its `meta.flush_ts`).
+    jumplist: (u64, Vec<StoredPos>),
+    /// The newest *clean* exit cursor across the stores (keyed by `meta.exit_ts`).
+    exit: (u64, Option<StoredPos>),
+}
+
+/// Recency-merge a set of opened stores into one [`MergedRaw`]: per-key newest-`ts`
+/// wins for registers / marks / changelists, history unions by text keeping the
+/// newest sequence, and the jumplist / exit-cursor take the newest store's whole
+/// value. Order-independent, so the caller can pass siblings alone (load) or its own
+/// store plus siblings (reload).
+fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
+    let mut m = MergedRaw::default();
+    for db in dbs {
+        merge_registers(db, &mut m.regs);
+        merge_global_marks(db, &mut m.global_marks);
+        merge_file_marks(db, &mut m.file_marks);
+        merge_numbered_marks(db, &mut m.numbered);
+        merge_changelists(db, &mut m.changelist);
+        merge_history(db, HIST_SEARCH, &mut m.hist_search);
+        merge_history(db, HIST_EX, &mut m.hist_ex);
+        if let Some(meta) = read_meta(db) {
+            if meta.flush_ts > m.jumplist.0 {
+                m.jumplist = (meta.flush_ts, read_jumplist(db));
+            }
+            if let Some(exit) = meta.exit {
+                if meta.exit_ts > m.exit.0 {
+                    m.exit = (meta.exit_ts, Some(exit));
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Project a [`MergedRaw`] (its numbered marks already resolved to `numbered_marks`,
+/// shifted or not by the caller) into the [`PersistState`] the editor imports. The
+/// snapshot never carries an `exit_cursor`: load consumes it into `'0` via the
+/// shift, and a `:rshada` re-read ignores it.
+fn build_state(m: MergedRaw, numbered_marks: Vec<NumberedMark>) -> PersistState {
+    PersistState {
+        registers: m
+            .regs
+            .into_iter()
+            .map(|(name, stored)| RegisterEntry {
+                name,
+                text: stored.text,
+                linewise: stored.linewise,
+            })
+            .collect(),
+        global_marks: m
+            .global_marks
+            .into_iter()
+            .map(|(name, stored)| GlobalMarkEntry {
+                name,
+                path: stored.path.into(),
+                line: stored.line,
+                col: stored.col,
+            })
+            .collect(),
+        file_marks: m
+            .file_marks
+            .into_iter()
+            .map(|((path, name), stored)| FileMarkEntry {
+                path: path.into(),
+                name,
+                line: stored.line,
+                col: stored.col,
+            })
+            .collect(),
+        search_history: m.hist_search.finish(),
+        ex_history: m.hist_ex.finish(),
+        numbered_marks,
+        file_changelists: m
+            .changelist
+            .into_iter()
+            .map(|(path, stored)| FileChangelist {
+                path: path.into(),
+                entries: stored.entries,
+            })
+            .collect(),
+        jumplist: m
+            .jumplist
+            .1
+            .into_iter()
+            .map(|p| JumpPos {
+                path: p.path.into(),
+                line: p.line,
+                col: p.col,
+            })
+            .collect(),
+        exit_cursor: None,
+    }
+}
+
+/// The merged numbered marks passed through *unchanged* — the `:rshada` re-read
+/// path, where the `'0` shift (a launch-only event) must not re-run.
+fn numbered_passthrough(marks: std::collections::HashMap<char, StoredMark>) -> Vec<NumberedMark> {
+    marks
+        .into_iter()
+        .map(|(digit, m)| NumberedMark {
+            digit,
+            path: m.path.into(),
+            line: m.line,
+            col: m.col,
+        })
+        .collect()
 }
 
 /// Fold one store's `registers` table into the running best-by-timestamp map.

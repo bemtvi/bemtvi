@@ -107,6 +107,25 @@ pub struct FileMarkEntry {
     pub col: usize,
 }
 
+/// A deferred shada I/O request raised by `:wshada` / `:rshada`. Core can't touch
+/// the store (it lives in the server, behind the `ShadaStore` seam), so the
+/// ex-command enqueues one of these and the server drains it after the tick — the
+/// same core→server hand-off [`PendingSave`](super::PendingSave) / `pending_checktime`
+/// use. Phase 7 (`docs/plans/2026-06-11-shada-persistence.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadaRequest {
+    /// `:wshada` — flush this instance's store now (a synchronous, explicit
+    /// checkpoint, like `:w`). Never writes the clean-exit cursor: `'0` tracks
+    /// *exits* only, and `:wshada` is not one.
+    Write,
+    /// `:rshada` / `:rshada!` — re-read the store(s) into the running session. The
+    /// store re-merges every *readable* sibling (a still-live instance's file is
+    /// locked, hence invisible — neovim's contract) plus this instance's own. When
+    /// `replace` (the `!`) is set, a stored value overwrites a conflicting live one;
+    /// otherwise it only fills an empty slot.
+    Read { replace: bool },
+}
+
 /// One persisted register: its name, contents, and how it pastes.
 #[derive(Debug, Clone)]
 pub struct RegisterEntry {
@@ -316,11 +335,34 @@ impl Editor {
         marks
     }
 
+    /// Drain the deferred shada requests (`:wshada` / `:rshada`) raised this tick,
+    /// for the server to act on against its store. Empty (a cheap clone of nothing)
+    /// when neither command ran.
+    pub fn take_pending_shada(&mut self) -> Vec<ShadaRequest> {
+        std::mem::take(&mut self.pending_shada)
+    }
+
     /// Seed editor state from a (merged) [`PersistState`] the server loaded.
     /// Called once at startup before the first frame. Additive — it fills empty
     /// slots; it does not clear state the running session has already set.
     pub fn import_persist(&mut self, state: PersistState) {
+        self.apply_persist(state, false);
+    }
+
+    /// Apply a (merged) [`PersistState`], either filling only empty slots
+    /// (`replace = false`, the startup load and a plain `:rshada`) or overwriting a
+    /// conflicting live value (`replace = true`, `:rshada!`). The only state with a
+    /// genuine *conflict* is the register file — a register the running session has
+    /// already set; everything else (marks, history, jumplist, changelist) is seeded
+    /// through the lazy pending-by-path maps, which are inherently additive (a
+    /// re-set mark already wins on export), so `replace` does not affect them.
+    pub fn apply_persist(&mut self, state: PersistState, replace: bool) {
         for entry in state.registers {
+            // A live register set this session is a conflict: keep it unless the
+            // bang (`replace`) says to overwrite.
+            if !replace && self.registers.get(Some(entry.name)).is_some() {
+                continue;
+            }
             let kind = if entry.linewise {
                 RegKind::Line
             } else {

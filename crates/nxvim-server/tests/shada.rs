@@ -54,6 +54,9 @@ impl ShadaStore for ProbeStore {
         self.flushes.lock().unwrap().push(state.clone());
         Ok(())
     }
+    fn reload(&mut self) -> std::io::Result<PersistState> {
+        Ok(PersistState::default())
+    }
 }
 
 /// Count the surviving shada store files in `dir`.
@@ -354,6 +357,116 @@ async fn debounced_checkpoint_flushes_mid_session() {
     assert!(
         snapshots.iter().all(|s| s.exit_cursor.is_none()),
         "live checkpoints must leave exit_cursor unset (only the exit flush sets it)",
+    );
+}
+
+#[tokio::test]
+async fn wshada_flushes_synchronously_without_a_quit() {
+    // Phase 7: `:wshada` writes the store *now*, on the tick that runs it — not on the
+    // debounce timer and not at exit. A probe store records every flush; right after
+    // the `:wshada` barrier (no sleep, so the 150ms debounce can't have fired) the
+    // register must already be in a flushed snapshot, with `exit_cursor` unset
+    // (`:wshada` is not a clean exit).
+    let file = write_temp("shada_wshada", "txt", "hello world\n");
+    let probe = ProbeStore::default();
+    let flushes = probe.flushes.clone();
+
+    let (rpc, _incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            shada: Some(Box::new(probe)),
+            ..Default::default()
+        },
+        80,
+        25,
+    )
+    .await;
+
+    feed(&rpc, "\"ayiw");
+    feed(&rpc, ":wshada<CR>");
+    // Barrier: drives the command to completion (and the `:wshada` drain) before we
+    // inspect the flushes. No sleep — so any flush we see was the explicit `:wshada`,
+    // not the debounced checkpoint.
+    assert_eq!(lines(&rpc).await, vec!["hello world"]);
+
+    let snapshots = flushes.lock().unwrap();
+    assert!(
+        snapshots.iter().any(|s| s
+            .registers
+            .iter()
+            .any(|r| r.name == 'a' && r.text == "hello")),
+        ":wshada should have flushed register `a` synchronously; saw {} flush(es)",
+        snapshots.len(),
+    );
+    assert!(
+        snapshots.iter().all(|s| s.exit_cursor.is_none()),
+        ":wshada must leave exit_cursor unset — `'0` tracks clean exits only",
+    );
+}
+
+#[tokio::test]
+async fn rshada_merges_a_sibling_that_exited_while_we_were_live() {
+    // Phase 7: the concurrent two-*live*-instance case. A and B run at once; a live
+    // instance's store is locked, so B cannot see A's data while A runs (neovim's
+    // contract). Once A exits cleanly (releasing the lock), B's explicit `:rshada`
+    // re-merges A's now-readable store into B's running session — reconciliation
+    // between instances at runtime, not just at the next launch.
+    let dir = temp_dir("shada_rshada_concurrent");
+    let file_a = write_temp("shada_rshada_a", "txt", "hello world\n");
+    let file_b = write_temp("shada_rshada_b", "txt", "beta\n");
+
+    // A and B are both live simultaneously: B starts while A holds its lock.
+    let (rpc_a, inc_a) = start_attached(init_with_store(&dir, Some(file_a)), 80, 25).await;
+    let (rpc_b, _inc_b) = start_attached(init_with_store(&dir, Some(file_b)), 80, 25).await;
+
+    // A yanks a whole line into register `x`, then exits cleanly (final flush +
+    // lock release). B was live the whole time and never set `x`.
+    feed(&rpc_a, "\"xyy");
+    assert_eq!(lines(&rpc_a).await, vec!["hello world"]);
+    feed(&rpc_a, ":qa!<CR>");
+    await_server_exit(inc_a).await;
+
+    // B re-reads: A's store is now openable, so register `x` lands in B's session and
+    // `"xp` pastes A's line below B's.
+    feed(&rpc_b, ":rshada<CR>");
+    feed(&rpc_b, "\"xp");
+    assert_eq!(lines(&rpc_b).await, vec!["beta", "hello world"]);
+}
+
+#[tokio::test]
+async fn rshada_fills_only_empty_slots_unless_banged() {
+    // Phase 7: `:rshada` only fills a register the session hasn't set (a conflict is
+    // kept); `:rshada!` overwrites it. The stored value comes from a sibling that
+    // exited while this instance stayed live.
+    let dir = temp_dir("shada_rshada_replace");
+    let file_a = write_temp("shada_rshada_r_a", "txt", "FROM_DISK\n");
+    let file_b = write_temp("shada_rshada_r_b", "txt", "live line\n");
+
+    let (rpc_a, inc_a) = start_attached(init_with_store(&dir, Some(file_a)), 80, 25).await;
+    let (rpc_b, _inc_b) = start_attached(init_with_store(&dir, Some(file_b)), 80, 25).await;
+
+    // A stores "FROM_DISK" in register `x` and exits, leaving a readable store.
+    feed(&rpc_a, "\"xyy");
+    assert_eq!(lines(&rpc_a).await, vec!["FROM_DISK"]);
+    feed(&rpc_a, ":qa!<CR>");
+    await_server_exit(inc_a).await;
+
+    // B sets its *own* register `x` live to a different line.
+    feed(&rpc_b, "\"xyy");
+    assert_eq!(lines(&rpc_b).await, vec!["live line"]);
+
+    // Plain `:rshada` keeps B's live `x` (a conflict): pasting it yields B's line.
+    feed(&rpc_b, ":rshada<CR>");
+    feed(&rpc_b, "\"xp");
+    assert_eq!(lines(&rpc_b).await, vec!["live line", "live line"]);
+
+    // `:rshada!` overwrites the conflict with the stored value, so the next paste is
+    // A's line.
+    feed(&rpc_b, ":rshada!<CR>");
+    feed(&rpc_b, "\"xp");
+    assert_eq!(
+        lines(&rpc_b).await,
+        vec!["live line", "live line", "FROM_DISK"],
     );
 }
 

@@ -385,10 +385,33 @@ host, is being removed, so there is no "shada on the remote host" case.)
 6. **Phase 6 — the OPFS backend (browser).** A second `ShadaStore`/`StorageBackend`
    impl over an OPFS sync access handle, landing with the wasm-Worker server
    (Phase 5 of the edit-host plan). The native `RedbFileStore` is unchanged.
-7. **Phase 7 — caps, retention, `:wshada`/`:rshada`.** History caps, file-mark
-   count caps (newest-N per neovim), and the explicit `:wshada`/`:rshada[!]`
-   ex-commands (loud, real — they flush/reload now, never a no-op). A concurrent
-   two-*live*-instance test (both running at once, not just sequential) lands here.
+7. **Phase 7a — `:wshada`/`:rshada` + the concurrent merge. ✅ DONE.** The explicit
+   `:wshada` / `:rshada[!]` ex-commands (loud, real — never a no-op): core enqueues a
+   `ShadaRequest` (it can't touch the store, which lives behind the `ShadaStore` seam)
+   that the server drains at the tail of `run_pending`, the same core→server hand-off
+   `pending_saves` / `pending_checktime` use. `:wshada` flushes this instance's store
+   *now*, synchronously, leaving `exit_cursor` unset (`'0` tracks clean exits only).
+   `:rshada` re-merges every *readable* sibling — a still-live instance's file is
+   locked, hence invisible, exactly neovim's contract — plus this instance's own store,
+   via a new `ShadaStore::reload` (no mint, no numbered-mark shift, no compaction; the
+   shift is a launch event); the `!` overwrites a conflicting live register, otherwise
+   only empty slots fill (`Editor::apply_persist(state, replace)`). Persistence-off and
+   I/O errors are echoed loudly, never swallowed. The `load`/`reload` recency-fold is
+   refactored behind a shared `collect_merge` + `build_state`. Tested (`tests/shada.rs`):
+   `:wshada` flushes a register synchronously (probe store, no debounce wait); the
+   **concurrent two-*live*-instance** case — A and B both running, B `:rshada` absorbs
+   A's store only *after* A exits and releases its lock; and `:rshada` vs `:rshada!`
+   conflict semantics. History caps already ship (the `HISTORY_CAP` merge cap, Phase 3).
+7. **Phase 7b — file-mark count caps (newest-N files). DEFERRED (not yet built).**
+   neovim's `'100`-style cap keeps marks for only the most-recently-*used* N files. That
+   needs a per-file **last-used timestamp** — but nxvim stamps every mark in a flush with
+   the *same* `now_ms` (the write time, the merge key), so files marked in one session
+   are indistinguishable and a cap test would be non-deterministic. Doing it right means
+   teaching core to track per-buffer last-used time and carrying it through
+   `export_file_marks`, which is its own slice. Until then file marks are uncapped
+   (bounded only by the per-file mark count, which is small). Explicitly **not** a silent
+   stub: the cap simply does not exist yet, and unbounded retention is the honest current
+   behavior, called out here.
 
 ---
 

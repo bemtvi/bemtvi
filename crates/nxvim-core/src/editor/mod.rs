@@ -64,7 +64,7 @@ pub use self::buffers::{
 };
 pub use self::persist::{
     FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
-    RegisterEntry,
+    RegisterEntry, ShadaRequest,
 };
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
@@ -789,6 +789,12 @@ pub struct Editor {
     /// though detection / reload live in core. Both `:checktime` and the per-buffer
     /// file watch ([`Editor::checktime_buffer`]) enqueue here.
     pending_checktime: Vec<BufferId>,
+
+    /// Deferred shada I/O requests (`:wshada` / `:rshada`) raised this tick, drained
+    /// by the server with [`Editor::take_pending_shada`]. Core can't touch the store
+    /// (it lives behind the server's `ShadaStore` seam), so the ex-command enqueues a
+    /// [`ShadaRequest`] and the server runs the flush / re-merge after the tick.
+    pending_shada: Vec<ShadaRequest>,
 }
 
 impl Editor {
@@ -961,6 +967,7 @@ impl Editor {
             pending_opens: Vec::new(),
             pending_quit_all: None,
             pending_checktime: Vec::new(),
+            pending_shada: Vec::new(),
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

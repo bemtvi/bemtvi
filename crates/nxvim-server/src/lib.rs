@@ -87,7 +87,8 @@ use lsp::{
     ServerRuntime,
 };
 use nxvim_core::{
-    BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, StdHostFs, TabId, WindowId,
+    BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, ShadaRequest, StdHostFs, TabId,
+    WindowId,
 };
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
@@ -588,6 +589,54 @@ impl EditHost {
             if let Err(e) = store.flush(&snap) {
                 eprintln!("shada: final flush failed: {e}");
             }
+        }
+    }
+
+    /// Drain the deferred shada requests (`:wshada` / `:rshada`) core raised this
+    /// convergence and act on each against the store. Called from the tail of
+    /// [`run_pending`](EditHost::run_pending), so a request typed at the command line,
+    /// queued from `:lua`, or fired from a timer callback all reach the store. A cheap
+    /// no-op when neither command ran.
+    pub(crate) fn drain_pending_shada(&mut self) {
+        for req in self.editor.take_pending_shada() {
+            match req {
+                ShadaRequest::Write => self.shada_write_now(),
+                ShadaRequest::Read { replace } => self.shada_read_now(replace),
+            }
+        }
+    }
+
+    /// `:wshada` — flush this instance's store now. Unlike the clean-exit flush this
+    /// leaves `exit_cursor` unset (`'0` tracks *exits* only, and `:wshada` is not
+    /// one). Fails loud: an error, or persistence being off, is echoed rather than
+    /// silently dropped — there is no "looked like it saved" outcome.
+    fn shada_write_now(&mut self) {
+        if self.shada.is_none() {
+            self.editor
+                .echo("E: shada is disabled — :wshada wrote nothing".to_string());
+            return;
+        }
+        let mut snap = self.editor.export_persist();
+        snap.exit_cursor = None;
+        let result = self.shada.as_mut().unwrap().flush(&snap);
+        if let Err(e) = result {
+            self.editor.echo(format!("E: shada write failed: {e}"));
+        }
+    }
+
+    /// `:rshada[!]` — re-merge the readable store(s) and apply the result to the
+    /// running session (`replace` overwrites a conflicting live register, otherwise
+    /// only empty slots fill). Fails loud when persistence is off or the read errors.
+    fn shada_read_now(&mut self, replace: bool) {
+        if self.shada.is_none() {
+            self.editor
+                .echo("E: shada is disabled — :rshada read nothing".to_string());
+            return;
+        }
+        let result = self.shada.as_mut().unwrap().reload();
+        match result {
+            Ok(state) => self.editor.apply_persist(state, replace),
+            Err(e) => self.editor.echo(format!("E: shada read failed: {e}")),
         }
     }
 }

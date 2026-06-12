@@ -76,13 +76,13 @@ before this plan was written. All green. (Throwaway crates at
 | --- | --- | --- |
 | 1 | Does PUC Lua 5.1 compile **and run** in wasm? | ✅ `wasm32-unknown-emscripten`, `_VERSION=Lua 5.1`, `pcall(error)` caught (**setjmp/longjmp survives wasm** — the real risk), coroutines work. ~387 KB release wasm. |
 | 2 | Can one wasm module hold the VM **and** do JS interop without wasm-bindgen? | ✅ JS→Rust via `ccall`/`cwrap`, Rust→JS via `EM_JS`/`emscripten_run_script`, a `thread_local` VM keeps **state persistent across calls** (buffer survives between keystrokes). |
-| 3 | Can a **synchronous blocking read** work without freezing the page? | ✅ Lua `getcharstr()` parks on `Atomics.wait` against a `SharedArrayBuffer` in a Worker, fed by the UI thread; wakes in ~0–1 ms, no spin. **Confirms Worker+SAB → no Asyncify needed.** |
+| 3 | Can the Worker **wait for input synchronously** without freezing the page? | ✅ The Worker parks on `Atomics.wait` against a `SharedArrayBuffer`, fed by the UI thread; wakes in ~0–1 ms, no spin. **Confirms Worker+SAB → no Asyncify needed.** |
 
 Two facts these pin down, both load-bearing for the plan:
 
 - **LuaJIT is permanently out in wasm** (mlua: WASM supports all versions *excluding
-  JIT*). The browser is forever on the `lua51` backend (PUC Lua 5.1), so it
-  inherits the `lua51` plugin ceiling — see Phase 2.
+  JIT*). The browser is forever on the `lua51` backend (PUC Lua 5.1) — so a config
+  relying on LuaJIT-only behavior (`ffi`, `bit`) won't run there.
 - **The emscripten EH gotcha:** rust 1.96 links the emscripten target with new
   wasm exceptions (`-fwasm-exceptions`) but `cc` compiles vendored Lua with the
   legacy EH → `undefined symbol: __cxa_find_matching_catch_3`. Fix:
@@ -116,15 +116,14 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 
 | phase | title | depends on | status |
 | --- | --- | --- | --- |
-| 0 | Feasibility spikes (compile / interop / blocking read) | — | ✅ |
+| 0 | Feasibility spikes (compile / interop / input wait) | — | ✅ |
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
-| 2 | Opt-in yieldable `pcall` primitive (`vim.co_pcall`) | — | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1, 2 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
-| 5 | wasm edit-host: Worker + blocking input + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib done; Worker/`window.__nxvim` 5c, SAB blocking input 5d, COOP/COEP+docs 5e remain) |
+| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
+| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib done; Worker/`window.__nxvim` 5c, SAB input/timer loop 5d, COOP/COEP+docs 5e remain) |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
-Phases 1 and 2 are independent and small; tackle either first. Phase 3 is the
+Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
 the one daemon. Each phase is sized to be picked up in a focused session with only
 its dependencies loaded.
@@ -181,102 +180,6 @@ clippy clean. The only failures are two pre-existing tree-sitter-grammar tests
 that fail identically on a stashed clean tree (a sandbox limitation — the grammar
 worker can't compile). Zero behavior change; pure inversion. Server unchanged
 (default `StdHostFs` = today's behavior). Committed as `a378c16`.
-
----
-
-## Phase 2 — An opt-in yieldable `pcall` primitive (`vim.co_pcall`) — ✅ DONE
-
-**Independent of everything else; smallest, testable today.**
-
-PUC Lua 5.1 can't `coroutine.yield` across a C-call boundary, and `pcall` is a C
-function — so `pcall(vim.fn.getcharstr)` (which-key's live-popup loop) raises
-*"attempt to yield across metamethod/C-call boundary"* instead of reading a key
-(project memory `pcall-yield-blocks-on-puc-lua51`,
-`whichkey-needs-vim-split-and-str2list`). LuaJIT (today's default) has a yieldable
-pcall, so this only bites `lua51` — including the browser, which is permanently
-`lua51` (Phase 0).
-
-**Decision (2026-06-10): expose the fix as a named, opt-in primitive — do NOT
-replace the global `pcall`.** Globally swapping `pcall` would impose a per-call
-coroutine allocation on *every* protected call and risk subtle fidelity
-regressions across unrelated code, for the benefit of the handful of plugins that
-block-read inside `pcall`. Instead we ship `vim.co_pcall` (and `vim.co_xpcall` /
-`vim.co_wrap`) that plugin authors targeting nxvim call explicitly when they need
-a yieldable protected call. This fits nxvim's existing posture — plugins run
-through a compat layer (`prelude/compat.lua`), not byte-for-byte unmodified.
-
-**The trade we are accepting:** plugins that wrap a blocking read in the *global*
-`pcall` — foremost **which-key's live popup** — will **not** read keys on
-`lua51`/browser builds unless they switch to `vim.co_pcall`. This is a deliberate
-carve-out from principle #1's "run the ecosystem unmodified," scoped to the narrow
-blocking-read-in-pcall pattern. (On the default LuaJIT native build the global
-pcall is already yieldable, so nothing regresses there.) See *Known limitations*.
-
-**The implementation.** Run the protected fn in its own coroutine and *relay*
-yields through a pure-Lua path (no C frame in the way) — exposed under
-`vim.co_pcall`, not as a global:
-
-```lua
-function vim.co_pcall(f, ...)
-  local co = coroutine.create(f)
-  local function step(ok, ...)
-    if not ok then return false, ... end
-    if coroutine.status(co) == 'dead' then return true, ... end
-    return step(coroutine.resume(co, coroutine.yield(...)))
-  end
-  return step(coroutine.resume(co, ...))
-end
-```
-
-It composes with nxvim's pump-coroutine model: the inner yield is caught by
-`coroutine.resume`, re-emitted by the relay to park the pumped coroutine, and the
-server's key resumes the whole chain (verified logically; Phase 0 spike #1
-confirmed coroutines work on the wasm build, and `lua51` natively already runs
-them).
-
-**Scope.** Ship `vim.co_pcall`, `vim.co_xpcall`, and `vim.co_wrap` in the prelude.
-Match varargs, non-string error values, `error` level, and `xpcall`'s
-message-handler semantics as closely as possible. Because it's opt-in, the
-per-call coroutine cost falls only on calls a plugin author deliberately routes
-through it. **Does not** cover yields from genuinely C-level callbacks
-(`table.sort` comparator, `string.gsub` replacer, raw metamethods) — rare;
-document the gap. Available on both backends (harmless on LuaJIT, where the global
-`pcall` is already yieldable) so plugin authors can target a single name.
-
-**Files.** `crates/nxvim-lua/.../prelude/` (alongside `stdlib.lua` /
-`runtime.lua`); document `vim.co_pcall` for plugin authors.
-
-**The relay needed one more piece than the sketch above (found in
-implementation).** nxvim's blocking reads do *not* "bubble a yield up to the pump
-which resumes the top coroutine" — the model the plan's relay was written for.
-Instead `fs.lua`'s `await_prompt` (the single funnel for `getcharstr` / `input` /
-`confirm`) registers a server callback that resumes **`coroutine.running()`
-directly** and then yields. Under a `vim.co_pcall` the running coroutine is the
-*inner* protected one, so a direct resume bypasses the relay and the relay's
-coroutine — which holds the protected call's continuation — never wakes; the
-sketch's relay alone hangs. The fix is a small, backend-shared change at that one
-chokepoint: a `vim._co_driver` map (coroutine → its driver, weak keys) records
-the resume chain, and `await_prompt` walks it to resume the **outermost** driver
-so the relay chain forwards the resume value back down to the blocked inner
-coroutine. With no `co_pcall` on the stack the map is empty, the root *is* the
-running coroutine, and `await_prompt` is byte-for-byte its old self — zero
-regression (the 18 `editing::prompts` + existing `getcharstr` tests stay green on
-both backends). Shipped in `prelude/copcall.lua` (the `vim.co_pcall` /
-`co_xpcall` / `co_wrap` family + the driver map) and the `await_prompt` edit.
-
-**Exit criteria — met.** A black-box test (`crates/nxvim-server/tests/blockers.rs`,
-the existing which-key regression home) drives a Lua snippet that wraps
-`vim.fn.getcharstr` in `vim.co_pcall` through several keystrokes on a
-`--features lua51` build and asserts it reads them — proving the relay reads input,
-not merely that it doesn't error. Six tests landed: a single protected read, a
-loop relaying several reads then feeding a resolved sequence (the which-key
-shape), error/args/return passthrough, and `co_xpcall` / `co_wrap`. A throwaway
-negative control confirmed the *global* `pcall(getcharstr)` still raises *"attempt
-to yield across metamethod/C-call boundary"* on `lua51` where `co_pcall` succeeds —
-so the test proves the relay does real work, not a no-op. Full `blockers` suite
-green on **both** backends (34 tests, `luajit` + `lua51`); fmt + clippy clean. The
-memory's "unmodified which-key live popup" case stays a documented limitation,
-distinct from this passing opt-in test.
 
 ---
 
@@ -1150,7 +1053,7 @@ PATH); `fs_mkdir` mutates the daemon store, observable on a follow-up stat; dist
 distinct sizes (reacts to input). Two controls: dropping the injection flips every `/virtual/...`
 probe to a local miss, and a local-`StdLuaFs` test round-trips write/read/stat/mkdir/scandir against
 a real temp dir (the refactor is behavior-preserving). Regression-clean — full `cargo test
---workspace` green (the plenary-heavy `plugin_compat`/`telescope_e2e` suites included), fmt +
+--workspace` green, fmt +
 clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
 
 ### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — ✅ DONE — both multiplexers *and* the QUIC listener shipped (2026-06-11)
@@ -1506,8 +1409,8 @@ all three.
   `executable` (`install.rs` / `host.rs` in `nxvim-lua`), and the blocking
   `vim.fn.system`. The proposed split-brain rule: **vim-level fs/process APIs
   route through the host seams** (`HostFsAsync` / the blocking bridge /
-  `HostProc` — Open Decision #5's residual note) — so telescope previewers, root
-  detection, and gitsigns see the *remote* project — while **raw Lua `io.*` /
+  `HostProc` — Open Decision #5's residual note) — so file-picker previewers, root
+  detection, and VCS-status providers see the *remote* project — while **raw Lua `io.*` /
   `os.*` and `require`/`package.path` stay local**: plugins and config live on
   the local machine (a feature — no remote plugin install needed), and their
   caches/state files are local. This is exactly the consequence of diverging
@@ -1567,10 +1470,9 @@ the vendored Lua/regex C.
   `wasm32-unknown-emscripten`. Wire `EMCC_CFLAGS=-fwasm-exceptions` and the
   emsdk-sourced `emcc` into the build script. `nxvim-core` is pure Rust and
   compiles to the new target unchanged.
-- **Backend = `lua51`** (LuaJIT excluded from wasm). Phase 2's `vim.co_pcall` ships
-  here, but the global `pcall` is *not* swapped — so plugins that block-read inside
-  the global `pcall` (unmodified which-key live popup) don't read keys unless they
-  opt in. Known limitation, by design.
+- **Backend = `lua51`** (LuaJIT excluded from wasm). The browser inherits the
+  PUC 5.1 dialect ceiling — a config relying on LuaJIT-only `ffi`/`bit` won't run
+  there. Known limitation, by design.
 
 **Exit criteria.** A headless node harness loads the compiled edit-host module,
 feeds a vim key sequence, and reads back buffer lines / a redraw — i.e. the *real*
@@ -1814,7 +1716,7 @@ The throwaway `nxvim-edithost-demo` stays until Phase 5's wasm cdylib replaces i
 
 ---
 
-## Phase 5 — wasm edit-host: Worker + blocking input + JS interop
+## Phase 5 — wasm edit-host: Worker + input/timer loop + JS interop
 
 Make it a real browser editor (Phase 0 spikes #2/#3 proved the mechanisms; this
 integrates them).
@@ -1828,17 +1730,15 @@ integrates them).
   `EXPORTED_FUNCTIONS`.
 - **Edit-host in a Web Worker.** UI thread renders + ferries input; Worker owns
   core+Lua (the single `!Send` thread). Redraws post back to the UI.
-- **Blocking input over SAB.** `getcharstr` / the pump-coroutine park on
-  `Atomics.wait` against a `SharedArrayBuffer` keyboard channel the UI fills — no
-  Asyncify. Plugins that opt into Phase 2's `vim.co_pcall` get yieldable blocking
-  reads on top of this; unmodified global-`pcall` block-readers stay blocked (see
-  *Known limitations*).
-- **Timers in the Worker.** Native `vim.defer_fn` / `vim.uv` timers ride
+- **Input over SAB.** The Worker's run loop parks on `Atomics.wait` against a
+  `SharedArrayBuffer` keyboard channel the UI fills — no Asyncify. It wakes on a
+  keystroke, runs the tick, and posts the redraw back.
+- **Timers in the Worker.** Native `vim.defer_fn` / `nx.timer` timers ride
   `evloop.rs` (tokio), which doesn't exist in the wasm edit-host — the plan
   needs a Worker-side analog of `LoopEvent::Timer`. The SAB park *is* the event
   loop: `Atomics.wait` takes a timeout, so set it to the next-due timer's
   deadline and the same park that wakes on input doubles as the timer wheel —
-  one mechanism, no busy loop. (Statusline refresh à la lualine depends on
+  one mechanism, no busy loop. (Timer-driven statusline refresh depends on
   timers firing.)
 - **COOP/COEP serving.** `SharedArrayBuffer` needs cross-origin isolation
   (`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
@@ -1846,9 +1746,8 @@ integrates them).
 
 **Exit criteria.** Driveable via Playwright through the `window.__nxvim` hook
 (project memory `web-client-driveable-via-playwright`): type vim commands, assert
-buffer/cursor/redraw, and drive a `vim.co_pcall(vim.fn.getcharstr)`-based snippet
-(the opt-in blocking-read path) to prove SAB-backed blocking reads work end-to-end
-in a real browser.
+buffer/cursor/redraw, and prove the SAB input/timer loop works end-to-end in a
+real browser — keystrokes drive the tick and a timer fires a deferred callback.
 
 ### Phase 5-proper — the slices
 
@@ -1990,18 +1889,18 @@ shape where the projections line up. Redraws `postMessage` UI-ward; the UI expos
 - **Exit (needs browser):** Playwright types vim commands through `window.__nxvim` and
   asserts buffer / cursor / redraw — the first half of the Phase 5 exit criteria.
 
-#### Slice 5d — blocking input + timers over `SharedArrayBuffer`
+#### Slice 5d — input + timers over `SharedArrayBuffer`
 
-`vim.fn.getcharstr` / the pump-coroutine park on `Atomics.wait` against an SAB keyboard
-channel the UI fills (Phase 0 spike #3 — no Asyncify). The same park's `Atomics.wait`
-*timeout* is the next-due timer's deadline, so one mechanism is both the input wait and
-the `LoopEvent::Timer` wheel `evloop.rs` can't provide in-Worker (`vim.defer_fn` /
-`vim.uv` timers; lualine's refresh). The opt-in `vim.co_pcall(vim.fn.getcharstr)` (Phase 2)
-gets yieldable blocking reads on top; bare global-`pcall` block-readers stay blocked
-(*Known limitations* — PUC 5.1 can't yield across `pcall`).
+The Worker's run loop parks on `Atomics.wait` against an SAB keyboard channel the UI
+fills (Phase 0 spike #3 — no Asyncify). The same park's `Atomics.wait` *timeout* is the
+next-due timer's deadline, so one mechanism is both the input wait and the
+`LoopEvent::Timer` wheel `evloop.rs` can't provide in-Worker (`vim.defer_fn` / `nx.timer`
+timers; timer-driven statusline refresh). It wakes on a keystroke or the timeout,
+runs the tick, and posts the redraw back.
 
-- **Exit (needs browser):** Playwright drives a `vim.co_pcall(vim.fn.getcharstr)` snippet
-  end to end — the second half of the exit criteria, proving SAB blocking reads work live.
+- **Exit (needs browser):** Playwright types keystrokes and lets a deferred timer fire
+  end to end — the second half of the exit criteria, proving the SAB input/timer loop
+  works live.
 
 #### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo`
 
@@ -2029,11 +1928,11 @@ the Phase 3 daemon.
   Phase 3, and the *inverse* of today's Socket.IO mode (`docs/architecture.md` →
   *connecting to a real server over Socket.IO*), which puts the whole server
   (editing included) remote and laggy. Here, editing is in the browser Worker;
-  only fs/process cross the wire. Telescope's `rg`/`fd` run on the remote daemon
+  only fs/process cross the wire. A file picker's `rg`/`fd` run on the remote daemon
   via `HostProc`. **Why WebTransport over a single WebSocket** — see *Transport &
   stream multiplexing* below: the daemon carries three independent traffic classes
   (`HostFs` blobs, per-process `HostProc` stdio, `HostWatch` pushes), and a single
-  WebSocket is one TCP stream, so a heavy `HostProc` flood (telescope's `rg`, an
+  WebSocket is one TCP stream, so a heavy `HostProc` flood (a file picker's `rg`, an
   `npm install`'s output) head-of-line-blocks an LSP `didChange` or a file save
   queued behind it. QUIC's independent streams remove that coupling at the protocol
   level. The Rust daemon uses `wtransport` (on `quinn`); WebTransport mandates TLS
@@ -2104,19 +2003,10 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
 
 - **No protocol negotiation** (inherited): edit-host and daemon must be the same
   build; mismatch surfaces as a dropped connection, not a clean version error.
-- **wasm plugin ceiling = `lua51`, not LuaJIT.** The browser runs the PUC 5.1
-  dialect; plugins relying on LuaJIT-only behavior (e.g. `ffi`, `bit`) won't run.
-  `Luau` (faster non-JIT, 5.1-ish, yieldable pcall, wasm-capable per mlua) is a
-  possible future pivot but a different dialect bet — out of scope here.
-- **Blocking reads inside the global `pcall` need opt-in.** `vim.co_pcall` is
-  available but the global `pcall` is *not* replaced (Phase 2 decision). So plugins
-  that wrap a blocking read in the global `pcall` — the canonical case is
-  **which-key's live popup** — do not read keys on `lua51`/browser builds unless
-  they switch to `vim.co_pcall`. A plugin author targeting nxvim opts in; we do not
-  emulate LuaJIT's yieldable global pcall. (Native LuaJIT builds are unaffected —
-  their global pcall is already yieldable.)
-- **Yields from C-level callbacks** (sort/gsub/metamethods) remain un-yieldable on
-  `lua51` even via `vim.co_pcall` (Phase 2 scope note).
+- **wasm config ceiling = `lua51`, not LuaJIT.** The browser runs the PUC 5.1
+  dialect; config relying on LuaJIT-only behavior (e.g. `ffi`, `bit`) won't run.
+  `Luau` (faster non-JIT, 5.1-ish, wasm-capable per mlua) is a possible future
+  pivot but a different dialect bet — out of scope here.
 - **Vimscript** stays a non-goal (`docs/architecture.md` → principle #2).
 
 ---

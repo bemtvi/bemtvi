@@ -275,6 +275,8 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         include_str!("prelude/diagnostic.lua"),
     ),
     ("nxvim:prelude/compat", include_str!("prelude/compat.lua")),
+    // Loads last: the `nx.*` namespace is built over every `vim.*` surface above.
+    ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
 ];
 
 /// neovim's own `vim.treesitter` Lua, vendored verbatim under `src/vendor/nvim/`

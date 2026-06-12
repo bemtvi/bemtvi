@@ -12,6 +12,10 @@ globals:
   # plus assignment of new submodules (vim.treesitter = require("vim.treesitter")).
   vim:
     any: true
+  # nxvim's own canonical config/plugin API (prelude/nx.lua); the bounded `vim.*`
+  # whitelist is aliases onto it. Open-ended like `vim`.
+  nx:
+    any: true
   # LuaJIT's bit library. neovim ships it; the prelude polyfills it on PUC 5.1
   # (stdlib.lua) and plugins reach for `bit` / `bit32`.
   bit:

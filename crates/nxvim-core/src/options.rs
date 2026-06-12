@@ -493,6 +493,10 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         // Buffer-local: drives the treesitter language override rather than a
         // global string slot (handled specially in `apply_set_str`).
         "filetype" | "ft" => Some(("filetype", Str)),
+        // Buffer-local: whether treesitter paints this buffer — the *whether* noun,
+        // orthogonal to `filetype` (the language). Handled specially in
+        // `apply_set_bool` (the per-buffer enable map, not an `options` slot).
+        "ts_highlight" => Some(("ts_highlight", Bool)),
         _ => None,
     }
 }

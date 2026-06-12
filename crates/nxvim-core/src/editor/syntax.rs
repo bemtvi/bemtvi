@@ -126,16 +126,15 @@ impl Editor {
             .retain(|_buf, opened| opened.as_str() != lang);
     }
 
-    /// The language the engine would highlight `buf` as, or `None` when there is
-    /// nothing to parse. A `vim.treesitter.start` override wins (force a lang, or
-    /// — `Some(None)` — explicitly stop); otherwise the path's extension decides.
-    /// Both "stopped" and "no grammar for this path" collapse to `None` (the engine
-    /// treats them identically). The server reads this on the async side to know
-    /// which language's queries to resolve before the buffer's first highlight.
-    pub fn ts_language_for(&self, buf: BufferId) -> Option<String> {
-        match self.ts_override.get(&buf) {
-            Some(Some(lang)) => Some(lang.clone()),
-            Some(None) => None, // stopped via vim.treesitter.stop
+    /// The buffer's **filetype** — the *language* noun, independent of whether
+    /// treesitter paints. An explicit override (`nx.bo.filetype` / `:set ft` /
+    /// `:setf`) wins; otherwise the path's extension decides. `None` when the
+    /// filetype is explicitly empty or the extension has no known grammar. This is
+    /// what LSP / indent / the statusline key off, even with highlighting disabled.
+    pub fn buffer_filetype(&self, buf: BufferId) -> Option<String> {
+        match self.ts_filetype.get(&buf) {
+            Some(ft) if ft.is_empty() => None, // explicit "no filetype"
+            Some(ft) => Some(ft.clone()),
             None => {
                 let path = self.buffer_of(buf)?.path.as_deref();
                 language_of_path(path).map(str::to_string)
@@ -143,30 +142,61 @@ impl Editor {
         }
     }
 
-    /// Enable native treesitter highlighting for `buf` in `lang`, the bridge
-    /// behind `vim.treesitter.start(buf, lang)` (ADR 0001, bridge #1). Forces
-    /// `lang` regardless of the path's extension — so a buffer the extension
-    /// table misses (a `.tex` file, a no-name scratch buffer) gets highlighted —
-    /// and overrides a prior `stop`. The next `highlights` call opens the grammar.
-    pub fn ts_start(&mut self, buf: BufferId, lang: String) {
-        self.ts_override.insert(buf, Some(lang));
+    /// Whether treesitter highlighting is enabled for `buf` — the *whether* noun.
+    /// Defaults on; `ts_highlight = false` (or the `stop` verb) turns it off
+    /// without touching the filetype.
+    pub fn ts_highlight_enabled(&self, buf: BufferId) -> bool {
+        self.ts_enabled.get(&buf).copied().unwrap_or(true)
     }
 
-    /// Clear any treesitter language override for `buf`, restoring the
-    /// extension-derived default — the `:set filetype&` ("reset to default")
-    /// path. Unlike [`Self::ts_stop`] (which records an explicit "stay dark"),
-    /// this *removes* the override entirely, so a recognized extension highlights
-    /// again. Drops the "opened in this language" marker so the next sync re-opens
-    /// the buffer against whatever language the extension now resolves to.
-    pub fn ts_reset(&mut self, buf: BufferId) {
-        self.ts_override.remove(&buf);
+    /// The language the engine actually highlights `buf` as: the [filetype]
+    /// [`Self::buffer_filetype`], **gated** by the [enable]
+    /// [`Self::ts_highlight_enabled`] flag. `None` when highlighting is off or no
+    /// language resolves — the engine treats both identically (nothing to paint).
+    /// The server reads this on the async side to know which language's queries to
+    /// resolve before the buffer's first highlight.
+    pub fn ts_language_for(&self, buf: BufferId) -> Option<String> {
+        if !self.ts_highlight_enabled(buf) {
+            return None;
+        }
+        self.buffer_filetype(buf)
+    }
+
+    /// Set `buf`'s explicit filetype (the language noun). `""` means "no
+    /// filetype". Drops stale parse state so the next sync re-opens against the
+    /// new language (or, if it now resolves to nothing, paints nothing).
+    pub fn set_filetype(&mut self, buf: BufferId, ft: &str) {
+        self.ts_filetype.insert(buf, ft.to_string());
+        self.refresh_syntax(buf);
+    }
+
+    /// Reset `buf` to its extension-derived filetype (`:set filetype&`).
+    pub fn reset_filetype(&mut self, buf: BufferId) {
+        self.ts_filetype.remove(&buf);
+        self.refresh_syntax(buf);
+    }
+
+    /// Enable or disable treesitter highlighting for `buf` (the `ts_highlight`
+    /// noun / the `start`/`stop` verbs). Leaves the filetype untouched, so a
+    /// disabled buffer still reports its language to LSP/indent.
+    pub fn set_ts_highlight(&mut self, buf: BufferId, on: bool) {
+        self.ts_enabled.insert(buf, on);
+        self.refresh_syntax(buf);
+    }
+
+    /// Reset `buf`'s highlight-enable to the default (on).
+    pub fn reset_ts_highlight(&mut self, buf: BufferId) {
+        self.ts_enabled.remove(&buf);
+        self.refresh_syntax(buf);
+    }
+
+    /// After a filetype/enable change, drop the buffer's "opened in language"
+    /// marker so the next sync re-opens it, and — when it now resolves to no
+    /// highlight language (disabled, or filetype with no grammar) — close the
+    /// engine's parse so a `highlights` query returns nothing rather than the
+    /// stale tree.
+    fn refresh_syntax(&mut self, buf: BufferId) {
         self.syntax_opened.remove(&buf);
-        // If the buffer now resolves to *no* language (an extension the table
-        // misses), drop the engine's parse so a query returns nothing — otherwise
-        // the tree from the just-removed override would keep coloring it (the same
-        // close `ts_stop` does, minus recording an explicit "stopped"). When it
-        // resolves to a *different* language, the dropped `syntax_opened` marker
-        // above makes the next sync re-open it.
         if self.ts_language_for(buf).is_none() {
             if let Some(engine) = self.syntax.as_mut() {
                 engine.close(buf);
@@ -174,16 +204,25 @@ impl Editor {
         }
     }
 
-    /// Disable native treesitter highlighting for `buf`, the bridge behind
-    /// `vim.treesitter.stop(buf)`. Records an explicit "stopped" override (so the
-    /// buffer stays dark even with a known extension) and drops the engine's
-    /// parse state, so `highlights` returns nothing until a later `ts_start`.
+    /// Force highlighting for `buf` as `lang` — set the filetype **and** enable.
+    /// The verb behind `nx.treesitter.start` (and its `vim.treesitter.start`
+    /// alias): a buffer the extension table misses, or one previously stopped,
+    /// gets painted as `lang`.
+    pub fn ts_start(&mut self, buf: BufferId, lang: String) {
+        self.set_filetype(buf, &lang);
+        self.set_ts_highlight(buf, true);
+    }
+
+    /// Stop highlighting `buf` (the verb behind `nx.treesitter.stop`) — disable
+    /// the enable noun, keeping the filetype so LSP/indent still see the language.
     pub fn ts_stop(&mut self, buf: BufferId) {
-        self.ts_override.insert(buf, None);
-        if let Some(engine) = self.syntax.as_mut() {
-            engine.close(buf);
-        }
-        self.syntax_opened.remove(&buf);
+        self.set_ts_highlight(buf, false);
+    }
+
+    /// Reset `buf` to defaults — extension-derived filetype, highlighting on.
+    pub fn ts_reset(&mut self, buf: BufferId) {
+        self.reset_filetype(buf);
+        self.reset_ts_highlight(buf);
     }
 
     /// Install (or clear, with `text = None`) a resolved treesitter query for
@@ -237,7 +276,8 @@ impl Editor {
             engine.close(id);
         }
         self.syntax_opened.remove(&id);
-        self.ts_override.remove(&id);
+        self.ts_filetype.remove(&id);
+        self.ts_enabled.remove(&id);
     }
 
     /// Target indent **width in columns** for `line` of the current buffer, the

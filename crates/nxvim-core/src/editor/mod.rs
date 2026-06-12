@@ -736,13 +736,20 @@ pub struct Editor {
     /// once. Dedups the failure message so opening many files of a broken-grammar
     /// language doesn't spam (a *missing* grammar is silent and never recorded).
     syntax_failed: HashSet<String>,
-    /// Per-buffer treesitter language override, the [`Editor::ts_start`] /
-    /// [`Editor::ts_stop`] bridge behind `vim.treesitter.start` / `stop`. Absent:
-    /// the buffer highlights by its path's extension (the default floor).
-    /// `Some(lang)`: force `lang`, even for an extension the table misses.
-    /// `Some(None)`: explicitly stopped — no highlighting, even with a known
-    /// extension. (See ADR 0001, bridge #1.)
-    ts_override: HashMap<BufferId, Option<String>>,
+    /// Per-buffer **filetype** override — the *language* noun. Absent: the
+    /// buffer's filetype is derived from its path's extension (the default
+    /// floor). `Some(ft)`: force `ft` (e.g. an extension the table misses);
+    /// `Some("")`: explicitly no filetype. Orthogonal to [`Editor::ts_enabled`]:
+    /// the filetype is what LSP/indent/statusline key off, independent of whether
+    /// treesitter paints. Written by `nx.bo.filetype` / `:set filetype` / `:setf`.
+    ts_filetype: HashMap<BufferId, String>,
+    /// Per-buffer **treesitter-highlight enable** — the *whether* noun. Absent:
+    /// enabled (the default, when a language resolves). `Some(false)`: highlighting
+    /// off even though the filetype/language still resolves — so `filetype = rust`
+    /// with `ts_highlight = false` keeps LSP/indent on rust while treesitter stays
+    /// dark. Written by `nx.bo.ts_highlight` / `:set ts_highlight` / the
+    /// `nx.treesitter` (and aliased `vim.treesitter`) `start`/`stop` verbs.
+    ts_enabled: HashMap<BufferId, bool>,
     /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
     /// bare-core test (or a front end whose platform backend failed to start).
     /// Injected by the server via [`Editor::set_clipboard`]; when absent,
@@ -958,7 +965,8 @@ impl Editor {
             syntax: None,
             syntax_opened: HashMap::new(),
             syntax_failed: HashSet::new(),
-            ts_override: HashMap::new(),
+            ts_filetype: HashMap::new(),
+            ts_enabled: HashMap::new(),
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
             host_fs_offtick: false,

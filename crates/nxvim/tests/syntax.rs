@@ -741,6 +741,54 @@ async fn a_missing_grammar_is_silent() {
     );
 }
 
+// ----- two-noun model: `filetype` (language) vs `ts_highlight` (whether) -----
+
+#[tokio::test]
+async fn ts_highlight_toggles_independently_of_an_explicit_filetype() {
+    // The two nouns are orthogonal. A `.txt` buffer (extension table misses) is
+    // given an explicit `filetype=rust`, so it highlights. `:set nots_highlight`
+    // darkens it *without* clearing the filetype — proven by re-enabling with a
+    // bare `:set ts_highlight` (which sets no filetype): it highlights as rust
+    // again, so the explicit `rust` filetype survived the disable. The extension
+    // alone could never supply `rust` here, so re-highlighting proves retention.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("ts-two-noun", "txt", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Force the language noun; the buffer the extension misses now highlights.
+    exec_lua(&rpc, "vim.cmd('set filetype=rust')").await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+
+    // Disable the *whether* noun: highlighting goes dark, filetype untouched.
+    exec_lua(&rpc, "vim.cmd('set nots_highlight')").await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.iter().all(|row| row.is_empty())
+    })
+    .await;
+
+    // Re-enable highlighting only — set no filetype. It paints rust again, so the
+    // explicit filetype persisted across the disable (orthogonal nouns).
+    exec_lua(&rpc, "vim.cmd('set ts_highlight')").await;
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    let fn_span = hl[0]
+        .iter()
+        .find(|(s, _, _)| *s == 0)
+        .expect("the `fn` keyword repaints after re-enabling ts_highlight");
+    assert_eq!(
+        fn_span.2.split('.').next().unwrap(),
+        "keyword",
+        "the retained filetype=rust repaints `fn` as a keyword, got {:?}",
+        fn_span.2
+    );
+}
+
 // ----- vim.treesitter.start / stop bridge (ADR 0001, #1) --------------------
 
 #[tokio::test]

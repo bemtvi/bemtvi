@@ -51,6 +51,30 @@ impl Editor {
     /// buffer-local (on the current buffer); the rest are global search options on
     /// the editor.
     fn apply_set_bool(&mut self, name: &str, op: SetOp) {
+        // `ts_highlight` is the buffer-local *whether-treesitter-paints* noun —
+        // orthogonal to `filetype` (the language). It lives in the per-buffer
+        // enable map (`set_ts_highlight`), not a plain `options` bool slot, so it
+        // can drop/restore the engine parse; handle it before the slot match.
+        if name == "ts_highlight" {
+            let buf = self.current_buffer_id();
+            match op {
+                SetOp::On => self.set_ts_highlight(buf, true),
+                SetOp::Off => self.set_ts_highlight(buf, false),
+                SetOp::Toggle => {
+                    let on = self.ts_highlight_enabled(buf);
+                    self.set_ts_highlight(buf, !on);
+                }
+                SetOp::Query => {
+                    let label = if self.ts_highlight_enabled(buf) {
+                        "ts_highlight"
+                    } else {
+                        "nots_highlight"
+                    };
+                    self.echo(label.to_string());
+                }
+            }
+            return;
+        }
         let slot = match name {
             "number" => &mut self.windows.cur_mut().options.number,
             "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
@@ -154,16 +178,17 @@ impl Editor {
         if name == "filetype" {
             let buf = self.current_buffer_id();
             match op {
-                // `:set ft=` to empty is vim's "no filetype → no syntax": an
-                // explicit off, like `vim.treesitter.stop`.
-                StrOp::Set(value) if value.is_empty() => self.ts_stop(buf),
-                StrOp::Set(value) => self.ts_start(buf, value),
+                // `filetype` is the *language* noun: set it (`""` = no filetype),
+                // reset it to the extension default, or query it. Whether
+                // treesitter actually paints is the orthogonal `ts_highlight` noun
+                // (see `apply_set_bool`), not this.
+                StrOp::Set(value) => self.set_filetype(buf, &value),
                 // `:set ft&` resets to the default, which in nxvim is the
-                // extension-derived language (more useful than vim's literal "").
-                StrOp::Reset => self.ts_reset(buf),
+                // extension-derived filetype (more useful than vim's literal "").
+                StrOp::Reset => self.reset_filetype(buf),
                 // `:set ft?` echoes the *effective* filetype (override or extension).
                 StrOp::Query => {
-                    let ft = self.ts_language_for(buf).unwrap_or_default();
+                    let ft = self.buffer_filetype(buf).unwrap_or_default();
                     self.echo(format!("filetype={ft}"));
                 }
             }

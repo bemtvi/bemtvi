@@ -64,7 +64,8 @@ same surface, later. The in-process Lua host is v1.
 | `nx.buf` / `nx.win` / `nx.cursor` | snapshot reads, queued edits, `on_change` byte-delta subscription | mirrors + effect queues + the edit journal |
 | `nx.on(event, opts, fn)` | structured event subscriptions | the lifecycle/autocmd diff |
 | `nx.spawn` / `nx.timer` / `nx.fs.*` | async process / timer / fs, callback-based | evloop actor + HostFs seams |
-| `nx.hl.set(ns, buf, marks)` | batch-published decorations | the extmark layer + priorities |
+| `nx.hl.set(ns, buf, marks)` | batch-published decorations (known up front) | the extmark layer + priorities |
+| `nx.decor.provider` | viewport-scoped decoration publisher — lazy, recomputed on scroll, off the frame | the decoration-provider drive (`decor_on_win`), debounced off `redraw`; folds into the extmark layer |
 | `nx.keymap` / `nx.command` / `nx.cmd` | maps, user commands, ex dispatch | existing |
 | `nx.ui.input` / `select` / `confirm` / `float` | small async UI primitives | cmdline + floats + pmenu |
 | `nx.complete` | **native completion engine**; plugins = sources | pmenu + docs float, native LSP, evloop debounce; Rust fuzzy matcher (new) |
@@ -113,7 +114,7 @@ to optimize: manifests defer code load by construction, and the UI paints
 before plugins finish loading anyway (the server is async; startup is not a
 single blocking script).
 
-## Five worked examples
+## Six worked examples
 
 The ecosystem staples a daily driver needs, designed as providers. In every
 case the *hard* part is the server's job, in Rust, built once — and the
@@ -314,6 +315,68 @@ nx.keymap.set("n", "<leader>e", function() view:toggle() end)
 nx.fs.watch(nx.cwd(), function() view:refresh() end)
 ```
 
+### 6. Viewport decorations (the decoration-provider shape) — `nx.decor`
+
+Some decorations are expensive *and* depend on what's on screen: rainbow
+parens, indent guides, inline blame, semantic tokens on a huge file. neovim
+serves these with a **decoration provider** — `on_win`/`on_line` callbacks the
+renderer invokes per visible row, every frame. That is precisely the
+re-enter-Lua-every-redraw model rule 4 forbids: a slow provider stalls the
+frame, and the PUC 5.1 backend cannot host the per-row hot loop at all.
+
+`nx.decor` keeps the *useful kernel* — only decorate what is visible;
+recompute when the viewport moves — and drops the frame coupling. The engine
+wakes the provider **once per visible-range change** (scroll, resize, edit
+reflow), debounced off the frame path, hands it a snapshot of the visible
+slice, and the provider **publishes** marks carrying a generation token; a
+publish from a viewport the user already scrolled past is dropped. There is no
+`on_line`, no per-frame call, and no single-frame "ephemeral" mark — a
+published range stands until the next publish supersedes it or the viewport
+invalidates its generation.
+
+```lua
+-- a rainbow-delimiters-shaped plugin — the whole thing
+nx.decor.provider {
+  name = "rainbow",
+  bufs = { filetype = { "lua", "rust", "json" } },   -- engine skips non-matching windows
+
+  -- Called off the frame, once per range change, never during redraw.
+  on_range = function(ctx, publish)
+    -- ctx is a snapshot, never live state:
+    --   { win, buf, top, bot, lines, tick, gen }
+    --   top/bot = 0-based inclusive visible rows; lines = exactly that slice
+    local marks, depth = {}, 0
+    for i, line in ipairs(ctx.lines) do
+      local row = ctx.top + i - 1
+      for col = 1, #line do
+        local c = line:sub(col, col)
+        if c:match("[%(%[{]") then
+          marks[#marks+1] = { row, col-1, end_col = col, hl = RAINBOW[depth % 6 + 1] }
+          depth = depth + 1
+        elseif c:match("[%)%]}]") then
+          depth = math.max(0, depth - 1)
+          marks[#marks+1] = { row, col-1, end_col = col, hl = RAINBOW[depth % 6 + 1] }
+        end
+      end
+    end
+    publish(marks)          -- carries ctx.gen; engine folds it into the next frame,
+  end,                      -- or drops it if the window already scrolled past `gen`
+}
+```
+
+Marks are the **same shape as `nx.hl.set`** — decorations are one data type
+whether static or viewport-driven:
+`{ row, col, end_row?, end_col?, hl?, virt_text?, virt_lines?, sign?, conceal?, priority? }`.
+Async is fine: an indent-guide or blame provider can `nx.spawn`/`nx.lsp`
+inside `on_range` and call `publish` from the callback — the generation token
+makes a late response safe to fold or safe to drop. A provider that errors is
+reported loud (`E5108`) and disabled after repeated failures, matching the
+"no silent stubs" convention and neovim's own `CB_MAX_ERROR`.
+
+Decorations you already know — diagnostics from an LSP response, signs from a
+diff — need no provider; they are a plain `nx.hl.set(ns, buf, marks)`. Reach
+for `nx.decor` only when the work is worth scoping to the viewport.
+
 ## The compatibility boundary
 
 Per [ADR 0002](../decisions/0002-native-plugin-system.md) the break is clean:
@@ -343,9 +406,10 @@ objects, `nx` semantics, no growth beyond the list.
 There is no `vim.treesitter` or `vim.lsp`: of that machinery, what serves
 nxvim's objectives is refactored into `nx.treesitter` / `nx.lsp`, and the
 rest is deleted. The neovim runtime-model surfaces — wait-pumps, public uv
-handles, decoration providers, the `vim.fn` long tail, prompt-buffer
-emulation — exist on neither side of the API: plugins and config get
-`nx.spawn` / `nx.timer` / `nx.fs` / `nx.ui.*` instead.
+handles, frame-time decoration providers, the `vim.fn` long tail,
+prompt-buffer emulation — exist on neither side of the API: plugins and config
+get `nx.spawn` / `nx.timer` / `nx.fs` / `nx.ui.*` and the off-frame
+`nx.decor` instead.
 
 The native subsystems the surfaces above expose — LSP, treesitter, extmarks,
 the pmenu, floats, the panel, the evloop, the settle contract — are the
@@ -360,4 +424,10 @@ engines this API is a thin contract over.
    cancellation / floats / preview end to end.
 3. **Completion engine** — LSP + buffer + snippets sources built-in.
 4. **Statusline segments**, **snippet engine** (shared with 3), **tree docks**.
-5. RPC twins of the registries (out-of-process providers) — later.
+5. **`nx.decor`** — the decoration-provider drive already exists; the new
+   piece is the debounced viewport-changed signal off the scroll/resize path
+   (not `redraw`) and the generation-keyed publish into the extmark layer.
+   Lower daily-driver priority (rainbow / indent guides / inline blame are
+   polish), and it shares the off-frame event-keyed-publish mechanism with the
+   statusline (4), so it slots in naturally after it.
+6. RPC twins of the registries (out-of-process providers) — later.

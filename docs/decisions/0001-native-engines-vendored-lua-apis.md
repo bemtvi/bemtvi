@@ -1,6 +1,14 @@
 # 0001 — Native engines underneath, vendored neovim Lua APIs on top
 
-**Status:** accepted (2026-06-08). Records a cross-cutting boundary that several
+**Status:** superseded by [ADR 0002](0002-native-plugin-system.md). The
+native-engine half carries forward (engines drive editor behavior; script
+results project through the extmark layer — the bridge pattern). The
+vendored-API half does not: nxvim's scripting surface is its own `nx.*`
+namespace — there is no `vim.treesitter` / `vim.lsp` surface; that machinery
+is refactored into the `nx` API where useful and deleted where not, and the
+only `vim.*` Lua is the colorscheme glue. Kept as the dated record of the
+engine/API split and the bridge pattern. *(Original status: accepted
+2026-06-08.)* Records a cross-cutting boundary that several
 feature designs already assume but none states in one place: who owns the
 treesitter / LSP *engine* (nxvim, natively) versus who owns the `vim.treesitter`
 / `vim.lsp` *API surface* (vendored neovim Lua), and where the two are wired

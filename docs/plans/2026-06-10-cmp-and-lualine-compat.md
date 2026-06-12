@@ -1,6 +1,14 @@
 # Making nvim-cmp and lualine.nvim *actually* work — remaining-work plan
 
-> **Status: PLANNED (not started).** This document scopes the two plugin
+> **Status: WON'T DO.** Completion and the statusline are native, server-owned
+> surfaces of nxvim's plugin system — see
+> [the native plugin API](../specs/2026-06-11-native-plugin-api.md) and
+> [ADR 0002](../decisions/0002-native-plugin-system.md) (the neovim plugin
+> surface nxvim ships is colorschemes; nvim-cmp / lualine are not hosting
+> targets). §1's decoration-provider subsystem landed before this was scoped
+> out and remains in the tree. Kept as a dated record.
+>
+> *(Original header:)* This document scopes the two plugin
 > compatibility gaps left after the 2026-06-10 plugin smoke-test sweep. That
 > sweep fixed five plugins/clusters by adding the small `vim.*` primitives they
 > were missing (see [Context](#context)); the two below need real *subsystems*,

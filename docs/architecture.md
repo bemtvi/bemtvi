@@ -1,8 +1,16 @@
 # nxvim architecture
 
-nxvim is a [neovim](https://neovim.io) clone written in Rust. The goal is to be
-as compatible with vim/neovim as possible — including Lua extensions — while
-adopting an idiomatic, rust-native, fully-async, client-server design.
+nxvim is a modal, vim-style editor written in Rust: vim's editing language
+(keystrokes, modes, ex-commands) on an idiomatic, rust-native, fully-async,
+client-server design. nxvim is its own editor, not a
+[neovim](https://neovim.io) build: editing behavior tracks vim/neovim's
+observable behavior, but every API is nxvim's own — configuration and
+extensibility live in the `nx.*` Lua namespace
+([the `nx` API](specs/2026-06-11-native-plugin-api.md);
+[ADR 0002](decisions/0002-native-plugin-system.md)) — and the `vim.*` that
+remains is small and closed: a whitelist of muscle-memory aliases over `nx`
+(`vim.g`, `vim.o`, …) and the **colorscheme** shim, which runs real neovim
+colorschemes unmodified.
 
 A pristine copy of neovim is vendored at [`vendor/neovim`](../vendor/neovim) (a
 shallow git submodule) and used purely as a behavioral and source-layout
@@ -12,17 +20,35 @@ reference. nxvim does not link against or embed any neovim code.
 
 ## Guiding principles
 
-1. **Editing compatibility first.** Keystrokes, modes, ex-commands, options, and
-   the Lua `vim.*` API should match neovim's observable behavior. When in doubt,
-   the reference in `vendor/neovim` is the source of truth. *Note:* nxvim does
-   **not** aim for neovim *UI/client* wire-compatibility — there is no
-   `ext_linegrid` protocol and external neovim GUIs are not a target. The
-   client↔server protocol is nxvim's own.
-2. **Lua plugins, not Vimscript.** The objective is to run neovim's plugin
-   ecosystem — but only plugins written in **Lua**. Supporting legacy Vimscript
-   (`.vim` plugins, the `eval.c` language) is an explicit non-goal and is not on
-   the roadmap. Compatibility work targets the Lua `vim.*` API surface that
-   modern plugins depend on.
+1. **Editing compatibility first.** Keystrokes, modes, ex-commands, and options
+   should match vim/neovim's observable behavior. When in doubt, the reference
+   in `vendor/neovim`
+   is the source of truth. *Note:* nxvim does **not** aim for neovim
+   *UI/client* wire-compatibility — there is no `ext_linegrid` protocol and
+   external neovim GUIs are not a target. The client↔server protocol is nxvim's
+   own.
+2. **A native plugin system; colorschemes are the only neovim plugin surface.**
+   Extensibility is nxvim's own provider-based plugin API
+   ([the `nx` design](specs/2026-06-11-native-plugin-api.md),
+   [ADR 0002](decisions/0002-native-plugin-system.md)): the server owns every
+   UI surface and the frame; plugins supply data and behavior, asynchronously.
+   Configuration is the same namespace: `init.lua` is written against `nx.*`.
+   A closed whitelist of **muscle-memory aliases** (`vim.g`, `vim.o`/`vim.opt`,
+   `vim.cmd`, `vim.keymap.set`, autocmd / user-command / highlight
+   registration, `vim.notify`, the pure `vim.tbl_*`-style helpers, … — the
+   canonical list is [ADR 0002](decisions/0002-native-plugin-system.md))
+   maps 1:1 onto the same `nx` objects, so the declarative
+   portion of an existing neovim config runs unmodified — aliases, not an API;
+   beyond them there is no `vim.*` API. nxvim does not host neovim plugins —
+   they are
+   imperative programs written
+   against neovim's runtime model (synchronous re-entrant state, blocking
+   reads, libuv as a public API, frame-time render hooks), which this
+   snapshot + effect-queue, client-server design deliberately is not. The one
+   neovim surface nxvim provides is the **colorscheme glue** — a bounded
+   `vim.*` shim for sourcing colorschemes (pure `nvim_set_hl` data), so e.g.
+   catppuccin runs unmodified. Supporting legacy Vimscript
+   (`.vim` plugins, the `eval.c` language) is likewise an explicit non-goal.
 3. **Client-server, always.** The editor is a headless server; every UI is a
    client. There is no "embedded-only" code path.
 4. **Async and responsive.** The UI never blocks on the editor and the editor
@@ -601,12 +627,13 @@ runs, the server drains those queues into the (pure, synchronous) core — Lua
 never mutates the editor directly. The end-state is for `vim.api.nvim_*` to call
 the very same API functions remote clients invoke (`Lua → API → core`).
 
-**A plugin runtime, not just a bridge.** nxvim resolves a config dir and
+**A config runtime.** nxvim resolves a config dir and
 **runtimepath** the way neovim does (`$NXVIM_CONFIG` / `$XDG_CONFIG_HOME/nxvim` /
-`~/.config/nxvim`, plus `pack/*/start/*` plugin discovery and `$NXVIM_RUNTIMEPATH`
-for tests), seeds `package.path` from it so `require` resolves plugin modules,
-and sources `<config>/init.lua` at startup — before the first frame. The `vim.*`
-surface real plugins reach for is provided as a bundled **Lua prelude**
+`~/.config/nxvim`, plus `pack/*/start/*` discovery and `$NXVIM_RUNTIMEPATH`
+for tests), seeds `package.path` from it so `require` resolves config and
+colorscheme modules, and sources `<config>/init.lua` at startup — before the
+first frame. The Lua
+surface is provided as a bundled **Lua prelude**
 (the `nxvim-lua/src/prelude/` modules, the analogue of neovim's `runtime/lua/vim/`):
 `vim.tbl_*`, `vim.split`, `vim.inspect`, `vim.g`/`vim.o`/`vim.opt`/`vim.env`,
 `vim.notify`, `vim.log`, user commands, and autocmds; FS/env-touching helpers
@@ -618,6 +645,25 @@ runtimepath, its `setup()` compiles the highlight table to Lua bytecode under
 `stdpath("cache")` and `load()` populates the highlight registry via
 `nvim_set_hl` — the same mechanics as under neovim. See the
 [README](../README.md#configuration) to set it up.
+
+The editor's scripting namespace is its own: config files and plugins target
+the `nx.*` API ([ADR 0002](decisions/0002-native-plugin-system.md);
+[the `nx` design](specs/2026-06-11-native-plugin-api.md)). The lasting `vim.*`
+is exactly two things: the **colorscheme glue** — `nvim_set_hl`, plus the
+small helpers colorschemes actually touch — bounded to sourcing unmodified
+neovim colorschemes, and a closed whitelist of **muscle-memory aliases** —
+variables / options / env (`vim.g`, `vim.o`/`vim.opt`, scoped variants),
+`vim.cmd` / `vim.keymap.set`, the declarative registrations (autocmds, user
+commands, `nvim_set_hl`, `vim.filetype.add`), the pure helpers (`vim.tbl_*`,
+`vim.split`, `vim.inspect`, …), and the callback-shaped async (`vim.notify`,
+`vim.schedule`/`vim.defer_fn`, `vim.ui.*`, callback-form `vim.system`) —
+mapping 1:1 onto the `nx` equivalents so the
+declarative portion of an existing neovim config runs unmodified (the
+canonical list: [ADR 0002](decisions/0002-native-plugin-system.md)). The
+prelude's
+broader vim-shaped surface is donor code
+for the `nx` build-out: what serves nxvim's objectives is refactored under
+`nx.*`, the rest is deleted (see the roadmap).
 
 ---
 
@@ -661,9 +707,13 @@ and
 
 ### The `vim.treesitter` Lua platform
 
-Parallel to (not a replacement for) the redraw highlighter above, nxvim exposes
-neovim's **`vim.treesitter` Lua API** so treesitter-consuming plugins (textobjects,
-AST/query tools, query-driven motions) run unmodified. It mirrors neovim's own
+Parallel to (not a replacement for) the redraw highlighter above, nxvim has a
+**tree-scripting Lua platform** (today spelled as neovim's `vim.treesitter`
+API) for textobjects, AST/query tools, and query-driven motions — the
+machinery the native plugin system surfaces as `nx.treesitter`
+([ADR 0002](decisions/0002-native-plugin-system.md): the vim-named Lua is
+refactored into the `nx` API where useful and deleted where not; the Rust
+primitives below are the part that stays). It mirrors neovim's own
 split — a small bespoke C-equivalent layer with neovim's real Lua on top:
 
 - **Bespoke primitives in Rust** (`nxvim-ts/src/lua.rs`, behind the crate's `lua`
@@ -705,12 +755,15 @@ remains a non-goal for now. Full design:
 [the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md)
 and [injections](specs/2026-06-08-treesitter-injections-design.md).
 
-The boundary this section embodies — **native engine for editor behavior,
-vendored neovim Lua API for plugins** — is the same one LSP follows (a native
-async server under the vendored `vim.lsp`), and it is recorded as a standing
-decision in [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md). That
-ADR also names the *bridge pattern* (`vim.treesitter.start`, LSP semantic tokens)
-by which a vendored API is wired to the native engine underneath, projecting into
+The boundary this section embodies — **native engine for editor behavior, a
+Lua scripting layer on top** — is the same one LSP follows (a native
+async server under a Lua control surface), recorded in
+[ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and carried
+forward by [ADR 0002](decisions/0002-native-plugin-system.md) (which retires
+the vendored vim-named spelling in favor of `nx.*`). ADR 0001
+also names the *bridge pattern* (`vim.treesitter.start`, LSP semantic tokens)
+by which a scripting API is wired to the native engine underneath, projecting
+into
 the extmark highlight layer rather than into core's synchronous path.
 
 ---
@@ -911,6 +964,14 @@ screen," and that is exactly the shape of these tests.
 `vim.*` gaps and the silent approximations live in
 [*Known approximations & missing features*](known-approximations.md).
 
+- **The native plugin system (`nx.*`)** — the headline extensibility item:
+  server-owned UI surfaces (completion engine, fuzzy picker, statusline
+  segments, snippet engine, tree docks) with plugins as async, declarative
+  *providers* registered through manifest-declared contributions, plus the
+  built-in package manager. Design:
+  [the native plugin API](specs/2026-06-11-native-plugin-api.md); decision:
+  [ADR 0002](decisions/0002-native-plugin-system.md). Suggested build order is
+  in the spec (picker → completion → statusline/snippets/tree).
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up) and a `:set`-driven
   highlight toggle. (Treesitter **injections** have landed — ADR 0001 bridge #5,
@@ -930,7 +991,12 @@ screen," and that is exactly the shape of these tests.
   `nvim_tabpage_*` Lua surface, and `showtabline`) are all implemented — see
   [*Windows*](#windows). What remains on this axis is more window-local options
   (`wrap`, `cursorline`, …).
-- A broader Lua `vim.*` API surface. The runtimepath, `require`, `init.lua`,
+- **The `nx.*` config surface** — `init.lua` targets nxvim's own API
+  ([ADR 0002](decisions/0002-native-plugin-system.md)); the prelude's current
+  vim-shaped spelling is donor code, refactored under `nx` where it serves
+  nxvim's objectives and deleted where it doesn't, with the colorscheme glue
+  as the only lasting `vim.*`. What the runtime already does: the runtimepath,
+  `require`, `init.lua`,
   `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
   (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
   built-ins fire instantly even under a colliding user prefix, via the shared
@@ -966,7 +1032,10 @@ screen," and that is exactly the shape of these tests.
   [the LSP completion plan](plans/2026-06-05-lsp-completion.md) for the phase-by-phase route
   it took from "starts" to "works". Two whole configs are skipped: gdscript (a non-stdio
   TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a user-only
-  `bundle_path`).
+  `bundle_path`). (Per [ADR 0002](decisions/0002-native-plugin-system.md),
+  this vim-named control surface is donor code for `nx.lsp`: the native
+  client and the editing-loop features stay; the lspconfig-corpus spelling is
+  refactored into the `nx` API or deleted.)
 
   **What does *not* work yet** is tracked canonically — both the *silent
   approximations* (a feature that looks whole but isn't) and the *loud gaps*
@@ -1021,9 +1090,13 @@ screen," and that is exactly the shape of these tests.
   registry, the keymap-callback shape applied to async work). `vim.schedule`
   defers to convergence, `vim.defer_fn`/`vim.uv` timers fire on wall-clock time,
   and `vim.system`'s `on_exit` fires off-tick. The `vim.uv`/`vim.loop` surface
-  beyond timers (`new_pipe`, TCP, event-based `fs_*`) still grows as plugins demand
-  it — e.g. `vim.lsp.rpc.connect`'s TCP transport (the skipped gdscript config).
-- The full `vim.*` standard library. (LuaJIT is already the **default** backend —
+  does not grow: it is not part of the colorscheme glue, and async primitives
+  are the `nx` API's job (`nx.spawn` / `nx.timer` / `nx.fs`) — the existing
+  timer/process machinery is the donor for those
+  ([ADR 0002](decisions/0002-native-plugin-system.md)).
+- The `vim.*` glue, kept only as far as colorschemes need
+  ([ADR 0002](decisions/0002-native-plugin-system.md)).
+  (LuaJIT is already the **default** backend —
   vendored PUC Lua 5.1 is the `lua51` opt-in — see [*Lua*](#lua).)
 
 [`tokio::io::duplex`]: https://docs.rs/tokio/latest/tokio/io/fn.duplex.html

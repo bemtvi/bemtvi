@@ -1,0 +1,134 @@
+# 0002 — A native plugin system; neovim compatibility is editing behavior + colorschemes
+
+**Status:** accepted (2026-06-11). Records the boundary of nxvim's neovim
+compatibility and the shape of its extensibility. Companion design:
+[the native plugin API (`nx.*`)](../specs/2026-06-11-native-plugin-api.md).
+Bounds the scope of [ADR 0001](0001-native-engines-vendored-lua-apis.md) (see
+*Relationship to ADR 0001* below).
+
+## Context
+
+nxvim's architecture rests on three commitments (architecture.md):
+`nxvim-core` is **pure and synchronous**; Lua influences the editor only
+through **snapshot reads + queued effects** drained at a settle point; and the
+editor is a **client-server** system where the server owns the frame and every
+UI surface a client paints.
+
+neovim plugins are imperative programs written against a different runtime
+model: synchronous, re-entrant access to live editor state; blocking reads
+(`getcharstr`, `vim.wait` pumping the loop); **libuv as a public API**
+(`vim.uv` timers / check handles / processes); **frame-time render hooks**
+(decoration providers running Lua inside redraw); and the open-ended
+Vimscript-era `vim.fn` inventory. The plugins that define the ecosystem's UX —
+completion menus, fuzzy pickers, statuslines, popups — are precisely the ones
+that own frame time and input loops.
+
+Hosting that model would mean reimplementing neovim's event loop and renderer
+contract underneath someone else's API — surrendering the architectural
+properties (a pure core, a frame no script can stall, one behavior across
+front ends including the serverless wasm builds) that are the point of the
+design.
+
+## Decision
+
+**nxvim has its own plugin system. neovim compatibility is bounded to editing
+behavior and colorschemes.**
+
+1. **Extensibility is the native provider API (`nx.*`).** The server owns
+   every UI surface and the frame — the completion engine, the fuzzy picker,
+   statusline segments, the snippet engine, tree docks — and plugins are
+   async, declarative *providers* of data and behavior. Reads are snapshots;
+   writes are queued effects; nothing blocks; no Lua runs at frame time;
+   registrations are data (with generation tokens, so stale async responses
+   are dropped). Because plugins influence the editor through the same queues
+   RPC clients use, every registry has an RPC twin in principle —
+   out-of-process providers in any language are the same surface. Design:
+   [the native plugin API](../specs/2026-06-11-native-plugin-api.md).
+2. **The neovim plugin surface that ships is colorschemes, via a bounded
+   glue.** A colorscheme is pure data (`nvim_set_hl` tables) and therefore
+   crosses the runtime-model boundary intact — the real, unmodified catppuccin
+   runs. The glue that runs it is a bounded `vim.*` shim (`nvim_set_hl`,
+   `vim.g`, option reads, the small helpers colorschemes actually touch),
+   present for sourcing a colorscheme. It is glue, not an API: nothing else is
+   written against it, and there is no goal of hosting any other neovim
+   plugin.
+3. **Every editor API lives in the `nx.*` namespace — a clean break.** Config
+   files are `nx` scripts: `init.lua` is written against the same `nx.*`
+   surface plugins use (options, keymaps, events, user commands, LSP setup
+   via `nx.lsp`, tree scripting via `nx.treesitter`). There is no `vim.*`
+   API and no vendored neovim Lua surface: of the existing `vim.treesitter` /
+   `vim.lsp` machinery, what serves nxvim's objectives is refactored into the
+   `nx` API, and the rest is deleted. Per the no-silent-stubs rule, anything
+   outside the shipped surface fails loud rather than approximating.
+4. **A closed whitelist of muscle-memory aliases.** An enumerated set of
+   `vim.*` names is kept as thin aliases of their `nx.*` equivalents. The
+   admission test: high frequency in real configs, declarative or
+   callback-shaped (never blocking, never frame-time), and 1:1 onto an `nx`
+   primitive with no semantic emulation. The whitelist — this list is
+   canonical; the other docs summarize it:
+   - **Variables / options / environment:** `vim.g` / `vim.b` / `vim.w`,
+     `vim.o` / `vim.opt` / `vim.opt_local` / `vim.bo` / `vim.wo`, `vim.env`.
+   - **Dispatch & keymaps:** `vim.cmd`, `vim.keymap.set` / `vim.keymap.del`.
+   - **Pure helpers** (shared functions, no editor contact):
+     `vim.tbl_extend` / `vim.tbl_deep_extend` / `vim.tbl_contains`,
+     `vim.split`, `vim.trim`, `vim.startswith` / `vim.endswith`,
+     `vim.list_extend`, `vim.deepcopy`, `vim.inspect`, `vim.json`.
+   - **Declarative registrations:** a **partial `vim.api` table** containing
+     exactly `nvim_create_autocmd` / `nvim_create_augroup` /
+     `nvim_del_autocmd` / `nvim_clear_autocmds` (→ `nx.on`),
+     `nvim_create_user_command` (→ `nx.command`), and `nvim_set_hl`
+     (→ `nx.hl.define`) — any other `vim.api` access fails loud — plus
+     `vim.filetype.add` (→ `nx.filetype`).
+   - **Callback-shaped async** (the neovim APIs already designed this way):
+     `vim.notify` (→ `nx.notify`), `vim.schedule` (run at settle),
+     `vim.defer_fn` (→ `nx.timer`), `vim.ui.input` / `vim.ui.select`
+     (→ `nx.ui.*`), and `vim.system` in its **callback form only**
+     (→ `nx.spawn`; the blocking `:wait()` fails loud).
+
+   Together these cover the declarative portion of a typical neovim config —
+   options, globals, keymaps, autocmds, user commands, highlights, filetypes,
+   notify — so an `init.lua` ports by deleting its plugin-manager block, not
+   by rewriting every line (`vim.g.mapleader`, `vim.o.number = true`, a
+   `vim.keymap.set` block, an `nvim_create_autocmd` block, and
+   `vim.cmd.colorscheme` all work unmodified). They are aliases, not an API:
+   the same objects as `nx`, with `nx` semantics (snapshot reads, queued
+   effects, settle-point callbacks), and the list grows only by deliberate
+   decision — `vim.fn`, `vim.uv` / `vim.loop`, `vim.wait`, and the rest of
+   `vim.api` are not part of it.
+5. **Vimscript remains an explicit non-goal** (unchanged).
+
+## Relationship to ADR 0001
+
+ADR 0001 (native engines underneath, vendored neovim Lua APIs on top) is
+**superseded**. Its engine half carries forward unchanged: native engines
+(treesitter, LSP) drive editor behavior, synchronously where the editor needs
+it, and script-driven results project into the extmark layer at the right
+priority — the bridge pattern this decision generalizes into the `nx`
+extension contract. Its API half does not carry forward: there is no
+`vim.treesitter` or `vim.lsp` surface. The useful machinery behind them —
+the treesitter parser/query/cursor primitives in Rust, the LSP client control
+paths — is refactored into the `nx.*` API (`nx.treesitter`, `nx.lsp`) in
+nxvim's own shape, free of the bug-for-bug-with-upstream constraint that
+justified vendoring; the vendored neovim Lua itself is deleted.
+
+## Consequences
+
+- **The UI-orchestration surfaces are built natively, once, in the server**:
+  completion engine, picker, statusline segments, snippets, tree docks — each
+  exposing a provider registry instead of rendering hooks. Suggested order in
+  the spec: picker → completion → statusline / snippets / tree.
+- **The lasting `vim.*` is exactly two things: the colorscheme glue and the
+  muscle-memory alias whitelist.** No `vim.uv`, no `vim.fn` long tail, no
+  vim-shaped config surface beyond the aliases. The prelude beyond those is
+  donor code for the `nx` build-out: refactored under `nx.*` where it serves
+  nxvim's objectives, deleted where it doesn't.
+- **Plugin asynchrony lives in `nx`** (`nx.spawn` / `nx.timer` / `nx.fs` /
+  `nx.ui.input`, callback-based). Nothing in the plugin API can block the
+  editor, which also keeps the PUC Lua 5.1 backend (no yield across `pcall`)
+  fully supported by construction.
+- **Distribution is first-party**: manifest-declared contributions
+  (activation by first use), a built-in package manager over the async
+  runtime — no third-party plugin manager layer.
+- **Portability holds**: a provider API that is data-and-queues composes with
+  the edit-host split and the wasm builds, where an in-server imperative
+  runtime cannot.

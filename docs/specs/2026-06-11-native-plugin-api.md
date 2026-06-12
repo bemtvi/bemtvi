@@ -1,57 +1,59 @@
 # The native plugin API (`nx.*`) — design sketch
 
-> **Status: PROPOSAL (2026-06-11).** Supersedes the plugin half of
-> [ADR 0001](../decisions/0001-native-engines-vendored-lua-apis.md): the
-> "vendored neovim Lua APIs on top" strategy is **abandoned** for everything
-> except trivial data-shaped surfaces (colorschemes via `nvim_set_hl`). This
-> document sketches the replacement: nxvim's own plugin system, designed *for*
-> the snapshot + effect-queue + client-server architecture instead of hiding it.
+> **Status: PROPOSAL (2026-06-11).** The design for nxvim's plugin system —
+> the extensibility half of
+> [ADR 0002](../decisions/0002-native-plugin-system.md): the server owns every
+> UI surface and the frame, plugins are async, declarative *providers*, and
+> the only neovim plugin surface nxvim ships is colorschemes
+> (`nvim_set_hl` data).
 
-## Why the emulation failed
+## Why not neovim's plugin model
 
-The compat effort kept succeeding at the test level ("this driven path passes")
-and failing at the user level ("the plugin is a daily tool"). The root cause is
-structural, not effort: neovim plugins are **imperative programs written against
-neovim's runtime model** — synchronous re-entrant editor access, blocking reads
-(`getcharstr`, `vim.wait`), libuv as a public API (`vim.uv` timers / check
-handles / processes), frame-time rendering hooks (decoration providers), and the
-unbounded `vim.fn` inventory. nxvim's model is snapshot reads + queued effects on
-a pure synchronous core. Emulating the former on the latter means reimplementing
-neovim's event loop and renderer contract shim by shim — the one thing this
-architecture exists to refuse. The plugins that fought hardest (cmp, telescope,
-which-key, lualine) are all **UI-orchestration programs**: they want to own frame
-time and input loops.
+neovim plugins are **imperative programs written against neovim's runtime
+model** — synchronous re-entrant editor access, blocking reads (`getcharstr`,
+`vim.wait`), libuv as a public API (`vim.uv` timers / check handles /
+processes), frame-time rendering hooks (decoration providers), and the
+unbounded `vim.fn` inventory. nxvim's model is snapshot reads + queued effects
+on a pure synchronous core, behind a client-server boundary. Hosting the
+former on the latter would mean reimplementing neovim's event loop and
+renderer contract underneath someone else's API — surrendering the properties
+that are the point of the design (a pure core, a frame no script can stall,
+identical behavior across front ends including the serverless wasm builds).
 
-That diagnosis dictates the design.
+The plugins that define the ecosystem's UX — completion menus, fuzzy pickers,
+statuslines, popups, tree sidebars — are precisely **UI-orchestration
+programs**: they want to own frame time and input loops. That observation
+dictates the design.
 
 ## The model in one sentence
 
-**The server owns every UI surface and the frame; plugins are async, declarative
-*providers* of data and behavior.** Where neovim says "here are buffer
-primitives and hooks, draw your own completion menu", nxvim says "here is a
-completion engine; give it items."
+**The server owns every UI surface and the frame; plugins are async,
+declarative *providers* of data and behavior.** Where neovim says "here are
+buffer primitives and hooks, draw your own completion menu", nxvim says "here
+is a completion engine; give it items."
 
-Five rules, all of which the architecture already enforces internally — the API
-just makes them the documented contract instead of a hidden shim:
+Five rules — each one a property the architecture already enforces
+internally; the API makes them the documented contract:
 
-1. **Reads are snapshots.** `nx.buf.lines(b)` etc. read the state pushed at Lua
-   entry. Documented, not disguised.
+1. **Reads are snapshots.** `nx.buf.lines(b)` etc. read the state pushed at
+   Lua entry. Documented, not disguised.
 2. **Writes are queued effects.** Applied at the settle point
-   (`apply_lua_effects → run_pending → redraw`), same as today. Async writers
-   guard with a changedtick: `nx.buf.edit{tick = t, ...}` fails loud if stale.
-3. **Nothing blocks, ever.** No `vim.wait`, no blocking `getcharstr`, no uv
-   handles. Anything that waits takes a callback (`nx.ui.input`, `nx.spawn`,
-   `nx.fs.*`, `nx.timer`). This deletes the pcall-yield problem class on PUC Lua
-   by construction.
+   (`apply_lua_effects → run_pending → redraw`). Async writers guard with a
+   changedtick: `nx.buf.edit{tick = t, ...}` fails loud if stale.
+3. **Nothing blocks, ever.** No wait-pumps, no blocking reads, no uv handles.
+   Anything that waits takes a callback (`nx.ui.input`, `nx.spawn`,
+   `nx.fs.*`, `nx.timer`). This also keeps the PUC Lua 5.1 backend (no yield
+   across `pcall`) fully supported by construction.
 4. **No frame-time Lua.** Plugins publish decorations / segments / items
-   whenever they like; the server folds them into the next frame. A plugin can
-   never make redraw slow. (ADR 0001's bridge pattern, promoted to *the* API.)
+   whenever they like; the server folds them into the next frame. A plugin
+   cannot make redraw slow. (ADR 0001's bridge pattern, generalized into *the*
+   extension contract.)
 5. **Registrations are data.** Providers register with a name + schema and get
-   called with a context + a `respond` continuation carrying a generation token;
-   stale responses are dropped by the engine.
+   called with a context + a `respond` continuation carrying a generation
+   token; stale responses are dropped by the engine.
 
-Because Lua already influences the editor only through the same queues RPC
-clients use, every `nx.*` registration gets an RPC twin for free
+Because Lua influences the editor only through the same queues RPC clients
+use, every `nx.*` registration gets an RPC twin in principle
 (`nx_complete_register`, …) — out-of-process plugins in any language are the
 same surface, later. The in-process Lua host is v1.
 
@@ -71,11 +73,17 @@ same surface, later. The in-process Lua host is v1.
 | `nx.snippet` | **native snippet engine** (LSP grammar, tabstop mode, choices) | the existing LSP-snippet parse; tabstop session modeled like multi-cursor placement mode |
 | `nx.tree` | generic dock/tree views (file explorer, symbols, git) | the panel generalized to a persistent vertical dock |
 
-### Plugins, manifests, and lazy-loading (the lazy.nvim answer)
+The same `nx.*` namespace is the **config** API: `init.lua` is written against
+it (`nx.o`/`nx.opt` for options, `nx.keymap`, `nx.on`, `nx.command`, `nx.lsp`
+for server setup, `nx.treesitter` for tree scripting). The only `vim.*` Lua is
+the colorscheme glue and a closed set of muscle-memory aliases (see *The
+compatibility boundary* below).
+
+### Plugins, manifests, and activation (why there is no plugin-manager plugin)
 
 A plugin is a directory with a cheap data-only manifest; code loads on first
-contribution hit (VS Code-style activation, which lazy.nvim approximates from
-the outside because neovim plugins can't declare contributions):
+contribution hit (VS Code-style activation — the thing lazy.nvim approximates
+from the outside, because neovim plugins cannot *declare* their triggers):
 
 ```lua
 -- ~/.config/nxvim/plugins/nx-files/plugin.lua  (data only; no requires)
@@ -89,9 +97,8 @@ return {
 }
 ```
 
-`init.lua` declares the set; a built-in manager syncs it over the async runtime
-(real `git clone` via `nx.spawn` — the machinery the lazy compat work already
-proved out):
+`init.lua` declares the set; the built-in manager syncs it over the async
+runtime (real `git clone` via `nx.spawn`):
 
 ```lua
 nx.plugins {
@@ -101,26 +108,26 @@ nx.plugins {
 -- :PluginSync clones/updates; :PluginList shows state
 ```
 
-There is no lazy.nvim-shaped plugin because there is nothing left to optimize
-around: manifests defer code load by construction, and the UI paints before
-plugins finish loading anyway (the server is async; startup is not a single
-blocking script).
+There is no third-party plugin-manager layer because there is nothing for one
+to optimize: manifests defer code load by construction, and the UI paints
+before plugins finish loading anyway (the server is async; startup is not a
+single blocking script).
 
-## The five proofs
+## Five worked examples
 
-Each of the plugins that defeated the compat layer, rebuilt as a provider. In
-every case the *hard* part moves into the server in Rust and the plugin shrinks
-to data + small callbacks.
+The ecosystem staples a daily driver needs, designed as providers. In every
+case the *hard* part is the server's job, in Rust, built once — and the
+plugin shrinks to data + small callbacks.
 
-### 1. nvim-cmp → the native completion engine + sources
+### 1. Completion (the nvim-cmp shape) — native engine + sources
 
 The engine owns trigger detection (input path), debounce (evloop), source
-fan-out with generation tokens, fuzzy ranking (Rust), the menu + matched-char
-highlighting + doc float (the pmenu already renders docs), and snippet expansion
-on accept. Recall what cmp's compat chain actually consisted of —
-`timer:is_active`, the `vim.wait` pump, uv check-handle methods, `hlID`/`syn*`,
-decoration providers — none of it was *completion*; all of it was runtime
-emulation so cmp could run its own menu. All of it evaporates.
+fan-out with generation tokens, fuzzy ranking (Rust), the menu +
+matched-char highlighting + doc float (the pmenu already renders docs), and
+snippet expansion on accept. Under neovim, a completion plugin must build all
+of that itself — its own menu windows, debounce on libuv check handles,
+frame-time decoration providers for matched-char highlights. Here none of it
+is plugin surface.
 
 ```lua
 -- init.lua — completion is built in; this is the whole setup
@@ -161,11 +168,11 @@ nx.complete.source {
 }
 ```
 
-### 2. lualine → statusline segments
+### 2. Statusline (the lualine shape) — segments
 
 The server already renders status lines. Segments are functions re-evaluated
-**only on declared events** — never per frame (lualine's model is "re-enter Lua
-every redraw", which is exactly the forbidden shape). The server caches each
+**only on declared events** — never per frame (the "re-enter Lua every
+redraw" model is exactly what rule 4 forbids). The server caches each
 segment's resolved cells and paints natively.
 
 ```lua
@@ -192,13 +199,13 @@ nx.spawn { cmd = "git", args = { "branch", "--show-current" },
   end }
 ```
 
-### 3. telescope → the native picker + sources
+### 3. Fuzzy finding (the telescope shape) — native picker + sources
 
-The picker UI is server-owned: prompt line, result list, preview pane (floats),
-fuzzy matching in Rust (nucleo-class), and **all navigation/typing handled
-natively** — Lua sees only "query changed" (dynamic sources) and "confirmed".
-Telescope's entire performance story (the prompt-buffer `on_lines` → Lua sorter
-loop per keystroke) ceases to exist.
+The picker UI is server-owned: prompt line, result list, preview pane
+(floats), fuzzy matching in Rust (nucleo-class), and **all navigation/typing
+handled natively**. Under neovim a picker's hot loop is Lua — a prompt-buffer
+callback re-sorting results on every keystroke; here Lua sees only "query
+changed" (dynamic sources) and "confirmed".
 
 ```lua
 nx.keymap.set("n", "<leader>ff", function() nx.picker.open("files") end)
@@ -239,13 +246,13 @@ nx.picker.source {
 }
 ```
 
-### 4. LuaSnip → the native snippet engine
+### 4. Snippets (the LuaSnip shape) — native engine
 
 The server owns the LSP snippet grammar (a parser already exists for pmenu
 inserts), expansion, the tabstop session (a small input mode — multi-cursor
 placement mode is the in-repo precedent for exactly this shape), mirrored
-placeholders, and `${1|a,b|}` choices via the native pmenu. Plugins contribute
-snippet *data*, with functions for dynamic bodies:
+placeholders, and `${1|a,b|}` choices via the native pmenu. Plugins
+contribute snippet *data*, with functions for dynamic bodies:
 
 ```lua
 nx.snippet.setup { jump_next = "<C-j>", jump_prev = "<C-k>" }
@@ -260,17 +267,18 @@ nx.snippet.add("rust", {
 })
 ```
 
-A friendly-snippets loader is a ten-line plugin: `nx.fs.read` the VS Code JSON,
-`nx.snippet.add` per filetype. The completion engine's `snippets` source and
-LSP completions with snippet bodies expand through the same engine.
+A friendly-snippets loader is a ten-line plugin: `nx.fs.read` the VS Code
+JSON, `nx.snippet.add` per filetype. The completion engine's `snippets`
+source and LSP completions with snippet bodies expand through the same
+engine.
 
-### 5. nvim-tree → `nx.tree` dock views
+### 5. File explorer (the nvim-tree shape) — `nx.tree` dock views
 
-Not a file-explorer built-in but a generic **tree view** surface (file explorer,
-symbol outline, git status are all instances). The server owns the dock window
-(the panel generalized to a persistent vertical dock), rendering, expand/collapse
-state, cursor movement, and key routing; the plugin supplies children and
-actions. No buffer puppeteering, no `getcharstr` prompts.
+Not a file-explorer built-in but a generic **tree view** surface (file
+explorer, symbol outline, git status are all instances). The server owns the
+dock window (the panel generalized to a persistent vertical dock), rendering,
+expand/collapse state, cursor movement, and key routing; the plugin supplies
+children and actions. No buffer puppeteering, no blocking prompts.
 
 ```lua
 local view = nx.tree.view {
@@ -306,25 +314,50 @@ nx.keymap.set("n", "<leader>e", function() view:toggle() end)
 nx.fs.watch(nx.cwd(), function() view:refresh() end)
 ```
 
-## What dies, what stays
+## The compatibility boundary
 
-**Dies:** `vim.wait` and the pump, the `vim.uv` emulation (timers/checks/
-processes as public handles), decoration providers, the `vim.fn` long tail,
-prompt-buffer emulation, the pcall-yield concern, `prelude/compat.lua` growth.
-The existing compat code is frozen, not ripped out, until `nx` covers config
-needs.
+Per [ADR 0002](../decisions/0002-native-plugin-system.md) the break is clean:
+**every editor API lives in `nx.*`**, config included. The only `vim.*` Lua
+is the **colorscheme glue** — a bounded shim (`nvim_set_hl`, `vim.g`, option
+reads, the small helpers colorschemes actually touch) present for sourcing a
+colorscheme, so real neovim colorschemes (e.g. catppuccin) run unmodified.
 
-**Stays:** colorscheme compat (`nvim_set_hl` data — catppuccin keeps working);
-the runtimepath/`require` machinery; the snapshot/queue/settle machinery itself
-(it *is* the `nx` contract, finally documented); the native LSP, treesitter,
-extmark, pmenu, float, and panel subsystems — they're the engines the surfaces
-above expose.
+One carve-out, for muscle memory: a **closed whitelist of `vim.*` aliases**
+maps 1:1 onto the `nx.*` equivalents, so the declarative portion of an
+existing neovim config works unmodified. The admission test: frequent in real
+configs, declarative or callback-shaped (never blocking, never frame-time),
+1:1 onto an `nx` primitive. The set (the canonical list lives in
+[ADR 0002](../decisions/0002-native-plugin-system.md)): variables / options /
+env (`vim.g`/`vim.b`/`vim.w`, `vim.o`/`vim.opt`/`vim.opt_local`/`vim.bo`/
+`vim.wo`, `vim.env`); `vim.cmd` and `vim.keymap.set`/`del`; the pure helpers
+(`vim.tbl_*`, `vim.split`, `vim.trim`, `vim.startswith`/`endswith`,
+`vim.list_extend`, `vim.deepcopy`, `vim.inspect`, `vim.json`); a partial
+`vim.api` of exactly the declarative registrations
+(`nvim_create_autocmd`/`augroup`/`del`/`clear`, `nvim_create_user_command`,
+`nvim_set_hl` — any other `vim.api` access fails loud) plus
+`vim.filetype.add`; and the callback-shaped async (`vim.notify`,
+`vim.schedule`, `vim.defer_fn`, `vim.ui.input`/`select`, and `vim.system` in
+its callback form only — `:wait()` fails loud). Aliases, not an API: the same
+objects, `nx` semantics, no growth beyond the list.
+
+There is no `vim.treesitter` or `vim.lsp`: of that machinery, what serves
+nxvim's objectives is refactored into `nx.treesitter` / `nx.lsp`, and the
+rest is deleted. The neovim runtime-model surfaces — wait-pumps, public uv
+handles, decoration providers, the `vim.fn` long tail, prompt-buffer
+emulation — exist on neither side of the API: plugins and config get
+`nx.spawn` / `nx.timer` / `nx.fs` / `nx.ui.*` instead.
+
+The native subsystems the surfaces above expose — LSP, treesitter, extmarks,
+the pmenu, floats, the panel, the evloop, the settle contract — are the
+engines this API is a thin contract over.
 
 ## Suggested build order
 
-1. **`nx` core** (buf/win/event/spawn/fs/timer/keymap/ui.input — mostly renames
-   + contracts over existing machinery) and the manifest loader.
-2. **Picker** — highest user value; exercises spawn/stream/cancel/float/preview.
+1. **`nx` core** (buf/win/options/event/spawn/fs/timer/keymap/command/ui.input
+   + `nx.lsp` setup — contracts over existing machinery; `init.lua` targets it
+   from day one) and the manifest loader + package manager.
+2. **Picker** — highest daily-driver value; exercises spawn / streaming /
+   cancellation / floats / preview end to end.
 3. **Completion engine** — LSP + buffer + snippets sources built-in.
 4. **Statusline segments**, **snippet engine** (shared with 3), **tree docks**.
-5. RPC twins of the registries (out-of-process providers) — later, free-ish.
+5. RPC twins of the registries (out-of-process providers) — later.

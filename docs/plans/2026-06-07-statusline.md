@@ -3,13 +3,13 @@
 A custom, per-window status line driven by neovim's `'statusline'` option, with
 **full neovim format semantics**: `%`-items (`%f %l %c %m %= %< …`), highlight
 switches (`%#Group#`), and embedded expressions (`%{expr}`, `%!expr`,
-`%{%expr%}`). This is the foundation for plugin-class status lines (lualine,
-heirline) and the **shared `%`-format engine the tabline will later reuse** —
+`%{%expr%}`). This is the foundation for rich, user-configured status lines and
+the **shared `%`-format engine the tabline will later reuse** —
 the original request that kicked this off (custom tab labels via
 `tabline = '%!v:lua...'`) is a follow-up that drops onto the same engine.
 
-Status line first, because it is lualine's actual target and exercises every
-hard part of the format language; the tabline is a thin second customer.
+Status line first, because it exercises every hard part of the format language;
+the tabline is a thin second customer.
 
 ## Why this is feasible now (de-risking facts)
 
@@ -24,8 +24,8 @@ Verified in the current tree before planning:
   `@`-fallback resolution all live in `crates/nxvim-core/src/highlight.rs`, and
   the redraw path already resolves chrome regions to concrete `Style`s
   (`crates/nxvim-server/src/redraw.rs:223`, including a `StatusLine` group).
-  `%#Group#` resolution is reusing machinery that already works. lualine
-  generates its segment highlights via `nvim_set_hl` — already supported.
+  `%#Group#` resolution is reusing machinery that already works. Segment
+  highlights generated via `nvim_set_hl` are already supported.
 - **The status line is the last client-composed chrome.** Today the TUI builds
   the status *text* itself in `render_status`
   (`crates/nxvim-tui/src/render.rs:796`) from projected `WindowView` fields
@@ -78,8 +78,8 @@ only known after `%{}`/`%!` expressions evaluate. So:
 ### Expression scope (loud, not silent)
 
 `%{}` / `%!` evaluate **Vimscript** in real neovim. nxvim has no Vimscript, so we
-support **only `v:lua.…` expressions** (which is what lualine and the user's
-config use: `%!v:lua.require('myutils').my_tab_line()`). Any non-`v:lua`
+support **only `v:lua.…` expressions** (which is what a user's statusline
+config uses: `%!v:lua.require('myutils').my_tab_line()`). Any non-`v:lua`
 expression **errors loudly** at eval time (per the no-silent-stub rule in
 CLAUDE.md) — naming the unsupported expression — rather than rendering empty.
 
@@ -112,7 +112,7 @@ by setting `'statusline'` and asserting on the `redraw` notification
   elsewhere; preserving today's look).
 - Rendering is **live**: redraw re-evaluates the format every frame, so
   `%{}`/`%!` results that depend on editor state stay current with no extra
-  invalidation machinery. (lualine's own refresh is then mostly redundant.)
+  invalidation machinery. (An external refresh timer is then mostly redundant.)
 
 ## Phases
 
@@ -166,7 +166,7 @@ correctness is asserted through Phase 3's redraw tests.
 
 ### Phase 5 — `vim.fn` / `vim.api` surface for real configs ✅ done
 
-Add the functions a real statusline (and lualine) call from inside `%{}`/`%!`:
+Add the functions a real statusline calls from inside `%{}`/`%!`:
 `mode()`, `line('.')`, `col('.')`, `winnr()`, `bufnr()`, `fnamemodify()`,
 `expand('%:…')`, `getbufvar`, `nvim_get_current_line` width helpers, etc. Each
 added only when exercised by a test (no speculative stubs). Confirm live refresh:
@@ -209,12 +209,12 @@ neovim. `getbufvar` deferred (no test demands it yet). The window-relative
 - **Tabline reuse** — the original request: a `tabline` string option that runs
   the *same* engine, with `%nT` tab-select / `%T` / `%X` close items. At this
   point `tabline = '%!v:lua.require("myutils").my_tab_line()'` works verbatim.
-- lualine-readiness pass.
+- Full-config readiness pass.
 
 ## Out of scope (for now)
 
 - Full Vimscript `%{}` expressions — only `v:lua.*` is supported (loud error
-  otherwise). Covers lualine and the user's config.
+  otherwise). Covers the user's config.
 - `%@click@` mouse-click handlers in the statusline (revisit with `%nT`/`%X` in
   Phase 6, where the tabline genuinely needs click regions).
 - Per-window (`setlocal statusline`) overrides — global-only in v1.

@@ -7,8 +7,8 @@ the `<C-w>` family, and the `nvim_win_*` / Lua API (see
 [`architecture.md` → *Windows*](../architecture.md#windows)). What it does **not**
 have is the *other* kind of window neovim grew: a **floating window** — a free
 window positioned by absolute coordinates *on top of* the tiled layout rather than
-tiled into it. Floats are how every modern plugin draws UI: completion docs,
-hover, signature help, `which-key`, `telescope`, `lazy.nvim`, notifications,
+tiled into it. Floats are how every rich editor UI is drawn: completion docs,
+hover, signature help, key-hint popups, fuzzy-finder pickers, notifications,
 borders around `vim.ui.select`. Today `nvim_open_win` accepts **only the split
 form** and raises/ignores the float config:
 
@@ -462,8 +462,8 @@ round-trips full fidelity; `vim.api.nvim_open_win` builds the float config and t
 `vim._wins` mirror reflects it so reads within the same `:lua` chunk see it.
 
 **Why.** Phase 1–2 made a float openable and visible from the RPC layer; the
-*plugin* surface is `vim.api` + `set_config` (every float-using plugin repositions
-or resizes after open — `telescope` resizing on `VimResized`, hover moving with
+*plugin* surface is `vim.api` + `set_config` (every float-using UI repositions
+or resizes after open — a picker resizing on `VimResized`, hover moving with
 the cursor). This phase makes floats a first-class Lua citizen, following the
 established **"Lua queues, core mutates"** flow windows already use.
 

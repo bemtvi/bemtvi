@@ -47,7 +47,7 @@ vim.keymap.set('n', 'gh', function() print('gh') end)
 
 Typing `gg` does **not** jump to the top immediately — it resolves only on the
 *next* keystroke or after the `timeoutlen` idle flush. neovim has no such lag: `gg`
-is instant, and which-key shows `gg`, `gh`, … as peers under the `g` prefix.
+is instant, and a key-hint popup shows `gg`, `gh`, … as peers under the `g` prefix.
 
 ### Why nxvim lags (root cause)
 

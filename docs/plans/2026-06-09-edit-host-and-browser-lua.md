@@ -30,8 +30,8 @@ above it — the same direction VS Code Remote takes (the Monaco editor and its
 text model are local; fs, LSP, terminals are remote). One honest divergence from
 that precedent, owned rather than glossed: VS Code runs its *extension host* on
 the **remote**, while nxvim keeps the plugin runtime (Lua) **local** —
-deliberately, because nvim plugins are latency-sensitive UI (statusline per
-keystroke, which-key popups, telescope sorters) and running them remote would
+deliberately, because plugins are latency-sensitive UI (statusline per
+keystroke, key-hint popups, fuzzy-finder sorters) and running them remote would
 reintroduce the very lag this plan removes. The cost is that the Lua VM's
 *native* view of the filesystem is the local machine's — see the *Lua-visible
 filesystem semantics* bullet under Phase 3, the hardest semantic the full split
@@ -544,7 +544,7 @@ rather than re-deriving the reconcile logic.
 The reconciliation with the recent `vim.uv.fs_event` work (commit `f7bae73`), built.
 The server *already had* a native `notify`-backed watcher actor (`evloop.rs`:
 `FsEventStart`/`FsEventStop` → `LoopEvent::FsEvent`), driven only by Lua
-(`vim.uv.new_fs_event`, lualine watches `.git/HEAD`). That watcher is the **trigger**
+(`vim.uv.new_fs_event`, e.g. a statusline VCS segment watching `.git/HEAD`). That watcher is the **trigger**
 primitive; Phase 3i's `checktime`/`autoread` is the **policy** — complementary layers,
 exactly as neovim splits libuv fs_event from `FileChangedShell`, and **non-overlapping**
 (3i added a stat-based reconcile, not a second watcher). So the auto-trigger **reuses** the
@@ -1099,7 +1099,7 @@ The cross-cutting semantic the *Lua-visible filesystem semantics* bullet below n
 hardest one": plugins read the *project* through `vim.uv.fs_*` and a handful of `vim.fn` fs
 builtins, which bound **directly** to `std::fs` (~22 sites in `nxvim-lua/uvfs.rs`, plus
 `install.rs`/`host.rs`). In a daemon session that silently hits the *local* machine — the
-wrong filesystem — so telescope previewers, LSP `root_dir` detection, and gitsigns would
+wrong filesystem — so file-picker previewers, LSP `root_dir` detection, and VCS-status providers would
 see the wrong tree. This slice routes that surface through a synchronous **`LuaFs` seam**
 (the fs analogue of Phase 3n's `BlockingSystem`), with a daemon **blocking bridge** so a
 plugin reads the *remote* project. The **split-brain routing rule was decided up front, not

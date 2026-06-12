@@ -478,8 +478,8 @@ separate spec rather than a sixth phase):
    **pmenu**, the **hover doc preview**, and arguably the bottom **panel** are
    bespoke `View` fields with their own client paint paths today. The float
    primitive is the chance to rebuild those on one general overlay path (or share
-   it), and it is what unblocks the plugins that *require* real floats —
-   telescope, which-key, notify, lazy.nvim's UI.
+   it), and it is what unblocks the UI surfaces that *require* real floats —
+   fuzzy-finder pickers, key-hint popups, notifications, plugin-manager UIs.
 
 So the tiled-windows work is the foundation floats stand on: the protocol
 (Phase 2) and `nvim_open_win` (Phase 5) are intentionally left open at the seams

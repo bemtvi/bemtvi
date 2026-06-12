@@ -65,7 +65,7 @@ are no longer listed here — only the edges that still diverge are.
   Rust indent stays. `query.get` returns nil for a missing on-disk query file.
 - **`vim.uv` / `vim.loop` is host primitives only.** The libuv **handle** surface
   (`new_timer` / `new_check` / `new_fs_event` / `spawn` / `new_pipe`, the plugin
-  event-loop primitives) was removed with the plugin-compat pivot — async lives in
+  event-loop primitives) is **not** part of the `nx` model — async lives in
   the `nx` API (`nx.spawn` / `nx.timer` / `nx.fs`). What stays is the synchronous
   host primitives the kept LSP-config / treesitter paths read: `fs_*`, `fs_realpath`,
   `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`.

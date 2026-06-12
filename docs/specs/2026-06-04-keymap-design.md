@@ -695,7 +695,7 @@ algorithm, the trie shape, the registry, or the Lua surface.
   would expose. Add when a plugin needs it.
 - **Recorded macros (`q`/`@`)** — a separate feed source that would reuse the same
   input path; out of scope here.
-- **`which-key`-style ambiguity UI** — surfacing pending-prefix hints in the panel; a
+- **Key-hint ambiguity UI** — surfacing pending-prefix hints in the panel; a
   UI follow-up once `pending` exists.
 
 ## Compared to neovim

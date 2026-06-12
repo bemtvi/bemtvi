@@ -143,7 +143,7 @@ of the local disk. See
 **split-brain filesystem rule** for the Lua bridge, decided up front: *project-facing*
 fs APIs (`vim.uv.fs_*`, `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
 through the `LuaFs` seam — local disk by default, the remote daemon in a split — so
-telescope previewers, root detection, and gitsigns see the *project*; while raw Lua
+file-picker previewers, root detection, and VCS-status providers see the *project*; while raw Lua
 `io.*`/`os.*`, `require`/`package.path`, the runtimepath (`nvim_get_runtime_file`), and
 `stdpath` stay **local** — plugins and their caches live on the local machine by design
 (the divergence from VS Code's remote-extension-host model).
@@ -1050,8 +1050,8 @@ screen," and that is exactly the shape of these tests.
   `sidescroll`/`sidescrolloff`, the buffer-local indentation options, and global
   `showtabline` are wired; `wrap`/`cursorline`/… are not) and richer diagnostic
   surfaces. (Blocking reads — `vim.fn.input` / `vim.fn.confirm` / `vim.fn.getcharstr`
-  / `vim.wait` and the coroutine pump that hosted them — were **removed** with the
-  pivot off neovim-plugin compat: nothing in the `nx` model blocks the editor, so
+  / `vim.wait` and the coroutine pump that hosted them — are **not** part of the
+  `nx` model: nothing in it blocks the editor, so
   the only prompt surface is the callback-shaped `vim.ui.input` / `vim.ui.select`.)
   Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
@@ -1089,7 +1089,7 @@ screen," and that is exactly the shape of these tests.
   defers to convergence, `vim.defer_fn` fires on wall-clock time, and
   `vim.system`'s `on_exit` fires off-tick. The libuv **handle** surface
   (`vim.uv.new_timer`/`new_check`/`new_fs_event`/`spawn`, the plugin event-loop
-  primitives) was **removed** with the plugin-compat pivot; the `vim.uv` scalars
+  primitives) is **not** part of the `nx` model; the `vim.uv` scalars
   and synchronous `fs_*` that the kept LSP-config / treesitter paths read stay.
   Async primitives are the `nx` API's job (`nx.spawn` / `nx.timer` / `nx.fs`) —
   the existing timer/process machinery is the donor for those

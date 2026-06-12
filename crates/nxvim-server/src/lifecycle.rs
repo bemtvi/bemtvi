@@ -615,57 +615,22 @@ impl EditHost {
 
     /// Source a startup Lua file (the user's `init.lua`). Missing files are
     /// skipped silently — having no config is normal. A Lua error surfaces on
-    /// the message line; effects are drained through the same path as `:lua`.
-    ///
-    /// Runs through the coroutine **pump** (not a bare `exec`), so a blocking
-    /// `vim.wait` / `vim.fn.input` in config PARKS on the loop instead of erroring
-    /// "requires a synchronous pumped context" — the path lazy.nvim's startup
-    /// auto-install takes (its `setup()` blocks on `vim.wait` while it clones).
-    /// Returns `true` when the script ran to completion, `false` when it parked: in
-    /// that case the caller must drive the event loop until [`init_complete`] holds
-    /// before serving, so config is fully applied first (as neovim does).
-    ///
-    /// [`init_complete`]: Self::init_complete
-    #[must_use]
-    pub(crate) fn source_init(&mut self, path: &Path) -> bool {
+    /// the message line; effects are drained through the same path as `:lua`. The
+    /// script runs to completion synchronously (its options, mappings, and
+    /// colorscheme are in place by the time the first frame goes out), matching
+    /// neovim sourcing `init.lua` before serving the UI.
+    pub(crate) fn source_init(&mut self, path: &Path) {
         let src = match std::fs::read_to_string(path) {
             Ok(src) => src,
-            Err(_) => return true, // no config = nothing to wait on
+            Err(_) => return, // no config = nothing to source
         };
         let name = format!("@{}", path.display());
-        let complete = match self.lua.source_init_pumped(&src, &name) {
-            Ok(complete) => complete,
-            Err(e) => {
-                self.editor
-                    .echo(format!("E5113: Error while sourcing init.lua: {e}"));
-                true // the script errored out — there is nothing parked to drive
-            }
-        };
+        if let Err(e) = self.lua.exec_named(&src, &name) {
+            self.editor
+                .echo(format!("E5113: Error while sourcing init.lua: {e}"));
+        }
         self.apply_lua_effects();
         self.run_pending();
-        complete
-    }
-
-    /// Whether the parked `init.lua` coroutine has finished. The startup loop polls
-    /// this between event-loop drives after [`source_init`](Self::source_init)
-    /// reports a park, so the UI is served only once config has fully run. A Lua
-    /// error reading the flag is treated as "complete" so a malformed state can
-    /// never wedge startup in the drive loop.
-    pub(crate) fn init_complete(&self) -> bool {
-        self.lua.init_complete().unwrap_or(true)
-    }
-
-    /// Fail loud when the startup drive loop gives up on a parked `init.lua` (no
-    /// event-loop activity for the silence window — the script blocked on a read
-    /// with no input source, e.g. `vim.fn.input` before a UI is attached). Surfaces
-    /// on the message line rather than letting startup hang forever; the rest of
-    /// startup (plugins, the first frame) then proceeds.
-    pub(crate) fn echo_startup_stall(&mut self) {
-        self.editor.echo(
-            "E5113: Error while sourcing init.lua: blocked at startup on a read \
-             with no input source (vim.fn.input before UI attach?)"
-                .to_string(),
-        );
     }
 
     /// Source the package `plugin/` Lua scripts found across the runtimepath, then

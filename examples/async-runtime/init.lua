@@ -43,20 +43,20 @@ vim.defer_fn(function()
 end, 300)
 
 --------------------------------------------------------------------------------
--- 3. vim.uv timer — a repeating timer that ticks a few times then stops itself.
---    Each tick prints on wall-clock time with no keypresses; it self-stops after
---    4 ticks (proof a repeating timer both repeats AND is stoppable).
+-- 3. A repeating timer via vim.defer_fn — it self-reschedules each tick, prints
+--    on wall-clock time with no keypresses, and stops itself after 4 ticks.
 --------------------------------------------------------------------------------
 do
-  local timer = vim.uv.new_timer()
-  timer:start(250, 250, function()
+  local function tick()
     _G.async_demo.uv_ticks = _G.async_demo.uv_ticks + 1
-    print("[uv timer] tick " .. _G.async_demo.uv_ticks .. " of 4")
-    if _G.async_demo.uv_ticks >= 4 then
-      timer:stop()
-      vim.notify("[uv timer] done — stopped after 4 ticks")
+    print("[timer] tick " .. _G.async_demo.uv_ticks .. " of 4")
+    if _G.async_demo.uv_ticks < 4 then
+      vim.defer_fn(tick, 250)
+    else
+      vim.notify("[timer] done — stopped after 4 ticks")
     end
-  end)
+  end
+  vim.defer_fn(tick, 250)
 end
 
 --------------------------------------------------------------------------------

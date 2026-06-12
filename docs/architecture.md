@@ -1049,13 +1049,11 @@ screen," and that is exactly the shape of these tests.
   nxvim honors (window-local `number`/`relativenumber` + the horizontal-scroll
   `sidescroll`/`sidescrolloff`, the buffer-local indentation options, and global
   `showtabline` are wired; `wrap`/`cursorline`/… are not) and richer diagnostic
-  surfaces. (The **synchronous prompts**
-  `vim.fn.input` /
-  `vim.fn.confirm` are now implemented: a pumped entry — a `:lua` chunk, keymap,
-  or user command — runs its Lua inside a coroutine via `vim._pump`, so the prompt
-  `coroutine.yield`s to park the chunk on the command line and the result resumes
-  it inline. See `examples/sync-prompts/`.) Legacy Vimscript (`eval.c`) is **not**
-  on the roadmap — see guiding principle 2.
+  surfaces. (Blocking reads — `vim.fn.input` / `vim.fn.confirm` / `vim.fn.getcharstr`
+  / `vim.wait` and the coroutine pump that hosted them — were **removed** with the
+  pivot off neovim-plugin compat: nothing in the `nx` model blocks the editor, so
+  the only prompt surface is the callback-shaped `vim.ui.input` / `vim.ui.select`.)
+  Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
   **window-local** number-gutter options `number` / `relativenumber` (also via
   `:setlocal` / `vim.wo` / `nvim_win_{get,set}_option`) and the window-local
@@ -1088,11 +1086,13 @@ screen," and that is exactly the shape of these tests.
   child processes; on completion it sends a typed `LoopEvent` back to the single
   server thread, which runs the matching Lua callback by id (the `vim._cb_fns`
   registry, the keymap-callback shape applied to async work). `vim.schedule`
-  defers to convergence, `vim.defer_fn`/`vim.uv` timers fire on wall-clock time,
-  and `vim.system`'s `on_exit` fires off-tick. The `vim.uv`/`vim.loop` surface
-  does not grow: it is not part of the colorscheme glue, and async primitives
-  are the `nx` API's job (`nx.spawn` / `nx.timer` / `nx.fs`) — the existing
-  timer/process machinery is the donor for those
+  defers to convergence, `vim.defer_fn` fires on wall-clock time, and
+  `vim.system`'s `on_exit` fires off-tick. The libuv **handle** surface
+  (`vim.uv.new_timer`/`new_check`/`new_fs_event`/`spawn`, the plugin event-loop
+  primitives) was **removed** with the plugin-compat pivot; the `vim.uv` scalars
+  and synchronous `fs_*` that the kept LSP-config / treesitter paths read stay.
+  Async primitives are the `nx` API's job (`nx.spawn` / `nx.timer` / `nx.fs`) —
+  the existing timer/process machinery is the donor for those
   ([ADR 0002](decisions/0002-native-plugin-system.md)).
 - The `vim.*` glue, kept only as far as colorschemes need
   ([ADR 0002](decisions/0002-native-plugin-system.md)).

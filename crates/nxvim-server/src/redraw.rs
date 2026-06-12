@@ -34,10 +34,6 @@ impl EditHost {
         // Drive LSP document sync for the current buffer (non-blocking).
         #[cfg(feature = "native")]
         self.sync_lsp();
-        // Drive any registered decoration providers, populating the per-frame
-        // ephemeral extmark store the projection below reads (a no-op, save the
-        // gate check, when none is registered).
-        self.run_decoration_providers(&view);
 
         // Resolve every highlight span and chrome region to a concrete style here
         // on the server (the registry lives in the core). Spans carry an index
@@ -409,7 +405,7 @@ impl EditHost {
     /// `E:…` marker naming the offending expression (rendered on the status line)
     /// rather than silently expanding to nothing. A `v:lua.` prefix is stripped to
     /// the bare Lua expression (`v:lua.require('m').f()` → `require('m').f()`),
-    /// which the synchronous, prompt-pumping evaluator runs inline during redraw.
+    /// which the synchronous evaluator runs inline during redraw.
     fn eval_statusline_expr(&self, raw: &str) -> String {
         let expr = raw.trim();
         let Some(lua) = expr.strip_prefix("v:lua.") else {
@@ -417,7 +413,7 @@ impl EditHost {
                 "E:statusline: unsupported expression {{{expr}}} (only v:lua.* is supported)"
             );
         };
-        match self.lua.eval_to_value_pumped(lua) {
+        match self.lua.eval_to_value(lua) {
             Ok(value) => stringify_eval(&value),
             Err(err) => format!("E:{err}"),
         }

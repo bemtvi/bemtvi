@@ -1,158 +1,39 @@
 -- nxvim Lua prelude — timers and vim.bo.
--- vim.defer_fn, vim.uv timers and vim.fn.timer_* over the event-loop bridge, plus the vim.bo buffer-option proxy.
+-- vim.defer_fn over the event-loop bridge, plus the vim.bo buffer-option proxy.
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
 
 local vim = vim
 
--- ----- timers: vim.defer_fn / vim.uv timers / vim.fn.timer_* -----------------
--- All wall-clock timers ride the event-loop actor through the vim._timer_start /
+-- ----- vim.defer_fn ----------------------------------------------------------
+-- Wall-clock deferral rides the event-loop actor through the vim._timer_start /
 -- vim._timer_stop bridge: a callback id is registered in vim._cb_fns, the actor
 -- sleeps and fires LoopEvent::Timer, and the server runs the callback by id on its
--- thread. A repeating timer (repeat > 0) keeps its callback across fires; a
--- one-shot drops it. This is the same registry the keymap/schedule paths use.
-
--- A libuv-style timer handle: a table carrying its callback id, with the
--- start/stop/close/again methods plugins call. :start arms the actor timer;
--- :stop / :close cancel it (and :close drops the callback, freeing the registry).
--- Logical timer state, id-keyed, so :is_active() can answer faithfully. The
--- event-loop actor (Rust) *runs* the timer, but the armed/expired transition is
--- knowable Lua-side: a timer is active from :start until it is :stop/:close'd or
--- (one-shot only) fires. The lone edge the actor owns alone — a one-shot
--- auto-expiring with no Lua-side stop — is cleared at the single fire chokepoint
--- vim._run_cb (runtime.lua), which sees `keep == false` for a spent one-shot.
--- (Repeating timers stay active across fires until explicitly stopped.)
+-- thread. This is the same registry the keymap/schedule paths use.
 vim._timer_active = vim._timer_active or {}
 
-local uv_timer = {}
-uv_timer.__index = uv_timer
-function uv_timer:start(timeout, rep, cb)
-  if cb ~= nil then vim._cb_fns[self._id] = cb end
-  self._repeat = rep or 0
-  vim._timer_active[self._id] = true
-  vim._timer_start(self._id, timeout or 0, self._repeat)
-  return 0
-end
-function uv_timer:stop()
+-- A minimal timer handle returned by vim.defer_fn, so a caller can :stop() the
+-- deferral before it fires (neovim returns a uv timer; nxvim returns this). It is
+-- NOT the libuv handle API — the `nx` timer surface is the supported one.
+local defer_handle = {}
+defer_handle.__index = defer_handle
+function defer_handle:stop()
   vim._timer_active[self._id] = nil
   vim._timer_stop(self._id)
+  vim._cb_fns[self._id] = nil
   return 0
 end
-function uv_timer:again()
-  -- libuv: restart a repeating timer, using its stored repeat as the new delay.
-  vim._timer_active[self._id] = true
-  vim._timer_start(self._id, self._repeat, self._repeat)
-  return 0
-end
-function uv_timer:close(cb)
-  self._closing = true
-  vim._timer_active[self._id] = nil
-  vim._timer_stop(self._id)
-  vim._cb_fns[self._id] = nil -- drop the callback so the registry can't leak
-  vim._proc_pids[self._id] = nil
-  if cb then cb() end
-end
--- libuv semantics: is_active() is true while the timer is armed and will still
--- fire; is_closing() is true once :close() has begun tearing the handle down.
-function uv_timer:is_closing() return self._closing == true end
-function uv_timer:is_active() return vim._timer_active[self._id] == true end
-
--- vim.uv.new_timer_handle(id): wrap an existing callback id in a handle (used by
--- defer_fn, whose fn is already registered). vim.uv.new_timer(): a fresh handle.
--- vim.uv and vim.loop are the same table, so this lands on both.
-function vim.uv.new_timer_handle(id) return setmetatable({ _id = id, _repeat = 0 }, uv_timer) end
-function vim.uv.new_timer() return vim.uv.new_timer_handle(vim._next_cb_id()) end
-
--- luv's *function-form* timer API: uv.timer_start(handle, timeout, repeat, cb) /
--- uv.timer_stop(handle) / uv.timer_again(handle). luv exposes both the handle
--- methods (handle:start(...)) and these table-level functions taking the handle as
--- the first argument; some plugins use the latter (lualine's statusline refresh
--- timer is `vim.loop.timer_start(handle, …)` / `timer_stop(handle)`). vim.uv and
--- vim.loop are the same table, so these land on both. Each just delegates to the
--- handle method, so the event-loop bridge and no-leak guarantees are unchanged.
-function vim.uv.timer_start(handle, timeout, rep, cb) return handle:start(timeout, rep, cb) end
-function vim.uv.timer_stop(handle) return handle:stop() end
-function vim.uv.timer_again(handle) return handle:again() end
-
--- ----- vim.uv.new_fs_event: filesystem change watcher ------------------------
--- A libuv-style fs-event handle: watch a path and fire callback(err, filename,
--- events) when it changes. nxvim backs this with a native watcher (inotify /
--- FSEvents / kqueue, via the `notify` crate) in the event-loop actor (evloop.rs).
--- :start arms the watch, :stop cancels it (the handle can be re-started), :close
--- cancels and drops the callback. `flags` is luv's { watch_entry, stat, recursive }
--- table; `recursive` (watch a subtree) is honored, the others are accepted for
--- call-compatibility (they don't change what's reported).
-local uv_fs_event = {}
-uv_fs_event.__index = uv_fs_event
-function uv_fs_event:start(path, flags, cb)
-  if type(path) ~= "string" or path == "" then
-    error("fs_event:start: path must be a non-empty string", 2)
-  end
-  if type(cb) ~= "function" then error("fs_event:start: callback must be a function", 2) end
-  vim._cb_fns[self._id] = cb
-  self._path = path
-  vim._fs_event_start(self._id, path, type(flags) == "table" and flags.recursive or false)
-  return 0
-end
-function uv_fs_event:stop()
-  vim._fs_event_stop(self._id)
-  return 0
-end
-function uv_fs_event:getpath() return self._path end
-function uv_fs_event:close(cb)
-  vim._fs_event_stop(self._id)
-  vim._cb_fns[self._id] = nil -- drop the callback so the registry can't leak
-  if cb then cb() end
-end
-
-function vim.uv.new_fs_event() return setmetatable({ _id = vim._next_cb_id() }, uv_fs_event) end
+function defer_handle:is_active() return vim._timer_active[self._id] == true end
 
 -- vim.defer_fn(fn, timeout): run `fn` once, `timeout` ms from now, on the loop —
--- the off-tick deferral configs use for retry patterns. Returns a timer handle so
--- the caller can :stop() it before it fires (neovim returns a uv timer).
+-- the off-tick deferral configs use for retry patterns. Returns a handle so the
+-- caller can :stop() it before it fires.
 function vim.defer_fn(fn, timeout)
   local id = vim._next_cb_id()
   vim._cb_fns[id] = fn
   vim._timer_active[id] = true -- armed; the returned handle's :is_active() reads this
   vim._timer_start(id, timeout or 0, 0) -- one-shot
-  return vim.uv.new_timer_handle(id)
-end
-
--- vim.fn.timer_start(timeout, callback, opts): the vimscript timer. Returns a
--- timer id for timer_stop. `opts.repeat` is a *count* (-1 = forever, N = fire N
--- times, absent/0 = once); since the actor speaks intervals not counts, a finite
--- N>1 is honored by a wrapper that decrements and stops itself, so the count is
--- real rather than approximated. `callback` is called with the timer id (vim
--- passes the timer id as its argument).
-function vim.fn.timer_start(timeout, callback, opts)
-  opts = opts or {}
-  local count = opts["repeat"] or 0
-  local id = vim._next_cb_id()
-  if count == 0 then
-    vim._cb_fns[id] = function() callback(id) end
-    vim._timer_start(id, timeout, 0)
-  elseif count < 0 then
-    vim._cb_fns[id] = function() callback(id) end
-    vim._timer_start(id, timeout, timeout) -- forever, interval == timeout
-  else
-    local remaining = count
-    vim._cb_fns[id] = function()
-      callback(id)
-      remaining = remaining - 1
-      if remaining <= 0 then
-        vim._timer_stop(id)
-        vim._cb_fns[id] = nil
-      end
-    end
-    vim._timer_start(id, timeout, timeout)
-  end
-  return id
-end
-
--- vim.fn.timer_stop(id): cancel a timer started by timer_start and drop its fn.
-function vim.fn.timer_stop(id)
-  vim._timer_stop(id)
-  vim._cb_fns[id] = nil
+  return setmetatable({ _id = id }, defer_handle)
 end
 
 -- vim.ui: the selection / input / open surface, driven through nxvim's own panel

@@ -23,17 +23,10 @@ impl EditHost {
         self.drain_feedkeys();
     }
 
-    /// Route one input key. A coroutine parked on `vim.fn.getcharstr()` consumes
-    /// the key first (vim's blocking `getchar` reads from the typeahead ahead of
-    /// the editor); otherwise the key flows through the completion popup / mapping
-    /// engine as usual. Every key processed here is also reported to the
-    /// `vim.on_key` observers (including a getchar-consumed key, matching neovim).
+    /// Route one input key through the completion popup / mapping engine. Every key
+    /// processed here is also reported to the `vim.on_key` observers.
     pub(crate) fn process_key(&mut self, key: Key) {
         self.notify_on_key(key);
-        if let Some(cb) = self.pending_getchar.take() {
-            self.resume_getchar(cb, key);
-            return;
-        }
         // Insert-mode completion popup is modal, stateful UI routing: while it is
         // open it owns every key (navigate / accept / dismiss / live-refresh) ahead
         // of the mapping engine (design B5). A key the popup *doesn't* claim
@@ -73,25 +66,11 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
-    /// Resume a coroutine parked on `vim.fn.getcharstr()` (callback `cb`) with
-    /// `key`, the getchar analogue of delivering a `vim.ui.input` result. The
-    /// continuation commonly reads buffer/cursor state and may itself park on
-    /// another `getcharstr` (re-arming `pending_getchar`) or queue `nvim_feedkeys`,
-    /// both handled when its effects drain.
-    pub(crate) fn resume_getchar(&mut self, cb: u64, key: Key) {
-        self.push_buf_mirror();
-        if let Err(e) = self.lua.deliver_getchar(cb, &key_to_notation(key)) {
-            self.editor
-                .echo(format!("E5108: Error in getcharstr continuation: {e}"));
-        }
-        self.apply_lua_effects();
-    }
-
     /// Process the `nvim_feedkeys` typeahead to exhaustion: each queued key is fed
     /// through the matcher (a `remap` feed, so it can trigger mappings) or straight
     /// to the editor (a `noremap` feed), with its effects driven to convergence
     /// before the next. A fed key can re-fill the buffer (a mapping that itself
-    /// feeds keys) or be claimed by a parked `getcharstr`; both are handled here.
+    /// feeds keys), handled here.
     /// Bounded by a generous budget so a self-perpetuating feed can't spin forever.
     pub(crate) fn drain_feedkeys(&mut self) {
         if self.feed_buffer.is_empty() {
@@ -110,11 +89,9 @@ impl EditHost {
                 break;
             }
             budget -= 1;
-            // A fed key, like a typed one, is observed and can feed a parked getchar.
+            // A fed key, like a typed one, is observed.
             self.notify_on_key(key);
-            if let Some(cb) = self.pending_getchar.take() {
-                self.resume_getchar(cb, key);
-            } else if remap {
+            if remap {
                 self.feed_matcher(key);
             } else {
                 self.editor.input(key);

@@ -50,9 +50,8 @@ These have **no single call site to tag** because the subsystem itself is
 absent — a config touching them hits a nil index or a generic error, not a named
 gap. Recorded here so the sweep doesn't lose them. Subsystems that are now
 **fully built** (the treesitter platform — `start`/`stop`, customized/on-disk
-queries, injections, incremental `on_bytes` updates; `:TSInstall` fetch/compile;
-synchronous `vim.fn.input`/`confirm`) are no longer listed here — only the edges
-that still diverge are.
+queries, injections, incremental `on_bytes` updates; `:TSInstall` fetch/compile)
+are no longer listed here — only the edges that still diverge are.
 
 - **Treesitter — two edges remain.** The `vim.treesitter` platform is built (see
   the [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md) and
@@ -64,9 +63,12 @@ that still diverge are.
   (2) **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
   wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
   Rust indent stays. `query.get` returns nil for a missing on-disk query file.
-- **`vim.uv` / `vim.loop` beyond timers.** `new_pipe`, TCP (`new_tcp` — the
-  TCP transport behind the skipped gdscript `vim.lsp.rpc.connect`), and
-  event-based `fs_*` watchers are absent.
+- **`vim.uv` / `vim.loop` is host primitives only.** The libuv **handle** surface
+  (`new_timer` / `new_check` / `new_fs_event` / `spawn` / `new_pipe`, the plugin
+  event-loop primitives) was removed with the plugin-compat pivot — async lives in
+  the `nx` API (`nx.spawn` / `nx.timer` / `nx.fs`). What stays is the synchronous
+  host primitives the kept LSP-config / treesitter paths read: `fs_*`, `fs_realpath`,
+  `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`.
 - **Broad options surface.** `:set` honors the search/number booleans plus the
   buffer-local indentation options `tabstop` / `shiftwidth` / `softtabstop` /
   `expandtab` (also via `:setlocal`, `vim.bo`, and `nvim_{set,get}_option_value`).

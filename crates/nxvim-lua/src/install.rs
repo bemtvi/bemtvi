@@ -290,33 +290,6 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
-    // `vim._fs_event_start(id, path, recursive)`: begin watching `path` in the
-    // event-loop actor (native — inotify/FSEvents/kqueue), firing callback `id`
-    // (err, filename, events) on each change. `recursive` watches a subtree
-    // (libuv's `recursive` flag). Backs `vim.uv.new_fs_event():start`.
-    let sh = shared.clone();
-    vim.set(
-        "_fs_event_start",
-        lua.create_function(
-            move |_, (id, path, recursive): (u64, String, Option<bool>)| {
-                sh.borrow_mut().loop_ops.push(LoopOp::FsEventStart {
-                    id,
-                    path,
-                    recursive: recursive.unwrap_or(false),
-                });
-                Ok(())
-            },
-        )?,
-    )?;
-    // `vim._fs_event_stop(id)`: cancel the watch armed under `id`.
-    let sh = shared.clone();
-    vim.set(
-        "_fs_event_stop",
-        lua.create_function(move |_, id: u64| {
-            sh.borrow_mut().loop_ops.push(LoopOp::FsEventStop { id });
-            Ok(())
-        })?,
-    )?;
 
     // `vim.fn`: the Vimscript builtins the load path calls. Only the ones that
     // need real filesystem / environment access are Rust-backed; the rest of
@@ -543,17 +516,6 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `vim._getchar(cb_id)`: queue a blocking-getchar request carrying the parked
-    // coroutine's callback id. The server arms it as `pending_getchar` and resumes
-    // the coroutine with the next key (the `vim.fn.getcharstr` bridge).
-    let sh = shared.clone();
-    vim.set(
-        "_getchar",
-        lua.create_function(move |_, cb_id: u64| {
-            sh.borrow_mut().getchar_reqs.push(cb_id);
-            Ok(())
-        })?,
-    )?;
 
     // `vim._create_buf()`: queue a [`BufOp::Create`] for the server to drain into
     // `Editor::create_buffer`. The Lua-facing `nvim_create_buf` (prelude) has
@@ -617,42 +579,6 @@ pub(crate) fn install_runtime_api(
                     hl_group,
                     priority,
                 });
-                Ok(())
-            },
-        )?,
-    )?;
-    // The ephemeral funnel (`vim._extmark_set_ephemeral`): a decoration provider's
-    // `on_win` / `on_line` callback emitting `nvim_buf_set_extmark(…, { ephemeral =
-    // true })` while the server drives it during redraw. No id (ephemeral marks are
-    // not addressable) and no mirror write-through — these live for one frame only.
-    // `(bufnr, ns, row, col, end_row, end_col, hl_group, priority)`.
-    type ExtmarkEphemeralArgs = (
-        u64,
-        u32,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        u32,
-    );
-    let sh = shared.clone();
-    vim.set(
-        "_extmark_set_ephemeral",
-        lua.create_function(
-            move |_, (bufnr, ns, row, col, end_row, end_col, hl_group, priority): ExtmarkEphemeralArgs| {
-                sh.borrow_mut()
-                    .ephemeral_extmark_ops
-                    .push(ExtmarkOp::SetEphemeral {
-                        bufnr,
-                        ns,
-                        row,
-                        col,
-                        end_row,
-                        end_col,
-                        hl_group,
-                        priority,
-                    });
                 Ok(())
             },
         )?,

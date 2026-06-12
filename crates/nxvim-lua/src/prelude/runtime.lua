@@ -75,57 +75,6 @@ function vim._run_cb(id, keep, ...)
   if fn then return fn(...) end
 end
 
--- vim._pump(fn, ...): run fn(...) inside a coroutine so a SYNCHRONOUS prompt
--- (vim.fn.input / vim.fn.confirm) called within it can `coroutine.yield` to park
--- the chunk on the command line while it waits for the answer, then resume inline
--- with it. The pumped entry points (a :lua chunk, a keymap RHS, a user command)
--- run their Lua through this; a bare callback (timer / schedule / autocmd) does
--- not, so a blocking prompt there fails loud rather than hanging.
---
--- Returns (true, fn's-first-return) when fn ran to completion, or (false) when it
--- parked on a prompt — the prompt-result callback the prompt registered resumes
--- the coroutine later (see vim.fn.input). A fn error is re-raised (level 0, so no
--- extra position is prepended) for the server to surface as E5108.
-function vim._pump(fn, ...)
-  local co = coroutine.create(fn)
-  local ok, a = coroutine.resume(co, ...)
-  if not ok then error(a, 0) end
-  if coroutine.status(co) == "dead" then
-    return true, a -- completed; `a` is fn's first return value
-  end
-  return false -- suspended: parked on a prompt
-end
-
--- vim._source_init(fn): run the user's init.lua chunk through the same coroutine
--- pump as _pump, but RETAIN the coroutine (in vim._init_co) so the server can poll
--- whether it has finished (vim._init_done). Like _pump it lets a blocking vim.wait
--- / vim.fn.input in init.lua PARK on the loop instead of erroring "outside a
--- coroutine"; the server then nested-drives the event loop (timers firing, child
--- processes exiting — e.g. lazy.nvim's git clones) until the coroutine is dead,
--- matching neovim sourcing init.lua to completion before serving the UI.
---
--- Returns true when the chunk ran straight through (no park), false when it parked.
--- A chunk error is re-raised (level 0) for the server to surface as E5113.
-function vim._source_init(fn)
-  local co = coroutine.create(fn)
-  vim._init_co = co
-  local ok, a = coroutine.resume(co)
-  if not ok then
-    vim._init_co = nil
-    error(a, 0)
-  end
-  return coroutine.status(co) == "dead"
-end
-
--- vim._init_done(): has the parked init.lua coroutine finished? True when there is
--- no init coroutine (none sourced, or it ran straight through) or it is dead (it
--- completed, or errored on a resumed continuation — either way nothing left to
--- drive). The server polls this between nested loop drives during startup.
-function vim._init_done()
-  local co = vim._init_co
-  return co == nil or coroutine.status(co) == "dead"
-end
-
 -- vim.schedule(fn): defer `fn` to the end of the current convergence — it runs
 -- after the work that scheduled it settles, no longer nested in the caller's
 -- stack frame (the strict improvement over the old inline `fn()`), but still
@@ -208,30 +157,6 @@ end
 -- vim.notify_once: in neovim this dedups by message; we have no message history
 -- to dedup against during a one-shot colorscheme load, so route to notify.
 function vim.notify_once(msg, level, opts) return vim.notify(msg, level, opts) end
-
--- vim.health: the checkhealth reporting API plugins call from their `check()`
--- functions (and bind into locals at load time — lazy.nvim does
--- `local start = vim.health.start or vim.health.report_start` when its health
--- module is required, so the table must exist with callable members or the
--- require errors). nxvim has no :checkhealth report buffer yet, so each call
--- accumulates into vim._health_report (observable / inspectable) instead of
--- rendering. The deprecated `report_*` names alias the current ones.
-vim._health_report = vim._health_report or {}
-local function health_push(level, msg)
-  vim._health_report[#vim._health_report + 1] = { level = level, msg = tostring(msg) }
-end
-vim.health = {
-  start = function(name) health_push("start", name) end,
-  ok = function(msg) health_push("ok", msg) end,
-  info = function(msg) health_push("info", msg) end,
-  warn = function(msg, _adv) health_push("warn", msg) end,
-  error = function(msg, _adv) health_push("error", msg) end,
-}
-vim.health.report_start = vim.health.start
-vim.health.report_ok = vim.health.ok
-vim.health.report_info = vim.health.info
-vim.health.report_warn = vim.health.warn
-vim.health.report_error = vim.health.error
 
 function vim.inspect(value)
   local function ins(v, indent)

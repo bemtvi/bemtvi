@@ -71,23 +71,12 @@ impl EditHost {
                 capture: false,
             })
         };
-        let mut out: Vec<HlInterval<'a>> = buf
+        let out: Vec<HlInterval<'a>> = buf
             .extmarks
             .iter_all()
             .enumerate()
             .filter_map(|(i, m)| clip(m, base_order + i as u32))
             .collect();
-        // The per-frame ephemeral marks a decoration provider placed this redraw
-        // layer *above* the persistent set: continue the `order` past the
-        // persistent marks so an ephemeral mark wins ties at equal priority.
-        if let Some(eph) = self.ephemeral_extmarks.get(&buffer) {
-            let off = base_order + buf.extmarks.iter_all().count() as u32;
-            out.extend(
-                eph.iter_all()
-                    .enumerate()
-                    .filter_map(|(j, m)| clip(m, off + j as u32)),
-            );
-        }
         out
     }
 }

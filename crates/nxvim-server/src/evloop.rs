@@ -96,19 +96,11 @@ pub enum LoopEvent {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
-    /// A path watched via [`LoopCommand::FsEventStart`] changed (or the watch failed
-    /// to arm). Carries the changed entry's filename and libuv's `{ change, rename }`
-    /// flags (`rename` when the path was created/deleted/renamed, `change` for a
-    /// content/attribute edit), or `error` when the watch couldn't be established
-    /// (the path doesn't exist, a watch limit was hit). The callback is retained — a
-    /// watch fires until explicitly stopped.
-    FsEvent {
-        id: u64,
-        filename: Option<String>,
-        change: bool,
-        rename: bool,
-        error: Option<String>,
-    },
+    /// A path watched via [`LoopCommand::FsEventStart`] changed (a content/attribute
+    /// edit, or a create/delete/rename), or `error` when the watch couldn't be
+    /// established (the path doesn't exist, a watch limit was hit). Drives the
+    /// internal per-buffer file watch (`:checktime`); the watch fires until stopped.
+    FsEvent { id: u64, error: Option<String> },
 }
 
 /// Handle the server holds to drive the event loop. Cheap to construct; the actor
@@ -260,9 +252,6 @@ async fn run_evloop(
                         // bridge defers it one hop to the callback.)
                         let _ = event_tx.send(LoopEvent::FsEvent {
                             id,
-                            filename: None,
-                            change: false,
-                            rename: false,
                             error: Some(e.to_string()),
                         });
                     }
@@ -293,11 +282,6 @@ fn start_fs_watch(
     recursive: bool,
     event_tx: UnboundedSender<LoopEvent>,
 ) -> notify::Result<RecommendedWatcher> {
-    // The path's final component — what luv hands the callback as `filename` when
-    // an event doesn't carry its own (e.g. a watch on a single file).
-    let watched_name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned());
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let event = match res {
             Ok(event) => event,
@@ -306,30 +290,15 @@ fn start_fs_watch(
             Err(e) => {
                 let _ = event_tx.send(LoopEvent::FsEvent {
                     id,
-                    filename: None,
-                    change: false,
-                    rename: false,
                     error: Some(e.to_string()),
                 });
                 return;
             }
         };
-        let Some((change, rename)) = classify_fs_event(&event.kind) else {
+        if classify_fs_event(&event.kind).is_none() {
             return; // an access/metadata-only event libuv wouldn't report
-        };
-        let filename = event
-            .paths
-            .first()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .or_else(|| watched_name.clone());
-        let _ = event_tx.send(LoopEvent::FsEvent {
-            id,
-            filename,
-            change,
-            rename,
-            error: None,
-        });
+        }
+        let _ = event_tx.send(LoopEvent::FsEvent { id, error: None });
     })?;
     let mode = if recursive {
         RecursiveMode::Recursive

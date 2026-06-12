@@ -308,12 +308,6 @@ impl EditHost {
                 }
             }
         }
-        // A blocking `vim.fn.getcharstr()` parked its coroutine: arm `pending_getchar`
-        // so the next key the server processes resumes it (one in flight; a getchar
-        // loop reads one key at a time, so a later request simply replaces it).
-        for cb_id in self.lua.take_getchar_reqs() {
-            self.pending_getchar = Some(cb_id);
-        }
     }
 
     /// Apply one [`BufOp`] to the live editor (Phase 6). Converts the neovim line
@@ -446,35 +440,6 @@ impl EditHost {
                     buf.extmarks
                         .set(ns, Some(id), start, end, hl_group, priority);
                 }
-            }
-            ExtmarkOp::SetEphemeral {
-                bufnr,
-                ns,
-                row,
-                col,
-                end_row,
-                end_col,
-                hl_group,
-                priority,
-            } => {
-                // A single-frame decoration mark: convert its position the same way
-                // a persistent set does, but fold it into the server's per-frame
-                // ephemeral store (cleared each redraw) rather than the buffer's
-                // persistent `ExtmarkStore`. A missing buffer (deleted between the
-                // provider callback and this drain) is a no-op.
-                let bid = BufferId(bufnr);
-                let Some(buf) = self.editor.buffer_of(bid) else {
-                    return;
-                };
-                let start = byte_of(buf, row, col);
-                let end = match (end_row, end_col) {
-                    (Some(r), Some(c)) => Some(byte_of(buf, r, c).max(start)),
-                    _ => None,
-                };
-                self.ephemeral_extmarks
-                    .entry(bid)
-                    .or_default()
-                    .set(ns, None, start, end, hl_group, priority);
             }
             ExtmarkOp::Del { bufnr, ns, id } => {
                 if let Some(buf) = self.editor.buffer_of_mut(BufferId(bufnr)) {
@@ -1141,18 +1106,6 @@ impl EditHost {
             }),
             #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
-            #[cfg(feature = "native")]
-            LoopOp::FsEventStart {
-                id,
-                path,
-                recursive,
-            } => self.fx.loop_command(LoopCommand::FsEventStart {
-                id,
-                path,
-                recursive,
-            }),
-            #[cfg(feature = "native")]
-            LoopOp::FsEventStop { id } => self.fx.loop_command(LoopCommand::FsEventStop { id }),
             // The browser build has no event loop yet: surface the unsupported
             // timer/process/watch request loudly rather than dropping it silently.
             #[cfg(not(feature = "native"))]
@@ -1204,15 +1157,16 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
-            LoopEvent::FsEvent { id, error, .. } if id >= crate::INTERNAL_WATCH_BASE => {
-                // An *internal* per-buffer file watch (not a Lua `vim.uv.fs_event`):
-                // the watch leg's auto-trigger. The file under buffer `id - BASE`
-                // changed, so enqueue its reconcile — the trailing `settle_events`
-                // → `run_pending` fires the `FileChangedShell` round-trip (autoreload
-                // / a handler's `v:fcs_choice` / W11 / W12 / E211) and re-arms the
-                // watch after any reload (a reload re-stamps the disk snapshot, so the
-                // watch key changed). `error` (the watch failed to arm) just drops the
-                // watch state so a later tick re-arms.
+            LoopEvent::FsEvent { id, error, .. } => {
+                // An internal per-buffer file watch's auto-trigger (the only
+                // `fs_event` producer — the Lua `vim.uv.fs_event` surface is gone).
+                // The file under buffer `id - BASE` changed, so enqueue its reconcile
+                // — the trailing `settle_events` → `run_pending` fires the
+                // `FileChangedShell` round-trip (autoreload / a handler's
+                // `v:fcs_choice` / W11 / W12 / E211) and re-arms the watch after any
+                // reload (a reload re-stamps the disk snapshot, so the watch key
+                // changed). `error` (the watch failed to arm) just drops the watch
+                // state so a later tick re-arms.
                 let buf = BufferId(id - crate::INTERNAL_WATCH_BASE);
                 if error.is_some() {
                     self.buf_watches.remove(&buf);
@@ -1220,27 +1174,6 @@ impl EditHost {
                 } else {
                     self.editor.checktime_buffer(buf);
                 }
-            }
-            LoopEvent::FsEvent {
-                id,
-                filename,
-                change,
-                rename,
-                error,
-            } => {
-                let args = CallbackArgs::FsEvent {
-                    filename,
-                    change,
-                    rename,
-                    error,
-                };
-                // `keep = true`: a watch fires repeatedly until `:stop`/`:close`, so
-                // its callback stays registered (unlike a one-shot timer/on_exit).
-                if let Err(e) = self.lua.run_callback(id, true, args) {
-                    self.editor
-                        .echo(format!("E5108: Error in fs_event callback: {e}"));
-                }
-                self.apply_lua_effects();
             }
         }
     }
@@ -1302,10 +1235,7 @@ impl EditHost {
                 self.reconcile_file_change(buf);
             }
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
-                // `exec_pumped` (not `exec`) so a `vim.fn.input` / `vim.fn.confirm`
-                // in a `:lua` chunk can block on the command line and resume with
-                // the answer instead of erroring "outside a coroutine".
-                if let Err(e) = self.lua.exec_pumped(&chunk) {
+                if let Err(e) = self.lua.exec(&chunk) {
                     self.editor.echo(format!("E5108: Error executing lua: {e}"));
                 }
                 self.apply_lua_effects();

@@ -28,7 +28,6 @@
 )]
 
 // The synchronous-tick modules — wasm-eligible (the Phase 5 edit-host subset).
-mod decoration;
 mod edithost;
 mod effects;
 mod excmd;
@@ -511,28 +510,11 @@ pub struct EditHost {
     /// command-line prompt's result, or `None` when no scripted prompt is open
     /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
     pending_ui_input: Option<u64>,
-    /// The `vim._cb_fns` id of a coroutine parked on `vim.fn.getcharstr()`, or
-    /// `None`. While set, the next key the server processes is delivered to this
-    /// callback (resuming the coroutine) instead of being routed to the matcher —
-    /// nxvim's stand-in for vim's blocking `getchar()` reading the typeahead.
-    pending_getchar: Option<u64>,
     /// Keys queued by `nvim_feedkeys`, drained after the input batch / off-tick
     /// settle. Each carries whether it should be remapped (the `m` flag) or fed
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
     feed_buffer: VecDeque<(Key, bool)>,
-    /// Per-frame **ephemeral** extmarks placed by decoration providers, keyed by
-    /// buffer. Rebuilt from scratch every redraw: cleared at the start of the
-    /// provider drive ([`EditHost::run_decoration_providers`]), populated as each
-    /// provider's `on_win` / `on_line` emits `ephemeral = true` marks, read by
-    /// [`EditHost::extmark_intervals`] while projecting, and left until the next
-    /// frame clears it. Separate from each buffer's persistent
-    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) so single-frame decorations never
-    /// touch undo/redo or the `nvim_buf_get_extmarks` mirror.
-    ephemeral_extmarks: HashMap<BufferId, nxvim_core::ExtmarkStore>,
-    /// Monotonic redraw counter handed to decoration providers as the frame `tick`
-    /// (neovim's display tick). Incremented once per [`EditHost::run_decoration_providers`].
-    decor_tick: u64,
     /// Buffers with an off-tick write currently on the wire — at most one per buffer,
     /// so a buffer's overlapping `:w`s serialize (snapshot order = wire order) rather
     /// than racing. Cleared when the write acks.
@@ -635,10 +617,7 @@ impl EditHost {
             mouse_clock: None,
             hl_mirror_gen: None,
             pending_ui_input: None,
-            pending_getchar: None,
             feed_buffer: VecDeque::new(),
-            ephemeral_extmarks: HashMap::new(),
-            decor_tick: 0,
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),
             quit_all_gate: None,
@@ -702,7 +681,7 @@ impl EditHost {
     pub fn exec_lua(&mut self, code: &str) -> Result<String, String> {
         let rendered = self
             .lua
-            .eval_to_value_pumped(code)
+            .eval_to_value(code)
             .map(|value| {
                 value
                     .as_i64()
@@ -1149,32 +1128,7 @@ where
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.
     if let Some(config_dir) = &init.config_dir {
-        let complete = host.source_init(&config_dir.join("init.lua"));
-        // If init.lua parked on a blocking `vim.wait` / `vim.fn.input`, drive the
-        // event loop (timers firing, child processes exiting — e.g. lazy.nvim's
-        // git clones) until the script runs to completion, so config is fully
-        // applied before we source plugins and serve the UI, exactly as neovim
-        // sources init.lua to its end before the first frame. A `vim.wait` is
-        // self-bounding (its poll timer resumes the script at the timeout), so this
-        // terminates; the silence guard below is a fail-loud backstop for a script
-        // that parked on a read with no input source (e.g. `vim.fn.input` before a
-        // UI is attached), which would otherwise wait here forever.
-        if !complete {
-            // No loop event for this long while still parked ⇒ nothing is driving
-            // the script (a parked `vim.wait` keeps its poll timer ticking, so it
-            // never goes this quiet). Generous so even a slow clone never trips it.
-            const STARTUP_DRIVE_SILENCE: std::time::Duration = std::time::Duration::from_secs(30);
-            while !host.init_complete() {
-                match tokio::time::timeout(STARTUP_DRIVE_SILENCE, loop_events.recv()).await {
-                    Ok(Some(event)) => host.on_loop_events(event, &mut loop_events),
-                    Ok(None) => break, // event loop gone; stop waiting
-                    Err(_) => {
-                        host.echo_startup_stall();
-                        break;
-                    }
-                }
-            }
-        }
+        host.source_init(&config_dir.join("init.lua"));
     }
     // Then source the package `plugin/` / `after/plugin/` Lua scripts across the
     // runtimepath — neovim's startup package load, after `init.lua` and before the

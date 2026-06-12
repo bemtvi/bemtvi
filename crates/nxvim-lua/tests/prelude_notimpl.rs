@@ -37,15 +37,6 @@ assert(next(vim._cb_fns) ~= nil, "the scheduled callback should be registered fo
 assert(type(vim.api.nvim_get_current_buf()) == "number",
   "nvim_get_current_buf should stay real, not raise")
 
--- A uv timer handle's :is_active()/:is_closing() are now REAL (no longer loud
--- gaps): faithful Lua-side lifecycle tracking, not a canned constant.
-local timer = vim.uv.new_timer()
-assert(timer:is_active() == false, "fresh timer is not active")
-timer:start(1000, 0, function() end)
-assert(timer:is_active() == true, "started timer is active")
-assert(timer:stop() == 0, "timer:stop should stay real, returning 0")
-assert(timer:is_active() == false, "stopped timer is not active")
-
 return "ok"
 "#,
         )

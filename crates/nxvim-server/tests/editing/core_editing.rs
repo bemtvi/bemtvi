@@ -448,8 +448,8 @@ async fn checktime_reports_a_deleted_file() {
 #[tokio::test]
 async fn an_external_change_autoreloads_via_the_buffer_watch() {
     // The auto-trigger: with no explicit `:checktime`, the server's per-buffer
-    // native file watch (reusing the `vim.uv.fs_event` machinery) must notice an
-    // external change and run checktime on its own — reloading under `'autoread'`.
+    // native file watch (the evloop fs-watch machinery) must notice an external
+    // change and run checktime on its own — reloading under `'autoread'`.
     let path = temp_path("watch-autoreload");
     std::fs::write(&path, "one\ntwo\n").unwrap();
     let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;

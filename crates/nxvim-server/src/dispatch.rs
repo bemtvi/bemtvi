@@ -119,10 +119,7 @@ impl EditHost {
                 // trailing `run_pending`, so a `nvim_buf_get_lines` in the chunk
                 // must see fresh lines (Phase 6).
                 self.push_buf_mirror();
-                // `eval_to_value_pumped` so a `vim.fn.input` / `vim.fn.confirm` in
-                // the chunk can park on the command line (returning Nil now; the
-                // chunk resumes when the user answers) rather than erroring.
-                let value = match self.lua.eval_to_value_pumped(&code) {
+                let value = match self.lua.eval_to_value(&code) {
                     Ok(value) => value,
                     Err(e) => {
                         self.editor.echo(format!("E5108: Error executing lua: {e}"));

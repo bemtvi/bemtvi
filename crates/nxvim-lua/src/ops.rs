@@ -266,19 +266,6 @@ pub enum LoopOp {
     /// carried here: the actor terminates the child unconditionally (it has no
     /// libc binding to deliver an arbitrary signal), a documented approximation.
     Kill { id: u64 },
-    /// `vim.uv.new_fs_event():start(path, flags, …)` — begin watching `path`,
-    /// firing callback `id` (`err, filename, events`) each time it changes.
-    /// Forwarded to the event-loop actor, which watches it natively (inotify /
-    /// FSEvents / kqueue). `recursive` is libuv's `recursive` flag (watch a
-    /// subtree). Re-arming an `id` replaces its watch.
-    FsEventStart {
-        id: u64,
-        path: String,
-        recursive: bool,
-    },
-    /// `fs_event:stop()` / `:close()` — cancel the watch armed under `id`. A no-op
-    /// if it was never armed.
-    FsEventStop { id: u64 },
 }
 
 /// A buffer mutation queued by the buffer Lua API (`vim.api.nvim_buf_set_lines`),
@@ -340,23 +327,6 @@ pub enum ExtmarkOp {
         bufnr: u64,
         ns: u32,
         id: u64,
-        row: i64,
-        col: i64,
-        end_row: Option<i64>,
-        end_col: Option<i64>,
-        hl_group: Option<String>,
-        priority: u32,
-    },
-    /// Place an **ephemeral** mark — a single-frame decoration a registered
-    /// decoration provider's `on_win` / `on_line` callback emits during redraw
-    /// (`nvim_buf_set_extmark(…, { ephemeral = true })`). It is not addressable
-    /// (no id) and never enters the persistent [`ExtmarkStore`] or the
-    /// `vim._extmarks` mirror: the server drains these into a per-frame ephemeral
-    /// store that is cleared before each redraw, so they live for exactly the
-    /// frame that produced them.
-    SetEphemeral {
-        bufnr: u64,
-        ns: u32,
         row: i64,
         col: i64,
         end_row: Option<i64>,
@@ -582,16 +552,6 @@ pub enum CallbackArgs {
         err: Option<String>,
         /// The server's JSON result on success; `Null` when `err` is set.
         result: serde_json::Value,
-    },
-    /// A `vim.uv.fs_event` watch fired: the callback is `(err, filename, events)`.
-    /// `error` is `Some` only when the watch failed to arm or the backend errored
-    /// mid-watch (delivered as the `err` arg); otherwise `filename` is the changed
-    /// entry's name and `events` is libuv's `{ change, rename }` flag table.
-    FsEvent {
-        filename: Option<String>,
-        change: bool,
-        rename: bool,
-        error: Option<String>,
     },
 }
 

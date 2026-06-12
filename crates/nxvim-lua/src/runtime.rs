@@ -264,16 +264,10 @@ pub struct GoMirror {
 const PRELUDE_MODULES: &[(&str, &str)] = &[
     ("nxvim:prelude/stdlib", include_str!("prelude/stdlib.lua")),
     ("nxvim:prelude/runtime", include_str!("prelude/runtime.lua")),
-    ("nxvim:prelude/copcall", include_str!("prelude/copcall.lua")),
     ("nxvim:prelude/api", include_str!("prelude/api.lua")),
     ("nxvim:prelude/keymap", include_str!("prelude/keymap.lua")),
     ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
     ("nxvim:prelude/system", include_str!("prelude/system.lua")),
-    ("nxvim:prelude/uv", include_str!("prelude/uv.lua")),
-    (
-        "nxvim:prelude/uv_process",
-        include_str!("prelude/uv_process.lua"),
-    ),
     ("nxvim:prelude/timer", include_str!("prelude/timer.lua")),
     ("nxvim:prelude/lsp", include_str!("prelude/lsp.lua")),
     (
@@ -353,15 +347,6 @@ pub(crate) struct Shared {
     /// `_clear_namespace`, drained by the server into the target buffer's
     /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) after the chunk.
     pub(crate) extmark_ops: Vec<ExtmarkOp>,
-    /// **Ephemeral** extmark placements ([`ExtmarkOp::SetEphemeral`]) emitted by a
-    /// decoration provider's `on_win` / `on_line` callback while the server drives
-    /// it during redraw. Kept in their own queue (not [`extmark_ops`]) because the
-    /// server drains them at a different point — into the per-frame ephemeral store
-    /// it reads while projecting, then clears — rather than into the persistent
-    /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) after a chunk.
-    ///
-    /// [`extmark_ops`]: Shared::extmark_ops
-    pub(crate) ephemeral_extmark_ops: Vec<ExtmarkOp>,
     /// Window mutations from the `vim.api.nvim_win_*` / `nvim_open_win` /
     /// `nvim_set_current_win` API, drained by the server into the live editor
     /// after the chunk (Phase 5).
@@ -390,10 +375,6 @@ pub(crate) struct Shared {
     /// buffer and processed (through the mapping engine, or straight to the
     /// editor) after the chunk / off-tick settle.
     pub(crate) feedkeys: Vec<FeedKeysOp>,
-    /// Blocking `vim.fn.getcharstr()` requests: each carries the `vim._cb_fns` id
-    /// of the parked coroutine the server resumes with the next key. Normally at
-    /// most one is in flight (a getchar loop reads one key at a time).
-    pub(crate) getchar_reqs: Vec<u64>,
     /// The backend the **blocking** `vim._system` shell-out runs through. `None` (the
     /// default) spawns the process locally
     /// ([`StdBlockingSystem`](crate::StdBlockingSystem)); a daemon session injects a
@@ -585,76 +566,6 @@ impl LuaRuntime {
     /// package `plugin/` scripts at startup.
     pub fn exec_named(&self, chunk: &str, name: &str) -> mlua::Result<()> {
         self.lua.load(chunk).set_name(name).exec()
-    }
-
-    /// Compile `chunk` to a callable function, trying the expression form
-    /// (`return <chunk>`) first and falling back to statements — the same
-    /// dual-mode load `Chunk::eval` does, so both an expression and a statement
-    /// block become a function we can run inside a coroutine.
-    fn load_callable(&self, chunk: &str) -> mlua::Result<mlua::Function> {
-        if let Ok(f) = self.lua.load(format!("return {chunk}")).into_function() {
-            return Ok(f);
-        }
-        self.lua.load(chunk).into_function()
-    }
-
-    /// Run `func` through the prompt pump (`vim._pump`), which executes it inside a
-    /// coroutine so a `vim.fn.input` / `vim.fn.confirm` in it can park on the
-    /// command line and resume with the answer. Returns the function's first
-    /// return value (`Some`) when it ran to completion, or `None` when it parked
-    /// on a prompt (the prompt-result callback resumes the coroutine later). A
-    /// throwing function propagates its error (re-raised by `vim._pump`).
-    fn pump(&self, func: mlua::Function) -> mlua::Result<Option<mlua::Value>> {
-        let pump: mlua::Function = self.vim()?.get("_pump")?;
-        let (completed, value): (bool, mlua::Value) = pump.call(func)?;
-        Ok(completed.then_some(value))
-    }
-
-    /// Run a `:lua` chunk under the prompt pump — the [`exec`](Self::exec)
-    /// analogue for the queued `:lua` drain, so a `vim.fn.input` / `vim.fn.confirm`
-    /// in the chunk parks on the command line instead of erroring "outside a
-    /// coroutine". Errors are returned for the server to surface.
-    pub fn exec_pumped(&self, chunk: &str) -> mlua::Result<()> {
-        let func = self.lua.load(chunk).into_function()?;
-        self.pump(func)?;
-        Ok(())
-    }
-
-    /// Source the user's `init.lua` through the coroutine pump — the
-    /// [`exec_pumped`](Self::exec_pumped) analogue for startup config, naming the
-    /// chunk `name` (use `@<path>`) so a traceback points at the file. A blocking
-    /// `vim.wait` / `vim.fn.input` in it PARKS the coroutine instead of erroring
-    /// "outside a coroutine" (the error the bare [`exec`](Self::exec) produced);
-    /// the server then drives the loop until [`init_complete`](Self::init_complete)
-    /// reports it finished. Returns `true` when the chunk ran straight through (no
-    /// park), `false` when it parked. A chunk error propagates for the server to
-    /// surface as `E5113`.
-    pub fn source_init_pumped(&self, chunk: &str, name: &str) -> mlua::Result<bool> {
-        let func = self.lua.load(chunk).set_name(name).into_function()?;
-        let source: mlua::Function = self.vim()?.get("_source_init")?;
-        source.call(func)
-    }
-
-    /// Whether the parked `init.lua` coroutine has finished (or there was none, or
-    /// it never parked). The server polls this while nested-driving the event loop
-    /// at startup, so it serves the UI only once config has fully run — matching
-    /// neovim, which sources `init.lua` to completion before the first frame.
-    pub fn init_complete(&self) -> mlua::Result<bool> {
-        let done: mlua::Function = self.vim()?.get("_init_done")?;
-        done.call(())
-    }
-
-    /// [`eval_to_value`](Self::eval_to_value) under the prompt pump — the
-    /// `nvim_exec_lua` entry. When the chunk parks on a prompt its return value is
-    /// not available synchronously, so `Nil` is returned and the chunk's eventual
-    /// value is discarded (a documented limit of blocking from a synchronous RPC
-    /// getter; drive prompts from a keymap / `:lua` instead).
-    pub fn eval_to_value_pumped(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
-        let func = self.load_callable(chunk)?;
-        match self.pump(func)? {
-            Some(value) => lua_to_rmpv(&value),
-            None => Ok(rmpv::Value::Nil),
-        }
     }
 
     /// Evaluate a Lua chunk and convert its return value to an RPC [`rmpv::Value`]
@@ -867,13 +778,6 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take the ephemeral extmark placements a decoration provider emitted while
-        /// the server drove it this frame ([`ExtmarkOp::SetEphemeral`]), for the
-        /// server to fold into its per-frame ephemeral store before projecting.
-        take_ephemeral_extmark_ops -> Vec<ExtmarkOp> = ephemeral_extmark_ops
-    }
-
-    take_queue! {
         /// Take the window mutations queued by the `vim.api.nvim_win_*` family since
         /// the last drain, for the server to apply to the live editor (Phase 5).
         take_window_ops -> Vec<WindowOp> = window_ops
@@ -921,24 +825,6 @@ impl LuaRuntime {
         /// for the server to parse and feed (through the mapping engine or straight to
         /// the editor).
         take_feedkeys -> Vec<FeedKeysOp> = feedkeys
-    }
-
-    take_queue! {
-        /// Take the blocking `vim.fn.getcharstr()` requests queued since the last
-        /// drain — each a `vim._cb_fns` id of a parked coroutine the server arms to
-        /// resume with the next key.
-        take_getchar_reqs -> Vec<u64> = getchar_reqs
-    }
-
-    /// Resume a coroutine parked on `vim.fn.getcharstr()` (callback id `cb_id`)
-    /// with `key` (vim key-notation) — the getchar analogue of
-    /// [`Self::run_ui_input`]. Runs `vim._run_cb(id, false, key)`, a one-shot, so
-    /// the registry entry is dropped after firing. Effects the resumed coroutine
-    /// queues drain through `apply_lua_effects`.
-    pub fn deliver_getchar(&self, cb_id: u64, key: &str) -> mlua::Result<()> {
-        let run: mlua::Function = self.vim()?.get("_run_cb")?;
-        let arg = mlua::Value::String(self.lua.create_string(key)?);
-        run.call::<()>((cb_id, false, arg))
     }
 
     /// Whether any `vim.on_key` observer is registered — the cheap guard the
@@ -1024,32 +910,6 @@ impl LuaRuntime {
                 };
                 let result = json_to_lua(&self.lua, &result)?;
                 run.call::<()>((id, keep, err, result))
-            }
-            CallbackArgs::FsEvent {
-                filename,
-                change,
-                rename,
-                error,
-            } => {
-                // `callback(err, filename, events)` — `err` set only when the watch
-                // failed to arm / the backend errored; `events` carries the set
-                // flags, matching luv.
-                let err = match error {
-                    Some(msg) => mlua::Value::String(self.lua.create_string(&msg)?),
-                    None => mlua::Value::Nil,
-                };
-                let filename = match filename {
-                    Some(s) => mlua::Value::String(self.lua.create_string(&s)?),
-                    None => mlua::Value::Nil,
-                };
-                let events = self.lua.create_table()?;
-                if change {
-                    events.set("change", true)?;
-                }
-                if rename {
-                    events.set("rename", true)?;
-                }
-                run.call::<()>((id, keep, err, filename, events))
             }
         }
     }
@@ -1363,41 +1223,6 @@ impl LuaRuntime {
         f.call((bang, args, bufnr))
     }
 
-    /// Whether any decoration provider is registered
-    /// (`nvim_set_decoration_provider`). The server checks this once per redraw to
-    /// skip the whole provider-driving path (and its buffer-mirror push) on the
-    /// common frame where none is active.
-    pub fn has_decoration_providers(&self) -> mlua::Result<bool> {
-        let f: mlua::Function = self.vim()?.get("_has_decoration_providers")?;
-        f.call(())
-    }
-
-    /// Begin a decoration frame: invoke every registered provider's `on_start(tick)`.
-    /// `tick` is the server's monotonic redraw counter (neovim's display tick).
-    pub fn decor_frame_start(&self, tick: u64) -> mlua::Result<()> {
-        let f: mlua::Function = self.vim()?.get("_decor_frame_start")?;
-        f.call(tick)
-    }
-
-    /// Drive the registered decoration providers for one window: each provider's
-    /// `on_win('win', ns, win, buf, top, bot)` and then, unless `on_win` returned
-    /// `false`, its `on_line('line', ns, win, buf, row)` for each row in
-    /// `[top, bot]` (0-based buffer lines). The callbacks place ephemeral extmarks
-    /// (`nvim_buf_set_extmark(…, { ephemeral = true })`) which queue as
-    /// [`ExtmarkOp::SetEphemeral`] for the server to drain. Returns any provider
-    /// error text (empty when all ran clean) so the server can surface it loud
-    /// rather than let a broken provider fail silently.
-    pub fn decor_on_win(&self, win: u64, bufnr: u64, top: i64, bot: i64) -> mlua::Result<String> {
-        let f: mlua::Function = self.vim()?.get("_decor_on_win")?;
-        f.call((win, bufnr, top, bot))
-    }
-
-    /// End a decoration frame: invoke every registered provider's `on_end(tick)`.
-    pub fn decor_frame_end(&self, tick: u64) -> mlua::Result<()> {
-        let f: mlua::Function = self.vim()?.get("_decor_frame_end")?;
-        f.call(tick)
-    }
-
     /// Refresh the `vim._cur_buf` snapshot the prelude reads back through
     /// `nvim_buf_get_name(0)` / `expand('%')`. The server pushes this immediately
     /// before firing a buffer/mode autocmd so a callback can resolve the buffer
@@ -1656,10 +1481,7 @@ impl LuaRuntime {
                 }
                 opts.set("fargs", fargs)?;
                 opts.set("bang", false)?;
-                // Run through the prompt pump so a `vim.fn.input` / `vim.fn.confirm`
-                // in the command's body can block and use the answer.
-                let pump: mlua::Function = self.vim()?.get("_pump")?;
-                pump.call::<mlua::MultiValue>((f, opts))?;
+                f.call::<()>(opts)?;
                 Ok(())
             }
             mlua::Value::String(s) => {

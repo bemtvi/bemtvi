@@ -87,7 +87,7 @@ pub unsafe extern "C" fn eh_exec_lua(h: *mut DemoEditHost, code: *const c_char) 
     let Some(host) = h.as_mut() else {
         return into_owned_cstr("err:null host".into());
     };
-    let rendered = match host.lua.eval_to_value_pumped(as_str(code)) {
+    let rendered = match host.lua.eval_to_value(as_str(code)) {
         Ok(value) => {
             let shown = value
                 .as_i64()

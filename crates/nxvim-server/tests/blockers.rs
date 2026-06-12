@@ -55,10 +55,10 @@ fn as_ints(v: &Value) -> Vec<i64> {
 }
 
 // ===================== vim.split / str2list / nr2char =======================
-// The key-parsing surface which-key.nvim runs every keymap through: `Util.keys`
-// round-trips an lhs via `str2list`/`nr2char`, and `Mappings.add` splits a
-// multi-char mode string with `vim.split(modes, "")`. A regression here cost the
-// plugin its whole load path (a `setup()` that hung, then errored).
+// The key-notation parsing surface keymap introspection runs every lhs through:
+// round-tripping an lhs via `str2list`/`nr2char`, and splitting a multi-char mode
+// string with `vim.split(modes, "")`. The empty-separator split once hung — a
+// zero-width `string.find` match never advanced `pos` — so it is pinned below.
 
 #[tokio::test]
 async fn vim_split_empty_separator_splits_into_characters() {
@@ -68,7 +68,7 @@ async fn vim_split_empty_separator_splits_into_characters() {
     // An empty separator splits into individual characters, matching neovim —
     // with no leading/trailing empty segment. This *used to hang*: `string.find`
     // returns a zero-width match for "", so the split loop never advanced `pos`.
-    // (which-key calls `vim.split("nxso", "")` to expand a mode string.)
+    // (Expanding a multi-char mode string like "nxso" into its modes.)
     assert_eq!(
         as_strs(&exec_lua(&rpc, "return vim.split('nxso', '')").await),
         vec!["n", "x", "s", "o"],
@@ -159,8 +159,8 @@ async fn missing_vim_fn_fails_loud_with_its_name() {
 }
 
 // =================== window view / screen position ==========================
-// The popup-placement surface which-key reads to draw and scroll its float:
-// winsaveview/winrestview (its scroll) and screenrow/screencol (cursor-overlap).
+// The popup-placement surface a floating UI reads to draw and scroll its float:
+// winsaveview/winrestview (the scroll) and screenrow/screencol (cursor-overlap).
 
 #[tokio::test]
 async fn winsaveview_winrestview_round_trip_the_scroll() {
@@ -516,10 +516,10 @@ async fn on_key_reports_special_keys_in_notation() {
     assert_eq!(as_str(&exec_lua(&rpc, "return _G.last").await), "<Esc>");
 }
 
-// ============================ which-key display surface =====================
-// The APIs which-key.nvim drives to *render* its popup: highlight reads
+// ========================= popup render surface ============================
+// The APIs a floating popup UI drives to *render* itself: highlight reads
 // (nvim_get_hl), context callbacks (nvim_buf_call / nvim_win_call), scratch-buffer
-// teardown (nvim_buf_delete), and the width/character builtins its grid layout
+// teardown (nvim_buf_delete), and the width/character builtins a grid layout
 // needs (strdisplaywidth / strchars / strcharpart / strtrans / keytrans).
 
 #[tokio::test]
@@ -531,13 +531,13 @@ async fn nvim_get_hl_reads_colors_and_attrs() {
     // next chunk reads it back.
     exec_lua(
         &rpc,
-        "vim.api.nvim_set_hl(0, 'WhichKey', { fg = '#ff0000', bg = '#0000ff', bold = true })",
+        "vim.api.nvim_set_hl(0, 'KeyHint', { fg = '#ff0000', bg = '#0000ff', bold = true })",
     )
     .await;
     assert_eq!(
         exec_lua(
             &rpc,
-            "return vim.api.nvim_get_hl(0, { name = 'WhichKey' }).fg"
+            "return vim.api.nvim_get_hl(0, { name = 'KeyHint' }).fg"
         )
         .await,
         Value::from(0xff0000u64)
@@ -545,7 +545,7 @@ async fn nvim_get_hl_reads_colors_and_attrs() {
     assert_eq!(
         exec_lua(
             &rpc,
-            "return vim.api.nvim_get_hl(0, { name = 'WhichKey' }).bg"
+            "return vim.api.nvim_get_hl(0, { name = 'KeyHint' }).bg"
         )
         .await,
         Value::from(0x0000ffu64)
@@ -553,7 +553,7 @@ async fn nvim_get_hl_reads_colors_and_attrs() {
     assert_eq!(
         exec_lua(
             &rpc,
-            "return vim.api.nvim_get_hl(0, { name = 'WhichKey' }).bold"
+            "return vim.api.nvim_get_hl(0, { name = 'KeyHint' }).bold"
         )
         .await,
         Value::Boolean(true)

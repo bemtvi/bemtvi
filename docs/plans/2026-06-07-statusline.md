@@ -177,7 +177,7 @@ a `%{}` reading editor state updates as the state changes across redraws.
 before evaluating a statusline that contains a `%{}`/`%!` expression — so a
 `%{v:lua.vim.fn.mode()}` tracks the mode live across frames. New / enhanced
 `vim.fn`: `mode`, `line('.'/'$')`, `col('.'/'$')`, `winnr('.'/'$')`,
-`winwidth`/`winheight` (api.lua), plus a vim-faithful `fnamemodify`
+`winwidth`/`winheight` (nvim_api.lua), plus a vim-faithful `fnamemodify`
 (`:p :~ :. :h :t :r :e`, consecutive-`:e` widening, loud error on unsupported
 modifiers — replacing fs.lua's coarser version) and `bufnr('$')`. `expand`
 routes `%:<mods>` through `fnamemodify`. fnamemodify cases are derived from real

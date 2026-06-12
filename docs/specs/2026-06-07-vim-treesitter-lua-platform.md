@@ -40,7 +40,7 @@ Investigating that surfaced a **load-bearing constraint** that reshapes the goal
 
 Unlike neovim — where Lua holds a *live* handle to the editor and the C core
 calls *into* Lua synchronously mid-keystroke (how `indentexpr=v:lua…` works) —
-nxvim's Lua bridge is a **snapshot + effect-queue** (`runtime.rs`, `api.lua`):
+nxvim's Lua bridge is a **snapshot + effect-queue** (`runtime.rs`, `nvim_api.lua`):
 
 - Before running a Lua chunk/callback, the server **pushes a snapshot** of buffer
   state into Lua (`vim._bufs[bufnr] = { lines, name, loaded }`).

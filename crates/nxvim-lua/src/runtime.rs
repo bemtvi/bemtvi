@@ -272,7 +272,10 @@ pub struct GoMirror {
 const PRELUDE_MODULES: &[(&str, &str)] = &[
     ("nxvim:prelude/stdlib", include_str!("prelude/stdlib.lua")),
     ("nxvim:prelude/runtime", include_str!("prelude/runtime.lua")),
-    ("nxvim:prelude/api", include_str!("prelude/api.lua")),
+    (
+        "nxvim:prelude/nvim_api",
+        include_str!("prelude/nvim_api.lua"),
+    ),
     ("nxvim:prelude/keymap", include_str!("prelude/keymap.lua")),
     ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
     ("nxvim:prelude/system", include_str!("prelude/system.lua")),

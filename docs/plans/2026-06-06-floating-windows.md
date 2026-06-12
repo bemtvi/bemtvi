@@ -14,7 +14,7 @@ form** and raises/ignores the float config:
 
 | surface | neovim semantics | nxvim today | where |
 | --- | --- | --- | --- |
-| `nvim_open_win(buf, enter, {relative=…})` | open a float positioned by `relative`/`anchor`/`row`/`col` | **split form only** — `relative` is dropped, a split is made instead | `dispatch.rs` `nvim_open_win`; `api.lua` `nvim_open_win` |
+| `nvim_open_win(buf, enter, {relative=…})` | open a float positioned by `relative`/`anchor`/`row`/`col` | **split form only** — `relative` is dropped, a split is made instead | `dispatch.rs` `nvim_open_win`; `nvim_api.lua` `nvim_open_win` |
 | `nvim_win_set_config(win, cfg)` | move/resize a float, convert split↔float | **absent** (`vim._notimpl`/unknown method) | — |
 | `nvim_win_get_config(win)` | read a window's float config (`{relative=""}` for non-floats) | **absent** | — |
 | a window drawn over the tiled area with a border | a float with `border`, `title`, `zindex` | only the **completion pmenu** floats, and it is bespoke client chrome, not a window | `render.rs` `render_pmenu` |
@@ -144,7 +144,7 @@ on top" idea from bespoke client chrome (`render_pmenu`) into a first-class
 
 - **`ops.rs`** `WindowOp` (`SetCurrent`/`SetBuf`/`SetCursor`/`SetWidth`/`SetHeight`/
   `Close`/`Open`). Floats add `OpenFloat` and `SetConfig`.
-- **`prelude/api.lua`** `nvim_open_win` (split form, write-through to `vim._wins`),
+- **`prelude/nvim_api.lua`** `nvim_open_win` (split form, write-through to `vim._wins`),
   `vim._next_win`, the `vim._wins` mirror the server refreshes before each chunk.
 
 ---
@@ -180,7 +180,7 @@ on top" idea from bespoke client chrome (`render_pmenu`) into a first-class
   `border`, `zindex`; the redraw serializes them; the TUI overlays them.
 - **`OpenFloat`/`SetConfig` `WindowOp`s + the config RPC (Phase 3).**
   `nvim_open_win` float form, `nvim_win_set_config`/`get_config`, the `vim._wins`
-  mirror's float fields, write-through in `api.lua`.
+  mirror's float fields, write-through in `nvim_api.lua`.
 - **The lifecycle span (Phase 4).** Floats participate in `nvim_list_wins`, the
   focus cycle (honoring `focusable`), `:q`/`:only`/`<C-w>` semantics, and the
   `WinNew`/`WinEnter`/`WinClosed`/`WinResized` autocmd diff.
@@ -319,7 +319,7 @@ owns the terminal cursor (`text_inner_rect` insets by the border too).
 `BorderStyle::Solid` maps to ratatui `QuadrantInside`. **One deliberate
 divergence from the literal phase split:** the *minimal* Lua open-float
 (`vim.api.nvim_open_win` float form → `WindowOp::OpenFloat` → `effects.rs` →
-`open_float_window`, with loud validation in `api.lua`) was pulled forward from
+`open_float_window`, with loud validation in `nvim_api.lua`) was pulled forward from
 Phase 3, because the project's example-config convention requires a *runnable*
 `examples/floats/` and a pure-RPC float can't be opened from an `init.lua`. The
 *rest* of the config surface — `nvim_win_set_config`/`get_config` fidelity, the
@@ -427,7 +427,7 @@ mirror gained the float fields: `WindowMirror` became a struct with an
 `Option<FloatMirror>` (the placement pre-formatted into the strings
 `nvim_win_get_config` returns, so nxvim-lua never sees the core's enums —
 `effects.rs::float_mirror` translates), serialized as a nested `float` table by
-`runtime.rs::set_buf_mirror`. `api.lua` gained `nvim_win_get_config` (reads
+`runtime.rs::set_buf_mirror`. `nvim_api.lua` gained `nvim_win_get_config` (reads
 `w.float` off the mirror) and `nvim_win_set_config` (loud-validates the enumerated
 fields, queues `_win_set_config`, and write-throughs `w.float` so a `get_config`
 later in the same chunk agrees); `nvim_open_win`'s write-through now seeds the
@@ -448,7 +448,7 @@ config grew those three commands.
 ## Phase 3 (original plan) — The full config surface: `set_config`/`get_config`, split↔float, the Lua API
 
 **Already landed in Phase 2 (don't redo):** `WindowOp::OpenFloat`, the
-`vim._open_float` bridge, `api.lua`'s `nvim_open_win` float branch (with loud
+`vim._open_float` bridge, `nvim_api.lua`'s `nvim_open_win` float branch (with loud
 validation), and the `effects.rs` drain into `open_float_window`. So the **open**
 path from Lua works. Phase 3 is the *remaining* surface below: `set_config`
 (move/resize/restyle + split↔float conversion), `get_config` reading the live
@@ -471,7 +471,7 @@ established **"Lua queues, core mutates"** flow windows already use.
 - `crates/nxvim-lua/src/ops.rs` — `WindowOp::OpenFloat { ... }` and
   `WindowOp::SetConfig { win, ... }` (the float-config payload as plain fields, no
   Lua types, like the existing `Open`).
-- `crates/nxvim-lua/src/prelude/api.lua` — `nvim_open_win` builds the float config
+- `crates/nxvim-lua/src/prelude/nvim_api.lua` — `nvim_open_win` builds the float config
   and write-throughs it into `vim._wins`; new `nvim_win_set_config`/
   `nvim_win_get_config` against the mirror + a queued op.
 - `crates/nxvim-server/src/effects.rs` — drain `OpenFloat`/`SetConfig` into
@@ -489,17 +489,17 @@ established **"Lua queues, core mutates"** flow windows already use.
    float ops carrying the resolved config. `effects.rs` drains them after the Lua
    chunk (the same drain point as `Open`), calling `open_float_window` /
    `set_window_config`. `nvim_open_win`'s split-vs-float decision moves into
-   `api.lua` (which op to queue), matching where `vertical` is decided today.
+   `nvim_api.lua` (which op to queue), matching where `vertical` is decided today.
 
 2. **The mirror (`vim._wins`).** `effects.rs` pushes `vim._wins` before each
    chunk; add the float fields (`relative`, `anchor`, `row`, `col`, `width`,
    `height`, `zindex`, `focusable`, `border`) so `nvim_win_get_config` reads the
-   live value. `api.lua`'s `nvim_open_win` write-through (it already seeds a
+   live value. `nvim_api.lua`'s `nvim_open_win` write-through (it already seeds a
    `vim._wins[id]` entry) seeds the float fields too, so a `get_config` *later in
    the same chunk* sees the just-opened float before the op drains — the exact
    write-through pattern already there for the split form.
 
-3. **`nvim_win_set_config`.** `api.lua` validates + queues `WindowOp::SetConfig`
+3. **`nvim_win_set_config`.** `nvim_api.lua` validates + queues `WindowOp::SetConfig`
    and write-throughs the mirror. Core's `set_window_config`:
    - **float → moved/resized float:** overwrite the `FloatConfig`, `relayout()`.
    - **tiled → float:** the window leaves `root` (collapse its parent split, the

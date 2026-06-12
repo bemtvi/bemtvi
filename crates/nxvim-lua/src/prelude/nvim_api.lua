@@ -1,5 +1,7 @@
--- nxvim Lua prelude — Lua-side API registries.
--- User-command and autocmd registration kept purely in Lua (the vim._fire dispatcher the server reads back), plus the callable-and-indexable vim.cmd.
+-- nxvim Lua prelude — the `vim.api.nvim_*` surface (and the Lua-side API registries).
+-- Holds the core `nvim_*` functions (buffers, windows, tabpages, extmarks, autocmds,
+-- user commands), the user-command/autocmd registration kept purely in Lua (the
+-- vim._fire dispatcher the server reads back), and the callable-and-indexable vim.cmd.
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
 

@@ -1,5 +1,5 @@
 -- nxvim Lua prelude — runtime services.
--- The vim._notimpl loud-failure funnel, the deferred-callback registry (vim.schedule / _cb_fns / proc pids), and vim.notify / vim.inspect. (vim.treesitter is wired later, in prelude/treesitter.lua.)
+-- The vim._notimpl loud-failure funnel, the deferred-callback registry (nx.schedule / _cb_fns / proc pids), and nx.notify / vim.inspect. (vim.treesitter is wired later, in prelude/treesitter.lua.)
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
 
@@ -75,16 +75,17 @@ function vim._run_cb(id, keep, ...)
   if fn then return fn(...) end
 end
 
--- vim.schedule(fn): defer `fn` to the end of the current convergence — it runs
+-- nx.schedule(fn): defer `fn` to the end of the current convergence — it runs
 -- after the work that scheduled it settles, no longer nested in the caller's
 -- stack frame (the strict improvement over the old inline `fn()`), but still
 -- within the same input tick (not a later wall-clock turn; that is defer_fn).
 -- This is exactly what the colorscheme's "defer to avoid reentrancy" wants.
-function vim.schedule(fn)
+function nx.schedule(fn)
   local id = vim._next_cb_id()
   vim._cb_fns[id] = fn
   vim._schedule(id) -- Rust bridge: push LoopOp::Schedule{id} onto Shared.loop_ops
 end
+vim.schedule = nx.schedule
 
 -- vim.schedule_wrap(fn): return a function that, when called, schedules `fn` with
 -- whatever arguments it was given — a common plugin idiom for "run this callback
@@ -149,10 +150,11 @@ function vim._run_on_key(key, typed)
   end
 end
 
-function vim.notify(msg, _level, _opts)
+function nx.notify(msg, _level, _opts)
   if type(msg) == "table" then msg = table.concat(msg, "\n") end
   print(msg)
 end
+vim.notify = nx.notify
 
 -- vim.notify_once: in neovim this dedups by message; we have no message history
 -- to dedup against during a one-shot colorscheme load, so route to notify.

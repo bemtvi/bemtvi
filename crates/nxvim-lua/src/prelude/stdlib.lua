@@ -4,6 +4,11 @@
 -- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
 
 local vim = vim
+-- `nx` is the canonical editor namespace (ADR 0002); `vim.*` is a thin alias onto
+-- it. The Rust bridge seeds the global, but default it here too so this chunk is
+-- robust on its own. The option/variable stores below are authored as `nx.*`, with
+-- the matching `vim.*` name set to the same object right after.
+nx = nx or {}
 
 -- ----- bit: LuaJIT-compatible bit ops on PUC Lua 5.1 ------------------------
 
@@ -62,8 +67,9 @@ end
 
 -- ----- option / variable stores ---------------------------------------------
 
--- vim.g: global variables. Plain storage; reading an unset key yields nil.
-vim.g = vim.g or {}
+-- nx.g: global variables. Plain storage; reading an unset key yields nil.
+nx.g = nx.g or {}
+vim.g = nx.g
 
 -- vim.w / vim.b: window- and buffer-scoped variables. In neovim each is indexed
 -- first by a window/buffer handle (`vim.w[win].name`) and bare access targets the
@@ -105,16 +111,18 @@ local function scoped_vars(store, current)
 end
 vim._w_vars = vim._w_vars or {}
 vim._b_vars = vim._b_vars or {}
-vim.w = scoped_vars(vim._w_vars, function() return vim.api.nvim_get_current_win() end)
-vim.b = scoped_vars(vim._b_vars, function() return vim.api.nvim_get_current_buf() end)
+nx.w = scoped_vars(vim._w_vars, function() return vim.api.nvim_get_current_win() end)
+nx.b = scoped_vars(vim._b_vars, function() return vim.api.nvim_get_current_buf() end)
+vim.w = nx.w
+vim.b = nx.b
 
--- vim.o: editor options with neovim's set-semantics — a write reaches the
+-- nx.o: editor options with neovim's set-semantics — a write reaches the
 -- option's real home and a read returns the core's current value (the default
 -- until set, and a value set through the `:set` ex path, not just one written
 -- from Lua). The wired options route to the scope their name implies:
---   * number / relativenumber       -> window-local (delegated to vim.wo)
+--   * number / relativenumber       -> window-local (delegated to nx.wo)
 --   * tabstop / shiftwidth /
---     softtabstop / expandtab       -> buffer-local (delegated to vim.bo)
+--     softtabstop / expandtab       -> buffer-local (delegated to nx.bo)
 --   * ignorecase / smartcase /
 --     wrapscan / hlsearch /
 --     incsearch / showtabline       -> global (vim._go_mirror + the
@@ -122,9 +130,9 @@ vim.b = scoped_vars(vim._b_vars, function() return vim.api.nvim_get_current_buf(
 -- Any other option (termguicolors, background, winblend, pumblend, …) lands in
 -- the plain Lua store `vim._o_store`: observable read/write, not yet honored.
 --
--- vim.wo / vim.bo are defined in later prelude chunks; vim.o only touches them
--- from inside its metamethods, which run at config time once every chunk has
--- loaded, so the forward reference is fine.
+-- nx.wo / nx.bo are defined later in this chunk; nx.o only touches them from
+-- inside its metamethods, which run at config time once every chunk has loaded,
+-- so the forward reference is fine.
 
 -- Window- and buffer-local options vim.o forwards to vim.wo / vim.bo. Keyed by
 -- both the full name and its abbreviation (the delegate canonicalizes again).
@@ -267,10 +275,11 @@ local function o_set(k, v)
   vim._o_store[k] = v
 end
 
-vim.o = setmetatable({}, {
+nx.o = setmetatable({}, {
   __index = function(_, k) return o_get(k) end,
   __newindex = function(_, k, v) o_set(k, v) end,
 })
+vim.o = nx.o
 
 -- An option name nxvim actually models (any scope): the routed window/buffer/
 -- global options plus the read-mostly catch-all store. Used by vim.fn.exists to
@@ -341,12 +350,12 @@ function vim.fn.trim(text, mask, dir)
   return text:sub(from, to)
 end
 
--- vim.opt: neovim's rich Option object. Reading a field yields an Option wrapping
+-- nx.opt: neovim's rich Option object. Reading a field yields an Option wrapping
 -- the option's current value; the methods (:get / :append / :prepend / :remove)
 -- and the +/-/^ operators mutate list / char-flag / key:val-map options the way
 -- plugin configs (and plugin managers) expect, and a table assignment
--- (`vim.opt.rtp = { ... }`) encodes back to the option's comma string. Scope
--- routing is inherited from vim.o. For the runtimepath family a mutation also
+-- (`nx.opt.rtp = { ... }`) encodes back to the option's comma string. Scope
+-- routing is inherited from nx.o. For the runtimepath family a mutation also
 -- feeds Lua's package.path, so a freshly-added plugin dir becomes require-able —
 -- matching neovim, where runtimepath drives module search. (The earlier thin
 -- scalar proxy sufficed for colorscheme get/set but broke `vim.opt.rtp:append`.)
@@ -607,21 +616,24 @@ local function opt_assign(name, v)
   end
 end
 
-vim.opt = setmetatable({}, {
+nx.opt = setmetatable({}, {
   __index = function(_, k)
     local kind = opt_kind(k, false)
     return opt_new(k, kind, opt_decode(kind, o_get(k)))
   end,
   __newindex = function(_, k, v) opt_assign(k, v) end,
 })
--- nxvim's vim.o already routes by scope, so opt_local / opt_global share the
+vim.opt = nx.opt
+-- nxvim's nx.o already routes by scope, so opt_local / opt_global share the
 -- same Option machinery (the forced-scope distinction neovim draws is collapsed).
-vim.opt_local = vim.opt
-vim.opt_global = vim.opt
+nx.opt_local = nx.opt
+nx.opt_global = nx.opt
+vim.opt_local = nx.opt
+vim.opt_global = nx.opt
 
--- vim.go: the *global* value of options (neovim's editor-wide scope). Unlike
--- vim.o it never delegates to the window/buffer scope — reading a window/buffer
--- option through vim.go yields its global default, matching neovim's "go is the
+-- nx.go: the *global* value of options (neovim's editor-wide scope). Unlike
+-- nx.o it never delegates to the window/buffer scope — reading a window/buffer
+-- option through nx.go yields its global default, matching neovim's "go is the
 -- global option store" semantics. The wired global options reflect the core
 -- (vim._go_mirror, the same home vim.o's global branch uses); any other option
 -- lands in the plain vim._o_store (observable read/write, not yet honored).
@@ -643,10 +655,190 @@ local function go_set(k, v)
   end
   vim._o_store[k] = v
 end
-vim.go = setmetatable({}, {
+nx.go = setmetatable({}, {
   __index = function(_, k) return go_get(k) end,
   __newindex = function(_, k, v) go_set(k, v) end,
 })
+vim.go = nx.go
+
+-- nx.bo: buffer-local options, indexed by bufnr (`nx.bo[buf].filetype`).
+--
+-- The indentation options nxvim's core honors — tabstop/shiftwidth/expandtab and
+-- their `ts`/`sw`/`et` abbreviations — are *wired*: a write reaches the live
+-- editor (it changes how the buffer renders tabs and indents on <Tab>), and a
+-- read returns the core's current value (`vim._bo_mirror`, refreshed by the
+-- server) — the option default until set, and a value set through the `:set`
+-- ex-command path, not just one written from Lua.
+--
+-- `filetype`/`ft` stays authoritative from the current-buffer snapshot (it backs
+-- the `root_dir` filetype checks configs do at load) unless a write overrode it.
+-- Any other option falls back to the plain Lua store `vim._bo_store` (observable
+-- read/write, but not yet driving editor behavior). A bare `nx.bo.<opt>` (no
+-- bufnr) targets the current buffer. The `vim._bo_mirror` / `vim._bo_store`
+-- mirrors and the `vim._resolve_bufnr` / `vim._buf_set_option` bridges this reads
+-- are defined later (prelude/nvim_api.lua + the Rust bridge), but only touched
+-- from inside the metamethods at config time, so the forward reference is fine.
+
+-- Canonical name of a *wired* (core-honored) buffer option, or nil for the rest.
+local BUF_OPT_CANON = {
+  tabstop = "tabstop",
+  ts = "tabstop",
+  shiftwidth = "shiftwidth",
+  sw = "shiftwidth",
+  softtabstop = "softtabstop",
+  sts = "softtabstop",
+  expandtab = "expandtab",
+  et = "expandtab",
+  -- The buffer-local override of the global `regexsyntax` dialect for `/` and
+  -- `:s`. `nx.bo.regexsyntax = "vim"` pins this buffer; reads return the
+  -- *effective* dialect (the override resolved against the global).
+  regexsyntax = "regexsyntax",
+  rxs = "regexsyntax",
+}
+-- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
+-- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
+-- their sentinels (0 = follow tabstop, -1 = follow shiftwidth); regexsyntax
+-- "pcre" (the buffer follows the global, whose default is pcre).
+local BUF_OPT_DEFAULT =
+  { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false, regexsyntax = "pcre" }
+
+local function bo_get(bufnr, opt)
+  local canon = BUF_OPT_CANON[opt]
+  if canon then
+    local mirror = vim._bo_mirror[bufnr]
+    if mirror ~= nil and mirror[canon] ~= nil then return mirror[canon] end
+    return BUF_OPT_DEFAULT[canon]
+  end
+  -- `modified` is read-only buffer *state* (not a settable option), mirrored by
+  -- the server so a `'tabline'`/statusline label can read `nx.bo[n].modified`.
+  if opt == "modified" or opt == "mod" then
+    local mirror = vim._bo_mirror[bufnr]
+    return (mirror ~= nil and mirror.modified) or false
+  end
+  -- `filetype` (the treesitter *language* noun) and `ts_highlight` (the *whether*
+  -- noun) are wired to the core; reads come from the bo mirror the server pushes
+  -- (so `:set ft`, `:setf`, and `nx.bo.filetype` all agree), with the current-
+  -- buffer snapshot / the default as the pre-first-push fallback.
+  if opt == "filetype" or opt == "ft" then
+    local mirror = vim._bo_mirror[bufnr]
+    if mirror ~= nil and mirror.filetype ~= nil then return mirror.filetype end
+    return (vim._cur_buf or {}).filetype
+  end
+  if opt == "ts_highlight" then
+    local mirror = vim._bo_mirror[bufnr]
+    if mirror ~= nil and mirror.ts_highlight ~= nil then return mirror.ts_highlight end
+    return true
+  end
+  local store = vim._bo_store[bufnr]
+  if store ~= nil and store[opt] ~= nil then return store[opt] end
+  return nil
+end
+local function bo_set(bufnr, opt, value)
+  local canon = BUF_OPT_CANON[opt]
+  if canon then
+    -- Queue the change for the core and update the mirror so a read-after-write
+    -- within this chunk is consistent (the server overwrites it on the next push).
+    vim._buf_set_option(bufnr, canon, value)
+    vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
+    vim._bo_mirror[bufnr][canon] = value
+    return
+  end
+  -- `filetype` / `ts_highlight` are the wired treesitter nouns: write through to
+  -- the core and echo into the mirror for read-after-write within this chunk.
+  if opt == "filetype" or opt == "ft" then
+    vim._buf_set_option(bufnr, "filetype", value)
+    vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
+    vim._bo_mirror[bufnr].filetype = value
+    return
+  end
+  if opt == "ts_highlight" then
+    vim._buf_set_option(bufnr, "ts_highlight", value)
+    vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
+    vim._bo_mirror[bufnr].ts_highlight = value
+    return
+  end
+  vim._bo_store[bufnr] = vim._bo_store[bufnr] or {}
+  vim._bo_store[bufnr][opt] = value
+end
+local function bo_proxy(bufnr)
+  bufnr = vim._resolve_bufnr(bufnr)
+  return setmetatable({}, {
+    __index = function(_, opt) return bo_get(bufnr, opt) end,
+    __newindex = function(_, opt, value) bo_set(bufnr, opt, value) end,
+  })
+end
+nx.bo = setmetatable({}, {
+  __index = function(_, k)
+    -- numeric key -> per-buffer proxy; option name -> current-buffer value.
+    if type(k) == "number" then return bo_proxy(k) end
+    return bo_get(vim._resolve_bufnr(0), k)
+  end,
+  __newindex = function(_, k, value) bo_set(vim._resolve_bufnr(0), k, value) end,
+})
+vim.bo = nx.bo
+
+-- nx.wo: window-local options, indexed by window id (`nx.wo[win].number`), the
+-- window analogue of nx.bo. The number-gutter options nxvim's core honors —
+-- number/relativenumber and their nu/rnu abbreviations — are *wired*: a write
+-- reaches the live editor (it changes that window's gutter) and a read returns
+-- the core's current value from the `vim._wins` mirror the server refreshes (the
+-- default until set, or a value set via the `:set` ex path). Any other option
+-- falls back to the plain `vim._wo_store` (observable, not yet honored). A bare
+-- `nx.wo.<opt>` (no window id) targets the current window. As with nx.bo the
+-- `vim._wins` / `vim._wo_store` mirrors and the `vim._resolve_win` /
+-- `vim._win_set_option` bridges are defined later (prelude/nvim_api.lua), reached
+-- only from the metamethods at config time.
+local WIN_OPT_CANON = {
+  number = "number",
+  nu = "number",
+  relativenumber = "relativenumber",
+  rnu = "relativenumber",
+}
+local WIN_OPT_DEFAULT = { number = true, relativenumber = true }
+-- Exposed for nvim_api.lua's nvim_{get,set}_option_value, which classify a name
+-- as window-scoped before routing it through nx.wo.
+vim._win_opt_canon = WIN_OPT_CANON
+
+local function wo_get(win, opt)
+  local canon = WIN_OPT_CANON[opt]
+  if canon then
+    local w = (vim._wins or {})[win]
+    if w ~= nil and w[canon] ~= nil then return w[canon] end
+    return WIN_OPT_DEFAULT[canon]
+  end
+  local store = vim._wo_store[win]
+  if store ~= nil and store[opt] ~= nil then return store[opt] end
+  return nil
+end
+local function wo_set(win, opt, value)
+  local canon = WIN_OPT_CANON[opt]
+  if canon then
+    -- Queue the change for the core and update the mirror so a read-after-write
+    -- within this chunk is consistent (the server overwrites it on the next push).
+    vim._win_set_option(win, canon, value)
+    local w = (vim._wins or {})[win]
+    if w then w[canon] = value end
+    return
+  end
+  vim._wo_store[win] = vim._wo_store[win] or {}
+  vim._wo_store[win][opt] = value
+end
+local function wo_proxy(win)
+  win = vim._resolve_win(win)
+  return setmetatable({}, {
+    __index = function(_, opt) return wo_get(win, opt) end,
+    __newindex = function(_, opt, value) wo_set(win, opt, value) end,
+  })
+end
+nx.wo = setmetatable({}, {
+  __index = function(_, k)
+    -- numeric key -> per-window proxy; option name -> current-window value.
+    if type(k) == "number" then return wo_proxy(k) end
+    return wo_get(vim._resolve_win(0), k)
+  end,
+  __newindex = function(_, k, value) wo_set(vim._resolve_win(0), k, value) end,
+})
+vim.wo = nx.wo
 
 -- vim.v: neovim's predefined `v:` variables. nxvim backs the few with a real
 -- editor source from a Rust→Lua mirror (vim._v_mirror) the server refreshes
@@ -794,8 +986,8 @@ end
 -- vim/_core/shared.lua). vim.func._memoize uses them to parse a `concat-N` hash
 -- spec; _assert_integer raises on a non-integer, _tointeger returns nil.
 function vim._tointeger(x, base)
-  local nx = tonumber(x, base)
-  if nx and nx == math.floor(nx) then return nx end
+  local n = tonumber(x, base)
+  if n and n == math.floor(n) then return n end
 end
 
 function vim._assert_integer(x, base)

@@ -58,14 +58,19 @@ impl UserData for LuaRegex {
 pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     let vim = lua.create_table()?;
 
+    // `nx` is the canonical editor namespace (ADR 0002); the `vim.*` whitelist is
+    // aliases onto it. The Lua prelude builds most of `nx.*`, but the surfaces
+    // that need a Rust closure (here: `nx.cmd`) are seeded on the `nx` table now,
+    // with `vim.*` forwarding to the same value.
+    let nx = lua.create_table()?;
+
     let sh = shared.clone();
-    vim.set(
-        "cmd",
-        lua.create_function(move |_, cmd: String| {
-            sh.borrow_mut().commands.push(cmd);
-            Ok(())
-        })?,
-    )?;
+    let cmd = lua.create_function(move |_, cmd: String| {
+        sh.borrow_mut().commands.push(cmd);
+        Ok(())
+    })?;
+    nx.set("cmd", cmd.clone())?;
+    vim.set("cmd", cmd)?;
 
     vim.set("version", "nxvim 0.1.0")?;
 
@@ -361,6 +366,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     )?;
     vim.set("fn", func)?;
 
+    lua.globals().set("nx", nx)?;
     lua.globals().set("vim", vim)?;
 
     // Capture `print` so output can be shown on the message line.

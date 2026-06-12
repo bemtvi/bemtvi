@@ -870,10 +870,15 @@ function vim.api.nvim_get_mode() return { mode = vim._cur_mode or "n", blocking 
 -- `vim._open_win` Rust bridges) the server drains into the live editor after the
 -- chunk, the same "Lua queues, core mutates" flow as the buffer API. `0`/`nil`
 -- means the current window throughout.
-local function resolve_win(win)
+-- Current-window resolution (`0`/`nil` -> the current window). Exposed on the
+-- global `vim` table — mirroring `vim._resolve_bufnr` — so the `nx.wo` machinery,
+-- authored in prelude/stdlib.lua (which loads earlier), can share it; the local
+-- alias keeps this file's many call sites terse.
+function vim._resolve_win(win)
   if win == nil or win == 0 then return vim._cur_win or 1000 end
   return win
 end
+local resolve_win = vim._resolve_win
 
 function vim.api.nvim_get_current_win() return vim._cur_win or 1000 end
 
@@ -1329,62 +1334,9 @@ function vim.api.nvim_win_set_config(win, config)
   end
 end
 
--- vim.wo: window-local options, indexed by window id (`vim.wo[win].number`), the
--- window analogue of vim.bo. The number-gutter options nxvim's core honors —
--- number/relativenumber and their nu/rnu abbreviations — are *wired*: a write
--- reaches the live editor (it changes that window's gutter) and a read returns
--- the core's current value from the `vim._wins` mirror the server refreshes (the
--- default until set, or a value set via the `:set` ex path). Any other option
--- falls back to the plain `vim._wo_store` (observable, not yet honored). A bare
--- `vim.wo.<opt>` (no window id) targets the current window.
-local WIN_OPT_CANON = {
-  number = "number",
-  nu = "number",
-  relativenumber = "relativenumber",
-  rnu = "relativenumber",
-}
-local WIN_OPT_DEFAULT = { number = true, relativenumber = true }
-
-local function wo_get(win, opt)
-  local canon = WIN_OPT_CANON[opt]
-  if canon then
-    local w = (vim._wins or {})[win]
-    if w ~= nil and w[canon] ~= nil then return w[canon] end
-    return WIN_OPT_DEFAULT[canon]
-  end
-  local store = vim._wo_store[win]
-  if store ~= nil and store[opt] ~= nil then return store[opt] end
-  return nil
-end
-local function wo_set(win, opt, value)
-  local canon = WIN_OPT_CANON[opt]
-  if canon then
-    -- Queue the change for the core and update the mirror so a read-after-write
-    -- within this chunk is consistent (the server overwrites it on the next push).
-    vim._win_set_option(win, canon, value)
-    local w = (vim._wins or {})[win]
-    if w then w[canon] = value end
-    return
-  end
-  vim._wo_store[win] = vim._wo_store[win] or {}
-  vim._wo_store[win][opt] = value
-end
-local function wo_proxy(win)
-  win = resolve_win(win)
-  return setmetatable({}, {
-    __index = function(_, opt) return wo_get(win, opt) end,
-    __newindex = function(_, opt, value) wo_set(win, opt, value) end,
-  })
-end
-vim.wo = setmetatable({}, {
-  __index = function(_, k)
-    -- numeric key -> per-window proxy; option name -> current-window value.
-    if type(k) == "number" then return wo_proxy(k) end
-    return wo_get(resolve_win(0), k)
-  end,
-  __newindex = function(_, k, value) wo_set(resolve_win(0), k, value) end,
-})
-
+-- `nx.wo` / `vim.wo` (window-local options) live with the other option scopes in
+-- prelude/stdlib.lua; the gutter mirror (`vim._wins`) and `vim._resolve_win` it
+-- reads are defined here.
 function vim.api.nvim_win_get_option(win, name) return vim.wo[resolve_win(win)][name] end
 function vim.api.nvim_win_set_option(win, name, value) vim.wo[resolve_win(win)][name] = value end
 
@@ -1735,7 +1687,7 @@ end
 -- observable per-scope store.
 function vim.api.nvim_set_option_value(name, value, opts)
   opts = opts or {}
-  if opts.win or WIN_OPT_CANON[name] then
+  if opts.win or vim._win_opt_canon[name] then
     vim.wo[opts.win and resolve_win(opts.win) or resolve_win(0)][name] = value
     return
   end
@@ -1748,7 +1700,7 @@ end
 -- current value (default until set).
 function vim.api.nvim_get_option_value(name, opts)
   opts = opts or {}
-  if opts.win or WIN_OPT_CANON[name] then
+  if opts.win or vim._win_opt_canon[name] then
     return vim.wo[opts.win and resolve_win(opts.win) or resolve_win(0)][name]
   end
   local buf = opts.buf and vim._resolve_bufnr(opts.buf) or vim._resolve_bufnr(0)

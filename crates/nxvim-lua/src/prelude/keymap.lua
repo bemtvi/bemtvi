@@ -19,7 +19,8 @@ vim._keymap_fns = vim._keymap_fns or {}
 vim._keymaps_version = vim._keymaps_version or 0
 local keymap_seq = 0
 
-vim.keymap = vim.keymap or {}
+nx.keymap = nx.keymap or {}
+vim.keymap = nx.keymap
 
 -- Normalize the `mode` argument to a list of mode codes. A bare string is one
 -- mode (`'n'`, `'x'`, `''` = all); a list passes through unchanged. Each code's
@@ -174,14 +175,14 @@ local function keymap_remove(modes, lhs, buffer)
   vim._keymaps_version = vim._keymaps_version + 1
 end
 
--- vim.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
+-- nx.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
 -- `rhs` is a function (stored in vim._keymap_fns) or a string (fed as keys).
--- Maps are non-recursive by default (the vim.keymap.set convention); pass
+-- Maps are non-recursive by default (the nx.keymap.set convention); pass
 -- `opts.remap = true` for a recursive map whose RHS keys are re-fed through the
 -- mapping layer (or, equivalently, `opts.noremap = false`). `opts.desc` is stored
 -- but unused; `opts.buffer` ties the map to one buffer (0 = current), `opts.default`
 -- marks an overridable built-in — both feed the precedence ladder the server applies.
-function vim.keymap.set(mode, lhs, rhs, opts)
+function nx.keymap.set(mode, lhs, rhs, opts)
   opts = opts or {}
   -- noremap unless either `noremap = false` or `remap = true` is given.
   local noremap = opts.noremap ~= false and not opts.remap
@@ -197,9 +198,9 @@ function vim.keymap.set(mode, lhs, rhs, opts)
   })
 end
 
--- vim.keymap.del(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
+-- nx.keymap.del(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
 -- `opts.buffer` (0 = current) targets a buffer-local map; absent targets globals.
-function vim.keymap.del(mode, lhs, opts)
+function nx.keymap.del(mode, lhs, opts)
   opts = opts or {}
   keymap_remove(keymap_modes(mode), lhs, keymap_resolve_buffer(opts.buffer))
 end

@@ -286,7 +286,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         include_str!("prelude/diagnostic.lua"),
     ),
     ("nxvim:prelude/compat", include_str!("prelude/compat.lua")),
-    // Loads last: the `nx.*` namespace is built over every `vim.*` surface above.
+    // Loads last: the `nx.*` namespace's remaining surface (events, commands,
+    // async, treesitter). The variable/option/dispatch/keymap nouns are authored
+    // as `nx.*` directly in the chunks above, each aliasing `vim.*` onto itself.
     ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
 ];
 

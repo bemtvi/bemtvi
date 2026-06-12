@@ -32,7 +32,12 @@ glyphon.workspace = true
 pollster.workspace = true
 nxvim-rpc.workspace = true
 nxvim-view.workspace = true
-nxvim-server.workspace = true
+# The workspace dep is `default-features = false`, so re-enable `native`
+# explicitly — the gui's main.rs uses native-gated server items
+# (default_runtime/default_shada/ClipboardProvider). Without this the crate only
+# builds when nxvim-server is also a build target (e.g. `cargo test --workspace`),
+# which silently turns its default `native` on via feature unification.
+nxvim-server = { workspace = true, features = ["native"] }
 arboard.workspace = true
 # Native open/save dialog for the `:eo`/`:wn`/… pickers, on all three desktop
 # platforms (no GTK — see the rfd note in the workspace Cargo.toml).

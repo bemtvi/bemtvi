@@ -25,7 +25,10 @@ luajit = ["nxvim-server/luajit", "nxvim-test-harness/luajit"]
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
-nxvim-server.workspace = true
+# Re-enable `native` explicitly (the workspace dep is `default-features = false`):
+# this binary depends on native-gated server items, so it must not rely on feature
+# unification from a `--workspace` build to turn `native` on.
+nxvim-server = { workspace = true, features = ["native"] }
 nxvim-tui.workspace = true
 nxvim-lsp.workspace = true
 

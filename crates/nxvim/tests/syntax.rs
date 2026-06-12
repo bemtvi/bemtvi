@@ -744,6 +744,78 @@ async fn a_missing_grammar_is_silent() {
 // ----- two-noun model: `filetype` (language) vs `ts_highlight` (whether) -----
 
 #[tokio::test]
+async fn nx_bo_filetype_and_ts_highlight_drive_highlighting() {
+    // The native front doors: `nx.bo.filetype` (language noun) and
+    // `nx.bo.ts_highlight` (whether noun) reach the core and read back through the
+    // server-pushed mirror. A `.txt` the extension table misses highlights once
+    // `nx.bo.filetype = "rust"`, darkens on `nx.bo.ts_highlight = false`, and the
+    // filetype reads back unchanged across the disable.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("nx-bo-ts", "txt", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    exec_lua(&rpc, "nx.bo.filetype = 'rust'").await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.bo.filetype").await.as_str(),
+        Some("rust"),
+        "nx.bo.filetype reads back through the mirror"
+    );
+
+    // Disable highlighting; the buffer darkens but the filetype is retained.
+    exec_lua(&rpc, "nx.bo.ts_highlight = false").await;
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.iter().all(|row| row.is_empty())
+    })
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.bo.filetype").await.as_str(),
+        Some("rust"),
+        "filetype survives ts_highlight = false (orthogonal nouns)"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.bo.ts_highlight").await.as_bool(),
+        Some(false),
+        "nx.bo.ts_highlight reads back false"
+    );
+}
+
+#[tokio::test]
+async fn nx_treesitter_start_and_stop_verbs_drive_highlighting() {
+    // `nx.treesitter.start(buf, lang)` / `stop(buf)` are verbs over the nouns.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = write_temp("nx-ts-verbs", "txt", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    exec_lua(&rpc, "nx.treesitter.start(0, 'rust')").await;
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    assert!(
+        hl[0]
+            .iter()
+            .any(|(s, _, g)| *s == 0 && g.split('.').next() == Some("keyword")),
+        "nx.treesitter.start highlights the `fn` keyword"
+    );
+
+    exec_lua(&rpc, "nx.treesitter.stop(0)").await;
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.iter().all(|row| row.is_empty())
+    })
+    .await;
+    assert!(
+        hl.iter().all(|row| row.is_empty()),
+        "nx.treesitter.stop darkens the buffer"
+    );
+}
+
+#[tokio::test]
 async fn ts_highlight_toggles_independently_of_an_explicit_filetype() {
     // The two nouns are orthogonal. A `.txt` buffer (extension table misses) is
     // given an explicit `filetype=rust`, so it highlights. `:set nots_highlight`

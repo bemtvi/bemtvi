@@ -139,9 +139,18 @@ impl Editor {
         }
     }
 
-    /// Set a boolean buffer-local option (currently `expandtab`) on buffer `id`.
-    /// The boolean companion to [`Editor::set_buffer_option_num`].
+    /// Set a boolean buffer-local option (`expandtab`, `ts_highlight`) on buffer
+    /// `id`. The boolean companion to [`Editor::set_buffer_option_num`].
     pub fn set_buffer_option_bool(&mut self, id: BufferId, name: &str, value: bool) {
+        // `ts_highlight` is the treesitter-enable noun (`nx.bo.ts_highlight`); it
+        // lives in the per-buffer enable map, not an `options` slot, so route it
+        // through the dedicated setter (which also drops/restores the parse).
+        if name == "ts_highlight" {
+            if self.buffers.map.contains_key(&id) {
+                self.set_ts_highlight(id, value);
+            }
+            return;
+        }
         let Some(ob) = self.buffers.map.get_mut(&id) else {
             return;
         };
@@ -157,6 +166,14 @@ impl Editor {
     /// loud (`E474`), so a raw `vim.bo` write of garbage leaves the override
     /// untouched (the buffer keeps following the global).
     pub fn set_buffer_option_str(&mut self, id: BufferId, name: &str, value: &str) {
+        // `filetype` is the treesitter language noun (`nx.bo.filetype`); route it
+        // through `set_filetype` (which refreshes the parse). `""` = no filetype.
+        if name == "filetype" {
+            if self.buffers.map.contains_key(&id) {
+                self.set_filetype(id, value);
+            }
+            return;
+        }
         let Some(ob) = self.buffers.map.get_mut(&id) else {
             return;
         };

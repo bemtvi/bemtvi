@@ -148,9 +148,22 @@ local function bo_get(bufnr, opt)
     local mirror = vim._bo_mirror[bufnr]
     return (mirror ~= nil and mirror.modified) or false
   end
+  -- `filetype` (the treesitter *language* noun) and `ts_highlight` (the *whether*
+  -- noun) are wired to the core; reads come from the bo mirror the server pushes
+  -- (so `:set ft`, `:setf`, and `nx.bo.filetype` all agree), with the current-
+  -- buffer snapshot / the default as the pre-first-push fallback.
+  if opt == "filetype" or opt == "ft" then
+    local mirror = vim._bo_mirror[bufnr]
+    if mirror ~= nil and mirror.filetype ~= nil then return mirror.filetype end
+    return (vim._cur_buf or {}).filetype
+  end
+  if opt == "ts_highlight" then
+    local mirror = vim._bo_mirror[bufnr]
+    if mirror ~= nil and mirror.ts_highlight ~= nil then return mirror.ts_highlight end
+    return true
+  end
   local store = vim._bo_store[bufnr]
   if store ~= nil and store[opt] ~= nil then return store[opt] end
-  if opt == "filetype" or opt == "ft" then return (vim._cur_buf or {}).filetype end
   return nil
 end
 local function bo_set(bufnr, opt, value)
@@ -161,6 +174,20 @@ local function bo_set(bufnr, opt, value)
     vim._buf_set_option(bufnr, canon, value)
     vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
     vim._bo_mirror[bufnr][canon] = value
+    return
+  end
+  -- `filetype` / `ts_highlight` are the wired treesitter nouns: write through to
+  -- the core and echo into the mirror for read-after-write within this chunk.
+  if opt == "filetype" or opt == "ft" then
+    vim._buf_set_option(bufnr, "filetype", value)
+    vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
+    vim._bo_mirror[bufnr].filetype = value
+    return
+  end
+  if opt == "ts_highlight" then
+    vim._buf_set_option(bufnr, "ts_highlight", value)
+    vim._bo_mirror[bufnr] = vim._bo_mirror[bufnr] or {}
+    vim._bo_mirror[bufnr].ts_highlight = value
     return
   end
   vim._bo_store[bufnr] = vim._bo_store[bufnr] or {}

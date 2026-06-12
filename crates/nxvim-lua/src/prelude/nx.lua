@@ -69,4 +69,20 @@ function nx.command(name, fn, opts) return vim.api.nvim_create_user_command(name
 nx.notify = vim.notify
 nx.schedule = vim.schedule
 
+-- Treesitter highlight control, as declarative buffer state (the two-noun model).
+-- `start`/`stop` are verbs over the nouns: which language (`nx.bo.filetype`) and
+-- whether treesitter paints (`nx.bo.ts_highlight`). `start(buf, lang)` forces a
+-- language and enables; `start(buf)` (no lang) just enables, keeping the buffer's
+-- filetype; `stop(buf)` disables highlighting without clearing the filetype, so
+-- LSP/indent still see the language.
+nx.treesitter = nx.treesitter or {}
+
+function nx.treesitter.start(buf, lang)
+  buf = buf or 0
+  if lang ~= nil and lang ~= "" then nx.bo[buf].filetype = lang end
+  nx.bo[buf].ts_highlight = true
+end
+
+function nx.treesitter.stop(buf) nx.bo[buf or 0].ts_highlight = false end
+
 return nx

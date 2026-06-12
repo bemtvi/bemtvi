@@ -764,6 +764,8 @@ impl EditHost {
                     expandtab: o.expandtab,
                     regexsyntax: self.editor.resolve_regexsyntax(o.regexsyntax).to_string(),
                     modified: b.modified,
+                    filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
+                    ts_highlight: self.editor.ts_highlight_enabled(id),
                 });
                 if !b.extmarks.is_empty() {
                     let marks = b

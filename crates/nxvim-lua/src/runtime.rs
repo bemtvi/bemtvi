@@ -206,6 +206,14 @@ pub struct BoMirror {
     /// what `/`/`:s` actually use in this buffer.
     pub regexsyntax: String,
     pub modified: bool,
+    /// The buffer's filetype (the treesitter language noun) — explicit override
+    /// or extension-derived, mirrored so `nx.bo.filetype` / `vim.bo.filetype` read
+    /// the core's value regardless of who set it (`:set`, `nx.bo`, `:setf`). Empty
+    /// when the buffer has no filetype.
+    pub filetype: String,
+    /// Whether treesitter highlighting is enabled for the buffer (the
+    /// `ts_highlight` noun); mirrored so `nx.bo.ts_highlight` reads the core flag.
+    pub ts_highlight: bool,
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`

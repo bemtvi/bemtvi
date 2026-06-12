@@ -412,24 +412,20 @@ pub struct GlobalOptionOp {
 }
 
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the
-/// `vim.treesitter` → native-engine seam (ADR 0001, bridge #1). The Lua side has
-/// already resolved `0` to the current buffer and (for `Start`) the language;
-/// the server forwards each to the editor's per-buffer treesitter override
-/// ([`Editor::ts_start`](nxvim_core::Editor::ts_start) / `ts_stop`). The query
-/// bridge (#4) adds a `SetQuery` variant here later.
+/// `nx.treesitter.set_query` → native-engine seam. The Lua side queues an
+/// override that the server pushes straight to the engine — no Lua merge or
+/// runtimepath resolution (highlight on/off and the language are declarative
+/// buffer state now: `nx.bo.ts_highlight` / `nx.bo.filetype`, not ops).
 #[derive(Clone, Debug)]
 pub enum TsOp {
-    /// `vim.treesitter.start(buf, lang)`: highlight `bufnr` in `lang` via the
-    /// native engine, regardless of the path's extension.
-    Start { bufnr: u64, lang: String },
-    /// `vim.treesitter.stop(buf)`: stop highlighting `bufnr`.
-    Stop { bufnr: u64 },
-    /// `vim.treesitter.query.set(lang, name, …)` (the query-resolution bridge,
-    /// #4): the named query for `lang` changed. The server re-resolves the merged
-    /// string from Lua and pushes it to the engine — only `name` is carried; the
-    /// resolved text is fetched on drain (so `;extends`/`after` merges are
-    /// included), not trusted from the raw `set` argument.
-    SetQuery { lang: String, name: String },
+    /// `nx.treesitter.set_query(lang, name, text|nil)`: install `text` as the
+    /// `(lang, name)` query override directly on the engine. `text = None` drops
+    /// the override, reverting to the engine's on-disk query.
+    SetQuery {
+        lang: String,
+        name: String,
+        text: Option<String>,
+    },
 }
 
 /// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,

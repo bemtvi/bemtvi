@@ -23,14 +23,12 @@ rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-# The treesitter crate, with its `vim.treesitter` Lua binding enabled. nxvim-lua
-# owns the Lua VM, so it installs the binding (`nxvim_ts::lua::install`) and
-# selects the shared mlua backend (`lua51`/`luajit`) the binding links against.
+# The treesitter crate (the native highlight `Engine` + grammar/data-dir helpers
+# nxvim-lua references). There is no Lua parser binding anymore — `nx.treesitter`
+# is config/query control, not a tree-walking API — so no extra feature is needed.
 #
 # Gated off wasm: nxvim-ts pulls `libloading` (dynamic library loading), which has
 # no wasm implementation, and the browser highlights in JS via web-tree-sitter
-# anyway — so the `vim.treesitter` Rust binding is compiled out there (edit-host
-# plan, Phase 4). The two call sites in `runtime.rs` are `cfg(not(wasm))`-gated to
-# match.
+# anyway — so it is compiled out there (edit-host plan, Phase 4).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-nxvim-ts = { workspace = true, features = ["lua"] }
+nxvim-ts = { workspace = true }

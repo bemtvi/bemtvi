@@ -85,4 +85,16 @@ end
 
 function nx.treesitter.stop(buf) nx.bo[buf or 0].ts_highlight = false end
 
+-- Install (or, with `text = nil`, drop) a treesitter query override for
+-- `(lang, name)` — e.g. a custom `highlights` or `injections` query. Replaces the
+-- engine's on-disk query directly; there is no `;extends`/runtimepath merge (that
+-- neovim-compat resolution does not exist in nxvim).
+function nx.treesitter.set_query(lang, name, text) vim._nx_set_ts_query(lang, name, text) end
+
+-- The bounded `vim.treesitter` alias (the muscle-memory whitelist, ADR 0002):
+-- only the `start`/`stop` toggle, mapped 1:1 onto the `nx` verbs. Every other
+-- `vim.treesitter.*` field is absent and fails loud on access (no parser API, no
+-- `query.*` — those are deliberately not part of nxvim's surface).
+vim.treesitter = { start = nx.treesitter.start, stop = nx.treesitter.stop }
+
 return nx

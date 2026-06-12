@@ -233,28 +233,14 @@ impl EditHost {
         #[cfg(feature = "native")]
         for op in self.lua.take_ts_ops() {
             match op {
-                TsOp::Start { bufnr, lang } => {
-                    self.editor.ts_start(BufferId(bufnr), lang);
-                    self.syntax_states.remove(&BufferId(bufnr));
-                }
-                TsOp::Stop { bufnr } => {
-                    self.editor.ts_stop(BufferId(bufnr));
-                    self.syntax_states.remove(&BufferId(bufnr));
-                }
-                TsOp::SetQuery { lang, name } => {
-                    // Pull the merged string back through the faithful Lua resolver
-                    // (so `;extends`/`after` merges are included), then push it to
-                    // the engine. A resolver error echoes loud rather than silently
-                    // leaving the customization unapplied.
-                    match self.lua.resolve_ts_query(&lang, &name) {
-                        Ok(text) => self.editor.set_ts_query(&lang, &name, text),
-                        Err(e) => self.editor.echo(format!(
-                            "treesitter: resolving query {lang}/{name} failed: {e}"
-                        )),
-                    }
-                    // A query change is rare (config time) and lang-wide, so drop
-                    // every buffer's highlight memo rather than track which buffers
-                    // are this language; they all re-query on the next redraw.
+                TsOp::SetQuery { lang, name, text } => {
+                    // `nx.treesitter.set_query`: install the override on the engine
+                    // directly — no Lua merge/resolution. A compile failure echoes
+                    // loud via `set_ts_query` itself. A query change is rare (config
+                    // time) and lang-wide, so drop every buffer's highlight memo
+                    // rather than track which are this language; they all re-query on
+                    // the next redraw.
+                    self.editor.set_ts_query(&lang, &name, text);
                     self.syntax_states.clear();
                 }
             }

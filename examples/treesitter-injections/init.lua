@@ -2,17 +2,14 @@
 --
 -- An "injection" is a region of a buffer that belongs to another grammar: SQL in
 -- a Rust string, Lua in `vim.cmd[[ … ]]`, a ```rust block in markdown. nxvim's
--- injection bridge (ADR 0001, #5) keeps the discipline of the other bridges: the
--- vendored `vim.treesitter.query` resolves the injection *query* (faithful), and
--- the in-core engine *executes* it — running the query over the live tree each
--- parse, parsing every injected region with its child grammar, and painting the
--- child's captures over the host's. All synchronous, all per-edit, no Lua on the
--- redraw hot path.
+-- in-core engine runs the injection query over the live tree each parse, parses
+-- every injected region with its child grammar, and paints the child's captures
+-- over the host's — all synchronous, all per-edit, no Lua on the redraw hot path.
 --
 -- Most injections need no config at all: a host grammar that ships an
 -- `injections.scm` (markdown, for one) injects automatically. This example shows
--- the *custom* path — `vim.treesitter.query.set(lang, 'injections', text)`, which
--- runs through the same resolver and is pushed to the engine like any other query.
+-- the *custom* path — `nx.treesitter.set_query(lang, 'injections', text)`, which
+-- installs an injection query directly on the engine (a replace, not a merge).
 --
 -- PREREQUISITE: a Rust parser + queries in nxvim's data dir, laid out like
 -- neovim's: `<data>/parser/rust.so` and `<data>/queries/rust/highlights.scm`.
@@ -34,13 +31,13 @@
 local INJECT_RUST_IN_STRINGS =
   '((string_content) @injection.content (#set! injection.language "rust"))'
 
-vim.treesitter.query.set("rust", "injections", INJECT_RUST_IN_STRINGS)
+nx.treesitter.set_query("rust", "injections", INJECT_RUST_IN_STRINGS)
 
 --------------------------------------------------------------------------------
 -- :TSInjectOn — (re)enable the string→Rust injection.
 --------------------------------------------------------------------------------
-vim.api.nvim_create_user_command("TSInjectOn", function()
-  vim.treesitter.query.set("rust", "injections", INJECT_RUST_IN_STRINGS)
+nx.command("TSInjectOn", function()
+  nx.treesitter.set_query("rust", "injections", INJECT_RUST_IN_STRINGS)
   print("rust string bodies are now injected as rust")
 end, {})
 
@@ -48,8 +45,8 @@ end, {})
 -- :TSInjectOff — drop the injection query; string bodies go back to flat @string.
 --    Pass nil as the text to clear the override.
 --------------------------------------------------------------------------------
-vim.api.nvim_create_user_command("TSInjectOff", function()
-  vim.treesitter.query.set("rust", "injections", nil)
+nx.command("TSInjectOff", function()
+  nx.treesitter.set_query("rust", "injections", nil)
   print("rust injection cleared — string bodies are flat again")
 end, {})
 

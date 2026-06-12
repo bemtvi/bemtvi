@@ -1175,40 +1175,20 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `vim._ts_start(bufnr, lang)` / `vim._ts_stop(bufnr)`: queue a [`TsOp`] for
-    // the server to apply to the editor's per-buffer treesitter override — the
-    // `vim.treesitter.start` / `stop` bridge (ADR 0001, #1). The Lua wrapper has
-    // already resolved `0` to the current buffer and the language; this records
-    // the deferred toggle, which the server forwards to `Editor::ts_start` /
-    // `ts_stop` so the native engine highlights (or stops highlighting) the buffer.
+    // `vim._nx_set_ts_query(lang, name, text|nil)`: the native query setter behind
+    // `nx.treesitter.set_query`. Queues a [`TsOp::SetQuery`] the server pushes
+    // straight to the engine — no Lua merge/resolution. `nil` text drops the override.
     let sh = shared.clone();
     vim.set(
-        "_ts_start",
-        lua.create_function(move |_, (bufnr, lang): (u64, String)| {
-            sh.borrow_mut().ts_ops.push(TsOp::Start { bufnr, lang });
-            Ok(())
-        })?,
-    )?;
-    let sh = shared.clone();
-    vim.set(
-        "_ts_stop",
-        lua.create_function(move |_, bufnr: u64| {
-            sh.borrow_mut().ts_ops.push(TsOp::Stop { bufnr });
-            Ok(())
-        })?,
-    )?;
-    // `vim._ts_set_query(lang, name)`: queue a [`TsOp::SetQuery`] for the server to
-    // re-resolve and push to the engine — the query-resolution bridge (#4). The
-    // Lua wrapper has already stored the override into `explicit_queries` (via the
-    // real `query.set`); this only signals *which* query changed, and the server
-    // pulls the merged string back through `query.get` when it drains.
-    let sh = shared.clone();
-    vim.set(
-        "_ts_set_query",
-        lua.create_function(move |_, (lang, name): (String, String)| {
-            sh.borrow_mut().ts_ops.push(TsOp::SetQuery { lang, name });
-            Ok(())
-        })?,
+        "_nx_set_ts_query",
+        lua.create_function(
+            move |_, (lang, name, text): (String, String, Option<String>)| {
+                sh.borrow_mut()
+                    .ts_ops
+                    .push(TsOp::SetQuery { lang, name, text });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `vim.regex(pat)`: compile a vim pattern into a regex object exposing

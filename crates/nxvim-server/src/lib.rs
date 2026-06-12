@@ -371,12 +371,6 @@ pub struct EditHost {
     #[cfg(feature = "native")]
     syntax_states: HashMap<BufferId, SyntaxState>,
     /// Languages whose *on-disk* treesitter queries have already been resolved
-    /// through the Lua runtimepath and offered to the engine (the buffer-open half
-    /// of the query bridge). Guards the resolve to once per language — a pure
-    /// `after/queries` / `;extends` overlay is merged by Lua the first time a buffer
-    /// of that language is about to be highlighted, never re-resolved per redraw.
-    #[cfg(feature = "native")]
-    ts_resolved_langs: HashSet<String>,
     /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
     /// analogue).
     #[cfg(feature = "native")]
@@ -571,8 +565,6 @@ impl EditHost {
             ui: None,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
-            #[cfg(feature = "native")]
-            ts_resolved_langs: HashSet::new(),
             #[cfg(feature = "native")]
             lsp_states: HashMap::new(),
             #[cfg(feature = "native")]

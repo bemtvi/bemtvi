@@ -1065,7 +1065,7 @@ fn row0_keyword_at_0(hl: &[Vec<(u64, u64, String)>]) -> bool {
 
 #[tokio::test]
 async fn query_set_replaces_the_engine_highlights_query() {
-    // `vim.treesitter.query.set(lang, 'highlights', text)` (no modeline) REPLACES
+    // `nx.treesitter.set_query(lang, 'highlights', text)` (no modeline) REPLACES
     // the query, exactly as in neovim. The engine must paint with the new query:
     // `(identifier) @variable` lights up `main` but no longer the `fn` keyword.
     let _guard = test_lock().lock().await;
@@ -1079,7 +1079,7 @@ async fn query_set_replaces_the_engine_highlights_query() {
     // Override with an identifier-only query.
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'highlights', '(identifier) @variable')",
+        "nx.treesitter.set_query('rust', 'highlights', '(identifier) @variable')",
     )
     .await;
 
@@ -1099,40 +1099,6 @@ async fn query_set_replaces_the_engine_highlights_query() {
 }
 
 #[tokio::test]
-async fn query_set_with_extends_merges_onto_the_base_query() {
-    // A `;extends` modeline merges the override ON TOP of the base query rather
-    // than replacing it. The merge runs in the vendored Lua (`query.get` prepends
-    // the base file found on the runtimepath — which now includes the engine's
-    // data dir), so the engine paints BOTH the base `fn` keyword and the added
-    // @variable on `main`. This is the case the loader could never do alone.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let file = temp_rs("q-extends", "fn main() {}\n");
-    let (rpc, mut incoming) = start(Some(file)).await;
-
-    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
-
-    exec_lua(
-        &rpc,
-        "vim.treesitter.query.set('rust', 'highlights', ';extends\\n(identifier) @variable')",
-    )
-    .await;
-
-    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
-        row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
-    })
-    .await;
-    assert!(
-        row0_keyword_at_0(&hl),
-        "`;extends` keeps the base `fn` keyword: {hl:?}"
-    );
-    assert!(
-        row0_has_group(&hl, "variable"),
-        "`;extends` adds the @variable capture on top: {hl:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_broken_set_query_echoes_loud_and_keeps_the_old_paint() {
     // No silent stubs: an override that fails to compile must echo loud (like a
     // broken on-disk query), not swallow the error. The previously compiled query
@@ -1146,7 +1112,7 @@ async fn a_broken_set_query_echoes_loud_and_keeps_the_old_paint() {
 
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'highlights', '((((')",
+        "nx.treesitter.set_query('rust', 'highlights', '((((')",
     )
     .await;
 
@@ -1188,113 +1154,16 @@ async fn clearing_a_set_query_reverts_to_the_disk_query() {
     // Replace (keyword disappears), then clear (keyword returns).
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'highlights', '(identifier) @variable')",
+        "nx.treesitter.set_query('rust', 'highlights', '(identifier) @variable')",
     )
     .await;
     wait_for_highlights(&rpc, &mut incoming, |hl| !row0_keyword_at_0(hl)).await;
 
-    exec_lua(&rpc, "vim.treesitter.query.set('rust', 'highlights', nil)").await;
+    exec_lua(&rpc, "nx.treesitter.set_query('rust', 'highlights', nil)").await;
     let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
     assert!(
         row0_keyword_at_0(&hl),
         "clearing the override restores the disk query's `fn` keyword: {hl:?}"
-    );
-}
-
-#[tokio::test]
-async fn the_treesitter_query_example_config_extends_on_startup() {
-    // The shipped `examples/treesitter-query/` config calls
-    // `vim.treesitter.query.set('rust','highlights', ';extends\n(identifier) @variable')`
-    // at the top level of init.lua. Sourced at startup against its own sample, the
-    // buffer must paint BOTH the base `fn` keyword and the added @variable — the
-    // query bridge resolving + pushing the merge end-to-end through the example.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/treesitter-query")
-        .canonicalize()
-        .expect("example dir exists");
-    let sample = example.join("sample.rs").display().to_string();
-    let (rpc, mut incoming) = start_with_config(Some(sample), example).await;
-
-    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
-        row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
-    })
-    .await;
-    assert!(
-        row0_keyword_at_0(&hl),
-        "the example keeps the base `fn` keyword: {hl:?}"
-    );
-    assert!(
-        row0_has_group(&hl, "variable"),
-        "the example's ;extends adds @variable on `main`: {hl:?}"
-    );
-}
-
-/// Create a fresh runtimepath dir holding an on-disk `queries/rust/highlights.scm`
-/// overlay with the given text (a `;extends` modeline merges onto the engine's
-/// base query, which also sits on the runtimepath via `NXVIM_DATA_DIR`).
-fn query_overlay_runtimepath(tag: &str, scm: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nxvim-tsq-{}-{}", std::process::id(), tag));
-    let qdir = dir.join("queries").join("rust");
-    std::fs::create_dir_all(&qdir).unwrap();
-    std::fs::write(qdir.join("highlights.scm"), scm).unwrap();
-    dir
-}
-
-#[tokio::test]
-async fn an_on_disk_query_overlay_merges_with_no_query_set() {
-    // The buffer-open half of the bridge: a *pure on-disk* `queries/rust/`
-    // overlay with a `;extends` modeline — and NO `vim.treesitter.query.set` call
-    // anywhere — must still change what the engine paints. The first time a rust
-    // buffer is highlighted, the server resolves the merged query through the Lua
-    // runtimepath (base on `NXVIM_DATA_DIR` + this overlay) and pushes it. The
-    // buffer paints BOTH the base `fn` keyword and the overlay's @variable on
-    // `main`, neither of which the engine could reach from a single base file.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let rtp = query_overlay_runtimepath("extends", ";extends\n(identifier) @variable");
-    let file = temp_rs("q-overlay", "fn main() {}\n");
-    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
-
-    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
-        row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
-    })
-    .await;
-    assert!(
-        row0_keyword_at_0(&hl),
-        "the on-disk `;extends` overlay keeps the base `fn` keyword: {hl:?}"
-    );
-    assert!(
-        row0_has_group(&hl, "variable"),
-        "the on-disk overlay adds @variable on `main` with no query.set: {hl:?}"
-    );
-}
-
-#[tokio::test]
-async fn an_on_disk_replacing_query_overlay_replaces_the_base() {
-    // A pure on-disk overlay with NO `;extends` modeline REPLACES the base query
-    // (it becomes the sole non-extension file resolution picks), just as a plain
-    // `query.set` would — again with no `query.set` call. The buffer paints the
-    // overlay's @variable on `main` and no longer the base `fn` keyword, proving
-    // the buffer-open trigger honors a replacing overlay too, not only `;extends`.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let rtp = query_overlay_runtimepath("replace", "(identifier) @variable");
-    let file = temp_rs("q-overlay-replace", "fn main() {}\n");
-    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
-
-    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
-        !row0_keyword_at_0(hl) && row0_has_group(hl, "variable")
-    })
-    .await;
-    assert!(
-        !row0_keyword_at_0(&hl),
-        "the replacing on-disk overlay drops the base `fn` keyword: {hl:?}"
-    );
-    assert!(
-        row0_has_group(&hl, "variable"),
-        "the replacing on-disk overlay paints `main` as @variable: {hl:?}"
     );
 }
 
@@ -1337,7 +1206,7 @@ async fn query_set_injections_compiles_without_echo() {
 
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((line_comment) @injection.content (#set! injection.language \"rust\"))')",
     )
     .await;
@@ -1367,7 +1236,7 @@ async fn a_broken_injections_query_echoes_loud() {
 
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', '((((')",
+        "nx.treesitter.set_query('rust', 'injections', '((((')",
     )
     .await;
 
@@ -1380,44 +1249,6 @@ async fn a_broken_injections_query_echoes_loud() {
     assert!(
         row0_keyword_at_0(&hl),
         "a broken injections push keeps the base paint: {hl:?}"
-    );
-}
-
-/// Create a fresh runtimepath dir holding an on-disk `queries/rust/injections.scm`
-/// — the buffer-open resolution path for injections, the analogue of
-/// [`query_overlay_runtimepath`] for the highlights overlay.
-fn injections_overlay_runtimepath(tag: &str, scm: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nxvim-tsi-{}-{}", std::process::id(), tag));
-    let qdir = dir.join("queries").join("rust");
-    std::fs::create_dir_all(&qdir).unwrap();
-    std::fs::write(qdir.join("injections.scm"), scm).unwrap();
-    dir
-}
-
-#[tokio::test]
-async fn an_on_disk_injections_overlay_compiles_without_echo() {
-    // The buffer-open half: a pure on-disk `queries/rust/injections.scm` (no
-    // `query.set` call) is resolved through the Lua runtimepath the first time a
-    // rust buffer is highlighted and pushed to the engine. A valid one compiles
-    // silently and does not disturb the base paint.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let rtp = injections_overlay_runtimepath(
-        "valid",
-        "((line_comment) @injection.content (#set! injection.language \"rust\"))",
-    );
-    let file = temp_rs("inj-overlay", "fn main() {}\n");
-    let (rpc, mut incoming) = start_with(Some(file), vec![rtp]).await;
-
-    wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
-    assert!(
-        !saw_ts_compile_failure(&rpc, &mut incoming).await,
-        "a valid on-disk injections overlay must not echo a compile failure"
-    );
-    let hl = wait_for_highlights(&rpc, &mut incoming, row0_keyword_at_0).await;
-    assert!(
-        row0_keyword_at_0(&hl),
-        "the on-disk injections overlay leaves the base paint intact: {hl:?}"
     );
 }
 
@@ -1470,7 +1301,7 @@ async fn injected_rust_paints_over_a_host_string_self_injection() {
     // Inject rust into the string's content.
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.language \"rust\"))')",
     )
     .await;
@@ -1497,7 +1328,7 @@ async fn an_edit_keeps_the_injection_layers_alive() {
     wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.language \"rust\"))')",
     )
     .await;
@@ -1535,7 +1366,7 @@ async fn an_edit_inside_an_injected_region_tracks_incrementally() {
     wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.language \"rust\"))')",
     )
     .await;
@@ -1575,7 +1406,7 @@ async fn sibling_injected_regions_of_the_same_language_both_paint() {
     wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.language \"rust\"))')",
     )
     .await;
@@ -1609,7 +1440,7 @@ async fn the_injected_language_can_come_from_a_capture_node_text() {
     wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '(const_item name: (identifier) @injection.language \
           value: (string_literal (string_content) @injection.content))')",
     )
@@ -1672,7 +1503,7 @@ async fn a_nested_injection_paints_the_innermost_grammar() {
     // Give rust an injection query → level 2 (rust-in-rust) builds under the fence.
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.language \"rust\"))')",
     )
     .await;
@@ -1697,7 +1528,7 @@ async fn injection_self_injects_the_host_language() {
     wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.self))')",
     )
     .await;
@@ -1727,7 +1558,7 @@ async fn a_combined_injection_parses_split_regions_as_one_tree() {
     wait_for_highlights(&rpc, &mut incoming, |hl| row0_has_group(hl, "string")).await;
     exec_lua(
         &rpc,
-        "vim.treesitter.query.set('rust', 'injections', \
+        "nx.treesitter.set_query('rust', 'injections', \
          '((string_content) @injection.content (#set! injection.language \"rust\") \
            (#set! injection.combined))')",
     )
@@ -1743,50 +1574,10 @@ async fn a_combined_injection_parses_split_regions_as_one_tree() {
     );
 }
 
-// ----- injections bridge, Phase 4 (the platform half / drift oracle) --------
-
-#[tokio::test]
-async fn the_engine_paint_agrees_with_the_platform_injection_resolution() {
-    // Drift oracle: the engine's painted injection (the directive logic ported to
-    // Rust) and the vendored `LanguageTree`'s `_get_injections` (pure Lua, over
-    // nxvim's snapshot primitives) must agree on what is injected where. For a
-    // markdown ```rust fence the engine paints rust into the fence AND the platform
-    // resolves the fenced region's language to rust — a divergence between the two
-    // independent ports of the injection-directive vocabulary would surface here.
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let file = write_temp("inj-oracle", "md", "```rust\nfn z() {}\n```\n");
-    let (rpc, mut incoming) = start(Some(file)).await;
-
-    // Engine side: rust is painted inside the fence — row 1's `fn` is a keyword.
-    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 1, 0)).await;
-    assert!(
-        row_keyword_at(&hl, 1, 0),
-        "engine paints rust into the fenced block: {hl:?}"
-    );
-
-    // Platform side: the vendored LanguageTree resolves the same region to rust.
-    let lang = exec_lua(
-        &rpc,
-        r#"
-        local p = vim.treesitter.get_parser(0, 'markdown')
-        p:parse(true)
-        local child = p:language_for_range({ 1, 0, 1, 0 })
-        return child and child:lang() or 'nil'
-        "#,
-    )
-    .await;
-    assert_eq!(
-        lang.as_str(),
-        Some("rust"),
-        "the platform resolves the fenced region to rust, agreeing with the engine paint"
-    );
-}
-
 #[tokio::test]
 async fn the_treesitter_injections_example_config_injects_on_startup() {
     // The shipped `examples/treesitter-injections/` config calls
-    // `vim.treesitter.query.set('rust','injections', <string_content → rust>)` at
+    // `nx.treesitter.set_query('rust','injections', <string_content → rust>)` at
     // the top of init.lua. Sourced at startup against its own sample, the Rust
     // inside the `const SNIPPET` string literal must paint — its `fn` (row 4, column
     // 23) is a keyword — proving the injection bridge resolves + pushes + paints

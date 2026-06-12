@@ -287,50 +287,6 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
 ];
 
-/// neovim's own `vim.treesitter` Lua, vendored verbatim under `src/vendor/nvim/`
-/// (see each file's header + that tree's `LICENSE`). Registered into Lua's
-/// `package.preload` by module name so `require('vim.treesitter…')` resolves them
-/// from memory — hermetic, shipping in the binary, with no runtime dependency on
-/// the `vendor/neovim` submodule. They run on the bespoke primitives installed by
-/// [`nxvim_ts::lua::install`]; `prelude/treesitter.lua` supplies the remaining
-/// globals and adapts the snapshot seam. Order is irrelevant (lazy `require`).
-const VENDORED_TS_LUA: &[(&str, &str)] = &[
-    ("vim.F", include_str!("vendor/nvim/vim/F.lua")),
-    ("vim.func", include_str!("vendor/nvim/vim/func.lua")),
-    (
-        "vim.func._memoize",
-        include_str!("vendor/nvim/vim/func/_memoize.lua"),
-    ),
-    (
-        "vim._core.util",
-        include_str!("vendor/nvim/vim/_core/util.lua"),
-    ),
-    (
-        "vim.pos._util",
-        include_str!("vendor/nvim/vim/pos/_util.lua"),
-    ),
-    (
-        "vim.treesitter._range",
-        include_str!("vendor/nvim/vim/treesitter/_range.lua"),
-    ),
-    (
-        "vim.treesitter.language",
-        include_str!("vendor/nvim/vim/treesitter/language.lua"),
-    ),
-    (
-        "vim.treesitter.query",
-        include_str!("vendor/nvim/vim/treesitter/query.lua"),
-    ),
-    (
-        "vim.treesitter.languagetree",
-        include_str!("vendor/nvim/vim/treesitter/languagetree.lua"),
-    ),
-    (
-        "vim.treesitter",
-        include_str!("vendor/nvim/vim/treesitter.lua"),
-    ),
-];
-
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -429,20 +385,6 @@ pub struct LuaRuntime {
     runtimepath: Vec<PathBuf>,
 }
 
-/// Register the [`VENDORED_TS_LUA`] modules into Lua's `package.preload` keyed by
-/// module name, each compiled to a loader function, so `require(name)` returns it
-/// without touching the filesystem. The chunk name carries into tracebacks.
-fn register_vendored_modules(lua: &Lua) -> mlua::Result<()> {
-    let package: Table = lua.globals().get("package")?;
-    let preload: Table = package.get("preload")?;
-    for (name, src) in VENDORED_TS_LUA {
-        let chunk_name = format!("@vendor/nvim/{}.lua", name.replace('.', "/"));
-        let loader = lua.load(*src).set_name(chunk_name).into_function()?;
-        preload.set(*name, loader)?;
-    }
-    Ok(())
-}
-
 /// Generate a `take_*` accessor that drains one [`Shared`] queue with
 /// `mem::take`. Every queue is filled by the Lua FFI closures and emptied once
 /// per turn by the server's effect drain; all seventeen have the identical body, so
@@ -463,25 +405,6 @@ impl LuaRuntime {
     /// `<rt>/lua/?/init.lua` (the layout neovim plugins ship), so a plugin
     /// dropped on the runtimepath is `require`-able by module name.
     pub fn new(runtimepath: Vec<PathBuf>) -> mlua::Result<Self> {
-        // Put the engine's data dir on the runtimepath so the vendored
-        // `vim.treesitter.query` resolver finds the same base `queries/<lang>/`
-        // trees the native engine reads from `NXVIM_DATA_DIR` — the analogue of
-        // neovim's parser/query install dir (`stdpath('data')/site`) being on the
-        // rtp. Without it, the query-resolution bridge could not merge an
-        // `after/queries` overlay or a `;extends` base onto the engine's grammar.
-        // `mut` is used only by the `cfg(not(wasm))` data-dir push below.
-        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-        let mut runtimepath = runtimepath;
-        // The native treesitter engine (`nxvim-ts` → `libloading`) is compiled out
-        // on wasm (edit-host plan, Phase 4); the browser highlights in JS instead.
-        // Its data dir / `vim.treesitter` primitives are gated out there to match.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let data_dir = nxvim_ts::data_dir();
-            if !runtimepath.contains(&data_dir) {
-                runtimepath.push(data_dir);
-            }
-        }
         // Load the full safe stdlib *plus* `debug`. Real plugins (catppuccin
         // among them) call `debug.getinfo` to locate their own install path, and
         // neovim exposes the full `debug` library to its trusted user config —
@@ -495,34 +418,15 @@ impl LuaRuntime {
         let shared = Rc::new(RefCell::new(Shared::default()));
         install_vim(&lua, &shared)?;
         install_runtime_api(&lua, &shared, &runtimepath)?;
-        // The `vim.treesitter` Lua platform's low-level primitives
-        // (`vim._create_ts_parser` & co.), backed by the in-process grammars the
-        // highlight engine already loads. Registering them is cheap and lazy — no
-        // grammar is touched until a plugin actually calls one — so it is always
-        // installed; the data dir is resolved the same way the engine resolves it.
-        #[cfg(not(target_arch = "wasm32"))]
-        nxvim_ts::lua::install(&lua, &nxvim_ts::data_dir())?;
         seed_package_path(&lua, &runtimepath)?;
-        // Register the vendored `vim.treesitter` Lua into `package.preload` so a
-        // later `require('vim.treesitter…')` loads it from memory. Done before the
-        // prelude so `prelude/treesitter.lua` can require it.
-        register_vendored_modules(&lua)?;
-        // The pure-Lua half of `vim.*`, layered over the Rust bridge above. Split
-        // across focused modules but loaded in source order — each is its own
-        // chunk (its own `local` scope), so the order is what one big chunk's was.
-        // Their chunk names carry into Lua tracebacks (`nxvim:prelude/lsp:42`).
+        // The pure-Lua half of `vim.*` + the `nx.*` namespace, layered over the Rust
+        // bridge above. Split across focused modules but loaded in source order —
+        // each is its own chunk (its own `local` scope), so the order is what one big
+        // chunk's was. Their chunk names carry into Lua tracebacks
+        // (`nxvim:prelude/lsp:42`).
         for (name, src) in PRELUDE_MODULES {
             lua.load(*src).set_name(*name).exec()?;
         }
-        // Wire the vendored `vim.treesitter` onto the primitives + snapshot bridge.
-        // Loaded last: it `require`s the high-level API, which calls back into the
-        // `vim.api`/autocmd surface the prelude above installs. Gated off wasm — it
-        // wires onto the `vim._create_ts_*` primitives that `nxvim_ts::lua::install`
-        // (above) registers, which are absent on wasm; the browser highlights in JS.
-        #[cfg(not(target_arch = "wasm32"))]
-        lua.load(include_str!("prelude/treesitter.lua"))
-            .set_name("nxvim:prelude/treesitter")
-            .exec()?;
         Ok(LuaRuntime {
             lua,
             shared,
@@ -582,19 +486,6 @@ impl LuaRuntime {
     pub fn eval_to_value(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
         let value: mlua::Value = self.lua.load(chunk).eval()?;
         lua_to_rmpv(&value)
-    }
-
-    /// Resolve the merged `(lang, name)` treesitter query **string** through the
-    /// vendored `vim.treesitter.query` resolver — the Lua half of the
-    /// query-resolution bridge (#4). Returns the final text the engine should
-    /// compile (explicit `query.set` + `;extends` base + `after/queries`, merged
-    /// faithfully by upstream), or `None` when no query resolves (revert to the
-    /// engine's on-disk default). Called by the server when it drains a
-    /// [`TsOp::SetQuery`](crate::TsOp), and on a buffer's first highlight.
-    pub fn resolve_ts_query(&self, lang: &str, name: &str) -> mlua::Result<Option<String>> {
-        let treesitter: Table = self.vim()?.get("treesitter")?;
-        let resolver: mlua::Function = treesitter.get("_resolved_query_string")?;
-        resolver.call((lang, name))
     }
 
     /// Mirror a buffer's diagnostics into `vim._diagnostics[bufnr]` as the plain

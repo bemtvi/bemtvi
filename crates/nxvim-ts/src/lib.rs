@@ -15,8 +15,6 @@
 pub mod engine;
 pub mod install;
 pub mod loader;
-#[cfg(feature = "lua")]
-pub mod lua;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

@@ -2,7 +2,9 @@
 //! highlights/commands/output/panel/LSP/loop/buffer ops, the Rust→Lua buffer
 //! mirror, event-loop completions, and the `run_pending` fixpoint.
 
+#[cfg(feature = "native")]
 use crate::evloop::{LoopCommand, LoopEvent};
+#[cfg(feature = "native")]
 use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::EditHost;
 use nxvim_core::highlight::HlDef;
@@ -162,8 +164,16 @@ impl EditHost {
         }
         // Server-start requests from `vim.lsp.start` (the `vim.lsp.enable` FileType
         // dispatcher) bind a buffer to its language server and ensure it is spawned.
+        // Native only — a serverless browser build has no language servers (Phase 6);
+        // a config that tries fails *loud* rather than silently dropping the request.
+        #[cfg(feature = "native")]
         for op in self.lua.take_lsp_ops() {
             self.apply_lsp_op(op);
+        }
+        #[cfg(not(feature = "native"))]
+        if !self.lua.take_lsp_ops().is_empty() {
+            self.editor
+                .echo("E: language servers (vim.lsp) are not available in the browser build yet");
         }
         // Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `vim.uv`
         // timers / async `vim.system`: a `Schedule` is serviced directly (queued
@@ -218,6 +228,9 @@ impl EditHost {
         // toggle (ADR 0001, #1) and the query-resolution push (#4). Each ends by
         // dropping the affected highlight memo(s) so the next redraw re-queries the
         // engine — the change isn't reflected in any buffer's changedtick.
+        // Native only — the in-process treesitter engine isn't built for wasm (the
+        // browser highlights JS-side in `nxvim-web`); a `vim.treesitter.*` op fails loud.
+        #[cfg(feature = "native")]
         for op in self.lua.take_ts_ops() {
             match op {
                 TsOp::Start { bufnr, lang } => {
@@ -245,6 +258,11 @@ impl EditHost {
                     self.syntax_states.clear();
                 }
             }
+        }
+        #[cfg(not(feature = "native"))]
+        if !self.lua.take_ts_ops().is_empty() {
+            self.editor
+                .echo("E: vim.treesitter is not available in the browser build yet");
         }
         // Register writes from `vim.fn.setreg`: applied to the editor's register
         // file after the chunk — the same store yanks/deletes write. The Lua side
@@ -390,6 +408,7 @@ impl EditHost {
             .unwrap_or(0);
         self.editor
             .apply_edits_to(id, vec![(start_byte..end_byte, repl_text)]);
+        #[cfg(feature = "native")]
         self.sync_lsp_buffer(id);
         if let Some(b) = self.editor.buffer_of_mut(id) {
             b.truncate_lua_ts_edits(lua_ts_len);
@@ -1089,7 +1108,12 @@ impl EditHost {
     /// [`LoopCommand`], never awaited).
     pub(crate) fn apply_loop_op(&mut self, op: LoopOp) {
         match op {
+            // `vim.schedule` needs no event loop — the id queues for the trailing
+            // `run_pending` drain — so it works in every build.
             LoopOp::Schedule { id } => self.scheduled.push_back(id),
+            // Timers / processes / fs-watches ride the tokio event loop. Native only
+            // for now; the Worker-side timer wheel is slice 5d.
+            #[cfg(feature = "native")]
             LoopOp::TimerStart {
                 id,
                 delay_ms,
@@ -1099,7 +1123,9 @@ impl EditHost {
                 delay: std::time::Duration::from_millis(delay_ms),
                 repeat: std::time::Duration::from_millis(repeat_ms),
             }),
+            #[cfg(feature = "native")]
             LoopOp::TimerStop { id } => self.fx.loop_command(LoopCommand::TimerStop { id }),
+            #[cfg(feature = "native")]
             LoopOp::Spawn {
                 id,
                 cmd,
@@ -1113,7 +1139,9 @@ impl EditHost {
                 env,
                 stdin,
             }),
+            #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
+            #[cfg(feature = "native")]
             LoopOp::FsEventStart {
                 id,
                 path,
@@ -1123,7 +1151,15 @@ impl EditHost {
                 path,
                 recursive,
             }),
+            #[cfg(feature = "native")]
             LoopOp::FsEventStop { id } => self.fx.loop_command(LoopCommand::FsEventStop { id }),
+            // The browser build has no event loop yet: surface the unsupported
+            // timer/process/watch request loudly rather than dropping it silently.
+            #[cfg(not(feature = "native"))]
+            _ => self.editor.echo(
+                "E: timers/jobs/fs-watch (vim.defer_fn / vim.uv / jobstart) are not \
+                 available in the browser build yet",
+            ),
         }
     }
 
@@ -1131,6 +1167,9 @@ impl EditHost {
     /// reported its pid, or a child exited) by running its Lua callback on the
     /// server thread, then draining the effects it queued. The caller's
     /// `settle_events` drives the rest to convergence and repaints once per burst.
+    /// Native only — it arrives on the run loop's `loop_events` arm, which the wasm
+    /// build doesn't have (its inbound side is slice 5c).
+    #[cfg(feature = "native")]
     pub(crate) fn on_loop_event(&mut self, event: LoopEvent) {
         match event {
             LoopEvent::Timer { id, keep } => {
@@ -1248,6 +1287,8 @@ impl EditHost {
         // Whether any `:checktime` / watch reconcile reloaded a buffer this drain —
         // a reload re-stamps the disk snapshot (a new inode after an atomic replace),
         // so the per-buffer watch must re-arm against the new key once we settle.
+        // Native only — the serverless browser build has no on-disk file to reconcile.
+        #[cfg(feature = "native")]
         let mut reconciled = false;
         loop {
             // File-change reconciles core deferred (`:checktime`, or the per-buffer
@@ -1255,6 +1296,7 @@ impl EditHost {
             // choice. Inside the fixpoint so a handler's queued `vim.cmd`/`:lua`
             // drains in the same convergence (and a handler that re-runs `:checktime`
             // keeps draining via the break check below).
+            #[cfg(feature = "native")]
             for buf in self.editor.take_pending_checktime() {
                 reconciled = true;
                 self.reconcile_file_change(buf);
@@ -1278,7 +1320,9 @@ impl EditHost {
                 // The `:LspCodeAction` list (Phase 6) is a select-enabled panel:
                 // a `<CR>` on row `index` applies that action's edit, keyed to the
                 // currently-open code-action panel by title so a select on some
-                // *other* select panel can't misroute here.
+                // *other* select panel can't misroute here. (Native only — the
+                // browser build has no code actions.)
+                #[cfg(feature = "native")]
                 if self.editor.panel_title() == Some(CODE_ACTION_PANEL_TITLE) {
                     self.apply_code_action(index);
                     continue;
@@ -1357,6 +1401,7 @@ impl EditHost {
         // A reconcile that reloaded a buffer changed its `(path, disk-stat)` watch key
         // (a fresh inode after an atomic replace); re-arm the per-buffer watch so it
         // follows the file. Idempotent — `sync_buffer_watches` no-ops when keys match.
+        #[cfg(feature = "native")]
         if reconciled {
             self.sync_buffer_watches();
         }
@@ -1368,6 +1413,8 @@ impl EditHost {
         self.drain_pending_opens();
         // Explicit `:wshada` / `:rshada` raised this convergence: flush / re-merge the
         // store. After the opens/saves drain so a `:rshada` sees the settled session.
+        // Native only — the shada store (redb) is gated off the wasm build (slice 5a).
+        #[cfg(feature = "native")]
         self.drain_pending_shada();
     }
 }

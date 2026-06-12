@@ -15,31 +15,60 @@
 //! [`redraw`] (View→wire projection), [`treesitter`] (highlight projection), and
 //! [`lsp`] (language-server integration).
 
-mod clipboard;
-mod daemon;
+// Without the `native` feature this crate builds only the synchronous `EditHost`
+// tick (the Phase 5 wasm subset, slice 5a). Nothing *constructs* an `EditHost`
+// here — that's the wasm cdylib's job (slice 5b) — so the tick's methods and the
+// struct itself read as dead code, and the imports / locals that serve only the
+// (gated) native transport read as unused. Allow all three on that config only;
+// the **native** build — the one that ships and is fully tested — keeps strict
+// `-D warnings` linting, so nothing real is masked.
+#![cfg_attr(
+    not(feature = "native"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
+
+// The synchronous-tick modules — wasm-eligible (the Phase 5 edit-host subset).
 mod decoration;
-mod dispatch;
 mod edithost;
 mod effects;
-mod evloop;
 mod excmd;
 mod extmarks;
-mod host;
-mod inbound;
 mod input;
 mod keymap;
 mod lifecycle;
-mod lsp;
-mod quic;
 mod redraw;
 mod save;
+
+// The native-transport surface — gated off the wasm build (slice 5a): the
+// msgpack wire + RPC router, the daemon/QUIC legs, the event-loop actor and its
+// inbound translator, the process seam, the redb shada store, the system
+// clipboard, and the not-yet-portable LSP + native treesitter.
+#[cfg(feature = "native")]
+mod clipboard;
+#[cfg(feature = "native")]
+mod daemon;
+#[cfg(feature = "native")]
+mod dispatch;
+#[cfg(feature = "native")]
+mod evloop;
+#[cfg(feature = "native")]
+mod host;
+#[cfg(feature = "native")]
+mod inbound;
+#[cfg(feature = "native")]
+mod lsp;
+#[cfg(feature = "native")]
+mod quic;
+#[cfg(feature = "native")]
 mod shada;
+#[cfg(feature = "native")]
 mod treesitter;
 
 /// The process-spawning seam (`vim.system` / `jobstart` / `:!`) and its types,
 /// re-exported for [`ServerInit::host_proc`] — the edit-host split injects a
 /// daemon-backed [`HostProc`] here (the process-side companion to
 /// [`nxvim_core::HostFs`]).
+#[cfg(feature = "native")]
 pub use host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 /// The cross-session snapshot the [`ShadaStore`] seam round-trips, re-exported so an
 /// out-of-crate store implementor (a test probe, the future wasm OPFS backend) can
@@ -54,6 +83,7 @@ pub use nxvim_core::{
 /// [`ServerInit::shada`] — native binaries pass [`default_shada`] (redb over a
 /// file at [`shada_dir`]); the wasm Worker build will pass a redb-over-OPFS store;
 /// tests pass a [`RedbFileStore`] over a temp dir, or `None` to disable.
+#[cfg(feature = "native")]
 pub use shada::{default_shada, is_store_file, shada_dir, RedbFileStore, ShadaStore};
 
 /// The daemon wire protocol for the edit-host split: the daemon-side servers
@@ -64,6 +94,7 @@ pub use shada::{default_shada, is_store_file, shada_dir, RedbFileStore, ShadaSto
 /// wire (a duplex, or ssh stdio to `nxvim --daemon`). [`HostFsAsync`] is the async fs
 /// seam the server fetches buffer contents through off the editor tick; [`FsRead`] is
 /// what one fetch resolves to.
+#[cfg(feature = "native")]
 pub use daemon::{
     connect_daemon, serve_daemon, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
     serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
@@ -77,11 +108,23 @@ pub use daemon::{
 /// daemon's self-signed cert TOFU + presents the launch-minted bearer token and returns
 /// the same [`DaemonClient`] `connect_daemon` does over stdio. [`bind_quic_listener`]
 /// mints the identity/token and resolves the bound address (for an ephemeral `:0` port).
+#[cfg(feature = "native")]
 pub use quic::{bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo};
 
-use edithost::{HostEffects, NativeEffects};
+/// The outbound async-effect seam the synchronous [`EditHost`] tick emits through
+/// (redraws / notifications to the client, off-tick fs, the event-loop / LSP command
+/// sinks). Re-exported so the out-of-crate wasm cdylib ([`nxvim-edithost`], slice 5b)
+/// can implement it for the browser transport, the way [`NativeEffects`] implements it
+/// for the native server.
+pub use edithost::HostEffects;
+#[cfg(feature = "native")]
+use edithost::NativeEffects;
+#[cfg(feature = "native")]
 use evloop::{EventLoop, LoopCommand, LoopEvent};
-use keymap::{BuiltinAction, Keymaps, NativeDefault};
+use keymap::Keymaps;
+#[cfg(feature = "native")]
+use keymap::{BuiltinAction, NativeDefault};
+#[cfg(feature = "native")]
 use lsp::{
     CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
@@ -90,16 +133,21 @@ use nxvim_core::{
     BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, ShadaRequest, StdHostFs, TabId,
     WindowId,
 };
+#[cfg(feature = "native")]
 use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
 use nxvim_lua::LuaRuntime;
+#[cfg(feature = "native")]
 use nxvim_rpc::{connect, Incoming};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+#[cfg(feature = "native")]
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "native")]
 use tokio::sync::mpsc::unbounded_channel;
+#[cfg(feature = "native")]
 use treesitter::SyntaxState;
 
 /// Startup options for the server.
@@ -107,6 +155,7 @@ use treesitter::SyntaxState;
 /// Not `Clone`/`Debug`: [`ClipboardProvider::Custom`] holds a trait object that
 /// is neither. No caller needs those — every construction site builds a fresh
 /// value (`..Default::default()`) and moves it straight into [`run`].
+#[cfg(feature = "native")]
 #[derive(Default)]
 pub struct ServerInit {
     /// File to open in the initial buffer, if any.
@@ -199,6 +248,7 @@ pub struct ServerInit {
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
+#[cfg(feature = "native")]
 #[derive(Default)]
 pub enum ClipboardProvider {
     /// Best-effort real host clipboard (the binary's choice). If no clipboard
@@ -223,6 +273,7 @@ pub enum ClipboardProvider {
 ///   then the config dir, then every plugin discovered under
 ///   `<config>/pack/*/start/*` (neovim's package layout, so a plugin checkout is
 ///   drop-in).
+#[cfg(feature = "native")]
 pub fn default_runtime() -> (Option<PathBuf>, Vec<PathBuf>) {
     let config_dir = resolve_config_dir();
     let mut runtimepath: Vec<PathBuf> = Vec::new();
@@ -237,6 +288,7 @@ pub fn default_runtime() -> (Option<PathBuf>, Vec<PathBuf>) {
 }
 
 /// First of `$NXVIM_CONFIG`, `$XDG_CONFIG_HOME/nxvim`, `$HOME/.config/nxvim`.
+#[cfg(feature = "native")]
 fn resolve_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("NXVIM_CONFIG") {
         return Some(PathBuf::from(dir));
@@ -249,6 +301,7 @@ fn resolve_config_dir() -> Option<PathBuf> {
 
 /// Every immediate `<config>/pack/*/start/*` directory — installed plugins, each
 /// contributing its root to the runtimepath. Missing/unreadable dirs yield none.
+#[cfg(feature = "native")]
 fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
     let mut plugins = Vec::new();
     let pack = config_dir.join("pack");
@@ -287,7 +340,12 @@ type WindowRect = (WindowId, (usize, usize, usize, usize));
 /// channel or socket directly — every async edge is either `fx` (outbound) or a loop arm
 /// feeding a tick method (inbound). See the Phase 4 hoist in
 /// `docs/plans/2026-06-09-edit-host-and-browser-lua.md`.
-struct EditHost {
+///
+/// Public so the out-of-crate wasm cdylib ([`nxvim-edithost`], slice 5b) can
+/// construct one ([`new`](Self::new)) and drive it ([`boot`](Self::boot) /
+/// [`feed`](Self::feed)) behind a wasm [`HostEffects`]; the native [`run`] loop
+/// builds and drives it in-crate. The fields stay private either way.
+pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
     /// The outbound async-effect seam (Phase 4, Open Decision #6 (a)): the editor
@@ -303,6 +361,7 @@ struct EditHost {
     /// clean-exit flush ([`EditHost::shada_flush_final`]). A capability injected via
     /// [`ServerInit::shada`], like [`fx`](EditHost::fx) — but `load`/`flush` only ever
     /// run off the input tick (startup, the debounce arm, exit), never inside it.
+    #[cfg(feature = "native")]
     shada: Option<Box<dyn ShadaStore + Send>>,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
@@ -310,60 +369,75 @@ struct EditHost {
     /// redraw of a buffer, dropped when the buffer is deleted). The parse tree
     /// itself lives in the editor's [`nxvim_core::SyntaxEngine`]; this is only the
     /// slim span cache the redraw projects.
+    #[cfg(feature = "native")]
     syntax_states: HashMap<BufferId, SyntaxState>,
     /// Languages whose *on-disk* treesitter queries have already been resolved
     /// through the Lua runtimepath and offered to the engine (the buffer-open half
     /// of the query bridge). Guards the resolve to once per language — a pure
     /// `after/queries` / `;extends` overlay is merged by Lua the first time a buffer
     /// of that language is about to be highlighted, never re-resolved per redraw.
+    #[cfg(feature = "native")]
     ts_resolved_langs: HashSet<String>,
     /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
     /// analogue).
+    #[cfg(feature = "native")]
     lsp_states: HashMap<BufferId, LspDocState>,
     /// Negotiated runtime state (encoding, sync kind) per started server, learned
     /// from each `initialize` reply.
+    #[cfg(feature = "native")]
     lsp_servers: HashMap<ServerKey, ServerRuntime>,
     /// Server keys already handed to `ensure_server`, so a server is requested
     /// once rather than on every redraw (a lazy-start guard).
+    #[cfg(feature = "native")]
     lsp_ensured: HashSet<ServerKey>,
     /// The next LSP client id to assign. Each `(name, root)` server gets one,
     /// stable across respawns (reused when its runtime is replaced), and it is
     /// the handle `LspAttach`'s `data.client_id` carries to Lua (Slice 3).
+    #[cfg(feature = "native")]
     next_lsp_client_id: u64,
     /// Set when an LSP event changed something the client should see (e.g. a fresh
     /// `Initialized` that should trigger a `didOpen`). Coalesced per loop turn so a
     /// burst of replies costs one repaint.
+    #[cfg(feature = "native")]
     lsp_dirty: bool,
     /// Monotonic generation counter stamped onto each language-feature request,
     /// so a reply whose generation is behind the latest of its kind is dropped
     /// (Decision 3 — the go-to analogue of the syntax `tick`).
+    #[cfg(feature = "native")]
     lsp_req_gen: u64,
     /// The in-flight language-feature request per kind (definition, references,
     /// …), used to match a reply to its intent and drop stale ones.
+    #[cfg(feature = "native")]
     lsp_requests: HashMap<LspReqKind, PendingLspReq>,
     /// In-flight `inlayHint/resolve`s, keyed by the `cb_id` their token carries.
     /// Unlike the single-slot `lsp_requests`, many lazy hints can resolve at once,
     /// so each gets a distinct `cb_id` (from `inlay_resolve_seq`) and routes back
     /// by it — the [`InlayResolveTarget`] records which placeholder span to fill.
+    #[cfg(feature = "native")]
     inlay_resolves: HashMap<u64, InlayResolveTarget>,
     /// Monotonic source of `cb_id`s for `inlay_resolves` (never reused, so a stale
     /// reply for a superseded resolve finds no target and is dropped).
+    #[cfg(feature = "native")]
     inlay_resolve_seq: u64,
     /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
     /// like the diagnostics cache; projected into the `pmenu` redraw key and
     /// driven by the popup-open key routing in [`EditHost::completion_menu_key`].
+    #[cfg(feature = "native")]
     completion: Option<CompletionMenu>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
+    #[cfg(feature = "native")]
     lsp_code_actions: Vec<CodeActionData>,
     /// The `vim.diagnostic.config` keys with a backing surface — the underline
     /// spans and the inline virtual text — toggled by `vim.diagnostic.config`.
+    #[cfg(feature = "native")]
     diag_config: DiagnosticConfig,
     /// The editor-wide semantic-tokens gate (Phase 3), toggled by
     /// `vim.lsp.semantic_tokens.enable`. Default on; `false` hides the semantic
     /// paint everywhere and stops the refresh requests (the per-buffer
     /// `LspDocState::semantic_enabled` is the narrower override).
+    #[cfg(feature = "native")]
     semantic_tokens_enabled: bool,
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
@@ -497,27 +571,184 @@ struct EditHost {
     reload_posts: HashSet<BufferId>,
 }
 
+impl EditHost {
+    /// Construct an edit-host over the given outbound-effect seam, every field at its
+    /// startup default. The single construction site for the struct, shared by the
+    /// native [`run_io`] (which then seeds `shada` / `mouse_clock` / the LSP keymap
+    /// defaults and sources config) and the out-of-crate wasm cdylib (slice 5b, which
+    /// calls [`boot`](Self::boot) for the serverless startup). The caller attaches a
+    /// UI — [`attach_ui`](Self::attach_ui) on wasm, the `nvim_ui_attach` RPC natively —
+    /// before the first [`redraw`](Self::redraw).
+    pub fn new(editor: Editor, lua: LuaRuntime, fx: Box<dyn HostEffects>) -> EditHost {
+        EditHost {
+            editor,
+            lua,
+            fx,
+            #[cfg(feature = "native")]
+            shada: None,
+            ui: None,
+            #[cfg(feature = "native")]
+            syntax_states: HashMap::new(),
+            #[cfg(feature = "native")]
+            ts_resolved_langs: HashSet::new(),
+            #[cfg(feature = "native")]
+            lsp_states: HashMap::new(),
+            #[cfg(feature = "native")]
+            lsp_servers: HashMap::new(),
+            #[cfg(feature = "native")]
+            lsp_ensured: HashSet::new(),
+            #[cfg(feature = "native")]
+            next_lsp_client_id: 1,
+            #[cfg(feature = "native")]
+            lsp_dirty: false,
+            #[cfg(feature = "native")]
+            lsp_req_gen: 0,
+            #[cfg(feature = "native")]
+            lsp_requests: HashMap::new(),
+            #[cfg(feature = "native")]
+            inlay_resolves: HashMap::new(),
+            #[cfg(feature = "native")]
+            inlay_resolve_seq: 0,
+            #[cfg(feature = "native")]
+            completion: None,
+            #[cfg(feature = "native")]
+            lsp_code_actions: Vec::new(),
+            #[cfg(feature = "native")]
+            diag_config: DiagnosticConfig::default(),
+            #[cfg(feature = "native")]
+            semantic_tokens_enabled: true,
+            last_buffer_id: None,
+            announced: HashSet::new(),
+            known_buffers: Vec::new(),
+            last_mode: Mode::Normal,
+            last_window_id: None,
+            known_windows: Vec::new(),
+            last_window_rects: None,
+            last_tab_id: None,
+            known_tabs: Vec::new(),
+            keymaps: Keymaps::default(),
+            scheduled: VecDeque::new(),
+            buf_mirror_ticks: HashMap::new(),
+            buf_mirror_lines: HashMap::new(),
+            undo_mirror_versions: HashMap::new(),
+            start: std::time::Instant::now(),
+            mouse_clock: None,
+            hl_mirror_gen: None,
+            pending_ui_input: None,
+            pending_getchar: None,
+            feed_buffer: VecDeque::new(),
+            ephemeral_extmarks: HashMap::new(),
+            decor_tick: 0,
+            saves_inflight: HashSet::new(),
+            saves_queued: HashMap::new(),
+            quit_all_gate: None,
+            buf_watches: HashMap::new(),
+            remote_watches: HashSet::new(),
+            reload_posts: HashSet::new(),
+        }
+    }
+}
+
+/// The wasm Worker's drive API for the standalone [`EditHost`] (slice 5b). The native
+/// [`run`] loop drives the tick in-crate through `pub(crate)` `input` / `redraw`; the
+/// out-of-crate wasm cdylib reaches the same tick through these thin public wrappers
+/// plus a serverless [`boot`](Self::boot). Gated to the wasm build so the native API
+/// surface is unchanged.
+#[cfg(not(feature = "native"))]
+impl EditHost {
+    /// Attach a UI of `width` × `height` cells — the wasm analogue of the
+    /// `nvim_ui_attach` RPC (the dispatch router is gated off the wasm build), so
+    /// [`redraw`](Self::redraw) has dimensions to project the view into, then paints
+    /// the initial frame (as `nvim_ui_attach` triggers a repaint natively). Also the
+    /// resize path — a re-attach at a new size repaints.
+    pub fn attach_ui(&mut self, width: usize, height: usize) {
+        self.ui = Some((width, height));
+        self.redraw();
+    }
+
+    /// Run the serverless startup seed: snapshot the initial buffer for Lua, seed the
+    /// window / tab / buffer lifecycle sets, fire the first buffer's lifecycle events,
+    /// drain queued work, and mark `v:vim_did_enter`. The serverless analogue of
+    /// [`run_io`]'s startup, minus the native-only steps (config sourcing, plugin
+    /// discovery, shada load, LSP keymap defaults) the v1 browser build doesn't have.
+    pub fn boot(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
+        self.push_buf_mirror();
+        self.known_windows = self.editor.window_ids();
+        self.last_window_rects = Some(self.window_rects_snapshot());
+        self.known_tabs = self.editor.tab_ids();
+        self.known_buffers = self.editor.buffer_ids();
+        self.emit_lifecycle_events();
+        self.run_pending();
+        let _ = self.lua.set_vim_did_enter(true);
+    }
+
+    /// Feed vim key-notation and project the resulting frame — the wasm Worker's
+    /// keystroke tick: `input` settles the core (mappings, ex-commands, queued Lua),
+    /// then `redraw` pushes a frame through the [`HostEffects`] seam to the UI. Mirrors
+    /// one turn of the native [`run`] loop's input arm.
+    pub fn feed(&mut self, keys: &str) {
+        self.input(keys);
+        self.redraw();
+    }
+
+    /// Execute a Lua chunk through the **real** effects path (the queued `vim.cmd`s,
+    /// highlights, and deferred work a chunk produces are applied exactly as a `:lua`
+    /// from the keystroke tick would be), then project a frame. Returns the eval result
+    /// rendered as a string (`int` verbatim, else `Debug`), or the Lua error message.
+    pub fn exec_lua(&mut self, code: &str) -> Result<String, String> {
+        let rendered = self
+            .lua
+            .eval_to_value_pumped(code)
+            .map(|value| {
+                value
+                    .as_i64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| format!("{value:?}"))
+            })
+            .map_err(|e| e.to_string());
+        // The chunk may have queued ex-commands / highlights and deferred work; drain
+        // them through the same machinery `input`'s settle uses, then repaint.
+        self.apply_lua_effects();
+        self.run_pending();
+        self.redraw();
+        rendered
+    }
+
+    /// The current buffer's lines (the wasm `eh_lines` readout).
+    pub fn lines(&self) -> Vec<String> {
+        self.editor.lines()
+    }
+}
+
 /// Base for the loop ids of the server's **internal** per-buffer file watches, set
 /// far above any Lua-allocated `vim.uv.fs_event` callback id so a [`LoopEvent::FsEvent`]
 /// can be classified by `id >= INTERNAL_WATCH_BASE` alone. Buffer `b`'s watch id is
 /// `INTERNAL_WATCH_BASE + b.0`, so the change routes straight back to the buffer with
 /// no side table. (Lua callback ids are monotonic from 1 and never approach `1 << 48`.)
+#[cfg(feature = "native")]
 pub(crate) const INTERNAL_WATCH_BASE: u64 = 1 << 48;
 
 /// The loop id of the shada **debounced-checkpoint** timer (Phase 5). Set above
 /// both the Lua-allocated callback ids (monotonic from 1) and the per-buffer watch
 /// ids ([`INTERNAL_WATCH_BASE`]` + buffer.0`), so a [`LoopEvent::Timer`] carrying it
 /// is unambiguously the shada flush and never collides with a real callback.
+#[cfg(feature = "native")]
 pub(crate) const SHADA_FLUSH_TIMER_ID: u64 = 1 << 49;
 
 /// How long after the last handled message a debounced shada checkpoint fires. Each
 /// message re-arms the one-shot timer (replacing the pending one), so continuous
 /// activity pushes the flush forward to the next idle gap — a crash then loses at
 /// most this window, never the whole session.
+#[cfg(feature = "native")]
 const SHADA_FLUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Whether `event` is the shada debounced-checkpoint timer firing (vs. a real Lua
 /// timer / process / watch event the run loop hands to [`EditHost::on_loop_event`]).
+#[cfg(feature = "native")]
 pub(crate) fn is_shada_flush_timer(event: &LoopEvent) -> bool {
     matches!(event, LoopEvent::Timer { id, .. } if *id == SHADA_FLUSH_TIMER_ID)
 }
@@ -526,6 +757,7 @@ pub(crate) fn is_shada_flush_timer(event: &LoopEvent) -> bool {
 /// the debounced live checkpoint, the clean-exit flush, and the per-message
 /// debounce arming. All run **off** the editor input tick — the store's I/O never
 /// blocks a keystroke. A no-op throughout when persistence is off (`shada: None`).
+#[cfg(feature = "native")]
 impl EditHost {
     /// Open + merge + compact the store before the first frame and seed the result
     /// into the editor. A load error is surfaced to the user and persistence is then
@@ -644,10 +876,12 @@ impl EditHost {
 /// A finished `:TSInstall` job: the requested language and the install result
 /// (the report, or a loud error). Delivered from the blocking worker to the
 /// server's `select!` loop.
+#[cfg(feature = "native")]
 type InstallOutcome = (String, anyhow::Result<nxvim_ts::install::InstallReport>);
 
 /// Run the server over a connected stream until the client disconnects or the
 /// editor quits.
+#[cfg(feature = "native")]
 pub async fn run<S>(stream: S, init: ServerInit) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -660,6 +894,7 @@ where
 /// single-stream entry every front end uses) splits its stream and delegates here;
 /// the two-half shape is kept so a transport whose directions are distinct objects
 /// needn't `join` them only to be `split` straight back apart.
+#[cfg(feature = "native")]
 async fn run_io<R, W>(reader: R, writer: W, init: ServerInit) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -824,15 +1059,14 @@ where
         });
     }
 
-    let mut host = EditHost {
+    // The native outbound-effect seam: the client wire ([`Rpc`]), the event-loop actor
+    // ([`EventLoop`]), the off-tick daemon fs (read/write/watch + the `open_tx` /
+    // `save_done_tx` deliveries), and the LSP command sink ([`LspManager`]) the editor
+    // tick fires through. The wasm build (slice 5b) swaps a JS-interop implementor here.
+    let mut host = EditHost::new(
         editor,
         lua,
-        // The native outbound-effect seam: the client wire ([`Rpc`]), the event-loop
-        // actor ([`EventLoop`]), the off-tick daemon fs (read/write/watch + the
-        // `open_tx` / `save_done_tx` deliveries), and the LSP command sink ([`LspManager`])
-        // the editor tick fires through. The wasm build (Phase 5) swaps a JS-interop +
-        // daemon-link implementor here.
-        fx: Box::new(NativeEffects::new(
+        Box::new(NativeEffects::new(
             rpc,
             evloop,
             host_fs_async,
@@ -841,52 +1075,12 @@ where
             lsp,
             install_tx,
         )),
-        shada: init.shada,
-        ui: None,
-        syntax_states: HashMap::new(),
-        ts_resolved_langs: HashSet::new(),
-        lsp_states: HashMap::new(),
-        lsp_servers: HashMap::new(),
-        lsp_ensured: HashSet::new(),
-        next_lsp_client_id: 1,
-        lsp_dirty: false,
-        lsp_req_gen: 0,
-        lsp_requests: HashMap::new(),
-        inlay_resolves: HashMap::new(),
-        inlay_resolve_seq: 0,
-        completion: None,
-        lsp_code_actions: Vec::new(),
-        diag_config: DiagnosticConfig::default(),
-        semantic_tokens_enabled: true,
-        last_buffer_id: None,
-        announced: HashSet::new(),
-        known_buffers: Vec::new(),
-        last_mode: Mode::Normal,
-        last_window_id: None,
-        known_windows: Vec::new(),
-        last_window_rects: None,
-        last_tab_id: None,
-        known_tabs: Vec::new(),
-        keymaps: Keymaps::default(),
-        scheduled: VecDeque::new(),
-        buf_mirror_ticks: HashMap::new(),
-        buf_mirror_lines: HashMap::new(),
-        undo_mirror_versions: HashMap::new(),
-        start: std::time::Instant::now(),
-        mouse_clock: init.mouse_clock,
-        hl_mirror_gen: None,
-        pending_ui_input: None,
-        pending_getchar: None,
-        feed_buffer: VecDeque::new(),
-        ephemeral_extmarks: HashMap::new(),
-        decor_tick: 0,
-        saves_inflight: HashSet::new(),
-        saves_queued: HashMap::new(),
-        quit_all_gate: None,
-        buf_watches: HashMap::new(),
-        remote_watches: HashSet::new(),
-        reload_posts: HashSet::new(),
-    };
+    );
+    // The two capabilities `new` defaults but the native session injects: the
+    // persistence store (loaded before the first frame) and the optional fake mouse
+    // clock (multi-click timing in tests).
+    host.shada = init.shada;
+    host.mouse_clock = init.mouse_clock;
 
     // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
     // so a user `vim.keymap.set` for the same `(mode, lhs)` shadows them via the
@@ -1091,6 +1285,7 @@ where
 /// (`fs_read`/`fs_write`/`sys_run`/`luafs`) are msgid-routed *inside* `Rpc` and never
 /// surface here. EOF on `reader` (the edit-host hung up) ends the loop, drops the
 /// per-leg senders so each leg winds down and reaps its children, and awaits them.
+#[cfg(feature = "native")]
 pub async fn run_daemon_io<R, W>(reader: R, writer: W) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,

@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use nxvim_core::{command_status, parse_keys, CommandStatus, Key, Mode};
 use nxvim_lua::{RawKeymap, RawRhs};
 
+#[cfg(feature = "native")]
 use crate::lsp::LspReqKind;
 
 /// A built-in editor action a default mapping fires natively, rather than by
@@ -50,7 +51,9 @@ use crate::lsp::LspReqKind;
 /// (`gd`/`gD`/`gr`/`K`) and the insert-mode completion triggers
 /// (`<C-Space>`/`<C-x><C-o>`/`<C-k>`) all resolve to a [`LspReqKind`] the server
 /// issues via `request_lsp`. No key-feeding, so the `<cmd>` / remap caveats never
-/// apply to these.
+/// apply to these. LSP-only today, so the whole machinery is native (the browser
+/// build has no language servers yet — slice 5a / Phase 6).
+#[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug)]
 pub enum BuiltinAction {
     /// Issue an LSP request of this kind (the only native action kind today).
@@ -74,6 +77,7 @@ pub enum MappingRhs {
     /// only by the [`native defaults`](Keymaps::set_native_defaults), never by a
     /// user map (the Lua registry has no way to produce one), so it always sits at
     /// the lowest precedence rung and a user `vim.keymap.set` shadows it.
+    #[cfg(feature = "native")]
     Native(BuiltinAction),
 }
 
@@ -100,6 +104,7 @@ pub struct Mapping {
 /// LSP keys, given as the raw map-mode code (`"n"`, `"i"`, …), the LHS notation,
 /// and the native action they fire. Compiled into every buffer's tries at the
 /// lowest precedence so a user `vim.keymap.set` for the same `(mode, lhs)` wins.
+#[cfg(feature = "native")]
 #[derive(Clone, Copy)]
 pub struct NativeDefault {
     /// The declared map-mode code, expanded through [`mode_buckets`] like a user
@@ -233,7 +238,8 @@ pub struct Keymaps {
     /// The built-in default mappings (the LSP keys) installed once at startup,
     /// inserted into every buffer's tries *before* the snapshot so any user (or
     /// Lua-default) map at the same LHS overwrites them — the lowest rung of the
-    /// precedence ladder (design D6/B2).
+    /// precedence ladder (design D6/B2). Native only (LSP-only today).
+    #[cfg(feature = "native")]
     native_defaults: Vec<NativeDefault>,
     /// Remaining recursive-`remap` re-feeds for the current keystroke (vim's
     /// `maxmapdepth`). Reset at the top of every [`feed`](Keymaps::feed) and
@@ -269,6 +275,7 @@ impl Keymaps {
     /// precedence on every [`build_for`](Self::build_for), so a user
     /// `vim.keymap.set` for the same `(mode, lhs)` shadows them (design D6/B2).
     /// Marks the tries stale so the next match rebuilds with the defaults in place.
+    #[cfg(feature = "native")]
     pub fn set_native_defaults(&mut self, defaults: Vec<NativeDefault>) {
         self.native_defaults = defaults;
         self.built_buffer = None;
@@ -294,6 +301,8 @@ impl Keymaps {
         // Built-in defaults go in first, at the bottom of the precedence ladder:
         // every snapshot entry below (all user maps, plus any Lua-registered
         // default) is inserted afterward and overwrites at the same LHS path (D6).
+        // Native only — the defaults are the LSP keys (slice 5a).
+        #[cfg(feature = "native")]
         for d in &self.native_defaults {
             let lhs = parse_keys(d.lhs);
             if lhs.is_empty() {

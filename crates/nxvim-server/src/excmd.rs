@@ -2,6 +2,7 @@
 //! commands the core didn't recognize (LSP commands, user commands, colorscheme),
 //! and runtime-file lookup.
 
+#[cfg(feature = "native")]
 use crate::lsp::LspReqKind;
 use crate::EditHost;
 use std::path::PathBuf;
@@ -35,12 +36,14 @@ impl EditHost {
             // runtime; vimscript is fail-loud, not a silent skip).
             "so" | "sou" | "sour" | "sourc" | "source" => self.ex_source(args.trim()),
             // Phase-1 LSP observability: dump server/document state into the panel.
+            #[cfg(feature = "native")]
             "LspInfo" => {
                 let lines = self.lsp_info_lines();
                 self.editor.open_panel("LSP info", lines, false, 0);
             }
             // Phase-2: list the current buffer's diagnostics as a navigable
             // location list; `<CR>` on a row jumps to it (handled in the core).
+            #[cfg(feature = "native")]
             "LspDiagnostics" => match self.diagnostics_location_list() {
                 Some((lines, targets)) => {
                     self.editor.open_panel("LSP diagnostics", lines, false, 0);
@@ -50,20 +53,29 @@ impl EditHost {
             },
             // Phase-3: go-to / references as ex-commands (the keymap-free path;
             // the reply jumps the cursor or opens a panel location list).
+            #[cfg(feature = "native")]
             "LspDefinition" => self.request_lsp(LspReqKind::Definition),
+            #[cfg(feature = "native")]
             "LspDeclaration" => self.request_lsp(LspReqKind::Declaration),
+            #[cfg(feature = "native")]
             "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition),
+            #[cfg(feature = "native")]
             "LspImplementation" => self.request_lsp(LspReqKind::Implementation),
+            #[cfg(feature = "native")]
             "LspReferences" => self.request_lsp(LspReqKind::References),
             // Phase-4: hover docs into the panel, signature help on the message
             // line (the keymap-free path for `K` / `<C-k>`).
+            #[cfg(feature = "native")]
             "LspHover" => self.request_lsp(LspReqKind::Hover),
+            #[cfg(feature = "native")]
             "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp),
             // Phase-6: buffer-mutating features. Format/code-action take no
             // argument; rename reads the new name the dispatcher split off — or,
             // with no name, prompts for it through `vim.lsp.buf.rename()`
             // (`vim.ui.input`, Phase 8) instead of erroring.
+            #[cfg(feature = "native")]
             "LspFormat" => self.request_lsp_format(),
+            #[cfg(feature = "native")]
             "LspRename" if args.trim().is_empty() => {
                 if let Err(e) = self.lua.exec("vim.lsp.buf.rename()") {
                     self.editor
@@ -71,7 +83,9 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            #[cfg(feature = "native")]
             "LspRename" => self.request_lsp_rename(args),
+            #[cfg(feature = "native")]
             "LspCodeAction" => self.request_lsp_code_action(),
             // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
             // an optional `!`) drive the Lua autocmd registry. The core defers
@@ -134,11 +148,24 @@ impl EditHost {
             // guard defers to a real nvim-treesitter plugin: if the user loaded one
             // and it registered `:TSInstall`, this arm is skipped and the
             // user-command arm below runs the plugin's instead (no silent shadow).
+            #[cfg(feature = "native")]
             "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
                 self.ts_install(args)
             }
+            // The browser build has no native treesitter (no C compiler / `dlopen` to
+            // build + load a grammar), so say so loudly rather than reach the
+            // `ts_install` effect (which `unreachable!`s on the wasm `HostEffects`). The
+            // defer-to-plugin guard still applies — a real nvim-treesitter `:TSInstall`
+            // shadows this. (`:TSInstallInfo` stays an `E492` on this build, as in 5a.)
+            #[cfg(not(feature = "native"))]
+            "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
+                self.editor.echo(format!(
+                    "{name}: treesitter is not available in the browser build yet"
+                ))
+            }
             // `:TSInstallInfo` — list the parsers installed across the search path.
             // Same defer-to-plugin guard as the install commands.
+            #[cfg(feature = "native")]
             "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
             _ if self.lua.has_user_command(name, cur_buf) => {
                 if let Err(e) = self.lua.run_user_command(name, args, cur_buf) {
@@ -157,7 +184,10 @@ impl EditHost {
     /// off the editor thread. The work (network + a C compile) can take seconds, so
     /// each language runs on a `spawn_blocking` worker; its result returns on the
     /// `install_events` `select!` arm ([`EditHost::on_install_done`]). We echo a
-    /// "installing…" line now so the user sees the command took.
+    /// "installing…" line now so the user sees the command took. Native only — the
+    /// browser build has no native treesitter (the `:TSInstall` arm above echoes a
+    /// loud "not available" there instead of reaching this / the `ts_install` effect).
+    #[cfg(feature = "native")]
     fn ts_install(&mut self, args: &str) {
         let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
         if langs.is_empty() {
@@ -179,6 +209,7 @@ impl EditHost {
     /// with the queries it ships and the root it resolves from. Installed parsers
     /// only: the full installable catalog lives behind a network fetch we don't do
     /// for a read-only info command.
+    #[cfg(feature = "native")]
     fn ts_install_info(&mut self) {
         let parsers = nxvim_ts::installed_parsers();
         let mut lines = Vec::new();
@@ -205,6 +236,7 @@ impl EditHost {
     /// Apply a finished `:TSInstall` job: on success, reload the grammar so every
     /// open buffer of that language re-highlights / re-indents against the new
     /// parser without a manual `:e`; on failure, echo the (loud) reason.
+    #[cfg(feature = "native")]
     pub(crate) fn on_install_done(&mut self, outcome: crate::InstallOutcome) {
         let (lang, result) = outcome;
         match result {

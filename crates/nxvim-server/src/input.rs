@@ -1,7 +1,9 @@
 //! Keystroke handling: the per-key input loop, the keymap matcher drive, the
 //! completion-popup key routing, and mapping (RHS) execution.
 
-use crate::keymap::{BuiltinAction, MappingRhs, Step};
+#[cfg(feature = "native")]
+use crate::keymap::BuiltinAction;
+use crate::keymap::{MappingRhs, Step};
 use crate::EditHost;
 use nxvim_core::{key_to_notation, parse_keys, Key, KeyCode, Mode};
 
@@ -37,7 +39,9 @@ impl EditHost {
         // of the mapping engine (design B5). A key the popup *doesn't* claim
         // dismisses it and returns `false`, so we fall through to the matcher below
         // — `<C-k>` then fires signature help, `<Esc>` then leaves insert, etc.
-        // (`completion_menu_key` is only reached while open.)
+        // (`completion_menu_key` is only reached while open.) Native only — the
+        // insert-mode completion popup is LSP-driven, which the browser build lacks.
+        #[cfg(feature = "native")]
         if self.editor.mode == Mode::Insert
             && self.completion_menu_open()
             && self.completion_menu_key(key)
@@ -154,7 +158,9 @@ impl EditHost {
     /// the menu, so the caller lets the key take its normal effect (`<Esc>` also
     /// leaves insert, a non-word char is inserted, `<C-k>` fires signature help).
     /// A word character or backspace is applied to the editor first, then the menu
-    /// re-ranks (or re-requests) against the new prefix in place.
+    /// re-ranks (or re-requests) against the new prefix in place. Native only — the
+    /// popup is LSP-driven (`lsp_menu_*`), absent from the browser build.
+    #[cfg(feature = "native")]
     pub(crate) fn completion_menu_key(&mut self, key: Key) -> bool {
         if key.ctrl {
             return match key.code {
@@ -365,7 +371,10 @@ impl EditHost {
             // the `<cmd>`/remap caveats never touch it (design B3). `request_lsp`
             // and `LspReqKind` already exist on this branch; the matcher only ever
             // hands us a `Native` RHS for the four normal-mode LSP defaults and the
-            // insert-mode completion triggers installed at startup.
+            // insert-mode completion triggers installed at startup. The whole
+            // `Native` rung is native-only (LSP), so on the browser build the
+            // `MappingRhs` match has no such arm to cover.
+            #[cfg(feature = "native")]
             MappingRhs::Native(BuiltinAction::Lsp(kind)) => self.request_lsp(kind),
         }
     }

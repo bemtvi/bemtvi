@@ -27,15 +27,27 @@
 //! (`ts_install`). [`NativeEffects`] implements all of them over today's tokio/RPC/LSP
 //! machinery; the wasm Worker (Phase 5) supplies its own implementor.
 
-use crate::daemon::{FsRead, HostFsAsync};
-use crate::evloop::{EventLoop, LoopCommand};
-use crate::save::SaveDone;
 use nxvim_core::{BufferId, PendingSave};
-use nxvim_lsp::{LspManager, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
-use nxvim_rpc::Rpc;
 use rmpv::Value;
+
+// Native-only: the event-loop command type the (gated) `loop_command` method names, the
+// LSP request types the (gated) `lsp_*` methods name, and everything `NativeEffects`
+// holds (the wire, the daemon fs, the LSP manager, tokio senders).
+#[cfg(feature = "native")]
+use crate::daemon::{FsRead, HostFsAsync};
+#[cfg(feature = "native")]
+use crate::evloop::{EventLoop, LoopCommand};
+#[cfg(feature = "native")]
+use crate::save::SaveDone;
+#[cfg(feature = "native")]
+use nxvim_lsp::{LspManager, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
+#[cfg(feature = "native")]
+use nxvim_rpc::Rpc;
+#[cfg(feature = "native")]
 use std::io;
+#[cfg(feature = "native")]
 use std::sync::Arc;
+#[cfg(feature = "native")]
 use tokio::sync::mpsc::UnboundedSender;
 
 /// The async-effect boundary the synchronous editor tick emits through. See the
@@ -49,7 +61,10 @@ pub trait HostEffects {
     fn respond(&mut self, id: u64, result: Result<Value, Value>);
     /// Hand a command to the event-loop actor (start/stop a timer, spawn/kill a
     /// child, arm/disarm a native file watch). Fire-and-forget; completions return
-    /// as inbound `LoopEvent`s on the run loop's `select!`, not here.
+    /// as inbound `LoopEvent`s on the run loop's `select!`, not here. Native-only for
+    /// now: timers/processes/watches ride the tokio event loop, which the wasm build
+    /// has no analogue for yet (the Worker-side timer wheel is slice 5d).
+    #[cfg(feature = "native")]
     fn loop_command(&mut self, cmd: LoopCommand);
 
     /// Off-tick fs — fetch a buffer's bytes over the daemon read leg (a startup /
@@ -81,16 +96,20 @@ pub trait HostEffects {
 
     /// LSP — ensure `key`'s language server is running (idempotent), spawning it via
     /// `spawn` on first use. Fire-and-forget; the server's notifications and reply
-    /// stream return *inbound* on the run loop's `lsp_events` arm, not here.
+    /// stream return *inbound* on the run loop's `lsp_events` arm, not here. Native-only
+    /// for now — a serverless browser build has no language servers (that's Phase 6).
+    #[cfg(feature = "native")]
     fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn);
 
     /// LSP — fire-and-forget a document-sync notification (`didOpen` / `didChange` /
     /// `didSave` / `didClose`) at `key`'s server. Dropped if no such server is running.
+    #[cfg(feature = "native")]
     fn lsp_notify(&mut self, key: ServerKey, note: LspNotify);
 
     /// LSP — fire a language-feature request at `key`'s server; its reply returns later
     /// *inbound* as an `LspEvent::Reply` carrying `token` (the editor never awaits the
     /// round-trip). Dropped if no such server is running.
+    #[cfg(feature = "native")]
     fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest);
 
     /// `:TSInstall` — fetch + compile `lang`'s treesitter grammar into the data dir off
@@ -106,6 +125,7 @@ pub trait HostEffects {
 /// the command sink is the tokio [`EventLoop`] actor. Holds both transports so the
 /// editor tick reaches neither directly — exactly the indirection the wasm build later
 /// swaps for JS interop + the daemon link.
+#[cfg(feature = "native")]
 pub struct NativeEffects {
     rpc: Rpc,
     evloop: EventLoop,
@@ -130,6 +150,7 @@ pub struct NativeEffects {
     install_tx: UnboundedSender<crate::InstallOutcome>,
 }
 
+#[cfg(feature = "native")]
 impl NativeEffects {
     pub fn new(
         rpc: Rpc,
@@ -152,6 +173,7 @@ impl NativeEffects {
     }
 }
 
+#[cfg(feature = "native")]
 impl HostEffects for NativeEffects {
     fn notify(&mut self, method: &str, params: Vec<Value>) {
         self.rpc.notify(method, params);

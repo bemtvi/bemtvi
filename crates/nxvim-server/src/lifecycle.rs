@@ -1,10 +1,12 @@
 //! Buffer/mode lifecycle autocmd emission: the server-side diff that fires
 //! `BufReadPost`/`FileType`/`BufEnter`/`InsertEnter`, and `init.lua` sourcing.
 
+#[cfg(feature = "native")]
 use crate::evloop::LoopCommand;
 use crate::filetype_of;
-use crate::{EditHost, WindowRect, INTERNAL_WATCH_BASE};
-use crate::{FsRead, WatchEvent};
+use crate::{EditHost, WindowRect};
+#[cfg(feature = "native")]
+use crate::{FsRead, WatchEvent, INTERNAL_WATCH_BASE};
 use nxvim_core::{
     BufferId, DirEntry, FileChangeAction, FileChangeReason, FileStat, TabId, WindowId,
 };
@@ -21,6 +23,7 @@ impl EditHost {
     /// echoed loudly rather than left as a silent empty buffer.
     /// While the fetch was in flight the editor served the client with the (empty)
     /// buffer — the whole point of fetching the remote file off the editor tick.
+    #[cfg(feature = "native")]
     pub(crate) fn apply_open(
         &mut self,
         buffer: BufferId,
@@ -58,6 +61,7 @@ impl EditHost {
     /// filetype comes from `path` directly (the buffer is named for it), so this works
     /// whether or not `buffer` is current. Then refresh the Lua snapshot/mirror and
     /// drive the queued autocmd work.
+    #[cfg(feature = "native")]
     fn load_replica(&mut self, buffer: BufferId, path: String, contents: &str) {
         self.editor
             .load_str_into(buffer, Some(path.clone()), contents);
@@ -81,6 +85,7 @@ impl EditHost {
     /// keys to the explorer); clearing `announced` lets the now-named buffer's
     /// `BufReadPost` fire. A directory has no filetype, so no `FileType`/LSP work — just
     /// refresh the Lua snapshot/mirror and drive the queued autocmd work.
+    #[cfg(feature = "native")]
     fn load_dir_replica(&mut self, buffer: BufferId, dir: String, entries: Vec<DirEntry>) {
         self.editor
             .load_dir_into(buffer, PathBuf::from(&dir), entries);
@@ -319,6 +324,7 @@ impl EditHost {
     /// rather than hooked into every open/close/rename site. A **daemon** session arms
     /// the watches on the *daemon* instead (the `HostWatch` leg — see below), since the
     /// edit-host can't watch a remote file with a local `notify`.
+    #[cfg(feature = "native")]
     pub(crate) fn sync_buffer_watches(&mut self) {
         if self.fx.has_remote_fs() {
             // The remote watch leg: one watch per file-backed buffer path, armed on the
@@ -384,6 +390,12 @@ impl EditHost {
             self.buf_watches.remove(&id);
         }
     }
+
+    /// The serverless browser build has no file watching — buffers are in-memory, so
+    /// there is no on-disk file to reconcile against. A no-op twin keeps the
+    /// per-tick caller (`emit_lifecycle_events`) transport-agnostic.
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn sync_buffer_watches(&mut self) {}
 
     /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.
     pub(crate) fn window_rects_snapshot(&self) -> Vec<WindowRect> {
@@ -469,6 +481,7 @@ impl EditHost {
     /// - **handler, `"ask"`** → fall through to the default warning, then the post event.
     /// - **handler, choice left empty** → the handler took over: nothing further, and
     ///   (matching neovim's early `return 2`) **no** `FileChangedShellPost`.
+    #[cfg(feature = "native")]
     pub(crate) fn reconcile_file_change(&mut self, buf: BufferId) {
         match self.editor.begin_file_change(buf) {
             FileChangeAction::None => {}
@@ -539,6 +552,7 @@ impl EditHost {
     /// `FileChangedShell` round-trip is identical to the local path, but a reload can't
     /// be synchronous (it crosses the wire), so it goes off-tick via [`Self::remote_reload`]
     /// and the `FileChangedShellPost` fires when the re-fetch lands.
+    #[cfg(feature = "native")]
     pub(crate) fn on_remote_file_changed(&mut self, ev: WatchEvent) {
         let WatchEvent { path, stat } = ev;
         let Some(buf) = self.editor.find_buffer_by_path(Path::new(&path)) else {

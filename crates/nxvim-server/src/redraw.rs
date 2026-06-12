@@ -27,8 +27,12 @@ impl EditHost {
 
         // Refresh the current buffer's highlights from the in-process engine for
         // the freshly-settled viewport (same-frame, memoized per content+view).
+        // Native only — the browser highlights JS-side (`nxvim-web`), and LSP sync
+        // needs a language server (Phase 6).
+        #[cfg(feature = "native")]
         self.refresh_highlights(h);
         // Drive LSP document sync for the current buffer (non-blocking).
+        #[cfg(feature = "native")]
         self.sync_lsp();
         // Drive any registered decoration providers, populating the per-frame
         // ephemeral extmark store the projection below reads (a no-op, save the
@@ -54,7 +58,15 @@ impl EditHost {
         } else if !self.editor.message.is_empty() {
             self.editor.message.clone()
         } else {
-            self.diagnostic_under_cursor().unwrap_or_default()
+            // The under-cursor diagnostic is LSP-sourced — empty on the browser build.
+            #[cfg(feature = "native")]
+            {
+                self.diagnostic_under_cursor().unwrap_or_default()
+            }
+            #[cfg(not(feature = "native"))]
+            {
+                String::new()
+            }
         };
 
         // The global `'statusline'` / `'tabline'` formats (empty ⇒ the built-in
@@ -128,7 +140,14 @@ impl EditHost {
             .rect
             .width
             .saturating_sub(view.focused().number_width);
+        // The popup is LSP-completion-driven — always `Nil` on the browser build.
+        #[cfg(feature = "native")]
         let pmenu = self.pmenu_value(&view, text_width);
+        #[cfg(not(feature = "native"))]
+        let pmenu = {
+            let _ = text_width;
+            Value::Nil
+        };
         // The bottom panel (`:messages`, `:ls`), `Nil` when none is open.
         let panel = match &view.panel {
             Some(p) => project_panel(p),
@@ -191,13 +210,31 @@ impl EditHost {
         statusline_fmt: &str,
         styles: &mut StyleTable,
     ) -> Value {
+        // Syntax highlights (treesitter) and the LSP overlays (diagnostics / signs /
+        // inlay hints) are native-only projections; the browser build emits empty
+        // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
+        // paints from the buffer text instead).
+        #[cfg(feature = "native")]
         let highlights = self.highlights_for(win.buffer, &win.numbers, styles);
+        #[cfg(not(feature = "native"))]
+        let highlights = Value::Array(Vec::new());
         let status = self.status_value(win, mode_label, statusline_fmt, styles);
-        let diagnostics = self.diagnostics_for(win.buffer, &win.numbers, styles);
-        let diagnostics_virt = self.diagnostics_virt_text_for(win.buffer, &win.numbers, styles);
-        let diagnostics_signs = self.diagnostics_signs_for(win.buffer, &win.numbers, styles);
-        let sign_column = self.diagnostics_sign_column(win.buffer);
-        let inlay_hints = self.inlay_hints_for(win.buffer, &win.numbers, styles);
+        #[cfg(feature = "native")]
+        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
+            self.diagnostics_for(win.buffer, &win.numbers, styles),
+            self.diagnostics_virt_text_for(win.buffer, &win.numbers, styles),
+            self.diagnostics_signs_for(win.buffer, &win.numbers, styles),
+            self.diagnostics_sign_column(win.buffer),
+            self.inlay_hints_for(win.buffer, &win.numbers, styles),
+        );
+        #[cfg(not(feature = "native"))]
+        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
+            Value::Array(Vec::new()),
+            Value::Array(Vec::new()),
+            Value::Array(Vec::new()),
+            false,
+            Value::Array(Vec::new()),
+        );
         let scroll = match &win.scroll {
             Some(s) => self.project_band(win.buffer, s, styles),
             None => Value::Nil,
@@ -395,10 +432,18 @@ impl EditHost {
         s: &ScrollAnim,
         styles: &mut StyleTable,
     ) -> Value {
+        // Native-only overlays (see `window_value`); the browser band carries empty
+        // highlight/inlay arrays.
+        #[cfg(feature = "native")]
         let highlights = self.highlights_for(buffer, &s.numbers, styles);
+        #[cfg(not(feature = "native"))]
+        let highlights = Value::Array(Vec::new());
         // Inlay hints ride the band too (keyed on `s.numbers` like highlights), so
         // they slide with the text instead of vanishing until the slide settles.
+        #[cfg(feature = "native")]
         let inlay_hints = self.inlay_hints_for(buffer, &s.numbers, styles);
+        #[cfg(not(feature = "native"))]
+        let inlay_hints = Value::Array(Vec::new());
         Value::Map(vec![
             (Value::from("from_top"), Value::from(s.from_top as u64)),
             (Value::from("to_top"), Value::from(s.to_top as u64)),

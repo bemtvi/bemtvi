@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Build the wasm edit-host (Phase 5, slice 5b): compile the staticlib to
+# wasm32-unknown-emscripten, then link it with emcc into an ES module (dist/eh.mjs +
+# eh.wasm) that the node harness (harness.mjs) — and, later, the Web Worker (slice 5c) —
+# drives. Unlike the throwaway demo this links the *real* EditHost tick (core + Lua +
+# the full server glue).
+#
+# Prereqs: rustup target add wasm32-unknown-emscripten; emcc on PATH (an installed
+# emsdk, or the Arch `emscripten` package at /usr/lib/emscripten).
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# emcc may live in an emsdk (sourced env) or the Arch system package. Use it if already
+# on PATH, else try the emsdk env, else the Arch package dir.
+if ! command -v emcc >/dev/null 2>&1; then
+  if [ -f "$HOME/emsdk/emsdk_env.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$HOME/emsdk/emsdk_env.sh" >/dev/null 2>&1
+  elif [ -x /usr/lib/emscripten/emcc ]; then
+    PATH="/usr/lib/emscripten:$PATH"
+  fi
+fi
+command -v emcc >/dev/null 2>&1 || {
+  echo "error: emcc not found — install emsdk or the system emscripten package first" >&2
+  exit 1
+}
+
+# 1. Staticlib: Rust core + Lua + the server tick, plus the lua51/regex C, as wasm
+#    objects. `--no-default-features --features lua51` is threaded to nxvim-server
+#    through this crate's dep (LuaJIT is excluded from wasm; the `native` feature and
+#    its non-emscripten deps drop out). -fwasm-exceptions aligns Rust's wasm EH with the
+#    vendored C's (project memory: puc-lua-compiles-to-wasm-emscripten).
+EMCC_CFLAGS="-fwasm-exceptions" \
+  cargo build --release --target wasm32-unknown-emscripten
+
+LIB=target/wasm32-unknown-emscripten/release/libnxvim_edithost.a
+
+# A Rust `staticlib` bundles Rust code but NOT the native C libraries its build scripts
+# compiled (the vendored Lua, and nxvim-regex's C) — cargo records those as link
+# directives we bypass by invoking emcc by hand. Locate and pass them explicitly; paths
+# carry a build-hash, so find the newest match rather than pin it.
+newest() { find target/wasm32-unknown-emscripten/release/build -path "$1" -print0 2>/dev/null \
+  | xargs -0 ls -t 2>/dev/null | head -1; }
+LUA_A=$(newest '*/out/lib/liblua5.1.a')
+REGEX_A=$(newest '*/out/libnxvim_regex_c.a')
+[ -n "$LUA_A" ]   || { echo "error: liblua5.1.a not found (did the cargo build run?)" >&2; exit 1; }
+[ -n "$REGEX_A" ] || { echo "error: libnxvim_regex_c.a not found" >&2; exit 1; }
+
+# 2. Final link → an importable ES module. Archive order: the edit-host lib first, then
+#    the C libs it depends on (wasm-ld pulls members to satisfy earlier undefineds).
+#    --no-entry: this is a library, no main().
+mkdir -p dist
+emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
+  -fwasm-exceptions \
+  --no-entry \
+  -sMODULARIZE=1 \
+  -sEXPORT_ES6=1 \
+  -sENVIRONMENT=node,web \
+  -sALLOW_MEMORY_GROWTH=1 \
+  -sEXIT_RUNTIME=0 \
+  -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString \
+  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
+
+echo
+echo "built dist/eh.mjs — run the harness:  node harness.mjs"

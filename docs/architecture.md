@@ -49,11 +49,25 @@ reference. nxvim does not link against or embed any neovim code.
    `vim.*` shim for sourcing colorschemes (pure `nvim_set_hl` data), so e.g.
    catppuccin runs unmodified. Supporting legacy Vimscript
    (`.vim` plugins, the `eval.c` language) is likewise an explicit non-goal.
-3. **Client-server, always.** The editor is a headless server; every UI is a
+3. **Dogfood the plugin API: first-party features are `nx` plugins.**
+   Everything that *can* reasonably be built as an `nx.*` Lua plugin *is* built
+   as one. nxvim's own surfaces — the fuzzy picker, completion, statusline
+   segments, snippets, tree docks, and the features layered on top of them — are
+   the plugin API's first and most demanding consumer, shipped as bundled `nx`
+   plugins rather than as bespoke Rust. If a feature can't be expressed against
+   `nx.*`, that is a gap in the API to close, not a reason to reach behind it —
+   so the API is proven by the editor that depends on it. The line is the one
+   the architecture already draws: Rust owns the pure core, the frame /
+   renderer, and the native engines (treesitter, LSP, regex) — a Lua plugin
+   can't *be* the renderer or the synchronous core; the orchestration, UX, and
+   behavior composed on top of those primitives are Lua. "Makes sense" is the
+   only escape hatch, and it means a genuine engine/frame/perf constraint, not
+   convenience.
+4. **Client-server, always.** The editor is a headless server; every UI is a
    client. There is no "embedded-only" code path.
-4. **Async and responsive.** The UI never blocks on the editor and the editor
+5. **Async and responsive.** The UI never blocks on the editor and the editor
    never blocks on the UI. Slow work on one side cannot freeze the other.
-5. **Rust-native, not a transliteration.** We mirror neovim's *organization*
+6. **Rust-native, not a transliteration.** We mirror neovim's *organization*
    and *behavior*, not its C. We use a rope, ownership, enums, async tasks, and
    crates instead of globals, longjmp, and libuv callbacks.
 

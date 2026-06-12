@@ -106,7 +106,18 @@ behavior and colorschemes.**
    effects, settle-point callbacks), and the list grows only by deliberate
    decision — `vim.fn`, `vim.uv` / `vim.loop`, `vim.wait`, and the rest of
    `vim.api` are not part of it.
-5. **Vimscript remains an explicit non-goal** (unchanged).
+5. **First-party features are `nx` plugins — dogfood the API.** Everything that
+   can reasonably be built as an `nx.*` Lua plugin is built as one. The
+   UI-orchestration surfaces (picker, completion, statusline, snippets, tree
+   docks) and the behavior composed on top of them ship as bundled `nx` plugins,
+   not as bespoke Rust. nxvim is the plugin API's first and most demanding
+   consumer; a feature that can't be expressed against `nx.*` is a gap to close
+   in the API, not a reason to reach behind it. Rust keeps only what a plugin
+   *cannot* be — the pure synchronous core, the frame / renderer, and the native
+   engines (treesitter, LSP, regex); the orchestration and UX layered on those
+   primitives are Lua. The "makes sense" carve-out is a genuine engine / frame /
+   performance constraint, never mere convenience.
+6. **Vimscript remains an explicit non-goal** (unchanged).
 
 ## Relationship to ADR 0001
 
@@ -129,10 +140,13 @@ vendored Lua — the engine seam is kept, the command skin is replaced by a noun
 
 ## Consequences
 
-- **The UI-orchestration surfaces are built natively, once, in the server**:
-  completion engine, picker, statusline segments, snippets, tree docks — each
-  exposing a provider registry instead of rendering hooks. Suggested order in
-  the spec: picker → completion → statusline / snippets / tree.
+- **The UI-orchestration surfaces split native seam / Lua feature**: the server
+  owns the frame and exposes a *provider registry* (instead of rendering hooks)
+  for completion, the picker, statusline segments, snippets, and tree docks; the
+  orchestration and UX that drive each registry ship as **bundled `nx` plugins**
+  (point 5), so the editor's own features dogfood the API. Rust gets the seam;
+  Lua gets the feature. Suggested order in the spec: picker → completion →
+  statusline / snippets / tree.
 - **The lasting `vim.*` is exactly two things: the colorscheme glue and the
   muscle-memory alias whitelist.** No `vim.uv`, no `vim.fn` long tail, no
   vim-shaped config surface beyond the aliases. The prelude beyond those is

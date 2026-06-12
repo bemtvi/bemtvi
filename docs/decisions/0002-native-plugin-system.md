@@ -84,6 +84,17 @@ behavior and colorschemes.**
      `vim.defer_fn` (→ `nx.timer`), `vim.ui.input` / `vim.ui.select`
      (→ `nx.ui.*`), and `vim.system` in its **callback form only**
      (→ `nx.spawn`; the blocking `:wait()` fails loud).
+   - **Treesitter highlight toggle:** `vim.treesitter.start(buf, lang?)` /
+     `vim.treesitter.stop(buf)` — the sole carve-out from "no `vim.treesitter`
+     surface." Admitted only because they desugar 1:1 onto declarative buffer
+     state, not because the namespace is: `start` sets `nx.bo.filetype` / lang
+     and `nx.bo.ts_highlight = true`, `stop` sets `ts_highlight = false` and
+     leaves `filetype`. nxvim models *which* language (`filetype`) and
+     *whether* the native engine highlights (`ts_highlight`) as two derived
+     buffer nouns — readable, idempotent, session-serializable — rather than as
+     neovim's two verbs; the verbs are kept only as aliases onto those writes.
+     `vim.treesitter.get_parser` / `query.*` / `highlighter.*` and the rest of
+     the namespace are **not** admitted (they fail loud) — only the toggle.
 
    Together these cover the declarative portion of a typical neovim config —
    options, globals, keymaps, autocmds, user commands, highlights, filetypes,
@@ -109,7 +120,12 @@ extension contract. Its API half does not carry forward: there is no
 the treesitter parser/query/cursor primitives in Rust, the LSP client control
 paths — is refactored into the `nx.*` API (`nx.treesitter`, `nx.lsp`) in
 nxvim's own shape, free of the bug-for-bug-with-upstream constraint that
-justified vendoring; the vendored neovim Lua itself is deleted.
+justified vendoring; the vendored neovim Lua itself is deleted. ADR 0001's
+bridge #1 (`vim.treesitter.start` / `stop` → the engine's per-buffer override)
+is the worked example of this: the override (`Editor::ts_override`) survives
+unchanged, but it is now fed by **declarative buffer state** (`nx.bo.filetype`
+/ `nx.bo.ts_highlight`, point 4 above) instead of an imperative `TsOp` from
+vendored Lua — the engine seam is kept, the command skin is replaced by a noun.
 
 ## Consequences
 

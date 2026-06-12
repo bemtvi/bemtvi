@@ -377,6 +377,36 @@ Decorations you already know — diagnostics from an LSP response, signs from a
 diff — need no provider; they are a plain `nx.hl.set(ns, buf, marks)`. Reach
 for `nx.decor` only when the work is worth scoping to the viewport.
 
+## Treesitter highlighting is buffer state, not a verb
+
+A small case that sharpens rule 5 ("registrations are data") into a working
+rule of thumb: **prefer the noun.** neovim toggles treesitter highlighting
+with `vim.treesitter.start(buf, lang)` / `stop(buf)` — *commands*. A command
+leaves no readable state ("is TS on for this buffer?" has no answer you can
+point at), isn't idempotent, and doesn't survive a session/shada round-trip.
+`nx` models the same capability as **derived buffer state**, two declarative
+nouns the engine reads:
+
+| `nx.bo` state | Default | Decides |
+| --- | --- | --- |
+| `filetype` | from the path's extension | *which* language (`filetype` → lang) |
+| `ts_highlight` | on when a language resolves | *whether* the native engine highlights |
+
+Two nouns, not one, because "off" is orthogonal to "which": a giant `.rs`
+buffer can keep `filetype = "rust"` (so LSP, indent, and comments still key off
+it) with `ts_highlight = false`. Both are plain buffer options — set in
+`init.lua`, in a `nx.on("filetype", …)` handler, or by a plugin — and both
+write the per-buffer override the engine already derives its highlight language
+from (`Editor::ts_override`). Nothing new in the engine: the writer moves from
+a command to an option, and the state becomes introspectable and serializable.
+
+The neovim verbs survive only as **aliases that desugar to these option
+writes** (see the whitelist below): `vim.treesitter.start(buf, lang?)` sets
+`filetype`/lang and `ts_highlight = true`; `vim.treesitter.stop(buf)` sets
+`ts_highlight = false` and leaves `filetype` alone. They pass the alias
+admission test precisely because there *is* a 1:1 declarative target to desugar
+onto — the noun is what makes the alias admissible.
+
 ## The compatibility boundary
 
 Per [ADR 0002](../decisions/0002-native-plugin-system.md) the break is clean:
@@ -400,12 +430,15 @@ env (`vim.g`/`vim.b`/`vim.w`, `vim.o`/`vim.opt`/`vim.opt_local`/`vim.bo`/
 `nvim_set_hl` — any other `vim.api` access fails loud) plus
 `vim.filetype.add`; and the callback-shaped async (`vim.notify`,
 `vim.schedule`, `vim.defer_fn`, `vim.ui.input`/`select`, and `vim.system` in
-its callback form only — `:wait()` fails loud). Aliases, not an API: the same
-objects, `nx` semantics, no growth beyond the list.
+its callback form only — `:wait()` fails loud); and `vim.treesitter.start` /
+`stop`, the one carve-out from the no-`vim.treesitter`-surface rule, desugaring
+to the `filetype` / `ts_highlight` buffer-state writes above (*Treesitter
+highlighting is buffer state*). Aliases, not an API: the same objects, `nx`
+semantics, no growth beyond the list.
 
-There is no `vim.treesitter` or `vim.lsp`: of that machinery, what serves
-nxvim's objectives is refactored into `nx.treesitter` / `nx.lsp`, and the
-rest is deleted. The neovim runtime-model surfaces — wait-pumps, public uv
+There is no `vim.treesitter` or `vim.lsp` *surface*: of that machinery, what
+serves nxvim's objectives is refactored into `nx.treesitter` / `nx.lsp` (the
+highlight toggle becomes buffer state, above), and the rest is deleted. The neovim runtime-model surfaces — wait-pumps, public uv
 handles, frame-time decoration providers, the `vim.fn` long tail,
 prompt-buffer emulation — exist on neither side of the API: plugins and config
 get `nx.spawn` / `nx.timer` / `nx.fs` / `nx.ui.*` and the off-frame

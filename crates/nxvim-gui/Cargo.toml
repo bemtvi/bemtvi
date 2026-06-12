@@ -13,14 +13,6 @@ build = "build.rs"
 name = "nxvim-gui"
 path = "src/main.rs"
 
-# Lua backend, threaded down to nxvim-server exactly as the `nxvim` (TUI) binary
-# does it. Default is LuaJIT; `--no-default-features --features lua51` builds on
-# vendored PUC Lua 5.1. nxvim-server inherits `default-features = false` from
-# [workspace.dependencies], so a backend must be selected here.
-[features]
-default = ["luajit"]
-lua51 = ["nxvim-server/lua51"]
-luajit = ["nxvim-server/luajit"]
 
 [dependencies]
 anyhow.workspace = true

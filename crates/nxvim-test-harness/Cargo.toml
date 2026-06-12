@@ -9,15 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
-# Mirror the Lua-backend toggle every downstream crate threads, so the harness's
-# `nxvim-server` dep selects the same backend as the crate under test (see the
-# `nxvim` binary's manifest). `nxvim-server` inherits `default-features = false`
-# from [workspace.dependencies]; these features turn the backend back on.
-[features]
-default = ["luajit"]
-lua51 = ["nxvim-server/lua51"]
-luajit = ["nxvim-server/luajit"]
-
 [dependencies]
 nxvim-core.workspace = true
 nxvim-rpc.workspace = true

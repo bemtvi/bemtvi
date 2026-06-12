@@ -37,31 +37,29 @@ rust-version = "1.80"
 [workspace.dependencies]
 nxvim-core = { path = "crates/nxvim-core" }
 nxvim-rpc = { path = "crates/nxvim-rpc" }
-# default-features = false so the lua51/luajit backend toggle can be threaded
-# through these crates (see the mlua note below). Building any of them as a
-# workspace member still applies its own `default` feature (luajit).
+# nxvim-server is `default-features = false` so the `native` feature is off by
+# default (the wasm edit-host builds without it); native binaries re-enable it
+# via `features = ["native"]`. (There is no Lua-backend toggle to thread — see
+# the mlua note below; PUC lua51 is baked into the shared mlua dep.)
 nxvim-server = { path = "crates/nxvim-server", default-features = false }
-nxvim-lua = { path = "crates/nxvim-lua", default-features = false }
+nxvim-lua = { path = "crates/nxvim-lua" }
 nxvim-tui = { path = "crates/nxvim-tui" }
 nxvim-gui = { path = "crates/nxvim-gui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
 nxvim-lsp = { path = "crates/nxvim-lsp" }
 nxvim-view = { path = "crates/nxvim-view" }
 nxvim-regex = { path = "crates/nxvim-regex" }
-# Test-only harness. Inherits `default-features = false` so the lua51/luajit
-# backend toggle can be threaded through the crate under test (same pattern as
-# nxvim-server above); each consumer re-enables a backend via its own features.
-nxvim-test-harness = { path = "crates/nxvim-test-harness", default-features = false }
+# Test-only harness (a single Lua backend, PUC lua51, baked in via mlua).
+nxvim-test-harness = { path = "crates/nxvim-test-harness" }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
 # builds. Pre-release lines (ropey 2.0-beta, mlua 0.12-rc) are intentionally
 # avoided in favor of the latest stable releases.
 #
-# mlua's Lua-version features (`lua51` vs `luajit`) are mutually exclusive, so
-# the version is NOT selected here — only `vendored` is. The version is chosen
-# by `nxvim-lua`'s own `luajit` (default) / `lua51` features, threaded up
-# through `nxvim-server` and the `nxvim` binary. Build on vendored PUC Lua with
-# e.g. `cargo run -p nxvim --no-default-features --features lua51`.
+# Lua backend: vendored PUC Lua 5.1, the single backend (LuaJIT was dropped —
+# nxvim is PUC-Lua-only, matching the wasm build, which never supported LuaJIT).
+# `lua51` is selected here so every crate that links mlua shares it; there is no
+# backend toggle to thread anymore.
 anyhow = "=1.0.102"
 ropey = "=2.0.0-beta.1"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
@@ -107,7 +105,7 @@ tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", 
 notify = { version = "=8.2.0", features = ["macos_kqueue"] }
 futures = "=0.3.32"
 rmpv = "=1.3.1"
-mlua = { version = "=0.11.6", features = ["vendored", "serde"] }
+mlua = { version = "=0.11.6", features = ["vendored", "serde", "lua51"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 # Persistence (shada). `redb` is the pure-Rust, ACID, single-file embedded store
 # each daemon's per-instance shada file lives in; `rmp-serde` encodes the table

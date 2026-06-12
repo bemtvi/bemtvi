@@ -488,15 +488,9 @@ impl LuaRuntime {
         // so nxvim does the same. mlua only permits `debug` via its unsafe
         // constructor (it also re-enables C-module loading, which a user config
         // is already trusted to do); the VM is otherwise the standard safe set.
-        //
-        // On the LuaJIT backend, also load `ffi`. LuaJIT exposes the `jit`
-        // global, so plugins probe for it and take their ffi code path (plenary's
-        // path.lua / strings.lua `require('ffi')`); neovim runs LuaJIT with ffi
-        // available, so nxvim matches it. ffi is gated behind the same trusted-
-        // user-config model as `debug` and C-module loading above.
+        // nxvim runs vendored PUC Lua 5.1, which has no `ffi` library (that is a
+        // LuaJIT extension), so the safe set + `debug` is the whole VM.
         let libs = StdLib::ALL_SAFE | StdLib::DEBUG;
-        #[cfg(feature = "luajit")]
-        let libs = libs | StdLib::FFI;
         let lua = unsafe { Lua::unsafe_new_with(libs, LuaOptions::default()) };
         let shared = Rc::new(RefCell::new(Shared::default()));
         install_vim(&lua, &shared)?;

@@ -19,9 +19,9 @@ command -v emcc >/dev/null 2>&1 || {
   exit 1
 }
 
-# 1. Staticlib: Rust core + the lua51/regex C, as wasm objects. lua51 is mandatory
-#    (LuaJIT is excluded from wasm); -fwasm-exceptions aligns Rust's wasm EH with the
-#    vendored C's (project memory: wasm32-mlua / puc-lua-compiles-to-wasm-emscripten).
+# 1. Staticlib: Rust core + the lua51/regex C, as wasm objects. PUC lua51 is the
+#    only Lua backend (nxvim is PUC-Lua-only); -fwasm-exceptions aligns Rust's wasm
+#    EH with the vendored C's (wasm32-mlua / puc-lua-compiles-to-wasm-emscripten).
 EMCC_CFLAGS="-fwasm-exceptions" \
   cargo build --release --target wasm32-unknown-emscripten
 

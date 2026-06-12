@@ -31,9 +31,9 @@ crate-type = ["staticlib"]
 # The editor model (pure, synchronous). Default features → no vim-regex, so the
 # core stays C-free; the only C in this build comes via nxvim-lua below.
 nxvim-core = { path = "../nxvim-core" }
-# The Lua VM + vim.* bindings. lua51 is mandatory on wasm (LuaJIT is excluded);
-# default-features = false drops the default luajit backend so lua51 stands alone.
-nxvim-lua = { path = "../nxvim-lua", default-features = false, features = ["lua51"] }
+# The Lua VM + vim.* bindings. The backend (vendored PUC Lua 5.1) comes from the
+# shared mlua dep — the only backend nxvim supports, and the one wasm requires.
+nxvim-lua = { path = "../nxvim-lua" }
 # Render a Lua eval result back to the harness as a string.
 rmpv = "=1.3.1"
 

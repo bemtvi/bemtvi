@@ -12,16 +12,6 @@ rust-version.workspace = true
 name = "nxvim"
 path = "src/main.rs"
 
-# Lua backend, threaded down to nxvim-lua. Default is LuaJIT;
-# `--no-default-features --features lua51` builds the binary on vendored PUC Lua 5.1.
-# nxvim-server inherits `default-features = false` from [workspace.dependencies].
-[features]
-default = ["luajit"]
-# Backend toggle threaded to nxvim-server and, for tests, the shared harness, so
-# a `--no-default-features --features lua51` build keeps a single backend.
-lua51 = ["nxvim-server/lua51", "nxvim-test-harness/lua51"]
-luajit = ["nxvim-server/luajit", "nxvim-test-harness/luajit"]
-
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true

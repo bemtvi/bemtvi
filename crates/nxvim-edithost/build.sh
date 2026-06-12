@@ -26,10 +26,10 @@ command -v emcc >/dev/null 2>&1 || {
 }
 
 # 1. Staticlib: Rust core + Lua + the server tick, plus the lua51/regex C, as wasm
-#    objects. `--no-default-features --features lua51` is threaded to nxvim-server
-#    through this crate's dep (LuaJIT is excluded from wasm; the `native` feature and
-#    its non-emscripten deps drop out). -fwasm-exceptions aligns Rust's wasm EH with the
-#    vendored C's (project memory: puc-lua-compiles-to-wasm-emscripten).
+#    objects. This crate's nxvim-server dep is `default-features = false`, so the
+#    `native` feature and its non-emscripten deps drop out; the Lua backend (PUC
+#    lua51, the only backend) comes from the shared mlua dep. -fwasm-exceptions
+#    aligns Rust's wasm EH with the vendored C's (puc-lua-compiles-to-wasm-emscripten).
 EMCC_CFLAGS="-fwasm-exceptions" \
   cargo build --release --target wasm32-unknown-emscripten
 

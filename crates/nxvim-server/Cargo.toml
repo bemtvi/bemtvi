@@ -8,20 +8,15 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Lua-backend selection threaded through to nxvim-lua. The dep inherits
-# `default-features = false` from [workspace.dependencies], which is what lets
-# `--no-default-features` at the top turn luajit off so lua51 isn't enabled
-# alongside it.
+# The Lua backend (PUC lua51) is baked into the shared `mlua` dep — no backend
+# feature to select here. The dep inherits `default-features = false` from
+# [workspace.dependencies] so `--no-default-features` (the wasm build) drops
+# `native` below; the Lua VM is unaffected either way.
 [features]
-default = ["luajit", "native"]
-# The backend toggle is threaded into the test harness too (a dev-dependency),
-# so a `--no-default-features --features lua51` test run doesn't drag luajit back
-# in through the harness alongside lua51 (which breaks mlua-sys).
-lua51 = ["nxvim-lua/lua51", "nxvim-test-harness/lua51"]
-luajit = ["nxvim-lua/luajit", "nxvim-test-harness/luajit"]
+default = ["native"]
 # The native-transport surface (Phase 5, the wasm edit-host seam). Default-on, so
 # every native binary and the test suite are unchanged; turning it *off*
-# (`--no-default-features --features lua51`) compiles only the synchronous
+# (`--no-default-features`) compiles only the synchronous
 # `EditHost` tick — the wasm build's subset. It gates the whole async/transport
 # tree (the `run`/daemon/QUIC loop, the event-loop actor, the inbound translator,
 # the msgpack wire, the redb shada store) plus the not-yet-portable LSP + native

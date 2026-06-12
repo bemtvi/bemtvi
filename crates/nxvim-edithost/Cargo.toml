@@ -27,15 +27,15 @@ crate-type = ["staticlib"]
 [dependencies]
 # The reusable synchronous edit-host tick. `default-features = false` drops the
 # default `native` feature (the whole async/transport tree + its non-emscripten
-# deps); `lua51` is the mandatory wasm backend (LuaJIT is excluded from wasm). This
-# pulls nxvim-core (with vim-regex, which compiles under emscripten) and nxvim-lua
-# (lua51) transitively, so the backend/feature set is unified across the build.
-nxvim-server = { path = "../nxvim-server", default-features = false, features = ["lua51"] }
+# deps); the Lua backend (PUC lua51) comes from the shared mlua dep. This pulls
+# nxvim-core (with vim-regex, which compiles under emscripten) and nxvim-lua
+# transitively, so the feature set is unified across the build.
+nxvim-server = { path = "../nxvim-server", default-features = false }
 # The editor model + the Lua runtime, named directly to construct the `EditHost`.
-# Feature flags must match nxvim-server's wasm tree (vim-regex on, lua51 only) so
-# cargo unifies them rather than building a conflicting second copy.
+# Feature flags must match nxvim-server's wasm tree (vim-regex on) so cargo
+# unifies them rather than building a conflicting second copy.
 nxvim-core = { path = "../nxvim-core", features = ["vim-regex"] }
-nxvim-lua = { path = "../nxvim-lua", default-features = false, features = ["lua51"] }
+nxvim-lua = { path = "../nxvim-lua" }
 # Name the `rmpv::Value` the `HostEffects::notify` redraw frames arrive as. Pinned to
 # the workspace version so the type matches nxvim-server's.
 rmpv = "=1.3.1"

@@ -83,11 +83,11 @@ impl Grammar {
     /// parser ([`LoadError::NotInstalled`], silent) from a parser that is present
     /// but broken ([`LoadError::Failed`], worth echoing).
     ///
-    /// `overrides` is the query-resolution bridge's store: a `(lang, name)` entry
-    /// supplies the query text directly (a `vim.treesitter.query.set` /
-    /// `after/queries` / `;extends` merge resolved by Lua) in place of the on-disk
-    /// `highlights.scm` / `indents.scm`. With no entry the disk file is read
-    /// exactly as before, so the common no-customization case is byte-identical.
+    /// `overrides` is the query-override store: a `(lang, name)` entry supplies the
+    /// query text directly (from `nx.treesitter.set_query` — a replace, no merge) in
+    /// place of the on-disk `highlights.scm` / `indents.scm`. With no entry the disk
+    /// file is read exactly as before, so the common no-customization case is
+    /// byte-identical.
     pub fn load(
         data_dir: &Path,
         lang: &str,

@@ -1,6 +1,10 @@
 # Vendored `vim.treesitter` deletion — plan
 
-> **Status: PROPOSAL (2026-06-12).** Removes the vendored neovim
+> **Status: COMPLETE (2026-06-12).** Executed as Phase 4 of
+> [the nx.* foundation plan](2026-06-12-nx-foundation-and-treesitter.md), with
+> D1 = delete the Lua parser API and D2 = keep query execution / drop the merge.
+> The native replacement is `nx.treesitter.set_query`; `vim.treesitter.start`/
+> `stop` remain the bounded alias. Removes the vendored neovim
 > `vim.treesitter` Lua surface — the API half of
 > [ADR 0001](../decisions/0001-native-engines-vendored-lua-apis.md), superseded
 > by [ADR 0002](../decisions/0002-native-plugin-system.md) ("there is no

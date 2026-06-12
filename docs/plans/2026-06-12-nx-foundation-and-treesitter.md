@@ -1,6 +1,8 @@
 # `nx.*` foundation + two-noun treesitter — implementation plan
 
-> **Status: IN PROGRESS (2026-06-12).** Supersedes the scope of
+> **Status: COMPLETE (2026-06-12).** All five phases landed (nx.* foundation →
+> two-noun TS core → nx.bo/nx.treesitter front doors → vendored deletion → this
+> docs reconcile), plus the LuaJIT removal. Supersedes the scope of
 > [the vendored-treesitter deletion plan](2026-06-12-vendored-treesitter-deletion.md)
 > (now Phase 4 here). Stands up the real `nx.*` config namespace as the
 > canonical surface — `vim.*` becomes the thin alias whitelist

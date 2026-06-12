@@ -85,7 +85,7 @@ subsystems:
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library, embedded on its own thread by the `nxvim` / `nxvim-gui` binaries; the `--daemon` role reuses it as the remote fs/process half of the edit-host split. |
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime (LuaJIT by default, vendored PUC Lua 5.1 via the `lua51` feature) and the `vim.*` standard library. |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
-| `nxvim-ts`      | `lua/vim/treesitter/`, `tree_sitter/`                | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
+| `nxvim-ts`      | `tree_sitter/`                                       | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
 | `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
 
 Dependency direction is strictly one-way:
@@ -694,9 +694,8 @@ and their `highlights.scm` queries, parsed **in-process**:
   posture: a buggy grammar (compiled C) can segfault the editor, a risk accepted
   because grammars are user-installed and stable, bounded by a **parse deadline**
   (a per-parse wall-clock budget; on expiry the last good tree is kept, costing
-  one frame of stale highlights rather than a hang). It also unblocks treesitter
-  *indentation* and the future `vim.treesitter` Lua API, both of which need a
-  synchronously-queryable tree.
+  one frame of stale highlights rather than a hang). It also drives treesitter
+  *indentation* and *injections*, both of which need a synchronously-queryable tree.
 - **Installable grammars.** Grammars are not bundled; they load dynamically by
   filetype from a data directory laid out exactly like neovim's
   (`<data>/parser/<lang>.so`, `<data>/queries/<lang>/highlights.scm`), so an
@@ -719,55 +718,34 @@ designs:
 and
 [the catppuccin colorscheme](specs/2026-06-01-catppuccin-colorscheme-design.md).
 
-### The `vim.treesitter` Lua platform
+### `nx.treesitter` — control, not a parser API
 
-Parallel to (not a replacement for) the redraw highlighter above, nxvim has a
-**tree-scripting Lua platform** (today spelled as neovim's `vim.treesitter`
-API) for textobjects, AST/query tools, and query-driven motions — the
-machinery the native plugin system surfaces as `nx.treesitter`
-([ADR 0002](decisions/0002-native-plugin-system.md): the vim-named Lua is
-refactored into the `nx` API where useful and deleted where not; the Rust
-primitives below are the part that stays). It mirrors neovim's own
-split — a small bespoke C-equivalent layer with neovim's real Lua on top:
+The native engine above *is* nxvim's treesitter. There is no Lua parser/AST
+platform: per [ADR 0002](decisions/0002-native-plugin-system.md) the vendored
+neovim `vim.treesitter` Lua (the `LanguageTree` / `get_parser` / `TSNode`
+machinery and the Rust primitives that backed it) was **deleted** — it served
+only neovim-plugin compat, a non-goal. What remains is a small **control**
+surface over the engine, `nx.treesitter`:
 
-- **Bespoke primitives in Rust** (`nxvim-ts/src/lua.rs`, behind the crate's `lua`
-  feature): the `TSParser`/`TSTree`/`TSNode`/`TSQuery` userdata, `TSQuery:inspect`,
-  and `vim._create_ts_querycursor` — the analogue of neovim's
-  `src/nvim/lua/treesitter.c`. The cursor is ported over the raw `tree_sitter::ffi`
-  so matches are returned **unfiltered** (predicates evaluate in Lua, bug-for-bug
-  with upstream). The node/tree lifetime over the Lua boundary is reconciled by
-  co-owning an `Rc<TreeInner>` and erasing the borrow to `'static` (sound because
-  trees are immutable snapshots).
-- **Vendored neovim Lua on top** (`nxvim-lua/src/vendor/nvim/`, Apache-2.0, kept
-  verbatim with a provenance header): `vim/treesitter/*.lua` + the `vim.func` /
-  `vim.F` / `vim._core.util` / `vim.pos._util` helpers, embedded into
-  `package.preload` so it ships in the binary with no dependency on the
-  `vendor/neovim` submodule. `nxvim-lua/src/prelude/treesitter.lua` wires it onto
-  the primitives.
-- **The snapshot seam.** Unlike neovim's live buffer handle, nxvim's Lua bridge is
-  a snapshot + effect queue. `TSParser:parse(bufnr)` reads the pushed
-  `vim._bufs[bufnr]` lines. A buffer-sourced `LanguageTree` still reads that
-  snapshot, but reparses **incrementally**: it attaches through the vendored
-  `_create_parser`, and nxvim's `nvim_buf_attach` is real — the server fires
-  `on_bytes` from each buffer's byte-delta journal (the same `BufferEdit` stream
-  the native engine reparses from) for core edits, and the `nvim_buf_set_lines`
-  write-through fires `on_bytes` synchronously for in-entry plugin edits (the
-  server then suppresses its own fire so the tree is edited exactly once). Undo /
-  redo / `:e` arrive as `on_reload` (a full reparse). String parsers
-  (`get_string_parser`) keep their incremental trees.
+- **Highlight control is declarative buffer state** (the two-noun model):
+  `nx.bo.filetype` chooses the language, `nx.bo.ts_highlight` chooses whether the
+  engine paints it. `nx.treesitter.start(buf, lang)` / `stop(buf)` are thin verbs
+  over those nouns (start = set filetype + enable; stop = disable, keeping the
+  filetype so LSP/indent still see the language). `:set filetype` / `:setf` write
+  the same per-buffer override, so there is a no-Lua path too (the web build,
+  which has no Lua, drives it from the ex line).
+- **Query customization is `nx.treesitter.set_query(lang, name, text)`** — it
+  installs a `highlights` / `injections` / `indents` override straight on the
+  engine (a replace, `nil` to drop). There is no `;extends` / `after-queries` /
+  runtimepath *merge*: base queries come from the engine's data-dir files, an
+  override replaces them.
 
-This is **additive**: a `LanguageTree` is created only when a plugin calls
-`get_parser`, so buffers without a treesitter consumer pay nothing; one that has a
-consumer pays a second parse (the Rust engine's + Lua's). `vim.treesitter.start` /
-`stop` are wired as ADR 0001 bridge #1: they toggle the **native** engine for a
-buffer (a `lang` override) rather than running neovim's Lua decoration-provider
-highlighter on the redraw hot path, so a highlight-only buffer still parses once.
-Injections are implemented (ADR 0001 bridge #5 — the engine runs the resolved
-`injections` query and parses each region with its child grammar; the vendored
-`LanguageTree` mirrors the same child trees on the Lua side); Lua-driven indent
-remains a non-goal for now. Full design:
-[the `vim.treesitter` Lua platform](specs/2026-06-07-vim-treesitter-lua-platform.md)
-and [injections](specs/2026-06-08-treesitter-injections-design.md).
+Injections are engine-native: the engine runs the resolved `injections` query
+over the live tree and parses each region with its child grammar, per-edit and
+synchronous (see [injections](specs/2026-06-08-treesitter-injections-design.md)).
+The one bounded `vim.treesitter` alias kept for muscle memory is `start` / `stop`
+(mapped onto the `nx` verbs); every other `vim.treesitter.*` field is absent and
+fails loud.
 
 The boundary this section embodies — **native engine for editor behavior, a
 Lua scripting layer on top** — is the same one LSP follows (a native
@@ -988,14 +966,15 @@ screen," and that is exactly the shape of these tests.
   in the spec (picker → completion → statusline/snippets/tree).
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up) and a `:set`-driven
-  highlight toggle. (Treesitter **injections** have landed — ADR 0001 bridge #5,
-  see [*Syntax highlighting*](#syntax-highlighting-treesitter).) The **`vim.treesitter` Lua
-  platform** itself is in place — `get_parser(buf):parse()`, `get_string_parser`,
-  and `query.parse` + `iter_captures`/`iter_matches` with predicates run neovim's
-  vendored Lua on bespoke Rust primitives (see [*The `vim.treesitter` Lua
-  platform*](#the-vimtreesitter-lua-platform)); `vim.treesitter.start` / `stop`
-  toggle the native engine per buffer (ADR 0001 bridge #1), and **injections** are
-  implemented (ADR 0001 bridge #5). Lua-driven indent remains deferred.
+  highlight toggle. (Treesitter **injections** have landed — engine-native, see
+  [*Syntax highlighting*](#syntax-highlighting-treesitter).) Treesitter is the
+  **native engine**; control is `nx.treesitter` (see
+  [*`nx.treesitter` — control, not a parser API*](#nxtreesitter--control-not-a-parser-api)):
+  highlight on/off + language are declarative buffer state (`nx.bo.filetype` /
+  `nx.bo.ts_highlight`, also reachable from `:set`), query customization is
+  `nx.treesitter.set_query`, and **injections** are engine-native. There is no Lua
+  parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
+  Lua-driven indent remains deferred.
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay

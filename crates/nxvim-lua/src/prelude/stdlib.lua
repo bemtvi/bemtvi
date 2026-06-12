@@ -771,8 +771,8 @@ function vim.deep_equal(a, b)
 end
 
 -- vim.npcall(fn, ...): pcall that maps failure to nil — `select(2, pcall(...))`
--- on success, nil on error. vim.treesitter.get_parser guards _create_parser with
--- it so a parser that can't be built returns nil rather than raising.
+-- on success, nil on error. A neovim helper kept for config/plugin convenience
+-- (wrap a call that may raise and treat failure as "no value").
 function vim.npcall(fn, ...)
   local ok, rv = pcall(fn, ...)
   if ok then return rv end

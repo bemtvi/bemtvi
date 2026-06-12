@@ -1,11 +1,21 @@
 # The native plugin API (`nx.*`) — design sketch
 
-> **Status: PROPOSAL (2026-06-11).** The design for nxvim's plugin system —
-> the extensibility half of
+> **Status: PARTIALLY IMPLEMENTED (proposed 2026-06-11).** The design for
+> nxvim's plugin system — the extensibility half of
 > [ADR 0002](../decisions/0002-native-plugin-system.md): the server owns every
 > UI surface and the frame, plugins are async, declarative *providers*, and
 > the only neovim plugin surface nxvim ships is colorschemes
 > (`nvim_set_hl` data).
+>
+> **Landed (2026-06-12,
+> [foundation plan](../plans/2026-06-12-nx-foundation-and-treesitter.md)):** the
+> `nx.*` namespace as the canonical config surface with `vim.*` re-expressed as
+> the bounded alias whitelist — `nx.g`/`b`/`w`, `nx.o`/`opt`/`bo`/`wo`/`go`,
+> `nx.cmd`, `nx.keymap`, `nx.on`, `nx.command`, `nx.notify`/`schedule` — plus
+> `nx.treesitter` (highlight control as the `nx.bo.filetype` / `nx.bo.ts_highlight`
+> two nouns, and `nx.treesitter.set_query`). The UI-orchestration registries below
+> (`nx.complete` / `picker` / `statusline` / `snippet` / `tree`) and the async
+> primitives (`nx.spawn` / `timer` / `fs` / `ui`) remain proposed.
 
 ## Why not neovim's plugin model
 

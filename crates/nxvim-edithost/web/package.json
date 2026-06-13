@@ -1,0 +1,13 @@
+{
+  "name": "nxvim-edithost-web",
+  "private": true,
+  "type": "module",
+  "description": "Phase 5 web shell for the wasm edit-host: the Web Worker that owns core+Lua (worker.mjs), the UI renderer + window.__nxvim hook (index.html), a cross-origin-isolated dev server (serve.mjs), and the Playwright verifier (verify.mjs). Build the wasm first with ../build.sh.",
+  "scripts": {
+    "serve": "node serve.mjs",
+    "verify": "node verify.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}

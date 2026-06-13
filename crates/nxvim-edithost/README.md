@@ -27,11 +27,25 @@ filesystem or a process is unavailable and fails *loud*, never silently:
 ## Interop
 
 emscripten `ccall`/`cwrap` over the `#[no_mangle] extern "C"` exports in `src/lib.rs`
-(`eh_new` / `eh_input` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` / `eh_free*`) —
-**not** wasm-bindgen (that's `nxvim-web`'s `unknown-unknown` build). The redraw comes
-back as a JSON return value here; the Web Worker + `postMessage` transport and the
-`window.__nxvim` Playwright hook are slice 5c. Blocking input + timers over a
-`SharedArrayBuffer` are slice 5d.
+(`eh_new` / `eh_input` / `eh_attach` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` /
+`eh_free*`) — **not** wasm-bindgen (that's `nxvim-web`'s `unknown-unknown` build). The
+redraw comes back as a JSON return value. Slice 5c runs these exports **inside a Web
+Worker** and ferries the JSON redraw to the UI over `postMessage`; blocking input +
+Worker-side timers over a `SharedArrayBuffer` are slice 5d.
+
+## The browser shell (slice 5c) — `web/`
+
+- `web/worker.mjs` — the Web Worker, the single `!Send` thread that owns core + Lua. It
+  loads `dist/eh.mjs`, constructs the real `EditHost`, and drives the production tick;
+  input arrives as `postMessage`s, the latest `redraw` frame + buffer lines post back.
+- `web/index.html` — the UI thread: renders the server `redraw` frame into a character
+  grid (mirroring the native TUI layout), translates keystrokes to vim key-notation, and
+  exposes `window.__nxvim` (`feed` / `execLua` / `attach` / `lines` / `frame` / `cursor` /
+  `cmdline` / …) for automation.
+- `web/serve.mjs` — a cross-origin-isolated dev server (COOP/COEP/CORP), so the page can
+  use a `SharedArrayBuffer` (slice 5d). `crossOriginIsolated === true`.
+- `web/verify.mjs` — the Playwright verifier: drives the real wasm edit-host in a real
+  headless Chromium through `window.__nxvim` and asserts buffer / cursor / redraw.
 
 ## Build & run
 
@@ -39,5 +53,10 @@ back as a JSON return value here; the Web Worker + `postMessage` transport and t
 rustup target add wasm32-unknown-emscripten   # once
 # plus emcc: an installed+activated emsdk, or the system emscripten package
 ./build.sh         # → dist/eh.mjs + eh.wasm
-node harness.mjs   # feeds `ihello<Esc>`, asserts lines + a real redraw frame show "hello"
+node harness.mjs   # node smoke test: feeds `ihello<Esc>`, asserts lines + a real redraw
+
+# the browser shell:
+cd web && npm install        # playwright (once); plus `npx playwright install chromium`
+node serve.mjs               # open http://localhost:8088/web/  to use the editor
+node verify.mjs              # headless-browser proof of slice 5c (PW_CHROMIUM overrides the binary)
 ```

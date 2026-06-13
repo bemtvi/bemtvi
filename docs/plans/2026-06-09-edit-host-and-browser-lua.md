@@ -120,7 +120,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
-| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib done; Worker/`window.__nxvim` 5c, SAB input/timer loop 5d, COOP/COEP+docs 5e remain) |
+| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib + 5c Worker/`postMessage` redraw/`window.__nxvim` done; SAB input/timer loop 5d, COOP/COEP docs + demo deletion 5e remain) |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
 Phase 1 is independent and small. Phase 3 is the
@@ -1879,15 +1879,52 @@ Shipped:
   lua51` wasm subset, fmt clean (incl. the excluded crate). The throwaway
   `nxvim-edithost-demo` stays until slice 5e deletes it.
 
-#### Slice 5c — the Web Worker + redraw transport + `window.__nxvim`
+#### Slice 5c — the Web Worker + redraw transport + `window.__nxvim` — ✅ DONE (2026-06-13)
 
-Edit-host runs in a Web Worker (the single `!Send` thread owning core+Lua); the UI thread
-renders the redraw and ferries input. Reuse `nxvim-web`'s grid renderer / `View`-JSON
-shape where the projections line up. Redraws `postMessage` UI-ward; the UI exposes
-`window.__nxvim` (type, read lines/cursor, read the last redraw) for Playwright.
+The edit-host now runs in a **Web Worker** — the single `!Send` thread owning core + Lua,
+mapping nxvim's threading model onto the browser exactly as the native edit-host owns its
+own OS thread. The UI thread holds **no** editor/Lua state: it ferries input and renders
+the redraw. Transport is `postMessage` request/response (correlated by `id`); slice 5d
+swaps the UI→worker input leg for the SAB park (so the same wait fires Worker-side timers).
 
-- **Exit (needs browser):** Playwright types vim commands through `window.__nxvim` and
-  asserts buffer / cursor / redraw — the first half of the Phase 5 exit criteria.
+Shipped (`crates/nxvim-edithost/`):
+- **`eh_attach` FFI export** (`src/lib.rs`) — the resize path; re-attaches the UI at a new
+  `cols`×`rows` and repaints (the JS side fires it on window resize, the plan's "resize via
+  a re-attach" note). `build.sh` exports it and adds the `worker` emscripten environment.
+- **`web/worker.mjs`** — loads `dist/eh.mjs`, constructs the real `EditHost` (`eh_new`,
+  fail-loud if the Lua VM can't init), and on each `attach`/`feed`/`exec_lua` message drives
+  the production tick, then reads the latest `redraw` frame + buffer lines back out and posts
+  them UI-ward. The `eh_redraw_json` return is the redraw *params array* `[viewMap]`; the
+  worker unwraps the single view map.
+- **`web/index.html`** — the UI: a renderer that composes the **server** `redraw` frame
+  (the same projection the native TUI consumes — windows by rect offset past the tabline,
+  gutters, statuslines, cmdline/message, cursor placement) into a character grid + a cursor
+  overlay; a keystroke→vim-notation translator; and the `window.__nxvim` hook (`feed` /
+  `execLua` / `attach` / `lines` / `frame` / `cursor` / `cursorCell` / `mode` / `cmdline` /
+  `message`, plus a `ready` promise) for automation.
+- **`web/serve.mjs`** — a cross-origin-isolated dev/CI server (COOP `same-origin` + COEP
+  `require-corp` + CORP `same-origin` on every response), so `crossOriginIsolated === true`
+  — the SAB prerequisite slice 5d needs. (Slice 5e ships the *production* serving docs; this
+  is the dev server the verifier runs against.)
+- **`web/verify.mjs`** + **`web/package.json`** — the Playwright verifier (the reproducible
+  form of the exit criteria) and its `playwright` devDependency.
+
+**Exit criteria — met.** `web/verify.mjs` drives the **real** wasm edit-host in a real
+headless Chromium through `window.__nxvim` and asserts, all PASS: the page is
+cross-origin isolated; `ihello world<Esc>` inserts the line (the production tick runs in
+the browser); the cursor settles on the last char (col 10) where vim leaves it after
+`<Esc>`; the **rendered DOM grid** (not just the FFI return — proving the Worker +
+`postMessage` transport + renderer) shows the text; `0dw` deletes the first word; a
+`vim.cmd("%s/world/wasm/")` through the real effects path mutates the buffer; and
+command-line mode renders the `:` prompt + text on the bottom row. The node smoke test
+(`harness.mjs`) and the `--no-default-features --features lua51` clippy (host + wasm
+target) stay green; no workspace crate changed (the FFI lives in the workspace-excluded
+`nxvim-edithost`), so the native suite is untouched.
+
+> **Verifier note (env-specific).** `verify.mjs` prefers an explicitly-installed Chromium
+> (`PW_CHROMIUM`, else the newest `~/.cache/ms-playwright/chromium-*/chrome`) so the run
+> doesn't pin this Playwright build's bundled-browser revision. With a clean
+> `npm install` + `npx playwright install chromium` it uses Playwright's own browser.
 
 #### Slice 5d — input + timers over `SharedArrayBuffer`
 
@@ -1909,12 +1946,13 @@ The dev server sends `Cross-Origin-Opener-Policy: same-origin` +
 serving + build docs. With `nxvim-edithost` now the real edit-host, **delete the throwaway
 `nxvim-edithost-demo`** (the Phase 4 promise).
 
-> **Toolchain prerequisite (not yet provisioned).** Slices 5b–5e — and the wasm half of
-> 5a — require the emscripten SDK (`emcc`), the `wasm32-unknown-emscripten` rustup target,
-> and (5c–5d) a browser + Playwright. None are installed in the current dev environment
-> (only Node is). The *native* half of 5a is fully verifiable without them; the wasm
-> compile and the browser exit criteria are **not**, and per *no silent stubs / don't
-> conflate loads with works* must not be claimed green until run against the real toolchain.
+> **Toolchain prerequisite (now provisioned).** Slices 5b–5e — and the wasm half of 5a —
+> require the emscripten SDK (`emcc`, at `/usr/lib/emscripten`), the
+> `wasm32-unknown-emscripten` rustup target, and (5c–5d) a browser + Playwright. **All are
+> now installed** in the dev environment (emcc 6.0.0-git, the wasm target, Playwright 1.60
+> + a Chromium under `~/.cache/ms-playwright`), so 5b's node harness and 5c's headless
+> browser exit criteria run for real here — claimed green only after running against that
+> toolchain, per *no silent stubs / don't conflate loads with works*.
 
 ---
 

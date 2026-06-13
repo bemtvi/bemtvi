@@ -550,7 +550,6 @@ dependencies = [
  "anyhow",
  "flate2",
  "libloading",
- "mlua",
  "nxvim-core",
  "ropey",
  "sha2",

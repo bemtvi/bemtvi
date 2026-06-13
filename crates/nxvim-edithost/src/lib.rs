@@ -10,8 +10,10 @@
 //!
 //! **Interop (emscripten, not wasm-bindgen):** JS→Rust via `ccall`/`cwrap` on the
 //! `#[no_mangle] extern "C"` exports below; the redraw goes the other way as a return
-//! value (JSON) the JS side reads, rather than a pushed `EM_JS` callback — the Worker /
-//! `postMessage` transport is slice 5c. v1 is **serverless**: there is no daemon, so the
+//! value (JSON) the JS side reads, rather than a pushed `EM_JS` callback. Slice 5c runs
+//! these exports **inside a Web Worker** (`web/worker.mjs`) and ferries the JSON redraw
+//! UI-ward over `postMessage`; the UI (`web/index.html`) renders it and exposes the
+//! `window.__nxvim` Playwright hook. v1 is **serverless**: there is no daemon, so the
 //! off-tick fs / LSP / native-treesitter effects are unreachable and the [`WasmEffects`]
 //! impls of them `unreachable!`-loud (never a silent no-op) — see each method.
 
@@ -211,6 +213,19 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
 pub unsafe extern "C" fn eh_input(h: *mut WasmEditHost, notation: *const c_char) {
     let Some(handle) = h.as_mut() else { return };
     handle.host.feed(as_str(notation));
+}
+
+/// Re-attach the UI at a new `cols` × `rows` size (the resize path) and repaint — the
+/// browser fires this on window resize so the redraw projects into the new grid. A
+/// no-op-shaped wrapper over [`EditHost::attach_ui`], which both sizes the grid and
+/// pushes a fresh frame into the [`Sink`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_attach(h: *mut WasmEditHost, cols: usize, rows: usize) {
+    let Some(handle) = h.as_mut() else { return };
+    handle.host.attach_ui(cols.max(1), rows.max(1));
 }
 
 /// Execute a Lua chunk through the real effects path (queued `vim.cmd`s and deferred

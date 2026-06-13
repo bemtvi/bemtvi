@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>nxvim — wasm edit-host (Phase 5)</title>
+<link rel="icon" href="data:," />
+<style>
+  :root { --fg: #d8dee9; --bg: #1c1f26; --cursor: #ebcb8b; --status: #3b4252; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { font: 15px/1.2 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #wrap { position: relative; padding: 8px; }
+  #grid { margin: 0; white-space: pre; position: relative; }
+  /* The cursor is an absolutely-positioned block over the grid cell. */
+  #cursor {
+    position: absolute; background: var(--cursor); opacity: .75;
+    width: var(--cw, 9px); height: var(--ch, 18px);
+    left: 0; top: 0; pointer-events: none;
+  }
+  #status { position: fixed; right: 8px; bottom: 6px; font-size: 11px; opacity: .5; }
+</style>
+</head>
+<body>
+<div id="wrap" tabindex="0">
+  <div id="cursor"></div>
+  <pre id="grid"></pre>
+</div>
+<div id="status">booting…</div>
+
+<script type="module">
+  // The UI thread (slice 5c). It owns NO editor/Lua state — that lives in the Web
+  // Worker (`worker.mjs`, the single `!Send` thread). This thread ferries input to the
+  // worker, renders the `redraw` frames the worker posts back, and exposes the
+  // `window.__nxvim` hook Playwright drives. Transport is `postMessage` (request/response
+  // correlated by `id`); slice 5d swaps the input leg for a SharedArrayBuffer park.
+
+  const gridEl = document.getElementById("grid");
+  const cursorEl = document.getElementById("cursor");
+  const wrapEl = document.getElementById("wrap");
+  const statusEl = document.getElementById("status");
+
+  // --- cell metrics -------------------------------------------------------------
+  let cw = 9, ch = 18;
+  function measureCell() {
+    const probe = document.createElement("span");
+    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;";
+    probe.textContent = "M".repeat(100);
+    gridEl.appendChild(probe);
+    const r = probe.getBoundingClientRect();
+    cw = r.width / 100;
+    ch = r.height;
+    probe.remove();
+    cursorEl.style.setProperty("--cw", cw + "px");
+    cursorEl.style.setProperty("--ch", ch + "px");
+    cursorEl.style.width = cw + "px";
+    cursorEl.style.height = ch + "px";
+  }
+
+  // Grid size: fill the viewport, with a conventional 80×24 floor.
+  let cols = 80, rows = 24;
+  function computeSize() {
+    measureCell();
+    const availW = window.innerWidth - 16;
+    const availH = window.innerHeight - 16;
+    cols = Math.max(20, Math.floor(availW / cw));
+    rows = Math.max(6, Math.floor(availH / ch));
+  }
+
+  // --- worker transport ---------------------------------------------------------
+  const worker = new Worker(new URL("./worker.mjs", import.meta.url), { type: "module" });
+  let nextId = 1;
+  const pending = new Map();
+  let latest = { frame: null, lines: "" };
+  let readyResolve;
+  const readyPromise = new Promise((res) => (readyResolve = res));
+
+  function send(type, extra = {}) {
+    const id = nextId++;
+    return new Promise((resolve) => {
+      pending.set(id, resolve);
+      worker.postMessage({ id, type, ...extra });
+    });
+  }
+
+  worker.onmessage = (ev) => {
+    const msg = ev.data;
+    if (msg.type === "fatal") {
+      statusEl.textContent = "FATAL: " + msg.error;
+      console.error("edit-host worker fatal:", msg.error);
+      return;
+    }
+    if (msg.type === "ready") {
+      computeSize();
+      // Attach at the real grid size; the reply carries the first frame.
+      send("attach", { cols, rows }).then(() => {
+        statusEl.textContent = `nxvim wasm edit-host — ${cols}×${rows}`;
+        readyResolve();
+      });
+      return;
+    }
+    if (msg.type === "redraw") {
+      latest = { frame: msg.frame, lines: msg.lines };
+      render(msg.frame);
+      const resolve = pending.get(msg.id);
+      if (resolve) {
+        pending.delete(msg.id);
+        resolve({ frame: msg.frame, lines: msg.lines, result: msg.result });
+      }
+    }
+  };
+
+  // --- the renderer: compose the server redraw frame into a character grid --------
+  // Mirrors the native TUI renderer's layout (nxvim-tui/src/render.rs): the vertical
+  // stack is [tabline][windows][global status][panel][command line]; window rects are
+  // in windows-area cells, offset by the tabline row. Best-effort styling — the cells'
+  // text + the cursor position are what matter for the redraw contract.
+  function expandTabs(s, tabstop) {
+    if (!s.includes("\t")) return s;
+    let out = "";
+    for (const chr of s) {
+      if (chr === "\t") out += " ".repeat(tabstop - (out.length % tabstop));
+      else out += chr;
+    }
+    return out;
+  }
+
+  function compose(frame) {
+    const grid = Array.from({ length: rows }, () => Array(cols).fill(" "));
+    const put = (r, c, s) => {
+      if (r < 0 || r >= rows || !s) return;
+      for (let i = 0; i < s.length; i++) {
+        const cc = c + i;
+        if (cc >= 0 && cc < cols) grid[r][cc] = s[i];
+      }
+    };
+
+    const tabline = frame.tabline || [];
+    const tablineRows = tabline.length > 0 ? 1 : 0;
+    if (tablineRows) {
+      let x = 0;
+      tabline.forEach((t, i) => {
+        const count = t.window_count > 1 ? `${t.window_count} ` : "";
+        const mod = t.modified ? "+" : "";
+        const text = ` ${count}${t.label}${mod} `;
+        put(0, x, text);
+        x += text.length;
+      });
+    }
+    const winsY = tablineRows;
+
+    const globalStatus = Array.isArray(frame.global_status) ? frame.global_status : null;
+    const hasGlobalStatus = !!(globalStatus && globalStatus.length);
+    const panel = frame.panel || null;
+    const panelRows = panel ? (panel.height ?? 0) + 1 : 0;
+    const cmdRow = rows - 1;
+
+    for (const win of frame.windows || []) {
+      const rect = win.rect || {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows - winsY - (hasGlobalStatus ? 1 : 0) - panelRows - 1,
+      };
+      const ax = rect.x;
+      const ay = winsY + rect.y;
+      const signW = win.sign_column ? 2 : 0;
+      const numW = win.number_width || 0;
+      const gw = signW + numW;
+      const lines = win.lines || [];
+      const numbers = win.numbers || [];
+      const leftcol = win.leftcol || 0;
+      const tabstop = win.tabstop || 8;
+      for (let r = 0; r < lines.length; r++) {
+        if (numW > 0) {
+          const n = numbers[r];
+          const label = n == null ? "" : String(n);
+          put(ay + r, ax + signW, label.padStart(numW - 1).slice(0, numW - 1) + " ");
+        }
+        const text = expandTabs(lines[r], tabstop).slice(leftcol);
+        put(ay + r, ax + gw, text.slice(0, rect.width - gw));
+      }
+      if (win.status_visible && Array.isArray(win.status) && win.status.length) {
+        put(ay + lines.length, ax, win.status.map((s) => s.text).join("").slice(0, rect.width));
+      }
+    }
+
+    if (hasGlobalStatus) {
+      put(rows - panelRows - 1 - 1, 0, globalStatus.map((s) => s.text).join(""));
+    }
+    if (panel) {
+      const py = rows - panelRows - 1;
+      put(py, 0, `─ ${panel.title} ` + "─".repeat(Math.max(0, cols - (panel.title || "").length - 4)));
+      (panel.lines || []).forEach((l, i) => put(py + 1 + i, 0, l));
+    }
+
+    // Command line / message on the last row.
+    if (frame.command_mode) {
+      put(cmdRow, 0, promptStr(frame) + (frame.cmdline || ""));
+    } else {
+      put(cmdRow, 0, frame.message || "");
+    }
+
+    return { grid, winsY, hasGlobalStatus, panelRows };
+  }
+
+  function promptStr(frame) {
+    return frame.cmdline_prompt && frame.cmdline_prompt.length
+      ? frame.cmdline_prompt
+      : frame.cmdline_prefix || "";
+  }
+
+  // The terminal's one real cursor, in absolute grid (row, col) — matching the TUI's
+  // cursor placement: the focused window's text cursor, or the command line in
+  // command mode, or the panel line when a panel is focused.
+  function cursorCell(frame) {
+    if (!frame) return null;
+    const tablineRows = (frame.tabline || []).length > 0 ? 1 : 0;
+    if (frame.panel) {
+      const panelRows = (frame.panel.height ?? 0) + 1;
+      return { row: rows - panelRows + (frame.panel.cursor_row || 0), col: 0 };
+    }
+    if (frame.command_mode) {
+      return { row: rows - 1, col: [...promptStr(frame)].length + (frame.cmdline_cursor || 0) };
+    }
+    const fw = (frame.windows || []).find((w) => w.focused);
+    if (!fw) return null;
+    const rect = fw.rect || { x: 0, y: 0 };
+    const gw = (fw.sign_column ? 2 : 0) + (fw.number_width || 0);
+    return {
+      row: tablineRows + rect.y + fw.cursor_row,
+      col: rect.x + gw + (fw.cursor_screen_col - (fw.leftcol || 0)),
+    };
+  }
+
+  function render(frame) {
+    if (!frame) {
+      gridEl.textContent = "";
+      cursorEl.style.display = "none";
+      return;
+    }
+    const { grid } = compose(frame);
+    gridEl.textContent = grid.map((row) => row.join("")).join("\n");
+    const cur = cursorCell(frame);
+    if (cur && cur.row >= 0 && cur.row < rows && cur.col >= 0 && cur.col < cols) {
+      cursorEl.style.display = "block";
+      cursorEl.style.left = 8 + cur.col * cw + "px";
+      cursorEl.style.top = 8 + cur.row * ch + "px";
+    } else {
+      cursorEl.style.display = "none";
+    }
+  }
+
+  // --- keyboard → vim key-notation ----------------------------------------------
+  const SPECIAL = {
+    Enter: "CR", Escape: "Esc", Backspace: "BS", Tab: "Tab", Delete: "Del",
+    ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down",
+    Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown",
+  };
+  function keyToNotation(e) {
+    const mods = [];
+    if (e.ctrlKey) mods.push("C");
+    if (e.altKey) mods.push("A");
+    if (e.metaKey) mods.push("D");
+    let base = SPECIAL[e.key];
+    const isSpecial = !!base;
+    if (!base) {
+      if (e.key === " ") base = "Space";
+      else if (e.key.length === 1) base = e.key === "<" ? "lt" : e.key;
+      else return null; // bare modifier / unhandled key
+    }
+    if (mods.length === 0) {
+      if (isSpecial || base === "Space" || base === "lt") return `<${base}>`;
+      return base; // plain printable char
+    }
+    return `<${mods.join("-")}-${base}>`;
+  }
+
+  wrapEl.addEventListener("keydown", (e) => {
+    const n = keyToNotation(e);
+    if (n == null) return;
+    e.preventDefault();
+    send("feed", { notation: n });
+  });
+  wrapEl.focus();
+
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      computeSize();
+      send("attach", { cols, rows });
+    }, 80);
+  });
+
+  // --- the Playwright / automation hook -----------------------------------------
+  // Drive the editor without a real keyboard. `feed`/`exec_lua`/`attach` return a
+  // promise that resolves once the worker has ticked and the frame is rendered;
+  // `lines`/`frame`/`cursor` read the latest rendered state synchronously.
+  window.__nxvim = {
+    ready: readyPromise,
+    feed: (notation) => send("feed", { notation }),
+    type: (notation) => send("feed", { notation }), // alias
+    execLua: (code) => send("exec_lua", { code }),
+    attach: (c, r) => send("attach", { cols: c, rows: r }),
+    lines: () => latest.lines,
+    frame: () => latest.frame,
+    cursor: () => {
+      const fw = (latest.frame?.windows || []).find((w) => w.focused);
+      return fw
+        ? { row: fw.cursor_row, col: fw.cursor_col, screenCol: fw.cursor_screen_col }
+        : null;
+    },
+    cursorCell: () => cursorCell(latest.frame),
+    mode: () => latest.frame?.mode_label ?? "",
+    cmdline: () => (latest.frame?.command_mode ? promptStr(latest.frame) + latest.frame.cmdline : ""),
+    message: () => latest.frame?.message ?? "",
+  };
+</script>
+</body>
+</html>

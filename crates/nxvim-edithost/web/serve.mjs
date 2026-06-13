@@ -30,8 +30,14 @@ const server = createServer(async (req, res) => {
   res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
 
-  let urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname);
-  if (urlPath === "/") urlPath = "/web/index.html";
+  const urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname);
+  // The app lives under /web/; redirect the bare root there rather than serving
+  // index.html *at* `/` — the page loads `./worker.mjs` / `../dist/eh.mjs` relative to
+  // the document URL, so it only resolves correctly when that URL is under /web/.
+  if (urlPath === "/") {
+    res.writeHead(302, { Location: "/web/" }).end();
+    return;
+  }
   // Resolve under ROOT and refuse any traversal escape.
   const filePath = normalize(join(ROOT, urlPath));
   if (!filePath.startsWith(ROOT)) {
@@ -39,13 +45,12 @@ const server = createServer(async (req, res) => {
     return;
   }
   try {
-    const info = await stat(filePath);
-    if (info.isDirectory()) {
-      res.writeHead(404).end("not found");
-      return;
-    }
-    const body = await readFile(filePath);
-    res.writeHead(200, { "Content-Type": MIME[extname(filePath)] || "application/octet-stream" });
+    // A directory request (e.g. /web/) serves its index.html, so the page's relative
+    // subresources resolve under that directory.
+    let target = filePath;
+    if ((await stat(target)).isDirectory()) target = join(target, "index.html");
+    const body = await readFile(target);
+    res.writeHead(200, { "Content-Type": MIME[extname(target)] || "application/octet-stream" });
     res.end(body);
   } catch {
     res.writeHead(404).end("not found");

@@ -119,6 +119,13 @@ pub struct ScrollFrame<'a> {
     pub cursor: f32,
     pub base_line: usize,
     pub lines: &'a [String],
+    /// Per-row visual-selection spans for the band (aligned with `lines`), so the
+    /// selection slides with the text. `None` rows carry no selection.
+    pub selection: &'a [Option<(u16, u16)>],
+    /// How to clip the selection's moving edge to the interpolated `cursor` as the
+    /// slide grows: `Some(true)` extending down, `Some(false)` up, `None` for a
+    /// pure scroll (cursor unmoved) where the full extent just slides.
+    pub sel_clip: Option<bool>,
     pub numbers: &'a [Option<usize>],
     pub highlights: &'a [Vec<nxvim_view::HlSpan>],
     /// Inline inlay hints for the band (aligned with `lines`), so they slide with
@@ -637,15 +644,47 @@ impl Renderer {
             Some(s) => {
                 let clip = self.text_bounds(ox, oy, wcols, text_rows);
                 let slide_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
+                let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 // The cursor line tracks the interpolated slide, so relative numbers
-                // stay in step with the moving text.
-                let current_line = s.cursor.round() as usize + 1;
+                // stay in step with the moving text; the selection's moving edge is
+                // clipped to the same line (see `sel_clip`).
+                let cur_line0 = s.cursor.round() as usize; // 0-based interpolated cursor
+                let current_line = cur_line0 + 1;
                 for (k, raw) in s.lines.iter().enumerate() {
                     let row = (s.base_line + k) as f32 - s.top;
                     if row <= -1.0 || row >= text_rows as f32 {
                         continue; // fully outside the text area
                     }
                     let y = (oy as f32 + row) * self.cell_h;
+                    let inlay = s.inlay_hints.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    // Visual selection rides the slide. Its moving edge grows with the
+                    // scroll: rows the interpolated cursor hasn't reached yet are not
+                    // highlighted (the band carries the destination extent), so the
+                    // selection extends together with the slide instead of flashing to
+                    // full extent on frame 0. A pure scroll (`sel_clip == None`) slides
+                    // the whole extent. The quad clamps to the text area vertically
+                    // (quads aren't scissored) so a partial row cuts off at the edge.
+                    if let Some(Some(span)) = s.selection.get(k) {
+                        let line0 = s.base_line + k; // 0-based buffer line of this row
+                        let hidden = match s.sel_clip {
+                            Some(true) => line0 > cur_line0,
+                            Some(false) => line0 < cur_line0,
+                            None => false,
+                        };
+                        if !hidden {
+                            self.push_span_quad_at(
+                                quads,
+                                text_x0,
+                                y,
+                                *span,
+                                win.leftcol,
+                                inlay,
+                                sel_bg,
+                                clip.top as f32,
+                                clip.bottom as f32,
+                            );
+                        }
+                    }
                     let display = expand_tabs(raw, win.tabstop.max(1) as usize);
                     if gutter > 0 {
                         if let Some(Some(n)) = s.numbers.get(k) {
@@ -658,7 +697,6 @@ impl Renderer {
                         row_segments(&display, hl, s.styles, fg, slide_bg, win.leftcol);
                     // Splice the band row's inlay hints in, like the settled path, so
                     // they slide with the text instead of vanishing during the slide.
-                    let inlay = s.inlay_hints.get(k).map(Vec::as_slice).unwrap_or(&[]);
                     segments = splice_inlay(segments, inlay, win.leftcol, s.styles);
                     let x = text_x0.saturating_sub(win.leftcol) as f32 * self.cell_w;
                     self.push_text(items, &segments, (x, y), fg, clip);
@@ -1552,6 +1590,44 @@ impl Renderer {
             y: py,
             w: self.cell_w * (end - start) as f32,
             h: self.cell_h,
+            color: color_to_rgba(srgb_to_color(color)),
+        });
+    }
+
+    /// Like [`push_span_quad`], but at an explicit fractional pixel `y` (a sliding
+    /// row sits between cell rows) and vertically clamped to `[clip_top,
+    /// clip_bottom]` — quads carry no scissor, so a partially-scrolled selection
+    /// row must cut off at the text-area edge itself instead of bleeding over the
+    /// status row or a neighbour.
+    #[allow(clippy::too_many_arguments)]
+    fn push_span_quad_at(
+        &self,
+        quads: &mut Vec<Quad>,
+        base: u16,
+        y: f32,
+        span: (u16, u16),
+        leftcol: u16,
+        inlay: &[InlayHint],
+        color: u32,
+        clip_top: f32,
+        clip_bottom: f32,
+    ) {
+        let (s, e) = span;
+        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
+        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
+        if end <= start {
+            return;
+        }
+        let top = y.max(clip_top);
+        let bottom = (y + self.cell_h).min(clip_bottom);
+        if bottom <= top {
+            return; // fully outside the text area
+        }
+        quads.push(Quad {
+            x: start as f32 * self.cell_w,
+            y: top,
+            w: self.cell_w * (end - start) as f32,
+            h: bottom - top,
             color: color_to_rgba(srgb_to_color(color)),
         });
     }

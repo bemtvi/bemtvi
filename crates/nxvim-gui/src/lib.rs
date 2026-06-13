@@ -275,6 +275,10 @@ struct ScrollAnim {
     duration: Duration,
     base_line: usize,
     lines: Vec<String>,
+    selection: Vec<Option<(u16, u16)>>,
+    /// Orientation of the sliding visual selection (see
+    /// [`ScrollData::sel_extends_down`]); drives the selection edge clip.
+    sel_extends_down: Option<bool>,
     numbers: Vec<Option<usize>>,
     highlights: Vec<Vec<HlSpan>>,
     inlay_hints: Vec<Vec<InlayHint>>,
@@ -292,6 +296,8 @@ impl ScrollAnim {
             duration: s.duration,
             base_line: s.base_line,
             lines: s.lines.clone(),
+            selection: s.selection.clone(),
+            sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
             inlay_hints: s.inlay_hints.clone(),
@@ -318,6 +324,11 @@ impl ScrollAnim {
             cursor: lerp(self.from_cursor, self.to_cursor),
             base_line: self.base_line,
             lines: &self.lines,
+            selection: &self.selection,
+            // The selection's moving edge tracks the interpolated cursor; the clip
+            // side follows the selection's orientation (anchor above ⇒ down), not
+            // the scroll direction, so it grows *and* shrinks smoothly either way.
+            sel_clip: self.sel_extends_down,
             numbers: &self.numbers,
             highlights: &self.highlights,
             inlay_hints: &self.inlay_hints,

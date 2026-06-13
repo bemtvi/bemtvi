@@ -33,8 +33,19 @@ pub struct ScrollAnim {
     /// `|to_top - from_top| + height` rows starting at `base_line`, "~"-padded
     /// past end of buffer.
     pub lines: Vec<String>,
-    /// Selection spans aligned with `lines` (same length).
+    /// Selection spans aligned with `lines` (same length), covering the
+    /// **maximal** extent the slide touches (anchor → the scroll endpoint
+    /// furthest from the anchor), so the client can grow *and* shrink the
+    /// highlight to the interpolated cursor. See [`sel_extends_down`].
+    ///
+    /// [`sel_extends_down`]: ScrollAnim::sel_extends_down
     pub selection: Vec<Option<(usize, usize)>>,
+    /// Orientation of the visual selection sliding with the band, used by the
+    /// client to clip the highlight's moving edge to the interpolated cursor:
+    /// `Some(true)` when the anchor is at/above the cursor (selection extends
+    /// downward, so rows below the cursor aren't selected yet), `Some(false)`
+    /// when it extends upward, `None` when no visual selection is sliding.
+    pub sel_extends_down: Option<bool>,
     /// 1-based buffer line number per row (aligned with `lines`), `None` for
     /// `~` filler rows, so the number column slides with the text during the
     /// animation.
@@ -394,6 +405,31 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         ed.pending_scroll().map(|ps| {
             let base_line = ps.from_top.min(ps.to_top);
             let count = ps.from_top.abs_diff(ps.to_top) + height;
+            // The band carries the selection over the *maximal* extent the slide
+            // touches: anchor → whichever scroll endpoint is furthest from the
+            // anchor. Computing it at the live (destination) cursor would carry the
+            // *small* end when the selection is shrinking, so the rows the cursor is
+            // still sweeping back across wouldn't be in the band and would flash.
+            // The client reveals/hides them per the interpolated cursor (see
+            // `sel_extends_down`). (A selection whose anchor sits *between* the two
+            // scroll endpoints — the cursor crossing the anchor mid-slide — only
+            // gets the far side's rows; the near side is a rare, minor under-show.)
+            let (selection, sel_extends_down) = if ed.mode.is_visual() {
+                let anchor_line = ed.visual_anchor().line;
+                let far_line =
+                    if anchor_line.abs_diff(ps.from_cursor) >= anchor_line.abs_diff(ps.to_cursor) {
+                        ps.from_cursor
+                    } else {
+                        ps.to_cursor
+                    };
+                let mut head = ed.cursor;
+                head.line = far_line;
+                let spans =
+                    selection_spans_with_head(ed, buf, width, line_count, base_line, count, head);
+                (spans, Some(anchor_line <= far_line))
+            } else {
+                (vec![None; count], None)
+            };
             ScrollAnim {
                 from_top: ps.from_top,
                 to_top: ps.to_top,
@@ -402,7 +438,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 duration_ms: ps.duration_ms,
                 base_line,
                 lines: window_lines(buf, base_line, count, line_count),
-                selection: selection_spans(ed, buf, width, line_count, base_line, count),
+                selection,
+                sel_extends_down,
                 numbers: window_numbers(base_line, count, line_count),
             }
         })
@@ -585,12 +622,28 @@ fn selection_spans(
     base: usize,
     count: usize,
 ) -> Vec<Option<(usize, usize)>> {
+    selection_spans_with_head(ed, buf, width, line_count, base, count, ed.cursor)
+}
+
+/// [`selection_spans`] with an explicit selection `head` instead of the live
+/// cursor — so the scroll band can project the selection at the slide's furthest
+/// extent (rather than the destination cursor) and let the client clip it back to
+/// the interpolated cursor.
+fn selection_spans_with_head(
+    ed: &Editor,
+    buf: &Buffer,
+    width: usize,
+    line_count: usize,
+    base: usize,
+    count: usize,
+    head: Cursor,
+) -> Vec<Option<(usize, usize)>> {
     let mut spans = vec![None; count];
     if !ed.mode.is_visual() {
         return spans;
     }
 
-    let (start, end) = order_selection(ed.visual_anchor(), ed.cursor);
+    let (start, end) = order_selection(ed.visual_anchor(), head);
     let linewise = ed.mode == Mode::VisualLine;
     let ts = ed.tabstop();
     for (row, span) in spans.iter_mut().enumerate() {

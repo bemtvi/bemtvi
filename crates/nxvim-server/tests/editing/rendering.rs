@@ -436,6 +436,46 @@ async fn ctrl_d_emits_half_page_scroll() {
 }
 
 #[tokio::test]
+async fn visual_scroll_band_carries_the_maximal_selection_extent() {
+    // A scroll in visual mode slides the selection with the text. The band must
+    // carry the selection over the *maximal* extent the slide touches — anchor →
+    // the scroll endpoint furthest from the anchor — so the client can grow it
+    // (scrolling away from the anchor) *and* shrink it (scrolling back) by clipping
+    // to the interpolated cursor. Projecting only the destination cursor's extent
+    // would collapse the band to the *small* end while shrinking, and the rows the
+    // cursor sweeps back across would flash instead of sliding.
+    let path = write_n_lines("vsel", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Linewise visual from line 0 (anchor), then <C-d>: cursor + viewport 0 -> 12.
+    feed(&rpc, "V");
+    let down = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+    assert_eq!(scroll_u64(&down, "from_cursor"), 0);
+    assert_eq!(scroll_u64(&down, "to_cursor"), 12);
+    // Anchor (line 0) is above the cursor, so the selection extends downward.
+    assert_eq!(scroll_sel_extends_down(&down), Some(true));
+    // Band (base_line 0) selects lines 0..=12 — the full extent — and nothing past.
+    let sel = scroll_selection(&down);
+    assert!(sel[0].is_some(), "line 0 (the anchor) is selected");
+    assert!(sel[12].is_some(), "line 12 (the cursor) is selected");
+    assert!(sel[13].is_none(), "line 13 past the cursor is not selected");
+
+    // Now <C-u> shrinks the selection back toward the anchor: cursor 12 -> 0. The
+    // furthest endpoint from the anchor is the *source* cursor (12), so the band
+    // still carries lines 0..=12 — the rows the cursor sweeps back across stay in
+    // the band to be revealed/hidden per frame, rather than collapsing to line 0.
+    let up = scroll_after(&rpc, &mut incoming, "<C-u>").await;
+    assert_eq!(scroll_u64(&up, "from_cursor"), 12);
+    assert_eq!(scroll_u64(&up, "to_cursor"), 0);
+    assert_eq!(scroll_sel_extends_down(&up), Some(true));
+    let sel = scroll_selection(&up);
+    assert!(
+        sel[12].is_some(),
+        "the band keeps the maximal (source) extent while shrinking, not just the destination line 0"
+    );
+}
+
+#[tokio::test]
 async fn page_down_acts_like_ctrl_d() {
     let path = write_n_lines("pgdn", 100);
     let (rpc, mut incoming) = start(Some(path)).await;

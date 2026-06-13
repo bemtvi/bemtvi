@@ -456,6 +456,10 @@ impl EditHost {
             (Value::from("base_line"), Value::from(s.base_line as u64)),
             (Value::from("lines"), lines_value(&s.lines)),
             (Value::from("selection"), spans_value(&s.selection)),
+            (
+                Value::from("sel_extends_down"),
+                s.sel_extends_down.map_or(Value::Nil, Value::from),
+            ),
             (Value::from("numbers"), numbers_value(&s.numbers)),
             (Value::from("highlights"), highlights),
             (Value::from("inlay_hints"), inlay_hints),

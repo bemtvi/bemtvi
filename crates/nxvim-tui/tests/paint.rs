@@ -780,6 +780,126 @@ fn a_zero_duration_scroll_gesture_does_not_arm_an_animation() {
     assert_eq!(row_text(&buf, 0).trim_end(), "l3");
 }
 
+#[test]
+fn the_visual_selection_grows_with_the_slide_instead_of_flashing_to_full_extent() {
+    // A Ctrl-D in visual mode scrolls *and* extends the selection. The band carries
+    // the selection over the maximal extent (anchor..far cursor), but the moving
+    // edge must grow together with the slide: on frame 0 only the rows the cursor
+    // has already reached are highlighted, not the full final extent. Anchor on
+    // line 0 (so the selection extends down), cursor moving from line 1 to line 4.
+    let band_sel = Value::Array(vec![
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l0 selected
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l1 selected
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l2 (ahead of cursor)
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l3 (ahead of cursor)
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l4 (ahead of cursor)
+        Value::Nil,
+        Value::Nil,
+        Value::Nil,
+    ]);
+    let scroll = Value::Map(vec![
+        (Value::from("from_top"), Value::from(0u64)),
+        (Value::from("to_top"), Value::from(3u64)),
+        (Value::from("from_cursor"), Value::from(1u64)),
+        (Value::from("to_cursor"), Value::from(4u64)),
+        (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
+        (Value::from("base_line"), Value::from(0u64)),
+        (Value::from("sel_extends_down"), Value::from(true)), // anchor above
+        (
+            Value::from("lines"),
+            lines(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"]),
+        ),
+        (Value::from("selection"), band_sel),
+    ]);
+    let params = redraw(vec![
+        ("lines", lines(&["l3", "l4", "l5"])),
+        ("scroll", scroll),
+    ]);
+
+    let mut client = ScrollHarness::new();
+    client.on_redraw(&params);
+    assert!(client.animating(), "a non-zero scroll gesture must animate");
+
+    // At t≈0 the interpolated cursor sits on line 1, so the selection reaches only
+    // lines 0..=1 (screen rows 0 and 1). The destination-only rows 2..4 must stay
+    // unhighlighted — they light up as the cursor sweeps past them, not before.
+    let buf = client.paint(20, 10);
+    assert!(
+        reversed(&buf, 0, 0),
+        "line 0 (at/above the cursor) is selected"
+    );
+    assert!(reversed(&buf, 0, 1), "line 1 (the cursor line) is selected");
+    assert!(
+        !reversed(&buf, 0, 2),
+        "line 2 is past the interpolated cursor — not yet selected"
+    );
+    assert!(
+        !reversed(&buf, 0, 3),
+        "line 3 is past the interpolated cursor — not yet selected"
+    );
+}
+
+#[test]
+fn shrinking_the_visual_selection_tracks_the_cursor_instead_of_vanishing() {
+    // Scrolling *back toward* the anchor (e.g. <C-u> after a <C-d>) shrinks the
+    // selection. The band carries the maximal (source) extent and the orientation
+    // flag — not the scroll direction — so the trailing rows the cursor sweeps back
+    // across stay highlighted at t≈0 and peel off as the cursor reaches them. A
+    // direction-derived clip got this backwards and hid them (a flash). Anchor on
+    // line 0 (selection extends down); cursor recedes from line 5 to 1, viewport
+    // top from 4 back to 0.
+    let band_sel = Value::Array(vec![
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l0
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l1
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l2
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l3
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l4
+        Value::Array(vec![Value::from(0u64), Value::from(2u64)]), // l5 (source edge)
+        Value::Nil,
+        Value::Nil,
+    ]);
+    let scroll = Value::Map(vec![
+        (Value::from("from_top"), Value::from(4u64)),
+        (Value::from("to_top"), Value::from(0u64)),
+        (Value::from("from_cursor"), Value::from(5u64)),
+        (Value::from("to_cursor"), Value::from(1u64)),
+        (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
+        (Value::from("base_line"), Value::from(0u64)),
+        (Value::from("sel_extends_down"), Value::from(true)), // anchor above, still
+        (
+            Value::from("lines"),
+            lines(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"]),
+        ),
+        (Value::from("selection"), band_sel),
+    ]);
+    let params = redraw(vec![
+        ("lines", lines(&["l0", "l1", "l2"])),
+        ("scroll", scroll),
+    ]);
+
+    let mut client = ScrollHarness::new();
+    client.on_redraw(&params);
+    assert!(client.animating(), "a non-zero scroll gesture must animate");
+
+    // At t≈0 top is 4 (rows show lines l4, l5, l6, …) and the cursor is on line 5.
+    // The selection still reaches line 5, so screen row 0 (l4) and row 1 (l5) are
+    // highlighted — they peel off only as the cursor recedes past them. A
+    // direction-derived clip would have hidden these (selection "vanishes" on <C-u>).
+    let buf = client.paint(20, 10);
+    assert!(
+        reversed(&buf, 0, 0),
+        "line 4 (still inside the selection) is highlighted"
+    );
+    assert!(
+        reversed(&buf, 0, 1),
+        "line 5 (the cursor line) is highlighted"
+    );
+    assert!(
+        !reversed(&buf, 0, 2),
+        "line 6 past the cursor is not selected"
+    );
+}
+
 /// Build a `tabline` array value from `(label, modified, window_count)` triples.
 fn tabline(tabs: &[(&str, bool, u64)]) -> Value {
     Value::Array(

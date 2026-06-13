@@ -18,6 +18,10 @@ pub(crate) struct Animation {
     pub(crate) base_line: usize,
     pub(crate) lines: Vec<String>,
     pub(crate) selection: Vec<Option<(u16, u16)>>,
+    /// Orientation of the sliding visual selection (see
+    /// [`ScrollData::sel_extends_down`]): `Some(true)` extends down, `Some(false)`
+    /// up, `None` when none is sliding. Drives the selection edge clip in `render`.
+    pub(crate) sel_extends_down: Option<bool>,
     pub(crate) numbers: Vec<Option<usize>>,
     pub(crate) highlights: Vec<Vec<HlSpan>>,
     /// Inline inlay hints for the band (aligned with `lines`), so they slide with
@@ -39,6 +43,7 @@ impl Animation {
             base_line: s.base_line,
             lines: s.lines.clone(),
             selection: s.selection.clone(),
+            sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
             inlay_hints: s.inlay_hints.clone(),

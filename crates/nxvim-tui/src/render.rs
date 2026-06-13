@@ -420,7 +420,29 @@ fn render_window(
             let cur = lerp(a.from_cursor, a.to_cursor, t).round() as usize;
             let off = top.saturating_sub(a.base_line);
             anim_lines = a.lines.iter().skip(off).take(height).cloned().collect();
-            anim_sel = a.selection.iter().skip(off).take(height).copied().collect();
+            // Grow/shrink the selection's moving edge in step with the slide. The
+            // band carries the selection over the *maximal* extent the slide
+            // touches; mid-slide, only the rows on the anchor side of the
+            // interpolated cursor are highlighted, so the selection tracks the
+            // scroll instead of snapping to its full extent (or vanishing) on frame
+            // 0. The clip side follows the *selection orientation*, not the scroll
+            // direction: anchor above ⇒ extends down ⇒ hide rows past the cursor
+            // below; anchor below ⇒ extends up ⇒ hide above. `None` when no visual
+            // selection is sliding (the band is all-empty anyway).
+            anim_sel = {
+                let mut sel: Vec<Option<(u16, u16)>> =
+                    a.selection.iter().skip(off).take(height).copied().collect();
+                if let Some(down) = a.sel_extends_down {
+                    for (j, span) in sel.iter_mut().enumerate() {
+                        let line = top + j; // 0-based buffer line of this visible row
+                        let past = if down { line > cur } else { line < cur };
+                        if past {
+                            *span = None;
+                        }
+                    }
+                }
+                sel
+            };
             anim_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
             anim_hl = a
                 .highlights

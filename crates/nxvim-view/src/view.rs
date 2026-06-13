@@ -30,6 +30,12 @@ pub struct ScrollData {
     pub base_line: usize,
     pub lines: Vec<String>,
     pub selection: Vec<Option<(u16, u16)>>,
+    /// Orientation of the visual selection sliding with the band: `Some(true)` the
+    /// anchor is at/above the cursor (selection extends downward), `Some(false)`
+    /// upward, `None` when no visual selection is sliding. The client clips the
+    /// highlight's moving edge to the interpolated cursor accordingly — rows past
+    /// the cursor on the growing side aren't selected yet.
+    pub sel_extends_down: Option<bool>,
     pub numbers: Vec<Option<usize>>,
     /// Syntax highlights for the band (aligned with `lines`), so the slide is
     /// colored frame by frame instead of flashing white until it settles. Style
@@ -413,6 +419,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             base_line: map_u64(s, "base_line") as usize,
             lines: map_str_array(s, "lines"),
             selection: parse_spans(map_get(s, "selection")),
+            sel_extends_down: map_get(s, "sel_extends_down").and_then(Value::as_bool),
             numbers: parse_numbers(map_get(s, "numbers")),
             highlights: parse_highlights(map_get(s, "highlights")),
             inlay_hints: parse_inlay_hints(map_get(s, "inlay_hints")),

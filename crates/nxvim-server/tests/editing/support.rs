@@ -165,6 +165,36 @@ pub fn scroll_lines_len(map: &[(Value, Value)]) -> usize {
         .unwrap_or(0)
 }
 
+/// The band's visual-selection spans (`scroll.selection`): per band row, the
+/// highlighted screen-column span `[start, end)`, or `None`.
+pub fn scroll_selection(map: &[(Value, Value)]) -> Vec<Option<(u64, u64)>> {
+    let s = scroll(map).expect("scroll present");
+    s.iter()
+        .find(|(k, _)| k.as_str() == Some("selection"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|v| match v.as_array() {
+                    Some(p) if p.len() == 2 => {
+                        Some((p[0].as_u64().unwrap_or(0), p[1].as_u64().unwrap_or(0)))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The band's selection orientation (`scroll.sel_extends_down`): `Some(true)` the
+/// selection extends downward from its anchor, `Some(false)` upward, `None` when
+/// no visual selection is sliding.
+pub fn scroll_sel_extends_down(map: &[(Value, Value)]) -> Option<bool> {
+    let s = scroll(map).expect("scroll present");
+    s.iter()
+        .find(|(k, _)| k.as_str() == Some("sel_extends_down"))
+        .and_then(|(_, v)| v.as_bool())
+}
+
 // ===== view helpers ==========================================================
 
 /// The most recent `redraw` view map currently buffered on the connection.

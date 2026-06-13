@@ -1,391 +1,1044 @@
 <!doctype html>
+<!--
+  nxvim — wasm edit-host (the in-browser editor, Phase 5/6).
+
+  The editor core + Lua + OPFS filesystem run in a Web Worker (worker.mjs, the single
+  `!Send` thread). THIS file is the renderer + input layer: it ferries keystrokes and
+  mouse gestures to the Worker as vim key-notation / nvim_input_mouse, reads the `redraw`
+  frame the Worker posts back (the server's own `View` projection), and paints it as
+  HTML/CSS — the same DOM renderer the serverless `nxvim-web` build uses, adapted to the
+  Worker's async transport. Syntax highlighting is layered client-side via web-tree-sitter
+  (highlight.js), since the wasm build omits the native treesitter engine. Transport is a
+  SharedArrayBuffer park (slice 5d) when the page is cross-origin isolated, else
+  postMessage (slice 5c); both expose the same feed/mouse/execLua/attach ops + the
+  `window.__nxvim` automation hook.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>nxvim — wasm edit-host (Phase 5)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>nxvim — wasm edit-host</title>
 <link rel="icon" href="data:," />
 <style>
-  :root { --fg: #d8dee9; --bg: #1c1f26; --cursor: #ebcb8b; --status: #3b4252; }
-  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
-  body { font: 15px/1.2 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  #wrap { position: relative; padding: 8px; }
-  #grid { margin: 0; white-space: pre; position: relative; }
-  /* The cursor is an absolutely-positioned block over the grid cell. */
-  #cursor {
-    position: absolute; background: var(--cursor); opacity: .75;
-    width: var(--cw, 9px); height: var(--ch, 18px);
-    left: 0; top: 0; pointer-events: none;
+  :root {
+    --bg: #1e2127; --fg: #abb2bf; --gutter: #4b5263; --gutter-cur: #e5c07b;
+    --sel: #3e4451; --search: #e5c07b; --status-bg: #2c313a; --status-fg: #9da5b4;
+    --cursor: #61afef; --eob: #4b5263; --accent: #e5c07b;
   }
-  #status { position: fixed; right: 8px; bottom: 6px; font-size: 11px; opacity: .5; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  #grid {
+    position: absolute; inset: 0;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    white-space: pre; color: var(--fg); background: var(--bg); overflow: hidden; outline: none;
+  }
+  #grid .row { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); }
+  .win { position: absolute; overflow: hidden; }
+  .gutter { color: var(--gutter); }
+  .gutter-cur { color: var(--gutter-cur); }
+  .eob { color: var(--eob); }
+  .sel { background: var(--sel); }
+  .search { background: var(--search); color: #1e2127; }
+  .incsearch { background: #ffd866; color: #1e2127; }
+  .statusline { background: var(--status-bg); color: var(--status-fg); }
+  .statusline.focused { color: #e6e6e6; }
+  .sep { background: #181a1f; color: var(--gutter); position: absolute; }
+  /* Cursor shapes. Block reverses the cell; bar/underline are thin overlays. */
+  .cur-block { background: var(--cursor); color: var(--bg); }
+  .cur-bar { box-shadow: inset 2px 0 0 0 var(--cursor); }
+  .cur-underline { box-shadow: inset 0 -2px 0 0 var(--cursor); }
+  .cur-hollow { box-shadow: inset 0 0 0 1px var(--cursor); }
+  /* Multi-cursor: placed cursors are reverse-video; the active one is amber. */
+  .seccur { background: #d7dae0; color: #1e2127; }
+  .cur-mc { background: var(--accent); color: #1e2127; font-weight: 700; }
+  .cmdline { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); color: var(--fg); }
+  .panel { position: absolute; left: 0; background: #21252b; }
+  .panel-title { background: #2c313a; color: var(--accent); }
+  .panel-cur { background: var(--sel); }
+  .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  .inlay { color: #5c6370; font-style: italic; }
+  .pmenu { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; }
+  .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
+  .pmenu-sel { background: var(--sel); color: #e6e6e6; }
+  .pmenu-doc { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; color: var(--status-fg); }
+  .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
+  /* A tiny boot/transport indicator, hidden shortly after the first frame. */
+  #status { position: fixed; right: 6px; bottom: 4px; font-size: 11px; opacity: .4;
+            color: #5c6370; pointer-events: none; z-index: 5; }
 </style>
 </head>
 <body>
-<div id="wrap" tabindex="0">
-  <div id="cursor"></div>
-  <pre id="grid"></pre>
-</div>
-<div id="status">booting…</div>
+  <div id="grid" tabindex="0"></div>
+  <div id="status">booting…</div>
 
-<script type="module">
-  // The UI thread (slice 5c). It owns NO editor/Lua state — that lives in the Web
-  // Worker (`worker.mjs`, the single `!Send` thread). This thread ferries input to the
-  // worker, renders the `redraw` frames the worker posts back, and exposes the
-  // `window.__nxvim` hook Playwright drives. Transport is `postMessage` (request/response
-  // correlated by `id`); slice 5d swaps the input leg for a SharedArrayBuffer park.
-
-  const gridEl = document.getElementById("grid");
-  const cursorEl = document.getElementById("cursor");
-  const wrapEl = document.getElementById("wrap");
-  const statusEl = document.getElementById("status");
-
-  // --- cell metrics -------------------------------------------------------------
-  let cw = 9, ch = 18;
-  function measureCell() {
-    const probe = document.createElement("span");
-    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;";
-    probe.textContent = "M".repeat(100);
-    gridEl.appendChild(probe);
-    const r = probe.getBoundingClientRect();
-    cw = r.width / 100;
-    ch = r.height;
-    probe.remove();
-    cursorEl.style.setProperty("--cw", cw + "px");
-    cursorEl.style.setProperty("--ch", ch + "px");
-    cursorEl.style.width = cw + "px";
-    cursorEl.style.height = ch + "px";
-  }
-
-  // Grid size: fill the viewport, with a conventional 80×24 floor.
-  let cols = 80, rows = 24;
-  function computeSize() {
-    measureCell();
-    const availW = window.innerWidth - 16;
-    const availH = window.innerHeight - 16;
-    cols = Math.max(20, Math.floor(availW / cw));
-    rows = Math.max(6, Math.floor(availH / ch));
-  }
-
-  // --- worker transport ---------------------------------------------------------
-  // Two modes, picked by capability: SAB (slice 5d) when the page is cross-origin
-  // isolated so timers can fire via the Worker's Atomics.wait park, else postMessage
-  // (slice 5c). Both expose the same feed/execLua/attach promises to the hook below.
-  const worker = new Worker(new URL("./worker.mjs", import.meta.url), { type: "module" });
-  const useSAB = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
-  let latest = { frame: null, lines: "" };
-  let readyResolve;
-  const readyPromise = new Promise((res) => (readyResolve = res));
-
-  // SAB channel (5d): ctrl = [SEQ, WRITE, READ, _]; data = byte ring of framed input.
-  const SEQ = 0, WRITE = 1, READ = 2;
-  let ctrl, data, dataCap;
-  let nextReqId = 1;
-  const pendingAcks = new Map();    // reqId → resolver (feed/attach)
-  const pendingResults = new Map(); // reqId → resolver (exec_lua, resolves with result)
-  // postMessage fallback (5c) request map.
-  const pendingMsg = new Map();
-
-  function wrU32(pos, v) {
-    data[(pos) % dataCap] = v & 0xff;
-    data[(pos + 1) % dataCap] = (v >>> 8) & 0xff;
-    data[(pos + 2) % dataCap] = (v >>> 16) & 0xff;
-    data[(pos + 3) % dataCap] = (v >>> 24) & 0xff;
-  }
-  // Write a framed message into the ring and wake the worker. Returns the reqId.
-  function pushFrame(type, payload) {
-    const reqId = nextReqId++ >>> 0;
-    let wp = Atomics.load(ctrl, WRITE) >>> 0;
-    data[wp % dataCap] = type;
-    wrU32(wp + 1, reqId);
-    wrU32(wp + 5, payload.length);
-    for (let i = 0; i < payload.length; i++) data[(wp + 9 + i) % dataCap] = payload[i];
-    // Publish WRITE (a fence) before bumping SEQ, so the worker that observes the new
-    // SEQ is guaranteed to see the bytes + WRITE cursor.
-    Atomics.store(ctrl, WRITE, (wp + 9 + payload.length) >>> 0);
-    Atomics.add(ctrl, SEQ, 1);
-    Atomics.notify(ctrl, SEQ, 1);
-    return reqId;
-  }
-  const enc = (s) => new TextEncoder().encode(s);
-
-  // The transport-agnostic ops the hook calls.
-  function feedOp(notation) {
-    if (useSAB) return new Promise((r) => pendingAcks.set(pushFrame(0, enc(notation)), r));
-    return sendMsg("feed", { notation });
-  }
-  function execLuaOp(code) {
-    if (useSAB) return new Promise((r) => pendingResults.set(pushFrame(1, enc(code)), r));
-    return sendMsg("exec_lua", { code });
-  }
-  function attachOp(c, r) {
-    if (useSAB) {
-      const payload = new Uint8Array(8);
-      new DataView(payload.buffer).setUint32(0, c, true);
-      new DataView(payload.buffer).setUint32(4, r, true);
-      return new Promise((res) => pendingAcks.set(pushFrame(2, payload), res));
+  <script type="module">
+    // Syntax highlighting is optional: highlight.js statically imports the
+    // web-tree-sitter vendor assets (built by build.sh → npm run build:treesitter).
+    // When those aren't present the import fails — degrade to plain (un-highlighted)
+    // rendering rather than breaking the whole page.
+    let createHighlighter = null, colorFor = () => null;
+    try {
+      ({ createHighlighter, colorFor } = await import("./highlight.js"));
+    } catch (e) {
+      console.warn("nxvim: syntax highlighting unavailable (tree-sitter vendor not built):", e);
     }
-    return sendMsg("attach", { cols: c, rows: r });
-  }
-  function sendMsg(type, extra) {
-    const id = nextReqId++;
-    return new Promise((resolve) => {
-      pendingMsg.set(id, resolve);
-      worker.postMessage({ id, type, ...extra });
-    });
-  }
 
-  worker.onmessage = (ev) => {
-    const msg = ev.data;
-    if (msg.type === "fatal") {
-      statusEl.textContent = "FATAL: " + msg.error;
-      console.error("edit-host worker fatal:", msg.error);
-      return;
+    const FONT_PX = 15, LINE = 1.4;
+    const gridEl = document.getElementById("grid");
+    const statusEl = document.getElementById("status");
+
+    let view = null;          // the latest redraw frame (the server's View map)
+    let bufferText = "";      // the focused buffer's full text, for the highlighter
+    let ts = null;            // tree-sitter highlighter (loaded lazily by language)
+    let cw = 9, ch = 21;
+    let cols = 80, editorRows = 24; // editorRows = grid rows minus the command row
+
+    // ============================================================================
+    // Cell metrics + grid size. The core lays windows out in `editorRows` (the
+    // windows area); the command/message line is THIS client's own extra row, so we
+    // attach `editorRows` and paint the command line at row `editorRows`. (Matching
+    // the TUI client and core's `relayout`, which excludes the command row.)
+    // ============================================================================
+    function measureCell() {
+      const probe = document.createElement("span");
+      probe.style.cssText = `position:absolute;visibility:hidden;font-family:${getComputedStyle(gridEl).fontFamily};font-size:${FONT_PX}px;`;
+      probe.textContent = "M".repeat(100);
+      gridEl.appendChild(probe);
+      cw = probe.getBoundingClientRect().width / 100;
+      probe.remove();
+      ch = Math.round(FONT_PX * LINE);
+      gridEl.style.fontSize = FONT_PX + "px";
+      gridEl.style.setProperty("--ch", ch + "px");
     }
-    if (msg.type === "ready") {
-      computeSize();
-      const label = `nxvim wasm edit-host — ${cols}×${rows} — ${useSAB ? "SAB+timers" : "postMessage"}`;
+    function layout() {
+      const rect = gridEl.getBoundingClientRect();
+      cols = Math.max(20, Math.floor(rect.width / cw));
+      const totalRows = Math.max(4, Math.floor(rect.height / ch));
+      editorRows = totalRows - 1; // reserve the command row, like the TUI client
+    }
+    function escapeHtml(s) {
+      return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+    }
+
+    // ============================================================================
+    // Worker transport. Two modes, picked by capability: SAB (slice 5d) when the
+    // page is cross-origin isolated so timers can fire via the Worker's Atomics.wait
+    // park, else postMessage (slice 5c). Both expose the same feed/mouse/execLua/
+    // attach promises to the renderer + hook below.
+    // ============================================================================
+    const worker = new Worker(new URL("./worker.mjs", import.meta.url), { type: "module" });
+    const useSAB = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+    let latest = { frame: null, lines: "" };
+    let readyResolve;
+    const readyPromise = new Promise((res) => (readyResolve = res));
+
+    // SAB channel (5d): ctrl = [SEQ, WRITE, READ, _]; data = byte ring of framed input.
+    const SEQ = 0, WRITE = 1, READ = 2;
+    let ctrl, data, dataCap;
+    let nextReqId = 1;
+    const pendingAcks = new Map();    // reqId → resolver (feed/mouse/attach)
+    const pendingResults = new Map(); // reqId → resolver (exec_lua, resolves with result)
+    const pendingMsg = new Map();     // postMessage fallback (5c) request map
+
+    function wrU32(pos, v) {
+      data[(pos) % dataCap] = v & 0xff;
+      data[(pos + 1) % dataCap] = (v >>> 8) & 0xff;
+      data[(pos + 2) % dataCap] = (v >>> 16) & 0xff;
+      data[(pos + 3) % dataCap] = (v >>> 24) & 0xff;
+    }
+    // Write a framed message into the ring and wake the worker. Returns the reqId.
+    function pushFrame(type, payload) {
+      const reqId = nextReqId++ >>> 0;
+      let wp = Atomics.load(ctrl, WRITE) >>> 0;
+      data[wp % dataCap] = type;
+      wrU32(wp + 1, reqId);
+      wrU32(wp + 5, payload.length);
+      for (let i = 0; i < payload.length; i++) data[(wp + 9 + i) % dataCap] = payload[i];
+      Atomics.store(ctrl, WRITE, (wp + 9 + payload.length) >>> 0);
+      Atomics.add(ctrl, SEQ, 1);
+      Atomics.notify(ctrl, SEQ, 1);
+      return reqId;
+    }
+    const enc = (s) => new TextEncoder().encode(s);
+
+    // The transport-agnostic ops the renderer + hook call.
+    function feedOp(notation) {
+      if (useSAB) return new Promise((r) => pendingAcks.set(pushFrame(0, enc(notation)), r));
+      return sendMsg("feed", { notation });
+    }
+    function execLuaOp(code) {
+      if (useSAB) return new Promise((r) => pendingResults.set(pushFrame(1, enc(code)), r));
+      return sendMsg("exec_lua", { code });
+    }
+    function attachOp(c, r) {
       if (useSAB) {
-        ctrl = new Int32Array(new SharedArrayBuffer(16));
-        const sab = new SharedArrayBuffer(1 << 16);
-        data = new Uint8Array(sab);
-        dataCap = data.length;
-        worker.postMessage({ type: "init", ctrl: ctrl.buffer, data: sab, cols, rows });
-        statusEl.textContent = label;
-        readyResolve();
-      } else {
-        attachOp(cols, rows).then(() => {
-          statusEl.textContent = label;
-          readyResolve();
-        });
+        const payload = new Uint8Array(8);
+        new DataView(payload.buffer).setUint32(0, c, true);
+        new DataView(payload.buffer).setUint32(4, r, true);
+        return new Promise((res) => pendingAcks.set(pushFrame(2, payload), res));
       }
-      return;
+      return sendMsg("attach", { cols: c, rows: r });
     }
-    if (msg.type === "redraw") {
-      latest = { frame: msg.frame, lines: msg.lines };
-      render(msg.frame);
-      // 5c: a single id reply. 5d: batched acks + exec_lua results.
-      if (msg.id !== undefined) {
-        const resolve = pendingMsg.get(msg.id);
-        if (resolve) { pendingMsg.delete(msg.id); resolve({ frame: msg.frame, lines: msg.lines, result: msg.result }); }
+    // A mouse gesture (nvim_input_mouse strings + a 0-based global screen cell).
+    function mouseOp(button, action, modifier, row, col) {
+      if (useSAB) {
+        const payload = enc(JSON.stringify({ b: button, a: action, m: modifier, r: row, c: col }));
+        return new Promise((res) => pendingAcks.set(pushFrame(3, payload), res));
       }
-      for (const reqId of msg.acks || []) {
-        const r = pendingAcks.get(reqId);
-        if (r) { pendingAcks.delete(reqId); r({ frame: msg.frame, lines: msg.lines }); }
-      }
-      for (const [reqId, result] of msg.results || []) {
-        const r = pendingResults.get(reqId);
-        if (r) { pendingResults.delete(reqId); r({ frame: msg.frame, lines: msg.lines, result }); }
-      }
+      return sendMsg("input_mouse", { button, action, modifier, row, col });
     }
-  };
-
-  // --- the renderer: compose the server redraw frame into a character grid --------
-  // Mirrors the native TUI renderer's layout (nxvim-tui/src/render.rs): the vertical
-  // stack is [tabline][windows][global status][panel][command line]; window rects are
-  // in windows-area cells, offset by the tabline row. Best-effort styling — the cells'
-  // text + the cursor position are what matter for the redraw contract.
-  function expandTabs(s, tabstop) {
-    if (!s.includes("\t")) return s;
-    let out = "";
-    for (const chr of s) {
-      if (chr === "\t") out += " ".repeat(tabstop - (out.length % tabstop));
-      else out += chr;
-    }
-    return out;
-  }
-
-  function compose(frame) {
-    const grid = Array.from({ length: rows }, () => Array(cols).fill(" "));
-    const put = (r, c, s) => {
-      if (r < 0 || r >= rows || !s) return;
-      for (let i = 0; i < s.length; i++) {
-        const cc = c + i;
-        if (cc >= 0 && cc < cols) grid[r][cc] = s[i];
-      }
-    };
-
-    const tabline = frame.tabline || [];
-    const tablineRows = tabline.length > 0 ? 1 : 0;
-    if (tablineRows) {
-      let x = 0;
-      tabline.forEach((t, i) => {
-        const count = t.window_count > 1 ? `${t.window_count} ` : "";
-        const mod = t.modified ? "+" : "";
-        const text = ` ${count}${t.label}${mod} `;
-        put(0, x, text);
-        x += text.length;
+    function sendMsg(type, extra) {
+      const id = nextReqId++;
+      return new Promise((resolve) => {
+        pendingMsg.set(id, resolve);
+        worker.postMessage({ id, type, ...extra });
       });
     }
-    const winsY = tablineRows;
 
-    const globalStatus = Array.isArray(frame.global_status) ? frame.global_status : null;
-    const hasGlobalStatus = !!(globalStatus && globalStatus.length);
-    const panel = frame.panel || null;
-    const panelRows = panel ? (panel.height ?? 0) + 1 : 0;
-    const cmdRow = rows - 1;
-
-    for (const win of frame.windows || []) {
-      const rect = win.rect || {
-        x: 0,
-        y: 0,
-        width: cols,
-        height: rows - winsY - (hasGlobalStatus ? 1 : 0) - panelRows - 1,
-      };
-      const ax = rect.x;
-      const ay = winsY + rect.y;
-      const signW = win.sign_column ? 2 : 0;
-      const numW = win.number_width || 0;
-      const gw = signW + numW;
-      const lines = win.lines || [];
-      const numbers = win.numbers || [];
-      const leftcol = win.leftcol || 0;
-      const tabstop = win.tabstop || 8;
-      for (let r = 0; r < lines.length; r++) {
-        if (numW > 0) {
-          const n = numbers[r];
-          const label = n == null ? "" : String(n);
-          put(ay + r, ax + signW, label.padStart(numW - 1).slice(0, numW - 1) + " ");
+    let statusHideTimer = null;
+    worker.onmessage = (ev) => {
+      const msg = ev.data;
+      if (msg.type === "fatal") {
+        statusEl.style.opacity = "1";
+        statusEl.style.color = "#e06c75";
+        statusEl.textContent = "FATAL: " + msg.error;
+        console.error("edit-host worker fatal:", msg.error);
+        return;
+      }
+      if (msg.type === "ready") {
+        layout();
+        if (useSAB) {
+          ctrl = new Int32Array(new SharedArrayBuffer(16));
+          const sab = new SharedArrayBuffer(1 << 16);
+          data = new Uint8Array(sab);
+          dataCap = data.length;
+          worker.postMessage({ type: "init", ctrl: ctrl.buffer, data: sab, cols, rows: editorRows });
+          markReady();
+        } else {
+          attachOp(cols, editorRows).then(markReady);
         }
-        const text = expandTabs(lines[r], tabstop).slice(leftcol);
-        put(ay + r, ax + gw, text.slice(0, rect.width - gw));
+        return;
       }
-      if (win.status_visible && Array.isArray(win.status) && win.status.length) {
-        put(ay + lines.length, ax, win.status.map((s) => s.text).join("").slice(0, rect.width));
+      if (msg.type === "redraw") {
+        setFrame(msg.frame, msg.lines);
+        // 5c: a single id reply. 5d: batched acks + exec_lua results.
+        if (msg.id !== undefined) {
+          const resolve = pendingMsg.get(msg.id);
+          if (resolve) { pendingMsg.delete(msg.id); resolve({ frame: msg.frame, lines: msg.lines, result: msg.result }); }
+        }
+        for (const reqId of msg.acks || []) {
+          const r = pendingAcks.get(reqId);
+          if (r) { pendingAcks.delete(reqId); r({ frame: msg.frame, lines: msg.lines }); }
+        }
+        for (const [reqId, result] of msg.results || []) {
+          const r = pendingResults.get(reqId);
+          if (r) { pendingResults.delete(reqId); r({ frame: msg.frame, lines: msg.lines, result }); }
+        }
       }
-    }
-
-    if (hasGlobalStatus) {
-      put(rows - panelRows - 1 - 1, 0, globalStatus.map((s) => s.text).join(""));
-    }
-    if (panel) {
-      const py = rows - panelRows - 1;
-      put(py, 0, `─ ${panel.title} ` + "─".repeat(Math.max(0, cols - (panel.title || "").length - 4)));
-      (panel.lines || []).forEach((l, i) => put(py + 1 + i, 0, l));
-    }
-
-    // Command line / message on the last row.
-    if (frame.command_mode) {
-      put(cmdRow, 0, promptStr(frame) + (frame.cmdline || ""));
-    } else {
-      put(cmdRow, 0, frame.message || "");
-    }
-
-    return { grid, winsY, hasGlobalStatus, panelRows };
-  }
-
-  function promptStr(frame) {
-    return frame.cmdline_prompt && frame.cmdline_prompt.length
-      ? frame.cmdline_prompt
-      : frame.cmdline_prefix || "";
-  }
-
-  // The terminal's one real cursor, in absolute grid (row, col) — matching the TUI's
-  // cursor placement: the focused window's text cursor, or the command line in
-  // command mode, or the panel line when a panel is focused.
-  function cursorCell(frame) {
-    if (!frame) return null;
-    const tablineRows = (frame.tabline || []).length > 0 ? 1 : 0;
-    if (frame.panel) {
-      const panelRows = (frame.panel.height ?? 0) + 1;
-      return { row: rows - panelRows + (frame.panel.cursor_row || 0), col: 0 };
-    }
-    if (frame.command_mode) {
-      return { row: rows - 1, col: [...promptStr(frame)].length + (frame.cmdline_cursor || 0) };
-    }
-    const fw = (frame.windows || []).find((w) => w.focused);
-    if (!fw) return null;
-    const rect = fw.rect || { x: 0, y: 0 };
-    const gw = (fw.sign_column ? 2 : 0) + (fw.number_width || 0);
-    return {
-      row: tablineRows + rect.y + fw.cursor_row,
-      col: rect.x + gw + (fw.cursor_screen_col - (fw.leftcol || 0)),
     };
-  }
 
-  function render(frame) {
-    if (!frame) {
-      gridEl.textContent = "";
-      cursorEl.style.display = "none";
-      return;
+    function markReady() {
+      statusEl.textContent = `nxvim wasm edit-host — ${cols}×${editorRows + 1} — ${useSAB ? "SAB+timers" : "postMessage"}`;
+      clearTimeout(statusHideTimer);
+      statusHideTimer = setTimeout(() => { statusEl.style.display = "none"; }, 1500);
+      gridEl.focus();
+      readyResolve();
     }
-    const { grid } = compose(frame);
-    gridEl.textContent = grid.map((row) => row.join("")).join("\n");
-    const cur = cursorCell(frame);
-    if (cur && cur.row >= 0 && cur.row < rows && cur.col >= 0 && cur.col < cols) {
-      cursorEl.style.display = "block";
-      cursorEl.style.left = 8 + cur.col * cw + "px";
-      cursorEl.style.top = 8 + cur.row * ch + "px";
-    } else {
-      cursorEl.style.display = "none";
+
+    // Adopt a freshly posted redraw frame: normalize the server map to the field
+    // names the ported renderer expects, stash the buffer text for the highlighter,
+    // then paint. The server map differs from the serverless `WebEditor` view_json in
+    // two key names only — `mode_label` (top-level mode) and `cursors` (the secondary
+    // multi-cursors) — so bridge those rather than fork the renderer.
+    function setFrame(frame, lines) {
+      latest = { frame, lines: lines ?? latest.lines };
+      if (!frame) { view = null; gridEl.innerHTML = ""; return; }
+      frame.mode = frame.mode_label;
+      for (const w of frame.windows || []) w.secondary_cursors = w.cursors || [];
+      view = frame;
+      if (lines != null) bufferText = lines;
+      applyView();
     }
-  }
 
-  // --- keyboard → vim key-notation ----------------------------------------------
-  const SPECIAL = {
-    Enter: "CR", Escape: "Esc", Backspace: "BS", Tab: "Tab", Delete: "Del",
-    ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down",
-    Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown",
-  };
-  function keyToNotation(e) {
-    const mods = [];
-    if (e.ctrlKey) mods.push("C");
-    if (e.altKey) mods.push("A");
-    if (e.metaKey) mods.push("D");
-    let base = SPECIAL[e.key];
-    const isSpecial = !!base;
-    if (!base) {
-      if (e.key === " ") base = "Space";
-      else if (e.key.length === 1) base = e.key === "<" ? "lt" : e.key;
-      else return null; // bare modifier / unhandled key
+    // ============================================================================
+    // Syntax highlighting (client-side web-tree-sitter, exactly as nxvim-web). The
+    // highlighter loads grammars asynchronously; when the runtime or a grammar becomes
+    // ready it asks for a repaint. Coalesce those into one frame.
+    // ============================================================================
+    let tsPending = false;
+    function tsRefresh() {
+      if (tsPending) return;
+      tsPending = true;
+      requestAnimationFrame(() => { tsPending = false; if (view) render(); });
     }
-    if (mods.length === 0) {
-      if (isSpecial || base === "Space" || base === "lt") return `<${base}>`;
-      return base; // plain printable char
+
+    // Syntax-highlight context for this frame: the focused buffer's per-line capture
+    // spans, plus the file it belongs to. Returns null when there's nothing to
+    // highlight (runtime not ready, unsupported file, or grammar still loading). The
+    // buffer text comes from the Worker (the focused buffer's full contents), not a
+    // synchronous editor call. Other windows showing the SAME file reuse this.
+    function highlightContext() {
+      if (!ts || !ts.isReady()) return null;
+      const fw = view.windows.find((w) => w.focused) || view.windows[0];
+      if (!fw) return null;
+      const lang =
+        ts.langForFiletype(fw.filetype) || (fw.unnamed ? null : ts.langForName(fw.file_name));
+      if (!lang) return null;
+      const spans = ts.spansForBuffer(lang, bufferText);
+      return spans ? { file: fw.file_name, spans } : null;
     }
-    return `<${mods.join("-")}-${base}>`;
-  }
 
-  wrapEl.addEventListener("keydown", (e) => {
-    const n = keyToNotation(e);
-    if (n == null) return;
-    e.preventDefault();
-    feedOp(n);
-  });
-  wrapEl.focus();
+    // ============================================================================
+    // The renderer — ported from nxvim-web/web/index.html. Reads the global `view`
+    // (the redraw frame) and paints per-cell spans into #grid. serverStyled keys on a
+    // resolved colorscheme palette; the wasm build emits an empty palette, so the
+    // in-page highlighter path is taken (the palette path is kept dormant for a future
+    // palette-bearing frame).
+    // ============================================================================
+    let serverStyled = false;
 
-  let resizeTimer;
-  window.addEventListener("resize", () => {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-      computeSize();
-      attachOp(cols, rows);
-    }, 80);
-  });
+    // ---- smooth scrolling ----
+    let scrollAnim = null; // in-flight slide, or null
+    let scrollRAF = 0;
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
 
-  // --- the Playwright / automation hook -----------------------------------------
-  // Drive the editor without a real keyboard. `feed`/`exec_lua`/`attach` return a
-  // promise that resolves once the worker has ticked and the frame is rendered;
-  // `lines`/`frame`/`cursor` read the latest rendered state synchronously.
-  window.__nxvim = {
-    ready: readyPromise,
-    sab: useSAB, // whether the SAB input/timer loop is active (slice 5d)
-    feed: (notation) => feedOp(notation),
-    type: (notation) => feedOp(notation), // alias
-    execLua: (code) => execLuaOp(code),
-    attach: (c, r) => attachOp(c, r),
-    lines: () => latest.lines,
-    frame: () => latest.frame,
-    cursor: () => {
-      const fw = (latest.frame?.windows || []).find((w) => w.focused);
-      return fw
-        ? { row: fw.cursor_row, col: fw.cursor_col, screenCol: fw.cursor_screen_col }
-        : null;
-    },
-    cursorCell: () => cursorCell(latest.frame),
-    mode: () => latest.frame?.mode_label ?? "",
-    cmdline: () => (latest.frame?.command_mode ? promptStr(latest.frame) + latest.frame.cmdline : ""),
-    message: () => latest.frame?.message ?? "",
-  };
-</script>
+    function applyView() {
+      const w = focusedWindow();
+      const s = w?.scroll;
+      if (s && s.duration_ms > 0) { armScroll(w, s); return; }
+      if (scrollAnim && repaintsDestination(w)) return; // let the slide finish
+      cancelScroll();
+      render();
+    }
+    function repaintsDestination(w) {
+      if (!w || !scrollAnim) return false;
+      const a = scrollAnim;
+      return w.numbers?.[0] === Math.round(a.to_top) + 1
+        && w.cursor_line === Math.round(a.to_cursor) + 1;
+    }
+    function armScroll(w, s) {
+      cancelScroll();
+      scrollAnim = {
+        from_top: s.from_top, to_top: s.to_top,
+        from_cursor: s.from_cursor, to_cursor: s.to_cursor,
+        duration: s.duration_ms, base_line: s.base_line,
+        band: bandWindow(w, s), start: performance.now(), strip: null,
+      };
+      render();
+      scrollRAF = requestAnimationFrame(stepScroll);
+    }
+    function scrollProgress(a, now) {
+      return Math.min(1, Math.max(0, (now - a.start) / a.duration));
+    }
+    function stepScroll(now) {
+      const a = scrollAnim;
+      if (!a) return;
+      const t = scrollProgress(a, now);
+      if (a.strip) a.strip.style.transform = `translate3d(0, ${stripOffset(a, easeOutCubic(t))}px, 0)`;
+      if (t < 1) { scrollRAF = requestAnimationFrame(stepScroll); return; }
+      scrollAnim = null;
+      scrollRAF = 0;
+      render();
+    }
+    function stripOffset(a, e) {
+      const topF = a.from_top + (a.to_top - a.from_top) * e;
+      return (a.base_line - topF) * ch;
+    }
+    function bandWindow(w, s) {
+      const n = s.lines.length;
+      const blanks = Array.from({ length: n }, () => []);
+      return Object.assign({}, w, {
+        lines: s.lines,
+        numbers: s.numbers,
+        selection: s.selection,
+        search: blanks,
+        incsearch: Array.from({ length: n }, () => null),
+        secondary_selection: blanks,
+        secondary_cursors: [],
+        highlights: s.highlights || [],
+        diagnostics: [], diagnostics_virt: [], diagnostics_signs: [], inlay_hints: [],
+        cursor_row: Math.round(s.to_cursor) - s.base_line,
+      });
+    }
+    function cancelScroll() {
+      if (scrollRAF) cancelAnimationFrame(scrollRAF);
+      scrollRAF = 0;
+      scrollAnim = null;
+    }
+    function renderScrollBand(box, w, rect, winSpans) {
+      const a = scrollAnim;
+      const band = a.band;
+      const gutterW = w.number_width || 0;
+      const strip = document.createElement("div");
+      strip.className = "scroll-band";
+      strip.style.cssText = `position:absolute;left:0;top:0;width:${rect.width * cw}px;will-change:transform;`;
+      for (let i = 0; i < band.lines.length; i++) {
+        const rowEl = document.createElement("div");
+        rowEl.className = "row";
+        rowEl.style.top = i * ch + "px";
+        rowEl.style.width = rect.width * cw + "px";
+        if (serverStyled) {
+          rowEl.innerHTML = renderLineServer(band, i, gutterW, rect);
+        } else {
+          const bufLine = band.numbers[i];
+          const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
+          rowEl.innerHTML = renderLine(band, i, gutterW, lineSpans);
+        }
+        strip.appendChild(rowEl);
+      }
+      const t = scrollProgress(a, performance.now());
+      strip.style.transform = `translate3d(0, ${stripOffset(a, easeOutCubic(t))}px, 0)`;
+      box.appendChild(strip);
+      a.strip = strip;
+    }
+
+    function render() {
+      if (!view) return;
+      serverStyled = (view.styles?.length ?? 0) > 0;
+      gridEl.innerHTML = "";
+      if (serverStyled) applyChrome();
+      const hasTabline = serverStyled
+        ? (view.tabline_segments?.length || view.tabline.length)
+        : view.tabline.length;
+      const tablineRows = hasTabline ? 1 : 0;
+      const cmdRow = editorRows; // command line sits just past the editor area
+      const hl = serverStyled ? null : highlightContext();
+
+      if (tablineRows) {
+        if (serverStyled && view.tabline_segments?.length) renderTablineSegments(0);
+        else renderTabline(0);
+      }
+      for (const w of view.windows) if (!w.floating) renderWindow(w, tablineRows, hl);
+      renderSeparators(tablineRows);
+      for (const w of view.windows) if (w.floating) renderFloat(w, tablineRows, hl);
+      if (serverStyled && view.global_status?.length) renderGlobalStatus(cmdRow - 1);
+      if (view.panel) renderPanel(view.panel, cmdRow);
+      if (serverStyled && view.pmenu) renderPmenu(view.pmenu, tablineRows);
+      renderCommand(cmdRow);
+    }
+
+    function winRect(w) {
+      return w.rect || { x: 0, y: 0, width: cols, height: editorRows };
+    }
+    function place(el, x, y, wCells, hCells) {
+      el.style.left = x * cw + "px";
+      el.style.top = y * ch + "px";
+      if (wCells != null) el.style.width = wCells * cw + "px";
+      if (hCells != null) el.style.height = hCells * ch + "px";
+    }
+
+    function renderWindow(w, tablineRows, hl) {
+      const rect = winRect(w);
+      const box = document.createElement("div");
+      box.className = "win";
+      place(box, rect.x, tablineRows + rect.y, rect.width, rect.height);
+      gridEl.appendChild(box);
+
+      const textRows = w.lines.length;
+      const statusRows = Math.max(0, rect.height - textRows);
+      const gutterW = w.number_width || 0;
+      const winSpans = hl && w.file_name === hl.file ? hl.spans : null;
+
+      if (scrollAnim && w.focused) {
+        renderScrollBand(box, w, rect, winSpans);
+      } else {
+        for (let r = 0; r < textRows; r++) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "row";
+          rowEl.style.top = r * ch + "px";
+          rowEl.style.width = rect.width * cw + "px";
+          if (serverStyled) {
+            rowEl.innerHTML = renderLineServer(w, r, gutterW, rect);
+          } else {
+            const bufLine = w.numbers[r];
+            const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
+            rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans);
+          }
+          box.appendChild(rowEl);
+        }
+      }
+      if (serverStyled) {
+        if (statusRows > 0 && w.status_visible !== false) {
+          renderStatusSegments(box, w.status || [], textRows, rect.width, w.focused);
+        }
+      } else if (statusRows > 0) {
+        renderStatus(box, w, textRows);
+      }
+    }
+
+    function renderLine(w, row, gutterW, lineSpans) {
+      const line = w.lines[row] ?? "";
+      const isFiller = w.numbers[row] === null;
+      let html = "";
+      if (gutterW > 0) html += renderGutterCell(w, row, gutterW);
+      if (isFiller) return html + `<span class="eob">${escapeHtml(line)}</span>`;
+
+      const tabstop = w.tabstop || 8;
+      const colors = lineSpans && ts ? ts.colorsForLine(lineSpans, line.length) : null;
+      const cells = [];
+      let u16 = 0, col = 0;
+      for (const cp of line) {
+        if (cp === "\t") {
+          const n = tabstop - (col % tabstop);
+          for (let k = 0; k < n; k++) cells.push({ ch: " ", color: null });
+          col += n;
+        } else {
+          cells.push({ ch: cp, color: colors ? colors[u16] : null });
+          col += 1;
+        }
+        u16 += cp.length;
+      }
+
+      const leftcol = w.leftcol || 0;
+      const isFocused = w.focused && !view.command_mode && !view.panel;
+      const cursorCol = w.cursor_screen_col;
+      const cursorRow = w.cursor_row;
+      const sel = w.selection[row] || null;
+      const search = w.search[row] || [];
+      const inc = w.incsearch[row] || null;
+      const secSel = w.secondary_selection[row] || [];
+      const secCols = new Set((w.secondary_cursors || []).filter(([r]) => r === row).map(([, c]) => c));
+      const inSpan = (sp, c) => c >= sp[0] && c < sp[1];
+      const COLOR_OWNED = new Set(["cur-block", "cur-mc", "seccur", "search", "incsearch"]);
+
+      let run = "", runCls = "", runColor = "", out = "";
+      const flush = () => {
+        if (!run) return;
+        const style = runColor ? ` style="color:${runColor}"` : "";
+        out += `<span class="${runCls}"${style}>${escapeHtml(run)}</span>`;
+        run = "";
+      };
+      for (let c = 0; c < cells.length; c++) {
+        if (c < leftcol) continue;
+        let cls = "";
+        if (search.some((s) => inSpan(s, c))) cls = "search";
+        if (inc && inSpan(inc, c)) cls = "incsearch";
+        if ((sel && inSpan(sel, c)) || secSel.some((s) => inSpan(s, c))) cls = "sel";
+        if (secCols.has(c)) cls = "seccur";
+        if (isFocused && row === cursorRow && c === cursorCol) cls = cursorClass();
+        else if (!w.focused && row === cursorRow && c === cursorCol && !view.command_mode && !view.panel) cls = "cur-hollow";
+        const color = COLOR_OWNED.has(cls) ? "" : (cells[c].color || "");
+        if (cls !== runCls || color !== runColor) { flush(); runCls = cls; runColor = color; }
+        run += cells[c].ch;
+      }
+      flush();
+      if (isFocused && row === cursorRow && cursorCol >= cells.length) {
+        out += `<span class="${cursorClass()}"> </span>`;
+      } else if (!w.focused && row === cursorRow && cursorCol >= cells.length && !view.command_mode && !view.panel) {
+        out += `<span class="cur-hollow"> </span>`;
+      }
+      return html + out;
+    }
+
+    function cursorClass() {
+      if (view.mode === "MULTICURSOR") return "cur-mc";
+      if (view.mode === "INSERT") return "cur-bar";
+      if (view.mode === "REPLACE" || view.pending_replace) return "cur-underline";
+      return "cur-block";
+    }
+
+    // ---- server-styled (palette) paint helpers — dormant on the wasm build ----
+    function styleToCss(s) {
+      if (!s) return "";
+      let fg = s.fg, bg = s.bg;
+      if (s.reverse) { const t = fg; fg = bg || "var(--bg)"; bg = t || "var(--fg)"; }
+      let css = "";
+      if (fg) css += `color:${fg};`;
+      if (bg) css += `background:${bg};`;
+      if (s.bold) css += "font-weight:700;";
+      if (s.italic) css += "font-style:italic;";
+      if (s.strikethrough) css += "text-decoration:line-through;";
+      else if (s.underline) css += "text-decoration:underline;";
+      else if (s.undercurl) css += `text-decoration:underline wavy;${s.sp ? `text-decoration-color:${s.sp};` : ""}`;
+      return css;
+    }
+    function paletteStyle(id) { return id == null ? null : (view.styles[id] || null); }
+    function chromeCss(style) { return style ? styleToCss(style) : ""; }
+    function applyChrome() {
+      const c = view.chrome || {};
+      const root = document.documentElement.style;
+      if (c.normal?.bg) gridEl.style.background = c.normal.bg;
+      if (c.normal?.fg) gridEl.style.color = c.normal.fg;
+      const setVar = (name, color) => { if (color) root.setProperty(name, color); };
+      setVar("--eob", c.end_of_buffer?.fg);
+      setVar("--gutter", c.line_nr?.fg);
+      setVar("--gutter-cur", c.cursor_line_nr?.fg);
+      setVar("--status-bg", c.status_line?.bg);
+      setVar("--status-fg", c.status_line?.fg);
+      setVar("--sel", c.visual?.bg);
+      setVar("--search", c.search?.bg);
+    }
+    function cellBaseCss(col, hlSpans, diagSpans) {
+      let css = "";
+      for (const [s, e, group, id] of hlSpans) {
+        if (col >= s && col < e) {
+          if (id != null) css = styleToCss(paletteStyle(id));
+          else { const fg = colorFor(group); if (fg) css = `color:${fg};`; }
+          break;
+        }
+      }
+      for (const [s, e, sev, id] of diagSpans) {
+        if (col >= s && col < e) {
+          const sp = (id != null && paletteStyle(id)?.sp) || severityColor(sev);
+          css += `text-decoration:underline wavy;text-decoration-color:${sp};text-underline-offset:2px;`;
+          break;
+        }
+      }
+      return css;
+    }
+    function severityColor(sev) {
+      return sev === 1 ? "#e06c75" : sev === 2 ? "#e5c07b" : sev === 4 ? "#56b6c2" : "#61afef";
+    }
+    function renderLineServer(w, row, gutterW, rect) {
+      const line = w.lines[row] ?? "";
+      const isFiller = w.numbers[row] === null;
+      let html = (gutterW > 0 || w.sign_column) ? renderGutterCell(w, row, gutterW) : "";
+      if (isFiller) {
+        const css = chromeCss(view.chrome?.end_of_buffer);
+        return html + `<span class="eob"${css ? ` style="${css}"` : ""}>${escapeHtml(line)}</span>`;
+      }
+      const tabstop = w.tabstop || 8;
+      const leftcol = w.leftcol || 0;
+      const hints = w.inlay_hints?.[row] || [];
+      const hlSpans = w.highlights?.[row] || [];
+      const diagSpans = w.diagnostics?.[row] || [];
+      const sel = w.selection?.[row] || null;
+      const secSel = w.secondary_selection?.[row] || [];
+      const search = w.search?.[row] || [];
+      const inc = w.incsearch?.[row] || null;
+      const secCols = new Set((w.secondary_cursors || []).filter(([r]) => r === row).map(([, c]) => c));
+      const inSpan = (sp, c) => c >= sp[0] && c < sp[1];
+
+      const expanded = [];
+      let c0 = 0;
+      for (const cp of line) {
+        if (cp === "\t") { const n = tabstop - (c0 % tabstop); for (let k = 0; k < n; k++) expanded.push(" "); c0 += n; }
+        else { expanded.push(cp); c0 += 1; }
+      }
+
+      const cells = [];
+      let hi = 0;
+      const emitHints = (anchor) => {
+        while (hi < hints.length && hints[hi][0] <= anchor) {
+          const [hcol, text, id] = hints[hi++];
+          if (hcol < leftcol) continue;
+          const css = id != null ? styleToCss(paletteStyle(id)) : "";
+          for (const cp of text) cells.push({ ch: cp, abs: -1, base: css });
+        }
+      };
+      for (let c = 0; c < expanded.length; c++) {
+        emitHints(c);
+        if (c >= leftcol) cells.push({ ch: expanded[c], abs: c, base: cellBaseCss(c, hlSpans, diagSpans) });
+      }
+      emitHints(Infinity);
+
+      const isFocused = w.focused && !view.command_mode && !view.panel;
+      const cursorRow = w.cursor_row;
+      let inlayShift = 0;
+      for (const [hcol, text] of hints) {
+        if (hcol >= leftcol && hcol <= w.cursor_screen_col) inlayShift += [...text].length;
+      }
+      const cursorPainted = w.cursor_screen_col + inlayShift;
+
+      const COLOR_OWNED = new Set(["cur-block", "cur-bar", "cur-underline", "cur-mc", "seccur", "search", "incsearch"]);
+      let run = "", runCls = "", runStyle = "", out = "";
+      const flush = () => {
+        if (!run) return;
+        out += `<span class="${runCls}"${runStyle ? ` style="${runStyle}"` : ""}>${escapeHtml(run)}</span>`;
+        run = "";
+      };
+      let painted = leftcol;
+      for (const cell of cells) {
+        const a = cell.abs;
+        let cls = "";
+        if (a >= 0) {
+          if (search.some((s) => inSpan(s, a))) cls = "search";
+          if (inc && inSpan(inc, a)) cls = "incsearch";
+          if ((sel && inSpan(sel, a)) || secSel.some((s) => inSpan(s, a))) cls = "sel";
+          if (secCols.has(a)) cls = "seccur";
+        } else {
+          cls = "inlay";
+        }
+        if (isFocused && cursorRow === row && painted === cursorPainted) cls = cursorClass();
+        else if (!w.focused && cursorRow === row && painted === cursorPainted && !view.command_mode && !view.panel) cls = "cur-hollow";
+        const style = (a < 0) ? cell.base : (COLOR_OWNED.has(cls) ? "" : cell.base);
+        if (cls !== runCls || style !== runStyle) { flush(); runCls = cls; runStyle = style; }
+        run += cell.ch;
+        painted += 1;
+      }
+      flush();
+      if (isFocused && cursorRow === row && cursorPainted >= painted) {
+        out += `<span class="${cursorClass()}"> </span>`;
+      } else if (!w.focused && cursorRow === row && cursorPainted >= painted && !view.command_mode && !view.panel) {
+        out += `<span class="cur-hollow"> </span>`;
+      }
+      const virt = w.diagnostics_virt?.[row];
+      if (virt) {
+        const [text, sev, id] = virt;
+        const vcss = (id != null) ? styleToCss(paletteStyle(id)) : `color:${severityColor(sev)};`;
+        out += `<span${vcss ? ` style="${vcss}"` : ""}> ${escapeHtml(text)}</span>`;
+      }
+      return html + out;
+    }
+
+    function renderGutterCell(w, row, width) {
+      let html = "";
+      if (serverStyled && w.sign_column) {
+        const sign = w.diagnostics_signs?.[row];
+        if (sign) {
+          const [glyph, sev, id] = sign;
+          const css = (id != null) ? styleToCss(paletteStyle(id)) : `color:${severityColor(sev)};`;
+          html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml((glyph + " ").slice(0, 2).padEnd(2))}</span>`;
+        } else {
+          html += `<span class="gutter">  </span>`;
+        }
+      }
+      if (width <= 0) return html;
+      const n = w.numbers[row];
+      const cur = w.cursor_line;
+      let cell, cls = "gutter";
+      if (n === null || n === undefined) cell = " ".repeat(width);
+      else if (w.number && w.relativenumber && n === cur) { cell = String(n).padEnd(width); cls = "gutter-cur"; }
+      else {
+        let v;
+        if (!w.relativenumber) v = n;
+        else if (n === cur) v = 0;
+        else v = Math.abs(n - cur);
+        cell = String(v).padStart(width - 1) + " ";
+        if (n === cur) cls = "gutter-cur";
+      }
+      return html + `<span class="${cls}">${escapeHtml(cell)}</span>`;
+    }
+
+    function renderSegmentBar(segments, width, cls) {
+      let html = "";
+      for (const { text, style } of (segments || [])) {
+        const css = styleToCss(style);
+        html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
+      }
+      const el = document.createElement("div");
+      el.className = cls;
+      el.style.width = width * cw + "px";
+      el.innerHTML = html;
+      return el;
+    }
+    function renderStatusSegments(box, segments, atRow, width, focused) {
+      const el = renderSegmentBar(segments, width, "row statusline" + (focused ? " focused" : ""));
+      el.style.top = atRow * ch + "px";
+      box.appendChild(el);
+    }
+    function renderGlobalStatus(atRow) {
+      const el = renderSegmentBar(view.global_status, cols, "row statusline focused");
+      el.style.top = atRow * ch + "px";
+      gridEl.appendChild(el);
+    }
+    function renderTablineSegments(y) {
+      const el = renderSegmentBar(view.tabline_segments, cols, "row statusline");
+      el.style.top = y * ch + "px";
+      gridEl.appendChild(el);
+    }
+
+    function renderPmenu(pmenu, tablineRows) {
+      const fw = view.windows.find((w) => w.focused) || view.windows[0];
+      const rect = fw ? winRect(fw) : { x: 0, y: 0 };
+      const x = rect.x + pmenu.col;
+      const y = tablineRows + rect.y + pmenu.row;
+      const rows = Math.max(1, Math.min(pmenu.height, pmenu.items.length));
+      const first = Math.max(0, Math.min(pmenu.selected - rows + 1, pmenu.items.length - rows));
+      const start = pmenu.selected >= rows ? first : 0;
+      const box = document.createElement("div");
+      box.className = "pmenu";
+      place(box, x, y, pmenu.width, rows);
+      for (let i = 0; i < rows; i++) {
+        const idx = start + i;
+        const [label, , detail] = pmenu.items[idx] || ["", 0, ""];
+        const left = String(label);
+        const right = detail ? String(detail) : "";
+        const pad = Math.max(1, pmenu.width - left.length - right.length);
+        const text = (left + " ".repeat(pad) + right).slice(0, pmenu.width).padEnd(pmenu.width);
+        const rowEl = document.createElement("div");
+        rowEl.className = "row" + (idx === pmenu.selected ? " pmenu-sel" : "");
+        rowEl.style.width = pmenu.width * cw + "px";
+        rowEl.textContent = text;
+        box.appendChild(rowEl);
+      }
+      gridEl.appendChild(box);
+      if (pmenu.doc && pmenu.doc.length) {
+        const docW = Math.max(...pmenu.doc.map((l) => l.length), 1);
+        const docBox = document.createElement("div");
+        docBox.className = "pmenu-doc";
+        place(docBox, x + pmenu.width, y, docW, pmenu.doc.length);
+        for (const l of pmenu.doc) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "row";
+          rowEl.style.width = docW * cw + "px";
+          rowEl.textContent = l;
+          docBox.appendChild(rowEl);
+        }
+        gridEl.appendChild(docBox);
+      }
+    }
+
+    // A synthesized status line (the wasm build emits no %-format statusline segments
+    // for laststatus modes 1/2): MODE  filename [+]            line,col
+    function renderStatus(box, w, atRow) {
+      const name = w.unnamed ? "[No Name]" : (w.file_name || "[No Name]");
+      const mod = w.modified ? " [+]" : "";
+      const modeTag = view.mode ? view.mode + "  " : "";
+      const left = `${modeTag}${name}${mod}`;
+      const right = `${w.cursor_line},${w.cursor_col + 1}`;
+      const width = winRect(w).width;
+      const pad = Math.max(1, width - left.length - right.length - 1);
+      const text = (" " + left + " ".repeat(pad) + right + " ").slice(0, width).padEnd(width);
+      const el = document.createElement("div");
+      el.className = "row statusline" + (w.focused ? " focused" : "");
+      el.style.top = atRow * ch + "px";
+      el.style.width = width * cw + "px";
+      el.textContent = text;
+      box.appendChild(el);
+    }
+
+    function renderSeparators(tablineRows) {
+      for (const s of view.separators) {
+        const el = document.createElement("div");
+        el.className = "sep";
+        if (s.vertical) {
+          place(el, s.x, tablineRows + s.y, 1, s.length);
+          el.textContent = Array(s.length).fill("│").join("\n");
+          el.style.lineHeight = ch + "px";
+        } else {
+          place(el, s.x, tablineRows + s.y, s.length, 1);
+          el.textContent = "─".repeat(s.length);
+          el.style.lineHeight = ch + "px";
+        }
+        gridEl.appendChild(el);
+      }
+    }
+    function renderFloat(w, tablineRows, hl) {
+      renderWindow(w, tablineRows, hl);
+    }
+    function renderTabline(y) {
+      const el = document.createElement("div");
+      el.className = "row statusline";
+      el.style.top = y * ch + "px";
+      el.style.width = cols * cw + "px";
+      let s = "";
+      view.tabline.forEach((t, i) => {
+        const count = t.window_count > 1 ? t.window_count + " " : "";
+        const mark = i === view.current_tab ? "▸" : " ";
+        s += ` ${mark}${count}${t.label}${t.modified ? "+" : ""} `;
+      });
+      el.textContent = s;
+      gridEl.appendChild(el);
+    }
+    function renderPanel(panel, cmdRow) {
+      const borderRow = cmdRow - (panel.height + 1);
+      const titleEl = document.createElement("div");
+      titleEl.className = "row panel-title";
+      titleEl.style.top = borderRow * ch + "px";
+      titleEl.style.width = cols * cw + "px";
+      titleEl.textContent = `─ ${panel.title} ` + "─".repeat(Math.max(0, cols - panel.title.length - 6)) + "[X]─";
+      gridEl.appendChild(titleEl);
+      const curEnd = panel.cursor_row + Math.max(1, panel.cursor_span);
+      for (let r = 0; r < panel.height; r++) {
+        const rowEl = document.createElement("div");
+        rowEl.className = "row" + (r >= panel.cursor_row && r < curEnd ? " panel-cur" : "");
+        rowEl.style.top = (borderRow + 1 + r) * ch + "px";
+        rowEl.style.width = cols * cw + "px";
+        rowEl.textContent = panel.lines[r] ?? "";
+        gridEl.appendChild(rowEl);
+      }
+    }
+    function renderCommand(cmdRow) {
+      const el = document.createElement("div");
+      el.className = "cmdline";
+      el.style.top = cmdRow * ch + "px";
+      el.style.width = cols * cw + "px";
+      if (view.command_mode) {
+        const prompt = view.cmdline_prompt || view.cmdline_prefix;
+        const text = prompt + view.cmdline;
+        const curIdx = [...prompt].length + view.cmdline_cursor;
+        const chars = [...text];
+        let html = "";
+        for (let i = 0; i < chars.length; i++) {
+          html += i === curIdx ? `<span class="cur-block">${escapeHtml(chars[i])}</span>` : escapeHtml(chars[i]);
+        }
+        if (curIdx >= chars.length) html += `<span class="cur-block"> </span>`;
+        el.innerHTML = html;
+      } else {
+        el.textContent = view.message || "";
+      }
+      gridEl.appendChild(el);
+    }
+    function focusedWindow() { return (view.windows || []).find((w) => w.focused) || view.windows?.[0]; }
+    function promptStr(frame) {
+      return frame.cmdline_prompt && frame.cmdline_prompt.length ? frame.cmdline_prompt : frame.cmdline_prefix || "";
+    }
+
+    // ============================================================================
+    // Keyboard → vim key-notation. Unlike nxvim-web (which has the shared nxvim-view
+    // encoder as a synchronous FFI call), the Worker tick only takes vim notation, so
+    // we encode the browser event to notation here and feed it.
+    // ============================================================================
+    const SPECIAL = {
+      Enter: "CR", Escape: "Esc", Backspace: "BS", Tab: "Tab", Delete: "Del",
+      ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down",
+      Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown",
+    };
+    function keyToNotation(e) {
+      const mods = [];
+      if (e.ctrlKey) mods.push("C");
+      if (e.altKey) mods.push("A");
+      if (e.metaKey) mods.push("D");
+      let base = SPECIAL[e.key];
+      const isSpecial = !!base;
+      if (!base) {
+        // With a Ctrl/Alt modifier read e.code so the BASE letter survives composition.
+        if ((e.ctrlKey || e.altKey) && /^Key[A-Z]$/.test(e.code)) {
+          const m = e.code.slice(3);
+          base = e.shiftKey ? m : m.toLowerCase();
+        } else if ((e.ctrlKey || e.altKey) && /^Digit\d$/.test(e.code)) {
+          base = e.code.slice(5);
+        } else if (e.key === " ") base = "Space";
+        else if (e.key.length === 1) base = e.key === "<" ? "lt" : e.key;
+        else return null; // bare modifier / unhandled key
+      }
+      if (mods.length === 0) {
+        if (isSpecial || base === "Space" || base === "lt") return `<${base}>`;
+        return base;
+      }
+      return `<${mods.join("-")}-${base}>`;
+    }
+
+    gridEl.addEventListener("keydown", (e) => {
+      if (e.key === "F5" || e.key === "F12") return;
+      if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
+      const n = keyToNotation(e);
+      if (n == null) return;
+      e.preventDefault();
+      feedOp(n);
+    });
+
+    // ============================================================================
+    // Mouse. Core owns the hit-test from a global screen cell to a window + buffer
+    // position, multi-click word/line selection, drag-select, and wheel scroll — the
+    // page only forwards the raw cell, exactly as the TUI/GUI forward nvim_input_mouse.
+    // ============================================================================
+    const BTN = { 0: "left", 1: "middle", 2: "right" };
+    let dragBtn = null;
+    function cellAt(e) {
+      const r = gridEl.getBoundingClientRect();
+      return {
+        col: Math.max(0, Math.floor((e.clientX - r.left) / cw)),
+        row: Math.max(0, Math.floor((e.clientY - r.top) / ch)),
+      };
+    }
+    function mods(e) { return (e.ctrlKey ? "C" : "") + (e.shiftKey ? "S" : "") + (e.altKey ? "A" : ""); }
+
+    // Drag-select autoscroll: re-send the held drag on a timer while it sits in the
+    // top/bottom band, since the browser fires no mousemove while the pointer is still.
+    const AUTOSCROLL_MS = 40;
+    let autoscrollCell = null, autoscrollTimer = null;
+    function inScrollZone(row) { return row <= 0 || row + 2 >= editorRows + 1; }
+    function armAutoscroll(row, col) {
+      if (dragBtn === "left" && inScrollZone(row)) {
+        autoscrollCell = { row, col };
+        if (!autoscrollTimer) autoscrollTimer = setInterval(autoscrollTick, AUTOSCROLL_MS);
+      } else {
+        disarmAutoscroll();
+      }
+    }
+    function disarmAutoscroll() {
+      if (autoscrollTimer) { clearInterval(autoscrollTimer); autoscrollTimer = null; }
+      autoscrollCell = null;
+    }
+    function autoscrollTick() {
+      if (!dragBtn || !autoscrollCell) { disarmAutoscroll(); return; }
+      mouseOp("left", "drag", "", autoscrollCell.row, autoscrollCell.col);
+    }
+
+    gridEl.addEventListener("mousedown", (e) => {
+      gridEl.focus();
+      const button = BTN[e.button];
+      if (!button) return;
+      e.preventDefault();
+      disarmAutoscroll();
+      const { row, col } = cellAt(e);
+      if (button === "left") dragBtn = "left";
+      mouseOp(button, "press", mods(e), row, col);
+    });
+    gridEl.addEventListener("mousemove", (e) => {
+      if (!dragBtn) return;
+      const { row, col } = cellAt(e);
+      mouseOp(dragBtn, "drag", mods(e), row, col);
+      armAutoscroll(row, col);
+    });
+    window.addEventListener("mouseup", (e) => {
+      if (!dragBtn) return;
+      disarmAutoscroll();
+      const { row, col } = cellAt(e);
+      mouseOp(dragBtn, "release", mods(e), row, col);
+      dragBtn = null;
+    });
+
+    // Wheel → whole-line notches. The browser fires many sub-line wheel events per
+    // physical scroll; accumulate the fractional remainder so a slow drag still scrolls
+    // one row at a time and a flung wheel doesn't fly. Mirrors WebEditor::wheel /
+    // nxvim-gui's drain_notches; emitted as nvim_input_mouse wheel gestures.
+    let wheelAccumX = 0, wheelAccumY = 0;
+    function drainNotches(amount, axis) {
+      if (axis === "y") { wheelAccumY += amount; const w = Math.trunc(wheelAccumY); wheelAccumY -= w; return w; }
+      wheelAccumX += amount; const w = Math.trunc(wheelAccumX); wheelAccumX -= w; return w;
+    }
+    gridEl.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const { row, col } = cellAt(e);
+      const m = mods(e);
+      let lx, ly;
+      if (e.deltaMode === 1) { lx = e.deltaX; ly = e.deltaY; }                       // line units
+      else if (e.deltaMode === 2) { lx = e.deltaX * Math.max(1, cols); ly = e.deltaY * Math.max(1, editorRows); } // page
+      else { lx = e.deltaX / Math.max(1, cw); ly = e.deltaY / Math.max(1, ch); }     // pixels
+      const MAX = 10;
+      const vn = drainNotches(ly, "y");
+      if (vn !== 0) { const a = vn > 0 ? "down" : "up"; for (let i = 0; i < Math.min(Math.abs(vn), MAX); i++) mouseOp("wheel", a, m, row, col); }
+      const hn = drainNotches(lx, "x");
+      if (hn !== 0) { const a = hn > 0 ? "right" : "left"; for (let i = 0; i < Math.min(Math.abs(hn), MAX); i++) mouseOp("wheel", a, m, row, col); }
+    }, { passive: false });
+    gridEl.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => { layout(); attachOp(cols, editorRows); }, 80);
+    });
+
+    // ============================================================================
+    // Boot: measure, create the highlighter, then let the Worker's "ready" attach.
+    // ============================================================================
+    measureCell();
+    layout();
+    ts = createHighlighter ? createHighlighter({ onReady: tsRefresh }) : null;
+
+    // The automation hook (Playwright / verify.mjs). `feed`/`mouse`/`execLua`/`attach`
+    // resolve once the Worker has ticked and the frame rendered; `lines`/`frame`/`cursor`
+    // read the latest rendered state synchronously.
+    window.__nxvim = {
+      ready: readyPromise,
+      sab: useSAB,
+      feed: (notation) => feedOp(notation),
+      type: (notation) => feedOp(notation),
+      mouse: (button, action, modifier, row, col) => mouseOp(button, action, modifier, row | 0, col | 0),
+      execLua: (code) => execLuaOp(code),
+      attach: (c, r) => attachOp(c, r),
+      lines: () => latest.lines,
+      frame: () => latest.frame,
+      cursor: () => {
+        const fw = (latest.frame?.windows || []).find((w) => w.focused);
+        return fw ? { row: fw.cursor_row, col: fw.cursor_col, screenCol: fw.cursor_screen_col } : null;
+      },
+      mode: () => latest.frame?.mode_label ?? "",
+      cmdline: () => (latest.frame?.command_mode ? promptStr(latest.frame) + latest.frame.cmdline : ""),
+      message: () => latest.frame?.message ?? "",
+    };
+  </script>
 </body>
 </html>

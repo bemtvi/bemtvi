@@ -267,6 +267,10 @@ impl EditHost {
                 Value::from("file_name"),
                 Value::from(win.file_name.as_str()),
             ),
+            // The buffer's effective treesitter filetype (override or extension),
+            // so a client that highlights JS-side (the wasm edit-host) can pick the
+            // grammar. Native clients ignore it (they paint server highlight spans).
+            (Value::from("filetype"), Value::from(win.filetype.as_str())),
             (Value::from("unnamed"), Value::from(win.unnamed)),
             (Value::from("modified"), Value::from(win.modified)),
             (

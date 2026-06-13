@@ -59,7 +59,29 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -sALLOW_MEMORY_GROWTH=1 \
   -sEXIT_RUNTIME=0 \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,HEAPU8 \
-  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
+  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_input_mouse,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
+
+# 3. Tree-sitter highlighter assets → web/vendor/ (the web-tree-sitter runtime + the
+#    per-language grammar .wasm + sanitized queries) for the in-page syntax highlighter
+#    (web/highlight.js). The pinned grammar devDeps + generator live in the sibling
+#    nxvim-web crate; build them there once (if absent) and copy them in, rather than
+#    duplicate ~13 MB of grammar packages. web/vendor/ is gitignored like dist/. The
+#    highlighter is optional — index.html degrades to plain rendering if this is skipped.
+WEB="../nxvim-web"
+if [ -d "$WEB" ]; then
+  if [ ! -d "$WEB/web/vendor" ]; then
+    echo "generating tree-sitter assets in $WEB (one-time)…"
+    ( cd "$WEB" && { [ -f package-lock.json ] && npm ci || npm install; } && npm run build:treesitter ) \
+      || echo "warn: tree-sitter asset generation failed — highlighting will be off (plain rendering)"
+  fi
+  if [ -d "$WEB/web/vendor" ]; then
+    mkdir -p web/vendor
+    cp -r "$WEB/web/vendor/." web/vendor/
+    echo "copied tree-sitter assets → web/vendor/"
+  fi
+else
+  echo "note: $WEB not found — skipping syntax-highlighter assets (plain rendering)"
+fi
 
 echo
 echo "built dist/eh.mjs — run the harness:  node harness.mjs"

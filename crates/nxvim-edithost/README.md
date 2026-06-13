@@ -29,15 +29,17 @@ they live in the browser's Origin Private File System (OPFS, Phase 6a):
 - ❌ Processes — `vim.fn.system` / `nx._system` fail loud with a named "not available in
   the browser build yet" (`WasmBlockingSystem`); the async spawn path (`LoopOp::Spawn`)
   likewise echoes loud. The Phase 6 daemon over WebTransport re-enables them.
-- ❌ LSP and native treesitter — gated off the build (slice 5a); `:TSInstall` echoes a
-  loud "not available in the browser build yet". (Treesitter highlighting is done
-  JS-side in `nxvim-web`.)
+- ❌ LSP and **native** treesitter — gated off the build (slice 5a); `:TSInstall` echoes
+  a loud "not available in the browser build yet". Syntax **highlighting** is still
+  present: done JS-side in the UI thread via web-tree-sitter (`web/highlight.js` + the
+  `web/vendor/` grammars), exactly as `nxvim-web` does — the Worker ships the focused
+  buffer's text with each frame and the page parses + colors it.
 
 ## Interop
 
 emscripten `ccall`/`cwrap` over the `#[no_mangle] extern "C"` exports in `src/lib.rs`
-(`eh_new` / `eh_input` / `eh_attach` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` /
-the OPFS fs leg `eh_take_fs_requests` / `eh_save_bytes` / `eh_save_len` /
+(`eh_new` / `eh_input` / `eh_input_mouse` / `eh_attach` / `eh_exec_lua` / `eh_redraw_json`
+/ `eh_lines` / the OPFS fs leg `eh_take_fs_requests` / `eh_save_bytes` / `eh_save_len` /
 `eh_fs_read_complete` / `eh_fs_write_complete` / `eh_free*`) — **not** wasm-bindgen
 (that's `nxvim-web`'s `unknown-unknown` build). The
 redraw comes back as a JSON return value. Slice 5c runs these exports **inside a Web
@@ -54,15 +56,24 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
   `Atomics.wait` against an SAB input ring, waking on a keystroke **or** the next timer
   deadline; otherwise (5c) it is `postMessage`-driven (input works, timers don't fire).
   The latest `redraw` frame + buffer lines post back to the UI either way.
-- `web/index.html` — the UI thread: renders the server `redraw` frame into a character
-  grid (mirroring the native TUI layout), translates keystrokes to vim key-notation, picks
-  the SAB or postMessage transport by capability, and exposes `window.__nxvim` (`feed` /
-  `execLua` / `attach` / `lines` / `frame` / `cursor` / `cmdline` / `sab` / …) for automation.
+- `web/index.html` — the UI thread: the **DOM renderer** (the same per-cell-span renderer
+  `nxvim-web` uses — windows/gutter/status/tabline/panel/pmenu, selection + cursor-shape
+  classes, smooth scroll), driven off the server `redraw` frame; it translates keystrokes
+  to vim key-notation and mouse gestures to `eh_input_mouse`, picks the SAB or postMessage
+  transport by capability, and exposes `window.__nxvim` (`feed` / `mouse` / `execLua` /
+  `attach` / `lines` / `frame` / `cursor` / `cmdline` / `sab` / …) for automation.
+- `web/highlight.js` — the client-side web-tree-sitter highlighter (copied from
+  `nxvim-web`); its grammars/runtime are generated into `web/vendor/` by `build.sh`
+  (gitignored). The import is optional — the renderer degrades to plain text if absent.
 - `web/serve.mjs` — a cross-origin-isolated dev server (COOP/COEP/CORP), so the page can
   use a `SharedArrayBuffer`. `crossOriginIsolated === true`.
 - `web/verify.mjs` — the Playwright verifier: drives the real wasm edit-host in a real
   headless Chromium through `window.__nxvim` and asserts buffer / cursor / redraw, **and**
-  that a deferred timer fires unattended via the SAB park.
+  that a deferred timer fires unattended via the SAB park (plus the OPFS round-trip).
+- `web/verify-ui.mjs` — the renderer/input verifier: asserts the DOM renderer (not a
+  `<pre>`), the command-line-below-status-line layout, visual-mode selection painting,
+  cursor-shape-by-mode, mouse click / drag-select / wheel-scroll, and tree-sitter
+  highlight colors — all in a real headless browser.
 
 > **Note (not a gap, and not wasm-specific):** the Lua `vim.api.nvim_buf_*` *mutation*
 > surface (`nvim_buf_set_lines` / `set_text` / `set_name`, `nvim_open_win`,
@@ -83,8 +94,13 @@ node harness.mjs   # node smoke test: feeds `ihello<Esc>`, asserts lines + a rea
 # the browser shell:
 cd web && npm install        # playwright (once); plus `npx playwright install chromium`
 node serve.mjs               # open http://localhost:8088/web/  to use the editor
-node verify.mjs              # headless-browser proof of slices 5c+5d (PW_CHROMIUM overrides the binary)
+node verify.mjs              # headless-browser proof of the editor/transport/OPFS contract
+node verify-ui.mjs           # headless-browser proof of the renderer/mouse/selection/highlighting
 ```
+
+`build.sh` also copies the web-tree-sitter highlighter assets into `web/vendor/`
+(generating them once in the sibling `nxvim-web` crate, which owns the pinned grammar
+deps). Highlighting is optional: skip it and the renderer falls back to plain text.
 
 ## Serving in production
 

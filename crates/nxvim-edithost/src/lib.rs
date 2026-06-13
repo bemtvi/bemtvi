@@ -273,6 +273,35 @@ pub unsafe extern "C" fn eh_input(h: *mut WasmEditHost, notation: *const c_char)
     handle.host.feed(as_str(notation));
 }
 
+/// Apply a mouse gesture through the real tick and project the resulting frame — the
+/// `nvim_input_mouse` counterpart of [`eh_input`]. `button`/`action`/`modifier` are the
+/// `nvim_input_mouse` strings (`"left"`/`"wheel"`, `"press"`/`"drag"`/`"release"`/`"up"`/
+/// `"down"`, `"CS"`…) and `row`/`col` the 0-based global screen cell; core owns the
+/// hit-test (single-grid). The Worker sets the clock ([`eh_set_clock`]) before this call
+/// so multi-click timing is right.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `button`/`action`/`modifier` valid
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn eh_input_mouse(
+    h: *mut WasmEditHost,
+    button: *const c_char,
+    action: *const c_char,
+    modifier: *const c_char,
+    row: usize,
+    col: usize,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    handle.host.mouse(
+        as_str(button),
+        as_str(action),
+        as_str(modifier),
+        row,
+        col,
+    );
+}
+
 /// Re-attach the UI at a new `cols` × `rows` size (the resize path) and repaint — the
 /// browser fires this on window resize so the redraw projects into the new grid. A
 /// no-op-shaped wrapper over [`EditHost::attach_ui`], which both sizes the grid and

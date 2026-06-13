@@ -19,6 +19,7 @@ const M = await createModule();
 
 const eh_new = M.cwrap("eh_new", "number", []);
 const eh_input = M.cwrap("eh_input", null, ["number", "string"]);
+const eh_input_mouse = M.cwrap("eh_input_mouse", null, ["number", "string", "string", "string", "number", "number"]);
 const eh_attach = M.cwrap("eh_attach", null, ["number", "number", "number"]);
 const eh_set_clock = M.cwrap("eh_set_clock", null, ["number", "number"]);
 const eh_next_deadline = M.cwrap("eh_next_deadline", "number", ["number"]);
@@ -208,7 +209,8 @@ async function fulfillFsRequests() {
 //   notifies; WRITE/READ are monotonic byte cursors (mod 2^32) into the data ring.
 // data: Uint8Array ring. Frames are [type:u8][reqId:u32][len:u32][payload:len]:
 //   type 0 = feed (payload = vim notation), 1 = exec_lua (payload = code),
-//   2 = attach (payload = cols:u32, rows:u32).
+//   2 = attach (payload = cols:u32, rows:u32),
+//   3 = mouse (payload = JSON {b:button, a:action, m:modifier, r:row, c:col}).
 // =============================================================================
 const SEQ = 0, WRITE = 1, READ = 2;
 
@@ -238,6 +240,11 @@ async function runLoopSAB(ctrl, data) {
         results.push([reqId, readStr(eh_exec_lua(h, utf8(payload)))]);
       } else if (type === 2) {
         eh_attach(h, rdU32Bytes(payload, 0), rdU32Bytes(payload, 4));
+      } else if (type === 3) {
+        // The clock was set to now before this drain, so the mouse stamp drives
+        // 'mousetime' multi-click detection off the same JS clock as input.
+        const m = JSON.parse(utf8(payload));
+        eh_input_mouse(h, m.b, m.a, m.m, m.r | 0, m.c | 0);
       }
       acks.push(reqId);
     }
@@ -310,6 +317,13 @@ onmessage = async (ev) => {
       break;
     case "feed":
       eh_input(h, String(msg.notation));
+      await fulfillFsRequests();
+      postFrame(msg.id);
+      break;
+    case "input_mouse":
+      // Stamp from the JS clock so multi-click timing matches the keystroke tick.
+      eh_set_clock(h, nowMs());
+      eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
       postFrame(msg.id);
       break;

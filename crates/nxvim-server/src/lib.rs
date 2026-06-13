@@ -702,6 +702,24 @@ impl EditHost {
         self.redraw();
     }
 
+    /// Apply a mouse gesture and repaint — the wasm Worker's `eh_input_mouse` tick.
+    /// `button`/`action`/`modifier` are the `nvim_input_mouse` strings and `row`/`col`
+    /// the 0-based global screen cell; core owns the hit-test, multi-click word/line
+    /// selection, drag-select, and wheel scroll, exactly as the native dispatch path
+    /// does. The event is stamped from the Worker's JS clock ([`set_clock`](Self::set_clock),
+    /// which the Worker sets before this call) so `'mousetime'` multi-click detection
+    /// works. A malformed gesture surfaces a loud message rather than a silent no-op.
+    pub fn mouse(&mut self, button: &str, action: &str, modifier: &str, row: usize, col: usize) {
+        match nxvim_core::MouseEvent::parse(button, action, modifier, row, col) {
+            Ok(mut ev) => {
+                ev.stamp_ms = self.clock_ms;
+                self.editor.mouse(ev);
+            }
+            Err(err) => self.editor.message = err,
+        }
+        self.redraw();
+    }
+
     /// Execute a Lua chunk through the **real** effects path (the queued `vim.cmd`s,
     /// highlights, and deferred work a chunk produces are applied exactly as a `:lua`
     /// from the keystroke tick would be), then project a frame. Returns the eval result

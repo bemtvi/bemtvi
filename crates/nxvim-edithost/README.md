@@ -52,11 +52,13 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
   headless Chromium through `window.__nxvim` and asserts buffer / cursor / redraw, **and**
   that a deferred timer fires unattended via the SAB park.
 
-> **Known v1 gap (not timer-related):** the `vim.api.nvim_buf_*` *mutation* surface
-> (`nvim_buf_set_lines`, …) is not wired into the serverless wasm build yet — it reads as
-> `nil`. Buffer editing through keystrokes / ex-commands / `vim.cmd` works; the
-> programmatic buffer-write API a plugin would use does not. A follow-up, tracked in the
-> Phase 5 plan.
+> **Note (not a gap, and not wasm-specific):** the Lua `vim.api.nvim_buf_*` *mutation*
+> surface (`nvim_buf_set_lines` / `set_text` / `set_name`, `nvim_open_win`,
+> `nvim_create_buf`, `nvim_feedkeys`, …) reads as `nil` here — but **by design, in every
+> build**: nxvim's config API is autocmds / diagnostics / keymaps / options, not entity
+> mutation (see `crates/nxvim-lua/src/prelude/api.lua`'s header). The *read* getters
+> (`nvim_buf_get_lines`, …) and extmarks do exist. Mutate a buffer via keystrokes /
+> ex-commands / `vim.cmd`.
 
 ## Build & run
 

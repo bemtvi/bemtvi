@@ -1967,12 +1967,15 @@ input** (only the Worker's park timeout could have fired it); and a self-resched
 message-line redraw flake — passes in isolation; my Rust is all `cfg(not(native))`, so the
 native binary is unchanged); clippy clean on native + the `--no-default-features` wasm subset.
 
-> **Follow-up surfaced here (orthogonal to 5d, deliberately not chased in it):** the
-> `vim.api.nvim_buf_*` *mutation* surface (`nvim_buf_set_lines`, …) reads as `nil` in the
-> serverless wasm build — keystroke / ex-command / `vim.cmd` editing works, but the
-> programmatic buffer-write API a plugin would call does not. Per *no silent stubs* it
-> errors (calling `nil`) rather than no-op'ing, but a loud "not available" message + actually
-> wiring the buffer-write ops into the wasm tick is a Phase 5 follow-up.
+> **Clarification (not a 5d gap):** while writing the timer test the `vim.api.nvim_buf_*`
+> *mutation* surface (`nvim_buf_set_lines`, …) showed up as `nil` — but that is **by
+> design and project-wide** (native *and* wasm load the same `prelude/api.lua`, whose
+> header declares the mutating entity surface — `nvim_buf_set_lines`/`set_text`/`set_name`,
+> `nvim_open_win`, `nvim_win_set_*`, `nvim_create_buf`, `nvim_feedkeys`, `nvim_buf_attach`
+> — *intentionally absent*: nxvim's config API is autocmds / diagnostics / keymaps /
+> options, not entity mutation). The *read* getters + extmarks exist. So the 5d test
+> mutates via `vim.cmd` / keystrokes, which is the supported path — there is nothing to
+> "wire in." (An earlier draft of this note mis-filed it as a wasm follow-up; corrected.)
 
 #### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo` — ✅ DONE (2026-06-13)
 
@@ -2001,8 +2004,10 @@ shows no `nxvim-edithost-demo`, and `grep -r nxvim-edithost-demo` over the tree 
 this plan's historical narrative. **Phase 5 is complete** — the full Lua edit-host runs in
 the browser (core + Lua + autocmds + redraw + Worker-side timers), driven over SAB, served
 cross-origin-isolated; what remains browser-side is Phase 6 (the daemon over WebTransport
-for real files/processes/LSP) and the documented v1 gaps (the `vim.api.nvim_buf_*` write
-surface; LSP + native treesitter).
+for real files/processes/LSP) and the v1 feature gaps that are genuinely *gated out* of the
+wasm build (LSP + native treesitter). (The `vim.api.nvim_buf_*` *write* surface being `nil`
+is **not** one of these — it is intentionally absent in every build by the nx.* config-API
+design; see the slice-5d clarification above.)
 
 > **Toolchain prerequisite (now provisioned).** Slices 5b–5e — and the wasm half of 5a —
 > require the emscripten SDK (`emcc`, at `/usr/lib/emscripten`), the

@@ -476,6 +476,66 @@ async fn visual_scroll_band_carries_the_maximal_selection_extent() {
 }
 
 #[tokio::test]
+async fn search_next_animates_the_jump_to_an_offscreen_match() {
+    // `n` is a navigation, so a jump to an off-screen match scrolls the viewport
+    // and animates — like the explicit scrolls. (The committed `/pattern<CR>` runs
+    // in command mode and is left crisp; only `n`/`N` from normal mode animate.)
+    let body: String = (0..100)
+        .map(|i| if i == 4 || i == 89 { "needle\n" } else { "x\n" })
+        .collect();
+    let path = write_temp("nsearch", "txt", &body);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // First match is on line 5 (on screen); the committed search itself isn't animated.
+    let _ = redraw_after(&rpc, &mut incoming, "/needle<CR>").await;
+    // `n` jumps to the far match on line 90 — off screen, so the slide animates.
+    let map = scroll_after(&rpc, &mut incoming, "n").await;
+    assert_eq!(
+        scroll_u64(&map, "to_cursor"),
+        89,
+        "n lands on line 90 (index 89)"
+    );
+}
+
+#[tokio::test]
+async fn jumplist_navigation_animates_the_scroll() {
+    // `<C-o>`/`<C-i>` walk the jumplist; landing off screen scrolls and animates.
+    let path = write_n_lines("jumpscroll", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // `G` jumps to the last line (recording line 1) and scrolls there.
+    let _ = scroll_after(&rpc, &mut incoming, "G").await;
+    // `<C-o>` returns to the pre-jump line 1 — a jump back up the file, animated.
+    let back = scroll_after(&rpc, &mut incoming, "<C-o>").await;
+    assert_eq!(scroll_u64(&back, "to_cursor"), 0, "<C-o> returns to line 1");
+    // `<C-i>` walks forward again to the last line, animated.
+    let fwd = scroll_after(&rpc, &mut incoming, "<C-i>").await;
+    assert_eq!(
+        scroll_u64(&fwd, "to_cursor"),
+        99,
+        "<C-i> returns to the last line"
+    );
+}
+
+#[tokio::test]
+async fn changelist_navigation_animates_the_scroll() {
+    // `g;` steps to an older change; when it's off screen the viewport slides.
+    let path = write_n_lines("changescroll", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // A change low in the file, then one near the bottom (leaving the cursor there).
+    feed(&rpc, "5Gx");
+    feed(&rpc, "90Gx");
+    // `g;` jumps back to the older change on line 5 — off screen now, so it animates.
+    let map = scroll_after(&rpc, &mut incoming, "g;").await;
+    assert_eq!(
+        scroll_u64(&map, "to_cursor"),
+        4,
+        "g; lands on the line-5 change"
+    );
+}
+
+#[tokio::test]
 async fn page_down_acts_like_ctrl_d() {
     let path = write_n_lines("pgdn", 100);
     let (rpc, mut incoming) = start(Some(path)).await;

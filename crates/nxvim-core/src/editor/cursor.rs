@@ -250,7 +250,6 @@ impl Editor {
         if new_top == self.top {
             return false;
         }
-        self.scroll_from = Some((self.top, self.cursor.line));
         self.top = new_top;
         true
     }
@@ -277,11 +276,10 @@ impl Editor {
     }
 
     /// Scroll the viewport by `delta` lines, vim-style: move both `top` and the
-    /// cursor together so the cursor keeps its screen row. Records the pre-move
-    /// `(top, cursor.line)` in `scroll_from`; `input` turns that into a
-    /// `PendingScroll` if `top` actually changed.
+    /// cursor together so the cursor keeps its screen row. The pre-move viewport is
+    /// snapshotted by [`input`](Self::input), which turns it into a `PendingScroll`
+    /// once `top` has moved more than a line.
     fn scroll_by(&mut self, delta: i64) {
-        self.scroll_from = Some((self.top, self.cursor.line));
         let last = self.last_line() as i64;
         self.top = (self.top as i64 + delta).clamp(0, last) as usize;
         self.move_vertical(delta, false);

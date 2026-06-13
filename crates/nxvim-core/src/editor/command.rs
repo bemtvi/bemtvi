@@ -979,7 +979,6 @@ impl Editor {
                     if self.pending.operator.is_some() {
                         self.edit_each_cursor(|ed| ed.apply_motion_once(m));
                     } else {
-                        self.scroll_from = Some((self.top, self.cursor.line));
                         self.for_each_cursor(|ed| ed.apply_motion_once(m));
                     }
                     self.reset_pending();
@@ -1373,13 +1372,12 @@ impl Editor {
     }
 
     /// Apply a resolved motion: as an operator's range if one is pending,
-    /// otherwise as plain cursor movement (recording the pre-move position so
-    /// an off-screen jump animates its scroll, like the explicit scrolls).
+    /// otherwise as plain cursor movement. An off-screen jump animates its scroll
+    /// via the viewport snapshot [`input`](Self::input) takes around every command.
     fn apply_resolved_motion(&mut self, m: MotionResult) {
         if let Some(op) = self.pending.operator.take() {
             self.apply_operator(op, m);
         } else {
-            self.scroll_from = Some((self.top, self.cursor.line));
             self.apply_movement(m);
         }
         // A completed motion clears the whole pending command. (The old movement

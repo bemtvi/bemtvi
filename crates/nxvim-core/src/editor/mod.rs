@@ -1090,6 +1090,21 @@ impl Editor {
         // a fresh insert session, which resets the `".` last-insert accumulator.
         let was_insert = matches!(self.mode, Mode::Insert | Mode::Replace);
 
+        // Snapshot the viewport up front so *any* navigation keystroke that ends up
+        // moving it more than a line animates the slide (see
+        // [`finalize_scroll_gesture`](Self::finalize_scroll_gesture)) — explicit
+        // scrolls, motions, jumps (`<C-o>`/`<C-i>`), the change list (`g;`/`g,`),
+        // search (`n`/`N`), marks, … — captured once here rather than in each
+        // handler. Two things unset it before the gesture is built: an edit (the
+        // `changedtick` check below) keeps typing/deleting crisp, and a
+        // buffer/tab/window switch (which clears `scroll_from` itself) has no slide
+        // to play. Skipped in insert/command mode, where the viewport tracks typing
+        // or the incsearch preview and should stay crisp, not animate per keystroke.
+        let pre_tick = self.buffer().changedtick;
+        if !self.mode.is_insert() && self.mode != Mode::Command {
+            self.scroll_from = Some((self.top, self.cursor.line));
+        }
+
         // Dot-repeat recording. The *outer* call (not a `.` replay) records its
         // raw key stream from one normal/visual command boundary to the next; if
         // the command edited the buffer it becomes `last_change`, replayed by `.`.
@@ -1169,9 +1184,16 @@ impl Editor {
         }
         self.ensure_visible();
 
-        // If this key moved the viewport — an explicit scroll command, or a
-        // motion that jumped off-screen — record the gesture for the client to
-        // animate.
+        // Edits stay crisp: only a navigation that moved the viewport animates, so
+        // a keystroke that changed the buffer drops the snapshot taken above. (A
+        // buffer switch already cleared `scroll_from`; comparing its `changedtick`
+        // to the pre-dispatch one is then irrelevant — the snapshot is already gone.)
+        if self.buffer().changedtick != pre_tick {
+            self.scroll_from = None;
+        }
+        // Turn the surviving snapshot into a gesture when the viewport moved more
+        // than a line (an explicit scroll, or a motion/jump/search that landed
+        // off-screen); the client animates the slide.
         self.finalize_scroll_gesture();
     }
 

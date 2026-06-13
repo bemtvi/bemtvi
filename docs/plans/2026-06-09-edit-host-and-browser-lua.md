@@ -1926,18 +1926,53 @@ target) stay green; no workspace crate changed (the FFI lives in the workspace-e
 > doesn't pin this Playwright build's bundled-browser revision. With a clean
 > `npm install` + `npx playwright install chromium` it uses Playwright's own browser.
 
-#### Slice 5d — input + timers over `SharedArrayBuffer`
+#### Slice 5d — input + timers over `SharedArrayBuffer` — ✅ DONE (2026-06-13)
 
-The Worker's run loop parks on `Atomics.wait` against an SAB keyboard channel the UI
-fills (Phase 0 spike #3 — no Asyncify). The same park's `Atomics.wait` *timeout* is the
-next-due timer's deadline, so one mechanism is both the input wait and the
-`LoopEvent::Timer` wheel `evloop.rs` can't provide in-Worker (`vim.defer_fn` / `nx.timer`
-timers; timer-driven statusline refresh). It wakes on a keystroke or the timeout,
-runs the tick, and posts the redraw back.
+The Worker's run loop now parks on `Atomics.wait` against an SAB input ring the UI fills
+(Phase 0 spike #3 — no Asyncify), and the **same park's timeout is the next-due timer
+deadline**, so one mechanism is both the input wait and the `LoopEvent::Timer` wheel
+`evloop.rs` (tokio) can't provide in-Worker. It wakes on a keystroke or the timeout, fires
+due timers, runs the tick, and posts the redraw back.
 
-- **Exit (needs browser):** Playwright types keystrokes and lets a deferred timer fire
-  end to end — the second half of the exit criteria, proving the SAB input/timer loop
-  works live.
+Shipped:
+- **The Worker-side timer wheel** (`nxvim-server`, all `#[cfg(not(feature = "native"))]` —
+  the native build is byte-identical). [`EditHost`] gains a `WasmTimer { id, due_ms,
+  repeat_ms }` list + a JS clock, with `set_clock` / `next_timer_deadline` /
+  `fire_due_timers` and `arm_wasm_timer` / `stop_wasm_timer`. `fire_due_timers` runs each
+  due timer's Lua callback through the **real** effects path and repaints once; only timers
+  due *at entry* fire per pass (so a 0-delay self-re-arming timer can't spin the wheel), and
+  a repeating timer re-arms to `now + repeat_ms` *before* its callback runs.
+  `apply_loop_op`'s wasm branch now **arms/stops** these from `vim.defer_fn` / `nx.timer`
+  (the `LoopOp::TimerStart` / `TimerStop` it used to echo "not available" for); processes /
+  fs-watch (`vim.system` / `jobstart` / `vim.uv.spawn`) still echo loud (Phase 6 daemon).
+- **The cdylib FFI** (`nxvim-edithost`): `eh_set_clock` / `eh_next_deadline` /
+  `eh_tick_timers` (build.sh exports them).
+- **The Worker SAB loop** (`web/worker.mjs`): when the page is cross-origin isolated it
+  enters a blocking loop draining a framed byte ring (`[type:u8][reqId:u32][len:u32][payload]`;
+  feed / exec_lua / attach), fires due timers on every wake (`eh_tick_timers`), posts a
+  redraw out (posting out is never blocked), and parks with `eh_next_deadline - now` as the
+  `Atomics.wait` timeout. The clock is set to *now* before draining so a timer armed by the
+  batch dates from now. Falls back to the 5c `postMessage` path when SAB is unavailable.
+- **The UI transport** (`web/index.html`): picks SAB vs. postMessage by capability
+  (`crossOriginIsolated && SharedArrayBuffer`), writes framed input into the ring +
+  `Atomics.notify`, and resolves the `feed` / `execLua` / `attach` promises by `reqId`
+  carried back in the redraw's `acks` / `results`. `window.__nxvim.sab` reports the mode.
+
+**Exit criteria — met.** `web/verify.mjs` (real headless Chromium): all 5c checks still
+pass; the SAB input/timer loop is active (`__nxvim.sab === true`, cross-origin isolated); a
+one-shot `vim.defer_fn` rewrites the buffer **on its own** ~150 ms later with **no further
+input** (only the Worker's park timeout could have fired it); and a self-rescheduling
+`defer_fn` chain fires ≥5 times unattended. Native `cargo test --workspace` green (the lone
+`mouse_example_config_runs` miss under full-suite load is the documented load-sensitive
+message-line redraw flake — passes in isolation; my Rust is all `cfg(not(native))`, so the
+native binary is unchanged); clippy clean on native + the `--no-default-features` wasm subset.
+
+> **Follow-up surfaced here (orthogonal to 5d, deliberately not chased in it):** the
+> `vim.api.nvim_buf_*` *mutation* surface (`nvim_buf_set_lines`, …) reads as `nil` in the
+> serverless wasm build — keystroke / ex-command / `vim.cmd` editing works, but the
+> programmatic buffer-write API a plugin would call does not. Per *no silent stubs* it
+> errors (calling `nil`) rather than no-op'ing, but a loud "not available" message + actually
+> wiring the buffer-write ops into the wasm tick is a Phase 5 follow-up.
 
 #### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo`
 

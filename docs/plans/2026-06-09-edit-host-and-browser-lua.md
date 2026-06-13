@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs — `:e`/`:w` against the Origin Private File System — done; the WebTransport/QUIC daemon path remains) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs — `:e`/`:w` + the file explorer against the Origin Private File System — done; the WebTransport/QUIC daemon path remains) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2094,13 +2094,25 @@ isolation); clippy `-D warnings` clean on the native default **and** the
 `--no-default-features` wasm subset; fmt clean (incl. the excluded crate); the node
 `harness.mjs` smoke test still green.
 
-**Deferred to later Phase 6 slices (not stubbed):** the **OPFS file explorer** (a `:e
-<dir>` directory listing — `complete_fs_read` echoes loud for kind 2 today, exactly as 3d
-deferred the remote explorer to 3g); a watch leg (OPFS has no change-notification and the
-serverless editor is its sole writer, so there's nothing to reconcile); and the
-**WebTransport/QUIC daemon path** below (real remote files + processes + LSP) — the heavy
-half, which reuses the *same* off-tick `fs_fetch`/`fs_save` seam this slice exercised, only
-crossing a QUIC stream instead of OPFS.
+**The OPFS file explorer landed next (same slice family).** `:e <dir>` now lists a real
+OPFS directory (netrw), and descending / `../` / opening an entry navigate the browser's
+OPFS tree — the directory analogue of the file open, mirroring how Phase 3g added the
+remote explorer to the daemon read leg. The whole explorer (`enter_dir` /
+`explorer_open_entry` / `explorer_open_file`) was *already* off-tick-aware in core (it
+enqueues a `PendingOpen` and routes entry-is-dir off the listing's trailing `/`, no remote
+stat); the one missing piece was landing the entries — so the cdylib's `opfsRead`
+enumerates a directory (`FileSystemDirectoryHandle.entries()`) into
+`[{ is_dir, name }, …]`, the read reply gains a directory shape (`kind == 2`, the canonical
+dir + entries JSON), and `eh_fs_read_complete` routes it to a new
+`EditHost::complete_fs_read_dir` → `Editor::load_dir_into` (the wasm twin of the native
+`load_dir_replica`). Verified: `web/verify.mjs` lists `/xpl` (two files written via `:w`)
+and opens an entry with `gg j <CR>`, reading it back from OPFS.
+
+**Deferred to later Phase 6 slices (not stubbed):** a watch leg (OPFS has no
+change-notification and the serverless editor is its sole writer, so there's nothing to
+reconcile); and the **WebTransport/QUIC daemon path** below (real remote files + processes
++ LSP) — the heavy half, which reuses the *same* off-tick `fs_fetch`/`fs_save` seam this
+slice exercised, only crossing a QUIC stream instead of OPFS.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 

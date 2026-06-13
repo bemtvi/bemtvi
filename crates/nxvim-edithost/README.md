@@ -23,8 +23,9 @@ they live in the browser's Origin Private File System (OPFS, Phase 6a):
   the *synchronous* core `HostFs` without Asyncify — instead the editor runs in **off-tick
   fs** mode (`has_remote_fs() == true`) and the Worker fulfills `:e`/`:w` against OPFS
   *between* ticks (`eh_take_fs_requests` → `eh_fs_read_complete` / `eh_fs_write_complete`),
-  the same off-tick seam a daemon session uses, only the transport is OPFS. (The OPFS file
-  *explorer* — `:e <dir>` — is a later slice.)
+  the same off-tick seam a daemon session uses, only the transport is OPFS. `:e <dir>`
+  lists a real OPFS directory (the netrw-style explorer) and opening an entry reads it
+  back — the directory enumeration rides the same off-tick read reply (`kind == 2`).
 - ❌ Processes — `vim.fn.system` / `nx._system` fail loud with a named "not available in
   the browser build yet" (`WasmBlockingSystem`); the async spawn path (`LoopOp::Spawn`)
   likewise echoes loud. The Phase 6 daemon over WebTransport re-enables them.

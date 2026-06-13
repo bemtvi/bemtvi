@@ -830,19 +830,20 @@ impl EditHost {
         self.editor.set_host_fs_offtick(true);
     }
 
-    /// Apply a finished off-tick OPFS **read** the Worker fetched for `buffer` (the
+    /// Apply a finished off-tick OPFS **file** read the Worker fetched for `buffer` (the
     /// `:edit` / startup analogue of the native [`apply_open`](Self::apply_open), minus the
     /// daemon-only `FsRead` / watch machinery). `kind`: `0` = an existing file (`contents`
-    /// is its UTF-8 text), `1` = a not-yet-existing path (a new-file buffer, no bytes),
-    /// `2` = a directory (the in-browser explorer over OPFS is a later slice — echoed
-    /// loud, never a silent empty buffer), any other = a read error (`contents` carries
-    /// the message). Repaints once the buffer lands.
+    /// is its UTF-8 text), `1` = a not-yet-existing path (a new-file buffer, no bytes), any
+    /// other = a read error (`contents` carries the message). A **directory** read does not
+    /// arrive here — the cdylib routes it to [`complete_fs_read_dir`](Self::complete_fs_read_dir)
+    /// with its entries; a stray `kind == 2` here is a defensive loud echo, never a silent
+    /// empty buffer. Repaints once the buffer lands.
     pub fn complete_fs_read(&mut self, buffer: BufferId, path: String, kind: u8, contents: &str) {
         match kind {
             0 => self.load_replica_wasm(buffer, path, contents),
             1 => self.load_replica_wasm(buffer, path, ""),
             2 => self.editor.echo(format!(
-                "nxvim: opening a directory ({path}) in the browser is not supported yet"
+                "nxvim: directory read of {path} reached the file applier (use complete_fs_read_dir)"
             )),
             _ => self
                 .editor
@@ -864,6 +865,44 @@ impl EditHost {
         self.announced.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
+        self.push_buf_mirror();
+        self.emit_lifecycle_events();
+        self.run_pending();
+    }
+
+    /// Apply a finished off-tick OPFS directory listing into `buffer` — the wasm analogue
+    /// of the native `apply_open`'s `FsRead::Dir` arm (Phase 3g over the wire). The Worker
+    /// enumerated OPFS directory `dir` and hands back its `entries`; this turns `buffer`
+    /// into the read-only file-explorer listing (netrw), so `:e <dir>` and descending /
+    /// going up navigate the browser's OPFS tree exactly as a daemon session navigates the
+    /// remote tree. The whole explorer (`enter_dir` / `explorer_open_entry`) is already
+    /// off-tick-aware in core; this is the only piece that was missing. Repaints after.
+    pub fn complete_fs_read_dir(
+        &mut self,
+        buffer: BufferId,
+        dir: String,
+        entries: Vec<nxvim_core::DirEntry>,
+    ) {
+        self.load_dir_replica_wasm(buffer, dir, entries);
+        self.redraw();
+    }
+
+    /// Build the file-explorer listing of OPFS directory `dir` into `buffer` from the
+    /// off-tick enumeration — the directory analogue of [`load_replica_wasm`](Self::load_replica_wasm),
+    /// mirroring the native `load_dir_replica`: [`Editor::load_dir_into`](nxvim_core::Editor)
+    /// replaces the buffer with the listing (its `dir` marker routes keys to the explorer);
+    /// clearing `announced` lets the now-named buffer's `BufReadPost` fire. A directory has
+    /// no filetype, so no `FileType` work — just refresh the snapshot / mirror and drain.
+    fn load_dir_replica_wasm(
+        &mut self,
+        buffer: BufferId,
+        dir: String,
+        entries: Vec<nxvim_core::DirEntry>,
+    ) {
+        self.editor
+            .load_dir_into(buffer, PathBuf::from(&dir), entries);
+        self.announced.remove(&buffer);
+        let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "");
         self.push_buf_mirror();
         self.emit_lifecycle_events();
         self.run_pending();

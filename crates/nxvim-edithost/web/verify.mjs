@@ -186,6 +186,32 @@ try {
     `nx._system → ${JSON.stringify(sysOut)}`,
   );
 
+  // 11. Phase 6 (OPFS file explorer) — `:e <dir>` lists a real OPFS directory (netrw),
+  //     and opening an entry reads it back. Create two files under /xpl, then browse it.
+  await page.evaluate(() => window.__nxvim.feed("ggdGione<Esc>"));
+  await page.evaluate(() => window.__nxvim.feed(":w /xpl/one.txt<CR>"));
+  await page.evaluate(() => window.__nxvim.feed("ggdGitwo<Esc>"));
+  await page.evaluate(() => window.__nxvim.feed(":w /xpl/two.txt<CR>"));
+
+  // `:e /xpl` enumerates the directory over the off-tick seam and builds the listing.
+  await page.evaluate(() => window.__nxvim.feed(":e /xpl<CR>"));
+  const listing = await page.evaluate(() => window.__nxvim.lines());
+  check(
+    "opfs explorer: :e <dir> lists the OPFS directory entries",
+    listing.includes("one.txt") && listing.includes("two.txt") && listing.startsWith("../"),
+    `listing=${JSON.stringify(listing)}`,
+  );
+
+  // The listing is `../`, then `one.txt`, `two.txt` (sorted). `gg` to the top, `j` to
+  // `one.txt`, `<CR>` opens it — reading the file back from OPFS through the explorer.
+  await page.evaluate(() => window.__nxvim.feed("ggj<CR>"));
+  const opened = await page.evaluate(() => window.__nxvim.lines());
+  check(
+    "opfs explorer: <CR> on an entry opens the file (read back from OPFS)",
+    opened === "one",
+    `got ${JSON.stringify(opened)}`,
+  );
+
   await browser.close();
 } finally {
   cleanup();

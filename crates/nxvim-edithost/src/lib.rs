@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::rc::Rc;
 
-use nxvim_core::{BufferId, Editor, PendingSave};
+use nxvim_core::{BufferId, DirEntry, Editor, PendingSave};
 use nxvim_lua::{BlockingSystem, LuaRuntime, SystemOutput, SystemSpec};
 use nxvim_server::{EditHost, HostEffects};
 use rmpv::Value;
@@ -416,9 +416,10 @@ pub unsafe extern "C" fn eh_save_len(h: *mut WasmEditHost, seq: f64) -> usize {
 
 /// Land a finished off-tick OPFS **read** into `buffer`: `kind` is `0` an existing file
 /// (`contents` is its UTF-8 text), `1` a not-yet-existing path (new-file buffer), `2` a
-/// directory (loud "not supported yet"), any other a read error (`contents` is the
-/// message). Drives the real `BufReadPost` / `FileType` lifecycle and repaints — see
-/// [`EditHost::complete_fs_read`].
+/// **directory** (`path` is the canonical dir, `contents` is a JSON array of its entries
+/// `[{ "is_dir": bool, "name": str }, …]` → the file-explorer listing), any other a read
+/// error (`contents` is the message). Drives the real lifecycle and repaints — see
+/// [`EditHost::complete_fs_read`] / [`EditHost::complete_fs_read_dir`].
 ///
 /// # Safety
 /// `h` must come from [`eh_new`] and not yet be freed; `path` / `contents` valid C strings.
@@ -430,14 +431,37 @@ pub unsafe extern "C" fn eh_fs_read_complete(
     kind: u8,
     contents: *const c_char,
 ) {
-    if let Some(handle) = h.as_mut() {
-        handle.host.complete_fs_read(
-            BufferId(buffer.max(0.0) as u64),
-            as_str(path).to_string(),
-            kind,
-            as_str(contents),
-        );
+    let Some(handle) = h.as_mut() else { return };
+    let buffer = BufferId(buffer.max(0.0) as u64);
+    let path = as_str(path).to_string();
+    if kind == 2 {
+        handle
+            .host
+            .complete_fs_read_dir(buffer, path, parse_dir_entries(as_str(contents)));
+    } else {
+        handle
+            .host
+            .complete_fs_read(buffer, path, kind, as_str(contents));
     }
+}
+
+/// Parse a directory listing's entries — a JSON array `[{ "is_dir": bool, "name": str }, …]`
+/// the Worker built from the OPFS enumeration — into [`DirEntry`]s for the explorer. A
+/// malformed array / entry is skipped rather than failing the whole listing (the explorer
+/// degrades to the entries it could read, never a panic across the FFI boundary).
+fn parse_dir_entries(json: &str) -> Vec<DirEntry> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|e| {
+            let name = e.get("name")?.as_str()?.to_string();
+            let is_dir = e.get("is_dir").and_then(|b| b.as_bool()).unwrap_or(false);
+            Some(DirEntry { is_dir, name })
+        })
+        .collect()
 }
 
 /// Report a finished off-tick OPFS **write** of `seq`: `ok != 0` finalizes the buffer's

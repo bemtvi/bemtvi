@@ -86,13 +86,34 @@ async function opfsDir(parts, create) {
   return dir;
 }
 
-// Read `path` from OPFS → { kind, text }: kind 0 file (text = its UTF-8 contents), 1 a
-// not-yet-existing path (new-file buffer), 2 a directory, 3 an error (text = message).
-// A missing parent dir or missing file is "new" (the editor opens an empty buffer bound
-// to the name, savable later) — not an error.
+// Enumerate OPFS directory handle `dh` → a sorted-agnostic JSON array the editor's
+// explorer builder turns into a listing: [{ is_dir, name }, …]. The core listing builder
+// sorts (dirs first, case-insensitive) and prepends `../`, so order here is irrelevant.
+async function opfsDirEntries(dh) {
+  const entries = [];
+  for await (const [name, handle] of dh.entries()) {
+    entries.push({ is_dir: handle.kind === "directory", name });
+  }
+  return entries;
+}
+
+// Read `path` from OPFS → { kind, text, path? }: kind 0 file (text = its UTF-8 contents),
+// 1 a not-yet-existing path (new-file buffer), 2 a directory (text = its entries as JSON,
+// `path` = the canonical dir for the explorer), 3 an error (text = message). A missing
+// parent dir or missing file is "new" (the editor opens an empty buffer bound to the name,
+// savable later) — not an error.
 async function opfsRead(path) {
   const parts = splitPath(path);
-  if (parts.length === 0) return { kind: 3, text: "empty path" };
+  const canonicalDir = "/" + parts.join("/"); // "/" for the root
+  // The OPFS root itself (`:e /`) is a directory — enumerate it directly.
+  if (parts.length === 0) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      return { kind: 2, text: JSON.stringify(await opfsDirEntries(root)), path: "/" };
+    } catch (e) {
+      return { kind: 3, text: String(e) };
+    }
+  }
   const name = parts[parts.length - 1];
   let dir;
   try {
@@ -105,7 +126,15 @@ async function opfsRead(path) {
     fh = await dir.getFileHandle(name, { create: false });
   } catch (e) {
     if (e.name === "NotFoundError") return { kind: 1, text: "" };
-    if (e.name === "TypeMismatchError") return { kind: 2, text: "" }; // it's a directory
+    if (e.name === "TypeMismatchError") {
+      // It's a directory — enumerate it into an explorer listing.
+      try {
+        const dh = await dir.getDirectoryHandle(name, { create: false });
+        return { kind: 2, text: JSON.stringify(await opfsDirEntries(dh)), path: canonicalDir };
+      } catch (e2) {
+        return { kind: 3, text: String(e2) };
+      }
+    }
     return { kind: 3, text: String(e) };
   }
   try {
@@ -153,7 +182,9 @@ async function fulfillFsRequests() {
     didWork = true;
     for (const r of reqs.reads) {
       const res = await opfsRead(r.path);
-      eh_fs_read_complete(h, r.buffer, r.path, res.kind, res.text);
+      // A directory read carries its canonical dir in res.path (the explorer navigates
+      // from it); a file/new/err keeps the requested path.
+      eh_fs_read_complete(h, r.buffer, res.path ?? r.path, res.kind, res.text);
     }
     for (const w of reqs.writes) {
       // Copy the snapshot bytes out of wasm memory *before* the await — ALLOW_MEMORY_GROWTH

@@ -144,9 +144,11 @@ pub struct Highlights {
 const MAX_LINK_DEPTH: usize = 32;
 
 impl Highlights {
-    /// A fresh registry. nxvim ships no built-in colorscheme (the client owns
-    /// the no-theme fallback look), so this starts empty — `:hi clear` returns
-    /// here.
+    /// A fresh registry: empty until a colorscheme populates it. nxvim *does*
+    /// bundle a default scheme (`:colorscheme nxvim`, embedded in the server),
+    /// but it is opt-in like any other — nothing is loaded automatically, so the
+    /// client's no-theme fallback look governs until a scheme is selected.
+    /// `:hi clear` returns here.
     pub fn new() -> Self {
         Highlights::default()
     }

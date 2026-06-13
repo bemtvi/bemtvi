@@ -502,6 +502,100 @@ async fn a_loaded_colorscheme_paints_resolved_styles_truecolor() {
     );
 }
 
+// One Dark hex values the bundled `:colorscheme nxvim` sets, mirrored here as
+// the RGB the painted cells must carry once it loads (the same palette the GUI
+// and edit-host ship — proving the terminal reaches color parity).
+const ONEDARK_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
+const ONEDARK_KEYWORD: Color = Color::Rgb(0xc6, 0x78, 0xdd); // purple
+const ONEDARK_STRING: Color = Color::Rgb(0x98, 0xc3, 0x79); // green
+
+/// The bundled scheme, end to end through the real TUI: `:colorscheme nxvim`
+/// needs *no* runtimepath fixture (it's embedded in the binary), yet the real
+/// client paints the resolved One Dark styles — keyword foreground, string
+/// foreground, and the editor background.
+#[tokio::test]
+async fn the_builtin_nxvim_colorscheme_paints_one_dark_in_the_terminal() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    // `fn` is a keyword; `"hi"` is a string — both on row 0.
+    let file = temp_rs("builtin-theme", "fn main() { let s = \"hi\"; }\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // Wait for treesitter spans (painted in the fallback theme), then load the
+    // built-in scheme — note no runtimepath was seeded, unlike the catppuccin
+    // fixture test above.
+    wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first().is_some_and(|row| !row.is_empty())
+    })
+    .await;
+    feed(&rpc, ":colorscheme nxvim<CR>");
+
+    const GUTTER: u16 = 4; // hybrid number column, width 4 → text at col 4
+    let (params, buf) = paint_until(&rpc, &mut incoming, |buf| {
+        buf.cell((GUTTER, 0)).unwrap().style().fg == Some(ONEDARK_KEYWORD)
+    })
+    .await;
+
+    // The `fn` keyword paints purple, sitting on the Normal background.
+    let kw = buf.cell((GUTTER, 0)).unwrap().style();
+    assert_eq!(
+        kw.fg,
+        Some(ONEDARK_KEYWORD),
+        "the `fn` keyword paints purple"
+    );
+    assert_eq!(
+        kw.bg,
+        Some(ONEDARK_BG),
+        "themed text sits on the One Dark background"
+    );
+
+    // The string literal paints green.
+    let hl = highlights_of(&params);
+    let str_start = hl[0]
+        .iter()
+        .find(|(_, _, group)| group.split('.').next() == Some("string"))
+        .map(|(start, _, _)| *start as u16)
+        .expect("a string span on row 0");
+    assert_eq!(
+        buf.cell((GUTTER + str_start, 0)).unwrap().style().fg,
+        Some(ONEDARK_STRING),
+        "the string literal paints green"
+    );
+}
+
+/// The shipped `examples/colorscheme/` config, end to end: its `init.lua` calls
+/// `vim.cmd.colorscheme('nxvim')` at startup, so the very first painted frame of
+/// its sample buffer is already One Dark — guarding the example against bitrot.
+#[tokio::test]
+async fn the_colorscheme_example_config_themes_the_buffer() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let example = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/colorscheme"
+    ))
+    .canonicalize()
+    .expect("examples/colorscheme exists");
+    let file = example.join("sample.rs").to_string_lossy().into_owned();
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(example)).await;
+
+    // No `:colorscheme` is fed here — the example's init.lua loaded it. Row 0 of
+    // the sample is a `//` comment, so wait for it to paint in One Dark grey on
+    // the One Dark background, proving both the chrome and syntax themed at
+    // startup straight from the shipped config.
+    const ONEDARK_COMMENT: Color = Color::Rgb(0x5c, 0x63, 0x70);
+    const GUTTER: u16 = 4;
+    let (_, buf) = paint_until(&rpc, &mut incoming, |buf| {
+        buf.cell((GUTTER, 0)).unwrap().style().fg == Some(ONEDARK_COMMENT)
+    })
+    .await;
+    assert_eq!(
+        buf.cell((GUTTER, 0)).unwrap().style().bg,
+        Some(ONEDARK_BG),
+        "the example config paints its buffer on the One Dark background"
+    );
+}
+
 #[tokio::test]
 async fn the_scroll_animation_band_is_highlighted() {
     let _guard = test_lock().lock().await;

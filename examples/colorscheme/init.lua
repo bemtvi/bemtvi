@@ -1,0 +1,27 @@
+-- ~~~ nxvim's built-in colorscheme: `:colorscheme nxvim` ~~~
+--
+-- Run it (from the repo root) against the sample buffer:
+--
+--     NXVIM_CONFIG=examples/colorscheme \
+--       cargo run -p nxvim -- examples/colorscheme/sample.rs
+--
+-- nxvim ships its own One Dark colorscheme — the truecolor sibling of the look
+-- the GUI and the browser edit-host paint by default — so a plain terminal can
+-- reach the same colors with no plugin, no download, no config beyond this line:
+--
+--     vim.cmd.colorscheme('nxvim')
+--
+-- It's bundled in the binary (not sourced off the runtimepath), so this works
+-- on a fresh install. A user `colors/nxvim.lua` on the runtimepath still wins,
+-- so you can fork the palette by dropping your own file there.
+--
+-- TRY IT interactively:
+--   :colorscheme nxvim        load it live (already loaded by this config)
+--   :hi clear                 strip it back to the terminal's own colors
+--   :colorscheme nxvim        bring it back
+--
+-- The scheme needs a treesitter grammar installed to light up syntax; install
+-- the Rust parser once with `:TSInstall rust` (see examples/ts-install) so the
+-- keywords/strings/types above get their colors.
+
+vim.cmd.colorscheme('nxvim')

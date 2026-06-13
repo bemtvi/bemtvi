@@ -258,6 +258,68 @@ async fn colorscheme_missing_file_reports_e185() {
 }
 
 #[tokio::test]
+async fn builtin_nxvim_colorscheme_loads_with_no_runtime_file() {
+    // `:colorscheme nxvim` must work with an empty config dir — the scheme is
+    // bundled in the binary, not sourced off the runtimepath. It populates the
+    // registry (One Dark palette) and fires the ColorScheme autocmd like any
+    // file-backed scheme.
+    let dir = temp_dir("builtin_nxvim");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_autocmd('ColorScheme', \
+           { pattern = 'nxvim', callback = function(o) print('themed:' .. o.match) end })\n",
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("themed:nxvim"),
+        "the bundled scheme should fire the ColorScheme autocmd"
+    );
+    // Editor chrome (One Dark base) and a couple of syntax groups resolve.
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(hl_color(&normal, "fg"), Some(hex("abb2bf")));
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("282c34")));
+    let comment = get_hl(&rpc, "Comment").await;
+    assert_eq!(hl_color(&comment, "fg"), Some(hex("5c6370")));
+    assert!(hl_flag(&comment, "italic"), "Comment is italic in One Dark");
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "Keyword").await, "fg"),
+        Some(hex("c678dd"))
+    );
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "String").await, "fg"),
+        Some(hex("98c379"))
+    );
+    // The treesitter capture chain resolves through the bundled legacy groups.
+    let func = resolve_capture(&rpc, "function.call")
+        .await
+        .expect("@function.call resolves under the bundled scheme");
+    assert_eq!(hl_color(&func, "fg"), Some(hex("61afef")));
+}
+
+#[tokio::test]
+async fn user_colors_file_overrides_the_builtin_scheme() {
+    // A `colors/nxvim.lua` on the runtimepath shadows the bundled scheme — the
+    // runtimepath is searched first, the built-in is only the fallback.
+    let dir = temp_dir("override_nxvim");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("nxvim.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#ffffff', bg = '#000000' })\n",
+    )
+    .expect("write override colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(
+        hl_color(&normal, "bg"),
+        Some(hex("000000")),
+        "a user colors/nxvim.lua must win over the bundled scheme"
+    );
+}
+
+#[tokio::test]
 async fn hi_clear_empties_the_registry() {
     let dir = temp_dir("hiclear");
     let (rpc, mut incoming) = start_with_config(

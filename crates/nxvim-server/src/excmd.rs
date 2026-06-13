@@ -273,18 +273,26 @@ impl EditHost {
         if name.is_empty() {
             return; // `:colorscheme` with no arg is a query we don't surface yet
         }
-        let Some(path) = self.find_runtime_file(&format!("colors/{name}.lua")) else {
-            self.editor
-                .echo(format!("E185: Cannot find color scheme '{name}'"));
-            return;
-        };
-        let src = match std::fs::read_to_string(&path) {
-            Ok(src) => src,
-            Err(e) => {
-                self.editor
-                    .echo(format!("E185: Cannot read color scheme '{name}': {e}"));
-                return;
-            }
+        // A `colors/<name>.lua` on the runtimepath wins (so a user can shadow a
+        // bundled scheme); otherwise fall back to a scheme embedded in the
+        // binary, so `:colorscheme nxvim` works with zero config.
+        let src = match self.find_runtime_file(&format!("colors/{name}.lua")) {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(src) => src,
+                Err(e) => {
+                    self.editor
+                        .echo(format!("E185: Cannot read color scheme '{name}': {e}"));
+                    return;
+                }
+            },
+            None => match builtin_colorscheme(name) {
+                Some(src) => src.to_string(),
+                None => {
+                    self.editor
+                        .echo(format!("E185: Cannot find color scheme '{name}'"));
+                    return;
+                }
+            },
         };
         if let Err(e) = self.lua.exec(&src) {
             self.editor
@@ -354,6 +362,18 @@ impl EditHost {
         } else {
             self.editor.echo(out);
         }
+    }
+}
+
+/// The Lua source of a colorscheme bundled in the binary, by name, or `None`
+/// for an unknown name. These ship in the embedded `runtime/colors/` tree so
+/// `:colorscheme <name>` works with no user config (and on the wasm build,
+/// which has no filesystem). A user file on the runtimepath shadows these — the
+/// caller searches the runtimepath first.
+fn builtin_colorscheme(name: &str) -> Option<&'static str> {
+    match name {
+        "nxvim" => Some(include_str!("../runtime/colors/nxvim.lua")),
+        _ => None,
     }
 }
 

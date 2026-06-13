@@ -180,7 +180,7 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Mirror the blocking `vim._system`: a missing tool degrades to
+            // Mirror the blocking `nx._system`: a missing tool degrades to
             // `code = -1` with the message on stderr rather than raising, so an
             // async `vim.system` can never break a config on a machine lacking it.
             events.spawned(None);

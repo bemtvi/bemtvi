@@ -65,7 +65,7 @@ pub enum BuiltinAction {
 /// variant + one more arm — not an engine change.
 #[derive(Clone, Debug)]
 pub enum MappingRhs {
-    /// A Lua function RHS, keyed by id in `vim._keymap_fns`; the server runs it
+    /// A Lua function RHS, keyed by id in `nx._keymap_fns`; the server runs it
     /// via `LuaRuntime::run_keymap` and folds in the effects.
     Lua(u64),
     /// A string RHS already parsed to keys, with its `noremap` flag. A `noremap`
@@ -213,7 +213,7 @@ impl Trie {
 /// built from, and the withhold/replay buffer. One of these lives on the server.
 #[derive(Default)]
 pub struct Keymaps {
-    /// `vim._keymaps_version` the cached [`snapshot`](Self::snapshot) was last
+    /// `nx._keymaps_version` the cached [`snapshot`](Self::snapshot) was last
     /// pulled at. The server re-reads the registry only when the live version
     /// advances (checked once per batch).
     pub version: u64,
@@ -255,7 +255,7 @@ pub struct Keymaps {
 const MAX_MAP_DEPTH: usize = 100;
 
 impl Keymaps {
-    /// Cache a fresh registry snapshot (read when `vim._keymaps_version`
+    /// Cache a fresh registry snapshot (read when `nx._keymaps_version`
     /// advanced) and remember its version. Entries are sorted once into
     /// precedence order — **buffer-local > global**, within a scope **user
     /// (non-default) > default**, and among equals **last-set wins** — so

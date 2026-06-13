@@ -43,7 +43,7 @@ calls *into* Lua synchronously mid-keystroke (how `indentexpr=v:lua…` works) �
 nxvim's Lua bridge is a **snapshot + effect-queue** (`runtime.rs`, `nvim_api.lua`):
 
 - Before running a Lua chunk/callback, the server **pushes a snapshot** of buffer
-  state into Lua (`vim._bufs[bufnr] = { lines, name, loaded }`).
+  state into Lua (`nx._bufs[bufnr] = { lines, name, loaded }`).
 - Lua getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read **that
   snapshot**, not the live editor.
 - Lua mutations **queue effects** (`buf_ops`, `window_ops`, …) that the server
@@ -92,11 +92,11 @@ primitives it stands on. The required primitive surface (confirmed against
 upstream `languagetree.lua` / `query.lua` / `language.lua`) is small:
 
 ```text
-vim._create_ts_parser(lang)            -> TSParser userdata
-vim._ts_has_language(lang)             -> bool
-vim._ts_add_language(path, lang)       -> (via vim.treesitter.language.add)
-vim._ts_inspect_language(lang)         -> symbols/fields table (language.inspect)
-vim._ts_parse_query(lang, query_str)   -> TSQuery userdata
+nx._create_ts_parser(lang)            -> TSParser userdata
+nx._ts_has_language(lang)             -> bool
+nx._ts_add_language(path, lang)       -> (via vim.treesitter.language.add)
+nx._ts_inspect_language(lang)         -> symbols/fields table (language.inspect)
+nx._ts_parse_query(lang, query_str)   -> TSQuery userdata
 
 TSParser:  :parse(old_tree|nil, source, include_ranges?) -> {TSTree,...}
            :set_included_ranges(ranges)  :reset()  :_set_logger(...)
@@ -113,7 +113,7 @@ TSQuery:   query iteration consumed by query.lua's iter_captures/iter_matches
 
 **`source`** passed to `:parse()` is where the snapshot plugs in. neovim's C
 parser reads the buffer directly; ours reads the **pushed snapshot**
-(`vim._bufs[bufnr].lines`, or a literal string for `get_string_parser`). The
+(`nx._bufs[bufnr].lines`, or a literal string for `get_string_parser`). The
 adapter materializes the snapshot text and hands its bytes to tree-sitter's read
 callback — no live editor access required.
 
@@ -165,7 +165,7 @@ feature, reusing the existing `loader`/`Engine` internals:
   match `nxvim-lua`'s version + `lua51`). No new heavy dep; tree-sitter already
   present.
 - `nxvim-ts/src/lua.rs`: `pub fn install(lua: &mlua::Lua, data_dir: &Path)` —
-  registers the userdata types and the `vim._ts_*` / `vim._create_ts_parser`
+  registers the userdata types and the `nx._ts_*` / `nx._create_ts_parser`
   primitives onto the shared VM.
 - `nxvim-lua` gains a dep on `nxvim-ts` (feature `lua`) and calls
   `nxvim_ts::lua::install(&lua, …)` during runtime construction, then loads the
@@ -242,8 +242,8 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
 1. **Userdata + lifetime model.** ✅ **Done.** `nxvim-ts/src/lua.rs`: `TSNode`/
    `TSTree`/`TSQuery` userdata over tree-sitter with the `Rc<TreeInner>` erasure
    (the `Rc` co-owns the `Tree` *and* the `LoadedLanguage` whose dylib the node
-   types live in); the `vim._create_ts_parser` / `vim._ts_has_language` /
-   `vim._ts_parse_query` primitives; `TSParser:parse(source)` reading a
+   types live in); the `nx._create_ts_parser` / `nx._ts_has_language` /
+   `nx._ts_parse_query` primitives; `TSParser:parse(source)` reading a
    **string** and returning `(tree, changed_ranges)` (matching neovim's
    `parser_parse`, not the `{TSTree,…}` sketch above). The full upstream
    `TSNode` method surface is implemented so phases 2–3 vendor the Lua against no
@@ -256,12 +256,12 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
    missing-grammar loud error. *No high-level API yet — proves the hardest part.*
 2. **Vendor neovim treesitter Lua + `get_parser` over buffers.** ✅ **Done.**
    The vendored `vim/treesitter/*.lua` (plus the `vim.func` / `vim.F` /
-   `vim._core.util` / `vim.pos._util` helpers it stands on) is embedded under
+   `nx._core.util` / `vim.pos._util` helpers it stands on) is embedded under
    `crates/nxvim-lua/src/vendor/nvim/` and registered into `package.preload` by
    `runtime.rs` (hermetic — no runtime dependency on the `vendor/neovim`
-   submodule). `prelude/treesitter.lua` wires it: defines `vim._defer_require`,
+   submodule). `prelude/treesitter.lua` wires it: defines `nx._defer_require`,
    sets `vim.func`/`vim.F`, requires `vim.treesitter`, and adapts the two snapshot
-   seams — `TSParser:parse(bufnr)` reads `vim._bufs[bufnr].lines`, and a
+   seams — `TSParser:parse(bufnr)` reads `nx._bufs[bufnr].lines`, and a
    buffer-sourced `LanguageTree` re-reads that snapshot each `:parse()` (full
    reparse, no `nvim_buf_attach`). New primitives: `_ts_get_language_version` /
    `_ts_get_minimum_language_version` / `_ts_inspect_language` / parse-from-bufnr /
@@ -269,7 +269,7 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
 3. **Query surface.** ✅ **Done.** `query.parse` / `iter_captures` /
    `iter_matches`, predicates (`#eq?`, `#match?` via `vim.regex`, `#any-of?`, …),
    directives, and metadata all run via the vendored `query.lua`. The bespoke core
-   is `vim._create_ts_querycursor` + `TSQuery:inspect()`, ported from neovim's
+   is `nx._create_ts_querycursor` + `TSQuery:inspect()`, ported from neovim's
    `treesitter.c` over the raw tree-sitter cursor FFI so matches are returned
    **unfiltered** (predicate evaluation stays in Lua, bug-for-bug with upstream —
    the safe Rust iterator's text-predicate filtering would diverge on `#match?`'s
@@ -303,7 +303,7 @@ plus the one further bespoke piece — the unfiltered query cursor.
   `lua51`/`luajit` exclusivity rule).
 - **Vendored Lua reaching for absent `vim.*`** — upstream treesitter Lua may call
   `vim.func._memoize`, `vim.validate`, `vim.deprecate`, `vim.iter`, etc. Most
-  exist; any gap fails *loud* (`vim._notimpl`) per the no-silent-stubs rule and is
+  exist; any gap fails *loud* (`nx._notimpl`) per the no-silent-stubs rule and is
   filled as found, exactly like the lspconfig bring-up.
 - **Snapshot staleness** — a plugin that parses then reads stale lines sees the
   snapshot at chunk entry. This matches how every other nxvim Lua getter already

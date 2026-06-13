@@ -93,7 +93,7 @@ compatibility boundary* below).
 ### Plugins, manifests, and activation (why there is no plugin-manager plugin)
 
 A plugin is a directory with a cheap data-only manifest; code loads on first
-contribution hit (VS Code-style activation — the thing lazy.nvim approximates
+contribution hit (VS Code-style activation — the thing a plugin manager approximates
 from the outside, because neovim plugins cannot *declare* their triggers):
 
 ```lua
@@ -130,7 +130,7 @@ The ecosystem staples a daily driver needs, designed as providers. In every
 case the *hard* part is the server's job, in Rust, built once — and the
 plugin shrinks to data + small callbacks.
 
-### 1. Completion (the nvim-cmp shape) — native engine + sources
+### 1. Completion (the completion-menu shape) — native engine + sources
 
 The engine owns trigger detection (input path), debounce (evloop), source
 fan-out with generation tokens, fuzzy ranking (Rust), the menu +
@@ -210,7 +210,7 @@ nx.spawn { cmd = "git", args = { "branch", "--show-current" },
   end }
 ```
 
-### 3. Fuzzy finding (the telescope shape) — native picker + sources
+### 3. Fuzzy finding (the fuzzy-finder shape) — native picker + sources
 
 The picker UI is server-owned: prompt line, result list, preview pane
 (floats), fuzzy matching in Rust (nucleo-class), and **all navigation/typing

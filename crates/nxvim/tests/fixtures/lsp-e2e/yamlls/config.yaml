@@ -1,7 +1,0 @@
-name: nxvim
-# Deliberate error: `name` is defined twice. The YAML language server reports a
-# "duplicate key" diagnostic on this line.
-name: duplicate
-items:
-  - one
-  - two

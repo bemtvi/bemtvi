@@ -6,8 +6,8 @@ code-grounded direction, split out of
 [`2026-06-04-autocmd-lifecycle-design.md`](2026-06-04-autocmd-lifecycle-design.md)
 during its sanity check. Flesh it into a full phased plan before executing.
 
-**Depends on:** the autocmd lifecycle doc (Phases 1–2: `vim._fire` buffer args, the
-`vim._cur_buf` snapshot, `fire_autocmd_buf`/`set_buf_snapshot`).
+**Depends on:** the autocmd lifecycle doc (Phases 1–2: `nx._fire` buffer args, the
+`nx._cur_buf` snapshot, `fire_autocmd_buf`/`set_buf_snapshot`).
 **Consumer:** format-on-save (its own design; this only lays the pre-write seam).
 
 ## Why this is its own doc
@@ -60,7 +60,7 @@ Model `BufWritePre` the same way. Sketch:
    new queue (analogous to `deferred_commands`).
 2. **Server fulfills it** in the `run_pending` fixpoint (so a callback's queued
    `vim.cmd` / future buffer edits drain in the same loop): for each pending write,
-   push the `vim._cur_buf` snapshot, fire `BufWritePre` via `fire_autocmd_buf`, run
+   push the `nx._cur_buf` snapshot, fire `BufWritePre` via `fire_autocmd_buf`, run
    `apply_lua_effects()` so callback edits land on the buffer, **then** perform the
    write through a core method (e.g. `editor.do_write(id, path)`) that does the disk
    I/O, sets `saved_seq` (`editor.rs:3106`), and echoes the `"N L, B written"` line.

@@ -16,7 +16,7 @@
 > transparently. Phase 3 adds the **`vim.lsp.semantic_tokens` Lua surface** —
 > `start`/`stop`/`force_refresh`/`get_at_pos`, the editor-wide `enable` gate, and
 > `client.server_capabilities.semanticTokensProvider` — over a per-buffer enable
-> flag and a Rust→Lua token mirror; `highlight_token` stays a loud `vim._notimpl`
+> flag and a Rust→Lua token mirror; `highlight_token` stays a loud `nx._notimpl`
 > gap. The remaining gaps are the per-phase *approximations* below (one group per
 > cell, theme-gated, no `range`, `highlight_token`).
 
@@ -40,7 +40,7 @@ A real nvim setup paints them at priority `125`, just over the treesitter floor
 
 The fail-loud, no-silent-stub rule from the
 [LSP completion plan](2026-06-05-lsp-completion.md) applies: a part of the API we
-don't honor yet stays a documented approximation or raises through `vim._notimpl`
+don't honor yet stays a documented approximation or raises through `nx._notimpl`
 — never a silent no-op that looks like it worked.
 
 ## What's already in place (the seams these phases extend)
@@ -308,10 +308,10 @@ feature off per buffer or forces a refresh, and how an `on_attach` branches on
   reads truthy (Phase 1 already plumbs the bool; this exposes it to Lua).
 - `crates/nxvim-lua/src/prelude/lsp.lua` — `vim.lsp.semantic_tokens` table:
   `start(bufnr, client_id, opts)` / `stop(bufnr, client_id)` →
-  `vim._lsp_semantic(bufnr, on)` ops enabling/disabling the per-buffer projection;
+  `nx._lsp_semantic(bufnr, on)` ops enabling/disabling the per-buffer projection;
   `force_refresh(bufnr)` → re-request; `get_at_pos(bufnr, row, col)` → the cached
   token(s) under a position (read from the mirror). `highlight_token` (the
-  per-token highlight-customization callback) stays `vim._notimpl` for v1 — it
+  per-token highlight-customization callback) stays `nx._notimpl` for v1 — it
   needs a Lua callback on the decode hot path, out of scope — recorded as a loud
   gap.
 - `crates/nxvim-lua/src/ops.rs` + `crates/nxvim-server/src/lsp/sync.rs` — the
@@ -339,7 +339,7 @@ deep-customization hooks fail loud.
 **Done when.** ✅ `vim.lsp.semantic_tokens.start`/`stop`/`force_refresh`/`get_at_pos`
 drive the per-buffer projection from user Lua, `semanticTokensProvider` is readable
 on `client.server_capabilities`, an editor-wide gate disables the feature, and the
-genuinely-unimplemented `highlight_token` raises through `vim._notimpl` rather than
+genuinely-unimplemented `highlight_token` raises through `nx._notimpl` rather than
 no-op.
 
 The capability exposure threads `ProviderCaps.semantic_tokens` (Phase 1) →
@@ -357,11 +357,11 @@ round-trip, and `start` re-requests a cold cache); `force_refresh` →
 `Server::semantic_tokens_enabled` gate, re-requesting every attached buffer when
 flipped back on). Both `semantic_intervals` (the projection) and
 `request_semantic_tokens` consult the global gate and the per-buffer flag.
-`get_at_pos` reads a new Rust→Lua mirror `vim._semantic_tokens[bufnr]` (the
+`get_at_pos` reads a new Rust→Lua mirror `nx._semantic_tokens[bufnr]` (the
 diagnostics-mirror analogue): `on_semantic_tokens_reply` pushes the decoded tokens
 (`{ line, start_col, end_col, type, modifiers, client_id }`, byte columns) via
 `LuaRuntime::set_semantic_tokens` each reply, built from the `SemanticSpan`'s new
-`ty`/`mods` fields. `highlight_token` raises `vim._notimpl`. Verified by
+`ty`/`mods` fields. `highlight_token` raises `nx._notimpl`. Verified by
 `stop_hides_the_paint_and_start_restores_it` /
 `the_editor_wide_gate_off_hides_all_semantic_paint` /
 `force_refresh_re_issues_a_full_request` /
@@ -397,7 +397,7 @@ loud gap.
   `semanticTokens/range` (the viewport-scoped request neovim uses for huge files)
   is unsupported — the whole document is tokenized.
 - **`highlight_token` is a loud gap.** The per-token highlight-customization
-  callback raises `vim._notimpl` (it would put a Lua call on the decode path).
+  callback raises `nx._notimpl` (it would put a Lua call on the decode path).
 - **`update_in_insert`-equivalent is always on.** Tokens repaint as soon as a reply
   lands, including mid-insert; neovim can defer. Out of scope.
 

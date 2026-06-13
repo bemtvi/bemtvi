@@ -26,7 +26,7 @@ use crate::redraw::StyleTable;
 use crate::EditHost;
 
 /// Flatten the decoded per-line [`InlayHintSpan`]s into the flat
-/// [`InlayHintMirrorData`] list the `vim._inlay_hints` mirror holds (one entry per
+/// [`InlayHintMirrorData`] list the `nx._inlay_hints` mirror holds (one entry per
 /// hint, in line then column order), tagging each with the owning `client_id` — the
 /// shape `vim.lsp.inlay_hint.get` returns. A still-unresolved lazy hint (empty
 /// `text`) is omitted: it paints nothing and has no label to read yet.
@@ -153,7 +153,7 @@ impl EditHost {
 
         let state = self.lsp_states.get_mut(&buffer).expect("checked above");
         state.inlay.hints = by_line;
-        // Push the read mirror (`vim._inlay_hints`) and then resolve any lazy
+        // Push the read mirror (`nx._inlay_hints`) and then resolve any lazy
         // placeholders; a resolve reply refreshes the mirror again as it fills in.
         let mirror = inlay_mirror(&state.inlay, client_id);
         let _ = self.lua.set_inlay_hints(buffer.0, &mirror);

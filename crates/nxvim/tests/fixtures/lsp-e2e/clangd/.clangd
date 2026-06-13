@@ -1,5 +1,0 @@
-# Presence of this file makes the fixture directory a clangd project root (one of
-# clangd's `root_markers`), so the resolved root is this dir rather than an
-# ancestor. No options needed for the e2e diagnostic.
-CompileFlags:
-  Add: [-std=c11]

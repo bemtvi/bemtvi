@@ -39,7 +39,7 @@ Verified in the current tree before planning:
   `Option<Box<dyn Clipboard>>`, the server wires the OS clipboard. No purity
   violation.
 - **The Lua compat shims already exist as loud stubs.** `vim.fn.setreg` is a
-  `vim._notimpl("vim.fn.setreg")` placeholder
+  `nx._notimpl("vim.fn.setreg")` placeholder
   (`crates/nxvim-lua/src/prelude/fs.lua:275`) — there's a defined seam to fill,
   not a new surface to invent.
 

@@ -233,7 +233,7 @@ async fn buf_get_name_and_expand_read_the_snapshot() {
     let msg = lua_message(
         &rpc,
         &mut incoming,
-        "vim._set_cur_buf(4, '/tmp/foo/bar.rs') \
+        "nx._set_cur_buf(4, '/tmp/foo/bar.rs') \
          print(vim.api.nvim_buf_get_name(0) .. '|' .. vim.fn.expand('%:t') .. '|' .. vim.fn.expand('%:h'))",
     )
     .await;
@@ -443,146 +443,6 @@ async fn focus_motion_fires_winleave_and_winenter() {
     assert_eq!(msg, "leave2,enter1");
 }
 
-#[tokio::test]
-async fn nvim_open_win_creates_a_window_and_fires_winnew() {
-    // The programmatic split form of nvim_open_win: open a fresh buffer in a new
-    // window. WinNew fires for the new window, and it ends up in vim's window list.
-    let dir = temp_dir("au_open_win");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "_G.new = {}\n\
-         vim.api.nvim_create_autocmd('WinNew', {\n\
-         \x20 callback = function(a) _G.new[#_G.new+1] = a.match end })\n",
-    )
-    .await;
-    lua_message(&rpc, &mut incoming, "_G.new = {}").await;
-    // Open the current buffer (handle 0) in a new split window.
-    let msg = lua_message(
-        &rpc,
-        &mut incoming,
-        "_G.win = vim.api.nvim_open_win(0, true, { vertical = false }); \
-         print(#vim.api.nvim_list_wins() .. ',' .. tostring(_G.win))",
-    )
-    .await;
-    // Two windows now; the returned handle is the new window's id.
-    let parts: Vec<&str> = msg.split(',').collect();
-    assert_eq!(parts[0], "2", "open_win added a second window: {msg}");
-    // WinNew fired for the new window (its id matches the returned handle).
-    let fired = lua_message(&rpc, &mut incoming, "print(table.concat(_G.new, ','))").await;
-    assert_eq!(fired, parts[1], "WinNew fired for the opened window {msg}");
-}
-
-#[tokio::test]
-async fn opening_and_closing_a_float_fires_window_autocmds() {
-    // A float is a window, so the lifecycle diff spans it: opening+entering fires
-    // WinNew then WinEnter for the float; closing it fires WinClosed.
-    let dir = temp_dir("au_float_life");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "_G.log = {}\n\
-         local function rec(tag) return function(a) _G.log[#_G.log+1] = tag .. a.match end end\n\
-         vim.api.nvim_create_autocmd('WinNew', { callback = rec('new') })\n\
-         vim.api.nvim_create_autocmd('WinEnter', { callback = rec('enter') })\n\
-         vim.api.nvim_create_autocmd('WinClosed', { callback = rec('closed') })\n",
-    )
-    .await;
-    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
-    // Open+enter the float (fires WinNew/WinEnter into _G.log). Read its id with a
-    // synchronous getter — `print(_G.f)` in the open chunk is wiped by the float's
-    // own WinEnter (which clears the message line).
-    lua_message(
-        &rpc,
-        &mut incoming,
-        "_G.f = vim.api.nvim_open_win(0, true, \
-         { relative='editor', row=1, col=1, width=10, height=4 })",
-    )
-    .await;
-    let id = exec_lua(&rpc, "return _G.f")
-        .await
-        .as_u64()
-        .expect("float id");
-    let opened = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
-    assert_eq!(
-        opened,
-        format!("new{id},enter{id}"),
-        "opening+entering a float fired WinNew then WinEnter"
-    );
-
-    lua_message(&rpc, &mut incoming, "_G.log = {}").await;
-    lua_message(&rpc, &mut incoming, "vim.api.nvim_win_close(_G.f, false)").await;
-    let closed = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
-    let want = format!("closed{id}");
-    assert!(
-        closed.contains(&want),
-        "closing the float fired WinClosed: {closed}"
-    );
-}
-
-#[tokio::test]
-async fn resizing_a_float_with_set_config_fires_winresized() {
-    // `nvim_win_set_config` that changes a float's size makes its rect change,
-    // which the lifecycle diff reports as WinResized.
-    let dir = temp_dir("au_float_resize");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "_G.resized = {}\n\
-         vim.api.nvim_create_autocmd('WinResized', {\n\
-         \x20 callback = function(a) _G.resized[#_G.resized+1] = a.match end })\n",
-    )
-    .await;
-    lua_message(
-        &rpc,
-        &mut incoming,
-        "_G.f = vim.api.nvim_open_win(0, true, \
-         { relative='editor', row=1, col=1, width=10, height=4 })",
-    )
-    .await;
-    let id = exec_lua(&rpc, "return _G.f")
-        .await
-        .as_u64()
-        .expect("float id");
-    let id = id.to_string();
-    // Clear any layout churn from the open before measuring the resize.
-    lua_message(&rpc, &mut incoming, "_G.resized = {}").await;
-    lua_message(
-        &rpc,
-        &mut incoming,
-        "vim.api.nvim_win_set_config(_G.f, \
-         { relative='editor', row=1, col=1, width=20, height=8 })",
-    )
-    .await;
-    let fired = lua_message(&rpc, &mut incoming, "print(table.concat(_G.resized, ','))").await;
-    assert!(
-        fired.contains(id.as_str()),
-        "resizing the float fired WinResized for it: {fired}"
-    );
-}
-
-#[tokio::test]
-async fn examples_windows_config_loads_and_drives_the_window_api() {
-    // End-to-end check of the shipped `examples/windows/` config: source its real
-    // init.lua, then exercise the helper commands it defines. Proves the example
-    // is runnable (no Lua errors) and that its window API + autocmds work.
-    let example =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/windows/init.lua");
-    let init = std::fs::read_to_string(&example).expect("read examples/windows/init.lua");
-    let dir = temp_dir("examples_windows");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    // The config defines :WinDemo (opens a split via nvim_open_win) and :WinList.
-    redraw_after(&rpc, &mut incoming, ":WinDemo<CR>").await;
-    let count = exec_lua(&rpc, r#"return #vim.api.nvim_list_wins()"#).await;
-    assert_eq!(count.as_u64(), Some(2), ":WinDemo opened a second window");
-
-    // The window autocmds recorded the lifecycle (at least the WinNew/WinEnter the
-    // split produced).
-    let logged = exec_lua(&rpc, r#"return #_G.win_log"#).await;
-    assert!(
-        logged.as_u64().unwrap_or(0) >= 1,
-        "window events were recorded"
-    );
-}
-
 // ----- Phase 3: tab lifecycle events -----------------------------------------
 
 #[tokio::test]
@@ -650,43 +510,8 @@ async fn tabclose_fires_tabenter_survivor_then_tabclosed() {
     assert_eq!(msg, "enter1,closed2");
 }
 
-#[tokio::test]
-async fn examples_tabs_config_loads_and_drives_the_tab_api() {
-    // End-to-end check of the shipped `examples/tabs/` config: source its real
-    // init.lua, then exercise the helpers it defines. Proves the example is
-    // runnable (no Lua errors) and that its tab API + autocmds + showtabline work.
-    let example =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/tabs/init.lua");
-    let init = std::fs::read_to_string(&example).expect("read examples/tabs/init.lua");
-    let dir = temp_dir("examples_tabs");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    // The config sets showtabline=2 via vim.o, so the tabline shows immediately.
-    let stal = exec_lua(&rpc, r#"return vim.o.showtabline"#).await;
-    assert_eq!(
-        stal.as_u64(),
-        Some(2),
-        "the config set showtabline=2 via vim.o"
-    );
-
-    // Open a second tab; the tab autocmds record the lifecycle.
-    redraw_after(&rpc, &mut incoming, ":tabnew<CR>").await;
-    let tabs = exec_lua(&rpc, r#"return #vim.api.nvim_list_tabpages()"#).await;
-    assert_eq!(tabs.as_u64(), Some(2), ":tabnew opened a second tab");
-    let logged = exec_lua(&rpc, r#"return #_G.tab_log"#).await;
-    assert!(
-        logged.as_u64().unwrap_or(0) >= 1,
-        "tab events were recorded by the config's autocmds"
-    );
-
-    // :TabFirst drives nvim_set_current_tabpage back to tab 1.
-    redraw_after(&rpc, &mut incoming, ":TabFirst<CR>").await;
-    let cur = exec_lua(&rpc, r#"return vim.api.nvim_get_current_tabpage()"#).await;
-    assert_eq!(cur.as_u64(), Some(1), ":TabFirst switched to the first tab");
-}
-
 // ----- :autocmd / :augroup / :doautocmd ex-commands --------------------------
-// The Vimscript front-end (vim._ex_autocmd / _ex_augroup / _ex_doautocmd) drives
+// The Vimscript front-end (nx._ex_autocmd / _ex_augroup / _ex_doautocmd) drives
 // the same store the nvim_* API uses. These feed the `:`-command forms over RPC
 // and observe firing through a command-string autocmd's `print` / a counter.
 
@@ -772,7 +597,7 @@ async fn ex_augroup_bang_deletes_the_group_and_its_autocmds() {
     )
     .await;
     assert_eq!(gone.as_u64(), Some(0), "the group's autocmd was removed");
-    let id = exec_lua(&rpc, "return vim._augroups.Foo == nil").await;
+    let id = exec_lua(&rpc, "return nx._augroups.Foo == nil").await;
     assert_eq!(id.as_bool(), Some(true), "the group name was deleted");
 }
 

@@ -155,7 +155,7 @@ LSP transport, and the Lua-facing `nxvim_lua::LuaFs`) pointed at the daemon inst
 of the local disk. See
 [the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
 **split-brain filesystem rule** for the Lua bridge, decided up front: *project-facing*
-fs APIs (`vim.uv.fs_*`, `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
+fs APIs (`vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
 through the `LuaFs` seam — local disk by default, the remote daemon in a split — so
 file-picker previewers, root detection, and VCS-status providers see the *project*; while raw Lua
 `io.*`/`os.*`, `require`/`package.path`, the runtimepath (`nvim_get_runtime_file`), and
@@ -453,7 +453,7 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   `0` = current), `nvim_win_get_width`/`height` + setters, `nvim_win_close`,
   `nvim_win_get_config`/`nvim_win_get_position`, and `nvim_open_win` (both the
   split form and the float form). The Lua bindings follow the established "Lua
-  queues, core mutates" flow: window *reads* resolve against the `vim._wins`
+  queues, core mutates" flow: window *reads* resolve against the `nx._wins`
   mirror the server pushes before each Lua entry; window *mutations* queue a
   `WindowOp` drained into the core after the chunk.
 - **Floating windows.** A float is a `Window` the layout tree does **not** own: it
@@ -515,7 +515,7 @@ reserved top row the server's `relayout` subtracts — by the global `showtablin
 (0/1/2) through one `tabline_visible` check. The lifecycle diff fires
 `TabNew`/`TabLeave`/`TabEnter`/`TabClosed`, bracketing the window events
 (`TabLeave → WinLeave → … → WinEnter → TabEnter`); the `nvim_tabpage_*` reads
-resolve against a `vim._tabs` mirror and `nvim_set_current_tabpage` queues a
+resolve against a `nx._tabs` mirror and `nvim_set_current_tabpage` queues a
 `TabOp`, the same "Lua queues, core mutates" flow as windows. (Design:
 [`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md).)
 
@@ -600,7 +600,7 @@ window but simpler: a transient overlay that grabs input focus while open.
   `vim.panel.on_select(fn)`, or `want_select` on `nxvim_panel_open`): the
   built-in `:messages` viewer opts out, so a stale handler never fires on it.
   `:ls` itself rides this path — it opens its panel, then queues
-  `vim.panel.on_select(vim._panel_select_buffer)` (a prelude helper that parses
+  `vim.panel.on_select(nx._panel_select_buffer)` (a prelude helper that parses
   the buffer number off the selected line, jumps to it, and closes the list), so
   pressing `<CR>` on a listed buffer switches to it.
 - **The `[X]` is clickable.** A left-click on the title bar's close button
@@ -995,40 +995,19 @@ screen," and that is exactly the shape of these tests.
   built-ins fire instantly even under a colliding user prefix, via the shared
   command grammar `nxvim_core::command_status` the matcher consults) are in place
   — enough to run the real catppuccin colorscheme unmodified (see [*Lua*](#lua)).
-  So is the **`vim.lsp`/`vim.diagnostic` surface**: a server is configured and
-  started entirely from user Lua (`vim.lsp.config`/`vim.lsp.enable`, with the
-  built-in server table removed), `vim.lsp.buf.*` and `vim.diagnostic.*` drive the
-  native features, and `LspAttach`/`on_attach` wire buffer-local LSP keymaps off
-  `client.server_capabilities` — verified against the vendored nvim-lspconfig (see
-  the [LSP support design](specs/2026-06-02-lsp-support-design.md)).
-  **All ~400 vendored `lsp/<server>.lua` configs LOAD and START unmodified, and
-  the nxvim-side gap between merely *starting* a server and actually *driving* it
-  — the careful distinction the LSP completion plan tracked — is now closed (all
-  eight phases landed).** The config-resolution surface is real and
-  regression-tested (`crates/nxvim-lua/tests/lspconfig_configs.rs` loads every
-  config and resolves its `root_dir` + `cmd`): `vim.system`/`vim.json`/`vim.uv`
-  (`fs_stat`, `os_homedir`, `cwd`, `fs_realpath`, `os_uname`), the `vim.fn`
-  filesystem/process helpers (`executable`, `exepath`, `glob`, `resolve`,
-  `getpid`, …), `vim.fs.root` with neovim 0.11 priority-tier markers, `vim.iter`
-  over iterators, `vim.version`, `vim.tbl_get`/`tbl_flatten`, and the real
-  `lspconfig.util` framework module (required by ~33 configs). The many configs
-  whose `cmd` is a `function(dispatchers, config)` builder returning
-  `vim.lsp.rpc.start({argv}, …)` (ts_ls, eslint, jsonls, biome, tailwindcss, … —
-  20-plus) resolve to a real argv because nxvim does its own stdio spawning. Once
-  a server is up, the editing loop — `vim.lsp.buf.*`, `vim.diagnostic.*`, and
-  capability-gated `on_attach` keymaps — genuinely works.
-
-  Concretely, the config's `settings` / `init_options` / `capabilities` are
-  forwarded at `initialize`, the lifecycle hooks (`before_init` / `on_init` /
-  `on_exit`) fire, and the deferred-callback surface (`vim.lsp.util.*`,
-  `client:request`, `vim.ui.*`, the buffer/window getters) is real — see
-  [the LSP completion plan](plans/2026-06-05-lsp-completion.md) for the phase-by-phase route
-  it took from "starts" to "works". Two whole configs are skipped: gdscript (a non-stdio
-  TCP transport, `vim.lsp.rpc.connect`) and powershell_es (needs a user-only
-  `bundle_path`). (Per [ADR 0002](decisions/0002-native-plugin-system.md),
-  this vim-named control surface is donor code for `nx.lsp`: the native
-  client and the editing-loop features stay; the lspconfig-corpus spelling is
-  refactored into the `nx` API or deleted.)
+  The **LSP and diagnostics surface** is moving the same way. The vendored
+  nvim-lspconfig corpus (~400 `lsp/<server>.lua` configs) and the `vim.lsp` /
+  `vim.diagnostic` Lua compat layer (`prelude/lsp.lua`) — together with their
+  tests and fixtures — have been **removed** in the native-plugin-API cut. What
+  stays is the native LSP engine: the `nxvim-lsp` crate (client, protocol,
+  manager, transport) that does nxvim's own stdio spawning and drives the in-core
+  editing features. Per [ADR 0002](decisions/0002-native-plugin-system.md) the
+  control surface is the `nx.lsp` API's job — the native client and the
+  editing-loop features stay; the vim-named/lspconfig-corpus spelling is
+  refactored into the `nx` API or deleted. (Design background, describing the now
+  superseded vim-named route: the
+  [LSP support design](specs/2026-06-02-lsp-support-design.md) and the
+  [completion plan](plans/2026-06-05-lsp-completion.md).)
 
   **What does *not* work yet** is tracked canonically — both the *silent
   approximations* (a feature that looks whole but isn't) and the *loud gaps*
@@ -1036,8 +1015,8 @@ screen," and that is exactly the shape of these tests.
   no-silent-stubs rule) — in
   [**Known approximations & missing features**](known-approximations.md). That
   doc explains how to enumerate them straight from the code (`grep -rn
-  'INCOMPLETE:'` for approximations, the `vim._notimpl` raises / runtime
-  `vim._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
+  'INCOMPLETE:'` for approximations, the `nx._notimpl` raises / runtime
+  `nx._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — the bulk of vim's options beyond the handful
   nxvim honors (window-local `number`/`relativenumber` + the horizontal-scroll
   `sidescroll`/`sidescrolloff`, the buffer-local indentation options, and global
@@ -1066,24 +1045,24 @@ screen," and that is exactly the shape of these tests.
   [the search design](specs/2026-06-02-search-design.md) and
   `docs/plans/2026-06-07-substitute-command.md`.)
 - **Per-buffer user commands.** *Done.* `nvim_buf_create_user_command(buffer, …)`
-  stores into a per-bufnr registry (`vim._buf_user_commands[bufnr][name]`, the
-  command analogue of the buffer-local `vim._keymaps`): `vim._resolve_user_command`
+  stores into a per-bufnr registry (`nx._buf_user_commands[bufnr][name]`, the
+  command analogue of the buffer-local `nx._keymaps`): `nx._resolve_user_command`
   gives a buffer-local command precedence over a global of the same name and hides
   it from other buffers, dispatch routes through the editor's authoritative current
   bufnr, `nvim_buf_get_commands` returns a buffer's locals, and a wiped buffer's
-  locals (commands *and* keymaps) are purged via `vim._cleanup_buffer` so a reused
+  locals (commands *and* keymaps) are purged via `nx._cleanup_buffer` so a reused
   bufnr can't inherit them.
 - **An async Lua runtime (event loop).** *Landed* (see
   [the async-runtime plan](plans/2026-06-06-async-lua-runtime.md)). A `Send` background actor
   (`crates/nxvim-server/src/evloop.rs`, modeled on `LspManager`) owns timers and
   child processes; on completion it sends a typed `LoopEvent` back to the single
-  server thread, which runs the matching Lua callback by id (the `vim._cb_fns`
+  server thread, which runs the matching Lua callback by id (the `nx._cb_fns`
   registry, the keymap-callback shape applied to async work). `vim.schedule`
   defers to convergence, `vim.defer_fn` fires on wall-clock time, and
-  `vim.system`'s `on_exit` fires off-tick. The libuv **handle** surface
-  (`vim.uv.new_timer`/`new_check`/`new_fs_event`/`spawn`, the plugin event-loop
-  primitives) is **not** part of the `nx` model; the `vim.uv` scalars
-  and synchronous `fs_*` that the kept LSP-config / treesitter paths read stay.
+  `vim.system`'s `on_exit` fires off-tick. neovim's libuv-as-public-API surface
+  — `vim.uv` / `vim.loop`, both the **handle** primitives
+  (`new_timer`/`new_check`/`new_fs_event`/`spawn`) and the synchronous `fs_*` /
+  scalars — is **not** part of the `nx` model and is absent entirely.
   Async primitives are the `nx` API's job (`nx.spawn` / `nx.timer` / `nx.fs`) —
   the existing timer/process machinery is the donor for those
   ([ADR 0002](decisions/0002-native-plugin-system.md)).

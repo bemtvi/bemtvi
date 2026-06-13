@@ -141,7 +141,7 @@ pub struct ExtmarkMirror {
     pub priority: u32,
 }
 
-/// One highlight group's row in the Rust→Lua highlight mirror (`vim._hl_defs`),
+/// One highlight group's row in the Rust→Lua highlight mirror (`nx._hl_defs`),
 /// pushed when the core registry changes so `nvim_get_hl` reads live definitions.
 /// Colors ride as the `0xRRGGBB` integers neovim's API reports; a `link` group
 /// carries only `link` (its attrs are ignored, matching neovim), and the Lua side
@@ -152,7 +152,7 @@ pub struct HlDefMirror {
     /// mirror push, so it isn't part of the serialized row.
     #[serde(skip)]
     pub ns: u32,
-    /// The group name keys the mirror table (`vim._hl_defs[name]`), so it isn't a
+    /// The group name keys the mirror table (`nx._hl_defs[name]`), so it isn't a
     /// field of the serialized entry.
     #[serde(skip)]
     pub name: String,
@@ -178,7 +178,7 @@ pub struct HlDefMirror {
     pub link: Option<String>,
 }
 
-/// One buffer's row in the Rust→Lua buffer mirror (`vim._buffers[bufnr]`). `lines`
+/// One buffer's row in the Rust→Lua buffer mirror (`nx._buffers[bufnr]`). `lines`
 /// rides only on the ticks where the buffer changed (the server passes `None` to
 /// reuse the table already in Lua, the bulk the per-chunk push otherwise skips);
 /// `bufnr` is both the mirror key and a field the entry carries.
@@ -190,7 +190,7 @@ pub struct BufMirror {
     pub name: String,
 }
 
-/// One buffer's wired buffer-local options (`vim._bo_mirror[bufnr]`) read by
+/// One buffer's wired buffer-local options (`nx._bo_mirror[bufnr]`) read by
 /// `vim.bo` / `nvim_get_option_value`. `bufnr` keys the table, so it isn't a
 /// field of the serialized entry.
 #[derive(Clone, Debug, Serialize)]
@@ -221,7 +221,7 @@ pub struct BoMirror {
 /// `vim.treesitter` parser edits its trees and reparses incrementally. The
 /// row/col fields are *relative* deltas exactly as neovim's `on_bytes` reports
 /// them (see the server's `on_bytes_edit`, which builds these); the runtime
-/// forwards them verbatim to the prelude's `vim._buf_bytes_changed`.
+/// forwards them verbatim to the prelude's `nx._buf_bytes_changed`.
 #[derive(Clone, Debug)]
 pub struct BufBytesEdit {
     pub bufnr: u64,
@@ -237,7 +237,7 @@ pub struct BufBytesEdit {
     pub new_byte: u64,
 }
 
-/// The wired global options (`vim._go_mirror`) read by `vim.o`. Serialized as one
+/// The wired global options (`nx._go_mirror`) read by `vim.o`. Serialized as one
 /// flat table, so the awkward positional signature the hand-rolled setter carried
 /// becomes a single struct the caller fills by field name.
 #[derive(Clone, Debug, Serialize)]
@@ -258,7 +258,7 @@ pub struct GoMirror {
     /// unmodified buffer. Backs `vim.o.autoread`.
     pub autoread: bool,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
-    /// float-positioning plugin (telescope) can center its windows.
+    /// float-positioning plugin can center its windows.
     pub columns: u64,
     pub lines: u64,
 }
@@ -270,25 +270,32 @@ pub struct GoMirror {
 /// the editor-facing surfaces. `(chunk name, source)`; the name shows up in Lua
 /// tracebacks.
 const PRELUDE_MODULES: &[(&str, &str)] = &[
+    // Pure helpers first (nx.tbl / nx.list / nx.str / nx.iter + bit), then the VM
+    // runtime services (schedule / notify / callbacks).
     ("nxvim:prelude/stdlib", include_str!("prelude/stdlib.lua")),
     ("nxvim:prelude/runtime", include_str!("prelude/runtime.lua")),
-    (
-        "nxvim:prelude/nvim_api",
-        include_str!("prelude/nvim_api.lua"),
-    ),
+    // The Rust↔Lua mirror state, shared resolvers, context lock, and the scalar
+    // surfaces (variables / options / registers) the entity API reads.
+    ("nxvim:prelude/state", include_str!("prelude/state.lua")),
+    // The namespace / highlight / extmark surface (`nx.ns` / `nx.hl` / the extmark
+    // decoration layer) and the two current-handle getters the option/variable
+    // scopes read. Reads the mirror state / resolvers from state.lua above.
+    ("nxvim:prelude/api", include_str!("prelude/api.lua")),
+    // Autocmds / augroups / user commands / ex-command drivers / vim.cmd.
+    ("nxvim:prelude/autocmd", include_str!("prelude/autocmd.lua")),
     ("nxvim:prelude/keymap", include_str!("prelude/keymap.lua")),
-    ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
-    ("nxvim:prelude/system", include_str!("prelude/system.lua")),
-    ("nxvim:prelude/timer", include_str!("prelude/timer.lua")),
-    ("nxvim:prelude/lsp", include_str!("prelude/lsp.lua")),
+    // nx.timer (vim.defer_fn) over the event-loop bridge.
+    ("nxvim:prelude/ui", include_str!("prelude/ui.lua")),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
     ),
-    ("nxvim:prelude/compat", include_str!("prelude/compat.lua")),
+    // vim.fn editor-query read builtins (line / col / expand / pos / …) that read
+    // the state mirror; loads after the surfaces they build on.
+    ("nxvim:prelude/vimfn", include_str!("prelude/vimfn.lua")),
     // Loads last: the `nx.*` namespace's remaining surface (events, commands,
-    // async, treesitter). The variable/option/dispatch/keymap nouns are authored
-    // as `nx.*` directly in the chunks above, each aliasing `vim.*` onto itself.
+    // async). The variable/option/dispatch/keymap nouns are authored as `nx.*`
+    // directly in the chunks above, each aliasing `vim.*` onto itself.
     ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
 ];
 
@@ -324,7 +331,7 @@ pub(crate) struct Shared {
     pub(crate) window_ops: Vec<WindowOp>,
     /// Tab-page mutations from `vim.api.nvim_set_current_tabpage`, drained by the
     /// server into the live editor after the chunk (Phase 3). Reads resolve from
-    /// the `vim._tabs` mirror, so only the switch needs an op.
+    /// the `nx._tabs` mirror, so only the switch needs an op.
     pub(crate) tab_ops: Vec<TabOp>,
     /// Global-option writes from `vim.o` for a wired search option, drained by
     /// the server into the editor's global options after the chunk.
@@ -334,7 +341,7 @@ pub(crate) struct Shared {
     pub(crate) ts_ops: Vec<TsOp>,
     /// Register writes from `vim.fn.setreg`, drained by the server into the
     /// editor's register file after the chunk. Reads resolve from the
-    /// `vim._registers` mirror, so only the write needs an op.
+    /// `nx._registers` mirror, so only the write needs an op.
     pub(crate) reg_ops: Vec<RegisterSetOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
@@ -346,7 +353,7 @@ pub(crate) struct Shared {
     /// buffer and processed (through the mapping engine, or straight to the
     /// editor) after the chunk / off-tick settle.
     pub(crate) feedkeys: Vec<FeedKeysOp>,
-    /// The backend the **blocking** `vim._system` shell-out runs through. `None` (the
+    /// The backend the **blocking** `nx._system` shell-out runs through. `None` (the
     /// default) spawns the process locally
     /// ([`StdBlockingSystem`](crate::StdBlockingSystem)); a daemon session injects a
     /// blocking bridge ([`set_blocking_system`](LuaRuntime::set_blocking_system)) so a
@@ -370,7 +377,7 @@ pub(crate) struct Shared {
 /// Resolve the active [`LuaFs`](crate::LuaFs): the injected daemon bridge, or a
 /// persistent local [`StdLuaFs`](crate::StdLuaFs) lazily installed on first use (so the
 /// open-fd table outlives a single call). Project-facing `vim.uv`/`vim.fn` fs closures
-/// call this, mirroring how `vim._system` resolves `blocking_system`.
+/// call this, mirroring how `nx._system` resolves `blocking_system`.
 pub(crate) fn resolve_lua_fs(shared: &Rc<RefCell<Shared>>) -> Rc<dyn crate::LuaFs> {
     let mut sh = shared.borrow_mut();
     sh.lua_fs
@@ -444,13 +451,18 @@ impl LuaRuntime {
         self.lua.globals().get("vim")
     }
 
+    /// The `nx` global table — home of nxvim's private native bridge (`nx._*`).
+    fn nx(&self) -> mlua::Result<Table> {
+        self.lua.globals().get("nx")
+    }
+
     /// The runtimepath this VM searches (read by the colorscheme/`require`
     /// machinery to locate `colors/<name>.lua` and friends).
     pub fn runtimepath(&self) -> &[PathBuf] {
         &self.runtimepath
     }
 
-    /// Inject the backend the **blocking** `vim._system` runs through — the daemon's
+    /// Inject the backend the **blocking** `nx._system` runs through — the daemon's
     /// blocking bridge. Without this the default local spawn
     /// ([`StdBlockingSystem`](crate::StdBlockingSystem)) is used, so a bare/local
     /// session is unchanged. The server calls this once at startup when a daemon is
@@ -493,13 +505,13 @@ impl LuaRuntime {
         lua_to_rmpv(&value)
     }
 
-    /// Mirror a buffer's diagnostics into `vim._diagnostics[bufnr]` as the plain
+    /// Mirror a buffer's diagnostics into `nx._diagnostics[bufnr]` as the plain
     /// data `vim.diagnostic.get` reads back (the Rust→Lua state mirror). Called on
     /// every `publishDiagnostics`; keyed by `bufnr`, so it never goes stale on a
-    /// buffer switch (the getter resolves `0` → current via `vim._cur_buf`).
+    /// buffer switch (the getter resolves `0` → current via `nx._cur_buf`).
     pub fn set_diagnostics(&self, bufnr: u64, diags: &[DiagnosticData]) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let set: mlua::Function = vim.get("_set_diagnostics")?;
+        let nx = self.nx()?;
+        let set: mlua::Function = nx.get("_set_diagnostics")?;
         let list = self.lua.create_table()?;
         for (i, d) in diags.iter().enumerate() {
             let t = self.lua.create_table()?;
@@ -517,7 +529,7 @@ impl LuaRuntime {
         set.call((bufnr, list))
     }
 
-    /// Mirror a buffer's decoded semantic tokens into `vim._semantic_tokens[bufnr]`
+    /// Mirror a buffer's decoded semantic tokens into `nx._semantic_tokens[bufnr]`
     /// as the plain data `vim.lsp.semantic_tokens.get_at_pos` reads back (Phase 3,
     /// the diagnostics-mirror analogue). Called on every `semanticTokens/full`(/delta)
     /// reply; keyed by `bufnr`. Each entry's `modifiers` is both a list (legend
@@ -527,8 +539,8 @@ impl LuaRuntime {
         bufnr: u64,
         tokens: &[SemanticTokenData],
     ) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let set: mlua::Function = vim.get("_set_semantic_tokens")?;
+        let nx = self.nx()?;
+        let set: mlua::Function = nx.get("_set_semantic_tokens")?;
         let list = self.lua.create_table()?;
         for (i, tok) in tokens.iter().enumerate() {
             let t = self.lua.create_table()?;
@@ -548,14 +560,14 @@ impl LuaRuntime {
         set.call((bufnr, list))
     }
 
-    /// Mirror a buffer's decoded inlay hints into `vim._inlay_hints[bufnr]` as the
+    /// Mirror a buffer's decoded inlay hints into `nx._inlay_hints[bufnr]` as the
     /// plain data `vim.lsp.inlay_hint.get` reads back (the semantic-tokens-mirror
     /// analogue). Called on every `textDocument/inlayHint` reply (and after a lazy
     /// hint resolves, or when hints are disabled — an empty list clears the mirror);
     /// keyed by `bufnr`. `col` is a 0-based byte column.
     pub fn set_inlay_hints(&self, bufnr: u64, hints: &[InlayHintMirrorData]) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let set: mlua::Function = vim.get("_set_inlay_hints")?;
+        let nx = self.nx()?;
+        let set: mlua::Function = nx.get("_set_inlay_hints")?;
         let list = self.lua.create_table()?;
         for (i, h) in hints.iter().enumerate() {
             let t = self.lua.create_table()?;
@@ -575,7 +587,7 @@ impl LuaRuntime {
     /// finishes `initialize`. The provider flags become the camelCase
     /// `*Provider` keys neovim configs probe.
     pub fn set_lsp_client(&self, client: &LspClientData) -> mlua::Result<()> {
-        let lsp: Table = self.vim()?.get("lsp")?;
+        let lsp: Table = self.nx()?.get("lsp")?;
         let set: mlua::Function = lsp.get("_set_client")?;
         let caps = self.lua.create_table()?;
         let c = &client.capabilities;
@@ -598,7 +610,7 @@ impl LuaRuntime {
     /// Forget an LSP client (`vim.lsp._clients[id] = nil`) when its server exits,
     /// so a stale `get_client_by_id` after a `LspDetach` returns `nil`.
     pub fn remove_lsp_client(&self, id: u64) -> mlua::Result<()> {
-        let lsp: Table = self.vim()?.get("lsp")?;
+        let lsp: Table = self.nx()?.get("lsp")?;
         let remove: mlua::Function = lsp.get("_remove_client")?;
         remove.call(id)
     }
@@ -608,7 +620,7 @@ impl LuaRuntime {
     /// finishes `initialize`, right after the client is mirrored — so the hook can
     /// read `result.capabilities` / `result.offsetEncoding` and tweak the client.
     pub fn run_lsp_on_init(&self, id: u64, result: &serde_json::Value) -> mlua::Result<()> {
-        let lsp: Table = self.vim()?.get("lsp")?;
+        let lsp: Table = self.nx()?.get("lsp")?;
         let run: mlua::Function = lsp.get("_run_on_init")?;
         let result = json_to_lua(&self.lua, result)?;
         run.call((id, result))
@@ -624,7 +636,7 @@ impl LuaRuntime {
         code: Option<i32>,
         signal: Option<i32>,
     ) -> mlua::Result<()> {
-        let lsp: Table = self.vim()?.get("lsp")?;
+        let lsp: Table = self.nx()?.get("lsp")?;
         let run: mlua::Function = lsp.get("_run_on_exit")?;
         run.call((id, code, signal))
     }
@@ -735,27 +747,27 @@ impl LuaRuntime {
     }
 
     fn read_has_on_key(&self) -> mlua::Result<bool> {
-        let f: mlua::Function = self.vim()?.get("_has_on_key")?;
+        let f: mlua::Function = self.nx()?.get("_has_on_key")?;
         f.call::<bool>(())
     }
 
     /// Fire every `vim.on_key` observer with `key` (vim key-notation), passed as
     /// both the `(key, typed)` arguments neovim's on_key callback receives. A
-    /// throwing observer is detached (matching neovim) inside `vim._run_on_key`;
+    /// throwing observer is detached (matching neovim) inside `nx._run_on_key`;
     /// any other error is returned for the server to surface.
     pub fn run_on_key(&self, key: &str) -> mlua::Result<()> {
-        let run: mlua::Function = self.vim()?.get("_run_on_key")?;
+        let run: mlua::Function = self.nx()?.get("_run_on_key")?;
         let k = mlua::Value::String(self.lua.create_string(key)?);
         run.call::<()>((k.clone(), k))
     }
 
     /// Deliver a `vim.ui.input` result to its callback `id`: the typed line
-    /// (`Some`) on `<CR>`, or `nil` (`None`) on cancel. Runs `vim._run_cb(id,
+    /// (`Some`) on `<CR>`, or `nil` (`None`) on cancel. Runs `nx._run_cb(id,
     /// false, text)` — a one-shot, so the callback registry entry is dropped after
     /// firing (Phase 8). Effects it queues drain through `apply_lua_effects`.
     pub fn run_ui_input(&self, id: u64, result: Option<String>) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let run: mlua::Function = vim.get("_run_cb")?;
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_cb")?;
         let arg = match result {
             Some(s) => mlua::Value::String(self.lua.create_string(&s)?),
             None => mlua::Value::Nil,
@@ -764,20 +776,20 @@ impl LuaRuntime {
     }
 
     /// Dispatch an LSP code-action `command` (Phase 8): runs
-    /// `vim.lsp._dispatch_command(client_id, command)`, which routes to a
+    /// `nx.lsp._dispatch_command(client_id, command)`, which routes to a
     /// client-side `vim.lsp.commands[name]` handler when registered, else issues a
     /// `workspace/executeCommand` to the client's server. `command` is the LSP
     /// `Command` (`{ title, command, arguments }`) as JSON. Errors are returned for
     /// the server to surface.
     pub fn run_lsp_command(&self, client_id: u64, command: &serde_json::Value) -> mlua::Result<()> {
-        let lsp: Table = self.vim()?.get("lsp")?;
+        let lsp: Table = self.nx()?.get("lsp")?;
         let dispatch: mlua::Function = lsp.get("_dispatch_command")?;
         let cmd = json_to_lua(&self.lua, command)?;
         dispatch.call((client_id, cmd))
     }
 
     /// Run the deferred callback registered under `id` (the `run_keymap` analogue
-    /// for the async runtime). Invokes `vim._run_cb(id, keep, …)`; with `keep ==
+    /// for the async runtime). Invokes `nx._run_cb(id, keep, …)`; with `keep ==
     /// false` the registry entry is dropped after firing (one-shot), so
     /// `vim.schedule` / `vim.defer_fn` / `vim.system` `on_exit` never leak. A
     /// repeating timer passes `keep == true` to retain its function across fires.
@@ -786,8 +798,8 @@ impl LuaRuntime {
     /// `apply_lua_effects`; a throwing callback returns its error for the server to
     /// surface (it isolates one callback, never aborting the drain).
     pub fn run_callback(&self, id: u64, keep: bool, args: CallbackArgs) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let run: mlua::Function = vim.get("_run_cb")?;
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_cb")?;
         match args {
             CallbackArgs::None => run.call::<()>((id, keep)),
             CallbackArgs::Process {
@@ -819,8 +831,8 @@ impl LuaRuntime {
     /// actor shortly after the spawn — the pid can't be known synchronously on the
     /// single-threaded runtime, so the handle reads `nil` until this lands.
     pub fn set_process_pid(&self, id: u64, pid: Option<u32>) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let set: mlua::Function = vim.get("_set_proc_pid")?;
+        let nx = self.nx()?;
+        let set: mlua::Function = nx.get("_set_proc_pid")?;
         set.call((id, pid))
     }
 
@@ -836,7 +848,7 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// The current `vim._keymaps_version`, bumped by every `vim.keymap.set`/`del`.
+    /// The current `nx._keymaps_version`, bumped by every `vim.keymap.set`/`del`.
     /// The server reads it once per input batch and rebuilds its tries only when
     /// it advanced — so per keystroke it walks the cached trie, never the bridge.
     /// `0` on any error (a malformed VM simply yields no mappings).
@@ -845,11 +857,11 @@ impl LuaRuntime {
     }
 
     fn read_keymaps_version(&self) -> mlua::Result<u64> {
-        let vim = self.vim()?;
-        Ok(vim.get::<Option<u64>>("_keymaps_version")?.unwrap_or(0))
+        let nx = self.nx()?;
+        Ok(nx.get::<Option<u64>>("_keymaps_version")?.unwrap_or(0))
     }
 
-    /// Pull `vim._keymaps` across the bridge as a list of [`RawKeymap`]s for the
+    /// Pull `nx._keymaps` across the bridge as a list of [`RawKeymap`]s for the
     /// server to compile into per-mode tries. A read error yields an empty
     /// snapshot (the editor keeps running with no user mappings).
     pub fn keymaps_snapshot(&self) -> Vec<RawKeymap> {
@@ -857,8 +869,8 @@ impl LuaRuntime {
     }
 
     fn read_keymaps(&self) -> mlua::Result<Vec<RawKeymap>> {
-        let vim = self.vim()?;
-        let list: Table = vim.get("_keymaps")?;
+        let nx = self.nx()?;
+        let list: Table = nx.get("_keymaps")?;
         let mut out = Vec::new();
         for entry in list.sequence_values::<Table>() {
             let entry = entry?;
@@ -903,20 +915,20 @@ impl LuaRuntime {
     /// Effects land in [`Shared`] and drain through the server's
     /// `apply_lua_effects`. Errors (a throwing handler) are returned to surface.
     pub fn run_keymap(&self, id: u64) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let run: mlua::Function = vim.get("_run_keymap")?;
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_keymap")?;
         run.call::<()>(id)
     }
 
     /// Invoke an `<expr>` function RHS and return the **keys it produced** (its
     /// return value, coerced to a string; `nil`/`false` → `""`). The function runs
-    /// under the prelude's `vim._expr_lock` so the editor-mutating funnels refuse
-    /// (the textlock contract — see `vim._run_keymap_expr`); any effects it queued
+    /// under the prelude's `nx._expr_lock` so the editor-mutating funnels refuse
+    /// (the textlock contract — see `nx._run_keymap_expr`); any effects it queued
     /// anyway are discarded by the server, which feeds only the returned keys. An
     /// error (a throwing handler, or a textlock violation) is returned to surface.
     pub fn run_keymap_expr(&self, id: u64) -> mlua::Result<String> {
-        let vim = self.vim()?;
-        let run: mlua::Function = vim.get("_run_keymap_expr")?;
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_keymap_expr")?;
         run.call::<String>(id)
     }
 
@@ -931,10 +943,10 @@ impl LuaRuntime {
     /// the base the server stamps onto undo-node timestamps, so the undotree
     /// visualizer's `localtime() - node.time` elapsed math is correct.
     pub fn set_mono_secs(&self, secs: i64) -> mlua::Result<()> {
-        self.vim()?.set("_mono_secs", secs)
+        self.nx()?.set("_mono_secs", secs)
     }
 
-    /// Refresh the `vim._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
+    /// Refresh the `nx._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
     /// `updates` carries `(bufnr, dict)` for the trees that changed since the last
     /// push (each `dict` an `rmpv` map in neovim's `undotree()` shape); `live` is
     /// every current bufnr, so entries for closed buffers are pruned.
@@ -943,12 +955,12 @@ impl LuaRuntime {
         updates: &[(u64, rmpv::Value)],
         live: &[u64],
     ) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let mirror: Table = match vim.get("_undotree")? {
+        let nx = self.nx()?;
+        let mirror: Table = match nx.get("_undotree")? {
             mlua::Value::Table(t) => t,
             _ => {
                 let t = self.lua.create_table()?;
-                vim.set("_undotree", t.clone())?;
+                nx.set("_undotree", t.clone())?;
                 t
             }
         };
@@ -967,21 +979,21 @@ impl LuaRuntime {
 
     /// Fire every autocmd registered for `event` whose pattern matches
     /// `pattern` (used for `ColorScheme` when a theme loads). Delegates to the
-    /// prelude's `vim._fire`, which runs callbacks / queues `command` strings;
+    /// prelude's `nx._fire`, which runs callbacks / queues `command` strings;
     /// effects land in [`Shared`] and drain like any other chunk.
     pub fn fire_autocmd(&self, event: &str, pattern: &str) -> mlua::Result<()> {
-        let fire: mlua::Function = self.vim()?.get("_fire")?;
+        let fire: mlua::Function = self.nx()?.get("_fire")?;
         fire.call((event, pattern))
     }
 
     /// Fire the `nvim_buf_attach` `on_lines` callbacks for buffers that changed.
     /// `changes` is `(bufnr, changedtick, old_line_count, new_line_count)` per
-    /// buffer; the prelude's `vim._buf_changed` looks up the attached callbacks and
+    /// buffer; the prelude's `nx._buf_changed` looks up the attached callbacks and
     /// invokes each with neovim's `on_lines` argument tuple (detaching one that
     /// returns `true` or errors). A buffer with no attachment is a cheap no-op.
     pub fn fire_buf_changes(&self, changes: &[(u64, u64, usize, usize)]) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let fire: mlua::Function = vim.get("_buf_changed")?;
+        let nx = self.nx()?;
+        let fire: mlua::Function = nx.get("_buf_changed")?;
         for &(buf, tick, old, new) in changes {
             fire.call::<()>((buf, tick, 0u64, old as u64, new as u64))?;
         }
@@ -991,13 +1003,13 @@ impl LuaRuntime {
     /// Fire the `nvim_buf_attach` `on_bytes` callbacks for a batch of byte-level
     /// edits (the `vim.treesitter` parser's incremental-reparse channel). Each edit
     /// carries its bufnr/changedtick and neovim's relative `on_bytes` tuple; the
-    /// prelude's `vim._buf_bytes_changed` dispatches it to that buffer's attached
+    /// prelude's `nx._buf_bytes_changed` dispatches it to that buffer's attached
     /// callbacks (the vendored `LanguageTree:_on_bytes` among them, which edits its
     /// trees). Edits are forwarded in order — tree-sitter requires every edit
     /// between two parses, in sequence, or the incremental tree corrupts.
     pub fn fire_buf_bytes(&self, edits: &[BufBytesEdit]) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let fire: mlua::Function = vim.get("_buf_bytes_changed")?;
+        let nx = self.nx()?;
+        let fire: mlua::Function = nx.get("_buf_bytes_changed")?;
         for e in edits {
             fire.call::<()>((
                 e.bufnr,
@@ -1021,8 +1033,8 @@ impl LuaRuntime {
     /// vendored `LanguageTree`'s reload handler invalidates the tree so the next
     /// `:parse()` is a full reparse of the current snapshot.
     pub fn fire_buf_reloads(&self, bufs: &[u64]) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        let fire: mlua::Function = vim.get("_buf_reloaded")?;
+        let nx = self.nx()?;
+        let fire: mlua::Function = nx.get("_buf_reloaded")?;
         for &buf in bufs {
             fire.call::<()>(buf)?;
         }
@@ -1040,7 +1052,7 @@ impl LuaRuntime {
         buf: u64,
         file: &str,
     ) -> mlua::Result<()> {
-        let fire: mlua::Function = self.vim()?.get("_fire")?;
+        let fire: mlua::Function = self.nx()?.get("_fire")?;
         fire.call((event, pattern, buf, file))
     }
 
@@ -1057,7 +1069,7 @@ impl LuaRuntime {
         file: &str,
         client_id: u64,
     ) -> mlua::Result<()> {
-        let fire: mlua::Function = self.vim()?.get("_fire")?;
+        let fire: mlua::Function = self.nx()?.get("_fire")?;
         let data = self.lua.create_table()?;
         data.set("client_id", client_id)?;
         fire.call((event, pattern, buf, file, data))
@@ -1071,7 +1083,7 @@ impl LuaRuntime {
     /// warning / autoreload. `buf`/`file` give the buffer context a buffer-local
     /// `FileChangedShell` autocmd matches against.
     pub fn fire_file_changed(&self, reason: &str, buf: u64, file: &str) -> mlua::Result<bool> {
-        let f: mlua::Function = self.vim()?.get("_fire_file_changed")?;
+        let f: mlua::Function = self.nx()?.get("_fire_file_changed")?;
         f.call((reason, buf, file))
     }
 
@@ -1080,57 +1092,57 @@ impl LuaRuntime {
     /// buffer, `"ask"` falls through to the default warning, anything else (incl. `""`)
     /// means the handler took over and the reconcile does nothing further.
     pub fn fcs_choice(&self) -> mlua::Result<String> {
-        let f: mlua::Function = self.vim()?.get("_fcs_choice")?;
+        let f: mlua::Function = self.nx()?.get("_fcs_choice")?;
         f.call(())
     }
 
     /// Run a `:au[tocmd][!]` ex-command through the prelude driver
-    /// (`vim._ex_autocmd`), which parses the Vimscript argument line and drives
-    /// the same `vim._autocmds` store the `nvim_create_autocmd` API uses. `bang`
+    /// (`nx._ex_autocmd`), which parses the Vimscript argument line and drives
+    /// the same `nx._autocmds` store the `nvim_create_autocmd` API uses. `bang`
     /// is the `!`; `args` is the remainder after the command name. Returns the
     /// text to surface: `""` (nothing), a one-line message/error, or a multi-line
     /// autocmd listing.
     pub fn ex_autocmd(&self, bang: bool, args: &str) -> mlua::Result<String> {
-        let f: mlua::Function = self.vim()?.get("_ex_autocmd")?;
+        let f: mlua::Function = self.nx()?.get("_ex_autocmd")?;
         f.call((bang, args))
     }
 
     /// Run a `:aug[roup][!]` ex-command through the prelude driver
-    /// (`vim._ex_augroup`): enter / leave / report the current augroup, or, with
+    /// (`nx._ex_augroup`): enter / leave / report the current augroup, or, with
     /// a bang, delete a group and its autocmds. Returns the text to surface.
     pub fn ex_augroup(&self, bang: bool, args: &str) -> mlua::Result<String> {
-        let f: mlua::Function = self.vim()?.get("_ex_augroup")?;
+        let f: mlua::Function = self.nx()?.get("_ex_augroup")?;
         f.call((bang, args))
     }
 
     /// Run a `:doau[tocmd]` ex-command through the prelude driver
-    /// (`vim._ex_doautocmd`), firing an event now (the manual analogue of
+    /// (`nx._ex_doautocmd`), firing an event now (the manual analogue of
     /// `nvim_exec_autocmds`). Returns the text to surface.
     pub fn ex_doautocmd(&self, args: &str) -> mlua::Result<String> {
-        let f: mlua::Function = self.vim()?.get("_ex_doautocmd")?;
+        let f: mlua::Function = self.nx()?.get("_ex_doautocmd")?;
         f.call(args)
     }
 
     /// Run a `:com[mand][!]` ex-command through the prelude driver
-    /// (`vim._ex_command`): parse the `[attrs] {Name} {repl}` line and register a
+    /// (`nx._ex_command`): parse the `[attrs] {Name} {repl}` line and register a
     /// user command (global, or buffer-local with `-buffer`) into the same
-    /// `vim._user_commands` store the API uses. `bang` is the replace-existing
+    /// `nx._user_commands` store the API uses. `bang` is the replace-existing
     /// `!`; `args` is the remainder after the command name; `bufnr` is the current
     /// buffer (for a `-buffer` command). Returns `""` on success, a one-line
     /// `E…` error, or a newline-joined listing for a bare `:command`.
     pub fn ex_command(&self, bang: bool, args: &str, bufnr: u64) -> mlua::Result<String> {
-        let f: mlua::Function = self.vim()?.get("_ex_command")?;
+        let f: mlua::Function = self.nx()?.get("_ex_command")?;
         f.call((bang, args, bufnr))
     }
 
-    /// Refresh the `vim._cur_buf` snapshot the prelude reads back through
+    /// Refresh the `nx._cur_buf` snapshot the prelude reads back through
     /// `nvim_buf_get_name(0)` / `expand('%')`. The server pushes this immediately
     /// before firing a buffer/mode autocmd so a callback can resolve the buffer
     /// that fired. `filetype` is the buffer's detected filetype (`""` when none),
     /// which `vim.lsp.enable` reads to start a server for the already-open buffer.
     /// (Interim until a real per-bufnr registry exists.)
     pub fn set_buf_snapshot(&self, bufnr: u64, name: &str, filetype: &str) -> mlua::Result<()> {
-        let set: mlua::Function = self.vim()?.get("_set_cur_buf")?;
+        let set: mlua::Function = self.nx()?.get("_set_cur_buf")?;
         set.call((bufnr, name, filetype))
     }
 
@@ -1138,7 +1150,7 @@ impl LuaRuntime {
     /// commands and keymaps — when the server detects the buffer was deleted, so a
     /// later buffer that reuses the bufnr can't inherit them.
     pub fn cleanup_buffer(&self, bufnr: u64) -> mlua::Result<()> {
-        let f: mlua::Function = self.vim()?.get("_cleanup_buffer")?;
+        let f: mlua::Function = self.nx()?.get("_cleanup_buffer")?;
         f.call(bufnr)
     }
 
@@ -1153,8 +1165,8 @@ impl LuaRuntime {
     }
 
     /// Refresh the Rust→Lua buffer mirror the buffer-read API resolves against
-    /// (Phase 6): `vim._bufs[bufnr] = { lines, name, loaded = true }` for every
-    /// open buffer, plus `vim._cur_cursor = { row, col }` (row 1-based, col 0-based,
+    /// (Phase 6): `nx._bufs[bufnr] = { lines, name, loaded = true }` for every
+    /// open buffer, plus `nx._cur_cursor = { row, col }` (row 1-based, col 0-based,
     /// neovim convention) and the current-window handle. The server pushes this
     /// before running any Lua that can read buffer/cursor state, so synchronous
     /// getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read live data
@@ -1166,10 +1178,10 @@ impl LuaRuntime {
     /// `next_win` the id the next `nvim_open_win` will mint (so the Lua side can
     /// return the new handle synchronously while the real window is created when
     /// the queued op drains). `mode` is the editor's current `mode()` short code
-    /// (`"n"`/`"i"`/`"v"`/…), stored as `vim._cur_mode` so a `%{}` statusline
+    /// (`"n"`/`"i"`/`"v"`/…), stored as `nx._cur_mode` so a `%{}` statusline
     /// expression reading `vim.fn.mode()` reflects this frame. `cmdtype` is the
     /// open command line's type char (`:` / `/` / `?` / `@`, or `""` when none is
-    /// open), stored as `vim._cur_cmdtype` for `vim.fn.getcmdtype()`.
+    /// open), stored as `nx._cur_cmdtype` for `vim.fn.getcmdtype()`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_buf_mirror(
         &self,
@@ -1181,7 +1193,7 @@ impl LuaRuntime {
         mode: &str,
         cmdtype: &str,
     ) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let entries = self.lua.create_table()?;
         for b in bufs {
             entries.set(b.bufnr, self.to_lua(b)?)?;
@@ -1190,50 +1202,50 @@ impl LuaRuntime {
         // serializes to the table shape `nvim_win_get_config` returns, the nested
         // float included.
         let win_arr = self.to_lua(wins)?;
-        let set: mlua::Function = vim.get("_set_buf_mirror")?;
+        let set: mlua::Function = nx.get("_set_buf_mirror")?;
         set.call((
             entries, cursor.0, cursor.1, win, win_arr, next_win, mode, cmdtype,
         ))
     }
 
-    /// Refresh the Rust→Lua extmark mirror (`vim._extmarks[bufnr][ns][id]`) that
+    /// Refresh the Rust→Lua extmark mirror (`nx._extmarks[bufnr][ns][id]`) that
     /// `nvim_buf_get_extmarks` reads. `bufs` carries only buffers that hold marks;
     /// each entry's marks come from the authoritative core
     /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) with positions already shifted
     /// for any edits, so a read this chunk reflects the live buffer.
     pub fn set_extmark_mirror(&self, bufs: &[(u64, Vec<ExtmarkMirror>)]) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let entries = self.lua.create_table()?;
         for (bufnr, marks) in bufs {
             entries.set(*bufnr, self.to_lua(marks)?)?;
         }
-        let set: mlua::Function = vim.get("_set_extmark_mirror")?;
+        let set: mlua::Function = nx.get("_set_extmark_mirror")?;
         set.call(entries)
     }
 
-    /// Refresh the Rust→Lua highlight mirror (`vim._hl_defs[name]`) that
+    /// Refresh the Rust→Lua highlight mirror (`nx._hl_defs[name]`) that
     /// `nvim_get_hl` reads. Pushed only when the core registry's generation
     /// changed (a colorscheme rarely re-runs), so the common chunk pays nothing.
     /// Each entry mirrors one [`HlDefMirror`]: colors as `0xRRGGBB` ints, the set
     /// boolean attrs, and `link` for an alias group.
     pub fn set_hl_mirror(&self, defs: &[HlDefMirror]) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let entries = self.lua.create_table()?;
         for d in defs {
             entries.set(self.lua.create_string(&d.name)?, self.to_lua(d)?)?;
         }
-        let set: mlua::Function = vim.get("_set_hl_mirror")?;
+        let set: mlua::Function = nx.get("_set_hl_mirror")?;
         set.call(entries)
     }
 
-    /// Refresh the per-namespace highlight mirror (`vim._hl_defs_ns[ns][name]`)
+    /// Refresh the per-namespace highlight mirror (`nx._hl_defs_ns[ns][name]`)
     /// that `nvim_get_hl(ns, …)` reads for a non-zero namespace. Rebuilds the
     /// whole `_hl_defs_ns` map from the core registry's non-zero namespaces (the
     /// global table goes through [`set_hl_mirror`](Self::set_hl_mirror)), pushed
     /// under the same generation gate. `defs` carries one [`HlDefMirror`] per
     /// `(ns, name)`; rows are byte-identical to the global mirror's.
     pub fn set_hl_mirror_ns(&self, defs: &[HlDefMirror]) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let by_ns = self.lua.create_table()?;
         for d in defs {
             let ns_table: mlua::Table = match by_ns.get::<Option<mlua::Table>>(d.ns)? {
@@ -1246,11 +1258,11 @@ impl LuaRuntime {
             };
             ns_table.set(self.lua.create_string(&d.name)?, self.to_lua(d)?)?;
         }
-        let set: mlua::Function = vim.get("_set_hl_mirror_ns")?;
+        let set: mlua::Function = nx.get("_set_hl_mirror_ns")?;
         set.call(by_ns)
     }
 
-    /// Refresh the Rust→Lua buffer-option mirror (`vim._bo_mirror[bufnr] =
+    /// Refresh the Rust→Lua buffer-option mirror (`nx._bo_mirror[bufnr] =
     /// { tabstop, shiftwidth, expandtab }`) that `vim.bo` / `nvim_get_option_value`
     /// read for the wired buffer-local options. Pushed alongside the buffer mirror
     /// before any Lua that can read options, so a read reflects the core's current
@@ -1260,36 +1272,36 @@ impl LuaRuntime {
     /// buffer (`modified` backs `vim.bo[n].modified`, which a `'tabline'` label
     /// reads).
     pub fn set_bo_mirror(&self, bufs: &[BoMirror]) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let entries = self.lua.create_table()?;
         for b in bufs {
             entries.set(b.bufnr, self.to_lua(b)?)?;
         }
-        let set: mlua::Function = vim.get("_set_bo_mirror")?;
+        let set: mlua::Function = nx.get("_set_bo_mirror")?;
         set.call(entries)
     }
 
-    /// Refresh the Rust→Lua global-option mirror (`vim._go_mirror = { ignorecase,
+    /// Refresh the Rust→Lua global-option mirror (`nx._go_mirror = { ignorecase,
     /// smartcase, wrapscan, hlsearch, incsearch, showtabline, laststatus,
     /// statusline, tabline }`) that `vim.o` reads for the wired global options.
     /// Pushed alongside the buffer mirror before any Lua that can read options, so a
     /// read reflects the core's current value — the default until set, and a value
     /// set through the `:set` ex path, not just one written from Lua.
     pub fn set_go_mirror(&self, go: &GoMirror) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let entry = self.to_lua(go)?;
-        let set: mlua::Function = vim.get("_set_go_mirror")?;
+        let set: mlua::Function = nx.get("_set_go_mirror")?;
         set.call(entry)
     }
 
-    /// Refresh the Rust→Lua register mirror (`vim._registers[name] = { text, type
+    /// Refresh the Rust→Lua register mirror (`nx._registers[name] = { text, type
     /// }`, `type` being `"v"` charwise / `"V"` linewise) that `vim.fn.getreg` /
     /// `getregtype` read. Pushed alongside the buffer mirror before any Lua that
     /// can read registers, so a read reflects the core's register file (including
     /// the read-only specials the caller folds in). Keyed by the single-char
     /// register name as a string.
     pub fn set_reg_mirror(&self, regs: &[(char, String, bool)]) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let entries = self.lua.create_table()?;
         for (name, text, linewise) in regs {
             let entry = self.lua.create_table()?;
@@ -1297,7 +1309,7 @@ impl LuaRuntime {
             entry.set("type", if *linewise { "V" } else { "v" })?;
             entries.set(name.to_string(), entry)?;
         }
-        let set: mlua::Function = vim.get("_set_reg_mirror")?;
+        let set: mlua::Function = nx.get("_set_reg_mirror")?;
         set.call(entries)
     }
 
@@ -1313,14 +1325,14 @@ impl LuaRuntime {
         register: &str,
         operator: &str,
     ) -> mlua::Result<()> {
-        let set: mlua::Function = self.vim()?.get("_set_v_mirror")?;
+        let set: mlua::Function = self.nx()?.get("_set_v_mirror")?;
         set.call((count, count1, register, operator))
     }
 
     /// Set `v:vim_did_enter` (`1` once the startup VimEnter point passes). Sticky:
     /// the per-tick [`Self::set_v_mirror`] preserves it.
     pub fn set_vim_did_enter(&self, entered: bool) -> mlua::Result<()> {
-        let set: mlua::Function = self.vim()?.get("_set_vim_did_enter")?;
+        let set: mlua::Function = self.nx()?.get("_set_vim_did_enter")?;
         set.call(entered)
     }
 
@@ -1328,17 +1340,17 @@ impl LuaRuntime {
     /// `nvim_create_buf` can predict its return value (the buffer analogue of the
     /// window mirror's `next_win`). Pushed alongside the buffer mirror.
     pub fn set_next_buf(&self, next_buf: u64) -> mlua::Result<()> {
-        self.vim()?.set("_next_buf", next_buf)
+        self.nx()?.set("_next_buf", next_buf)
     }
 
     /// Mirror the focused window cursor's screen position (1-based row/col, the
     /// whole-screen coordinates `vim.fn.screenrow()` / `vim.fn.screencol()`
-    /// return), pushed alongside the buffer mirror. which-key reads them to keep
-    /// its popup from covering the cursor.
+    /// return), pushed alongside the buffer mirror. A popup plugin reads them to
+    /// keep its popup from covering the cursor.
     pub fn set_screen_cursor(&self, row: u64, col: u64) -> mlua::Result<()> {
-        let vim = self.vim()?;
-        vim.set("_cur_screenrow", row)?;
-        vim.set("_cur_screencol", col)
+        let nx = self.nx()?;
+        nx.set("_cur_screenrow", row)?;
+        nx.set("_cur_screencol", col)
     }
 
     /// Refresh the Rust→Lua tab mirror that backs `vim.api.nvim_tabpage_*` /
@@ -1347,9 +1359,9 @@ impl LuaRuntime {
     /// Pushed alongside the buffer/window mirror before any Lua that can read tab
     /// state, so a read reflects the core's current layout.
     pub fn set_tab_mirror(&self, tabs: &[TabMirror], cur_tab: u64) -> mlua::Result<()> {
-        let vim = self.vim()?;
+        let nx = self.nx()?;
         let tab_arr = self.to_lua(tabs)?;
-        let set: mlua::Function = vim.get("_set_tab_mirror")?;
+        let set: mlua::Function = nx.get("_set_tab_mirror")?;
         set.call((tab_arr, cur_tab))
     }
 
@@ -1397,9 +1409,9 @@ impl LuaRuntime {
 
     /// Resolve `name` to its command entry (function or string) for buffer
     /// `bufnr`, letting a buffer-local command for that buffer shadow a global of
-    /// the same name — `vim._resolve_user_command` owns the precedence.
+    /// the same name — `nx._resolve_user_command` owns the precedence.
     fn user_command(&self, name: &str, bufnr: u64) -> mlua::Result<mlua::Value> {
-        let resolve: mlua::Function = self.vim()?.get("_resolve_user_command")?;
+        let resolve: mlua::Function = self.nx()?.get("_resolve_user_command")?;
         resolve.call((name, bufnr))
     }
 }

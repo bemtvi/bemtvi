@@ -173,7 +173,7 @@ added only when exercised by a test (no speculative stubs). Confirm live refresh
 a `%{}` reading editor state updates as the state changes across redraws.
 
 **Shipped:** the editor mode is now threaded into the Rust→Lua mirror
-(`vim._cur_mode`, via `set_buf_mirror`), and `redraw` refreshes that mirror
+(`nx._cur_mode`, via `set_buf_mirror`), and `redraw` refreshes that mirror
 before evaluating a statusline that contains a `%{}`/`%!` expression — so a
 `%{v:lua.vim.fn.mode()}` tracks the mode live across frames. New / enhanced
 `vim.fn`: `mode`, `line('.'/'$')`, `col('.'/'$')`, `winnr('.'/'$')`,

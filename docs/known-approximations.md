@@ -18,7 +18,7 @@ only what has *no* call site to tag.
    the call site, stating what's wrong and what a faithful implementation needs.
 
 2. **Loud gap** — not implemented, and it says so: raises
-   `nxvim: not implemented: <name>` through `vim._notimpl(name)` rather than
+   `nxvim: not implemented: <name>` through `nx._notimpl(name)` rather than
    returning a fake value. Self-documenting at the call site (the name is in the
    raise) and at runtime (see below). This is the project's no-silent-stubs rule
    (`CLAUDE.md`, and `docs/plans/2026-06-05-lsp-completion.md` Phase 0).
@@ -34,14 +34,14 @@ grep -rn 'vim\._notimpl(' crates/nxvim-lua/src/prelude/
 ```
 
 At runtime, every loud gap a real config trips is recorded in the global
-`vim._notimpl_hits` set (populated by `vim._notimpl` wherever it fires —
-`vim.fn`, `vim.uv`, the LSP layer, …), so you can see exactly which gaps *a given
+`nx._notimpl_hits` set (populated by `nx._notimpl` wherever it fires —
+`vim.fn`, the LSP layer, …), so you can see exactly which gaps *a given
 config* hit, not just which exist: inspect it directly
-(`:lua print(vim.inspect(vim._notimpl_hits))`), or via the future `:checkhealth`.
-The runtime scoreboard `vim._report()` also surfaces it as its `notimpl_hits`
+(`:lua print(vim.inspect(nx._notimpl_hits))`), or via the future `:checkhealth`.
+The runtime scoreboard `nx._report()` also surfaces it as its `notimpl_hits`
 field, alongside the LSP-specific status.
 
-When you implement one: delete its `INCOMPLETE:` tag (or its `vim._notimpl`
+When you implement one: delete its `INCOMPLETE:` tag (or its `nx._notimpl`
 raise). If it's one of the subsystems below, update this file too.
 
 ## Missing features not yet in code
@@ -57,18 +57,21 @@ are no longer listed here — only the edges that still diverge are.
   the [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md) and
   [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md)). What still
   diverges: (1) the decoration-provider highlighter `highlighter.new` fails loud
-  (`vim._notimpl`) — nxvim's `start`/`stop` drives the in-core Rust engine
+  (`nx._notimpl`) — nxvim's `start`/`stop` drives the in-core Rust engine
   instead, so a highlight-only `start` never builds a Lua-side `LanguageTree` and
   `highlighter.active[buf].tree` reads nil until something calls `get_parser`;
   (2) **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
   wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
   Rust indent stays. `query.get` returns nil for a missing on-disk query file.
-- **`vim.uv` / `vim.loop` is host primitives only.** The libuv **handle** surface
-  (`new_timer` / `new_check` / `new_fs_event` / `spawn` / `new_pipe`, the plugin
-  event-loop primitives) is **not** part of the `nx` model — async lives in
-  the `nx` API (`nx.spawn` / `nx.timer` / `nx.fs`). What stays is the synchronous
-  host primitives the kept LSP-config / treesitter paths read: `fs_*`, `fs_realpath`,
-  `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`.
+- **No `vim.uv` / `vim.loop`.** neovim exposes libuv as a public Lua API; nxvim
+  does not — the `vim.uv` / `vim.loop` table does not exist, so a plugin reaching
+  for it hits a loud nil index. Both the libuv **handle** surface (`new_timer` /
+  `new_check` / `new_fs_event` / `spawn` / `new_pipe`, the plugin event-loop
+  primitives) and the synchronous `fs_*` / scalar primitives (`fs_realpath`,
+  `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`) are gone. Async lives in the
+  `nx` API (`nx.spawn` / `nx.timer` / `nx.fs`); the synchronous host info the
+  LSP-config paths need is read through `vim.fn` (`executable` / `exepath` /
+  `glob` / `filereadable` / `resolve` / …) instead.
 - **Broad options surface.** `:set` honors the search/number booleans plus the
   buffer-local indentation options `tabstop` / `shiftwidth` / `softtabstop` /
   `expandtab` (also via `:setlocal`, `vim.bo`, and `nvim_{set,get}_option_value`).
@@ -93,7 +96,7 @@ are no longer listed here — only the edges that still diverge are.
   (the merge picks the most-specific `@lsp.*` winner, it doesn't blend neovim's
   `@lsp.type.<t>` + per-modifier stack); **theme-gated** (an undefined group is
   dropped so the floor shows); **no `range`** (only `full`/`full/delta`);
-  **`highlight_token` is a loud gap** (`vim._notimpl` — a Lua callback on the
+  **`highlight_token` is a loud gap** (`nx._notimpl` — a Lua callback on the
   decode hot path); `get_at_pos` reads the cached mirror even for a `stop`ped
   buffer; no per-client granularity (one cache per buffer); repaints mid-insert
   (`update_in_insert` always on). See `docs/plans/2026-06-08-lsp-semantic-tokens.md`.
@@ -106,7 +109,7 @@ are no longer listed here — only the edges that still diverge are.
   (`leftcol>0`) + inline hints is best-effort; repaints mid-insert. See
   `docs/plans/2026-06-08-lsp-inlay-hints.md`.
 - **Synchronous prompts — one caveat.** `vim.fn.input`/`confirm` return inline
-  via a pumped coroutine (`vim._pump`), but only *pumped* entry points (`:lua`
+  via a pumped coroutine (`nx._pump`), but only *pumped* entry points (`:lua`
   chunk, keymap, user command) can prompt — Lua sourced at startup or off a bare
   callback has no coroutine to yield from. See `examples/sync-prompts/`.
 
@@ -128,5 +131,5 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 that drove the LSP surface from "every hollow stub raises" (Phase 0) to today;
 each phase notes the approximations it deliberately left behind. That document is
 *history + plan*, not a live registry. The live registry is the `INCOMPLETE:` /
-`vim._notimpl` tags in code (and this file's missing-features list above). If the
+`nx._notimpl` tags in code (and this file's missing-features list above). If the
 two ever disagree, the code wins.

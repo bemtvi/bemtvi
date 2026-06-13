@@ -2,8 +2,8 @@ Floating-windows playground — open floats and watch them paint on top.
 
 A float is a window positioned by absolute coordinates ON TOP of the tiled
 layout, rather than tiled into it. It steals no space from its neighbours: it
-paints over them. This is how plugins draw hover, completion docs, which-key,
-telescope, notifications, and bordered vim.ui prompts.
+paints over them. This is how plugins draw hover, completion docs, keymap-hint
+popups, fuzzy-finders, notifications, and bordered vim.ui prompts.
 
 A hint float opened on startup (top of the screen, single border, titled
 "nxvim floats"). It did not steal focus — your cursor is still down here.

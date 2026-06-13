@@ -3,7 +3,7 @@
 > **Status: COMPLETE.** All eight phases (0–8) landed; this document is now
 > *history*, not a live to-do. The remaining gaps are the per-phase
 > *approximations* each phase recorded — tracked canonically in code
-> (`INCOMPLETE:` / `vim._notimpl`) and summarized in
+> (`INCOMPLETE:` / `nx._notimpl`) and summarized in
 > [`docs/known-approximations.md`](../known-approximations.md), which the code
 > wins over if they ever disagree.
 
@@ -56,7 +56,7 @@ list of what to build (the later phases).
 **Scope (files).** `crates/nxvim-lua/src/prelude.lua` only.
 
 **Approach.**
-- Add `vim._notimpl(name)`: records `name` into `vim._notimpl_hits` (a set, for
+- Add `nx._notimpl(name)`: records `name` into `nx._notimpl_hits` (a set, for
   introspection / a future `:checkhealth`) and `error("nxvim: not implemented: "
   .. name, 2)`.
 - Convert these hollow stubs to call it:
@@ -97,9 +97,9 @@ NOT gaps).**
   (snapshot-backed); it backs the `root_dir` filetype checks. Every other `vim.bo`
   read and all writes raise.
 
-**Done when.** ✅ Every hollow stub raises a named error via `vim._notimpl`; the
+**Done when.** ✅ Every hollow stub raises a named error via `nx._notimpl`; the
 config sweep (`lspconfig_configs.rs`) is green with the documented allowlist
-(`powershell_es`, `gdscript`); `vim._notimpl_hits` accumulates hit names; a
+(`powershell_es`, `gdscript`); `nx._notimpl_hits` accumulates hit names; a
 prelude test (`prelude_notimpl.rs`) asserts a representative stub raises with its
 name and records the hit while the faithful neighbours stay real.
 
@@ -121,22 +121,22 @@ surface. Optionally a `vim.lsp` health/report function.
 
 **Approach.**
 - When `lsp_base_config`'s chunk errors, record `{name, error}` into
-  `vim._lsp_load_errors` and echo a one-line warning (don't hard-crash the whole
+  `nx._lsp_load_errors` and echo a one-line warning (don't hard-crash the whole
   editor — one broken server shouldn't wedge startup — but make it loud).
 - When `lsp_resolve_cmd` skips a server (non-argv / builder threw), record
-  `{name, reason}` into `vim._lsp_skipped` instead of silently returning.
+  `{name, reason}` into `nx._lsp_skipped` instead of silently returning.
 - Add `vim.lsp._report()` (and wire a `:LspInfo`-style command later) listing:
   enabled servers, which started, which were skipped/failed and why, and the
-  `vim._notimpl_hits` set.
+  `nx._notimpl_hits` set.
 
 **Tests.** A config that references a not-implemented symbol at load surfaces in
-`vim._lsp_load_errors`; a non-argv cmd surfaces in `vim._lsp_skipped`.
+`nx._lsp_load_errors`; a non-argv cmd surfaces in `nx._lsp_skipped`.
 
 **Done when.** ✅ `lsp_base_config` records a present-but-failing config (unreadable
-/ parse error / runtime error / non-table return) into `vim._lsp_load_errors` and
+/ parse error / runtime error / non-table return) into `nx._lsp_load_errors` and
 echoes a one-line warning instead of degrading to `{}`; `lsp_resolve_cmd` returns
 `nil, reason` on a throwing builder, and `lsp_start_resolved` / `vim.lsp.start`
-record a skip into `vim._lsp_skipped` (deduped, with a reason) instead of a bare
+record a skip into `nx._lsp_skipped` (deduped, with a reason) instead of a bare
 `return`. `vim.lsp._report()` enumerates `enabled` / `started` / `load_errors` /
 `skipped` / `notimpl_hits`. Covered by `lsp_report.rs`. (A `:LspInfo`-style command
 that renders `_report()` is left as a later follow-up — the data surface is here.)
@@ -156,12 +156,12 @@ that renders `_report()` is left as a later follow-up — the data surface is he
 `{name,cmd,root_dir,filetype,bufnr}`. Everything a config configures is dropped.
 
 **Scope.** `prelude.lua` (`vim.lsp.start` / `lsp_start_resolved`), `lib.rs`
-(`vim._lsp_start` signature, `LspOp::Start` fields), `nxvim-server` (apply path),
+(`nx._lsp_start` signature, `LspOp::Start` fields), `nxvim-server` (apply path),
 `nxvim-lsp/manager.rs` (`InitializeParams`, post-init `didChangeConfiguration`).
 
 **Approach.**
 - Thread `settings`, `init_options`, `capabilities` from the resolved config
-  through `vim._lsp_start` → `LspOp::Start` as JSON (reuse the `vim.json`/serde
+  through `nx._lsp_start` → `LspOp::Start` as JSON (reuse the `vim.json`/serde
   bridge → `serde_json::Value`).
 - In `manager.rs`: set `InitializeParams.initialization_options =
   init_options (or settings fallback)`, and **merge** the config's
@@ -176,7 +176,7 @@ over the base (sentinel present *and* base `positionEncodings` survive), and
 `settings` → `workspace/didChangeConfiguration`.
 
 **Done when.** ✅ The resolved config's `settings` / `init_options` /
-`capabilities` ride `vim._lsp_start` → `LspOp::Start` (as `serde_json::Value` via
+`capabilities` ride `nx._lsp_start` → `LspOp::Start` (as `serde_json::Value` via
 the `lua_to_json` bridge, empties dropped) → `ServerSpawn` → `run_server_once`:
 `initialization_options = init_options or settings`, `capabilities` = base
 deep-merged with the config's (malformed → logged, base used — loud, not silent),
@@ -217,7 +217,7 @@ feed the Phase-2 forwarding. `on_init(client, result)` fires when the `Initializ
 event lands, carrying the raw `InitializeResult` (now threaded as JSON on the
 event). `on_exit(code, signal, client)` fires on `ServerExited` with the child's
 exit status (captured in the manager; `signal` is unix-only), while the client is
-still registered. A throwing hook is recorded in `vim._lsp_hook_errors` (surfaced
+still registered. A throwing hook is recorded in `nx._lsp_hook_errors` (surfaced
 by `vim.lsp._report`) and echoed, never fatal.
 
 *Approximations:* a `config.cmd` mutation inside `before_init` is not honored (the
@@ -233,7 +233,7 @@ shutdown (only on a server exit / crash), since that path registers no client.
 **Landed.** Implemented in full as its own four-phase effort —
 [`docs/plans/2026-06-06-async-lua-runtime.md`](2026-06-06-async-lua-runtime.md). The event-loop
 actor is `crates/nxvim-server/src/evloop.rs`; the deferred-callback registry is
-`vim._cb_fns` (Lua) driven by `LuaRuntime::run_callback(id, keep, args)` (Rust);
+`nx._cb_fns` (Lua) driven by `LuaRuntime::run_callback(id, keep, args)` (Rust);
 the queue is `Shared.loop_ops` / `take_loop_ops`. Phase 5 below plugs into that
 **callback-dispatch primitive** rather than inventing its own — see its note.
 
@@ -282,7 +282,7 @@ the manager sends it; the response enqueues `handler(err, result)` on the
 callback queue. Wire config `handlers[method]` into the response path.
 
 > **Seam (from the async-runtime plan).** The callback-dispatch primitive already
-> exists: register the handler with `vim._next_cb_id()` (Lua) — the same registry
+> exists: register the handler with `nx._next_cb_id()` (Lua) — the same registry
 > `vim.schedule`/timers/`vim.system` use — and thread the id through the `LspOp`
 > alongside the existing `ReqToken` (`crates/nxvim-lsp/src/manager.rs` already
 > correlates replies by token). On `LspEvent::Reply`, `on_lsp_event` runs the
@@ -356,19 +356,19 @@ write reads back while `filetype` still resolves; strict-indexing raises loud.
 
 **Done when.** ✅ The synchronous getters (`nvim_buf_get_lines`/`is_loaded`,
 `nvim_win_get_cursor`, `nvim_get_current_win`, `vim.fn.bufnr`) read the Rust→Lua
-buffer mirror (`vim._bufs` / `vim._cur_cursor` / current-window handle) the server
+buffer mirror (`nx._bufs` / `nx._cur_cursor` / current-window handle) the server
 refreshes via `LuaRuntime::set_buf_mirror` ← `Server::push_buf_mirror` before every
 Lua entry that can read buffer/cursor state (top of `run_pending`, before
 `eval_to_value`, before `run_keymap`/`run_keymap_expr`, and folded into the autocmd
 `set_buf_snapshot` sites); the per-buffer line arrays are `changedtick`-gated so the
 cursor-moved-no-edit path stays cheap. `nvim_buf_set_lines` writes through to the
-`vim._bufs` mirror (so read-after-write within a chunk is consistent) and queues
+`nx._bufs` mirror (so read-after-write within a chunk is consistent) and queues
 `BufOp::SetLines` → `Server::apply_buf_op`, which normalizes the neovim line range,
 converts it to a byte range against the real rope, applies it via
 `Editor::apply_edits_to`, then flushes the buffer's LSP `didChange` via
 `sync_lsp_buffer` (the must-not-omit step for a non-current buffer). `vim.bo` /
-`nvim_set_option_value` are backed by a per-buffer store (`vim._bo_store`). The
-Phase-0 `vim._notimpl` raises for all of the above are gone.
+`nvim_set_option_value` are backed by a per-buffer store (`nx._bo_store`). The
+Phase-0 `nx._notimpl` raises for all of the above are gone.
 
 *Known approximations:* `nvim_win_get_cursor(win)` ignores `win` (single-window
 nxvim, handle `1000`); the `vim.bo` store is *observable* but not yet wired to
@@ -413,7 +413,7 @@ rope), `show_document_jumps_the_cursor_to_the_location`,
 implementations: the param builders (`make_position_params` /
 `make_text_document_params` / `make_given_range_params`) read the Phase-6 cursor /
 buffer mirror and convert byte columns to the offset encoding via the shared
-`vim._byte_to_position_char` / `vim._position_char_to_byte` UTF-8 walkers (utf-16
+`nx._byte_to_position_char` / `nx._position_char_to_byte` UTF-8 walkers (utf-16
 default, surrogate-aware); `locations_to_items` emits sorted loclist items with the
 byte `col` and `text` from the open buffer backing each URI; `get_effective_tabstop`
 reads the `vim.bo` store (shiftwidth → tabstop → 8); `open_floating_preview` shows
@@ -475,7 +475,7 @@ handed back); `vim.ui.input` opens a command-line prompt — a new
 `cmdline_prompt`, the typed line / `nil`-on-cancel flow back through
 `Editor::prompt_results` → `Server::pending_ui_input` → `LuaRuntime::run_ui_input`
 → the `on_confirm` callback off-tick); `vim.ui.open` spawns the platform opener
-(`open` / `xdg-open`, via `vim._ui_opener`) through the async `vim.system`. Command
+(`open` / `xdg-open`, via `nx._ui_opener`) through the async `vim.system`. Command
 dispatch goes through `vim.lsp._dispatch_command(client_id, command)` (shared by
 `vim.lsp.buf.execute_command` and the native code-action path): a registered
 `vim.lsp.commands[name]` handler wins client-side, else the command is relayed as a
@@ -510,5 +510,5 @@ eager/bare path only; a resolve-then-command chain is a follow-up.
 
 `0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8`. Phases 2 and 3 deliver the most
 "starts → works" value early and need no event loop; Phase 4 is the pivot the
-back half (5, 7, 8) builds on. After each phase, the set of `vim._notimpl_hits`
+back half (5, 7, 8) builds on. After each phase, the set of `nx._notimpl_hits`
 a real config triggers shrinks — that set is the running scoreboard.

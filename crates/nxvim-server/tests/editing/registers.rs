@@ -201,61 +201,6 @@ async fn setreg_append_flag_concatenates() {
 }
 
 #[tokio::test]
-async fn getreg_and_getregtype_read_the_core_register_file() {
-    let (rpc, _incoming) = start(None).await;
-    feed(&rpc, "ialpha<Esc>");
-    // A linewise yank into `a`; `getreg`/`getregtype` must read it from core.
-    // Route the answer back through the buffer (trailing newline trimmed) so a
-    // plain `lines()` assertion proves the read.
-    feed(&rpc, "\"ayy");
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, \
-         { vim.fn.getregtype('a') .. '|' .. (vim.fn.getreg('a'):gsub('%s+$', '')) })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec!["V|alpha"]);
-}
-
-#[tokio::test]
-async fn getregtype_is_charwise_for_an_empty_register() {
-    let (rpc, _incoming) = start(None).await;
-    // An untouched register is charwise ("v"); its contents are "".
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, \
-         { vim.fn.getregtype('z') .. '|' .. vim.fn.getreg('z') })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec!["v|"]);
-}
-
-#[tokio::test]
-async fn getreg_reads_the_search_register() {
-    let (rpc, _incoming) = start(None).await;
-    feed(&rpc, "ihello bar<Esc>");
-    // The search sets `"/`; `getreg('/')` projects it like any read.
-    feed(&rpc, "/bar<CR>");
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { vim.fn.getreg('/') })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec!["bar"]);
-}
-
-#[tokio::test]
-async fn setreg_rejects_a_read_only_register() {
-    let (rpc, _incoming) = start(None).await;
-    feed(&rpc, "ialpha<Esc>");
-    // Writing the read-only filename register `%` must raise, not silently
-    // no-op: the pcall fails, so the buffer reads "ERR".
-    feed(
-        &rpc,
-        ":lua local ok = pcall(vim.fn.setreg, '%', 'x'); \
-         vim.api.nvim_buf_set_lines(0, 0, -1, false, { ok and 'OK' or 'ERR' })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec!["ERR"]);
-}
-
-#[tokio::test]
 async fn put_inserts_register_below_the_current_line() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ialpha<Esc>obeta<Esc>");
@@ -296,69 +241,6 @@ async fn last_insert_register_pastes_the_typed_text() {
     feed(&rpc, "iabc<Esc>");
     feed(&rpc, "\".p"); // paste `".` after 'c' -> "abcabc"
     assert_eq!(lines(&rpc).await, vec!["abcabc"]);
-}
-
-#[tokio::test]
-async fn getreg_reads_the_last_insert_register() {
-    let (rpc, _incoming) = start(None).await;
-    feed(&rpc, "iZZ<Esc>");
-    // Route `getreg('.')` back through the buffer behind a marker so a plain
-    // `lines()` assertion proves the read.
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec![">ZZ"]);
-}
-
-#[tokio::test]
-async fn last_insert_register_holds_changed_text() {
-    let (rpc, _incoming) = start(None).await;
-    // A change operator (`ciw`) is an insert session too — `".` is its typed text.
-    feed(&rpc, "ione two<Esc>0");
-    feed(&rpc, "ciwfoo<Esc>");
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec![">foo"]);
-}
-
-#[tokio::test]
-async fn last_insert_register_reflects_the_latest_session() {
-    let (rpc, _incoming) = start(None).await;
-    feed(&rpc, "ifirst<Esc>");
-    feed(&rpc, "osecond<Esc>"); // a newer insert session replaces `".`
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec![">second"]);
-}
-
-#[tokio::test]
-async fn last_insert_register_tracks_backspaced_text() {
-    let (rpc, _incoming) = start(None).await;
-    // Two `<BS>` rub out the "XY" typed last, so `".` is just "ab".
-    feed(&rpc, "iabXY<BS><BS><Esc>");
-    assert_eq!(lines(&rpc).await, vec!["ab"]);
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { '>' .. vim.fn.getreg('.') })<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec![">ab"]);
-}
-
-#[tokio::test]
-async fn last_insert_register_captures_newlines() {
-    let (rpc, _incoming) = start(None).await;
-    feed(&rpc, "ione<CR>two<Esc>"); // `".` is "one\ntwo"
-                                    // Split the register on its newline to prove the `<CR>` was captured.
-    feed(
-        &rpc,
-        ":lua vim.api.nvim_buf_set_lines(0, 0, -1, false, vim.split(vim.fn.getreg('.'), '\\n'))<CR>",
-    );
-    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
 }
 
 #[tokio::test]

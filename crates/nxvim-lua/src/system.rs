@@ -1,4 +1,4 @@
-//! The blocking shell-out seam `vim._system` runs through.
+//! The blocking shell-out seam `nx._system` runs through.
 //!
 //! `vim.system(...):wait()` (the synchronous form, no `on_exit`) shells out **on the
 //! editor/Lua thread** and blocks the input tick to completion — an `lsp/<server>.lua`
@@ -52,7 +52,7 @@ pub struct SystemOutput {
 impl SystemOutput {
     /// A degraded result for a failure that never produced an exit code — a missing
     /// tool, a dropped daemon link: `code = -1`, `msg` on stderr, no pid. Matches how
-    /// the local `vim._system` reports a spawn failure (it never raises, so a config
+    /// the local `nx._system` reports a spawn failure (it never raises, so a config
     /// `root_dir` shell-out on a machine that lacks the toolchain degrades rather than
     /// breaking `vim.lsp.enable`).
     pub fn failed(msg: impl Into<String>) -> Self {
@@ -65,7 +65,7 @@ impl SystemOutput {
     }
 }
 
-/// The seam `vim._system` runs its shell-out through. **Synchronous** — the caller
+/// The seam `nx._system` runs its shell-out through. **Synchronous** — the caller
 /// (LSP `root_dir` detection) needs the value inline on the editor tick. The default
 /// ([`StdBlockingSystem`]) spawns a real local process; a daemon session injects a
 /// blocking bridge that runs the process on the remote.
@@ -77,7 +77,7 @@ pub trait BlockingSystem {
 }
 
 /// The default [`BlockingSystem`]: spawn the process on the *local* machine and wait —
-/// today's `vim._system` behavior verbatim, factored behind the seam. It serves both
+/// today's `nx._system` behavior verbatim, factored behind the seam. It serves both
 /// as the editor-side default (no daemon) and as the daemon-side backend in the real
 /// `nxvim --daemon`, where "local" *is* where the project files live.
 pub struct StdBlockingSystem;

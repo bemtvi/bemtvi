@@ -26,7 +26,7 @@ use crate::extmarks::HlInterval;
 use crate::EditHost;
 
 /// Flatten the decoded per-line [`SemanticSpan`]s into the flat
-/// [`SemanticTokenData`] list the `vim._semantic_tokens` mirror holds (one entry
+/// [`SemanticTokenData`] list the `nx._semantic_tokens` mirror holds (one entry
 /// per token, in line then column order), tagging each with the owning
 /// `client_id` — the shape `vim.lsp.semantic_tokens.get_at_pos` returns.
 fn semantic_mirror(
@@ -160,7 +160,7 @@ impl EditHost {
         };
 
         let spans = decode_tokens(&tokens, legend, encoding, buf);
-        // Mirror the decoded tokens into `vim._semantic_tokens[bufnr]` so the
+        // Mirror the decoded tokens into `nx._semantic_tokens[bufnr]` so the
         // synchronous `vim.lsp.semantic_tokens.get_at_pos` can read them from pure
         // Lua (the diagnostics-mirror analogue), then cache the spans for the paint.
         let mirror = semantic_mirror(&spans, client_id);

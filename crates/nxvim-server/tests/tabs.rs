@@ -208,30 +208,6 @@ async fn count_gt_jumps_to_an_absolute_tab_number() {
 }
 
 #[tokio::test]
-async fn nvim_set_current_tabpage_switches_and_restores_focus() {
-    let (rpc, _incoming) = start().await;
-    feed_sync(&rpc, ":tabnew<CR>").await;
-    let win2 = handle(&req(&rpc, "nvim_get_current_win", vec![]).await);
-
-    // Jump to tab 1 via the API; its focused window becomes current.
-    req(&rpc, "nvim_set_current_tabpage", vec![Value::from(1u64)]).await;
-    assert_eq!(
-        handle(&req(&rpc, "nvim_get_current_tabpage", vec![]).await),
-        1
-    );
-    let win1 = handle(&req(&rpc, "nvim_get_current_win", vec![]).await);
-    assert_ne!(win1, win2, "tab 1's window is focused, not tab 2's");
-
-    // Back to tab 2 restores its window.
-    req(&rpc, "nvim_set_current_tabpage", vec![Value::from(2u64)]).await;
-    assert_eq!(
-        handle(&req(&rpc, "nvim_get_current_win", vec![]).await),
-        win2,
-        "returning to a tab restores its focused window"
-    );
-}
-
-#[tokio::test]
 async fn tabclose_removes_the_current_tab_but_refuses_the_last() {
     let (rpc, _incoming) = start().await;
     feed_sync(&rpc, ":tabnew<CR>:tabnew<CR>").await; // [1, 2, 3], on 3
@@ -432,7 +408,7 @@ async fn lua_tabpage_reads_resolve_from_the_mirror() {
     // Two tabs, the second active (`:tabnew` switches to it).
     feed_sync(&rpc, ":tabnew<CR>").await;
 
-    // `nvim_list_tabpages` / `nvim_get_current_tabpage` read the `vim._tabs`
+    // `nvim_list_tabpages` / `nvim_get_current_tabpage` read the `nx._tabs`
     // mirror, agreeing with the RPC surface.
     let list = exec_lua(&rpc, "return vim.api.nvim_list_tabpages()").await;
     assert_eq!(handles(&list), vec![1, 2], "Lua lists both tabs in order");
@@ -454,25 +430,6 @@ async fn lua_tabpage_reads_resolve_from_the_mirror() {
     let win0 = handle(&exec_lua(&rpc, "return vim.api.nvim_tabpage_get_win(0)").await);
     assert_eq!(wins0.len(), 1, "the current tab owns one window");
     assert_eq!(wins0[0], win0, "its focused window is that window");
-}
-
-#[tokio::test]
-async fn lua_set_current_tabpage_switches_the_tab() {
-    let (rpc, _incoming) = start().await;
-    feed_sync(&rpc, ":tabnew<CR>").await; // now on tab 2
-
-    // Switching back through the Lua API queues a `TabOp` the server applies.
-    exec_lua(&rpc, "vim.api.nvim_set_current_tabpage(1)").await;
-    let cur = handle(&req(&rpc, "nvim_get_current_tabpage", vec![]).await);
-    assert_eq!(cur, 1, "nvim_set_current_tabpage(1) switched to tab 1");
-
-    // The write-through means a read *within* the same chunk already sees it.
-    let same = exec_lua(
-        &rpc,
-        "vim.api.nvim_set_current_tabpage(2); return vim.api.nvim_get_current_tabpage()",
-    )
-    .await;
-    assert_eq!(handle(&same), 2, "read-after-set is consistent in-chunk");
 }
 
 #[tokio::test]

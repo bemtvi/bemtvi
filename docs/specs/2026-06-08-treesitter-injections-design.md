@@ -288,7 +288,7 @@ position, not just the root.
 
 The vendored `languagetree.lua` already implements `_get_injections` /
 `_add_injections` / child trees in pure Lua, over the snapshot primitives
-(`vim._create_ts_parser` & co.). The work here is plumbing the snapshot side so a
+(`nx._create_ts_parser` & co.). The work here is plumbing the snapshot side so a
 `LanguageTree:parse(true)` actually runs injections over the pushed snapshot and
 builds children — i.e. ensuring `included_ranges` / `set_included_regions` are honored
 by the primitive parser binding. This is independent of the engine's internal layers

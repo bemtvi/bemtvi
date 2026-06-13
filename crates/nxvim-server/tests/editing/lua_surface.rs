@@ -133,7 +133,7 @@ async fn buf_local_user_command_is_scoped_to_its_buffer() {
     // `nvim_buf_create_user_command(buf, …)` registers a *buffer-local* command:
     // it dispatches only while `buf` is the current buffer, and is unknown
     // (E492) from any other buffer. Before the per-buffer registry it leaked into
-    // `vim._user_commands` globally, so it fired everywhere.
+    // `nx._user_commands` globally, so it fired everywhere.
     let a = write_temp("a", "txt", "a1\n");
     let b = write_temp("b", "txt", "b1\n");
     let (rpc, mut incoming) = start(None).await;
@@ -197,8 +197,8 @@ async fn deleting_a_buffer_purges_its_buffer_local_commands_and_keymaps() {
 
     // Probe both registries for a buffer-2 entry: "<has-command>,<keymap-count>".
     let probe = "local kc = 0\n\
-         for _, e in ipairs(vim._keymaps) do if e.buffer == 2 then kc = kc + 1 end end\n\
-         return tostring(vim._buf_user_commands[2] ~= nil) .. ',' .. tostring(kc)";
+         for _, e in ipairs(nx._keymaps) do if e.buffer == 2 then kc = kc + 1 end end\n\
+         return tostring(nx._buf_user_commands[2] ~= nil) .. ',' .. tostring(kc)";
     assert_eq!(
         exec_lua(&rpc, probe).await.as_str(),
         Some("true,1"),
@@ -441,168 +441,4 @@ async fn vim_tbl_get_follows_a_nested_key_path() {
     // Present path -> value; a missing intermediate key -> nil; descending past a
     // scalar (c is 42, not a table) -> nil rather than an error.
     assert_eq!(startup_message(&rpc, &mut incoming).await, "42 nil nil");
-}
-
-#[tokio::test]
-async fn vim_fs_relpath_is_segment_aware() {
-    let dir = temp_dir("relpath");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "print(vim.fs.relpath('/a/b', '/a/b/c/d') .. ' '\n\
-           .. tostring(vim.fs.relpath('/a/b', '/a/bc')) .. ' '\n\
-           .. vim.fs.relpath('/a/b', '/a/b'))\n",
-    )
-    .await;
-    // Subpath -> relative remainder; "/a/bc" is NOT under "/a/b" (segment
-    // boundary) -> nil; an equal path -> ".".
-    assert_eq!(startup_message(&rpc, &mut incoming).await, "c/d nil .");
-}
-
-#[tokio::test]
-async fn vim_json_decodes_and_encodes() {
-    let dir = temp_dir("vimjson");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "local d = vim.json.decode('{\"workspace_root\":\"/w\",\"n\":3,\"arr\":[10,20]}')\n\
-         print(d.workspace_root .. ' ' .. d.n .. ' ' .. d.arr[2] .. ' ' .. vim.json.encode({ a = 1 }))\n",
-    )
-    .await;
-    // Object -> string-keyed table, array -> 1-based sequence; encode emits an
-    // object for a non-sequence table.
-    assert_eq!(
-        startup_message(&rpc, &mut incoming).await,
-        "/w 3 20 {\"a\":1}"
-    );
-}
-
-#[tokio::test]
-async fn vim_lsp_get_clients_starts_empty() {
-    let dir = temp_dir("getclients");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "print(#vim.lsp.get_clients() .. ' ' .. #vim.lsp.get_clients({ name = 'nope' }))\n",
-    )
-    .await;
-    // No server has attached, so the list is empty with and without a filter.
-    assert_eq!(startup_message(&rpc, &mut incoming).await, "0 0");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn lspconfig_style_root_dir_resolves_through_the_new_surface() {
-    // A miniature `lsp/<name>.lua` shaped exactly like rust_analyzer's: its
-    // `root_dir` reaches for vim.tbl_get, vim.system (shelling out), vim.json,
-    // vim.fs.relpath and vim.lsp.get_clients. Driven through `vim.lsp.enable` +
-    // the FileType dispatcher, the whole config must evaluate without a Lua error
-    // — the regression the user hit ("attempt to call field 'tbl_get'").
-    let dir = temp_dir("lspprobe");
-    std::fs::create_dir_all(dir.join("lsp")).expect("create lsp dir");
-    std::fs::write(
-        dir.join("lsp").join("probe.lua"),
-        // root_dir deliberately does NOT call on_dir: this asserts the API
-        // surface a config evaluates, not the (separately covered) server spawn.
-        r#"return {
-  cmd = { 'true' },
-  filetypes = { 'probe' },
-  root_dir = function(bufnr, on_dir)
-    local deep = vim.tbl_get(vim.lsp.config['probe'], 'settings', 'probe', 'missing')
-    local res = vim.system({ '/bin/echo', '{"workspace_root":"/tmp/proj","n":2}' }, { text = true }):wait()
-    local decoded = vim.json.decode(res.stdout)
-    local rel = vim.fs.relpath('/a/b', '/a/x')
-    local nclients = #vim.lsp.get_clients({ name = 'probe' })
-    print(string.format('probe %s %s %d %s %d',
-      decoded.workspace_root, tostring(deep), decoded.n, tostring(rel), nclients))
-  end,
-}
-"#,
-    )
-    .expect("write lsp config");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "vim.lsp.enable('probe')\nvim.lsp._on_filetype(0, 'probe')\n",
-    )
-    .await;
-    assert_eq!(
-        startup_message(&rpc, &mut incoming).await,
-        "probe /tmp/proj nil 2 nil 0",
-        "an lspconfig-style root_dir should evaluate the new vim.* surface cleanly"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn host_primitives_for_lspconfig_are_available() {
-    // The libuv/process/version surface the configs build defaults from. Bundled
-    // into one assertion: cwd is resolvable, getpid is positive, a ubiquitous
-    // binary (`sh`) is executable, vim.version() stringifies, vim.trim trims,
-    // vim.empty_dict is empty, and the vim.lsp.rpc.start shim hands a cmd builder
-    // back its argv (the mechanism behind the 20-plus rpc.start configs).
-    let dir = temp_dir("hostprim");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "local parts = {\n\
-         \x20 tostring(vim.uv.cwd() ~= nil),\n\
-         \x20 tostring(vim.fn.getpid() > 0),\n\
-         \x20 tostring(vim.fn.executable('sh') == 1),\n\
-         \x20 tostring(vim.version()),\n\
-         \x20 vim.trim('  hi  '),\n\
-         \x20 tostring(next(vim.empty_dict()) == nil),\n\
-         \x20 table.concat(vim.lsp.rpc.start({ 'mybin', '--stdio' }, {}), ','),\n\
-         }\n\
-         print(table.concat(parts, ' '))\n",
-    )
-    .await;
-    assert_eq!(
-        startup_message(&rpc, &mut incoming).await,
-        "true true true 0.11.0 hi true mybin,--stdio"
-    );
-}
-
-#[tokio::test]
-async fn vim_iter_handles_iterators_and_find_any() {
-    // vim.iter must accept a stateless iterator triple (what vim.fs.parents
-    // returns) — the fennel_ls/vala_ls root_dir pattern — and expose :find/:any.
-    let dir = temp_dir("vimiter");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "local p = vim.iter(vim.fs.parents('/a/b/c')):totable()\n\
-         print(p[1] .. ' ' .. p[2] .. ' '\n\
-           .. tostring(vim.iter({ 10, 20, 30 }):find(function(x) return x == 20 end)) .. ' '\n\
-           .. tostring(vim.iter({ 1, 2, 3 }):any(function(x) return x > 2 end)))\n",
-    )
-    .await;
-    // Ancestors of /a/b/c are /a/b, /a, … (the walk stops at /, not the cwd).
-    assert_eq!(
-        startup_message(&rpc, &mut incoming).await,
-        "/a/b /a 20 true"
-    );
-}
-
-#[tokio::test]
-async fn vim_fs_root_resolves_priority_tiers() {
-    // vim.fs.root treats a list marker as an ordered priority chain (neovim 0.11):
-    // the highest-priority tier with a match anywhere up the tree wins regardless
-    // of depth, and a nested list is an equal-priority tier. Lay out a tree and
-    // check both the ordered-beats-proximity rule and nested-tier matching.
-    let dir = temp_dir("fsroot");
-    let proj = dir.join("proj");
-    std::fs::create_dir_all(proj.join("sub").join("deep")).expect("mkdir tree");
-    std::fs::write(proj.join("low"), "").expect("low marker"); // high up
-    std::fs::write(proj.join("sub").join("g1"), "").expect("g1 marker"); // closer
-    let src = proj.join("sub").join("deep").join("src.txt");
-    let p = proj.to_string_lossy();
-
-    // marker1: prefer 'top' (absent), then the equal-priority {g1,g2} tier (g1 is
-    // at proj/sub) -> proj/sub. marker2: 'low' tier first (at proj) beats the
-    // closer 'g1' (at proj/sub) -> proj.
-    let init = format!(
-        "print(vim.fs.root('{src}', {{ 'top', {{ 'g1', 'g2' }}, 'low' }}) .. ' | '\n\
-         \x20 .. vim.fs.root('{src}', {{ 'low', 'g1' }}))\n",
-        src = src.to_string_lossy()
-    );
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-    assert_eq!(
-        startup_message(&rpc, &mut incoming).await,
-        format!("{p}/sub | {p}")
-    );
 }

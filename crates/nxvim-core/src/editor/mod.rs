@@ -1244,8 +1244,8 @@ impl Editor {
     /// The editor's total screen size in `(columns, rows)` — the text-viewport
     /// dimensions the client last sized us to (via [`Editor::resize`] / the most
     /// recent `view`). Backs `vim.o.columns` / `vim.o.lines` (and
-    /// `nvim_list_uis`), the values a float-positioning plugin (telescope,
-    /// plenary.popup) reads to center and size its windows. NOTE: `rows` is the
+    /// `nvim_list_uis`), the values a float-positioning plugin reads to center
+    /// and size its windows. NOTE: `rows` is the
     /// editable text height — the client owns the cmdline / status regions — so it
     /// runs a row or two short of neovim's total `lines`; it is the only screen
     /// extent the core knows, and is close enough for float geometry.

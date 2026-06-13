@@ -28,13 +28,13 @@ no-op that looks like it worked.
 ## What's already in place (the seams these phases extend)
 
 - **Cache + mirror.** `Server::diagnostics_of(buffer)` → `(&[Diagnostic],
-  PositionEncoding)`; the Lua mirror `vim._diagnostics` (keyed by bufnr).
+  PositionEncoding)`; the Lua mirror `nx._diagnostics` (keyed by bufnr).
 - **Per-window projection.** `Server::diagnostics_for(buffer, &numbers, styles)`
   (`crates/nxvim-server/src/lsp/diagnostics.rs`) builds the per-row underline
   spans; `redraw.rs::window_value` attaches them under the `diagnostics` key;
   `WindowView.diagnostics: Vec<Vec<DiagSpan>>`
   (`crates/nxvim-view/src/view.rs`); `render_text` composes the underline last.
-- **Config bridge.** `vim.diagnostic.config` → `vim._diagnostic_config(underline)`
+- **Config bridge.** `vim.diagnostic.config` → `nx._diagnostic_config(underline)`
   (`install.rs`) → `LspOp::DiagnosticConfig { underline }`
   (`crates/nxvim-lua/src/ops.rs`) → `Server::diagnostics_underline`
   (`lsp/sync.rs`).
@@ -111,7 +111,7 @@ bool; the projection is `Server::diagnostics_virt_text_for` → the
 → `highlight_line` paints it after end-of-text (one-cell gap, truncated to the
 viewport, severity foreground or the resolved `DiagnosticVirtualText*` group). The
 config threads `virtual_text` (bool, plus the table form's `prefix`) through
-`vim._diagnostic_config` → `LspOp::DiagnosticConfig`. The `INCOMPLETE` note in
+`nx._diagnostic_config` → `LspOp::DiagnosticConfig`. The `INCOMPLETE` note in
 `diagnostic.lua` lost its `virtual_text` clause. Verified by
 `vim_diagnostic_config_virtual_text_paints_the_message_inline` /
 `virtual_text_picks_the_highest_severity_on_a_row_and_honors_a_prefix`
@@ -179,7 +179,7 @@ buffer has ≥1 diagnostic — vim's `signcolumn=auto`) →
 the number gutter (severity foreground or the resolved `DiagnosticSign*` group),
 and `text_inner_rect` mirrors the carve so the completion popup still anchors past
 both gutters. The config threads `signs` (bool, plus the table form's `text` map)
-through `vim._diagnostic_config` → `LspOp::DiagnosticConfig`. Verified by
+through `nx._diagnostic_config` → `LspOp::DiagnosticConfig`. Verified by
 `signs_are_on_by_default_and_reserve_a_column` /
 `signs_pick_the_highest_severity_on_a_line` / `signs_false_reserves_no_column` /
 `signs_honor_a_custom_text_glyph` (`crates/nxvim/tests/lsp/diagnostic_api.rs`) and
@@ -213,7 +213,7 @@ directly; it completes the trio.
   format `severity  source: message [code]` lines, and open them via the
   existing `Editor::open_panel` / float surface (reuse `show_hover`'s path).
 - `crates/nxvim-lua/src/{ops.rs,install.rs}` + `prelude/diagnostic.lua` —
-  `vim.diagnostic.open_float` → `vim._diagnostic_open_float()` →
+  `vim.diagnostic.open_float` → `nx._diagnostic_open_float()` →
   `LspOp::DiagnosticOpenFloat`. No-op (loud nothing) when the line is clean.
 - Optionally wire `config.float` later; the function is the deliverable.
 
@@ -237,7 +237,7 @@ every line control-sanitized like `first_line`), and opens them through the
 existing `Editor::open_panel` ("Diagnostics" title) — the same float surface hover
 uses. A clean cursor line is a *loud* no-op: `echo("No diagnostics under cursor")`,
 no panel. The op threads `vim.diagnostic.open_float` →
-`vim._diagnostic_open_float()` (`install.rs`) → `LspOp::DiagnosticOpenFloat`
+`nx._diagnostic_open_float()` (`install.rs`) → `LspOp::DiagnosticOpenFloat`
 (`ops.rs`) → `Server::diagnostics_open_float` (`sync.rs`), reading the cursor at
 apply time. The `INCOMPLETE` note in `diagnostic.lua` lost its bare `float`
 clause (only the `config.float` pre-style defaults remain inert). Verified by

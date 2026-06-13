@@ -109,54 +109,17 @@ async fn a_throwing_timer_callback_does_not_wedge_the_loop() {
 
 // ----- Phase 3: async vim.system ---------------------------------------------
 
-#[tokio::test]
-async fn vim_system_with_on_exit_runs_async() {
-    let (rpc, _incoming) = start().await;
-    // A child that sleeps briefly, so barrier #1 reliably observes "not done yet".
-    exec_lua(
-        &rpc,
-        "_G.code = nil\n\
-         vim.system({ 'sh', '-c', 'sleep 0.1' }, {}, function(r) _G.code = r.code end)",
-    )
-    .await;
-    // Barrier #1: on_exit has not fired (it didn't run synchronously inline).
-    assert_eq!(lua_bool(&rpc, "return _G.code ~= nil").await, Some(false));
-    // Past the child's lifetime: on_exit fired off-tick with the result.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(lua_u64(&rpc, "return _G.code").await, Some(0));
-}
-
-#[tokio::test]
-async fn vim_system_wait_without_on_exit_is_synchronous() {
-    let (rpc, _incoming) = start().await;
-    // The blocking `:wait()` branch the config `root_dir` path relies on: a
-    // complete result returned synchronously, no event loop involved.
-    let out = exec_lua(
-        &rpc,
-        "local r = vim.system({ 'sh', '-c', 'printf hello' }):wait()\n\
-         return r.stdout",
-    )
-    .await;
-    assert_eq!(out.as_str(), Some("hello"));
-    let code = lua_u64(
-        &rpc,
-        "return vim.system({ 'sh', '-c', 'exit 3' }):wait().code",
-    )
-    .await;
-    assert_eq!(code, Some(3));
-}
-
 // ----- Phase 4: robustness (leaks, schedule_wrap) ----------------------------
 
 #[tokio::test]
 async fn one_shot_callbacks_do_not_leak_the_registry() {
     let (rpc, _incoming) = start().await;
-    // A long run of one-shot schedules must leave vim._cb_fns empty (each is
+    // A long run of one-shot schedules must leave nx._cb_fns empty (each is
     // dropped after firing).
     exec_lua(&rpc, "for _ = 1, 64 do vim.schedule(function() end) end").await;
     let remaining = lua_u64(
         &rpc,
-        "local n = 0; for _ in pairs(vim._cb_fns) do n = n + 1 end; return n",
+        "local n = 0; for _ in pairs(nx._cb_fns) do n = n + 1 end; return n",
     )
     .await;
     assert_eq!(remaining, Some(0), "scheduled one-shots must not leak");

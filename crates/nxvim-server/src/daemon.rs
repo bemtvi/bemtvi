@@ -1032,7 +1032,7 @@ fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
 /// The blocking bridge: [`run`](BlockingSystem::run) hands the spec to a **dedicated
 /// link thread** (which owns the wire and its own current-thread runtime) over a plain
 /// `std` channel, then parks the calling (Lua) thread on the reply. Parking with a
-/// `std` channel — not a tokio primitive — is deliberate: `vim._system` runs *inside*
+/// `std` channel — not a tokio primitive — is deliberate: `nx._system` runs *inside*
 /// the server's tokio runtime, where a tokio `blocking_recv` would panic; a `std` recv
 /// just parks the OS thread, and the link thread (a different thread entirely) is free
 /// to drive the wire that delivers the reply.
@@ -1119,7 +1119,7 @@ impl BlockingSystem for RemoteBlockingSystem {
             return SystemOutput::failed("vim.system: daemon link is gone");
         }
         // Park the editor thread until the link thread delivers the daemon's reply. This
-        // is the blocking bridge: `vim._system` is synchronous (the LSP `root_dir`
+        // is the blocking bridge: `nx._system` is synchronous (the LSP `root_dir`
         // caller needs the value inline), so the tick blocks here, the same as a local
         // spawn blocks on `wait`. A `std` recv parks the OS thread without caring that
         // it sits inside the server's tokio runtime; the link's reader is on its own

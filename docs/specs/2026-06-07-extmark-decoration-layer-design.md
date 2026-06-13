@@ -21,7 +21,7 @@ From the treesitter-Lua-platform design's non-goals: real
 and LSP semantic tokens "share only the future highlight-layering primitive."
 That primitive is the **extmark**: a buffer-anchored position (or range) that
 shifts with edits and can carry a highlight group. Almost every plugin highlight
-the user actually wants — LSP semantic tokens, gitsigns-style signs/blame,
+the user actually wants — LSP semantic tokens, git-status-style signs/blame,
 diagnostics-as-marks, search-everywhere overlays — is an *extmark* consumer, not
 a *decoration-provider* consumer.
 
@@ -171,7 +171,7 @@ a mark (the fast path is byte-identical to the pre-extmark projection).
 
 Mutations ride the existing **effect-queue** (`Shared` → drained in
 [`effects.rs`](../../crates/nxvim-server/src/effects.rs)); reads come from a
-**snapshot mirror** refreshed before each Lua run (like `vim._bufs`). New
+**snapshot mirror** refreshed before each Lua run (like `nx._bufs`). New
 functions in [`install.rs`](../../crates/nxvim-lua/src/install.rs):
 
 - `nvim_create_namespace(name) -> integer` — create-or-get; empty name ⇒ fresh

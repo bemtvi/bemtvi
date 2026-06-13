@@ -591,7 +591,7 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
 }
 
 /// Project a buffer's cached diagnostics into the plain [`DiagnosticData`] the
-/// Lua mirror (`vim._diagnostics`) holds for `vim.diagnostic.get`. Positions are
+/// Lua mirror (`nx._diagnostics`) holds for `vim.diagnostic.get`. Positions are
 /// the raw 0-based LSP coordinates; `col`/`end_col` are byte offsets under the
 /// UTF-8 encoding nxvim advertises first (the negotiated default), matching
 /// neovim's byte-column `get` shape for the common case.

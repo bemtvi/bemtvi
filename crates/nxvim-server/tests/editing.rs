@@ -15,8 +15,6 @@
 #[path = "editing/support.rs"]
 mod support;
 
-#[path = "editing/buffer_window_api.rs"]
-mod buffer_window_api;
 #[path = "editing/changelist.rs"]
 mod changelist;
 #[path = "editing/clipboard.rs"]
@@ -35,8 +33,6 @@ mod global_cmd;
 mod highlights;
 #[path = "editing/jumplist.rs"]
 mod jumplist;
-#[path = "editing/lsp_util.rs"]
-mod lsp_util;
 #[path = "editing/lua_surface.rs"]
 mod lua_surface;
 #[path = "editing/marks.rs"]
@@ -47,8 +43,6 @@ mod multicursor;
 mod numbers;
 #[path = "editing/panel.rs"]
 mod panel;
-#[path = "editing/prompts.rs"]
-mod prompts;
 #[path = "editing/registers.rs"]
 mod registers;
 #[path = "editing/rendering.rs"]

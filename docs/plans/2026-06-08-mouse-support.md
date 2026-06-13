@@ -189,7 +189,7 @@ matches on event and routes to per-phase handlers).
 **Approach.** Map `(button, action)` to the `MouseEvent` enums; reject unknown
 pairs with a named error. Add the options with neovim defaults + validation.
 `Editor::mouse` checks the `'mouse'` gate for the current mode, then matches —
-every arm `vim._notimpl`-style loud-fails for now.
+every arm `nx._notimpl`-style loud-fails for now.
 
 **Test.** `nvim_input_mouse("left","press","",0,0,0)` with `mouse=` empty → no
 state change; with a bad action → RPC error; option get/set round-trips.

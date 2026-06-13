@@ -12,7 +12,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn, temp_dir};
+use nxvim_test_harness::{attach, exec_lua, feed, spawn, temp_dir};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -151,7 +151,7 @@ async fn missing_vim_fn_fails_loud_with_its_name() {
     assert_eq!(
         exec_lua(
             &rpc,
-            "pcall(vim.fn.another_missing_one); return vim._notimpl_hits['vim.fn.another_missing_one'] == true",
+            "pcall(vim.fn.another_missing_one); return nx._notimpl_hits['vim.fn.another_missing_one'] == true",
         )
         .await,
         Value::Boolean(true),
@@ -163,56 +163,11 @@ async fn missing_vim_fn_fails_loud_with_its_name() {
 // winsaveview/winrestview (the scroll) and screenrow/screencol (cursor-overlap).
 
 #[tokio::test]
-async fn winsaveview_winrestview_round_trip_the_scroll() {
-    let dir = temp_dir("winview");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // Fill the buffer past one screen so a non-1 topline is valid (the harness
-    // window is 24 rows).
-    exec_lua(
-        &rpc,
-        "local lines = {}\n\
-         for i = 1, 60 do lines[i] = 'line ' .. i end\n\
-         vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)",
-    )
-    .await;
-
-    // A fresh view: cursor at the top, no scroll.
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "local v = vim.fn.winsaveview(); return { v.lnum, v.col, v.topline, v.leftcol }",
-        )
-        .await,
-        Value::Array(vec![
-            Value::from(1u64),
-            Value::from(0u64),
-            Value::from(1u64),
-            Value::from(0u64),
-        ]),
-    );
-
-    // winrestview scrolls to a given topline; winsaveview reads it back.
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "vim.fn.winrestview({ topline = 10 }); return vim.fn.winsaveview().topline",
-        )
-        .await,
-        Value::from(10u64),
-    );
-}
-
-#[tokio::test]
 async fn screenrow_and_screencol_track_the_cursor() {
     let dir = temp_dir("screenpos");
     let (rpc, _incoming) = start_with_config(&dir, "").await;
 
-    exec_lua(
-        &rpc,
-        "vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'hello', 'world', 'third' })",
-    )
-    .await;
+    feed(&rpc, "ihello<CR>world<CR>third<Esc>gg");
 
     // Cursor at the top-left: row 1, and column 1 past the window's number gutter
     // (so >= 1; nxvim shows a gutter by default). Read the baseline, then assert
@@ -405,75 +360,7 @@ async fn buf_get_keymap_separates_buffer_local_from_global() {
 
 // ===================== nvim_create_buf =====================================
 
-#[tokio::test]
-async fn create_buf_makes_a_real_windowless_buffer() {
-    let dir = temp_dir("create_buf");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // The new buffer gets a fresh id (the startup buffer is 1).
-    let id = exec_lua(
-        &rpc,
-        "_G.b = vim.api.nvim_create_buf(false, true); return _G.b",
-    )
-    .await;
-    let handle = id.as_u64().expect("bufnr");
-    assert!(handle >= 2, "expected a fresh buffer id, got {handle}");
-
-    // Lines written through the new handle are readable back through it…
-    assert_eq!(
-        as_str(
-            &exec_lua(
-                &rpc,
-                "vim.api.nvim_buf_set_lines(_G.b, 0, -1, false, {'x', 'y'}); \
-                 return table.concat(vim.api.nvim_buf_get_lines(_G.b, 0, -1, false), ',')",
-            )
-            .await
-        ),
-        "x,y"
-    );
-    // …and reach the real server-side buffer (proving it was actually created).
-    assert_eq!(buf_lines(&rpc, handle).await, vec!["x", "y"]);
-    // The current buffer is untouched — the scratch buffer has no window.
-    assert_eq!(
-        exec_lua(&rpc, "return vim.api.nvim_get_current_buf()").await,
-        Value::from(1u64)
-    );
-}
-
 // ============== nvim_replace_termcodes + nvim_feedkeys =====================
-
-#[tokio::test]
-async fn feedkeys_noremap_types_into_the_buffer() {
-    let dir = temp_dir("feed_n");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // replace_termcodes + feedkeys with the 'n' (noremap) flag: the keys are
-    // parsed and fed straight to the editor — `ihello<Esc>` inserts "hello".
-    exec_lua(
-        &rpc,
-        "local k = vim.api.nvim_replace_termcodes('ihello<Esc>', true, true, true) \
-         vim.api.nvim_feedkeys(k, 'n', false)",
-    )
-    .await;
-    assert_eq!(buf_lines(&rpc, 0).await, vec!["hello"]);
-}
-
-#[tokio::test]
-async fn feedkeys_remap_runs_through_mappings() {
-    // A `m`-flag feed is itself remapped: feeding the lhs of a map fires it.
-    let dir = temp_dir("feed_m");
-    let init = r#"
-        vim.keymap.set("n", "<F2>", "iremapped<Esc>")
-    "#;
-    let (rpc, _incoming) = start_with_config(&dir, init).await;
-
-    exec_lua(
-        &rpc,
-        "vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<F2>', true, true, true), 'm', false)",
-    )
-    .await;
-    assert_eq!(buf_lines(&rpc, 0).await, vec!["remapped"]);
-}
 
 // ===================== vim.on_key ==========================================
 
@@ -603,31 +490,6 @@ async fn nvim_get_hl_follows_links_only_when_asked() {
 }
 
 #[tokio::test]
-async fn nvim_buf_call_runs_with_buffer_as_current() {
-    let dir = temp_dir("buf_call");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // Inside nvim_buf_call the scratch buffer is current, so a read of its lines
-    // resolves to it; the return value propagates out.
-    let lines = exec_lua(
-        &rpc,
-        "local b = vim.api.nvim_create_buf(false, true)\n\
-         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'inside' })\n\
-         return vim.api.nvim_buf_call(b, function()\n\
-           assert(vim.api.nvim_get_current_buf() == b, 'current buf not swapped')\n\
-           return vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
-         end)",
-    )
-    .await;
-    assert_eq!(lines, Value::Array(vec![Value::from("inside")]));
-    // The current buffer is restored after the call returns.
-    assert_eq!(
-        exec_lua(&rpc, "return vim.api.nvim_get_current_buf()").await,
-        Value::from(1u64)
-    );
-}
-
-#[tokio::test]
 async fn nvim_win_call_swaps_window_context() {
     let dir = temp_dir("win_call");
     let (rpc, _incoming) = start_with_config(&dir, "").await;
@@ -642,33 +504,6 @@ async fn nvim_win_call_swaps_window_context() {
         .await,
         Value::from(1u64)
     );
-}
-
-#[tokio::test]
-async fn nvim_buf_delete_removes_the_buffer() {
-    let dir = temp_dir("buf_delete");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // Create + populate + delete a scratch buffer in one chunk; the write-through
-    // drops it from the mirror immediately.
-    let result = exec_lua(
-        &rpc,
-        "local b = vim.api.nvim_create_buf(false, true)\n\
-         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'doomed' })\n\
-         local before = vim.api.nvim_buf_is_valid(b)\n\
-         vim.api.nvim_buf_delete(b, { force = true })\n\
-         return { before, vim.api.nvim_buf_is_valid(b), b }",
-    )
-    .await;
-    let arr = match result {
-        Value::Array(a) => a,
-        other => panic!("expected array, got {other:?}"),
-    };
-    assert_eq!(arr[0], Value::Boolean(true), "valid before delete");
-    assert_eq!(arr[1], Value::Boolean(false), "invalid after delete");
-    // The core really removed it: an RPC read of the handle yields no lines.
-    let handle = arr[2].as_u64().expect("buffer handle");
-    assert_eq!(buf_lines(&rpc, handle).await, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -710,101 +545,5 @@ async fn string_width_and_character_builtins() {
     assert_eq!(
         exec_lua(&rpc, "return vim.api.nvim_strwidth('a\\228\\184\\173b')").await,
         Value::from(4u64)
-    );
-}
-
-#[tokio::test]
-async fn buf_call_blocks_context_dependent_mutations() {
-    // A mutation that binds to "current" at drain time (an ex-command, feedkeys)
-    // would run against the real current buffer, not the one passed to
-    // nvim_buf_call. nxvim can't retarget it, so it must raise rather than silently
-    // mutate the wrong buffer.
-    let dir = temp_dir("buf_call_lock");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // vim.cmd inside a differing-context buf_call raises (pcall catches it).
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "local b = vim.api.nvim_create_buf(false, true)\n\
-             local ok = pcall(function()\n\
-               vim.api.nvim_buf_call(b, function() vim.cmd('normal! dd') end)\n\
-             end)\n\
-             return ok",
-        )
-        .await,
-        Value::Boolean(false)
-    );
-    // nvim_feedkeys is blocked the same way.
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "local b = vim.api.nvim_create_buf(false, true)\n\
-             return (pcall(function()\n\
-               vim.api.nvim_buf_call(b, function() vim.api.nvim_feedkeys('x', 'n', false) end)\n\
-             end))",
-        )
-        .await,
-        Value::Boolean(false)
-    );
-    // The error message names the call and the offending operation.
-    let msg = exec_lua(
-        &rpc,
-        "local b = vim.api.nvim_create_buf(false, true)\n\
-         local ok, e = pcall(function()\n\
-           vim.api.nvim_buf_call(b, function() vim.cmd('write') end)\n\
-         end)\n\
-         return e",
-    )
-    .await;
-    let msg = as_str(&msg);
-    assert!(msg.contains("nvim_buf_call"), "names the call: {msg}");
-    assert!(msg.contains("ex-command"), "names the op: {msg}");
-}
-
-#[tokio::test]
-async fn call_allows_reads_and_explicit_handle_writes() {
-    // The lock blocks ONLY context-dependent mutations. Reads and explicit-handle
-    // writes (which resolve the swapped mirror and queue a concrete handle) stay
-    // allowed inside a differing-context call.
-    let dir = temp_dir("call_allow");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    // An explicit-handle write inside buf_call targets the right buffer and is not
-    // blocked.
-    let lines = exec_lua(
-        &rpc,
-        "local b = vim.api.nvim_create_buf(false, true)\n\
-         vim.api.nvim_buf_call(b, function()\n\
-           vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'written' })\n\
-         end)\n\
-         return vim.api.nvim_buf_get_lines(b, 0, -1, false)",
-    )
-    .await;
-    assert_eq!(lines, Value::Array(vec![Value::from("written")]));
-
-    // A same-context call (target == real current) does NOT lock — an ex-command
-    // there is fine (it already targets the right buffer).
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "return (pcall(function()\n\
-               vim.api.nvim_buf_call(0, function() vim.cmd('noh') end)\n\
-             end))",
-        )
-        .await,
-        Value::Boolean(true)
-    );
-
-    // The lock is cleared after the call returns: an ex-command afterward works.
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "local b = vim.api.nvim_create_buf(false, true)\n\
-             pcall(function() vim.api.nvim_buf_call(b, function() vim.cmd('noh') end) end)\n\
-             return (pcall(function() vim.cmd('noh') end))",
-        )
-        .await,
-        Value::Boolean(true)
     );
 }

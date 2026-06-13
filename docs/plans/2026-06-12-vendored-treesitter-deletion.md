@@ -20,7 +20,7 @@
 > (*Treesitter highlighting is buffer state, not a verb*).
 >
 > **Context (2026-06-12):** the `300cdb0` "rip out neovim-plugin-compat runtime"
-> refactor has landed on `main` — it removed the which-key / telescope / cmp /
+> refactor has landed on `main` — it removed the popup / fuzzy-finder / completion /
 > prompt-buffer compat runtime but **left the vendored treesitter surface, the
 > bridges, and `nxvim-ts/src/lua.rs` fully intact**. This plan is the next cut,
 > unaffected by that refactor; line anchors below are against `main` after it.
@@ -35,7 +35,7 @@ against the recommended answers and flags where the alternative diverges.
 
 Walking trees (`get_node`, `iter_matches`, `get_parser`) for plugins. Today
 **nothing native needs it**: nxvim's own highlight/indent/fold run in Rust on
-`nxvim-ts::Engine`, and the Lua-facing parser primitives (`vim._create_ts_parser`
+`nxvim-ts::Engine`, and the Lua-facing parser primitives (`nx._create_ts_parser`
 & co. in [`nxvim-ts/src/lua.rs`](../../crates/nxvim-ts/src/lua.rs)) exist *solely*
 to back the vendored surface. No shipped plugin walks trees (catppuccin doesn't).
 
@@ -43,7 +43,7 @@ to back the vendored surface. No shipped plugin walks trees (catppuccin doesn't)
   with zero consumers. Rebuild a parser API under `nx.treesitter` when a real
   textobjects-class consumer lands, in nxvim's own shape.
 - **Alternative — expose.** The primitives survive but are re-homed under `nx.*`
-  naming (not `vim._*`), and `treesitter_lua.rs` is rewritten rather than deleted.
+  naming (not `nx._*`), and `treesitter_lua.rs` is rewritten rather than deleted.
 
 ### D2 — keep plugin query *customization*?
 

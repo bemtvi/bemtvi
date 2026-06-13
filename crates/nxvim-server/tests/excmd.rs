@@ -48,8 +48,8 @@ async fn message_after(
     panic!("no redraw arrived for {keys:?}");
 }
 
-/// `:silent! {cmd}` swallows the error a bare `{cmd}` would echo — lazy.nvim relies
-/// on this for `silent! runtime <optional file>`. The unmodified command still
+/// `:silent! {cmd}` swallows the error a bare `{cmd}` would echo — a plugin manager
+/// relies on this for `silent! runtime <optional file>`. The unmodified command still
 /// reports loudly (the modifier is the only thing suppressing it).
 #[tokio::test]
 async fn silent_bang_suppresses_command_error() {
@@ -71,7 +71,7 @@ async fn silent_bang_suppresses_command_error() {
     );
 }
 
-/// `:silent! runtime <missing>` — lazy.nvim's exact bootstrap call (`silent!
+/// `:silent! runtime <missing>` — a plugin manager's typical bootstrap call (`silent!
 /// runtime plugin/rplugin.vim`) — must not surface an error for the unimplemented
 /// `:runtime`; the modifier swallows it.
 #[tokio::test]
@@ -91,7 +91,7 @@ async fn silent_bang_swallows_runtime() {
 }
 
 /// `:source {file.lua}` runs the Lua file: a `vim.g` marker it sets is observable
-/// afterward. (lazy.nvim's loader sources plugin/ftdetect Lua files this way.)
+/// afterward. (a plugin manager's loader sources plugin/ftdetect Lua files this way.)
 #[tokio::test]
 async fn source_runs_a_lua_file() {
     let dir = temp_dir("excmd_source");

@@ -102,7 +102,7 @@ impl EditHost {
             // `:sil[ent][!] {cmd}` — the silent command modifier. Run `{cmd}` to
             // full convergence with its message-line output suppressed; the `!`
             // form is the one plugins lean on to ignore a command that errors or
-            // doesn't exist (lazy.nvim: `silent! runtime plugin/rplugin.vim`). The
+            // doesn't exist (e.g. a plugin manager: `silent! runtime plugin/rplugin.vim`). The
             // core defers the whole `silent …` string here, so this is the one
             // place it resolves. We snapshot the message line + history, run the
             // inner command (it may defer further — `run_command` drains that), then
@@ -131,7 +131,7 @@ impl EditHost {
             // `:com[mand][!] [attrs] {Name} {repl}` — define a user command. The
             // prelude parses the attribute/name/replacement line and registers a
             // command whose `{repl}` runs as an ex-command on invocation (reusing
-            // the same `vim._user_commands` store the `nvim_*` API uses), so the
+            // the same `nx._user_commands` store the `nvim_*` API uses), so the
             // many vimscript plugins that define their commands this way load. A
             // bare `:command` lists the defined commands (multi-line → panel).
             _ if is_command_def(base) => match self.lua.ex_command(bang, args, cur_buf) {
@@ -341,7 +341,7 @@ impl EditHost {
         })
     }
 
-    /// Surface the text a `vim._ex_*` autocmd driver returned: empty is nothing,
+    /// Surface the text a `nx._ex_*` autocmd driver returned: empty is nothing,
     /// a multi-line listing opens a panel (like `:LspInfo`), and a single line is
     /// echoed (a message or an `E…` error).
     fn surface_autocmd_output(&mut self, title: &str, out: &str) {

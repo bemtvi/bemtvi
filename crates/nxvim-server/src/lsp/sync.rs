@@ -574,7 +574,7 @@ impl EditHost {
                     });
                 if let Some((bufnr, data)) = mirror {
                     self.lsp_dirty = true;
-                    // Mirror into `vim._diagnostics[bufnr]` so the synchronous
+                    // Mirror into `nx._diagnostics[bufnr]` so the synchronous
                     // `vim.diagnostic.get` (Slice 2) can read it from pure Lua.
                     let _ = self.lua.set_diagnostics(bufnr, &data);
                 }

@@ -10,7 +10,7 @@
 //! `vim.fn.*`, and the `print` capture), while the broad pure-Lua part of
 //! `vim.*` — the table / list / string helpers, `vim.g`/`vim.o`/`vim.opt`/
 //! `vim.env`, `vim.iter`, and the registration APIs (`nvim_create_user_command`,
-//! `nvim_create_autocmd`, the `vim._fire` autocmd dispatcher) — lives in the
+//! `nvim_create_autocmd`, the `nx._fire` autocmd dispatcher) — lives in the
 //! `src/prelude/` Lua modules, loaded in order at init. The data-flow stays "Lua -> queued
 //! commands / output / highlights -> core mutation": effects are buffered in
 //! `Shared` ([`runtime`]) and drained by the server after each chunk.
@@ -21,7 +21,7 @@
 //! - [`install`] — installing the `vim.*` Rust bridge into a fresh VM.
 //! - [`convert`] — the Lua↔`rmpv`/`serde_json` value bridges and opts readers.
 //! - [`host`] — filesystem / process / glob / standard-path host primitives.
-//! - [`system`] — the blocking `vim._system` shell-out seam ([`BlockingSystem`]).
+//! - [`system`] — the blocking `nx._system` shell-out seam ([`BlockingSystem`]).
 //! - [`luafs`] — the project-facing Lua filesystem seam ([`LuaFs`]).
 
 mod convert;
@@ -31,7 +31,6 @@ mod luafs;
 mod ops;
 mod runtime;
 mod system;
-mod uvfs;
 mod vimregex;
 
 pub use luafs::{FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};

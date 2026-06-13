@@ -76,7 +76,7 @@ impl EditHost {
         if self.feed_buffer.is_empty() {
             return;
         }
-        // A `nvim_feedkeys` producer (e.g. which-key) may have changed the keymap
+        // A `nvim_feedkeys` producer (e.g. a popup plugin) may have changed the keymap
         // registry just before feeding (suspending its own triggers so the fed keys
         // hit the real maps); pick that up before feeding.
         self.refresh_keymaps();
@@ -212,7 +212,7 @@ impl EditHost {
     }
 
     /// Bring the keymap tries up to date for the current buffer. Re-reads the
-    /// registry only when `vim._keymaps_version` advanced (one integer read across
+    /// registry only when `nx._keymaps_version` advanced (one integer read across
     /// the bridge on the common path), and rebuilds the per-mode tries when either
     /// the snapshot or the current buffer changed — the latter so a buffer-local
     /// map (design D6) is in force exactly in its own buffer. Both checks are
@@ -285,7 +285,7 @@ impl EditHost {
 
     /// Run an `<expr>` Lua RHS and feed the keys it returns. The function computes
     /// keys rather than acting (vim's `<expr>`): it runs under the prelude's textlock
-    /// (`vim._expr_lock`, which makes `vim.cmd` raise), and whatever effects it
+    /// (`nx._expr_lock`, which makes `vim.cmd` raise), and whatever effects it
     /// queued anyway are **discarded** here — only the returned keys take effect, fed
     /// straight to the editor (noremap; the computed keys are not themselves
     /// remapped, the common case for `<expr>`, which is noremap by default). An error

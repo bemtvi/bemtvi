@@ -570,7 +570,7 @@ impl Editor {
             }
             // `:helpt[ags]` — recognized but not implemented: nxvim has no help
             // system yet (no `:help`, no `doc/tags` generation). Plugin managers
-            // (lazy.nvim, vim.pack) call this during install; rather than fail as an
+            // (a plugin manager) call this during install; rather than fail as an
             // unknown command — which can abort the caller — we complete with a loud
             // message so the install proceeds. NOT a silent no-op: it says plainly
             // that no tags were written. Replace with a real generator if/when the

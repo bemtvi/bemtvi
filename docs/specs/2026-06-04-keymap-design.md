@@ -30,12 +30,12 @@ first, then execute the phases in order — later phases assume earlier foundati
 
 The closest existing subsystems, and the templates for this work, are the
 **autocmd lifecycle** ([2026-06-04-autocmd-lifecycle-design.md](2026-06-04-autocmd-lifecycle-design.md))
-and **user commands**: a pure-Lua registry (`vim._autocmds` / `vim._user_commands`)
+and **user commands**: a pure-Lua registry (`nx._autocmds` / `nx._user_commands`)
 the server reads back, with callbacks invoked from Rust (`run_user_command` /
 `run_panel_select`) whose effects drain through `apply_lua_effects`. Keymaps add
 **two** twists those don't have: (a) the **LHS is matched against the live input
 stream**, mid-keystroke — the interesting part; and (b) unlike autocmds, where
-*matching* happens in Lua (`vim._fire`), keymap matching happens **in Rust** (the
+*matching* happens in Lua (`nx._fire`), keymap matching happens **in Rust** (the
 trie lives in the server, design §1/D1), so the server must read the registry **as
 data**, not just call into it.
 
@@ -133,8 +133,8 @@ that returns an owned list of **steps** the server then executes (design §3) �
 also sidesteps borrow conflicts between the matcher state and `self.editor`.
 
 **2. The Lua surface mirrors autocmds/user-commands.** `vim.keymap.set` stores an
-entry in a pure-Lua registry `vim._keymaps`; a **function** RHS is kept in a
-Lua-side table keyed by a stable id (`vim._keymap_fns[id]`), invoked from Rust by
+entry in a pure-Lua registry `nx._keymaps`; a **function** RHS is kept in a
+Lua-side table keyed by a stable id (`nx._keymap_fns[id]`), invoked from Rust by
 `LuaRuntime::run_keymap(id)` (the `run_user_command` / `run_panel_select` analogue),
 effects draining via `apply_lua_effects`. A **string** RHS is fed back into the input
 path. Registration is pure Lua (like `nvim_create_autocmd`); the Rust surface is just
@@ -204,10 +204,10 @@ backport sidestep this entirely: they are **native** actions (point D7) that cal
 `request_lsp(kind)` directly rather than feeding keys.
 
 **6. Reading the registry (the one structural difference from autocmds).** Autocmds
-keep *matching* in Lua: Rust calls `vim._fire(event,…)` and Lua walks `vim._autocmds`.
+keep *matching* in Lua: Rust calls `nx._fire(event,…)` and Lua walks `nx._autocmds`.
 Keymaps match **in Rust** (the trie), so `LuaRuntime` gains a **snapshot reader**,
 `keymaps_snapshot() -> Vec<RawKeymap>` plus `keymaps_version() -> u64`, that pulls
-`vim._keymaps` across the bridge as plain data:
+`nx._keymaps` across the bridge as plain data:
 `RawKeymap { modes: Vec<String>, lhs: String, rhs: RawRhs, noremap, buffer: Option<u64>, desc, default }`,
 `RawRhs = Lua(fn_id) | Str(String)`. The server compiles this snapshot into per-mode
 tries of `MappingRhs`. It checks `keymaps_version()` **once per `nvim_input` batch**
@@ -226,7 +226,7 @@ therefore takes effect on the *next* batch — an acceptable ordering, noted.)
   one-off. On the backport it **replaces** the bespoke `lsp_pending_g` /
   `lsp_pending_ctrl_x` recognizers; the LSP keys become ordinary default mappings
   (D6/D7). One matcher, not two.
-- **D3 — Registry mirrors autocmds; rebuild-on-version, not per-key.** `vim._keymaps`
+- **D3 — Registry mirrors autocmds; rebuild-on-version, not per-key.** `nx._keymaps`
   is read into a cached trie via the snapshot reader (point 6); a version counter
   invalidates it on `set`/`del`, checked once per batch. Per keystroke the server
   only walks the trie.
@@ -261,8 +261,8 @@ therefore takes effect on the *next* batch — an acceptable ordering, noted.)
 
 ### Files (touched across phases)
 
-- `crates/nxvim-lua/src/prelude.lua` — `vim.keymap.set`/`del`, the `vim._keymaps`
-  registry + `vim._keymap_fns` + `vim._run_keymap(id)` + `vim._keymaps_version`,
+- `crates/nxvim-lua/src/prelude.lua` — `vim.keymap.set`/`del`, the `nx._keymaps`
+  registry + `nx._keymap_fns` + `nx._run_keymap(id)` + `nx._keymaps_version`,
   `nvim_set_keymap`/`nvim_buf_set_keymap`/`nvim_del_keymap`, `<leader>` expansion,
   mode normalization. (Pure-Lua, like the autocmd registration helpers.)
 - `crates/nxvim-lua/src/lib.rs` — `LuaRuntime::run_keymap(id)` (the
@@ -299,8 +299,8 @@ one focused context window.
 
 > **Landed.** The engine is in `crates/nxvim-server/src/keymap.rs` (trie +
 > withhold/replay matcher), wired through `Server::input`; the Lua surface is in
-> `prelude.lua` (`vim.keymap.set`, `vim._keymaps`/`_keymap_fns`/`_keymaps_version`,
-> `vim._run_keymap`) with the snapshot reader / `run_keymap` in `nxvim-lua`'s
+> `prelude.lua` (`vim.keymap.set`, `nx._keymaps`/`_keymap_fns`/`_keymaps_version`,
+> `nx._run_keymap`) with the snapshot reader / `run_keymap` in `nxvim-lua`'s
 > `lib.rs`; the one core change (`#[derive(Hash)]` on `Key`/`KeyCode`) is in
 > `input.rs`. Covered by `crates/nxvim-server/tests/keymaps.rs`. **One realized
 > divergence (since fixed):** with no input timer, a trailing live-prefix stayed
@@ -325,16 +325,16 @@ here.)
 - The `nxvim-core` change: `#[derive(Hash)]` on `Key`/`KeyCode` (design §5).
 - `vim.keymap.set(mode, lhs, rhs, opts)` for a **string** `mode` (normal: `'n'`),
   `rhs` a **function** or **string**, `opts` honoring `noremap` (default true) and
-  `desc` (stored, unused). Stored in `vim._keymaps` with a stable id; a function rhs
-  in `vim._keymap_fns[id]`; bump `vim._keymaps_version`.
-- `vim._run_keymap(id)` (Lua) + `LuaRuntime::run_keymap(id)` (Rust), plus the
+  `desc` (stored, unused). Stored in `nx._keymaps` with a stable id; a function rhs
+  in `nx._keymap_fns[id]`; bump `nx._keymaps_version`.
+- `nx._run_keymap(id)` (Lua) + `LuaRuntime::run_keymap(id)` (Rust), plus the
   `keymaps_snapshot()` / `keymaps_version()` reader (design §6).
 - The server-side `keymap.rs` module: the **prefix trie** (per mode; Phase 1 only
   builds the Normal trie) + the `pending` withhold/replay matcher with the
   `feed(mode, key) -> Vec<Step>` surface (design §3), the precedence ladder shell
   (D6), and `MappingRhs::{Lua, Keys}` (D7). Wire it into `Server::input` as the
   **first** interception layer (`main` has none today), rebuilt when
-  `vim._keymaps_version` advances (checked once per batch).
+  `nx._keymaps_version` advances (checked once per batch).
 - RHS execution: a `Lua(id)` fire calls `run_keymap(id)` then `apply_lua_effects()`
   (which folds in the callback's highlights/commands/output — its direct `vim.cmd`s
   run there via `take_commands`); any *further* deferred ex-commands converge in the
@@ -451,7 +451,7 @@ ambiguity timer and `expr` (Phase 4).
 > version check it is once-per-batch, so a mid-batch switch takes effect next batch.
 > A startup seed (`set_buf_snapshot` before `source_init`) makes `buffer = 0`
 > resolve to the real startup buffer at config-time, matching neovim (the same
-> `vim._cur_buf` snapshot `nvim_create_autocmd`'s `buffer = 0` already used).
+> `nx._cur_buf` snapshot `nvim_create_autocmd`'s `buffer = 0` already used).
 > `vim.keymap.set`/`del` and the `nvim_*` family share two pure-Lua helpers
 > (`keymap_register`/`keymap_remove`); the only behavioral split is the `noremap`
 > default (D5 — `set` true, the `nvim_*`/`:map` family false). `keymap_remove`
@@ -540,7 +540,7 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
     to the editor (noremap — the computed keys aren't themselves remapped, matching
     `<expr>`'s noremap-by-default use).
   - **Sandbox (textlock).** An `<expr>` RHS must *compute*, not mutate. It runs under
-    the prelude's `vim._expr_lock`, which makes `vim.cmd` raise (the main mutation
+    the prelude's `nx._expr_lock`, which makes `vim.cmd` raise (the main mutation
     funnel); the server additionally **discards** any effects it queued (`print`,
     highlights, panel ops), so only the returned keys take effect. A throwing handler
     or a textlock violation surfaces an error and feeds nothing. (Scope cut: only a

@@ -235,8 +235,8 @@ pub struct ServerInit {
     /// `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) runs through. `None`
     /// (the default) hits the local disk via the persistent
     /// [`StdLuaFs`](nxvim_lua::StdLuaFs); the edit-host split injects a daemon-backed
-    /// [`RemoteLuaFs`] here so a plugin reads the *remote* project (telescope previews,
-    /// LSP `root_dir` detection, gitsigns) instead of the local machine
+    /// [`RemoteLuaFs`] here so a plugin reads the *remote* project (file previews,
+    /// LSP `root_dir` detection, git-status marks) instead of the local machine
     /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → *The full split*,
     /// *Lua-visible filesystem semantics*). Like [`blocking_system`](Self::blocking_system)
     /// it is a synchronous blocking bridge: each call parks the editor thread on the
@@ -467,13 +467,13 @@ pub struct EditHost {
     known_tabs: Vec<TabId>,
     /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
     /// `EditHost::input` runs every key through before `editor.input`. Rebuilt from
-    /// `vim._keymaps` when its version advances (checked once per input batch).
+    /// `nx._keymaps` when its version advances (checked once per input batch).
     keymaps: Keymaps,
     /// Callback ids queued by `vim.schedule`, drained inside `run_pending` so a
     /// scheduled fn runs at the end of the current convergence (not nested in its
     /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
     scheduled: VecDeque<u64>,
-    /// Per-buffer `changedtick` last copied into the `vim._bufs` Lua mirror
+    /// Per-buffer `changedtick` last copied into the `nx._bufs` Lua mirror
     /// ([`EditHost::push_buf_mirror`]), so an unchanged buffer's line array isn't
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
     /// refresh each time (Phase 6).
@@ -481,9 +481,9 @@ pub struct EditHost {
     /// Per-buffer line count last mirrored, so [`EditHost::push_buf_mirror`] can pass
     /// the old line count as `on_lines`' `lastline` when an attached buffer changes
     /// (`nvim_buf_attach`). Tracked only to fire faithful buffer-change callbacks —
-    /// telescope drives its prompt filtering off `on_lines`.
+    /// a fuzzy-finder plugin drives its prompt filtering off `on_lines`.
     buf_mirror_lines: HashMap<BufferId, usize>,
-    /// Per-buffer undo fingerprint last serialized into the `vim._undotree` Lua
+    /// Per-buffer undo fingerprint last serialized into the `nx._undotree` Lua
     /// mirror ([`EditHost::push_undotree_mirror`]), so an unchanged tree isn't
     /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
     undo_mirror_versions: HashMap<BufferId, (u64, usize, u64, bool)>,
@@ -495,12 +495,12 @@ pub struct EditHost {
     /// when set, [`EditHost::mouse_stamp_ms`] reads it instead of `start.elapsed()`.
     mouse_clock: Option<Arc<AtomicU64>>,
     /// The highlight-registry [`generation`](nxvim_core::highlight::Highlights::generation)
-    /// last folded into the `vim._hl_defs` Lua mirror ([`EditHost::push_buf_mirror`]).
+    /// last folded into the `nx._hl_defs` Lua mirror ([`EditHost::push_buf_mirror`]).
     /// The mirror (potentially hundreds of groups) is re-pushed only when this
     /// changes — a colorscheme load, a `:hi`/`nvim_set_hl` — so the common chunk
     /// pays nothing for `nvim_get_hl` support. `None` until the first push.
     hl_mirror_gen: Option<u64>,
-    /// The `vim._cb_fns` id of the `vim.ui.input` callback awaiting the open
+    /// The `nx._cb_fns` id of the `vim.ui.input` callback awaiting the open
     /// command-line prompt's result, or `None` when no scripted prompt is open
     /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
     pending_ui_input: Option<u64>,
@@ -1125,7 +1125,7 @@ where
     // Then source the package `plugin/` / `after/plugin/` Lua scripts across the
     // runtimepath — neovim's startup package load, after `init.lua` and before the
     // first buffer's lifecycle events, so a plugin's autocmds/registration are in
-    // place (this is what initializes nvim-cmp's engine, cmp-buffer's source, etc.).
+    // place (this is what initializes a completion plugin's engine, its sources, etc.).
     host.source_plugins();
 
     // Startup seed: the initial buffer and the config's autocmds both exist now,

@@ -74,7 +74,7 @@ pub enum LspOp {
         /// The buffer's filetype, used verbatim as the LSP `languageId`.
         filetype: String,
         /// The buffer to attach, as the `BufferId` the server snapshotted into
-        /// `vim._cur_buf` before firing `FileType` (so it round-trips exactly).
+        /// `nx._cur_buf` before firing `FileType` (so it round-trips exactly).
         bufnr: u64,
         /// The config's `init_options`, sent verbatim as `initialization_options`
         /// at `initialize` (Phase 2). `None` when the config sets none.
@@ -144,7 +144,7 @@ pub enum LspOp {
     },
     /// `client:request(method, params, handler)` (Phase 5) — issue a generic LSP
     /// request to the client `client_id`'s server and route its reply to the Lua
-    /// callback `cb_id` (a `vim._cb_fns` entry holding the resolved handler). The
+    /// callback `cb_id` (a `nx._cb_fns` entry holding the resolved handler). The
     /// server resolves the client's [`ServerKey`] and forwards a raw request; the
     /// reply comes back off-tick as a [`CallbackArgs::LspReply`].
     ClientRequest {
@@ -154,7 +154,7 @@ pub enum LspOp {
         method: String,
         /// The request params as JSON (`Null` when the caller passed none).
         params: serde_json::Value,
-        /// The `vim._cb_fns` id the reply's handler is registered under.
+        /// The `nx._cb_fns` id the reply's handler is registered under.
         cb_id: u64,
     },
     /// `client:notify(method, params)` (Phase 5) — fire-and-forget a generic LSP
@@ -226,7 +226,7 @@ pub enum LspOp {
 
 /// A request to the async runtime (the "event loop"), queued by the `vim.schedule`
 /// / `vim.defer_fn` / `vim.uv` timer / `vim.system` family and drained by the
-/// server in `apply_lua_effects`. Each op carries a `cb_id` into `vim._cb_fns`
+/// server in `apply_lua_effects`. Each op carries a `cb_id` into `nx._cb_fns`
 /// (the deferred-callback registry); the server either services it directly
 /// ([`LoopOp::Schedule`], same-convergence deferral) or forwards it to the
 /// background event-loop actor (timers and processes, which take wall-clock time).
@@ -252,7 +252,7 @@ pub enum LoopOp {
     /// exits. The pid is returned synchronously by the bridge; only the *wait* is
     /// async. `stdin` is fed to the child's standard input then closed (empty for
     /// `vim.system`, which takes no stdin; non-empty for a `uv.spawn` pipe written
-    /// by `plenary.job`).
+    /// by a plugin's job runner).
     Spawn {
         id: u64,
         cmd: Vec<String>,
@@ -300,15 +300,15 @@ pub enum BufOp {
         value: OptionValue,
     },
     /// `nvim_create_buf(listed, scratch)` — create a new empty buffer with no
-    /// window. The Lua side already predicted the id (from `vim._next_buf`) and
+    /// window. The Lua side already predicted the id (from `nx._next_buf`) and
     /// mirrored the buffer; the server calls `Editor::create_buffer`, which hands
     /// out that same id (buffer ids are monotonic, so the prediction holds as long
     /// as nothing else creates a buffer between the mirror push and this drain).
     Create,
     /// `nvim_buf_delete(bufnr, { force })` — remove buffer `bufnr` from the editor
-    /// (the popup-teardown half of which-key's lifecycle). `force` drops a modified
+    /// (the popup-teardown half of a popup plugin's lifecycle). `force` drops a modified
     /// buffer without the `E89` guard. The Lua side has already dropped it from the
-    /// `vim._bufs` mirror (write-through); the server calls `Editor::delete_buffer`.
+    /// `nx._bufs` mirror (write-through); the server calls `Editor::delete_buffer`.
     Delete { bufnr: u64, force: bool },
 }
 
@@ -317,7 +317,7 @@ pub enum BufOp {
 /// [`ExtmarkStore`](nxvim_core::ExtmarkStore). Positions ride as neovim's 0-based
 /// `(row, col)`; the server converts them to byte offsets against the live buffer
 /// (the conversion needs the rope, which the Lua side can't see). The Lua front
-/// has already updated its `vim._extmarks` mirror (read-after-write within the
+/// has already updated its `nx._extmarks` mirror (read-after-write within the
 /// chunk); this op makes the core catch up after the chunk.
 #[derive(Clone, Debug)]
 pub enum ExtmarkOp {
@@ -363,7 +363,7 @@ pub enum OptionValue {
 /// A register write queued by `vim.fn.setreg`, drained by the server into the
 /// live editor's register file after the chunk — the register analogue of
 /// [`BufOp`] / [`GlobalOptionOp`]. Reads (`vim.fn.getreg` / `getregtype`)
-/// resolve against the `vim._registers` mirror the server pushes before running
+/// resolve against the `nx._registers` mirror the server pushes before running
 /// Lua, so only the write needs an op. The Lua bridge has already rejected
 /// read-only specials and folded an uppercase name / `a` flag into `append`.
 #[derive(Clone, Debug)]
@@ -399,7 +399,7 @@ pub struct FeedKeysOp {
 /// A global (editor-wide) option mutation queued by `vim.o` for a search option
 /// (`ignorecase` / `smartcase` / `wrapscan` / `hlsearch` / `incsearch`), the
 /// global analogue of [`BufOp::SetOption`] / [`WindowOp::SetOption`]. The Lua
-/// side has canonicalized `name` and written through its `vim._go_mirror`; the
+/// side has canonicalized `name` and written through its `nx._go_mirror`; the
 /// server applies the value to the editor's global options after the chunk.
 /// These are all boolean today, but the value rides as an [`OptionValue`] for
 /// symmetry with the buffer/window bridges (and so a numeric global can land here
@@ -432,7 +432,7 @@ pub enum TsOp {
 /// `nvim_win_set_buf`/`set_cursor`/`set_width`/`set_height`/`close`, `nvim_open_win`),
 /// drained by the server in `apply_lua_effects` and applied to the live editor —
 /// the window analogue of [`BufOp`]. Reads (`nvim_list_wins`, `nvim_win_get_*`)
-/// need no op: they resolve against the `vim._wins` mirror the server pushes
+/// need no op: they resolve against the `nx._wins` mirror the server pushes
 /// before running Lua. `0` is the current window/buffer, resolved server-side.
 #[derive(Clone, Debug)]
 pub enum WindowOp {
@@ -515,7 +515,7 @@ pub enum WindowOp {
 /// A tab-page mutation queued by the tab Lua API (`vim.api.nvim_set_current_tabpage`),
 /// drained by the server in `apply_lua_effects` and applied to the live editor —
 /// the tab analogue of [`WindowOp`]. Reads (`nvim_list_tabpages`,
-/// `nvim_tabpage_*`) need no op: they resolve against the `vim._tabs` mirror the
+/// `nvim_tabpage_*`) need no op: they resolve against the `nx._tabs` mirror the
 /// server pushes before running Lua. `0` is the current tab, resolved server-side.
 #[derive(Clone, Debug)]
 pub enum TabOp {
@@ -551,9 +551,9 @@ pub enum CallbackArgs {
     },
 }
 
-/// One diagnostic mirrored into the Lua `vim._diagnostics[bufnr]` table so the
+/// One diagnostic mirrored into the Lua `nx._diagnostics[bufnr]` table so the
 /// synchronous getter `vim.diagnostic.get` can read it without reaching the live
-/// `Server` (the Rust→Lua mirror, the analogue of `vim._set_cur_buf`). Fields
+/// `Server` (the Rust→Lua mirror, the analogue of `nx._set_cur_buf`). Fields
 /// match neovim's `vim.diagnostic.get` shape: 0-based positions and severity
 /// numbered 1=ERROR…4=HINT. `col`/`end_col` are in the server's negotiated
 /// position encoding — byte offsets under the UTF-8 nxvim advertises first.
@@ -575,9 +575,9 @@ pub struct DiagnosticData {
     pub source: Option<String>,
 }
 
-/// One decoded semantic token mirrored into `vim._semantic_tokens[bufnr]` so the
+/// One decoded semantic token mirrored into `nx._semantic_tokens[bufnr]` so the
 /// synchronous getter `vim.lsp.semantic_tokens.get_at_pos` can read it from pure
-/// Lua (the Rust→Lua mirror, the analogue of `vim._diagnostics`). Positions are
+/// Lua (the Rust→Lua mirror, the analogue of `nx._diagnostics`). Positions are
 /// 0-based; `start_col`/`end_col` are line-local **byte** offsets (already
 /// converted from the server's encoding when the tokens were decoded), matching
 /// neovim's byte-column `get_at_pos` shape.
@@ -598,9 +598,9 @@ pub struct SemanticTokenData {
     pub client_id: u64,
 }
 
-/// One decoded inlay hint mirrored into `vim._inlay_hints[bufnr]` so the
+/// One decoded inlay hint mirrored into `nx._inlay_hints[bufnr]` so the
 /// synchronous getter `vim.lsp.inlay_hint.get` can read it from pure Lua (the
-/// Rust→Lua mirror, the analogue of [`SemanticTokenData`] / `vim._diagnostics`).
+/// Rust→Lua mirror, the analogue of [`SemanticTokenData`] / `nx._diagnostics`).
 /// Pushed on every `textDocument/inlayHint` reply (and after a lazy hint resolves).
 /// `line` is 0-based; `col` is a line-local **byte** offset (already converted from
 /// the server's encoding when the hint was decoded), a documented approximation of
@@ -656,9 +656,9 @@ pub struct LspServerCapabilities {
     pub inlay_hints: bool,
 }
 
-/// One `vim.keymap.set` entry, read back from `vim._keymaps` as plain data for
+/// One `vim.keymap.set` entry, read back from `nx._keymaps` as plain data for
 /// the server to compile into its per-mode prefix tries. Unlike autocmds — whose
-/// *matching* stays in Lua (`vim._fire`) — keymap matching happens in Rust, so
+/// *matching* stays in Lua (`nx._fire`) — keymap matching happens in Rust, so
 /// the runtime exposes the registry as a snapshot rather than a dispatcher.
 #[derive(Clone, Debug)]
 pub struct RawKeymap {
@@ -694,14 +694,14 @@ pub struct RawKeymap {
 /// A keymap's right-hand side, as carried in the snapshot.
 #[derive(Clone, Debug)]
 pub enum RawRhs {
-    /// A function RHS, keyed by id in `vim._keymap_fns` (run via `run_keymap`).
+    /// A function RHS, keyed by id in `nx._keymap_fns` (run via `run_keymap`).
     Lua(u64),
     /// A string RHS — key notation the server parses and feeds.
     Str(String),
 }
 
 /// A `vim.ui.input(opts, on_confirm)` request: open a one-line prompt labelled
-/// `prompt`, prefilled with `default`, and fire callback `cb_id` (a `vim._cb_fns`
+/// `prompt`, prefilled with `default`, and fire callback `cb_id` (a `nx._cb_fns`
 /// entry wrapping `on_confirm`) with the typed text — or `nil` on cancel — when
 /// the user submits. Queued in [`crate::runtime::Shared::ui_inputs`], drained by the server.
 #[derive(Clone, Debug)]
@@ -710,14 +710,14 @@ pub struct UiInputReq {
     pub prompt: String,
     /// The text the line is prefilled with (`opts.default`; empty when unset).
     pub default: String,
-    /// The `vim._cb_fns` id whose `on_confirm` wrapper receives the result.
+    /// The `nx._cb_fns` id whose `on_confirm` wrapper receives the result.
     pub cb_id: u64,
 }
 
 /// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a
 /// single-key button dialog showing `label` (the message plus the rendered
 /// buttons, already formatted by the Lua wrapper) and fire callback `cb_id` (a
-/// `vim._cb_fns` entry that resumes the blocked coroutine) with the chosen
+/// `nx._cb_fns` entry that resumes the blocked coroutine) with the chosen
 /// button's 1-based index — or `0` on cancel. Queued in
 /// [`crate::runtime::Shared::confirms`], drained by the server.
 #[derive(Clone, Debug)]
@@ -729,6 +729,6 @@ pub struct ConfirmReq {
     pub accelerators: Vec<String>,
     /// The button selected by `<CR>` (1-based; `0` = none, so `<CR>` cancels).
     pub default: i64,
-    /// The `vim._cb_fns` id whose continuation receives the chosen index.
+    /// The `nx._cb_fns` id whose continuation receives the chosen index.
     pub cb_id: u64,
 }

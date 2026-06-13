@@ -198,7 +198,7 @@ impl Highlights {
     }
 
     /// Iterate the raw `(name, def)` definitions of the global namespace — the
-    /// source the server folds into the Lua `vim._hl_defs` mirror that backs
+    /// source the server folds into the Lua `nx._hl_defs` mirror that backs
     /// `nvim_get_hl`. Links are kept unresolved (the Lua side follows the chain
     /// when asked).
     pub fn iter(&self) -> impl Iterator<Item = (&str, &HlDef)> {

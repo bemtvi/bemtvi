@@ -1107,7 +1107,7 @@ impl Editor {
         // (like `:lua`); the server runs it after the panel is open, so it sets
         // the handler on this very panel.
         self.lua_queue
-            .push("vim.panel.on_select(vim._panel_select_buffer)".to_string());
+            .push("vim.panel.on_select(nx._panel_select_buffer)".to_string());
     }
 
     /// `:messages` — show the message history in the bottom panel, opened

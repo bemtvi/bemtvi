@@ -457,7 +457,7 @@ impl EditHost {
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, file, ft);
         // Keep the buffer mirror in lockstep: an autocmd callback runs here before
-        // the caller's `run_pending`, so refresh `vim._bufs` / the cursor too.
+        // the caller's `run_pending`, so refresh `nx._bufs` / the cursor too.
         self.push_buf_mirror();
         if let Err(e) = self.lua.fire_autocmd_buf(event, pattern, buf.0, file) {
             self.editor
@@ -637,7 +637,7 @@ impl EditHost {
     /// every entry's `after/plugin/` last — neovim's startup package-load order
     /// (`pack/*/start/*` plugins included), run *after* `init.lua`. This is what
     /// lets a plugin's `plugin/` script wire its autocmds / register itself (e.g.
-    /// nvim-cmp's engine, cmp-buffer's `register_source`) — without it a plugin that
+    /// a completion plugin's engine, a source's `register_source`) — without it a plugin that
     /// merely `require`s cleanly still never initializes. Each entry's
     /// `plugin/**/*.lua` is sourced sorted (recursing); a script error surfaces on
     /// the message line and does not abort the rest. Effects drain through the same

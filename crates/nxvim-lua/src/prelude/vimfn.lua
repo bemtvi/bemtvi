@@ -1,0 +1,399 @@
+-- nxvim Lua prelude — vim.fn editor-query builtins.
+-- The Vimscript builtins that read live editor state through the state mirror:
+-- nx.line / nx.col / nx.expand / nx.localtime / nx.undotree, and the
+-- nx.pum / nx.pos / nx.match / nx.jumplist registries that plugins query. Each is
+-- authored as an nx.* noun with its vim.fn.* alias.
+local vim = vim
+local api = vim.api
+local fn = vim.fn
+nx = nx or {}
+
+-- nx.line(expr) [alias vim.fn.line]: a buffer line number. "." is the cursor line
+-- (1-based), "$" the last line (the line count). The window-relative forms
+-- ("w0"/"w$") need the scroll position, which the mirror doesn't carry yet, so they
+-- error loud.
+function nx.line(expr)
+  if expr == "." then
+    return (nx._cur_cursor or {}).row or 1
+  elseif expr == "$" then
+    local buf = nx._bufs[nx._resolve_bufnr(0)]
+    return (buf and buf.lines) and #buf.lines or 1
+  end
+  error("line(): unsupported expression '" .. tostring(expr) .. "'", 2)
+end
+vim.fn.line = nx.line
+
+-- nx.col(expr) [alias vim.fn.col]: a byte column (1-based). "." is the cursor
+-- column, "$" one past the end of the cursor line (its byte length + 1), matching vim.
+function nx.col(expr)
+  if expr == "." then
+    return ((nx._cur_cursor or {}).col or 0) + 1
+  elseif expr == "$" then
+    local buf = nx._bufs[nx._resolve_bufnr(0)]
+    local row = (nx._cur_cursor or {}).row or 1
+    local ln = (buf and buf.lines) and buf.lines[row] or ""
+    return #ln + 1
+  end
+  error("col(): unsupported expression '" .. tostring(expr) .. "'", 2)
+end
+vim.fn.col = nx.col
+
+-- nx.localtime() [alias vim.fn.localtime]: the current time in seconds. nxvim
+-- sources this from a MONOTONIC clock (the server's `nx._mono_secs`, the same base
+-- stamped onto undo nodes), not wall-clock unix epoch, so `localtime() - node.time`
+-- elapsed math (e.g. the undotree visualizer's "N minutes ago") stays correct and
+-- non-negative across NTP steps and manual clock changes. Only differences matter.
+function nx.localtime()
+  return nx._mono_secs or 0
+end
+vim.fn.localtime = nx.localtime
+
+-- nx.undotree.get([bufnr]) [alias vim.fn.undotree]: the buffer's undo tree, in neovim's shape
+-- ({ seq_last, seq_cur, save_last, save_cur, time_cur, synced, entries }, each
+-- entry { seq, time, save?, alt? }). Reads the `nx._undotree` mirror the server
+-- projects from the core's branching history before each Lua entry; `bufnr`
+-- 0/nil is the current buffer. A buffer with no recorded history yet yields an
+-- empty-`entries` tree rather than erroring.
+nx.undotree = nx.undotree or {}
+function nx.undotree.get(bufnr)
+  bufnr = nx._resolve_bufnr(bufnr)
+  local t = (nx._undotree or {})[bufnr]
+  if t == nil then
+    return {
+      synced = 1,
+      seq_last = 0,
+      seq_cur = 0,
+      save_last = 0,
+      save_cur = 0,
+      time_cur = 0,
+      entries = {},
+    }
+  end
+  return t
+end
+vim.fn.undotree = nx.undotree.get
+
+-- (vim.fn.fnamemodify lives in prelude/fs.lua, alongside the other path vim.fn;
+-- this chunk's expand routes through it at call time.)
+
+-- nx.expand(expr) [alias vim.fn.expand]: the `%` (current file) forms autocmd
+-- callbacks and statuslines use to resolve paths, backed by the current-buffer
+-- snapshot. `%` is the stored name; `%:<mods>` routes through fnamemodify (so `%:t`,
+-- `%:p`, `%:h`, `%:r`, `%:~:.`, … all work). A non-`%` expression errors loud.
+-- (the override below extends this with cursor keywords / globs, re-binding nx.expand.)
+function nx.expand(expr)
+  local name = (nx._cur_buf or {}).name or ""
+  if expr == "%" then
+    return name
+  end
+  local mods = expr:match("^%%(:.*)$")
+  if mods then
+    return vim.fn.fnamemodify(name, mods)
+  end
+  error("expand(): unsupported expression '" .. tostring(expr) .. "'", 2)
+end
+vim.fn.expand = nx.expand
+
+-- nx.pum.visible() [alias vim.fn.pumvisible]: whether the insert-mode completion
+-- popup is showing. nxvim doesn't surface the popup-menu state to Lua, so this is
+-- truthfully 0 in the contexts a plugin checks it (a prompt buffer has no ins-completion
+-- menu) — an honest "not visible", not a faked value.
+nx.pum = nx.pum or {}
+function nx.pum.visible()
+  return 0
+end
+vim.fn.pumvisible = nx.pum.visible
+
+-- nx.jumplist.get([winnr [, tabnr]]) [alias vim.fn.getjumplist]: the window's jumplist as
+-- `{ list, curidx }`. `list` is an array of `{ bufnr, lnum, col, coladd }` dicts
+-- oldest-first (lnum 1-based, col 0-based byte); `curidx` is the navigation
+-- pointer `<C-o>`/`<C-i>` walk — a 0-based index into `list`, equal to `#list`
+-- when sitting at the present (not navigating). `winnr` is a window-ID or a
+-- 1-based window number (default: the current window). `tabnr` is accepted but
+-- only the current tab's windows are mirrored, so an off-tab window yields
+-- `{ {}, 0 }`. Reads the window mirror the server pushes (`nx._wins`).
+nx.jumplist = nx.jumplist or {}
+function nx.jumplist.get(winnr, _tabnr)
+  local id
+  if winnr == nil or winnr == 0 then
+    id = nx._cur_win or 1000
+  elseif (nx._wins or {})[winnr] then
+    id = winnr -- already a window-ID
+  else
+    id = (nx._win_order or {})[winnr] or 0
+  end
+  local w = (nx._wins or {})[id]
+  if not w then
+    return { {}, 0 }
+  end
+  local list = {}
+  for _, e in ipairs(w.jumps or {}) do
+    list[#list + 1] = { bufnr = e.bufnr, lnum = e.lnum, col = e.col, coladd = e.coladd or 0 }
+  end
+  return { list, w.jump_idx or #list }
+end
+fn.getjumplist = nx.jumplist.get
+
+-- nx.pos.get(expr) [alias vim.fn.getpos]: a position as `{bufnr, lnum, col, off}`
+-- (1-based lnum/col). "." is the cursor; "'<" / "'>" are the visual-selection
+-- corners — nxvim doesn't mirror those marks to vim.fn yet, so they fall back to the
+-- cursor (a grep-from-selection plugin then greps the cursor word, a graceful
+-- degradation rather than an error). Backs a plugin's visual-selection range read.
+nx.pos = nx.pos or {}
+function nx.pos.get(expr)
+  local c = nx._cur_cursor or { row = 1, col = 0 }
+  if expr == "." or expr == "'<" or expr == "'>" or expr == "v" then
+    return { 0, c.row, c.col + 1, 0 }
+  end
+  return { 0, 0, 0, 0 }
+end
+fn.getpos = nx.pos.get
+
+-- nx.pos.set(expr, pos) [alias vim.fn.setpos]: move the cursor when `expr` is "."
+-- (the only settable position nxvim models); `pos` is `{bufnr, lnum, col, off}`.
+-- Other marks are accepted but not stored (no writable-mark mirror), returning 0.
+function nx.pos.set(expr, pos)
+  if expr == "." then
+    api.nvim_win_set_cursor(0, { pos[2], math.max(0, (pos[3] or 1) - 1) })
+  end
+  return 0
+end
+fn.setpos = nx.pos.set
+
+-- ----- match highlighting (matchadd family) ----------------------------------
+-- A per-window registry of match-highlight requests. INCOMPLETE: the registry is
+-- faithful (ids are allocated, stored, and removable, and getmatches reflects it),
+-- but nxvim does not yet RENDER these matches — there is no `:match`/`matchadd`
+-- decoration path in the core. A plugin uses it to tint the searched term inside
+-- a previewer; the preview content is correct, the term is just not yet tinted.
+-- This is the documented-approximation pattern (observable state, rendering TBD),
+-- chosen over a loud failure so the previewer runs rather than erroring.
+nx._matches = nx._matches or {}
+nx._match_seq = nx._match_seq or 0
+local function match_store(win)
+  win = (win == nil or win == 0) and (nx._cur_win or 1000) or win
+  nx._matches[win] = nx._matches[win] or {}
+  return nx._matches[win]
+end
+-- nx.match.* (aliases vim.fn.matchadd / matchaddpos / matchdelete / clearmatches /
+-- getmatches): the per-window match-highlight registry.
+nx.match = nx.match or {}
+function nx.match.add(group, pattern, priority, id, opts)
+  nx._match_seq = nx._match_seq + 1
+  local mid = (id and id ~= -1) and id or nx._match_seq
+  local store = match_store(opts and opts.window)
+  store[mid] = { group = group, pattern = pattern, priority = priority or 10, id = mid }
+  return mid
+end
+function nx.match.addpos(group, pos, priority, id, opts)
+  nx._match_seq = nx._match_seq + 1
+  local mid = (id and id ~= -1) and id or nx._match_seq
+  local store = match_store(opts and opts.window)
+  store[mid] = { group = group, pos = pos, priority = priority or 10, id = mid }
+  return mid
+end
+function nx.match.delete(id, win)
+  local store = match_store(win)
+  local existed = store[id] ~= nil
+  store[id] = nil
+  return existed and 0 or -1
+end
+function nx.match.clear(win)
+  nx._matches[(win == nil or win == 0) and (nx._cur_win or 1000) or win] = {}
+  return 0
+end
+function nx.match.get(win)
+  local out = {}
+  for _, m in pairs(match_store(win)) do
+    out[#out + 1] = m
+  end
+  table.sort(out, function(a, b)
+    return a.id < b.id
+  end)
+  return out
+end
+fn.matchadd = nx.match.add
+fn.matchaddpos = nx.match.addpos
+fn.matchdelete = nx.match.delete
+fn.clearmatches = nx.match.clear
+fn.getmatches = nx.match.get
+
+-- nx.expand(expr[, nosuf, list]) [alias vim.fn.expand]: superset of the
+-- snapshot-backed `%` form (the base nx.expand above) that
+-- plugins also drive with cursor keywords, `~`/`$ENV` paths, and
+-- wildcards. Resolution order:
+--   * `%`, `%:<mods>`         — the current file (delegated to the base impl)
+--   * `<cword>` / `<cWORD>`   — the (WORD) under the cursor
+--   * `<cfile>`               — the path-like token under the cursor
+--   * a `:<mods>` suffix on any of the cursor keywords routes through fnamemodify
+--   * leading `~` / `$VAR`    — home / environment expansion
+--   * a wildcard (`*`/`?`)    — glob (returns a list when `list` is truthy)
+--   * anything else           — the path with ~/$ expanded, returned verbatim
+-- This re-binds nx.expand (the base loaded earlier), keeping its `%` behavior.
+local expand_pct = nx.expand
+local function cursor_word(big)
+  local c = nx._cur_cursor or { row = 1, col = 0 }
+  local buf = nx._bufs and nx._bufs[nx._resolve_bufnr(0)]
+  local line = (buf and buf.lines and buf.lines[c.row]) or ""
+  local col = (c.col or 0) + 1 -- 1-based byte index of the cursor
+  -- `<cword>` is a run of keyword chars (word + underscore); `<cWORD>` is a run of
+  -- non-blanks. Scan left and right from the cursor over the matching class.
+  local class = big and "%S" or "[%w_]"
+  if col > #line then
+    col = #line
+  end
+  if col < 1 then
+    return ""
+  end
+  if line:sub(col, col):match(class) == nil then
+    -- Cursor not on the class: vim scans forward to the next match on the line.
+    local s = line:find(class, col)
+    if not s then
+      return ""
+    end
+    col = s
+  end
+  local b = col
+  while b > 1 and line:sub(b - 1, b - 1):match(class) do
+    b = b - 1
+  end
+  local e = col
+  while e < #line and line:sub(e + 1, e + 1):match(class) do
+    e = e + 1
+  end
+  return line:sub(b, e)
+end
+local function expand_path(p)
+  if p:sub(1, 1) == "~" then
+    p = (os.getenv("HOME") or "") .. p:sub(2)
+  end
+  p = p:gsub("%$([%w_]+)", function(v)
+    return os.getenv(v) or ("$" .. v)
+  end)
+  return p
+end
+function nx.expand(expr, nosuf, list)
+  expr = tostring(expr)
+  -- `%`-family: keep the existing snapshot-backed behavior verbatim.
+  if expr == "%" or expr:match("^%%:") then
+    return expand_pct(expr, nosuf, list)
+  end
+  -- Cursor keywords, with an optional `:mods` filename-modifier suffix.
+  local kw, mods = expr:match("^(<c%a+>)(.*)$")
+  if kw then
+    local word
+    if kw == "<cword>" then
+      word = cursor_word(false)
+    elseif kw == "<cWORD>" or kw == "<cfile>" then
+      word = cursor_word(true)
+    else
+      word = ""
+    end
+    if mods ~= "" then
+      word = fn.fnamemodify(word, mods)
+    end
+    return word
+  end
+  -- Wildcard expansion → glob.
+  if expr:find("[*?]") then
+    return fn.glob(expand_path(expr), nosuf, list)
+  end
+  -- A plain string: home / env expansion, returned verbatim (vim's behavior for a
+  -- path with no wildcards).
+  return expand_path(expr)
+end
+vim.fn.expand = nx.expand
+
+-- nx.fname.modify(fname, mods) [alias vim.fn.fnamemodify]: apply vim's filename
+-- modifiers left to right. A pure path-string helper (no I/O beyond reading cwd),
+-- so it lives with the vim.fn read builtins — `expand('%:t')` / `'%:h'` and a
+-- `'statusline'` `%f` route through it. Supported: `:p` (absolute against cwd),
+-- `:~` (relative to $HOME with `~`), `:.` (relative to cwd when under it), `:h`
+-- (head/dir), `:t` (tail), `:r` (root, strip one extension — a leading dot isn't
+-- one), `:e` (extension; consecutive `:e` widen it to the last k dot-components,
+-- vim's quirk). An unsupported modifier errors loud rather than silently passing
+-- the name through. Cases match real neovim's vim.fn.fnamemodify.
+nx.fname = nx.fname or {}
+function nx.fname.modify(fname, mods)
+  fname = fname or ""
+  mods = mods or ""
+  local i, n = 1, #mods
+  while i <= n do
+    local m = mods:sub(i, i + 1)
+    if m == ":p" then
+      if fname == "" then
+        fname = vim.fn.getcwd()
+      elseif fname:sub(1, 1) ~= "/" then
+        fname = vim.fn.getcwd() .. "/" .. fname
+      end
+      i = i + 2
+    elseif m == ":~" then
+      local home = os.getenv("HOME") or ""
+      if home ~= "" and (fname == home or fname:sub(1, #home + 1) == home .. "/") then
+        fname = "~" .. fname:sub(#home + 1)
+      end
+      i = i + 2
+    elseif m == ":." then
+      local cwd = vim.fn.getcwd()
+      if cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then
+        fname = fname:sub(#cwd + 2)
+      end
+      i = i + 2
+    elseif m == ":h" then
+      local head = fname:match("^(.*)/[^/]*$")
+      if head == nil then
+        fname = "."
+      elseif head == "" then
+        fname = "/"
+      else
+        fname = head
+      end
+      i = i + 2
+    elseif m == ":t" then
+      fname = fname:match("[^/]*$") or ""
+      i = i + 2
+    elseif m == ":r" then
+      -- Strip the last extension of the tail component (a leading dot isn't one).
+      local dir, tail = fname:match("^(.*/)([^/]*)$")
+      if not tail then
+        dir, tail = "", fname
+      end
+      for p = #tail, 2, -1 do
+        if tail:sub(p, p) == "." then
+          tail = tail:sub(1, p - 1)
+          break
+        end
+      end
+      fname = dir .. tail
+      i = i + 2
+    elseif m == ":e" then
+      -- Count the run of consecutive `:e`; k of them widen the extension to its
+      -- last k dot-separated components (capped at the count of extensions).
+      local k = 0
+      while mods:sub(i, i + 1) == ":e" do
+        k = k + 1
+        i = i + 2
+      end
+      local tail = fname:match("[^/]*$") or ""
+      local dots = {}
+      for p = 2, #tail do
+        if tail:sub(p, p) == "." then
+          dots[#dots + 1] = p
+        end
+      end
+      if #dots == 0 then
+        fname = ""
+      else
+        local idx = #dots - k + 1
+        if idx < 1 then
+          idx = 1
+        end
+        fname = tail:sub(dots[idx] + 1)
+      end
+    else
+      error("fnamemodify(): unsupported modifier '" .. mods:sub(i) .. "'", 2)
+    end
+  end
+  return fname
+end
+vim.fn.fnamemodify = nx.fname.modify

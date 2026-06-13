@@ -7,7 +7,7 @@
 --
 -- A *floating* window is a window positioned by absolute coordinates ON TOP of
 -- the tiled layout (the kind every plugin uses for hover, completion docs,
--- which-key, telescope, notifications). Unlike a split it steals no space from
+-- keymap-hint popups, fuzzy-finders, notifications). Unlike a split it steals no space from
 -- its neighbours — it paints over them. This config opens a few floats so you
 -- can see the border styles, titles, anchors, and zindex stacking in the TUI.
 --
@@ -119,7 +119,7 @@ end, {})
 --------------------------------------------------------------------------------
 -- nvim_win_set_config — reconfigure a float after it is open. The config is a
 -- *partial*: only the keys you pass change, the rest are kept. This is how
--- plugins reposition (hover following the cursor), resize (telescope on resize),
+-- plugins reposition (hover following the cursor), resize (a fuzzy-finder on resize),
 -- or convert a float into a normal split. These act on the most-recent float.
 --------------------------------------------------------------------------------
 local function last_float()

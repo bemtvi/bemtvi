@@ -52,7 +52,7 @@ pub(crate) fn flag_field(opts: &Table, key: &str) -> mlua::Result<bool> {
 ///
 /// This is a deliberate, parity-exact port of `nxvim_core::highlight::parse_color`
 /// (+ its `named_color` table): the `nvim_set_hl` write-through uses it to build
-/// the *same-turn* `vim._hl_defs` mirror row, which must match byte-for-byte the
+/// the *same-turn* `nx._hl_defs` mirror row, which must match byte-for-byte the
 /// row the server's between-turn push derives by sending the same string through
 /// the core parser. Keep the two in lockstep — if core gains a color form, mirror
 /// it here. nxvim-lua intentionally carries no `nxvim-core` dependency (it stays
@@ -241,7 +241,7 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<
 }
 
 /// Convert an optional Lua config table (`init_options` / `settings` /
-/// `capabilities` from `vim._lsp_start`) to JSON for `LspOp::Start`. `None`
+/// `capabilities` from `nx._lsp_start`) to JSON for `LspOp::Start`. `None`
 /// passes through; a present table goes through [`lua_to_json`] (the same bridge
 /// `vim.json.encode` uses), so what the config wrote reaches the server verbatim.
 pub(crate) fn opt_table_to_json(t: Option<Table>) -> mlua::Result<Option<serde_json::Value>> {
@@ -253,8 +253,8 @@ pub(crate) fn opt_table_to_json(t: Option<Table>) -> mlua::Result<Option<serde_j
 
 /// Flatten a `vim.system` `opts.env` table (`{ VAR = value }`) into the
 /// `(key, value)` pairs the event-loop actor layers onto the child's inherited
-/// environment — the async `vim._system_async` analogue of the inline loop in the
-/// blocking `vim._system`. An absent table yields no pairs.
+/// environment — the async `nx._system_async` analogue of the inline loop in the
+/// blocking `nx._system`. An absent table yields no pairs.
 pub(crate) fn env_pairs(env: Option<Table>) -> mlua::Result<Vec<(String, String)>> {
     let Some(env) = env else {
         return Ok(Vec::new());

@@ -169,7 +169,7 @@ script.
 (plain store), `vim.o` (`background`/`termguicolors`/`winblend`/`pumblend`
 defaults), `vim.opt` (scalar proxy over `vim.o`), `vim.env` (read-through to
 `os.getenv`), and the registration APIs `nvim_create_user_command` /
-`nvim_create_augroup` / `nvim_create_autocmd` (stored in `vim._user_commands` /
+`nvim_create_augroup` / `nvim_create_autocmd` (stored in `nx._user_commands` /
 `_augroups` / `_autocmds`) plus a no-op `nvim_set_hl` stub. `vim.cmd` became
 callable **and** indexable (`vim.cmd.set("number")` → `:set number`). Rust-backed
 `vim.fn` (`stdpath`, `getftime`, `isdirectory`, `mkdir`, `has`) covers what needs
@@ -256,7 +256,7 @@ in `nxvim-lua` (captures the opts shape — incl. integer→`#rrggbb` colors —
 server folds them into the registry through the existing `apply_lua_effects`
 drain, so the core stays the sole mutator. `:colorscheme <name>` sources
 `colors/<name>.lua` off the runtimepath, records `g:colors_name`, and fires the
-`ColorScheme` autocmd (new prelude `vim._fire` + `LuaRuntime::fire_autocmd`);
+`ColorScheme` autocmd (new prelude `nx._fire` + `LuaRuntime::fire_autocmd`);
 missing → `E185`. `:hi clear` empties the registry. New RPCs: `nvim_get_hl(0,
 {name})` (link-resolved style as RGB ints + attr flags) and the
 `nxvim_resolve_capture` debug hook. Tests in `editing.rs`:

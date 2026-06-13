@@ -6,7 +6,7 @@
 //! *directly* to `std::fs` today, which is correct for a local session but wrong in
 //! the edit-host / daemon split (`docs/plans/2026-06-09-edit-host-and-browser-lua.md`
 //! → *The full split*): there the editor + Lua VM run **locally** while the project
-//! files live on the remote **daemon**, so a `root_dir` detector or a telescope
+//! files live on the remote **daemon**, so a `root_dir` detector or a file
 //! previewer touching the disk directly would see the *wrong* machine.
 //!
 //! This module is the synchronous seam those project-facing fs calls route through.
@@ -22,11 +22,11 @@
 //! **Routes through this seam** (project-facing — must reach the daemon): the whole
 //! `vim.uv.fs_*` surface; `vim.fn` `readfile`/`readblob`/`readdir`/`glob`/
 //! `filereadable`/`isdirectory`/`getfsize`/`getftime`/`resolve`/`executable`/
-//! `exepath`; and the `vim._readdir` primitive `vim.fs.find` walks the project with.
+//! `exepath`; and the `nx._readdir` primitive `vim.fs.find` walks the project with.
 //!
 //! **Stays local** (config / plugin / VM state — never routed): raw Lua `io.*` /
 //! `os.*`, `require` / `package.path`, `nvim_get_runtime_file` (runtimepath = local
-//! plugins), `vim._read_file` (sources an `lsp/<name>.lua` *config* found on the
+//! plugins), `nx._read_file` (sources an `lsp/<name>.lua` *config* found on the
 //! runtimepath), and `stdpath` (local config/data/state dirs). These keep their
 //! direct `std::fs` calls — plugins and config live on the local machine by design.
 
@@ -182,8 +182,8 @@ pub trait LuaFs {
     fn access(&self, path: &str, modes: &str) -> bool;
     /// Resolve symlinks and `.`/`..` to a canonical absolute path.
     fn realpath(&self, path: &str) -> io::Result<String>;
-    /// Read a whole file's bytes (backs `vim.fn.readfile`/`readblob`/`vim._readdir`'s
-    /// `vim._read_file` is *not* this — that stays local).
+    /// Read a whole file's bytes (backs `vim.fn.readfile`/`readblob`/`nx._readdir`'s
+    /// `nx._read_file` is *not* this — that stays local).
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>>;
     /// Resolve `name` to an executable path on the host's `$PATH` (or accept an
     /// explicit executable path). Backs `vim.fn.executable`/`exepath` — the *remote's*

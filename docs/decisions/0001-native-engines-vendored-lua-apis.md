@@ -28,8 +28,9 @@ Two constraints pull in opposite directions:
 
 - **The plugin ecosystem is the product.** nxvim's value is running unmodified
   neovim plugins, and the corpus already in the repo proves the target:
-  catppuccin, lspconfig, plenary, which-key, nvim-treesitter, telescope,
-  nvim-treesitter-textobjects, gitsigns. Those plugins call `vim.treesitter.*`
+  a colorscheme, an LSP config layer, a filesystem/async helper library, a
+  keymap-hint popup, treesitter highlighting and textobjects, a fuzzy finder,
+  and git-status signs. Those plugins call `vim.treesitter.*`
   and `vim.lsp.*` *by name*, and depend on the **exact** behavior of those APIs —
   the `#match?` regex dialect, `#lua-match?`, query directives/metadata,
   `LanguageTree` injection semantics, the shape of what `iter_matches` yields.

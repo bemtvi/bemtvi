@@ -1338,7 +1338,7 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 > **Implementation notes (as built).** Faithful to the plan; choices worth
 > recording:
 > - **`LspOp::Start` is the new queue**, the LSP analogue of `PanelOp`: a
->   `vim.lsp.start` (Rust `vim._lsp_start`) pushes `{name, cmd, root, filetype,
+>   `vim.lsp.start` (Rust `nx._lsp_start`) pushes `{name, cmd, root, filetype,
 >   bufnr}` into `nxvim-lua`'s `Shared`; the server drains it in `apply_lua_effects`
 >   (right after panel ops) into `Server::apply_lsp_op`, which ensures the
 >   `(name, root)` client and binds the buffer. The whole start path is one more
@@ -1368,7 +1368,7 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   uri_to_fname/uri_from_bufnr`, `vim.fn.getcwd/bufname/fnamemodify`,
 >   `vim.lsp.protocol.make_client_capabilities` (stub — caps stay Rust-owned),
 >   `vim.validate`/`vim.deprecate` (no-ops). Rust-backed: `nvim_get_runtime_file`
->   (runtimepath `lsp/` discovery, single-`*` glob), `vim._read_file`/`vim._readdir`.
+>   (runtimepath `lsp/` discovery, single-`*` glob), `nx._read_file`/`nx._readdir`.
 > - **`vim.lsp.config` is a `setmetatable` table:** `__call` merges a user override,
 >   `__index` returns the resolved chain (`'*'` ← `lsp/<name>.lua` runtimepath base
 >   ← user override, via `tbl_deep_extend('force', …)`), `__newindex` redefines
@@ -1376,7 +1376,7 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   shared `FileType` autocmd (augroup `nxvim.lsp.enable`) that, per opened buffer,
 >   starts every enabled config whose resolved `filetypes` matches. It **also**
 >   processes the already-open current buffer on the spot (via `_on_filetype` over
->   the `vim._cur_buf` snapshot, which now carries the buffer's `filetype`) — so an
+>   the `nx._cur_buf` snapshot, which now carries the buffer's `filetype`) — so an
 >   interactive `:lua vim.lsp.enable(…)` after a file is already open starts the
 >   server immediately, matching neovim's "process loaded buffers" behavior instead
 >   of silently arming only future `FileType` events. The retroactive start is
@@ -1488,8 +1488,8 @@ only as plugins demand it." Legacy Vimscript configs are a non-goal.
    `Start`) — do not invent a new channel.
 2. **State mirror (Rust → Lua)** for the one synchronous getter (`vim.diagnostic.get`).
    Lua closures can't reach the live `Server`, so mirror the cache into a Lua table
-   the way `vim._set_cur_buf` mirrors the current buffer (`prelude.lua:289`): on every
-   `publishDiagnostics` the server calls a new `vim._set_diagnostics(bufnr, list)`,
+   the way `nx._set_cur_buf` mirrors the current buffer (`prelude.lua:289`): on every
+   `publishDiagnostics` the server calls a new `nx._set_diagnostics(bufnr, list)`,
    and `vim.diagnostic.get` reads that table in pure Lua.
 
 The native entry points already exist and are what the ops route into:
@@ -1511,8 +1511,8 @@ The thin-routing slice: each function enqueues an op; the server calls the exist
 >   u16 }` (the position family — definition/declaration/typeDefinition/
 >   implementation/references/hover/signatureHelp, `kind` = `LspReqKind::as_u16`),
 >   `Format`, `Rename { new_name }`, `CodeAction`. Four Rust closures
->   (`vim._lsp_buf`, `vim._lsp_buf_format`, `vim._lsp_buf_code_action`,
->   `vim._lsp_buf_rename`) sit next to `_lsp_start` and just push the op — no new
+>   (`nx._lsp_buf`, `nx._lsp_buf_format`, `nx._lsp_buf_code_action`,
+>   `nx._lsp_buf_rename`) sit next to `_lsp_start` and just push the op — no new
 >   channel.
 > - **`apply_lsp_op` routes them** (`nxvim-server/src/lsp.rs`): it now matches the
 >   op, sending `BufRequest`→`request_lsp(from_u16(kind))`, `Format`→
@@ -1523,7 +1523,7 @@ The thin-routing slice: each function enqueues an op; the server calls the exist
 >   `run_keymap` in `apply_lua_effects`).
 > - **`vim.lsp.buf` is bare functions** (`prelude.lua`): `definition`/`declaration`/
 >   `type_definition`/`implementation`/`references`/`hover`/`signature_help` each
->   call `vim._lsp_buf(<kind>)`; `format`/`code_action` accept and ignore their
+>   call `nx._lsp_buf(<kind>)`; `format`/`code_action` accept and ignore their
 >   neovim options table (no behavior yet); `rename(name)` requires a non-empty
 >   string and echoes `E471` otherwise (no prompt UI). Being bare means
 >   `vim.keymap.set('n','gd',vim.lsp.buf.definition)` works — the RHS is the
@@ -1548,7 +1548,7 @@ The thin-routing slice: each function enqueues an op; the server calls the exist
 **Rust — `nxvim-lua/src/lib.rs`:** extend `LspOp` with
 `BufRequest { kind: u16 }`, `Format`, `Rename { new_name: String }`, `CodeAction`
 (`kind` reuses `LspReqKind::as_u16`/`from_u16`, `lsp.rs:88`, so the wire stays one
-int). Register a `vim._lsp_buf(kind_u16)` / `vim._lsp_buf_rename(name)` Rust closure
+int). Register a `nx._lsp_buf(kind_u16)` / `nx._lsp_buf_rename(name)` Rust closure
 next to `_lsp_start` (`lib.rs:701`) that pushes the matching op.
 
 **Rust — `apply_lsp_op` (`lsp.rs:216`):** add arms routing `BufRequest`→`request_lsp`,
@@ -1558,7 +1558,7 @@ next to `_lsp_start` (`lib.rs:701`) that pushes the matching op.
 
 **Lua — `prelude.lua` (new `vim.lsp.buf` table near `:972`):** one bare function per
 feature (so `vim.keymap.set('n','gd',vim.lsp.buf.definition)` works), each calling
-`vim._lsp_buf(<kind>)`; `rename` → `vim._lsp_buf_rename`.
+`nx._lsp_buf(<kind>)`; `rename` → `nx._lsp_buf_rename`.
 
 **Tests (`crates/nxvim/tests/lsp.rs`).** Cover the distinct reply shapes through the
 Lua path: definition (jump via a Lua-set `gd`), references (panel), hover (panel
@@ -1576,11 +1576,11 @@ the existing jump/panel logic.
 > to the one diagnostic surface nxvim has — the underline spans — and store the rest)
 > and **match neovim** field indexing.
 > - **Rust→Lua mirror.** A new `LuaRuntime::set_diagnostics(bufnr, &[DiagnosticData])`
->   writes `vim._diagnostics[bufnr]` (via a prelude `vim._set_diagnostics`); the
+>   writes `nx._diagnostics[bufnr]` (via a prelude `nx._set_diagnostics`); the
 >   server calls it from the `LspEvent::Diagnostics` handler on **every**
 >   `publishDiagnostics` (the same spot it caches `state.diagnostics`). Keyed by
 >   `bufnr`, the mirror never goes stale on a buffer switch — `get(0)` resolves
->   `0` → current via `vim._cur_buf`, which `BufEnter` already refreshes — so the
+>   `0` → current via `nx._cur_buf`, which `BufEnter` already refreshes — so the
 >   plan's extra "push on buffer switch" is unnecessary in this design (noted as a
 >   deliberate, documented deviation). `DiagnosticData` is a new public
 >   `nxvim-lua` struct with neovim's shape: 0-based `lnum`/`col`/`end_lnum`/`end_col`,
@@ -1613,7 +1613,7 @@ the existing jump/panel logic.
 >   (with the number→name reverse map), `get(bufnr, opts)` reading the mirror
 >   (`nil` → all buffers, `0` → current, `opts.severity` number filter, entries
 >   copied out with their `bufnr`), `goto_next`/`goto_prev`/`setloclist` →
->   `vim._diagnostic_*`, and `config(opts)` merging into a stored table and pushing
+>   `nx._diagnostic_*`, and `config(opts)` merging into a stored table and pushing
 >   the resolved `underline` bool (an explicit `false` disables; a table/true
 >   enables).
 > - **Tests** (`crates/nxvim/tests/lsp.rs`, +4): `get(0)` field shape + severity
@@ -1632,9 +1632,9 @@ the existing jump/panel logic.
 
 **Rust — mirror push.** In the `publishDiagnostics` handler (`lsp.rs:416–428`, where
 `state.diagnostics` is set) *and* on buffer switch, call a new
-`Lua::set_diagnostics(bufnr, &[Diagnostic])` writing `vim._diagnostics[bufnr]` as
+`Lua::set_diagnostics(bufnr, &[Diagnostic])` writing `nx._diagnostics[bufnr]` as
 `{lnum,col,end_lnum,end_col,severity,message,source}`. Push on **every**
-`publishDiagnostics` and on buffer switch or the getter goes stale (the `vim._cur_buf`
+`publishDiagnostics` and on buffer switch or the getter goes stale (the `nx._cur_buf`
 refresh is the model).
 
 **Rust — actions.** Add `LspOp::DiagnosticGoto { forward, severity }` and
@@ -1647,9 +1647,9 @@ duplicate the byte↔char conversion (reuse the encoding on `LspDocState`).
 panel like `:LspDiagnostics` (`lib.rs:980`).
 
 **Lua — `prelude.lua` (new `vim.diagnostic` table):** `severity` constants;
-`vim._diagnostics` table; `get(bufnr,opts)` reading the mirror (0/`nil` bufnr →
+`nx._diagnostics` table; `get(bufnr,opts)` reading the mirror (0/`nil` bufnr →
 current, `opts.severity` filter, deepcopy out); `goto_next`/`goto_prev` →
-`vim._diagnostic_goto`; `setloclist` → `vim._diagnostic_setloclist`; `config` per the
+`nx._diagnostic_goto`; `setloclist` → `nx._diagnostic_setloclist`; `config` per the
 answer above.
 
 **Tests.** Seed canned diagnostics via the mock; assert `get(0)` returns them with

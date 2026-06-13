@@ -3,7 +3,7 @@
 -- This drives the decoration layer — neovim's extmark API on nxvim. An *extmark*
 -- anchors a highlight group to a byte range in a buffer; it shifts with edits and
 -- is grouped under a *namespace* you can clear all at once. LSP semantic tokens,
--- gitsigns-style plugins, and diagnostics-as-marks are all built on this surface.
+-- git-status-gutter plugins, and diagnostics-as-marks are all built on this surface.
 --
 -- Run it (from the repo root) against the sample buffer:
 --

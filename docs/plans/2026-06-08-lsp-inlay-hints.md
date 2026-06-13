@@ -23,7 +23,7 @@ and `foo(count: 3)` the moment you call `vim.lsp.inlay_hint.enable(true)`.
 The fail-loud, no-silent-stub rule from the
 [LSP completion plan](2026-06-05-lsp-completion.md) applies: a part of the API we
 don't honor yet stays a documented approximation or raises through
-`vim._notimpl` — never a silent no-op.
+`nx._notimpl` — never a silent no-op.
 
 ## What's already in place (the seams these phases extend)
 
@@ -116,8 +116,8 @@ when the theme leaves it undefined). `is_enabled` reports the state.
   dim fallback).
 - `crates/nxvim-lua/src/{ops.rs,install.rs}` + `prelude/lsp.lua` —
   `vim.lsp.inlay_hint.enable(enable, filter)` / `is_enabled(filter)` →
-  `vim._lsp_inlay_hint_enable(bufnr, enabled)` → `LspOp::InlayHintEnable`, with a
-  Lua-side `vim._inlay_hint_enabled[bufnr]` mirror so `is_enabled` is pure Lua.
+  `nx._lsp_inlay_hint_enable(bufnr, enabled)` → `LspOp::InlayHintEnable`, with a
+  Lua-side `nx._inlay_hint_enabled[bufnr]` mirror so `is_enabled` is pure Lua.
 - `crates/nxvim-lsp/src/mock.rs` — an `inlay_hints` script field (an
   `InlayHint[]`) returned for `textDocument/inlayHint`, and the
   `inlayHintProvider` capability when scripted.
@@ -166,7 +166,7 @@ The TUI `highlight_line` splices each hint's span into the paint stream at its
 column (`emit_inlay_hint`), shifting the real glyphs right; `inlay_cursor_shift`
 moves the terminal cursor by the same width. The Lua surface
 `vim.lsp.inlay_hint.enable(enable, filter)` / `is_enabled(filter)` →
-`LspOp::InlayHintEnable` flips the per-buffer flag (with a `vim._inlay_hint_enabled`
+`LspOp::InlayHintEnable` flips the per-buffer flag (with a `nx._inlay_hint_enabled`
 Lua mirror for `is_enabled`). Verified by `inlay_hints_paint_when_enabled` /
 `inlay_hints_are_off_by_default` / `inlay_hint_columns_are_encoding_correct` /
 `editing_re_requests_inlay_hints` / `an_inlay_hint_shifts_the_text_right_on_the_grid`
@@ -202,7 +202,7 @@ a server's lazy hints (an empty label + `data`) actually paint; the cap is what 
   `LspServerCapabilities.inlay_hints` → `set_lsp_client` as the
   `inlayHintProvider` key on `client.server_capabilities`, beside
   `semanticTokensProvider`.
-- **`get`.** A `vim._inlay_hints[bufnr]` mirror (the `vim._semantic_tokens`
+- **`get`.** A `nx._inlay_hints[bufnr]` mirror (the `nx._semantic_tokens`
   analogue) is pushed on every reply, after a resolve fills a label, and cleared
   on disable — built by `inlay_mirror` (`lsp/inlay.rs`) and set via
   `LuaRuntime::set_inlay_hints` (`InlayHintMirrorData`). `vim.lsp.inlay_hint.get`

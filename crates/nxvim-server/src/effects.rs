@@ -103,7 +103,7 @@ fn undo_entry_value(e: &UndoEntry) -> Value {
     Value::Map(map)
 }
 
-/// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `vim._wins`
+/// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `nx._wins`
 /// mirror carries — the enums become the strings `nvim_win_get_config` returns,
 /// so nxvim-lua never sees the core's float types. The inverse of the
 /// `parse_float_config` / `WindowOp::OpenFloat` parse.
@@ -185,14 +185,14 @@ impl EditHost {
         }
         // Buffer mutations from `nvim_buf_set_lines` (Phase 6): applied to the live
         // editor after the chunk, so the rope catches up with the write-through the
-        // Lua side already did against the `vim._bufs` mirror.
+        // Lua side already did against the `nx._bufs` mirror.
         for op in self.lua.take_buf_ops() {
             self.apply_buf_op(op);
         }
         // Extmark mutations from the `nvim_buf_set_extmark` family (the decoration
         // layer): applied to the target buffer's `ExtmarkStore` after the chunk,
         // catching the core up with the write-through the Lua side did against its
-        // `vim._extmarks` mirror.
+        // `nx._extmarks` mirror.
         for op in self.lua.take_extmark_ops() {
             self.apply_extmark_op(op);
         }
@@ -312,7 +312,7 @@ impl EditHost {
             } => (bufnr, start, end, repl),
             BufOp::Create => {
                 // Hand out the id the Lua side already predicted (buffer ids are
-                // monotonic, so this matches `vim._next_buf`). The new buffer is
+                // monotonic, so this matches `nx._next_buf`). The new buffer is
                 // empty and windowless until a later op (e.g. `nvim_win_set_buf` or
                 // `nvim_buf_set_lines`) touches it.
                 let _ = self.editor.create_buffer();
@@ -682,7 +682,7 @@ impl EditHost {
         }
     }
 
-    /// Refresh the Rust→Lua buffer mirror (`vim._bufs` + `vim._cur_cursor` +
+    /// Refresh the Rust→Lua buffer mirror (`nx._bufs` + `nx._cur_cursor` +
     /// current window) the buffer-read API resolves against (Phase 6). Pushed
     /// before any Lua entry that can read buffer/cursor state. The per-buffer line
     /// arrays are gated on `changedtick` — only a buffer that changed since its last
@@ -879,7 +879,7 @@ impl EditHost {
         // gutter, plus the cursor offset within the scrolled viewport. INCOMPLETE:
         // the column uses the cursor's byte offset, not its display column (tabs /
         // wide chars aren't expanded), and the row ignores a `'showtabline'` offset
-        // — close enough for which-key's cursor-overlap check, off by a tab's width
+        // — close enough for a popup plugin's cursor-overlap check, off by a tab's width
         // / one row in those cases.
         if let (Some((wx, wy, _, _)), Some((top, leftcol)), Some(textoff)) = (
             self.editor.window_rect(cur_win_id),
@@ -931,7 +931,7 @@ impl EditHost {
                 .map(|(name, def)| mirror(0, name, def))
                 .collect();
             let _ = self.lua.set_hl_mirror(&defs);
-            // Non-zero namespaces ride a separate mirror (`vim._hl_defs_ns`) so
+            // Non-zero namespaces ride a separate mirror (`nx._hl_defs_ns`) so
             // `nvim_get_hl(ns, …)` reads them without touching the global table.
             let ns_defs: Vec<HlDefMirror> = self
                 .editor
@@ -1019,8 +1019,8 @@ impl EditHost {
         // `on_bytes` (and `on_reload`) go first — they edit the `vim.treesitter`
         // parser's trees so the next `:parse()` reparses incrementally — then
         // `on_lines`, whose callbacks read the refreshed buffer via
-        // `nvim_buf_get_lines` and schedule follow-up work (telescope re-runs its
-        // finder), drained by the enclosing `run_pending` fixpoint.
+        // `nvim_buf_get_lines` and schedule follow-up work (a fuzzy-finder plugin
+        // re-runs its finder), drained by the enclosing `run_pending` fixpoint.
         if !byte_reloads.is_empty() {
             let _ = self.lua.fire_buf_reloads(&byte_reloads);
         }
@@ -1032,7 +1032,7 @@ impl EditHost {
         }
     }
 
-    /// Refresh the `vim._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
+    /// Refresh the `nx._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
     /// Only buffers whose undo fingerprint changed since the last push are
     /// re-projected (the tree walk is O(history), so this keeps the hot
     /// buffer-mirror path cheap when nothing edited).
@@ -1176,7 +1176,7 @@ impl EditHost {
         let had_scheduled = !self.scheduled.is_empty();
         self.run_pending();
         // An off-tick callback (a timer, a scheduled fn) may have queued
-        // `nvim_feedkeys` — e.g. which-key's deferred `M.start` re-feed; process
+        // `nvim_feedkeys` — e.g. a plugin's deferred re-feed; process
         // that typeahead now, the off-tick analogue of `input`'s trailing drain.
         let had_feed = !self.feed_buffer.is_empty();
         self.drain_feedkeys();

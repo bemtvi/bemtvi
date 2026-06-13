@@ -55,7 +55,7 @@ pub enum FloatAnchor {
 
 impl FloatAnchor {
     /// The `nvim_open_win` `anchor` string for this corner — the inverse of the
-    /// RPC/Lua parse, used to format `nvim_win_get_config` and the `vim._wins`
+    /// RPC/Lua parse, used to format `nvim_win_get_config` and the `nx._wins`
     /// mirror.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -97,7 +97,7 @@ pub enum BorderStyle {
 
 impl BorderStyle {
     /// The `nvim_open_win` `border` string for this style — the inverse of the
-    /// RPC/Lua parse, used to format `nvim_win_get_config` and the `vim._wins`
+    /// RPC/Lua parse, used to format `nvim_win_get_config` and the `nx._wins`
     /// mirror.
     pub fn as_str(self) -> &'static str {
         match self {

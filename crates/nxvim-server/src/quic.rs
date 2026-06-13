@@ -9,7 +9,7 @@
 //! (Phase 6) reaches an identical `--daemon --listen` listener.
 //!
 //! **Why QUIC and not ssh.** ssh stdio is one ordered TCP stream: a `HostProc` flood
-//! (telescope's `rg`, an `npm install`) head-of-line-blocks an `HostFs` save or an LSP
+//! (a fuzzy-finder's `rg`, an `npm install`) head-of-line-blocks an `HostFs` save or an LSP
 //! `didChange` queued behind it, and app-level framing can't escape it (the bytes are
 //! already committed to one socket). QUIC's independent streams remove that coupling at
 //! the protocol level. *This slice* still multiplexes all six legs over **one** bidi

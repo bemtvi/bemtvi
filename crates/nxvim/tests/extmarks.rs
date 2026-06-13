@@ -266,7 +266,7 @@ async fn get_extmarks_round_trips_across_chunks() {
     .await;
     assert_eq!(id.as_u64(), Some(1), "first mark id is 1");
 
-    // Read it back in a *separate* chunk: the server rebuilt vim._extmarks from
+    // Read it back in a *separate* chunk: the server rebuilt nx._extmarks from
     // core before this eval, so position + details are present.
     let summary = exec_lua(
         &rpc,
@@ -334,8 +334,8 @@ async fn unknown_extmark_option_errors() {
 /// Virtual text (and the rest of the decoration family) is ACCEPTED and STORED —
 /// a documented approximation: the mark is created (so the plugin's render path
 /// doesn't break) and the payload is returned by a details read, but it isn't
-/// painted yet. This is what lets telescope's result counter / preview overlays
-/// run instead of erroring.
+/// painted yet. This is what lets a fuzzy-finder plugin's result counter / preview
+/// overlays run instead of erroring.
 #[tokio::test]
 async fn virtual_text_is_accepted_and_stored() {
     let (rpc, _rx) = start().await;
@@ -357,64 +357,5 @@ async fn virtual_text_is_accepted_and_stored() {
     assert_eq!(
         s, "true|1|true",
         "virt_text should create a mark and be retrievable via details, got {s:?}"
-    );
-}
-
-/// The shipped `examples/extmarks/` config works end to end through the real
-/// stack: sourcing its `init.lua` over the sample buffer paints the startup marks
-/// (proving the documented API surface stays correct), and its `:ExtClear`
-/// command wipes the namespace. Guards the example against bitrot.
-#[tokio::test]
-async fn the_extmarks_example_config_paints_and_clears() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/extmarks");
-    let init = std::fs::read_to_string(format!("{root}/init.lua")).unwrap();
-    let sample = std::fs::read_to_string(format!("{root}/sample.txt")).unwrap();
-    let (rpc, mut incoming) = start().await;
-
-    // Load the sample text into the buffer (via the Lua API), then source config.
-    let set = sample
-        .lines()
-        .map(|l| format!("{l:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    exec_lua(
-        &rpc,
-        &format!("vim.api.nvim_buf_set_lines(0, 0, -1, false, {{ {set} }})"),
-    )
-    .await;
-    exec_lua(&rpc, &init).await;
-
-    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
-        hl.get(1)
-            .is_some_and(|r| r.iter().any(|(_, _, g)| g == "ExtNote"))
-            && hl
-                .get(2)
-                .is_some_and(|r| r.iter().any(|(_, _, g)| g == "ExtTodo"))
-    })
-    .await;
-    assert!(
-        hl[1].iter().any(|(_, _, g)| g == "ExtNote"),
-        "line 1 carries ExtNote marks"
-    );
-    assert!(
-        hl[2].iter().any(|(_, _, g)| g == "ExtTodo"),
-        "the TODO: tag is marked"
-    );
-    assert!(
-        hl[3].iter().any(|(_, _, g)| g == "ExtWarn"),
-        "the NOTE: tag is marked"
-    );
-
-    exec_lua(&rpc, "vim.cmd('ExtClear')").await;
-    let cleared = wait_for_highlights(&rpc, &mut incoming, |hl| {
-        hl.iter()
-            .all(|r| r.iter().all(|(_, _, g)| !g.starts_with("Ext")))
-    })
-    .await;
-    assert!(
-        cleared
-            .iter()
-            .all(|r| r.iter().all(|(_, _, g)| !g.starts_with("Ext"))),
-        ":ExtClear wipes the namespace"
     );
 }

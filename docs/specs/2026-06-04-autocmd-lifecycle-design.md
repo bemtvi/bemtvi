@@ -20,7 +20,7 @@ first, then execute the phases in order.
 ## Goal
 
 nxvim already has the **spine** of an autocmd system — `vim.api.nvim_create_autocmd`
-registers callbacks (`crates/nxvim-lua/src/prelude.lua`), `vim._fire(event, pattern)`
+registers callbacks (`crates/nxvim-lua/src/prelude.lua`), `nx._fire(event, pattern)`
 dispatches them, and `LuaRuntime::fire_autocmd` drives it from Rust
 (`crates/nxvim-lua/src/lib.rs`). It is proven end-to-end: `:colorscheme` works by
 firing `ColorScheme` (`crates/nxvim-server/src/lib.rs`).
@@ -47,13 +47,13 @@ establishes. It is its own design:
 ### How autocmds work today
 
 - **Registration** (`prelude.lua`): `nvim_create_autocmd(event, opts)` appends
-  `{id, event, opts}` to `vim._autocmds`; `nvim_create_augroup(name, opts)` stores
-  a sequence id in `vim._augroups` and **ignores `opts`** (no `clear`).
-- **Dispatch** (`prelude.lua`): `vim._fire(event, pattern)` linearly scans
-  `vim._autocmds`, matches on event + `opts.pattern`, and invokes
+  `{id, event, opts}` to `nx._autocmds`; `nvim_create_augroup(name, opts)` stores
+  a sequence id in `nx._augroups` and **ignores `opts`** (no `clear`).
+- **Dispatch** (`prelude.lua`): `nx._fire(event, pattern)` linearly scans
+  `nx._autocmds`, matches on event + `opts.pattern`, and invokes
   `opts.callback({id, event, match, file})` or runs `opts.command`. **No `buf`.**
 - **Emission** (`crates/nxvim-server/src/lib.rs`): `LuaRuntime::fire_autocmd`
-  calls `vim._fire`. The **only** caller is `set_colorscheme`.
+  calls `nx._fire`. The **only** caller is `set_colorscheme`.
 
 ### The model this phase establishes
 
@@ -83,8 +83,8 @@ detects nothing); `BufEnter` fires on **every** entry.
 **2. Buffer context via a current-buffer snapshot.** Callbacks need to know *which*
 buffer fired (`args.buf`) and resolve it (`vim.api.nvim_buf_get_name(0)`,
 `vim.fn.expand('%:p:h')`). Until Lua has a real buffer registry, the server pushes
-a small snapshot — `vim._cur_buf = {bufnr, name}` — into the VM immediately before
-firing, and `nvim_buf_get_name`/`expand('%')` read it. `vim._fire` gains optional
+a small snapshot — `nx._cur_buf = {bufnr, name}` — into the VM immediately before
+firing, and `nvim_buf_get_name`/`expand('%')` read it. `nx._fire` gains optional
 `buf`/`file` params so `args` carries the real bufnr and path. Existing
 `ColorScheme` callers pass nothing and are unaffected.
 
@@ -100,7 +100,7 @@ firing, and `nvim_buf_get_name`/`expand('%')` read it. `vim._fire` gains optiona
   design decision here rather than a separate doc. `BufWritePre` is **not** modeled
   this way: a pre-action write hook can't be reconstructed from after-the-fact state,
   so it gets its own core-deferral design (the write-seam doc).
-- **D2 — Snapshot for buffer context.** A `vim._cur_buf` snapshot backs
+- **D2 — Snapshot for buffer context.** A `nx._cur_buf` snapshot backs
   `nvim_buf_get_name(0)`/`expand('%')` synchronously during dispatch. No async
   window exists (the core is single-message-at-a-time; `vim.schedule` runs inline),
   so the snapshot can't go stale mid-callback. A real per-bufnr registry is a later
@@ -113,8 +113,8 @@ firing, and `nvim_buf_get_name`/`expand('%')` read it. `vim._fire` gains optiona
 
 ### Files
 
-- `crates/nxvim-lua/src/prelude.lua` — `vim._fire` args; augroup `clear` + per-autocmd
-  `group`; `vim._cur_buf` snapshot; `nvim_exec_autocmds`; `nvim_del_autocmd`.
+- `crates/nxvim-lua/src/prelude.lua` — `nx._fire` args; augroup `clear` + per-autocmd
+  `group`; `nx._cur_buf` snapshot; `nvim_exec_autocmds`; `nvim_del_autocmd`.
 - `crates/nxvim-lua/src/lib.rs` — `fire_autocmd` gains buffer context
   (`fire_autocmd_buf`/`set_buf_snapshot`); add the **Lua** binding
   `vim.api.nvim_buf_get_name` and the minimal `vim.fn.expand('%'...)`, both backed by
@@ -144,8 +144,8 @@ firing. Independently testable with **zero** editor lifecycle wiring, via
 **Prerequisites.** None.
 
 **Scope (in).**
-- `vim._fire(event, pattern, buf, file)` → callback `args = {id, event, match, buf, file}`.
-- `vim._cur_buf = {bufnr, name}` snapshot + `vim._set_cur_buf`; add the Lua
+- `nx._fire(event, pattern, buf, file)` → callback `args = {id, event, match, buf, file}`.
+- `nx._cur_buf = {bufnr, name}` snapshot + `nx._set_cur_buf`; add the Lua
   `vim.api.nvim_buf_get_name(bufnr)` binding (0 / snapshot bufnr → snapshot name) and a
   minimal `vim.fn.expand` for `%`, `%:p`, `%:h`, `%:t`. `%` is the path as stored on
   the buffer; `%:p` wants an absolute path, so the snapshot should carry an absolute

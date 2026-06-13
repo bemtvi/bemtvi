@@ -282,7 +282,7 @@ pub enum LspRequest {
 pub struct ReqToken {
     pub kind: u16,
     pub generation: u64,
-    /// The Lua deferred-callback id ([`vim._cb_fns`]) a generic
+    /// The Lua deferred-callback id ([`nx._cb_fns`]) a generic
     /// [`LspRequest::Raw`] (Phase 5 `client:request`) routes its reply to; `0` for
     /// the typed native requests, which dispatch by `kind`/`generation` instead.
     /// The manager only ferries it, exactly as it does `kind`/`generation`.

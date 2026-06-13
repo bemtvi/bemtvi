@@ -652,11 +652,7 @@ async fn insert_delete_at_end_of_line_joins_the_next_line() {
     // character ahead of the cursor, so it must delete the line break and pull the
     // next line up — the mirror of `<BS>` at column 0.
     let (rpc, _incoming) = start(None).await;
-    exec_lua(
-        &rpc,
-        r#"vim.api.nvim_buf_set_lines(0, 0, -1, false, {"foo", "bar"})"#,
-    )
-    .await;
+    feed(&rpc, "ifoo<CR>bar<Esc>gg");
     // `A` enters insert mode at the end of "foo"; `<Del>` then has nothing ahead
     // of it on the line, so it must join "bar".
     feed(&rpc, "A<Del>");

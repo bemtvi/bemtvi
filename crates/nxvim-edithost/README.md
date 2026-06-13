@@ -120,8 +120,14 @@ Without them the page still runs but degrades to the slower `postMessage` transp
 **timers never fire** (`window.__nxvim.sab` reports which mode is active). The `.wasm`
 must also be served as `application/wasm` (most hosts do this by extension).
 
-- **Netlify / Cloudflare Pages:** the `web/_headers` file already sets all three for `/*`.
-  Publish `web/` (with `dist/` copied in) — done.
+- **Netlify:** wired up — `../../netlify.toml` runs `netlify-build.sh` (provisions
+  Rust + the emscripten `emcc` linker, runs `build.sh`, then assembles a clean static
+  root at `_site/`: `web/` + `dist/` as siblings with `web/_headers` copied to the root
+  so `/*` is cross-origin isolated) and redirects `/` → `/web/`. Connect the repo in the
+  dashboard; every push to the production branch deploys.
+- **Cloudflare Pages / any `_headers` host:** the `web/_headers` file already sets all
+  three for `/*`. Publish a root with `web/` and `dist/` as siblings, `_headers` at the
+  root, and `/` → `/web/` (the layout `netlify-build.sh` assembles in `_site/`).
 - **nginx:**
   ```nginx
   location / {

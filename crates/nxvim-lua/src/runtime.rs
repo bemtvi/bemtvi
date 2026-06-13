@@ -257,6 +257,12 @@ pub struct GoMirror {
     /// `'autoread'` — whether `:checktime` silently reloads an externally-changed,
     /// unmodified buffer. Backs `vim.o.autoread`.
     pub autoread: bool,
+    /// `'scrollanim'` — whether viewport scrolls animate as a slide. Backs
+    /// `vim.o.scrollanim`.
+    pub scrollanim: bool,
+    /// `'scrollanimduration'` — the scroll-animation duration ceiling in ms (`0`
+    /// disables). Backs `vim.o.scrollanimduration`.
+    pub scrollanimduration: u64,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
     /// float-positioning plugin can center its windows.
     pub columns: u64,

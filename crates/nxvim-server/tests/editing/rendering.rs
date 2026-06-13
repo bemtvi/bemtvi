@@ -480,6 +480,130 @@ async fn ctrl_f_emits_full_page_scroll() {
 }
 
 #[tokio::test]
+async fn noscrollanim_snaps_without_a_scroll_gesture() {
+    let path = write_n_lines("noscrollanim", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Turn the animation off — the viewport must still scroll (to_top = 12), but
+    // the redraw carries no `scroll` descriptor, so every client snaps there.
+    feed(&rpc, ":set noscrollanim<CR>");
+    let map = redraw_after(&rpc, &mut incoming, "<C-d>").await;
+
+    assert!(
+        scroll(&map).is_none(),
+        "noscrollanim must emit no scroll gesture"
+    );
+    assert_eq!(
+        first_visible_line(&map),
+        "line13",
+        "the viewport still scrolled half a page (top 0 -> 12)"
+    );
+}
+
+#[tokio::test]
+async fn scrollanimduration_caps_the_slide() {
+    let path = write_n_lines("scad-cap", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // <C-f> travels 22 lines → the default would be 22*8=176 clamped to 160; with
+    // a 100ms ceiling it clamps to 100 instead.
+    feed(&rpc, ":set scrollanimduration=100<CR>");
+    let map = scroll_after(&rpc, &mut incoming, "<C-f>").await;
+
+    assert_eq!(scroll_u64(&map, "to_top"), 22, "still scrolls a full page");
+    assert_eq!(scroll_u64(&map, "duration_ms"), 100);
+}
+
+#[tokio::test]
+async fn scrollanimduration_below_the_floor_collapses_to_a_fixed_slide() {
+    let path = write_n_lines("scad-floor", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // With a ceiling under the usual 80ms floor, the floor drops to the ceiling so
+    // even a short <C-d> (12*8=96) settles at the fixed cap rather than an empty
+    // [80, 50] range.
+    feed(&rpc, ":set scrollanimduration=50<CR>");
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+
+    assert_eq!(scroll_u64(&map, "duration_ms"), 50);
+}
+
+#[tokio::test]
+async fn scrollanimduration_zero_disables_animation() {
+    let path = write_n_lines("scad-zero", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // A zero ceiling is equivalent to `noscrollanim`: the viewport jumps with no
+    // `scroll` descriptor.
+    feed(&rpc, ":set scrollanimduration=0<CR>");
+    let map = redraw_after(&rpc, &mut incoming, "<C-d>").await;
+
+    assert!(
+        scroll(&map).is_none(),
+        "a zero duration ceiling emits no scroll gesture"
+    );
+    assert_eq!(first_visible_line(&map), "line13");
+}
+
+/// The shipped `examples/smooth-scroll/init.lua` loads cleanly and its
+/// `vim.o.scrollanimduration = 220` reaches the core — a guard so the example
+/// can't silently rot.
+#[tokio::test]
+async fn smooth_scroll_example_config_loads_and_applies() {
+    let dir = temp_dir("smooth-scroll-example");
+    let init = include_str!("../../../../examples/smooth-scroll/init.lua");
+    let (rpc, _incoming) = start_with_config(&dir, init).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.scrollanimduration")
+            .await
+            .as_u64(),
+        Some(220),
+        "the example's vim.o.scrollanimduration must reach the core"
+    );
+    // The :ScrollReport command the example registers exists.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_get_commands({})['ScrollReport'] ~= nil"
+        )
+        .await
+        .as_bool(),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn scrollanim_options_round_trip_through_vim_o() {
+    let path = write_n_lines("scad-lua", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Defaults read back through the Lua option bridge.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.scrollanim").await.as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.scrollanimduration")
+            .await
+            .as_u64(),
+        Some(160)
+    );
+
+    // Writing the option through `vim.o` reaches the core and turns the slide off.
+    exec_lua(&rpc, "vim.o.scrollanim = false").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.scrollanim").await.as_bool(),
+        Some(false)
+    );
+    let map = redraw_after(&rpc, &mut incoming, "<C-d>").await;
+    assert!(
+        scroll(&map).is_none(),
+        "vim.o.scrollanim = false must suppress the scroll gesture"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_u_at_top_is_not_a_scroll() {
     let path = write_n_lines("cu", 100);
     let (rpc, mut incoming) = start(Some(path)).await;

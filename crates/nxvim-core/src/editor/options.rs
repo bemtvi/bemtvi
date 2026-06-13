@@ -84,6 +84,7 @@ impl Editor {
             "hlsearch" => &mut self.options.hlsearch,
             "incsearch" => &mut self.options.incsearch,
             "autoread" => &mut self.options.autoread,
+            "scrollanim" => &mut self.options.scrollanim,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             _ => return,
         };
@@ -114,7 +115,11 @@ impl Editor {
                 // `showtabline` / `laststatus` are the global numeric options;
                 // route them through the shared setter so the `:set` and `vim.o`
                 // paths validate, echo, and relayout identically.
-                if name == "showtabline" || name == "laststatus" || name == "mousetime" {
+                if name == "showtabline"
+                    || name == "laststatus"
+                    || name == "mousetime"
+                    || name == "scrollanimduration"
+                {
                     self.set_global_option_num(name, v);
                     return;
                 }
@@ -149,6 +154,7 @@ impl Editor {
                     "showtabline" => self.options.showtabline as i64,
                     "laststatus" => self.options.laststatus as i64,
                     "mousetime" => self.options.mousetime as i64,
+                    "scrollanimduration" => self.options.scrollanimduration as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {

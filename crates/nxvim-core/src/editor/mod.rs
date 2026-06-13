@@ -1188,6 +1188,13 @@ impl Editor {
         if from_top.abs_diff(self.top) <= 1 {
             return;
         }
+        // Honor `'scrollanim'` / `'scrollanimduration'`: with animation off (or a
+        // zero duration cap) emit no `scroll` descriptor, so the client snaps
+        // straight to the destination instead of sliding.
+        let dur_cap = self.options.scrollanimduration as u64;
+        if !self.options.scrollanim || dur_cap == 0 {
+            return;
+        }
         // Cap the visual travel so a huge jump (e.g. `G` in a big file) animates a
         // bounded slide of the last couple of screens instead of projecting
         // thousands of lines into the view.
@@ -1202,12 +1209,16 @@ impl Editor {
         let from_top = clamp(from_top, self.top);
         let from_cursor = clamp(from_cursor, self.cursor.line);
         let dist = from_top.abs_diff(self.top) as u64;
+        // 8ms per line of travel, clamped to the configurable `scrollanimduration`
+        // ceiling (default 160). The floor is the usual 80ms, lowered to the cap
+        // itself when the user picks a shorter one so a small cap means a fixed,
+        // snappy slide rather than an empty range.
         self.pending_scroll = Some(PendingScroll {
             from_top,
             to_top: self.top,
             from_cursor,
             to_cursor: self.cursor.line,
-            duration_ms: (dist * 8).clamp(80, 160),
+            duration_ms: (dist * 8).clamp(80.min(dur_cap), dur_cap),
         });
     }
 

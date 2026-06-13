@@ -976,6 +976,7 @@ impl Editor {
             "hlsearch" => self.options.hlsearch = value,
             "incsearch" => self.options.incsearch = value,
             "autoread" => self.options.autoread = value,
+            "scrollanim" => self.options.scrollanim = value,
             _ => {}
         }
     }
@@ -993,12 +994,16 @@ impl Editor {
         // `mousetime` is an unbounded non-negative millisecond count — it doesn't
         // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
         // so handle it before the bounded block.
-        if name == "mousetime" {
+        if name == "mousetime" || name == "scrollanimduration" {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));
                 return;
             }
-            self.options.mousetime = value as usize;
+            match name {
+                "mousetime" => self.options.mousetime = value as usize,
+                "scrollanimduration" => self.options.scrollanimduration = value as usize,
+                _ => unreachable!("guarded above"),
+            }
             return;
         }
         let max = match name {

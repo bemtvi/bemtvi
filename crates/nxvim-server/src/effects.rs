@@ -912,6 +912,8 @@ impl EditHost {
             guifont: go.guifont.clone(),
             regexsyntax: go.regexsyntax.clone(),
             autoread: go.autoread,
+            scrollanim: go.scrollanim,
+            scrollanimduration: go.scrollanimduration as u64,
             columns: columns as u64,
             lines: lines as u64,
         });

@@ -84,6 +84,17 @@ pub struct Options {
     /// for the user to `:edit!`. A *modified* buffer is never autoreloaded — that
     /// is the W12 conflict — regardless of this flag.
     pub autoread: bool,
+    /// Animate viewport scrolls (`<C-d>`/`<C-u>`/`<C-f>`/`<C-b>`, the wheel, and
+    /// off-screen jumps) as a slide instead of a teleport (nxvim's `'scrollanim'`,
+    /// not a standard vim option — neoscroll.nvim's behavior built in). On by
+    /// default. When off, [`crate::Editor::finalize_scroll_gesture`] emits no
+    /// `scroll` descriptor, so every client snaps straight to the destination.
+    pub scrollanim: bool,
+    /// The longest a scroll animation may last, in milliseconds (nxvim's
+    /// `'scrollanimduration'`). The per-scroll duration scales with the travel
+    /// distance and is clamped to this ceiling; `0` disables animation entirely
+    /// (equivalent to `noscrollanim`). Default `160`.
+    pub scrollanimduration: usize,
 }
 
 impl Default for Options {
@@ -119,6 +130,10 @@ impl Default for Options {
             // Reload externally-changed, unmodified buffers on `:checktime`
             // (neovim's default — vim's is off).
             autoread: true,
+            // Slide the viewport on scroll commands (neoscroll-style), capped at
+            // 160ms — the per-scroll duration scales with distance up to this.
+            scrollanim: true,
+            scrollanimduration: 160,
         }
     }
 }
@@ -490,6 +505,8 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "mousescroll" => Some(("mousescroll", Str)),
         "mousetime" | "mouset" => Some(("mousetime", Num)),
         "regexsyntax" | "rxs" => Some(("regexsyntax", Str)),
+        "scrollanim" | "sca" => Some(("scrollanim", Bool)),
+        "scrollanimduration" | "scad" => Some(("scrollanimduration", Num)),
         // Buffer-local: drives the treesitter language override rather than a
         // global string slot (handled specially in `apply_set_str`).
         "filetype" | "ft" => Some(("filetype", Str)),

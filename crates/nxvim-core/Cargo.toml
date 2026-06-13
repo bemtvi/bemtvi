@@ -16,6 +16,11 @@ rust-version.workspace = true
 # whole workspace (and its tests) compiles it in through feature unification.
 default = []
 vim-regex = ["dep:nxvim-regex"]
+# Derive serde on the persistence snapshot ([`PersistState`] & friends) so a consumer can
+# serialize it directly. Off by default — the native server has its own redb/msgpack
+# encoding and doesn't need it; the wasm edit-host turns it on to write the snapshot as a
+# single JSON blob to OPFS. Pure derives, no I/O, so the core stays pure.
+serde = ["dep:serde"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,3 +29,4 @@ unicode-width.workspace = true
 unicode-segmentation.workspace = true
 regex.workspace = true
 nxvim-regex = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }

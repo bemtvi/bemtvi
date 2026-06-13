@@ -208,6 +208,15 @@
       if (useSAB) pushFrame(4, enc(path));
       else worker.postMessage({ type: "bind", path });
     }
+    // Ask the Worker to persist cross-session (shada) state now, with the exit cursor — a
+    // ring frame under SAB, a message under 5c. Resolves when the Worker reports the write
+    // (the `shada_written` message). Used on tab-hide and by the automation hook.
+    const shadaWrittenWaiters = [];
+    function requestShadaFlush() {
+      if (useSAB) pushFrame(5, new Uint8Array(0));
+      else worker.postMessage({ type: "shada_flush" });
+      return new Promise((res) => shadaWrittenWaiters.push(res));
+    }
 
     let statusHideTimer = null;
     // Briefly show a transient message in the corner indicator (picker errors, etc.).
@@ -237,6 +246,11 @@
           ? await realFsWrite(handle, msg.bytes)
           : { ok: false, error: `no file handle for ${msg.path}` };
         worker.postMessage({ type: "fs_write_result", seq: msg.seq, ok: res.ok, size: res.size || 0, error: res.error || "" });
+        return;
+      }
+      // The Worker persisted cross-session (shada) state — resolve any pending flush.
+      if (msg.type === "shada_written") {
+        shadaWrittenWaiters.splice(0).forEach((r) => r(msg));
         return;
       }
       if (msg.type === "fatal") {
@@ -1180,6 +1194,13 @@
       resizeTimer = setTimeout(() => { layout(); attachOp(cols, editorRows); }, 80);
     });
 
+    // Persist cross-session (shada) state when the tab is hidden/closed. Best-effort: an
+    // async OPFS write may not finish on a hard close, but the Worker's debounced checkpoint
+    // already captured the bulk during editing — this mainly stamps the exit cursor (`'0`).
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") requestShadaFlush();
+    });
+
     // ============================================================================
     // Boot: measure, create the highlighter, then let the Worker's "ready" attach.
     // ============================================================================
@@ -1198,6 +1219,9 @@
       // Press Enter *through* the file-picker interception (the keydown path), so a
       // `:eo`/`:wo`/… command line pops the picker. Plain `feed("<CR>")` bypasses it.
       pressEnter: () => (tryFilePickerIntercept() ? Promise.resolve({ intercepted: true }) : feedOp("<CR>")),
+      // Flush cross-session (shada) state to OPFS now (resolves when written) — the tab-hide
+      // path, exposed for tests so they can persist + reload without racing the debounce.
+      shadaFlush: () => requestShadaFlush(),
       mouse: (button, action, modifier, row, col) => mouseOp(button, action, modifier, row | 0, col | 0),
       execLua: (code) => execLuaOp(code),
       attach: (c, r) => attachOp(c, r),

@@ -25,6 +25,7 @@ use super::{Cursor, Editor};
 /// merge key) and no `BufferId`s (positions resolve through file paths, which
 /// survive a restart where session-local ids do not).
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PersistState {
     /// The register file: named `"a`–`"z`, numbered `"0`–`"9`, the unnamed `"`,
     /// and small-delete `"-`. The black hole and the live-resolved specials
@@ -62,6 +63,7 @@ pub struct PersistState {
 
 /// One persisted numbered mark `'0`–`'9`: the digit, the file, and the position.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NumberedMark {
     pub digit: char,
     pub path: PathBuf,
@@ -72,6 +74,7 @@ pub struct NumberedMark {
 /// One persisted per-file changelist: the file and its `(line, col)` change
 /// positions, oldest first.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FileChangelist {
     pub path: PathBuf,
     pub entries: Vec<(usize, usize)>,
@@ -80,6 +83,7 @@ pub struct FileChangelist {
 /// One position in a persisted jumplist or the exit cursor: a file path and a
 /// 0-based `(line, col)`.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JumpPos {
     pub path: PathBuf,
     pub line: usize,
@@ -90,6 +94,7 @@ pub struct JumpPos {
 /// the 0-based `(line, col)` within that file. The path replaces the live
 /// `BufferId` (meaningless across sessions); restoring re-resolves it.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GlobalMarkEntry {
     pub name: char,
     pub path: PathBuf,
@@ -100,6 +105,7 @@ pub struct GlobalMarkEntry {
 /// One persisted per-file mark: the file it lives in, the mark name (`a`–`z`, a
 /// special, or `"`), and the 0-based `(line, col)` within that file.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FileMarkEntry {
     pub path: PathBuf,
     pub name: char,
@@ -128,6 +134,7 @@ pub enum ShadaRequest {
 
 /// One persisted register: its name, contents, and how it pastes.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RegisterEntry {
     pub name: char,
     pub text: String,

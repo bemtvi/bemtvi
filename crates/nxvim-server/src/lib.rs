@@ -784,6 +784,21 @@ impl EditHost {
         self.editor.lines()
     }
 
+    /// Snapshot the cross-session (shada) state for persistence. The native server
+    /// serializes this into its redb store ([`shada`]); the wasm Worker serializes it to
+    /// a JSON blob in OPFS. Pure — just the editor's [`export_persist`](Editor::export_persist).
+    pub fn export_persist(&self) -> nxvim_core::PersistState {
+        self.editor.export_persist()
+    }
+
+    /// Seed cross-session (shada) state restored from the store, before the startup
+    /// lifecycle fires (so a restored `` `" `` / registers / history are live for the
+    /// first frame). The wasm Worker calls this between config-sourcing and
+    /// [`boot_finish`](Self::boot_finish), mirroring native's load ordering.
+    pub fn import_persist(&mut self, state: nxvim_core::PersistState) {
+        self.editor.import_persist(state);
+    }
+
     /// Set the Worker's current JS clock (ms) so a [`WasmTimer`] armed during the next
     /// tick computes its `due_ms` relative to *now*. The Worker calls this before
     /// feeding input; [`fire_due_timers`](Self::fire_due_timers) sets it too.

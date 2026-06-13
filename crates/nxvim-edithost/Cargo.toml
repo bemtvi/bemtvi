@@ -33,7 +33,7 @@ nxvim-server = { path = "../nxvim-server", default-features = false }
 # The editor model + the Lua runtime, named directly to construct the `EditHost`.
 # Feature flags must match nxvim-server's wasm tree (vim-regex on) so cargo
 # unifies them rather than building a conflicting second copy.
-nxvim-core = { path = "../nxvim-core", features = ["vim-regex"] }
+nxvim-core = { path = "../nxvim-core", features = ["vim-regex", "serde"] }
 nxvim-lua = { path = "../nxvim-lua" }
 # Name the `rmpv::Value` the `HostEffects::notify` redraw frames arrive as. Pinned to
 # the workspace version so the type matches nxvim-server's.

@@ -37,6 +37,10 @@ const eh_save_bytes = M.cwrap("eh_save_bytes", "number", ["number", "number"]);
 const eh_save_len = M.cwrap("eh_save_len", "number", ["number", "number"]);
 const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string"]);
 const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "number", "number", "number", "number", "string"]);
+// Persistence (shada): the editor's cross-session snapshot ↔ a JSON blob the Worker keeps
+// in OPFS. `eh_export_shada(include_exit)` serializes it; `eh_load_shada(json)` restores it.
+const eh_export_shada = M.cwrap("eh_export_shada", "number", ["number", "number"]);
+const eh_load_shada = M.cwrap("eh_load_shada", "number", ["number", "string"]);
 
 function readStr(ptr) {
   const s = M.UTF8ToString(ptr);
@@ -65,6 +69,20 @@ async function bootWithConfig() {
     }
   } catch (e) {
     postMessage({ type: "config_error", error: String(e) });
+  }
+  // Restore cross-session state (registers/marks/history/jumplist) from OPFS *after* the
+  // config (so a config can't clobber a restored mark) and *before* `eh_boot_finish` fires
+  // the startup lifecycle — so a restored `` `" `` / registers / history are live for the
+  // first frame, matching native's load ordering.
+  try {
+    const sh = await opfsRead(SHADA_PATH); // kind 0 = present, 1 = none yet
+    if (sh.kind === 0 && sh.text.length) {
+      const err = readStr(eh_load_shada(h, sh.text));
+      if (err) postMessage({ type: "config_error", error: err });
+      else shadaBaseline = readStr(eh_export_shada(h, 0)); // seed baseline so the first checkpoint is a no-op
+    }
+  } catch (e) {
+    postMessage({ type: "config_error", error: "shada load: " + e });
   }
   eh_boot_finish(h);
 }
@@ -297,6 +315,51 @@ async function fulfillFsRequests() {
 }
 
 // =============================================================================
+// Persistence (shada) — serverless OPFS.
+//
+// The editor's cross-session state (registers, marks, search/ex history, jumplist,
+// changelist) is the pure snapshot the core hands out; we serialize it to a single JSON
+// blob at SHADA_PATH in OPFS and restore it at boot (`bootWithConfig`). This is the
+// browser analogue of the native redb store — minus the multi-instance merge a single tab
+// doesn't need. Durability is the *debounced checkpoint* (write after a quiet period),
+// exactly as native treats it as the primary mechanism; a flush-with-exit-cursor on tab
+// hide seeds `'0` for next launch (best-effort — the debounce already captured the rest).
+// =============================================================================
+const SHADA_PATH = "/.nxvim/shada";
+const SHADA_DEBOUNCE_MS = 1200;
+let shadaBaseline = null; // last-written no-exit JSON, for change detection (skip no-op writes)
+let shadaDirty = false; // input arrived since the last checkpoint
+let shadaDueMs = 0; // earliest time the debounced checkpoint may fire
+let shadaFlushRequested = false; // a flush-with-exit was asked for (tab hidden / test hook)
+
+// Write the shada snapshot to OPFS when it changed (or `force`). The no-exit form is the
+// change-detection baseline (pure cursor moves don't churn it); `includeExit` additionally
+// persists the clean-exit cursor so `'0` seeds next launch. Posts `shada_written` on a real
+// write (the UI's flush hook awaits it). Returns whether it wrote.
+async function checkpointShada(includeExit, force) {
+  shadaDirty = false;
+  const canonical = readStr(eh_export_shada(h, 0));
+  if (!canonical) return false; // serialization failed — write nothing rather than a bad blob
+  if (!force && canonical === shadaBaseline) return false;
+  shadaBaseline = canonical;
+  const json = includeExit ? readStr(eh_export_shada(h, 1)) : canonical;
+  const res = await opfsWrite(SHADA_PATH, new TextEncoder().encode(json));
+  if (res.ok) postMessage({ type: "shada_written", bytes: json.length });
+  return res.ok;
+}
+
+// 5c-only throttled checkpoint: the postMessage path has no run loop to debounce against,
+// so write at most once per SHADA_DEBOUNCE_MS of activity (leading-edge). The UI's hide
+// flush covers the trailing gap. (Under SAB the run loop does the proper debounce instead.)
+let shada5cLast = 0;
+async function maybeCheckpoint5c() {
+  const now = nowMs();
+  if (now - shada5cLast < SHADA_DEBOUNCE_MS) return;
+  shada5cLast = now;
+  await checkpointShada(false, false);
+}
+
+// =============================================================================
 // Slice 5d — the SharedArrayBuffer run loop.
 //
 // ctrl: Int32Array(4) — [SEQ, WRITE, READ, _]. SEQ is the wake counter the UI bumps +
@@ -346,6 +409,9 @@ async function runLoopSAB(ctrl, data) {
         // drains. (Bulk content never rides the ring — it's small enough to overflow it —
         // so only this marker does; the file bytes flow over postMessage.)
         boundPaths.add(utf8(payload));
+      } else if (type === 5) {
+        // shada_flush: persist cross-session state now, with the exit cursor (tab hidden).
+        shadaFlushRequested = true;
       }
       acks.push(reqId);
     }
@@ -373,6 +439,19 @@ async function runLoopSAB(ctrl, data) {
     if (fired || acks.length || fsWork) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
     }
+    // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
+    // flush (tab hidden) writes immediately with the exit cursor. The checkpoint write is
+    // async (OPFS) — awaiting it here is fine (the thread isn't parked yet).
+    if (acks.length || results.length || fsWork) {
+      shadaDirty = true;
+      shadaDueMs = nowMs() + SHADA_DEBOUNCE_MS;
+    }
+    if (shadaFlushRequested) {
+      shadaFlushRequested = false;
+      await checkpointShada(true, true);
+    } else if (shadaDirty && nowMs() >= shadaDueMs) {
+      await checkpointShada(false, false);
+    }
     // A picker-bound `:e`/`:w` dispatched a read/write to the UI this pass. Don't park on
     // `Atomics.wait` — a parked thread can't receive the UI's reply postMessage. Instead
     // stay in the event loop awaiting the reply (`onmessage` → `landRealFsReply` resolves
@@ -391,7 +470,10 @@ async function runLoopSAB(ctrl, data) {
     // returns "not-equal" at once — no missed wakeup. Blocking inside an async function
     // is fine: the `await` above fully settled before we reach here, so nothing is
     // pending on the microtask queue while the thread is parked.
-    const deadline = eh_next_deadline(h);
+    let deadline = eh_next_deadline(h);
+    // Fold the shada debounce deadline into the same park, so the one wait that wakes on a
+    // keystroke / timer also wakes to flush cross-session state after a quiet period.
+    if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
     const timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
     Atomics.wait(ctrl, SEQ, seqBefore, timeout);
   }
@@ -449,6 +531,11 @@ onmessage = async (ev) => {
     boundPaths.add(String(msg.path));
     return;
   }
+  // Shada flush (SAB requests it via a ring frame). Persist now, with the exit cursor.
+  if (msg.type === "shada_flush") {
+    await checkpointShada(true, true);
+    return;
+  }
   // postMessage fallback (5c). `:e`/`:w` fulfill against OPFS before the frame posts, so
   // the resolved frame reflects the open/save (the SAB loop does the same inline).
   switch (msg.type) {
@@ -460,6 +547,7 @@ onmessage = async (ev) => {
       eh_input(h, String(msg.notation));
       await fulfillFsRequests();
       postFrame(msg.id);
+      await maybeCheckpoint5c();
       break;
     case "input_mouse":
       // Stamp from the JS clock so multi-click timing matches the keystroke tick.
@@ -467,11 +555,13 @@ onmessage = async (ev) => {
       eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
       postFrame(msg.id);
+      await maybeCheckpoint5c();
       break;
     case "exec_lua": {
       const result = readStr(eh_exec_lua(h, String(msg.code)));
       await fulfillFsRequests();
       postFrame(msg.id, result);
+      await maybeCheckpoint5c();
       break;
     }
     default:

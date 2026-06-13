@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::rc::Rc;
 
-use nxvim_core::{BufferId, DirEntry, Editor, PendingSave};
+use nxvim_core::{BufferId, DirEntry, Editor, NumberedMark, PendingSave, PersistState};
 use nxvim_lua::{BlockingSystem, LuaRuntime, SystemOutput, SystemSpec};
 use nxvim_server::{EditHost, HostEffects};
 use rmpv::Value;
@@ -294,13 +294,9 @@ pub unsafe extern "C" fn eh_input_mouse(
     col: usize,
 ) {
     let Some(handle) = h.as_mut() else { return };
-    handle.host.mouse(
-        as_str(button),
-        as_str(action),
-        as_str(modifier),
-        row,
-        col,
-    );
+    handle
+        .host
+        .mouse(as_str(button), as_str(action), as_str(modifier), row, col);
 }
 
 /// Source a single-file `init.lua` (read from OPFS by the Worker) during startup —
@@ -611,6 +607,97 @@ pub unsafe extern "C" fn eh_lines(h: *mut WasmEditHost) -> *mut c_char {
     match h.as_ref() {
         Some(handle) => into_owned_cstr(handle.host.lines().join("\n")),
         None => into_owned_cstr(String::new()),
+    }
+}
+
+// ============================================================================
+// Persistence (shada) — serverless OPFS. The editor's cross-session state (registers,
+// marks, history, jumplist, …) is the pure [`PersistState`] core hands out; the Worker
+// serializes it to a single JSON blob in OPFS and restores it at boot. This is the
+// browser analogue of `nxvim-server`'s redb store, minus the multi-instance merge a tab
+// doesn't need — same snapshot, simpler bytes.
+// ============================================================================
+
+/// Apply vim's numbered-mark shift to a freshly-loaded snapshot — the wasm store's
+/// load-time step (native does the equivalent in `shada.rs`). A consumed clean-exit
+/// cursor becomes `'0`, the prior `'0`–`'8` slide down one, and `'9` drops; with no exit
+/// cursor (the tab was hidden/closed without a flush) the set passes through unchanged.
+/// Clears `exit_cursor` — it's consumed into `'0`, exactly as the native merged snapshot.
+fn shift_numbered_on_load(state: &mut PersistState) {
+    let Some(exit) = state.exit_cursor.take() else {
+        return;
+    };
+    let mut by_digit: HashMap<char, NumberedMark> = state
+        .numbered_marks
+        .drain(..)
+        .map(|m| (m.digit, m))
+        .collect();
+    let mut out = vec![NumberedMark {
+        digit: '0',
+        path: exit.path,
+        line: exit.line,
+        col: exit.col,
+    }];
+    for n in 1u8..=9 {
+        let from = (b'0' + n - 1) as char;
+        if let Some(m) = by_digit.remove(&from) {
+            out.push(NumberedMark {
+                digit: (b'0' + n) as char,
+                path: m.path,
+                line: m.line,
+                col: m.col,
+            });
+        }
+    }
+    state.numbered_marks = out;
+}
+
+/// Serialize the cross-session (shada) snapshot as a JSON blob for the Worker to persist
+/// to OPFS. `include_exit != 0` keeps the clean-exit cursor (the flush-on-hide path, so it
+/// seeds `'0` next launch); the debounced live checkpoint passes `0` (matching native,
+/// where `'0` tracks *exits* only). Empty string on the (practically impossible)
+/// serialization failure, so the Worker writes nothing rather than a corrupt/empty blob.
+/// Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_export_shada(h: *mut WasmEditHost, include_exit: i32) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(String::new());
+    };
+    let mut state = handle.host.export_persist();
+    if include_exit == 0 {
+        state.exit_cursor = None;
+    }
+    into_owned_cstr(serde_json::to_string(&state).unwrap_or_default())
+}
+
+/// Seed the editor from a shada JSON blob the Worker read from OPFS, applying the
+/// numbered-mark shift (load is when `'0` ← last-exit cursor). Run between config sourcing
+/// and [`eh_boot_finish`], so restored marks / registers / history are live for the first
+/// frame. Returns an owned C string: empty on success, else the parse error (the Worker
+/// surfaces it, like a bad `init.lua`) — a corrupt blob doesn't brick the session. Caller
+/// frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `json` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_load_shada(h: *mut WasmEditHost, json: *const c_char) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(String::new());
+    };
+    let json = as_str(json);
+    if json.is_empty() {
+        return into_owned_cstr(String::new());
+    }
+    match serde_json::from_str::<PersistState>(json) {
+        Ok(mut state) => {
+            shift_numbered_on_load(&mut state);
+            handle.host.import_persist(state);
+            into_owned_cstr(String::new())
+        }
+        Err(e) => into_owned_cstr(format!("shada parse: {e}")),
     }
 }
 

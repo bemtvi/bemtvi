@@ -498,6 +498,7 @@ dependencies = [
  "nxvim-regex",
  "regex",
  "ropey",
+ "serde",
  "unicode-segmentation",
  "unicode-width",
 ]

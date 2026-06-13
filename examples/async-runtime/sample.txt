@@ -1,5 +1,5 @@
 Watch the message line after this buffer opens — with no keypresses you'll see,
 in order and on wall-clock time: the deferred vim.schedule line, vim.defer_fn at
-~300ms, four "[uv timer] tick" lines ~250ms apart, and the async vim.system
-on_exit at ~500ms. The whole time the editor stays responsive: move around,
-edit, run `:lua print(vim.inspect(_G.async_demo))`, or :q whenever you like.
+~300ms, then four "[timer] tick" lines ~250ms apart. The whole time the editor
+stays responsive: move around, edit, run `:lua print(vim.inspect(_G.async_demo))`,
+or :q whenever you like.

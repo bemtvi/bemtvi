@@ -6,11 +6,10 @@
 --       cargo run -p nxvim -- examples/async-runtime/sample.txt
 --
 -- Before this feature, all Lua ran synchronously on the input tick: vim.schedule
--- ran its callback inline, vim.defer_fn raised "not implemented", and vim.system
--- blocked the whole editor until the child exited. Now a background actor (the
--- event loop) owns timers and child processes and wakes the editor when they
--- complete — so deferred work, timers, and vim.system's on_exit all fire OFF the
--- input tick without ever stalling the editor.
+-- ran its callback inline and vim.defer_fn raised "not implemented". Now a
+-- background actor (the event loop) owns timers and wakes the editor when they
+-- complete — so deferred work and timers fire OFF the input tick without ever
+-- stalling the editor.
 --
 -- Everything below runs at startup. Watch the MESSAGE LINE (and `:messages` for
 -- the full history): lines appear on wall-clock time with no keypresses, and the
@@ -18,7 +17,7 @@
 --
 -- Each demo also records its progress in `_G.async_demo`, so you can inspect the
 -- state at any moment with:   :lua print(vim.inspect(_G.async_demo))
-_G.async_demo = { schedule = "pending", defer = "pending", uv_ticks = 0, system = "pending" }
+_G.async_demo = { schedule = "pending", defer = "pending", timer_ticks = 0 }
 
 --------------------------------------------------------------------------------
 -- 1. vim.schedule — defer to the END of the current convergence (not inline).
@@ -48,9 +47,9 @@ end, 300)
 --------------------------------------------------------------------------------
 do
   local function tick()
-    _G.async_demo.uv_ticks = _G.async_demo.uv_ticks + 1
-    print("[timer] tick " .. _G.async_demo.uv_ticks .. " of 4")
-    if _G.async_demo.uv_ticks < 4 then
+    _G.async_demo.timer_ticks = _G.async_demo.timer_ticks + 1
+    print("[timer] tick " .. _G.async_demo.timer_ticks .. " of 4")
+    if _G.async_demo.timer_ticks < 4 then
       vim.defer_fn(tick, 250)
     else
       vim.notify("[timer] done — stopped after 4 ticks")
@@ -58,16 +57,3 @@ do
   end
   vim.defer_fn(tick, 250)
 end
-
---------------------------------------------------------------------------------
--- 4. vim.system — run a child process ASYNCHRONOUSLY. on_exit fires off-tick
---    with { code, stdout, stderr }; the editor never blocks on the child.
---    (The synchronous form — vim.system(cmd):wait() with NO on_exit — still
---    exists for the short shell-outs an lsp/<server>.lua root_dir performs.)
---------------------------------------------------------------------------------
-vim.system({ "sh", "-c", "sleep 0.5; echo hello-from-async" }, {}, function(result)
-  local out = (result.stdout or ""):gsub("%s+$", "") -- trim echo's trailing newline
-  _G.async_demo.system = "code=" .. tostring(result.code) .. " stdout=" .. out
-  vim.notify("[vim.system] async on_exit: " .. _G.async_demo.system)
-end)
-print("[vim.system] spawned async; the editor kept running while it slept")

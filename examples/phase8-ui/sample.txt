@@ -1,7 +1,0 @@
-nxvim Phase 8 — vim.ui.* + command dispatch playground
-
-  <Space>s   vim.ui.select: pick a fruit from the panel (j/k + <CR>)
-  <Space>c   vim.ui.select with format_item: pick a colour, see its hex
-  <Space>i   vim.ui.input: type a name at the prompt (<CR> confirms, <Esc> cancels)
-
-Run  :messages  to review what each pick/entry printed.

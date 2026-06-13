@@ -254,10 +254,11 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     // OPFS is async to open, so `:e` / `:w` defer to the off-tick seam the Worker
     // fulfills (Phase 6); turn it on before boot so the very first open routes there.
     host.enable_offtick_fs();
-    // Seed the serverless startup (lifecycle events, mirrors, `v:vim_did_enter`)
-    // *before* attaching the UI — the same order the native server uses (startup runs,
-    // then a client attaches and triggers the first paint).
-    host.boot();
+    // Seed the serverless startup (buffer snapshot + mirrors + baselines) *before*
+    // attaching the UI. This is only the FIRST half of boot — the Worker sources an
+    // optional `init.lua` from OPFS next, then calls `eh_boot_finish` to fire the
+    // startup lifecycle events + `v:vim_did_enter` (native ordering: config first).
+    host.boot_begin();
     host.attach_ui(DEFAULT_COLS, DEFAULT_ROWS);
     Box::into_raw(Box::new(WasmEditHost { host, sink }))
 }
@@ -300,6 +301,40 @@ pub unsafe extern "C" fn eh_input_mouse(
         row,
         col,
     );
+}
+
+/// Source a single-file `init.lua` (read from OPFS by the Worker) during startup —
+/// run after [`eh_new`]'s boot-begin and before [`eh_boot_finish`], so a config's
+/// startup-buffer autocmds (`BufEnter` …) fire. Returns an owned C string: empty on success,
+/// else the Lua error message (the Worker surfaces it). The editor still finishes
+/// booting on error. `require` of further modules won't resolve (empty runtimepath) —
+/// this is one self-contained file.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `code` a valid C string. Free the
+/// returned pointer with [`eh_free_string`].
+#[no_mangle]
+pub unsafe extern "C" fn eh_source_lua(h: *mut WasmEditHost, code: *const c_char) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(String::new());
+    };
+    match handle.host.source_config(as_str(code)) {
+        Ok(()) => into_owned_cstr(String::new()),
+        Err(e) => into_owned_cstr(e),
+    }
+}
+
+/// Finish serverless startup: fire the lifecycle events and mark `v:vim_did_enter`.
+/// Run by the Worker after [`eh_new`] and the optional [`eh_source_lua`] config sourcing
+/// — the second half of the boot [`eh_new`] began.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_boot_finish(h: *mut WasmEditHost) {
+    if let Some(handle) = h.as_mut() {
+        handle.host.boot_finish();
+    }
 }
 
 /// Re-attach the UI at a new `cols` × `rows` size (the resize path) and repaint — the

@@ -20,6 +20,8 @@ const M = await createModule();
 const eh_new = M.cwrap("eh_new", "number", []);
 const eh_input = M.cwrap("eh_input", null, ["number", "string"]);
 const eh_input_mouse = M.cwrap("eh_input_mouse", null, ["number", "string", "string", "string", "number", "number"]);
+const eh_source_lua = M.cwrap("eh_source_lua", "number", ["number", "string"]);
+const eh_boot_finish = M.cwrap("eh_boot_finish", null, ["number"]);
 const eh_attach = M.cwrap("eh_attach", null, ["number", "number", "number"]);
 const eh_set_clock = M.cwrap("eh_set_clock", null, ["number", "number"]);
 const eh_next_deadline = M.cwrap("eh_next_deadline", "number", ["number"]);
@@ -47,6 +49,28 @@ if (h === 0) {
   postMessage({ type: "fatal", error: "eh_new returned null (Lua VM failed to init in wasm)" });
   throw new Error("eh_new returned null");
 }
+
+// Serverless config: source a single-file `/init.lua` from OPFS (if present) between the
+// two halves of boot (`eh_new` did `boot_begin`; we finish with `eh_boot_finish`), so a
+// config's options / keymaps / autocmds — including the startup buffer's `BufEnter` —
+// apply to the very first frame (native ordering: config first). `require` of further
+// modules won't resolve (the browser build's runtimepath is empty), so this is one file.
+// A broken config is surfaced (non-fatal) — the editor still finishes booting.
+async function bootWithConfig() {
+  try {
+    const cfg = await opfsRead("/init.lua"); // kind 0 = file, 1 = absent, 2 = dir, 3 = error
+    if (cfg.kind === 0 && cfg.text.length) {
+      const err = readStr(eh_source_lua(h, cfg.text));
+      if (err) postMessage({ type: "config_error", error: err });
+    }
+  } catch (e) {
+    postMessage({ type: "config_error", error: String(e) });
+  }
+  eh_boot_finish(h);
+}
+// NB: invoked at the very END of the module (see below), not here — the OPFS helpers it
+// reaches (`splitPath` et al.) are `const` arrows still in their temporal dead zone at
+// this point in module evaluation.
 
 // `eh_redraw_json` returns the `redraw` notification's params array `[viewMap]` (or
 // "null" before the first frame); the renderable frame is the single view map.
@@ -337,5 +361,10 @@ onmessage = async (ev) => {
       postMessage({ type: "fatal", error: `unknown worker message: ${msg.type}` });
   }
 };
+
+// Source the optional /init.lua + finish boot before announcing "ready", so the config
+// is fully applied before the UI attaches and the first frame paints. Run here (module
+// tail) so the `const` OPFS helpers it reaches are past their temporal dead zone.
+await bootWithConfig();
 
 postMessage({ type: "ready" });

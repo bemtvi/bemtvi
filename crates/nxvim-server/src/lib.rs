@@ -679,6 +679,18 @@ impl EditHost {
     /// [`run_io`]'s startup, minus the native-only steps (config sourcing, plugin
     /// discovery, shada load, LSP keymap defaults) the v1 browser build doesn't have.
     pub fn boot(&mut self) {
+        self.boot_begin();
+        self.boot_finish();
+    }
+
+    /// Serverless startup, phase 1: seed the Lua buffer snapshot + mirrors and the
+    /// window/tab/buffer baselines, so an `init.lua` sourced next reads correct editor
+    /// state. Does **not** fire the startup lifecycle events or set `v:vim_did_enter` —
+    /// that is [`boot_finish`](Self::boot_finish), run *after* the optional config
+    /// sources, so a config's autocmds for the startup buffer (`BufEnter` …) fire
+    /// (native ordering: config first, then the startup lifecycle). [`boot`](Self::boot)
+    /// runs both back-to-back when there is no config phase.
+    pub fn boot_begin(&mut self) {
         let buf = self.editor.current_buffer_id();
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
@@ -688,9 +700,33 @@ impl EditHost {
         self.last_window_rects = Some(self.window_rects_snapshot());
         self.known_tabs = self.editor.tab_ids();
         self.known_buffers = self.editor.buffer_ids();
+    }
+
+    /// Serverless startup, phase 2: fire the startup lifecycle events and mark
+    /// `v:vim_did_enter`. Run after [`boot_begin`](Self::boot_begin) and the optional
+    /// `init.lua` sourcing ([`source_config`](Self::source_config)).
+    pub fn boot_finish(&mut self) {
         self.emit_lifecycle_events();
         self.run_pending();
         let _ = self.lua.set_vim_did_enter(true);
+    }
+
+    /// Source the user's single-file `init.lua` (read from OPFS by the Worker) through
+    /// the **real** effects path — the serverless analogue of native config sourcing,
+    /// run between [`boot_begin`](Self::boot_begin) and [`boot_finish`](Self::boot_finish).
+    /// `require` of further modules won't resolve (the browser build's runtimepath is
+    /// empty), so this is a single self-contained file: options, keymaps, autocmds, user
+    /// commands, highlights. The chunk is named `@init.lua` so a traceback points at it.
+    /// A Lua error is returned for the Worker to surface; the editor still finishes
+    /// booting, so a broken config can't brick the session.
+    pub fn source_config(&mut self, code: &str) -> Result<(), String> {
+        let result = self
+            .lua
+            .exec_named(code, "@init.lua")
+            .map_err(|e| e.to_string());
+        self.apply_lua_effects();
+        self.run_pending();
+        result
     }
 
     /// Feed vim key-notation and project the resulting frame — the wasm Worker's

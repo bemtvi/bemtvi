@@ -8,6 +8,7 @@ import createModule from "./dist/eh.mjs";
 const M = await createModule();
 
 const eh_new = M.cwrap("eh_new", "number", []);
+const eh_boot_finish = M.cwrap("eh_boot_finish", null, ["number"]);
 const eh_input = M.cwrap("eh_input", null, ["number", "string"]);
 const eh_exec_lua = M.cwrap("eh_exec_lua", "number", ["number", "string"]);
 const eh_redraw_json = M.cwrap("eh_redraw_json", "number", ["number"]);
@@ -36,6 +37,9 @@ if (h === 0) {
   console.error("FATAL: eh_new returned null (Lua VM failed to init in wasm)");
   process.exit(1);
 }
+// `eh_new` only runs the first half of boot (so a browser can source `init.lua` from
+// OPFS in between); this node smoke test has no config, so finish boot straight away.
+eh_boot_finish(h);
 
 // 1. The real tick runs in wasm: insert text via vim keys, read it back.
 eh_input(h, "ihello<Esc>");

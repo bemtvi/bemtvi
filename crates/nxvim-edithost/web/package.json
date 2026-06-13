@@ -6,7 +6,8 @@
   "scripts": {
     "serve": "node serve.mjs",
     "verify": "node verify.mjs",
-    "verify-ui": "node verify-ui.mjs"
+    "verify-ui": "node verify-ui.mjs",
+    "verify-config": "node verify-config.mjs"
   },
   "devDependencies": {
     "playwright": "1.60.0"

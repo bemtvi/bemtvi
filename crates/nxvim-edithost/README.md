@@ -26,6 +26,15 @@ they live in the browser's Origin Private File System (OPFS, Phase 6a):
   the same off-tick seam a daemon session uses, only the transport is OPFS. `:e <dir>`
   lists a real OPFS directory (the netrw-style explorer) and opening an entry reads it
   back — the directory enumeration rides the same off-tick read reply (`kind == 2`).
+- ✅ **Single-file `init.lua` from OPFS.** On boot the Worker reads `/init.lua` from OPFS
+  (if present) and sources it through the real effects path, *between* the two halves of
+  startup (`eh_new` does `boot_begin`; `eh_boot_finish` fires the lifecycle + sets
+  `v:vim_did_enter`) — so the config sources first, then the startup buffer's autocmds
+  (`BufEnter` …) fire, matching native ordering. Options, keymaps, autocmds, user
+  commands, and highlights all apply. A broken config is surfaced (non-fatal); the editor
+  still boots. **One self-contained file only** — `require` of further modules / plugins
+  won't resolve, since the browser build's runtimepath is empty and OPFS reads are async
+  (Lua's `require` is synchronous). Multi-file/plugin configs are a later step.
 - ❌ Processes — `vim.fn.system` / `nx._system` fail loud with a named "not available in
   the browser build yet" (`WasmBlockingSystem`); the async spawn path (`LoopOp::Spawn`)
   likewise echoes loud. The Phase 6 daemon over WebTransport re-enables them.
@@ -38,9 +47,10 @@ they live in the browser's Origin Private File System (OPFS, Phase 6a):
 ## Interop
 
 emscripten `ccall`/`cwrap` over the `#[no_mangle] extern "C"` exports in `src/lib.rs`
-(`eh_new` / `eh_input` / `eh_input_mouse` / `eh_attach` / `eh_exec_lua` / `eh_redraw_json`
-/ `eh_lines` / the OPFS fs leg `eh_take_fs_requests` / `eh_save_bytes` / `eh_save_len` /
-`eh_fs_read_complete` / `eh_fs_write_complete` / `eh_free*`) — **not** wasm-bindgen
+(`eh_new` / `eh_input` / `eh_input_mouse` / `eh_source_lua` / `eh_boot_finish` /
+`eh_attach` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` / the OPFS fs leg
+`eh_take_fs_requests` / `eh_save_bytes` / `eh_save_len` / `eh_fs_read_complete` /
+`eh_fs_write_complete` / `eh_free*`) — **not** wasm-bindgen
 (that's `nxvim-web`'s `unknown-unknown` build). The
 redraw comes back as a JSON return value. Slice 5c runs these exports **inside a Web
 Worker** and ferries the JSON redraw to the UI over `postMessage`. Slice 5d drives the
@@ -74,6 +84,9 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
   `<pre>`), the command-line-below-status-line layout, visual-mode selection painting,
   cursor-shape-by-mode, mouse click / drag-select / wheel-scroll, and tree-sitter
   highlight colors — all in a real headless browser.
+- `web/verify-config.mjs` — the config verifier: writes an `/init.lua` to OPFS, reloads,
+  and asserts the config applied on startup (an option, a global, a keymap that fires,
+  and a startup-buffer `BufEnter` autocmd) and that a broken config is non-fatal.
 
 > **Note (not a gap, and not wasm-specific):** the Lua `vim.api.nvim_buf_*` *mutation*
 > surface (`nvim_buf_set_lines` / `set_text` / `set_name`, `nvim_open_win`,
@@ -96,7 +109,13 @@ cd web && npm install        # playwright (once); plus `npx playwright install c
 node serve.mjs               # open http://localhost:8088/web/  to use the editor
 node verify.mjs              # headless-browser proof of the editor/transport/OPFS contract
 node verify-ui.mjs           # headless-browser proof of the renderer/mouse/selection/highlighting
+node verify-config.mjs       # headless-browser proof of single-file init.lua sourcing from OPFS
 ```
+
+**Configuring it:** drop a single self-contained `init.lua` at the OPFS root (`:w
+/init.lua` from inside the editor, or write it via the File System API) — on the next
+load the Worker sources it at startup. Options / keymaps / autocmds / user commands /
+highlights apply; `require` of further modules / plugins does not (empty runtimepath).
 
 `build.sh` also copies the web-tree-sitter highlighter assets into `web/vendor/`
 (generating them once in the sibling `nxvim-web` crate, which owns the pinned grammar

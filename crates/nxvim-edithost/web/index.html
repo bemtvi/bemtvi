@@ -204,6 +204,17 @@
         console.error("edit-host worker fatal:", msg.error);
         return;
       }
+      if (msg.type === "config_error") {
+        // A broken /init.lua is non-fatal — the editor still boots. Surface it so the
+        // user can fix the config rather than wonder why it didn't apply.
+        clearTimeout(statusHideTimer);
+        statusEl.style.display = "";
+        statusEl.style.opacity = "1";
+        statusEl.style.color = "#e5c07b";
+        statusEl.textContent = "init.lua error: " + msg.error;
+        console.error("nxvim init.lua:", msg.error);
+        return;
+      }
       if (msg.type === "ready") {
         layout();
         if (useSAB) {

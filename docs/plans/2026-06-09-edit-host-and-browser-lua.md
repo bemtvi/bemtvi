@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs — `:e`/`:w` against the Origin Private File System — done; the WebTransport/QUIC daemon path remains) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2023,6 +2023,86 @@ design; see the slice-5d clarification above.)
 
 Tie the browser edit-host to actual files/processes, reusing the Phase 1 traits and
 the Phase 3 daemon.
+
+### Phase 6a — serverless OPFS filesystem (`:e` / `:w` against the browser's OPFS) — ✅ DONE (2026-06-13)
+
+The serverless half of Phase 6, sliced first (self-contained — no daemon, no QUIC, no
+auth/cert) on the same "simplest path first / prove the seam" discipline that scoped 3a
+to the startup file and 3d to the initial open. Until this slice the browser edit-host
+was **in-memory only**: `boot()` seeded an empty `[No Name]` buffer, `has_remote_fs()` was
+`false`, and every fs effect was unreachable — there was no way to open or persist a real
+file. Now `:e` / `:w` operate on the browser's **Origin Private File System (OPFS)**, so
+edits survive a reload.
+
+**The shape — reuse the off-tick seam, not the sync `HostFs`.** The plan's framing
+("`HostFs` backed by OPFS") implied the synchronous Phase-1 trait, but that is
+*impossible* without Asyncify (which Phase 0 deliberately avoids): OPFS handle
+acquisition — `navigator.storage.getDirectory()`, `getFileHandle`,
+`createSyncAccessHandle()` — is **asynchronous**; only a `FileSystemSyncAccessHandle`'s
+*operations* (`read`/`write`/`truncate`/`getSize`) are synchronous. So OPFS is, from
+core's view, an **off-tick fs** even though it is local — and the slice reuses the *exact*
+machinery the daemon path built (Phase 3d/3e/3f): `has_remote_fs() → true`, so `:e` / `:w`
+defer to a `PendingOpen` / `PendingSave`, and the **Web Worker fulfills them against OPFS
+between ticks** (when it isn't parked on `Atomics.wait`, so the event loop runs and the
+OPFS promises resolve). The OPFS analogue of the native `select!` arms — only the
+transport is OPFS instead of the QUIC wire. No new core seam; the daemon path and the
+serverless path are now the *same* off-tick design with two transports.
+
+Shipped:
+- **Core/server (the wasm-eligible tick, `nxvim-server`):** three public methods on the
+  `#[cfg(not(feature = "native"))]` `EditHost` drive surface — `enable_offtick_fs()` (turns
+  on `Editor::set_host_fs_offtick`), `complete_fs_read(buffer, path, kind, contents)` (the
+  read applier: kind file/new/dir/err — reuses the *ungated* subset of the native
+  `load_replica`: `load_str_into` + cleared `announced` → `BufReadPost`/`FileType` +
+  snapshot/mirror + `run_pending`; a directory echoes loud "not supported yet", deferring
+  the OPFS explorer), and `complete_fs_write(save, ok, size, mtime, err)` (the write
+  applier: reuses the shared `apply_save_done`, so the `written` echo, ack-gated `[+]`
+  clear, `FileStat` baseline, deferred-`:wq` replay, and per-buffer/`:wqa` serialization
+  behave **identically** to the daemon save path). The native binary is byte-identical —
+  every line is inside the existing wasm-only `impl` block.
+- **The cdylib (`nxvim-edithost`):** `WasmEffects::has_remote_fs() → true`; `fs_fetch` /
+  `fs_save` record the request into the `Sink` (a read list; a write queue + a
+  seq→`PendingSave` map holding the snapshot bytes) instead of `unreachable!`. New FFI:
+  `eh_take_fs_requests` (drains the queued reads/writes as JSON), `eh_save_bytes` /
+  `eh_save_len` (hand a write's snapshot bytes to JS), `eh_fs_read_complete` /
+  `eh_fs_write_complete` (land the OPFS result back through the two appliers). `eh_new`
+  also injects a **`WasmBlockingSystem`**: `nx._system` (the blocking shell-out behind
+  `vim.fn.system`) now fails *loud* with a named "processes are not available in the
+  browser build yet" rather than `StdBlockingSystem`'s cryptic emscripten spawn errno —
+  the serverless "fail loud, name what's missing" for the process half.
+- **The Worker (`web/worker.mjs`):** OPFS helpers (`opfsRead` / `opfsWrite` — descend the
+  OPFS root by path component, sync-access-handle read/write; a missing file/parent is a
+  *new* buffer, a directory is kind 2) and `fulfillFsRequests()` — drains `eh_take_fs_requests`,
+  runs each OPFS op, lands it back, and **loops until dry** (a landed read fires
+  `BufReadPost` autocmds that may enqueue more opens/saves). The SAB run loop is now
+  `async` with an `await fulfillFsRequests()` after each input drain (and the postMessage
+  fallback fulfills before posting its frame) — so the `:e`/`:w` `feed` promise resolves
+  only once the buffer/save has landed. `Atomics.wait` blocking inside the async loop is
+  fine: the `await` fully settles before the park.
+
+**Exit criteria — met.** `web/verify.mjs` (real headless Chromium, the same harness as
+5c/5d) adds, all PASS alongside the existing 11 checks: `:w /nxvim-verify/rt.txt` saves a
+buffer to OPFS and `vim.bo.modified` clears **only after** the write acks; the saved bytes
+are read back through the **raw OPFS API** (`navigator.storage` — a path the editor never
+touches), proving they truly landed in storage; `:e!` reloads the file from OPFS,
+discarding an unsaved in-memory edit (so the reloaded content can only have come from
+storage — the read leg); and `nx._system({...})` returns a clear `code = -1` + a "not
+available in the browser build" message (the process half fails loud). Native
+`cargo test --workspace` regression-clean (my Rust is all `cfg(not(native))`, so every
+native binary is byte-identical — the lone load-sensitive `mouse` flake passes in
+isolation); clippy `-D warnings` clean on the native default **and** the
+`--no-default-features` wasm subset; fmt clean (incl. the excluded crate); the node
+`harness.mjs` smoke test still green.
+
+**Deferred to later Phase 6 slices (not stubbed):** the **OPFS file explorer** (a `:e
+<dir>` directory listing — `complete_fs_read` echoes loud for kind 2 today, exactly as 3d
+deferred the remote explorer to 3g); a watch leg (OPFS has no change-notification and the
+serverless editor is its sole writer, so there's nothing to reconcile); and the
+**WebTransport/QUIC daemon path** below (real remote files + processes + LSP) — the heavy
+half, which reuses the *same* off-tick `fs_fetch`/`fs_save` seam this slice exercised, only
+crossing a QUIC stream instead of OPFS.
+
+### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 
 - **The good path:** the browser edit-host is a `HostServices` client over
   **WebTransport (HTTP/3 / QUIC)** to a remote daemon — the browser analog of

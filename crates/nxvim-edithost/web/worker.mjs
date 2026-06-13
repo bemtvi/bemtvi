@@ -27,6 +27,13 @@ const eh_exec_lua = M.cwrap("eh_exec_lua", "number", ["number", "string"]);
 const eh_redraw_json = M.cwrap("eh_redraw_json", "number", ["number"]);
 const eh_lines = M.cwrap("eh_lines", "number", ["number"]);
 const eh_free_string = M.cwrap("eh_free_string", null, ["number"]);
+// Off-tick OPFS fs (Phase 6): the editor enqueues `:e`/`:w` off-tick; the Worker drains
+// the requests, runs the async OPFS op, and lands the result back through these.
+const eh_take_fs_requests = M.cwrap("eh_take_fs_requests", "number", ["number"]);
+const eh_save_bytes = M.cwrap("eh_save_bytes", "number", ["number", "number"]);
+const eh_save_len = M.cwrap("eh_save_len", "number", ["number", "number"]);
+const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string"]);
+const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "number", "number", "number", "number", "string"]);
 
 function readStr(ptr) {
   const s = M.UTF8ToString(ptr);
@@ -56,6 +63,114 @@ const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Da
 const utf8 = (bytes) => new TextDecoder().decode(bytes);
 
 // =============================================================================
+// Off-tick OPFS filesystem (Phase 6 — serverless).
+//
+// The editor runs in off-tick fs mode (`has_remote_fs() == true`) because OPFS handle
+// acquisition is asynchronous — only a `FileSystemSyncAccessHandle`'s *operations* are
+// synchronous, so a synchronous `HostFs` read/write on the editor thread is impossible
+// without Asyncify (which this build avoids). So `:e` / `:w` defer to a request the
+// editor enqueues; the Worker fulfills it against OPFS *between* ticks (when it isn't
+// parked, so the event loop runs and the OPFS promises resolve), exactly as a daemon
+// session fulfills the same request over the wire. The OPFS analogue of the native
+// `select!` arms (`apply_open` / `apply_save_done`).
+// =============================================================================
+
+// Path → OPFS handle. OPFS has one root directory (`getDirectory`); a path descends it
+// component by component. Leading `/` and `.` segments are dropped (the editor's paths
+// are absolute-looking but OPFS has no real root prefix).
+const splitPath = (path) => String(path).split("/").filter((s) => s.length && s !== ".");
+
+async function opfsDir(parts, create) {
+  let dir = await navigator.storage.getDirectory();
+  for (const p of parts) dir = await dir.getDirectoryHandle(p, { create });
+  return dir;
+}
+
+// Read `path` from OPFS → { kind, text }: kind 0 file (text = its UTF-8 contents), 1 a
+// not-yet-existing path (new-file buffer), 2 a directory, 3 an error (text = message).
+// A missing parent dir or missing file is "new" (the editor opens an empty buffer bound
+// to the name, savable later) — not an error.
+async function opfsRead(path) {
+  const parts = splitPath(path);
+  if (parts.length === 0) return { kind: 3, text: "empty path" };
+  const name = parts[parts.length - 1];
+  let dir;
+  try {
+    dir = await opfsDir(parts.slice(0, -1), false);
+  } catch (e) {
+    return e.name === "NotFoundError" ? { kind: 1, text: "" } : { kind: 3, text: String(e) };
+  }
+  let fh;
+  try {
+    fh = await dir.getFileHandle(name, { create: false });
+  } catch (e) {
+    if (e.name === "NotFoundError") return { kind: 1, text: "" };
+    if (e.name === "TypeMismatchError") return { kind: 2, text: "" }; // it's a directory
+    return { kind: 3, text: String(e) };
+  }
+  try {
+    const ah = await fh.createSyncAccessHandle();
+    const buf = new Uint8Array(ah.getSize());
+    ah.read(buf, { at: 0 });
+    ah.close();
+    return { kind: 0, text: new TextDecoder().decode(buf) };
+  } catch (e) {
+    return { kind: 3, text: String(e) };
+  }
+}
+
+// Write `bytes` to `path` in OPFS (creating parent dirs), atomically truncating first →
+// { ok, size, error }. The editor is the sole writer, so a plain truncate+write is the
+// "atomic write" here (no concurrent reader to tear).
+async function opfsWrite(path, bytes) {
+  const parts = splitPath(path);
+  if (parts.length === 0) return { ok: false, error: "empty path" };
+  const name = parts[parts.length - 1];
+  try {
+    const dir = await opfsDir(parts.slice(0, -1), true);
+    const fh = await dir.getFileHandle(name, { create: true });
+    const ah = await fh.createSyncAccessHandle();
+    ah.truncate(0);
+    ah.write(bytes, { at: 0 });
+    ah.flush();
+    const size = ah.getSize();
+    ah.close();
+    return { ok: true, size };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+// Drain every off-tick fs request the editor enqueued, run its OPFS op, and land the
+// result back into the tick. Loops until the queue is dry, because landing a read fires
+// `BufReadPost` autocmds (and `run_pending`) that may enqueue further opens/saves.
+// Returns whether any request was handled (so the caller posts a fresh redraw).
+async function fulfillFsRequests() {
+  let didWork = false;
+  for (;;) {
+    const reqs = JSON.parse(readStr(eh_take_fs_requests(h)));
+    if (reqs.reads.length === 0 && reqs.writes.length === 0) return didWork;
+    didWork = true;
+    for (const r of reqs.reads) {
+      const res = await opfsRead(r.path);
+      eh_fs_read_complete(h, r.buffer, r.path, res.kind, res.text);
+    }
+    for (const w of reqs.writes) {
+      // Copy the snapshot bytes out of wasm memory *before* the await — ALLOW_MEMORY_GROWTH
+      // can detach HEAPU8 across a later wasm call, and the pointer is only valid until
+      // `eh_fs_write_complete` drops the save.
+      const ptr = eh_save_bytes(h, w.seq);
+      const len = eh_save_len(h, w.seq);
+      const bytes = ptr ? new Uint8Array(M.HEAPU8.subarray(ptr, ptr + len)) : new Uint8Array(0);
+      const res = await opfsWrite(w.path, bytes);
+      // mtime_ms = -1: OPFS sync handles don't expose mtime and there's no watch leg, so
+      // the disk baseline doesn't need it.
+      eh_fs_write_complete(h, w.seq, res.ok ? 1 : 0, res.ok ? res.size : 0, -1, res.ok ? "" : res.error);
+    }
+  }
+}
+
+// =============================================================================
 // Slice 5d — the SharedArrayBuffer run loop.
 //
 // ctrl: Int32Array(4) — [SEQ, WRITE, READ, _]. SEQ is the wake counter the UI bumps +
@@ -66,7 +181,7 @@ const utf8 = (bytes) => new TextDecoder().decode(bytes);
 // =============================================================================
 const SEQ = 0, WRITE = 1, READ = 2;
 
-function runLoopSAB(ctrl, data) {
+async function runLoopSAB(ctrl, data) {
   const cap = data.length;
   const rdByte = (pos) => data[((pos % cap) + cap) % cap];
   const rdU32 = (pos) =>
@@ -111,12 +226,19 @@ function runLoopSAB(ctrl, data) {
     // not a stale clock that would make it instantly due.
     eh_set_clock(h, nowMs());
     const { acks, results } = drain();
-    if (fired || acks.length) {
+    // Fulfill any `:e`/`:w` the tick (or a fired timer) deferred against OPFS. We're not
+    // parked here, so the event loop runs and the OPFS promises resolve; the completions
+    // land the buffer/save back into the tick before we post the ack, so the UI sees the
+    // opened/saved frame when its `feed` promise resolves.
+    const fsWork = await fulfillFsRequests();
+    if (fired || acks.length || fsWork) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
     }
     // Park until the UI notifies (SEQ changes) or the next timer is due. If input
     // arrived while we processed (SEQ already moved off seqBefore), `Atomics.wait`
-    // returns "not-equal" at once — no missed wakeup.
+    // returns "not-equal" at once — no missed wakeup. Blocking inside an async function
+    // is fine: the `await` above fully settled before we reach here, so nothing is
+    // pending on the microtask queue while the thread is parked.
     const deadline = eh_next_deadline(h);
     const timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
     Atomics.wait(ctrl, SEQ, seqBefore, timeout);
@@ -135,7 +257,7 @@ function postFrame(id, result) {
 }
 
 let started = false;
-onmessage = (ev) => {
+onmessage = async (ev) => {
   const msg = ev.data;
   if (msg.type === "init") {
     // SAB handover (5d): enter the blocking run loop and never return — all further
@@ -143,10 +265,13 @@ onmessage = (ev) => {
     if (started) return;
     started = true;
     eh_attach(h, msg.cols | 0, msg.rows | 0);
-    runLoopSAB(new Int32Array(msg.ctrl), new Uint8Array(msg.data));
+    runLoopSAB(new Int32Array(msg.ctrl), new Uint8Array(msg.data)).catch((e) =>
+      postMessage({ type: "fatal", error: `SAB run loop failed: ${e}` }),
+    );
     return;
   }
-  // postMessage fallback (5c).
+  // postMessage fallback (5c). `:e`/`:w` fulfill against OPFS before the frame posts, so
+  // the resolved frame reflects the open/save (the SAB loop does the same inline).
   switch (msg.type) {
     case "attach":
       eh_attach(h, msg.cols | 0, msg.rows | 0);
@@ -154,11 +279,15 @@ onmessage = (ev) => {
       break;
     case "feed":
       eh_input(h, String(msg.notation));
+      await fulfillFsRequests();
       postFrame(msg.id);
       break;
-    case "exec_lua":
-      postFrame(msg.id, readStr(eh_exec_lua(h, String(msg.code))));
+    case "exec_lua": {
+      const result = readStr(eh_exec_lua(h, String(msg.code)));
+      await fulfillFsRequests();
+      postFrame(msg.id, result);
       break;
+    }
     default:
       postMessage({ type: "fatal", error: `unknown worker message: ${msg.type}` });
   }

@@ -814,6 +814,94 @@ impl EditHost {
     pub(crate) fn stop_wasm_timer(&mut self, id: u64) {
         self.wasm_timers.retain(|t| t.id != id);
     }
+
+    /// Turn on **off-tick fs** for the serverless browser build (Phase 6, the OPFS
+    /// slice). The editor then defers `:e` / `:w` to a [`PendingOpen`](nxvim_core::editor)
+    /// / [`PendingSave`] the Worker fulfills against the Origin Private File System off
+    /// the keystroke tick — the *exact* seam a daemon session uses, only the transport is
+    /// OPFS instead of the wire. OPFS is "off-tick" even though it is local because
+    /// acquiring an OPFS file handle is **asynchronous** (only a `FileSystemSyncAccessHandle`'s
+    /// *operations* are synchronous), so a synchronous [`HostFs`] read/write is impossible
+    /// without Asyncify — which this plan deliberately avoids (Phase 0). Pairs with the
+    /// cdylib's `WasmEffects::has_remote_fs() == true`, which routes the editor onto the
+    /// off-tick branches ([`drain_pending_opens`](Self::drain_pending_opens) /
+    /// [`dispatch_save`](Self::drain_pending_saves)).
+    pub fn enable_offtick_fs(&mut self) {
+        self.editor.set_host_fs_offtick(true);
+    }
+
+    /// Apply a finished off-tick OPFS **read** the Worker fetched for `buffer` (the
+    /// `:edit` / startup analogue of the native [`apply_open`](Self::apply_open), minus the
+    /// daemon-only `FsRead` / watch machinery). `kind`: `0` = an existing file (`contents`
+    /// is its UTF-8 text), `1` = a not-yet-existing path (a new-file buffer, no bytes),
+    /// `2` = a directory (the in-browser explorer over OPFS is a later slice — echoed
+    /// loud, never a silent empty buffer), any other = a read error (`contents` carries
+    /// the message). Repaints once the buffer lands.
+    pub fn complete_fs_read(&mut self, buffer: BufferId, path: String, kind: u8, contents: &str) {
+        match kind {
+            0 => self.load_replica_wasm(buffer, path, contents),
+            1 => self.load_replica_wasm(buffer, path, ""),
+            2 => self.editor.echo(format!(
+                "nxvim: opening a directory ({path}) in the browser is not supported yet"
+            )),
+            _ => self
+                .editor
+                .echo(format!("nxvim: could not open {path}: {contents}")),
+        }
+        self.redraw();
+    }
+
+    /// Load `contents` into `buffer` as a freshly-read replica of OPFS file `path`, then
+    /// fire the lifecycle a read implies — the wasm-eligible subset of the native
+    /// `load_replica`: [`Editor::load_str_into`](nxvim_core::Editor) replaces the buffer
+    /// in place; clearing it from `announced` lets the now-named buffer's
+    /// `BufReadPost` / `FileType` fire (the latter drives syntax); then refresh the Lua
+    /// snapshot / mirror and drain any autocmd-queued work (which may itself enqueue
+    /// further opens/saves the Worker picks up next).
+    fn load_replica_wasm(&mut self, buffer: BufferId, path: String, contents: &str) {
+        self.editor
+            .load_str_into(buffer, Some(path.clone()), contents);
+        self.announced.remove(&buffer);
+        let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
+        self.push_buf_mirror();
+        self.emit_lifecycle_events();
+        self.run_pending();
+    }
+
+    /// Apply a finished off-tick OPFS **write** of `save`'s snapshot: `ok` gates the ack
+    /// exactly as the daemon `fs_write` reply does — on success the buffer's saved-state
+    /// finalizes (`modified` clears, the `FileStat` of `size` + optional `mtime_ms` is
+    /// stamped, the `written` echo fires, a deferred `:wq` / `:wqa` replays), and on
+    /// failure the write surfaces loud and cancels any deferred quit. Reuses the shared
+    /// [`apply_save_done`](Self::apply_save_done), so per-buffer write serialization and
+    /// the `:wqa` gate behave identically to the daemon save path. Repaints after.
+    pub fn complete_fs_write(
+        &mut self,
+        save: PendingSave,
+        ok: bool,
+        size: u64,
+        mtime_ms: Option<u64>,
+        err: &str,
+    ) {
+        let bytes_len = save.bytes.len();
+        let result = if ok {
+            Ok(Some(FileStat {
+                size,
+                mtime: mtime_ms
+                    .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+            }))
+        } else {
+            Err(std::io::Error::other(format!("OPFS write failed: {err}")))
+        };
+        self.apply_save_done(crate::save::SaveDone::new(save, bytes_len, result));
+        // Converge as the native save-ack path does (`on_save_dones` → `settle_events`):
+        // `run_pending` refreshes the buffer mirror at entry, so the Lua-visible
+        // `vim.bo.modified` reflects the now-cleared `[+]`, and drains any work the ack
+        // queued (a replayed `:wq`, the next serialized write). Then repaint.
+        self.run_pending();
+        self.redraw();
+    }
 }
 
 /// Base for the loop ids of the server's **internal** per-buffer file watches, set

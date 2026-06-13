@@ -128,12 +128,70 @@ try {
     check("timer: a self-rescheduling defer_fn chain fired repeatedly unattended", n >= 5, `ticks=${JSON.stringify(ticks)} (parsed ${n})`);
   }
 
+  // 9. Phase 6 (serverless OPFS) — open/edit/save a real file in the browser's Origin
+  //    Private File System. `:w` defers to the off-tick seam the Worker fulfills against
+  //    OPFS; the round-trip proves the bytes truly land in storage (not just in-memory).
+  const OPFS_PATH = "/nxvim-verify/rt.txt";
+  const MARKER = "opfs-roundtrip-OK";
+  // Replace the buffer with a known marker line, then save it to OPFS.
+  await page.evaluate((m) => window.__nxvim.feed(`ggdGi${m}<Esc>`), MARKER);
+  await page.evaluate((p) => window.__nxvim.feed(`:w ${p}<CR>`), OPFS_PATH);
+
+  // The `modified` flag is ack-gated: it clears only once the OPFS write completes (the
+  // `:w` feed promise resolves after the Worker's fulfill), never optimistically.
+  const modified = await page.evaluate(() =>
+    window.__nxvim.execLua("return vim.bo.modified and 1 or 0").then((r) => r.result),
+  );
+  check("opfs: :w clears [+] only after the write acks", /:?0$/.test(String(modified)), `modified=${JSON.stringify(modified)}`);
+
+  // Read the file back through the *raw* OPFS API (a path the editor never touches) — the
+  // bytes can only be there if `:w` actually wrote them to storage.
+  const onDisk = await page.evaluate(async () => {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle("nxvim-verify");
+      const fh = await dir.getFileHandle("rt.txt");
+      return await (await fh.getFile()).text();
+    } catch (e) {
+      return `ERR:${e}`;
+    }
+  });
+  check("opfs: the saved bytes are in OPFS storage", onDisk.includes(MARKER), `onDisk=${JSON.stringify(onDisk)}`);
+
+  // Round-trip read: dirty the buffer in memory, then `:e!` to reload from OPFS. The
+  // reloaded content is the *saved* marker (the unsaved edit discarded) — so it can only
+  // have come from OPFS, proving the read leg, not a local-buffer artifact.
+  await page.evaluate(() => window.__nxvim.feed("oLOCAL-UNSAVED-EDIT<Esc>"));
+  await page.evaluate((p) => window.__nxvim.feed(`:e! ${p}<CR>`), OPFS_PATH);
+  const reloaded = await page.evaluate(() => window.__nxvim.lines());
+  check(
+    "opfs: :e! reloads the file from OPFS (discards the unsaved edit)",
+    reloaded === MARKER,
+    `got ${JSON.stringify(reloaded)}`,
+  );
+
+  // 10. Per "no silent stubs": a process shell-out has no serverless analogue and must
+  //     fail *loud*, not fake success. `nx._system` is nxvim's blocking shell-out primitive
+  //     (what `vim.fn.system` / a config's `root_dir` probe ride); the browser build's
+  //     WasmBlockingSystem degrades it to a clear, named failure (code = -1, message on
+  //     stderr) instead of trying — and failing cryptically — to spawn under emscripten.
+  const sysOut = await page.evaluate(() =>
+    window.__nxvim.execLua(
+      "local r = nx._system({'echo','hi'}); return r.code .. '|' .. r.stderr",
+    ).then((r) => r.result),
+  );
+  check(
+    "opfs: a system() call fails loud (no processes in the serverless build)",
+    /-1\|/.test(String(sysOut)) && /not\s+available in the browser build/i.test(String(sysOut)),
+    `nx._system → ${JSON.stringify(sysOut)}`,
+  );
+
   await browser.close();
 } finally {
   cleanup();
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — wasm edit-host driven in a real browser via window.__nxvim (slice 5c)"
+  ? "\nALL PASS — wasm edit-host driven in a real browser via window.__nxvim (slices 5c–5d + Phase 6 OPFS)"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

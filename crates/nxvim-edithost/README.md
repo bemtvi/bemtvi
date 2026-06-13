@@ -10,15 +10,24 @@ of
 It links the **production** `nxvim-server` tick (the keystroke path is the same one the
 native server drives — not a hand-wired minimal tie-in).
 
-## What runs here vs. not (serverless v1)
+## What runs here vs. not (serverless)
 
-The browser build is **serverless**: there is no daemon, so anything that needs the
-filesystem or a process is unavailable and fails *loud*, never silently:
+The browser build is **serverless**: there is no daemon, so anything that needs a
+*process* is unavailable and fails *loud*, never silently. Files, however, persist —
+they live in the browser's Origin Private File System (OPFS, Phase 6a):
 
 - ✅ Core editing + the full Lua VM + autocmds + the redraw projection.
-- ❌ Off-tick fs (open/save/watch over a daemon) — the `WasmEffects` fs methods are
-  unreachable (`has_remote_fs() == false`) and `unreachable!`. The Phase 6 daemon over
-  WebTransport re-enables remote files.
+- ✅ **Files via OPFS** (Phase 6a): `:e` / `:w` open/save real files in the browser's
+  Origin Private File System, so edits survive a reload. OPFS handle acquisition is
+  *async* (only a `FileSystemSyncAccessHandle`'s operations are sync), so it can't back
+  the *synchronous* core `HostFs` without Asyncify — instead the editor runs in **off-tick
+  fs** mode (`has_remote_fs() == true`) and the Worker fulfills `:e`/`:w` against OPFS
+  *between* ticks (`eh_take_fs_requests` → `eh_fs_read_complete` / `eh_fs_write_complete`),
+  the same off-tick seam a daemon session uses, only the transport is OPFS. (The OPFS file
+  *explorer* — `:e <dir>` — is a later slice.)
+- ❌ Processes — `vim.fn.system` / `nx._system` fail loud with a named "not available in
+  the browser build yet" (`WasmBlockingSystem`); the async spawn path (`LoopOp::Spawn`)
+  likewise echoes loud. The Phase 6 daemon over WebTransport re-enables them.
 - ❌ LSP and native treesitter — gated off the build (slice 5a); `:TSInstall` echoes a
   loud "not available in the browser build yet". (Treesitter highlighting is done
   JS-side in `nxvim-web`.)
@@ -27,7 +36,9 @@ filesystem or a process is unavailable and fails *loud*, never silently:
 
 emscripten `ccall`/`cwrap` over the `#[no_mangle] extern "C"` exports in `src/lib.rs`
 (`eh_new` / `eh_input` / `eh_attach` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` /
-`eh_free*`) — **not** wasm-bindgen (that's `nxvim-web`'s `unknown-unknown` build). The
+the OPFS fs leg `eh_take_fs_requests` / `eh_save_bytes` / `eh_save_len` /
+`eh_fs_read_complete` / `eh_fs_write_complete` / `eh_free*`) — **not** wasm-bindgen
+(that's `nxvim-web`'s `unknown-unknown` build). The
 redraw comes back as a JSON return value. Slice 5c runs these exports **inside a Web
 Worker** and ferries the JSON redraw to the UI over `postMessage`. Slice 5d drives the
 Worker's run loop off a `SharedArrayBuffer` + `Atomics.wait` park: the same wait that

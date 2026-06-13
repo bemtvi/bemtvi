@@ -52,9 +52,10 @@ end
 
 -- A few more vim.api the configs touch. `nvim_get_current_buf` resolves against
 -- the single-buffer snapshot (faithful: it returns the real current buffer). The
--- window/cursor/line-access getters (Phase 6) read the `nx._bufs` / `nx._cur_*`
--- mirror the server refreshes before running Lua, so they return live state, and
--- `nvim_buf_set_lines` write-through updates the mirror then queues the real edit.
+-- window/cursor/line-access *getters* read the `nx._bufs` / `nx._cur_*` mirror the
+-- server refreshes before running Lua, so they return live state. (There is no
+-- matching *write* surface — `nvim_buf_set_lines` and the rest of the mutation API
+-- are intentionally absent, per this file's header.)
 -- (`nvim_create_augroup`/`_autocmd`/`nvim_buf_get_name`/`nvim_echo` are the real,
 -- behavior-carrying ones, defined elsewhere.)
 function nx.buf.current()
@@ -130,9 +131,9 @@ end
 -- mirror context for the call, run `fn`, and restore it — which makes every
 -- *read* inside the callback (nvim_win_get_cursor, nvim_get_current_buf,
 -- vim.fn.line/col/winnr, …) resolve against the requested window/buffer, and
--- every explicit-handle write (nvim_buf_set_lines(buf, …), nvim_win_set_cursor(
--- win, …)) resolve the swapped mirror at call time and queue that concrete
--- handle — so it, too, targets the right place.
+-- every explicit-handle write that nxvim *does* expose (vim.bo[buf] option sets,
+-- nvim_buf_set_extmark(buf, …)) resolves the swapped mirror at call time and queues
+-- that concrete handle — so it, too, targets the right place.
 --
 -- What nxvim CAN'T do is retarget a mutation that binds to "current" only at
 -- DRAIN time — an ex-command (vim.cmd), feedkeys, or an LSP buf request — since

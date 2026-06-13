@@ -988,9 +988,9 @@ end
 -- nx._set_buf_mirror before running any Lua that can read buffer or cursor
 -- state, so nvim_buf_get_lines / nvim_win_get_cursor / nvim_buf_is_loaded read
 -- live data without reaching the Server. nx._bufs[bufnr] = { lines, name,
--- loaded }; nvim_buf_set_lines write-through mutates `lines` here directly so a
--- read-after-write within one chunk stays consistent (the real buffer catches up
--- when the server drains the queued BufOp).
+-- loaded }. (Read-only: the buffer-text mutation surface is intentionally absent
+-- from nxvim's Lua API — see prelude/api.lua's header — so nothing writes `lines`
+-- back through here; mutation is via ex-commands / keystrokes.)
 nx._bufs = nx._bufs or {}
 nx._cur_cursor = nx._cur_cursor or { row = 1, col = 0 }
 nx._cur_win = nx._cur_win or 1000
@@ -1021,10 +1021,6 @@ end
 nx._wins = nx._wins or {}
 nx._win_order = nx._win_order or { 1000 }
 nx._next_win = nx._next_win or 1001
--- The id the next nvim_create_buf will mint, refreshed by the server (set_next_buf)
--- before each Lua entry. Seeded to 2 (the startup buffer is 1) so a create before
--- the first mirror push still predicts a fresh id.
-nx._next_buf = nx._next_buf or 2
 -- Tab mirror (Phase 3): `nx._tabs[id]` = per-tab record ({ id, windows,
 -- current_window }), `nx._tab_order` the tabline order `nvim_list_tabpages`
 -- returns, `nx._cur_tab` the active id. Seeded to the single startup tab so a
@@ -1208,11 +1204,10 @@ function nx._resolve_bufnr(bufnr)
   return bufnr
 end
 
--- Normalize a neovim line index against a buffer of `n` real lines, shared by
--- nvim_buf_get_lines and nvim_buf_set_lines (and mirrored on the Rust side so the
--- write-through and the real apply can't disagree): negatives count from the end
--- (`-1` == one past the last line), then clamp into [0, n]. `strict` raises on an
--- out-of-range index instead of clamping (neovim's strict_indexing).
+-- Normalize a neovim line index against a buffer of `n` real lines, used by the
+-- buffer read range API (nvim_buf_get_lines / nvim_buf_get_text): negatives count
+-- from the end (`-1` == one past the last line), then clamp into [0, n]. `strict`
+-- raises on an out-of-range index instead of clamping (neovim's strict_indexing).
 function nx._norm_line_index(i, n, strict)
   local orig = i
   if i < 0 then

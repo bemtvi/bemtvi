@@ -183,9 +183,10 @@ impl EditHost {
         for op in self.lua.take_loop_ops() {
             self.apply_loop_op(op);
         }
-        // Buffer mutations from `nvim_buf_set_lines` (Phase 6): applied to the live
-        // editor after the chunk, so the rope catches up with the write-through the
-        // Lua side already did against the `nx._bufs` mirror.
+        // Buffer-local option writes (`vim.bo`): applied to the live editor after the
+        // chunk, catching the core up with the write-through the Lua side already did
+        // against its option mirror. (Buffer *text* / lifecycle mutation is not part of
+        // the Lua API — see `BufOp`.)
         for op in self.lua.take_buf_ops() {
             self.apply_buf_op(op);
         }
@@ -296,28 +297,13 @@ impl EditHost {
         }
     }
 
-    /// Apply one [`BufOp`] to the live editor (Phase 6). Converts the neovim line
-    /// range (0-based, `end`-exclusive, negatives from the end) to a byte range
-    /// against the real buffer and replaces it as one undo step via
-    /// [`Editor::apply_edits_to`], then flushes the buffer's pending LSP edits with
-    /// [`Self::sync_lsp_buffer`] so a server attached to it sees the `didChange`
-    /// (the must-not-omit step for a non-current buffer, which `sync_lsp` skips).
+    /// Apply one [`BufOp`] to the live editor: a buffer-local option write (`vim.bo` /
+    /// `nvim_set_option_value` with a `buf`). The buffer-*text* / lifecycle mutation
+    /// surface (`nvim_buf_set_lines`, `nvim_create_buf`, `nvim_buf_delete`) is
+    /// intentionally absent from nxvim's Lua API (see `nxvim-lua`'s `prelude/api.lua`
+    /// header), so this is option-only.
     pub(crate) fn apply_buf_op(&mut self, op: BufOp) {
-        let (bufnr, start, end, repl) = match op {
-            BufOp::SetLines {
-                bufnr,
-                start,
-                end,
-                repl,
-            } => (bufnr, start, end, repl),
-            BufOp::Create => {
-                // Hand out the id the Lua side already predicted (buffer ids are
-                // monotonic, so this matches `nx._next_buf`). The new buffer is
-                // empty and windowless until a later op (e.g. `nvim_win_set_buf` or
-                // `nvim_buf_set_lines`) touches it.
-                let _ = self.editor.create_buffer();
-                return;
-            }
+        match op {
             BufOp::SetOption { bufnr, name, value } => {
                 let id = BufferId(bufnr);
                 match value {
@@ -328,70 +314,7 @@ impl EditHost {
                     // it as a `String`.
                     OptionValue::String(s) => self.editor.set_buffer_option_str(id, &name, &s),
                 }
-                return;
             }
-            BufOp::Delete { bufnr, force } => {
-                self.editor.delete_buffer(BufferId(bufnr), force);
-                return;
-            }
-        };
-        let id = BufferId(bufnr);
-        let Some(n) = self.editor.line_count_of(id) else {
-            return; // unknown buffer — the Lua mirror guards this, but stay safe.
-        };
-        // Same normalization the Lua getter applies (kept in lockstep): negatives
-        // count from the end, then clamp into [0, n]; `end` not below `start`.
-        let norm = |i: i64| -> usize {
-            let i = if i < 0 { n as i64 + i + 1 } else { i };
-            i.clamp(0, n as i64) as usize
-        };
-        let start = norm(start);
-        let end = norm(end).max(start);
-
-        let buf = self
-            .editor
-            .buffer_of(id)
-            .expect("line_count_of(id) was Some");
-        let start_byte = buf.line_start(start);
-        // Replacing through the last real line reaches the trailing phantom `\n`.
-        // `line_start(n)` already equals `len_bytes()` for a real buffer (`n >= 1`),
-        // but spell out the intent and guard the degenerate `n == 0` so the phantom
-        // newline is never consumed.
-        let end_byte = if end >= n && n > 0 {
-            buf.len_bytes()
-        } else {
-            buf.line_start(end)
-        };
-        // Each replacement line needs its terminating `\n` (the removed span always
-        // ends at a line boundary); `normalize()` re-adds the phantom trailing one.
-        let repl_text = if repl.is_empty() {
-            String::new()
-        } else {
-            let mut s = repl.join("\n");
-            s.push('\n');
-            s
-        };
-        // Snapshot the Lua-treesitter journal length so the edit this op is about to
-        // append can be dropped from it afterwards: the Lua `nvim_buf_set_lines`
-        // write-through already fired `on_bytes` for this change synchronously (so an
-        // attached `vim.treesitter` parser saw it within the same entry), and the
-        // server must not fire it a *second* time from `push_buf_mirror` — that would
-        // double-edit and corrupt the incremental tree. Truncating back (rather than
-        // draining the whole journal) preserves any *other* pending deltas, e.g. a
-        // deferred `:s` that journaled earlier in the same `run_pending` fixpoint and
-        // still needs its own server-fired `on_bytes`. The native-engine and LSP
-        // journals keep the edit untouched.
-        let lua_ts_len = self
-            .editor
-            .buffer_of(id)
-            .map(|b| b.lua_ts_edits_len())
-            .unwrap_or(0);
-        self.editor
-            .apply_edits_to(id, vec![(start_byte..end_byte, repl_text)]);
-        #[cfg(feature = "native")]
-        self.sync_lsp_buffer(id);
-        if let Some(b) = self.editor.buffer_of_mut(id) {
-            b.truncate_lua_ts_edits(lua_ts_len);
         }
     }
 
@@ -1011,9 +934,6 @@ impl EditHost {
                 .map(String::from)
                 .unwrap_or_default(),
         );
-        // The id the next `nvim_create_buf` will mint, so it can return
-        // synchronously (the buffer analogue of the window mirror's `next_win`).
-        let _ = self.lua.set_next_buf(self.editor.next_buffer_id().0);
         self.push_undotree_mirror();
         // Now that every mirror is consistent, fire the `nvim_buf_attach` callbacks.
         // `on_bytes` (and `on_reload`) go first — they edit the `vim.treesitter`
@@ -1217,9 +1137,8 @@ impl EditHost {
         let mut rounds = 0;
         // Refresh the buffer mirror before draining: everything that flows through
         // `run_pending` (user commands, scheduled / select callbacks, queued `:lua`)
-        // can read buffer/cursor state. Intra-batch read-after-write stays
-        // consistent via the `nvim_buf_set_lines` write-through, so once-at-entry is
-        // enough (Phase 6).
+        // can read buffer/cursor state. The Lua API exposes no buffer-text write, so
+        // the mirror can't go stale mid-batch from Lua — once-at-entry is enough.
         self.push_buf_mirror();
         // Whether any `:checktime` / watch reconcile reloaded a buffer this drain —
         // a reload re-stamps the disk snapshot (a new inode after an atomic replace),

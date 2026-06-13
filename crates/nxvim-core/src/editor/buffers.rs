@@ -238,14 +238,6 @@ impl Editor {
         self.add_buffer(Buffer::empty())
     }
 
-    /// The id the next [`Editor::create_buffer`] will hand out. Buffer ids are
-    /// monotonic and never reused, so a caller can predict the id of a buffer it
-    /// is about to create — the buffer analogue of [`Editor::next_window_id`],
-    /// used by the Lua `nvim_create_buf` to return synchronously.
-    pub fn next_buffer_id(&self) -> BufferId {
-        BufferId(self.buffers.next_id)
-    }
-
     /// Editable lines of buffer `id`, or `None` if no such buffer is open
     /// (the buffer-addressed form of [`Editor::lines`]).
     pub fn lines_of(&self, id: BufferId) -> Option<Vec<String>> {

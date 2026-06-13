@@ -268,26 +268,18 @@ pub enum LoopOp {
     Kill { id: u64 },
 }
 
-/// A buffer mutation queued by the buffer Lua API (`vim.api.nvim_buf_set_lines`),
-/// drained by the server in `apply_lua_effects` and applied to the live editor —
-/// the buffer-text analogue of [`LspOp`]/[`LoopOp`]. Reads (`nvim_buf_get_lines`,
-/// the cursor) need no op: they read the Rust→Lua *mirror* the server pushes via
-/// [`crate::LuaRuntime::set_buf_mirror`] before running Lua. `set_lines` write-through
-/// updates that mirror in Lua first (so read-after-write within a chunk is
-/// consistent) and queues this op so the real buffer catches up after the chunk.
+/// A buffer-local *option* write queued by the Lua side, drained by the server in
+/// `apply_lua_effects` and applied to the live editor — the buffer analogue of
+/// [`LspOp`]/[`LoopOp`]. Reads (`nvim_buf_get_lines`, the cursor) need no op: they read
+/// the Rust→Lua *mirror* the server pushes via
+/// [`crate::LuaRuntime::set_buf_mirror`] before running Lua.
+///
+/// The buffer-*text* / lifecycle mutation surface (`nvim_buf_set_lines` / `set_text`,
+/// `nvim_create_buf`, `nvim_buf_delete`, …) is **not** part of nxvim's Lua API — it is
+/// intentionally absent (see `crates/nxvim-lua/src/prelude/api.lua`'s header); the only
+/// buffer mutation a config reaches is the option write below (`vim.bo`).
 #[derive(Clone, Debug)]
 pub enum BufOp {
-    /// `nvim_buf_set_lines(bufnr, start, end, strict, repl)` — replace lines
-    /// `[start, end)` of buffer `bufnr` with `repl`. Indices are neovim's: 0-based,
-    /// `end` exclusive, negatives count from the end, `end == -1` is the last line.
-    /// The server normalizes them against the real line count and converts the line
-    /// range to a byte range before calling `Editor::apply_edits_to`.
-    SetLines {
-        bufnr: u64,
-        start: i64,
-        end: i64,
-        repl: Vec<String>,
-    },
     /// `vim.bo[bufnr].<opt> = value` / `nvim_set_option_value(name, value, {buf})`
     /// — set a buffer-local option (`tabstop`/`shiftwidth`/`expandtab`) on the
     /// live editor's buffer `bufnr`. The Lua side has already canonicalized the
@@ -299,17 +291,6 @@ pub enum BufOp {
         name: String,
         value: OptionValue,
     },
-    /// `nvim_create_buf(listed, scratch)` — create a new empty buffer with no
-    /// window. The Lua side already predicted the id (from `nx._next_buf`) and
-    /// mirrored the buffer; the server calls `Editor::create_buffer`, which hands
-    /// out that same id (buffer ids are monotonic, so the prediction holds as long
-    /// as nothing else creates a buffer between the mirror push and this drain).
-    Create,
-    /// `nvim_buf_delete(bufnr, { force })` — remove buffer `bufnr` from the editor
-    /// (the popup-teardown half of a popup plugin's lifecycle). `force` drops a modified
-    /// buffer without the `E89` guard. The Lua side has already dropped it from the
-    /// `nx._bufs` mirror (write-through); the server calls `Editor::delete_buffer`.
-    Delete { bufnr: u64, force: bool },
 }
 
 /// An extmark mutation queued by the `nvim_buf_set_extmark` / `_del_extmark` /

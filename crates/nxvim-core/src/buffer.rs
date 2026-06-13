@@ -534,22 +534,6 @@ impl Buffer {
         std::mem::take(&mut self.jump_edits)
     }
 
-    /// Length of the Lua-treesitter journal — paired with
-    /// [`Buffer::truncate_lua_ts_edits`] to drop exactly the edits a single
-    /// operation appended (the server uses it to suppress its own `on_bytes` for a
-    /// `nvim_buf_set_lines` the Lua write-through already fired, without disturbing
-    /// other pending deltas in the journal). See the server's `apply_buf_op`.
-    pub fn lua_ts_edits_len(&self) -> usize {
-        self.lua_ts_edits.len()
-    }
-
-    /// Drop the Lua-treesitter journal back to `len` (the value
-    /// [`Buffer::lua_ts_edits_len`] returned before an operation), discarding only
-    /// the edits that operation appended.
-    pub fn truncate_lua_ts_edits(&mut self, len: usize) {
-        self.lua_ts_edits.truncate(len);
-    }
-
     fn record(&mut self, edit: BufferEdit) {
         self.extmarks
             .shift(edit.start_byte, edit.old_end_byte, edit.new_end_byte);

@@ -318,8 +318,8 @@ pub(crate) struct Shared {
     /// timers / async `vim.system`, drained by the server into its scheduled-work
     /// queue and event-loop actor after the chunk.
     pub(crate) loop_ops: Vec<LoopOp>,
-    /// Buffer mutations from `vim.api.nvim_buf_set_lines`, drained by the server
-    /// into the live editor after the chunk (Phase 6).
+    /// Buffer-local option writes (`vim.bo`), drained by the server into the live
+    /// editor after the chunk. (Buffer text/lifecycle mutation is not part of the API.)
     pub(crate) buf_ops: Vec<BufOp>,
     /// Extmark mutations from `nvim_buf_set_extmark` / `_del_extmark` /
     /// `_clear_namespace`, drained by the server into the target buffer's
@@ -677,8 +677,8 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take the buffer mutations queued by `nvim_buf_set_lines` since the last
-        /// drain, for the server to apply to the live editor (Phase 6).
+        /// Take the buffer-local option writes (`vim.bo`) queued since the last drain,
+        /// for the server to apply to the live editor.
         take_buf_ops -> Vec<BufOp> = buf_ops
     }
 
@@ -1334,13 +1334,6 @@ impl LuaRuntime {
     pub fn set_vim_did_enter(&self, entered: bool) -> mlua::Result<()> {
         let set: mlua::Function = self.nx()?.get("_set_vim_did_enter")?;
         set.call(entered)
-    }
-
-    /// Tell Lua the id the next `Editor::create_buffer` will hand out, so
-    /// `nvim_create_buf` can predict its return value (the buffer analogue of the
-    /// window mirror's `next_win`). Pushed alongside the buffer mirror.
-    pub fn set_next_buf(&self, next_buf: u64) -> mlua::Result<()> {
-        self.nx()?.set("_next_buf", next_buf)
     }
 
     /// Mirror the focused window cursor's screen position (1-based row/col, the

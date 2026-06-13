@@ -485,27 +485,6 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._buf_set_lines(bufnr, start, end, repl)`: queue a [`BufOp::SetLines`]
-    // for the server to apply to the live editor (Phase 6). The Lua-facing
-    // `vim.api.nvim_buf_set_lines` wrapper (prelude) has already updated the
-    // `nx._bufs` mirror (write-through) and resolved `bufnr` to a concrete id; the
-    // server normalizes the indices and converts the line range to a byte range.
-    let sh = shared.clone();
-    nx.set(
-        "_buf_set_lines",
-        lua.create_function(
-            move |_, (bufnr, start, end, repl): (u64, i64, i64, Vec<String>)| {
-                sh.borrow_mut().buf_ops.push(BufOp::SetLines {
-                    bufnr,
-                    start,
-                    end,
-                    repl,
-                });
-                Ok(())
-            },
-        )?,
-    )?;
-
     // `nx._feedkeys(keys, remap, insert)`: queue a [`FeedKeysOp`] for the server
     // to drain into its typeahead after the chunk. The Lua-facing
     // `nvim_feedkeys` (prelude) parses the mode flags into `remap`/`insert`.
@@ -518,33 +497,6 @@ pub(crate) fn install_runtime_api(
                 remap,
                 insert,
             });
-            Ok(())
-        })?,
-    )?;
-
-    // `nx._create_buf()`: queue a [`BufOp::Create`] for the server to drain into
-    // `Editor::create_buffer`. The Lua-facing `nvim_create_buf` (prelude) has
-    // already predicted the id (`nx._next_buf`) and mirrored the new buffer, so
-    // it returns synchronously; this only records the deferred creation.
-    let sh = shared.clone();
-    nx.set(
-        "_create_buf",
-        lua.create_function(move |_, ()| {
-            sh.borrow_mut().buf_ops.push(BufOp::Create);
-            Ok(())
-        })?,
-    )?;
-
-    // `nx._buf_delete(bufnr, force)`: queue a [`BufOp::Delete`] for the server to
-    // drain into `Editor::delete_buffer` (the popup-teardown half of a popup
-    // plugin's lifecycle). The Lua-facing `nvim_buf_delete` (prelude) has resolved `bufnr`
-    // and dropped it from the `nx._bufs` mirror (write-through); this records the
-    // deferred removal.
-    let sh = shared.clone();
-    nx.set(
-        "_buf_delete",
-        lua.create_function(move |_, (bufnr, force): (u64, bool)| {
-            sh.borrow_mut().buf_ops.push(BufOp::Delete { bufnr, force });
             Ok(())
         })?,
     )?;

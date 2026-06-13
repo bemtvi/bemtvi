@@ -120,7 +120,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
-| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib + 5c Worker/`postMessage` redraw/`window.__nxvim` + 5d SAB input/timer park done; only COOP/COEP **production** docs + demo deletion 5e remain) |
+| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
 Phase 1 is independent and small. Phase 3 is the
@@ -1712,7 +1712,7 @@ HTTPS mirror (real gunzip → untar → C compile → `dlopen`) and asserts the 
 parser highlights/indents — exactly the `fx.ts_install` → `spawn_blocking` → install arm →
 `on_install_done` → reload path this slice reroutes. Phase 4-proper is complete: the
 reusable sync `EditHost` exists, coupled to the outside world only through `HostEffects`.
-The throwaway `nxvim-edithost-demo` stays until Phase 5's wasm cdylib replaces it.
+The throwaway `nxvim-edithost-demo` was replaced by Phase 5's wasm cdylib (`nxvim-edithost`) and deleted in slice 5e.
 
 ---
 
@@ -1877,7 +1877,7 @@ Shipped:
   test since `run_io` now builds the host via `EditHost::new`), `clippy -D
   warnings` clean on **both** the native default and the `--no-default-features --features
   lua51` wasm subset, fmt clean (incl. the excluded crate). The throwaway
-  `nxvim-edithost-demo` stays until slice 5e deletes it.
+  `nxvim-edithost-demo` was deleted in slice 5e once this crate fully superseded it.
 
 #### Slice 5c — the Web Worker + redraw transport + `window.__nxvim` — ✅ DONE (2026-06-13)
 
@@ -1974,12 +1974,35 @@ native binary is unchanged); clippy clean on native + the `--no-default-features
 > errors (calling `nil`) rather than no-op'ing, but a loud "not available" message + actually
 > wiring the buffer-write ops into the wasm tick is a Phase 5 follow-up.
 
-#### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo`
+#### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo` — ✅ DONE (2026-06-13)
 
-The dev server sends `Cross-Origin-Opener-Policy: same-origin` +
-`Cross-Origin-Embedder-Policy: require-corp` (SAB needs cross-origin isolation); ship the
-serving + build docs. With `nxvim-edithost` now the real edit-host, **delete the throwaway
-`nxvim-edithost-demo`** (the Phase 4 promise).
+The cross-origin-isolation serving requirement (SAB → `crossOriginIsolated`) is now
+documented for production, and the throwaway demo is gone.
+
+Shipped:
+- **Production serving docs + a ready `_headers`** (`crates/nxvim-edithost/web/`):
+  `web/_headers` sets `Cross-Origin-Opener-Policy: same-origin` +
+  `Cross-Origin-Embedder-Policy: require-corp` + `Cross-Origin-Resource-Policy:
+  same-origin` for `/*` (Netlify / Cloudflare Pages format). The README's *Serving in
+  production* section explains the requirement (without the headers the page degrades to
+  the slow `postMessage` transport and timers never fire — `window.__nxvim.sab` reports
+  which mode is live) and gives nginx / Apache / generic recipes plus the `application/wasm`
+  mime note. The dev/CI server `web/serve.mjs` already sets the same three (slice 5c).
+- **`nxvim-edithost-demo` deleted** — the Phase 4 throwaway that only proved core+Lua
+  *compile and run* in wasm. `nxvim-edithost` (the real `nxvim-server` tick in a Worker)
+  has fully superseded it, so the crate dir is removed, dropped from the workspace
+  `exclude` list, and every "supersedes the demo / deleted in 5e" reference scrubbed to
+  past tense across `Cargo.toml` / the crate README / `src/lib.rs`.
+
+**Exit criteria — met.** `web/serve.mjs` + `web/_headers` make `crossOriginIsolated ===
+true` (the `verify.mjs` run asserts it, and the SAB timer path depends on it — both green);
+the build + serving + production-headers docs ship in the crate README; `git ls-files`
+shows no `nxvim-edithost-demo`, and `grep -r nxvim-edithost-demo` over the tree returns only
+this plan's historical narrative. **Phase 5 is complete** — the full Lua edit-host runs in
+the browser (core + Lua + autocmds + redraw + Worker-side timers), driven over SAB, served
+cross-origin-isolated; what remains browser-side is Phase 6 (the daemon over WebTransport
+for real files/processes/LSP) and the documented v1 gaps (the `vim.api.nvim_buf_*` write
+surface; LSP + native treesitter).
 
 > **Toolchain prerequisite (now provisioned).** Slices 5b–5e — and the wasm half of 5a —
 > require the emscripten SDK (`emcc`, at `/usr/lib/emscripten`), the

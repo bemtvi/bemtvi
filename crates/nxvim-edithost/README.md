@@ -2,14 +2,13 @@
 
 The real editor in the browser: the reusable synchronous [`EditHost`] tick (nxvim's
 core + the PUC Lua 5.1 VM + the `vim.*` bindings + the full server glue — autocmds,
-mirrors, lifecycle, the redraw projection) compiled to `wasm32-unknown-emscripten` and
-driven behind a wasm [`HostEffects`] (`WasmEffects`). This is Phase 5, slice 5b of
+mirrors, lifecycle, the redraw projection) compiled to `wasm32-unknown-emscripten`,
+driven behind a wasm [`HostEffects`] (`WasmEffects`) inside a Web Worker. This is Phase 5
+of
 [`docs/plans/2026-06-09-edit-host-and-browser-lua.md`](../../docs/plans/2026-06-09-edit-host-and-browser-lua.md).
 
-It **supersedes** `nxvim-edithost-demo`. That throwaway proved only that core+Lua
-*compile and run* together in wasm via a hand-wired minimal tie-in (no glue, no redraw);
-this crate links the **production** `nxvim-server` tick. (The demo is deleted in slice
-5e.)
+It links the **production** `nxvim-server` tick (the keystroke path is the same one the
+native server drives — not a hand-wired minimal tie-in).
 
 ## What runs here vs. not (serverless v1)
 
@@ -72,3 +71,43 @@ cd web && npm install        # playwright (once); plus `npx playwright install c
 node serve.mjs               # open http://localhost:8088/web/  to use the editor
 node verify.mjs              # headless-browser proof of slices 5c+5d (PW_CHROMIUM overrides the binary)
 ```
+
+## Serving in production
+
+The editor is **static files** — serve `web/` (this dir) with the built `dist/` (`eh.mjs`
++ `eh.wasm`) alongside it; no server-side code runs. The one hard requirement is
+**cross-origin isolation**: the Worker's run loop parks on a `SharedArrayBuffer` (slice
+5d), which the browser only grants when the document is cross-origin isolated. So every
+response must carry:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+Cross-Origin-Resource-Policy: same-origin   # so same-origin subresources satisfy COEP
+```
+
+Without them the page still runs but degrades to the slower `postMessage` transport and
+**timers never fire** (`window.__nxvim.sab` reports which mode is active). The `.wasm`
+must also be served as `application/wasm` (most hosts do this by extension).
+
+- **Netlify / Cloudflare Pages:** the `web/_headers` file already sets all three for `/*`.
+  Publish `web/` (with `dist/` copied in) — done.
+- **nginx:**
+  ```nginx
+  location / {
+    add_header Cross-Origin-Opener-Policy   "same-origin"  always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+    add_header Cross-Origin-Resource-Policy "same-origin"  always;
+    types { application/wasm wasm; }
+  }
+  ```
+- **Apache (`.htaccess`):**
+  ```apache
+  Header always set Cross-Origin-Opener-Policy   "same-origin"
+  Header always set Cross-Origin-Embedder-Policy "require-corp"
+  Header always set Cross-Origin-Resource-Policy "same-origin"
+  AddType application/wasm .wasm
+  ```
+- **Any host:** `web/serve.mjs` is a reference Node static server that sets exactly these
+  (it's what the dev workflow and `verify.mjs` use); copy its header logic if you roll
+  your own.

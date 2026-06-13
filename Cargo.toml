@@ -19,12 +19,12 @@ members = [
 # workspace member: excluding it keeps it out of the host `cargo build/test/clippy
 # --workspace` flow, which can't meaningfully compile or run a wasm cdylib. Being
 # excluded, it pins its own dependencies rather than inheriting the workspace's.
-# nxvim-edithost is the real wasm edit-host (slice 5b): the reusable synchronous
-# `EditHost` tick (core + Lua) compiled to `wasm32-unknown-emscripten` behind a wasm
-# `HostEffects`, built via its own build.sh. Excluded for the same reason as nxvim-web —
-# wasm target + C deps, not host-buildable. (nxvim-edithost-demo is the TEMPORARY
-# throwaway it supersedes; the demo is deleted in slice 5e.)
-exclude = ["crates/nxvim-web", "crates/nxvim-edithost-demo", "crates/nxvim-edithost"]
+# nxvim-edithost is the real wasm edit-host: the reusable synchronous `EditHost` tick
+# (core + Lua) compiled to `wasm32-unknown-emscripten` behind a wasm `HostEffects`, run
+# in a Web Worker (Phase 5), built via its own build.sh. Excluded for the same reason as
+# nxvim-web — wasm target + C deps, not host-buildable. (It superseded the throwaway
+# nxvim-edithost-demo, deleted in slice 5e.)
+exclude = ["crates/nxvim-web", "crates/nxvim-edithost"]
 
 [workspace.package]
 version = "0.1.0"

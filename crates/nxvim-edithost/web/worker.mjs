@@ -88,6 +88,64 @@ const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Da
 const utf8 = (bytes) => new TextDecoder().decode(bytes);
 
 // =============================================================================
+// Real local filesystem (File System Access API) — the `:eo` / `:wo` / … picker family.
+//
+// Unlike OPFS (the sandboxed default fs), these commands open *real* local files the user
+// grants through the browser's native picker. The picker must run on the UI thread (it
+// needs a window + a user gesture) and yields a `FileSystemFileHandle`, not a path — so a
+// picker-bound file's bytes live behind a handle the UI holds, and its read/write can only
+// be done by the UI (async `getFile()` / `createWritable()`). The Worker therefore *routes*
+// the editor's off-tick read/write for a bound path UI-ward instead of fulfilling it
+// against OPFS, exactly as a daemon session would route it over the wire — only here the
+// "wire" is a postMessage to the UI thread and back.
+//
+// `boundPaths` is the set of editor paths that resolve to a real handle. The UI sends a
+// `bind` (a ring frame under SAB, a message under 5c) *before* the `:e`/`:w` it issues, so
+// the routing decision is already known when `eh_take_fs_requests` drains the request.
+// Everything not bound stays on OPFS.
+const boundPaths = new Set();
+// Off-tick realfs ops dispatched to the UI and awaiting its reply. While this is > 0 the
+// SAB run loop stays event-loop-live (it `await`s a JS promise rather than parking on
+// `Atomics.wait`) so the UI's reply postMessage can actually be received — a thread parked
+// in `Atomics.wait` can't process its message queue.
+let pendingRealFs = 0;
+let fsReplyWaiter = null; // resolve() to wake the SAB loop when a realfs reply lands
+let sabMode = false; // true once the SAB run loop owns the tick (vs the 5c postMessage path)
+
+// Hand the in-flight write `seq`'s snapshot bytes to the UI to write to the bound handle.
+// Copy them out of wasm memory first (`slice`, not `subarray`) — the copy is detach-safe
+// across `ALLOW_MEMORY_GROWTH` and can be transferred (zero-copy) to the UI thread.
+function dispatchRealFsWrite(seq, path) {
+  const ptr = eh_save_bytes(h, seq);
+  const len = eh_save_len(h, seq);
+  const bytes = ptr ? M.HEAPU8.slice(ptr, ptr + len) : new Uint8Array(0);
+  pendingRealFs++;
+  postMessage({ type: "fs_write", seq, path, bytes }, [bytes.buffer]);
+}
+// Ask the UI to read a bound path's real file (its handle is UI-side); the reply lands via
+// the `fs_read_result` message.
+function dispatchRealFsRead(buffer, path) {
+  pendingRealFs++;
+  postMessage({ type: "fs_read", buffer, path });
+}
+// A realfs reply (read content / write result) was just applied into the tick. Under SAB,
+// wake the run loop (it reposts the frame and drains any cascade the completion enqueued);
+// under 5c there's no loop, so drain + repaint inline.
+async function landRealFsReply() {
+  pendingRealFs = Math.max(0, pendingRealFs - 1);
+  if (sabMode) {
+    if (fsReplyWaiter) {
+      const r = fsReplyWaiter;
+      fsReplyWaiter = null;
+      r();
+    }
+  } else {
+    await fulfillFsRequests();
+    postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+  }
+}
+
+// =============================================================================
 // Off-tick OPFS filesystem (Phase 6 — serverless).
 //
 // The editor runs in off-tick fs mode (`has_remote_fs() == true`) because OPFS handle
@@ -206,12 +264,24 @@ async function fulfillFsRequests() {
     if (reqs.reads.length === 0 && reqs.writes.length === 0) return didWork;
     didWork = true;
     for (const r of reqs.reads) {
+      // A picker-bound path's bytes live behind a UI-held handle — route the read there;
+      // the `fs_read_result` reply lands it (`landRealFsReply`). Else fulfill from OPFS.
+      if (boundPaths.has(r.path)) {
+        dispatchRealFsRead(r.buffer, r.path);
+        continue;
+      }
       const res = await opfsRead(r.path);
       // A directory read carries its canonical dir in res.path (the explorer navigates
       // from it); a file/new/err keeps the requested path.
       eh_fs_read_complete(h, r.buffer, res.path ?? r.path, res.kind, res.text);
     }
     for (const w of reqs.writes) {
+      // A picker-bound path is written by the UI against its handle; route it there and
+      // leave the save in-flight until the `fs_write_result` reply finalizes it.
+      if (boundPaths.has(w.path)) {
+        dispatchRealFsWrite(w.seq, w.path);
+        continue;
+      }
       // Copy the snapshot bytes out of wasm memory *before* the await — ALLOW_MEMORY_GROWTH
       // can detach HEAPU8 across a later wasm call, and the pointer is only valid until
       // `eh_fs_write_complete` drops the save.
@@ -239,6 +309,7 @@ async function fulfillFsRequests() {
 const SEQ = 0, WRITE = 1, READ = 2;
 
 async function runLoopSAB(ctrl, data) {
+  sabMode = true;
   const cap = data.length;
   const rdByte = (pos) => data[((pos % cap) + cap) % cap];
   const rdU32 = (pos) =>
@@ -269,6 +340,12 @@ async function runLoopSAB(ctrl, data) {
         // 'mousetime' multi-click detection off the same JS clock as input.
         const m = JSON.parse(utf8(payload));
         eh_input_mouse(h, m.b, m.a, m.m, m.r | 0, m.c | 0);
+      } else if (type === 4) {
+        // bind: the path resolves to a real-FS handle the UI holds. Sent *before* the
+        // `:e`/`:w` that references it, so the routing decision is set when the request
+        // drains. (Bulk content never rides the ring — it's small enough to overflow it —
+        // so only this marker does; the file bytes flow over postMessage.)
+        boundPaths.add(utf8(payload));
       }
       acks.push(reqId);
     }
@@ -295,6 +372,19 @@ async function runLoopSAB(ctrl, data) {
     const fsWork = await fulfillFsRequests();
     if (fired || acks.length || fsWork) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
+    }
+    // A picker-bound `:e`/`:w` dispatched a read/write to the UI this pass. Don't park on
+    // `Atomics.wait` — a parked thread can't receive the UI's reply postMessage. Instead
+    // stay in the event loop awaiting the reply (`onmessage` → `landRealFsReply` resolves
+    // it), repaint with the landed result, then loop to drain any cascade + any input that
+    // arrived meanwhile (it's queued in the ring; the SEQ notify was a no-op while unparked,
+    // but the next `drain()` picks it up).
+    if (pendingRealFs > 0) {
+      await new Promise((res) => {
+        fsReplyWaiter = res;
+      });
+      postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks: [], results: [] });
+      continue;
     }
     // Park until the UI notifies (SEQ changes) or the next timer is due. If input
     // arrived while we processed (SEQ already moved off seqBefore), `Atomics.wait`
@@ -330,6 +420,33 @@ onmessage = async (ev) => {
     runLoopSAB(new Int32Array(msg.ctrl), new Uint8Array(msg.data)).catch((e) =>
       postMessage({ type: "fatal", error: `SAB run loop failed: ${e}` }),
     );
+    return;
+  }
+  // Real-FS picker plumbing (both transports). The UI fulfills a bound path's read/write
+  // against its `FileSystemFileHandle` and reports back here; land it into the tick. Under
+  // SAB these are received while the run loop is event-loop-live (pendingRealFs > 0); under
+  // 5c the Worker isn't parked, so they're received normally.
+  if (msg.type === "fs_read_result") {
+    eh_fs_read_complete(h, msg.buffer, String(msg.path), msg.kind | 0, String(msg.text ?? ""));
+    await landRealFsReply();
+    return;
+  }
+  if (msg.type === "fs_write_result") {
+    eh_fs_write_complete(
+      h,
+      msg.seq,
+      msg.ok ? 1 : 0,
+      msg.ok ? msg.size : 0,
+      -1,
+      msg.ok ? "" : String(msg.error ?? "write failed"),
+    );
+    await landRealFsReply();
+    return;
+  }
+  // 5c bind (the SAB transport binds via a ring frame in `drain()` instead). Marks a path
+  // as resolving to a real handle; must precede the `:e`/`:w` the UI sends after it.
+  if (msg.type === "bind") {
+    boundPaths.add(String(msg.path));
     return;
   }
   // postMessage fallback (5c). `:e`/`:w` fulfill against OPFS before the frame posts, so

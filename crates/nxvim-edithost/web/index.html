@@ -139,6 +139,14 @@
     const pendingResults = new Map(); // reqId → resolver (exec_lua, resolves with result)
     const pendingMsg = new Map();     // postMessage fallback (5c) request map
 
+    // Real local files opened via the native picker (`:eo`/`:wo`/…). Keyed by the editor
+    // path — the picked file's name, which is exactly what `:e <name>` / `:w <name>` make
+    // the buffer's path — so the Worker's off-tick read/write for that path is fulfilled
+    // here against the granted FileSystemFileHandle (see worker.mjs's boundPaths routing).
+    const fsHandles = new Map();
+    const fsApiAvailable =
+      typeof self.showOpenFilePicker === "function" && typeof self.showSaveFilePicker === "function";
+
     function wrU32(pos, v) {
       data[(pos) % dataCap] = v & 0xff;
       data[(pos + 1) % dataCap] = (v >>> 8) & 0xff;
@@ -193,10 +201,44 @@
         worker.postMessage({ id, type, ...extra });
       });
     }
+    // Tell the Worker a path resolves to a real-FS handle. It must reach the Worker before
+    // the `:e`/`:w` that references it: a ring frame under SAB (ordered with the feeds in
+    // the same channel), a message under 5c (FIFO with the feed messages). Fire-and-forget.
+    function bindOp(path) {
+      if (useSAB) pushFrame(4, enc(path));
+      else worker.postMessage({ type: "bind", path });
+    }
 
     let statusHideTimer = null;
-    worker.onmessage = (ev) => {
+    // Briefly show a transient message in the corner indicator (picker errors, etc.).
+    function flashStatus(text, color = "#e5c07b") {
+      clearTimeout(statusHideTimer);
+      statusEl.style.display = "";
+      statusEl.style.opacity = "1";
+      statusEl.style.color = color;
+      statusEl.textContent = text;
+      statusHideTimer = setTimeout(() => { statusEl.style.display = "none"; }, 4000);
+    }
+    worker.onmessage = async (ev) => {
       const msg = ev.data;
+      // Real-FS picker plumbing: the Worker routes a bound path's read/write here (its
+      // handle is UI-side) and we fulfill it against the real file, then report back.
+      if (msg.type === "fs_read") {
+        const handle = fsHandles.get(msg.path);
+        const res = handle
+          ? await realFsRead(handle)
+          : { kind: 3, text: `no file handle for ${msg.path}` };
+        worker.postMessage({ type: "fs_read_result", buffer: msg.buffer, path: msg.path, kind: res.kind, text: res.text });
+        return;
+      }
+      if (msg.type === "fs_write") {
+        const handle = fsHandles.get(msg.path);
+        const res = handle
+          ? await realFsWrite(handle, msg.bytes)
+          : { ok: false, error: `no file handle for ${msg.path}` };
+        worker.postMessage({ type: "fs_write_result", seq: msg.seq, ok: res.ok, size: res.size || 0, error: res.error || "" });
+        return;
+      }
       if (msg.type === "fatal") {
         statusEl.style.opacity = "1";
         statusEl.style.color = "#e06c75";
@@ -920,12 +962,128 @@
       return `<${mods.join("-")}-${base}>`;
     }
 
+    // ============================================================================
+    // Native file picker — the `:eo` / `:wo` / … family (mirrors nxvim-gui's rfd dialogs,
+    // adapted to the browser's File System Access API). `<CR>` over one of these `:`
+    // command lines opens the OS picker instead of running the command verbatim, then
+    // drives the real open/save with the picked handle. The handle (not a path) is the
+    // capability, so we register it under the file's name and `bind` that name; the
+    // editor's off-tick read/write for the name then routes to the handle (worker.mjs).
+    // ============================================================================
+
+    // The base verb to run after the *open* picker, or null — ports nxvim-gui's
+    // `open_dialog_verb`: the `…o` family + bare `:e`/`:edit` (an alias of `:eo`).
+    function openDialogVerb(cmd) {
+      switch (cmd) {
+        case "e": case "ed": case "edi": case "edit": case "eo": return "e";
+        case "spo": return "sp";
+        case "vso": return "vs";
+        case "tabeo": return "tabe";
+        case "newo": return "new";
+        case "vnewo": return "vnew";
+        default: return null;
+      }
+    }
+    // Whether `<CR>` should pop the *save* picker: `:wo` always, or a bare `:w`/`:write` on
+    // an unnamed buffer (no file to write to). Ports nxvim-gui's `save_dialog_needed`.
+    function saveDialogNeeded(cmd, unnamed) {
+      if (cmd === "wo") return true;
+      return unnamed && (cmd === "w" || cmd === "wr" || cmd === "wri" || cmd === "writ" || cmd === "write");
+    }
+    function focusedView() {
+      const f = latest.frame;
+      if (!f) return null;
+      return (f.windows || []).find((w) => w.focused) || f.windows?.[0] || null;
+    }
+    function pickerUnavailable(what) {
+      flashStatus(`${what}: this browser has no File System Access API (try Chrome/Edge)`, "#e06c75");
+    }
+    // Run an ex command by feeding `:<cmd><CR>` as key notation (the Worker tick takes
+    // notation via nvim_input, not a direct nvim_command — so the `:` and `<CR>` are
+    // required). A literal `<` in a filename would be read as notation, so escape it.
+    function runExCommand(cmd) {
+      return feedOp(`:${cmd.replace(/</g, "<lt>")}<CR>`);
+    }
+
+    // Decide *synchronously* (so the picker call stays inside the keystroke's user gesture)
+    // whether `<CR>` over the current `:` command line should pop a file picker. Returns
+    // true if it handled the `<CR>` (the caller then skips feeding it). Only `:`-prefixed.
+    function tryFilePickerIntercept() {
+      const f = latest.frame;
+      if (!f || !f.command_mode) return false;
+      const prefix = f.cmdline_prompt || f.cmdline_prefix || "";
+      if (prefix !== ":") return false;
+      const cmd = (f.cmdline || "").trim();
+      const verb = openDialogVerb(cmd);
+      if (verb) { startOpenPicker(verb); return true; }
+      const fw = focusedView();
+      if (saveDialogNeeded(cmd, fw ? fw.unnamed : true)) { startSavePicker(fw); return true; }
+      return false;
+    }
+
+    // Pop the open picker, then `:<verb> <name>` the chosen file. `<Esc>` first so the
+    // half-typed `:eo` command line clears even if the user cancels the picker.
+    function startOpenPicker(verb) {
+      feedOp("<Esc>");
+      if (!fsApiAvailable) { pickerUnavailable("open"); return; }
+      self.showOpenFilePicker({ multiple: false }).then(async ([handle]) => {
+        // Request write access up front (within the picker's activation) so a later bare
+        // `:w` to this handle needs no fresh gesture; read-only is fine if declined.
+        try { await handle.requestPermission?.({ mode: "readwrite" }); } catch {}
+        const path = handle.name;
+        fsHandles.set(path, handle);
+        bindOp(path);
+        runExCommand(`${verb} ${path}`);
+      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("open failed: " + (e?.message || e), "#e06c75"); });
+    }
+
+    // Pop the save picker, then `:w <name>` the buffer to the chosen file. nxvim's
+    // `:w <path>` both writes *and* renames the buffer to that path, so the buffer becomes
+    // bound to the real file and future bare `:w`s write straight back to it.
+    function startSavePicker(fw) {
+      feedOp("<Esc>");
+      if (!fsApiAvailable) { pickerUnavailable("save"); return; }
+      const opts = {};
+      if (fw && !fw.unnamed && fw.file_name) opts.suggestedName = fw.file_name.split("/").pop();
+      self.showSaveFilePicker(opts).then((handle) => {
+        const path = handle.name;
+        fsHandles.set(path, handle);
+        bindOp(path);
+        runExCommand(`w ${path}`);
+      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("save failed: " + (e?.message || e), "#e06c75"); });
+    }
+
+    // Read a bound file's real bytes for the Worker (off-tick `:e`): { kind, text } where
+    // kind 0 = file contents, 3 = error (per eh_fs_read_complete's contract).
+    async function realFsRead(handle) {
+      try {
+        const file = await handle.getFile();
+        return { kind: 0, text: await file.text() };
+      } catch (e) { return { kind: 3, text: String(e?.message || e) }; }
+    }
+    // Write the Worker's snapshot bytes to a bound file (off-tick `:w`): { ok, size, error }.
+    async function realFsWrite(handle, bytes) {
+      try {
+        if (handle.requestPermission) {
+          const perm = await handle.requestPermission({ mode: "readwrite" });
+          if (perm !== "granted") return { ok: false, error: "write permission denied" };
+        }
+        const w = await handle.createWritable();
+        await w.write(bytes);
+        await w.close();
+        return { ok: true, size: bytes.byteLength };
+      } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+    }
+
     gridEl.addEventListener("keydown", (e) => {
       if (e.key === "F5" || e.key === "F12") return;
       if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
       const n = keyToNotation(e);
       if (n == null) return;
       e.preventDefault();
+      // `<CR>` over a `:eo`/`:wo`/… command line opens the native picker instead of feeding
+      // the key (the picker must fire synchronously here to keep the user gesture).
+      if (n === "<CR>" && tryFilePickerIntercept()) return;
       feedOp(n);
     });
 
@@ -1037,6 +1195,9 @@
       sab: useSAB,
       feed: (notation) => feedOp(notation),
       type: (notation) => feedOp(notation),
+      // Press Enter *through* the file-picker interception (the keydown path), so a
+      // `:eo`/`:wo`/… command line pops the picker. Plain `feed("<CR>")` bypasses it.
+      pressEnter: () => (tryFilePickerIntercept() ? Promise.resolve({ intercepted: true }) : feedOp("<CR>")),
       mouse: (button, action, modifier, row, col) => mouseOp(button, action, modifier, row | 0, col | 0),
       execLua: (code) => execLuaOp(code),
       attach: (c, r) => attachOp(c, r),

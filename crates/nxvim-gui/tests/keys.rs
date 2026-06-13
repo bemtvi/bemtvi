@@ -3,7 +3,8 @@
 //! GUI analogue of `nxvim-tui`'s `keys` test.
 
 use nxvim_gui::{
-    encode_key, is_paste, open_dialog_verb, open_path_command, parse_guifont, save_dialog_needed,
+    dialog_action, encode_key, is_paste, open_dialog_verb, open_path_command, parse_guifont,
+    save_dialog_needed, DialogAction,
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -226,4 +227,53 @@ fn save_dialog_fires_for_wo_and_bare_write_on_unnamed() {
     assert!(!save_dialog_needed("w foo.txt", true));
     assert!(!save_dialog_needed("wq", true));
     assert!(!save_dialog_needed("e", true));
+}
+
+#[test]
+fn dialog_action_is_suppressed_in_a_remote_session() {
+    // Connected to a remote daemon, the buffers live on the *daemon's* fs — a local
+    // native open/save dialog would browse and write the wrong machine. So `<CR>`
+    // over every dialog-triggering `:` command must run as typed (None), letting the
+    // server handle it (netrw listing, `E32` for a nameless `:w`, …). This is the
+    // regression guard for the "GUI pops a native dialog while connected to remote" bug.
+    for &(cmdline, unnamed) in &[
+        ("eo", false),    // open family
+        ("e", false),     // bare `:e` aliases `:eo`
+        ("e src", false), // open-with-path (dir picker, locally)
+        ("wo", false),    // save-as
+        ("w", true),      // bare `:w` on an unnamed buffer
+        ("write", true),
+    ] {
+        assert!(
+            dialog_action(cmdline, unnamed, true).is_none(),
+            "remote session must not pop a dialog for {cmdline:?}"
+        );
+    }
+}
+
+#[test]
+fn dialog_action_routes_each_trigger_locally() {
+    // The same triggers still pop their dialog in a *local* session (remote = false),
+    // so the suppression above is the only behavior change.
+    assert!(matches!(
+        dialog_action("eo", false, false),
+        Some(DialogAction::Open { base: "e" })
+    ));
+    assert!(matches!(
+        dialog_action("e src", false, false),
+        Some(DialogAction::OpenPath {
+            base: "e",
+            arg: "src"
+        })
+    ));
+    assert!(matches!(
+        dialog_action("wo", false, false),
+        Some(DialogAction::Save)
+    ));
+    assert!(matches!(
+        dialog_action("w", true, false),
+        Some(DialogAction::Save)
+    ));
+    // A nameless concern that triggers nothing stays None even locally.
+    assert!(dialog_action("wq", true, false).is_none());
 }

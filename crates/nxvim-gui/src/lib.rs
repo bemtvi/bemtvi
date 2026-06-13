@@ -162,10 +162,14 @@ pub enum UserEvent {
 /// on the same runtime that polls it. The embedded caller passes
 /// `|| async { Ok(duplex_end) }`. A connect failure propagates back before any
 /// window opens.
+///
+/// `remote` marks an edit-host (daemon) session — buffers live on the daemon's fs, so
+/// the native local-fs open/save dialogs are suppressed (see [`dialog_action`]).
 pub fn run<C, Fut, S>(
     connect_transport: C,
     config: GuiConfig,
     open_dir: Option<PathBuf>,
+    remote: bool,
 ) -> Result<()>
 where
     C: FnOnce() -> Fut + Send + 'static,
@@ -248,7 +252,7 @@ where
             return Err(anyhow::anyhow!("client IO thread exited before connecting"));
         }
     };
-    let mut app = App::new(rpc, config, open_dir);
+    let mut app = App::new(rpc, config, open_dir, remote);
     event_loop.run_app(&mut app)?;
 
     // The UI is done: stop the IO thread and wait for it, so the stream is dropped
@@ -401,10 +405,14 @@ struct App {
     /// the server's in-window listing — see [`Self::resumed`]. Taken on first use so
     /// it fires exactly once.
     open_dir: Option<PathBuf>,
+    /// Whether this is an edit-host (daemon) session — buffers live on the daemon's
+    /// fs, not the local disk. Suppresses the native open/save file dialogs (see
+    /// [`dialog_action`]), which would otherwise browse and write the wrong machine.
+    remote: bool,
 }
 
 impl App {
-    fn new(rpc: Rpc, config: GuiConfig, open_dir: Option<PathBuf>) -> Self {
+    fn new(rpc: Rpc, config: GuiConfig, open_dir: Option<PathBuf>, remote: bool) -> Self {
         Self {
             rpc,
             window: None,
@@ -424,6 +432,7 @@ impl App {
             config,
             applied_guifont: String::new(),
             open_dir,
+            remote,
         }
     }
 
@@ -860,6 +869,45 @@ pub fn save_dialog_needed(cmdline: &str, unnamed: bool) -> bool {
         || (unnamed && matches!(cmdline.trim(), "w" | "wr" | "wri" | "writ" | "write"))
 }
 
+/// What `<CR>` over a `:` command line should make the GUI do — the native-dialog
+/// affordance, decided in one place (see [`dialog_action`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DialogAction<'a> {
+    /// Pop the **open** dialog, then run `<base> <picked>` (the `…o` family / bare `:e`).
+    Open { base: &'static str },
+    /// `cmdline` opens `arg` with `base`; if `arg` is a local **directory** the caller
+    /// pops the open dialog anchored there, else the command runs as typed (`:e somedir`).
+    OpenPath { base: &'static str, arg: &'a str },
+    /// Pop the **save** dialog, then `:w <picked>` (`:wo` / a bare `:w` on an unnamed buffer).
+    Save,
+}
+
+/// Decide what `<CR>` over a `:` command line should do in the GUI: pop a native file
+/// dialog, or nothing (run the command as typed). Folds the three pure predicates
+/// ([`open_dialog_verb`], [`open_path_command`], [`save_dialog_needed`]) into one
+/// decision, in their established priority order.
+///
+/// Returns `None` in a **remote (daemon) session** (`remote == true`): the buffers live
+/// on the *daemon's* fs, so a local native dialog would browse and write the wrong
+/// machine — the command must run as typed and let the server handle it (the in-window
+/// netrw listing for `:e <dir>`, `E32` for a nameless `:w`, …). The `OpenPath`
+/// directory-vs-file test is the caller's (it touches the local fs), keeping this pure
+/// and unit-tested in `tests/keys.rs`.
+pub fn dialog_action(cmdline: &str, unnamed: bool, remote: bool) -> Option<DialogAction<'_>> {
+    if remote {
+        return None;
+    }
+    if let Some(base) = open_dialog_verb(cmdline) {
+        Some(DialogAction::Open { base })
+    } else if let Some((base, arg)) = open_path_command(cmdline) {
+        Some(DialogAction::OpenPath { base, arg })
+    } else if save_dialog_needed(cmdline, unnamed) {
+        Some(DialogAction::Save)
+    } else {
+        None
+    }
+}
+
 /// Parse a vim / Neovide `guifont` value into `(family, point size)`. The family is
 /// the first of the comma-separated fonts (the font system handles fallback on its
 /// own); a backslash-escaped space (`Fira\ Code`, the `:set` form) is unescaped. A
@@ -1036,23 +1084,30 @@ impl ApplicationHandler<UserEvent> for App {
                     && self.view.cmdline_prefix == ':'
                     && self.view.cmdline_prompt.is_empty()
                 {
-                    if let Some(base) = open_dialog_verb(&self.view.cmdline) {
-                        if self.pick_open(base) {
+                    let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
+                    // `dialog_action` returns `None` in a remote (daemon) session, so
+                    // the native local-fs picker never fires for remote buffers — the
+                    // command runs as typed and the server/daemon handles it.
+                    // Each `pick_*` swallows the `<CR>` (it aborts the command line and
+                    // re-issues the real command with the chosen path), so `return`
+                    // before the key is encoded below.
+                    match dialog_action(&self.view.cmdline, unnamed, self.remote) {
+                        Some(DialogAction::Open { base }) => {
+                            self.pick_open(base);
                             return;
                         }
-                    } else if let Some((base, dir)) = open_path_command(&self.view.cmdline)
-                        .filter(|(_, arg)| Path::new(arg).is_dir())
-                    {
                         // Opening a *directory* (`:e somedir`): pop the picker there
-                        // instead of letting the server show its netrw listing.
-                        if self.pick_open_at(base, dir) {
+                        // instead of letting the server show its netrw listing. A file
+                        // argument runs as typed (the server opens it).
+                        Some(DialogAction::OpenPath { base, arg }) if Path::new(arg).is_dir() => {
+                            self.pick_open_at(base, arg);
                             return;
                         }
-                    } else {
-                        let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
-                        if save_dialog_needed(&self.view.cmdline, unnamed) && self.pick_save() {
+                        Some(DialogAction::Save) => {
+                            self.pick_save();
                             return;
                         }
+                        _ => {}
                     }
                 }
                 // macOS composes Option(Alt)+key into a character — Option+c yields

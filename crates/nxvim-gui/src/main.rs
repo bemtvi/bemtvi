@@ -147,6 +147,7 @@ fn run_embedded(file: Option<String>, config: GuiConfig, open_dir: Option<PathBu
         move || async move { anyhow::Ok(client_end) },
         config,
         open_dir,
+        false, // local session — native file dialogs operate on the real disk.
     );
 
     // When the client exits, the dropped stream signals the server to wind down.
@@ -289,7 +290,14 @@ where
     // The GUI client owns the main thread, exactly as the default role. The transport
     // is already built; the connector hands it over. A daemon session opens the startup
     // file through the daemon's fs, so there is no local file picker (`open_dir` is None).
-    let result = nxvim_gui::run(move || async move { anyhow::Ok(client_end) }, config, None);
+    // `remote = true`: buffers live on the daemon's fs, so the native local-fs file
+    // dialogs are suppressed (a `:w`/`:e` picker would target the wrong machine).
+    let result = nxvim_gui::run(
+        move || async move { anyhow::Ok(client_end) },
+        config,
+        None,
+        true,
+    );
 
     if let Err(payload) = server_thread.join() {
         eprintln!(

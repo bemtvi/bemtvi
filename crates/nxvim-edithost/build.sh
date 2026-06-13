@@ -59,7 +59,7 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -sALLOW_MEMORY_GROWTH=1 \
   -sEXIT_RUNTIME=0 \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString \
-  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_attach,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
+  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
 
 echo
 echo "built dist/eh.mjs — run the harness:  node harness.mjs"

@@ -67,17 +67,69 @@
   }
 
   // --- worker transport ---------------------------------------------------------
+  // Two modes, picked by capability: SAB (slice 5d) when the page is cross-origin
+  // isolated so timers can fire via the Worker's Atomics.wait park, else postMessage
+  // (slice 5c). Both expose the same feed/execLua/attach promises to the hook below.
   const worker = new Worker(new URL("./worker.mjs", import.meta.url), { type: "module" });
-  let nextId = 1;
-  const pending = new Map();
+  const useSAB = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
   let latest = { frame: null, lines: "" };
   let readyResolve;
   const readyPromise = new Promise((res) => (readyResolve = res));
 
-  function send(type, extra = {}) {
-    const id = nextId++;
+  // SAB channel (5d): ctrl = [SEQ, WRITE, READ, _]; data = byte ring of framed input.
+  const SEQ = 0, WRITE = 1, READ = 2;
+  let ctrl, data, dataCap;
+  let nextReqId = 1;
+  const pendingAcks = new Map();    // reqId → resolver (feed/attach)
+  const pendingResults = new Map(); // reqId → resolver (exec_lua, resolves with result)
+  // postMessage fallback (5c) request map.
+  const pendingMsg = new Map();
+
+  function wrU32(pos, v) {
+    data[(pos) % dataCap] = v & 0xff;
+    data[(pos + 1) % dataCap] = (v >>> 8) & 0xff;
+    data[(pos + 2) % dataCap] = (v >>> 16) & 0xff;
+    data[(pos + 3) % dataCap] = (v >>> 24) & 0xff;
+  }
+  // Write a framed message into the ring and wake the worker. Returns the reqId.
+  function pushFrame(type, payload) {
+    const reqId = nextReqId++ >>> 0;
+    let wp = Atomics.load(ctrl, WRITE) >>> 0;
+    data[wp % dataCap] = type;
+    wrU32(wp + 1, reqId);
+    wrU32(wp + 5, payload.length);
+    for (let i = 0; i < payload.length; i++) data[(wp + 9 + i) % dataCap] = payload[i];
+    // Publish WRITE (a fence) before bumping SEQ, so the worker that observes the new
+    // SEQ is guaranteed to see the bytes + WRITE cursor.
+    Atomics.store(ctrl, WRITE, (wp + 9 + payload.length) >>> 0);
+    Atomics.add(ctrl, SEQ, 1);
+    Atomics.notify(ctrl, SEQ, 1);
+    return reqId;
+  }
+  const enc = (s) => new TextEncoder().encode(s);
+
+  // The transport-agnostic ops the hook calls.
+  function feedOp(notation) {
+    if (useSAB) return new Promise((r) => pendingAcks.set(pushFrame(0, enc(notation)), r));
+    return sendMsg("feed", { notation });
+  }
+  function execLuaOp(code) {
+    if (useSAB) return new Promise((r) => pendingResults.set(pushFrame(1, enc(code)), r));
+    return sendMsg("exec_lua", { code });
+  }
+  function attachOp(c, r) {
+    if (useSAB) {
+      const payload = new Uint8Array(8);
+      new DataView(payload.buffer).setUint32(0, c, true);
+      new DataView(payload.buffer).setUint32(4, r, true);
+      return new Promise((res) => pendingAcks.set(pushFrame(2, payload), res));
+    }
+    return sendMsg("attach", { cols: c, rows: r });
+  }
+  function sendMsg(type, extra) {
+    const id = nextReqId++;
     return new Promise((resolve) => {
-      pending.set(id, resolve);
+      pendingMsg.set(id, resolve);
       worker.postMessage({ id, type, ...extra });
     });
   }
@@ -91,20 +143,38 @@
     }
     if (msg.type === "ready") {
       computeSize();
-      // Attach at the real grid size; the reply carries the first frame.
-      send("attach", { cols, rows }).then(() => {
-        statusEl.textContent = `nxvim wasm edit-host — ${cols}×${rows}`;
+      const label = `nxvim wasm edit-host — ${cols}×${rows} — ${useSAB ? "SAB+timers" : "postMessage"}`;
+      if (useSAB) {
+        ctrl = new Int32Array(new SharedArrayBuffer(16));
+        const sab = new SharedArrayBuffer(1 << 16);
+        data = new Uint8Array(sab);
+        dataCap = data.length;
+        worker.postMessage({ type: "init", ctrl: ctrl.buffer, data: sab, cols, rows });
+        statusEl.textContent = label;
         readyResolve();
-      });
+      } else {
+        attachOp(cols, rows).then(() => {
+          statusEl.textContent = label;
+          readyResolve();
+        });
+      }
       return;
     }
     if (msg.type === "redraw") {
       latest = { frame: msg.frame, lines: msg.lines };
       render(msg.frame);
-      const resolve = pending.get(msg.id);
-      if (resolve) {
-        pending.delete(msg.id);
-        resolve({ frame: msg.frame, lines: msg.lines, result: msg.result });
+      // 5c: a single id reply. 5d: batched acks + exec_lua results.
+      if (msg.id !== undefined) {
+        const resolve = pendingMsg.get(msg.id);
+        if (resolve) { pendingMsg.delete(msg.id); resolve({ frame: msg.frame, lines: msg.lines, result: msg.result }); }
+      }
+      for (const reqId of msg.acks || []) {
+        const r = pendingAcks.get(reqId);
+        if (r) { pendingAcks.delete(reqId); r({ frame: msg.frame, lines: msg.lines }); }
+      }
+      for (const [reqId, result] of msg.results || []) {
+        const r = pendingResults.get(reqId);
+        if (r) { pendingResults.delete(reqId); r({ frame: msg.frame, lines: msg.lines, result }); }
       }
     }
   };
@@ -279,7 +349,7 @@
     const n = keyToNotation(e);
     if (n == null) return;
     e.preventDefault();
-    send("feed", { notation: n });
+    feedOp(n);
   });
   wrapEl.focus();
 
@@ -288,7 +358,7 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       computeSize();
-      send("attach", { cols, rows });
+      attachOp(cols, rows);
     }, 80);
   });
 
@@ -298,10 +368,11 @@
   // `lines`/`frame`/`cursor` read the latest rendered state synchronously.
   window.__nxvim = {
     ready: readyPromise,
-    feed: (notation) => send("feed", { notation }),
-    type: (notation) => send("feed", { notation }), // alias
-    execLua: (code) => send("exec_lua", { code }),
-    attach: (c, r) => send("attach", { cols: c, rows: r }),
+    sab: useSAB, // whether the SAB input/timer loop is active (slice 5d)
+    feed: (notation) => feedOp(notation),
+    type: (notation) => feedOp(notation), // alias
+    execLua: (code) => execLuaOp(code),
+    attach: (c, r) => attachOp(c, r),
     lines: () => latest.lines,
     frame: () => latest.frame,
     cursor: () => {

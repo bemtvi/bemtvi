@@ -344,6 +344,27 @@ type WindowRect = (WindowId, (usize, usize, usize, usize));
 /// construct one ([`new`](Self::new)) and drive it ([`boot`](Self::boot) /
 /// [`feed`](Self::feed)) behind a wasm [`HostEffects`]; the native [`run`] loop
 /// builds and drives it in-crate. The fields stay private either way.
+/// A pending Worker-side timer (the wasm build's analogue of a tokio timer armed via
+/// [`LoopCommand::TimerStart`](crate::evloop::LoopCommand), which the wasm build has no
+/// event loop for). Holds the Lua callback id, its absolute due time on the JS clock,
+/// and the repeat interval (`0` ⇒ a one-shot `vim.defer_fn`). The Worker parks on
+/// `Atomics.wait` until the soonest [`due_ms`](WasmTimer::due_ms)
+/// ([`EditHost::next_timer_deadline`]), then fires the due ones
+/// ([`EditHost::fire_due_timers`]) — one mechanism for both the input wait and the timer
+/// wheel (slice 5d).
+#[cfg(not(feature = "native"))]
+#[derive(Clone, Copy)]
+struct WasmTimer {
+    /// The `nx._cb_fns` callback id to run when the timer fires (the same id space the
+    /// native [`LoopEvent::Timer`](crate::evloop::LoopEvent) carries).
+    id: u64,
+    /// Absolute due time on the Worker's JS clock (ms), `clock_ms + delay` at arm time.
+    due_ms: u64,
+    /// Repeat interval (ms); `0` is a one-shot (removed after it fires), `>0` re-arms to
+    /// `now + repeat_ms` and keeps the Lua callback registered.
+    repeat_ms: u64,
+}
+
 pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
@@ -545,6 +566,17 @@ pub struct EditHost {
     /// remote reload can't be synchronous (it crosses the wire), so the post event is
     /// deferred to the fetch's completion rather than fired inline like the local path.
     reload_posts: HashSet<BufferId>,
+    /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
+    /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
+    /// JS clock — the serverless analogue of the tokio timers the native build arms via
+    /// the event loop (which the wasm build gates out). Unused on the native build.
+    #[cfg(not(feature = "native"))]
+    wasm_timers: Vec<WasmTimer>,
+    /// The current JS clock (ms), set by the Worker before each input / timer tick
+    /// ([`EditHost::set_clock`] / [`EditHost::fire_due_timers`]); a [`WasmTimer`]'s
+    /// `due_ms` is computed relative to it at arm time. Wasm build only.
+    #[cfg(not(feature = "native"))]
+    clock_ms: u64,
 }
 
 impl EditHost {
@@ -616,6 +648,10 @@ impl EditHost {
             buf_watches: HashMap::new(),
             remote_watches: HashSet::new(),
             reload_posts: HashSet::new(),
+            #[cfg(not(feature = "native"))]
+            wasm_timers: Vec::new(),
+            #[cfg(not(feature = "native"))]
+            clock_ms: 0,
         }
     }
 }
@@ -692,6 +728,91 @@ impl EditHost {
     /// The current buffer's lines (the wasm `eh_lines` readout).
     pub fn lines(&self) -> Vec<String> {
         self.editor.lines()
+    }
+
+    /// Set the Worker's current JS clock (ms) so a [`WasmTimer`] armed during the next
+    /// tick computes its `due_ms` relative to *now*. The Worker calls this before
+    /// feeding input; [`fire_due_timers`](Self::fire_due_timers) sets it too.
+    pub fn set_clock(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
+    }
+
+    /// The soonest pending timer deadline (ms on the JS clock), or `None` when no timer
+    /// is armed. The Worker parks on `Atomics.wait` with this as its timeout — so the one
+    /// wait that wakes on a keystroke also wakes to fire the next timer (slice 5d's "one
+    /// mechanism" — no busy loop, no separate timer thread).
+    pub fn next_timer_deadline(&self) -> Option<u64> {
+        self.wasm_timers.iter().map(|t| t.due_ms).min()
+    }
+
+    /// Fire every timer due at `now_ms` (the Worker calls this on a wake), running each
+    /// Lua callback through the **real** effects path and repainting once if any fired.
+    /// Returns whether any timer fired (so the Worker knows to post a fresh redraw).
+    ///
+    /// Only timers already due at entry fire this call — a callback that arms a new,
+    /// already-due timer doesn't re-fire in the same pass (it waits for the Worker's next
+    /// tick, which is immediate when [`next_timer_deadline`](Self::next_timer_deadline)
+    /// is `<= now`), so a 0-delay self-re-arming timer can't spin the wheel here. A
+    /// repeating timer (`repeat_ms > 0`) re-arms to `now + repeat_ms` *before* its
+    /// callback runs, so the callback sees the next deadline already set.
+    pub fn fire_due_timers(&mut self, now_ms: u64) -> bool {
+        self.clock_ms = now_ms;
+        let mut due: Vec<WasmTimer> = self
+            .wasm_timers
+            .iter()
+            .copied()
+            .filter(|t| t.due_ms <= now_ms)
+            .collect();
+        due.sort_by_key(|t| t.due_ms);
+        let mut fired_any = false;
+        for timer in due {
+            // Skip a timer a prior callback in this pass stopped (`:stop` / `vim.uv`
+            // close); re-arm a repeat or drop a one-shot *before* running the callback.
+            let Some(idx) = self.wasm_timers.iter().position(|t| t.id == timer.id) else {
+                continue;
+            };
+            let keep = timer.repeat_ms > 0;
+            if keep {
+                self.wasm_timers[idx].due_ms = now_ms.saturating_add(timer.repeat_ms);
+            } else {
+                self.wasm_timers.remove(idx);
+            }
+            if let Err(e) = self
+                .lua
+                .run_callback(timer.id, keep, nxvim_lua::CallbackArgs::None)
+            {
+                self.editor
+                    .echo(format!("E5108: Error in timer callback: {e}"));
+            }
+            self.apply_lua_effects();
+            fired_any = true;
+        }
+        if fired_any {
+            self.run_pending();
+            self.redraw();
+        }
+        fired_any
+    }
+
+    /// Arm (or re-arm) a Worker-side timer — the wasm branch of
+    /// [`apply_loop_op`](Self::apply_loop_op)'s [`LoopOp::TimerStart`](nxvim_lua::LoopOp::TimerStart).
+    /// Replaces any existing timer with the same `id` (a re-`start` on one handle), so the
+    /// wheel never accrues stale duplicates.
+    pub(crate) fn arm_wasm_timer(&mut self, id: u64, delay_ms: u64, repeat_ms: u64) {
+        let due_ms = self.clock_ms.saturating_add(delay_ms);
+        self.wasm_timers.retain(|t| t.id != id);
+        self.wasm_timers.push(WasmTimer {
+            id,
+            due_ms,
+            repeat_ms,
+        });
+    }
+
+    /// Cancel the Worker-side timer armed under `id` (a `:stop` / `vim.uv` close, or a
+    /// `defer_fn` handle's stop) — the wasm branch of
+    /// [`LoopOp::TimerStop`](nxvim_lua::LoopOp::TimerStop). A no-op if it already fired.
+    pub(crate) fn stop_wasm_timer(&mut self, id: u64) {
+        self.wasm_timers.retain(|t| t.id != id);
     }
 }
 

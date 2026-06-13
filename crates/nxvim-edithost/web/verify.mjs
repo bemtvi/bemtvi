@@ -91,6 +91,43 @@ try {
   check("redraw: command-line mode shows ':' prompt + text", cmdline === ":set number", `got ${JSON.stringify(cmdline)}`);
   await page.evaluate(() => window.__nxvim.feed("<Esc>"));
 
+  // 8. Slice 5d — the SAB input/timer loop. A deferred timer fires on its own (no
+  //    further input) when the Worker's Atomics.wait park times out at the timer's
+  //    deadline — the second half of the Phase 5 exit criteria.
+  const sabActive = await page.evaluate(() => window.__nxvim.sab === true);
+  check("slice 5d: SAB input/timer loop is active (cross-origin isolated)", sabActive, `sab=${sabActive}`);
+
+  if (sabActive) {
+    // Buffer currently reads "wasm" (from the :substitute above). Arm a one-shot
+    // vim.defer_fn that rewrites it 150ms from now, via the proven vim.cmd path.
+    await page.evaluate(() =>
+      window.__nxvim.execLua('vim.defer_fn(function() vim.cmd("%s/wasm/timerfired/") end, 150)'),
+    );
+    const before = await page.evaluate(() => window.__nxvim.lines());
+    check("timer: not fired immediately after scheduling", before === "wasm", `got ${JSON.stringify(before)}`);
+
+    // Wait WITHOUT sending any further input. The only thing that can mutate the buffer
+    // now is the Worker firing the deferred callback off its park timeout.
+    await sleep(600);
+    const after = await page.evaluate(() => window.__nxvim.lines());
+    check("timer: deferred callback fired on its own via the SAB park", after === "timerfired", `got ${JSON.stringify(after)}`);
+
+    // A self-rescheduling defer_fn chain fires repeatedly with no input — each one-shot
+    // re-arms the next, so the wheel must wake and fire several times unattended.
+    await page.evaluate(() =>
+      window.__nxvim.execLua(
+        "_G.__ticks = 0; " +
+          "local function tick() _G.__ticks = _G.__ticks + 1; " +
+          "if _G.__ticks < 6 then vim.defer_fn(tick, 50) end end; " +
+          "vim.defer_fn(tick, 50)",
+      ),
+    );
+    await sleep(600);
+    const ticks = await page.evaluate(() => window.__nxvim.execLua("return _G.__ticks").then((r) => r.result));
+    const n = parseInt(String(ticks).replace(/^ok:/, ""), 10);
+    check("timer: a self-rescheduling defer_fn chain fired repeatedly unattended", n >= 5, `ticks=${JSON.stringify(ticks)} (parsed ${n})`);
+  }
+
   await browser.close();
 } finally {
   cleanup();

@@ -1094,11 +1094,21 @@ impl EditHost {
             }),
             #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
-            // The browser build has no event loop yet: surface the unsupported
-            // timer/process/watch request loudly rather than dropping it silently.
+            // The browser build has no tokio event loop; timers ride the Worker-side
+            // wheel instead (slice 5d) — `vim.defer_fn` / `nx.timer` arm and fire there.
             #[cfg(not(feature = "native"))]
-            _ => self.editor.echo(
-                "E: timers/jobs/fs-watch (vim.defer_fn / vim.uv / jobstart) are not \
+            LoopOp::TimerStart {
+                id,
+                delay_ms,
+                repeat_ms,
+            } => self.arm_wasm_timer(id, delay_ms, repeat_ms),
+            #[cfg(not(feature = "native"))]
+            LoopOp::TimerStop { id } => self.stop_wasm_timer(id),
+            // Processes / fs-watch still have no serverless analogue (those need the
+            // Phase 6 daemon): surface the unsupported request loudly, never silently.
+            #[cfg(not(feature = "native"))]
+            LoopOp::Spawn { .. } | LoopOp::Kill { .. } => self.editor.echo(
+                "E: jobs/processes (vim.system / jobstart / vim.uv.spawn) are not \
                  available in the browser build yet",
             ),
         }

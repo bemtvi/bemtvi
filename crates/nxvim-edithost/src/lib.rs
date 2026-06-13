@@ -13,7 +13,11 @@
 //! value (JSON) the JS side reads, rather than a pushed `EM_JS` callback. Slice 5c runs
 //! these exports **inside a Web Worker** (`web/worker.mjs`) and ferries the JSON redraw
 //! UI-ward over `postMessage`; the UI (`web/index.html`) renders it and exposes the
-//! `window.__nxvim` Playwright hook. v1 is **serverless**: there is no daemon, so the
+//! `window.__nxvim` Playwright hook. Slice 5d drives the Worker's run loop off a
+//! `SharedArrayBuffer` + `Atomics.wait` park — the same wait that blocks on input also
+//! fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via [`eh_set_clock`] /
+//! [`eh_next_deadline`] / [`eh_tick_timers`], the wheel `evloop.rs` can't provide
+//! in-Worker. v1 is **serverless**: there is no daemon, so the
 //! off-tick fs / LSP / native-treesitter effects are unreachable and the [`WasmEffects`]
 //! impls of them `unreachable!`-loud (never a silent no-op) — see each method.
 
@@ -226,6 +230,51 @@ pub unsafe extern "C" fn eh_input(h: *mut WasmEditHost, notation: *const c_char)
 pub unsafe extern "C" fn eh_attach(h: *mut WasmEditHost, cols: usize, rows: usize) {
     let Some(handle) = h.as_mut() else { return };
     handle.host.attach_ui(cols.max(1), rows.max(1));
+}
+
+/// Set the Worker's current JS clock (ms) so a timer armed during the next input tick
+/// computes its deadline relative to now. The Worker calls this before [`eh_input`].
+/// `now_ms` is a `double` (`performance.now()` / `Date.now()`), floored to whole ms.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_set_clock(h: *mut WasmEditHost, now_ms: f64) {
+    if let Some(handle) = h.as_mut() {
+        handle.host.set_clock(now_ms.max(0.0) as u64);
+    }
+}
+
+/// The soonest pending timer deadline (ms on the JS clock), or `-1` when no timer is
+/// armed — the Worker uses it as its `Atomics.wait` timeout so the one park that wakes on
+/// a keystroke also wakes to fire the next `vim.defer_fn` / `nx.timer` (slice 5d).
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_next_deadline(h: *mut WasmEditHost) -> f64 {
+    match h
+        .as_ref()
+        .and_then(|handle| handle.host.next_timer_deadline())
+    {
+        Some(due_ms) => due_ms as f64,
+        None => -1.0,
+    }
+}
+
+/// Fire every timer due at `now_ms` (the Worker calls this on each wake), running each
+/// Lua callback through the real effects path and projecting a frame if any fired.
+/// Returns `1` when at least one timer fired (so the Worker posts a fresh redraw), else
+/// `0`.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_tick_timers(h: *mut WasmEditHost, now_ms: f64) -> i32 {
+    match h.as_mut() {
+        Some(handle) => i32::from(handle.host.fire_due_timers(now_ms.max(0.0) as u64)),
+        None => 0,
+    }
 }
 
 /// Execute a Lua chunk through the real effects path (queued `vim.cmd`s and deferred

@@ -120,7 +120,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
-| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib + 5c Worker/`postMessage` redraw/`window.__nxvim` done; SAB input/timer loop 5d, COOP/COEP docs + demo deletion 5e remain) |
+| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | 🚧 (5a feature seam + 5b wasm `HostEffects`/cdylib + 5c Worker/`postMessage` redraw/`window.__nxvim` + 5d SAB input/timer park done; only COOP/COEP **production** docs + demo deletion 5e remain) |
 | 6 | Browser fs/process: daemon over WebSocket (or serverless OPFS) | 3, 5 | ⬜ |
 
 Phase 1 is independent and small. Phase 3 is the

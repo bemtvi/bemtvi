@@ -814,3 +814,29 @@ async fn search_line_offset_moves_whole_lines() {
     feed(&rpc, "/foo/+1<CR>");
     assert_eq!(cursor(&rpc).await, (3, 0));
 }
+
+#[tokio::test]
+async fn search_from_visual_mode_stays_visual_and_extends_the_selection() {
+    let (rpc, _incoming) = search_fixture().await;
+    // Enter charwise visual at (1,0), then `/foo` searches forward to the next
+    // "foo" (line 2, col 4). vim keeps the selection live: the mode stays Visual
+    // and the moving end extends to the match, anchored at (1,0).
+    feed(&rpc, "v/foo<CR>");
+    assert_eq!(mode(&rpc).await, "v", "still in visual mode after a search");
+    assert_eq!(cursor(&rpc).await, (2, 4));
+    // The selection [(1,0)..=(2,4)] is real: `d` deletes through the match.
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["oo", "qux foo"]);
+}
+
+#[tokio::test]
+async fn search_from_visual_line_mode_stays_visual_line() {
+    let (rpc, _incoming) = search_fixture().await;
+    // `V` (linewise) then `/qux` extends the line selection down to line 3.
+    feed(&rpc, "V/qux<CR>");
+    assert_eq!(mode(&rpc).await, "V", "still in visual-line mode");
+    assert_eq!(cursor(&rpc).await, (3, 0));
+    // The whole [1..=3] line range deletes.
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec![""]);
+}

@@ -639,12 +639,12 @@ fn selection_spans_with_head(
     head: Cursor,
 ) -> Vec<Option<(usize, usize)>> {
     let mut spans = vec![None; count];
-    if !ed.mode.is_visual() {
+    let Some(visual_mode) = ed.rendered_visual_mode() else {
         return spans;
-    }
+    };
 
     let (start, end) = order_selection(ed.visual_anchor(), head);
-    let linewise = ed.mode == Mode::VisualLine;
+    let linewise = visual_mode == Mode::VisualLine;
     let ts = ed.tabstop();
     for (row, span) in spans.iter_mut().enumerate() {
         let buf_line = base + row;

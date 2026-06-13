@@ -34,7 +34,7 @@ impl Editor {
     /// (`3/foo` finds the 3rd match), stashed for submit since `reset_pending`
     /// clears it.
     pub(crate) fn enter_search(&mut self, dir: SearchDir, count: usize) {
-        self.cmdline_return_mode = self.command_return_mode();
+        self.cmdline_return_mode = self.search_return_mode();
         self.mode = Mode::Command;
         self.cmdline.clear();
         self.cmdline_col = 0;
@@ -158,15 +158,30 @@ impl Editor {
         self.cmdline_col = 0;
     }
 
-    /// The mode a command line opened *now* should restore when it closes: back to
-    /// [`Mode::MultiCursor`] when opened from placement mode (so a `/`-search can
-    /// hop to a match and keep dropping cursors), else [`Mode::Normal`] — even from
-    /// Visual, which vim leaves on `:`/`/`.
+    /// The mode an *ex* command line (`:`) opened now should restore when it
+    /// closes: back to [`Mode::MultiCursor`] when opened from placement mode (so a
+    /// `:`-command can keep dropping cursors), else [`Mode::Normal`] — including
+    /// from Visual, which vim leaves on `:` (the `'<,'>` range carries the
+    /// selection into the command).
     fn command_return_mode(&self) -> Mode {
         if self.mode == Mode::MultiCursor {
             Mode::MultiCursor
         } else {
             Mode::Normal
+        }
+    }
+
+    /// The mode a `/`,`?` search command line opened now should restore on close.
+    /// Unlike `:`, vim keeps the *selection live* through a visual-mode search —
+    /// the moving end hops to the match while the anchor holds — so a search
+    /// opened from Visual / Visual-Line returns to that mode (the preserved
+    /// [`Editor::visual_anchor`] then spans anchor→match). Placement mode is
+    /// likewise kept so a search can hop between cursor drops; everything else
+    /// returns to [`Mode::Normal`].
+    fn search_return_mode(&self) -> Mode {
+        match self.mode {
+            Mode::Visual | Mode::VisualLine | Mode::MultiCursor => self.mode,
+            _ => Mode::Normal,
         }
     }
 

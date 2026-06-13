@@ -208,6 +208,39 @@ async fn charwise_visual_selecting_backwards_orders_the_span() {
 }
 
 #[tokio::test]
+async fn incsearch_from_visual_extends_the_selection_live_while_typing() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<Esc>gg0");
+    // Open a charwise selection at (1,0), then start typing a search for "bar"
+    // *without* committing. vim keeps the selection live: the incsearch preview
+    // hops the moving end to the match (line 2), and the highlight follows.
+    feed(&rpc, "v/bar");
+    let _ = lines(&rpc).await; // barrier so the redraw is buffered
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    let sel = view_selection(&view);
+    // Line 1 fully selected plus the newline cell; line 2 up to the preview cursor.
+    assert_eq!(sel.first().copied().flatten(), Some((0, 4)));
+    assert_eq!(sel.get(1).copied().flatten(), Some((0, 1)));
+}
+
+#[tokio::test]
+async fn escaping_a_visual_search_restores_the_original_selection() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<Esc>gg0");
+    // Select two chars, start a search, then cancel it: the selection rewinds to
+    // exactly what it was before the `/` — same mode, same extent.
+    feed(&rpc, "vl/bar<Esc>");
+    let _ = lines(&rpc).await;
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    assert_eq!(mode(&rpc).await, "v");
+    let sel = view_selection(&view);
+    assert_eq!(sel.first().copied().flatten(), Some((0, 2)));
+    assert!(sel.iter().skip(1).all(Option::is_none));
+}
+
+#[tokio::test]
 async fn leaving_visual_mode_clears_the_selection() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello<Esc>");

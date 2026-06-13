@@ -1334,6 +1334,21 @@ impl Editor {
         self.visual_anchor
     }
 
+    /// The visual mode governing the rendered selection, or `None` when none
+    /// should show. Normally just [`Self::mode`] when it's visual — but a `/`,`?`
+    /// search *opened from* Visual keeps the selection live (it returns to that
+    /// mode on `<CR>`), so while the search command line is open the selection
+    /// still renders, extended to the incsearch preview at [`Self::cursor`]. Drives
+    /// the View's selection highlight.
+    pub(crate) fn rendered_visual_mode(&self) -> Option<Mode> {
+        if self.mode.is_visual() {
+            return Some(self.mode);
+        }
+        let searching =
+            self.mode == Mode::Command && matches!(self.cmdline_kind, CmdlineKind::Search(_));
+        (searching && self.cmdline_return_mode.is_visual()).then_some(self.cmdline_return_mode)
+    }
+
     // ----- pending-state mirror (vim.v.*) ----------------------------------
 
     /// The count accumulated for the pending normal/visual command — `v:count`.

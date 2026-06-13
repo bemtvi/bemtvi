@@ -1154,11 +1154,17 @@ impl EditHost {
                 // `v:fcs_choice` / W11 / W12 / E211) and re-arms the watch after any
                 // reload (a reload re-stamps the disk snapshot, so the watch key
                 // changed). `error` (the watch failed to arm) just drops the watch
-                // state so a later tick re-arms.
+                // state and stops — a *later* tick (a lifecycle event or a reconcile)
+                // re-arms it. It must NOT re-arm here: re-arming the same failing key
+                // in place would fail again and re-enter this arm, spinning forever
+                // (an absent path can't be watched by kqueue/inotify). `sync_buffer_watches`
+                // already declines to arm a not-yet-written new-file buffer (no disk
+                // snapshot), so the common case never reaches here; this is the backstop
+                // for a transient arm failure (e.g. the file vanished between the key
+                // snapshot and the arm).
                 let buf = BufferId(id - crate::INTERNAL_WATCH_BASE);
                 if error.is_some() {
                     self.buf_watches.remove(&buf);
-                    self.sync_buffer_watches();
                 } else {
                     self.editor.checktime_buffer(buf);
                 }

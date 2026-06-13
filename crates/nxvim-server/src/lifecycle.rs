@@ -357,11 +357,18 @@ impl EditHost {
             return;
         }
         // Desired: one watch per file-backed buffer, keyed on (path, disk snapshot).
+        // A new-file buffer not yet written has a path but a `None` disk snapshot —
+        // nothing on disk to watch. kqueue/inotify can't watch an absent path, so
+        // arming one fails, and the arm-failure handler would re-arm the same dead key
+        // forever (an unbounded arm→fail→re-arm storm that repaints every cycle). Skip
+        // those here: the watch arms on the next sync once `:w` creates the file (which
+        // re-stamps the disk snapshot, changing the key).
         let want: HashMap<BufferId, (PathBuf, Option<FileStat>)> = self
             .editor
             .buffer_ids()
             .into_iter()
             .filter_map(|id| self.editor.buffer_watch_key(id).map(|k| (id, k)))
+            .filter(|(_, (_, stat))| stat.is_some())
             .collect();
 
         // Arm or re-arm anything new or whose key changed (FsEventStart on an

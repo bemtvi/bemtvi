@@ -169,6 +169,56 @@ async fn buf_name(rpc: &Rpc, handle: u64) -> String {
 }
 
 #[tokio::test]
+async fn editing_a_nonexistent_file_does_not_storm_the_file_watch() {
+    // Regression: `:e <missing>` opens a new-file buffer whose path has nothing on
+    // disk behind it. The server used to arm a native file watch on that absent path;
+    // kqueue/inotify can't watch a path that doesn't exist, so the arm failed — and the
+    // arm-failure handler dropped the watch state then *immediately re-armed*, which
+    // failed again, an unbounded arm→fail→re-arm storm that repainted on every cycle
+    // and froze the UI. A new-file buffer (nothing to watch) must arm no watch at all,
+    // so the channel goes quiet once the open settles.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let missing = std::env::temp_dir().join(format!(
+        "nxvim_missing_{}_{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    assert!(!missing.exists(), "the test path must not exist on disk");
+    let real = temp_file("storm", "hello\nworld\n");
+    let (rpc, mut incoming) = start().await;
+
+    // Open a real file first (arms its watch), then — the way a user does, via *typed*
+    // keystrokes (`nvim_input`), not an `nvim_command` RPC — edit a missing file.
+    feed(&rpc, &format!(":e {}<CR>", name(&real)));
+    let _ = lines(&rpc).await;
+    feed(&rpc, &format!(":e {}<CR>", name(&missing)));
+    // Barrier: `lines` round-trips a request so the open has been applied. The open
+    // itself still works — a new-file buffer, current, named, one empty line.
+    assert_eq!(lines(&rpc).await, vec![""]);
+    let cur = current_buf(&rpc).await;
+    assert_eq!(buf_name(&rpc, cur).await, name(&missing));
+
+    // Drain whatever the open queued, then watch a quiet window. With the storm the
+    // watch keeps repainting forever, so the channel never goes quiet; fixed, the
+    // count is ~0.
+    while incoming.try_recv().is_ok() {}
+    let mut redraws = 0usize;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        while let Ok(inc) = incoming.try_recv() {
+            if matches!(&inc, Incoming::Notification { method, .. } if method == "redraw") {
+                redraws += 1;
+            }
+        }
+    }
+    std::fs::remove_file(&real).ok();
+    assert!(
+        redraws < 20,
+        "`:e <missing>` must not storm the file watch; saw {redraws} redraws in 1s"
+    );
+}
+
+#[tokio::test]
 async fn unnamed_flag_tracks_whether_the_buffer_has_a_file() {
     // The redraw carries an explicit `unnamed` flag per window — the signal the GUI
     // uses to send a bare `:w` to its save dialog. A fresh buffer is unnamed;

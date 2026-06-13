@@ -829,11 +829,17 @@ impl Editor {
     }
 
     /// The server's file-watch key for buffer `id`: its on-disk path and the disk
-    /// snapshot we last reconciled to, or `None` for a buffer with no file (scratch,
-    /// or a new-file buffer not yet written — nothing to watch). The server arms one
-    /// native watch per file-backed buffer and re-arms when this key changes, so the
-    /// watch follows the file across reloads/saves (a fresh inode after an atomic
-    /// replace gets a fresh watch).
+    /// snapshot we last reconciled to, or `None` for a buffer with no file at all (a
+    /// scratch / `[No Name]` buffer). The disk snapshot is itself `None` for a
+    /// **new-file buffer not yet written** — a path with nothing on disk behind it;
+    /// the native watch leg uses that (`disk_stat.is_some()`) to decline arming, since
+    /// kqueue/inotify can't watch an absent path and a failed arm would re-arm-spin,
+    /// while the daemon leg watches by path regardless (the daemon owns change
+    /// detection and dedupes its watch set, so it can't spin). A `:w` re-stamps
+    /// `disk_stat`, changing this key, so the native watch arms on the next sync. The
+    /// server arms one watch per file-backed buffer and re-arms when this key changes,
+    /// so the watch follows the file across reloads/saves (a fresh inode after an
+    /// atomic replace gets a fresh watch).
     pub fn buffer_watch_key(&self, id: BufferId) -> Option<(PathBuf, Option<FileStat>)> {
         let ob = self.buffers.map.get(&id)?;
         let path = ob.buffer.path.clone()?;

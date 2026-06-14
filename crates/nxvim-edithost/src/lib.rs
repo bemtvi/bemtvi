@@ -84,6 +84,16 @@ struct Sink {
     /// [`EditHost::complete_fs_write`] needs to finalize the buffer's saved-state — until
     /// the Worker reports the OPFS write done ([`eh_fs_write_complete`]), which removes it.
     fs_writes: HashMap<u64, PendingSave>,
+    /// File paths the editor newly asked to **watch** this convergence (the remote watch
+    /// leg — Phase 6 watch slice), recorded by [`fs_watch`](HostEffects::fs_watch). Drained
+    /// by [`eh_take_watch_requests`] for the Worker to arm on the daemon (`fs_watch [path]`
+    /// over WebTransport); a serverless OPFS session has no change source, so the Worker
+    /// drops them. A `fs_changed` push the arm yields lands back via [`eh_remote_file_changed`].
+    watch_arms: Vec<String>,
+    /// File paths the editor newly asked to **stop watching** (a buffer closed / lost its
+    /// file), recorded by [`fs_unwatch`](HostEffects::fs_unwatch); the disarm twin of
+    /// [`watch_arms`](Sink::watch_arms), drained by [`eh_take_watch_requests`].
+    watch_disarms: Vec<String>,
 }
 
 /// The wasm [`HostEffects`]: the analogue of `nxvim-server`'s `NativeEffects`, but the
@@ -134,14 +144,18 @@ impl HostEffects for WasmEffects {
         sink.fs_write_queue.push(seq);
     }
 
-    fn fs_watch(&mut self, _path: String) {
-        // `sync_buffer_watches` is native-only; the wasm build arms no file watches (OPFS
-        // has no change-notification, and the serverless editor is the sole writer).
-        unreachable!("fs_watch: the wasm edit-host arms no file watches (native-only)")
+    fn fs_watch(&mut self, path: String) {
+        // The remote watch leg (Phase 6): record the arm for the Worker to forward to the
+        // daemon (`fs_watch [path]` over WebTransport) — the wasm twin of the native
+        // `sync_buffer_watches` arming a watch. A serverless OPFS session has no external
+        // writer, so the Worker drops it; either way the editor arms uniformly.
+        self.sink.borrow_mut().watch_arms.push(path);
     }
 
-    fn fs_unwatch(&mut self, _path: String) {
-        unreachable!("fs_unwatch: the wasm edit-host arms no file watches (native-only)")
+    fn fs_unwatch(&mut self, path: String) {
+        // The disarm twin of `fs_watch` (a buffer closed / lost its file): record it for the
+        // Worker to drop the daemon watch (`fs_unwatch [path]`).
+        self.sink.borrow_mut().watch_disarms.push(path);
     }
 
     fn has_remote_fs(&self) -> bool {
@@ -435,6 +449,26 @@ pub unsafe extern "C" fn eh_take_fs_requests(h: *mut WasmEditHost) -> *mut c_cha
     into_owned_cstr(serde_json::json!({ "reads": reads, "writes": writes }).to_string())
 }
 
+/// Drain the remote-watch arm/disarm requests the editor enqueued since the last call, as
+/// JSON `{"arm":["…"],"disarm":["…"]}` — the watch leg's outbound half. In a daemon session
+/// the Worker forwards each as an `fs_watch` / `fs_unwatch` notification over WebTransport;
+/// serverless OPFS has no change source, so the Worker drops them. A `fs_changed` push the
+/// daemon sends in response lands back through [`eh_remote_file_changed`]. Caller frees with
+/// [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_watch_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
+    };
+    let mut sink = handle.sink.borrow_mut();
+    let arm: Vec<String> = std::mem::take(&mut sink.watch_arms);
+    let disarm: Vec<String> = std::mem::take(&mut sink.watch_disarms);
+    into_owned_cstr(serde_json::json!({ "arm": arm, "disarm": disarm }).to_string())
+}
+
 /// Pointer to the snapshotted bytes of the in-flight off-tick write `seq` (a `double` so
 /// the small counter crosses the JS boundary without 64-bit-int marshalling), for the
 /// Worker to copy out (`HEAPU8.subarray(ptr, ptr + len)`) and write to OPFS. Valid until
@@ -558,6 +592,33 @@ pub unsafe extern "C" fn eh_fs_write_complete(
     handle
         .host
         .complete_fs_write(save, ok != 0, size.max(0.0) as u64, mtime, as_str(err));
+}
+
+/// Land a daemon-pushed file change (the `HostWatch` leg's `fs_changed`) — the watch leg's
+/// inbound half, the daemon→edit-host push direction the fs leg never used. The Worker calls
+/// this from `RpcClient.onNotify` when the daemon reports `path` changed under a watch armed
+/// via [`eh_take_watch_requests`]. `has_stat == 0` means the file vanished (a `"deleted"`
+/// reconcile); otherwise `size` + `mtime_ms` (negative = unknown) carry its new stat. Drives
+/// the real `FileChangedShell` round-trip and, on an autoread / `"reload"` choice, enqueues
+/// an off-tick re-fetch the Worker then fulfils (via [`eh_take_fs_requests`] →
+/// [`eh_fs_read_complete`]); repaints. See [`EditHost::remote_file_changed`]. `size` /
+/// `mtime_ms` are `double`s (small values; no 64-bit-int marshalling).
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `path` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_remote_file_changed(
+    h: *mut WasmEditHost,
+    path: *const c_char,
+    has_stat: i32,
+    size: f64,
+    mtime_ms: f64,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let mtime = if mtime_ms < 0.0 { -1 } else { mtime_ms as i64 };
+    handle
+        .host
+        .remote_file_changed(as_str(path).to_string(), has_stat != 0, size.max(0.0) as u64, mtime);
 }
 
 /// Execute a Lua chunk through the real effects path (queued `vim.cmd`s and deferred

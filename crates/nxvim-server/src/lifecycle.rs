@@ -398,11 +398,43 @@ impl EditHost {
         }
     }
 
-    /// The serverless browser build has no file watching — buffers are in-memory, so
-    /// there is no on-disk file to reconcile against. A no-op twin keeps the
-    /// per-tick caller (`emit_lifecycle_events`) transport-agnostic.
+    /// The browser's per-buffer watch reconcile — the **remote** branch only (the wasm
+    /// build has no `notify`, so no local-disk leg exists). Arms one watch per file-backed
+    /// buffer path through the off-tick effect seam ([`HostEffects::fs_watch`]); in a daemon
+    /// session the Worker forwards each as an `fs_watch` / `fs_unwatch` over the wire and a
+    /// `fs_changed` push lands via `eh_remote_file_changed` → [`Self::reconcile_remote_change`].
+    /// Mirrors the native `has_remote_fs()` branch (paths only — the daemon owns change
+    /// detection, so no stat snapshot / re-arm). A serverless OPFS session has no external
+    /// writer to watch, so the Worker simply drops the arm. A no-op when no off-tick fs is
+    /// wired (it never is on this build, but keep the gate honest).
     #[cfg(not(feature = "native"))]
-    pub(crate) fn sync_buffer_watches(&mut self) {}
+    pub(crate) fn sync_buffer_watches(&mut self) {
+        if !self.fx.has_remote_fs() {
+            return;
+        }
+        let want: HashSet<String> = self
+            .editor
+            .buffer_ids()
+            .into_iter()
+            .filter_map(|id| self.editor.buffer_watch_key(id))
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect();
+        for path in &want {
+            if self.remote_watches.insert(path.clone()) {
+                self.fx.fs_watch(path.clone());
+            }
+        }
+        let stale: Vec<String> = self
+            .remote_watches
+            .iter()
+            .filter(|p| !want.contains(*p))
+            .cloned()
+            .collect();
+        for path in stale {
+            self.remote_watches.remove(&path);
+            self.fx.fs_unwatch(path);
+        }
+    }
 
     /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.
     pub(crate) fn window_rects_snapshot(&self) -> Vec<WindowRect> {
@@ -536,7 +568,7 @@ impl EditHost {
     /// Fire `FileChangedShellPost` for `buf` after a file change was handled — even
     /// when nothing reloaded (a warning-only change still fires it, as neovim does).
     /// A cheap no-op when no handler is registered; skipped if the buffer is gone.
-    fn fire_file_changed_post(&mut self, buf: BufferId) {
+    pub(crate) fn fire_file_changed_post(&mut self, buf: BufferId) {
         let Some(file) = self.editor.buffer_name(buf) else {
             return;
         };
@@ -562,6 +594,16 @@ impl EditHost {
     #[cfg(feature = "native")]
     pub(crate) fn on_remote_file_changed(&mut self, ev: WatchEvent) {
         let WatchEvent { path, stat } = ev;
+        self.reconcile_remote_change(path, stat);
+    }
+
+    /// Reconcile one daemon-pushed file change (a `fs_changed` for `path` with its new
+    /// `stat`, `None` = vanished) — the shared body of the remote watch leg, driven natively
+    /// by [`Self::on_remote_file_changed`] (off the run loop's `watch_rx` arm) and in the
+    /// browser by [`EditHost::remote_file_changed`] (off `RpcClient.onNotify`). The wire
+    /// types ([`WatchEvent`]) are native-only, so the entry points hand in the decomposed
+    /// `(path, stat)` instead. See [`Self::on_remote_file_changed`] for the full contract.
+    pub(crate) fn reconcile_remote_change(&mut self, path: String, stat: Option<FileStat>) {
         let Some(buf) = self.editor.find_buffer_by_path(Path::new(&path)) else {
             return; // the buffer was closed since the watch was armed
         };

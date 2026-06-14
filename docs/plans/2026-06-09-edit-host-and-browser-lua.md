@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; the daemon proc/watch/lsp/sys_run/luafs legs over WebTransport remain) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; the daemon proc/lsp/sys_run/luafs legs over WebTransport remain) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2185,6 +2185,81 @@ reuses the same `RpcClient`, the process legs adding the daemon→browser notifi
 the per-`HostServices`-class **QUIC stream split** (the HOL-blocking escape, one bidi stream
 here) — a shared native+browser follow-up already deferred by Phase 3r; and an in-browser
 connect UI / live re-point beyond the `?daemon=` param.
+
+### Phase 6c — browser edit-host ↔ daemon over WebTransport (the watch leg) — ✅ DONE (2026-06-13)
+
+The second daemon leg in the browser, and the first to use the **daemon→edit-host push
+direction** the fs leg (6b) never needed. Where 6b's fs reads/writes are request/response
+always *initiated by the Worker during a tick*, the watch leg has the daemon **own change
+detection** and *push* `fs_changed [path, stat?]` when a watched file drifts; the browser
+turns each push into the same `FileChangedShell` reconcile (autoreload / W11 / W12 /
+handler choice) the native `watch_rx` arm runs — the browser twin of Phase 3l, reusing
+6b's `RpcClient` and 6b's off-tick re-fetch appliers. Editing stays in the Worker; only the
+change notification + the reload re-fetch cross the wire. (Slice direction confirmed with
+the requester, 2026-06-13.)
+
+**The daemon needed no change** — `run_daemon_io` already routes every `fs_*` method
+(including `fs_watch` / `fs_unwatch`) to `serve_fs_daemon_on`, which baselines each watched
+path and pushes `fs_changed` on a `WATCH_POLL` (200 ms) drift (Phase 3l/3q/3r). This slice is
+purely the **browser/edit-host** half — the inverse of 6b, which was purely browser-side too.
+
+**The reconcile body was already there; only its *entry points* were native-gated.** The
+watch policy (detection → `'autoread'` silent reload / `FileChangedShell` round-trip /
+`v:fcs_choice` / `FileChangedShellPost`) is in `EditHost` and worked for the native daemon
+already; the wasm build just never reached it (`on_remote_file_changed` and the watch-arm
+`sync_buffer_watches` branch were `#[cfg(feature = "native")]`, and `WasmEffects::fs_watch`
+was `unreachable!()`). So the Rust change is a small de-gating, not new policy.
+
+Shipped:
+- **Shared reconcile body** (`nxvim-server` `lifecycle.rs`) — `on_remote_file_changed`'s body
+  lifted into an un-gated `reconcile_remote_change(path, stat)`; the native run-loop wrapper
+  (`on_remote_file_changed(WatchEvent)`) and a new wasm `EditHost::remote_file_changed`
+  (decomposed `(path, has_stat, size, mtime_ms)` — the daemon wire types are native-only)
+  both delegate to it. `remote_reload` un-gated; `fire_file_changed_post` made `pub(crate)`
+  for the wasm applier. `load_replica_wasm` now fires the deferred `FileChangedShellPost` from
+  `reload_posts` when a watch-driven re-fetch lands (mirrors the native `load_replica`).
+- **The wasm watch-arm branch** — the `#[cfg(not(feature = "native"))] sync_buffer_watches`
+  no-op became the **remote branch** (the native build's `has_remote_fs()` path verbatim,
+  paths-only): every file-backed buffer arms one watch through `HostEffects::fs_watch`. The
+  wasm `WasmEffects::fs_watch` / `fs_unwatch` enqueue into the `Sink` instead of `unreachable!`.
+- **Two new FFI exports** (`nxvim-edithost` cdylib) — `eh_take_watch_requests` (drains the
+  arm/disarm queue as `{"arm":[…],"disarm":[…]}` for the Worker to forward) and
+  `eh_remote_file_changed(path, has_stat, size, mtime_ms)` (the Worker calls it from
+  `RpcClient.onNotify`; it builds the `FileStat`, runs `reconcile_remote_change`, and settles —
+  draining any enqueued reload into the fs-request queue and repainting, exactly as the native
+  `on_watch_events` tail does). Added to `build.sh`'s `EXPORTED_FUNCTIONS`.
+- **Worker wiring** (`web/worker.mjs`) — `daemon.onNotify` queues each push; the run loop
+  applies queued pushes (`applyDaemonNotifications`, run-loop-side so the wasm tick has one
+  consumer — no reentrancy), forwards watch arms (`drainWatchRequests` → `fs_watch` /
+  `fs_unwatch`), and **receives** pushes by parking on **`Atomics.waitAsync`** (not blocking
+  `Atomics.wait`) whenever a daemon session has watches armed: a thread frozen in
+  `Atomics.wait` can't run the WebTransport reader, so an unsolicited push would sit until the
+  next keystroke. The async park stays event-loop-live; a push wakes it at once
+  (`daemonWake()` race) and input still wakes it (SEQ notify), capped so a dangling wait
+  clears. **Serverless OPFS keeps the cheaper blocking park** — it has no pushes (the tab is
+  the sole writer, so a watch arm is dropped, not a silent stub). The 5c postMessage fallback
+  applies pushes inline (no run loop to race).
+
+**Exit criteria — met.** `web/verify-watch.mjs` (real headless Chromium + a real `--daemon
+--listen`, the browser twin of `daemon_watch.rs`): `:e <file>` arms the watch, then a Node
+rewrite of the file **on the daemon's disk** (a path the browser origin can't touch, with
+**no** `:checktime`) autoreloads the new bytes in the browser buffer over the wire — so the
+daemon detected, pushed, and the browser re-fetched on its own; and with `'noautoread'` a
+`FileChangedShell` handler fires on the edit-host with `v:fcs_reason = "changed"` and its
+`v:fcs_choice = "reload"` drives the off-tick re-fetch. Native `cargo test --workspace` green
+(993 passing, incl. the unchanged `daemon_watch` native suite — the de-gating didn't regress
+it), fmt + clippy `-D warnings` clean; the existing browser suites stay green — serverless
+OPFS (`verify.mjs`) and the 6b fs leg (`verify-daemon.mjs`) are untouched (the watch-arm path
+no-ops without a daemon, and the park is unchanged when no watch is armed).
+
+**Deferred to later Phase 6 slices (not stubbed):** the remaining four wire legs over
+WebTransport — **proc** (`HostProc`; the process legs add the daemon→browser
+`proc_spawned`/`proc_exited` notification routing this slice's push plumbing now proves),
+**sys_run** (blocking `nx._system` — still fails loud in the browser), **lsp**, and **luafs**
+(`vim.uv.fs_stat` / `filereadable`); the per-`HostServices`-class **QUIC stream split** (one
+bidi stream still); and an **event-driven push wakeup** to replace the async-park cap — a
+second worker (or the UI thread) owning the connection and poking the edit-host Worker's SAB,
+folded into the same deferred stream-split follow-up.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 

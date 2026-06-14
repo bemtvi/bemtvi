@@ -38,6 +38,10 @@ const eh_save_bytes = M.cwrap("eh_save_bytes", "number", ["number", "number"]);
 const eh_save_len = M.cwrap("eh_save_len", "number", ["number", "number"]);
 const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string"]);
 const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "number", "number", "number", "number", "string"]);
+// Remote watch leg (Phase 6): the editor arms one watch per file-backed buffer off-tick; the
+// Worker forwards each to the daemon and lands its `fs_changed` pushes back into the tick.
+const eh_take_watch_requests = M.cwrap("eh_take_watch_requests", "number", ["number"]);
+const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number", "string", "number", "number", "number"]);
 // Persistence (shada): the editor's cross-session snapshot ↔ a JSON blob the Worker keeps
 // in OPFS. `eh_export_shada(include_exit)` serializes it; `eh_load_shada(json)` restores it.
 const eh_export_shada = M.cwrap("eh_export_shada", "number", ["number", "number"]);
@@ -296,8 +300,8 @@ async function connectDaemon() {
   if (!daemonUri) return;
   try {
     daemon = await dialDaemon(daemonUri);
-    // The fs leg uses no daemon→edit-host pushes; later legs (proc/watch/lsp) route here.
-    daemon.onNotify = () => {};
+    // The watch leg's `fs_changed` pushes (and later proc/lsp pushes) arrive here.
+    daemon.onNotify = onDaemonNotify;
   } catch (e) {
     daemonError = String(e && e.message ? e.message : e);
     postMessage({ type: "config_error", error: `daemon connection failed: ${daemonError}` });
@@ -341,6 +345,92 @@ async function daemonWrite(path, bytes) {
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
+}
+
+// =============================================================================
+// Off-tick daemon watch leg (Phase 6 — the `HostWatch` push direction).
+//
+// The fs leg (above) is request/response, always initiated by the Worker during a tick. The
+// watch leg adds the *other* direction: the daemon pushes `fs_changed [path, stat?]` whenever
+// a watched file changes on its disk, and the editor reconciles it (autoreload / W11 / W12 /
+// `FileChangedShell`) — the browser twin of the native `watch_rx` arm. Two halves:
+//   * outbound — the editor arms one watch per file-backed buffer off-tick (`fs_watch` /
+//     `fs_unwatch` effects → `eh_take_watch_requests`); the Worker forwards each to the daemon.
+//   * inbound — a `fs_changed` push arrives on `RpcClient.onNotify`; we queue it and apply it
+//     on the run loop (`eh_remote_file_changed`), which may enqueue an off-tick reload the fs
+//     leg then re-fetches over the wire.
+//
+// The crux is *receiving* a push: a thread parked in blocking `Atomics.wait` freezes the
+// WebTransport reader, so an unsolicited push would sit until the next keystroke. So in a
+// daemon session with watches armed the run loop parks on `Atomics.waitAsync` instead (it
+// stays event-loop-live, the reader delivers pushes), waking immediately on a push via the
+// `daemonWake()` race or on input via the SEQ notify. Serverless OPFS keeps the (cheaper)
+// blocking park — it has no pushes. Pushes are queued and applied on the run loop only, so the
+// wasm tick has a single consumer (no reentrancy with the loop's own drain).
+// =============================================================================
+const armedWatches = new Set(); // paths currently watched on the daemon (gates the async park)
+const daemonNotifications = []; // [method, params] pushes received but not yet applied
+let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
+const DAEMON_PUSH_POLL_MS = 1000; // async-park cap: clears a dangling waitAsync + backstops a push
+
+// A daemon→edit-host push landed on the RPC reader. Queue it (the run loop applies it — single
+// consumer of the wasm tick) and wake the loop. Under 5c (no run loop) apply it inline.
+function onDaemonNotify(method, params) {
+  daemonNotifications.push([method, params]);
+  if (sabMode) {
+    if (daemonWaker) { const r = daemonWaker; daemonWaker = null; r(); }
+  } else {
+    pump5cDaemon();
+  }
+}
+
+// Apply every queued daemon push through the real tick (run-loop side). Today only `fs_changed`
+// (the watch leg); proc/lsp pushes route here in later slices. An unknown push is surfaced
+// loudly (it can only arrive for something we subscribed to — fail loud, per CLAUDE.md).
+function applyDaemonNotifications() {
+  if (daemonNotifications.length === 0) return false;
+  let any = false;
+  for (let n; (n = daemonNotifications.shift()); ) {
+    const [method, params] = n;
+    if (method === "fs_changed") {
+      // params = [path, stat?] where stat = [secs, nanos, size] | nil (nil = vanished).
+      const path = params[0];
+      const stat = params[1];
+      const hasStat = Array.isArray(stat) ? 1 : 0;
+      const size = hasStat ? (stat[2] ?? 0) : 0;
+      const mtimeMs = hasStat ? (stat[0] ?? 0) * 1000 + Math.floor((stat[1] ?? 0) / 1e6) : -1;
+      eh_remote_file_changed(h, String(path), hasStat, size, mtimeMs);
+      any = true;
+    } else {
+      postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
+    }
+  }
+  return any;
+}
+
+// Forward the watch arm/disarm requests the editor enqueued to the daemon (`fs_watch` /
+// `fs_unwatch`). Serverless OPFS has no change source, so a watch is dropped — not a silent
+// stub: the tab is the sole writer, there is genuinely nothing external to watch.
+async function drainWatchRequests() {
+  const reqs = JSON.parse(readStr(eh_take_watch_requests(h)));
+  if (reqs.arm.length === 0 && reqs.disarm.length === 0) return;
+  if (!daemon) return; // serverless OPFS — no remote to watch
+  for (const path of reqs.arm) {
+    armedWatches.add(path);
+    await daemon.notify("fs_watch", [path]);
+  }
+  for (const path of reqs.disarm) {
+    armedWatches.delete(path);
+    await daemon.notify("fs_unwatch", [path]);
+  }
+}
+
+// 5c (postMessage, no run loop): apply a push + fulfil any reload re-fetch + repaint inline.
+// Safe because 5c is never parked (no single-consumer run loop to race).
+async function pump5cDaemon() {
+  applyDaemonNotifications();
+  await fulfillFsRequests();
+  postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
 }
 
 // Drain every off-tick fs request the editor enqueued, run its op (OPFS serverless, or the
@@ -504,12 +594,19 @@ async function runLoopSAB(ctrl, data) {
     // not a stale clock that would make it instantly due.
     eh_set_clock(h, nowMs());
     const { acks, results } = drain();
-    // Fulfill any `:e`/`:w` the tick (or a fired timer) deferred against OPFS. We're not
-    // parked here, so the event loop runs and the OPFS promises resolve; the completions
-    // land the buffer/save back into the tick before we post the ack, so the UI sees the
-    // opened/saved frame when its `feed` promise resolves.
+    // Apply any daemon pushes received since the last pass (the watch leg's `fs_changed`):
+    // a reconcile may enqueue an off-tick reload, which `fulfillFsRequests` then re-fetches
+    // over the wire in this same pass. Done before `fulfillFsRequests` so the reload lands now.
+    const notified = applyDaemonNotifications();
+    // Fulfill any `:e`/`:w` the tick (or a fired timer / a push reconcile) deferred against
+    // OPFS or the daemon. We're not parked here, so the event loop runs and the promises
+    // resolve; the completions land the buffer/save back into the tick before we post the ack,
+    // so the UI sees the opened/saved frame when its `feed` promise resolves.
     const fsWork = await fulfillFsRequests();
-    if (fired || acks.length || fsWork) {
+    // Forward any watches the tick armed/disarmed (file-backed buffers opened/closed) to the
+    // daemon, so it begins/stops pushing `fs_changed` for them.
+    await drainWatchRequests();
+    if (fired || acks.length || fsWork || notified) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
@@ -538,17 +635,33 @@ async function runLoopSAB(ctrl, data) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks: [], results: [] });
       continue;
     }
+    // A push that arrived during this pass (e.g. while awaiting `fulfillFsRequests`) is
+    // queued — re-process it next iteration rather than parking on a now-stale wait.
+    if (daemonNotifications.length > 0) continue;
     // Park until the UI notifies (SEQ changes) or the next timer is due. If input
-    // arrived while we processed (SEQ already moved off seqBefore), `Atomics.wait`
-    // returns "not-equal" at once — no missed wakeup. Blocking inside an async function
-    // is fine: the `await` above fully settled before we reach here, so nothing is
-    // pending on the microtask queue while the thread is parked.
+    // arrived while we processed (SEQ already moved off seqBefore), the wait
+    // returns "not-equal" at once — no missed wakeup.
     let deadline = eh_next_deadline(h);
     // Fold the shada debounce deadline into the same park, so the one wait that wakes on a
     // keystroke / timer also wakes to flush cross-session state after a quiet period.
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
-    const timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
-    Atomics.wait(ctrl, SEQ, seqBefore, timeout);
+    let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
+    if (daemon && armedWatches.size > 0) {
+      // A daemon session with watches armed: don't *block* — a thread frozen in
+      // `Atomics.wait` can't run the WebTransport reader, so a `fs_changed` push would sit
+      // until the next keystroke. Park on the non-blocking `Atomics.waitAsync` so the event
+      // loop (hence the reader) keeps running; wake the instant a push lands (`daemonWake`)
+      // or input arrives (SEQ notify resolves `w.value`), capped so a dangling wait clears.
+      timeout = timeout === undefined ? DAEMON_PUSH_POLL_MS : Math.min(timeout, DAEMON_PUSH_POLL_MS);
+      const w = Atomics.waitAsync(ctrl, SEQ, seqBefore, timeout);
+      if (w.async) await Promise.race([w.value, new Promise((res) => { daemonWaker = res; })]);
+      // (`!w.async` ⇒ SEQ already moved / timeout 0 — loop immediately, no missed wakeup.)
+    } else {
+      // Serverless OPFS (or daemon with no watches): no pushes to receive, so block — it's
+      // cheaper. Blocking inside an async function is fine: the `await`s above fully settled,
+      // so nothing is pending on the microtask queue while the thread is parked.
+      Atomics.wait(ctrl, SEQ, seqBefore, timeout);
+    }
   }
 }
 
@@ -619,6 +732,7 @@ onmessage = async (ev) => {
     case "feed":
       eh_input(h, String(msg.notation));
       await fulfillFsRequests();
+      await drainWatchRequests();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -627,12 +741,14 @@ onmessage = async (ev) => {
       eh_set_clock(h, nowMs());
       eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
+      await drainWatchRequests();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
     case "exec_lua": {
       const result = readStr(eh_exec_lua(h, String(msg.code)));
       await fulfillFsRequests();
+      await drainWatchRequests();
       postFrame(msg.id, result);
       await maybeCheckpoint5c();
       break;

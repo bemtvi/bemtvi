@@ -936,6 +936,12 @@ impl EditHost {
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
         self.emit_lifecycle_events();
+        // A remote watch reload (the daemon `fs_changed` leg) deferred its
+        // `FileChangedShellPost` to this landing point — fire it now, before `run_pending`,
+        // so a handler's queued work drains in the same convergence (mirrors `load_replica`).
+        if self.reload_posts.remove(&buffer) {
+            self.fire_file_changed_post(buffer);
+        }
         self.run_pending();
     }
 
@@ -1009,6 +1015,32 @@ impl EditHost {
         // queued (a replayed `:wq`, the next serialized write). Then repaint.
         self.run_pending();
         self.redraw();
+    }
+
+    /// Reconcile a daemon-pushed file change (the `HostWatch` leg's `fs_changed`) in the
+    /// browser — the wasm entry the Worker calls from `RpcClient.onNotify` (the daemon→
+    /// edit-host push direction the fs leg never used). Decomposed `(path, stat)` instead
+    /// of the native `WatchEvent` (the wire types are native-only); `has_stat == 0` means
+    /// the file vanished, else `size` + `mtime_ms` (negative = unknown) carry its new
+    /// [`FileStat`]. Delegates to the shared [`reconcile_remote_change`](Self::reconcile_remote_change)
+    /// — which fires `FileChangedShell` and, on an autoread / `"reload"` choice, enqueues an
+    /// off-tick re-fetch the Worker fulfils over the wire (landing via
+    /// [`complete_fs_read`](Self::complete_fs_read), which fires `FileChangedShellPost`).
+    /// `settle_events` drains that enqueued open into the fs-request queue and repaints,
+    /// exactly as the native `on_watch_events` tail does.
+    pub fn remote_file_changed(&mut self, path: String, has_stat: bool, size: u64, mtime_ms: i64) {
+        let stat = if has_stat {
+            let mtime = if mtime_ms < 0 {
+                None
+            } else {
+                Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms as u64))
+            };
+            Some(FileStat { size, mtime })
+        } else {
+            None
+        };
+        self.reconcile_remote_change(path, stat);
+        self.settle_events(true);
     }
 }
 

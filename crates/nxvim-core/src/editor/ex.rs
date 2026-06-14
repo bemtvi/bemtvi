@@ -482,7 +482,7 @@ impl Editor {
                 self.goto_tab_prev(parse_opt_count_arg(args))
             }
             "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
-            "tabl" | "tablast" => self.goto_tab_next(Some(self.tabs.len())),
+            "tabl" | "tablast" => self.goto_tab_next(Some(self.main_tabs.tabs.len())),
             "tab" => self.ex_tab(args),
             "dr" | "dro" | "drop" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
@@ -1473,7 +1473,7 @@ impl Editor {
         // Last tiled window of *this* tab, but other tabs are open: `:q` closes the
         // tab page (like `:tabclose`), not the editor — its buffers stay loaded, so
         // there's nothing to lose and no modified guard, same as a non-last window.
-        if self.tabs.len() > 1 {
+        if self.main_tabs.tabs.len() > 1 {
             self.close_tab();
             return;
         }

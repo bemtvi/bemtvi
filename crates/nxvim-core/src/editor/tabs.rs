@@ -19,41 +19,45 @@ fn parse_rel_count(rest: &str) -> Option<usize> {
 impl Editor {
     /// The active tab's id (the `nvim_get_current_tabpage` target).
     pub fn current_tab_id(&self) -> TabId {
-        self.tabs[self.current_tab].id
+        self.main_tabs.tabs[self.main_tabs.current].id
     }
 
     /// Every tab id in tabline order (the `nvim_list_tabpages` order).
     pub fn tab_ids(&self) -> Vec<TabId> {
-        self.tabs.iter().map(|t| t.id).collect()
+        self.main_tabs.tabs.iter().map(|t| t.id).collect()
     }
 
     /// Number of open tab pages (always ≥ 1).
     pub fn tab_count(&self) -> usize {
-        self.tabs.len()
+        self.main_tabs.tabs.len()
     }
 
     /// Whether `id` names an open tab (`nvim_tabpage_is_valid`).
     pub fn tab_is_valid(&self, id: TabId) -> bool {
-        self.tabs.iter().any(|t| t.id == id)
+        self.main_tabs.tabs.iter().any(|t| t.id == id)
     }
 
     /// A tab's 1-based position in the tabline (`nvim_tabpage_get_number`), or
     /// `None` if `id` names no open tab.
     pub fn tab_number(&self, id: TabId) -> Option<usize> {
-        self.tabs.iter().position(|t| t.id == id).map(|i| i + 1)
+        self.main_tabs
+            .tabs
+            .iter()
+            .position(|t| t.id == id)
+            .map(|i| i + 1)
     }
 
     /// The window layout backing tab `id`: the live tree for the active tab, the
     /// stashed tree otherwise. `None` if `id` names no open tab.
     fn tab_tree(&self, id: TabId) -> Option<&WindowTree> {
-        let idx = self.tabs.iter().position(|t| t.id == id)?;
-        if idx == self.current_tab {
+        let idx = self.main_tabs.tabs.iter().position(|t| t.id == id)?;
+        if idx == self.main_tabs.current {
             // The active tab's main tree is live on `self.windows` — unless a dock
-            // is focused, in which case it is parked in `main_parked`. `layer_tree`
-            // resolves either.
+            // is focused, in which case it is parked in the main layer's active tab
+            // slot. `layer_tree` resolves either.
             self.layer_tree(Layer::Main)
         } else {
-            self.tabs[idx].tree.as_ref()
+            self.main_tabs.tabs[idx].tree.as_ref()
         }
     }
 
@@ -86,7 +90,7 @@ impl Editor {
 
     /// The active tab's index in tabline order (the highlighted cell).
     pub(crate) fn current_tab_index(&self) -> usize {
-        self.current_tab
+        self.main_tabs.current
     }
 
     /// Every window id across **all** tab pages, in tab order then in-tab layout
@@ -94,6 +98,7 @@ impl Editor {
     /// the order matches [`Editor::tab_window_ids`].
     pub fn all_window_ids(&self) -> Vec<WindowId> {
         let mut ids: Vec<WindowId> = self
+            .main_tabs
             .tabs
             .iter()
             .flat_map(|slot| self.tab_window_ids(slot.id).unwrap_or_default())
@@ -116,7 +121,8 @@ impl Editor {
         if !self.tabline_visible() {
             return Vec::new();
         }
-        self.tabs
+        self.main_tabs
+            .tabs
             .iter()
             .map(|slot| {
                 let tree = self
@@ -143,7 +149,7 @@ impl Editor {
     /// Make tab `id` the active tab (`nvim_set_current_tabpage`). A no-op if `id`
     /// is already active or names no open tab.
     pub fn set_current_tabpage(&mut self, id: TabId) {
-        if let Some(idx) = self.tabs.iter().position(|t| t.id == id) {
+        if let Some(idx) = self.main_tabs.tabs.iter().position(|t| t.id == id) {
             self.switch_tab(idx);
         }
     }
@@ -164,14 +170,14 @@ impl Editor {
         w.saved_leftcol = leftcol;
     }
 
-    /// Make the tab at `target` (an index into [`Editor::tabs`]) the active one:
+    /// Make the tab at `target` (an index into the main layer's [`TabStack`]) the active one:
     /// stash the live window layout into the outgoing tab's slot, swap the
     /// incoming tab's stashed layout onto [`Editor::windows`], and re-enter its
     /// focused window. The tab analogue of [`Editor::focus_window`] — keeping
     /// `self.windows` always the active layout means the whole editing machine is
     /// untouched. A no-op for the current tab or an out-of-range index.
     fn switch_tab(&mut self, target: usize) {
-        if target == self.current_tab || target >= self.tabs.len() {
+        if target == self.main_tabs.current || target >= self.main_tabs.tabs.len() {
             return;
         }
         // Docks are global; a tab swap must move the *main* tree, never a dock's.
@@ -181,13 +187,13 @@ impl Editor {
         // Stash the outgoing tab's live view into its focused window, then move the
         // whole live tree into its (currently empty) slot.
         self.stash_focused_view();
-        let incoming = self.tabs[target]
+        let incoming = self.main_tabs.tabs[target]
             .tree
             .take()
             .expect("an inactive tab always holds its stashed layout");
         let outgoing = std::mem::replace(&mut self.windows, incoming);
-        self.tabs[self.current_tab].tree = Some(outgoing);
-        self.current_tab = target;
+        self.main_tabs.tabs[self.main_tabs.current].tree = Some(outgoing);
+        self.main_tabs.current = target;
         // Lay the now-live tree out for the current area, then enter its focused
         // window (restores its buffer + view, clears transient state). A second
         // relayout settles any cursor-relative float now that the cursor is live.
@@ -211,11 +217,13 @@ impl Editor {
         let new_win = self.alloc_window_id();
         let tree = WindowTree::with_window(new_win, buf, options);
         let outgoing = std::mem::replace(&mut self.windows, tree);
-        self.tabs[self.current_tab].tree = Some(outgoing);
+        self.main_tabs.tabs[self.main_tabs.current].tree = Some(outgoing);
         let id = self.alloc_tab_id();
-        let insert_at = self.current_tab + 1;
-        self.tabs.insert(insert_at, TabSlot { id, tree: None });
-        self.current_tab = insert_at;
+        let insert_at = self.main_tabs.current + 1;
+        self.main_tabs
+            .tabs
+            .insert(insert_at, TabSlot { id, tree: None });
+        self.main_tabs.current = insert_at;
         // The new window is live; sync the editor's live buffer + view to it and
         // lay the (now one-row-shorter, if the tabline just appeared) area out.
         self.set_cur_buffer(buf);
@@ -252,7 +260,7 @@ impl Editor {
     /// it is not already active. Backs `:drop` / `:tab drop` when the requested
     /// file is already shown somewhere.
     pub(crate) fn goto_tab_window(&mut self, tab_idx: usize, win: WindowId) {
-        if tab_idx != self.current_tab {
+        if tab_idx != self.main_tabs.current {
             self.switch_tab(tab_idx);
         }
         self.set_current_window(win);
@@ -261,19 +269,19 @@ impl Editor {
     /// `gt` / `:tabnext` — go to the next tab (wrapping), or, with a count, to that
     /// absolute 1-based tab number (`{count}gt`, `:tabnext {count}`).
     pub(crate) fn goto_tab_next(&mut self, count: Option<usize>) {
-        let n = self.tabs.len();
+        let n = self.main_tabs.tabs.len();
         let target = match count {
             Some(c) => c.saturating_sub(1).min(n - 1),
-            None => (self.current_tab + 1) % n,
+            None => (self.main_tabs.current + 1) % n,
         };
         self.switch_tab(target);
     }
 
     /// `gT` / `:tabprevious` — go `count` tabs back (default 1), wrapping.
     pub(crate) fn goto_tab_prev(&mut self, count: Option<usize>) {
-        let n = self.tabs.len();
+        let n = self.main_tabs.tabs.len();
         let back = count.unwrap_or(1) % n;
-        let target = (self.current_tab + n - back) % n;
+        let target = (self.main_tabs.current + n - back) % n;
         self.switch_tab(target);
     }
 
@@ -281,18 +289,18 @@ impl Editor {
     /// (its whole layout; the buffers stay loaded in the store). Refuses the only
     /// tab (vim's `E784`). The argument form lives in [`Editor::close_tab_cmd`].
     pub(crate) fn close_tab(&mut self) {
-        if self.tabs.len() <= 1 {
+        if self.main_tabs.tabs.len() <= 1 {
             self.echo("E784: Cannot close last tab page");
             return;
         }
-        self.close_tab_at(self.current_tab);
+        self.close_tab_at(self.main_tabs.current);
     }
 
     /// `:tabclose[!] [N]` — close tab page `arg` (`N` 1-based, `+N`/`-N` relative,
     /// `$` last, empty = current), refusing the only tab (`E784`) and a malformed
     /// or out-of-range target (`E474`).
     pub(crate) fn close_tab_cmd(&mut self, arg: &str) {
-        if self.tabs.len() <= 1 {
+        if self.main_tabs.tabs.len() <= 1 {
             self.echo("E784: Cannot close last tab page");
             return;
         }
@@ -307,17 +315,17 @@ impl Editor {
     /// tab to the right, or the last tab); closing an **inactive** tab just drops
     /// its stashed slot, leaving the live layout untouched. Buffers stay loaded.
     fn close_tab_at(&mut self, target: usize) {
-        if target == self.current_tab {
+        if target == self.main_tabs.current {
             // The closing tab's tree is live on `self.windows`; its slot is empty.
             // Drop the slot, then replace the live tree with a surviving tab's stash.
-            self.tabs.remove(target);
-            let next = target.min(self.tabs.len() - 1);
-            let incoming = self.tabs[next]
+            self.main_tabs.tabs.remove(target);
+            let next = target.min(self.main_tabs.tabs.len() - 1);
+            let incoming = self.main_tabs.tabs[next]
                 .tree
                 .take()
                 .expect("a surviving tab is inactive, so holds its stashed layout");
             self.windows = incoming;
-            self.current_tab = next;
+            self.main_tabs.current = next;
             self.relayout();
             let cur = self.windows.current;
             self.enter_window(cur);
@@ -328,9 +336,9 @@ impl Editor {
             // An inactive tab: its stashed tree is dropped with the slot; the live
             // layout is unaffected. `current_tab` shifts left if the closed tab was
             // before it. Re-lay since the tabline row may vanish (down to one tab).
-            self.tabs.remove(target);
-            if target < self.current_tab {
-                self.current_tab -= 1;
+            self.main_tabs.tabs.remove(target);
+            if target < self.main_tabs.current {
+                self.main_tabs.current -= 1;
             }
             self.relayout();
             self.ensure_visible();
@@ -345,11 +353,11 @@ impl Editor {
     /// stash/restore and the windows area is untouched.
     pub(crate) fn move_tab(&mut self, arg: &str) {
         let arg = arg.trim();
-        let n = self.tabs.len();
+        let n = self.main_tabs.tabs.len();
         if n <= 1 {
             return;
         }
-        let c = self.current_tab;
+        let c = self.main_tabs.current;
         // Destination 0-based index, computed against the pre-move array.
         let dest = if arg.is_empty() || arg == "$" {
             n - 1
@@ -384,9 +392,9 @@ impl Editor {
         if dest == c {
             return;
         }
-        let slot = self.tabs.remove(c);
-        self.tabs.insert(dest, slot);
-        self.current_tab = dest;
+        let slot = self.main_tabs.tabs.remove(c);
+        self.main_tabs.tabs.insert(dest, slot);
+        self.main_tabs.current = dest;
     }
 
     /// Resolve a tab-selecting ex argument to a 0-based index into `tabs`: empty →
@@ -396,18 +404,22 @@ impl Editor {
     /// own "after tab N" placement rule and parses inline.)
     fn resolve_tab_arg(&self, arg: &str) -> Option<usize> {
         let arg = arg.trim();
-        let n = self.tabs.len();
+        let n = self.main_tabs.tabs.len();
         if arg.is_empty() {
-            return Some(self.current_tab);
+            return Some(self.main_tabs.current);
         }
         if arg == "$" {
             return Some(n - 1);
         }
         if let Some(rest) = arg.strip_prefix('+') {
-            return Some((self.current_tab + parse_rel_count(rest)?).min(n - 1));
+            return Some((self.main_tabs.current + parse_rel_count(rest)?).min(n - 1));
         }
         if let Some(rest) = arg.strip_prefix('-') {
-            return Some(self.current_tab.saturating_sub(parse_rel_count(rest)?));
+            return Some(
+                self.main_tabs
+                    .current
+                    .saturating_sub(parse_rel_count(rest)?),
+            );
         }
         let num: usize = arg.parse().ok()?;
         (1..=n).contains(&num).then_some(num - 1)
@@ -417,13 +429,13 @@ impl Editor {
     /// loaded). A no-op when only one tab is open. The kept tab's live layout is
     /// untouched; only the tabline-row reservation may change, so we re-lay.
     pub(crate) fn tab_only(&mut self) {
-        if self.tabs.len() <= 1 {
+        if self.main_tabs.tabs.len() <= 1 {
             return;
         }
-        let kept = self.tabs.remove(self.current_tab);
-        self.tabs.clear();
-        self.tabs.push(kept);
-        self.current_tab = 0;
+        let kept = self.main_tabs.tabs.remove(self.main_tabs.current);
+        self.main_tabs.tabs.clear();
+        self.main_tabs.tabs.push(kept);
+        self.main_tabs.current = 0;
         self.relayout();
         self.ensure_visible();
     }
@@ -455,7 +467,7 @@ impl Editor {
     }
 
     /// Mint a fresh, never-reused tab id.
-    fn alloc_tab_id(&mut self) -> TabId {
+    pub(crate) fn alloc_tab_id(&mut self) -> TabId {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         id

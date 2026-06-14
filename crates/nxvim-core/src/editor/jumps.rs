@@ -189,22 +189,13 @@ impl Editor {
                 for win in self.windows.all_windows_mut() {
                     shift_window_jumps(win, id, s, oe, ne);
                 }
-                // Background tabs stash their own window tree; their jumplists must
-                // ride the same edit so a `<C-o>` stays correct after a tab switch.
-                for slot in &mut self.tabs {
-                    if let Some(tree) = slot.tree.as_mut() {
-                        for win in tree.all_windows_mut() {
-                            shift_window_jumps(win, id, s, oe, ne);
-                        }
-                    }
-                }
-                // Global docks (and the parked main tree, while a dock is focused)
-                // ride the same edit too, so a `<C-o>` in a dock stays correct.
-                for tree in self
-                    .main_parked
-                    .iter_mut()
-                    .chain(self.docks.iter_mut().flatten())
-                {
+                // Every *parked* tree — inactive tabs of any layer, plus a
+                // non-focused layer's active tab (the main tree while a dock is
+                // focused, or a dock's tree while main is) — stashes its own window
+                // tree; their jumplists must ride the same edit so a `<C-o>` stays
+                // correct after a tab/layer switch. (The live tree on `self.windows`
+                // was handled above.)
+                for tree in self.parked_trees_mut() {
                     for win in tree.all_windows_mut() {
                         shift_window_jumps(win, id, s, oe, ne);
                     }

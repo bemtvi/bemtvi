@@ -8,8 +8,9 @@
 //! The whole editing machine reads its target window from [`Editor::windows`].
 //! Rather than teach `split`/`close`/`focus`/editing/redraw about docks, the
 //! *focused* layer's tree is always swapped live onto `Editor::windows` (the same
-//! trick tab pages use — see `tabs.rs`), and the non-focused layers' trees are
-//! parked in [`Editor::docks`] / [`Editor::main_parked`]. Crossing layers
+//! trick tab pages use — see `tabs.rs`), and every non-live tree parks in its own
+//! tab slot: each layer (main + each open dock) carries its own [`TabStack`], and
+//! a non-focused layer's active tab parks its tree there. Crossing layers
 //! ([`Editor::switch_layer`]) is therefore a tree swap, after which every existing
 //! window command "just works" within the now-live layer.
 
@@ -17,11 +18,55 @@ use super::*;
 use crate::options::WindowOptions;
 
 impl Editor {
-    /// Whether the dock on `side` is open — either parked in [`Editor::docks`] or
-    /// currently the focused layer (its tree swapped onto [`Editor::windows`], so
-    /// its `docks` slot reads `None`). Always prefer this over the bare `Option`.
+    /// Whether the dock on `side` is open: it has a [`TabStack`] in
+    /// [`Editor::dock_tabs`] (presence *is* open — even when it is the focused
+    /// layer, the stack stays, just with its active tab's tree swapped live onto
+    /// [`Editor::windows`]). Always prefer this over inspecting the `Option`.
     pub(crate) fn dock_is_open(&self, side: DockSide) -> bool {
-        self.focused_layer == Layer::Dock(side) || self.docks[side.idx()].is_some()
+        self.dock_tabs[side.idx()].is_some()
+    }
+
+    /// The tab stack backing `layer`: [`Editor::main_tabs`] for `Main`, the dock's
+    /// stack for `Dock(side)` (`None` when that dock is closed).
+    pub(crate) fn stack(&self, layer: Layer) -> Option<&TabStack> {
+        match layer {
+            Layer::Main => Some(&self.main_tabs),
+            Layer::Dock(s) => self.dock_tabs[s.idx()].as_ref(),
+        }
+    }
+
+    /// Mutable [`Editor::stack`].
+    pub(crate) fn stack_mut(&mut self, layer: Layer) -> Option<&mut TabStack> {
+        match layer {
+            Layer::Main => Some(&mut self.main_tabs),
+            Layer::Dock(s) => self.dock_tabs[s.idx()].as_mut(),
+        }
+    }
+
+    /// Park the tree live on [`Editor::windows`] into slot `(from_layer, from_tab)`
+    /// and swap the tree parked at `(to_layer, to_tab)` onto `windows`. The single
+    /// tree move shared by [`Editor::switch_layer`] (different layer) and
+    /// `switch_tab` (same layer, different tab): `from` must be the currently-live
+    /// slot (its stored tree `None`) and `to` a parked slot (tree `Some`). Updates
+    /// neither `focused_layer` nor any `current` index nor the layout — the caller
+    /// sequences those around it.
+    fn swap_live_tree(&mut self, from: (Layer, usize), to: (Layer, usize)) {
+        let incoming = self
+            .slot_tree_mut(to.0, to.1)
+            .take()
+            .expect("swap_live_tree target slot must hold a parked tree (Some) before the swap");
+        let outgoing = std::mem::replace(&mut self.windows, incoming);
+        *self.slot_tree_mut(from.0, from.1) = Some(outgoing);
+    }
+
+    /// The `tree` `Option` of tab `tab` in `layer` — the parking slot
+    /// [`Editor::swap_live_tree`] moves trees in and out of.
+    fn slot_tree_mut(&mut self, layer: Layer, tab: usize) -> &mut Option<WindowTree> {
+        &mut self
+            .stack_mut(layer)
+            .expect("slot_tree_mut on an open layer")
+            .tabs[tab]
+            .tree
     }
 
     /// Every open layer in canonical order: `Main` first, then each open dock by
@@ -36,16 +81,15 @@ impl Editor {
         out
     }
 
-    /// The tree backing `layer` — the live [`Editor::windows`] when `layer` is
-    /// focused, the parked tree otherwise. `None` for a dock that isn't open.
+    /// The tree backing `layer`'s **active** tab — the live [`Editor::windows`]
+    /// when `layer` is focused, the active tab's parked tree otherwise. `None` for
+    /// a dock that isn't open.
     pub(crate) fn layer_tree(&self, layer: Layer) -> Option<&WindowTree> {
         if self.focused_layer == layer {
             return Some(&self.windows);
         }
-        match layer {
-            Layer::Main => self.main_parked.as_ref(),
-            Layer::Dock(s) => self.docks[s.idx()].as_ref(),
-        }
+        let stack = self.stack(layer)?;
+        stack.tabs[stack.current].tree.as_ref()
     }
 
     /// Mutable [`Editor::layer_tree`].
@@ -53,10 +97,21 @@ impl Editor {
         if self.focused_layer == layer {
             return Some(&mut self.windows);
         }
-        match layer {
-            Layer::Main => self.main_parked.as_mut(),
-            Layer::Dock(s) => self.docks[s.idx()].as_mut(),
-        }
+        let stack = self.stack_mut(layer)?;
+        let current = stack.current;
+        stack.tabs[current].tree.as_mut()
+    }
+
+    /// Every **parked** window tree — every tab of every layer whose tree isn't
+    /// the one live on [`Editor::windows`]: all inactive tabs of every layer, plus
+    /// the active tab of each *non-focused* layer. The live tree is excluded (its
+    /// slot is `None`), so callers that also touch `self.windows` see no double
+    /// visit. Used by edits that must ride every background tree (jumplists, …).
+    pub(crate) fn parked_trees_mut(&mut self) -> impl Iterator<Item = &mut WindowTree> {
+        std::iter::once(&mut self.main_tabs)
+            .chain(self.dock_tabs.iter_mut().flatten())
+            .flat_map(|stack| stack.tabs.iter_mut())
+            .filter_map(|slot| slot.tree.as_mut())
     }
 
     /// The layer (and its tree) that owns window `id`, scanning every open layer.
@@ -92,16 +147,17 @@ impl Editor {
             return;
         }
         self.stash_focused_view();
-        let incoming = match target {
-            Layer::Main => self.main_parked.take(),
-            Layer::Dock(s) => self.docks[s.idx()].take(),
-        }
-        .expect("switch_layer target must be an open, parked layer");
-        let outgoing = std::mem::replace(&mut self.windows, incoming);
-        match self.focused_layer {
-            Layer::Main => self.main_parked = Some(outgoing),
-            Layer::Dock(s) => self.docks[s.idx()] = Some(outgoing),
-        }
+        // The live tree parks into the outgoing layer's active slot; the incoming
+        // layer's active slot (currently parked) becomes live.
+        let from_tab = self
+            .stack(self.focused_layer)
+            .expect("the focused layer always has a stack")
+            .current;
+        let to_tab = self
+            .stack(target)
+            .expect("switch_layer target must be an open layer")
+            .current;
+        self.swap_live_tree((self.focused_layer, from_tab), (target, to_tab));
         self.focused_layer = target;
         if let Layer::Dock(s) = target {
             self.last_dock = s;
@@ -144,13 +200,18 @@ impl Editor {
         let buf = buf.unwrap_or_else(|| self.add_buffer(Buffer::empty()));
         let win = self.alloc_window_id();
         let tree = WindowTree::with_window(win, buf, WindowOptions::default());
-        // Park the current layer, install the new dock tree as live, and enter it.
+        // Give the new dock a one-tab stack whose tree is live, park the outgoing
+        // layer's active tree into its own slot, install the dock tree as live, and
+        // enter it.
         self.stash_focused_view();
+        let tab_id = self.alloc_tab_id();
+        self.dock_tabs[side.idx()] = Some(TabStack::live(tab_id));
         let outgoing = std::mem::replace(&mut self.windows, tree);
-        match self.focused_layer {
-            Layer::Main => self.main_parked = Some(outgoing),
-            Layer::Dock(s) => self.docks[s.idx()] = Some(outgoing),
-        }
+        let from_tab = self
+            .stack(self.focused_layer)
+            .expect("the focused layer always has a stack")
+            .current;
+        *self.slot_tree_mut(self.focused_layer, from_tab) = Some(outgoing);
         self.focused_layer = Layer::Dock(side);
         self.last_dock = side;
         self.set_cur_buffer(buf);
@@ -178,7 +239,9 @@ impl Editor {
         if self.focused_layer == Layer::Dock(side) {
             self.switch_layer(Layer::Main);
         }
-        self.docks[side.idx()] = None;
+        // Drop the dock's whole tab stack (every tab's tree); the buffers each
+        // showed stay loaded in the store, like closing a window.
+        self.dock_tabs[side.idx()] = None;
         self.dock_sizes[side.idx()] = 0;
         self.relayout();
         self.ensure_visible();

@@ -147,6 +147,34 @@ struct TabSlot {
     tree: Option<WindowTree>,
 }
 
+/// One **layer**'s tab pages plus its active index — the [`Editor::main_tabs`]
+/// stack and each open dock's stack in [`Editor::dock_tabs`]. Across the whole
+/// editor exactly one `(layer, tab)` tree is `None`: the **focused** layer's
+/// active tab, whose tree is live on [`Editor::windows`] (the same trick a single
+/// active tab's `None` slot already uses). Every other tab — inactive tabs of any
+/// layer, and the active tab of a *non-focused* layer — parks its whole
+/// [`WindowTree`] in its own [`TabSlot`]. So a layer's "parked active tree" (the
+/// old `main_parked` / dock `Option<WindowTree>`) is simply
+/// `tabs[current].tree` while that layer isn't focused.
+pub(crate) struct TabStack {
+    /// This layer's tab pages, in tabline order.
+    tabs: Vec<TabSlot>,
+    /// Index into [`TabStack::tabs`] of this layer's active tab.
+    current: usize,
+}
+
+impl TabStack {
+    /// A one-tab stack whose sole tab is `id` and whose tree is **live** (slot
+    /// `None`) — the shape a layer takes the instant it becomes focused with its
+    /// tree swapped onto [`Editor::windows`].
+    fn live(id: TabId) -> Self {
+        Self {
+            tabs: vec![TabSlot { id, tree: None }],
+            current: 0,
+        }
+    }
+}
+
 pub(crate) use registers::{RegKind, RegisterCell, Registers};
 
 /// What the command line is editing: an `:` ex command, a `/`,`?` search, or a
@@ -492,16 +520,16 @@ pub struct Editor {
     /// focused window ([`Editor::cur_buffer`]); reach its text model through
     /// [`Editor::buffer`].
     buffers: BufferStore,
-    /// The window layout of the **active** tab — the split tree, the focused
-    /// window, and per-window view state. The buffer it shows is the current
-    /// buffer. Inactive tabs stash their own layout in [`Editor::tabs`].
+    /// The window layout of the **focused** layer's active tab — the split tree,
+    /// the focused window, and per-window view state. The buffer it shows is the
+    /// current buffer. Every other tree (inactive tabs of any layer, and a
+    /// non-focused layer's active tab) stashes its layout in its [`TabStack`] slot.
     windows: WindowTree,
-    /// Every tab page in tabline order. The active tab's slot holds `None` (its
-    /// layout is live on [`Editor::windows`]); inactive tabs stash theirs. Holds
-    /// exactly one tab until the creation surface lands.
-    tabs: Vec<TabSlot>,
-    /// Index into [`Editor::tabs`] of the active tab.
-    current_tab: usize,
+    /// The **main** layer's tab pages (see [`TabStack`]). The active tab's slot
+    /// holds `None` while the main layer is focused (its layout is live on
+    /// [`Editor::windows`]); when a dock is focused its active tab parks here
+    /// instead — the role the old `main_parked` field played.
+    main_tabs: TabStack,
     /// The next window id to mint, monotonic and **global** across every tab (a
     /// window handle is never reused, matching neovim). The active tab's splits and
     /// every new tab's first window draw from this one counter, so two tabs can
@@ -511,18 +539,15 @@ pub struct Editor {
     /// tab (id 1).
     next_tab_id: u64,
     /// The four permanent docks (left, right, top, bottom — indexed by
-    /// [`DockSide::idx`]), `None` when that side is closed. Docks are **global**:
-    /// they live here, outside [`Editor::tabs`], so the same docks show on every
-    /// tab and tab/split operations never disturb them. The slot for the
-    /// *focused* dock holds `None` — its tree is swapped live onto
-    /// [`Editor::windows`] (mirrors the active tab's `None` slot); read its
-    /// open-ness through [`Editor::dock_is_open`], not the `Option` alone.
-    docks: [Option<WindowTree>; 4],
-    /// The main per-tab window tree while a dock is focused (parked here so the
-    /// focused dock's tree can occupy [`Editor::windows`]). `None` whenever the
-    /// main layer is focused (its tree is then live on `windows`). The
-    /// layer-analogue of an inactive tab's stashed tree.
-    main_parked: Option<WindowTree>,
+    /// [`DockSide::idx`]), each its own [`TabStack`] when open and `None` when the
+    /// side is closed (so `is_some()` *is* "open" — read it through
+    /// [`Editor::dock_is_open`]). Docks are **global**: they live here, outside
+    /// [`Editor::main_tabs`], so the same docks show on every main tab and
+    /// main-tab/split operations never disturb them — but each dock now carries its
+    /// own independent tab pages. The focused dock's active tab holds `None` (its
+    /// tree is live on [`Editor::windows`], mirroring the main layer); a
+    /// non-focused dock parks its active tree in that tab's slot.
+    dock_tabs: [Option<TabStack>; 4],
     /// Which layer currently owns the live editing state on [`Editor::windows`]
     /// (and the live `cursor`/`top`/`leftcol`). `Main` until the first dock is
     /// focused via `<C-w><C-w>`.
@@ -1007,15 +1032,10 @@ impl Editor {
         let mut editor = Editor {
             buffers,
             windows,
-            tabs: vec![TabSlot {
-                id: TabId(1),
-                tree: None,
-            }],
-            current_tab: 0,
+            main_tabs: TabStack::live(TabId(1)),
             next_win_id: 2,
             next_tab_id: 2,
-            docks: [None, None, None, None],
-            main_parked: None,
+            dock_tabs: [None, None, None, None],
             focused_layer: Layer::Main,
             dock_sizes: [0; 4],
             last_dock: DockSide::Left,

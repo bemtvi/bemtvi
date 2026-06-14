@@ -926,8 +926,8 @@ impl Editor {
     /// `:drop` / `:tab drop`'s "already open somewhere?" check. Floats are
     /// excluded — `:drop` targets editable windows, as in vim.
     pub(crate) fn window_showing(&self, buf: BufferId) -> Option<(usize, WindowId)> {
-        for (idx, tab) in self.tabs.iter().enumerate() {
-            let tree = if idx == self.current_tab {
+        for (idx, tab) in self.main_tabs.tabs.iter().enumerate() {
+            let tree = if idx == self.main_tabs.current {
                 &self.windows
             } else {
                 tab.tree
@@ -1864,7 +1864,7 @@ impl Editor {
         match self.options.showtabline {
             0 => false,
             2 => true,
-            _ => self.tabs.len() > 1,
+            _ => self.main_tabs.tabs.len() > 1,
         }
     }
 

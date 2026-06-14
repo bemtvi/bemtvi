@@ -43,6 +43,22 @@ impl Editor {
         }
     }
 
+    /// The **focused** layer's tab stack — the one whose active tab is live on
+    /// [`Editor::windows`]. Always present (an open layer always has a stack), so
+    /// the interactive tab commands (`:tabnew`/`gt`/`:tabclose`/…) read it directly
+    /// to act on whatever region currently holds focus.
+    pub(crate) fn focused_stack(&self) -> &TabStack {
+        self.stack(self.focused_layer)
+            .expect("the focused layer always has a tab stack")
+    }
+
+    /// Mutable [`Editor::focused_stack`].
+    pub(crate) fn focused_stack_mut(&mut self) -> &mut TabStack {
+        let layer = self.focused_layer;
+        self.stack_mut(layer)
+            .expect("the focused layer always has a tab stack")
+    }
+
     /// Park the tree live on [`Editor::windows`] into slot `(from_layer, from_tab)`
     /// and swap the tree parked at `(to_layer, to_tab)` onto `windows`. The single
     /// tree move shared by [`Editor::switch_layer`] (different layer) and
@@ -50,7 +66,7 @@ impl Editor {
     /// slot (its stored tree `None`) and `to` a parked slot (tree `Some`). Updates
     /// neither `focused_layer` nor any `current` index nor the layout — the caller
     /// sequences those around it.
-    fn swap_live_tree(&mut self, from: (Layer, usize), to: (Layer, usize)) {
+    pub(crate) fn swap_live_tree(&mut self, from: (Layer, usize), to: (Layer, usize)) {
         let incoming = self
             .slot_tree_mut(to.0, to.1)
             .take()
@@ -100,6 +116,19 @@ impl Editor {
         let stack = self.stack_mut(layer)?;
         let current = stack.current;
         stack.tabs[current].tree.as_mut()
+    }
+
+    /// The tree of tab `idx` in `layer`: the live [`Editor::windows`] for the
+    /// focused layer's active tab, the parked slot tree otherwise. `None` for a
+    /// closed dock or an out-of-range index. Resolves any `(layer, tab)` to its
+    /// tree across both swap dimensions.
+    pub(crate) fn layer_tab_tree(&self, layer: Layer, idx: usize) -> Option<&WindowTree> {
+        let stack = self.stack(layer)?;
+        if idx == stack.current && self.focused_layer == layer {
+            Some(&self.windows)
+        } else {
+            stack.tabs.get(idx).and_then(|s| s.tree.as_ref())
+        }
     }
 
     /// Every **parked** window tree — every tab of every layer whose tree isn't

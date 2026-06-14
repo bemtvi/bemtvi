@@ -282,6 +282,26 @@ pub struct TabView {
     pub window_count: usize,
 }
 
+/// One region's tabline: its tab cells in tabline order plus the active cell
+/// index. Empty `tabs` ⇒ that region draws no tabline (its `showtabline` gate hid
+/// it, or — for a dock — it is closed). `current` is meaningful only when `tabs`
+/// is non-empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegionTabline {
+    pub tabs: Vec<TabView>,
+    pub current: usize,
+}
+
+/// Every region's independent tabline (see [`RegionTabline`]): the main editor
+/// area plus the four docks, indexed by `DockSide::idx` (`[left, right, top,
+/// bottom]`). Each region carries its own tab pages, so the client draws a tabline
+/// at the top of each region's band rather than one global bar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegionTablines {
+    pub main: RegionTabline,
+    pub docks: [RegionTabline; 4],
+}
+
 /// A snapshot of everything a client needs to draw a frame: the **global** chrome
 /// (mode label, command line, message, panel) plus the list of [`WindowView`]s to
 /// paint. With one window the list has a single entry spanning the whole text
@@ -297,6 +317,11 @@ pub struct View {
     /// Index into `tabline` of the active tab. Meaningful only when `tabline` is
     /// non-empty.
     pub current_tab: usize,
+    /// Per-region tablines — each region (main + each open dock) has its own
+    /// independent tab pages. `region_tablines.main` carries the same cells as the
+    /// legacy `tabline`/`current_tab` above (kept until clients migrate); the dock
+    /// entries are the new per-dock tablines. See [`RegionTablines`].
+    pub region_tablines: RegionTablines,
     /// The split borders between windows, each in its [`Separator::region`]'s
     /// cells. Empty with a single window and no dock.
     pub separators: Vec<Separator>,
@@ -374,8 +399,9 @@ impl View {
         });
         View {
             windows,
-            tabline: ed.tab_labels().into_iter().map(tab_view).collect(),
+            tabline: ed.tab_labels().into_iter().map(tab_label_to_view).collect(),
             current_tab: ed.current_tab_index(),
+            region_tablines: ed.region_tablines(),
             separators: ed.all_separators(),
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,
@@ -408,7 +434,7 @@ impl View {
 }
 
 /// Project a core [`TabLabel`] into the wire-facing [`TabView`].
-fn tab_view(label: TabLabel) -> TabView {
+pub(crate) fn tab_label_to_view(label: TabLabel) -> TabView {
     TabView {
         label: label.name,
         modified: label.modified,

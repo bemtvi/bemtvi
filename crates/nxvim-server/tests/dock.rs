@@ -21,6 +21,15 @@ async fn req(rpc: &Rpc, method: &str, args: Vec<Value>) -> Value {
     rpc.request(method, args).await.expect(method)
 }
 
+/// Feed `keys` and wait for the editor to settle (a `nvim_get_mode` barrier), so a
+/// following redraw drain sees this input's frame rather than a stale one.
+async fn feed_sync(rpc: &Rpc, keys: &str) {
+    rpc.request("nvim_input", vec![Value::from(keys)])
+        .await
+        .expect("input");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+}
+
 /// `nvim_list_wins` as a vec of handles.
 async fn win_count(rpc: &Rpc) -> usize {
     match req(rpc, "nvim_list_wins", vec![]).await {
@@ -51,6 +60,35 @@ fn regions(map: &[(Value, Value)]) -> Vec<String> {
 
 fn band(map: &[(Value, Value)], key: &str) -> u64 {
     map_get(map, key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// One region's sub-map inside the redraw `region_tablines` (key `main`/`left`/
+/// `right`/`top`/`bottom`).
+fn region_tabline<'a>(map: &'a [(Value, Value)], region: &str) -> Option<&'a [(Value, Value)]> {
+    let Some(Value::Map(rts)) = map_get(map, "region_tablines") else {
+        return None;
+    };
+    match map_get(rts, region) {
+        Some(Value::Map(r)) => Some(r),
+        _ => None,
+    }
+}
+
+/// How many tab cells a region's tabline projects (`0` when hidden — e.g. a
+/// single-tab region at the default `showtabline`).
+fn region_tab_count(map: &[(Value, Value)], region: &str) -> usize {
+    match region_tabline(map, region).and_then(|r| map_get(r, "tabs")) {
+        Some(Value::Array(a)) => a.len(),
+        _ => 0,
+    }
+}
+
+/// A region's active tab index, as projected in `region_tablines`.
+fn region_current(map: &[(Value, Value)], region: &str) -> usize {
+    region_tabline(map, region)
+        .and_then(|r| map_get(r, "current"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
 }
 
 #[tokio::test]
@@ -149,11 +187,13 @@ async fn closing_the_last_dock_window_with_ctrl_w_c_closes_the_dock() {
 }
 
 #[tokio::test]
-async fn dock_is_global_across_tabs() {
+async fn dock_is_global_across_main_tabs() {
     let (rpc, mut incoming) = start().await;
     exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
-    // New tab: must not disturb the dock (and must not panic while a dock is
-    // focused — `new_tab` crosses to main first).
+    // Cross back to the main area, then open a new *main* tab. Docks are global —
+    // they live outside the main tab stack, so the dock must persist untouched on
+    // the new main tab.
+    feed(&rpc, "<C-w><C-w>l");
     exec_lua(&rpc, "vim.cmd('tabnew')").await;
     assert!(
         win_count(&rpc).await >= 2,
@@ -168,19 +208,96 @@ async fn dock_is_global_across_tabs() {
 }
 
 #[tokio::test]
-async fn tab_switch_while_dock_focused_does_not_corrupt_state() {
+async fn tabnew_while_dock_focused_adds_a_dock_tab_not_a_main_tab() {
     let (rpc, _incoming) = start().await;
     feed(&rpc, "imain-one<Esc>");
-    // Open and stay focused in the dock, then switch tabs (the risky path).
+    // Open and stay focused in the dock, then `:tabnew` — it must add a *dock* tab
+    // (the focused region), not a main tab.
     exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
-    feed(&rpc, "idock<Esc>");
+    feed(&rpc, "idock-one<Esc>");
     exec_lua(&rpc, "vim.cmd('tabnew')").await;
-    // The new tab's main buffer is empty and editable; no panic occurred.
-    feed(&rpc, "inew-tab<Esc>");
-    assert_eq!(lines(&rpc).await, vec!["new-tab"]);
-    // Back to the first tab: its main buffer survived intact.
-    exec_lua(&rpc, "vim.cmd('tabprevious')").await;
-    assert_eq!(lines(&rpc).await, vec!["main-one"]);
+    feed(&rpc, "idock-two<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock-two"],
+        "typing lands in the dock's new tab"
+    );
+    // `gT` cycles the dock's *own* tabs back to its first tab.
+    feed(&rpc, "gT");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock-one"],
+        "gT cycles only the focused dock's tabs"
+    );
+    // Cross to main: its single tab and buffer are untouched by the dock's tabbing.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main-one"],
+        "the main area never gained a tab"
+    );
+}
+
+#[tokio::test]
+async fn dock_and_main_tab_counts_are_independent() {
+    let (rpc, mut incoming) = start().await;
+    // Always-on tablines so single-tab regions still project their cell count.
+    feed_sync(&rpc, ":set showtabline=2<CR>").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    // Dock focused: two `:tabnew`s give the dock three tabs.
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(region_tab_count(&rd, "left"), 3, "the dock has three tabs");
+    assert_eq!(region_tab_count(&rd, "main"), 1, "main is left at one tab");
+    assert_eq!(
+        region_current(&rd, "left"),
+        2,
+        "the dock's last tab is active"
+    );
+}
+
+#[tokio::test]
+async fn gt_in_one_region_leaves_the_other_regions_active_tab() {
+    let (rpc, mut incoming) = start().await;
+    feed_sync(&rpc, ":set showtabline=2<CR>").await;
+    // Main gets a second tab (active index 1), then we open a dock and give it a
+    // second tab (active index 1) while the dock is focused.
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 6 }").await;
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    // `gT` in the focused dock wraps it back to tab 0; main's active tab is intact.
+    feed_sync(&rpc, "gT").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_current(&rd, "bottom"),
+        0,
+        "gT moved the dock's active tab"
+    );
+    assert_eq!(
+        region_current(&rd, "main"),
+        1,
+        "main's active tab is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn closing_the_docks_last_tab_closes_the_dock() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    assert_eq!(win_count(&rpc).await, 2, "main + dock");
+    // Give the dock a second tab, then close tabs: the first close drops a tab but
+    // keeps the dock; closing its *last* tab collapses the whole dock.
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    assert_eq!(win_count(&rpc).await, 3, "main + two dock-tab windows");
+    exec_lua(&rpc, "vim.cmd('tabclose')").await;
+    assert_eq!(win_count(&rpc).await, 2, "dock survives with one tab left");
+    exec_lua(&rpc, "vim.cmd('tabclose')").await;
+    assert_eq!(
+        win_count(&rpc).await,
+        1,
+        "closing the dock's last tab closes the dock"
+    );
 }
 
 #[tokio::test]

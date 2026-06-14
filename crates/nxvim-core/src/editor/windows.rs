@@ -1861,10 +1861,22 @@ impl Editor {
     /// [`Editor::tab_labels`] (the projected labels) consult, so they never
     /// disagree.
     pub(crate) fn tabline_visible(&self) -> bool {
+        self.tabline_visible_for(Layer::Main)
+    }
+
+    /// Whether `layer`'s own tabline is drawn right now, per `showtabline` applied
+    /// to *that layer*'s tab count: never at `0`, only with more than one tab in
+    /// the layer at `1` (the default), always (for an open layer) at `2`. Each
+    /// region (main + each open dock) gates independently — a single-tab dock shows
+    /// no tabline at the default, a 2-tab dock does. `false` for a closed dock.
+    pub(crate) fn tabline_visible_for(&self, layer: Layer) -> bool {
+        let Some(stack) = self.stack(layer) else {
+            return false;
+        };
         match self.options.showtabline {
             0 => false,
             2 => true,
-            _ => self.main_tabs.tabs.len() > 1,
+            _ => stack.tabs.len() > 1,
         }
     }
 

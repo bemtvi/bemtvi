@@ -6,7 +6,8 @@ use crate::EditHost;
 use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
 use nxvim_core::view::{
-    MenuView, ScrollAnim, Separator, TabView, ViewRect, WindowRegion, WindowView,
+    MenuView, RegionTabline, RegionTablines, ScrollAnim, Separator, TabView, ViewRect,
+    WindowRegion, WindowView,
 };
 use nxvim_core::{BorderStyle, MenuPlacement, PanelView};
 use rmpv::Value;
@@ -111,6 +112,13 @@ impl EditHost {
         // draws no tabline) and the active cell index.
         let tabline = Value::Array(view.tabline.iter().map(tab_value).collect());
 
+        // Per-region tablines: each region (main + each open dock) carries its own
+        // independent tab pages. A map keyed by region (`main`/`left`/`right`/
+        // `top`/`bottom`), each value `{ tabs: [...], current: N }`. Clients draw a
+        // tabline at the top of each region's band from this; the legacy `tabline`/
+        // `current_tab` above mirror `main` until every client migrates.
+        let region_tablines = region_tablines_value(&view.region_tablines);
+
         // A custom `'tabline'` ('tabline' option non-empty), rendered through the
         // same `%`-format engine as the statusline into one styled row spanning the
         // full editor width — the focused window supplies the `%`-item context, as
@@ -166,6 +174,7 @@ impl EditHost {
             (Value::from("global_status"), global_status),
             (Value::from("separators"), separators),
             (Value::from("tabline"), tabline),
+            (Value::from("region_tablines"), region_tablines),
             (Value::from("tabline_segments"), tabline_segments),
             (
                 Value::from("current_tab"),
@@ -591,6 +600,31 @@ fn tab_value(tab: &TabView) -> Value {
             Value::from("window_count"),
             Value::from(tab.window_count as u64),
         ),
+    ])
+}
+
+/// One region's tabline as `{ tabs: [cell, …], current: N }`. `tabs` is empty when
+/// that region draws no tabline (hidden by `showtabline`, or a closed dock).
+fn region_tabline_value(rt: &RegionTabline) -> Value {
+    Value::Map(vec![
+        (
+            Value::from("tabs"),
+            Value::Array(rt.tabs.iter().map(tab_value).collect()),
+        ),
+        (Value::from("current"), Value::from(rt.current as u64)),
+    ])
+}
+
+/// The per-region tablines as a map keyed by region — `main` plus the four docks
+/// (`left`/`right`/`top`/`bottom`, matching the `nx.dock` side keywords). Each
+/// value is a [`region_tabline_value`].
+fn region_tablines_value(rts: &RegionTablines) -> Value {
+    Value::Map(vec![
+        (Value::from("main"), region_tabline_value(&rts.main)),
+        (Value::from("left"), region_tabline_value(&rts.docks[0])),
+        (Value::from("right"), region_tabline_value(&rts.docks[1])),
+        (Value::from("top"), region_tabline_value(&rts.docks[2])),
+        (Value::from("bottom"), region_tabline_value(&rts.docks[3])),
     ])
 }
 

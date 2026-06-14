@@ -49,6 +49,12 @@ const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number"
 const eh_take_ts_requests = M.cwrap("eh_take_ts_requests", "number", ["number"]);
 const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number", "string", "number", "string"]);
 const eh_ts_seed_installed = M.cwrap("eh_ts_seed_installed", null, ["number", "string"]);
+// Clipboard (`"+`/`"*`) leg: the editor enqueues each `"+`/`"*` yank/delete off-tick; the
+// Worker drains it and forwards to the UI thread (only the UI thread can reach
+// `navigator.clipboard`) to write out. The UI pushes the OS clipboard back in via
+// `eh_clipboard_push` so a `"+p` sees an external copy.
+const eh_take_clipboard_writes = M.cwrap("eh_take_clipboard_writes", "number", ["number"]);
+const eh_clipboard_push = M.cwrap("eh_clipboard_push", null, ["number", "string"]);
 // Persistence (shada): the editor's cross-session snapshot ↔ a JSON blob the Worker keeps
 // in OPFS. `eh_export_shada(include_exit)` serializes it; `eh_load_shada(json)` restores it.
 const eh_export_shada = M.cwrap("eh_export_shada", "number", ["number", "number"]);
@@ -483,6 +489,14 @@ function drainTsRequests() {
   return reqs.length > 0;
 }
 
+// Forward any `"+`/`"*` yanks/deletes the tick enqueued to the UI thread, which writes the
+// text to `navigator.clipboard` (a Worker has no clipboard access). Fire-and-forget, exactly
+// like `drainTsRequests` — the editor already painted the yank, so no extra repaint here.
+function drainClipboardWrites() {
+  const writes = JSON.parse(readStr(eh_take_clipboard_writes(h)));
+  for (const text of writes) postMessage({ type: "clipboard_write", text });
+}
+
 // 5c (postMessage, no run loop): apply a push + fulfil any reload re-fetch + repaint inline.
 // Safe because 5c is never parked (no single-consumer run loop to race).
 async function pump5cDaemon() {
@@ -646,6 +660,12 @@ async function runLoopSAB(ctrl, data) {
         // connect: a runtime `:connect nxvim://…`. Record the URI; the run loop dials it
         // after this drain (the dial is async, so it can't run here in the sync drain).
         pendingConnectUri = utf8(payload);
+      } else if (type === 8) {
+        // clipboard_push: the UI read `navigator.clipboard` (on focus / paste) and handed us
+        // its text — update the mirror a `"+`/`"*` paste reads. Not a user keystroke, so it
+        // earns neither an ack nor a repaint (the cache update is invisible until a paste).
+        eh_clipboard_push(h, utf8(payload));
+        continue;
       }
       acks.push(reqId);
     }
@@ -690,6 +710,8 @@ async function runLoopSAB(ctrl, data) {
     await drainWatchRequests();
     // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
     drainTsRequests();
+    // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
+    drainClipboardWrites();
     if (fired || acks.length || fsWork || notified || tsLanded) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
     }
@@ -820,6 +842,13 @@ onmessage = async (ev) => {
     postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
     return;
   }
+  // Clipboard mirror push (5c; SAB routes it via a ring type-8 frame in `drain()`). The UI
+  // read `navigator.clipboard` and handed us its text — update what a `"+`/`"*` paste reads.
+  // No repaint: the cache change is invisible until a paste consumes it.
+  if (msg.type === "clipboard_push") {
+    eh_clipboard_push(h, String(msg.text ?? ""));
+    return;
+  }
   // postMessage fallback (5c). `:e`/`:w` fulfill against OPFS before the frame posts, so
   // the resolved frame reflects the open/save (the SAB loop does the same inline).
   switch (msg.type) {
@@ -832,6 +861,7 @@ onmessage = async (ev) => {
       await fulfillFsRequests();
       await drainWatchRequests();
       drainTsRequests();
+      drainClipboardWrites();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -842,6 +872,7 @@ onmessage = async (ev) => {
       await fulfillFsRequests();
       await drainWatchRequests();
       drainTsRequests();
+      drainClipboardWrites();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -850,6 +881,7 @@ onmessage = async (ev) => {
       await fulfillFsRequests();
       await drainWatchRequests();
       drainTsRequests();
+      drainClipboardWrites();
       postFrame(msg.id, result);
       await maybeCheckpoint5c();
       break;

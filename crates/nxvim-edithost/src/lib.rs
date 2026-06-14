@@ -30,7 +30,9 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::rc::Rc;
 
-use nxvim_core::{BufferId, DirEntry, Editor, NumberedMark, PendingSave, PersistState};
+use nxvim_core::{
+    BufferId, Clipboard, DirEntry, Editor, NumberedMark, PendingSave, PersistState,
+};
 use nxvim_lua::{BlockingSystem, LuaRuntime, SystemOutput, SystemSpec};
 use nxvim_server::{EditHost, HostEffects};
 use rmpv::Value;
@@ -101,6 +103,52 @@ struct Sink {
     /// caches + registers them with the JS highlighter, and lands the outcome back via
     /// [`eh_ts_install_complete`]. Browser-side fetch, not a native compile.
     ts_requests: Vec<String>,
+    /// The browser clipboard mirror backing the `"+` / `"*` registers. `clipboard_get` is
+    /// the value the UI last pushed in from `navigator.clipboard` ([`eh_clipboard_push`],
+    /// refreshed on focus / paste); a `"+p` reads it. `clipboard_writes` queues each `"+` /
+    /// `"*` yank or delete for the Worker to drain ([`eh_take_clipboard_writes`]) and write
+    /// out to `navigator.clipboard`. Text is stored *verbatim* — linewise-ness rides the
+    /// trailing `\n`, exactly as `nxvim-server`'s native `SystemClipboard` (pbcopy/pbpaste)
+    /// treats it — so a value agrees whether read back in-editor or after a round trip
+    /// through the OS clipboard. Written by [`WasmClipboard`] (the editor owns it).
+    clipboard_get: Option<String>,
+    clipboard_writes: Vec<String>,
+}
+
+/// The `"+` / `"*` clipboard provider for the browser build — the wasm twin of
+/// `nxvim-server`'s `SystemClipboard` (which shells out to pbcopy/pbpaste). The synchronous
+/// [`Clipboard`] seam can't await `navigator.clipboard` (it's async, and unreachable off the
+/// UI thread anyway), so it bridges through the [`Sink`]: [`get`](Clipboard::get) returns the
+/// value the UI last pushed in ([`eh_clipboard_push`]), and [`set`](Clipboard::set) updates
+/// that mirror *and* queues the text for the UI to write out ([`eh_take_clipboard_writes`]).
+struct WasmClipboard {
+    sink: Rc<RefCell<Sink>>,
+}
+
+// SAFETY: the entire wasm edit-host runs on the single Web Worker thread, so the `Rc` is
+// never sent across threads. The `Send` bound on `Clipboard` exists for `nxvim-server`'s
+// native worker thread and is never exercised on this build — the same single-thread
+// justification the `Rc`-holding `WasmEffects` relies on (`HostEffects` is itself `!Send`).
+unsafe impl Send for WasmClipboard {}
+
+impl Clipboard for WasmClipboard {
+    fn get(&self) -> Option<(String, bool)> {
+        // Linewise iff the text ends in `\n`, mirroring the native `SystemClipboard` — a
+        // linewise yank kept its trailing newline, so reading it back re-derives the flag.
+        self.sink
+            .borrow()
+            .clipboard_get
+            .as_ref()
+            .map(|text| (text.clone(), text.ends_with('\n')))
+    }
+
+    fn set(&self, text: &str, _linewise: bool) {
+        // Store verbatim (a linewise yank already carries its `\n`); the UI hands the same
+        // bytes to `navigator.clipboard`, and `get` re-derives linewise from the newline.
+        let mut sink = self.sink.borrow_mut();
+        sink.clipboard_get = Some(text.to_string());
+        sink.clipboard_writes.push(text.to_string());
+    }
 }
 
 /// The wasm [`HostEffects`]: the analogue of `nxvim-server`'s `NativeEffects`, but the
@@ -273,7 +321,11 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     // named message rather than emscripten's cryptic spawn errno (StdBlockingSystem).
     lua.set_blocking_system(Rc::new(WasmBlockingSystem));
     let fx = Box::new(WasmEffects { sink: sink.clone() });
-    let mut host = EditHost::new(Editor::new(), lua, fx);
+    let mut editor = Editor::new();
+    // Wire the `"+` / `"*` registers to the browser clipboard via the Sink (the wasm twin of
+    // the native `SystemClipboard`). Without a provider the editor errors loud on `"+`.
+    editor.set_clipboard(Box::new(WasmClipboard { sink: sink.clone() }));
+    let mut host = EditHost::new(editor, lua, fx);
     // OPFS is async to open, so `:e` / `:w` defer to the off-tick seam the Worker
     // fulfills (Phase 6); turn it on before boot so the very first open routes there.
     host.enable_offtick_fs();
@@ -493,6 +545,38 @@ pub unsafe extern "C" fn eh_take_ts_requests(h: *mut WasmEditHost) -> *mut c_cha
     };
     let reqs: Vec<String> = std::mem::take(&mut handle.sink.borrow_mut().ts_requests);
     into_owned_cstr(serde_json::to_string(&reqs).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Drain the `"+` / `"*` clipboard writes the editor enqueued this convergence (one per
+/// `"+` / `"*` yank or delete) as a JSON `["text", …]` array, emptying the queue so each is
+/// forwarded to the UI thread exactly once. The Worker posts a `clipboard_write` message per
+/// entry; the UI thread writes the text to `navigator.clipboard` (a Worker has no clipboard
+/// access). Fire-and-forget — the editor tick never blocks on the OS clipboard. Caller frees
+/// the result with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_clipboard_writes(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    let writes: Vec<String> = std::mem::take(&mut handle.sink.borrow_mut().clipboard_writes);
+    into_owned_cstr(serde_json::to_string(&writes).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Push the host clipboard's current contents into the mirror a `"+` / `"*` paste reads.
+/// The UI thread reads `navigator.clipboard` where it has permission (on focus / paste /
+/// click) and calls this, so a subsequent `"+p` sees a copy made in another app. Stored
+/// verbatim; linewise-ness is re-derived from a trailing `\n` on read (the native
+/// `SystemClipboard` convention), so JS hands the text untouched.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `text` is a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_clipboard_push(h: *mut WasmEditHost, text: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    handle.sink.borrow_mut().clipboard_get = Some(as_str(text).to_string());
 }
 
 /// Land a finished browser `:TSInstall`: the UI thread fetched + registered the grammar

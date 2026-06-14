@@ -12,7 +12,8 @@
     "verify-shada": "node verify-shada.mjs",
     "verify-daemon": "node verify-daemon.mjs",
     "verify-connect": "node verify-connect.mjs",
-    "verify-treesitter": "node verify-treesitter.mjs"
+    "verify-treesitter": "node verify-treesitter.mjs",
+    "verify-clipboard": "node verify-clipboard.mjs"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",

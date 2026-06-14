@@ -242,6 +242,27 @@
       if (useSAB) pushFrame(6, enc(JSON.stringify({ lang, ok, msg })));
       else worker.postMessage({ type: "ts_install_result", lang, ok, msg });
     }
+    // Push the OS clipboard's text into the Worker's `"+`/`"*` read mirror — a ring type-8
+    // frame under SAB (ordered with the feeds, so it lands before a following `"+p`), a
+    // message under 5c. Fire-and-forget.
+    function clipboardPushOp(text) {
+      if (useSAB) pushFrame(8, enc(text));
+      else worker.postMessage({ type: "clipboard_push", text });
+    }
+    // Refresh the editor's `"+`/`"*` read mirror from `navigator.clipboard`. The editor's
+    // synchronous register read can't await the (async, Window-only) clipboard, so we push its
+    // contents *ahead* of a paste — on focus / tab-return / click, when the document is focused
+    // and clipboard-read permission holds — so a `"+p` sees a copy made in another app. A copy
+    // made *inside* nxvim needs no refresh: the yank already updated the mirror (and wrote out
+    // to the OS clipboard). Best-effort: no permission / not focused leaves the mirror as-is.
+    let clipboardRefreshing = false;
+    async function refreshClipboard() {
+      if (clipboardRefreshing || !navigator.clipboard?.readText) return;
+      clipboardRefreshing = true;
+      try { clipboardPushOp(await navigator.clipboard.readText()); }
+      catch { /* permission denied / not focused / empty — keep the existing mirror */ }
+      finally { clipboardRefreshing = false; }
+    }
 
     let statusHideTimer = null;
     // Briefly show a transient message in the corner indicator (picker errors, etc.).
@@ -287,6 +308,12 @@
           ? await ts.install(lang)
           : { ok: false, msg: "syntax highlighter unavailable (tree-sitter vendor not built)" };
         tsInstallResultOp(lang, res.ok, res.msg || "");
+        return;
+      }
+      // A `"+`/`"*` yank/delete — write the text to the real clipboard (only the UI thread can
+      // reach `navigator.clipboard`). Best-effort: a denied write is a no-op, not a crash.
+      if (msg.type === "clipboard_write") {
+        if (navigator.clipboard?.writeText) navigator.clipboard.writeText(msg.text).catch(() => {});
         return;
       }
       // A runtime `:connect nxvim://…` finished dialing — flash the outcome (the fs/watch seam
@@ -1212,6 +1239,7 @@
 
     gridEl.addEventListener("mousedown", (e) => {
       gridEl.focus();
+      refreshClipboard(); // a click is a user gesture — a good moment to re-read the OS clipboard
       const button = BTN[e.button];
       if (!button) return;
       e.preventDefault();
@@ -1270,7 +1298,12 @@
     // already captured the bulk during editing — this mainly stamps the exit cursor (`'0`).
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") requestShadaFlush();
+      else refreshClipboard(); // tab re-shown — pick up a copy made while we were away
     });
+    // Refresh the `"+`/`"*` read mirror whenever the editor (re)gains focus — switching back
+    // from another app/tab is the moment an external copy needs to become visible to `"+p`.
+    window.addEventListener("focus", refreshClipboard);
+    gridEl.addEventListener("focus", refreshClipboard);
 
     // ============================================================================
     // Boot: measure, create the highlighter, then let the Worker's "ready" attach.
@@ -1299,6 +1332,10 @@
       // Flush cross-session (shada) state to OPFS now (resolves when written) — the tab-hide
       // path, exposed for tests so they can persist + reload without racing the debounce.
       shadaFlush: () => requestShadaFlush(),
+      // Re-read the OS clipboard into the `"+`/`"*` mirror now (resolves once pushed). The
+      // focus/visibility/click triggers do this in normal use; exposed so a test can prime an
+      // external copy deterministically before a `"+p`.
+      clipboardRefresh: () => refreshClipboard(),
       mouse: (button, action, modifier, row, col) => mouseOp(button, action, modifier, row | 0, col | 0),
       execLua: (code) => execLuaOp(code),
       attach: (c, r) => attachOp(c, r),

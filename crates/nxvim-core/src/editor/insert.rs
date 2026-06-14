@@ -13,6 +13,12 @@ impl Editor {
     /// just the primary's; the typed text then lands at each. With no secondary
     /// cursors this is just a single move to `target(self)` before entering insert.
     pub(crate) fn enter_insert_each(&mut self, target: impl Fn(&Editor) -> usize) {
+        // A live terminal buffer is read-only; you type into it via terminal-job mode
+        // (`i`/`a` are intercepted upstream), so any other insert-entry path is refused.
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         self.push_undo();
         self.snapshot_taken = true;
         // Switch to Insert *before* the sweep: `for_each_cursor` clamps each cursor

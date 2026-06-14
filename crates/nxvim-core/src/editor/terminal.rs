@@ -97,6 +97,21 @@ impl Editor {
             .is_some_and(|ob| ob.buffer.terminal)
     }
 
+    /// Whether the current buffer accepts edits. A **live** terminal-job buffer is
+    /// read-only: its lines mirror the child's screen (overwritten on every refresh),
+    /// so only the child changes it — a `x`/`dd`/`p`/`R` would just corrupt the mirror
+    /// until the next redraw. It becomes editable once the child exits (the `terminal`
+    /// flag is cleared by [`Editor::terminal_closed`]). The edit chokepoints
+    /// (`edit_each_cursor`, `apply_operator_to_range`, `paste`, …) consult this.
+    pub(crate) fn modifiable(&self) -> bool {
+        !self.buffer().terminal
+    }
+
+    /// Echo vim's `E21` when an edit is refused on a read-only (live terminal) buffer.
+    pub(crate) fn refuse_edit(&mut self) {
+        self.echo("E21: Cannot make changes, 'modifiable' is off".to_string());
+    }
+
     /// Replace terminal buffer `buf`'s mirrored screen with `lines` and place the
     /// terminal cursor at `(cursor_row, cursor_col)` (0-based, in the new lines).
     /// Pushed in by the server's terminal engine on each PTY output update. Never
@@ -180,6 +195,10 @@ impl Editor {
         ob.buffer.normalize();
         ob.buffer.modified = false;
         ob.buffer.mark_resync();
+        // The child is gone: clear the terminal flag so the buffer becomes an ordinary
+        // (editable) scratch buffer holding the final output — keystrokes no longer
+        // forward, and the read-only edit guard lifts.
+        ob.buffer.terminal = false;
         if is_current && self.mode == Mode::Terminal {
             self.mode = Mode::Normal;
             self.terminal_pending_backslash = false;

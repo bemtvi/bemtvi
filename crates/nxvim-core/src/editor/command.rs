@@ -1378,6 +1378,10 @@ impl Editor {
             // `R` enters Replace mode: snapshot for undo, then overtype until
             // `<Esc>` (the insert handler honors `Mode::Replace`).
             NormalCmd::EnterReplace => {
+                if !self.modifiable() {
+                    self.refuse_edit();
+                    return;
+                }
                 self.push_undo();
                 self.snapshot_taken = true;
                 self.mode = Mode::Replace;

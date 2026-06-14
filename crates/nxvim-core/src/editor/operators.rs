@@ -50,6 +50,12 @@ impl Editor {
         if lo >= hi {
             return;
         }
+        // A live terminal buffer is read-only — refuse every operator that changes
+        // text (`d`/`c`/`>`/`<`/case/…); `y` (yank) reads only, so it's still allowed.
+        if op != 'y' && !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         // `d`/`y`/`c` write a register; a read-only target aborts the whole
         // operator before any text is touched (vim beeps and does nothing), and a
         // clipboard target with no provider aborts loudly rather than deleting.
@@ -702,6 +708,10 @@ impl Editor {
     }
 
     pub(crate) fn paste(&mut self, after: bool, count: usize) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let reg = self.pending.register;
         // A clipboard paste with no provider errors loudly rather than silently
         // pasting the unnamed register's contents instead.
@@ -773,6 +783,10 @@ impl Editor {
     /// single-source yank, or the set changed — every cursor pastes the active
     /// register, vim's plain `p` broadcast to all.
     pub(crate) fn paste_multi(&mut self, after: bool, count: usize) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let mut positions = self.secondary_cursor_bytes();
         positions.push(self.cursor_char());
         positions.sort_unstable();

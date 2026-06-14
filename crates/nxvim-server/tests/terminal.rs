@@ -160,6 +160,43 @@ async fn reentering_snaps_cursor_to_the_input_position() {
     );
 }
 
+/// A live terminal buffer is read-only in terminal-normal mode: editing commands
+/// (`x`, `dd`, …) are refused so they can't corrupt the mirrored screen. Once the
+/// child exits, the buffer becomes an ordinary editable scratch buffer.
+#[tokio::test]
+async fn live_terminal_buffer_is_read_only() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    feed(&rpc, "hello<CR>");
+    wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
+
+    // Into terminal-normal, to the top, and try to delete — must be refused.
+    feed(&rpc, "<C-\\><C-n>gg");
+    let before = lines(&rpc).await;
+    feed(&rpc, "ddx");
+    assert_eq!(
+        lines(&rpc).await,
+        before,
+        "edits must be refused while the terminal is live"
+    );
+
+    // End the child (EOF); the buffer becomes editable.
+    feed(&rpc, "i<C-d>");
+    wait_lines(&rpc, "the process-exit notice", |ls| {
+        ls.iter().any(|l| l.contains("[Process exited 0]"))
+    })
+    .await;
+    let before_dead = lines(&rpc).await;
+    feed(&rpc, "ggdd");
+    assert_ne!(
+        lines(&rpc).await,
+        before_dead,
+        "a dead terminal buffer is editable"
+    );
+}
+
 /// Triple-`<Esc>` is the discoverable escape hatch: three in a row leave to Normal,
 /// while one or two stay in the job (forwarded to the child).
 #[tokio::test]

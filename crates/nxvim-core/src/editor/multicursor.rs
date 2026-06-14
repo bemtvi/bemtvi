@@ -519,6 +519,12 @@ impl Editor {
     /// an `f` that enters Insert (`cw`/`s`) keeps the flag set so the following
     /// insert session stays in the same group, exactly as single-cursor `cw` does.
     pub(crate) fn edit_each_cursor(&mut self, f: impl Fn(&mut Editor)) {
+        // A live terminal buffer is read-only (its lines mirror the child's screen);
+        // refuse the edit rather than corrupt the mirror. See [`Editor::modifiable`].
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         if !self.cursors_active() {
             f(self);
             return;

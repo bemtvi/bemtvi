@@ -1,0 +1,12 @@
+Watch the message line after this buffer opens — with no keypresses you'll see,
+on wall-clock time: the basic chain (21) and the caught error immediately, then
+nx.promise.delay/all/race lines over the next ~300ms, and finally the
+nx.async/nx.await result (15). The editor stays responsive the whole time.
+
+Inspect the recorded state at any moment:
+
+    :lua print(vim.inspect(_G.promise_demo))
+
+Open examples/promise/init.lua to read the walkthrough. The headline: callback
+APIs become await-able, so a chain of async steps reads top-to-bottom instead of
+nesting into a pyramid of callbacks.

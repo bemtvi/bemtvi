@@ -292,6 +292,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ("nxvim:prelude/keymap", include_str!("prelude/keymap.lua")),
     // nx.timer (vim.defer_fn) over the event-loop bridge.
     ("nxvim:prelude/ui", include_str!("prelude/ui.lua")),
+    // nx.promise / nx.async — Promises/A+ over the microtask (nx.schedule) and
+    // timer (nx.timer) primitives installed just above.
+    ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),

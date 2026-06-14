@@ -135,11 +135,32 @@ impl Editor {
             // byte column. Clamp into the line so a wide-char / trailing-cell cursor
             // never lands past the text. (Wide-char column fidelity is deferred.)
             let col = cursor_col.min(line_text.len());
-            self.cursor.line = line;
-            self.cursor.col = col;
-            self.clamp_cursor();
-            self.ensure_visible();
+            // Stash the child's cursor so re-entering terminal mode (`i`/`a`) can snap
+            // back to it. Move the *live* cursor only while in terminal-job mode — in
+            // terminal-normal mode the user is navigating, so the child's output must
+            // not yank their cursor away.
+            self.terminal_cursor = (line, col);
+            if self.mode == Mode::Terminal {
+                self.cursor.line = line;
+                self.cursor.col = col;
+                self.clamp_cursor();
+                self.ensure_visible();
+            }
         }
+    }
+
+    /// Enter terminal-job mode from terminal-normal (`i`/`a`), snapping the cursor to
+    /// the child's live input position (stashed by [`Editor::terminal_update`]) rather
+    /// than leaving it where normal-mode navigation parked it.
+    pub(crate) fn enter_terminal_mode(&mut self) {
+        self.mode = Mode::Terminal;
+        self.terminal_pending_backslash = false;
+        self.terminal_esc_count = 0;
+        let (line, col) = self.terminal_cursor;
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.clamp_cursor();
+        self.ensure_visible();
     }
 
     /// Mark terminal buffer `buf`'s child as exited with `code`: append a
@@ -186,7 +207,11 @@ impl Editor {
             self.pending_terminal.push(TerminalOp::Send { buf, bytes });
             return;
         }
-        if key.ctrl && key.code == KeyCode::Char('\\') {
+        // The `<C-\>` escape prefix. Terminals deliver Ctrl-\ (the control byte 0x1c)
+        // in two spellings: `<C-\>` proper, and — on macOS / xterm — `<C-4>` (crossterm
+        // decodes 0x1c as Ctrl+'4' via the legacy control-code mapping). Accept both so
+        // `<C-\><C-n>` works regardless of terminal.
+        if key.ctrl && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4')) {
             self.terminal_pending_backslash = true;
             return;
         }
@@ -247,8 +272,16 @@ pub(crate) fn key_to_terminal_bytes(key: Key) -> Vec<u8> {
                 let upper = c.to_ascii_uppercase();
                 match upper {
                     '@'..='_' => vec![(upper as u8) & 0x1f],
-                    ' ' => vec![0],
-                    '?' => vec![0x7f],
+                    // The legacy digit spellings of the C0 controls (xterm / crossterm
+                    // decode the 0x1c..0x1f bytes as Ctrl+'4'..'7'): Ctrl-2 → NUL,
+                    // Ctrl-3 → ESC, Ctrl-4 → FS, … Ctrl-8 → DEL.
+                    ' ' | '2' => vec![0],
+                    '3' => vec![0x1b],
+                    '4' => vec![0x1c],
+                    '5' => vec![0x1d],
+                    '6' => vec![0x1e],
+                    '7' | '/' => vec![0x1f],
+                    '8' | '?' => vec![0x7f],
                     _ => c.to_string().into_bytes(),
                 }
             } else {

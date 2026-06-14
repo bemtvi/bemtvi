@@ -71,6 +71,15 @@ pub enum DockOp {
     Close { side: String },
     /// `nx.dock.focus(side)` — focus the dock (no-op if it isn't open).
     Focus { side: String },
+    /// `nx.dock.opt(side).<name> = <value>` (and the inline keys of
+    /// `nx.dock.open{...}`) — set a dock-scoped option. `name` is `showtabline` /
+    /// `size` (numbers), `title` / `winhighlight` (strings); the core validates the
+    /// name and reports an unknown one.
+    SetOption {
+        side: String,
+        name: String,
+        value: OptionValue,
+    },
 }
 
 /// A request to start (or attach a buffer to) a language server, queued by

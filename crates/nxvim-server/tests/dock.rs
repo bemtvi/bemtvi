@@ -108,6 +108,15 @@ fn region_current(map: &[(Value, Value)], region: &str) -> usize {
         .unwrap_or(0) as usize
 }
 
+/// A region's dock title, as projected in `region_tablines`.
+fn region_title(map: &[(Value, Value)], region: &str) -> String {
+    region_tabline(map, region)
+        .and_then(|r| map_get(r, "title"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 #[tokio::test]
 async fn open_left_dock_adds_a_window_and_reserves_a_band() {
     let (rpc, mut incoming) = start().await;
@@ -417,4 +426,93 @@ async fn four_docks_keep_a_nondegenerate_main_area() {
     };
     assert!(map_get(&rect, "width").and_then(Value::as_u64).unwrap() >= 1);
     assert!(map_get(&rect, "height").and_then(Value::as_u64).unwrap() >= 1);
+}
+
+// ----- Phase 6: per-dock options (the dock scope) ---------------------------
+
+#[tokio::test]
+async fn per_dock_showtabline_override_forces_the_strip() {
+    let (rpc, mut incoming) = start().await;
+    // Default showtabline=1: a single-tab dock shows no tabline.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(region_tab_count(&rd, "left"), 0, "1 tab, default: no strip");
+    // Per-dock showtabline=2 forces this dock's strip on, even with one tab.
+    exec_lua(&rpc, "nx.dock.opt('left').showtabline = 2").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_tab_count(&rd, "left"),
+        1,
+        "override 2: strip shows the lone tab"
+    );
+    // Main still follows the global default (no strip with its single tab).
+    assert_eq!(
+        region_tab_count(&rd, "main"),
+        0,
+        "main unaffected by the dock override"
+    );
+}
+
+#[tokio::test]
+async fn per_dock_showtabline_zero_hides_even_with_two_tabs() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, showtabline = 0 }",
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('tabnew')").await; // two dock tabs
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_tab_count(&rd, "left"),
+        0,
+        "override 0 hides the strip"
+    );
+}
+
+#[tokio::test]
+async fn dock_size_option_resizes_the_band() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 8 }").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(band(&rd, "dock_bottom"), 8, "opened at size 8");
+    exec_lua(&rpc, "nx.dock.opt('bottom').size = 15").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(band(&rd, "dock_bottom"), 15, "size option regrew the band");
+}
+
+#[tokio::test]
+async fn dock_title_projects_and_forces_the_strip() {
+    let (rpc, mut incoming) = start().await;
+    // A title shows the strip even with one tab (and projects in region_tablines).
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, title = 'EXPLORER' }",
+    )
+    .await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_title(&rd, "left"),
+        "EXPLORER",
+        "the dock title projects"
+    );
+    assert!(
+        region_tab_count(&rd, "left") >= 1,
+        "the title forces the strip on"
+    );
+}
+
+#[tokio::test]
+async fn dock_winhighlight_is_reported_not_silently_ignored() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    exec_lua(&rpc, "nx.dock.opt('left').winhighlight = 'Normal:NormalSB'").await;
+    let rd = latest(&mut incoming);
+    let msg = map_get(&rd, "message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        msg.contains("winhighlight") && msg.contains("not implemented"),
+        "winhighlight fails loud, got {msg:?}"
+    );
 }

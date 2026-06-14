@@ -42,6 +42,58 @@ function nx.command(name, fn, opts)
   return nx.user_command.create(name, fn, opts)
 end
 
+-- Dock-scoped options (the dock scope, alongside nx.bo/nx.wo/nx.o). Set via
+-- `nx.dock.opt(side).<name> = <value>` or inline in `nx.dock.open{...}`; read back
+-- through the same proxy. `nx._dock_opts` is a write-through cache keyed by side,
+-- and `nx.dock._set_opt` (Rust) queues the change to the core. Known options:
+-- `showtabline` (0/1/2), `size`, `title`, `winhighlight`.
+nx._dock_opts = nx._dock_opts or {}
+local DOCK_OPT_DEFAULT = { showtabline = nil, size = 0, title = "", winhighlight = "" }
+
+-- Apply one dock option: write-through the cache, then queue it to the core.
+local function dock_set_opt(side, name, value)
+  if DOCK_OPT_DEFAULT[name] == nil and name ~= "showtabline" then
+    return nx.notify("nx.dock.opt: unknown option '" .. tostring(name) .. "'", 4)
+  end
+  nx._dock_opts[side] = nx._dock_opts[side] or {}
+  nx._dock_opts[side][name] = value
+  nx.dock._set_opt(side, name, value)
+end
+
+-- `nx.dock.opt(side)` — an options proxy for one dock, mirroring nx.wo/nx.bo:
+-- reads return the cached value (or the default), writes queue the change.
+nx.dock.opt = function(side)
+  return setmetatable({}, {
+    __index = function(_, k)
+      local cached = nx._dock_opts[side]
+      if cached and cached[k] ~= nil then
+        return cached[k]
+      end
+      return DOCK_OPT_DEFAULT[k]
+    end,
+    __newindex = function(_, k, v)
+      dock_set_opt(side, k, v)
+    end,
+  })
+end
+
+-- Wrap `nx.dock.open` so it accepts the dock options inline (`showtabline`,
+-- `title`, `winhighlight`) alongside `side`/`size`/`buf`, applying them through the
+-- same path so the read cache stays in sync.
+local _dock_open_raw = nx.dock.open
+nx.dock.open = function(o)
+  _dock_open_raw({ side = o.side, size = o.size, buf = o.buf })
+  if o.size ~= nil then
+    nx._dock_opts[o.side] = nx._dock_opts[o.side] or {}
+    nx._dock_opts[o.side].size = o.size
+  end
+  for _, name in ipairs({ "showtabline", "title", "winhighlight" }) do
+    if o[name] ~= nil then
+      dock_set_opt(o.side, name, o[name])
+    end
+  end
+end
+
 -- Dock ex-commands — thin wrappers over the Rust-backed `nx.dock.*` surface
 -- (installed before the prelude), dogfooding the nx API. `:DockOpen {side} [size]`
 -- opens/focuses a permanent edge panel; `:DockClose`/`:DockFocus {side}` address it.

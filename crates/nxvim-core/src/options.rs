@@ -175,6 +175,26 @@ impl Default for WindowOptions {
     }
 }
 
+/// Dock-local options — the **dock** scope, alongside the buffer, window, and
+/// global scopes. One [`DockOptions`] per side lives on the editor (indexed by
+/// `DockSide::idx`), so each permanent dock can override chrome that doesn't fit
+/// the buffer or window scope. The dock's *size* is not here — it stays in the
+/// load-bearing `dock_sizes` array — but the `nx.dock.opt` surface presents it
+/// alongside these so a dock reads as one options bag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockOptions {
+    /// Per-dock `'showtabline'` override: `None` follows the global
+    /// [`Options::showtabline`]; `Some(n)` forces this dock's own tabline gate
+    /// (`0` never, `1` only with >1 tab, `2` always). Lets, e.g., an explorer dock
+    /// always show its tabline while other regions follow the global default.
+    pub showtabline: Option<u8>,
+    /// A fixed label shown at the start of this dock's tabline strip, independent
+    /// of the buffer names (e.g. `EXPLORER`, `TERMINAL`). Empty ⇒ no title; a
+    /// non-empty title also makes the strip appear even with a single tab (unless
+    /// `showtabline` is `0`).
+    pub title: String,
+}
+
 /// A buffer-local `'regexsyntax'` value: an explicit dialect for this buffer, or
 /// [`Inherit`](RegexSyntax::Inherit) to follow the global [`Options::regexsyntax`].
 /// This is what makes `regexsyntax` a *global-local* option — a buffer can pin its

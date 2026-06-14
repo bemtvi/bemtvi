@@ -16,7 +16,7 @@ use crate::highlight::Highlights;
 use crate::host::{HostFs, StdHostFs};
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
-use crate::options::Options;
+use crate::options::{DockOptions, Options};
 use crate::search::{RegexEngine, SearchRegex};
 
 /// Memoized search regex for the highlight path, keyed by the
@@ -558,6 +558,11 @@ pub struct Editor {
     /// `Top`/`Bottom`. Meaningful only where the dock is open. Indexed by
     /// [`DockSide::idx`].
     dock_sizes: [usize; 4],
+    /// Per-dock options — the **dock** scope (see [`DockOptions`]), indexed by
+    /// [`DockSide::idx`] like `dock_sizes`. Set through `nx.dock.opt` /
+    /// `nx.dock.open{...}`; persists across close/reopen of a side. The dock's
+    /// *size* lives in `dock_sizes`, not here.
+    dock_options: [DockOptions; 4],
     /// The dock a non-directional `<C-w><C-w>{cmd}` (e.g. `<C-w><C-w>v`) crosses
     /// to — the most recently focused dock. Directional crosses pick by edge
     /// instead ([`DockSide::from_dir`]).
@@ -1048,6 +1053,7 @@ impl Editor {
             dock_tabs: [None, None, None, None],
             focused_layer: Layer::Main,
             dock_sizes: [0; 4],
+            dock_options: Default::default(),
             last_dock: DockSide::Left,
             alternate: None,
             global_marks: HashMap::new(),

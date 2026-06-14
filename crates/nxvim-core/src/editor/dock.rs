@@ -326,4 +326,60 @@ impl Editor {
     pub fn dock_is_open_named(&self, side: &str) -> bool {
         DockSide::from_keyword(side).is_some_and(|s| self.dock_is_open(s))
     }
+
+    /// `nx.dock.opt(side).<name> = <number>` — set a numeric dock option by side
+    /// keyword: `showtabline` (0/1/2, the per-dock override) or `size` (the dock's
+    /// reserved width/height, kept in `dock_sizes`). An unknown side or option is
+    /// reported, never silently ignored.
+    pub fn set_dock_option_num(&mut self, side: &str, name: &str, value: i64) {
+        let Some(s) = DockSide::from_keyword(side) else {
+            self.echo(format!("E474: Invalid dock side: {side}"));
+            return;
+        };
+        match name {
+            "showtabline" => self.dock_options[s.idx()].showtabline = Some(value.clamp(0, 2) as u8),
+            "size" => self.dock_sizes[s.idx()] = value.max(1) as usize,
+            other => return self.echo(format!("E474: unknown dock option: {other}")),
+        }
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// `nx.dock.opt(side).<name> = <string>` — set a string dock option by side
+    /// keyword: `title` (a fixed strip label). `winhighlight` is recognized but not
+    /// implemented yet (it needs per-window backgrounds through the highlight
+    /// pipeline), so it fails loud rather than silently doing nothing.
+    pub fn set_dock_option_str(&mut self, side: &str, name: &str, value: String) {
+        let Some(s) = DockSide::from_keyword(side) else {
+            self.echo(format!("E474: Invalid dock side: {side}"));
+            return;
+        };
+        match name {
+            "title" => self.dock_options[s.idx()].title = value,
+            "winhighlight" => {
+                return self.echo("nx.dock: 'winhighlight' is not implemented yet".to_string());
+            }
+            other => return self.echo(format!("E474: unknown dock option: {other}")),
+        }
+        self.relayout();
+    }
+
+    /// The dock-option values for `side` (keyword), for the `nx._dock_opts` read
+    /// surface: `(showtabline_override, title, size)`. `None`/empty/`0` where unset
+    /// or the side is invalid.
+    pub fn dock_option_values(&self, side: &str) -> (Option<u8>, String, usize) {
+        match DockSide::from_keyword(side) {
+            Some(s) => {
+                let o = &self.dock_options[s.idx()];
+                (o.showtabline, o.title.clone(), self.dock_sizes[s.idx()])
+            }
+            None => (None, String::new(), 0),
+        }
+    }
+
+    /// A dock's title (the `nx.dock` strip label), for the view projection. Empty
+    /// when unset or the dock isn't open.
+    pub(crate) fn dock_title(&self, side: DockSide) -> &str {
+        &self.dock_options[side.idx()].title
+    }
 }

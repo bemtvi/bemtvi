@@ -170,6 +170,10 @@ impl Editor {
                 .map(crate::view::tab_label_to_view)
                 .collect(),
             current: self.stack(layer).map_or(0, |s| s.current),
+            title: match layer {
+                Layer::Dock(s) => self.dock_title(s).to_string(),
+                Layer::Main => String::new(),
+            },
         };
         crate::view::RegionTablines {
             main: region(Layer::Main),

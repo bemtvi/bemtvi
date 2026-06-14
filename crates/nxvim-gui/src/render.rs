@@ -1226,6 +1226,7 @@ impl Renderer {
         }
 
         self.build_tab_cells(
+            "",
             &view.tabline,
             view.current_tab,
             0,
@@ -1238,11 +1239,13 @@ impl Renderer {
     }
 
     /// Paint built-in tabline cells (` {count} {label}{+} `, active cell
-    /// reverse-video) starting at cell `(x0, row)`. Shared by the global (main)
+    /// reverse-video) starting at cell `(x0, row)`, preceded by an optional bold
+    /// `title` label (the `nx.dock` dock title). Shared by the global (main)
     /// tabline and each dock's own tabline ([`build_dock_tablines`]).
     #[allow(clippy::too_many_arguments)]
     fn build_tab_cells(
         &mut self,
+        title: &str,
         tabs: &[TabData],
         current: usize,
         x0: u16,
@@ -1253,6 +1256,14 @@ impl Renderer {
         items: &mut Vec<TextItem>,
     ) {
         let mut col = x0;
+        if !title.is_empty() {
+            let text = format!(" {title} ");
+            let w = text.chars().count() as u16;
+            let pos = self.cell_px(col, row);
+            let full = self.full_bounds();
+            self.push_plain(items, &text, pos, base_fg, full);
+            col = col.saturating_add(w);
+        }
         for (i, tab) in tabs.iter().enumerate() {
             let count = if tab.window_count > 1 {
                 format!("{} ", tab.window_count)
@@ -1294,7 +1305,7 @@ impl Renderer {
             if present && !rt.tabs.is_empty() {
                 self.fill_cells(quads, x0, row, width, base_bg);
                 self.build_tab_cells(
-                    &rt.tabs, rt.current, x0, row, base_bg, base_fg, quads, items,
+                    &rt.title, &rt.tabs, rt.current, x0, row, base_bg, base_fg, quads, items,
                 );
             }
         }

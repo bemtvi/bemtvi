@@ -1079,13 +1079,14 @@ fn no_tabline_with_a_single_tab() {
     assert_eq!(row_text(&buf, 0).trim_end(), "hello");
 }
 
-/// Build a `region_tablines` map value with one region's `{ tabs, current }`.
-fn region_tablines(region: &str, tabs: &[(&str, bool, u64)], current: u64) -> Value {
+/// Build a `region_tablines` map value with one region's `{ tabs, current, title }`.
+fn region_tablines(region: &str, tabs: &[(&str, bool, u64)], current: u64, title: &str) -> Value {
     Value::Map(vec![(
         Value::from(region),
         Value::Map(vec![
             (Value::from("tabs"), tabline(tabs)),
             (Value::from("current"), Value::from(current)),
+            (Value::from("title"), Value::from(title)),
         ]),
     )])
 }
@@ -1104,7 +1105,7 @@ fn a_top_dock_paints_its_own_tabline_above_its_content() {
         ("dock_top", Value::from(3u64)),
         (
             "region_tablines",
-            region_tablines("top", &[("a.txt", false, 1), ("b.txt", true, 1)], 1),
+            region_tablines("top", &[("a.txt", false, 1), ("b.txt", true, 1)], 1, ""),
         ),
     ]);
     let buf = paint(&v, 20, 8);
@@ -1142,5 +1143,42 @@ fn a_single_tab_dock_draws_no_tabline() {
     assert!(
         row_text(&buf, 0).starts_with("DOCKTEXT"),
         "no dock tabline: content keeps row 0"
+    );
+}
+
+#[test]
+fn a_dock_title_paints_at_the_start_of_its_tabline_strip() {
+    // A titled dock shows its strip even with one tab: the title leads the row,
+    // then the tab cell, and the window content sits below.
+    let windows = Value::Array(vec![
+        region_window(rect(0, 0, 20, 2), "dock_top", false, &["DOCKTEXT"]),
+        region_window(rect(0, 0, 20, 4), "main", true, &["MAIN"]),
+    ]);
+    let v = view(vec![
+        ("windows", windows),
+        ("dock_top", Value::from(3u64)),
+        (
+            "region_tablines",
+            region_tablines("top", &[("a.txt", false, 1)], 0, "EXPLORER"),
+        ),
+    ]);
+    let buf = paint(&v, 20, 8);
+    let strip = row_text(&buf, 0);
+    assert!(
+        strip.contains("EXPLORER"),
+        "the dock title leads the strip: {strip:?}"
+    );
+    assert!(
+        strip.contains("a.txt"),
+        "the tab cell follows the title: {strip:?}"
+    );
+    // The title sits before the tab cell.
+    assert!(
+        strip.find("EXPLORER").unwrap() < strip.find("a.txt").unwrap(),
+        "title precedes the cells: {strip:?}"
+    );
+    assert!(
+        row_text(&buf, 1).starts_with("DOCKTEXT"),
+        "content below the strip"
     );
 }

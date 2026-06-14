@@ -290,6 +290,10 @@ pub struct TabView {
 pub struct RegionTabline {
     pub tabs: Vec<TabView>,
     pub current: usize,
+    /// A fixed dock title shown at the start of the strip (the `nx.dock` `title`
+    /// option), independent of the tab cells. Empty for the main region and for a
+    /// dock with no title.
+    pub title: String,
 }
 
 /// Every region's independent tabline (see [`RegionTabline`]): the main editor

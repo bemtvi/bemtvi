@@ -612,6 +612,7 @@ fn region_tabline_value(rt: &RegionTabline) -> Value {
             Value::Array(rt.tabs.iter().map(tab_value).collect()),
         ),
         (Value::from("current"), Value::from(rt.current as u64)),
+        (Value::from("title"), Value::from(rt.title.as_str())),
     ])
 }
 

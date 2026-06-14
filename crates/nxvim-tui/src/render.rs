@@ -472,7 +472,7 @@ impl DockLayout {
         ];
         for (area, region) in docks {
             if let Some(area) = area {
-                render_tab_cells(frame, area, &region.tabs, region.current);
+                render_tab_cells(frame, area, &region.title, &region.tabs, region.current);
             }
         }
     }
@@ -1512,19 +1512,26 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
         return;
     }
 
-    render_tab_cells(frame, area, &view.tabline, view.current_tab);
+    render_tab_cells(frame, area, "", &view.tabline, view.current_tab);
 }
 
-/// Paint built-in tabline cells into `area`: one ` {count} {name}{+} ` cell per
-/// tab (the window count only when >1, a `+` when modified — vim's default), the
-/// `current` cell reverse-video and the strip past the last cell left blank
-/// (vim's `TabLineFill`). Shared by the global (main) tabline and each dock's own
-/// tabline. A no-op for an empty `tabs` or a zero-height `area`.
-fn render_tab_cells(frame: &mut Frame, area: Rect, tabs: &[TabData], current: usize) {
-    if tabs.is_empty() || area.height == 0 {
+/// Paint built-in tabline cells into `area`: an optional bold `title` label first
+/// (the `nx.dock` dock title), then one ` {count} {name}{+} ` cell per tab (the
+/// window count only when >1, a `+` when modified — vim's default), the `current`
+/// cell reverse-video and the strip past the last cell left blank (vim's
+/// `TabLineFill`). Shared by the global (main) tabline and each dock's own
+/// tabline. A no-op for an empty strip (no title and no tabs) or zero-height area.
+fn render_tab_cells(frame: &mut Frame, area: Rect, title: &str, tabs: &[TabData], current: usize) {
+    if (title.is_empty() && tabs.is_empty()) || area.height == 0 {
         return;
     }
-    let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
+    let mut spans: Vec<Span> = Vec::with_capacity(tabs.len() + 1);
+    if !title.is_empty() {
+        spans.push(Span::styled(
+            format!(" {title} "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
     for (i, tab) in tabs.iter().enumerate() {
         let count = if tab.window_count > 1 {
             format!("{} ", tab.window_count)

@@ -250,6 +250,35 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
+    // `nx._dock_set_opt(side, name, value)`: queue a [`DockOp::SetOption`] for the
+    // dock scope. The prelude's `nx.dock.opt(side)` proxy (and the inline keys of
+    // `nx.dock.open{...}`) call this after write-through to `nx._dock_opts`. A
+    // number rides as `Number` (`showtabline`/`size`), a string as `String`
+    // (`title`/`winhighlight`); the core validates the name. Other types are
+    // ignored.
+    let sh = shared.clone();
+    dock.set(
+        "_set_opt",
+        lua.create_function(
+            move |_, (side, name, value): (String, String, mlua::Value)| {
+                let value = match value {
+                    mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
+                    mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
+                    mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                    mlua::Value::String(s) => {
+                        s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
+                    }
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    sh.borrow_mut()
+                        .dock_ops
+                        .push(DockOp::SetOption { side, name, value });
+                }
+                Ok(())
+            },
+        )?,
+    )?;
     nx.set("dock", dock)?;
 
     // ----- the async runtime bridge (the "event loop") -----------------------

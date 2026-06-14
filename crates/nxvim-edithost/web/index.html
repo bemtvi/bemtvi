@@ -1064,15 +1064,16 @@
       renderWindow(w, tablineRows, hl);
     }
     // Paint tabline cells (` ▸{count}{label}{+} `, the active cell marked) for a
-    // `{ tabs, current }` at cell (x, y) spanning `width` cells. Shared by the
-    // global (main) tabline and each dock's own tabline.
-    function renderTabCells(tabs, current, x, y, width) {
+    // `{ tabs, current }` at cell (x, y) spanning `width` cells, preceded by an
+    // optional `title` label (the nx.dock dock title). Shared by the global (main)
+    // tabline and each dock's own tabline.
+    function renderTabCells(tabs, current, x, y, width, title) {
       const el = document.createElement("div");
       el.className = "row statusline";
       el.style.left = x * cw + "px";
       el.style.top = y * ch + "px";
       el.style.width = width * cw + "px";
-      let s = "";
+      let s = title ? ` ${title} ` : "";
       tabs.forEach((t, i) => {
         const count = t.window_count > 1 ? t.window_count + " " : "";
         const mark = i === current ? "▸" : " ";
@@ -1082,7 +1083,7 @@
       gridEl.appendChild(el);
     }
     function renderTabline(y) {
-      renderTabCells(view.tabline, view.current_tab, 0, y, cols);
+      renderTabCells(view.tabline, view.current_tab, 0, y, cols, "");
     }
     // Each open dock paints its own tabline into its band's first row.
     function renderDockTablines(tablineRows) {
@@ -1097,7 +1098,7 @@
       for (const [region, x, y, width] of docks) {
         if (!dockTl(region, g)) continue;
         const rt = regionTabs(region);
-        renderTabCells(rt.tabs, rt.current, x, y, width);
+        renderTabCells(rt.tabs, rt.current, x, y, width, rt.title || "");
       }
     }
     function renderPanel(panel, cmdRow) {

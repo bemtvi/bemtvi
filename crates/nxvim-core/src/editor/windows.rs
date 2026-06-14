@@ -1873,10 +1873,23 @@ impl Editor {
         let Some(stack) = self.stack(layer) else {
             return false;
         };
-        match self.options.showtabline {
+        // A dock may override `showtabline` and/or carry a title (which forces its
+        // strip on, unless the override is `0`); the main layer always follows the
+        // global option.
+        let (showtabline, has_title) = match layer {
+            Layer::Dock(s) => {
+                let opt = &self.dock_options[s.idx()];
+                (
+                    opt.showtabline.unwrap_or(self.options.showtabline),
+                    !opt.title.is_empty(),
+                )
+            }
+            Layer::Main => (self.options.showtabline, false),
+        };
+        match showtabline {
             0 => false,
             2 => true,
-            _ => stack.tabs.len() > 1,
+            _ => has_title || stack.tabs.len() > 1,
         }
     }
 

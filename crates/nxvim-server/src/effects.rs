@@ -172,6 +172,15 @@ impl EditHost {
                 ),
                 DockOp::Close { side } => self.editor.close_dock_named(&side),
                 DockOp::Focus { side } => self.editor.focus_dock_named(&side),
+                DockOp::SetOption { side, name, value } => match value {
+                    OptionValue::Number(n) => self.editor.set_dock_option_num(&side, &name, n),
+                    OptionValue::String(s) => self.editor.set_dock_option_str(&side, &name, s),
+                    OptionValue::Bool(b) => {
+                        // No dock option is boolean today; route through the numeric
+                        // setter (0/1) so an unknown name still reports loudly.
+                        self.editor.set_dock_option_num(&side, &name, i64::from(b))
+                    }
+                },
             }
         }
         // Server-start requests from `vim.lsp.start` (the `vim.lsp.enable` FileType

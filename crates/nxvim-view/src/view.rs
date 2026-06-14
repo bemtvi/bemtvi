@@ -347,6 +347,9 @@ pub struct TabData {
 pub struct RegionTabline {
     pub tabs: Vec<TabData>,
     pub current: usize,
+    /// A fixed dock title shown at the start of the strip (the `nx.dock` `title`
+    /// option). Empty for the main region and untitled docks.
+    pub title: String,
 }
 
 /// Every region's independent tabline (see [`RegionTabline`]): the main editor
@@ -637,6 +640,7 @@ fn parse_region_tablines(value: Option<&Value>) -> RegionTablines {
             Some(Value::Map(r)) => RegionTabline {
                 tabs: parse_tabline(map_get(r, "tabs")),
                 current: map_u64(r, "current") as usize,
+                title: map_str(r, "title"),
             },
             _ => RegionTabline::default(),
         }

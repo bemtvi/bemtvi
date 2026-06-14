@@ -18,6 +18,11 @@ use crate::buffer::Buffer;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 
+/// Max gap (ms) between consecutive `<Esc>`es for the triple-`<Esc>` terminal escape
+/// chord — three within this window of each other leave terminal mode. Matches the
+/// `'mousetime'` default feel for "quick repeated taps."
+const ESC_CHORD_WINDOW_MS: u64 = 500;
+
 /// An action the core asks the server to perform on a terminal's PTY. Core can't
 /// touch a process (it is pure/sync), so terminal lifecycle and input are enqueued
 /// here and drained by the server with [`Editor::take_pending_terminal`] — the
@@ -261,11 +266,21 @@ impl Editor {
             self.terminal_pending_backslash = true;
             return;
         }
-        // Triple-`<Esc>` is a discoverable escape hatch beside `<C-\><C-n>`: the first
-        // two `<Esc>`es are still forwarded to the child (so vim/htop inside keep
-        // working), the third leaves to Normal. Any other key resets the run.
+        // Triple-`<Esc>` is a discoverable escape hatch beside `<C-\><C-n>`: three in
+        // *quick succession* (each within the chord window) leave to Normal, while the
+        // first two `<Esc>`es are still forwarded to the child (so vim/htop inside keep
+        // working). A slow `<Esc>` (gap past the window) restarts the run, so deliberate
+        // single escapes a TUI program wants aren't hijacked. Any other key resets it.
         if key.code == KeyCode::Esc && !key.ctrl && !key.alt {
-            self.terminal_esc_count += 1;
+            let now = self.now_ms;
+            let quick = self.terminal_esc_count > 0
+                && now.saturating_sub(self.terminal_last_esc_ms) <= ESC_CHORD_WINDOW_MS;
+            self.terminal_esc_count = if quick {
+                self.terminal_esc_count + 1
+            } else {
+                1
+            };
+            self.terminal_last_esc_ms = now;
             if self.terminal_esc_count >= 3 {
                 self.leave_terminal_mode();
                 return;

@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{command, cursor, feed, lines, mode, serial_lock, start_attached};
+use nxvim_test_harness::{
+    attach, command, cursor, feed, lines, mode, serial_lock, spawn, start_attached, TestClock,
+};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -235,26 +237,55 @@ async fn live_terminal_buffer_is_read_only() {
     );
 }
 
-/// Triple-`<Esc>` is the discoverable escape hatch: three in a row leave to Normal,
-/// while one or two stay in the job (forwarded to the child).
-#[tokio::test]
-async fn triple_esc_leaves_terminal_mode() {
-    let _guard = serial_lock().lock().await;
-    let (rpc, _incoming) = start().await;
+/// Start a clocked terminal session so the triple-`<Esc>` chord window is driven
+/// deterministically (no wall-clock timing in the test).
+async fn start_clocked() -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
+    let clock = TestClock::new();
+    let init = ServerInit {
+        mouse_clock: Some(clock.handle()),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, clock, incoming)
+}
 
+/// Triple-`<Esc>` in quick succession (each press within the chord window) leaves
+/// terminal mode; the first two are still forwarded to the child.
+#[tokio::test]
+async fn triple_esc_quick_succession_leaves() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, clock, _incoming) = start_clocked().await;
+
+    clock.set_ms(1000);
     command(&rpc, "terminal cat").await;
-    // One or two escapes do not leave — they go to the program.
-    feed(&rpc, "<Esc><Esc>");
-    assert_eq!(
-        mode(&rpc).await,
-        "t",
-        "two escapes stay in the terminal job"
-    );
-    // The third in the run leaves to terminal-normal.
+    clock.set_ms(1000);
     feed(&rpc, "<Esc>");
-    assert_eq!(
-        mode(&rpc).await,
-        "n",
-        "the third escape leaves terminal mode"
-    );
+    assert_eq!(mode(&rpc).await, "t", "one escape stays");
+    clock.set_ms(1100);
+    feed(&rpc, "<Esc>");
+    assert_eq!(mode(&rpc).await, "t", "two escapes stay");
+    clock.set_ms(1200);
+    feed(&rpc, "<Esc>");
+    assert_eq!(mode(&rpc).await, "n", "three quick escapes leave");
+}
+
+/// Escapes spaced further apart than the chord window never leave — so a TUI program
+/// inside the terminal still gets each lone `<Esc>`.
+#[tokio::test]
+async fn slow_escapes_stay_in_terminal_mode() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, clock, _incoming) = start_clocked().await;
+
+    clock.set_ms(0);
+    command(&rpc, "terminal cat").await;
+    for t in [1000u64, 2000, 3000] {
+        clock.set_ms(t);
+        feed(&rpc, "<Esc>");
+        assert_eq!(
+            mode(&rpc).await,
+            "t",
+            "a spaced-out escape stays in the job"
+        );
+    }
 }

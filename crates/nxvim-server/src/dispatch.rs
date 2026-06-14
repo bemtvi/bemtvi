@@ -28,6 +28,10 @@ impl EditHost {
         let now = self.start.elapsed().as_secs() as i64;
         self.editor.set_now_mono(now);
         let _ = self.lua.set_mono_secs(now);
+        // Millisecond clock for sub-second timing (the terminal triple-`<Esc>` chord),
+        // from the same source as the mouse multi-click clock so a test's fake clock
+        // drives both deterministically.
+        self.editor.set_now_ms(self.mouse_stamp_ms());
         match message {
             Incoming::Request { id, method, params } => {
                 match self.dispatch(&method, &params) {

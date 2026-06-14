@@ -797,6 +797,10 @@ pub struct Editor {
     /// undo nodes at commit and surfaced via `vim.fn.undotree()`/`localtime()`;
     /// monotonic so elapsed-time labels are immune to wall-clock jumps.
     now_mono: i64,
+    /// Current time in **milliseconds**, injected by the server before each message
+    /// (same source as the mouse multi-click clock). Finer-grained than [`now_mono`]
+    /// for sub-second timing — the terminal triple-`<Esc>` chord window reads it.
+    now_ms: u64,
     /// Provenance for soft-tab `<BS>`: `(line, anchor_col)` of the whitespace run
     /// the *immediately preceding* `<Tab>` keypress inserted as spaces (its
     /// `anchor_col` is where the whole run began, preserved across consecutive
@@ -976,6 +980,11 @@ pub struct Editor {
     /// `a` from terminal-normal) snaps the cursor back here — to the live input
     /// position — rather than leaving it wherever normal-mode navigation parked it.
     terminal_cursor: (usize, usize),
+    /// [`now_ms`](Self::now_ms) of the most recent `<Esc>` in terminal mode, so the
+    /// triple-`<Esc>` chord only fires on three presses in *quick succession* — a gap
+    /// longer than the chord window restarts the run (so a TUI program inside the
+    /// terminal that wants a lone `<Esc>` isn't hijacked).
+    terminal_last_esc_ms: u64,
 }
 
 impl Editor {
@@ -1126,6 +1135,7 @@ impl Editor {
             pending_visual: None,
             snapshot_taken: false,
             now_mono: 0,
+            now_ms: 0,
             soft_tab: None,
             awaiting_register: false,
             visual_anchor: Cursor::default(),
@@ -1158,6 +1168,7 @@ impl Editor {
             terminal_pending_backslash: false,
             terminal_esc_count: 0,
             terminal_cursor: (0, 0),
+            terminal_last_esc_ms: 0,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.
@@ -1236,6 +1247,13 @@ impl Editor {
     /// share one monotonic timeline. See [`Editor::now_mono`].
     pub fn set_now_mono(&mut self, secs: i64) {
         self.now_mono = secs;
+    }
+
+    /// Inject the current time in milliseconds (same source as the mouse clock),
+    /// before each message. Read by sub-second timing like the terminal triple-`<Esc>`
+    /// chord window. See [`Editor::now_ms`].
+    pub fn set_now_ms(&mut self, ms: u64) {
+        self.now_ms = ms;
     }
 
     /// Feed a single key into the editor.

@@ -14,6 +14,7 @@
 //     isolation) — request/response messages, correlated by `id`. Timers don't fire in
 //     this mode (no run loop to wake them); input still works.
 import createModule from "../dist/eh.mjs";
+import { dialDaemon } from "./rpc.mjs";
 
 const M = await createModule();
 
@@ -271,10 +272,82 @@ async function opfsWrite(path, bytes) {
   }
 }
 
-// Drain every off-tick fs request the editor enqueued, run its OPFS op, and land the
-// result back into the tick. Loops until the queue is dry, because landing a read fires
-// `BufReadPost` autocmds (and `run_pending`) that may enqueue further opens/saves.
-// Returns whether any request was handled (so the caller posts a fresh redraw).
+// =============================================================================
+// Off-tick daemon filesystem (Phase 6b) — the WebTransport/QUIC remote.
+//
+// When the page is opened with `?daemon=nxvim://HOST:PORT/TOKEN?cert=HASH`, the same
+// off-tick fs seam that OPFS satisfies serverless-ly is instead fulfilled over a real
+// WebTransport connection to a remote `nxvim --daemon --listen` (rpc.mjs). The editor is
+// unchanged — `has_remote_fs()` is already true, so `:e`/`:w` defer the same way; only the
+// transport that answers `eh_take_fs_requests` differs. This is the browser twin of the
+// native `connect_quic` fs leg (Phase 3d/3e): editing stays in the Worker, only fs crosses
+// the wire. The other five legs (proc/watch/lsp/sys_run/luafs) are later slices on this
+// same `RpcClient`. Config + shada stay LOCAL (OPFS) even in daemon mode — the thesis.
+//
+// `daemonUri` rides the Worker's own URL (`?daemon=…`), so the Worker self-configures with
+// no boot-message race. In daemon mode fs NEVER silently falls back to OPFS: a dial failure
+// surfaces loudly and every fs request errors with that reason (CLAUDE.md "fail loud").
+// =============================================================================
+const daemonUri = new URL(self.location.href).searchParams.get("daemon");
+let daemon = null; // an RpcClient once connected
+let daemonError = null; // a dial failure reason (daemon mode requested but not connected)
+
+async function connectDaemon() {
+  if (!daemonUri) return;
+  try {
+    daemon = await dialDaemon(daemonUri);
+    // The fs leg uses no daemon→edit-host pushes; later legs (proc/watch/lsp) route here.
+    daemon.onNotify = () => {};
+  } catch (e) {
+    daemonError = String(e && e.message ? e.message : e);
+    postMessage({ type: "config_error", error: `daemon connection failed: ${daemonError}` });
+  }
+}
+
+// Fulfil one off-tick read over the daemon, projecting `fs_read`'s reply onto the same
+// `{ kind, text, path? }` shape `opfsRead` returns (so the applier path is identical).
+async function daemonRead(path) {
+  if (!daemon) return { kind: 3, text: daemonError || "daemon not connected" };
+  try {
+    const reply = await daemon.request("fs_read", [path]);
+    const tag = Array.isArray(reply) ? reply[0] : null;
+    if (tag === "file") return { kind: 0, text: utf8(reply[1]) };
+    if (tag === "new") return { kind: 1, text: "" };
+    if (tag === "dir") {
+      // Daemon entries are `[[is_dir, name], …]`; the wasm dir applier wants `[{is_dir,name}]`.
+      const entries = (reply[2] || []).map(([is_dir, name]) => ({ is_dir, name }));
+      return { kind: 2, text: JSON.stringify(entries), path: reply[1] };
+    }
+    return { kind: 3, text: `unexpected fs_read reply: ${JSON.stringify(reply)}` };
+  } catch (e) {
+    return { kind: 3, text: String(e && e.message ? e.message : e) };
+  }
+}
+
+// Fulfil one off-tick write over the daemon, projecting `fs_write`'s `["ok", stat?]` reply
+// onto the `{ ok, size, mtimeMs, error }` the write applier needs. An RPC error rejects →
+// a loud `{ ok: false }` (the editor's saved-state clears only on a real ack).
+async function daemonWrite(path, bytes) {
+  if (!daemon) return { ok: false, error: daemonError || "daemon not connected" };
+  try {
+    const reply = await daemon.request("fs_write", [path, bytes]);
+    const stat = Array.isArray(reply) ? reply[1] : null; // [secs, nanos, size] | null
+    if (Array.isArray(stat)) {
+      const [secs, nanos, size] = stat;
+      const mtimeMs = secs != null ? secs * 1000 + Math.floor((nanos || 0) / 1e6) : -1;
+      return { ok: true, size: size ?? bytes.length, mtimeMs };
+    }
+    return { ok: true, size: bytes.length, mtimeMs: -1 };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+// Drain every off-tick fs request the editor enqueued, run its op (OPFS serverless, or the
+// daemon over WebTransport when `?daemon=` is set), and land the result back into the tick.
+// Loops until the queue is dry, because landing a read fires `BufReadPost` autocmds (and
+// `run_pending`) that may enqueue further opens/saves. Returns whether any request was
+// handled (so the caller posts a fresh redraw).
 async function fulfillFsRequests() {
   let didWork = false;
   for (;;) {
@@ -288,7 +361,7 @@ async function fulfillFsRequests() {
         dispatchRealFsRead(r.buffer, r.path);
         continue;
       }
-      const res = await opfsRead(r.path);
+      const res = daemonUri ? await daemonRead(r.path) : await opfsRead(r.path);
       // A directory read carries its canonical dir in res.path (the explorer navigates
       // from it); a file/new/err keeps the requested path.
       eh_fs_read_complete(h, r.buffer, res.path ?? r.path, res.kind, res.text);
@@ -306,10 +379,10 @@ async function fulfillFsRequests() {
       const ptr = eh_save_bytes(h, w.seq);
       const len = eh_save_len(h, w.seq);
       const bytes = ptr ? new Uint8Array(M.HEAPU8.subarray(ptr, ptr + len)) : new Uint8Array(0);
-      const res = await opfsWrite(w.path, bytes);
-      // mtime_ms = -1: OPFS sync handles don't expose mtime and there's no watch leg, so
-      // the disk baseline doesn't need it.
-      eh_fs_write_complete(h, w.seq, res.ok ? 1 : 0, res.ok ? res.size : 0, -1, res.ok ? "" : res.error);
+      const res = daemonUri ? await daemonWrite(w.path, bytes) : await opfsWrite(w.path, bytes);
+      // mtime_ms: OPFS has no watch leg (so -1 is fine); the daemon returns a real stat
+      // (`res.mtimeMs`) the editor stamps as its disk baseline.
+      eh_fs_write_complete(h, w.seq, res.ok ? 1 : 0, res.ok ? res.size : 0, res.mtimeMs ?? -1, res.ok ? "" : res.error);
     }
   }
 }
@@ -568,6 +641,11 @@ onmessage = async (ev) => {
       postMessage({ type: "fatal", error: `unknown worker message: ${msg.type}` });
   }
 };
+
+// Connect the daemon (if `?daemon=` was passed) *before* boot finishes, so the link is
+// live for the first user `:e` — and a dial failure surfaces before "ready". A no-op in
+// serverless (OPFS) mode.
+await connectDaemon();
 
 // Source the optional /init.lua + finish boot before announcing "ready", so the config
 // is fully applied before the UI attaches and the first frame paints. Run here (module

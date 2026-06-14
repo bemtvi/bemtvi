@@ -10,11 +10,23 @@ of
 It links the **production** `nxvim-server` tick (the keystroke path is the same one the
 native server drives — not a hand-wired minimal tie-in).
 
-## What runs here vs. not (serverless)
+## What runs here vs. not (serverless, or a daemon over WebTransport)
 
-The browser build is **serverless**: there is no daemon, so anything that needs a
+The browser build runs **serverless by default**: no daemon, so anything that needs a
 *process* is unavailable and fails *loud*, never silently. Files, however, persist —
-they live in the browser's Origin Private File System (OPFS, Phase 6a):
+they live in the browser's Origin Private File System (OPFS, Phase 6a).
+
+**Optional daemon mode (Phase 6b):** opening the page with
+`?daemon=nxvim://HOST:PORT/TOKEN?cert=HASH` (the connect string a `nxvim --daemon --listen`
+prints) makes `:e` / `:w` / `:e <dir>` operate on the **daemon's** filesystem over a real
+**WebTransport (HTTP/3 / QUIC)** connection instead of OPFS — the browser twin of the native
+daemon fs leg, editing still entirely in the Worker (only fs crosses the wire). The off-tick
+seam is identical; only the transport differs (OPFS ↔ the `web/rpc.mjs` msgpack-RPC client
+over a bidi stream). Config + shada stay **local** (OPFS) even in daemon mode. The other
+daemon legs (processes / LSP / watch / `sys_run` / `luafs`) over WebTransport are later
+slices — so a daemon session still fails `system()` loud for now.
+
+The serverless capability map (the default; daemon mode adds remote files + the legs above):
 
 - ✅ Core editing + the full Lua VM + autocmds + the redraw projection.
 - ✅ **Files via OPFS** (Phase 6a): `:e` / `:w` open/save real files in the browser's
@@ -37,7 +49,8 @@ they live in the browser's Origin Private File System (OPFS, Phase 6a):
   (Lua's `require` is synchronous). Multi-file/plugin configs are a later step.
 - ❌ Processes — `vim.fn.system` / `nx._system` fail loud with a named "not available in
   the browser build yet" (`WasmBlockingSystem`); the async spawn path (`LoopOp::Spawn`)
-  likewise echoes loud. The Phase 6 daemon over WebTransport re-enables them.
+  likewise echoes loud. The Phase 6 daemon over WebTransport will re-enable them (the fs
+  leg landed in 6b; the process/LSP/watch legs are later slices).
 - ❌ LSP and **native** treesitter — gated off the build (slice 5a); `:TSInstall` echoes
   a loud "not available in the browser build yet". Syntax **highlighting** is still
   present: done JS-side in the UI thread via web-tree-sitter (`web/highlight.js` + the
@@ -77,6 +90,11 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
   (gitignored). The import is optional — the renderer degrades to plain text if absent.
 - `web/serve.mjs` — a cross-origin-isolated dev server (COOP/COEP/CORP), so the page can
   use a `SharedArrayBuffer`. `crossOriginIsolated === true`.
+- `web/rpc.mjs` — the browser↔daemon msgpack-RPC client (Phase 6b): the JS twin of
+  `nxvim-rpc`, over one WebTransport bidi stream. `dialDaemon(uri)` connects (token on the
+  CONNECT path, cert hash pinned TOFU); the Worker uses it to fulfill `:e`/`:w` over the wire
+  in daemon mode. msgpack is the vendored `@msgpack/msgpack` (`web/vendor/msgpack/`, staged by
+  `build.sh`); its `decodeMultiStream` frames the bidi stream.
 - `web/verify.mjs` — the Playwright verifier: drives the real wasm edit-host in a real
   headless Chromium through `window.__nxvim` and asserts buffer / cursor / redraw, **and**
   that a deferred timer fires unattended via the SAB park (plus the OPFS round-trip).
@@ -87,6 +105,11 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
 - `web/verify-config.mjs` — the config verifier: writes an `/init.lua` to OPFS, reloads,
   and asserts the config applied on startup (an option, a global, a keymap that fires,
   and a startup-buffer `BufEnter` autocmd) and that a broken config is non-fatal.
+- `web/verify-daemon.mjs` — the daemon verifier (Phase 6b): spawns a real
+  `nxvim --daemon --listen`, opens the page with `?daemon=<uri>`, and asserts `:e`/`:w`/`:e
+  <dir>` round-trip over WebTransport — the saved bytes read back from the daemon's disk in
+  Node (so they truly crossed the wire), `[+]` clearing only on the daemon's ack. The browser
+  twin of native `daemon_quic.rs`. (Needs `cargo build -p nxvim` for the daemon binary.)
 
 > **Note (not a gap, and not wasm-specific):** the Lua `vim.api.nvim_buf_*` *mutation*
 > surface (`nvim_buf_set_lines` / `set_text` / `set_name`, `nvim_open_win`,
@@ -110,6 +133,11 @@ node serve.mjs               # open http://localhost:8088/web/  to use the edito
 node verify.mjs              # headless-browser proof of the editor/transport/OPFS contract
 node verify-ui.mjs           # headless-browser proof of the renderer/mouse/selection/highlighting
 node verify-config.mjs       # headless-browser proof of single-file init.lua sourcing from OPFS
+node verify-daemon.mjs       # headless-browser proof of :e/:w/:e<dir> over WebTransport to a real --daemon
+
+# daemon mode by hand: start a daemon, then open the page with its connect URI:
+#   cargo run -p nxvim -- --daemon --listen 127.0.0.1:8765   # prints nxvim://…?cert=…
+#   open  http://localhost:8088/web/?daemon=<that-nxvim://-uri>
 ```
 
 **Configuring it:** drop a single self-contained `init.lua` at the OPFS root (`:w

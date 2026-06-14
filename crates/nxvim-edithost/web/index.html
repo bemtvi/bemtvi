@@ -125,7 +125,15 @@
     // park, else postMessage (slice 5c). Both expose the same feed/mouse/execLua/
     // attach promises to the renderer + hook below.
     // ============================================================================
-    const worker = new Worker(new URL("./worker.mjs", import.meta.url), { type: "module" });
+    // Daemon mode (Phase 6b): `?daemon=nxvim://HOST:PORT/TOKEN?cert=HASH` on the page URL
+    // makes the edit-host open/save files over WebTransport against a remote `nxvim
+    // --daemon --listen`, instead of the serverless OPFS sandbox. The URI is forwarded to
+    // the Worker on its own script URL (so the Worker self-configures with no boot race);
+    // no param = serverless OPFS (unchanged). Config + shada stay local either way.
+    const workerUrl = new URL("./worker.mjs", import.meta.url);
+    const daemonUri = new URLSearchParams(location.search).get("daemon");
+    if (daemonUri) workerUrl.searchParams.set("daemon", daemonUri);
+    const worker = new Worker(workerUrl, { type: "module" });
     const useSAB = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
     let latest = { frame: null, lines: "" };
     let readyResolve;

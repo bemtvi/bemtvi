@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs — `:e`/`:w` + the file explorer against the Origin Private File System — done; the WebTransport/QUIC daemon path remains) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; the daemon proc/watch/lsp/sys_run/luafs legs over WebTransport remain) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2112,7 +2112,79 @@ and opens an entry with `gg j <CR>`, reading it back from OPFS.
 change-notification and the serverless editor is its sole writer, so there's nothing to
 reconcile); and the **WebTransport/QUIC daemon path** below (real remote files + processes
 + LSP) — the heavy half, which reuses the *same* off-tick `fs_fetch`/`fs_save` seam this
-slice exercised, only crossing a QUIC stream instead of OPFS.
+slice exercised, only crossing a QUIC stream instead of OPFS. **The fs leg of that daemon
+path landed next — Phase 6b below.**
+
+### Phase 6b — browser edit-host ↔ daemon over WebTransport (the fs leg) — ✅ DONE (2026-06-13)
+
+The remote half of Phase 6, sliced first to the **fs read + write leg** on the same
+"simplest path first / prove the transport" discipline 6a used for OPFS. The browser
+edit-host is now a `HostFs` client of a real `nxvim --daemon --listen` over **WebTransport
+(HTTP/3 / QUIC)** — the browser twin of the native `connect_quic` fs leg (Phase 3d/3e), and
+the *inverse* of the deleted Socket.IO whole-editor-remote topology. Editing stays in the
+Worker (zero per-keystroke round-trips); only `:e`/`:w`/`:e <dir>` cross the wire.
+
+**The seam was already transport-agnostic** (the keystone): 6a made the wasm edit-host's
+off-tick fs seam (`eh_take_fs_requests` → JS fulfils → `eh_fs_read_complete` /
+`eh_fs_write_complete`) carry OPFS. This slice swaps OPFS for a WebTransport RPC client in
+the *same* `fulfillFsRequests()` drain loop — **no core/wasm/Rust change at all** (the
+native binary and the whole `cargo test --workspace` are byte-identical; zero `.rs` touched).
+`has_remote_fs()` is already `true`, so `:e`/`:w` defer the same `PendingOpen`/`PendingSave`;
+the appliers 6a proved are reused verbatim.
+
+**The one genuinely new piece is browser-side: a JS msgpack-RPC client** (`web/rpc.mjs`), the
+JS twin of `nxvim-rpc`'s `Rpc` + reader task (the Worker has no tokio — the point of
+`EditHost`). It wraps one WebTransport bidi stream: a msgid counter + pending-reply map, a
+`for await (const frame of decodeMultiStream(readable))` reader loop that resolves responses
+(`[1,msgid,err,result]` — reject on a non-nil `err`, fail loud) and surfaces notifications
+(`[2,method,params]` via `onNotify`, unused by the fs leg, ready for the next), and
+`encode([0,msgid,method,params])` writes. `dialDaemon(uri)` parses the launch-printed
+`nxvim://HOST:PORT/TOKEN?cert=HASH`, builds `https://HOST:PORT/TOKEN` (token on the CONNECT
+path, the daemon reads `request.path()`) + `serverCertificateHashes` (dotted-hex →
+`Uint8Array(32)`, TOFU), awaits `.ready`, opens the bidi stream. **msgpack is a real vendored
+library** — `@msgpack/msgpack`, staged into `web/vendor/msgpack/` by `build.sh` from the
+`web/` devDependency (gitignored/regenerated like the tree-sitter assets); its
+`decodeMultiStream` solves the bidi-stream frame-splitting for free (one decoded value per
+complete msgpack frame, `bin` → `Uint8Array`).
+
+Shipped:
+- **`web/rpc.mjs`** — `RpcClient` + `dialDaemon` (above); fails every in-flight request loud
+  on a dropped QUIC session (`transport.closed`) or stream EOF — no silently-hung `:e`/`:w`.
+- **`web/worker.mjs`** — a `?daemon=` on the Worker's own URL makes it `dialDaemon` before
+  "ready" (self-configures, no boot-message race). `fulfillFsRequests()`'s OPFS-fallback
+  branch forks to `daemonRead`/`daemonWrite` when in daemon mode, projecting `fs_read`'s
+  `["file",bin]`/`["new"]`/`["dir",canon,[[is_dir,name]…]]` and `fs_write`'s `["ok",stat?]`
+  onto the exact `{kind,text,path?}` / `{ok,size,mtimeMs,error}` shapes the appliers expect.
+  In daemon mode fs **never** silently falls back to OPFS — a dial failure surfaces and every
+  request errors with that reason. The picker (`boundPaths`) branch still wins first; the SAB
+  park / input loop is unchanged (a daemon request is an `await` that settles before the
+  park, exactly like an OPFS promise). **Config + shada stay LOCAL (OPFS)** even in daemon
+  mode — the thesis (only I/O crosses the wire).
+- **`web/index.html`** — forwards a page `?daemon=<uri>` onto the Worker's script URL; no
+  param = serverless OPFS, unchanged.
+- **The daemon needed no change** — Phase 3r's `wtransport` listener is already
+  browser-compatible (the feasibility spike confirmed headless Chromium accepts its
+  self-signed cert via `serverCertificateHashes` with **no launch flags and no cert tweak**).
+
+**Exit criteria — met.** `web/verify-daemon.mjs` (real headless Chromium + a real
+`--daemon --listen` on an ephemeral loopback port, the browser twin of `daemon_quic.rs`):
+`:e <file>` fills the buffer with the **daemon's** bytes (a path the browser origin can't
+hold — they can only have crossed the wire), the buffer binds to the remote path; an edit +
+`:w` clears `[+]` **only after** the daemon acks, and the edited bytes are read back **from
+the daemon's disk in Node** (proving the write truly landed remotely, not in-memory); and
+`:e <dir>` lists the daemon's directory entries over the wire. Native `cargo test
+--workspace` green and byte-identical (zero `.rs` changed); the existing browser suites
+(`verify.mjs` serverless OPFS, `verify-fs.mjs` picker, `verify-shada.mjs`) all stay green —
+serverless mode (no `?daemon=`) is untouched.
+
+**Deferred to later Phase 6 slices (not stubbed):** the other five wire legs over
+WebTransport — **proc** (`HostProc`), **sys_run** (the blocking `nx._system` — today the
+browser fails it loud), **lsp**, **watch** (`fs_changed` push → the `onNotify` hook this
+slice's `RpcClient` already exposes), and **luafs** (`vim.uv.fs_stat`/`filereadable`) — each
+reuses the same `RpcClient`, the process legs adding the daemon→browser notification routing;
+the per-`HostServices`-class **QUIC stream split** (the HOL-blocking escape, one bidi stream
+here) — a shared native+browser follow-up already deferred by Phase 3r; and an in-browser
+connect UI / live re-point beyond the `?daemon=` param.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 

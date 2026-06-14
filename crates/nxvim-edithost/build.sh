@@ -83,5 +83,22 @@ else
   echo "note: $WEB not found — skipping syntax-highlighter assets (plain rendering)"
 fi
 
+# 4. msgpack ESM → web/vendor/msgpack/ for the browser↔daemon WebTransport RPC client
+#    (web/rpc.mjs, used in daemon mode `?daemon=nxvim://…`). Vendored from the web/
+#    devDependency rather than committed (web/vendor is gitignored, regenerated like the
+#    tree-sitter assets); needs `cd web && npm install` to have populated node_modules.
+#    Multi-file ESM (it has a utils/ subdir) — copy the whole dist.esm tree, then drop the
+#    .d.ts/.map/tsbuildinfo the browser never imports. Optional: serverless OPFS mode
+#    (no `?daemon=`) doesn't touch it.
+MSGPACK_SRC="web/node_modules/@msgpack/msgpack/dist.esm"
+if [ -d "$MSGPACK_SRC" ]; then
+  rm -rf web/vendor/msgpack && mkdir -p web/vendor/msgpack
+  cp -r "$MSGPACK_SRC/." web/vendor/msgpack/
+  find web/vendor/msgpack \( -name '*.d.ts' -o -name '*.map' -o -name '*.tsbuildinfo' \) -delete
+  echo "copied @msgpack/msgpack → web/vendor/msgpack/"
+else
+  echo "note: $MSGPACK_SRC not found — run 'cd web && npm install' to enable daemon mode (WebTransport)" >&2
+fi
+
 echo
 echo "built dist/eh.mjs — run the harness:  node harness.mjs"

@@ -2,16 +2,18 @@
   "name": "nxvim-edithost-web",
   "private": true,
   "type": "module",
-  "description": "Web shell for the wasm edit-host: the Web Worker that owns core+Lua+OPFS (worker.mjs), the DOM renderer + input/mouse layer + window.__nxvim hook (index.html, with client-side tree-sitter highlighting via highlight.js), a cross-origin-isolated dev server (serve.mjs), and the Playwright verifiers (verify.mjs = editor/transport/OPFS contract; verify-ui.mjs = renderer/mouse/selection/layout/highlighting; verify-fs.mjs = real local filesystem picker :eo/:wo/bare :w via the File System Access API; verify-shada.mjs = serverless shada persistence (registers/history) across a reload via OPFS). Build the wasm first with ../build.sh.",
+  "description": "Web shell for the wasm edit-host: the Web Worker that owns core+Lua+OPFS (worker.mjs), the DOM renderer + input/mouse layer + window.__nxvim hook (index.html, with client-side tree-sitter highlighting via highlight.js), a cross-origin-isolated dev server (serve.mjs), the browser↔daemon WebTransport msgpack-RPC client (rpc.mjs, using the vendored @msgpack/msgpack), and the Playwright verifiers (verify.mjs = editor/transport/OPFS contract; verify-ui.mjs = renderer/mouse/selection/layout/highlighting; verify-fs.mjs = real local filesystem picker :eo/:wo/bare :w via the File System Access API; verify-shada.mjs = serverless shada persistence (registers/history) across a reload via OPFS; verify-daemon.mjs = the edit-host driving a real `nxvim --daemon --listen` over WebTransport). Build the wasm first with ../build.sh (which also vendors @msgpack/msgpack into vendor/).",
   "scripts": {
     "serve": "node serve.mjs",
     "verify": "node verify.mjs",
     "verify-ui": "node verify-ui.mjs",
     "verify-config": "node verify-config.mjs",
     "verify-fs": "node verify-fs.mjs",
-    "verify-shada": "node verify-shada.mjs"
+    "verify-shada": "node verify-shada.mjs",
+    "verify-daemon": "node verify-daemon.mjs"
   },
   "devDependencies": {
+    "@msgpack/msgpack": "3.1.3",
     "playwright": "1.60.0"
   }
 }

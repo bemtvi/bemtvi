@@ -529,6 +529,11 @@ pub struct EditHost {
     /// command-line prompt's result, or `None` when no scripted prompt is open
     /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
     pending_ui_input: Option<u64>,
+    /// The `nx._cb_fns` id of the `nx.ui.select` callback awaiting the open
+    /// menu's result, or `None` when no menu is open. Set when a menu opens;
+    /// taken when the user confirms / cancels. Separate from `pending_ui_input`
+    /// (a menu and a prompt are distinct surfaces).
+    pending_ui_select: Option<u64>,
     /// Keys queued by `nvim_feedkeys`, drained after the input batch / off-tick
     /// settle. Each carries whether it should be remapped (the `m` flag) or fed
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
@@ -661,6 +666,7 @@ impl EditHost {
             mouse_clock: None,
             hl_mirror_gen: None,
             pending_ui_input: None,
+            pending_ui_select: None,
             feed_buffer: VecDeque::new(),
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),

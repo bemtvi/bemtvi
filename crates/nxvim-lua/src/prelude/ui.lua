@@ -1,10 +1,13 @@
--- nxvim Lua prelude — timers.
--- nx.timer (alias vim.defer_fn) over the event-loop bridge. The interactive UI
--- surface (nx.ui.select / input / open) and the nx.validate / nx.deprecate no-ops
--- are not part of nxvim's config API (autocmds, diagnostics, keymaps, options) and
--- are intentionally absent.
+-- nxvim Lua prelude — timers + the async UI surface (nx.ui).
+-- nx.timer (alias vim.defer_fn) over the event-loop bridge, plus nx.ui.select —
+-- the callback-shaped chooser backed by the server's floating selectable-list
+-- widget (docs/specs/2026-06-14-nx-ui-float-widget.md), aliased by vim.ui.select
+-- per ADR 0002's whitelist. nx.ui.open and the nx.validate / nx.deprecate no-ops
+-- are not part of nxvim's config API and remain intentionally absent.
 local vim = vim
 nx = nx or {}
+nx.ui = nx.ui or {}
+vim.ui = vim.ui or {}
 
 -- ----- nx.timer [alias vim.defer_fn] -----------------------------------------
 -- Wall-clock deferral rides the event-loop actor through the nx._timer_start /
@@ -40,3 +43,40 @@ function nx.timer(fn, timeout)
   return setmetatable({ _id = id }, defer_handle)
 end
 vim.defer_fn = nx.timer
+
+-- ----- nx.ui.select [alias vim.ui.select] ------------------------------------
+-- nx.ui.select(items, opts, on_choice): open a floating selectable list and call
+-- on_choice(item, index) with the chosen element and its 1-based index — or
+-- on_choice(nil, nil) on cancel. The server owns the widget, its navigation, and
+-- the input grab; Lua only renders the display labels (opts.format_item, default
+-- tostring) up front and maps the chosen index back to the original item, so an
+-- arbitrary item table round-trips even though only strings cross the bridge.
+-- Non-blocking and callback-shaped (ADR 0002 rule 3): the call returns at once
+-- and on_choice fires on a later tick.
+function nx.ui.select(items, opts, on_choice)
+  opts = opts or {}
+  on_choice = on_choice or function() end
+  if type(items) ~= "table" then
+    error("nx.ui.select: items must be a list", 2)
+  end
+  local format_item = opts.format_item or tostring
+  local labels = {}
+  for i, item in ipairs(items) do
+    labels[i] = tostring(format_item(item))
+  end
+  -- An empty list has nothing to choose: resolve to cancel without a menu.
+  if #labels == 0 then
+    on_choice(nil, nil)
+    return
+  end
+  local id = nx._next_cb_id()
+  nx._cb_fns[id] = function(idx)
+    -- idx: the 1-based chosen index, or nil on cancel.
+    if idx == nil then
+      return on_choice(nil, nil)
+    end
+    return on_choice(items[idx], idx)
+  end
+  nx._ui_select(labels, opts.prompt or "", id)
+end
+vim.ui.select = nx.ui.select

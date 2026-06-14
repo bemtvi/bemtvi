@@ -20,7 +20,7 @@ use crate::convert::{
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
     BufOp, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp,
-    OptionValue, PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, WindowOp,
+    OptionValue, PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1098,6 +1098,27 @@ pub(crate) fn install_runtime_api(
             });
             Ok(())
         })?,
+    )?;
+
+    // `nx._ui_select(items, prompt, cb_id)`: queue a `nx.ui.select` request
+    // ([`UiSelectReq`]). The server opens the floating selectable-list widget
+    // showing `items` (the already-rendered display labels) titled `prompt`, and
+    // fires `nx._cb_fns[cb_id]` with the chosen 1-based index — or `nil` on
+    // cancel — when the user confirms. The Lua wrapper maps the index back to the
+    // original item before calling the user's `on_choice`.
+    let sh = shared.clone();
+    nx.set(
+        "_ui_select",
+        lua.create_function(
+            move |_, (items, prompt, cb_id): (Vec<String>, String, u64)| {
+                sh.borrow_mut().ui_selects.push(UiSelectReq {
+                    items,
+                    prompt,
+                    cb_id,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`

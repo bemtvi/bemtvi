@@ -1,0 +1,17 @@
+nx.ui.select — the floating selectable-list widget
+===================================================
+
+Put the cursor anywhere and try the leader maps (leader is "\"):
+
+    \p   pick a fruit          (plain string list)
+    \c   choose a command      (format_item + act on the choice)
+    \n   jump near a line       (a long, scrolling list)
+
+In the open menu:
+    j / k        move the highlight (also <C-n>/<C-p>, arrows)
+    gg / G       first / last
+    <CR>         confirm  ->  the choice is echoed on the message line
+    <Esc> or q   cancel   ->  the cancel branch fires (on_choice(nil))
+
+The menu floats under the cursor and grabs every key while open — the
+buffer underneath is untouched until you confirm or cancel.

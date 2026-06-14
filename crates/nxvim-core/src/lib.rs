@@ -30,8 +30,9 @@ pub use clipboard::Clipboard;
 pub use editor::{
     command_status, language_of_path, BorderStyle, BufferId, CommandStatus, Cursor, Editor,
     FileChangeAction, FileChangeReason, FileChangelist, FileMarkEntry, FloatAnchor, FloatConfig,
-    FloatRelative, GlobalMarkEntry, JumpPos, NumberedMark, PendingOpen, PendingQuitAll,
-    PendingSave, PersistState, RegisterEntry, ShadaRequest, TabId, TerminalOp, UndoEntry,
+    FloatRelative, GlobalMarkEntry, JumpPos, MenuPlacement, NumberedMark, PendingOpen,
+    PendingQuitAll, PendingSave, PersistState, RegisterEntry, ShadaRequest, TabId, TerminalOp,
+    UndoEntry,
     UndoTreeView, WindowConfigSpec, WindowId,
 };
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
@@ -41,4 +42,4 @@ pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseBut
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};
 pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
-pub use view::{PanelView, TabView, View, ViewRect, WindowView};
+pub use view::{MenuView, PanelView, TabView, View, ViewRect, WindowView};

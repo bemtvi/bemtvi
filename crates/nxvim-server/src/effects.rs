@@ -279,6 +279,15 @@ impl EditHost {
             self.editor.open_prompt(req.prompt, req.default);
             self.pending_ui_input = Some(req.cb_id);
         }
+        // `nx.ui.select`: open the floating selectable-list widget and remember
+        // which callback awaits the chosen index. The Lua wrapper never queues an
+        // empty list (it resolves to cancel itself), so the menu always has rows;
+        // like the prompt, only one is open at a time (the last queued wins).
+        for req in self.lua.take_ui_selects() {
+            self.editor
+                .open_menu(req.items, nxvim_core::MenuPlacement::Cursor, 0);
+            self.pending_ui_select = Some(req.cb_id);
+        }
         // `vim.fn.confirm` button dialogs: open the command line as a single-key
         // confirm prompt and remember the callback that resumes the blocked
         // `vim.fn.confirm` coroutine. Shares the `pending_ui_input` slot and the
@@ -1247,6 +1256,19 @@ impl EditHost {
                     self.apply_lua_effects();
                 }
             }
+            // `nx.ui.select` results: a confirmed (`Some(index)`) or cancelled
+            // (`None`) menu fires the waiting callback off the same tick, inside
+            // the fixpoint (the callback may open another menu / queue lua). The
+            // pending id is taken — one menu at a time.
+            for result in std::mem::take(&mut self.editor.menu_results) {
+                if let Some(id) = self.pending_ui_select.take() {
+                    if let Err(e) = self.lua.run_ui_select(id, result) {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.ui.select callback: {e}"));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
             // Scheduled callbacks (`vim.schedule`) run after the work that queued
             // them converges, but still within this fixpoint — a scheduled fn may
             // itself `vim.schedule` / `vim.cmd`, which re-enters the loop. One
@@ -1263,6 +1285,7 @@ impl EditHost {
                 && self.editor.deferred_commands.is_empty()
                 && self.editor.panel_selects.is_empty()
                 && self.editor.prompt_results.is_empty()
+                && self.editor.menu_results.is_empty()
                 && self.scheduled.is_empty()
                 && !self.editor.has_pending_checktime()
             {
@@ -1276,6 +1299,7 @@ impl EditHost {
                 self.editor.deferred_commands.clear();
                 self.editor.panel_selects.clear();
                 self.editor.prompt_results.clear();
+                self.editor.menu_results.clear();
                 self.editor.take_pending_checktime();
                 self.scheduled.clear();
                 self.editor

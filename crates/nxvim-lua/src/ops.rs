@@ -715,6 +715,26 @@ pub struct UiInputReq {
     pub cb_id: u64,
 }
 
+/// A `nx.ui.select(items, opts, on_choice)` request: open the floating
+/// selectable-list widget showing `items` (the display labels the Lua wrapper
+/// already rendered through `opts.format_item`) and fire callback `cb_id` (a
+/// `nx._cb_fns` entry wrapping `on_choice`) with the chosen **1-based index** —
+/// or `nil` on cancel — when the user confirms. The wrapper maps that index back
+/// to the original item, so only the labels and the index cross the bridge.
+/// Queued in [`crate::runtime::Shared::ui_selects`], drained by the server into
+/// [`Editor::open_menu`](nxvim_core::Editor::open_menu).
+#[derive(Clone, Debug)]
+pub struct UiSelectReq {
+    /// The display labels, in order, one per selectable row (non-empty: the Lua
+    /// wrapper resolves an empty list to an immediate cancel without queuing).
+    pub items: Vec<String>,
+    /// The prompt label (`opts.prompt`); empty when unset. Shown as the menu's
+    /// title. (Phase 1 has no prompt input — this is a static title only.)
+    pub prompt: String,
+    /// The `nx._cb_fns` id whose `on_choice` wrapper receives the chosen index.
+    pub cb_id: u64,
+}
+
 /// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a
 /// single-key button dialog showing `label` (the message plus the rendered
 /// buttons, already formatted by the Lua wrapper) and fire callback `cb_id` (a

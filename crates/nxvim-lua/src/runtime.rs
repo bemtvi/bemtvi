@@ -18,7 +18,7 @@ use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
     HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs,
-    RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
+    RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -354,6 +354,9 @@ pub(crate) struct Shared {
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
+    /// `nx.ui.select` requests, drained by the server into the editor's floating
+    /// selectable-list widget (`Editor::open_menu`) after the chunk.
+    pub(crate) ui_selects: Vec<UiSelectReq>,
     /// `vim.fn.confirm` button-dialog requests, drained by the server into the
     /// editor's command line (`Editor::open_confirm`) after the chunk.
     pub(crate) confirms: Vec<ConfirmReq>,
@@ -741,6 +744,12 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the `nx.ui.select` requests queued since the last drain, for the
+        /// server to open as floating selectable-list menus.
+        take_ui_selects -> Vec<UiSelectReq> = ui_selects
+    }
+
+    take_queue! {
         /// Take the `vim.fn.confirm` button-dialog requests queued since the last
         /// drain, for the server to open as command-line confirm prompts.
         take_confirms -> Vec<ConfirmReq> = confirms
@@ -784,6 +793,23 @@ impl LuaRuntime {
         let run: mlua::Function = nx.get("_run_cb")?;
         let arg = match result {
             Some(s) => mlua::Value::String(self.lua.create_string(&s)?),
+            None => mlua::Value::Nil,
+        };
+        run.call::<()>((id, false, arg))
+    }
+
+    /// Deliver a `nx.ui.select` result to its callback `id`: the **1-based**
+    /// index the user confirmed (`Some`), or `nil` (`None`) on cancel. Runs
+    /// `nx._run_cb(id, false, idx)` — a one-shot, so the registry entry drops
+    /// after firing. The Lua wrapper maps the index back to the original item
+    /// before calling the user's `on_choice`. Effects it queues drain through
+    /// `apply_lua_effects`.
+    pub fn run_ui_select(&self, id: u64, choice: Option<usize>) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_cb")?;
+        let arg = match choice {
+            // The core records a 0-based highlight index; Lua sees 1-based.
+            Some(idx0) => mlua::Value::Integer((idx0 + 1) as i64),
             None => mlua::Value::Nil,
         };
         run.call::<()>((id, false, arg))

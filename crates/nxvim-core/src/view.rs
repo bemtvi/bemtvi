@@ -11,7 +11,7 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{BorderStyle, BufferId, Cursor, Editor, TabLabel, WindowLayout};
+use crate::editor::{BorderStyle, BufferId, Cursor, Editor, MenuPlacement, TabLabel, WindowLayout};
 use crate::mode::Mode;
 use crate::statusline::StatuslineCtx;
 use crate::unicode;
@@ -84,6 +84,22 @@ pub struct PanelView {
     /// whole panel out as `height + 1` rows; the editor sized it so the text
     /// window keeps at least one row.
     pub height: usize,
+}
+
+/// The renderable form of the floating selectable-list [`Menu`](crate::editor):
+/// the choice labels, the highlighted index, and where it floats. The server
+/// projects the on-screen geometry (anchor + size) from this plus the focused
+/// window, the same way it places the completion popup. `None` in [`View::menu`]
+/// when no menu is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuView {
+    /// The choice labels, in order, each shown on its own row.
+    pub items: Vec<String>,
+    /// The highlighted index into `items` (0-based; always in range — a menu is
+    /// never opened empty).
+    pub selected: usize,
+    /// Whether the menu floats under the cursor or centered over the editor.
+    pub placement: MenuPlacement,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the
@@ -324,6 +340,10 @@ pub struct View {
     /// the panel rather than the text window. Global — one per editor, below all
     /// windows.
     pub panel: Option<PanelView>,
+    /// The floating selectable-list widget (`nx.ui.select`; later the picker),
+    /// or `None` when none is open. When present it has input focus and floats
+    /// over the focused window's text area; the server projects its geometry.
+    pub menu: Option<MenuView>,
     /// The single **global** status line's `%`-format context, present only at
     /// `'laststatus'`=3. It carries the *focused* window's facts (vim shows the
     /// current window's status line in the global bar); the server runs the engine
@@ -366,6 +386,7 @@ impl View {
             cmdline_cursor: ed.cmdline_cursor(),
             message: ed.message.clone(),
             panel: ed.panel_view(),
+            menu: ed.menu_view(),
             global_statusline,
             dock_left: bands.left,
             dock_right: bands.right,

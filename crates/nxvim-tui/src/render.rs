@@ -12,8 +12,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::anim::{arm_animation, lerp, Animation};
 use nxvim_view::{
-    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PanelData, PmenuData,
-    SearchSpans, Separator, StatusSegment, View, WindowRegion, WindowView,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, PanelData,
+    PmenuData, SearchSpans, Separator, StatusSegment, View, WindowRegion, WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -264,6 +264,12 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     // drawn after the windows so it sits on top.
     if let (Some(pmenu), Some((inner, _, _))) = (&view.pmenu, focused_inner) {
         render_pmenu(frame, inner, pmenu, doc_scroll);
+    }
+
+    // The floating selectable-list menu (`nx.ui.select`) floats the same way,
+    // over the focused window's text area, with input focus.
+    if let (Some(menu), Some((inner, _, _))) = (&view.menu, focused_inner) {
+        render_menu(frame, inner, menu);
     }
 
     // A focused panel owns the cursor: draw it on the panel's current line and
@@ -1564,6 +1570,57 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 
     // The documentation preview floats beside the popup (its own bordered box).
     render_pmenu_doc(frame, text_area, area, &pmenu.doc, doc_scroll);
+}
+
+/// Draw the floating selectable-list menu (`nx.ui.select`) as a bordered overlay
+/// over the text area, anchored at `(menu.col, menu.row)` in `text_area` cells —
+/// the same shape as the completion popup, but each row is a plain label and the
+/// highlighted row is reverse-video. The box is `Clear`ed first so the text
+/// beneath doesn't bleed through, and the list scrolls to keep the selection
+/// visible when there are more items than rows.
+fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) {
+    let x = text_area.x.saturating_add(menu.col);
+    let y = text_area.y.saturating_add(menu.row);
+    let width = menu
+        .width
+        .saturating_add(2)
+        .min(text_area.right().saturating_sub(x));
+    let height = menu
+        .height
+        .saturating_add(2)
+        .min(text_area.bottom().saturating_sub(y));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let block = Block::new().borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    let start = pmenu_start(Some(menu.selected), rows);
+    let lines: Vec<Line> = (0..inner.height)
+        .map(|r| {
+            let idx = start + r as usize;
+            let Some(label) = menu.items.get(idx) else {
+                return Line::from(" ".repeat(width));
+            };
+            let style = if idx == menu.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(pmenu_row(label, "", width), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// First visible item index for a popup whose inner content area is `rows` tall

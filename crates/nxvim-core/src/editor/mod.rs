@@ -38,6 +38,7 @@ mod expr;
 mod insert;
 mod jumps;
 mod marks;
+mod menu;
 mod motions;
 mod mouse;
 mod multicursor;
@@ -59,6 +60,7 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
+pub use self::menu::MenuPlacement;
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -709,6 +711,14 @@ pub struct Editor {
     /// index, line text)`. Drained by the server to fire the `on_select`
     /// scripting callback and the `nxvim_panel_select` RPC notification.
     pub panel_selects: Vec<(usize, String)>,
+    /// The floating selectable-list widget, when open (`nx.ui.select`; the shared
+    /// picker / completion surface). Grabs input focus like the panel, but floats
+    /// over the text. See [`menu`](crate::editor::MenuPlacement).
+    menu: Option<menu::Menu>,
+    /// Resolved menu outcomes: `Some(index)` (0-based) when the user confirmed a
+    /// row, `None` on cancel. Drained by the server to deliver the `nx.ui.select`
+    /// result to its callback — the menu analogue of [`Editor::prompt_results`].
+    pub menu_results: Vec<Option<usize>>,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -1075,6 +1085,8 @@ impl Editor {
             panel: None,
             last_panel: None,
             panel_selects: Vec::new(),
+            menu: None,
+            menu_results: Vec::new(),
             should_quit: false,
             options: Options::default(),
             highlights: Highlights::new(),
@@ -1213,6 +1225,13 @@ impl Editor {
         // buffer's mode handling and the `curswant`/scroll bookkeeping below.
         if self.panel.is_some() {
             self.handle_panel(key);
+            return;
+        }
+
+        // A focused menu (`nx.ui.select`, later the picker) grabs every key the
+        // same way — navigation + confirm / cancel — floating over the text.
+        if self.menu.is_some() {
+            self.handle_menu(key);
             return;
         }
 

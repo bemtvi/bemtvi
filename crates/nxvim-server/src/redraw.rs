@@ -5,8 +5,8 @@
 use crate::EditHost;
 use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
-use nxvim_core::view::{ScrollAnim, Separator, TabView, ViewRect, WindowRegion, WindowView};
-use nxvim_core::{BorderStyle, PanelView};
+use nxvim_core::view::{MenuView, ScrollAnim, Separator, TabView, ViewRect, WindowRegion, WindowView};
+use nxvim_core::{BorderStyle, MenuPlacement, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -149,6 +149,13 @@ impl EditHost {
             Some(p) => project_panel(p),
             None => Value::Nil,
         };
+        // The floating selectable-list menu (`nx.ui.select`; later the picker),
+        // `Nil` when none is open. Geometry is computed here from the focused
+        // window, the same way the completion popup is placed.
+        let menu = match &view.menu {
+            Some(m) => project_menu(m, &view, text_width),
+            None => Value::Nil,
+        };
 
         // Built last: every per-window/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
@@ -200,6 +207,7 @@ impl EditHost {
                 Value::from("dock_bottom"),
                 Value::from(view.dock_bottom as u64),
             ),
+            (Value::from("menu"), menu),
         ];
 
         self.fx.notify("redraw", vec![Value::Map(map)]);
@@ -637,6 +645,71 @@ fn project_panel(p: &PanelView) -> Value {
             Value::from(p.cursor_span as u64),
         ),
         (Value::from("height"), Value::from(p.height as u64)),
+    ])
+}
+
+/// Project the floating selectable-list [`MenuView`] into its redraw sub-map,
+/// computing the bordered box's anchor and content size in **text-area cells**
+/// (the client adds the gutter + text-area origin, then draws the border) — the
+/// same convention and placement strategy as the completion popup. `Cursor`
+/// placement anchors under the cursor and flips above when there's no room
+/// below; `Editor` placement centers the box over the focused window's text area
+/// (the picker refines this when it lands). `text_width` bounds the box to the
+/// editable region. Mirrors `EditHost::pmenu_value`.
+fn project_menu(m: &MenuView, view: &nxvim_core::View, text_width: usize) -> Value {
+    const MAX_H: usize = 10;
+    let focused = view.focused();
+    let text_height = focused.lines.len();
+    let count = m.items.len();
+    let want = count.min(MAX_H);
+    // Content width: the widest label (in cells), min 1.
+    let content_w = m
+        .items
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let (row, col, width, height) = match m.placement {
+        MenuPlacement::Cursor => {
+            let cursor_row = focused.cursor_row;
+            let anchor_col = focused.cursor_screen_col.saturating_sub(focused.leftcol);
+            let max_w = text_width.saturating_sub(anchor_col).max(1);
+            let width = content_w.min(max_w);
+            // Below if the bordered box fits, else above, else clamp to whichever
+            // side has more room (the popup's four-tier fallback).
+            let below = text_height.saturating_sub(cursor_row + 1);
+            let above = cursor_row;
+            let (row, height) = if want + 2 <= below {
+                (cursor_row + 1, want)
+            } else if want + 2 <= above {
+                (cursor_row - (want + 2), want)
+            } else if below >= above {
+                (cursor_row + 1, below.saturating_sub(2).clamp(1, want))
+            } else {
+                let h = above.saturating_sub(2).clamp(1, want);
+                (cursor_row.saturating_sub(h + 2), h)
+            };
+            (row, anchor_col, width, height)
+        }
+        MenuPlacement::Editor => {
+            let height = want.min(text_height.saturating_sub(2).max(1));
+            let width = content_w.min(text_width.saturating_sub(2).max(1));
+            let row = text_height.saturating_sub(height + 2) / 2;
+            let col = text_width.saturating_sub(width + 2) / 2;
+            (row, col, width, height)
+        }
+    };
+
+    let items: Vec<Value> = m.items.iter().map(|s| Value::from(s.as_str())).collect();
+    Value::Map(vec![
+        (Value::from("items"), Value::Array(items)),
+        (Value::from("selected"), Value::from(m.selected as u64)),
+        (Value::from("row"), Value::from(row as u64)),
+        (Value::from("col"), Value::from(col as u64)),
+        (Value::from("width"), Value::from(width as u64)),
+        (Value::from("height"), Value::from(height as u64)),
     ])
 }
 

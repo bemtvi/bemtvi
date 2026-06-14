@@ -287,6 +287,10 @@ pub struct View {
     /// The insert-mode completion popup, or `None` when none is open. Drawn last,
     /// over the focused window's text area. Global.
     pub pmenu: Option<PmenuData>,
+    /// The floating selectable-list menu (`nx.ui.select`; later the picker), or
+    /// `None` when none is open. Drawn over the focused window's text area with
+    /// input focus, like the popup. Global.
+    pub menu: Option<MenuData>,
 }
 
 /// The insert-mode completion popup mirrored from the server's redraw: the ranked
@@ -304,6 +308,21 @@ pub struct PmenuData {
     /// The selected item's documentation lines, drawn in a preview box beside the
     /// popup. Empty ⇒ no preview (nothing selected, or the item has no docs).
     pub doc: Vec<String>,
+}
+
+/// The floating selectable-list menu mirrored from the server's redraw: the
+/// choice labels, the highlighted index, and the overlay's anchor and content
+/// size in **text-area cells** (the client adds the gutter and text-area origin,
+/// then draws a bordered box) — the same convention as [`PmenuData`], but the
+/// rows are plain labels (no kind / detail) and there is no doc preview yet.
+#[derive(Clone)]
+pub struct MenuData {
+    pub items: Vec<String>,
+    pub selected: usize,
+    pub row: u16,
+    pub col: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// One tabline cell mirrored from the server's redraw: the buffer label, its
@@ -407,6 +426,17 @@ impl View {
                 width: map_u16(p, "width"),
                 height: map_u16(p, "height"),
                 doc: map_str_array(p, "doc"),
+            }),
+            _ => None,
+        };
+        self.menu = match map_get(map, "menu") {
+            Some(Value::Map(m)) => Some(MenuData {
+                items: map_str_array(m, "items"),
+                selected: map_u64(m, "selected") as usize,
+                row: map_u16(m, "row"),
+                col: map_u16(m, "col"),
+                width: map_u16(m, "width"),
+                height: map_u16(m, "height"),
             }),
             _ => None,
         };

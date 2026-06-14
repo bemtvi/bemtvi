@@ -14,8 +14,10 @@
 //! bytes is the part that differs (Phase 3 native / Phase 7 web). See
 //! `docs/plans/2026-06-14-terminal-in-buffer.md`.
 
-use nxvim_core::{BufferId, TerminalOp};
+use nxvim_core::{BufferId, Rgb, Style, TerminalOp};
+use rmpv::Value;
 
+use crate::redraw::StyleTable;
 use crate::EditHost;
 
 /// The `vt100` callback sink: captures the things the screen model itself doesn't
@@ -164,6 +166,159 @@ impl EditHost {
         if let Some(title) = title {
             self.editor.terminal_set_title(buf, &title);
         }
+    }
+
+    /// Project terminal buffer `buf`'s grid colors into a redraw `highlights`
+    /// payload — the Phase 4 color path. Returns `None` when `buf` is not a live
+    /// terminal, so the caller falls through to the treesitter projection.
+    ///
+    /// Each screen row's cells become coalesced spans `[start_col, end_col,
+    /// group, style_id]` in **screen columns**, the exact shape
+    /// [`highlights_for`](crate::EditHost::highlights_for) emits — so every
+    /// client paints terminal color through its existing styling path with no
+    /// wire change, the `style_id` indexing the shared per-frame `styles`
+    /// palette. A cell column is a display column (a wide glyph and its
+    /// continuation cell share one run), so the columns line up with the
+    /// projected row text. Cells with the terminal's default look (no color, no
+    /// attrs) emit no span, falling back to the client's base.
+    pub(crate) fn terminal_highlights(
+        &self,
+        buf: BufferId,
+        numbers: &[Option<usize>],
+        styles: &mut StyleTable,
+    ) -> Option<Value> {
+        let emu = self.terminals.get(&buf)?;
+        let screen = emu.parser.screen();
+        let (rows, cols) = screen.size();
+        let out = numbers
+            .iter()
+            .map(|num| {
+                // `numbers` are 1-based buffer lines; scrollback is 0 (Phase 6
+                // raises it), so buffer line N maps straight to grid row N-1.
+                let Some(row) = num.and_then(|n| u16::try_from(n - 1).ok()) else {
+                    return Value::Array(Vec::new());
+                };
+                if row >= rows {
+                    return Value::Array(Vec::new());
+                }
+                let mut spans: Vec<Value> = Vec::new();
+                // The run currently being coalesced (start column + its style),
+                // and the last lead cell's style so a wide-char continuation
+                // column inherits its glyph's look rather than a blank.
+                let mut run: Option<(u16, Style)> = None;
+                let mut carry = Style::default();
+                for col in 0..cols {
+                    let style = match screen.cell(row, col) {
+                        Some(cell) if cell.is_wide_continuation() => carry.clone(),
+                        Some(cell) => {
+                            carry = cell_style(cell);
+                            carry.clone()
+                        }
+                        None => Style::default(),
+                    };
+                    // Extend the current run while the style holds; otherwise flush
+                    // it and start a new one at this column.
+                    if !matches!(&run, Some((_, prev)) if *prev == style) {
+                        if let Some((start, prev)) = run.take() {
+                            push_span(&mut spans, start, col, prev, styles);
+                        }
+                        run = Some((col, style));
+                    }
+                }
+                if let Some((start, prev)) = run.take() {
+                    push_span(&mut spans, start, cols, prev, styles);
+                }
+                Value::Array(spans)
+            })
+            .collect();
+        Some(Value::Array(out))
+    }
+}
+
+/// Push one coalesced cell run as a `[start, end, group, style_id]` highlight
+/// span, interning its style into the frame palette. The terminal's default look
+/// (an empty [`Style`]) emits nothing, so blank cells fall back to the client's
+/// base rendering instead of bloating the palette.
+fn push_span(spans: &mut Vec<Value>, start: u16, end: u16, style: Style, styles: &mut StyleTable) {
+    if style == Style::default() {
+        return;
+    }
+    let id = styles.intern(style);
+    spans.push(Value::Array(vec![
+        Value::from(start as u64),
+        Value::from(end as u64),
+        Value::from("Terminal"),
+        Value::from(id as u64),
+    ]));
+}
+
+/// One vt100 [`Cell`](vt100::Cell)'s look as a resolved [`Style`]: its fg/bg
+/// colors projected to truecolor and its on/off attributes mapped across. The
+/// terminal's *default* fg/bg become `None` so the client paints them with its
+/// own base colors (matching neovim, where uncolored terminal text uses
+/// `Normal`); only explicitly-set cell colors carry through.
+fn cell_style(cell: &vt100::Cell) -> Style {
+    Style {
+        fg: ansi_rgb(cell.fgcolor()),
+        bg: ansi_rgb(cell.bgcolor()),
+        sp: None,
+        bold: cell.bold(),
+        italic: cell.italic(),
+        underline: cell.underline(),
+        undercurl: false,
+        strikethrough: false,
+        reverse: cell.inverse(),
+    }
+}
+
+/// Project a vt100 [`Color`](vt100::Color) to truecolor. `Default` is `None` (the
+/// client's base color); `Rgb` passes through; an indexed color resolves through
+/// the standard xterm 256-color palette — the 16 ANSI colors, the 6×6×6 color
+/// cube (16–231), and the 24-step grayscale ramp (232–255).
+fn ansi_rgb(color: vt100::Color) -> Option<Rgb> {
+    match color {
+        vt100::Color::Default => None,
+        vt100::Color::Rgb(r, g, b) => Some(Rgb { r, g, b }),
+        vt100::Color::Idx(i) => Some(match i {
+            // The 16 base ANSI colors, xterm's canonical values.
+            0..=15 => {
+                const ANSI16: [(u8, u8, u8); 16] = [
+                    (0, 0, 0),
+                    (205, 0, 0),
+                    (0, 205, 0),
+                    (205, 205, 0),
+                    (0, 0, 238),
+                    (205, 0, 205),
+                    (0, 205, 205),
+                    (229, 229, 229),
+                    (127, 127, 127),
+                    (255, 0, 0),
+                    (0, 255, 0),
+                    (255, 255, 0),
+                    (92, 92, 255),
+                    (255, 0, 255),
+                    (0, 255, 255),
+                    (255, 255, 255),
+                ];
+                let (r, g, b) = ANSI16[i as usize];
+                Rgb { r, g, b }
+            }
+            // The 6×6×6 cube: each axis steps 0, 95, 135, 175, 215, 255.
+            16..=231 => {
+                const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+                let n = i - 16;
+                Rgb {
+                    r: LEVELS[(n / 36) as usize],
+                    g: LEVELS[((n / 6) % 6) as usize],
+                    b: LEVELS[(n % 6) as usize],
+                }
+            }
+            // The grayscale ramp: 8 + 10·k for k in 0..24 (24, 34, … 238).
+            232..=255 => {
+                let v = 8 + 10 * (i - 232);
+                Rgb { r: v, g: v, b: v }
+            }
+        }),
     }
 }
 

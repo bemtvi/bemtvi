@@ -106,6 +106,12 @@ impl EditHost {
         numbers: &[Option<usize>],
         styles: &mut StyleTable,
     ) -> Value {
+        // A terminal buffer's "syntax" is its vt100 grid colors, not treesitter:
+        // project the per-cell fg/bg/attrs into the same span shape and skip the
+        // tree query entirely (the buffer has no grammar anyway).
+        if let Some(term) = self.terminal_highlights(buffer, numbers, styles) {
+            return term;
+        }
         // Spans for this window's buffer (absent until its first refresh, or for
         // a buffer with no grammar). Two windows onto the same buffer share one
         // `SyntaxState`, each slicing its own rows.

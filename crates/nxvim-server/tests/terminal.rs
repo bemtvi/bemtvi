@@ -11,7 +11,8 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, feed, lines, mode, serial_lock, spawn, start_attached, TestClock,
+    attach, command, cursor, drain_to_latest_redraw, feed, lines, map_get, mode, serial_lock,
+    spawn, start_attached, window0_field, write_temp, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -328,4 +329,62 @@ async fn slow_escapes_stay_in_terminal_mode() {
             "a spaced-out escape stays in the job"
         );
     }
+}
+
+/// Phase 4 — color projection. A child that paints `red` in ANSI red
+/// (`\e[31m` = the SGR foreground for the indexed color 1) must reach the client
+/// as a `highlights` span whose resolved `styles` entry carries a red `fg`, the
+/// same span shape treesitter emits — so every UI renders terminal color through
+/// its existing styling path. We feed the ANSI through a file `cat`s out and then
+/// keep `cat` blocked on stdin (`cat <file> -`), so the terminal stays *live* —
+/// a dead terminal drops its emulator (and colors) and becomes plain text.
+#[tokio::test]
+async fn terminal_projects_ansi_color_into_highlight_spans() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start().await;
+
+    // Raw ANSI red `red`; the file path has no spaces, so the whitespace-split
+    // argv (`cat <path> -`) stays three words. The trailing `-` makes `cat` read
+    // stdin after the file, so it blocks open instead of exiting.
+    let path = write_temp("term_color", "txt", "\x1b[31mred\x1b[0m\n");
+    command(&rpc, &format!("terminal cat {path} -")).await;
+    // The escapes are consumed by the emulator, so the buffer text is just `red`.
+    wait_lines(&rpc, "cat to emit 'red'", |ls| has_line(ls, "red")).await;
+
+    // xterm's canonical ANSI red (index 1) is #cd0000.
+    const RED: u64 = 0x00cd_0000;
+    for _ in 0..200 {
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            if first_red_fg_span(&map) == Some(RED) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for a red-fg terminal highlight span");
+}
+
+/// The `fg` color (`0xRRGGBB`) of the first highlight span in the focused
+/// window's `highlights`, resolved through the frame's `styles` palette, or
+/// `None` if there is no styled span yet.
+fn first_red_fg_span(map: &[(Value, Value)]) -> Option<u64> {
+    let styles = map_get(map, "styles")?.as_array()?;
+    let rows = window0_field(map, "highlights")?.as_array()?;
+    for row in rows {
+        for span in row.as_array()?.iter() {
+            let span = span.as_array()?;
+            let style_id = span.get(3)?.as_u64()? as usize;
+            let Value::Map(entry) = styles.get(style_id)? else {
+                continue;
+            };
+            if let Some(fg) = entry
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("fg"))
+                .and_then(|(_, v)| v.as_u64())
+            {
+                return Some(fg);
+            }
+        }
+    }
+    None
 }

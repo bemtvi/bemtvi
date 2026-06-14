@@ -109,6 +109,12 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
   <dir>` round-trip over WebTransport — the saved bytes read back from the daemon's disk in
   Node (so they truly crossed the wire), `[+]` clearing only on the daemon's ack. The browser
   twin of native `daemon_quic.rs`. (Needs `cargo build -p nxvim` for the daemon binary.)
+- `web/verify-connect.mjs` — the runtime-`:connect` verifier: spawns a real
+  `nxvim --daemon --listen`, opens the page **serverless** (no `?daemon=`), then dials the
+  daemon at runtime by typing `:connect nxvim://…` and pressing Enter through the real keydown
+  interception — asserting a subsequent `:e <daemon file>` reads the daemon's bytes over the
+  wire (the off-tick fs seam re-pointed from OPFS), and that a non-`nxvim://` URI is rejected
+  loudly. The browser twin of nxvim-gui's client-side `:connect`. (Needs the daemon binary.)
 
 > **Note (not a gap, and not wasm-specific):** the Lua `vim.api.nvim_buf_*` *mutation*
 > surface (`nvim_buf_set_lines` / `set_text` / `set_name`, `nvim_open_win`,
@@ -133,10 +139,12 @@ node verify.mjs              # headless-browser proof of the editor/transport/OP
 node verify-ui.mjs           # headless-browser proof of the renderer/mouse/selection/highlighting
 node verify-config.mjs       # headless-browser proof of single-file init.lua sourcing from OPFS
 node verify-daemon.mjs       # headless-browser proof of :e/:w/:e<dir> over WebTransport to a real --daemon
+node verify-connect.mjs      # headless-browser proof of runtime `:connect nxvim://…` (no ?daemon= param)
 
-# daemon mode by hand: start a daemon, then open the page with its connect URI:
+# daemon mode by hand: start a daemon, then either open the page with its connect URI…
 #   cargo run -p nxvim -- --daemon --listen 127.0.0.1:8765   # prints nxvim://…?cert=…
 #   open  http://localhost:8088/web/?daemon=<that-nxvim://-uri>
+# …or open the page serverless and dial it at runtime with  :connect <that-nxvim://-uri>
 ```
 
 **Configuring it:** drop a single self-contained `init.lua` at the OPFS root (`:w

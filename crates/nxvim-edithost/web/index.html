@@ -130,6 +130,8 @@
     // --daemon --listen`, instead of the serverless OPFS sandbox. The URI is forwarded to
     // the Worker on its own script URL (so the Worker self-configures with no boot race);
     // no param = serverless OPFS (unchanged). Config + shada stay local either way.
+    // The same connection can also be made *at runtime* with `:connect nxvim://…` (no page
+    // param needed) — intercepted on `<CR>` like the file pickers below (`tryConnectIntercept`).
     const workerUrl = new URL("./worker.mjs", import.meta.url);
     const daemonUri = new URLSearchParams(location.search).get("daemon");
     if (daemonUri) workerUrl.searchParams.set("daemon", daemonUri);
@@ -216,6 +218,15 @@
       if (useSAB) pushFrame(4, enc(path));
       else worker.postMessage({ type: "bind", path });
     }
+    // Ask the Worker to dial a daemon at runtime (`:connect nxvim://…`) and re-point the
+    // off-tick fs/watch seam from OPFS onto the wire — a ring frame under SAB (ordered after
+    // the `<Esc>` feed that dismissed the command line), a message under 5c. Fire-and-forget;
+    // the Worker reports the outcome with a `connected` message (flashed below). Ring type 7
+    // (type 6 is `:TSInstall`'s `tsInstallResultOp` — keep these distinct).
+    function connectOp(uri) {
+      if (useSAB) pushFrame(7, enc(uri));
+      else worker.postMessage({ type: "connect", uri });
+    }
     // Ask the Worker to persist cross-session (shada) state now, with the exit cursor — a
     // ring frame under SAB, a message under 5c. Resolves when the Worker reports the write
     // (the `shada_written` message). Used on tab-hide and by the automation hook.
@@ -276,6 +287,13 @@
           ? await ts.install(lang)
           : { ok: false, msg: "syntax highlighter unavailable (tree-sitter vendor not built)" };
         tsInstallResultOp(lang, res.ok, res.msg || "");
+        return;
+      }
+      // A runtime `:connect nxvim://…` finished dialing — flash the outcome (the fs/watch seam
+      // is now on the wire on success; on failure the editor stays on serverless OPFS).
+      if (msg.type === "connected") {
+        if (msg.ok) flashStatus("connected to daemon", "#98c379");
+        else flashStatus("connect failed: " + (msg.error || "unknown"), "#e06c75");
         return;
       }
       if (msg.type === "fatal") {
@@ -1060,6 +1078,31 @@
       return false;
     }
 
+    // Decide *synchronously* whether `<CR>` over a `:connect nxvim://…` command line should
+    // dial a daemon instead of running an ex-command (there is none — the editor core knows
+    // nothing of `:connect`). The browser twin of nxvim-gui's client-side `:connect`
+    // interception: the UI owns the daemon transport, so it handles the command here and asks
+    // the Worker to re-point the off-tick fs/watch seam onto the wire (`connectOp`). Only the
+    // daemon's own `nxvim://` scheme is accepted; anything else is rejected loudly (fail loud,
+    // matching nxvim-gui rejecting a mistyped `nvim://`). Returns true if it handled the `<CR>`.
+    function tryConnectIntercept() {
+      const f = latest.frame;
+      if (!f || !f.command_mode) return false;
+      const prefix = f.cmdline_prompt || f.cmdline_prefix || "";
+      if (prefix !== ":") return false;
+      const parts = (f.cmdline || "").trim().split(/\s+/);
+      if (parts[0] !== "connect" && parts[0] !== "Connect") return false;
+      feedOp("<Esc>"); // dismiss the command line regardless of the argument's validity
+      const arg = parts[1] || "";
+      if (!arg.startsWith("nxvim://")) {
+        flashStatus(":connect needs an nxvim:// daemon URI", "#e06c75");
+        return true;
+      }
+      connectOp(arg);
+      flashStatus("connecting to daemon…");
+      return true;
+    }
+
     // Pop the open picker, then `:<verb> <name>` the chosen file. `<Esc>` first so the
     // half-typed `:eo` command line clears even if the user cancels the picker.
     function startOpenPicker(verb) {
@@ -1120,6 +1163,9 @@
       const n = keyToNotation(e);
       if (n == null) return;
       e.preventDefault();
+      // `<CR>` over a `:connect nxvim://…` command line dials a daemon instead of feeding the
+      // key (a client affordance — the editor core has no `:connect`).
+      if (n === "<CR>" && tryConnectIntercept()) return;
       // `<CR>` over a `:eo`/`:wo`/… command line opens the native picker instead of feeding
       // the key (the picker must fire synchronously here to keep the user gesture).
       if (n === "<CR>" && tryFilePickerIntercept()) return;
@@ -1241,9 +1287,15 @@
       sab: useSAB,
       feed: (notation) => feedOp(notation),
       type: (notation) => feedOp(notation),
-      // Press Enter *through* the file-picker interception (the keydown path), so a
-      // `:eo`/`:wo`/… command line pops the picker. Plain `feed("<CR>")` bypasses it.
-      pressEnter: () => (tryFilePickerIntercept() ? Promise.resolve({ intercepted: true }) : feedOp("<CR>")),
+      // Press Enter *through* the client-side interceptions (the keydown path), so a
+      // `:connect nxvim://…` dials a daemon and a `:eo`/`:wo`/… command line pops the picker.
+      // Plain `feed("<CR>")` bypasses both.
+      pressEnter: () =>
+        tryConnectIntercept()
+          ? Promise.resolve({ intercepted: "connect" })
+          : tryFilePickerIntercept()
+            ? Promise.resolve({ intercepted: true })
+            : feedOp("<CR>"),
       // Flush cross-session (shada) state to OPFS now (resolves when written) — the tab-hide
       // path, exposed for tests so they can persist + reload without racing the debounce.
       shadaFlush: () => requestShadaFlush(),

@@ -314,7 +314,11 @@ async function opfsWrite(path, bytes) {
 // no boot-message race. In daemon mode fs NEVER silently falls back to OPFS: a dial failure
 // surfaces loudly and every fs request errors with that reason (CLAUDE.md "fail loud").
 // =============================================================================
-const daemonUri = new URL(self.location.href).searchParams.get("daemon");
+// `let`, not `const`: the boot value is the `?daemon=` page param (if any), but a runtime
+// `:connect nxvim://…` (the browser twin of nxvim-gui's `:connect`) re-points it after boot —
+// see `runtimeConnect`. Its truthiness is what switches the off-tick fs/watch seam from the
+// serverless OPFS sandbox onto the wire (`fulfillFsRequests` / `drainWatchRequests`).
+let daemonUri = new URL(self.location.href).searchParams.get("daemon");
 let daemon = null; // an RpcClient once connected
 let daemonError = null; // a dial failure reason (daemon mode requested but not connected)
 
@@ -328,6 +332,25 @@ async function connectDaemon() {
     daemonError = String(e && e.message ? e.message : e);
     postMessage({ type: "config_error", error: `daemon connection failed: ${daemonError}` });
   }
+}
+
+// Runtime `:connect nxvim://…`: dial a daemon *after* boot and re-point the off-tick fs/watch
+// seam from OPFS onto the wire — the browser twin of nxvim-gui's client-side `:connect`, which
+// the editor core knows nothing about (the UI intercepts it on `<CR>` and routes the URI here).
+// Replaces any existing link (a prior `?daemon=` boot or an earlier `:connect`): the old wire
+// is torn down, its watches forgotten (the new daemon knows none of them), and future `:e`/`:w`
+// route to the new daemon. Posts a `connected` status the UI flashes. Config + shada stay LOCAL
+// (OPFS) regardless, exactly as in `?daemon=` mode.
+async function runtimeConnect(uri) {
+  if (daemon) {
+    daemon.close();
+    daemon = null;
+  }
+  armedWatches.clear();
+  daemonError = null;
+  daemonUri = uri;
+  await connectDaemon();
+  postMessage({ type: "connected", ok: !!daemon, uri, error: daemonError });
 }
 
 // Fulfil one off-tick read over the daemon, projecting `fs_read`'s reply onto the same
@@ -393,6 +416,7 @@ async function daemonWrite(path, bytes) {
 const armedWatches = new Set(); // paths currently watched on the daemon (gates the async park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
+let pendingConnectUri = null; // a runtime `:connect nxvim://…` to dial on the next run-loop pass
 const DAEMON_PUSH_POLL_MS = 1000; // async-park cap: clears a dangling waitAsync + backstops a push
 
 // A daemon→edit-host push landed on the RPC reader. Queue it (the run loop applies it — single
@@ -618,6 +642,10 @@ async function runLoopSAB(ctrl, data) {
         eh_ts_install_complete(h, String(r.lang), r.ok ? 1 : 0, String(r.msg || ""));
         tsLanded = true;
         continue;
+      } else if (type === 7) {
+        // connect: a runtime `:connect nxvim://…`. Record the URI; the run loop dials it
+        // after this drain (the dial is async, so it can't run here in the sync drain).
+        pendingConnectUri = utf8(payload);
       }
       acks.push(reqId);
     }
@@ -637,6 +665,17 @@ async function runLoopSAB(ctrl, data) {
     // not a stale clock that would make it instantly due.
     eh_set_clock(h, nowMs());
     const { acks, results, tsLanded } = drain();
+    // A runtime `:connect nxvim://…` arrived this pass (`<Esc>` already dismissed the command
+    // line in the drain above): dial the daemon now, while the loop is event-loop-live — a
+    // blocking `Atomics.wait` park would freeze the WebTransport handshake. This re-points the
+    // off-tick fs/watch seam onto the wire; re-loop so subsequent input hits the new backend.
+    if (pendingConnectUri !== null) {
+      const uri = pendingConnectUri;
+      pendingConnectUri = null;
+      await runtimeConnect(uri);
+      postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
+      continue;
+    }
     // Apply any daemon pushes received since the last pass (the watch leg's `fs_changed`):
     // a reconcile may enqueue an off-tick reload, which `fulfillFsRequests` then re-fetches
     // over the wire in this same pass. Done before `fulfillFsRequests` so the reload lands now.
@@ -771,6 +810,13 @@ onmessage = async (ev) => {
   // the echo + record, then repaint so the status line shows it.
   if (msg.type === "ts_install_result") {
     eh_ts_install_complete(h, String(msg.lang), msg.ok ? 1 : 0, String(msg.msg ?? ""));
+    postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+    return;
+  }
+  // Runtime `:connect nxvim://…` (5c; SAB routes it via a ring frame in `drain()`). Dial the
+  // daemon and re-point the off-tick fs/watch seam onto the wire, then repaint.
+  if (msg.type === "connect") {
+    await runtimeConnect(String(msg.uri));
     postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
     return;
   }

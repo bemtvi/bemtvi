@@ -86,6 +86,20 @@ export class RpcClient {
     if (this.closed) return;
     await this.writer.write(encode([2, method, params]));
   }
+
+  /**
+   * Tear down this link — used when a runtime `:connect` replaces it with a new daemon.
+   * Fails any in-flight request loudly (no silently-hung `:e`/`:w` on the old wire) and
+   * closes the WebTransport session.
+   */
+  close() {
+    this._fail(new Error("daemon connection replaced"));
+    try {
+      this.transport.close();
+    } catch {
+      // Already closing/closed — nothing to do.
+    }
+  }
 }
 
 /**

@@ -32,6 +32,31 @@ nx.dock.open({ side = "left", size = 28 })
 nx.dock.open({ side = "bottom", size = 6 })
 
 --------------------------------------------------------------------------------
+-- Per-dock OPTIONS (the dock scope, alongside nx.bo / nx.wo / nx.o). Set them
+-- inline in `nx.dock.open{...}` or after the fact via `nx.dock.opt(side)`:
+--
+--   showtabline  per-dock override of the global option (0 never / 1 if >1 tab /
+--                2 always) — e.g. always show the explorer's strip
+--   title        a fixed strip label, shown ahead of the tab cells
+--   size         the dock's width (left/right) or height (top/bottom), settable
+--                live so you can grow/shrink a dock after opening
+--   winhighlight  (not implemented yet — reserved for theming a dock's window)
+--------------------------------------------------------------------------------
+-- A titled, always-on strip for the side bar.
+nx.dock.opt("left").title = "EXPLORER"
+nx.dock.opt("left").showtabline = 2
+-- The bottom tray gets a title too; open a second tab in it (`:tabnew` while it
+-- is focused) and its strip lights up on its own.
+nx.dock.opt("bottom").title = "TERMINAL"
+
+-- `:DockGrow {side} {n}` — resize a dock live through the `size` option.
+nx.command("DockGrow", function(o)
+  local side = o.fargs[1] or "left"
+  local n = tonumber(o.fargs[2]) or 40
+  nx.dock.opt(side).size = n
+end)
+
+--------------------------------------------------------------------------------
 -- :DockToggle {side} — open the dock (or resize/focus it if already open). Shows
 -- that the whole dock surface is driveable from Lua, not just the keymaps.
 --------------------------------------------------------------------------------

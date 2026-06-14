@@ -136,10 +136,10 @@ async fn ctrl_4_is_accepted_as_ctrl_backslash() {
     );
 }
 
-/// Re-entering terminal mode (`i`) keeps the cursor at the current position — like
-/// `i` in a normal buffer — instead of snapping to the child's last input point.
+/// Re-entering terminal mode (`i`) snaps the cursor back to the child's input
+/// position, not wherever normal-mode navigation parked it.
 #[tokio::test]
-async fn reentering_keeps_cursor_at_navigated_position() {
+async fn reentering_snaps_cursor_to_the_input_position() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
@@ -147,19 +147,16 @@ async fn reentering_keeps_cursor_at_navigated_position() {
     feed(&rpc, "hello");
     wait_lines(&rpc, "the echoed 'hello'", |ls| has_line(ls, "hello")).await;
 
-    // Leave to terminal-normal and move to the start of the input line.
-    feed(&rpc, "<C-\\><C-n>0");
+    // Leave to terminal-normal and navigate up/to the start.
+    feed(&rpc, "<C-\\><C-n>gg0");
     assert_eq!(mode(&rpc).await, "n");
-    let (_, ncol) = cursor(&rpc).await;
-    assert_eq!(ncol, 0, "navigated to column 0");
-    // Re-enter with `i`: the cursor stays at column 0 (where we navigated), not the
-    // input end. `cat` gets no input, so nothing converges it away — deterministic.
+    // Re-enter: the cursor jumps back to the input position (after "hello").
     feed(&rpc, "i");
     assert_eq!(mode(&rpc).await, "t");
-    let (_, ccol) = cursor(&rpc).await;
+    let (_cline, ccol) = cursor(&rpc).await;
     assert_eq!(
-        ccol, 0,
-        "`i` enters at the cursor (col 0), not the input point"
+        ccol, 5,
+        "re-entry snaps to the input position (col 5), not col 0"
     );
 }
 

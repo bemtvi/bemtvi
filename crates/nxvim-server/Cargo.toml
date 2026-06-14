@@ -39,6 +39,12 @@ native = [
 [dependencies]
 anyhow.workspace = true
 rmpv.workspace = true
+# The terminal-job emulator (`:terminal`): decodes a child's raw PTY bytes into a
+# screen grid the editor mirrors as buffer lines + per-cell colors. Pure Rust (no
+# C, no I/O), so it compiles to wasm and stays a *non-optional* dep shared by both
+# the native and edit-host builds — only the byte transport differs per build. See
+# `terminal.rs` and docs/plans/2026-06-14-terminal-in-buffer.md.
+vt100.workspace = true
 tokio = { workspace = true, optional = true }
 # The native daemon transport: WebTransport/QUIC listener + client (Open Decision
 # #2). `quic.rs` mints the bearer token + self-signed cert here and feeds a bidi

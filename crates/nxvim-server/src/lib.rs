@@ -37,6 +37,10 @@ mod keymap;
 mod lifecycle;
 mod redraw;
 mod save;
+// Feature-agnostic: the vt100 emulator + screen→buffer projection compile on the
+// wasm build too (pure CPU, no PTY). The native PTY transport added to this module
+// in Phase 3 is gated `#[cfg(feature = "native")]` inside it.
+mod terminal;
 
 // The native-transport surface — gated off the wasm build (slice 5a): the
 // msgpack wire + RPC router, the daemon/QUIC legs, the event-loop actor and its
@@ -566,6 +570,14 @@ pub struct EditHost {
     /// remote reload can't be synchronous (it crosses the wire), so the post event is
     /// deferred to the fetch's completion rather than fired inline like the local path.
     reload_posts: HashSet<BufferId>,
+    /// Per-terminal-buffer vt100 emulators, keyed by buffer id. Created when a
+    /// `:terminal` opens, fed the child's raw PTY bytes (decoding escape sequences
+    /// into a screen grid), and projected back into the buffer's mirrored lines +
+    /// the redraw's per-cell colors. The byte *transport* differs per build (a local
+    /// PTY natively, the daemon over WebTransport on wasm), but this emulation is
+    /// pure CPU and shared by both — hence feature-agnostic. See
+    /// [`terminal`](crate::terminal) and docs/plans/2026-06-14-terminal-in-buffer.md.
+    terminals: HashMap<BufferId, terminal::TermEmu>,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -656,6 +668,7 @@ impl EditHost {
             buf_watches: HashMap::new(),
             remote_watches: HashSet::new(),
             reload_posts: HashSet::new(),
+            terminals: HashMap::new(),
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]

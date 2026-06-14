@@ -331,6 +331,24 @@ async fn slow_escapes_stay_in_terminal_mode() {
     }
 }
 
+/// `:terminal` spawns the child with the editor's environment inherited, so a
+/// variable exported in the parent is visible to the shell. Verified with
+/// `printenv`, which prints a set variable and exits 0.
+#[tokio::test]
+async fn terminal_inherits_the_parent_environment() {
+    let _guard = serial_lock().lock().await;
+    // SAFETY: terminal tests hold `serial_lock`, so no other test in this binary
+    // races this process-global mutation; separate suites are separate processes.
+    std::env::set_var("NXVIM_TERM_ENV_TEST", "hello-from-parent");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, "terminal printenv NXVIM_TERM_ENV_TEST").await;
+    wait_lines(&rpc, "the child to see the inherited env var", |ls| {
+        has_line(ls, "hello-from-parent")
+    })
+    .await;
+}
+
 /// `:terminal` starts the child in the editor's working directory, not `$HOME`.
 /// `portable-pty` defaults a `None` cwd to the home directory, so without the
 /// server filling in the process cwd the shell would open in the wrong place.

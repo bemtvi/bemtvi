@@ -234,65 +234,10 @@ impl Editor {
     /// prefix then one ` {count}{name}{+} ` cell per tab — so a click lands on the
     /// tab it visually covers.
     fn region_tabline_at(&self, row: usize, col: usize) -> Option<(Layer, usize)> {
-        let bands = self.dock_bands();
-        let main_tabline = self.tabline_rows();
-        let chrome = main_tabline + self.panel_rows() + self.global_statusline_rows();
-        // The middle band (left dock | main | right docks): its top row and the
-        // main tree's width — what's left after the docks and the global chrome.
-        let mid_y = bands.reserved_top() + main_tabline;
-        let mid_h = self
-            .height
-            .saturating_sub(bands.reserved_top())
-            .saturating_sub(bands.reserved_bottom())
-            .saturating_sub(chrome)
-            .max(1);
-        let main_w = self
-            .width
-            .saturating_sub(bands.reserved_left())
-            .saturating_sub(bands.reserved_right())
-            .max(1);
-        // The bottom dock's tabline is the first content row of its band, which
-        // sits past its separator, below the middle band and global status line.
-        let bottom_tl_y = mid_y + mid_h + self.global_statusline_rows() + 1;
-        let right_x = bands.reserved_left() + main_w + 1;
-        // Each candidate: the region, its tabline's absolute row, and the column
-        // span of its tabline strip. A dock contributes one only when its band has
-        // room for both a tabline row and ≥1 content row (the client's same
-        // `content.height > 1` guard); main's global bar has no such guard.
-        let dock_shown = |side: DockSide, content_rows: usize| {
-            self.tabline_rows_for(Layer::Dock(side)) > 0 && content_rows > 1
-        };
-        let candidates: [Option<(Layer, usize, usize, usize)>; 5] = [
-            (main_tabline > 0).then_some((Layer::Main, bands.reserved_top(), 0, self.width)),
-            dock_shown(DockSide::Top, bands.top).then_some((
-                Layer::Dock(DockSide::Top),
-                0,
-                0,
-                self.width,
-            )),
-            dock_shown(DockSide::Bottom, bands.bottom).then_some((
-                Layer::Dock(DockSide::Bottom),
-                bottom_tl_y,
-                0,
-                self.width,
-            )),
-            (dock_shown(DockSide::Left, mid_h) && bands.left > 0).then_some((
-                Layer::Dock(DockSide::Left),
-                mid_y,
-                0,
-                bands.left,
-            )),
-            (dock_shown(DockSide::Right, mid_h) && bands.right > 0).then_some((
-                Layer::Dock(DockSide::Right),
-                mid_y,
-                right_x,
-                right_x + bands.right,
-            )),
-        ];
-        let (layer, _, x0, x1) = candidates
-            .into_iter()
-            .flatten()
-            .find(|&(_, ty, x0, x1)| row == ty && (x0..x1).contains(&col))?;
+        let (layer, x0) = self.region_geoms().into_iter().find_map(|g| {
+            let (ty, x0, w) = g.tabline?;
+            (row == ty && (x0..x0 + w).contains(&col)).then_some((g.layer, x0))
+        })?;
         if layer == Layer::Main && !self.global_options().tabline.is_empty() {
             return None; // a custom main tabline has no built-in click regions.
         }
@@ -311,11 +256,88 @@ impl Editor {
                 return Some((layer, i));
             }
             x += width;
-            if x >= x1 {
-                break; // the rest is clipped past this region's strip.
-            }
         }
         None
+    }
+
+    /// Every open region's absolute on-screen placement this frame, mirroring the
+    /// client `DockLayout` (`nxvim-tui` `render.rs`): where each region's window
+    /// tree paints, and — when its own tabline shows — that tabline's row and column
+    /// span. The inverse of the per-client band math (the core owns *which* cells,
+    /// the client owns *where*), shared by the mouse hit-tests so a global cell maps
+    /// back to the region the user sees. Geometry is read for `self.height`, which
+    /// is the windows-area height the client reports (cmdline excluded).
+    fn region_geoms(&self) -> Vec<RegionGeom> {
+        let bands = self.dock_bands();
+        let main_tabline = self.tabline_rows();
+        let gstatus = self.global_statusline_rows();
+        let chrome = main_tabline + self.panel_rows() + gstatus;
+        // The middle band (left dock | main | right docks): its top row, height, and
+        // the main tree's width — what's left after the docks and the global chrome.
+        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_h = self
+            .height
+            .saturating_sub(bands.reserved_top())
+            .saturating_sub(bands.reserved_bottom())
+            .saturating_sub(chrome)
+            .max(1);
+        let main_w = self
+            .width
+            .saturating_sub(bands.reserved_left())
+            .saturating_sub(bands.reserved_right())
+            .max(1);
+        // The bottom dock's band content starts past its separator, below the middle
+        // band and the global status line; the right dock sits past main + its sep.
+        let bottom_y = mid_y + mid_h + gstatus + 1;
+        let right_x = bands.reserved_left() + main_w + 1;
+        self.open_layers()
+            .into_iter()
+            .map(|layer| {
+                // The region's full content rect (its own tabline row, if any, plus
+                // the tree below it), absolute.
+                let (cx, cy, cw, ch) = match layer {
+                    Layer::Main => (bands.reserved_left(), mid_y, main_w, mid_h),
+                    Layer::Dock(DockSide::Left) => (0, mid_y, bands.left, mid_h),
+                    Layer::Dock(DockSide::Right) => (right_x, mid_y, bands.right, mid_h),
+                    Layer::Dock(DockSide::Top) => (0, 0, self.width, bands.top),
+                    Layer::Dock(DockSide::Bottom) => (0, bottom_y, self.width, bands.bottom),
+                };
+                // Rows this region's own tabline eats off the top of its content (0
+                // for main — its tabline is the global top bar, handled below).
+                let tlr = match layer {
+                    Layer::Main => 0,
+                    dock => self.tabline_rows_for(dock),
+                };
+                let tree = (cx, cy + tlr, cw, ch.saturating_sub(tlr).max(1));
+                // The tabline strip: main's is the global top bar (full width, at the
+                // reserved-top row); a dock's is its content's first row, shown only
+                // when the band has room for both it and ≥1 content row (the client's
+                // `content.height > 1` guard) and a non-zero width.
+                let tabline = match layer {
+                    Layer::Main => {
+                        (main_tabline > 0).then_some((bands.reserved_top(), 0, self.width))
+                    }
+                    _ => (tlr > 0 && ch > 1 && cw > 0).then_some((cy, cx, cw)),
+                };
+                RegionGeom {
+                    layer,
+                    tree,
+                    tabline,
+                }
+            })
+            .collect()
+    }
+
+    /// The open region — and the absolute top-left of its window-tree area — whose
+    /// tree contains the global cell `(row, col)`: the main area or a dock band,
+    /// below that region's own tabline row. `None` on chrome (a tabline, a
+    /// separator, the panel) or outside every region. Regions are disjoint, so at
+    /// most one matches.
+    fn region_at(&self, row: usize, col: usize) -> Option<(Layer, usize, usize)> {
+        self.region_geoms().into_iter().find_map(|g| {
+            let (x, y, w, h) = g.tree;
+            (col >= x && col < x + w && row >= y && row < y + h).then_some((g.layer, x, y))
+        })
     }
 
     /// Switch the region whose tabline cell holds the click to that tab, moving
@@ -685,10 +707,13 @@ impl Editor {
         row: usize,
         col: usize,
     ) -> Option<(usize, usize)> {
-        let (wx, wy, ww, _) = self.window_rect(win)?;
+        let (abs_x, abs_y) = self.window_screen_pos(win)?;
+        let (_, _, ww, _) = self.window_rect(win)?;
         let (_, text_height) = self.window_content_size(win)?;
         // The window's text band in global screen rows: `[top_edge, bottom_edge]`.
-        let top_edge = self.tabline_rows() + wy;
+        // `abs_y` is the window's absolute top, so this is correct in any region (a
+        // dock band as much as the main area), not just below the main tabline.
+        let top_edge = abs_y;
         let bottom_edge = top_edge + text_height.saturating_sub(1);
         let rel_y = if row <= top_edge {
             self.drag_scroll(false); // at/above the first line → reveal the line above
@@ -699,7 +724,7 @@ impl Editor {
         } else {
             row - top_edge
         };
-        let rel_x = col.saturating_sub(wx).min(ww.saturating_sub(1));
+        let rel_x = col.saturating_sub(abs_x).min(ww.saturating_sub(1));
         self.text_cell_to_buf(win, rel_x, rel_y)
     }
 
@@ -997,21 +1022,21 @@ impl Editor {
     }
 
     /// Resolve a **global** screen cell `(row, col)` to a [`MouseTarget`], or
-    /// `None` if it lands on no actionable region (the tabline, a separator, the
+    /// `None` if it lands on no actionable region (a tabline, a separator, the
     /// panel, or outside every window). This is the reverse of the forward layout:
-    /// strip the top chrome (the tabline row), find the window under the cell,
-    /// then turn the window-relative cell into a buffer line/col through that
-    /// window's scroll offset, number gutter, and tab/wide-char column math.
+    /// find the **region** under the cell (the main area or a dock band), probe that
+    /// region's (live or parked) window tree at the region-relative cell, then turn
+    /// the window-relative cell into a buffer line/col through that window's scroll
+    /// offset, number gutter, and tab/wide-char column math. Resolving across every
+    /// region — not just the focused one — is what lets a click in any dock land
+    /// there; the press handler then focuses that region via `set_current_window`.
     fn hit_test(&self, row: usize, col: usize) -> Option<MouseTarget> {
-        // The windows area sits below the tabline (when shown); the bottom chrome
-        // (panel, command line) is already excluded by the window rects, so a cell
-        // there simply matches no window. Columns are not inset (the area is full
-        // width).
-        let top_chrome = self.tabline_rows();
-        if row < top_chrome {
-            return None; // the tabline — a later phase resolves tab clicks
-        }
-        let (win, rel_x, rel_y) = self.window_at(col, row - top_chrome)?;
+        // Each region's tree lays out at its own origin (0, 0) and the client offsets
+        // it by the region's screen origin; this runs that offset backwards. A cell
+        // on chrome (a tabline, a separator, the panel) matches no region's tree.
+        let (layer, ox, oy) = self.region_at(row, col)?;
+        let tree = self.layer_tree(layer)?;
+        let (win, rel_x, rel_y) = window_at_in(tree, col - ox, row - oy)?;
         let (_, text_height) = self.window_content_size(win)?;
         if rel_y >= text_height {
             // Below the text body: the status row (the last content line).
@@ -1057,34 +1082,70 @@ impl Editor {
         Some((line, col))
     }
 
-    /// Find the window whose on-screen content area contains the windows-area cell
-    /// `(x, y)`, returning its id and the cell made **content-relative** (past a
-    /// bordered float's border). Floats are tested first, top-most by z-order
-    /// (`floats` is sorted bottom-to-top), then the tiled windows; this matches
-    /// the paint order so the cell resolves to the window drawn on top. `None`
-    /// when the cell is on a separator or outside every window.
+    /// Find the window in the **focused** layer's tree whose content area contains
+    /// the windows-area cell `(x, y)`, content-relative. The focused-tree shorthand
+    /// for [`window_at_in`], used by the wheel and resize hit-tests (which act on the
+    /// focused layer); the region-spanning click path uses `window_at_in` directly.
     fn window_at(&self, x: usize, y: usize) -> Option<(WindowId, usize, usize)> {
-        let probe = |id: WindowId| -> Option<(WindowId, usize, usize)> {
-            let w = self.windows.get(id);
-            // A bordered float spends one cell per side on its border; its content
-            // is the rect inset by one. Tiled windows and borderless floats use the
-            // whole rect.
-            let inset = matches!(&w.float, Some(c) if c.border != BorderStyle::None) as usize;
-            let r = w.rect;
-            let x0 = r.x + inset;
-            let y0 = r.y + inset;
-            let x1 = (r.x + r.width).saturating_sub(inset);
-            let y1 = (r.y + r.height).saturating_sub(inset);
-            (x >= x0 && x < x1 && y >= y0 && y < y1).then(|| (id, x - x0, y - y0))
-        };
-        self.windows
-            .floats
-            .iter()
-            .rev()
-            .copied()
-            .chain(self.windows.leaves())
-            .find_map(probe)
+        window_at_in(&self.windows, x, y)
     }
+
+    /// The absolute screen top-left of window `win`: its region's tree origin (from
+    /// [`Editor::region_geoms`]) plus its region-relative rect — the same place
+    /// every client paints it. `None` for an unknown window.
+    fn window_screen_pos(&self, win: WindowId) -> Option<(usize, usize)> {
+        let (layer, _) = self.tree_of_window(win)?;
+        let (ox, oy) = self
+            .region_geoms()
+            .into_iter()
+            .find(|g| g.layer == layer)
+            .map(|g| (g.tree.0, g.tree.1))?;
+        let (wx, wy, _, _) = self.window_rect(win)?;
+        Some((ox + wx, oy + wy))
+    }
+}
+
+/// Find the window in `tree` whose on-screen content area contains the
+/// **tree-relative** cell `(x, y)`, returning its id and the cell made
+/// **content-relative** (past a bordered float's border). Floats are tested first,
+/// top-most by z-order (`floats` is sorted bottom-to-top), then the tiled windows;
+/// this matches the paint order so the cell resolves to the window drawn on top.
+/// `None` when the cell is on a separator or outside every window. `tree` lays out
+/// at its own origin `(0, 0)`, so the caller subtracts the region's screen origin
+/// before calling (see [`Editor::region_at`]).
+fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usize, usize)> {
+    let probe = |id: WindowId| -> Option<(WindowId, usize, usize)> {
+        let w = tree.get(id);
+        // A bordered float spends one cell per side on its border; its content
+        // is the rect inset by one. Tiled windows and borderless floats use the
+        // whole rect.
+        let inset = matches!(&w.float, Some(c) if c.border != BorderStyle::None) as usize;
+        let r = w.rect;
+        let x0 = r.x + inset;
+        let y0 = r.y + inset;
+        let x1 = (r.x + r.width).saturating_sub(inset);
+        let y1 = (r.y + r.height).saturating_sub(inset);
+        (x >= x0 && x < x1 && y >= y0 && y < y1).then(|| (id, x - x0, y - y0))
+    };
+    tree.floats
+        .iter()
+        .rev()
+        .copied()
+        .chain(tree.leaves())
+        .find_map(probe)
+}
+
+/// One open region's absolute on-screen placement this frame (see
+/// [`Editor::region_geoms`]): where its window tree paints and, when shown, its own
+/// tabline strip.
+struct RegionGeom {
+    layer: Layer,
+    /// Absolute `(x, y, width, height)` of the region's window-tree area — below its
+    /// own tabline row, the rect the tree lays out into.
+    tree: (usize, usize, usize, usize),
+    /// Absolute `(row, x_start, width)` of this region's tabline strip, or `None`
+    /// when it isn't shown this frame.
+    tabline: Option<(usize, usize, usize)>,
 }
 
 /// Display width of one built-in tabline cell — the screen columns the client's

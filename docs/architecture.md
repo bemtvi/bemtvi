@@ -504,7 +504,10 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   owns *where*). Surface: the `nx.dock.*` Lua table
   (`open{side,size?,buf?,title?,showtabline?}` / `close` / `focus`, plus the
   per-dock option scope `nx.dock.opt(side)`) and the `:DockOpen`/`:DockClose`/
-  `:DockFocus` ex-commands, queued as a `DockOp` drained into the core. (Design:
+  `:DockFocus` ex-commands, queued as a `DockOp` drained into the core. Mouse:
+  `hit_test` resolves a click across **every** region (the focused layer plus each
+  parked dock tree, via `region_geoms`), so a left-click in any dock focuses it and
+  places the cursor — `set_current_window` crosses to that layer first. (Design:
   [`docs/plans/2026-06-14-permanent-docked-panels.md`](plans/2026-06-14-permanent-docked-panels.md).)
 - **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from
   the same server-side lifecycle diff as the buffer events, ordered

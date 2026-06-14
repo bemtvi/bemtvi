@@ -165,6 +165,64 @@ async fn focus_crosses_into_and_out_of_a_dock() {
     assert_eq!(lines(&rpc).await, vec!["dock"], "back in the dock buffer");
 }
 
+/// A left-click inside a dock's window focuses that dock (and places the cursor),
+/// even when the main area is focused — the mouse analogue of `<C-w><C-w>h`.
+#[tokio::test]
+async fn click_in_a_dock_focuses_it() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>");
+    // Cross to the main area so the dock is not focused.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "main is focused before the click"
+    );
+    // The left dock's window occupies cols 0..20, rows 0.. (single-tab → no dock
+    // tabline, and main's tabline is hidden at one tab). Click inside it.
+    feed_mouse(&rpc, "left", "press", 3, 5);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock"],
+        "the click focused the dock"
+    );
+    // Edits now land in the dock buffer.
+    feed(&rpc, "A!<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock!"],
+        "typing goes to the clicked dock"
+    );
+}
+
+/// A left-click in the main area focuses it back from a focused dock — the inverse
+/// crossing, by mouse.
+#[tokio::test]
+async fn click_in_main_focuses_it_from_a_dock() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    // Open the dock (it takes focus) and leave focus there.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock"],
+        "the dock is focused before the click"
+    );
+    // The main area sits to the right of the 20-col dock (+ its separator), so it
+    // starts at col 21; click well inside it.
+    feed_mouse(&rpc, "left", "press", 3, 40);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "the click focused the main area"
+    );
+    feed(&rpc, "A!<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["main!"], "typing goes back to main");
+}
+
 #[tokio::test]
 async fn single_ctrl_w_splits_within_the_focused_dock() {
     let (rpc, _incoming) = start().await;

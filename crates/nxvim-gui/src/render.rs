@@ -650,22 +650,26 @@ impl Renderer {
                 line(cx, cy, self.cell_w * s.length as f32, self.cell_h * 0.12);
             }
         }
-        // The border line between each open dock and the main area.
+        // The border line between each open dock and the main area. Drawn heavier
+        // than the split separators above (the GUI analogue of the TUI/web's heavy
+        // `━`/`┃` glyphs) so a permanent dock edge reads as distinct from an ordinary
+        // window split.
+        const DOCK_EDGE: f32 = 0.2;
         if dt > 0 {
             let (cx, cy) = self.cell_px(0, dt);
-            line(cx, cy, self.cell_w * cols as f32, self.cell_h * 0.12);
+            line(cx, cy, self.cell_w * cols as f32, self.cell_h * DOCK_EDGE);
         }
         if db > 0 {
             let (cx, cy) = self.cell_px(0, bottom_y);
-            line(cx, cy, self.cell_w * cols as f32, self.cell_h * 0.12);
+            line(cx, cy, self.cell_w * cols as f32, self.cell_h * DOCK_EDGE);
         }
         if dl > 0 {
             let (cx, cy) = self.cell_px(dl, mid_y);
-            line(cx, cy, self.cell_w * 0.12, self.cell_h * mid_h as f32);
+            line(cx, cy, self.cell_w * DOCK_EDGE, self.cell_h * mid_h as f32);
         }
         if dr > 0 {
             let (cx, cy) = self.cell_px(cols.saturating_sub(dr + 1), mid_y);
-            line(cx, cy, self.cell_w * 0.12, self.cell_h * mid_h as f32);
+            line(cx, cy, self.cell_w * DOCK_EDGE, self.cell_h * mid_h as f32);
         }
 
         // Floats on top, in list order (the server already sorts them by zindex) —

@@ -385,10 +385,11 @@ fn a_left_dock_paints_left_of_the_main_area_with_a_border() {
     );
     let main_at: String = row_text(&buf, 0).chars().skip(11).take(9).collect();
     assert_eq!(main_at, "MAIN-AREA", "main offset past the dock band");
-    // The vertical dock border is painted at column 10.
+    // The vertical dock border is painted at column 10 — heavy `┃`, distinct from
+    // the light `│` between ordinary window splits.
     assert_eq!(
         buf.cell((10, 0)).unwrap().symbol(),
-        "│",
+        "┃",
         "dock border column"
     );
 }
@@ -407,8 +408,8 @@ fn a_top_dock_paints_above_the_main_area() {
     assert!(row_text(&buf, 0).starts_with("TOPBAR"), "top dock on row 0");
     assert_eq!(
         row_text(&buf, 2),
-        "─".repeat(20),
-        "top dock border on row 2"
+        "━".repeat(20),
+        "top dock border on row 2 (heavy, distinct from split borders)"
     );
     assert!(
         row_text(&buf, 3).starts_with("MAIN"),
@@ -1126,7 +1127,7 @@ fn a_top_dock_paints_its_own_tabline_above_its_content() {
         row_text(&buf, 1).starts_with("DOCKTEXT"),
         "dock content on row 1"
     );
-    assert_eq!(row_text(&buf, 3), "─".repeat(20), "dock border on row 3");
+    assert_eq!(row_text(&buf, 3), "━".repeat(20), "dock border on row 3");
     assert!(row_text(&buf, 4).starts_with("MAIN"), "main below the dock");
 }
 

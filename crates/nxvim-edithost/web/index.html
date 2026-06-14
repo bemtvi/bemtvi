@@ -1055,10 +1055,12 @@
         el.style.lineHeight = ch + "px";
         gridEl.appendChild(el);
       };
-      if (g.dt > 0) sepLine(0, g.dt, cols, 1, "─", false);
-      if (g.db > 0) sepLine(0, g.midY + g.midH + g.globalStatusRows, cols, 1, "─", false);
-      if (g.dl > 0) sepLine(g.dl, g.midY, 1, g.midH, "│", true);
-      if (g.dr > 0) sepLine(cols - g.dr - 1, g.midY, 1, g.midH, "│", true);
+      // Heavy box-drawing glyphs (━/┃) mark a permanent dock edge, distinct from
+      // the light (─/│) borders between ordinary window splits drawn above.
+      if (g.dt > 0) sepLine(0, g.dt, cols, 1, "━", false);
+      if (g.db > 0) sepLine(0, g.midY + g.midH + g.globalStatusRows, cols, 1, "━", false);
+      if (g.dl > 0) sepLine(g.dl, g.midY, 1, g.midH, "┃", true);
+      if (g.dr > 0) sepLine(cols - g.dr - 1, g.midY, 1, g.midH, "┃", true);
     }
     function renderFloat(w, tablineRows, hl) {
       renderWindow(w, tablineRows, hl);

@@ -477,7 +477,9 @@ impl DockLayout {
         }
     }
 
-    /// Paint the border line between each open dock and the main area.
+    /// Paint the border line between each open dock and the main area. Drawn with
+    /// the **heavy** box-drawing glyphs (`━`/`┃`) so a permanent dock edge reads as
+    /// distinct from the light (`─`/`│`) borders between ordinary window splits.
     fn render_borders(&self, frame: &mut Frame, view: &View) {
         let style = view
             .status_line
@@ -485,13 +487,13 @@ impl DockLayout {
             .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
         let hline = |frame: &mut Frame, x: u16, y: u16, len: u16| {
             frame.render_widget(
-                Paragraph::new(Span::styled("─".repeat(len as usize), style)),
+                Paragraph::new(Span::styled("━".repeat(len as usize), style)),
                 Rect::new(x, y, len, 1),
             );
         };
         let vline = |frame: &mut Frame, x: u16, y: u16, len: u16| {
             let rows: Vec<Line> = (0..len)
-                .map(|_| Line::from(Span::styled("│", style)))
+                .map(|_| Line::from(Span::styled("┃", style)))
                 .collect();
             frame.render_widget(Paragraph::new(Text::from(rows)), Rect::new(x, y, 1, len));
         };

@@ -23,6 +23,11 @@ export const VERSIONS = {
   'tree-sitter-cpp': '0.23.4',
   'tree-sitter-c': '0.24.1',
   'tree-sitter-go': '0.25.0',
+  'tree-sitter-bash': '0.25.1',
+  'tree-sitter-css': '0.25.0',
+  'tree-sitter-html': '0.23.2',
+  'tree-sitter-java': '0.23.5',
+  'tree-sitter-c-sharp': '0.23.5',
   '@tree-sitter-grammars/tree-sitter-zig': '1.1.2',
   '@tree-sitter-grammars/tree-sitter-lua': '0.4.1',
 };
@@ -128,6 +133,52 @@ export const REGISTRY = {
     extensions: ['go'],
     sample: 'package main\n\nimport "fmt"\n\ntype Point struct {\n\tX, Y float64\n}\n\nfunc (p Point) Add(q Point) Point {\n\treturn Point{p.X + q.X, p.Y + q.Y}\n}\n\nfunc main() {\n\tconst n = 3\n\ts := "hello"\n\tfor i := 0; i < n; i++ {\n\t\tfmt.Println(s, i)\n\t}\n}',
   },
+  bash: {
+    pkg: 'tree-sitter-bash',
+    wasm: 'tree-sitter-bash.wasm',
+    extensions: ['sh', 'bash'],
+    sample: '#!/usr/bin/env bash\nset -euo pipefail\n# comment\nNAME="world"\ngreet() {\n  local who=$1\n  echo "hello ${NAME} $who"\n}\nfor i in 1 2 3; do greet "$i"; done\nif [[ -f "$HOME/.bashrc" ]]; then source "$HOME/.bashrc"; fi',
+  },
+  css: {
+    pkg: 'tree-sitter-css',
+    wasm: 'tree-sitter-css.wasm',
+    extensions: ['css'],
+    sample: '/* comment */\n:root { --accent: #3366ff; }\n.card, #main > .row:hover {\n  color: var(--accent);\n  margin: 0 auto;\n  font-size: 1.5rem;\n}\n@media (max-width: 600px) { .card { display: none; } }',
+  },
+  html: {
+    pkg: 'tree-sitter-html',
+    wasm: 'tree-sitter-html.wasm',
+    extensions: ['html', 'htm'],
+    sample: '<!DOCTYPE html>\n<html lang="en">\n<head><meta charset="utf-8"><title>T</title></head>\n<body>\n  <!-- comment -->\n  <div class="x" id="y"><p>Hello <a href="#">link</a></p></div>\n</body>\n</html>',
+  },
+  java: {
+    pkg: 'tree-sitter-java',
+    wasm: 'tree-sitter-java.wasm',
+    extensions: ['java'],
+    sample: 'package com.example;\nimport java.util.List;\n/** doc */\npublic class C<T> extends B implements I {\n  private final int x = 1;\n  public static void main(String[] args) {\n    String s = "hi";\n    for (int i = 0; i < 10; i++) { System.out.println(s + i); }\n  }\n}',
+  },
+  // npm package is `tree-sitter-c-sharp` (hyphen); its prebuilt parser is named with an
+  // underscore (`tree-sitter-c_sharp.wasm`). Reached via `:TSInstall c#` / `csharp` / `cs`
+  // through ALIASES below; `.cs`/`.csx` files select it directly.
+  c_sharp: {
+    pkg: 'tree-sitter-c-sharp',
+    wasm: 'tree-sitter-c_sharp.wasm',
+    extensions: ['cs', 'csx'],
+    sample: 'using System;\nnamespace App {\n  public class C : B {\n    private int _x = 1;\n    public string Name { get; set; }\n    public async Task<int> F(int a) {\n      var s = $"hi{a}";\n      return await Task.FromResult(a + _x);\n    }\n  }\n  enum E { A, B }\n}',
+  },
+  // JSX is parsed by the JavaScript grammar (no separate parser, unlike `tsx`/typescript),
+  // so this reuses tree-sitter-javascript + its JSX highlights. `.jsx` files keep mapping to
+  // the bundled `javascript` (see its `extensions`) so they highlight offline; this entry
+  // exists so `:TSInstall jsx` resolves to the same JSX-aware query set.
+  jsx: {
+    pkg: 'tree-sitter-javascript',
+    wasm: 'tree-sitter-javascript.wasm',
+    highlights: [
+      ['tree-sitter-javascript', 'queries/highlights.scm'],
+      ['tree-sitter-javascript', 'queries/highlights-jsx.scm'],
+    ],
+    sample: 'import React from "react";\nconst App = ({name}) => {\n  const [n, setN] = React.useState(0);\n  return <div className="x" onClick={() => setN(n + 1)}>Hello {name}: {n}<Sub/></div>;\n};\nfunction Sub() { return <span>!</span>; }',
+  },
 };
 
 // The languages bundled into web/vendor/ for offline use. Kept small: rust (the repo's
@@ -172,4 +223,24 @@ export const EXT = (() => {
 // editor-filetype → grammar name, for buffers whose language the core resolved itself
 // (an explicit `:set filetype=…` or an extension the core table knows). Only names
 // that *differ* from the grammar need an entry; `c` highlights with the C++ grammar.
-export const FT = { c: 'cpp' };
+export const FT = { c: 'cpp', sh: 'bash', cs: 'c_sharp', csharp: 'c_sharp' };
+
+// Friendly `:TSInstall <arg>` aliases → canonical registry name. The command argument is
+// resolved through this before the REGISTRY lookup, so `:TSInstall c#` / `csharp` / `cs`
+// all install `c_sharp`, and `sh` / `shell` install `bash`. File-name and filetype
+// resolution don't use this (they go through EXT / FT); it's only for the install command.
+export const ALIASES = {
+  'c#': 'c_sharp',
+  csharp: 'c_sharp',
+  cs: 'c_sharp',
+  sh: 'bash',
+  shell: 'bash',
+  htm: 'html',
+};
+
+// Canonicalize a `:TSInstall` language argument (lower-cased, alias-resolved). Unknown
+// names pass through unchanged so the caller can report `unknown language '<name>'`.
+export function resolveName(name) {
+  const k = String(name || '').toLowerCase();
+  return ALIASES[k] || k;
+}

@@ -21,7 +21,7 @@
 // the renderer already does).
 
 import { Parser, Language, Query } from './vendor/web-tree-sitter/web-tree-sitter.js';
-import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, versionOf } from './grammars.js';
+import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, versionOf, resolveName } from './grammars.js';
 import { sanitize } from './ts-sanitize.js';
 
 // Resolve vendored assets relative to THIS module, not the page, so the demo still
@@ -183,17 +183,21 @@ export function createHighlighter({ onReady } = {}) {
   // OPFS (so it survives reload), and register it. Returns `{ ok, msg }` for the status
   // line. Only highlights.scm is consumed today; indents/injections/folds/locals are
   // cached for forward-compat (no browser consumer yet).
-  async function install(name) {
+  async function install(rawName) {
     await ready;
+    // Canonicalize first (`c#`/`csharp`/`cs` → `c_sharp`, …); `name` is what we cache,
+    // register, and report back, so OPFS / the installed manifest / `:TSInstallInfo` all
+    // use the one canonical spelling regardless of which alias the user typed.
+    const name = resolveName(rawName);
     const cfg = REGISTRY[name];
-    if (!cfg) return { ok: false, msg: `unknown language '${name}'` };
+    if (!cfg) return { ok: false, name, msg: `unknown language '${rawName}'` };
     // Already available — re-register from cache (also the `:TSUpdate` of a bundled lang).
     if (isAvail(name)) {
       langs.delete(name);
       await load(name);
       return langs.get(name)
-        ? { ok: true, msg: installed.has(name) ? 'already installed' : 'bundled' }
-        : { ok: false, msg: 'cached grammar failed to load' };
+        ? { ok: true, name, msg: installed.has(name) ? 'already installed' : 'bundled' }
+        : { ok: false, name, msg: 'cached grammar failed to load' };
     }
     try {
       const ver = versionOf(cfg.pkg);
@@ -213,7 +217,7 @@ export function createHighlighter({ onReady } = {}) {
       const query = new Query(language, res.text);
       const caps = query.captures(tree.rootNode).length;
       tree.delete();
-      if (caps === 0) return { ok: false, msg: 'grammar/query mismatch (0 captures)' };
+      if (caps === 0) return { ok: false, name, msg: 'grammar/query mismatch (0 captures)' };
 
       // The rest of the standard query set — cached for forward-compat, best-effort
       // (a grammar that doesn't ship one is skipped, not an error).
@@ -238,9 +242,9 @@ export function createHighlighter({ onReady } = {}) {
       memo = { lang: null, text: null, spans: null }; // a now-installed buffer must re-highlight
       notify();
       const kinds = ['highlights', ...Object.keys(extras)].join('+');
-      return { ok: true, msg: `${cfg.pkg}@${ver}, queries: ${kinds}` };
+      return { ok: true, name, msg: `${cfg.pkg}@${ver}, queries: ${kinds}` };
     } catch (e) {
-      return { ok: false, msg: String(e && e.message ? e.message : e) };
+      return { ok: false, name, msg: String(e && e.message ? e.message : e) };
     }
   }
 

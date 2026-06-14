@@ -307,7 +307,9 @@
         const res = (ts && ts.install)
           ? await ts.install(lang)
           : { ok: false, msg: "syntax highlighter unavailable (tree-sitter vendor not built)" };
-        tsInstallResultOp(lang, res.ok, res.msg || "");
+        // Report the canonical name the highlighter resolved (e.g. `c#` → `c_sharp`) so the
+        // core's echo + `:TSInstallInfo` record match what's cached in OPFS.
+        tsInstallResultOp(res.name || lang, res.ok, res.msg || "");
         return;
       }
       // A `"+`/`"*` yank/delete — write the text to the real clipboard (only the UI thread can

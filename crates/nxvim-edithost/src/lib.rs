@@ -94,6 +94,13 @@ struct Sink {
     /// file), recorded by [`fs_unwatch`](HostEffects::fs_unwatch); the disarm twin of
     /// [`watch_arms`](Sink::watch_arms), drained by [`eh_take_watch_requests`].
     watch_disarms: Vec<String>,
+    /// Treesitter grammars the editor newly asked to **install** this convergence (one
+    /// per `:TSInstall <lang>`), recorded by [`ts_install`](HostEffects::ts_install).
+    /// Drained by [`eh_take_ts_requests`] for the Worker to forward to the UI thread,
+    /// which fetches the prebuilt `.wasm` + queries (offline bundle / OPFS / jsDelivr),
+    /// caches + registers them with the JS highlighter, and lands the outcome back via
+    /// [`eh_ts_install_complete`]. Browser-side fetch, not a native compile.
+    ts_requests: Vec<String>,
 }
 
 /// The wasm [`HostEffects`]: the analogue of `nxvim-server`'s `NativeEffects`, but the
@@ -165,11 +172,13 @@ impl HostEffects for WasmEffects {
         true
     }
 
-    fn ts_install(&mut self, _lang: String) {
-        // `:TSInstall` echoes a loud "not available in the browser build yet" at the
-        // ex-command layer (excmd.rs) on this build instead of reaching the effect, so
-        // this is unreachable; guard it loudly in case that gating ever regresses.
-        unreachable!("ts_install: native treesitter is unavailable in the browser build")
+    fn ts_install(&mut self, lang: String) {
+        // `:TSInstall <lang>` on the browser build: record the request for the Worker to
+        // forward to the UI thread (`eh_take_ts_requests` → `ts_install` postMessage),
+        // where web-tree-sitter lives. The UI fetches the prebuilt grammar (offline
+        // bundle / OPFS cache / jsDelivr), registers it, and lands the outcome back via
+        // `eh_ts_install_complete`. Fire-and-forget — the editor tick doesn't block on it.
+        self.sink.borrow_mut().ts_requests.push(lang);
     }
 }
 
@@ -469,6 +478,56 @@ pub unsafe extern "C" fn eh_take_watch_requests(h: *mut WasmEditHost) -> *mut c_
     into_owned_cstr(serde_json::json!({ "arm": arm, "disarm": disarm }).to_string())
 }
 
+/// Drain the treesitter grammars the editor asked to install this convergence (one per
+/// `:TSInstall <lang>`) as a JSON `["lang", …]` array, emptying the queue so each is
+/// forwarded to the UI thread exactly once. The Worker posts a `ts_install` message per
+/// language; the UI fetches/caches/registers the grammar (web-tree-sitter is UI-side) and
+/// lands the outcome via [`eh_ts_install_complete`]. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_ts_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    let reqs: Vec<String> = std::mem::take(&mut handle.sink.borrow_mut().ts_requests);
+    into_owned_cstr(serde_json::to_string(&reqs).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Land a finished browser `:TSInstall`: the UI thread fetched + registered the grammar
+/// (`ok != 0`) or failed (`ok == 0`, `msg` the loud reason). Records the language for
+/// `:TSInstallInfo` and echoes the outcome. Highlighting itself repaints JS-side when the
+/// grammar registers, independent of this echo. See [`EditHost::complete_ts_install`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `lang` / `msg` are valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn eh_ts_install_complete(
+    h: *mut WasmEditHost,
+    lang: *const c_char,
+    ok: i32,
+    msg: *const c_char,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    handle
+        .host
+        .complete_ts_install(as_str(lang).to_string(), ok != 0, as_str(msg).to_string());
+}
+
+/// Seed the grammars available to the JS highlighter at boot, from a JSON `["lang", …]`
+/// array the Worker assembles by reading the offline bundle's manifest and the OPFS
+/// install cache. Backs `:TSInstallInfo`. See [`EditHost::seed_ts_installed`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `json` is a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_ts_seed_installed(h: *mut WasmEditHost, json: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    let langs: Vec<String> = serde_json::from_str(as_str(json)).unwrap_or_default();
+    handle.host.seed_ts_installed(langs);
+}
+
 /// Pointer to the snapshotted bytes of the in-flight off-tick write `seq` (a `double` so
 /// the small counter crosses the JS boundary without 64-bit-int marshalling), for the
 /// Worker to copy out (`HEAPU8.subarray(ptr, ptr + len)`) and write to OPFS. Valid until
@@ -616,9 +675,12 @@ pub unsafe extern "C" fn eh_remote_file_changed(
 ) {
     let Some(handle) = h.as_mut() else { return };
     let mtime = if mtime_ms < 0.0 { -1 } else { mtime_ms as i64 };
-    handle
-        .host
-        .remote_file_changed(as_str(path).to_string(), has_stat != 0, size.max(0.0) as u64, mtime);
+    handle.host.remote_file_changed(
+        as_str(path).to_string(),
+        has_stat != 0,
+        size.max(0.0) as u64,
+        mtime,
+    );
 }
 
 /// Execute a Lua chunk through the real effects path (queued `vim.cmd`s and deferred

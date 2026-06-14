@@ -27,6 +27,7 @@ rm -rf "$site"
 mkdir -p "$site/web" "$site/dist"
 cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$site/dist/"
 cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/highlight.js" \
+   "$here/web/grammars.js" "$here/web/ts-sanitize.js" \
    "$here/web/serve.mjs" "$site/web/"
 [ -d "$here/web/vendor" ] && cp -r "$here/web/vendor" "$site/web/vendor"
 

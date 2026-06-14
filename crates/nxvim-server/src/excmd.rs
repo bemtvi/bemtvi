@@ -152,20 +152,23 @@ impl EditHost {
             "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
                 self.ts_install(args)
             }
-            // The browser build has no native treesitter (no C compiler / `dlopen` to
-            // build + load a grammar), so say so loudly rather than reach the
-            // `ts_install` effect (which `unreachable!`s on the wasm `HostEffects`). The
-            // defer-to-plugin guard still applies — a real nvim-treesitter `:TSInstall`
-            // shadows this. (`:TSInstallInfo` stays an `E492` on this build, as in 5a.)
+            // The browser build can't compile/`dlopen` a native grammar, but it
+            // highlights JS-side (web-tree-sitter), so `:TSInstall` fetches a *prebuilt*
+            // grammar `.wasm` + queries at runtime through the `ts_install` effect — the
+            // JS host does the fetch/cache/register (see edithost's `WasmEffects`). Same
+            // defer-to-plugin guard: a real nvim-treesitter `:TSInstall` shadows this.
             #[cfg(not(feature = "native"))]
             "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
-                self.editor.echo(format!(
-                    "{name}: treesitter is not available in the browser build yet"
-                ))
+                self.ts_install(args)
             }
             // `:TSInstallInfo` — list the parsers installed across the search path.
             // Same defer-to-plugin guard as the install commands.
             #[cfg(feature = "native")]
+            "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
+            // `:TSInstallInfo` on the browser build — list the grammars available to the
+            // JS highlighter (the offline bundle + whatever `:TSInstall` cached in OPFS),
+            // the wasm analogue of native's on-disk parser scan.
+            #[cfg(not(feature = "native"))]
             "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
             _ if self.lua.has_user_command(name, cur_buf) => {
                 if let Err(e) = self.lua.run_user_command(name, args, cur_buf) {
@@ -185,8 +188,7 @@ impl EditHost {
     /// each language runs on a `spawn_blocking` worker; its result returns on the
     /// `install_events` `select!` arm ([`EditHost::on_install_done`]). We echo a
     /// "installing…" line now so the user sees the command took. Native only — the
-    /// browser build has no native treesitter (the `:TSInstall` arm above echoes a
-    /// loud "not available" there instead of reaching this / the `ts_install` effect).
+    /// browser build's `:TSInstall` arm calls the wasm `ts_install` below instead.
     #[cfg(feature = "native")]
     fn ts_install(&mut self, args: &str) {
         let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
@@ -202,6 +204,49 @@ impl EditHost {
             // run loop's install arm ([`EditHost::on_install_done`]).
             self.fx.ts_install(lang);
         }
+    }
+
+    /// `:TSInstall <lang>…` on the browser build — fetch each named *prebuilt* grammar
+    /// (`.wasm` + queries) at runtime through the same `ts_install` effect, only here it
+    /// crosses to the JS host (web-tree-sitter lives UI-side), which fetches from a CDN,
+    /// caches in OPFS, and registers it. Fire-and-forget like the native path: the
+    /// outcome lands later via [`EditHost::complete_ts_install`]. No C compiler / `dlopen`
+    /// is involved — the browser loads a `.wasm` grammar, not a native `.so`.
+    #[cfg(not(feature = "native"))]
+    fn ts_install(&mut self, args: &str) {
+        let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+        if langs.is_empty() {
+            self.editor
+                .echo("TSInstall: usage: :TSInstall <language> [<language>…]");
+            return;
+        }
+        self.editor
+            .echo(format!("TSInstall: installing {}…", langs.join(", ")));
+        for lang in langs {
+            self.fx.ts_install(lang);
+        }
+    }
+
+    /// `:TSInstallInfo` on the browser build — panel-list the grammars available to the
+    /// JS highlighter (the offline bundle + whatever `:TSInstall` cached in OPFS), the
+    /// wasm analogue of native's on-disk parser scan. Highlighting is JS-side here, so
+    /// there is no parser dir / per-grammar query listing to show.
+    #[cfg(not(feature = "native"))]
+    fn ts_install_info(&mut self) {
+        let langs = self.ts_installed_list();
+        let mut lines = Vec::new();
+        if langs.is_empty() {
+            lines.push("No treesitter grammars installed.".to_string());
+            lines.push(String::new());
+            lines.push("Install one with  :TSInstall <language>".to_string());
+        } else {
+            lines.push(format!("Available treesitter grammars ({}):", langs.len()));
+            lines.push(String::new());
+            for lang in &langs {
+                lines.push(lang.clone());
+            }
+        }
+        self.editor.open_panel("TSInstall info", lines, false, 0);
     }
 
     /// `:TSInstallInfo` — open a panel listing every parser installed across the

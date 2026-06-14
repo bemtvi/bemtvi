@@ -42,6 +42,13 @@ const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "n
 // Worker forwards each to the daemon and lands its `fs_changed` pushes back into the tick.
 const eh_take_watch_requests = M.cwrap("eh_take_watch_requests", "number", ["number"]);
 const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number", "string", "number", "number", "number"]);
+// Treesitter `:TSInstall` leg: the editor enqueues each install off-tick; the Worker
+// forwards it to the UI thread (web-tree-sitter lives there), which fetches/caches/registers
+// the grammar and lands the outcome back via `eh_ts_install_complete`. `eh_ts_seed_installed`
+// tells the core, at boot, which grammars are already available (bundle + OPFS cache).
+const eh_take_ts_requests = M.cwrap("eh_take_ts_requests", "number", ["number"]);
+const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number", "string", "number", "string"]);
+const eh_ts_seed_installed = M.cwrap("eh_ts_seed_installed", null, ["number", "string"]);
 // Persistence (shada): the editor's cross-session snapshot ↔ a JSON blob the Worker keeps
 // in OPFS. `eh_export_shada(include_exit)` serializes it; `eh_load_shada(json)` restores it.
 const eh_export_shada = M.cwrap("eh_export_shada", "number", ["number", "number"]);
@@ -88,6 +95,21 @@ async function bootWithConfig() {
     }
   } catch (e) {
     postMessage({ type: "config_error", error: "shada load: " + e });
+  }
+  // Seed the core's set of available treesitter grammars (for `:TSInstallInfo`): the offline
+  // bundle (vendor/manifest.json) ∪ whatever a previous session installed (OPFS). The UI
+  // highlighter reads the same two manifests itself; this only mirrors the list into the core.
+  try {
+    const avail = new Set();
+    try {
+      const res = await fetch(new URL("vendor/manifest.json", import.meta.url));
+      if (res.ok) for (const l of (await res.json()).languages || []) avail.add(l);
+    } catch { /* highlighter assets not built — plain rendering, empty bundle */ }
+    const cache = await opfsRead("/.nxvim/treesitter/manifest.json"); // kind 0 = present
+    if (cache.kind === 0 && cache.text.length) for (const l of JSON.parse(cache.text)) avail.add(l);
+    eh_ts_seed_installed(h, JSON.stringify([...avail]));
+  } catch (e) {
+    postMessage({ type: "config_error", error: "treesitter seed: " + e });
   }
   eh_boot_finish(h);
 }
@@ -425,6 +447,18 @@ async function drainWatchRequests() {
   }
 }
 
+// Forward any `:TSInstall <lang>` the tick enqueued to the UI thread, where the
+// web-tree-sitter highlighter lives. Fire-and-forget: the UI fetches the prebuilt grammar
+// (offline bundle / OPFS / jsDelivr), caches + registers it, and posts the outcome back as a
+// `ts_install_result` (a ring type-6 frame under SAB, a message under 5c) which lands via
+// `eh_ts_install_complete`. The "installing…" echo already painted with the `:TSInstall`
+// keystroke, so no extra repaint is needed here. Returns whether any were sent.
+function drainTsRequests() {
+  const reqs = JSON.parse(readStr(eh_take_ts_requests(h)));
+  for (const lang of reqs) postMessage({ type: "ts_install", lang });
+  return reqs.length > 0;
+}
+
 // 5c (postMessage, no run loop): apply a push + fulfil any reload re-fetch + repaint inline.
 // Safe because 5c is never parked (no single-consumer run loop to race).
 async function pump5cDaemon() {
@@ -546,6 +580,7 @@ async function runLoopSAB(ctrl, data) {
   function drain() {
     const acks = [];
     const results = [];
+    let tsLanded = false;
     let rp = Atomics.load(ctrl, READ) >>> 0;
     const wp = Atomics.load(ctrl, WRITE) >>> 0;
     while (rp !== wp) {
@@ -575,11 +610,19 @@ async function runLoopSAB(ctrl, data) {
       } else if (type === 5) {
         // shada_flush: persist cross-session state now, with the exit cursor (tab hidden).
         shadaFlushRequested = true;
+      } else if (type === 6) {
+        // ts_install_result: the UI finished a `:TSInstall` ({lang, ok, msg} JSON). Land the
+        // outcome (echo + record installed). Not a user request, so it earns a repaint but
+        // no ack / shada churn — skip the `acks.push` below.
+        const r = JSON.parse(utf8(payload));
+        eh_ts_install_complete(h, String(r.lang), r.ok ? 1 : 0, String(r.msg || ""));
+        tsLanded = true;
+        continue;
       }
       acks.push(reqId);
     }
     Atomics.store(ctrl, READ, rp);
-    return { acks, results };
+    return { acks, results, tsLanded };
   }
 
   // Initial paint (the attach the UI requested rode in as the first frame, but paint a
@@ -593,7 +636,7 @@ async function runLoopSAB(ctrl, data) {
     // `vim.defer_fn` / `nx.timer` (feed or exec_lua) computes its deadline from now —
     // not a stale clock that would make it instantly due.
     eh_set_clock(h, nowMs());
-    const { acks, results } = drain();
+    const { acks, results, tsLanded } = drain();
     // Apply any daemon pushes received since the last pass (the watch leg's `fs_changed`):
     // a reconcile may enqueue an off-tick reload, which `fulfillFsRequests` then re-fetches
     // over the wire in this same pass. Done before `fulfillFsRequests` so the reload lands now.
@@ -606,7 +649,9 @@ async function runLoopSAB(ctrl, data) {
     // Forward any watches the tick armed/disarmed (file-backed buffers opened/closed) to the
     // daemon, so it begins/stops pushing `fs_changed` for them.
     await drainWatchRequests();
-    if (fired || acks.length || fsWork || notified) {
+    // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
+    drainTsRequests();
+    if (fired || acks.length || fsWork || notified || tsLanded) {
       postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
@@ -722,6 +767,13 @@ onmessage = async (ev) => {
     await checkpointShada(true, true);
     return;
   }
+  // `:TSInstall` outcome from the UI (SAB sends it as a ring type-6 frame instead). Land
+  // the echo + record, then repaint so the status line shows it.
+  if (msg.type === "ts_install_result") {
+    eh_ts_install_complete(h, String(msg.lang), msg.ok ? 1 : 0, String(msg.msg ?? ""));
+    postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+    return;
+  }
   // postMessage fallback (5c). `:e`/`:w` fulfill against OPFS before the frame posts, so
   // the resolved frame reflects the open/save (the SAB loop does the same inline).
   switch (msg.type) {
@@ -733,6 +785,7 @@ onmessage = async (ev) => {
       eh_input(h, String(msg.notation));
       await fulfillFsRequests();
       await drainWatchRequests();
+      drainTsRequests();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -742,6 +795,7 @@ onmessage = async (ev) => {
       eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
       await drainWatchRequests();
+      drainTsRequests();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -749,6 +803,7 @@ onmessage = async (ev) => {
       const result = readStr(eh_exec_lua(h, String(msg.code)));
       await fulfillFsRequests();
       await drainWatchRequests();
+      drainTsRequests();
       postFrame(msg.id, result);
       await maybeCheckpoint5c();
       break;

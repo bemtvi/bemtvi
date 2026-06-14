@@ -577,6 +577,14 @@ pub struct EditHost {
     /// `due_ms` is computed relative to it at arm time. Wasm build only.
     #[cfg(not(feature = "native"))]
     clock_ms: u64,
+    /// Names of treesitter grammars the browser host has available — the offline set
+    /// bundled in `web/vendor/` plus any fetched via `:TSInstall` into OPFS. Seeded at
+    /// boot ([`EditHost::seed_ts_installed`]) and extended on each completed install
+    /// ([`EditHost::complete_ts_install`]); read by `:TSInstallInfo`. The browser build
+    /// highlights JS-side (web-tree-sitter), so it has no on-disk parser dir to scan
+    /// like native's [`nxvim_ts::installed_parsers`] — this set is that listing. Wasm only.
+    #[cfg(not(feature = "native"))]
+    ts_installed: std::collections::BTreeSet<String>,
 }
 
 impl EditHost {
@@ -652,6 +660,8 @@ impl EditHost {
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]
             clock_ms: 0,
+            #[cfg(not(feature = "native"))]
+            ts_installed: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -1041,6 +1051,48 @@ impl EditHost {
         };
         self.reconcile_remote_change(path, stat);
         self.settle_events(true);
+    }
+
+    /// Seed the set of available treesitter grammars at boot — the offline bundle
+    /// plus whatever the previous session installed into OPFS, both discovered by the
+    /// Worker (it owns the manifests). Backs `:TSInstallInfo`; idempotent. No echo /
+    /// repaint — this runs before the first frame.
+    pub fn seed_ts_installed(&mut self, langs: Vec<String>) {
+        self.ts_installed.extend(langs);
+    }
+
+    /// Apply a finished browser `:TSInstall`: the JS host fetched + cached the grammar
+    /// (or failed). On success, record the language so `:TSInstallInfo` lists it and
+    /// echo a faithful — but honest — status (only highlighting is wired in the browser;
+    /// the cached indents/folds/locals queries have no consumer yet). On failure, echo
+    /// the loud reason. Highlighting itself repaints JS-side when the grammar registers,
+    /// independent of this echo (the analogue of native's [`on_install_done`], minus the
+    /// engine reload — the wasm core has no in-process treesitter engine).
+    pub fn complete_ts_install(&mut self, lang: String, ok: bool, msg: String) {
+        if ok {
+            self.ts_installed.insert(lang.clone());
+            let detail = if msg.is_empty() {
+                String::new()
+            } else {
+                format!(" ({msg})")
+            };
+            self.editor.echo(format!(
+                "TSInstall: installed {lang}{detail} — highlighting active"
+            ));
+        } else {
+            let why = if msg.is_empty() { "failed" } else { &msg };
+            self.editor.echo(format!("TSInstall: {lang} failed: {why}"));
+        }
+        // Project the echo into a fresh frame (this runs off the input tick, like the fs
+        // completions — `eh_redraw_json` only returns the last *emitted* redraw, so the
+        // echo would otherwise sit unseen until the next keystroke).
+        self.redraw();
+    }
+
+    /// The languages available to highlight, for `:TSInstallInfo` — the browser's
+    /// answer to native's on-disk parser scan ([`nxvim_ts::installed_parsers`]).
+    pub fn ts_installed_list(&self) -> Vec<String> {
+        self.ts_installed.iter().cloned().collect()
     }
 }
 

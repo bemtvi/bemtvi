@@ -225,6 +225,12 @@
       else worker.postMessage({ type: "shada_flush" });
       return new Promise((res) => shadaWrittenWaiters.push(res));
     }
+    // Report a `:TSInstall` outcome back to the Worker (so the core echoes + records it) — a
+    // ring type-6 frame under SAB, a message under 5c, matching `bind`/`shada_flush`.
+    function tsInstallResultOp(lang, ok, msg) {
+      if (useSAB) pushFrame(6, enc(JSON.stringify({ lang, ok, msg })));
+      else worker.postMessage({ type: "ts_install_result", lang, ok, msg });
+    }
 
     let statusHideTimer = null;
     // Briefly show a transient message in the corner indicator (picker errors, etc.).
@@ -259,6 +265,17 @@
       // The Worker persisted cross-session (shada) state — resolve any pending flush.
       if (msg.type === "shada_written") {
         shadaWrittenWaiters.splice(0).forEach((r) => r(msg));
+        return;
+      }
+      // `:TSInstall <lang>` — the core asked us to install a grammar (web-tree-sitter lives
+      // here, UI-side). Fetch/cache/register it, then report the outcome back so the core
+      // echoes it. A repaint on success comes for free via the highlighter's onReady.
+      if (msg.type === "ts_install") {
+        const lang = String(msg.lang);
+        const res = (ts && ts.install)
+          ? await ts.install(lang)
+          : { ok: false, msg: "syntax highlighter unavailable (tree-sitter vendor not built)" };
+        tsInstallResultOp(lang, res.ok, res.msg || "");
         return;
       }
       if (msg.type === "fatal") {

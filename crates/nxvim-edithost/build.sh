@@ -59,7 +59,7 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -sALLOW_MEMORY_GROWTH=1 \
   -sEXIT_RUNTIME=0 \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,HEAPU8 \
-  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_input_mouse,_eh_source_lua,_eh_boot_finish,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_take_watch_requests,_eh_remote_file_changed,_eh_export_shada,_eh_load_shada,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
+  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_input_mouse,_eh_source_lua,_eh_boot_finish,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_take_watch_requests,_eh_remote_file_changed,_eh_take_ts_requests,_eh_ts_install_complete,_eh_ts_seed_installed,_eh_export_shada,_eh_load_shada,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_free_string,_eh_free,_malloc,_free
 
 # 3. Tree-sitter highlighter assets → web/vendor/ (the web-tree-sitter runtime + the
 #    per-language grammar .wasm + sanitized queries) for the in-page syntax highlighter

@@ -440,3 +440,74 @@ jobs:
           name: ${{ env.APPIMAGE_ASSET }}
           path: dist/${{ env.APPIMAGE_ASSET }}
           if-no-files-found: error
+
+  # ── Edit-host: the editor compiled to WebAssembly (nxvim-edithost) ───────
+  # A self-contained static site — download the tarball, extract, and serve with any
+  # static host (the bundled web/serve.mjs sets the required cross-origin-isolation
+  # headers; _headers covers Netlify / Cloudflare Pages). This is the same publish
+  # layout the Netlify deploy ships, assembled by the shared package-site.sh. Links C
+  # (vendored Lua + vim-regex), so it needs Emscripten's `emcc` linker on top of the
+  # Rust→wasm toolchain; Node vendors the tree-sitter highlighter assets + msgpack.
+  edithost:
+    name: edit-host wasm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/nxvim-edithost
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-emscripten
+
+      # emcc — the final linker build.sh invokes by hand to combine the Rust staticlib
+      # with the vendored C archives. Pin to the EMSDK_VERSION netlify.toml uses so the
+      # release tarball matches the deployed site.
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.0
+          actions-cache-folder: emsdk-cache
+
+      - name: Install Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/nxvim-edithost
+          shared-key: edithost-wasm
+
+      # Vendor @msgpack/msgpack into web/vendor/ (build.sh copies it from here) so the
+      # tarball ships daemon mode — the browser↔daemon WebTransport RPC client. Skip
+      # Playwright's browser download: the verifiers don't run in this job.
+      - name: Vendor web deps
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: cd web && npm install
+
+      # build.sh: cargo (wasm32-unknown-emscripten) → emcc link → dist/eh.{mjs,wasm},
+      # and generates+copies the web-tree-sitter highlighter assets into web/vendor/.
+      - name: Build wasm edit-host
+        run: ./build.sh
+
+      # Assemble the static publish root (web/ + dist/ siblings, _headers, serve.mjs, a
+      # serving README), then tar it. The asset name matches the `nxvim-*` glob the
+      # edge/release publish jobs download, so it joins the GitHub release automatically.
+      - name: Package site tarball
+        run: |
+          set -euo pipefail
+          ./package-site.sh _site
+          mkdir -p dist
+          tar -czf "dist/nxvim-edithost-${{ inputs.version }}.tar.gz" -C _site .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nxvim-edithost-${{ inputs.version }}.tar.gz
+          path: crates/nxvim-edithost/dist/nxvim-edithost-${{ inputs.version }}.tar.gz
+          if-no-files-found: error

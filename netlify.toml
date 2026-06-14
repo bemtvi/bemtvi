@@ -14,7 +14,7 @@
 [build.environment]
   # Node (selected by Netlify) for the tree-sitter vendoring script build.sh runs in
   # the crate's treesitter/ tooling dir.
-  NODE_VERSION = "20"
+  NODE_VERSION = "24"
   # Rust toolchain version — read by netlify-build.sh, which installs/selects it via
   # rustup (Netlify's image has rustup but no default toolchain, and doesn't provision
   # RUST_VERSION itself). Must be >= 1.85 (the transitive rmpv dep needs edition2024).

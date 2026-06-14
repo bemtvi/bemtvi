@@ -50,18 +50,7 @@ fi
 #    web/vendor/ (generated once in the local treesitter/ tooling dir).
 bash "$here/build.sh"
 
-# 4. Assemble the static publish root. The page's relative imports require web/ and
-#    dist/ as siblings (index.html loads ./worker.mjs; worker.mjs loads ../dist/eh.mjs),
-#    served under /web/ — netlify.toml redirects / → /web/. Copy only the runtime files
-#    (not the dev server, the Playwright verifiers, or package.json) into a clean _site/,
-#    and put the cross-origin-isolation _headers at its root so /* (which includes /web/
-#    and /dist/) is cross-origin isolated — the SharedArrayBuffer prerequisite.
-site="$here/_site"
-rm -rf "$site"
-mkdir -p "$site/web" "$site/dist"
-cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$site/dist/"
-cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/highlight.js" "$site/web/"
-[ -d "$here/web/vendor" ] && cp -r "$here/web/vendor" "$site/web/vendor"
-cp "$here/web/_headers" "$site/_headers"
-
-echo "assembled static edit-host site → $site"
+# 4. Assemble the static publish root (web/ + dist/ as siblings, _headers at the root,
+#    the turnkey serve.mjs + a serving README) — the same layout the CI release tarball
+#    ships, via the shared package-site.sh. netlify.toml redirects / → /web/.
+bash "$here/package-site.sh" "$here/_site"

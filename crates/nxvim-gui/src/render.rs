@@ -128,6 +128,12 @@ pub struct ScrollFrame<'a> {
     pub sel_clip: Option<bool>,
     pub numbers: &'a [Option<usize>],
     pub highlights: &'a [Vec<nxvim_view::HlSpan>],
+    /// Per-row `hlsearch` match spans for the band (aligned with `lines`), so the
+    /// search highlight slides with the text instead of vanishing until the slide
+    /// settles. Empty inner slice for rows with no match.
+    pub search: &'a [Vec<(u16, u16)>],
+    /// Per-row live `incsearch` preview match for the band, or `None`.
+    pub incsearch: &'a [Option<(u16, u16)>],
     /// Inline inlay hints for the band (aligned with `lines`), so they slide with
     /// the text instead of vanishing until the slide settles.
     pub inlay_hints: &'a [Vec<InlayHint>],
@@ -645,6 +651,8 @@ impl Renderer {
                 let clip = self.text_bounds(ox, oy, wcols, text_rows);
                 let slide_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
+                let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
+                let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
                 // The cursor line tracks the interpolated slide, so relative numbers
                 // stay in step with the moving text; the selection's moving edge is
                 // clipped to the same line (see `sel_clip`).
@@ -684,6 +692,38 @@ impl Renderer {
                                 clip.bottom as f32,
                             );
                         }
+                    }
+                    // Search matches ride the slide too, so `hlsearch`/`incsearch`
+                    // keep highlighting the moving text instead of blinking off
+                    // until the slide settles. The live incsearch preview paints on
+                    // top of the persistent matches, as on the settled path.
+                    if let Some(spans) = s.search.get(k) {
+                        for span in spans {
+                            self.push_span_quad_at(
+                                quads,
+                                text_x0,
+                                y,
+                                *span,
+                                win.leftcol,
+                                inlay,
+                                search_bg,
+                                clip.top as f32,
+                                clip.bottom as f32,
+                            );
+                        }
+                    }
+                    if let Some(Some(span)) = s.incsearch.get(k) {
+                        self.push_span_quad_at(
+                            quads,
+                            text_x0,
+                            y,
+                            *span,
+                            win.leftcol,
+                            inlay,
+                            inc_bg,
+                            clip.top as f32,
+                            clip.bottom as f32,
+                        );
                     }
                     let display = expand_tabs(raw, win.tabstop.max(1) as usize);
                     if gutter > 0 {

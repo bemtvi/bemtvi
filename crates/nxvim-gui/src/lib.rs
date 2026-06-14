@@ -281,6 +281,10 @@ struct ScrollAnim {
     sel_extends_down: Option<bool>,
     numbers: Vec<Option<usize>>,
     highlights: Vec<Vec<HlSpan>>,
+    /// `hlsearch` / `incsearch` match spans for the band, so the search highlight
+    /// slides with the text instead of vanishing until the slide settles.
+    search: Vec<Vec<(u16, u16)>>,
+    incsearch: Vec<Option<(u16, u16)>>,
     inlay_hints: Vec<Vec<InlayHint>>,
     styles: Vec<Style>,
 }
@@ -300,6 +304,8 @@ impl ScrollAnim {
             sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
+            search: s.search.clone(),
+            incsearch: s.incsearch.clone(),
             inlay_hints: s.inlay_hints.clone(),
             styles: s.styles.clone(),
         }
@@ -331,6 +337,8 @@ impl ScrollAnim {
             sel_clip: self.sel_extends_down,
             numbers: &self.numbers,
             highlights: &self.highlights,
+            search: &self.search,
+            incsearch: &self.incsearch,
             inlay_hints: &self.inlay_hints,
             styles: &self.styles,
         }

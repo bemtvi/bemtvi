@@ -458,6 +458,10 @@ fn scroll_to_json(s: &ScrollAnim) -> Value {
         "base_line": s.base_line,
         "lines": s.lines,
         "selection": spans_opt(&s.selection),
+        // Search matches ride the band so `hlsearch`/`incsearch` keep highlighting
+        // the moving text instead of vanishing until the slide settles.
+        "search": spans_rows(&s.search),
+        "incsearch": spans_opt(&s.incsearch),
         "numbers": s.numbers.iter().map(|n| match n {
             Some(n) => json!(n),
             None => Value::Null,

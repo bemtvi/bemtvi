@@ -50,6 +50,14 @@ pub struct ScrollAnim {
     /// `~` filler rows, so the number column slides with the text during the
     /// animation.
     pub numbers: Vec<Option<usize>>,
+    /// Per band row (aligned with `lines`), the half-open screen-column spans of
+    /// every `hlsearch` match — so the search highlight rides the slide instead of
+    /// vanishing until it settles. Empty inner vec for rows with no match.
+    pub search: Vec<Vec<(usize, usize)>>,
+    /// Per band row, the live `incsearch` preview match, or `None` — carried for
+    /// the same reason as [`search`](ScrollAnim::search) (a scroll while the search
+    /// prompt is open).
+    pub incsearch: Vec<Option<(usize, usize)>>,
 }
 
 /// The renderable form of the bottom [`Panel`](crate::editor): a title, the
@@ -430,6 +438,11 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             } else {
                 (vec![None; count], None)
             };
+            // The hlsearch / incsearch matches over the *band's* rows, so the
+            // highlight slides with the text instead of disappearing for the
+            // duration of the animation and snapping back when it settles.
+            let (band_search, band_incsearch) =
+                ed.search_highlights_in(buf, w.cursor, w.focused, base_line, count);
             ScrollAnim {
                 from_top: ps.from_top,
                 to_top: ps.to_top,
@@ -441,6 +454,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 selection,
                 sel_extends_down,
                 numbers: window_numbers(base_line, count, line_count),
+                search: band_search,
+                incsearch: band_incsearch,
             }
         })
     } else {

@@ -460,6 +460,10 @@ impl EditHost {
                 Value::from("sel_extends_down"),
                 s.sel_extends_down.map_or(Value::Nil, Value::from),
             ),
+            // hlsearch / incsearch matches for the band, so the highlight rides the
+            // slide rather than vanishing until it settles (mirrors `window_value`).
+            (Value::from("search"), multi_spans_value(&s.search)),
+            (Value::from("incsearch"), spans_value(&s.incsearch)),
             (Value::from("numbers"), numbers_value(&s.numbers)),
             (Value::from("highlights"), highlights),
             (Value::from("inlay_hints"), inlay_hints),

@@ -900,6 +900,59 @@ fn shrinking_the_visual_selection_tracks_the_cursor_instead_of_vanishing() {
     );
 }
 
+#[test]
+fn search_matches_keep_highlighting_while_the_view_slides() {
+    // Regression: a scroll over `hlsearch` matches must keep them lit on the moving
+    // text, not blank them until the slide settles. The band carries per-row
+    // `search` spans; the client paints them on the band rows (Search bg = yellow
+    // with no colorscheme). Match at cols [0,2) on every band line.
+    let band_search = Value::Array(
+        (0..8)
+            .map(|_| {
+                Value::Array(vec![Value::Array(vec![
+                    Value::from(0u64),
+                    Value::from(2u64),
+                ])])
+            })
+            .collect(),
+    );
+    let scroll = Value::Map(vec![
+        (Value::from("from_top"), Value::from(0u64)),
+        (Value::from("to_top"), Value::from(3u64)),
+        (Value::from("from_cursor"), Value::from(0u64)),
+        (Value::from("to_cursor"), Value::from(3u64)),
+        (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
+        (Value::from("base_line"), Value::from(0u64)),
+        (
+            Value::from("lines"),
+            lines(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"]),
+        ),
+        (Value::from("search"), band_search),
+    ]);
+    let params = redraw(vec![
+        ("lines", lines(&["l0", "l1", "l2"])),
+        ("scroll", scroll),
+    ]);
+
+    let mut client = ScrollHarness::new();
+    client.on_redraw(&params);
+    assert!(client.animating(), "a non-zero scroll gesture must animate");
+
+    // At t≈0 the band shows lines l0.. from the top; the matched cells (col 0) must
+    // carry the Search background instead of vanishing for the slide's duration.
+    let buf = client.paint(20, 10);
+    assert_eq!(
+        bg(&buf, 0, 0),
+        Some(Color::Yellow),
+        "the search match keeps its highlight on the sliding band"
+    );
+    assert_eq!(
+        bg(&buf, 0, 1),
+        Some(Color::Yellow),
+        "every band row's match stays highlighted while sliding"
+    );
+}
+
 /// Build a `tabline` array value from `(label, modified, window_count)` triples.
 fn tabline(tabs: &[(&str, bool, u64)]) -> Value {
     Value::Array(

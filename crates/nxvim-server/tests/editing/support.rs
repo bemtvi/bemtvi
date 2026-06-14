@@ -185,6 +185,37 @@ pub fn scroll_selection(map: &[(Value, Value)]) -> Vec<Option<(u64, u64)>> {
         .unwrap_or_default()
 }
 
+/// The band's search-match spans (`scroll.search`): per band row, the half-open
+/// screen-column spans `[start, end)` of every `hlsearch` match (empty inner vec
+/// for rows with no match), so the highlight rides the slide.
+pub fn scroll_search(map: &[(Value, Value)]) -> Vec<Vec<(u64, u64)>> {
+    let s = scroll(map).expect("scroll present");
+    s.iter()
+        .find(|(k, _)| k.as_str() == Some("search"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|v| match v.as_array() {
+                                    Some(p) if p.len() == 2 => Some((
+                                        p[0].as_u64().unwrap_or(0),
+                                        p[1].as_u64().unwrap_or(0),
+                                    )),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The band's selection orientation (`scroll.sel_extends_down`): `Some(true)` the
 /// selection extends downward from its anchor, `Some(false)` upward, `None` when
 /// no visual selection is sliding.

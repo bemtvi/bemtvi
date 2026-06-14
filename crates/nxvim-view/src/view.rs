@@ -37,6 +37,13 @@ pub struct ScrollData {
     /// the cursor on the growing side aren't selected yet.
     pub sel_extends_down: Option<bool>,
     pub numbers: Vec<Option<usize>>,
+    /// `hlsearch` match spans for the band (aligned with `lines`), so the search
+    /// highlight slides with the text rather than vanishing until the slide
+    /// settles. Empty inner vec for rows with no match.
+    pub search: SearchSpans,
+    /// The live `incsearch` preview match per band row, or `None` — carried for the
+    /// same reason as [`search`](ScrollData::search).
+    pub incsearch: Vec<Option<(u16, u16)>>,
     /// Syntax highlights for the band (aligned with `lines`), so the slide is
     /// colored frame by frame instead of flashing white until it settles. Style
     /// ids index `styles` below.
@@ -420,6 +427,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             lines: map_str_array(s, "lines"),
             selection: parse_spans(map_get(s, "selection")),
             sel_extends_down: map_get(s, "sel_extends_down").and_then(Value::as_bool),
+            search: parse_multi_spans(map_get(s, "search")),
+            incsearch: parse_spans(map_get(s, "incsearch")),
             numbers: parse_numbers(map_get(s, "numbers")),
             highlights: parse_highlights(map_get(s, "highlights")),
             inlay_hints: parse_inlay_hints(map_get(s, "inlay_hints")),

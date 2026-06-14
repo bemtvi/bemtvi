@@ -378,10 +378,10 @@ fn render_window(
     };
     let height = text_area.height as usize;
 
-    // Search-match highlights for the static viewport. A search never starts a
-    // scroll animation, so the slide band carries none — left empty while sliding.
+    // Empty fallbacks for the overlays a slide band does not carry (diagnostics,
+    // signs, secondary selections). Search *is* carried (see `anim_search` below),
+    // so `hlsearch` keeps highlighting while the view slides.
     let empty_search: SearchSpans = Vec::new();
-    let empty_incsearch: IncSearchSpans = Vec::new();
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
     let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
@@ -395,11 +395,19 @@ fn render_window(
     let anim_hl: Vec<Vec<HlSpan>>;
     let anim_numbers: Vec<Option<usize>>;
     let anim_inlay: Vec<Vec<InlayHint>>;
+    let anim_search: SearchSpans;
+    let anim_incsearch: IncSearchSpans;
     let frame_lines: &[String];
     let frame_sel: &[Option<(u16, u16)>];
     let frame_hl: &[Vec<HlSpan>];
     let frame_inlay: &[Vec<InlayHint>];
     let frame_numbers: &[Option<usize>];
+    // Search spans ride the slide band (the static viewport uses the win's), so
+    // `hlsearch`/`incsearch` keep highlighting the moving text instead of blinking
+    // off until the slide settles. Assigned inside the match below (where the band
+    // snapshots are initialized), like `frame_hl`.
+    let frame_search: &SearchSpans;
+    let frame_incsearch: &IncSearchSpans;
     let cursor_row: u16;
     // 1-based buffer line the cursor sits on, used to compute relative numbers.
     // During a slide it tracks the interpolated cursor so the gutter stays in
@@ -458,11 +466,17 @@ fn render_window(
                 .take(height)
                 .cloned()
                 .collect();
+            // Search matches ride the slide too, sliced to the visible window like
+            // the highlights, so `hlsearch` stays lit on the moving text.
+            anim_search = a.search.iter().skip(off).take(height).cloned().collect();
+            anim_incsearch = a.incsearch.iter().skip(off).take(height).copied().collect();
             frame_lines = &anim_lines;
             frame_sel = &anim_sel;
             frame_numbers = &anim_numbers;
             frame_hl = &anim_hl;
             frame_inlay = &anim_inlay;
+            frame_search = &anim_search;
+            frame_incsearch = &anim_incsearch;
             cursor_row = cur.saturating_sub(top) as u16;
             current_line = cur + 1;
         }
@@ -472,6 +486,8 @@ fn render_window(
             frame_numbers = &win.numbers;
             frame_hl = &win.highlights;
             frame_inlay = &win.inlay_hints;
+            frame_search = &win.search;
+            frame_incsearch = &win.incsearch;
             cursor_row = win.cursor_row;
             current_line = win.cursor_line;
         }
@@ -525,12 +541,7 @@ fn render_window(
         incsearch: view.incsearch_style.map(rt),
         end_of_buffer: view.end_of_buffer.map(rt),
     };
-    // The slide band carries no search spans; the static viewport uses the win's.
-    let (frame_search, frame_incsearch): (&SearchSpans, &IncSearchSpans) = match anim {
-        Some(_) => (&empty_search, &empty_incsearch),
-        None => (&win.search, &win.incsearch),
-    };
-    // Secondary multi-cursor selections, like search, paint on the settled viewport.
+    // Secondary multi-cursor selections paint on the settled viewport only.
     let frame_secondary_sel: &SearchSpans = match anim {
         Some(_) => &empty_search,
         None => &win.secondary_selection,

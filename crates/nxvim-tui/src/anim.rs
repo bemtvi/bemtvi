@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use nxvim_view::{HlSpan, InlayHint, ScrollData, Style, View};
+use nxvim_view::{HlSpan, IncSearchSpans, InlayHint, ScrollData, SearchSpans, Style, View};
 
 /// An in-flight scroll animation, driven by the client's local clock.
 pub(crate) struct Animation {
@@ -24,6 +24,11 @@ pub(crate) struct Animation {
     pub(crate) sel_extends_down: Option<bool>,
     pub(crate) numbers: Vec<Option<usize>>,
     pub(crate) highlights: Vec<Vec<HlSpan>>,
+    /// `hlsearch` / `incsearch` match spans for the band (aligned with `lines`), so
+    /// the search highlight slides with the text instead of vanishing until the
+    /// slide settles.
+    pub(crate) search: SearchSpans,
+    pub(crate) incsearch: IncSearchSpans,
     /// Inline inlay hints for the band (aligned with `lines`), so they slide with
     /// the text instead of vanishing until the slide settles.
     pub(crate) inlay_hints: Vec<Vec<InlayHint>>,
@@ -46,6 +51,8 @@ impl Animation {
             sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
+            search: s.search.clone(),
+            incsearch: s.incsearch.clone(),
             inlay_hints: s.inlay_hints.clone(),
             styles: s.styles.clone(),
         }

@@ -469,6 +469,40 @@ async fn ctrl_d_emits_half_page_scroll() {
 }
 
 #[tokio::test]
+async fn scroll_band_carries_search_highlights() {
+    // hlsearch matches must ride the scroll band, not vanish until the slide
+    // settles: the band's `search` spans cover its rows so the client paints them
+    // frame by frame. Every line holds "needle" at columns 0..6.
+    let body: String = (1..=100).map(|i| format!("needle {i}\n")).collect();
+    let path = write_temp("scrollhl", "txt", &body);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Activate hlsearch, then scroll a half page so a band is projected.
+    feed(&rpc, "/needle<CR>");
+    let _ = lines(&rpc).await; // barrier: flush the search redraw
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+
+    let search = scroll_search(&map);
+    let band_len = scroll_lines_len(&map);
+    assert_eq!(
+        search.len(),
+        band_len,
+        "search spans align with the band rows"
+    );
+    // Every band row over real buffer lines carries the one "needle" match (0..6);
+    // rows past the buffer carry none.
+    assert_eq!(
+        search.first().cloned().unwrap_or_default(),
+        vec![(0, 6)],
+        "the first band row keeps its hlsearch match while sliding"
+    );
+    assert!(
+        search.iter().take(100).all(|row| row == &vec![(0, 6)]),
+        "every band row over the buffer keeps its match: {search:?}"
+    );
+}
+
+#[tokio::test]
 async fn visual_scroll_band_carries_the_maximal_selection_extent() {
     // A scroll in visual mode slides the selection with the text. The band must
     // carry the selection over the *maximal* extent the slide touches — anchor →

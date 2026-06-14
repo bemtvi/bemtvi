@@ -311,10 +311,11 @@
 
     // A synthetic window whose per-row arrays are the scroll band's, so the existing
     // row renderers paint the band rows unchanged. The band carries text, numbers,
-    // selection (and server highlights); overlays it doesn't carry — search,
-    // secondary cursors, diagnostics, inlay hints — are blanked for the brief slide.
-    // The cursor is pinned to its destination buffer line so its cell rides the strip
-    // to exactly where it settles.
+    // selection, search/incsearch (and server highlights), so `hlsearch` keeps
+    // highlighting the moving text; overlays it doesn't carry — secondary cursors,
+    // diagnostics, inlay hints — are blanked for the brief slide. The cursor is
+    // pinned to its destination buffer line so its cell rides the strip to exactly
+    // where it settles.
     function bandWindow(w, s) {
       const n = s.lines.length;
       const blanks = Array.from({ length: n }, () => []);
@@ -322,8 +323,8 @@
         lines: s.lines,
         numbers: s.numbers,
         selection: s.selection,
-        search: blanks,
-        incsearch: Array.from({ length: n }, () => null),
+        search: s.search || blanks,
+        incsearch: s.incsearch || Array.from({ length: n }, () => null),
         secondary_selection: blanks,
         secondary_cursors: [],
         highlights: s.highlights || [],

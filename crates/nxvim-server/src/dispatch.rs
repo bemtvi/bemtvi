@@ -367,14 +367,21 @@ impl EditHost {
             }
             "nvim_create_buf" => Ok(Value::from(self.editor.create_buffer().0)),
             "nvim_buf_get_name" => {
-                // (buffer): the buffer's file name, "" if unnamed; 0 = current.
+                // (buffer): the buffer's file name, "" if unnamed; 0 = current. A
+                // terminal-job buffer has no path, so it reports its window title (the
+                // child's OSC title) as its name — like neovim's `term://…` name.
                 let handle = uint(params.first(), 0) as u64;
                 let id = if handle == 0 {
                     self.editor.current_buffer_id()
                 } else {
                     BufferId(handle)
                 };
-                Ok(Value::from(self.editor.buffer_name(id).unwrap_or_default()))
+                let name = self
+                    .editor
+                    .terminal_title(id)
+                    .or_else(|| self.editor.buffer_name(id))
+                    .unwrap_or_default();
+                Ok(Value::from(name))
             }
             "nvim_get_hl" => {
                 // (ns, { name = "<group>" }) -> the group resolved through its

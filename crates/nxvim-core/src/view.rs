@@ -557,11 +557,19 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         None
     };
 
-    let file_name = buf
-        .path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "[No Name]".to_string());
+    let file_name = if buf.terminal {
+        // A terminal buffer shows the child's window title (OSC) as its name, seeded
+        // from the command until the child sets one.
+        buf.terminal_title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "terminal".to_string())
+    } else {
+        buf.path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "[No Name]".to_string())
+    };
 
     // Effective filetype: the treesitter override (`:set ft=…`) if any, else the
     // extension-derived language. Drives `%y` and the web build's grammar choice.

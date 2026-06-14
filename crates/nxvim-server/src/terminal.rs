@@ -18,12 +18,26 @@ use nxvim_core::{BufferId, TerminalOp};
 
 use crate::EditHost;
 
+/// Captures the child's window title (the OSC `\e]0;`/`\e]2;` sequence) that vt100
+/// reports through a callback rather than storing on the screen. The emulator reads
+/// the latest title back via [`vt100::Parser::callbacks`] after each `process`.
+#[derive(Default)]
+struct TitleSink {
+    title: Option<String>,
+}
+
+impl vt100::Callbacks for TitleSink {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+}
+
 /// A terminal buffer's vt100 emulator: the escape-sequence parser (which owns the
 /// screen grid) plus the last size it was projected at.
 pub(crate) struct TermEmu {
     /// The vt100 parser + screen grid. Fed the child's PTY bytes; queried for the
-    /// row text, cursor, and per-cell colors.
-    parser: vt100::Parser,
+    /// row text, cursor, per-cell colors, and (via its [`TitleSink`]) window title.
+    parser: vt100::Parser<TitleSink>,
     /// The `(rows, cols)` the emulator was last sized to, so a redraw-time resize
     /// only re-sizes (and reprojects) when the window's text area actually changed.
     last_size: (u16, u16),
@@ -35,7 +49,7 @@ impl TermEmu {
         TermEmu {
             // Scrollback is 0 for now — the visible screen only. Phase 6 raises it
             // and projects the scrolled-off history into the buffer.
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TitleSink::default()),
             last_size: (rows, cols),
         }
     }
@@ -87,7 +101,7 @@ impl EditHost {
     /// The grid's per-cell colors are read separately at redraw (Phase 4); here we
     /// only push the text and cursor through the pure-core inbound API.
     fn terminal_project(&mut self, buf: BufferId) {
-        let (lines, cursor_row, cursor_col) = {
+        let (lines, cursor_row, cursor_col, title) = {
             let Some(emu) = self.terminals.get(&buf) else {
                 return;
             };
@@ -95,10 +109,14 @@ impl EditHost {
             let (_rows, cols) = screen.size();
             let lines: Vec<String> = screen.rows(0, cols).collect();
             let (cy, cx) = screen.cursor_position();
-            (lines, cy as usize, cx as usize)
+            let title = emu.parser.callbacks().title.clone();
+            (lines, cy as usize, cx as usize, title)
         };
         self.editor
             .terminal_update(buf, &lines, cursor_row, cursor_col);
+        if let Some(title) = title {
+            self.editor.terminal_set_title(buf, &title);
+        }
     }
 }
 

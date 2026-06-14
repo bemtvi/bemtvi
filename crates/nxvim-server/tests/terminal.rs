@@ -11,10 +11,21 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{command, cursor, feed, lines, mode, serial_lock, start_attached};
+use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// The current buffer's reported name (`nvim_buf_get_name`).
+async fn buf_name(rpc: &Rpc) -> String {
+    rpc.request("nvim_buf_get_name", vec![Value::from(0u64)])
+        .await
+        .expect("get_name")
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Poll the current buffer until `pred` holds, or panic after ~10s. PTY output is
@@ -157,6 +168,33 @@ async fn reentering_snaps_cursor_to_the_input_position() {
     assert_eq!(
         ccol, 5,
         "re-entry snaps to the input position (col 5), not col 0"
+    );
+}
+
+/// A terminal buffer's name is its window title: seeded from the spawned command,
+/// then updated to the child's OSC title (`\e]2;…\a`) — what a desktop terminal
+/// shows in its title bar.
+#[tokio::test]
+async fn terminal_buffer_name_tracks_the_window_title() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    assert_eq!(buf_name(&rpc).await, "cat", "name seeded from the command");
+
+    // `cat` echoes its input, so feeding an OSC title sequence makes the emulator see
+    // it (as if the child had emitted it): ESC ] 2 ; my-title BEL.
+    feed(&rpc, "<Esc>]2;my-title<C-g><CR>");
+    for _ in 0..200 {
+        if buf_name(&rpc).await == "my-title" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        buf_name(&rpc).await,
+        "my-title",
+        "name follows the child's OSC window title"
     );
 }
 

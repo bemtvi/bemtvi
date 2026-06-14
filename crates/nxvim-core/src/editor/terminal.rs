@@ -70,6 +70,13 @@ impl Editor {
 
         let mut buffer = Buffer::empty();
         buffer.terminal = true;
+        // Seed the display name from the spawned command (the child replaces it with
+        // its OSC window title once it sets one).
+        buffer.terminal_title = Some(if argv.is_empty() {
+            "shell".to_string()
+        } else {
+            argv.join(" ")
+        });
         let buf = self.add_buffer(buffer);
         self.set_current_buffer(buf);
         self.mode = Mode::Terminal;
@@ -95,6 +102,16 @@ impl Editor {
             .map
             .get(&id)
             .is_some_and(|ob| ob.buffer.terminal)
+    }
+
+    /// Buffer `id`'s terminal window title (the child's OSC title), or `None` if it
+    /// is not a terminal buffer. Used as the buffer's reported name.
+    pub fn terminal_title(&self, id: BufferId) -> Option<String> {
+        self.buffers
+            .map
+            .get(&id)
+            .filter(|ob| ob.buffer.terminal)
+            .and_then(|ob| ob.buffer.terminal_title.clone())
     }
 
     /// Whether the current buffer accepts edits. A **live** terminal-job buffer is
@@ -176,6 +193,16 @@ impl Editor {
         self.cursor.col = col;
         self.clamp_cursor();
         self.ensure_visible();
+    }
+
+    /// Set terminal buffer `buf`'s display name to the child's window title (its OSC
+    /// `\e]0;`/`\e]2;` sequence). Surfaced as the buffer name in the statusline. A
+    /// no-op if `buf` is not an open terminal buffer or the title is empty.
+    pub fn terminal_set_title(&mut self, buf: BufferId, title: &str) {
+        if title.is_empty() || !self.is_terminal_buffer(buf) {
+            return;
+        }
+        self.buffers.get_mut(buf).buffer.terminal_title = Some(title.to_string());
     }
 
     /// Mark terminal buffer `buf`'s child as exited with `code`: append a

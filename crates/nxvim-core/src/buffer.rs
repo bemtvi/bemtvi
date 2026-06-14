@@ -173,6 +173,12 @@ pub struct Buffer {
     /// The PTY itself lives server-side keyed by this buffer's `BufferId`. `false`
     /// for every ordinary file / scratch / directory buffer.
     pub terminal: bool,
+    /// A terminal-job buffer's display name — the child's window title (the OSC
+    /// `\e]0;…`/`\e]2;…` sequence a shell or program sets, e.g. `user@host: ~/dir` or
+    /// `vim README.md`), surfaced as the buffer name in the statusline. Seeded from the
+    /// spawned command at [`crate::editor::Editor::open_terminal`] and updated as the
+    /// child changes it. `None` for every non-terminal buffer.
+    pub terminal_title: Option<String>,
     /// The file as last seen on disk (mtime + size), captured on read and
     /// refreshed on each successful [`Buffer::write`]. Drives
     /// [`Buffer::disk_changed`], which lets the editor refuse to overwrite a file
@@ -209,6 +215,7 @@ impl Buffer {
             marks: HashMap::new(),
             dir: None,
             terminal: false,
+            terminal_title: None,
             disk: None,
         }
     }
@@ -283,6 +290,7 @@ impl Buffer {
             marks: HashMap::new(),
             dir: None,
             terminal: false,
+            terminal_title: None,
         })
     }
 
@@ -334,6 +342,7 @@ impl Buffer {
             path: Some(dir.clone()),
             dir: Some(dir),
             terminal: false,
+            terminal_title: None,
             modified: false,
             options: crate::options::BufferOptions::default(),
             changedtick: 0,

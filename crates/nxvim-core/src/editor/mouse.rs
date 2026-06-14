@@ -920,6 +920,9 @@ impl Editor {
             Mode::Visual | Mode::VisualLine => 'v',
             Mode::Insert | Mode::Replace => 'i',
             Mode::Command => 'c',
+            // vim gates terminal-mode mouse on the `t` flag (we treat it like
+            // insert for click-to-position purposes).
+            Mode::Terminal => 't',
         };
         m.contains(flag)
     }

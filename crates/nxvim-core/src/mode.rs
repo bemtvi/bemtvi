@@ -16,6 +16,11 @@ pub enum Mode {
     /// cursors (`c` / `{count}c{motion}`); leaving with `<Esc>` keeps the placed
     /// cursors and returns to Normal, where motions and edits act on them all.
     MultiCursor,
+    /// Terminal-job mode: the current buffer hosts a live PTY child process and
+    /// keystrokes are forwarded to it as input bytes (vim/neovim's `t` mode).
+    /// `<C-\><C-n>` leaves to Normal, where the terminal buffer reads as ordinary
+    /// (read-only) text for scrolling / yanking.
+    Terminal,
 }
 
 impl Mode {
@@ -29,6 +34,7 @@ impl Mode {
             Mode::VisualLine => "V-LINE",
             Mode::Command => "COMMAND",
             Mode::MultiCursor => "MULTICURSOR",
+            Mode::Terminal => "TERMINAL",
         }
     }
 
@@ -43,6 +49,7 @@ impl Mode {
             Mode::Command => "c",
             // No vim equivalent; reads as normal mode for `mode()`-checking scripts.
             Mode::MultiCursor => "n",
+            Mode::Terminal => "t",
         }
     }
 

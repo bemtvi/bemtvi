@@ -48,6 +48,7 @@ mod registers;
 mod search;
 mod syntax;
 mod tabs;
+mod terminal;
 mod undo;
 mod windows;
 
@@ -66,6 +67,7 @@ pub use self::persist::{
     FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
     RegisterEntry, ShadaRequest,
 };
+pub use self::terminal::TerminalOp;
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;
@@ -808,6 +810,18 @@ pub struct Editor {
     /// (it lives behind the server's `ShadaStore` seam), so the ex-command enqueues a
     /// [`ShadaRequest`] and the server runs the flush / re-merge after the tick.
     pending_shada: Vec<ShadaRequest>,
+
+    /// Terminal-job actions (open / input / kill) raised this tick, drained by the
+    /// server with [`Editor::take_pending_terminal`]. Core is pure/sync and can't
+    /// own a PTY, so a `:terminal` open and every keystroke forwarded in
+    /// [`Mode::Terminal`](crate::mode::Mode::Terminal) enqueue a [`TerminalOp`] the
+    /// server's terminal engine fulfills — the terminal analogue of
+    /// [`pending_opens`](Self::pending_opens) / [`pending_saves`](Self::pending_saves).
+    pending_terminal: Vec<TerminalOp>,
+    /// Mid-`<C-\>` state in [`Mode::Terminal`](crate::mode::Mode::Terminal): set when
+    /// `<C-\>` was pressed, so the next key decides between leaving to Normal (`<C-n>`)
+    /// and forwarding both bytes to the child. Always `false` outside terminal mode.
+    terminal_pending_backslash: bool,
 }
 
 impl Editor {
@@ -983,6 +997,8 @@ impl Editor {
             pending_quit_all: None,
             pending_checktime: Vec::new(),
             pending_shada: Vec::new(),
+            pending_terminal: Vec::new(),
+            terminal_pending_backslash: false,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.
@@ -1080,6 +1096,30 @@ impl Editor {
         // boundary. See [`Editor::handle_explorer`].
         if self.mode == Mode::Normal && self.is_explorer_buffer() {
             self.handle_explorer(key);
+            return;
+        }
+
+        // Terminal-job mode forwards every keystroke to the PTY child as input
+        // bytes; `<C-\><C-n>` is the one exception, leaving to Normal. This sits
+        // ahead of the mode dispatch and the scroll/dot-repeat bookkeeping below
+        // (terminal keys are neither motions nor repeatable edits).
+        if self.mode == Mode::Terminal {
+            self.handle_terminal_key(key);
+            return;
+        }
+
+        // Terminal-*normal* mode (Normal mode on a terminal buffer): the buffer
+        // reads as ordinary text for scrolling / yanking, but the insert-entering
+        // commands return to the job instead of editing the read-only mirror.
+        if self.mode == Mode::Normal
+            && self.buffer().terminal
+            && self.pending.is_clean()
+            && !key.ctrl
+            && !key.alt
+            && matches!(key.code, KeyCode::Char('i' | 'a' | 'A' | 'I' | 'o' | 'O'))
+        {
+            self.mode = Mode::Terminal;
+            self.terminal_pending_backslash = false;
             return;
         }
 

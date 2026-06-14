@@ -164,6 +164,15 @@ pub struct Buffer {
     /// otherwise keeps the listing inert. Built by [`Buffer::from_dir`]; `None`
     /// for every ordinary file/scratch buffer.
     pub dir: Option<PathBuf>,
+    /// When `true`, this buffer hosts a **terminal job** — its lines mirror a live
+    /// PTY child's screen (and scrollback), pushed in by the server's terminal
+    /// engine via [`crate::editor::Editor::terminal_update`], not editable text.
+    /// It is non-file (a `:w` refuses, `modified` never sets, no disk backing); in
+    /// [`crate::mode::Mode::Terminal`] keystrokes are forwarded to the child, and in
+    /// Normal mode the buffer reads as ordinary read-only text for scroll / yank.
+    /// The PTY itself lives server-side keyed by this buffer's `BufferId`. `false`
+    /// for every ordinary file / scratch / directory buffer.
+    pub terminal: bool,
     /// The file as last seen on disk (mtime + size), captured on read and
     /// refreshed on each successful [`Buffer::write`]. Drives
     /// [`Buffer::disk_changed`], which lets the editor refuse to overwrite a file
@@ -199,6 +208,7 @@ impl Buffer {
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
+            terminal: false,
             disk: None,
         }
     }
@@ -272,6 +282,7 @@ impl Buffer {
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             dir: None,
+            terminal: false,
         })
     }
 
@@ -322,6 +333,7 @@ impl Buffer {
             text: Rope::from_str(&text),
             path: Some(dir.clone()),
             dir: Some(dir),
+            terminal: false,
             modified: false,
             options: crate::options::BufferOptions::default(),
             changedtick: 0,

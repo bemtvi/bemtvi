@@ -143,6 +143,25 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   `Screen::set_scrollback`) vs. accumulating scrolled-off rows ourselves; pick whichever gives
   faithful per-cell styles for history, and capture the choice here.
 
+  **Decision (implemented):** *both* — vt100 owns the scrollback (`scrollback_len = SCROLLBACK_CAP
+  = 10000`, matching neovim), and we keep our own `history: VecDeque<ScrollLine>` (text + coalesced
+  style runs) as a cache. vt100's scrollback API is a moving **view-window** only (`set_scrollback`
+  shifts an offset; `rows`/`cell` then read that window) — there is no addressable "all history
+  rows" accessor — so reading the full history on every projection/redraw would mean paging
+  hundreds of `rows`-tall windows per PTY burst. Instead `capture_scrollback` runs once per feed:
+  while vt100 is unsaturated the freshly-scrolled count is exact (`held - captured`) and we read
+  just those rows through the window (`read_scrollback`, paging only if a single burst scrolled
+  more than a screen); once vt100 saturates at the cap the count is no longer a reliable delta, so
+  we re-derive the full retained scrollback — but guarded by a cheap "did the newest scrolled row
+  change?" check, so a non-scrolling burst (plain typing at a full buffer) stays O(1). The live
+  screen still reads live vt100 cells (Phase 4); only scrolled-off rows read the captured styles.
+  `terminal_project` lays the buffer out as `history ++ live screen` with the cursor offset by
+  `history.len()`, so terminal-normal navigation just works (the buffer simply has more lines) and
+  history is append-only → old lines keep stable buffer indices until the cap drops the oldest.
+  Known cost: sustained output **past** the 10000-line cap re-derives the retained scrollback per
+  scrolling burst (a documented follow-up; a libvterm-style `sb_pushline` callback in vt100 would
+  make capture incremental even when saturated).
+
 ## Phase 7 — Web terminal over the daemon (`nxvim-edithost` + daemon, wasm-gated)
 
 Extends the Phase 6d proc leg into a **streaming** terminal leg. The daemon (`nxvim --daemon`,

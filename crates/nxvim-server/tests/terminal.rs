@@ -475,6 +475,76 @@ async fn terminal_projects_ansi_color_into_highlight_spans() {
     panic!("timed out waiting for a red-fg terminal highlight span");
 }
 
+/// Phase 6 — scrollback. Output taller than the screen scrolls the earliest rows
+/// off the live vt100 grid; they must be preserved in the buffer's scrollback so
+/// terminal-normal navigation still reaches them. `cat <file> -` prints the lines
+/// then blocks on stdin, keeping the terminal live (a dead terminal drops its
+/// emulator and history).
+#[tokio::test]
+async fn scrollback_preserves_lines_that_scrolled_off_the_screen() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await; // 80x24
+
+    let body: String = (1..=50).map(|i| format!("line{i}\n")).collect();
+    let path = write_temp("term_scroll", "txt", &body);
+    command(&rpc, &format!("terminal cat {path} -")).await;
+    wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line50")).await;
+
+    // The earliest line scrolled off the 24-row grid, but scrollback keeps it as
+    // the buffer's first line (without scrollback the top would be ~line27).
+    let ls = lines(&rpc).await;
+    assert_eq!(
+        ls.first().map(String::as_str),
+        Some("line1"),
+        "the scrolled-off first line is preserved at the top of the buffer"
+    );
+    assert!(has_line(&ls, "line50"), "the live bottom is present too");
+
+    // `gg` reaches the earliest history line.
+    feed(&rpc, "<C-\\><C-n>gg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "gg lands on the first (scrolled-off) line"
+    );
+}
+
+/// A scrolled-off row keeps its color: history rows project from the per-cell
+/// styles captured when they scrolled, not from live vt100 cells (which no longer
+/// hold them). `gg` brings the red first line into the viewport so its highlight
+/// is in the frame.
+#[tokio::test]
+async fn scrollback_rows_keep_their_color() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start().await;
+
+    let mut body = String::from("\x1b[31mredline\x1b[0m\n");
+    for i in 2..=40 {
+        body.push_str(&format!("line{i}\n"));
+    }
+    let path = write_temp("term_scroll_color", "txt", &body);
+    command(&rpc, &format!("terminal cat {path} -")).await;
+    wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line40")).await;
+    assert_eq!(
+        lines(&rpc).await.first().map(String::as_str),
+        Some("redline"),
+        "the red line scrolled into history at the top"
+    );
+
+    // Scroll the viewport to the top so the history row is rendered this frame.
+    feed(&rpc, "<C-\\><C-n>gg");
+    const RED: u64 = 0x00cd_0000;
+    for _ in 0..200 {
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            if first_red_fg_span(&map) == Some(RED) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for the scrolled-off red line's color");
+}
+
 /// The `fg` color (`0xRRGGBB`) of the first highlight span in the focused
 /// window's `highlights`, resolved through the frame's `styles` palette, or
 /// `None` if there is no styled span yet.

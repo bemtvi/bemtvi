@@ -14,11 +14,18 @@
 //! bytes is the part that differs (Phase 3 native / Phase 7 web). See
 //! `docs/plans/2026-06-14-terminal-in-buffer.md`.
 
+use std::collections::VecDeque;
+
 use nxvim_core::{BufferId, Rgb, Style, TerminalOp};
 use rmpv::Value;
 
 use crate::redraw::StyleTable;
 use crate::EditHost;
+
+/// Scrollback limit, in rows — the neovim `'scrollback'` default. Both vt100's
+/// internal scrollback and our captured-history cache are capped here; once a
+/// terminal has scrolled this many rows the oldest fall off, matching neovim.
+const SCROLLBACK_CAP: usize = 10_000;
 
 /// The `vt100` callback sink: captures the things the screen model itself doesn't
 /// store but a real terminal must act on — the child's window title (OSC), and the
@@ -71,8 +78,21 @@ impl vt100::Callbacks for TermSink {
     }
 }
 
+/// A scrolled-off row captured into the terminal's history: its display text and
+/// the coalesced per-cell style runs. We keep the styles ourselves because vt100
+/// only exposes scrollback through a moving view-window (`set_scrollback`), not as
+/// addressable rows — caching here lets the projection and color path read history
+/// without re-paging vt100 on every frame. The live screen still reads vt100 cells
+/// directly (Phase 4); only scrolled-off rows come from here.
+struct ScrollLine {
+    text: String,
+    /// `(start_col, end_col, style)` runs, already coalesced and default-filtered
+    /// (same shape [`row_spans`] produces for live rows).
+    spans: Vec<(u16, u16, Style)>,
+}
+
 /// A terminal buffer's vt100 emulator: the escape-sequence parser (which owns the
-/// screen grid) plus the last size it was projected at.
+/// screen grid) plus the last size it was projected at and the captured scrollback.
 pub(crate) struct TermEmu {
     /// The vt100 parser + screen grid. Fed the child's PTY bytes; queried for the
     /// row text, cursor, per-cell colors, and (via its [`TermSink`]) window title +
@@ -81,16 +101,30 @@ pub(crate) struct TermEmu {
     /// The `(rows, cols)` the emulator was last sized to, so a redraw-time resize
     /// only re-sizes (and reprojects) when the window's text area actually changed.
     last_size: (u16, u16),
+    /// Rows that have scrolled off the top of the screen, oldest-first, capped at
+    /// [`SCROLLBACK_CAP`]. Projected as the buffer's leading lines so terminal-normal
+    /// navigation (`gg`/`G`/`<C-u>`/search/yank) traverses history.
+    history: VecDeque<ScrollLine>,
+    /// How many rows of vt100's internal scrollback we have already captured into
+    /// `history`. While vt100 is unsaturated this is its scrollback length and the
+    /// per-burst delta is exact; once vt100 saturates it pins at [`SCROLLBACK_CAP`]
+    /// and capture switches to the re-derive path.
+    captured: usize,
 }
 
 impl TermEmu {
     fn new(rows: u16, cols: u16) -> Self {
         let (rows, cols) = (rows.max(1), cols.max(1));
         TermEmu {
-            // Scrollback is 0 for now — the visible screen only. Phase 6 raises it
-            // and projects the scrolled-off history into the buffer.
-            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TermSink::default()),
+            parser: vt100::Parser::new_with_callbacks(
+                rows,
+                cols,
+                SCROLLBACK_CAP,
+                TermSink::default(),
+            ),
             last_size: (rows, cols),
+            history: VecDeque::new(),
+            captured: 0,
         }
     }
 }
@@ -120,6 +154,7 @@ impl EditHost {
         if !replies.is_empty() {
             self.editor.terminal_send(buf, replies);
         }
+        self.capture_scrollback(buf);
         self.terminal_project(buf);
     }
 
@@ -137,6 +172,8 @@ impl EditHost {
         }
         emu.parser.screen_mut().set_size(rows, cols);
         emu.last_size = (rows, cols);
+        // A reflow can push rows into vt100's scrollback; capture before projecting.
+        self.capture_scrollback(buf);
         self.terminal_project(buf);
         true
     }
@@ -146,9 +183,12 @@ impl EditHost {
         self.terminals.remove(&buf);
     }
 
-    /// Project `buf`'s emulator screen into the buffer's mirrored lines + cursor.
-    /// The grid's per-cell colors are read separately at redraw (Phase 4); here we
-    /// only push the text and cursor through the pure-core inbound API.
+    /// Project `buf`'s emulator into the buffer's mirrored lines + cursor: the
+    /// captured scrollback history first, then the live screen rows. The grid's
+    /// per-cell colors are read separately at redraw (Phase 4); here we only push
+    /// the text and cursor through the pure-core inbound API. The cursor maps into
+    /// the live region — offset by the history length — so terminal-insert stays
+    /// pinned to the bottom while terminal-normal can navigate the history above.
     fn terminal_project(&mut self, buf: BufferId) {
         let (lines, cursor_row, cursor_col, title) = {
             let Some(emu) = self.terminals.get(&buf) else {
@@ -156,15 +196,84 @@ impl EditHost {
             };
             let screen = emu.parser.screen();
             let (_rows, cols) = screen.size();
-            let lines: Vec<String> = screen.rows(0, cols).collect();
+            let mut lines: Vec<String> = emu.history.iter().map(|l| l.text.clone()).collect();
+            lines.extend(screen.rows(0, cols));
             let (cy, cx) = screen.cursor_position();
             let title = emu.parser.callbacks().title.clone();
-            (lines, cy as usize, cx as usize, title)
+            (lines, emu.history.len() + cy as usize, cx as usize, title)
         };
         self.editor
             .terminal_update(buf, &lines, cursor_row, cursor_col);
         if let Some(title) = title {
             self.editor.terminal_set_title(buf, &title);
+        }
+    }
+
+    /// Append rows that scrolled off vt100's screen since the last feed into our
+    /// own `history` cache (text + per-cell style runs), so the projection above
+    /// and the color path can read them without re-paging vt100 each frame.
+    ///
+    /// vt100 exposes scrollback only as a moving view-window (`set_scrollback`
+    /// shifts an offset; `rows`/`cell` then read that window), so we read the
+    /// freshly-scrolled rows through that window and restore the offset to `0`
+    /// (the live view) before returning. While vt100 is unsaturated the new-row
+    /// count is exact (`held - captured`); once it saturates at [`SCROLLBACK_CAP`]
+    /// the oldest rows drop and the count is no longer a reliable delta, so we
+    /// re-derive the full retained scrollback — but only when the newest scrolled
+    /// row actually changed, so a non-scrolling burst (plain typing) stays cheap.
+    fn capture_scrollback(&mut self, buf: BufferId) {
+        let Some(emu) = self.terminals.get_mut(&buf) else {
+            return;
+        };
+        let (rows, cols) = emu.parser.screen().size();
+        let captured = emu.captured;
+        let last_text = emu.history.back().map(|l| l.text.clone());
+
+        // All screen reads happen inside this block so the `&mut Screen` borrow is
+        // released before we touch `emu.history` / `emu.captured` below.
+        enum Capture {
+            Append(Vec<ScrollLine>),
+            Replace(Vec<ScrollLine>),
+            Nothing,
+        }
+        let (action, held) = {
+            let screen = emu.parser.screen_mut();
+            // `set_scrollback(MAX)` clamps the offset to the scrollback length, which
+            // `scrollback()` then reports — i.e. how many rows vt100 currently holds.
+            screen.set_scrollback(usize::MAX);
+            let held = screen.scrollback();
+            let action = if held < SCROLLBACK_CAP {
+                if held > captured {
+                    Capture::Append(read_scrollback(screen, held, captured, held, rows, cols))
+                } else {
+                    Capture::Nothing
+                }
+            } else {
+                // Saturated: peek the newest scrolled row (offset 1 puts it at window
+                // row 0). Re-derive only if it differs from our last captured row.
+                screen.set_scrollback(1);
+                let newest = screen.rows(0, cols).next();
+                if newest.as_deref() != last_text.as_deref() {
+                    Capture::Replace(read_scrollback(screen, held, 0, held, rows, cols))
+                } else {
+                    Capture::Nothing
+                }
+            };
+            screen.set_scrollback(0); // back to the live view
+            (action, held)
+        };
+
+        match action {
+            Capture::Append(new) => emu.history.extend(new),
+            Capture::Replace(all) => {
+                emu.history.clear();
+                emu.history.extend(all);
+            }
+            Capture::Nothing => {}
+        }
+        emu.captured = held;
+        while emu.history.len() > SCROLLBACK_CAP {
+            emu.history.pop_front();
         }
     }
 
@@ -190,49 +299,104 @@ impl EditHost {
         let emu = self.terminals.get(&buf)?;
         let screen = emu.parser.screen();
         let (rows, cols) = screen.size();
+        let hist_len = emu.history.len();
         let out = numbers
             .iter()
             .map(|num| {
-                // `numbers` are 1-based buffer lines; scrollback is 0 (Phase 6
-                // raises it), so buffer line N maps straight to grid row N-1.
-                let Some(row) = num.and_then(|n| u16::try_from(n - 1).ok()) else {
+                // `numbers` are 1-based buffer lines. Buffer line idx maps to a
+                // captured-history row (idx < hist_len) or, beyond that, a live
+                // screen row (idx - hist_len) — the same split `terminal_project`
+                // lays the buffer out in.
+                let Some(idx) = num.map(|n| n - 1) else {
                     return Value::Array(Vec::new());
                 };
-                if row >= rows {
-                    return Value::Array(Vec::new());
-                }
-                let mut spans: Vec<Value> = Vec::new();
-                // The run currently being coalesced (start column + its style),
-                // and the last lead cell's style so a wide-char continuation
-                // column inherits its glyph's look rather than a blank.
-                let mut run: Option<(u16, Style)> = None;
-                let mut carry = Style::default();
-                for col in 0..cols {
-                    let style = match screen.cell(row, col) {
-                        Some(cell) if cell.is_wide_continuation() => carry.clone(),
-                        Some(cell) => {
-                            carry = cell_style(cell);
-                            carry.clone()
-                        }
-                        None => Style::default(),
-                    };
-                    // Extend the current run while the style holds; otherwise flush
-                    // it and start a new one at this column.
-                    if !matches!(&run, Some((_, prev)) if *prev == style) {
-                        if let Some((start, prev)) = run.take() {
-                            push_span(&mut spans, start, col, prev, styles);
-                        }
-                        run = Some((col, style));
+                let runs = if idx < hist_len {
+                    emu.history[idx].spans.clone()
+                } else {
+                    match u16::try_from(idx - hist_len) {
+                        Ok(row) if row < rows => row_spans(screen, row, cols),
+                        _ => return Value::Array(Vec::new()),
                     }
-                }
-                if let Some((start, prev)) = run.take() {
-                    push_span(&mut spans, start, cols, prev, styles);
+                };
+                let mut spans: Vec<Value> = Vec::new();
+                for (start, end, style) in runs {
+                    push_span(&mut spans, start, end, style, styles);
                 }
                 Value::Array(spans)
             })
             .collect();
         Some(Value::Array(out))
     }
+}
+
+/// Read scrollback rows `[from, to)` (absolute indices, oldest = 0) out of vt100's
+/// view-window, returning them oldest-first with text + coalesced style runs.
+/// `held` is the current scrollback length. vt100 only shows a `rows`-tall window
+/// at a time, so a range wider than the screen is read in pages; at scrollback
+/// offset `k` the window's row 0 is scrollback row `held - k`. The caller restores
+/// the offset to the live view afterward.
+fn read_scrollback(
+    screen: &mut vt100::Screen,
+    held: usize,
+    from: usize,
+    to: usize,
+    rows: u16,
+    cols: u16,
+) -> Vec<ScrollLine> {
+    let mut out = Vec::with_capacity(to.saturating_sub(from));
+    let mut idx = from;
+    while idx < to {
+        let k = held - idx; // offset that places scrollback row `idx` at window row 0
+        screen.set_scrollback(k);
+        // The window shows min(k, rows) scrollback rows before the live screen; take
+        // only as many as remain in the requested range.
+        let take = k.min(rows as usize).min(to - idx);
+        let texts: Vec<String> = screen.rows(0, cols).collect();
+        for r in 0..take {
+            out.push(ScrollLine {
+                text: texts.get(r).cloned().unwrap_or_default(),
+                spans: row_spans(screen, r as u16, cols),
+            });
+        }
+        idx += take;
+    }
+    out
+}
+
+/// Coalesce one grid row's cells into `(start_col, end_col, style)` runs in screen
+/// columns, dropping default-look runs (so blank cells fall back to the client's
+/// base). A wide glyph's continuation column inherits its lead cell's style, so the
+/// runs line up with the projected row text. Shared by the live color path and the
+/// scrollback capture, reading whichever row the current view-window exposes.
+fn row_spans(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, Style)> {
+    let mut runs = Vec::new();
+    let mut run: Option<(u16, Style)> = None;
+    let mut carry = Style::default();
+    let flush = |runs: &mut Vec<(u16, u16, Style)>, start: u16, end: u16, style: Style| {
+        if style != Style::default() {
+            runs.push((start, end, style));
+        }
+    };
+    for col in 0..cols {
+        let style = match screen.cell(row, col) {
+            Some(cell) if cell.is_wide_continuation() => carry.clone(),
+            Some(cell) => {
+                carry = cell_style(cell);
+                carry.clone()
+            }
+            None => Style::default(),
+        };
+        if !matches!(&run, Some((_, prev)) if *prev == style) {
+            if let Some((start, prev)) = run.take() {
+                flush(&mut runs, start, col, prev);
+            }
+            run = Some((col, style));
+        }
+    }
+    if let Some((start, prev)) = run.take() {
+        flush(&mut runs, start, cols, prev);
+    }
+    runs
 }
 
 /// Push one coalesced cell run as a `[start, end, group, style_id]` highlight

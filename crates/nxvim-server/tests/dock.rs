@@ -197,6 +197,31 @@ async fn click_in_a_dock_focuses_it() {
     );
 }
 
+/// A left-click on a dock window's status line focuses that dock (vim focuses a
+/// window when its status line is clicked), without entering the text.
+#[tokio::test]
+async fn click_a_dock_status_line_focuses_it() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>");
+    feed(&rpc, "<C-w><C-w>l"); // focus main
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "main is focused before the click"
+    );
+    // The single-window left dock fills rows 0..24 (the test attaches 24 windows-area
+    // rows); its status line is the last one, row 23. It has no window below it, so
+    // it isn't a resize handle — the click focuses the dock instead.
+    feed_mouse(&rpc, "left", "press", 23, 5);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock"],
+        "clicking the dock's status line focused it"
+    );
+}
+
 /// A left-click in the main area focuses it back from a focused dock — the inverse
 /// crossing, by mouse.
 #[tokio::test]

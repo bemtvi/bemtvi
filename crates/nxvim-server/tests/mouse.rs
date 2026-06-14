@@ -1218,3 +1218,72 @@ async fn insert_click_moves_caret_and_stays_insert() {
     assert_eq!(mode(&rpc).await, "i", "the click didn't leave Insert");
     assert_eq!(cursor(&rpc).await, (1, 6));
 }
+
+// ── Docks: the wheel and separator-drag reach a region you aren't focused in ──
+
+/// The wheel scrolls the window **under the pointer** even when it is in a dock
+/// the cursor is not focused in — without moving focus or scrolling the main area.
+#[tokio::test]
+async fn wheel_over_a_dock_scrolls_it_without_focus() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // Open a left dock showing the same 100-line buffer, then cross back to main so
+    // the dock is not focused. The dock window occupies cols 0..20.
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, buf = vim.api.nvim_get_current_buf() }",
+    )
+    .await;
+    feed(&rpc, "<C-w><C-w>l");
+    let main_win = current_win(&rpc).await;
+    let dock_win = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != main_win)
+        .expect("a dock window");
+    let dock_top0 = win_topline(&rpc, dock_win).await;
+    let main_top0 = win_topline(&rpc, main_win).await;
+    feed_mouse(&rpc, "wheel", "down", 5, 5); // col 5 lands in the left dock
+    assert_eq!(
+        win_topline(&rpc, dock_win).await,
+        dock_top0 + 3,
+        "the non-focused dock scrolled three lines"
+    );
+    assert_eq!(
+        win_topline(&rpc, main_win).await,
+        main_top0,
+        "the main area did not scroll"
+    );
+    assert_eq!(current_win(&rpc).await, main_win, "focus did not move");
+}
+
+/// Dragging a split divider *inside* a dock resizes that dock's windows — from the
+/// main area, without crossing focus (the region-aware resize hit-test).
+#[tokio::test]
+async fn drag_resizes_a_split_inside_a_dock() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    // Split the dock horizontally: the new (top) window takes focus.
+    feed(&rpc, "<C-w>s");
+    let top = current_win(&rpc).await;
+    // Cross to the main area so the dock is not focused.
+    feed(&rpc, "<C-w><C-w>l");
+    let main_win = current_win(&rpc).await;
+    let top_h0 = win_height(&rpc, top).await;
+    // The top dock window's own status row (its last content row, at `top_h0`) is a
+    // resize handle because another dock window sits below it. Grab it and drag down.
+    feed_mouse(&rpc, "left", "press", top_h0 as usize, 5);
+    feed_mouse(&rpc, "left", "drag", top_h0 as usize + 3, 5);
+    feed_mouse(&rpc, "left", "release", top_h0 as usize + 3, 5);
+    assert_eq!(
+        win_height(&rpc, top).await,
+        top_h0 + 3,
+        "the drag grew the dock's top window"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        main_win,
+        "focus stayed in the main area"
+    );
+}

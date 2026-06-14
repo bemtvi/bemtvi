@@ -1456,12 +1456,6 @@ impl Editor {
         out
     }
 
-    /// The split borders of the **focused** layer's tree (empty with one window).
-    /// Used by mouse separator-drag, which resizes within the focused layer.
-    pub(crate) fn separators(&self) -> &[Separator] {
-        &self.windows.separators
-    }
-
     /// The split borders for every open layer (the focused tree plus every parked
     /// dock / main tree), each tagged with its [`WindowRegion`] so the client can
     /// offset it by the region origin. Empty with one window and no dock.
@@ -1676,16 +1670,26 @@ impl Editor {
         self.resize_window_id(cur, axis, delta);
     }
 
-    /// Resize window `id` (focused or not) by `delta` cells along `axis`. The
-    /// id-targeting core of [`Editor::resize_window`], shared with the
-    /// `nvim_win_set_width`/`set_height` API and the mouse separator drag. A no-op
-    /// with one window, a zero delta, or an unknown id.
+    /// Resize window `id` (focused or not, in any layer) by `delta` cells along
+    /// `axis`. The id-targeting core of [`Editor::resize_window`], shared with the
+    /// `nvim_win_set_width`/`set_height` API and the mouse separator drag. Resizes
+    /// within `id`'s own tree — a dock's split resizes inside that dock without
+    /// crossing focus. A no-op when that tree has one window, a zero delta, or an
+    /// unknown id.
     pub(crate) fn resize_window_id(&mut self, id: WindowId, axis: SplitDir, delta: isize) {
-        if delta == 0 || self.windows.count() <= 1 || !self.windows.windows.contains_key(&id) {
+        if delta == 0 {
             return;
         }
         let mut done = false;
-        resize_toward(&mut self.windows.root, id, axis, delta, &mut done);
+        {
+            let Some(tree) = self.tree_of_window_mut(id) else {
+                return;
+            };
+            if tree.count() <= 1 || !tree.windows.contains_key(&id) {
+                return;
+            }
+            resize_toward(&mut tree.root, id, axis, delta, &mut done);
+        }
         self.relayout();
         self.ensure_visible();
     }

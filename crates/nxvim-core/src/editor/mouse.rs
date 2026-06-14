@@ -180,11 +180,21 @@ impl Editor {
     /// click no selection starts until the first drag; double/triple enter Visual
     /// immediately.
     fn mouse_left_press(&mut self, row: usize, col: usize, stamp_ms: u64) {
+        let target = self.hit_test(row, col);
+        if let Some(MouseTarget::StatusLine { win }) = target {
+            // A press on a window's status line focuses that window (vim) — crossing
+            // into its region if it is a dock — without moving into the text or
+            // starting a selection. (A status row with a window below it is grabbed
+            // as a resize handle earlier in `mouse`, before reaching here.)
+            self.mouse_select = None;
+            self.set_current_window(win);
+            return;
+        }
         let Some(MouseTarget::Text {
             win,
             line,
             col: bcol,
-        }) = self.hit_test(row, col)
+        }) = target
         else {
             // A press outside any window clears the gesture (and resets the count).
             self.mouse_select = None;
@@ -362,34 +372,38 @@ impl Editor {
     ///
     /// `None` otherwise (text, gutter, the bottom-most status line, the tabline, or
     /// outside every window), so the press falls through to the normal handling.
+    ///
+    /// The cell is resolved within the **region** it lands in (the main area or a
+    /// dock), against that region's own tree separators — so dragging a split inside
+    /// a dock resizes that dock, without crossing focus. The dock↔main edge itself
+    /// (the band size) is not a handle here.
     fn resize_handle_at(&self, row: usize, col: usize) -> Option<(WindowId, bool)> {
-        let top_chrome = self.tabline_rows();
-        if row < top_chrome {
-            return None;
-        }
-        let (x, y) = (col, row - top_chrome);
-        for sep in self.separators() {
+        let (layer, ox, oy) = self.region_at(row, col)?;
+        let tree = self.layer_tree(layer)?;
+        // Region-relative cell — each tree lays out at its own origin (0, 0).
+        let (x, y) = (col - ox, row - oy);
+        for sep in &tree.separators {
             if sep.vertical {
                 if x == sep.x && y >= sep.y && y < sep.y + sep.length {
                     // The window left of the divider grows when dragged right.
-                    let (win, ..) = self.window_at(sep.x.checked_sub(1)?, y)?;
+                    let (win, ..) = window_at_in(tree, sep.x.checked_sub(1)?, y)?;
                     return Some((win, true));
                 }
             } else if y == sep.y && x >= sep.x && x < sep.x + sep.length {
                 // The window above the divider grows when dragged down.
-                let (win, ..) = self.window_at(x, sep.y.checked_sub(1)?)?;
+                let (win, ..) = window_at_in(tree, x, sep.y.checked_sub(1)?)?;
                 return Some((win, false));
             }
         }
         // Not on a separator: a window's own status row is a drag handle too, but
         // only when a horizontal separator sits just below it — otherwise it is the
         // bottom-most window and there is nothing beneath to resize against.
-        let (win, _, rel_y) = self.window_at(x, y)?;
+        let (win, _, rel_y) = window_at_in(tree, x, y)?;
         let (_, text_height) = self.window_content_size(win)?;
         if rel_y == text_height {
             let below = y + 1;
-            let has_window_below = self
-                .separators()
+            let has_window_below = tree
+                .separators
                 .iter()
                 .any(|s| !s.vertical && s.y == below && x >= s.x && x < s.x + s.length);
             if has_window_below {
@@ -876,13 +890,18 @@ impl Editor {
             self.preserve_desired = true;
             self.finalize_scroll_gesture();
         } else {
-            let old_top = self.windows.get(win).saved_top;
+            // An inactive window (a split in another layer, or a non-focused dock)
+            // updates its stashed scroll — resolve its tree, which may be parked.
+            let Some(tree) = self.tree_of_window_mut(win) else {
+                return;
+            };
+            let w = tree.get_mut(win);
+            let old_top = w.saved_top;
             let new_top = (old_top as i64 + delta).clamp(0, last as i64) as usize;
             if new_top == old_top {
                 return;
             }
             let bottom = new_top + th.saturating_sub(1);
-            let w = self.windows.get_mut(win);
             w.saved_top = new_top;
             if w.saved_cursor.line < new_top {
                 w.saved_cursor.line = new_top;
@@ -911,7 +930,10 @@ impl Editor {
             self.leftcol = new;
             self.keep_cursor_in_leftcol();
         } else {
-            let w = self.windows.get_mut(win);
+            let Some(tree) = self.tree_of_window_mut(win) else {
+                return;
+            };
+            let w = tree.get_mut(win);
             let new = (w.saved_leftcol as i64 + delta).clamp(0, max) as usize;
             w.saved_leftcol = new;
         }
@@ -975,15 +997,15 @@ impl Editor {
     }
 
     /// The window whose content area is under the **global** screen cell `(row,
-    /// col)`, or `None` when the cell is on the tabline, a window separator, or
-    /// outside every window. Unlike [`hit_test`](Self::hit_test) this stops at the
-    /// window — the wheel needs only *which* window to scroll, not a buffer cell.
+    /// col)` — in *any* region (the main area or a dock), so the wheel scrolls a dock
+    /// you are not focused in. `None` when the cell is on a tabline, a window
+    /// separator, or outside every window. Unlike [`hit_test`](Self::hit_test) this
+    /// stops at the window — the wheel needs only *which* window to scroll, not a
+    /// buffer cell.
     fn window_at_cell(&self, row: usize, col: usize) -> Option<WindowId> {
-        let top_chrome = self.tabline_rows();
-        if row < top_chrome {
-            return None;
-        }
-        self.window_at(col, row - top_chrome).map(|(win, ..)| win)
+        let (layer, ox, oy) = self.region_at(row, col)?;
+        let tree = self.layer_tree(layer)?;
+        window_at_in(tree, col - ox, row - oy).map(|(win, ..)| win)
     }
 
     /// Window `win`'s text-area height in rows (its content height minus the status
@@ -1080,14 +1102,6 @@ impl Editor {
             crate::unicode::byte_at_virtcol(&text, screen_col, buf.options.effective_tabstop())
         };
         Some((line, col))
-    }
-
-    /// Find the window in the **focused** layer's tree whose content area contains
-    /// the windows-area cell `(x, y)`, content-relative. The focused-tree shorthand
-    /// for [`window_at_in`], used by the wheel and resize hit-tests (which act on the
-    /// focused layer); the region-spanning click path uses `window_at_in` directly.
-    fn window_at(&self, x: usize, y: usize) -> Option<(WindowId, usize, usize)> {
-        window_at_in(&self.windows, x, y)
     }
 
     /// The absolute screen top-left of window `win`: its region's tree origin (from

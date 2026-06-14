@@ -13,7 +13,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::anim::{arm_animation, lerp, Animation};
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, PanelData,
-    PmenuData, SearchSpans, Separator, StatusSegment, View, WindowRegion, WindowView,
+    PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View, WindowRegion,
+    WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -211,6 +212,8 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     if tabline_rows > 0 {
         render_tabline(frame, tabline_area, view);
     }
+    // Each open dock paints its own tabline into its band's first row.
+    dock.render_dock_tablines(frame, view);
 
     // Paint each window into its region (main area or a dock); capture the focused
     // one's text-inner rect and (possibly interpolated) cursor row for the terminal
@@ -331,6 +334,12 @@ struct DockLayout {
     cmd: Rect,
     /// The `[left|main|right]` band, for full-height left/right dock borders.
     mid: Rect,
+    /// Each dock's own tabline row (its band's first row), `None` when that dock
+    /// draws no tabline. The dock's content rect above already excludes this row.
+    tl_left: Option<Rect>,
+    tl_right: Option<Rect>,
+    tl_top: Option<Rect>,
+    tl_bottom: Option<Rect>,
     /// Per-side content extents (cells), `0` when closed.
     dl: u16,
     dr: u16,
@@ -391,6 +400,21 @@ impl DockLayout {
             dr,
             right_band.height,
         );
+        // Each dock reserves the first row of its content rect for its own tabline
+        // (when that dock's region tabline is non-empty). The stored content rects
+        // stay uncarved (so the dock-edge borders keep their band-relative
+        // positions); `content()` shifts a window down past its tabline, mirroring
+        // the row the core relayout removed from the dock tree. `tl` is the tabline
+        // row itself (the content rect's first row), `None` when no tabline shows.
+        let tl = |content: Rect, visible: bool| -> Option<Rect> {
+            (visible && content.height > 1)
+                .then(|| Rect::new(content.x, content.y, content.width, 1))
+        };
+        let rt = &view.region_tablines;
+        let tl_top = tl(top, !rt.top.tabs.is_empty());
+        let tl_bottom = tl(bottom, !rt.bottom.tabs.is_empty());
+        let tl_left = tl(left, !rt.left.tabs.is_empty());
+        let tl_right = tl(right, !rt.right.tabs.is_empty());
         DockLayout {
             main,
             left,
@@ -402,6 +426,10 @@ impl DockLayout {
             panel,
             cmd,
             mid,
+            tl_left,
+            tl_right,
+            tl_top,
+            tl_bottom,
             dl,
             dr,
             dt,
@@ -409,14 +437,43 @@ impl DockLayout {
         }
     }
 
-    /// The content rect a window of `region` is offset against.
+    /// The content rect a window of `region` is offset against — shifted down past
+    /// the region's own tabline row when it has one (docks only; the main tabline
+    /// is the global top row handled separately).
     fn content(&self, region: WindowRegion) -> Rect {
-        match region {
-            WindowRegion::Main => self.main,
-            WindowRegion::DockLeft => self.left,
-            WindowRegion::DockRight => self.right,
-            WindowRegion::DockTop => self.top,
-            WindowRegion::DockBottom => self.bottom,
+        let (rect, tabline) = match region {
+            WindowRegion::Main => (self.main, None),
+            WindowRegion::DockLeft => (self.left, self.tl_left),
+            WindowRegion::DockRight => (self.right, self.tl_right),
+            WindowRegion::DockTop => (self.top, self.tl_top),
+            WindowRegion::DockBottom => (self.bottom, self.tl_bottom),
+        };
+        match tabline {
+            Some(_) => Rect::new(
+                rect.x,
+                rect.y + 1,
+                rect.width,
+                rect.height.saturating_sub(1),
+            ),
+            None => rect,
+        }
+    }
+
+    /// Paint each open dock's own tabline into its reserved band row (the main
+    /// tabline is the global top row, drawn separately). A dock with no tabline
+    /// this frame has `None` here and paints nothing.
+    fn render_dock_tablines(&self, frame: &mut Frame, view: &View) {
+        let rt = &view.region_tablines;
+        let docks: [(Option<Rect>, &RegionTabline); 4] = [
+            (self.tl_left, &rt.left),
+            (self.tl_right, &rt.right),
+            (self.tl_top, &rt.top),
+            (self.tl_bottom, &rt.bottom),
+        ];
+        for (area, region) in docks {
+            if let Some(area) = area {
+                render_tab_cells(frame, area, &region.tabs, region.current);
+            }
         }
     }
 
@@ -1455,8 +1512,20 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
         return;
     }
 
-    let mut spans: Vec<Span> = Vec::with_capacity(view.tabline.len());
-    for (i, tab) in view.tabline.iter().enumerate() {
+    render_tab_cells(frame, area, &view.tabline, view.current_tab);
+}
+
+/// Paint built-in tabline cells into `area`: one ` {count} {name}{+} ` cell per
+/// tab (the window count only when >1, a `+` when modified — vim's default), the
+/// `current` cell reverse-video and the strip past the last cell left blank
+/// (vim's `TabLineFill`). Shared by the global (main) tabline and each dock's own
+/// tabline. A no-op for an empty `tabs` or a zero-height `area`.
+fn render_tab_cells(frame: &mut Frame, area: Rect, tabs: &[TabData], current: usize) {
+    if tabs.is_empty() || area.height == 0 {
+        return;
+    }
+    let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
+    for (i, tab) in tabs.iter().enumerate() {
         let count = if tab.window_count > 1 {
             format!("{} ", tab.window_count)
         } else {
@@ -1464,7 +1533,7 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
         };
         let modified = if tab.modified { "+" } else { "" };
         let text = format!(" {count}{}{modified} ", tab.label);
-        let style = if i == view.current_tab {
+        let style = if i == current {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()

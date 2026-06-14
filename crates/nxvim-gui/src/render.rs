@@ -32,7 +32,9 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use nxvim_view::{InlayHint, PanelData, StatusSegment, Style, View, WindowRegion, WindowView};
+use nxvim_view::{
+    InlayHint, PanelData, StatusSegment, Style, TabData, View, WindowRegion, WindowView,
+};
 use winit::window::Window;
 
 use crate::GuiConfig;
@@ -566,22 +568,54 @@ impl Renderer {
             .saturating_sub(right_band)
             .max(1);
         let bottom_y = mid_y + mid_h + global_status_rows;
+        // Each open dock reserves the first row of its band for its own tabline,
+        // shifting that dock's window content down a row (mirroring the row the core
+        // relayout removed from the dock tree). Left/right docks gate on the column
+        // height (`mid_h`), top/bottom on their band height.
+        let rt = &view.region_tablines;
+        let tl_top = u16::from(!rt.top.tabs.is_empty() && dt > 1);
+        let tl_bottom = u16::from(!rt.bottom.tabs.is_empty() && db > 1);
+        let tl_left = u16::from(!rt.left.tabs.is_empty() && mid_h > 1);
+        let tl_right = u16::from(!rt.right.tabs.is_empty() && mid_h > 1);
+        let dock_left_y = mid_y;
+        let dock_right_y = mid_y;
+        let dock_top_y = 0;
+        let dock_bottom_y = bottom_y + (bottom_band - db);
         // Each region's content-cell origin (the dock separator faces the main area,
-        // so the bottom/right docks' content starts one cell past the band edge).
+        // so the bottom/right docks' content starts one cell past the band edge),
+        // shifted past the dock's own tabline row where present.
         let region_origin = |region: WindowRegion| -> (u16, u16) {
             match region {
                 WindowRegion::Main => (main_x, mid_y),
-                WindowRegion::DockLeft => (0, mid_y),
-                WindowRegion::DockRight => (cols.saturating_sub(dr), mid_y),
-                WindowRegion::DockTop => (0, 0),
-                WindowRegion::DockBottom => (0, bottom_y + (bottom_band - db)),
+                WindowRegion::DockLeft => (0, dock_left_y + tl_left),
+                WindowRegion::DockRight => (cols.saturating_sub(dr), dock_right_y + tl_right),
+                WindowRegion::DockTop => (0, dock_top_y + tl_top),
+                WindowRegion::DockBottom => (0, dock_bottom_y + tl_bottom),
             }
         };
 
-        // The tabline on the row below the top dock.
+        // The global (main) tabline on the row below the top dock.
         if tabline_rows > 0 {
             self.build_tabline(view, cols, quads, items);
         }
+        // Each dock's own tabline at its band's first row.
+        self.build_dock_tablines(
+            view,
+            &[
+                (0, dock_top_y, cols, &rt.top, tl_top > 0),
+                (0, dock_bottom_y, cols, &rt.bottom, tl_bottom > 0),
+                (0, dock_left_y, dl, &rt.left, tl_left > 0),
+                (
+                    cols.saturating_sub(dr),
+                    dock_right_y,
+                    dr,
+                    &rt.right,
+                    tl_right > 0,
+                ),
+            ],
+            quads,
+            items,
+        );
 
         // Tiled windows first; floats overlay them in a second pass so they sit on
         // top. Only the focused window slides; the rest paint from the live view.
@@ -1191,8 +1225,35 @@ impl Renderer {
             return;
         }
 
-        let mut col = 0u16;
-        for (i, tab) in view.tabline.iter().enumerate() {
+        self.build_tab_cells(
+            &view.tabline,
+            view.current_tab,
+            0,
+            0,
+            base_bg,
+            base_fg,
+            quads,
+            items,
+        );
+    }
+
+    /// Paint built-in tabline cells (` {count} {label}{+} `, active cell
+    /// reverse-video) starting at cell `(x0, row)`. Shared by the global (main)
+    /// tabline and each dock's own tabline ([`build_dock_tablines`]).
+    #[allow(clippy::too_many_arguments)]
+    fn build_tab_cells(
+        &mut self,
+        tabs: &[TabData],
+        current: usize,
+        x0: u16,
+        row: u16,
+        base_bg: u32,
+        base_fg: u32,
+        quads: &mut Vec<Quad>,
+        items: &mut Vec<TextItem>,
+    ) {
+        let mut col = x0;
+        for (i, tab) in tabs.iter().enumerate() {
             let count = if tab.window_count > 1 {
                 format!("{} ", tab.window_count)
             } else {
@@ -1202,18 +1263,40 @@ impl Renderer {
             let text = format!(" {count}{}{modified} ", tab.label);
             let w = text.chars().count() as u16;
             // The active cell is reverse-video: the status fg becomes its ground.
-            let fg = if i == view.current_tab {
+            let fg = if i == current {
                 if w > 0 {
-                    self.fill_cells(quads, col, 0, w, base_fg);
+                    self.fill_cells(quads, col, row, w, base_fg);
                 }
                 base_bg
             } else {
                 base_fg
             };
-            let pos = self.cell_px(col, 0);
+            let pos = self.cell_px(col, row);
             let full = self.full_bounds();
             self.push_plain(items, &text, pos, fg, full);
             col = col.saturating_add(w);
+        }
+    }
+
+    /// Paint each open dock's own tabline into its band's first row (the row the
+    /// dock window content was shifted down past). `bands` carries each dock's
+    /// `(x0, row, width, present)`; only present docks paint.
+    fn build_dock_tablines(
+        &mut self,
+        view: &View,
+        bands: &[(u16, u16, u16, &nxvim_view::RegionTabline, bool)],
+        quads: &mut Vec<Quad>,
+        items: &mut Vec<TextItem>,
+    ) {
+        let base_bg = style_bg(&view.status_line).unwrap_or(0x1a_1a_1a);
+        let base_fg = style_fg(&view.status_line).unwrap_or(DEFAULT_FG);
+        for &(x0, row, width, rt, present) in bands {
+            if present && !rt.tabs.is_empty() {
+                self.fill_cells(quads, x0, row, width, base_bg);
+                self.build_tab_cells(
+                    &rt.tabs, rt.current, x0, row, base_bg, base_fg, quads, items,
+                );
+            }
         }
     }
 

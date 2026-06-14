@@ -62,6 +62,23 @@ fn band(map: &[(Value, Value)], key: &str) -> u64 {
     map_get(map, key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// The rect height of the first window painted in `region` (`main`/`dock_left`/…).
+fn region_win_height(map: &[(Value, Value)], region: &str) -> Option<u64> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| {
+        let Value::Map(m) = w else { return None };
+        if map_get(m, "region").and_then(Value::as_str) != Some(region) {
+            return None;
+        }
+        let Some(Value::Map(r)) = map_get(m, "rect") else {
+            return None;
+        };
+        map_get(r, "height").and_then(Value::as_u64)
+    })
+}
+
 /// One region's sub-map inside the redraw `region_tablines` (key `main`/`left`/
 /// `right`/`top`/`bottom`).
 fn region_tabline<'a>(map: &'a [(Value, Value)], region: &str) -> Option<&'a [(Value, Value)]> {
@@ -278,6 +295,24 @@ async fn gt_in_one_region_leaves_the_other_regions_active_tab() {
         region_current(&rd, "main"),
         1,
         "main's active tab is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_dock_tabline_shrinks_its_window_by_a_row() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 8 }").await;
+    let rd = latest(&mut incoming);
+    let before = region_win_height(&rd, "dock_bottom").expect("a dock window");
+    // A second dock tab makes the dock's own tabline appear (showtabline=1), eating
+    // the band's first row — the dock tree lays out one row shorter below it.
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    let rd = latest(&mut incoming);
+    let after = region_win_height(&rd, "dock_bottom").expect("a dock window");
+    assert_eq!(
+        after,
+        before - 1,
+        "the dock tree gave its top row to its tabline"
     );
 }
 

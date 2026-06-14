@@ -243,6 +243,11 @@ pub struct View {
     /// Index into `tabline` of the active tab (meaningful only when `tabline` is
     /// non-empty).
     pub current_tab: usize,
+    /// Per-region tablines — each region (main + each open dock) carries its own
+    /// independent tab pages. `tabline`/`current_tab` above mirror `main`; the dock
+    /// entries are the per-dock tablines a client draws at the top of each dock's
+    /// band. Empty `tabs` ⇒ that region draws no tabline. See [`RegionTablines`].
+    pub region_tablines: RegionTablines,
     pub mode_label: String,
     pub command_mode: bool,
     /// True while `r` waits for its replacement character (a one-shot replace
@@ -335,6 +340,27 @@ pub struct TabData {
     pub window_count: usize,
 }
 
+/// One region's tabline mirrored from the redraw: its tab cells plus the active
+/// cell index. Empty `tabs` ⇒ that region draws no tabline (its `showtabline`
+/// gate hid it, or — for a dock — it is closed).
+#[derive(Clone, Default)]
+pub struct RegionTabline {
+    pub tabs: Vec<TabData>,
+    pub current: usize,
+}
+
+/// Every region's independent tabline (see [`RegionTabline`]): the main editor
+/// area plus the four docks. A client draws each region's tabline at the top of
+/// that region's band.
+#[derive(Clone, Default)]
+pub struct RegionTablines {
+    pub main: RegionTabline,
+    pub left: RegionTabline,
+    pub right: RegionTabline,
+    pub top: RegionTabline,
+    pub bottom: RegionTabline,
+}
+
 /// The bottom panel mirrored from the server's redraw: a title, the visible
 /// content slice, the cursor row within it, and the content height to lay out.
 #[derive(Clone)]
@@ -401,6 +427,7 @@ impl View {
         self.tabline = parse_tabline(map_get(map, "tabline"));
         self.tabline_segments = parse_status(map_get(map, "tabline_segments"), &self.styles);
         self.current_tab = map_u64(map, "current_tab") as usize;
+        self.region_tablines = parse_region_tablines(map_get(map, "region_tablines"));
         self.panel = match map_get(map, "panel") {
             Some(Value::Map(p)) => Some(PanelData {
                 title: map_str(p, "title"),
@@ -596,6 +623,31 @@ fn parse_tabline(value: Option<&Value>) -> Vec<TabData> {
             _ => None,
         })
         .collect()
+}
+
+/// Parse the `region_tablines` map (`{ main, left, right, top, bottom }`, each a
+/// `{ tabs, current }`). Absent on an older server ⇒ all-empty (no per-region
+/// tablines drawn).
+fn parse_region_tablines(value: Option<&Value>) -> RegionTablines {
+    let Some(Value::Map(m)) = value else {
+        return RegionTablines::default();
+    };
+    let region = |key: &str| -> RegionTabline {
+        match map_get(m, key) {
+            Some(Value::Map(r)) => RegionTabline {
+                tabs: parse_tabline(map_get(r, "tabs")),
+                current: map_u64(r, "current") as usize,
+            },
+            _ => RegionTabline::default(),
+        }
+    };
+    RegionTablines {
+        main: region("main"),
+        left: region("left"),
+        right: region("right"),
+        top: region("top"),
+        bottom: region("bottom"),
+    }
 }
 
 /// Parse the `separators` array: each entry a `{ vertical, x, y, length }` map.

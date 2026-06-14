@@ -1888,6 +1888,15 @@ impl Editor {
         usize::from(self.tabline_visible())
     }
 
+    /// Rows `layer`'s own tabline reserves at the top of *its* region band: one when
+    /// that layer's tabline is shown ([`Editor::tabline_visible_for`]), zero
+    /// otherwise. A dock's tabline is the first row of its band (the tree lays out
+    /// below it); the client paints it there. (Main's tabline is the global top row,
+    /// counted by [`Editor::tabline_rows`] instead.)
+    pub(crate) fn tabline_rows_for(&self, layer: Layer) -> usize {
+        usize::from(self.tabline_visible_for(layer))
+    }
+
     /// Whether a window paints its own per-window status row. A **float** never
     /// does by default (matching neovim — see the body), regardless of
     /// `laststatus`. A **tiled** window follows `laststatus`: never at `0`, only
@@ -1968,8 +1977,18 @@ impl Editor {
         // each client maps the region to its absolute screen origin (the dock
         // bands it receives in the `View`). With no dock open this is exactly the
         // pre-dock layout: one main tree filling the full windows area.
+        //
+        // Each **dock** reserves the first row of its band for its own tabline (the
+        // client paints it there and offsets the tree down a row); the tree gets the
+        // remaining rows. Main has no per-region tabline row here — its tabline is
+        // the global top row already excluded via `chrome`.
         let full_w = self.width;
         for layer in self.open_layers() {
+            // Rows this dock's own tabline eats off the top of its band (0 for main).
+            let dock_tab = match layer {
+                Layer::Main => 0,
+                dock => self.tabline_rows_for(dock),
+            };
             let rect = match layer {
                 Layer::Main => Rect {
                     x: 0,
@@ -1981,25 +2000,25 @@ impl Editor {
                     x: 0,
                     y: 0,
                     width: bands.left,
-                    height: mid_h,
+                    height: mid_h.saturating_sub(dock_tab).max(1),
                 },
                 Layer::Dock(DockSide::Right) => Rect {
                     x: 0,
                     y: 0,
                     width: bands.right,
-                    height: mid_h,
+                    height: mid_h.saturating_sub(dock_tab).max(1),
                 },
                 Layer::Dock(DockSide::Top) => Rect {
                     x: 0,
                     y: 0,
                     width: full_w,
-                    height: bands.top,
+                    height: bands.top.saturating_sub(dock_tab).max(1),
                 },
                 Layer::Dock(DockSide::Bottom) => Rect {
                     x: 0,
                     y: 0,
                     width: full_w,
-                    height: bands.bottom,
+                    height: bands.bottom.saturating_sub(dock_tab).max(1),
                 },
             };
             let off = if layer == self.focused_layer {

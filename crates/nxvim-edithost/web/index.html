@@ -550,6 +550,7 @@
         if (serverStyled && view.tabline_segments?.length) renderTablineSegments(0);
         else renderTabline(0);
       }
+      renderDockTablines(tablineRows);
       for (const w of view.windows) if (!w.floating) renderWindow(w, tablineRows, hl);
       renderSeparators(tablineRows);
       for (const w of view.windows) if (w.floating) renderFloat(w, tablineRows, hl);
@@ -587,17 +588,38 @@
       );
       return { dl, dr, dt, db, topBand, bottomBand, leftBand, rightBand, midY, midH, globalStatusRows };
     }
+    // A region's own tabline (from `region_tablines`): `{ tabs, current }`, or
+    // undefined on an older server. `main` mirrors the legacy `tabline`.
+    function regionTabs(region) {
+      const rt = view.region_tablines || {};
+      switch (region) {
+        case "dock_left": return rt.left;
+        case "dock_right": return rt.right;
+        case "dock_top": return rt.top;
+        case "dock_bottom": return rt.bottom;
+        default: return rt.main;
+      }
+    }
+    // Rows a dock's own tabline reserves at the top of its band (0 or 1). Gated on
+    // the dock having >1 of its own tabs and the band having room for a tree row.
+    function dockTl(region, g) {
+      const rt = regionTabs(region);
+      if (!rt || !rt.tabs || rt.tabs.length === 0) return 0;
+      const bandH = region === "dock_top" ? g.dt : region === "dock_bottom" ? g.db : g.midH;
+      return bandH > 1 ? 1 : 0;
+    }
     // The content-cell origin a window/separator of `region` is offset against (the
     // dock separator faces the main area, so the bottom/right docks' content starts
-    // one cell past the band edge).
+    // one cell past the band edge), shifted past the dock's own tabline row.
     function regionOrigin(region, tablineRows) {
       const g = dockGeo(tablineRows);
+      const tl = dockTl(region, g);
       switch (region) {
-        case "dock_left": return { x: 0, y: g.midY };
-        case "dock_right": return { x: cols - g.dr, y: g.midY };
-        case "dock_top": return { x: 0, y: 0 };
+        case "dock_left": return { x: 0, y: g.midY + tl };
+        case "dock_right": return { x: cols - g.dr, y: g.midY + tl };
+        case "dock_top": return { x: 0, y: tl };
         case "dock_bottom":
-          return { x: 0, y: g.midY + g.midH + g.globalStatusRows + (g.bottomBand - g.db) };
+          return { x: 0, y: g.midY + g.midH + g.globalStatusRows + (g.bottomBand - g.db) + tl };
         default: return { x: g.leftBand, y: g.midY };
       }
     }
@@ -1041,19 +1063,42 @@
     function renderFloat(w, tablineRows, hl) {
       renderWindow(w, tablineRows, hl);
     }
-    function renderTabline(y) {
+    // Paint tabline cells (` ▸{count}{label}{+} `, the active cell marked) for a
+    // `{ tabs, current }` at cell (x, y) spanning `width` cells. Shared by the
+    // global (main) tabline and each dock's own tabline.
+    function renderTabCells(tabs, current, x, y, width) {
       const el = document.createElement("div");
       el.className = "row statusline";
+      el.style.left = x * cw + "px";
       el.style.top = y * ch + "px";
-      el.style.width = cols * cw + "px";
+      el.style.width = width * cw + "px";
       let s = "";
-      view.tabline.forEach((t, i) => {
+      tabs.forEach((t, i) => {
         const count = t.window_count > 1 ? t.window_count + " " : "";
-        const mark = i === view.current_tab ? "▸" : " ";
+        const mark = i === current ? "▸" : " ";
         s += ` ${mark}${count}${t.label}${t.modified ? "+" : ""} `;
       });
       el.textContent = s;
       gridEl.appendChild(el);
+    }
+    function renderTabline(y) {
+      renderTabCells(view.tabline, view.current_tab, 0, y, cols);
+    }
+    // Each open dock paints its own tabline into its band's first row.
+    function renderDockTablines(tablineRows) {
+      const g = dockGeo(tablineRows);
+      const bottomY = g.midY + g.midH + g.globalStatusRows + (g.bottomBand - g.db);
+      const docks = [
+        ["dock_top", 0, 0, cols],
+        ["dock_bottom", 0, bottomY, cols],
+        ["dock_left", 0, g.midY, g.dl],
+        ["dock_right", cols - g.dr, g.midY, g.dr],
+      ];
+      for (const [region, x, y, width] of docks) {
+        if (!dockTl(region, g)) continue;
+        const rt = regionTabs(region);
+        renderTabCells(rt.tabs, rt.current, x, y, width);
+      }
     }
     function renderPanel(panel, cmdRow) {
       const borderRow = cmdRow - (panel.height + 1);

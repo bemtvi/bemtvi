@@ -1078,3 +1078,69 @@ fn no_tabline_with_a_single_tab() {
     let buf = paint(&view(vec![("lines", lines(&["hello"]))]), 40, 6);
     assert_eq!(row_text(&buf, 0).trim_end(), "hello");
 }
+
+/// Build a `region_tablines` map value with one region's `{ tabs, current }`.
+fn region_tablines(region: &str, tabs: &[(&str, bool, u64)], current: u64) -> Value {
+    Value::Map(vec![(
+        Value::from(region),
+        Value::Map(vec![
+            (Value::from("tabs"), tabline(tabs)),
+            (Value::from("current"), Value::from(current)),
+        ]),
+    )])
+}
+
+#[test]
+fn a_top_dock_paints_its_own_tabline_above_its_content() {
+    // 20×8 grid. A top dock of height 3 with two tabs: its own tabline on row 0,
+    // its window content on rows 1..3, the dock border on row 3, main below.
+    let windows = Value::Array(vec![
+        // The dock tree lost its top row to the dock tabline (core: height 3-1=2).
+        region_window(rect(0, 0, 20, 2), "dock_top", false, &["DOCKTEXT"]),
+        region_window(rect(0, 0, 20, 4), "main", true, &["MAIN"]),
+    ]);
+    let v = view(vec![
+        ("windows", windows),
+        ("dock_top", Value::from(3u64)),
+        (
+            "region_tablines",
+            region_tablines("top", &[("a.txt", false, 1), ("b.txt", true, 1)], 1),
+        ),
+    ]);
+    let buf = paint(&v, 20, 8);
+
+    // Row 0 is the dock's own tabline (both tab labels, a `+` on the modified one).
+    let tl = row_text(&buf, 0);
+    assert!(
+        tl.contains("a.txt") && tl.contains("b.txt"),
+        "dock tabline: {tl:?}"
+    );
+    assert!(tl.contains('+'), "modified dock tab shows a +: {tl:?}");
+    // The active (second) cell is reverse-video.
+    let b_col = tl.find("b.txt").unwrap() as u16;
+    assert!(reversed(&buf, b_col, 0), "active dock tab highlighted");
+    // The dock's window content sits below its tabline (row 1), and the dock border
+    // is on row 3 — the window was pushed down a row by its tabline.
+    assert!(
+        row_text(&buf, 1).starts_with("DOCKTEXT"),
+        "dock content on row 1"
+    );
+    assert_eq!(row_text(&buf, 3), "─".repeat(20), "dock border on row 3");
+    assert!(row_text(&buf, 4).starts_with("MAIN"), "main below the dock");
+}
+
+#[test]
+fn a_single_tab_dock_draws_no_tabline() {
+    // A dock with one tab (empty region_tablines entry) reserves no tabline row:
+    // its content keeps row 0 of the band, exactly as before per-region tablines.
+    let windows = Value::Array(vec![
+        region_window(rect(0, 0, 20, 3), "dock_top", false, &["DOCKTEXT"]),
+        region_window(rect(0, 0, 20, 4), "main", true, &["MAIN"]),
+    ]);
+    let v = view(vec![("windows", windows), ("dock_top", Value::from(3u64))]);
+    let buf = paint(&v, 20, 8);
+    assert!(
+        row_text(&buf, 0).starts_with("DOCKTEXT"),
+        "no dock tabline: content keeps row 0"
+    );
+}

@@ -509,10 +509,10 @@ async fn terminal_projects_ansi_color_into_highlight_spans() {
 }
 
 /// Phase 6 — scrollback. Output taller than the screen scrolls the earliest rows
-/// off the live vt100 grid; they must be preserved in the buffer's scrollback so
-/// terminal-normal navigation still reaches them. `cat <file> -` prints the lines
-/// then blocks on stdin, keeping the terminal live (a dead terminal drops its
-/// emulator and history).
+/// off the live vt100 grid; they must be preserved so terminal-normal navigation
+/// reaches them. While output is live the buffer mirrors only the screen (so floods
+/// stay cheap); entering terminal-normal (`<C-\><C-n>`) materializes the scrollback,
+/// so `gg` then reaches the earliest line. `cat <file> -` keeps the terminal live.
 #[tokio::test]
 async fn scrollback_preserves_lines_that_scrolled_off_the_screen() {
     let _guard = serial_lock().lock().await;
@@ -523,18 +523,19 @@ async fn scrollback_preserves_lines_that_scrolled_off_the_screen() {
     command(&rpc, &format!("terminal cat {path} -")).await;
     wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line50")).await;
 
-    // The earliest line scrolled off the 24-row grid, but scrollback keeps it as
-    // the buffer's first line (without scrollback the top would be ~line27).
+    // Leave terminal-job mode to browse: the scrollback is materialized, so the
+    // earliest scrolled-off line is now the buffer's first line.
+    feed(&rpc, "<C-\\><C-n>");
     let ls = lines(&rpc).await;
     assert_eq!(
         ls.first().map(String::as_str),
         Some("line1"),
-        "the scrolled-off first line is preserved at the top of the buffer"
+        "browsing the terminal exposes the scrolled-off first line at the top"
     );
     assert!(has_line(&ls, "line50"), "the live bottom is present too");
 
     // `gg` reaches the earliest history line.
-    feed(&rpc, "<C-\\><C-n>gg");
+    feed(&rpc, "gg");
     assert_eq!(
         cursor(&rpc).await.0,
         1,
@@ -558,14 +559,15 @@ async fn scrollback_rows_keep_their_color() {
     let path = write_temp("term_scroll_color", "txt", &body);
     command(&rpc, &format!("terminal cat {path} -")).await;
     wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line40")).await;
+
+    // Browse (materialize scrollback) and scroll to the top so the red history row
+    // is rendered this frame.
+    feed(&rpc, "<C-\\><C-n>gg");
     assert_eq!(
         lines(&rpc).await.first().map(String::as_str),
         Some("redline"),
         "the red line scrolled into history at the top"
     );
-
-    // Scroll the viewport to the top so the history row is rendered this frame.
-    feed(&rpc, "<C-\\><C-n>gg");
     const RED: u64 = 0x00cd_0000;
     for _ in 0..200 {
         if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
@@ -578,49 +580,50 @@ async fn scrollback_rows_keep_their_color() {
     panic!("timed out waiting for the scrolled-off red line's color");
 }
 
-/// A flood of output — more lines than the scrollback cap — must not freeze the
-/// editor: each PTY burst splices only the changed tail + evicts the front, so the
-/// per-burst cost is bounded (not a full-buffer rebuild, which made `rg` dumping
-/// thousands of matches quadratic). The buffer stays capped near the scrollback
-/// limit, keeps the most recent output, and drops the oldest. Completing this at
-/// all (well within the poll budget) is the regression check.
+/// A flood of output far larger than the scrollback cap must not freeze the editor.
+/// While output is live the buffer mirrors only the screen, so each PTY burst is
+/// `O(screen)` regardless of how much has scrolled past — no per-line capture, no
+/// growing rebuild (the old design rebuilt the whole buffer every burst, which made
+/// `rg` dumping hundreds of thousands of matches quadratic and froze). Reaching the
+/// last line quickly is the regression check; browsing afterward then exposes a
+/// scrollback bounded near the cap, with the oldest evicted and the newest kept.
 #[tokio::test]
 async fn heavy_output_stays_bounded_and_does_not_freeze() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await; // 80x24
 
-    // 12000 lines — past the 10000-row scrollback cap, so eviction + the saturated
-    // capture path both run. `cat <file> -` prints them then blocks on stdin.
-    const N: usize = 12_000;
+    const N: usize = 40_000; // far past the 10000-row scrollback cap
     const CAP: usize = 10_000; // mirrors terminal.rs SCROLLBACK_CAP
     let body: String = (1..=N).map(|i| format!("line{i}\n")).collect();
     let path = write_temp("term_flood", "txt", &body);
     command(&rpc, &format!("terminal cat {path} -")).await;
 
-    // Poll cheaply (line count + a small tail) until the last line lands.
-    for _ in 0..200 {
-        let lc = line_count(&rpc).await;
-        if lc > 100 {
-            let tail = lines_range(&rpc, lc as i64 - 40, lc as i64).await;
-            if tail.iter().any(|l| l.trim_end() == "line12000") {
-                // Capped, not grown to 12000: the buffer holds ~cap + one screen.
-                assert!(
-                    lc <= CAP + 64,
-                    "buffer should stay capped near the scrollback limit, got {lc} lines"
-                );
-                // Oldest evicted, most recent kept.
-                let head = lines_range(&rpc, 0, 1).await;
-                assert_ne!(
-                    head.first().map(String::as_str),
-                    Some("line1"),
-                    "the oldest line is evicted once output passes the cap"
-                );
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out streaming {N} lines — heavy output should never stall");
+    // Live output: the buffer mirrors the screen, so the last line shows up fast.
+    wait_lines(&rpc, "the last line of a 40k-line flood", |ls| {
+        has_line(ls, "line40000")
+    })
+    .await;
+
+    // Browse: materialize the scrollback. It is bounded near the cap (not 40000),
+    // keeps the most recent output, and has dropped the oldest.
+    feed(&rpc, "<C-\\><C-n>G");
+    let lc = line_count(&rpc).await;
+    assert!(
+        lc <= CAP + 64,
+        "scrollback should stay capped near the limit, got {lc} lines"
+    );
+    let head = lines_range(&rpc, 0, 1).await;
+    assert_ne!(
+        head.first().map(String::as_str),
+        Some("line1"),
+        "the oldest line is evicted once output passes the cap"
+    );
+    feed(&rpc, "gg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "gg reaches the top of the scrollback"
+    );
 }
 
 /// The `fg` color (`0xRRGGBB`) of the first highlight span in the focused

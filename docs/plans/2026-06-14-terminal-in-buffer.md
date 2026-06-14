@@ -143,30 +143,29 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   `Screen::set_scrollback`) vs. accumulating scrolled-off rows ourselves; pick whichever gives
   faithful per-cell styles for history, and capture the choice here.
 
-  **Decision (implemented):** *both* — vt100 owns the scrollback (`scrollback_len = SCROLLBACK_CAP
-  = 10000`, matching neovim), and we keep our own `history: VecDeque<ScrollLine>` (text + coalesced
-  style runs) as a cache. vt100's scrollback API is a moving **view-window** only (`set_scrollback`
-  shifts an offset; `rows`/`cell` then read that window) — there is no addressable "all history
-  rows" accessor — so reading the full history on every projection/redraw would mean paging
-  hundreds of `rows`-tall windows per PTY burst. Instead `capture_scrollback` runs once per feed:
-  while vt100 is unsaturated the freshly-scrolled count is exact (`held - captured`) and we read
-  just those rows through the window (`read_scrollback`, paging only if a single burst scrolled
-  more than a screen); once vt100 saturates at the cap the count is no longer a reliable delta, so
-  `capture_saturated` pages the newest windows back **only as far as the last-captured row (the
-  anchor)** and appends everything newer — `O(rows scrolled this burst)`, never the whole buffer.
-  The live screen still reads live vt100 cells (Phase 4); only scrolled-off rows read the captured
-  styles.
+  **Decision (implemented):** vt100 owns the scrollback (`scrollback_len = SCROLLBACK_CAP = 10000`,
+  matching neovim); accumulating rows into its internal `VecDeque` is cheap. We do **not** mirror
+  it continuously. The critical realization for never-freeze: vt100 only exposes scrollback as a
+  moving **view-window** (`set_scrollback` shifts an offset; `rows`/`cell` read that window), and
+  reading it back — especially per-cell for styles — is the expensive part. So the rule is **never
+  read scrollback on the hot live-output path**:
 
-  **The projection must be incremental too** (this is what actually keeps the editor responsive
-  under a flood like `rg` printing thousands of matches): `terminal_project` lays the buffer out as
-  `history ++ live screen`, but `Editor::terminal_update` does **not** rebuild the rope each burst —
-  it evicts the rows that rolled past the cap from the front and rewrites only `[replace_from, end)`
-  (the newly-committed history tail + the live screen). A burst costs `O(evicted + new rows +
-  screen)`, not `O(buffer)`; the old full-rebuild-every-burst was `O(N²)` over a flood and froze the
-  editor. History is append-only between cap evictions, so the leading `replace_from` lines stay
-  byte-identical and untouched, and terminal-normal navigation just works (the buffer has more
-  lines). Residual edge: a single burst that scrolls *past the cap* and whose anchor line repeats
-  within that burst can leave a small gap in history beyond the cap (cosmetic; never a stall).
+  - **Live output** (the focused buffer is in terminal-job mode): `terminal_project` mirrors **only
+    the visible screen** into the buffer (`O(screen)` per PTY burst, no scrollback reads, no
+    per-line capture). A flood — `rg` printing 500k matches — stays linear and fast (measured ~0.4s
+    release for 500k); the buffer is just the 24-row screen, vt100 holds the history internally.
+  - **Browsing** (the user left terminal-insert with `<C-\><C-n>`, or it is a background terminal):
+    `terminal_project` materializes the retained scrollback from vt100 into `history:
+    Vec<ScrollLine>` (text + coalesced style runs, via `read_scrollback`) and projects `history ++
+    screen`, so `gg`/`G`/`<C-u>`/search/yank traverse it and the color path (taking `&self`) reads
+    the materialized rows. The cursor offset by `history.len()` keeps the live input position.
+
+  `sync_terminal_view` (called each redraw) flips the focused terminal between the two views when
+  the mode changes without any PTY output to trigger a projection (e.g. `<C-\><C-n>` / `i`). The
+  one-time materialization on entering browse reads ≤ cap rows (~9ms release); re-materializing
+  while a child floods *during* browsing is the only `O(cap)`-per-burst path, and is a rare/odd
+  usage (you browse when output is paused). `Editor::terminal_update` stays a simple full-replace —
+  cheap because the live buffer is small (one screen) and browse reprojections are occasional.
 
 ## Phase 7 — Web terminal over the daemon (`nxvim-edithost` + daemon, wasm-gated)
 

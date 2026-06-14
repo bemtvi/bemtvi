@@ -14,8 +14,6 @@
 //! bytes is the part that differs (Phase 3 native / Phase 7 web). See
 //! `docs/plans/2026-06-14-terminal-in-buffer.md`.
 
-use std::collections::VecDeque;
-
 use nxvim_core::{BufferId, Rgb, Style, TerminalOp};
 use rmpv::Value;
 
@@ -78,13 +76,12 @@ impl vt100::Callbacks for TermSink {
     }
 }
 
-/// A scrolled-off row captured into the terminal's history: its display text and
-/// the coalesced per-cell style runs. We keep the styles ourselves because vt100
-/// only exposes scrollback through a moving view-window (`set_scrollback`), not as
-/// addressable rows — caching here lets the projection and color path read history
-/// without re-paging vt100 on every frame. The live screen still reads vt100 cells
-/// directly (Phase 4); only scrolled-off rows come from here.
-#[derive(Clone, PartialEq)]
+/// A scrollback row materialized for *browsing*: its display text and the coalesced
+/// per-cell style runs. Built only while the user navigates terminal-normal mode
+/// (never during live output), by reading vt100's retained scrollback — vt100 owns
+/// the scrollback; this is a transient projection of it the redraw can read cheaply
+/// (the highlight path takes `&self`, so it can't re-page vt100 itself).
+#[derive(Clone)]
 struct ScrollLine {
     text: String,
     /// `(start_col, end_col, style)` runs, already coalesced and default-filtered
@@ -93,33 +90,25 @@ struct ScrollLine {
 }
 
 /// A terminal buffer's vt100 emulator: the escape-sequence parser (which owns the
-/// screen grid) plus the last size it was projected at and the captured scrollback.
+/// screen grid + its internal scrollback) plus the last projected size and view.
 pub(crate) struct TermEmu {
     /// The vt100 parser + screen grid. Fed the child's PTY bytes; queried for the
     /// row text, cursor, per-cell colors, and (via its [`TermSink`]) window title +
-    /// query replies.
+    /// query replies. It also holds the scrollback ([`SCROLLBACK_CAP`] rows) — cheap
+    /// to accumulate; we only *read* it back when the user browses.
     parser: vt100::Parser<TermSink>,
     /// The `(rows, cols)` the emulator was last sized to, so a redraw-time resize
     /// only re-sizes (and reprojects) when the window's text area actually changed.
     last_size: (u16, u16),
-    /// Rows that have scrolled off the top of the screen, oldest-first, capped at
-    /// [`SCROLLBACK_CAP`]. Projected as the buffer's leading lines so terminal-normal
-    /// navigation (`gg`/`G`/`<C-u>`/search/yank) traverses history.
-    history: VecDeque<ScrollLine>,
-    /// How many rows of vt100's internal scrollback we have already captured into
-    /// `history`. While vt100 is unsaturated this is its scrollback length and the
-    /// per-burst delta is exact; once vt100 saturates it pins at [`SCROLLBACK_CAP`]
-    /// and capture switches to the bounded overlap path.
-    captured: usize,
-    /// Total rows ever evicted from the front of `history` (it caps at
-    /// [`SCROLLBACK_CAP`]). Monotonic; lets the projection compute how many leading
-    /// buffer lines to drop since the last frame.
-    evicted_total: usize,
-    /// `(evicted_total, history.len())` as of the last [`terminal_project`], so the
-    /// next projection can splice the buffer incrementally (evict the newly-dropped
-    /// front, rewrite only the new history tail + live screen) instead of rebuilding.
-    proj_evicted: usize,
-    proj_history: usize,
+    /// The scrollback rows materialized for the current *browsing* projection, oldest
+    /// first. Empty while output is live (the buffer mirrors only the screen, so a
+    /// flood stays `O(screen)` per burst); populated from vt100 when the user enters
+    /// terminal-normal to navigate history, and read by the color path.
+    history: Vec<ScrollLine>,
+    /// Whether the buffer currently includes the scrollback history (browsing view)
+    /// rather than just the live screen. Tracks the projected view so a redraw can
+    /// detect a mode flip and reproject.
+    showing_history: bool,
 }
 
 impl TermEmu {
@@ -133,11 +122,8 @@ impl TermEmu {
                 TermSink::default(),
             ),
             last_size: (rows, cols),
-            history: VecDeque::new(),
-            captured: 0,
-            evicted_total: 0,
-            proj_evicted: 0,
-            proj_history: 0,
+            history: Vec::new(),
+            showing_history: false,
         }
     }
 }
@@ -167,7 +153,6 @@ impl EditHost {
         if !replies.is_empty() {
             self.editor.terminal_send(buf, replies);
         }
-        self.capture_scrollback(buf);
         self.terminal_project(buf);
     }
 
@@ -185,8 +170,6 @@ impl EditHost {
         }
         emu.parser.screen_mut().set_size(rows, cols);
         emu.last_size = (rows, cols);
-        // A reflow can push rows into vt100's scrollback; capture before projecting.
-        self.capture_scrollback(buf);
         self.terminal_project(buf);
         true
     }
@@ -196,106 +179,73 @@ impl EditHost {
         self.terminals.remove(&buf);
     }
 
-    /// Project `buf`'s emulator into the buffer's mirrored lines + cursor: the
-    /// captured scrollback history first, then the live screen rows. The grid's
-    /// per-cell colors are read separately at redraw (Phase 4); here we only push
-    /// the text and cursor through the pure-core inbound API. The cursor maps into
-    /// the live region — offset by the history length — so terminal-insert stays
-    /// pinned to the bottom while terminal-normal can navigate the history above.
+    /// Project `buf`'s emulator into the buffer's mirrored lines + cursor.
+    ///
+    /// While output is **live** (the user is in terminal-job mode on this buffer)
+    /// the buffer mirrors only the visible screen, so each PTY burst costs
+    /// `O(screen)` no matter how much has scrolled past — a flood (`rg` printing
+    /// 500k matches) can never make this `O(history)`. vt100 keeps the scrollback
+    /// internally (cheap). When the user **browses** (terminal-normal), the
+    /// scrollback is materialized from vt100 into `history` and projected ahead of
+    /// the screen, so `gg`/`G`/search/yank traverse it; the cursor offset by the
+    /// history length keeps the live input position correct.
     fn terminal_project(&mut self, buf: BufferId) {
+        let browsing = self.terminal_browsing(buf);
         let Some(emu) = self.terminals.get_mut(&buf) else {
             return;
         };
-        let h = emu.history.len();
-        // Incremental splice vs. the last frame: drop the history rows that rolled
-        // off the front since then, and rewrite only the rows from the first one
-        // that changed — the newly-committed history tail plus the live screen. The
-        // leading `replace_from` history lines are byte-identical to last frame
-        // (history is append-only between cap evictions), so they stay untouched.
-        let evict_front = emu.evicted_total - emu.proj_evicted;
-        let replace_from = emu.proj_history - evict_front;
+        let (rows, cols) = emu.parser.screen().size();
+
+        // Materialize (or clear) the scrollback history for the current view. Reading
+        // it back out of vt100 is only done here, when browsing — never on the hot
+        // live-output path.
+        if browsing {
+            let screen = emu.parser.screen_mut();
+            screen.set_scrollback(usize::MAX);
+            let held = screen.scrollback();
+            emu.history = read_scrollback(screen, held, 0, held, rows, cols);
+            // `read_scrollback` left the view-window offset paged into history; reset
+            // to the live view so the screen rows below read the live bottom.
+            emu.parser.screen_mut().set_scrollback(0);
+        } else {
+            emu.history.clear();
+        }
+        emu.showing_history = browsing;
 
         let screen = emu.parser.screen();
-        let (_rows, cols) = screen.size();
-        let mut tail: Vec<String> = emu
-            .history
-            .range(replace_from..)
-            .map(|l| l.text.clone())
-            .collect();
-        tail.extend(screen.rows(0, cols));
+        let mut lines: Vec<String> = emu.history.iter().map(|l| l.text.clone()).collect();
+        lines.extend(screen.rows(0, cols));
         let (cy, cx) = screen.cursor_position();
+        let cursor_row = emu.history.len() + cy as usize;
         let title = emu.parser.callbacks().title.clone();
-        let cursor_row = h + cy as usize;
 
-        emu.proj_evicted = emu.evicted_total;
-        emu.proj_history = h;
-
-        self.editor.terminal_update(
-            buf,
-            evict_front,
-            replace_from,
-            &tail,
-            cursor_row,
-            cx as usize,
-        );
+        self.editor
+            .terminal_update(buf, &lines, cursor_row, cx as usize);
         if let Some(title) = title {
             self.editor.terminal_set_title(buf, &title);
         }
     }
 
-    /// Append rows that scrolled off vt100's screen since the last feed into our
-    /// own `history` cache (text + per-cell style runs), so the projection above
-    /// and the color path can read them without re-paging vt100 each frame.
-    ///
-    /// vt100 exposes scrollback only as a moving view-window (`set_scrollback`
-    /// shifts an offset; `rows`/`cell` then read that window), so we read the
-    /// freshly-scrolled rows through that window and restore the offset to `0` (the
-    /// live view) before returning. The cost is bounded by the rows scrolled *this
-    /// burst*, never the whole buffer — the editor stays responsive under a flood of
-    /// output (e.g. `rg` printing thousands of matches):
-    ///
-    /// - **Unsaturated** (`held < cap`): the new-row count is exact (`held -
-    ///   captured`); read just those.
-    /// - **Saturated** (`held == cap`): vt100 has begun dropping its oldest rows, so
-    ///   the count is no longer a reliable delta. Skip cheaply if the newest scrolled
-    ///   row is unchanged; otherwise page the newest scrollback windows back only as
-    ///   far as the row we last captured (the anchor) and append everything newer.
-    ///   A single burst that scrolls past the cap *and* repeats its anchor line can
-    ///   leave a small gap in history beyond the cap — documented, and never a stall.
-    fn capture_scrollback(&mut self, buf: BufferId) {
-        let Some(emu) = self.terminals.get_mut(&buf) else {
+    /// Whether terminal buffer `buf` should show its scrollback history (browsing)
+    /// rather than just the live screen. True unless it is the focused buffer in
+    /// terminal-job mode — i.e. the user has left terminal-insert (`<C-\><C-n>`) to
+    /// navigate, or is looking at a background terminal. While `false` the projection
+    /// pins to the live bottom, keeping floods cheap.
+    fn terminal_browsing(&self, buf: BufferId) -> bool {
+        !(buf == self.editor.current_buffer_id() && self.editor.mode == nxvim_core::Mode::Terminal)
+    }
+
+    /// Reproject the focused terminal when its view should flip between live (pinned
+    /// to the bottom) and browsing (scrollback materialized) — e.g. on `<C-\><C-n>` /
+    /// `i`, which change the mode without any PTY output to trigger a projection.
+    /// Called each redraw; a no-op when the view is already correct.
+    pub(crate) fn sync_terminal_view(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        let Some(emu) = self.terminals.get(&buf) else {
             return;
         };
-        let (rows, cols) = emu.parser.screen().size();
-        let captured = emu.captured;
-        let anchor = emu.history.back().cloned();
-
-        // All screen reads happen inside this block so the `&mut Screen` borrow is
-        // released before we touch `emu.history` / `emu.captured` below.
-        let (new_rows, held) = {
-            let screen = emu.parser.screen_mut();
-            // `set_scrollback(MAX)` clamps the offset to the scrollback length, which
-            // `scrollback()` then reports — how many rows vt100 currently holds.
-            screen.set_scrollback(usize::MAX);
-            let held = screen.scrollback();
-            let new_rows = if held < SCROLLBACK_CAP {
-                if held > captured {
-                    read_scrollback(screen, held, captured, held, rows, cols)
-                } else {
-                    Vec::new()
-                }
-            } else {
-                capture_saturated(screen, held, anchor.as_ref(), rows, cols)
-            };
-            screen.set_scrollback(0); // back to the live view
-            (new_rows, held)
-        };
-
-        emu.history.extend(new_rows);
-        emu.captured = held;
-        while emu.history.len() > SCROLLBACK_CAP {
-            emu.history.pop_front();
-            emu.evicted_total += 1;
+        if emu.showing_history != self.terminal_browsing(buf) {
+            self.terminal_project(buf);
         }
     }
 
@@ -348,48 +298,6 @@ impl EditHost {
             })
             .collect();
         Some(Value::Array(out))
-    }
-}
-
-/// Capture the rows that scrolled off while vt100's scrollback is **saturated**
-/// (full at the cap), where the held-row count is no longer a reliable delta. Pages
-/// the newest scrollback windows backward only as far as `anchor` — the row we last
-/// captured — and returns everything newer than it, oldest-first. The anchor is the
-/// most recent row, so for ordinary scrolling it is found in the first window and
-/// the cost is `O(screen)`; a burst that scrolled more pages back proportionally
-/// (`O(rows scrolled)`), never the whole buffer. Returns empty when nothing scrolled
-/// (the newest row still equals the anchor).
-fn capture_saturated(
-    screen: &mut vt100::Screen,
-    held: usize,
-    anchor: Option<&ScrollLine>,
-    rows: u16,
-    cols: u16,
-) -> Vec<ScrollLine> {
-    let mut new_rows: Vec<ScrollLine> = Vec::new();
-    let mut top = held;
-    loop {
-        let from = top.saturating_sub(rows as usize);
-        let mut window = read_scrollback(screen, held, from, top, rows, cols);
-        // Find the last-captured row (newest occurrence) in this window: everything
-        // after it is new, everything up to it we already hold.
-        match anchor.and_then(|a| window.iter().rposition(|r| r == a)) {
-            Some(p) => {
-                let mut newer = window.split_off(p + 1);
-                newer.append(&mut new_rows);
-                return newer;
-            }
-            // The anchor is older than this window (a burst taller than the screen):
-            // the whole window is new — prepend it and page further back.
-            None => {
-                window.append(&mut new_rows);
-                new_rows = window;
-                if from == 0 {
-                    return new_rows; // reached the oldest retained row
-                }
-                top = from;
-            }
-        }
     }
 }
 

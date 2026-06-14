@@ -146,57 +146,36 @@ impl Editor {
         self.echo("E21: Cannot make changes, 'modifiable' is off".to_string());
     }
 
-    /// Splice terminal buffer `buf`'s mirror to match the emulator: drop the oldest
-    /// `evict_front` lines (scrollback rolled past the cap), then replace lines
-    /// `[replace_from, end)` with `tail_lines`, and place the terminal cursor at the
-    /// absolute `(cursor_row, cursor_col)` (0-based). This is an **incremental**
-    /// update — only the live-screen region and any newly-scrolled history rows are
-    /// rewritten, so a burst costs `O(evicted + new rows + screen)`, not `O(buffer)`.
-    /// A full-buffer rebuild every burst (the old behavior) made heavy output — `rg`
-    /// dumping thousands of lines — quadratic and froze the editor. Never touches
-    /// undo or `modified` — a terminal buffer mirrors a live screen, not edited text.
-    /// A no-op if `buf` is not an open terminal buffer.
+    /// Replace terminal buffer `buf`'s mirror with `lines` and place the terminal
+    /// cursor at `(cursor_row, cursor_col)` (0-based). The server keeps this buffer
+    /// small while output is live — it mirrors only the visible screen, materializing
+    /// the scrollback history into `lines` *only* when the user browses (terminal-
+    /// normal mode). So even under a flood (`rg` printing 500k matches) the per-burst
+    /// cost is `O(screen)`, never `O(history)`. Never touches undo or `modified` — a
+    /// terminal buffer mirrors a live screen, not edited text. A no-op if `buf` is not
+    /// an open terminal buffer.
     pub fn terminal_update(
         &mut self,
         buf: BufferId,
-        evict_front: usize,
-        replace_from: usize,
-        tail_lines: &[String],
+        lines: &[String],
         cursor_row: usize,
         cursor_col: usize,
     ) {
         if !self.is_terminal_buffer(buf) {
             return;
         }
+        let mut text = lines.join("\n");
+        text.push('\n');
         let is_current = buf == self.cur_buffer();
         let ob = self.buffers.get_mut(buf);
-
-        // Drop the oldest `evict_front` lines (history rolled past the cap). These
-        // are whole leading lines, so the remaining content keeps its byte layout.
-        if evict_front > 0 {
-            let cut = ob
-                .buffer
-                .line_start(evict_front.min(ob.buffer.line_count()));
-            if cut > 0 {
-                ob.buffer.remove(0..cut);
-                ob.buffer.normalize();
-            }
-        }
-        // Replace `[replace_from, end)` — the previous live-screen region plus any
-        // freshly-committed history rows — with the new tail.
-        let mut text = tail_lines.join("\n");
-        text.push('\n');
-        let from = replace_from.min(ob.buffer.line_count());
-        let start = ob.buffer.line_start(from);
         let len = ob.buffer.len_bytes();
-        ob.buffer.remove(start..len);
-        ob.buffer.insert(start, &text);
+        ob.buffer.remove(0..len);
+        ob.buffer.insert(0, &text);
         ob.buffer.normalize();
         // A terminal buffer is never "modified" relative to a backing store — it has
         // none — and these refreshes must not flip the `[+]` flag or arm a write.
         ob.buffer.modified = false;
-        // Byte anchors past the splice shifted; re-sync the highlight/extmark layers.
-        // Cheap for a terminal buffer (no grammar, no extmarks), but kept correct.
+        // The whole rope was swapped, so the highlight/extmark layers must re-sync.
         ob.buffer.mark_resync();
 
         if is_current {

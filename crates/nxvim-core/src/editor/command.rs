@@ -45,10 +45,27 @@ enum WindowCmd {
     MaxWidth,
 }
 
+/// A `<C-w><C-w>` *layer* command — the doubled-prefix grammar that crosses
+/// between the main window area and the permanent docks (nxvim's repurposing of
+/// vim's `<C-w><C-w>`, which there just cycles focus). The following key is read
+/// like an ordinary window command but applied to the *other* layer; see
+/// [`Editor::execute_window_layer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerWindowCmd {
+    /// `<C-w><C-w>{h,j,k,l}` — cross by edge: from the main area focus the dock on
+    /// that side; from a dock return to the main area.
+    CrossDir(WinDir),
+    /// `<C-w><C-w>{v,s,c,…}` — cross to the other layer (the last-focused dock from
+    /// the main area, or back to main from a dock) and run this window command
+    /// there.
+    CrossThenWindow(WindowCmd),
+}
+
 /// Resolve the key *after* `<C-w>` into a [`WindowCmd`], or `None` for a key that
-/// is not a window command.
+/// is not a window command. (A second `<C-w>` is intercepted earlier, in the
+/// [`Stage::WindowPending`] arm, as the dock layer-switch prefix — it is *not* a
+/// `WindowCmd`.)
 fn window_command(key: Key) -> Option<WindowCmd> {
-    // A bare `<C-w><C-w>` is the same as `<C-w>w` (cyclic focus) in vim.
     if key.ctrl {
         return match key.code {
             KeyCode::Char('w') => Some(WindowCmd::FocusCycle(true)),
@@ -77,6 +94,22 @@ fn window_command(key: Key) -> Option<WindowCmd> {
         '|' => WindowCmd::MaxWidth,
         _ => return None,
     })
+}
+
+/// Resolve the key *after* `<C-w><C-w>` into a [`LayerWindowCmd`], or `None` for a
+/// key that names neither a direction nor a window command. `h/j/k/l` are the
+/// layer cross (by edge); every other window key crosses and then runs there.
+fn layer_window_command(key: Key) -> Option<LayerWindowCmd> {
+    if !key.ctrl {
+        match key.as_char() {
+            Some('h') => return Some(LayerWindowCmd::CrossDir(WinDir::Left)),
+            Some('j') => return Some(LayerWindowCmd::CrossDir(WinDir::Down)),
+            Some('k') => return Some(LayerWindowCmd::CrossDir(WinDir::Up)),
+            Some('l') => return Some(LayerWindowCmd::CrossDir(WinDir::Right)),
+            _ => {}
+        }
+    }
+    window_command(key).map(LayerWindowCmd::CrossThenWindow)
 }
 
 /// Where a `z`-family command parks the cursor's line within the window's text
@@ -348,6 +381,9 @@ pub(crate) enum Stage {
     TextObjectPending(char),
     /// Saw the `<C-w>` window prefix; the next key is the window command.
     WindowPending,
+    /// Saw the doubled `<C-w><C-w>` prefix; the next key is the dock layer command
+    /// (cross to a dock / back to the main area, then optionally a window command).
+    WindowLayerPending,
     /// Saw a lone `z`; the next key completes a viewport command (`zz`/`zt`/`zb`,
     /// `z.`/`z<CR>`/`z-`).
     ZPending,
@@ -414,6 +450,8 @@ enum ResolvedCommand {
     Normal(NormalCmd),
     /// A `<C-w>` window command (split, focus, close, …).
     Window(WindowCmd),
+    /// A `<C-w><C-w>` dock layer command (cross between the main area and a dock).
+    WindowLayer(LayerWindowCmd),
 }
 
 /// What [`parse_step`] decides for `(pending, key)`. Pure: no buffer, no
@@ -553,8 +591,22 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             };
         }
         Stage::WindowPending => {
+            // A second `<C-w>` opens the dock layer-switch prefix (nxvim's
+            // repurposing of vim's `<C-w><C-w>`); any other key is an ordinary
+            // window command in the current layer.
+            if key.ctrl && key.code == KeyCode::Char('w') {
+                let mut next = pending.clone();
+                next.stage = Stage::WindowLayerPending;
+                return Prefix(next);
+            }
             return match window_command(key) {
                 Some(cmd) => Complete(ResolvedCommand::Window(cmd)),
+                None => Reset,
+            };
+        }
+        Stage::WindowLayerPending => {
+            return match layer_window_command(key) {
+                Some(cmd) => Complete(ResolvedCommand::WindowLayer(cmd)),
                 None => Reset,
             };
         }
@@ -1166,16 +1218,69 @@ impl Editor {
             ResolvedCommand::VisualOperate(op) => self.visual_operate(op),
             ResolvedCommand::Normal(cmd) => self.execute_normal(cmd),
             ResolvedCommand::Window(cmd) => self.execute_window(cmd),
+            ResolvedCommand::WindowLayer(cmd) => self.execute_window_layer(cmd),
         }
     }
 
     /// Apply a `<C-w>` window command. Pending state is already a clean boundary
-    /// (the prefix consumed it), so each arm just drives the window layout.
+    /// (the prefix consumed it), so this just reads the count and drives the
+    /// window layout of the focused layer.
     fn execute_window(&mut self, cmd: WindowCmd) {
         // The resize family honors a leading count (`3<C-w>+`); read it before
         // the pending state is cleared.
         let count = self.effective_count() as isize;
         self.reset_pending();
+        self.run_window_cmd(cmd, count);
+    }
+
+    /// Apply a `<C-w><C-w>` dock layer command: cross between the main area and a
+    /// dock, then (for the non-directional forms) run the window command in the
+    /// now-focused layer.
+    fn execute_window_layer(&mut self, cmd: LayerWindowCmd) {
+        let count = self.effective_count() as isize;
+        self.reset_pending();
+        match cmd {
+            LayerWindowCmd::CrossDir(dir) => match self.focused_layer {
+                // From the main area, focus the dock on that edge (no-op if closed).
+                Layer::Main => self.focus_dock(DockSide::from_dir(dir)),
+                // From a dock, any directional cross returns to the main area.
+                Layer::Dock(_) => self.switch_layer(Layer::Main),
+            },
+            LayerWindowCmd::CrossThenWindow(wcmd) => match self.focused_layer {
+                Layer::Main => {
+                    if self.dock_is_open(self.last_dock) {
+                        self.switch_layer(Layer::Dock(self.last_dock));
+                        self.run_window_cmd(wcmd, count);
+                    }
+                }
+                Layer::Dock(_) => {
+                    self.switch_layer(Layer::Main);
+                    self.run_window_cmd(wcmd, count);
+                }
+            },
+        }
+    }
+
+    /// Drive one [`WindowCmd`] on the focused layer's tree. Shared by single
+    /// `<C-w>` ([`Editor::execute_window`]) and the cross-layer form
+    /// ([`Editor::execute_window_layer`]). When the focused layer is a dock the
+    /// per-tab commands differ: closing the dock's last window closes the dock, and
+    /// `<C-w>T` (move-to-new-tab) is a no-op.
+    fn run_window_cmd(&mut self, cmd: WindowCmd, count: isize) {
+        if let Layer::Dock(side) = self.focused_layer {
+            match cmd {
+                WindowCmd::ToNewTab => return,
+                WindowCmd::Close | WindowCmd::Quit => {
+                    if self.windows.tiled_count() <= 1 {
+                        self.close_dock(side);
+                    } else {
+                        self.close_window();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match cmd {
             WindowCmd::Split(dir) => self.split(dir),
             WindowCmd::FocusDir(dir) => self.focus_dir(dir),

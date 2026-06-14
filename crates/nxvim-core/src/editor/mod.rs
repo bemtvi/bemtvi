@@ -31,6 +31,7 @@ mod changelist;
 mod cmdline;
 mod command;
 mod cursor;
+mod dock;
 mod ex;
 mod explorer;
 mod expr;
@@ -348,6 +349,83 @@ pub(crate) enum WinDir {
     Right,
 }
 
+/// Which screen edge a permanent **dock** is pinned to. A dock is a global
+/// (cross-tab) editable window region — nxvim's VSCode-style side/bottom panel.
+/// Unlike the main window tree it is never disturbed by splits, window switches,
+/// or tab changes in the editor area; the top dock sits *above* the tabline. See
+/// [`Editor::open_dock`] and the dock subtree in `editor/dock.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DockSide {
+    /// Every side, in the canonical order docks are carved and rendered.
+    pub(crate) const ALL: [DockSide; 4] = [
+        DockSide::Left,
+        DockSide::Right,
+        DockSide::Top,
+        DockSide::Bottom,
+    ];
+
+    /// Index into the `[_; 4]` per-side arrays on [`Editor`].
+    pub(crate) fn idx(self) -> usize {
+        match self {
+            DockSide::Left => 0,
+            DockSide::Right => 1,
+            DockSide::Top => 2,
+            DockSide::Bottom => 3,
+        }
+    }
+
+    /// Parse a side keyword (`"left"`/`"right"`/`"top"`/`"bottom"`) — the inverse
+    /// of the dock RPC/Lua surface. `None` for an unknown keyword, which each
+    /// caller reports loudly (per the no-silent-fallback rule).
+    pub(crate) fn from_keyword(s: &str) -> Option<DockSide> {
+        Some(match s {
+            "left" => DockSide::Left,
+            "right" => DockSide::Right,
+            "top" => DockSide::Top,
+            "bottom" => DockSide::Bottom,
+            _ => return None,
+        })
+    }
+
+    /// A sensible default reserved extent when `nx.dock.open` omits `size`: a wide
+    /// gutter for the vertical side bars, a short tray for the horizontal ones.
+    pub(crate) fn default_size(self) -> usize {
+        match self {
+            DockSide::Left | DockSide::Right => 30,
+            DockSide::Top | DockSide::Bottom => 10,
+        }
+    }
+
+    /// The [`DockSide`] reached by moving in `dir` from the main area (the
+    /// `<C-w><C-w>{h,j,k,l}` cross): `h`→left, `l`→right, `k`→top, `j`→bottom.
+    pub(crate) fn from_dir(dir: WinDir) -> DockSide {
+        match dir {
+            WinDir::Left => DockSide::Left,
+            WinDir::Right => DockSide::Right,
+            WinDir::Up => DockSide::Top,
+            WinDir::Down => DockSide::Bottom,
+        }
+    }
+}
+
+/// Which window *layer* currently owns the live editing state. The whole editor
+/// reads its target from [`Editor::windows`]; keeping the focused layer's tree
+/// swapped onto `windows` (the tab-page trick) means `split`/`close`/`focus`/
+/// editing/redraw all act on the focused layer with no special-casing. `Main` is
+/// the per-tab window tree; `Dock(side)` is one of the global docks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layer {
+    Main,
+    Dock(DockSide),
+}
+
 /// A bottom-docked, read-only, navigable panel — nxvim's home for multi-line
 /// output like `:messages` and `:ls`. It is **not** a vim window (there is
 /// still exactly one text window); it is a transient overlay that grabs focus
@@ -432,6 +510,31 @@ pub struct Editor {
     /// The next tab id to mint, monotonic and never reused. Seeded past the first
     /// tab (id 1).
     next_tab_id: u64,
+    /// The four permanent docks (left, right, top, bottom — indexed by
+    /// [`DockSide::idx`]), `None` when that side is closed. Docks are **global**:
+    /// they live here, outside [`Editor::tabs`], so the same docks show on every
+    /// tab and tab/split operations never disturb them. The slot for the
+    /// *focused* dock holds `None` — its tree is swapped live onto
+    /// [`Editor::windows`] (mirrors the active tab's `None` slot); read its
+    /// open-ness through [`Editor::dock_is_open`], not the `Option` alone.
+    docks: [Option<WindowTree>; 4],
+    /// The main per-tab window tree while a dock is focused (parked here so the
+    /// focused dock's tree can occupy [`Editor::windows`]). `None` whenever the
+    /// main layer is focused (its tree is then live on `windows`). The
+    /// layer-analogue of an inactive tab's stashed tree.
+    main_parked: Option<WindowTree>,
+    /// Which layer currently owns the live editing state on [`Editor::windows`]
+    /// (and the live `cursor`/`top`/`leftcol`). `Main` until the first dock is
+    /// focused via `<C-w><C-w>`.
+    focused_layer: Layer,
+    /// Each dock's reserved extent: columns for `Left`/`Right`, rows for
+    /// `Top`/`Bottom`. Meaningful only where the dock is open. Indexed by
+    /// [`DockSide::idx`].
+    dock_sizes: [usize; 4],
+    /// The dock a non-directional `<C-w><C-w>{cmd}` (e.g. `<C-w><C-w>v`) crosses
+    /// to — the most recently focused dock. Directional crosses pick by edge
+    /// instead ([`DockSide::from_dir`]).
+    last_dock: DockSide,
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
@@ -911,6 +1014,11 @@ impl Editor {
             current_tab: 0,
             next_win_id: 2,
             next_tab_id: 2,
+            docks: [None, None, None, None],
+            main_parked: None,
+            focused_layer: Layer::Main,
+            dock_sizes: [0; 4],
+            last_dock: DockSide::Left,
             alternate: None,
             global_marks: HashMap::new(),
             pending_global_marks: HashMap::new(),

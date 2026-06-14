@@ -70,6 +70,10 @@ pub struct WindowView {
     /// paint fixtures). The renderer offsets a `Some` rect by the windows-area
     /// origin; a `None` rect takes the whole area.
     pub rect: Option<WinRect>,
+    /// Which screen region (main area or a dock) this window belongs to. Its
+    /// `rect` is relative to that region's origin; the renderer offsets by the
+    /// region's absolute screen origin (derived from the [`View`] dock bands).
+    pub region: WindowRegion,
     pub focused: bool,
     pub lines: Vec<String>,
     pub cursor_row: u16,
@@ -158,6 +162,34 @@ pub struct WindowView {
     pub unnamed: bool,
 }
 
+/// Which screen region a window/separator belongs to (mirrors
+/// `nxvim_core::view::WindowRegion`). Its `rect`/coords are relative to the
+/// region's own origin; the renderer maps the region to an absolute screen origin
+/// using the [`View`]'s dock band sizes. `Main` is the default and the only region
+/// when no dock is open.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowRegion {
+    #[default]
+    Main,
+    DockLeft,
+    DockRight,
+    DockTop,
+    DockBottom,
+}
+
+impl WindowRegion {
+    /// Decode the wire string (`"main"`/`"dock_left"`/…); unknown ⇒ `Main`.
+    fn from_wire(s: &str) -> WindowRegion {
+        match s {
+            "dock_left" => WindowRegion::DockLeft,
+            "dock_right" => WindowRegion::DockRight,
+            "dock_top" => WindowRegion::DockTop,
+            "dock_bottom" => WindowRegion::DockBottom,
+            _ => WindowRegion::Main,
+        }
+    }
+}
+
 /// A window's rect in windows-area cells (mirrors `nxvim_core::ViewRect`).
 #[derive(Default, Clone, Copy)]
 pub struct WinRect {
@@ -176,6 +208,8 @@ pub struct Separator {
     pub x: u16,
     pub y: u16,
     pub length: u16,
+    /// The region this separator's `(x, y)` is relative to.
+    pub region: WindowRegion,
 }
 
 /// The server's view, mirrored client-side for rendering: the **global** chrome
@@ -187,6 +221,17 @@ pub struct View {
     pub windows: Vec<WindowView>,
     /// The split separators between windows (empty with one window).
     pub separators: Vec<Separator>,
+    /// The left dock's content width in cells, `0` when closed. The client reserves
+    /// `width + 1` columns on the left (the `+1` a separator) and renders
+    /// `WindowRegion::DockLeft` windows there. See [`WindowRegion`].
+    pub dock_left: u16,
+    /// The right dock's content width in cells, `0` when closed.
+    pub dock_right: u16,
+    /// The top dock's content height in rows, `0` when closed. Sits **above** the
+    /// tabline.
+    pub dock_top: u16,
+    /// The bottom dock's content height in rows, `0` when closed (above the panel).
+    pub dock_bottom: u16,
     /// The tab pages, in tabline order — empty when only one tab is open (no
     /// tabline is drawn). When non-empty, `current_tab` indexes the active cell.
     pub tabline: Vec<TabData>,
@@ -327,6 +372,11 @@ impl View {
             _ => vec![parse_window(map, &self.styles)],
         };
         self.separators = parse_separators(map_get(map, "separators"));
+        // The permanent dock band sizes (0 = closed); absent on an older server.
+        self.dock_left = map_u16(map, "dock_left");
+        self.dock_right = map_u16(map, "dock_right");
+        self.dock_top = map_u16(map, "dock_top");
+        self.dock_bottom = map_u16(map, "dock_bottom");
         // The global status line (`laststatus=3`); empty/absent for per-window modes.
         self.global_status = parse_status(map_get(map, "global_status"), &self.styles);
         self.tabline = parse_tabline(map_get(map, "tabline"));
@@ -416,6 +466,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         }),
         _ => None,
     };
+    let region = WindowRegion::from_wire(&map_str(m, "region"));
     let scroll = match map_get(m, "scroll") {
         Some(Value::Map(s)) => Some(ScrollData {
             from_top: map_u64(s, "from_top") as f32,
@@ -440,6 +491,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
     };
     WindowView {
         rect,
+        region,
         // A flat redraw has no `focused` flag; its sole window is always focused.
         focused: map_get(m, "focused")
             .and_then(Value::as_bool)
@@ -530,6 +582,7 @@ fn parse_separators(value: Option<&Value>) -> Vec<Separator> {
                 x: map_u16(s, "x"),
                 y: map_u16(s, "y"),
                 length: map_u16(s, "length"),
+                region: WindowRegion::from_wire(&map_str(s, "region")),
             }),
             _ => None,
         })

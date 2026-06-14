@@ -16,9 +16,9 @@ use crate::convert::{json_to_lua, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
+    HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs,
+    RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -317,6 +317,8 @@ pub(crate) struct Shared {
     pub(crate) highlights: Vec<HlSet>,
     /// Panel requests from `vim.panel.*`, applied to the core after the chunk.
     pub(crate) panel_ops: Vec<PanelOp>,
+    /// Dock requests from `nx.dock.*`, applied to the core after the chunk.
+    pub(crate) dock_ops: Vec<DockOp>,
     /// Server-start requests from `vim.lsp.start` (driven by `vim.lsp.enable`),
     /// drained by the server into its `LspManager` after the chunk.
     pub(crate) lsp_ops: Vec<LspOp>,
@@ -667,6 +669,12 @@ impl LuaRuntime {
         /// Take the panel requests queued by `vim.panel.*` since the last drain, for
         /// the server to apply to the core (which owns the panel state).
         take_panel_ops -> Vec<PanelOp> = panel_ops
+    }
+
+    take_queue! {
+        /// Take the dock requests queued by `nx.dock.*` since the last drain, for the
+        /// server to apply to the core (which owns the dock state).
+        take_dock_ops -> Vec<DockOp> = dock_ops
     }
 
     take_queue! {

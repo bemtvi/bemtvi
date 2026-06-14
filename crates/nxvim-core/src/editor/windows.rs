@@ -5,7 +5,7 @@
 use super::*;
 use crate::mode::Mode;
 use crate::options::{Options, WindowOptions};
-use crate::view::Separator;
+use crate::view::{Separator, WindowRegion};
 use std::collections::BTreeMap;
 
 /// A rectangle in terminal cells: top-left origin `(x, y)` plus size. The window
@@ -589,6 +589,7 @@ fn layout_node(
                                 x: rect.x,
                                 y,
                                 length: rect.width,
+                                region: WindowRegion::Main,
                             });
                             y += 1;
                         }
@@ -614,6 +615,7 @@ fn layout_node(
                                 x,
                                 y: rect.y,
                                 length: rect.height,
+                                region: WindowRegion::Main,
                             });
                             x += 1;
                         }
@@ -826,6 +828,9 @@ pub(crate) struct WindowLayout {
     pub(crate) border: BorderStyle,
     /// The float's title, drawn on the top border. `None` when untitled.
     pub(crate) title: Option<String>,
+    /// Which screen region (main area or a dock) this window belongs to. Its
+    /// `rect` is relative to that region's own origin.
+    pub(crate) region: WindowRegion,
 }
 
 /// One tab page's label data for the [`View`] tabline: the file name of the
@@ -860,14 +865,23 @@ impl Editor {
     /// All window ids (the `nvim_list_wins` order): the tiled windows in layout
     /// order first, then the floats bottom-to-top by `(zindex, id)`.
     pub fn window_ids(&self) -> Vec<WindowId> {
-        let mut ids = self.windows.leaves();
-        ids.extend(self.windows.floats.iter().copied());
+        let mut ids = Vec::new();
+        for layer in self.open_layers() {
+            if let Some(t) = self.layer_tree(layer) {
+                ids.extend(t.leaves());
+                ids.extend(t.floats.iter().copied());
+            }
+        }
         ids
     }
 
-    /// Number of open windows (always ≥ 1).
+    /// Number of open windows across the main tree and every open dock (always ≥ 1).
     pub fn window_count(&self) -> usize {
-        self.windows.count()
+        self.open_layers()
+            .into_iter()
+            .filter_map(|l| self.layer_tree(l))
+            .map(|t| t.count())
+            .sum()
     }
 
     /// The id the next [`Editor::open_split_window`] / split will mint, without
@@ -887,15 +901,23 @@ impl Editor {
     }
 
     /// Make window `id` the focused one (`nvim_set_current_win`). A no-op if `id`
-    /// is not open or already current.
+    /// is not open or already current. When `id` lives in a different layer (a
+    /// dock, or the main tree while a dock is focused), cross to that layer first.
     pub fn set_current_window(&mut self, id: WindowId) {
-        self.focus_window(id);
+        if self.windows.try_get(id).is_some() {
+            self.focus_window(id);
+            return;
+        }
+        if let Some((layer, _)) = self.tree_of_window(id) {
+            self.switch_layer(layer);
+            self.focus_window(id);
+        }
     }
 
     /// The buffer window `id` shows (`nvim_win_get_buf`), or `None` if there is
     /// no such window.
     pub fn window_buffer(&self, id: WindowId) -> Option<BufferId> {
-        self.windows.windows.get(&id).map(|w| w.buffer)
+        self.tree_of_window(id).map(|(_, t)| t.get(id).buffer)
     }
 
     /// The first `(tab index, window id)` whose tiled window shows `buf`,
@@ -926,7 +948,7 @@ impl Editor {
     /// an inactive window updates its binding and clamps its stashed cursor to the
     /// new buffer. A no-op if either handle is unknown.
     pub fn set_window_buffer(&mut self, id: WindowId, buf: BufferId) {
-        if !self.windows.windows.contains_key(&id) || !self.buffers.map.contains_key(&buf) {
+        if self.tree_of_window(id).is_none() || !self.buffers.map.contains_key(&buf) {
             return;
         }
         if id == self.windows.current {
@@ -934,7 +956,10 @@ impl Editor {
             return;
         }
         let lines = self.buffers.get(buf).buffer.line_count();
-        let w = self.windows.get_mut(id);
+        let w = self
+            .tree_of_window_mut(id)
+            .expect("checked above")
+            .get_mut(id);
         w.buffer = buf;
         if w.saved_cursor.line >= lines {
             w.saved_cursor.line = lines.saturating_sub(1);
@@ -945,7 +970,7 @@ impl Editor {
     /// Window `id`'s window-local options (the number gutter), or `None` for an
     /// unknown id. The server snapshots these into the `vim.wo` mirror.
     pub fn window_options(&self, id: WindowId) -> Option<WindowOptions> {
-        self.windows.windows.get(&id).map(|w| w.options)
+        self.tree_of_window(id).map(|(_, t)| t.get(id).options)
     }
 
     /// Set a boolean window-local option on window `id` (`vim.wo` /
@@ -953,9 +978,10 @@ impl Editor {
     /// any other name or an unknown id. `0` is resolved to the focused window by
     /// the caller.
     pub fn set_window_option_bool(&mut self, id: WindowId, name: &str, value: bool) {
-        let Some(w) = self.windows.windows.get_mut(&id) else {
+        let Some(t) = self.tree_of_window_mut(id) else {
             return;
         };
+        let w = t.get_mut(id);
         match name {
             "number" => w.options.number = value,
             "relativenumber" => w.options.relativenumber = value,
@@ -1058,11 +1084,11 @@ impl Editor {
     /// the focused window, the stashed one otherwise (`nvim_win_get_cursor`).
     /// `None` if there is no such window.
     pub fn window_cursor(&self, id: WindowId) -> Option<(usize, usize)> {
-        let w = self.windows.windows.get(&id)?;
+        let (_, t) = self.tree_of_window(id)?;
         let c = if id == self.windows.current {
             self.cursor
         } else {
-            w.saved_cursor
+            t.get(id).saved_cursor
         };
         Some((c.line, c.col))
     }
@@ -1073,9 +1099,9 @@ impl Editor {
     /// count; the column is re-clamped when the window is next focused). A no-op
     /// for an unknown id.
     pub fn set_window_cursor(&mut self, id: WindowId, line: usize, col: usize) {
-        if !self.windows.windows.contains_key(&id) {
+        let Some((_, t)) = self.tree_of_window(id) else {
             return;
-        }
+        };
         if id == self.windows.current {
             self.cursor.line = line;
             self.cursor.col = col;
@@ -1084,9 +1110,12 @@ impl Editor {
             self.ensure_visible();
             return;
         }
-        let buf = self.windows.get(id).buffer;
+        let buf = t.get(id).buffer;
         let lines = self.buffers.get(buf).buffer.line_count();
-        let w = self.windows.get_mut(id);
+        let w = self
+            .tree_of_window_mut(id)
+            .expect("checked above")
+            .get_mut(id);
         w.saved_cursor.line = line.min(lines.saturating_sub(1));
         w.saved_cursor.col = col;
     }
@@ -1096,10 +1125,11 @@ impl Editor {
     /// reports its live offset; an inactive window its stashed one. `None` for an
     /// unknown id. Backs `vim.fn.winsaveview`'s `topline`/`leftcol`.
     pub fn window_scroll(&self, id: WindowId) -> Option<(usize, usize)> {
-        let w = self.windows.windows.get(&id)?;
+        let (_, t) = self.tree_of_window(id)?;
         Some(if id == self.windows.current {
             (self.top, self.leftcol)
         } else {
+            let w = t.get(id);
             (w.saved_top, w.saved_leftcol)
         })
     }
@@ -1108,7 +1138,8 @@ impl Editor {
     /// first text cell. `None` for an unknown id. Feeds the server's screen-column
     /// math for `vim.fn.screencol`.
     pub fn window_textoff(&self, id: WindowId) -> Option<usize> {
-        let w = self.windows.windows.get(&id)?;
+        let (_, t) = self.tree_of_window(id)?;
+        let w = t.get(id);
         let lines = self.buffers.get(w.buffer).buffer.line_count();
         Some(self.number_width_for(w.options, lines))
     }
@@ -1118,20 +1149,19 @@ impl Editor {
     /// inactive window updates its stashed `top` (applied when next focused). A
     /// no-op for an unknown id. Backs `vim.fn.winrestview`'s `topline`.
     pub fn set_window_topline(&mut self, id: WindowId, top: usize) {
-        let Some(w) = self.windows.windows.get(&id) else {
+        let Some((_, t)) = self.tree_of_window(id) else {
             return;
         };
-        let last = self
-            .buffers
-            .get(w.buffer)
-            .buffer
-            .line_count()
-            .saturating_sub(1);
+        let buf = t.get(id).buffer;
+        let last = self.buffers.get(buf).buffer.line_count().saturating_sub(1);
         let top = top.min(last);
         if id == self.windows.current {
             self.top = top;
         } else {
-            self.windows.get_mut(id).saved_top = top;
+            self.tree_of_window_mut(id)
+                .expect("checked above")
+                .get_mut(id)
+                .saved_top = top;
         }
     }
 
@@ -1139,10 +1169,10 @@ impl Editor {
     /// `None` if there is no such window. `height` includes the status-line row;
     /// the API width/height the server returns derive from this.
     pub fn window_rect(&self, id: WindowId) -> Option<(usize, usize, usize, usize)> {
-        self.windows
-            .windows
-            .get(&id)
-            .map(|w| (w.rect.x, w.rect.y, w.rect.width, w.rect.height))
+        self.tree_of_window(id).map(|(_, t)| {
+            let w = t.get(id);
+            (w.rect.x, w.rect.y, w.rect.width, w.rect.height)
+        })
     }
 
     /// Window `id`'s **content** size as `(width, height)` — what
@@ -1152,7 +1182,8 @@ impl Editor {
     /// row when one is shown. Mirrors the [`crate::view::window_view`] /
     /// [`Editor::text_height`] content math so the API agrees with what is drawn.
     pub fn window_content_size(&self, id: WindowId) -> Option<(usize, usize)> {
-        let w = self.windows.windows.get(&id)?;
+        let (_, t) = self.tree_of_window(id)?;
+        let w = t.get(id);
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
         let status = usize::from(self.window_statusline_visible(w.float.is_some()));
         let width = w.rect.width.saturating_sub(2 * inset);
@@ -1383,45 +1414,67 @@ impl Editor {
     /// stashed `saved_*` for the rest), its computed rect, and whether it holds
     /// focus. In layout order.
     pub(crate) fn window_layouts(&self) -> Vec<WindowLayout> {
+        // The globally focused window is `self.windows.current` *in the focused
+        // layer's tree*; a parked tree's `current` is not focused (its cursor is
+        // not drawn), so it renders its stashed view.
         let cur = self.windows.current;
-        let layout_of = |id: WindowId| {
-            let w = self.windows.get(id);
-            let focused = id == cur;
-            let (floating, border, title) = match &w.float {
-                Some(cfg) => (true, cfg.border, cfg.title.clone()),
-                None => (false, BorderStyle::None, None),
+        let mut out = Vec::new();
+        for layer in self.open_layers() {
+            let Some(tree) = self.layer_tree(layer) else {
+                continue;
             };
-            WindowLayout {
-                buffer: w.buffer,
-                cursor: if focused { self.cursor } else { w.saved_cursor },
-                top: if focused { self.top } else { w.saved_top },
-                leftcol: if focused {
-                    self.leftcol
-                } else {
-                    w.saved_leftcol
-                },
-                rect: w.rect,
-                focused,
-                options: w.options,
-                floating,
-                border,
-                title,
+            let region = region_of_layer(layer);
+            let focused_layer = layer == self.focused_layer;
+            // Tiled windows in tree order first, then floats bottom-to-top by
+            // `(zindex, id)` — the same order `window_ids`/`nvim_list_wins` uses.
+            for id in tree.leaves().into_iter().chain(tree.floats.iter().copied()) {
+                let w = tree.get(id);
+                let focused = focused_layer && id == cur;
+                let (floating, border, title) = match &w.float {
+                    Some(cfg) => (true, cfg.border, cfg.title.clone()),
+                    None => (false, BorderStyle::None, None),
+                };
+                out.push(WindowLayout {
+                    buffer: w.buffer,
+                    cursor: if focused { self.cursor } else { w.saved_cursor },
+                    top: if focused { self.top } else { w.saved_top },
+                    leftcol: if focused {
+                        self.leftcol
+                    } else {
+                        w.saved_leftcol
+                    },
+                    rect: w.rect,
+                    focused,
+                    options: w.options,
+                    floating,
+                    border,
+                    title,
+                    region,
+                });
             }
-        };
-        // Tiled windows in tree order first, then the floats bottom-to-top by
-        // `(zindex, id)` — the same order `window_ids`/`nvim_list_wins` uses, so
-        // the client paints floats on top in z-order.
-        self.windows
-            .leaves()
-            .into_iter()
-            .chain(self.windows.floats.iter().copied())
-            .map(layout_of)
-            .collect()
+        }
+        out
     }
 
-    /// The split borders the last layout produced (empty with one window).
+    /// The split borders of the **focused** layer's tree (empty with one window).
+    /// Used by mouse separator-drag, which resizes within the focused layer.
     pub(crate) fn separators(&self) -> &[Separator] {
         &self.windows.separators
+    }
+
+    /// The split borders for every open layer (the focused tree plus every parked
+    /// dock / main tree), each tagged with its [`WindowRegion`] so the client can
+    /// offset it by the region origin. Empty with one window and no dock.
+    pub(crate) fn all_separators(&self) -> Vec<Separator> {
+        let mut out = Vec::new();
+        for layer in self.open_layers() {
+            let Some(tree) = self.layer_tree(layer) else {
+                continue;
+            };
+            let region = region_of_layer(layer);
+            out.extend(tree.separators.iter().map(|s| Separator { region, ..*s }));
+        }
+        out
     }
 
     /// Split the focused window in `dir`: the new window is a clone of the
@@ -1869,16 +1922,14 @@ impl Editor {
     /// whenever the panel, tabline, or global status line appears/disappears
     /// (which grows/shrinks the windows area).
     pub(crate) fn relayout(&mut self) {
-        let height = self
-            .height
-            .saturating_sub(self.panel_rows())
-            .saturating_sub(self.tabline_rows())
-            .saturating_sub(self.global_statusline_rows());
+        let bands = self.dock_bands();
         // The focused window's cursor cell, as an offset from its own rect's
         // top-left — what a `relative="cursor"` float anchors to. Guard against a
         // transient invalid `current` (mid-close, before the surviving window is
         // entered): `cursor_virtcol` reads the current window's buffer, which is
         // gone for that instant. Only floats consume this, so (0, 0) is harmless.
+        // It is meaningful only for the *focused* tree (it reads the live cursor);
+        // parked dock/main trees lay out with (0, 0).
         let cursor_off = if self.windows.windows.contains_key(&self.windows.current) {
             (
                 self.cursor_virtcol(),
@@ -1887,14 +1938,161 @@ impl Editor {
         } else {
             (0, 0)
         };
-        self.windows.layout(
-            Rect {
-                x: 0,
-                y: 0,
-                width: self.width,
-                height,
-            },
-            cursor_off,
-        );
+        let chrome = self.tabline_rows() + self.panel_rows() + self.global_statusline_rows();
+        // The middle band (left dock | main | right docks) height, and the main
+        // tree's width — what's left after the docks and the global chrome.
+        let mid_h = self
+            .height
+            .saturating_sub(bands.reserved_top())
+            .saturating_sub(bands.reserved_bottom())
+            .saturating_sub(chrome)
+            .max(1);
+        let main_w = self
+            .width
+            .saturating_sub(bands.reserved_left())
+            .saturating_sub(bands.reserved_right())
+            .max(1);
+        // Lay out every open layer's tree at origin (0, 0) in its own region size;
+        // each client maps the region to its absolute screen origin (the dock
+        // bands it receives in the `View`). With no dock open this is exactly the
+        // pre-dock layout: one main tree filling the full windows area.
+        let full_w = self.width;
+        for layer in self.open_layers() {
+            let rect = match layer {
+                Layer::Main => Rect {
+                    x: 0,
+                    y: 0,
+                    width: main_w,
+                    height: mid_h,
+                },
+                Layer::Dock(DockSide::Left) => Rect {
+                    x: 0,
+                    y: 0,
+                    width: bands.left,
+                    height: mid_h,
+                },
+                Layer::Dock(DockSide::Right) => Rect {
+                    x: 0,
+                    y: 0,
+                    width: bands.right,
+                    height: mid_h,
+                },
+                Layer::Dock(DockSide::Top) => Rect {
+                    x: 0,
+                    y: 0,
+                    width: full_w,
+                    height: bands.top,
+                },
+                Layer::Dock(DockSide::Bottom) => Rect {
+                    x: 0,
+                    y: 0,
+                    width: full_w,
+                    height: bands.bottom,
+                },
+            };
+            let off = if layer == self.focused_layer {
+                cursor_off
+            } else {
+                (0, 0)
+            };
+            if let Some(t) = self.layer_tree_mut(layer) {
+                t.layout(rect, off);
+            }
+        }
+    }
+
+    /// The clamped per-side dock **content** extents (columns for left/right, rows
+    /// for top/bottom; `0` where the dock is closed), shared by [`relayout`] and
+    /// the [`crate::view::View`] projection so the core and every client agree on
+    /// the geometry. Each open dock also reserves one separator cell toward the
+    /// main area (see [`DockBands::reserved_left`] etc.). Sizes are clamped down so
+    /// the main area always keeps at least one column and one row.
+    pub(crate) fn dock_bands(&self) -> DockBands {
+        let raw = |side: DockSide| {
+            if self.dock_is_open(side) {
+                self.dock_sizes[side.idx()].max(1)
+            } else {
+                0
+            }
+        };
+        let reserved = |n: usize| if n > 0 { n + 1 } else { 0 };
+        // Horizontal: left + right reservations must leave ≥1 column for main.
+        let (mut left, mut right) = (raw(DockSide::Left), raw(DockSide::Right));
+        while reserved(left) + reserved(right) >= self.width && (left > 0 || right > 0) {
+            // The loop guard keeps at least one of the two positive, so the larger
+            // side is always > 0 here.
+            if right >= left {
+                right = right.saturating_sub(1);
+            } else {
+                left = left.saturating_sub(1);
+            }
+        }
+        // Vertical: top + bottom reservations plus the global chrome must leave ≥1
+        // row for main.
+        let chrome = self.tabline_rows() + self.panel_rows() + self.global_statusline_rows();
+        let (mut top, mut bottom) = (raw(DockSide::Top), raw(DockSide::Bottom));
+        while reserved(top) + reserved(bottom) + chrome >= self.height && (top > 0 || bottom > 0) {
+            if bottom >= top {
+                bottom = bottom.saturating_sub(1);
+            } else {
+                top = top.saturating_sub(1);
+            }
+        }
+        DockBands {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+}
+
+/// Map a window [`Layer`] to its render [`WindowRegion`].
+fn region_of_layer(layer: Layer) -> WindowRegion {
+    match layer {
+        Layer::Main => WindowRegion::Main,
+        Layer::Dock(DockSide::Left) => WindowRegion::DockLeft,
+        Layer::Dock(DockSide::Right) => WindowRegion::DockRight,
+        Layer::Dock(DockSide::Top) => WindowRegion::DockTop,
+        Layer::Dock(DockSide::Bottom) => WindowRegion::DockBottom,
+    }
+}
+
+/// The per-side dock **content** extents (columns for left/right, rows for top/
+/// bottom; `0` = closed), as computed by [`Editor::dock_bands`]. Each open dock
+/// additionally reserves one separator cell between it and the main area — the
+/// `reserved_*` accessors fold that in, and are what shrinks the main region and
+/// what clients offset by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DockBands {
+    pub left: usize,
+    pub right: usize,
+    pub top: usize,
+    pub bottom: usize,
+}
+
+impl DockBands {
+    fn reserved(n: usize) -> usize {
+        if n > 0 {
+            n + 1
+        } else {
+            0
+        }
+    }
+    /// Columns the left dock reserves (content + one separator cell), or 0.
+    pub fn reserved_left(&self) -> usize {
+        Self::reserved(self.left)
+    }
+    /// Columns the right dock reserves (content + one separator cell), or 0.
+    pub fn reserved_right(&self) -> usize {
+        Self::reserved(self.right)
+    }
+    /// Rows the top dock reserves (content + one separator cell), or 0.
+    pub fn reserved_top(&self) -> usize {
+        Self::reserved(self.top)
+    }
+    /// Rows the bottom dock reserves (content + one separator cell), or 0.
+    pub fn reserved_bottom(&self) -> usize {
+        Self::reserved(self.bottom)
     }
 }

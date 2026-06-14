@@ -351,6 +351,71 @@ fn two_stacked_windows_each_paint_text_a_status_line_and_a_separator() {
     assert_eq!(row_text(&buf, 9).trim_end(), "");
 }
 
+/// A window sub-map carrying a `region` (for dock layout tests). No status row.
+fn region_window(r: Value, region: &str, focused: bool, text: &[&str]) -> Value {
+    Value::Map(vec![
+        (Value::from("rect"), r),
+        (Value::from("region"), Value::from(region)),
+        (Value::from("focused"), Value::from(focused)),
+        (Value::from("lines"), lines(text)),
+        (Value::from("status_visible"), Value::from(false)),
+        (Value::from("cursor_line"), Value::from(1u64)),
+    ])
+}
+
+#[test]
+fn a_left_dock_paints_left_of_the_main_area_with_a_border() {
+    // 30×6 grid (cmd row 5). A left dock of width 10 reserves columns 0..10 (the
+    // dock content) plus a separator at column 10; the main area starts at col 11.
+    let windows = Value::Array(vec![
+        region_window(rect(0, 0, 10, 5), "dock_left", false, &["SIDEBAR"]),
+        region_window(rect(0, 0, 19, 5), "main", true, &["MAIN-AREA"]),
+    ]);
+    let v = view(vec![
+        ("windows", windows),
+        ("dock_left", Value::from(10u64)),
+    ]);
+    let buf = paint(&v, 30, 6);
+
+    // The dock's text sits at column 0; the main text starts past the band (col 11).
+    assert!(
+        row_text(&buf, 0).starts_with("SIDEBAR"),
+        "{:?}",
+        row_text(&buf, 0)
+    );
+    let main_at: String = row_text(&buf, 0).chars().skip(11).take(9).collect();
+    assert_eq!(main_at, "MAIN-AREA", "main offset past the dock band");
+    // The vertical dock border is painted at column 10.
+    assert_eq!(
+        buf.cell((10, 0)).unwrap().symbol(),
+        "│",
+        "dock border column"
+    );
+}
+
+#[test]
+fn a_top_dock_paints_above_the_main_area() {
+    // 20×8 grid (cmd row 7). A top dock of height 2 owns rows 0..2 with a border on
+    // row 2; the main area starts on row 3.
+    let windows = Value::Array(vec![
+        region_window(rect(0, 0, 20, 2), "dock_top", false, &["TOPBAR"]),
+        region_window(rect(0, 0, 20, 4), "main", true, &["MAIN"]),
+    ]);
+    let v = view(vec![("windows", windows), ("dock_top", Value::from(2u64))]);
+    let buf = paint(&v, 20, 8);
+
+    assert!(row_text(&buf, 0).starts_with("TOPBAR"), "top dock on row 0");
+    assert_eq!(
+        row_text(&buf, 2),
+        "─".repeat(20),
+        "top dock border on row 2"
+    );
+    assert!(
+        row_text(&buf, 3).starts_with("MAIN"),
+        "main area below the top dock"
+    );
+}
+
 #[test]
 fn a_selection_span_highlights_exactly_its_cells() {
     let sel = Value::Array(vec![Value::Array(vec![

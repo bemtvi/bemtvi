@@ -19,8 +19,8 @@ use crate::convert::{
 };
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
-    BufOp, ConfirmReq, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue,
-    PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, WindowOp,
+    BufOp, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp,
+    OptionValue, PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -211,6 +211,46 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         })?,
     )?;
     vim.set("panel", panel)?;
+
+    // `nx.dock`: nxvim's permanent edge panels (VSCode-style side/bottom docks).
+    // Each call queues a [`DockOp`] the server drains into the core after the
+    // chunk — same "Lua queues, core mutates" flow as `vim.panel.*`. A dock holds
+    // an ordinary editable window; `<C-w><C-w>` crosses focus between the main area
+    // and the docks. `side` is `"left"`/`"right"`/`"top"`/`"bottom"`.
+    let dock = lua.create_table()?;
+    // `open{ side, size?, buf? }` — open (or resize/refocus) and focus the dock.
+    // `size` is columns (left/right) or rows (top/bottom); `buf` is an existing
+    // buffer handle to show (default: a fresh scratch buffer).
+    let sh = shared.clone();
+    dock.set(
+        "open",
+        lua.create_function(move |_, opts: mlua::Table| {
+            let side: String = opts.get("side")?;
+            let size: Option<u64> = opts.get("size")?;
+            let buf: Option<u64> = opts.get("buf")?;
+            sh.borrow_mut()
+                .dock_ops
+                .push(DockOp::Open { side, size, buf });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    dock.set(
+        "close",
+        lua.create_function(move |_, side: String| {
+            sh.borrow_mut().dock_ops.push(DockOp::Close { side });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    dock.set(
+        "focus",
+        lua.create_function(move |_, side: String| {
+            sh.borrow_mut().dock_ops.push(DockOp::Focus { side });
+            Ok(())
+        })?,
+    )?;
+    nx.set("dock", dock)?;
 
     // ----- the async runtime bridge (the "event loop") -----------------------
     // Lua queues a [`LoopOp`] carrying a callback id; the server drains it in

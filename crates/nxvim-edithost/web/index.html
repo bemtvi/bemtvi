@@ -549,7 +549,10 @@
       for (const w of view.windows) if (!w.floating) renderWindow(w, tablineRows, hl);
       renderSeparators(tablineRows);
       for (const w of view.windows) if (w.floating) renderFloat(w, tablineRows, hl);
-      if (serverStyled && view.global_status?.length) renderGlobalStatus(cmdRow - 1);
+      if (serverStyled && view.global_status?.length) {
+        const g = dockGeo(tablineRows);
+        renderGlobalStatus(g.midY + g.midH);
+      }
       if (view.panel) renderPanel(view.panel, cmdRow);
       if (serverStyled && view.pmenu) renderPmenu(view.pmenu, tablineRows);
       renderCommand(cmdRow);
@@ -557,6 +560,39 @@
 
     function winRect(w) {
       return w.rect || { x: 0, y: 0, width: cols, height: editorRows };
+    }
+    // The permanent dock band geometry for this frame (cells). Each open dock
+    // reserves its content extent plus one separator cell toward the main area; the
+    // frame stacks as [top dock][tabline][left|main|right][global status][bottom
+    // dock][panel][cmd]. With no dock open every band is 0 and the main area is the
+    // whole windows area (so a dock-free frame is unchanged).
+    function dockGeo(tablineRows) {
+      const res = (n) => (n > 0 ? n + 1 : 0);
+      const dl = view.dock_left || 0, dr = view.dock_right || 0;
+      const dt = view.dock_top || 0, db = view.dock_bottom || 0;
+      const topBand = res(dt), bottomBand = res(db), leftBand = res(dl), rightBand = res(dr);
+      const globalStatusRows = serverStyled && view.global_status?.length ? 1 : 0;
+      const panelRows = view.panel ? view.panel.height + 1 : 0;
+      const midY = topBand + tablineRows;
+      const midH = Math.max(
+        1,
+        editorRows - topBand - tablineRows - globalStatusRows - bottomBand - panelRows
+      );
+      return { dl, dr, dt, db, topBand, bottomBand, leftBand, rightBand, midY, midH, globalStatusRows };
+    }
+    // The content-cell origin a window/separator of `region` is offset against (the
+    // dock separator faces the main area, so the bottom/right docks' content starts
+    // one cell past the band edge).
+    function regionOrigin(region, tablineRows) {
+      const g = dockGeo(tablineRows);
+      switch (region) {
+        case "dock_left": return { x: 0, y: g.midY };
+        case "dock_right": return { x: cols - g.dr, y: g.midY };
+        case "dock_top": return { x: 0, y: 0 };
+        case "dock_bottom":
+          return { x: 0, y: g.midY + g.midH + g.globalStatusRows + (g.bottomBand - g.db) };
+        default: return { x: g.leftBand, y: g.midY };
+      }
     }
     function place(el, x, y, wCells, hCells) {
       el.style.left = x * cw + "px";
@@ -567,9 +603,10 @@
 
     function renderWindow(w, tablineRows, hl) {
       const rect = winRect(w);
+      const o = regionOrigin(w.region, tablineRows);
       const box = document.createElement("div");
       box.className = "win";
-      place(box, rect.x, tablineRows + rect.y, rect.width, rect.height);
+      place(box, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
       gridEl.appendChild(box);
 
       const textRows = w.lines.length;
@@ -879,8 +916,9 @@
     function renderPmenu(pmenu, tablineRows) {
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
-      const x = rect.x + pmenu.col;
-      const y = tablineRows + rect.y + pmenu.row;
+      const o = regionOrigin(fw ? fw.region : "main", tablineRows);
+      const x = o.x + rect.x + pmenu.col;
+      const y = o.y + rect.y + pmenu.row;
       const rows = Math.max(1, Math.min(pmenu.height, pmenu.items.length));
       const first = Math.max(0, Math.min(pmenu.selected - rows + 1, pmenu.items.length - rows));
       const start = pmenu.selected >= rows ? first : 0;
@@ -938,19 +976,34 @@
 
     function renderSeparators(tablineRows) {
       for (const s of view.separators) {
+        const o = regionOrigin(s.region, tablineRows);
         const el = document.createElement("div");
         el.className = "sep";
         if (s.vertical) {
-          place(el, s.x, tablineRows + s.y, 1, s.length);
+          place(el, o.x + s.x, o.y + s.y, 1, s.length);
           el.textContent = Array(s.length).fill("│").join("\n");
           el.style.lineHeight = ch + "px";
         } else {
-          place(el, s.x, tablineRows + s.y, s.length, 1);
+          place(el, o.x + s.x, o.y + s.y, s.length, 1);
           el.textContent = "─".repeat(s.length);
           el.style.lineHeight = ch + "px";
         }
         gridEl.appendChild(el);
       }
+      // The border line between each open dock and the main area.
+      const g = dockGeo(tablineRows);
+      const sepLine = (x, y, wCells, hCells, glyph, vertical) => {
+        const el = document.createElement("div");
+        el.className = "sep";
+        place(el, x, y, wCells, hCells);
+        el.textContent = vertical ? Array(hCells).fill(glyph).join("\n") : glyph.repeat(wCells);
+        el.style.lineHeight = ch + "px";
+        gridEl.appendChild(el);
+      };
+      if (g.dt > 0) sepLine(0, g.dt, cols, 1, "─", false);
+      if (g.db > 0) sepLine(0, g.midY + g.midH + g.globalStatusRows, cols, 1, "─", false);
+      if (g.dl > 0) sepLine(g.dl, g.midY, 1, g.midH, "│", true);
+      if (g.dr > 0) sepLine(cols - g.dr - 1, g.midY, 1, g.midH, "│", true);
     }
     function renderFloat(w, tablineRows, hl) {
       renderWindow(w, tablineRows, hl);

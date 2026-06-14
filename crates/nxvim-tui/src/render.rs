@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::anim::{arm_animation, lerp, Animation};
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PanelData, PmenuData,
-    SearchSpans, Separator, StatusSegment, View, WindowView,
+    SearchSpans, Separator, StatusSegment, View, WindowRegion, WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -195,28 +195,29 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     // The global status line (`laststatus=3`) claims one row docked below all
     // windows (matching the server's windows-area shrink); `0` for per-window modes.
     let global_status_rows = u16::from(!view.global_status.is_empty());
-    let regions = Layout::vertical([
-        Constraint::Length(tabline_rows),       // tabline (0 when ≤1 tab)
-        Constraint::Min(1),                     // windows area
-        Constraint::Length(global_status_rows), // global status line (laststatus=3)
-        Constraint::Length(panel_rows),         // panel (0 when none)
-        Constraint::Length(1),                  // command line
-    ])
-    .split(frame.area());
-    let (tabline_area, wins_area, global_status_area, panel_area, cmd_area) =
-        (regions[0], regions[1], regions[2], regions[3], regions[4]);
+    // The permanent dock bands. Each open dock reserves its content extent plus one
+    // separator cell toward the main area; all are `0` (and the layout collapses to
+    // the pre-dock form) when no dock is open.
+    let dock = DockLayout::new(
+        frame.area(),
+        view,
+        tabline_rows,
+        global_status_rows,
+        panel_rows,
+    );
+    let (tabline_area, panel_area, cmd_area) = (dock.tabline, dock.panel, dock.cmd);
+    let global_status_area = dock.global_status;
 
     if tabline_rows > 0 {
         render_tabline(frame, tabline_area, view);
     }
 
-    // Paint each window; capture the focused one's text-inner rect and (possibly
-    // interpolated) cursor row for the terminal cursor and the popup anchor.
-    // Tiled windows paint first; floats overlay them in a second pass so they sit
-    // on top — the focused window (tiled or float) wins the cursor either way.
+    // Paint each window into its region (main area or a dock); capture the focused
+    // one's text-inner rect and (possibly interpolated) cursor row for the terminal
+    // cursor and the popup anchor. Tiled windows paint first; floats overlay them.
     let mut focused_inner: Option<(Rect, u16, u16)> = None;
     for win in view.windows.iter().filter(|w| !w.floating) {
-        let area = window_area(wins_area, win);
+        let area = window_area(dock.content(win.region), win);
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
         let (text_inner, cursor_row, cursor_shift) =
@@ -226,13 +227,16 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         }
     }
 
-    render_separators(frame, wins_area, &view.separators, view);
+    // Per-tree split borders (each offset by its region origin), then the dock/main
+    // border lines.
+    render_separators(frame, &dock, &view.separators, view);
+    dock.render_borders(frame, view);
 
     // Floats, on top, in list order (the server already sorts them by zindex). A
     // float is opaque (`Clear`) over what it covers, draws its border + title, and
     // paints its own gutter/text/status inside. A float never scroll-animates.
     for win in view.windows.iter().filter(|w| w.floating) {
-        let outer = window_area(wins_area, win);
+        let outer = window_area(dock.content(win.region), win);
         frame.render_widget(Clear, outer);
         let inner = match win.border {
             Some(border) => {
@@ -302,26 +306,149 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     }
 }
 
-/// The windows-area rect (the frame minus the global bottom panel and command
-/// line) for a `width`×`height` terminal showing `view` — the region the window
-/// tree lays out into. Shared by the renderer and the geometry helpers so a
-/// hit-test lands on the cells the renderer drew.
-fn windows_area_rect(width: u16, height: u16, view: &View) -> Rect {
-    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
-    let tabline_rows = u16::from(!view.tabline.is_empty());
-    let global_status_rows = u16::from(!view.global_status.is_empty());
-    Layout::vertical([
-        Constraint::Length(tabline_rows),
-        Constraint::Min(1),
-        Constraint::Length(global_status_rows),
-        Constraint::Length(panel_rows),
-        Constraint::Length(1),
-    ])
-    .split(Rect::new(0, 0, width, height))[1]
+/// The absolute screen rectangles for each render region this frame: the main
+/// area, the four permanent docks, and the chrome rows. The whole frame stacks
+/// vertically as `[top dock][tabline][left|main|right][global status][bottom
+/// dock][panel][cmd]`; each open dock reserves its content extent plus one
+/// separator cell toward the main area. With no dock open every band is `0` and
+/// the layout collapses to the pre-dock `[tabline][main][global status][panel]
+/// [cmd]` form, so a dock-free frame is unchanged.
+struct DockLayout {
+    main: Rect,
+    left: Rect,
+    right: Rect,
+    top: Rect,
+    bottom: Rect,
+    tabline: Rect,
+    global_status: Rect,
+    panel: Rect,
+    cmd: Rect,
+    /// The `[left|main|right]` band, for full-height left/right dock borders.
+    mid: Rect,
+    /// Per-side content extents (cells), `0` when closed.
+    dl: u16,
+    dr: u16,
+    dt: u16,
+    db: u16,
 }
 
-/// A window's absolute rect: its wire rect offset by the windows-area origin, or
-/// the whole windows area for a legacy flat redraw (no rect → single window).
+impl DockLayout {
+    fn new(
+        area: Rect,
+        view: &View,
+        tabline_rows: u16,
+        global_status_rows: u16,
+        panel_rows: u16,
+    ) -> Self {
+        // A dock reserves `content + 1` cells (the `+1` its separator), `0` closed.
+        let res = |n: u16| if n > 0 { n + 1 } else { 0 };
+        let (dl, dr, dt, db) = (
+            view.dock_left,
+            view.dock_right,
+            view.dock_top,
+            view.dock_bottom,
+        );
+        let v = Layout::vertical([
+            Constraint::Length(res(dt)),            // top dock (above the tabline)
+            Constraint::Length(tabline_rows),       // tabline
+            Constraint::Min(1),                     // mid: left | main | right
+            Constraint::Length(global_status_rows), // global status (laststatus=3)
+            Constraint::Length(res(db)),            // bottom dock (above the panel)
+            Constraint::Length(panel_rows),         // read-only panel
+            Constraint::Length(1),                  // command line
+        ])
+        .split(area);
+        let (top_band, tabline, mid, global_status, bottom_band, panel, cmd) =
+            (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+        let h = Layout::horizontal([
+            Constraint::Length(res(dl)), // left dock
+            Constraint::Min(1),          // main
+            Constraint::Length(res(dr)), // right dock
+        ])
+        .split(mid);
+        let (left_band, main, right_band) = (h[0], h[1], h[2]);
+        // Content rects exclude the one separator cell facing the main area: the
+        // top dock's separator is its bottom row, the left dock's its right column,
+        // and the bottom/right docks' separators face the main area too (so their
+        // content starts one cell in).
+        let top = Rect::new(top_band.x, top_band.y, top_band.width, dt);
+        let bottom = Rect::new(
+            bottom_band.x,
+            bottom_band.y + res(db) - db,
+            bottom_band.width,
+            db,
+        );
+        let left = Rect::new(left_band.x, left_band.y, dl, left_band.height);
+        let right = Rect::new(
+            right_band.x + res(dr) - dr,
+            right_band.y,
+            dr,
+            right_band.height,
+        );
+        DockLayout {
+            main,
+            left,
+            right,
+            top,
+            bottom,
+            tabline,
+            global_status,
+            panel,
+            cmd,
+            mid,
+            dl,
+            dr,
+            dt,
+            db,
+        }
+    }
+
+    /// The content rect a window of `region` is offset against.
+    fn content(&self, region: WindowRegion) -> Rect {
+        match region {
+            WindowRegion::Main => self.main,
+            WindowRegion::DockLeft => self.left,
+            WindowRegion::DockRight => self.right,
+            WindowRegion::DockTop => self.top,
+            WindowRegion::DockBottom => self.bottom,
+        }
+    }
+
+    /// Paint the border line between each open dock and the main area.
+    fn render_borders(&self, frame: &mut Frame, view: &View) {
+        let style = view
+            .status_line
+            .map(rt)
+            .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
+        let hline = |frame: &mut Frame, x: u16, y: u16, len: u16| {
+            frame.render_widget(
+                Paragraph::new(Span::styled("─".repeat(len as usize), style)),
+                Rect::new(x, y, len, 1),
+            );
+        };
+        let vline = |frame: &mut Frame, x: u16, y: u16, len: u16| {
+            let rows: Vec<Line> = (0..len)
+                .map(|_| Line::from(Span::styled("│", style)))
+                .collect();
+            frame.render_widget(Paragraph::new(Text::from(rows)), Rect::new(x, y, 1, len));
+        };
+        if self.dt > 0 {
+            hline(frame, self.top.x, self.top.y + self.dt, self.top.width);
+        }
+        if self.db > 0 {
+            hline(frame, self.bottom.x, self.bottom.y - 1, self.bottom.width);
+        }
+        if self.dl > 0 {
+            vline(frame, self.left.x + self.dl, self.mid.y, self.mid.height);
+        }
+        if self.dr > 0 {
+            vline(frame, self.right.x - 1, self.mid.y, self.mid.height);
+        }
+    }
+}
+
+/// A window's absolute rect: its wire rect offset by its region's content origin,
+/// or the whole region for a legacy flat redraw (no rect → single window).
 fn window_area(wins_area: Rect, win: &WindowView) -> Rect {
     match win.rect {
         Some(r) => Rect {
@@ -676,12 +803,14 @@ fn paint_cursor_cell(
 /// run, anchored in the windows area. The theme's `StatusLine` style tints them
 /// (reverse-video out of the box), matching vim's `WinSeparator` default of
 /// reusing the status-line look. None to draw with a single window.
-fn render_separators(frame: &mut Frame, wins_area: Rect, separators: &[Separator], view: &View) {
+fn render_separators(frame: &mut Frame, dock: &DockLayout, separators: &[Separator], view: &View) {
     let style = view
         .status_line
         .map(rt)
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
     for sep in separators {
+        // Each separator is relative to its region's content origin.
+        let wins_area = dock.content(sep.region);
         let x = wins_area.x + sep.x;
         let y = wins_area.y + sep.y;
         let (w, h, lines): (u16, u16, Vec<Line>) = if sep.vertical {
@@ -1457,9 +1586,22 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     let Some(win) = view.focused() else {
         return Rect::new(0, 0, 0, 0);
     };
-    let wins_area = windows_area_rect(width, height, view);
+    let tabline_rows = u16::from(!view.tabline.is_empty());
+    let global_status_rows = u16::from(!view.global_status.is_empty());
+    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    let dock = DockLayout::new(
+        Rect::new(0, 0, width, height),
+        view,
+        tabline_rows,
+        global_status_rows,
+        panel_rows,
+    );
     // A focused float's content sits inside its border; the popup anchors there.
-    let area = float_inner(window_area(wins_area, win), win.border.map(bt));
+    // The focused window may live in a dock, so offset by its region's origin.
+    let area = float_inner(
+        window_area(dock.content(win.region), win),
+        win.border.map(bt),
+    );
     // The text body is the window rect minus its bottom status row — when this
     // window shows one (per `'laststatus'`); otherwise it claims the whole rect.
     let text_area = if win.status_visible {

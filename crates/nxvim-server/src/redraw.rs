@@ -5,7 +5,7 @@
 use crate::EditHost;
 use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
-use nxvim_core::view::{ScrollAnim, Separator, TabView, ViewRect, WindowView};
+use nxvim_core::view::{ScrollAnim, Separator, TabView, ViewRect, WindowRegion, WindowView};
 use nxvim_core::{BorderStyle, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;
@@ -190,6 +190,16 @@ impl EditHost {
             (Value::from("chrome"), chrome),
             (Value::from("panel"), panel),
             (Value::from("pmenu"), pmenu),
+            (Value::from("dock_left"), Value::from(view.dock_left as u64)),
+            (
+                Value::from("dock_right"),
+                Value::from(view.dock_right as u64),
+            ),
+            (Value::from("dock_top"), Value::from(view.dock_top as u64)),
+            (
+                Value::from("dock_bottom"),
+                Value::from(view.dock_bottom as u64),
+            ),
         ];
 
         self.fx.notify("redraw", vec![Value::Map(map)]);
@@ -237,6 +247,7 @@ impl EditHost {
         };
         Value::Map(vec![
             (Value::from("rect"), rect_value(&win.rect)),
+            (Value::from("region"), Value::from(region_str(win.region))),
             (Value::from("focused"), Value::from(win.focused)),
             (Value::from("lines"), lines_value(&win.lines)),
             (
@@ -573,15 +584,30 @@ fn tab_value(tab: &TabView) -> Value {
     ])
 }
 
-/// Encode a split border as a `{ vertical, x, y, length }` map (cells, relative
-/// to the windows area) for the redraw map's `separators` array.
+/// Encode a split border as a `{ vertical, x, y, length, region }` map (cells,
+/// relative to the separator's region origin) for the redraw map's `separators`
+/// array.
 fn separator_value(sep: &Separator) -> Value {
     Value::Map(vec![
         (Value::from("vertical"), Value::from(sep.vertical)),
         (Value::from("x"), Value::from(sep.x as u64)),
         (Value::from("y"), Value::from(sep.y as u64)),
         (Value::from("length"), Value::from(sep.length as u64)),
+        (Value::from("region"), Value::from(region_str(sep.region))),
     ])
+}
+
+/// The wire string for a window/separator [`WindowRegion`] — `"main"` or one of
+/// `"dock_left"`/`"dock_right"`/`"dock_top"`/`"dock_bottom"`. Clients map it to the
+/// region's absolute screen origin using the redraw map's dock band sizes.
+fn region_str(region: WindowRegion) -> &'static str {
+    match region {
+        WindowRegion::Main => "main",
+        WindowRegion::DockLeft => "dock_left",
+        WindowRegion::DockRight => "dock_right",
+        WindowRegion::DockTop => "dock_top",
+        WindowRegion::DockBottom => "dock_bottom",
+    }
 }
 
 /// Encode a window's screen rect as a `{ x, y, width, height }` map (cells,

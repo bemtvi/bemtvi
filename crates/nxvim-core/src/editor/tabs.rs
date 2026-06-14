@@ -48,7 +48,10 @@ impl Editor {
     fn tab_tree(&self, id: TabId) -> Option<&WindowTree> {
         let idx = self.tabs.iter().position(|t| t.id == id)?;
         if idx == self.current_tab {
-            Some(&self.windows)
+            // The active tab's main tree is live on `self.windows` — unless a dock
+            // is focused, in which case it is parked in `main_parked`. `layer_tree`
+            // resolves either.
+            self.layer_tree(Layer::Main)
         } else {
             self.tabs[idx].tree.as_ref()
         }
@@ -90,10 +93,19 @@ impl Editor {
     /// order (`nvim_list_wins`, which spans every tabpage in neovim). Within a tab
     /// the order matches [`Editor::tab_window_ids`].
     pub fn all_window_ids(&self) -> Vec<WindowId> {
-        self.tabs
+        let mut ids: Vec<WindowId> = self
+            .tabs
             .iter()
             .flat_map(|slot| self.tab_window_ids(slot.id).unwrap_or_default())
-            .collect()
+            .collect();
+        // Docks are global (not owned by any tab); append their windows once.
+        for side in DockSide::ALL {
+            if let Some(t) = self.layer_tree(Layer::Dock(side)) {
+                ids.extend(t.leaves());
+                ids.extend(t.floats.iter().copied());
+            }
+        }
+        ids
     }
 
     /// One [`TabLabel`] per tab in tabline order — empty when the tabline is
@@ -140,7 +152,7 @@ impl Editor {
     /// window back into its [`Window`], so a later [`Editor::enter_window`] (in
     /// this tab, or on return to it) restores it. The shared prelude of every
     /// focus / tab switch.
-    fn stash_focused_view(&mut self) {
+    pub(crate) fn stash_focused_view(&mut self) {
         // Stash the focused window's secondary multi-cursors first — finalizing
         // placement may snap the primary onto a placed cursor, which the view
         // stash below must capture.
@@ -162,6 +174,10 @@ impl Editor {
         if target == self.current_tab || target >= self.tabs.len() {
             return;
         }
+        // Docks are global; a tab swap must move the *main* tree, never a dock's.
+        // If a dock is focused, cross back to main so `self.windows` is the main
+        // tree before the swap below.
+        self.ensure_main_layer();
         // Stash the outgoing tab's live view into its focused window, then move the
         // whole live tree into its (currently empty) slot.
         self.stash_focused_view();
@@ -188,6 +204,9 @@ impl Editor {
     /// make it active. The outgoing tab's layout is stashed first. The caller
     /// follows up (e.g. `:enew` for an empty `:tabnew`, `:edit` for a file).
     pub(crate) fn new_tab(&mut self, buf: BufferId, options: WindowOptions) {
+        // A new tab installs a fresh main tree; cross off any focused dock first
+        // so the swap below replaces the *main* tree (docks are global).
+        self.ensure_main_layer();
         self.stash_focused_view();
         let new_win = self.alloc_window_id();
         let tree = WindowTree::with_window(new_win, buf, options);

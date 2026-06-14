@@ -32,7 +32,7 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use nxvim_view::{InlayHint, PanelData, StatusSegment, Style, View, WindowView};
+use nxvim_view::{InlayHint, PanelData, StatusSegment, Style, View, WindowRegion, WindowView};
 use winit::window::Window;
 
 use crate::GuiConfig;
@@ -540,14 +540,45 @@ impl Renderer {
         let global_status_rows = u16::from(!view.global_status.is_empty());
         let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
 
-        let origin = (0u16, tabline_rows);
-        let win_rows = cmd_row
-            .saturating_sub(panel_rows)
+        // The permanent dock bands. Each open dock reserves its content extent plus
+        // one separator cell toward the main area; the frame stacks as `[top dock]
+        // [tabline][left|main|right][global status][bottom dock][panel][cmd]`. With
+        // no dock open every band is 0 and this collapses to the pre-dock layout.
+        let res = |n: u16| if n > 0 { n + 1 } else { 0 };
+        let (dl, dr, dt, db) = (
+            view.dock_left,
+            view.dock_right,
+            view.dock_top,
+            view.dock_bottom,
+        );
+        let (top_band, bottom_band, left_band, right_band) = (res(dt), res(db), res(dl), res(dr));
+        let mid_y = top_band + tabline_rows;
+        let mid_h = cmd_row
+            .saturating_sub(top_band)
             .saturating_sub(tabline_rows)
             .saturating_sub(global_status_rows)
+            .saturating_sub(bottom_band)
+            .saturating_sub(panel_rows)
             .max(1);
+        let main_x = left_band;
+        let main_w = cols
+            .saturating_sub(left_band)
+            .saturating_sub(right_band)
+            .max(1);
+        let bottom_y = mid_y + mid_h + global_status_rows;
+        // Each region's content-cell origin (the dock separator faces the main area,
+        // so the bottom/right docks' content starts one cell past the band edge).
+        let region_origin = |region: WindowRegion| -> (u16, u16) {
+            match region {
+                WindowRegion::Main => (main_x, mid_y),
+                WindowRegion::DockLeft => (0, mid_y),
+                WindowRegion::DockRight => (cols.saturating_sub(dr), mid_y),
+                WindowRegion::DockTop => (0, 0),
+                WindowRegion::DockBottom => (0, bottom_y + (bottom_band - db)),
+            }
+        };
 
-        // The tabline on the top row.
+        // The tabline on the row below the top dock.
         if tabline_rows > 0 {
             self.build_tabline(view, cols, quads, items);
         }
@@ -555,24 +586,19 @@ impl Renderer {
         // Tiled windows first; floats overlay them in a second pass so they sit on
         // top. Only the focused window slides; the rest paint from the live view.
         for win in view.windows.iter().filter(|w| !w.floating) {
+            let (ox, oy) = region_origin(win.region);
             let rect = match win.rect {
-                Some(r) => (origin.0 + r.x, origin.1 + r.y, r.width, r.height),
-                None => (origin.0, origin.1, cols, win_rows),
+                Some(r) => (ox + r.x, oy + r.y, r.width, r.height),
+                None => (main_x, mid_y, main_w, mid_h),
             };
             let win_scroll = if win.focused { scroll } else { None };
             self.build_window(view, win, win_scroll, rect, quads, items);
         }
 
-        // Separators between splits — drawn as thin grey lines, offset by the
-        // windows-area origin like the windows they divide.
+        // Separators between splits — thin grey lines, each offset by its region's
+        // content origin like the windows they divide.
         let sep = srgb_to_color(style_bg(&view.status_line).unwrap_or(0x40_40_40));
-        for s in &view.separators {
-            let (px, py) = self.cell_px(origin.0 + s.x, origin.1 + s.y);
-            let (w, h) = if s.vertical {
-                (self.cell_w * 0.12, self.cell_h * s.length as f32)
-            } else {
-                (self.cell_w * s.length as f32, self.cell_h * 0.12)
-            };
+        let mut line = |px: f32, py: f32, w: f32, h: f32| {
             quads.push(Quad {
                 x: px,
                 y: py,
@@ -580,18 +606,50 @@ impl Renderer {
                 h,
                 color: color_to_rgba(sep),
             });
+        };
+        for s in &view.separators {
+            let (ox, oy) = region_origin(s.region);
+            let (cx, cy) = self.cell_px(ox + s.x, oy + s.y);
+            if s.vertical {
+                line(cx, cy, self.cell_w * 0.12, self.cell_h * s.length as f32);
+            } else {
+                line(cx, cy, self.cell_w * s.length as f32, self.cell_h * 0.12);
+            }
+        }
+        // The border line between each open dock and the main area.
+        if dt > 0 {
+            let (cx, cy) = self.cell_px(0, dt);
+            line(cx, cy, self.cell_w * cols as f32, self.cell_h * 0.12);
+        }
+        if db > 0 {
+            let (cx, cy) = self.cell_px(0, bottom_y);
+            line(cx, cy, self.cell_w * cols as f32, self.cell_h * 0.12);
+        }
+        if dl > 0 {
+            let (cx, cy) = self.cell_px(dl, mid_y);
+            line(cx, cy, self.cell_w * 0.12, self.cell_h * mid_h as f32);
+        }
+        if dr > 0 {
+            let (cx, cy) = self.cell_px(cols.saturating_sub(dr + 1), mid_y);
+            line(cx, cy, self.cell_w * 0.12, self.cell_h * mid_h as f32);
         }
 
         // Floats on top, in list order (the server already sorts them by zindex) —
         // into the overlay layer so their opaque background occludes the tiled-window
         // text beneath them (drawn after base text; see `render`).
         for win in view.windows.iter().filter(|w| w.floating) {
-            self.build_float(view, win, origin, overlay_quads, overlay_items);
+            self.build_float(
+                view,
+                win,
+                region_origin(win.region),
+                overlay_quads,
+                overlay_items,
+            );
         }
 
-        // The global status line (`laststatus=3`), docked below all windows.
+        // The global status line (`laststatus=3`), docked just below the main band.
         if global_status_rows > 0 {
-            let row = cmd_row.saturating_sub(panel_rows).saturating_sub(1);
+            let row = mid_y + mid_h;
             self.build_status_row(&view.global_status, (0, row), cols, view, quads, items);
         }
 
@@ -602,9 +660,14 @@ impl Renderer {
             self.build_panel(panel, top, cols, view, quads, items);
         }
 
-        // The insert-mode completion popup, anchored over the focused window — in
-        // the overlay layer (like floats) so it sits opaque over the window text.
-        self.build_pmenu(view, origin, doc_scroll, overlay_quads, overlay_items);
+        // The insert-mode completion popup, anchored over the focused window (in its
+        // region) — in the overlay layer (like floats) so it sits opaque over the
+        // window text.
+        let focus_origin = view
+            .focused()
+            .map(|w| region_origin(w.region))
+            .unwrap_or((main_x, mid_y));
+        self.build_pmenu(view, focus_origin, doc_scroll, overlay_quads, overlay_items);
 
         // The global command / message line on the reserved bottom row.
         self.build_cmdline(view, cmd_row, quads, items);

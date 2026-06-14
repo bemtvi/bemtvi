@@ -24,4 +24,6 @@ pub use parse::{
     StatusSegment,
 };
 pub use style::{Border, Style};
-pub use view::{PanelData, PmenuData, ScrollData, Separator, TabData, View, WinRect, WindowView};
+pub use view::{
+    PanelData, PmenuData, ScrollData, Separator, TabData, View, WinRect, WindowRegion, WindowView,
+};

@@ -1,0 +1,28 @@
+This is the MAIN editor area.
+
+The left side bar and the bottom tray around this text are permanent docks —
+editable windows pinned to the screen edge, shared across every tab.
+
+Cross into a dock with the doubled window key:
+
+    <C-w><C-w>h     focus the LEFT dock
+    <C-w><C-w>j     focus the BOTTOM dock
+    <C-w><C-w>l     (from a dock) cross back to the main area
+
+Once you are focused inside a dock, a SINGLE <C-w> acts within that dock:
+
+    <C-w>s          split the dock horizontally
+    <C-w>v          split the dock vertically
+    <C-w>w          cycle windows within the dock
+    <C-w>c          close a dock window (closes the dock on its last window)
+
+Back in the main area, split and switch tabs freely — the docks never move:
+
+    :vsplit         the main area splits; the docks stay put
+    :tabnew         a new tab; the same docks are still there
+
+Open more docks from the command line:
+
+    :DockOpen right 30
+    :DockOpen top 4
+    :DockClose right

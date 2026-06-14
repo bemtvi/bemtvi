@@ -42,6 +42,27 @@ function nx.command(name, fn, opts)
   return nx.user_command.create(name, fn, opts)
 end
 
+-- Dock ex-commands — thin wrappers over the Rust-backed `nx.dock.*` surface
+-- (installed before the prelude), dogfooding the nx API. `:DockOpen {side} [size]`
+-- opens/focuses a permanent edge panel; `:DockClose`/`:DockFocus {side}` address it.
+nx.command("DockOpen", function(o)
+  local side = o.fargs[1]
+  if not side then
+    return nx.notify("usage: :DockOpen {left|right|top|bottom} [size]", 4)
+  end
+  nx.dock.open({ side = side, size = tonumber(o.fargs[2]) })
+end)
+nx.command("DockClose", function(o)
+  if o.fargs[1] then
+    nx.dock.close(o.fargs[1])
+  end
+end)
+nx.command("DockFocus", function(o)
+  if o.fargs[1] then
+    nx.dock.focus(o.fargs[1])
+  end
+end)
+
 -- (`nx.notify` / `nx.schedule` — the callback-shaped async — are authored as
 -- `nx.*` in prelude/runtime.lua, with `vim.*` aliased onto them there.)
 --

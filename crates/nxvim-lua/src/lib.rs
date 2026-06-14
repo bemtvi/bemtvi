@@ -35,9 +35,10 @@ mod vimregex;
 
 pub use luafs::{FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    InlayHintMirrorData, LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp,
-    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, WindowOp,
+    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
+    HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue,
+    PanelOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq,
+    WindowOp,
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,

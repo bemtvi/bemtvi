@@ -198,6 +198,17 @@ impl Editor {
                         }
                     }
                 }
+                // Global docks (and the parked main tree, while a dock is focused)
+                // ride the same edit too, so a `<C-o>` in a dock stays correct.
+                for tree in self
+                    .main_parked
+                    .iter_mut()
+                    .chain(self.docks.iter_mut().flatten())
+                {
+                    for win in tree.all_windows_mut() {
+                        shift_window_jumps(win, id, s, oe, ne);
+                    }
+                }
             }
         }
     }

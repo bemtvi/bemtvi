@@ -97,17 +97,35 @@ pub struct ViewRect {
     pub height: usize,
 }
 
+/// Which screen region a window (or separator) belongs to: the main editor area,
+/// or one of the four permanent docks. A window's `rect`/separator coordinates are
+/// relative to its region's own origin (each region lays out at `(0, 0)`); the
+/// client maps the region to its absolute screen origin using the [`View`]'s dock
+/// band sizes. `Main` is the default and the only region when no dock is open, so
+/// a dock-free session renders exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowRegion {
+    #[default]
+    Main,
+    DockLeft,
+    DockRight,
+    DockTop,
+    DockBottom,
+}
+
 /// A split border between sibling windows: a vertical `│` run (between the
 /// columns of a vertical split) or a horizontal `─` run (between the rows of a
-/// horizontal split), anchored at `(x, y)` in **windows-area** cells and
-/// `length` cells long. The core computes these from the layout tree; the client
-/// only paints them.
+/// horizontal split), anchored at `(x, y)` in its [`region`](Separator::region)'s
+/// cells and `length` cells long. The core computes these from the layout tree;
+/// the client only paints them (offsetting by the region origin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Separator {
     pub vertical: bool,
     pub x: usize,
     pub y: usize,
     pub length: usize,
+    /// The region this separator's `(x, y)` is relative to.
+    pub region: WindowRegion,
 }
 
 /// One window's renderable content: its screen `rect`, whether it holds focus,
@@ -118,8 +136,11 @@ pub struct Separator {
 /// window this is the whole text area — identical to the pre-windows view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowView {
-    /// Where this window sits in the windows area.
+    /// Where this window sits within its [`region`](WindowView::region) (origin
+    /// `(0, 0)` per region; the client offsets by the region's screen origin).
     pub rect: ViewRect,
+    /// Which screen region (main area or a dock) this window belongs to.
+    pub region: WindowRegion,
     /// The buffer this window shows. The server projects this buffer's syntax /
     /// diagnostics slice for the window (two windows onto the same buffer share
     /// one `SyntaxState`, each slicing its own `(top, height)`).
@@ -260,9 +281,21 @@ pub struct View {
     /// Index into `tabline` of the active tab. Meaningful only when `tabline` is
     /// non-empty.
     pub current_tab: usize,
-    /// The split borders between windows, in windows-area cells. Empty with a
-    /// single window.
+    /// The split borders between windows, each in its [`Separator::region`]'s
+    /// cells. Empty with a single window and no dock.
     pub separators: Vec<Separator>,
+    /// The left dock's content width in cells, `0` when closed. A client reserves
+    /// `width + 1` columns on the left (the `+1` a separator) and renders
+    /// `WindowRegion::DockLeft` windows there. See [`WindowRegion`].
+    pub dock_left: usize,
+    /// The right dock's content width in cells, `0` when closed.
+    pub dock_right: usize,
+    /// The top dock's content height in rows, `0` when closed. The top dock sits
+    /// **above** the tabline.
+    pub dock_top: usize,
+    /// The bottom dock's content height in rows, `0` when closed (sits above the
+    /// read-only panel).
+    pub dock_bottom: usize,
     /// Uppercase mode name for the status line, e.g. `"NORMAL"`.
     pub mode_label: String,
     /// True while in command-line mode; the cursor then belongs to the command
@@ -302,6 +335,7 @@ pub struct View {
 
 impl View {
     pub(crate) fn from_editor(ed: &Editor) -> View {
+        let bands = ed.dock_bands();
         let windows: Vec<WindowView> = ed
             .window_layouts()
             .iter()
@@ -322,7 +356,7 @@ impl View {
             windows,
             tabline: ed.tab_labels().into_iter().map(tab_view).collect(),
             current_tab: ed.current_tab_index(),
-            separators: ed.separators().to_vec(),
+            separators: ed.all_separators(),
             mode_label: ed.mode.label().to_string(),
             command_mode: ed.mode == Mode::Command,
             pending_replace: ed.pending_replace(),
@@ -333,6 +367,10 @@ impl View {
             message: ed.message.clone(),
             panel: ed.panel_view(),
             global_statusline,
+            dock_left: bands.left,
+            dock_right: bands.right,
+            dock_top: bands.top,
+            dock_bottom: bands.bottom,
         }
     }
 
@@ -516,6 +554,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             width: w.rect.width,
             height: w.rect.height,
         },
+        region: w.region,
         buffer: w.buffer,
         focused: w.focused,
         lines,

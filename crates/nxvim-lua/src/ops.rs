@@ -53,6 +53,26 @@ pub enum PanelOp {
     Close,
 }
 
+/// A request to a permanent **dock** (the VSCode-style edge panels), queued by
+/// the `nx.dock.*` functions and drained by the server into the core (which owns
+/// the dock state). nxvim's own surface — docks are not a neovim concept. `side`
+/// is one of `left`/`right`/`top`/`bottom`, validated when drained.
+#[derive(Clone, Debug)]
+pub enum DockOp {
+    /// `nx.dock.open{ side, size?, buf? }` — open (or resize/refocus) and focus the
+    /// dock. `size` is columns (left/right) or rows (top/bottom); `None` keeps the
+    /// current/default. `buf` is the buffer to show (`None` ⇒ a fresh scratch).
+    Open {
+        side: String,
+        size: Option<u64>,
+        buf: Option<u64>,
+    },
+    /// `nx.dock.close(side)` — close the dock (its buffer stays loaded).
+    Close { side: String },
+    /// `nx.dock.focus(side)` — focus the dock (no-op if it isn't open).
+    Focus { side: String },
+}
+
 /// A request to start (or attach a buffer to) a language server, queued by
 /// `vim.lsp.start` after user Lua — directly, or through the `vim.lsp.enable`
 /// FileType dispatcher — resolved the config. The root is resolved **in Lua**

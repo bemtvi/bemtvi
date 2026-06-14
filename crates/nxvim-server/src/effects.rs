@@ -13,9 +13,9 @@ use nxvim_core::{
     UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, ExtmarkMirror, ExtmarkOp, FloatMirror,
-    GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp, TabMirror, TabOp, TsOp,
-    WindowMirror, WindowOp,
+    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DockOp, ExtmarkMirror, ExtmarkOp,
+    FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp, TabMirror,
+    TabOp, TsOp, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -160,6 +160,18 @@ impl EditHost {
                 PanelOp::OnSelect(wants) => self.editor.set_panel_on_select(wants),
                 PanelOp::SetCursor(line) => self.editor.set_panel_cursor(line),
                 PanelOp::Close => self.editor.close_panel(),
+            }
+        }
+        // Dock requests from `nx.dock.*` drive the core's dock (edge-panel) state.
+        for op in self.lua.take_dock_ops() {
+            match op {
+                DockOp::Open { side, size, buf } => self.editor.open_dock_named(
+                    &side,
+                    size.map(|s| s as usize),
+                    buf.map(nxvim_core::BufferId),
+                ),
+                DockOp::Close { side } => self.editor.close_dock_named(&side),
+                DockOp::Focus { side } => self.editor.focus_dock_named(&side),
             }
         }
         // Server-start requests from `vim.lsp.start` (the `vim.lsp.enable` FileType

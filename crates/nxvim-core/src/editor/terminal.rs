@@ -43,13 +43,30 @@ pub enum TerminalOp {
 }
 
 impl Editor {
+    /// `:terminal [cmd ...]` — open a terminal in the current window. With no
+    /// argument the server spawns the default shell; otherwise the whitespace-split
+    /// words are the program + args run directly (no shell). This is the builtin
+    /// entry; the `nx.terminal` Lua control surface (programmatic open + keymaps)
+    /// layers on top of [`Editor::open_terminal`].
+    pub(crate) fn ex_terminal(&mut self, args: &str) {
+        let argv: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+        self.open_terminal(argv, None);
+    }
+
+    /// The current window's text area as `(rows, cols)`, clamped to `u16` — the PTY
+    /// winsize for a terminal shown there.
+    pub fn current_text_area(&self) -> (u16, u16) {
+        let rows = self.text_height().clamp(1, u16::MAX as usize) as u16;
+        let cols = self.text_width().clamp(1, u16::MAX as usize) as u16;
+        (rows, cols)
+    }
+
     /// Open a terminal in the current window: create a fresh terminal-job buffer,
     /// switch to it, enter [`Mode::Terminal`], and enqueue a [`TerminalOp::Open`]
     /// sized to the current window's text area for the server to back with a PTY.
     /// `argv` empty ⇒ the server's default shell.
     pub fn open_terminal(&mut self, argv: Vec<String>, cwd: Option<String>) {
-        let rows = self.text_height().max(1).min(u16::MAX as usize) as u16;
-        let cols = self.text_width().max(1).min(u16::MAX as usize) as u16;
+        let (rows, cols) = self.current_text_area();
 
         let mut buffer = Buffer::empty();
         buffer.terminal = true;

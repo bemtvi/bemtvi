@@ -28,6 +28,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::daemon::{FsRead, WatchEvent};
 use crate::evloop::LoopEvent;
 use crate::save::SaveDone;
+use crate::terminal::native::TermEvent;
 use crate::{EditHost, InstallOutcome};
 
 impl EditHost {
@@ -135,6 +136,34 @@ impl EditHost {
         }
         self.settle_events(true);
         self.quitting()
+    }
+
+    /// Coalesce a burst of terminal events (a `:terminal` child's output / exit) into
+    /// one settle + repaint: feed each output chunk to the buffer's vt100 emulator
+    /// (refreshing its mirrored screen) and record an exit. Output arrives in a stream,
+    /// so coalescing a burst keeps a chatty child from repainting per chunk.
+    pub(crate) fn on_term_events(
+        &mut self,
+        first: TermEvent,
+        rx: &mut UnboundedReceiver<TermEvent>,
+    ) {
+        self.on_term_event(first);
+        while let Ok(ev) = rx.try_recv() {
+            self.on_term_event(ev);
+        }
+        self.settle_events(true);
+    }
+
+    /// Apply one terminal event: feed output bytes to `buf`'s emulator, or record the
+    /// child's exit (append the notice, leave terminal mode) and drop the emulator.
+    fn on_term_event(&mut self, ev: TermEvent) {
+        match ev {
+            TermEvent::Data { buf, bytes } => self.terminal_feed(buf, &bytes),
+            TermEvent::Exit { buf, code } => {
+                self.editor.terminal_closed(buf, code);
+                self.terminal_remove(buf);
+            }
+        }
     }
 
     /// Coalesce a burst of remote file-change pushes (the daemon `HostWatch` leg):

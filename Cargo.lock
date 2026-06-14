@@ -2305,6 +2305,7 @@ dependencies = [
  "nxvim-rpc",
  "nxvim-test-harness",
  "nxvim-ts",
+ "portable-pty",
  "redb",
  "rmp-serde",
  "rmpv",

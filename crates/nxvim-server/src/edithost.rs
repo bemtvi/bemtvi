@@ -67,6 +67,14 @@ pub trait HostEffects {
     #[cfg(feature = "native")]
     fn loop_command(&mut self, cmd: LoopCommand);
 
+    /// Hand a command to the terminal actor (open / write / resize / kill a PTY).
+    /// Fire-and-forget like [`loop_command`](Self::loop_command); the child's output
+    /// and exit return as inbound `TermEvent`s on the run loop's `select!`. Native
+    /// only — the wasm build's terminal leg (the daemon PTY over WebTransport) is
+    /// Phase 7, with its own seam.
+    #[cfg(feature = "native")]
+    fn terminal_command(&mut self, cmd: crate::terminal::native::TermCommand);
+
     /// Off-tick fs — fetch a buffer's bytes over the daemon read leg (a startup /
     /// `:edit` open). Fire-and-forget: the fetched bytes (or a read error) return
     /// *inbound* on the run loop's open arm, not here. A silent no-op when no daemon fs
@@ -181,10 +189,18 @@ pub struct NativeEffects {
     /// The effect spawns the fetch+compile on a `spawn_blocking` worker and forwards the
     /// outcome here.
     install_tx: UnboundedSender<crate::InstallOutcome>,
+    /// The terminal command sink — the actor the editor tick fires `Open` / `Write` /
+    /// `Resize` / `Kill` at. Its inbound output/exit stream (`term_events`) is owned by
+    /// the run loop's `select!`, not here (the [`EventLoop`] pattern).
+    terminals: crate::terminal::native::TerminalManager,
 }
 
 #[cfg(feature = "native")]
 impl NativeEffects {
+    // The native session's outbound capabilities, injected together at the one
+    // construction site ([`run_io`]); grouping them into a struct would just move the
+    // list without making it clearer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: Rpc,
         evloop: EventLoop,
@@ -193,6 +209,7 @@ impl NativeEffects {
         save_done_tx: UnboundedSender<SaveDone>,
         lsp: LspManager,
         install_tx: UnboundedSender<crate::InstallOutcome>,
+        terminals: crate::terminal::native::TerminalManager,
     ) -> Self {
         Self {
             rpc,
@@ -202,6 +219,7 @@ impl NativeEffects {
             save_done_tx,
             lsp,
             install_tx,
+            terminals,
         }
     }
 }
@@ -221,6 +239,11 @@ impl HostEffects for NativeEffects {
         // it (rather than a bare cloned sender) preserves the "no task until first
         // command" property.
         self.evloop.send(cmd);
+    }
+
+    fn terminal_command(&mut self, cmd: crate::terminal::native::TermCommand) {
+        // Lazily spawns the terminal actor on first use, same as `loop_command`.
+        self.terminals.send(cmd);
     }
 
     fn fs_fetch(&mut self, buffer: BufferId, path: String) {

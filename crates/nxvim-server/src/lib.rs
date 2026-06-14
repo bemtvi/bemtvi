@@ -1463,6 +1463,10 @@ where
         None => Arc::new(StdHostProc),
     };
     let (evloop, mut loop_events) = EventLoop::new(host_proc);
+    // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
+    // output back on `term_events`. Lazily started on the first open (the `EventLoop`
+    // pattern), so a session with no terminal spawns nothing.
+    let (terminals, mut term_events) = terminal::native::TerminalManager::new();
     // `:TSInstall` runs the fetch+compile off-thread (`spawn_blocking`); results
     // come back here and are applied on the one server thread.
     let (install_tx, mut install_events) = unbounded_channel::<InstallOutcome>();
@@ -1503,6 +1507,7 @@ where
             save_done_tx,
             lsp,
             install_tx,
+            terminals,
         )),
     );
     // The two capabilities `new` defaults but the native session injects: the
@@ -1639,6 +1644,9 @@ where
             // matching Lua callback runs here; the shada debounce-timer also wakes this
             // arm, and `on_loop_events` sorts its flush out from the real callbacks.
             Some(event) = loop_events.recv() => host.on_loop_events(event, &mut loop_events),
+            // A `:terminal` child wrote output or exited: feed the bytes to its vt100
+            // emulator (refreshing the buffer's mirrored screen) or record the exit.
+            Some(event) = term_events.recv() => host.on_term_events(event, &mut term_events),
             // Bytes for an off-tick open arrived from the daemon's fs — the startup
             // file (kept from freezing startup) or a later `:edit`. Idle for a
             // bare/local session.

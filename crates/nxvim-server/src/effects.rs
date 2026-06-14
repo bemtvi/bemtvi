@@ -1340,6 +1340,13 @@ impl EditHost {
         // Native only — the shada store (redb) is gated off the wasm build (slice 5a).
         #[cfg(feature = "native")]
         self.drain_pending_shada();
+        // Terminal ops core queued this convergence (`:terminal` opens, keystrokes
+        // forwarded in terminal mode, kills): spawn / write / kill the PTY. The
+        // child's output returns inbound on the `term_events` arm.
+        let term_ops = self.editor.take_pending_terminal();
+        if !term_ops.is_empty() {
+            self.dispatch_terminal_ops(term_ops);
+        }
     }
 }
 

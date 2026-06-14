@@ -26,6 +26,11 @@ impl EditHost {
             Some(dims) => dims,
             None => return,
         };
+        // Match the current terminal's PTY winsize to its window before projecting,
+        // so a resized terminal reflows its mirrored screen this frame. Native only —
+        // the wasm terminal resize rides the daemon leg (Phase 7).
+        #[cfg(feature = "native")]
+        self.sync_terminal_sizes();
         let view = self.editor.view(w, h);
 
         // Refresh the current buffer's highlights from the in-process engine for

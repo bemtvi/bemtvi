@@ -34,6 +34,7 @@ native = [
     "dep:nxvim-rpc",
     "dep:nxvim-lsp",
     "dep:nxvim-ts",
+    "dep:portable-pty",
 ]
 
 [dependencies]
@@ -60,6 +61,11 @@ serde = { workspace = true, optional = true }
 # Native filesystem watching backing `vim.uv.fs_event` (driven from the event-loop
 # actor in evloop.rs).
 notify = { workspace = true, optional = true }
+# The native PTY transport for `:terminal` (Phase 3): spawns the local
+# pseudo-terminal the terminal-job buffer mirrors. Native-only — the browser has no
+# local PTY (it runs the child on the daemon over WebTransport, Phase 7), so it's
+# gated under the `native` feature alongside the rest of the async/transport tree.
+portable-pty = { workspace = true, optional = true }
 # `vim-regex` pulls the real vim regexp engine into the core's `:s`/`/` search
 # (`:set regexsyntax=vim`). Enabled here so the whole host workspace — and the
 # integration tests — build it in via feature unification. The C compiles under

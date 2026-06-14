@@ -469,6 +469,7 @@ impl Editor {
             "clo" | "close" => self.close_window(),
             "hid" | "hide" => self.close_window(),
             "on" | "only" => self.only_window(),
+            "ter" | "term" | "termi" | "termin" | "termina" | "terminal" => self.ex_terminal(args),
             "tabnew" | "tabe" | "tabed" | "tabedit" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_tabnew(&a);

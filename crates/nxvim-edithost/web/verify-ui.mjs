@@ -150,6 +150,35 @@ try {
   }
   check("highlight: tree-sitter colors Rust tokens (inline color styles present)", colored, detail);
 
+  // ---- 9. nx.ui.select opens a floating menu and confirms a choice ----
+  // The widget runs entirely in the wasm edit-host (no server). Open a three-item
+  // chooser, assert the bordered list paints with the labels, move + confirm, and
+  // read back the choice the callback captured.
+  const luaResult = (code) => page.evaluate((c) => window.__nxvim.execLua(c).then((r) => r.result), code);
+  await page.evaluate(() => window.__nxvim.execLua(
+    "_G.picked, _G.pickedIdx = nil, nil\n" +
+    "nx.ui.select({ 'alpha', 'beta', 'gamma' }, {}, function(item, idx)\n" +
+    "  _G.picked, _G.pickedIdx = item, idx\n" +
+    "end)"));
+  await sleep(100);
+  const menuRows = await page.evaluate(() =>
+    [...document.querySelectorAll("#grid .pmenu .row")].map((e) => e.textContent.trim()));
+  check("nx.ui.select: the menu paints its item labels",
+    menuRows.length >= 3 && menuRows[0] === "alpha" && menuRows[1] === "beta" && menuRows[2] === "gamma",
+    JSON.stringify(menuRows));
+
+  await page.evaluate(() => window.__nxvim.feed("j")); // alpha -> beta
+  await page.evaluate(() => window.__nxvim.feed("<CR>"));
+  await sleep(100);
+  // execLua returns a rendered `ok:<value>` string, so match on content (as the
+  // other verify scripts do) rather than an exact JS value.
+  const picked = String(await luaResult("return _G.picked"));
+  const pickedIdx = String(await luaResult("return _G.pickedIdx"));
+  check("nx.ui.select: <CR> confirms the highlighted row (item + 1-based index)",
+    /beta/.test(picked) && /\b2\b/.test(pickedIdx), JSON.stringify({ picked, pickedIdx }));
+  const menuGone = await page.evaluate(() => document.querySelectorAll("#grid .pmenu .row").length === 0);
+  check("nx.ui.select: the menu closes after confirm", menuGone);
+
   await browser.close();
 } finally {
   cleanup();

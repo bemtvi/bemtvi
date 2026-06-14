@@ -12,7 +12,7 @@ use std::rc::Rc;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table};
 use serde::Serialize;
 
-use crate::convert::{json_to_lua, lua_to_rmpv};
+use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
@@ -809,7 +809,8 @@ impl LuaRuntime {
         let run: mlua::Function = nx.get("_run_cb")?;
         let arg = match choice {
             // The core records a 0-based highlight index; Lua sees 1-based.
-            Some(idx0) => mlua::Value::Integer((idx0 + 1) as i64),
+            // `lua_int` keeps the cast correct on wasm32 (where `Integer` is i32).
+            Some(idx0) => mlua::Value::Integer(lua_int((idx0 + 1) as i64)),
             None => mlua::Value::Nil,
         };
         run.call::<()>((id, false, arg))

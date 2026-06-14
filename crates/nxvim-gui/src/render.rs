@@ -669,6 +669,10 @@ impl Renderer {
             .unwrap_or((main_x, mid_y));
         self.build_pmenu(view, focus_origin, doc_scroll, overlay_quads, overlay_items);
 
+        // The floating selectable-list menu (`nx.ui.select`), in the same overlay
+        // layer and anchored the same way (the focused window's region origin).
+        self.build_menu(view, focus_origin, overlay_quads, overlay_items);
+
         // The global command / message line on the reserved bottom row.
         self.build_cmdline(view, cmd_row, quads, items);
     }
@@ -1476,6 +1480,70 @@ impl Renderer {
                 let pos = self.cell_px(dx + 1, by + 1 + r as u16);
                 self.push_plain(items, &text, pos, fg, full);
             }
+        }
+    }
+
+    /// Paint the floating selectable-list menu (`nx.ui.select`) — the same opaque
+    /// bordered overlay as the completion popup, anchored over the focused window,
+    /// but each row is a plain label and the highlighted row gets the selection
+    /// fill. Mirrors [`Self::build_pmenu`] (without the doc preview).
+    fn build_menu(
+        &mut self,
+        view: &View,
+        origin: (u16, u16),
+        quads: &mut Vec<Quad>,
+        items: &mut Vec<TextItem>,
+    ) {
+        let Some(menu) = &view.menu else {
+            return;
+        };
+        let Some(win) = view.focused() else {
+            return;
+        };
+        // The focused window's text-inner origin in screen cells (rect + gutter),
+        // identical to the popup's anchor derivation.
+        let (mut wx, mut wy) = match win.rect {
+            Some(r) => (origin.0 + r.x, origin.1 + r.y),
+            None => (origin.0, origin.1),
+        };
+        if win.floating && win.border.is_some() {
+            wx += 1;
+            wy += 1;
+        }
+        let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+        let gutter = if win.number || win.relativenumber {
+            win.number_width
+        } else {
+            0
+        };
+        let text_x0 = wx + sign_w + gutter;
+
+        let popup_bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14);
+        let border = lighten(popup_bg, 0x30);
+        let sel_bg = lighten(popup_bg, 0x28);
+        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+
+        let bx = text_x0 + menu.col;
+        let by = wy + menu.row;
+        let box_w = menu.width + 2;
+        let box_h = menu.height + 2;
+        self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
+
+        let rows = menu.height as usize;
+        let start = pmenu_start(Some(menu.selected), rows);
+        let full = self.full_bounds();
+        for r in 0..menu.height {
+            let idx = start + r as usize;
+            let Some(label) = menu.items.get(idx) else {
+                continue;
+            };
+            let cx = bx + 1;
+            let row = by + 1 + r;
+            if idx == menu.selected {
+                self.fill_cells(quads, cx, row, menu.width, sel_bg);
+            }
+            let text = pmenu_row(label, "", menu.width as usize);
+            self.push_plain(items, &text, self.cell_px(cx, row), fg, full);
         }
     }
 

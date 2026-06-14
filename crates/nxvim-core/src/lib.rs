@@ -32,8 +32,7 @@ pub use editor::{
     FileChangeAction, FileChangeReason, FileChangelist, FileMarkEntry, FloatAnchor, FloatConfig,
     FloatRelative, GlobalMarkEntry, JumpPos, MenuPlacement, NumberedMark, PendingOpen,
     PendingQuitAll, PendingSave, PersistState, RegisterEntry, ShadaRequest, TabId, TerminalOp,
-    UndoEntry,
-    UndoTreeView, WindowConfigSpec, WindowId,
+    UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};

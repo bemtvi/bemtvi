@@ -559,6 +559,9 @@
       }
       if (view.panel) renderPanel(view.panel, cmdRow);
       if (serverStyled && view.pmenu) renderPmenu(view.pmenu, tablineRows);
+      // The nx.ui.select menu is server-agnostic (it works in the pure-wasm
+      // build too), so it renders regardless of `serverStyled`.
+      if (view.menu) renderMenu(view.menu, tablineRows);
       renderCommand(cmdRow);
     }
 
@@ -957,6 +960,32 @@
         }
         gridEl.appendChild(docBox);
       }
+    }
+
+    // The nx.ui.select menu: a bordered float-list under the cursor, reusing the
+    // popup's look. Items are plain labels (no kind/detail/doc), and the
+    // highlighted row gets the selection style.
+    function renderMenu(menu, tablineRows) {
+      const fw = view.windows.find((w) => w.focused) || view.windows[0];
+      const rect = fw ? winRect(fw) : { x: 0, y: 0 };
+      const x = rect.x + menu.col;
+      const y = tablineRows + rect.y + menu.row;
+      const rows = Math.max(1, Math.min(menu.height, menu.items.length));
+      const first = Math.max(0, Math.min(menu.selected - rows + 1, menu.items.length - rows));
+      const start = menu.selected >= rows ? first : 0;
+      const box = document.createElement("div");
+      box.className = "pmenu";
+      place(box, x, y, menu.width, rows);
+      for (let i = 0; i < rows; i++) {
+        const idx = start + i;
+        const text = String(menu.items[idx] ?? "").slice(0, menu.width).padEnd(menu.width);
+        const rowEl = document.createElement("div");
+        rowEl.className = "row" + (idx === menu.selected ? " pmenu-sel" : "");
+        rowEl.style.width = menu.width * cw + "px";
+        rowEl.textContent = text;
+        box.appendChild(rowEl);
+      }
+      gridEl.appendChild(box);
     }
 
     // A synthesized status line (the wasm build emits no %-format statusline segments

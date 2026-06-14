@@ -5,7 +5,9 @@
 use crate::EditHost;
 use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
-use nxvim_core::view::{MenuView, ScrollAnim, Separator, TabView, ViewRect, WindowRegion, WindowView};
+use nxvim_core::view::{
+    MenuView, ScrollAnim, Separator, TabView, ViewRect, WindowRegion, WindowView,
+};
 use nxvim_core::{BorderStyle, MenuPlacement, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;

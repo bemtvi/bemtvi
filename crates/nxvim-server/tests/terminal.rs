@@ -99,3 +99,27 @@ async fn ctrl_backslash_ctrl_n_leaves_terminal_mode() {
     feed(&rpc, "i");
     assert_eq!(mode(&rpc).await, "t", "`i` re-enters the terminal job");
 }
+
+/// Triple-`<Esc>` is the discoverable escape hatch: three in a row leave to Normal,
+/// while one or two stay in the job (forwarded to the child).
+#[tokio::test]
+async fn triple_esc_leaves_terminal_mode() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    // One or two escapes do not leave — they go to the program.
+    feed(&rpc, "<Esc><Esc>");
+    assert_eq!(
+        mode(&rpc).await,
+        "t",
+        "two escapes stay in the terminal job"
+    );
+    // The third in the run leaves to terminal-normal.
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "the third escape leaves terminal mode"
+    );
+}

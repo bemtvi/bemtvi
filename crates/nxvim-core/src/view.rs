@@ -414,7 +414,13 @@ impl View {
             cmdline_prefix: ed.cmdline_prefix(),
             cmdline_prompt: ed.cmdline_prompt().to_string(),
             cmdline_cursor: ed.cmdline_cursor(),
-            message: ed.message.clone(),
+            // In terminal-job mode every key goes to the child, so surface the way
+            // out where vim shows `-- INSERT --` (unless a real message is up).
+            message: if ed.mode == Mode::Terminal && ed.message.is_empty() {
+                "-- TERMINAL --  (<C-\\><C-n> or 3×<Esc> to exit)".to_string()
+            } else {
+                ed.message.clone()
+            },
             panel: ed.panel_view(),
             menu: ed.menu_view(),
             global_statusline,

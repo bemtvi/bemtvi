@@ -965,6 +965,12 @@ pub struct Editor {
     /// `<C-\>` was pressed, so the next key decides between leaving to Normal (`<C-n>`)
     /// and forwarding both bytes to the child. Always `false` outside terminal mode.
     terminal_pending_backslash: bool,
+    /// Consecutive `<Esc>` presses in [`Mode::Terminal`](crate::mode::Mode::Terminal):
+    /// a discoverable escape hatch beside the neovim `<C-\><C-n>` chord — three in a
+    /// row leave to Normal. Single/double `<Esc>` are still forwarded to the child (so
+    /// a program that needs `<Esc>`, like vim/htop, keeps working). Reset by any other
+    /// key and on leaving terminal mode.
+    terminal_esc_count: u8,
 }
 
 impl Editor {
@@ -1145,6 +1151,7 @@ impl Editor {
             pending_shada: Vec::new(),
             pending_terminal: Vec::new(),
             terminal_pending_backslash: false,
+            terminal_esc_count: 0,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

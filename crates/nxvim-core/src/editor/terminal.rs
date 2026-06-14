@@ -162,6 +162,7 @@ impl Editor {
         if is_current && self.mode == Mode::Terminal {
             self.mode = Mode::Normal;
             self.terminal_pending_backslash = false;
+            self.terminal_esc_count = 0;
             self.clamp_cursor();
         }
     }
@@ -175,9 +176,9 @@ impl Editor {
         let buf = self.cur_buffer();
         if self.terminal_pending_backslash {
             self.terminal_pending_backslash = false;
+            self.terminal_esc_count = 0;
             if key.ctrl && key.code == KeyCode::Char('n') {
-                self.mode = Mode::Normal;
-                self.clamp_cursor();
+                self.leave_terminal_mode();
                 return;
             }
             let mut bytes = vec![0x1c];
@@ -189,10 +190,35 @@ impl Editor {
             self.terminal_pending_backslash = true;
             return;
         }
+        // Triple-`<Esc>` is a discoverable escape hatch beside `<C-\><C-n>`: the first
+        // two `<Esc>`es are still forwarded to the child (so vim/htop inside keep
+        // working), the third leaves to Normal. Any other key resets the run.
+        if key.code == KeyCode::Esc && !key.ctrl && !key.alt {
+            self.terminal_esc_count += 1;
+            if self.terminal_esc_count >= 3 {
+                self.leave_terminal_mode();
+                return;
+            }
+            self.pending_terminal.push(TerminalOp::Send {
+                buf,
+                bytes: vec![0x1b],
+            });
+            return;
+        }
+        self.terminal_esc_count = 0;
         let bytes = key_to_terminal_bytes(key);
         if !bytes.is_empty() {
             self.pending_terminal.push(TerminalOp::Send { buf, bytes });
         }
+    }
+
+    /// Leave terminal-job mode for terminal-normal (Normal on a terminal buffer),
+    /// clearing the chord/esc-run state. Shared by `<C-\><C-n>` and triple-`<Esc>`.
+    fn leave_terminal_mode(&mut self) {
+        self.mode = Mode::Normal;
+        self.terminal_pending_backslash = false;
+        self.terminal_esc_count = 0;
+        self.clamp_cursor();
     }
 }
 

@@ -41,6 +41,22 @@ impl Editor {
     }
 
     pub(crate) fn handle_insert(&mut self, key: Key) {
+        // `<C-r>{register}`: the keystroke after `<C-r>` names the register whose
+        // text is inserted at every cursor. Consume it before the normal handling
+        // (and before the soft-tab take below) — a non-register key cancels and
+        // inserts nothing, matching vim.
+        if self.awaiting_register {
+            self.awaiting_register = false;
+            if key.ctrl && key.code == KeyCode::Char('w') {
+                // `<C-r><C-w>`: the word under the cursor, not a named register.
+                if let Some(word) = self.word_under_cursor() {
+                    self.insert_text_session(&word);
+                }
+            } else if let Some(name) = key.as_char() {
+                self.insert_register(name);
+            }
+            return;
+        }
         // The soft-tab marker is valid only for the keystroke immediately after a
         // `<Tab>` (or a chained soft-tab `<BS>`). Take it here so every key clears
         // it; only the Tab/Backspace arms thread it through and may re-arm it.
@@ -104,6 +120,9 @@ impl Editor {
                     self.buffer_mut().modified = true;
                 }
             }
+            // `<C-r>` arms register insertion: the next keystroke (handled at the
+            // top of this fn) names the register to pull in.
+            KeyCode::Char('r') if key.ctrl => self.awaiting_register = true,
             // A typed character lands at every cursor (the primary and any
             // secondary multi-cursors); with none, `for_each_cursor` is just the
             // single-cursor insert. The `".` last-insert register records the
@@ -130,6 +149,44 @@ impl Editor {
         self.buffer_mut().insert_char(at, c);
         self.cursor.col += c.len_utf8();
         self.buffer_mut().modified = true;
+    }
+
+    /// Insert the named register's text at every cursor — the `<C-r>{register}`
+    /// action. An empty or absent register inserts nothing (vim beeps; we no-op).
+    /// The text goes in verbatim, including any newlines a linewise register
+    /// carries, so it splits the line exactly where the register's contents end
+    /// (no auto-indent, unlike a typed `<CR>`). The insert session already holds
+    /// the undo snapshot, so this groups into the surrounding insert.
+    fn insert_register(&mut self, name: char) {
+        let Some((text, _kind)) = self.register_text(Some(name)) else {
+            return;
+        };
+        self.insert_text_session(&text);
+    }
+
+    /// Insert `text` at every cursor as part of the current insert session — the
+    /// shared body of `<C-r>{register}` and `<C-r><C-w>`. Records the text once in
+    /// the `".` last-insert accumulator (not once per cursor), matching how a
+    /// typed character is recorded.
+    fn insert_text_session(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.for_each_cursor(|ed| ed.insert_register_text(text));
+        self.insert_text.push_str(text); // `".` last-insert register
+    }
+
+    /// Insert raw `text` (newlines and all) at the cursor and leave the cursor
+    /// just past it — the per-cursor primitive behind [`Editor::insert_register`],
+    /// run at every cursor via [`Editor::for_each_cursor`].
+    fn insert_register_text(&mut self, text: &str) {
+        let at = self.cursor_char();
+        self.buffer_mut().insert(at, text);
+        self.buffer_mut().normalize();
+        self.buffer_mut().modified = true;
+        // Land past the inserted text so continued typing follows it. Insert-mode
+        // placement (`set_cursor_char_insert`) lets the cursor sit at end-of-line.
+        self.set_cursor_char_insert(at + text.len());
     }
 
     /// Insert a tab at the cursor. The width it advances by is the buffer's

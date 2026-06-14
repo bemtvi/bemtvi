@@ -213,7 +213,13 @@ Wire the prefix end-to-end so the auto-population from Phase 1 becomes reachable
 
 - Visual-block-aware (blockwise) register paste — deferred with visual-block mode.
 - Macro recording/replay (`q` / `@`) — reuses the store but is a separate engine.
-- `:registers` interactive paste UI / `<C-r>` in insert & command-line mode
-  (insert-mode register paste is a natural Phase 4.5 follow-up if wanted).
+- `:registers` interactive paste UI. (Insert- & command-line-mode `<C-r>{register}`
+  has since landed — `<C-r>` arms an `awaiting_register` flag, the next key names the
+  register, and `handle_insert` / `handle_command` insert `register_text` at the
+  cursor; insert-mode insertion is verbatim, so a linewise register's trailing newline
+  splits the line. The `<C-r><C-w>` pseudo-register inserts the word under the cursor
+  (`word_under_cursor`, shared with `*`/`#`) instead of a register. Tests:
+  `registers::ctrl_r_*`. Still unwired: the `<C-r><C-r>`/`<C-r><C-o>`/`<C-r><C-p>`
+  literal/indent variants and `<C-r><C-a>` (WORD) / `<C-r><C-f>` (filename).)
 - `clipboard=unnamed` (vs `unnamedplus`) nuance and X11 PRIMARY vs CLIPBOARD
   (`"*` vs `"+`) split — both map to one provider in v1.

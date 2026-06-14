@@ -252,3 +252,125 @@ async fn last_insert_register_is_read_only() {
     feed(&rpc, "\".dd");
     assert_eq!(lines(&rpc).await, vec!["abc"]);
 }
+
+// ---- Insert-mode `<C-r>{register}` (insert a register's contents) -----------
+
+#[tokio::test]
+async fn ctrl_r_inserts_named_register_in_insert_mode() {
+    let (rpc, _incoming) = start(None).await;
+    // Yank "alpha" charwise into register `a`, then on a fresh line type "x" and
+    // pull the register in after it with `<C-r>a`.
+    feed(&rpc, "ialpha<Esc>");
+    feed(&rpc, "0\"ayiw");
+    feed(&rpc, "ox<C-r>a<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "xalpha"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_with_linewise_register_inserts_trailing_newline() {
+    let (rpc, _incoming) = start(None).await;
+    // A linewise register (`"ayy`) carries a trailing newline, so `<C-r>a` inserts
+    // it verbatim — splitting the line after the register's contents, like vim.
+    feed(&rpc, "ialpha<Esc>");
+    feed(&rpc, "\"ayy");
+    feed(&rpc, "ox<C-r>a<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "xalpha", ""]);
+}
+
+#[tokio::test]
+async fn ctrl_r_inserts_unnamed_register() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    // `yiw` fills the unnamed register with "foo"; `<C-r>"` re-inserts it.
+    feed(&rpc, "yiw");
+    feed(&rpc, "A bar <C-r>\"<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["foo bar foo"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_lands_cursor_after_inserted_text() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iab<Esc>");
+    feed(&rpc, "yiw"); // unnamed = "ab"
+                       // Insert at the start, pull in the register, then keep typing: the new text
+                       // must land *after* the inserted register contents, not inside it.
+    feed(&rpc, "I<C-r>\"X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["abXab"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_then_esc_inserts_nothing() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    feed(&rpc, "yiw");
+    // `<C-r>` then `<Esc>` aborts the register pick, leaving the typed text intact
+    // and no register content inserted.
+    feed(&rpc, "ox<C-r><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["foo", "x"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_inserts_register_in_command_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "0yiw"); // unnamed = "hello"
+                        // In the `:` command line, `<C-r>"` pulls the unnamed register in, building
+                        // `:s/hello/HI/` so the substitution runs against the yanked word.
+    feed(&rpc, ":s/<C-r>\"/HI/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["HI world"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_in_search_line_finds_yanked_word() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo bar foo<Esc>");
+    feed(&rpc, "0yiw"); // unnamed = "foo"
+                        // Search for the yanked word via `<C-r>"` in the `/` line; the cursor jumps
+                        // to the next match (the second "foo").
+    feed(&rpc, "/<C-r>\"<CR>");
+    assert_eq!(cursor(&rpc).await, (1, 8));
+}
+
+#[tokio::test]
+async fn ctrl_r_ctrl_w_inserts_word_under_cursor_in_insert_mode() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoobar baz<Esc>");
+    // Cursor back on "foobar"; `i<C-r><C-w>` pulls the word under the cursor in at
+    // the insert point (no register involved).
+    feed(&rpc, "0i<C-r><C-w><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["foobarfoobar baz"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_ctrl_w_inserts_word_under_cursor_in_command_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo bar<Esc>");
+    feed(&rpc, "0"); // cursor on "foo"
+                     // `<C-r><C-w>` in the `:s` line pulls in the word under the buffer cursor,
+                     // building `:s/foo/X/`.
+    feed(&rpc, ":s/<C-r><C-w>/X/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["X bar"]);
+}
+
+#[tokio::test]
+async fn ctrl_r_ctrl_w_in_search_finds_word_under_cursor() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo bar foo<Esc>");
+    feed(&rpc, "0"); // cursor on the first "foo"
+                     // `/<C-r><C-w><CR>` searches for the word under the cursor — like `*`,
+                     // landing on the next "foo".
+    feed(&rpc, "/<C-r><C-w><CR>");
+    assert_eq!(cursor(&rpc).await, (1, 8));
+}
+
+#[tokio::test]
+async fn ctrl_r_insert_is_dot_repeatable() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>");
+    feed(&rpc, "yiw"); // unnamed = "foo"
+                       // `o<C-r>"<Esc>` opens a line holding "foo"; `.` repeats the whole insert
+                       // session — register pull included — building another "foo" line.
+    feed(&rpc, "o<C-r>\"<Esc>");
+    feed(&rpc, ".");
+    assert_eq!(lines(&rpc).await, vec!["foo", "foo", "foo"]);
+}

@@ -235,8 +235,9 @@ than silently approximated:
   `<BS>` trims). `register_text`/`register_mirror` expose it as the charwise `".`
   (read-only, so `".dd` aborts via the existing `is_readonly_register('.')`), and
   `is_register_name` now accepts `.`. So `".p` and `vim.fn.getreg('.')` return the
-  last inserted text. (Insert-mode `<C-r>.` is *not* wired — `handle_insert` has no
-  `<C-r>` register-paste path yet — so that remains out of scope.)
+  last inserted text. (Insert-mode `<C-r>` register insertion later landed too — see
+  the registers plan — so `<C-r>.` now re-inserts the last-insert text; being part of
+  the insert session, it dot-repeats with the rest of the session.)
 - **Faithful visual-mode dot-repeat.** — ✅ landed. A visual `d`/`c` is now
   size-faithful: `visual_operate` calls `capture_visual_shape`, which synthesizes a
   reselect-and-operate key stream (`v`/`V` + `j`×rows + `l`×cols + op, columns

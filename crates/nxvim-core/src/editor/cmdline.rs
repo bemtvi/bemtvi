@@ -70,6 +70,24 @@ impl Editor {
             self.handle_confirm(key);
             return;
         }
+        // `<C-r>{register}`: the keystroke after `<C-r>` names the register whose
+        // text is inserted at the command cursor. A non-register key cancels,
+        // inserting nothing (vim).
+        if self.awaiting_register {
+            self.awaiting_register = false;
+            if key.ctrl && key.code == KeyCode::Char('w') {
+                // `<C-r><C-w>`: the word under the buffer cursor, not a register.
+                if let Some(word) = self.word_under_cursor() {
+                    self.cmdline_insert_str(&word);
+                }
+            } else if let Some(name) = key.as_char() {
+                self.cmdline_insert_register(name);
+            }
+            if let CmdlineKind::Search(dir) = self.cmdline_kind {
+                self.update_incsearch_preview(dir);
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.cancel_cmdline();
@@ -127,6 +145,9 @@ impl Editor {
             KeyCode::Down => self.cmdline_history_next(),
             KeyCode::Char('p') if key.ctrl => self.cmdline_history_prev(),
             KeyCode::Char('n') if key.ctrl => self.cmdline_history_next(),
+            // `<C-r>` arms register insertion: the next key (handled at the top of
+            // this fn) names the register to pull into the command line.
+            KeyCode::Char('r') if key.ctrl => self.awaiting_register = true,
             KeyCode::Char(c) if !key.ctrl => self.cmdline_insert(c),
             _ => {}
         }
@@ -264,6 +285,27 @@ impl Editor {
     fn cmdline_insert(&mut self, c: char) {
         self.cmdline.insert(self.cmdline_col, c);
         self.cmdline_col += c.len_utf8();
+    }
+
+    /// Insert the named register's text at the command cursor — the command-line
+    /// `<C-r>{register}`. An empty / absent register inserts nothing. The command
+    /// line is a single editable line, so embedded newlines (a linewise register's
+    /// trailing break, or a multi-line yank) are dropped rather than splitting it.
+    fn cmdline_insert_register(&mut self, name: char) {
+        let Some((text, _kind)) = self.register_text(Some(name)) else {
+            return;
+        };
+        self.cmdline_insert_str(&text);
+    }
+
+    /// Insert each char of `text` at the command cursor. The command line is a
+    /// single editable line, so embedded newlines (a linewise register's trailing
+    /// break, or a multi-line yank) are dropped rather than splitting it. Shared
+    /// by `<C-r>{register}` and `<C-r><C-w>`.
+    fn cmdline_insert_str(&mut self, text: &str) {
+        for c in text.chars().filter(|&c| c != '\n') {
+            self.cmdline_insert(c);
+        }
     }
 
     /// Delete the char before the command cursor (`<BS>`); a no-op at the start.

@@ -659,6 +659,12 @@ pub struct Editor {
     /// key, so only Tab-inserted spaces collapse a whole unit on backspace —
     /// hand-typed spaces always delete one at a time. `None` outside that window.
     soft_tab: Option<(usize, usize)>,
+    /// Set by `<C-r>` in Insert / Command mode: the *next* keystroke names the
+    /// register whose text is inserted at the cursor (vim's "insert a register"),
+    /// then the flag clears. A non-register key (e.g. `<Esc>`) cancels, inserting
+    /// nothing. Shared across both modes since only one is active at a time. See
+    /// [`Editor::handle_insert`] / [`Editor::handle_command`].
+    awaiting_register: bool,
     visual_anchor: Cursor,
     /// State for the in-flight left-button gesture: the multi-click counter that
     /// escalates char → word → line on same-cell presses within `'mousetime'`, and
@@ -950,6 +956,7 @@ impl Editor {
             snapshot_taken: false,
             now_mono: 0,
             soft_tab: None,
+            awaiting_register: false,
             visual_anchor: Cursor::default(),
             mouse_select: None,
             mouse_resize: None,

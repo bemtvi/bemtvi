@@ -216,7 +216,11 @@ impl Editor {
     /// The keyword (alphanumerics + `_`) under the cursor, or the next one on the
     /// line if the cursor sits on a non-word char; `None` if the line has none
     /// from the cursor on. Drives `*`/`#`.
-    fn word_under_cursor(&self) -> Option<String> {
+    /// The keyword (`[A-Za-z0-9_]`) the cursor sits on, or the next one to its
+    /// right on the same line — vim's `<cword>`. Backs `*`/`#` search and the
+    /// `<C-r><C-w>` register-insert pseudo-register. `None` when no keyword
+    /// follows the cursor on the line.
+    pub(crate) fn word_under_cursor(&self) -> Option<String> {
         let line = self.buffer().line(self.cursor.line);
         let chars: Vec<(usize, char)> = line.char_indices().collect();
         let is_word = |c: char| c.is_alphanumeric() || c == '_';

@@ -129,7 +129,14 @@ struct Sink {
     /// [`eh_proc_spawned`] / [`eh_proc_exited`]. Only ever enqueued in a daemon session
     /// (the tick gates on [`daemon_connected`](Sink::daemon_connected)).
     #[allow(clippy::type_complexity)]
-    proc_spawns: Vec<(u64, Vec<String>, Option<String>, Vec<(String, String)>, Vec<u8>)>,
+    proc_spawns: Vec<(
+        u64,
+        Vec<String>,
+        Option<String>,
+        Vec<(String, String)>,
+        Vec<u8>,
+        bool,
+    )>,
     /// Ids the editor asked to **kill** (`handle:kill()`), recorded by
     /// [`proc_kill`](HostEffects::proc_kill); the disarm twin of
     /// [`proc_spawns`](Sink::proc_spawns), drained by [`eh_take_proc_requests`] for the
@@ -411,16 +418,19 @@ impl HostEffects for WasmEffects {
         cwd: Option<String>,
         env: Vec<(String, String)>,
         stdin: Vec<u8>,
+        stream: bool,
     ) {
         // An async `vim.system` / `jobstart` against the daemon (Phase 6d): record the
         // spawn for the Worker to forward over WebTransport (`eh_take_proc_requests` →
         // `proc_spawn`). The child's pid/exit return via `eh_proc_spawned` / `eh_proc_exited`
-        // — the wasm twin of the daemon's `proc_spawned`/`proc_exited` pushes. Only reached
-        // when a daemon is connected (the tick gates on `has_remote_proc`).
+        // — the wasm twin of the daemon's `proc_spawned`/`proc_exited` pushes. A streaming
+        // spawn (`nx.spawn`'s `on_stdout`, e.g. a picker source) also streams stdout back
+        // inbound via `eh_proc_stdout`. Only reached when a daemon is connected (the tick
+        // gates on `has_remote_proc`).
         self.sink
             .borrow_mut()
             .proc_spawns
-            .push((id, cmd, cwd, env, stdin));
+            .push((id, cmd, cwd, env, stdin, stream));
     }
 
     fn proc_kill(&mut self, id: u64) {
@@ -1029,13 +1039,14 @@ pub unsafe extern "C" fn eh_take_proc_requests(h: *mut WasmEditHost) -> *mut c_c
     let mut sink = handle.sink.borrow_mut();
     let spawn: Vec<serde_json::Value> = std::mem::take(&mut sink.proc_spawns)
         .into_iter()
-        .map(|(id, argv, cwd, env, stdin)| {
+        .map(|(id, argv, cwd, env, stdin, stream)| {
             serde_json::json!({
                 "id": id,
                 "argv": argv,
                 "cwd": cwd,
                 "env": env.into_iter().map(|(k, v)| vec![k, v]).collect::<Vec<_>>(),
                 "stdin": stdin,
+                "stream": stream,
             })
         })
         .collect();
@@ -1055,6 +1066,20 @@ pub unsafe extern "C" fn eh_proc_spawned(h: *mut WasmEditHost, id: f64, pid: f64
     if let Some(handle) = h.as_mut() {
         handle.host.proc_spawned(id.max(0.0) as u64, pid as i64);
     }
+}
+
+/// Land a daemon `proc_stdout` push: a streaming child (`nx.spawn`'s `on_stdout`, e.g. a
+/// picker source) emitted a batch of stdout lines. `lines_json` is a JSON array of strings
+/// (the lines, newline-stripped); fires the persistent `on_stdout` under `id`, then settles
+/// + repaints so streamed rows appear as they arrive. See [`EditHost::proc_stdout`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `lines_json` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_proc_stdout(h: *mut WasmEditHost, id: f64, lines_json: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    let lines: Vec<String> = serde_json::from_str(as_str(lines_json)).unwrap_or_default();
+    handle.host.proc_stdout(id.max(0.0) as u64, lines);
 }
 
 /// Land a daemon `proc_exited` push: run the spawn `id`'s `vim.system` `on_exit` with the

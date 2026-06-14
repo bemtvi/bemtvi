@@ -60,7 +60,7 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
-pub use self::menu::MenuPlacement;
+pub use self::menu::{MenuExtent, MenuItem, MenuPlacement};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -720,10 +720,16 @@ pub struct Editor {
     /// picker / completion surface). Grabs input focus like the panel, but floats
     /// over the text. See [`menu`](crate::editor::MenuPlacement).
     menu: Option<menu::Menu>,
-    /// Resolved menu outcomes: `Some(index)` (0-based) when the user confirmed a
-    /// row, `None` on cancel. Drained by the server to deliver the `nx.ui.select`
-    /// result to its callback — the menu analogue of [`Editor::prompt_results`].
+    /// Resolved menu outcomes: `Some(key)` when the user confirmed a row (the
+    /// source key — a `select` choice index, or a picker item's wrapper key),
+    /// `None` on cancel. Drained by the server to deliver the result to its
+    /// callback — the menu analogue of [`Editor::prompt_results`].
     pub menu_results: Vec<Option<usize>>,
+    /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
+    /// query)`. A *static* source never appends here — the local fuzzy matcher
+    /// handles its query edits in core. Drained by the server, which stamps the
+    /// generation onto the source run + its pushes so a stale response is dropped.
+    pub picker_query_changes: Vec<(u64, String)>,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -1118,6 +1124,7 @@ impl Editor {
             panel_selects: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
+            picker_query_changes: Vec::new(),
             should_quit: false,
             options: Options::default(),
             highlights: Highlights::new(),

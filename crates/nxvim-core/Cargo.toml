@@ -28,5 +28,6 @@ ropey.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
 regex.workspace = true
+nucleo-matcher.workspace = true
 nxvim-regex = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

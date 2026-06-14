@@ -303,6 +303,58 @@ impl EditHost {
                 .open_menu(req.items, nxvim_core::MenuPlacement::Cursor, 0);
             self.pending_ui_select = Some(req.cb_id);
         }
+        // `nx.picker.open`: open the centered fuzzy-finder widget and kick the
+        // source's initial run (generation 0, empty query). The source streams
+        // candidates back as `picker_pushes` (drained just below) — synchronously
+        // for an in-memory source like `buffers`, or later via `on_stdout` for a
+        // process source. The chosen item / cancel comes back on `menu_results`,
+        // routed to the picker by `picker_active` (a picker and a `ui.select` are
+        // the same widget, mutually exclusive).
+        for req in self.lua.take_picker_opens() {
+            self.editor.open_picker(
+                nxvim_core::MenuPlacement::Editor,
+                req.dynamic,
+                parse_menu_extent(&req.width),
+                parse_menu_extent(&req.height),
+            );
+            self.pending_ui_select = None;
+            self.picker_active = true;
+            // Kick the source's initial run (generation 0, empty query) through the
+            // same `picker_query_changes` channel a dynamic query edit uses, rather
+            // than running it inline here: the settle fixpoint drains that channel
+            // and re-runs `apply_lua_effects` after, so the `nx.spawn` the source
+            // queues (already past this pass's `take_loop_ops`) actually starts.
+            self.editor.picker_query_changes.push((0, String::new()));
+        }
+        // Picker candidates streamed in: feed them into the open widget,
+        // generation-gated — a batch from a query the user has already typed past
+        // (`gen` behind the live generation) is dropped, never shown. Coalesced
+        // into one `menu_push` so the local matcher re-ranks once per drain.
+        let pushes = self.lua.take_picker_pushes();
+        if !pushes.is_empty() {
+            let live = self.editor.menu_generation();
+            let items: Vec<nxvim_core::MenuItem> = pushes
+                .into_iter()
+                .filter(|p| p.gen == live)
+                .map(|p| nxvim_core::MenuItem {
+                    label: p.label,
+                    key: p.key,
+                })
+                .collect();
+            if !items.is_empty() {
+                // `live` is the generation: a newer one atomically replaces the
+                // still-displayed older results (no flash-empty while typing).
+                self.editor.menu_push(items, live);
+            }
+        }
+        // A source run that *completed* (`done()`): for the live query, if nothing
+        // streamed in, the query matched nothing — clear the now-stale results.
+        // Gated on the live generation so a killed older run's `done()` is ignored.
+        for gen in self.lua.take_picker_finishes() {
+            if gen == self.editor.menu_generation() {
+                self.editor.menu_finish(gen);
+            }
+        }
         // `vim.fn.confirm` button dialogs: open the command line as a single-key
         // confirm prompt and remember the callback that resumes the blocked
         // `vim.fn.confirm` coroutine. Shares the `pending_ui_input` slot and the
@@ -1043,12 +1095,14 @@ impl EditHost {
                 cwd,
                 env,
                 stdin,
+                stream,
             } => self.fx.loop_command(LoopCommand::Spawn {
                 id,
                 argv: cmd,
                 cwd,
                 env,
                 stdin,
+                stream,
             }),
             #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
@@ -1075,9 +1129,10 @@ impl EditHost {
                 cwd,
                 env,
                 stdin,
+                stream,
             } => {
                 if self.fx.has_remote_proc() {
-                    self.fx.proc_spawn(id, cmd, cwd, env, stdin);
+                    self.fx.proc_spawn(id, cmd, cwd, env, stdin, stream);
                 } else {
                     self.editor.echo(
                         "E: jobs/processes (vim.system / jobstart / vim.uv.spawn) require a \
@@ -1119,6 +1174,16 @@ impl EditHost {
                     self.editor
                         .echo(format!("E5108: Error recording process pid: {e}"));
                 }
+            }
+            LoopEvent::ProcessStdout { id, lines } => {
+                // A streaming child (`nx.spawn` with an `on_stdout`) emitted a batch
+                // of stdout lines: fire the persistent stdout callback, then drain
+                // whatever it queued (a picker source's `push` of new candidates).
+                if let Err(e) = self.lua.run_process_stdout(id, lines) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.spawn on_stdout: {e}"));
+                }
+                self.apply_lua_effects();
             }
             LoopEvent::ProcessExit {
                 id,
@@ -1271,15 +1336,37 @@ impl EditHost {
                     self.apply_lua_effects();
                 }
             }
-            // `nx.ui.select` results: a confirmed (`Some(index)`) or cancelled
-            // (`None`) menu fires the waiting callback off the same tick, inside
-            // the fixpoint (the callback may open another menu / queue lua). The
-            // pending id is taken — one menu at a time.
+            // Picker prompt edits on a **dynamic** source: re-run the source for
+            // the new query. Drained *before* `menu_results` and *before* the
+            // candidate pushes (which `apply_lua_effects` already gated on the live
+            // generation) — the generation was bumped synchronously in core on the
+            // keystroke, so a late push from the superseded run is already dropped.
+            // Running the source reaps the prior job (`on_cancel`) Lua-side.
+            for (gen, query) in std::mem::take(&mut self.editor.picker_query_changes) {
+                if let Err(e) = self.lua.run_picker_run(gen, &query) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.picker source: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            // Float-list widget results: a confirmed (`Some(key)`) or cancelled
+            // (`None`) outcome fires the waiting consumer off the same tick, inside
+            // the fixpoint (it may open another widget / queue lua). A `nx.picker`
+            // routes to its source (`run_picker_result`, which closes the active
+            // picker); a `nx.ui.select` routes to its pending callback. One widget
+            // is open at a time, so the two are mutually exclusive.
             for result in std::mem::take(&mut self.editor.menu_results) {
                 if let Some(id) = self.pending_ui_select.take() {
                     if let Err(e) = self.lua.run_ui_select(id, result) {
                         self.editor
                             .echo(format!("E5108: Error in nx.ui.select callback: {e}"));
+                    }
+                    self.apply_lua_effects();
+                } else if self.picker_active {
+                    self.picker_active = false;
+                    if let Err(e) = self.lua.run_picker_result(result) {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.picker confirm: {e}"));
                     }
                     self.apply_lua_effects();
                 }
@@ -1301,6 +1388,7 @@ impl EditHost {
                 && self.editor.panel_selects.is_empty()
                 && self.editor.prompt_results.is_empty()
                 && self.editor.menu_results.is_empty()
+                && self.editor.picker_query_changes.is_empty()
                 && self.scheduled.is_empty()
                 && !self.editor.has_pending_checktime()
             {
@@ -1315,6 +1403,7 @@ impl EditHost {
                 self.editor.panel_selects.clear();
                 self.editor.prompt_results.clear();
                 self.editor.menu_results.clear();
+                self.editor.picker_query_changes.clear();
                 self.editor.take_pending_checktime();
                 self.scheduled.clear();
                 self.editor
@@ -1373,4 +1462,27 @@ fn hl_def(hl: &HlSet) -> HlDef {
         reverse: hl.reverse,
         link: hl.link.clone(),
     }
+}
+
+/// Parse a `nx.picker` size spec into a [`MenuExtent`](nxvim_core::MenuExtent), or
+/// `None` (use the picker default) for an empty / unparseable spec. A bare integer
+/// is a cell count (`"100"`); a `vw` / `vh` / `%` suffix is a CSS-style viewport
+/// fraction (`"80vw"` → 80% of the viewport dimension), clamped to a sane range.
+fn parse_menu_extent(spec: &str) -> Option<nxvim_core::MenuExtent> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let frac = spec
+        .strip_suffix("vw")
+        .or_else(|| spec.strip_suffix("vh"))
+        .or_else(|| spec.strip_suffix('%'));
+    if let Some(num) = frac {
+        return num
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| nxvim_core::MenuExtent::Frac((n / 100.0).clamp(0.1, 1.0)));
+    }
+    spec.parse::<u16>().ok().map(nxvim_core::MenuExtent::Cells)
 }

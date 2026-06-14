@@ -59,6 +59,8 @@
   .pmenu { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; }
   .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
   .pmenu-sel { background: var(--sel); color: #e6e6e6; }
+  .pmenu-match { color: #e5c07b; font-weight: bold; }
+  .pmenu-prompt { color: #abb2bf; }
   .pmenu-doc { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; color: var(--status-fg); }
   .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
@@ -992,19 +994,53 @@
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
       const x = rect.x + menu.col;
       const y = tablineRows + rect.y + menu.row;
-      const rows = Math.max(1, Math.min(menu.height, menu.items.length));
-      const first = Math.max(0, Math.min(menu.selected - rows + 1, menu.items.length - rows));
-      const start = menu.selected >= rows ? first : 0;
+      // A picker carries a prompt query (even when empty); a nx.ui.select does not.
+      const hasPrompt = menu.query !== null && menu.query !== undefined;
+      const promptRows = hasPrompt ? 1 : 0;
+      // Render the FULL box height (`menu.height` is the fixed picker size), padding
+      // empty rows past the item count so the box doesn't shrink to its content.
+      const listRows = Math.max(1, menu.height - promptRows);
+      const first = Math.max(0, Math.min(menu.selected - listRows + 1, menu.items.length - listRows));
+      const start = menu.selected >= listRows ? first : 0;
       const box = document.createElement("div");
       box.className = "pmenu";
-      place(box, x, y, menu.width, rows);
-      for (let i = 0; i < rows; i++) {
+      place(box, x, y, menu.width, listRows + promptRows);
+      if (hasPrompt) {
+        const text = ("> " + menu.query).slice(0, menu.width).padEnd(menu.width);
+        const promptEl = document.createElement("div");
+        promptEl.className = "row pmenu-prompt";
+        promptEl.style.width = menu.width * cw + "px";
+        promptEl.style.fontWeight = "bold";
+        promptEl.textContent = text;
+        box.appendChild(promptEl);
+      }
+      for (let i = 0; i < listRows; i++) {
         const idx = start + i;
-        const text = String(menu.items[idx] ?? "").slice(0, menu.width).padEnd(menu.width);
+        const label = String(menu.items[idx] ?? "");
         const rowEl = document.createElement("div");
         rowEl.className = "row" + (idx === menu.selected ? " pmenu-sel" : "");
         rowEl.style.width = menu.width * cw + "px";
-        rowEl.textContent = text;
+        // Bold + accent the matched characters (the fuzzy match), per the server's
+        // char-based spans; plain text when this picker/select has no spans.
+        const spans = (menu.match_spans && menu.match_spans[idx]) || [];
+        const chars = [...label].slice(0, menu.width);
+        if (spans.length === 0) {
+          rowEl.textContent = chars.join("").padEnd(menu.width);
+        } else {
+          chars.forEach((chr, ci) => {
+            const matched = spans.some(([s, e]) => ci >= s && ci < e);
+            if (matched) {
+              const m = document.createElement("span");
+              m.className = "pmenu-match";
+              m.textContent = chr;
+              rowEl.appendChild(m);
+            } else {
+              rowEl.appendChild(document.createTextNode(chr));
+            }
+          });
+          const pad = menu.width - chars.length;
+          if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
+        }
         box.appendChild(rowEl);
       }
       gridEl.appendChild(box);

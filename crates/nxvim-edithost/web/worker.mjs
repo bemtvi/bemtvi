@@ -49,6 +49,9 @@ const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number"
 const eh_set_daemon_connected = M.cwrap("eh_set_daemon_connected", null, ["number", "number"]);
 const eh_take_proc_requests = M.cwrap("eh_take_proc_requests", "number", ["number"]);
 const eh_proc_spawned = M.cwrap("eh_proc_spawned", null, ["number", "number", "number"]);
+// Streaming stdout (`nx.spawn`'s `on_stdout`): the daemon pushes `proc_stdout` batches; the
+// lines ride as a JSON string array (newline-stripped) into the Lua callback.
+const eh_proc_stdout = M.cwrap("eh_proc_stdout", null, ["number", "number", "string"]);
 const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "number", "number", "number", "number", "number"]);
 // Treesitter `:TSInstall` leg: the editor enqueues each install off-tick; the Worker
 // forwards it to the UI thread (web-tree-sitter lives there), which fetches/caches/registers
@@ -512,6 +515,13 @@ function applyDaemonNotifications() {
       const pid = params[1];
       eh_proc_spawned(h, Number(id), pid == null ? -1 : Number(pid));
       any = true;
+    } else if (method === "proc_stdout") {
+      // params = [id, lines(array of str)] — a streaming child's stdout batch
+      // (`nx.spawn`'s `on_stdout`). Hand the lines to the Lua callback as JSON.
+      const id = params[0];
+      const lines = Array.isArray(params[1]) ? params[1].map(String) : [];
+      eh_proc_stdout(h, Number(id), JSON.stringify(lines));
+      any = true;
     } else if (method === "proc_exited") {
       // params = [id, code, stdout(bin), stderr(bin)] — a killed child arrives as code -1.
       const id = params[0];
@@ -560,7 +570,11 @@ async function drainProcRequests() {
   if (!daemon) return; // defensive: the tick shouldn't enqueue a spawn without a daemon
   for (const s of reqs.spawn) {
     liveProcs.add(s.id);
-    await daemon.notify("proc_spawn", [s.id, s.argv, s.cwd ?? null, s.env, new Uint8Array(s.stdin)]);
+    // The 6th param is the stream flag (the daemon's `decode_spawn` reads it):
+    // a streaming spawn (`nx.spawn`'s `on_stdout`) gets `proc_stdout` batches back.
+    await daemon.notify("proc_spawn", [
+      s.id, s.argv, s.cwd ?? null, s.env, new Uint8Array(s.stdin), s.stream === true,
+    ]);
   }
   for (const id of reqs.kill) await daemon.notify("proc_kill", [id]);
 }

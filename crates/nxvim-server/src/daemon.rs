@@ -169,6 +169,7 @@ const WATCH_POLL: Duration = Duration::from_millis(200);
 const PROC_SPAWN: &str = "proc_spawn";
 const PROC_KILL: &str = "proc_kill";
 const PROC_SPAWNED: &str = "proc_spawned";
+const PROC_STDOUT: &str = "proc_stdout";
 const PROC_EXITED: &str = "proc_exited";
 
 // The blocking-system leg (`sys_run`): a request/response shell-out that runs to
@@ -202,6 +203,8 @@ const LUAFS: &str = "luafs";
 enum DaemonEvent {
     /// The child is running (or failed to spawn — `None` pid).
     Spawned(Option<u32>),
+    /// A streaming child emitted a batch of stdout lines (`nx.spawn`'s `on_stdout`).
+    Stdout(Vec<String>),
     /// The child exited (`code = -1` on spawn failure or a kill).
     Exited {
         code: i32,
@@ -292,6 +295,11 @@ impl HostProc for RemoteHostProc {
                                 e.spawned(pid);
                             }
                         }
+                        Some(DaemonEvent::Stdout(lines)) => {
+                            if let Some(e) = &events {
+                                e.stdout(lines);
+                            }
+                        }
                         Some(DaemonEvent::Exited { code, stdout, stderr }) => {
                             if let Some(e) = events.take() {
                                 e.exited(code, stdout, stderr);
@@ -327,6 +335,11 @@ async fn run_demux(mut incoming: UnboundedReceiver<Incoming>, inflight: Inflight
         match method.as_str() {
             PROC_SPAWNED => {
                 if let Some((id, ev)) = decode_spawned(&params) {
+                    forward(&inflight, id, ev);
+                }
+            }
+            PROC_STDOUT => {
+                if let Some((id, ev)) = decode_stdout(params) {
                     forward(&inflight, id, ev);
                 }
             }
@@ -384,6 +397,13 @@ pub async fn serve_proc_daemon_on(
                     vec![
                         Value::from(id),
                         pid.map_or(Value::Nil, |p| Value::from(p as u64)),
+                    ],
+                ),
+                LoopEvent::ProcessStdout { id, lines } => reply.notify(
+                    PROC_STDOUT,
+                    vec![
+                        Value::from(id),
+                        Value::Array(lines.into_iter().map(Value::from).collect()),
                     ],
                 ),
                 LoopEvent::ProcessExit {
@@ -448,6 +468,7 @@ fn encode_spawn(id: u64, spec: ProcSpec) -> Vec<Value> {
         cwd,
         env,
         stdin,
+        stream,
     } = spec;
     vec![
         Value::from(id),
@@ -459,6 +480,7 @@ fn encode_spawn(id: u64, spec: ProcSpec) -> Vec<Value> {
                 .collect(),
         ),
         Value::Binary(stdin),
+        Value::from(stream),
     ]
 }
 
@@ -496,6 +518,9 @@ fn decode_spawn(mut params: Vec<Value>) -> Option<(u64, ProcSpec)> {
         Value::Binary(b) => b,
         _ => Vec::new(),
     };
+    // `stream` (6th param) may be absent from an older peer's frame — default
+    // false (the one-shot `vim.system` shape).
+    let stream = params.get(5).and_then(Value::as_bool).unwrap_or(false);
     Some((
         id,
         ProcSpec {
@@ -503,6 +528,7 @@ fn decode_spawn(mut params: Vec<Value>) -> Option<(u64, ProcSpec)> {
             cwd,
             env,
             stdin,
+            stream,
         },
     ))
 }
@@ -512,6 +538,19 @@ fn decode_spawned(params: &[Value]) -> Option<(u64, DaemonEvent)> {
     let id = params.first()?.as_u64()?;
     let pid = params.get(1).and_then(Value::as_u64).map(|p| p as u32);
     Some((id, DaemonEvent::Spawned(pid)))
+}
+
+/// `proc_stdout` params → `(id, Stdout)` — a streaming child's batch of stdout lines.
+fn decode_stdout(mut params: Vec<Value>) -> Option<(u64, DaemonEvent)> {
+    let id = params.first()?.as_u64()?;
+    let lines = match params.get_mut(1).map(|v| std::mem::replace(v, Value::Nil)) {
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some((id, DaemonEvent::Stdout(lines)))
 }
 
 /// `proc_exited` params → `(id, Exited)`. Moves the captured output out of `params`.
@@ -2326,6 +2365,11 @@ async fn run_client_demux(
         match method.as_str() {
             PROC_SPAWNED => {
                 if let Some((id, ev)) = decode_spawned(&params) {
+                    forward(&proc_inflight, id, ev);
+                }
+            }
+            PROC_STDOUT => {
+                if let Some((id, ev)) = decode_stdout(params) {
                     forward(&proc_inflight, id, ev);
                 }
             }

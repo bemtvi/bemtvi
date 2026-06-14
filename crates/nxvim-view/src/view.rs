@@ -328,6 +328,13 @@ pub struct MenuData {
     pub col: u16,
     pub width: u16,
     pub height: u16,
+    /// The picker prompt query — `Some` (even when empty) for a `nx.picker`,
+    /// `None` for a promptless `nx.ui.select`. Presence tells the client to draw a
+    /// prompt row above the list.
+    pub query: Option<String>,
+    /// Per visible row (parallel to `items`), the matched-character spans to
+    /// highlight as half-open **char** ranges (empty for rows with no match).
+    pub match_spans: Vec<Vec<(u16, u16)>>,
 }
 
 /// One tabline cell mirrored from the server's redraw: the buffer label, its
@@ -467,6 +474,10 @@ impl View {
                 col: map_u16(m, "col"),
                 width: map_u16(m, "width"),
                 height: map_u16(m, "height"),
+                query: map_get(m, "query")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                match_spans: parse_multi_spans(map_get(m, "match_spans")),
             }),
             _ => None,
         };

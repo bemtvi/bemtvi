@@ -17,9 +17,9 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
-    HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs,
-    RegisterSetOp, SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq,
-    WindowOp,
+    HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush,
+    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq,
+    UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -296,6 +296,8 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.promise / nx.async — Promises/A+ over the microtask (nx.schedule) and
     // timer (nx.timer) primitives installed just above.
     ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
+    // nx.picker: the fuzzy finder (sources + open) over the float-list widget.
+    ("nxvim:prelude/picker", include_str!("prelude/picker.lua")),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
@@ -364,6 +366,17 @@ pub(crate) struct Shared {
     /// `nx.ui.select` requests, drained by the server into the editor's floating
     /// selectable-list widget (`Editor::open_menu`) after the chunk.
     pub(crate) ui_selects: Vec<UiSelectReq>,
+    /// `nx.picker.open` requests, drained by the server into the editor's fuzzy
+    /// finder (`Editor::open_picker`) after the chunk.
+    pub(crate) picker_opens: Vec<PickerOpenReq>,
+    /// Streamed picker candidates (`nx.picker` source `push`), drained by the
+    /// server (generation-gated) into `Editor::menu_push` after the chunk / a
+    /// streaming `on_stdout`.
+    pub(crate) picker_pushes: Vec<PickerPush>,
+    /// Generations whose source run has completed (`done()`), drained by the server
+    /// into `Editor::menu_finish` so a query that matched nothing clears the now
+    /// stale results (one that matched swaps them via `picker_pushes` instead).
+    pub(crate) picker_finishes: Vec<u64>,
     /// `vim.fn.confirm` button-dialog requests, drained by the server into the
     /// editor's command line (`Editor::open_confirm`) after the chunk.
     pub(crate) confirms: Vec<ConfirmReq>,
@@ -763,6 +776,24 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the `nx.picker.open` requests queued since the last drain, for the
+        /// server to open as fuzzy-finder widgets.
+        take_picker_opens -> Vec<PickerOpenReq> = picker_opens
+    }
+
+    take_queue! {
+        /// Take the picker candidates streamed since the last drain, for the server
+        /// to feed (generation-gated) into the open picker.
+        take_picker_pushes -> Vec<PickerPush> = picker_pushes
+    }
+
+    take_queue! {
+        /// Take the completed source generations since the last drain, for the
+        /// server to settle the open picker (clear a now-empty query's stale rows).
+        take_picker_finishes -> Vec<u64> = picker_finishes
+    }
+
+    take_queue! {
         /// Take the `vim.fn.confirm` button-dialog requests queued since the last
         /// drain, for the server to open as command-line confirm prompts.
         take_confirms -> Vec<ConfirmReq> = confirms
@@ -829,6 +860,31 @@ impl LuaRuntime {
         run.call::<()>((id, false, arg))
     }
 
+    /// Run the active `nx.picker` source for generation `gen` with the prompt
+    /// `query` (`nx._picker_run`). Cancels the previous run (`on_cancel`), resets
+    /// the source's per-generation item array, and invokes its `items(ctx, push,
+    /// done)`; the `push`es land back as [`PickerPush`](crate::ops::PickerPush)es.
+    /// Called on open (`gen 0`, empty query) and on each dynamic query edit.
+    pub fn run_picker_run(&self, gen: u64, query: &str) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_picker_run")?;
+        run.call::<()>((lua_int(gen as i64), query.to_string()))
+    }
+
+    /// Deliver the picker's outcome to the active source: the chosen item's
+    /// **`key`** (the 1-based wrapper index — `Some`) confirms, `nil` (`None`)
+    /// cancels (`nx._picker_result`). The wrapper resolves `key` to the original
+    /// item and calls the source's `confirm(item)`, then clears the active picker.
+    pub fn run_picker_result(&self, key: Option<usize>) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_picker_result")?;
+        let arg = match key {
+            Some(k) => mlua::Value::Integer(lua_int(k as i64)),
+            None => mlua::Value::Nil,
+        };
+        run.call::<()>((arg,))
+    }
+
     /// Dispatch an LSP code-action `command` (Phase 8): runs
     /// `nx.lsp._dispatch_command(client_id, command)`, which routes to a
     /// client-side `vim.lsp.commands[name]` handler when registered, else issues a
@@ -878,6 +934,17 @@ impl LuaRuntime {
                 run.call::<()>((id, keep, err, result))
             }
         }
+    }
+
+    /// Fire a streaming child's `on_stdout` callback with the latest batch of
+    /// stdout `lines` (`nx._run_stdout(id, lines)`). Persistent (not a one-shot):
+    /// fires once per [`LoopEvent::ProcessStdout`](crate) until the child exits,
+    /// which clears the registry entry. A no-op when no `on_stdout` is registered.
+    pub fn run_process_stdout(&self, id: u64, lines: Vec<String>) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_stdout")?;
+        let table = self.lua.create_sequence_from(lines)?;
+        run.call::<()>((id, table))
     }
 
     /// Record the OS pid of an async `vim.system` child (keyed by its callback

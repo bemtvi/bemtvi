@@ -534,6 +534,12 @@ pub struct EditHost {
     /// taken when the user confirms / cancels. Separate from `pending_ui_input`
     /// (a menu and a prompt are distinct surfaces).
     pending_ui_select: Option<u64>,
+    /// Whether the open float-list widget is a `nx.picker` (vs a `nx.ui.select`).
+    /// Set when a picker opens; cleared when it confirms / cancels. The widget's
+    /// outcome (`menu_results`) routes to the picker (`run_picker_result`) when
+    /// this is set, and to `pending_ui_select` (`run_ui_select`) otherwise — only
+    /// one float-list widget is open at a time, so the two are mutually exclusive.
+    picker_active: bool,
     /// Keys queued by `nvim_feedkeys`, drained after the input batch / off-tick
     /// settle. Each carries whether it should be remapped (the `m` flag) or fed
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
@@ -667,6 +673,7 @@ impl EditHost {
             hl_mirror_gen: None,
             pending_ui_input: None,
             pending_ui_select: None,
+            picker_active: false,
             feed_buffer: VecDeque::new(),
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),
@@ -1084,6 +1091,20 @@ impl EditHost {
             self.editor
                 .echo(format!("E5108: Error recording process pid: {e}"));
         }
+    }
+
+    /// Land a streaming child's stdout batch (the proc leg's `proc_stdout` push) — the wasm
+    /// twin of the native `on_loop_event`'s [`LoopEvent::ProcessStdout`](crate::evloop) arm.
+    /// Fires the persistent `on_stdout` callback under `id` (a picker source's `push` of new
+    /// candidates), drains the effects it queues, and settles + repaints so the streamed rows
+    /// appear as they arrive.
+    pub fn proc_stdout(&mut self, id: u64, lines: Vec<String>) {
+        if let Err(e) = self.lua.run_process_stdout(id, lines) {
+            self.editor
+                .echo(format!("E5108: Error in nx.spawn on_stdout: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
     }
 
     /// Land a daemon child's exit (the proc leg's `proc_exited` push) — the wasm entry the

@@ -1681,24 +1681,70 @@ fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let rows = inner.height as usize;
     let width = inner.width as usize;
-    let start = pmenu_start(Some(menu.selected), rows);
-    let lines: Vec<Line> = (0..inner.height)
-        .map(|r| {
-            let idx = start + r as usize;
-            let Some(label) = menu.items.get(idx) else {
-                return Line::from(" ".repeat(width));
-            };
-            let style = if idx == menu.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(pmenu_row(label, "", width), style))
-        })
-        .collect();
+    // A picker carries a prompt row at the top; the list scrolls in the rows below
+    // it. A promptless `nx.ui.select` uses the whole box for the list.
+    let prompt_rows = usize::from(menu.query.is_some());
+    let list_rows = (inner.height as usize).saturating_sub(prompt_rows);
+    let start = pmenu_start(Some(menu.selected), list_rows);
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    if let Some(query) = &menu.query {
+        // `> query` prompt line, the query in bold so it reads as the live input.
+        let mut spans = vec![Span::styled(
+            "> ",
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        spans.push(Span::styled(
+            pmenu_row(query, "", width.saturating_sub(2)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(spans));
+    }
+    for r in 0..list_rows {
+        let idx = start + r;
+        let Some(label) = menu.items.get(idx) else {
+            lines.push(Line::from(" ".repeat(width)));
+            continue;
+        };
+        let selected = idx == menu.selected;
+        let empty = Vec::new();
+        let spans = menu.match_spans.get(idx).unwrap_or(&empty);
+        lines.push(menu_row_line(label, spans, selected, width));
+    }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Build one menu row: the `label` padded to `width`, reverse-video when
+/// `selected`, with the matched-character `spans` (half-open **char** ranges)
+/// bold+underlined so the fuzzy match stands out. Char-indexed to match the
+/// server's char-based spans.
+fn menu_row_line(label: &str, spans: &[(u16, u16)], selected: bool, width: usize) -> Line<'static> {
+    let base = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let matched = base
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::UNDERLINED);
+    let mut out: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    for (i, ch) in label.chars().enumerate() {
+        if used >= width {
+            break;
+        }
+        let i = i as u16;
+        let is_match = spans.iter().any(|(s, e)| i >= *s && i < *e);
+        out.push(Span::styled(
+            ch.to_string(),
+            if is_match { matched } else { base },
+        ));
+        used += 1;
+    }
+    if used < width {
+        out.push(Span::styled(" ".repeat(width - used), base));
+    }
+    Line::from(out)
 }
 
 /// First visible item index for a popup whose inner content area is `rows` tall

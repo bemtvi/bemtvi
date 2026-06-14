@@ -87,19 +87,30 @@ pub struct PanelView {
 }
 
 /// The renderable form of the floating selectable-list [`Menu`](crate::editor):
-/// the choice labels, the highlighted index, and where it floats. The server
-/// projects the on-screen geometry (anchor + size) from this plus the focused
-/// window, the same way it places the completion popup. `None` in [`View::menu`]
-/// when no menu is open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the visible (filtered) labels, the highlighted row, the optional picker prompt,
+/// per-row match highlighting, and where it floats. The server projects the
+/// on-screen geometry (anchor + size) from this plus the focused window, the same
+/// way it places the completion popup. `None` in [`View::menu`] when no menu is
+/// open.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MenuView {
-    /// The choice labels, in order, each shown on its own row.
-    pub items: Vec<String>,
-    /// The highlighted index into `items` (0-based; always in range — a menu is
-    /// never opened empty).
+    /// The highlighted row, as a 0-based index into the **whole** view (`0` when the
+    /// view is empty). The server windows the rows it sends and rebases this.
     pub selected: usize,
+    /// Total number of rows in the view (after fuzzy filtering) — may be 100k+. The
+    /// server uses it for geometry and the scroll window; the rows themselves are
+    /// fetched windowed via [`Editor::menu_rows`](crate::Editor::menu_rows).
+    pub total: usize,
     /// Whether the menu floats under the cursor or centered over the editor.
     pub placement: MenuPlacement,
+    /// The picker prompt's query text — `Some` for a `nx.picker`, `None` for a
+    /// promptless `nx.ui.select`. Presence tells the client to draw a prompt line.
+    pub query: Option<String>,
+    /// The picker box's fixed width / height ([`MenuExtent`](crate::editor::MenuExtent),
+    /// `None` ⇒ the picker default), resolved against the viewport by the server at
+    /// projection time. Both `None` for a content-anchored `nx.ui.select`.
+    pub width: Option<crate::editor::MenuExtent>,
+    pub height: Option<crate::editor::MenuExtent>,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the
@@ -310,7 +321,7 @@ pub struct RegionTablines {
 /// (mode label, command line, message, panel) plus the list of [`WindowView`]s to
 /// paint. With one window the list has a single entry spanning the whole text
 /// area, so the rendered frame matches the pre-windows view exactly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct View {
     /// The windows to paint, in layout order. Always at least one.
     pub windows: Vec<WindowView>,

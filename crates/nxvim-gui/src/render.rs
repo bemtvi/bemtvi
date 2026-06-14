@@ -1627,21 +1627,45 @@ impl Renderer {
         let box_h = menu.height + 2;
         self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
 
-        let rows = menu.height as usize;
-        let start = pmenu_start(Some(menu.selected), rows);
         let full = self.full_bounds();
-        for r in 0..menu.height {
+        // A picker carries a prompt row at the top; the list fills the rows below.
+        let prompt_rows = u16::from(menu.query.is_some());
+        if let Some(query) = &menu.query {
+            let text = pmenu_row(&format!("> {query}"), "", menu.width as usize);
+            self.push_plain(items, &text, self.cell_px(bx + 1, by + 1), fg, full);
+        }
+        let list_rows = menu.height.saturating_sub(prompt_rows);
+        let start = pmenu_start(Some(menu.selected), list_rows as usize);
+        // A warm accent on matched characters, so the fuzzy match reads at a glance.
+        let match_fg = 0x00E5_C07B;
+        for r in 0..list_rows {
             let idx = start + r as usize;
             let Some(label) = menu.items.get(idx) else {
                 continue;
             };
             let cx = bx + 1;
-            let row = by + 1 + r;
+            let row = by + 1 + prompt_rows + r;
             if idx == menu.selected {
                 self.fill_cells(quads, cx, row, menu.width, sel_bg);
             }
             let text = pmenu_row(label, "", menu.width as usize);
             self.push_plain(items, &text, self.cell_px(cx, row), fg, full);
+            // Overdraw the matched characters in the accent color (monospace, so
+            // char `i` sits at column `cx + i`).
+            if let Some(spans) = menu.match_spans.get(idx) {
+                for (i, ch) in label.chars().enumerate() {
+                    let ci = i as u16;
+                    if spans.iter().any(|(s, e)| ci >= *s && ci < *e) {
+                        self.push_plain(
+                            items,
+                            &ch.to_string(),
+                            self.cell_px(cx + ci, row),
+                            match_fg,
+                            full,
+                        );
+                    }
+                }
+            }
         }
     }
 

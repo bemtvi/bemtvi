@@ -20,8 +20,8 @@ use crate::convert::{
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
     BufOp, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp,
-    OptionValue, PanelOp, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq,
-    WindowOp,
+    OptionValue, PanelOp, PickerOpenReq, PickerPush, RegisterSetOp, TabOp, TerminalOpenReq, TsOp,
+    UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -392,6 +392,31 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                     cwd,
                     env,
                     stdin,
+                    stream: false,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._spawn_stream(id, cmd, cwd, env)`: spawn `cmd` (argv list) in the
+    // event-loop actor and **stream** its stdout — each newline-delimited batch
+    // fires the persistent stdout callback `nx._run_stdout(id, lines)`, and the
+    // exit fires the one-shot `nx._run_cb(id, false, {code,stdout="",stderr})`.
+    // Backs `nx.spawn`'s `on_stdout`/`on_exit` (the picker's streaming sources).
+    // No stdin (a search/list job feeds none).
+    let sh = shared.clone();
+    nx.set(
+        "_spawn_stream",
+        lua.create_function(
+            move |_, (id, cmd, cwd, env): (u64, Vec<String>, Option<String>, Option<Table>)| {
+                let env = env_pairs(env)?;
+                sh.borrow_mut().loop_ops.push(LoopOp::Spawn {
+                    id,
+                    cmd,
+                    cwd,
+                    env,
+                    stdin: Vec::new(),
+                    stream: true,
                 });
                 Ok(())
             },
@@ -1192,6 +1217,57 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._picker_open(dynamic)`: queue a `nx.picker.open` request
+    // ([`PickerOpenReq`]). The server opens the centered fuzzy-finder widget and
+    // kicks the active source's initial run; the source's candidates / `confirm` /
+    // `on_cancel` stay Lua-side (`nx._picker`).
+    let sh = shared.clone();
+    nx.set(
+        "_picker_open",
+        lua.create_function(
+            move |_, (dynamic, width, height): (bool, Option<String>, Option<String>)| {
+                sh.borrow_mut().picker_opens.push(PickerOpenReq {
+                    dynamic,
+                    width: width.unwrap_or_default(),
+                    height: height.unwrap_or_default(),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._picker_push(gen, labels, keys)`: queue a BATCH of streamed picker
+    // candidates ([`PickerPush`]) — parallel `labels` / `keys` arrays, stamped with
+    // the run `gen`eration. Batching keeps a 100k-result stream to ~one bridge
+    // crossing per source chunk instead of one per item. The server drops a batch
+    // whose `gen` is behind the live query and feeds the rest into the open picker.
+    let sh = shared.clone();
+    nx.set(
+        "_picker_push",
+        lua.create_function(
+            move |_, (gen, labels, keys): (u64, Vec<String>, Vec<usize>)| {
+                let mut sh = sh.borrow_mut();
+                sh.picker_pushes.extend(
+                    labels
+                        .into_iter()
+                        .zip(keys)
+                        .map(|(label, key)| PickerPush { gen, label, key }),
+                );
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._picker_finish(gen)`: the source's `done()` for generation `gen` — the
+    // server settles the picker (a query that matched nothing clears its stale
+    // rows; one that matched already swapped them in via `_picker_push`).
+    let sh = shared.clone();
+    nx.set(
+        "_picker_finish",
+        lua.create_function(move |_, gen: u64| {
+            sh.borrow_mut().picker_finishes.push(gen);
+            Ok(())
+        })?,
     )?;
 
     // `nx._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`

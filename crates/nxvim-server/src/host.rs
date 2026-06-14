@@ -48,6 +48,12 @@ pub struct ProcSpec {
     /// Bytes written to the child's stdin then closed (empty feeds no input, and
     /// the child gets `/dev/null` rather than a pipe).
     pub stdin: Vec<u8>,
+    /// Stream stdout incrementally: emit newline-delimited batches as
+    /// [`ProcEvents::stdout`] as they arrive (the picker's streaming sources via
+    /// `nx.spawn`'s `on_stdout`), and report empty stdout with the exit. When
+    /// `false` the child runs to completion and its whole stdout is captured into
+    /// the single [`ProcEvents::exited`] — the original `vim.system` behavior.
+    pub stream: bool,
 }
 
 /// The handle a [`HostProc::run`] reports a child's progress through: the pid
@@ -76,6 +82,15 @@ impl ProcEvents {
     /// `vim.system` handle expose a real pid shortly after the call returns.
     pub fn spawned(&self, pid: Option<u32>) {
         let _ = self.tx.send(LoopEvent::ProcessSpawned { id: self.id, pid });
+    }
+
+    /// Report a batch of stdout `lines` from a streaming child (`stream = true`).
+    /// Fires zero or more times before [`exited`](ProcEvents::exited); takes
+    /// `&self` (unlike `exited`) so it can be called repeatedly.
+    pub fn stdout(&self, lines: Vec<String>) {
+        let _ = self
+            .tx
+            .send(LoopEvent::ProcessStdout { id: self.id, lines });
     }
 
     /// Report the child's exit — its status code and captured output (`code = -1`
@@ -147,6 +162,7 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
         cwd,
         env,
         stdin,
+        stream,
     } = spec;
     let Some((program, args)) = argv.split_first() else {
         events.spawned(None);
@@ -205,6 +221,10 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
             });
         }
     }
+    if stream {
+        stream_local_process(child, kill_rx, events).await;
+        return;
+    }
     let (code, stdout, stderr) = tokio::select! {
         result = child.wait_with_output() => match result {
             Ok(out) => (out.status.code().unwrap_or(-1), out.stdout, out.stderr),
@@ -219,4 +239,70 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
         ),
     };
     events.exited(code, stdout, stderr);
+}
+
+/// Run a **streaming** child: read its stdout line by line, emitting newline-
+/// delimited batches as [`ProcEvents::stdout`] as they arrive, while stderr is
+/// collected for the final exit. Races against the kill signal at every read; on a
+/// kill the child is dropped (terminated via `kill_on_drop`) and the exit reports
+/// `code = -1`. Exactly one [`ProcEvents::exited`] is always sent (with empty
+/// stdout — the output was already streamed), so `on_exit` never leaks.
+async fn stream_local_process(
+    mut child: tokio::process::Child,
+    mut kill_rx: oneshot::Receiver<()>,
+    events: ProcEvents,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    // Collect stderr concurrently in a detached task so a child that writes a lot
+    // of stderr can't deadlock against the stdout reader (both pipes full).
+    let stderr_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    if let Some(mut err) = child.stderr.take() {
+        let sink = stderr_buf.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf).await;
+            *sink.lock().await = buf;
+        });
+    }
+
+    // Stream stdout in batches: each newline-terminated line is pushed, and the
+    // accumulated batch is flushed whenever a read yields (natural OS-read
+    // batching) or it grows large, keeping the redraw cadence sane on big lists.
+    let mut killed = false;
+    if let Some(out) = child.stdout.take() {
+        let mut reader = BufReader::new(out);
+        let mut line = String::new();
+        let mut batch: Vec<String> = Vec::new();
+        loop {
+            line.clear();
+            tokio::select! {
+                read = reader.read_line(&mut line) => match read {
+                    Ok(0) => break, // EOF — the child closed stdout
+                    Ok(_) => {
+                        batch.push(line.trim_end_matches(['\n', '\r']).to_string());
+                        if batch.len() >= 512 {
+                            events.stdout(std::mem::take(&mut batch));
+                        }
+                    }
+                    Err(_) => break,
+                },
+                _ = &mut kill_rx => { killed = true; break; }
+            }
+        }
+        if !batch.is_empty() {
+            events.stdout(batch);
+        }
+    }
+
+    let code = if killed {
+        -1
+    } else {
+        tokio::select! {
+            status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
+            _ = &mut kill_rx => -1,
+        }
+    };
+    let stderr = std::mem::take(&mut *stderr_buf.lock().await);
+    events.exited(code, Vec::new(), stderr);
 }

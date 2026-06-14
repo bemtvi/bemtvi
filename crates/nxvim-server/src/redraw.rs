@@ -168,7 +168,7 @@ impl EditHost {
         // `Nil` when none is open. Geometry is computed here from the focused
         // window, the same way the completion popup is placed.
         let menu = match &view.menu {
-            Some(m) => project_menu(m, &view, text_width),
+            Some(m) => project_menu(&self.editor, m, &view, text_width),
             None => Value::Nil,
         };
 
@@ -698,23 +698,36 @@ fn project_panel(p: &PanelView) -> Value {
 /// below; `Editor` placement centers the box over the focused window's text area
 /// (the picker refines this when it lands). `text_width` bounds the box to the
 /// editable region. Mirrors `EditHost::pmenu_value`.
-fn project_menu(m: &MenuView, view: &nxvim_core::View, text_width: usize) -> Value {
+fn project_menu(
+    editor: &nxvim_core::Editor,
+    m: &MenuView,
+    view: &nxvim_core::View,
+    text_width: usize,
+) -> Value {
     const MAX_H: usize = 10;
     let focused = view.focused();
     let text_height = focused.lines.len();
-    let count = m.items.len();
-    let want = count.min(MAX_H);
-    // Content width: the widest label (in cells), min 1.
-    let content_w = m
-        .items
-        .iter()
-        .map(|s| s.chars().count())
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    // A picker carries a prompt line (the first content row); `nx.ui.select` does
+    // not. The prompt row counts toward the box height and its text toward the width.
+    let prompt_rows = usize::from(m.query.is_some());
+    let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
 
-    let (row, col, width, height) = match m.placement {
+    // The box height (content rows), the scroll offset of the first visible row,
+    // and the windowed rows themselves — only the visible slice is materialized, so
+    // a 100k-item picker costs the same per frame as a 10-item one.
+    let (row, col, width, height, rows, selected) = match m.placement {
         MenuPlacement::Cursor => {
+            // `select` is small — project the whole list (no scrolling subtlety) and
+            // let the client place the cursor; keeps the four-tier flip exact.
+            let rows = editor.menu_rows(0, m.total);
+            let count = (rows.len() + prompt_rows).min(MAX_H);
+            let content_w = rows
+                .iter()
+                .map(|(l, _)| l.chars().count())
+                .max()
+                .unwrap_or(1)
+                .max(query_w)
+                .max(1);
             let cursor_row = focused.cursor_row;
             let anchor_col = focused.cursor_screen_col.saturating_sub(focused.leftcol);
             let max_w = text_width.saturating_sub(anchor_col).max(1);
@@ -723,36 +736,92 @@ fn project_menu(m: &MenuView, view: &nxvim_core::View, text_width: usize) -> Val
             // side has more room (the popup's four-tier fallback).
             let below = text_height.saturating_sub(cursor_row + 1);
             let above = cursor_row;
-            let (row, height) = if want + 2 <= below {
-                (cursor_row + 1, want)
-            } else if want + 2 <= above {
-                (cursor_row - (want + 2), want)
+            let (row, height) = if count + 2 <= below {
+                (cursor_row + 1, count)
+            } else if count + 2 <= above {
+                (cursor_row - (count + 2), count)
             } else if below >= above {
-                (cursor_row + 1, below.saturating_sub(2).clamp(1, want))
+                (cursor_row + 1, below.saturating_sub(2).clamp(1, count))
             } else {
-                let h = above.saturating_sub(2).clamp(1, want);
+                let h = above.saturating_sub(2).clamp(1, count);
                 (cursor_row.saturating_sub(h + 2), h)
             };
-            (row, anchor_col, width, height)
+            (row, anchor_col, width, height, rows, m.selected)
         }
         MenuPlacement::Editor => {
-            let height = want.min(text_height.saturating_sub(2).max(1));
-            let width = content_w.min(text_width.saturating_sub(2).max(1));
+            // A picker is a FIXED box — never content-hugging (that looks ragged).
+            // Resolve the configured extent against the viewport, default ~80% × 60%.
+            const DEFAULT_W: f32 = 0.8;
+            const DEFAULT_H: f32 = 0.6;
+            let max_w = text_width.saturating_sub(2).max(1);
+            let max_h = text_height.saturating_sub(2).max(1);
+            let width = m
+                .width
+                .map_or((text_width as f32 * DEFAULT_W).round() as usize, |e| {
+                    e.resolve(text_width)
+                })
+                .clamp(1, max_w);
+            let height = m
+                .height
+                .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
+                    e.resolve(text_height)
+                })
+                .clamp(prompt_rows + 1, max_h);
             let row = text_height.saturating_sub(height + 2) / 2;
             let col = text_width.saturating_sub(width + 2) / 2;
-            (row, col, width, height)
+            // Scroll the window so the selected row stays visible, clamped to the end,
+            // and send `selected` rebased into that window (the client renders the
+            // window directly). Only `list_rows` rows are cloned, never all `total`.
+            let list_rows = height.saturating_sub(prompt_rows).max(1);
+            let mut start = if m.selected >= list_rows {
+                m.selected + 1 - list_rows
+            } else {
+                0
+            };
+            start = start.min(m.total.saturating_sub(list_rows));
+            let rows = editor.menu_rows(start, list_rows);
+            (row, col, width, height, rows, m.selected - start)
         }
     };
 
-    let items: Vec<Value> = m.items.iter().map(|s| Value::from(s.as_str())).collect();
-    Value::Map(vec![
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|(label, _)| Value::from(label.as_str()))
+        .collect();
+    // Matched-character spans per visible row (parallel to `items`): `[start, end]`
+    // half-open **char** ranges the client bolds.
+    let match_spans = Value::Array(
+        rows.iter()
+            .map(|(_, spans)| {
+                Value::Array(
+                    spans
+                        .iter()
+                        .map(|r| {
+                            Value::Array(vec![
+                                Value::from(r.start as u64),
+                                Value::from(r.end as u64),
+                            ])
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+    let mut map = vec![
         (Value::from("items"), Value::Array(items)),
-        (Value::from("selected"), Value::from(m.selected as u64)),
+        (Value::from("selected"), Value::from(selected as u64)),
         (Value::from("row"), Value::from(row as u64)),
         (Value::from("col"), Value::from(col as u64)),
         (Value::from("width"), Value::from(width as u64)),
         (Value::from("height"), Value::from(height as u64)),
-    ])
+        (Value::from("match_spans"), match_spans),
+    ];
+    // The prompt query: present (even when empty) for a picker, absent for a
+    // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row.
+    if let Some(query) = &m.query {
+        map.push((Value::from("query"), Value::from(query.as_str())));
+    }
+    Value::Map(map)
 }
 
 /// Encode per-row selection spans as an array of `[start, end]` pairs (`Nil`

@@ -302,6 +302,12 @@ pub enum LoopOp {
         cwd: Option<String>,
         env: Vec<(String, String)>,
         stdin: Vec<u8>,
+        /// Stream the child's stdout as it arrives (`nx.spawn`'s `on_stdout`):
+        /// each newline-delimited batch fires the persistent stdout callback under
+        /// `id`, and the final exit carries empty stdout (already delivered). When
+        /// `false` (`vim.system`) the child runs to completion and the whole stdout
+        /// is delivered once with the exit — the original one-shot behavior.
+        stream: bool,
     },
     /// `handle:kill(signal)` on a `vim.system` handle spawned async — terminate the
     /// child running under `id`. A no-op if it already exited. The `signal`
@@ -756,6 +762,36 @@ pub struct UiSelectReq {
     pub prompt: String,
     /// The `nx._cb_fns` id whose `on_choice` wrapper receives the chosen index.
     pub cb_id: u64,
+}
+
+/// A `nx.picker.open(name)` request: open the fuzzy-finder widget (a centered
+/// float with a prompt) over the unified float-list widget
+/// ([`Editor::open_picker`](nxvim_core::Editor::open_picker)). The source's
+/// candidates, `confirm`, and `on_cancel` all stay Lua-side (the wrapper's
+/// `nx._picker` state); only this open signal and the `dynamic` flag cross the
+/// bridge. Queued in [`crate::runtime::Shared::picker_opens`].
+#[derive(Clone, Debug)]
+pub struct PickerOpenReq {
+    /// Whether the active source is dynamic (forward each query edit to the source,
+    /// bypassing the local matcher) or static (matched locally in Rust).
+    pub dynamic: bool,
+    /// The picker box's fixed width / height, each as the raw spec the server
+    /// parses: a cell count (`"100"`), a CSS-style viewport fraction (`"80vw"` /
+    /// `"60vh"` / `"50%"`), or empty for the picker default. Never content-derived.
+    pub width: String,
+    pub height: String,
+}
+
+/// One streamed picker candidate (`nx.picker` source `push`): its display `label`
+/// and the wrapper's `key` (the 1-based index into the source run's Lua item
+/// array), stamped with the `gen`eration of the query run that produced it so the
+/// server can drop a batch from a superseded run. Queued in
+/// [`crate::runtime::Shared::picker_pushes`].
+#[derive(Clone, Debug)]
+pub struct PickerPush {
+    pub gen: u64,
+    pub label: String,
+    pub key: usize,
 }
 
 /// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a

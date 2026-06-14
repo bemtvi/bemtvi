@@ -179,6 +179,51 @@ try {
   const menuGone = await page.evaluate(() => document.querySelectorAll("#grid .pmenu .row").length === 0);
   check("nx.ui.select: the menu closes after confirm", menuGone);
 
+  // ---- 10. nx.picker: a fuzzy finder with a prompt, runs in the pure-wasm build ----
+  // Register an in-memory static source (no process spawn, so it works serverless),
+  // open it, and verify the prompt row, fuzzy filtering with match highlighting, and
+  // confirm — the float-list widget's Phase-2 surface in the browser.
+  await page.evaluate(() => window.__nxvim.execLua(
+    "_G.chosen = nil\n" +
+    "nx.picker.source { name = 'demo',\n" +
+    "  items = function(ctx, push, done)\n" +
+    "    for _, c in ipairs({ 'crimson', 'cornflower', 'cerulean', 'magenta' }) do push { text = c } end\n" +
+    "    done()\n" +
+    "  end,\n" +
+    "  confirm = function(item) _G.chosen = item.text end }\n" +
+    "nx.picker.open('demo')"));
+  await sleep(120);
+  const pickerOpen = await page.evaluate(() => {
+    const all = [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt)")].map((e) => e.textContent.trim());
+    return {
+      rows: all.filter((t) => t !== ""),          // non-empty (fixed box pads empties)
+      total: all.length,                          // the fixed box height (> item count)
+      prompt: document.querySelector("#grid .pmenu .pmenu-prompt") !== null,
+    };
+  });
+  check("nx.picker: opens a prompt + the streamed candidate rows in a fixed box",
+    pickerOpen.prompt && pickerOpen.rows.length === 4 && pickerOpen.rows[0] === "crimson" && pickerOpen.total > 4,
+    JSON.stringify(pickerOpen));
+
+  // Type a subsequence unique to "cerulean": the prompt grabs the keys, the matcher
+  // narrows the list, and the matched characters carry the .pmenu-match class.
+  await page.evaluate(() => window.__nxvim.feed("ceru"));
+  await sleep(120);
+  const filtered = await page.evaluate(() => ({
+    query: window.__nxvim.frame().menu?.query,
+    rows: [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt)")]
+      .map((e) => e.textContent.trim()).filter((t) => t !== ""),
+    matched: [...document.querySelectorAll("#grid .pmenu .pmenu-match")].length,
+  }));
+  check("nx.picker: typing filters the list and highlights matched chars",
+    filtered.query === "ceru" && filtered.rows.length === 1 && filtered.rows[0] === "cerulean" && filtered.matched > 0,
+    JSON.stringify(filtered));
+
+  await page.evaluate(() => window.__nxvim.feed("<CR>"));
+  await sleep(100);
+  const chosen = String(await luaResult("return _G.chosen"));
+  check("nx.picker: <CR> confirms the highlighted item", /cerulean/.test(chosen), chosen);
+
   await browser.close();
 } finally {
   cleanup();

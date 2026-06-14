@@ -54,6 +54,9 @@ pub enum LoopCommand {
         cwd: Option<String>,
         env: Vec<(String, String)>,
         stdin: Vec<u8>,
+        /// Stream stdout incrementally (`nx.spawn`'s `on_stdout`) rather than
+        /// delivering it whole with the exit (`vim.system`). See [`ProcSpec`].
+        stream: bool,
     },
     /// Terminate the async child running under `id` (a no-op if it already
     /// exited). The child is terminated via `kill_on_drop`, and its `on_exit`
@@ -88,8 +91,16 @@ pub enum LoopEvent {
     /// shortly after the call returns (it cannot be known synchronously on a
     /// single-threaded runtime — a blocking wait would deadlock the actor).
     ProcessSpawned { id: u64, pid: Option<u32> },
+    /// A streaming child (spawned with `stream = true`) emitted a batch of stdout
+    /// lines (newline-delimited, the trailing newline stripped). Fires the
+    /// persistent `on_stdout` callback under `id`; arrives zero or more times
+    /// before the single [`LoopEvent::ProcessExit`]. Only streaming spawns produce
+    /// these — a `vim.system` (`stream = false`) delivers its stdout with the exit.
+    ProcessStdout { id: u64, lines: Vec<String> },
     /// A child spawned via [`LoopCommand::Spawn`] exited; carries the result its
-    /// `on_exit` callback receives (`code = -1` on spawn failure or a kill).
+    /// `on_exit` callback receives (`code = -1` on spawn failure or a kill). A
+    /// streaming child's `stdout` here is empty (already delivered as
+    /// [`LoopEvent::ProcessStdout`] batches).
     ProcessExit {
         id: u64,
         code: i32,
@@ -213,6 +224,7 @@ async fn run_evloop(
                 cwd,
                 env,
                 stdin,
+                stream,
             } => {
                 let (kill_tx, kill_rx) = oneshot::channel();
                 procs.insert(id, kill_tx);
@@ -221,6 +233,7 @@ async fn run_evloop(
                     cwd,
                     env,
                     stdin,
+                    stream,
                 };
                 let events = ProcEvents::new(id, event_tx.clone());
                 tokio::spawn(host_proc.run(spec, kill_rx, events));

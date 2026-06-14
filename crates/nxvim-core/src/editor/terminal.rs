@@ -246,6 +246,14 @@ impl Editor {
     /// next key isn't `<C-n>`, both the literal `<C-\>` (0x1c) and that key are sent.
     pub(crate) fn handle_terminal_key(&mut self, key: Key) {
         let buf = self.cur_buffer();
+        // Awaiting the register name after `<C-\><C-r>` / `<C-S-r>`: this key names the
+        // register whose text is typed into the child. (`<C-w>` = word under cursor,
+        // matching insert mode's `<C-r><C-w>`.)
+        if self.terminal_awaiting_register {
+            self.terminal_awaiting_register = false;
+            self.terminal_send_register(key);
+            return;
+        }
         if self.terminal_pending_backslash {
             self.terminal_pending_backslash = false;
             self.terminal_esc_count = 0;
@@ -253,9 +261,22 @@ impl Editor {
                 self.leave_terminal_mode();
                 return;
             }
+            // `<C-\><C-r>{reg}`: paste a register into the child. Behind the `<C-\>`
+            // prefix so plain `<C-r>` still reaches the shell (reverse search).
+            if key.ctrl && key.code == KeyCode::Char('r') {
+                self.terminal_awaiting_register = true;
+                return;
+            }
             let mut bytes = vec![0x1c];
             bytes.extend(key_to_terminal_bytes(key));
             self.pending_terminal.push(TerminalOp::Send { buf, bytes });
+            return;
+        }
+        // `<C-S-r>` arms register paste directly — the literal "Ctrl+Shift+R" — for any
+        // client that can deliver `shift` on a ctrl-key (a legacy terminal cannot, so
+        // `<C-\><C-r>` above is the portable spelling).
+        if key.ctrl && key.shift && matches!(key.code, KeyCode::Char('r' | 'R')) {
+            self.terminal_awaiting_register = true;
             return;
         }
         // The `<C-\>` escape prefix. Terminals deliver Ctrl-\ (the control byte 0x1c)
@@ -295,6 +316,27 @@ impl Editor {
         let bytes = key_to_terminal_bytes(key);
         if !bytes.is_empty() {
             self.pending_terminal.push(TerminalOp::Send { buf, bytes });
+        }
+    }
+
+    /// Type a register's text into the child (the key after `<C-\><C-r>` / `<C-S-r>`).
+    /// `<C-w>` sends the word under the cursor; any other key names a register. A
+    /// newline in the register becomes `\r` so a multi-line register runs like typed
+    /// Enters. Unknown / empty registers send nothing.
+    fn terminal_send_register(&mut self, key: Key) {
+        let buf = self.cur_buffer();
+        let text = if key.ctrl && key.code == KeyCode::Char('w') {
+            self.word_under_cursor()
+        } else if let Some(name) = key.as_char() {
+            self.register_text(Some(name)).map(|(t, _)| t)
+        } else {
+            None
+        };
+        if let Some(text) = text {
+            let bytes = text.replace('\n', "\r").into_bytes();
+            if !bytes.is_empty() {
+                self.pending_terminal.push(TerminalOp::Send { buf, bytes });
+            }
         }
     }
 

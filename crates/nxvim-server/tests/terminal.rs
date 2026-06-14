@@ -149,6 +149,26 @@ async fn ctrl_4_is_accepted_as_ctrl_backslash() {
     );
 }
 
+/// Plain `<C-r>` reaches the child (shell reverse-search), while `<C-\><C-r>{reg}`
+/// pastes a register into the terminal — the analogue of insert mode's `<C-r>{reg}`.
+#[tokio::test]
+async fn ctrl_backslash_ctrl_r_pastes_a_register() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    // Yank "hello" into register a (in the startup scratch buffer).
+    feed(&rpc, "ihello<Esc>");
+    feed(&rpc, "\"ayy");
+
+    // Open a terminal and paste register a into it via the `<C-\><C-r>` chord.
+    command(&rpc, "terminal cat").await;
+    feed(&rpc, "<C-\\><C-r>a");
+    wait_lines(&rpc, "register paste to reach cat", |ls| {
+        has_line(ls, "hello")
+    })
+    .await;
+}
+
 /// Re-entering terminal mode (`i`) snaps the cursor back to the child's input
 /// position, not wherever normal-mode navigation parked it.
 #[tokio::test]

@@ -985,6 +985,11 @@ pub struct Editor {
     /// longer than the chord window restarts the run (so a TUI program inside the
     /// terminal that wants a lone `<Esc>` isn't hijacked).
     terminal_last_esc_ms: u64,
+    /// Armed by `<C-\><C-r>` (or `<C-S-r>`) in terminal mode: the next keystroke names
+    /// the register whose text is sent to the child — the terminal analogue of insert
+    /// mode's `<C-r>{register}`. Plain `<C-r>` is left for the child (shell reverse
+    /// search), so this is behind a prefix. Always `false` outside that two-key chord.
+    terminal_awaiting_register: bool,
 }
 
 impl Editor {
@@ -1169,6 +1174,7 @@ impl Editor {
             terminal_esc_count: 0,
             terminal_cursor: (0, 0),
             terminal_last_esc_ms: 0,
+            terminal_awaiting_register: false,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

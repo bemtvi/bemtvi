@@ -51,6 +51,39 @@ fn has_line(ls: &[String], text: &str) -> bool {
     ls.iter().any(|l| l.trim_end() == text)
 }
 
+/// The buffer's line count (`nvim_buf_line_count`) — a cheap poll target that does
+/// not transfer the whole (possibly huge) buffer the way `lines` does.
+async fn line_count(rpc: &Rpc) -> usize {
+    rpc.request("nvim_buf_line_count", vec![Value::from(0u64)])
+        .await
+        .expect("line_count")
+        .as_u64()
+        .unwrap_or(0) as usize
+}
+
+/// Lines `[start, end)` of the current buffer (`nvim_buf_get_lines`).
+async fn lines_range(rpc: &Rpc, start: i64, end: i64) -> Vec<String> {
+    let v = rpc
+        .request(
+            "nvim_buf_get_lines",
+            vec![
+                Value::from(0u64),
+                Value::from(start),
+                Value::from(end),
+                Value::from(false),
+            ],
+        )
+        .await
+        .expect("get_lines");
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `:terminal cat` runs a real child: typed input is echoed back into the buffer,
 /// and `<C-d>` (EOF) ends it with the `[Process exited 0]` notice, dropping us back
 /// to Normal mode.
@@ -543,6 +576,51 @@ async fn scrollback_rows_keep_their_color() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("timed out waiting for the scrolled-off red line's color");
+}
+
+/// A flood of output — more lines than the scrollback cap — must not freeze the
+/// editor: each PTY burst splices only the changed tail + evicts the front, so the
+/// per-burst cost is bounded (not a full-buffer rebuild, which made `rg` dumping
+/// thousands of matches quadratic). The buffer stays capped near the scrollback
+/// limit, keeps the most recent output, and drops the oldest. Completing this at
+/// all (well within the poll budget) is the regression check.
+#[tokio::test]
+async fn heavy_output_stays_bounded_and_does_not_freeze() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await; // 80x24
+
+    // 12000 lines — past the 10000-row scrollback cap, so eviction + the saturated
+    // capture path both run. `cat <file> -` prints them then blocks on stdin.
+    const N: usize = 12_000;
+    const CAP: usize = 10_000; // mirrors terminal.rs SCROLLBACK_CAP
+    let body: String = (1..=N).map(|i| format!("line{i}\n")).collect();
+    let path = write_temp("term_flood", "txt", &body);
+    command(&rpc, &format!("terminal cat {path} -")).await;
+
+    // Poll cheaply (line count + a small tail) until the last line lands.
+    for _ in 0..200 {
+        let lc = line_count(&rpc).await;
+        if lc > 100 {
+            let tail = lines_range(&rpc, lc as i64 - 40, lc as i64).await;
+            if tail.iter().any(|l| l.trim_end() == "line12000") {
+                // Capped, not grown to 12000: the buffer holds ~cap + one screen.
+                assert!(
+                    lc <= CAP + 64,
+                    "buffer should stay capped near the scrollback limit, got {lc} lines"
+                );
+                // Oldest evicted, most recent kept.
+                let head = lines_range(&rpc, 0, 1).await;
+                assert_ne!(
+                    head.first().map(String::as_str),
+                    Some("line1"),
+                    "the oldest line is evicted once output passes the cap"
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out streaming {N} lines — heavy output should never stall");
 }
 
 /// The `fg` color (`0xRRGGBB`) of the first highlight span in the focused

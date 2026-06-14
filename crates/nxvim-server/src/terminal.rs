@@ -84,6 +84,7 @@ impl vt100::Callbacks for TermSink {
 /// addressable rows — caching here lets the projection and color path read history
 /// without re-paging vt100 on every frame. The live screen still reads vt100 cells
 /// directly (Phase 4); only scrolled-off rows come from here.
+#[derive(Clone, PartialEq)]
 struct ScrollLine {
     text: String,
     /// `(start_col, end_col, style)` runs, already coalesced and default-filtered
@@ -108,8 +109,17 @@ pub(crate) struct TermEmu {
     /// How many rows of vt100's internal scrollback we have already captured into
     /// `history`. While vt100 is unsaturated this is its scrollback length and the
     /// per-burst delta is exact; once vt100 saturates it pins at [`SCROLLBACK_CAP`]
-    /// and capture switches to the re-derive path.
+    /// and capture switches to the bounded overlap path.
     captured: usize,
+    /// Total rows ever evicted from the front of `history` (it caps at
+    /// [`SCROLLBACK_CAP`]). Monotonic; lets the projection compute how many leading
+    /// buffer lines to drop since the last frame.
+    evicted_total: usize,
+    /// `(evicted_total, history.len())` as of the last [`terminal_project`], so the
+    /// next projection can splice the buffer incrementally (evict the newly-dropped
+    /// front, rewrite only the new history tail + live screen) instead of rebuilding.
+    proj_evicted: usize,
+    proj_history: usize,
 }
 
 impl TermEmu {
@@ -125,6 +135,9 @@ impl TermEmu {
             last_size: (rows, cols),
             history: VecDeque::new(),
             captured: 0,
+            evicted_total: 0,
+            proj_evicted: 0,
+            proj_history: 0,
         }
     }
 }
@@ -190,20 +203,41 @@ impl EditHost {
     /// the live region — offset by the history length — so terminal-insert stays
     /// pinned to the bottom while terminal-normal can navigate the history above.
     fn terminal_project(&mut self, buf: BufferId) {
-        let (lines, cursor_row, cursor_col, title) = {
-            let Some(emu) = self.terminals.get(&buf) else {
-                return;
-            };
-            let screen = emu.parser.screen();
-            let (_rows, cols) = screen.size();
-            let mut lines: Vec<String> = emu.history.iter().map(|l| l.text.clone()).collect();
-            lines.extend(screen.rows(0, cols));
-            let (cy, cx) = screen.cursor_position();
-            let title = emu.parser.callbacks().title.clone();
-            (lines, emu.history.len() + cy as usize, cx as usize, title)
+        let Some(emu) = self.terminals.get_mut(&buf) else {
+            return;
         };
-        self.editor
-            .terminal_update(buf, &lines, cursor_row, cursor_col);
+        let h = emu.history.len();
+        // Incremental splice vs. the last frame: drop the history rows that rolled
+        // off the front since then, and rewrite only the rows from the first one
+        // that changed — the newly-committed history tail plus the live screen. The
+        // leading `replace_from` history lines are byte-identical to last frame
+        // (history is append-only between cap evictions), so they stay untouched.
+        let evict_front = emu.evicted_total - emu.proj_evicted;
+        let replace_from = emu.proj_history - evict_front;
+
+        let screen = emu.parser.screen();
+        let (_rows, cols) = screen.size();
+        let mut tail: Vec<String> = emu
+            .history
+            .range(replace_from..)
+            .map(|l| l.text.clone())
+            .collect();
+        tail.extend(screen.rows(0, cols));
+        let (cy, cx) = screen.cursor_position();
+        let title = emu.parser.callbacks().title.clone();
+        let cursor_row = h + cy as usize;
+
+        emu.proj_evicted = emu.evicted_total;
+        emu.proj_history = h;
+
+        self.editor.terminal_update(
+            buf,
+            evict_front,
+            replace_from,
+            &tail,
+            cursor_row,
+            cx as usize,
+        );
         if let Some(title) = title {
             self.editor.terminal_set_title(buf, &title);
         }
@@ -215,65 +249,53 @@ impl EditHost {
     ///
     /// vt100 exposes scrollback only as a moving view-window (`set_scrollback`
     /// shifts an offset; `rows`/`cell` then read that window), so we read the
-    /// freshly-scrolled rows through that window and restore the offset to `0`
-    /// (the live view) before returning. While vt100 is unsaturated the new-row
-    /// count is exact (`held - captured`); once it saturates at [`SCROLLBACK_CAP`]
-    /// the oldest rows drop and the count is no longer a reliable delta, so we
-    /// re-derive the full retained scrollback — but only when the newest scrolled
-    /// row actually changed, so a non-scrolling burst (plain typing) stays cheap.
+    /// freshly-scrolled rows through that window and restore the offset to `0` (the
+    /// live view) before returning. The cost is bounded by the rows scrolled *this
+    /// burst*, never the whole buffer — the editor stays responsive under a flood of
+    /// output (e.g. `rg` printing thousands of matches):
+    ///
+    /// - **Unsaturated** (`held < cap`): the new-row count is exact (`held -
+    ///   captured`); read just those.
+    /// - **Saturated** (`held == cap`): vt100 has begun dropping its oldest rows, so
+    ///   the count is no longer a reliable delta. Skip cheaply if the newest scrolled
+    ///   row is unchanged; otherwise page the newest scrollback windows back only as
+    ///   far as the row we last captured (the anchor) and append everything newer.
+    ///   A single burst that scrolls past the cap *and* repeats its anchor line can
+    ///   leave a small gap in history beyond the cap — documented, and never a stall.
     fn capture_scrollback(&mut self, buf: BufferId) {
         let Some(emu) = self.terminals.get_mut(&buf) else {
             return;
         };
         let (rows, cols) = emu.parser.screen().size();
         let captured = emu.captured;
-        let last_text = emu.history.back().map(|l| l.text.clone());
+        let anchor = emu.history.back().cloned();
 
         // All screen reads happen inside this block so the `&mut Screen` borrow is
         // released before we touch `emu.history` / `emu.captured` below.
-        enum Capture {
-            Append(Vec<ScrollLine>),
-            Replace(Vec<ScrollLine>),
-            Nothing,
-        }
-        let (action, held) = {
+        let (new_rows, held) = {
             let screen = emu.parser.screen_mut();
             // `set_scrollback(MAX)` clamps the offset to the scrollback length, which
-            // `scrollback()` then reports — i.e. how many rows vt100 currently holds.
+            // `scrollback()` then reports — how many rows vt100 currently holds.
             screen.set_scrollback(usize::MAX);
             let held = screen.scrollback();
-            let action = if held < SCROLLBACK_CAP {
+            let new_rows = if held < SCROLLBACK_CAP {
                 if held > captured {
-                    Capture::Append(read_scrollback(screen, held, captured, held, rows, cols))
+                    read_scrollback(screen, held, captured, held, rows, cols)
                 } else {
-                    Capture::Nothing
+                    Vec::new()
                 }
             } else {
-                // Saturated: peek the newest scrolled row (offset 1 puts it at window
-                // row 0). Re-derive only if it differs from our last captured row.
-                screen.set_scrollback(1);
-                let newest = screen.rows(0, cols).next();
-                if newest.as_deref() != last_text.as_deref() {
-                    Capture::Replace(read_scrollback(screen, held, 0, held, rows, cols))
-                } else {
-                    Capture::Nothing
-                }
+                capture_saturated(screen, held, anchor.as_ref(), rows, cols)
             };
             screen.set_scrollback(0); // back to the live view
-            (action, held)
+            (new_rows, held)
         };
 
-        match action {
-            Capture::Append(new) => emu.history.extend(new),
-            Capture::Replace(all) => {
-                emu.history.clear();
-                emu.history.extend(all);
-            }
-            Capture::Nothing => {}
-        }
+        emu.history.extend(new_rows);
         emu.captured = held;
         while emu.history.len() > SCROLLBACK_CAP {
             emu.history.pop_front();
+            emu.evicted_total += 1;
         }
     }
 
@@ -326,6 +348,48 @@ impl EditHost {
             })
             .collect();
         Some(Value::Array(out))
+    }
+}
+
+/// Capture the rows that scrolled off while vt100's scrollback is **saturated**
+/// (full at the cap), where the held-row count is no longer a reliable delta. Pages
+/// the newest scrollback windows backward only as far as `anchor` — the row we last
+/// captured — and returns everything newer than it, oldest-first. The anchor is the
+/// most recent row, so for ordinary scrolling it is found in the first window and
+/// the cost is `O(screen)`; a burst that scrolled more pages back proportionally
+/// (`O(rows scrolled)`), never the whole buffer. Returns empty when nothing scrolled
+/// (the newest row still equals the anchor).
+fn capture_saturated(
+    screen: &mut vt100::Screen,
+    held: usize,
+    anchor: Option<&ScrollLine>,
+    rows: u16,
+    cols: u16,
+) -> Vec<ScrollLine> {
+    let mut new_rows: Vec<ScrollLine> = Vec::new();
+    let mut top = held;
+    loop {
+        let from = top.saturating_sub(rows as usize);
+        let mut window = read_scrollback(screen, held, from, top, rows, cols);
+        // Find the last-captured row (newest occurrence) in this window: everything
+        // after it is new, everything up to it we already hold.
+        match anchor.and_then(|a| window.iter().rposition(|r| r == a)) {
+            Some(p) => {
+                let mut newer = window.split_off(p + 1);
+                newer.append(&mut new_rows);
+                return newer;
+            }
+            // The anchor is older than this window (a burst taller than the screen):
+            // the whole window is new — prepend it and page further back.
+            None => {
+                window.append(&mut new_rows);
+                new_rows = window;
+                if from == 0 {
+                    return new_rows; // reached the oldest retained row
+                }
+                top = from;
+            }
+        }
     }
 }
 

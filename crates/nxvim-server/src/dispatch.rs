@@ -354,6 +354,18 @@ impl EditHost {
                 })
             }
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
+            "nvim_buf_line_count" => {
+                // params[0] is the buffer handle: 0 = current, else a specific buffer.
+                let handle = params.first().and_then(Value::as_u64).unwrap_or(0);
+                let id = if handle == 0 {
+                    self.editor.current_buffer_id()
+                } else {
+                    BufferId(handle)
+                };
+                Ok(Value::from(
+                    self.editor.line_count_of(id).unwrap_or(0) as u64
+                ))
+            }
             "nvim_list_bufs" => Ok(Value::Array(
                 self.editor
                     .buffer_ids()

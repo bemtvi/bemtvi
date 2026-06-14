@@ -152,15 +152,21 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   while vt100 is unsaturated the freshly-scrolled count is exact (`held - captured`) and we read
   just those rows through the window (`read_scrollback`, paging only if a single burst scrolled
   more than a screen); once vt100 saturates at the cap the count is no longer a reliable delta, so
-  we re-derive the full retained scrollback — but guarded by a cheap "did the newest scrolled row
-  change?" check, so a non-scrolling burst (plain typing at a full buffer) stays O(1). The live
-  screen still reads live vt100 cells (Phase 4); only scrolled-off rows read the captured styles.
-  `terminal_project` lays the buffer out as `history ++ live screen` with the cursor offset by
-  `history.len()`, so terminal-normal navigation just works (the buffer simply has more lines) and
-  history is append-only → old lines keep stable buffer indices until the cap drops the oldest.
-  Known cost: sustained output **past** the 10000-line cap re-derives the retained scrollback per
-  scrolling burst (a documented follow-up; a libvterm-style `sb_pushline` callback in vt100 would
-  make capture incremental even when saturated).
+  `capture_saturated` pages the newest windows back **only as far as the last-captured row (the
+  anchor)** and appends everything newer — `O(rows scrolled this burst)`, never the whole buffer.
+  The live screen still reads live vt100 cells (Phase 4); only scrolled-off rows read the captured
+  styles.
+
+  **The projection must be incremental too** (this is what actually keeps the editor responsive
+  under a flood like `rg` printing thousands of matches): `terminal_project` lays the buffer out as
+  `history ++ live screen`, but `Editor::terminal_update` does **not** rebuild the rope each burst —
+  it evicts the rows that rolled past the cap from the front and rewrites only `[replace_from, end)`
+  (the newly-committed history tail + the live screen). A burst costs `O(evicted + new rows +
+  screen)`, not `O(buffer)`; the old full-rebuild-every-burst was `O(N²)` over a flood and froze the
+  editor. History is append-only between cap evictions, so the leading `replace_from` lines stay
+  byte-identical and untouched, and terminal-normal navigation just works (the buffer has more
+  lines). Residual edge: a single burst that scrolls *past the cap* and whose anchor line repeats
+  within that burst can leave a small gap in history beyond the cap (cosmetic; never a stall).
 
 ## Phase 7 — Web terminal over the daemon (`nxvim-edithost` + daemon, wasm-gated)
 

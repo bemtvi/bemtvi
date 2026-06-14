@@ -342,6 +342,14 @@ impl EditHost {
                     // Build the emulator first so the very next redraw projects the
                     // (blank) screen at the right size, then spawn the PTY behind it.
                     self.terminal_open_emu(buf, rows, cols);
+                    // `portable-pty` defaults a `None` cwd to `$HOME`; the shell should
+                    // instead open in the editor's working directory, so resolve it here
+                    // (the server owns process I/O — core stays pure).
+                    let cwd = cwd.or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                    });
                     self.fx.terminal_command(native::TermCommand::Open {
                         buf,
                         argv,

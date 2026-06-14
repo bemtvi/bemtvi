@@ -331,6 +331,37 @@ async fn slow_escapes_stay_in_terminal_mode() {
     }
 }
 
+/// `:terminal` starts the child in the editor's working directory, not `$HOME`.
+/// `portable-pty` defaults a `None` cwd to the home directory, so without the
+/// server filling in the process cwd the shell would open in the wrong place.
+/// Verified by running `pwd` and matching its output to `current_dir()`.
+#[tokio::test]
+async fn terminal_starts_in_the_working_directory() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    let expect = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonicalize cwd")
+        .to_string_lossy()
+        .into_owned();
+
+    command(&rpc, "terminal pwd").await;
+    // `pwd` prints the working directory then exits; match it against the
+    // editor's cwd (canonicalizing both, so a symlinked path still compares).
+    wait_lines(&rpc, "pwd to print the editor's cwd", |ls| {
+        ls.iter().any(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && std::fs::canonicalize(t)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .as_deref()
+                    == Some(expect.as_str())
+        })
+    })
+    .await;
+}
+
 /// Phase 4 — color projection. A child that paints `red` in ANSI red
 /// (`\e[31m` = the SGR foreground for the indexed color 1) must reach the client
 /// as a `highlights` span whose resolved `styles` entry carries a red `fg`, the

@@ -22,8 +22,10 @@
 //! impossible without Asyncify — instead `:e` / `:w` route through the *same off-tick
 //! seam* a daemon session uses ([`HostEffects::fs_fetch`] / [`HostEffects::fs_save`]),
 //! and the Worker fulfills them against OPFS between ticks ([`eh_take_fs_requests`] →
-//! [`eh_fs_read_complete`] / [`eh_fs_write_complete`]). LSP / native-treesitter / process
-//! spawn remain unavailable and fail loud (a later daemon slice re-enables them).
+//! [`eh_fs_read_complete`] / [`eh_fs_write_complete`]). **Tree-sitter indentation** is wired
+//! through the [`WasmSyntax`] engine, which calls the worker's web-tree-sitter indenter
+//! synchronously over the `eh_js_ts_*` FFI bridge (highlighting stays a UI-thread overlay).
+//! LSP / process spawn remain unavailable and fail loud (a later daemon slice re-enables them).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -31,11 +33,34 @@ use std::ffi::{c_char, CStr, CString};
 use std::rc::Rc;
 
 use nxvim_core::{
-    BufferId, Clipboard, DirEntry, Editor, NumberedMark, PendingSave, PersistState,
+    BufferEdit, BufferId, Clipboard, DirEntry, Editor, IndentParams, NumberedMark, OpenOutcome,
+    PendingSave, PersistState, Span, SyntaxEngine,
 };
 use nxvim_lua::{BlockingSystem, LuaRuntime, SystemOutput, SystemSpec};
 use nxvim_server::{EditHost, HostEffects};
 use rmpv::Value;
+
+// The synchronous Rust→JS treesitter-indent bridge (web/eh-lib.js, linked by build.sh's
+// `--js-library`). These are the one place the editor tick calls *into* JS synchronously
+// — indentation is decided mid-keystroke, so it can't ride the off-tick `Sink` seam every
+// other effect uses. The worker installs the backing functions (its web-tree-sitter
+// indenter, web/ts-indent.js) on `globalThis`; with none installed (the Node harness),
+// they degrade to "no ts indent" (-1 / 0) and the core falls back. See [`WasmSyntax`].
+extern "C" {
+    /// Target indent width in columns for 0-indexed `line` of `text` (NUL-terminated
+    /// UTF-8) in `lang`, given the resolved `sw`/`ts`; `-1` to fall back.
+    fn eh_js_ts_indent(
+        lang: *const c_char,
+        text: *const c_char,
+        line: i32,
+        sw: i32,
+        ts: i32,
+    ) -> i32;
+    /// `1` if a grammar with an `indents.scm` is loaded for `lang`, else `0`.
+    fn eh_js_ts_available(lang: *const c_char) -> i32;
+    /// Drop `lang`'s cached grammar after a `:TSInstall`, so the next query reloads it.
+    fn eh_js_ts_reload(lang: *const c_char);
+}
 
 /// The blocking shell-out seam (`nx._system`, behind `vim.fn.system` / a config's
 /// `root_dir` probe) on the serverless browser build: there is no process to run — a
@@ -168,6 +193,145 @@ impl Clipboard for WasmClipboard {
         let mut sink = self.sink.borrow_mut();
         sink.clipboard_get = Some(text.to_string());
         sink.clipboard_writes.push(text.to_string());
+    }
+}
+
+/// One opened buffer's state the [`WasmSyntax`] engine keeps: the language it parses as
+/// and a **shadow copy of the text**, patched by the editor's edit deltas. The shadow is
+/// what gets handed to the JS indenter on a query — the trait's contract is that the
+/// engine owns its own text (so its methods never borrow the editor's buffers).
+struct WasmBufState {
+    language: String,
+    /// Full buffer text (the rope keeps a trailing `\n`, so this does too).
+    shadow: String,
+}
+
+/// The wasm [`SyntaxEngine`]: the browser twin of `nxvim-ts`'s native `Engine`, but it
+/// owns **no parser** — web-tree-sitter (the wasm tree-sitter runtime) lives in JS, not in
+/// this Rust wasm module. So highlighting is handled entirely UI-side (`web/highlight.js`,
+/// a paint overlay, never routed through this engine), and this engine exists purely for
+/// **indentation**, which — unlike highlighting — the core must decide *synchronously
+/// inside the tick*. On [`indent`](SyntaxEngine::indent) it hands the shadow text to the
+/// worker's web-tree-sitter indenter through the [`eh_js_ts_indent`] FFI bridge and returns
+/// its verdict; the worker keeps the grammars + `indents.scm` and runs the ported
+/// nvim-treesitter algorithm (`web/ts-indent.js`).
+///
+/// SAFETY of the `Send` bound `SyntaxEngine` does not require: this holds only owned data
+/// (no `Rc`), and the whole edit-host runs on the single Worker thread anyway.
+#[derive(Default)]
+struct WasmSyntax {
+    buffers: HashMap<BufferId, WasmBufState>,
+}
+
+impl WasmSyntax {
+    /// Borrow a buffer's language as a C string for the FFI bridge (empty on a buffer the
+    /// engine never opened — the JS side maps that to "no grammar" → fall back).
+    fn lang_cstr(language: &str) -> Option<CString> {
+        CString::new(language).ok()
+    }
+}
+
+impl SyntaxEngine for WasmSyntax {
+    fn open(&mut self, buffer: BufferId, language: &str, text: &str) -> OpenOutcome {
+        // Just snapshot the text + language; the parser is JS-side. A grammar that isn't
+        // available there is the JS indenter's silent-fallback case, never a load failure
+        // surfaced here — so always `Ok` (matches the wasm build's best-effort highlighting).
+        self.buffers.insert(
+            buffer,
+            WasmBufState {
+                language: language.to_string(),
+                shadow: text.to_string(),
+            },
+        );
+        OpenOutcome::Ok
+    }
+
+    fn edit(&mut self, buffer: BufferId, edits: &[BufferEdit]) {
+        let Some(state) = self.buffers.get_mut(&buffer) else {
+            return;
+        };
+        // Patch the shadow with each byte-range replacement, defending against a malformed
+        // delta (out-of-range / mid-codepoint) so a bad edit degrades to a stale shadow
+        // rather than a panic across the FFI boundary.
+        for e in edits {
+            let len = state.shadow.len();
+            if e.start_byte > e.old_end_byte
+                || e.old_end_byte > len
+                || !state.shadow.is_char_boundary(e.start_byte)
+                || !state.shadow.is_char_boundary(e.old_end_byte)
+            {
+                continue;
+            }
+            state
+                .shadow
+                .replace_range(e.start_byte..e.old_end_byte, &e.text);
+        }
+    }
+
+    fn close(&mut self, buffer: BufferId) {
+        self.buffers.remove(&buffer);
+    }
+
+    fn reload_grammar(&mut self, lang: &str) {
+        // A `:TSInstall <lang>` just landed: tell the JS indenter to evict its cached
+        // grammar so the next query reloads the freshly installed parser + indents.scm.
+        if let Some(c) = Self::lang_cstr(lang) {
+            unsafe { eh_js_ts_reload(c.as_ptr()) };
+        }
+    }
+
+    fn highlights(&mut self, _buffer: BufferId, _first: usize, _last: usize) -> Vec<Span> {
+        // Highlighting on the browser build is a UI-thread paint overlay (web/highlight.js),
+        // never routed through the core engine — so this is always empty (the redraw path
+        // doesn't even call it on wasm; `refresh_highlights` is native-only).
+        Vec::new()
+    }
+
+    fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {
+        let state = self.buffers.get(&buffer)?;
+        let lang = Self::lang_cstr(&state.language)?;
+        let text = CString::new(state.shadow.as_str()).ok()?;
+        let width = unsafe {
+            eh_js_ts_indent(
+                lang.as_ptr(),
+                text.as_ptr(),
+                line as i32,
+                p.shiftwidth as i32,
+                p.tabstop as i32,
+            )
+        };
+        // `-1` is the JS side's fallback signal (grammar still loading, no grammar / no
+        // indents.scm, or an inconclusive `@indent.auto` query). A real verdict is `>= 0`.
+        (width >= 0).then_some(width as usize)
+    }
+
+    fn indents_available(&self, buffer: BufferId) -> bool {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return false;
+        };
+        let Some(lang) = Self::lang_cstr(&state.language) else {
+            return false;
+        };
+        unsafe { eh_js_ts_available(lang.as_ptr()) != 0 }
+    }
+
+    fn set_query(&mut self, _lang: &str, _name: &str, _text: Option<String>) -> Result<(), String> {
+        // The browser indenter sources its `indents.scm` from fixed assets (the offline
+        // bundle / the OPFS `:TSInstall` cache), not from an engine-held query store, so a
+        // runtime `query.set` override has nothing to install here — the same way the wasm
+        // highlighter (web/highlight.js) uses its own sanitized queries and ignores
+        // overrides. Reported as a no-op success rather than a failure so buffer-open's
+        // query resolution doesn't echo a spurious error every time.
+        Ok(())
+    }
+
+    fn set_query_overlay(
+        &mut self,
+        _lang: &str,
+        _name: &str,
+        _text: Option<String>,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -377,6 +541,11 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     // Wire the `"+` / `"*` registers to the browser clipboard via the Sink (the wasm twin of
     // the native `SystemClipboard`). Without a provider the editor errors loud on `"+`.
     editor.set_clipboard(Box::new(WasmClipboard { sink: sink.clone() }));
+    // Install the treesitter-indent engine: it owns no parser (web-tree-sitter is JS-side)
+    // and answers indentation synchronously through the `eh_js_ts_*` bridge to the worker's
+    // indenter. Highlighting stays a UI-thread overlay; this is purely for `o`/`O`/`<CR>`/`=`
+    // indent. Without it the core has no ts-indent and every line opens at column 0.
+    editor.set_syntax_engine(Box::new(WasmSyntax::default()));
     let mut host = EditHost::new(editor, lua, fx);
     // OPFS is async to open, so `:e` / `:w` defer to the off-tick seam the Worker
     // fulfills (Phase 6); turn it on before boot so the very first open routes there.

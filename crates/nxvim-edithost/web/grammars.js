@@ -9,6 +9,25 @@
 // Because both read this file, the offline set and the on-demand set can never use
 // mismatched versions or paths.
 
+// nvim-treesitter commit the INDENT queries are read from — pinned (matching
+// `nxvim-ts`'s native `install.rs` `NVIM_TS_REF`) so the browser indents.scm is the
+// same revision, in the same `@indent.begin`/`@indent.end` format the ported
+// algorithm (web/ts-indent.js) expects. The grammar npm packages don't ship a usable
+// `indents.scm` — only `highlights.scm` lives there — so indents come from
+// nvim-treesitter's `runtime/queries/<lang>/indents.scm`, exactly like native.
+export const NVIM_TS_REF = '4916d6592ede8c07973490d9322f187e07dfefac';
+
+// The jsDelivr URL for `lang`'s nvim-treesitter `indents.scm` at the pinned ref, or
+// null for a language not in the registry. `base` overrides the CDN host (a test
+// mirror / the runtime's `__NXVIM_TS_BASE`). The nvim-treesitter query directory name
+// is the registry's own canonical name (rust, python, c_sharp, …); a grammar that
+// reuses another's parser (the FT map) still has its own query dir there.
+export function indentSource(name, base) {
+  if (!REGISTRY[name]) return null;
+  const root = base || 'https://cdn.jsdelivr.net/gh';
+  return `${root}/nvim-treesitter/nvim-treesitter@${NVIM_TS_REF}/runtime/queries/${name}/indents.scm`;
+}
+
 // Pinned package versions — MUST stay in lockstep with treesitter/package.json (the
 // build installs those exact versions; the runtime builds jsDelivr URLs from these).
 export const VERSIONS = {
@@ -188,11 +207,12 @@ export const REGISTRY = {
 export const BUNDLED = ['rust', 'lua', 'json', 'javascript', 'typescript', 'python'];
 
 // The standard query kinds a `:TSInstall` fetches + caches (faithful to the native
-// install). Only `highlights` is consumed by the current JS highlighter; the rest are
-// cached for forward-compat (no browser consumer exists yet — see the plan's "out of
-// scope"). `highlights` is assembled from the per-language `highlights` list above;
-// the others come from the grammar package's own `queries/` dir, best-effort (a
-// missing file is skipped, not an error).
+// install). `highlights` feeds the UI highlighter and `indents` the worker's tree-sitter
+// indenter (web/ts-indent.js); injections/folds/locals are cached for forward-compat (no
+// browser consumer yet). `highlights` is assembled from the per-language `highlights` list
+// above; `indents` comes from nvim-treesitter (see `indentSource`, since the grammar
+// packages don't ship a usable one); the others come from the grammar package's own
+// `queries/` dir, all best-effort (a missing file is skipped, not an error).
 export const QUERY_KINDS = ['highlights', 'injections', 'indents', 'folds', 'locals'];
 
 // Resolve the [pkg, file] query sources for a language's highlights.scm. Defaults to

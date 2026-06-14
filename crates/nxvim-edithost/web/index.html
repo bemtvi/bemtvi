@@ -136,6 +136,10 @@
     const daemonUri = new URLSearchParams(location.search).get("daemon");
     if (daemonUri) workerUrl.searchParams.set("daemon", daemonUri);
     const worker = new Worker(workerUrl, { type: "module" });
+    // Surface a worker that fails to *load* (a module-eval / import error). Without this a
+    // broken worker is silent — the `ready` promise just never resolves and the editor
+    // appears to hang. Log it loudly so it's diagnosable (e.g. in the Playwright verifiers).
+    worker.onerror = (e) => console.error("edit-host worker load error:", e.message || e, e.filename || "", e.lineno || "");
     const useSAB = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
     let latest = { frame: null, lines: "" };
     let readyResolve;

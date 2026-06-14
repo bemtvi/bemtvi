@@ -16,7 +16,7 @@ import { Parser, Language, Query } from 'web-tree-sitter';
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { REGISTRY, BUNDLED, highlightSources } from '../../web/grammars.js';
+import { REGISTRY, BUNDLED, highlightSources, indentSource } from '../../web/grammars.js';
 import { sanitize } from '../../web/ts-sanitize.js';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // tooling dir
@@ -31,13 +31,26 @@ async function main() {
   mkdirSync(join(OUT, 'web-tree-sitter'), { recursive: true });
   mkdirSync(join(OUT, 'grammars'), { recursive: true });
   mkdirSync(join(OUT, 'queries'), { recursive: true });
+  mkdirSync(join(OUT, 'indents'), { recursive: true });
 
   // Runtime (web-tree-sitter.js + .wasm) — copied once; shared by every grammar and
   // by the runtime installer.
   copyFileSync(g('web-tree-sitter/web-tree-sitter.js'), join(OUT, 'web-tree-sitter', 'web-tree-sitter.js'));
   copyFileSync(g('web-tree-sitter/web-tree-sitter.wasm'), join(OUT, 'web-tree-sitter', 'web-tree-sitter.wasm'));
 
+  // Indent queries come from nvim-treesitter (the grammar packages don't ship a usable
+  // `indents.scm`), fetched once at build time and sanitized against the grammar — the
+  // offline twin of the runtime `:TSInstall` indents fetch. Best-effort: a language
+  // nvim-treesitter has no indents for (or a network hiccup) is skipped, not fatal —
+  // that language simply falls back to copy-previous-line autoindent in the browser.
+  async function fetchText(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.text();
+  }
+
   const manifest = [];
+  const indented = [];
   for (const name of BUNDLED) {
     const cfg = REGISTRY[name];
     if (!cfg) throw new Error(`BUNDLED lists '${name}', which is not in the registry`);
@@ -61,10 +74,30 @@ async function main() {
     const dropped = res.droppedCompile + res.droppedRun;
     const note = dropped ? `  (dropped ${dropped}: ${res.droppedCompile} compile / ${res.droppedRun} run)` : '';
     console.log(`  ${name.padEnd(11)} ${res.kept}/${res.total} patterns, ${caps} sample captures${note}`);
+
+    // Indents — best-effort, from nvim-treesitter, sanitized against this grammar.
+    try {
+      const rawIndent = await fetchText(indentSource(name));
+      const ind = sanitize(rawIndent, Query, lang, tree.rootNode);
+      // A query that compiles to zero kept patterns carries no indent rules — skip it
+      // so the indenter reports "no ts indent" rather than loading a dead query.
+      if (ind.kept > 0) {
+        writeFileSync(join(OUT, 'indents', `${name}.scm`), ind.text);
+        indented.push(name);
+        console.log(`  ${''.padEnd(11)} indents: ${ind.kept}/${ind.total} patterns`);
+      } else {
+        console.log(`  ${''.padEnd(11)} indents: none kept — skipped`);
+      }
+    } catch (e) {
+      console.log(`  ${''.padEnd(11)} indents: unavailable (${e.message || e}) — skipped`);
+    }
   }
 
   writeFileSync(join(OUT, 'manifest.json'), JSON.stringify({ languages: manifest }, null, 2) + '\n');
-  console.log(`vendored ${manifest.length} bundled languages + runtime into ./vendor/`);
+  // The set of bundled languages that ship an indents.scm, so the worker indenter knows
+  // which to load offline without probing for a 404.
+  writeFileSync(join(OUT, 'indents.json'), JSON.stringify(indented, null, 2) + '\n');
+  console.log(`vendored ${manifest.length} bundled languages (${indented.length} with indents) + runtime into ./vendor/`);
 }
 
 main().catch((e) => {

@@ -74,6 +74,36 @@ function readStr(ptr) {
   return s;
 }
 
+// Tree-sitter INDENTATION (web/ts-indent.js). Unlike highlighting — a UI-thread paint
+// overlay that may repaint late — the core decides indentation *synchronously, inside the
+// tick* (on `o`/`O`/`<CR>`/`=`), so it must run HERE in the worker. The indenter loads
+// grammars + indents.scm (offline bundle / OPFS install cache) and answers `indent()`
+// synchronously; the Rust tick reaches it through the `eh_js_ts_*` FFI bridge
+// (web/eh-lib.js), which forwards to these globals.
+//
+// Loaded *dynamically and guarded*: the indenter is optional (it pulls in web-tree-sitter),
+// so a load failure must degrade to "no ts indent" (the core falls back to copy-previous /
+// column 0), never abort the worker and hang the editor. The grammar loads are async too, so
+// a keystroke that beats the first load just falls back that once.
+let indenter = null;
+let indenterSettled = false; // the dynamic import has resolved or rejected (not still loading the module)
+import("./ts-indent.js")
+  .then(({ createIndenter }) => {
+    indenter = createIndenter();
+    globalThis.__nxvimTsIndent = (lang, text, line, sw, ts) => indenter.indent(lang, text, line, sw, ts);
+    globalThis.__nxvimTsAvailable = (lang) => indenter.available(lang);
+    globalThis.__nxvimTsReload = (lang) => indenter.reload(lang);
+  })
+  .catch((e) => postMessage({ type: "config_error", error: "ts-indent unavailable: " + (e && e.stack ? e.stack : e) }))
+  .finally(() => { indenterSettled = true; });
+
+// Whether the indenter has async work the SAB run loop must stay event-loop-live for: the
+// module import itself, then its init (web-tree-sitter + manifests) and any in-flight grammar
+// load. A thread blocked in `Atomics.wait` can't run those promises, so the loop parks
+// non-blockingly (`Atomics.waitAsync`) while this is true — the same treatment daemon watches
+// get — and only blocks once the indenter is fully idle.
+const indenterBusy = () => !indenterSettled || (indenter !== null && indenter.pendingLoads() > 0);
+
 const h = eh_new();
 if (h === 0) {
   postMessage({ type: "fatal", error: "eh_new returned null (Lua VM failed to init in wasm)" });
@@ -136,7 +166,12 @@ async function bootWithConfig() {
 function currentFrame() {
   try {
     const parsed = JSON.parse(readStr(eh_redraw_json(h)));
-    return Array.isArray(parsed) ? (parsed[0] ?? null) : parsed;
+    const frame = Array.isArray(parsed) ? (parsed[0] ?? null) : parsed;
+    // Warm the indenter's grammars for whatever's on screen, so ts-indent is ready before
+    // the user types `o`/`<CR>` (the grammar load is async; a keystroke that beats it just
+    // falls back this once). Cheap + idempotent; the indenter may not be loaded yet.
+    if (indenter) indenter.ensureForFrame(frame);
+    return frame;
   } catch (e) {
     postMessage({ type: "fatal", error: `redraw JSON parse failed: ${e}` });
     return null;
@@ -441,6 +476,7 @@ const daemonNotifications = []; // [method, params] pushes received but not yet 
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
 let pendingConnectUri = null; // a runtime `:connect nxvim://…` to dial on the next run-loop pass
 const DAEMON_PUSH_POLL_MS = 1000; // async-park cap: clears a dangling waitAsync + backstops a push
+const INDENT_LOAD_POLL_MS = 25;   // async-park cap while the indenter loads a grammar (resolve its promises promptly)
 
 // A daemon→edit-host push landed on the RPC reader. Queue it (the run loop applies it — single
 // consumer of the wasm tick) and wake the loop. Under 5c (no run loop) apply it inline.
@@ -825,21 +861,25 @@ async function runLoopSAB(ctrl, data) {
     // keystroke / timer also wakes to flush cross-session state after a quiet period.
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
     let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
-    if (daemon && (armedWatches.size > 0 || liveProcs.size > 0)) {
-      // A daemon session expecting pushes — a watch armed, or a child in flight — must not
-      // *block*: a thread frozen in `Atomics.wait` can't run the WebTransport reader, so a
-      // `fs_changed` / `proc_exited` push would sit until the next keystroke. Park on the
-      // non-blocking `Atomics.waitAsync` so the event loop (hence the reader) keeps running;
-      // wake the instant a push lands (`daemonWake`) or input arrives (SEQ notify resolves
-      // `w.value`), capped so a dangling wait clears.
-      timeout = timeout === undefined ? DAEMON_PUSH_POLL_MS : Math.min(timeout, DAEMON_PUSH_POLL_MS);
+    const daemonPushing = daemon && (armedWatches.size > 0 || liveProcs.size > 0);
+    if (daemonPushing || indenterBusy()) {
+      // Don't *block* — a thread frozen in `Atomics.wait` can't run the event loop, so any
+      // pending promise stalls. Cases that need it live: a daemon session expecting pushes
+      // (a watch armed, or a child in flight — its WebTransport reader must keep running to
+      // receive a `fs_changed` / `proc_exited` push), and the treesitter indenter while it
+      // loads a grammar (its fetch / `Language.load` promises must resolve between
+      // keystrokes). Park on the non-blocking `Atomics.waitAsync` so the event loop (hence
+      // the reader) keeps running; wake on input (SEQ notify resolves `w.value`), a daemon
+      // push (`daemonWaker`), or the poll cap. The cap is short while a grammar is loading so
+      // the load completes promptly, then the loop falls back to blocking once idle.
+      const cap = indenterBusy() ? INDENT_LOAD_POLL_MS : DAEMON_PUSH_POLL_MS;
+      timeout = timeout === undefined ? cap : Math.min(timeout, cap);
       const w = Atomics.waitAsync(ctrl, SEQ, seqBefore, timeout);
       if (w.async) await Promise.race([w.value, new Promise((res) => { daemonWaker = res; })]);
       // (`!w.async` ⇒ SEQ already moved / timeout 0 — loop immediately, no missed wakeup.)
     } else {
-      // Serverless OPFS (or daemon with no watches): no pushes to receive, so block — it's
-      // cheaper. Blocking inside an async function is fine: the `await`s above fully settled,
-      // so nothing is pending on the microtask queue while the thread is parked.
+      // Serverless OPFS (or daemon with nothing pending) and the indenter idle: no pushes to
+      // receive and nothing pending on the microtask queue, so block — it's cheaper.
       Atomics.wait(ctrl, SEQ, seqBefore, timeout);
     }
   }

@@ -4,7 +4,8 @@
 //   2. a NON-bundled grammar (zig) installs at runtime — fetched from the CDN, sanitized,
 //      cached in OPFS, and registered — and then highlights;
 //   3. the install persists across a reload (highlights again from OPFS, with ZERO refetch);
-//   4. the full standard query set is cached in OPFS (indents.scm, though unused today).
+//   4. the full standard query set is cached in OPFS (incl. indents.scm, consumed by the
+//      worker indenter — see verify-treesitter-indent.mjs).
 //
 // Hermetic: the CDN (jsDelivr) is intercepted via page.route and served from the pinned
 // `treesitter/node_modules/` tarballs — the same versions the registry declares — so the
@@ -70,6 +71,10 @@ try {
   // Track which subpaths were served so we can prove an install fetched (and a reload did
   // NOT). Scoped packages (@tree-sitter-grammars/…) keep their leading segment.
   let cdnFetches = [];
+  // Indents now come from nvim-treesitter (jsDelivr's /gh/ mirror). Block it in this test so
+  // the install stays hermetic — zig ships its own queries/indents.scm, so highlight.js's
+  // fallback caches that instead (the `indents.scm` OPFS-cache assertion below still holds).
+  await page.route("**/cdn.jsdelivr.net/gh/**", (route) => route.fulfill({ status: 404, body: "gh mirror disabled in test" }));
   await page.route("**/cdn.jsdelivr.net/npm/**", async (route) => {
     const rest = new URL(route.request().url()).pathname.replace(/^\/npm\//, "");
     const m = rest.match(/^(@[^/]+\/[^/@]+|[^/@]+)@[^/]+\/(.+)$/);
@@ -134,7 +139,7 @@ try {
   }
   check("install: status echoes 'installed zig'", /installed zig/i.test(echo), echo);
 
-  // ---- 4. The full standard query set is cached in OPFS (indents, though unused) ----
+  // ---- 4. The full standard query set is cached in OPFS (indents → worker indenter) ----
   const cached = await page.evaluate(async () => {
     const out = {};
     try {

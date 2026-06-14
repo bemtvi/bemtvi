@@ -53,6 +53,7 @@ mkdir -p dist
 emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -fwasm-exceptions \
   --no-entry \
+  --js-library web/eh-lib.js \
   -sMODULARIZE=1 \
   -sEXPORT_ES6=1 \
   -sENVIRONMENT=node,web,worker \

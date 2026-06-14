@@ -21,7 +21,7 @@
 // the renderer already does).
 
 import { Parser, Language, Query } from './vendor/web-tree-sitter/web-tree-sitter.js';
-import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, versionOf, resolveName } from './grammars.js';
+import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, indentSource, versionOf, resolveName } from './grammars.js';
 import { sanitize } from './ts-sanitize.js';
 
 // Resolve vendored assets relative to THIS module, not the page, so the demo still
@@ -33,6 +33,12 @@ const V = new URL('./vendor/', import.meta.url);
 // origin-isolated page's COEP `require-corp` accepts the cors-mode fetch). Overridable
 // via a global so a hermetic test can point it at a local mirror.
 const CDN_BASE = (typeof globalThis !== 'undefined' && globalThis.__NXVIM_TS_BASE) || 'https://cdn.jsdelivr.net/npm';
+
+// Where the nvim-treesitter INDENT queries are fetched from (jsDelivr's GitHub mirror).
+// The grammar npm packages don't ship a usable `indents.scm`, so indents come from
+// nvim-treesitter at the pinned ref — same source as the bundle generator and native.
+// Overridable for a hermetic test.
+const GH_BASE = (typeof globalThis !== 'undefined' && globalThis.__NXVIM_TS_GH_BASE) || 'https://cdn.jsdelivr.net/gh';
 
 // OPFS path (under the same `.nxvim` dir the worker keeps shada in) where installed
 // grammars are cached: `/.nxvim/treesitter/<lang>/{parser.wasm,highlights.scm,…}` plus
@@ -181,8 +187,9 @@ export function createHighlighter({ onReady } = {}) {
   // (re)register it (no network). Otherwise fetch the prebuilt `.wasm` + the standard
   // query set from the CDN, sanitize highlights against the grammar, cache everything in
   // OPFS (so it survives reload), and register it. Returns `{ ok, msg }` for the status
-  // line. Only highlights.scm is consumed today; indents/injections/folds/locals are
-  // cached for forward-compat (no browser consumer yet).
+  // line. highlights.scm feeds this UI highlighter; indents.scm is consumed by the worker's
+  // tree-sitter indenter (web/ts-indent.js); injections/folds/locals are cached for
+  // forward-compat (no browser consumer yet).
   async function install(rawName) {
     await ready;
     // Canonicalize first (`c#`/`csharp`/`cs` → `c_sharp`, …); `name` is what we cache,
@@ -220,10 +227,21 @@ export function createHighlighter({ onReady } = {}) {
       if (caps === 0) return { ok: false, name, msg: 'grammar/query mismatch (0 captures)' };
 
       // The rest of the standard query set — cached for forward-compat, best-effort
-      // (a grammar that doesn't ship one is skipped, not an error).
+      // (a grammar that doesn't ship one is skipped, not an error). `indents` is special:
+      // the grammar packages don't ship a usable one, so it comes from nvim-treesitter (the
+      // worker indenter consumes it); fall back to the grammar package if nvim-treesitter
+      // has none for this language.
       const extras = {};
       for (const kind of QUERY_KINDS) {
         if (kind === 'highlights') continue;
+        if (kind === 'indents') {
+          try { extras.indents = await fetchText(indentSource(name, GH_BASE)); }
+          catch {
+            try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
+            catch { /* no indents from either source */ }
+          }
+          continue;
+        }
         try { extras[kind] = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/${kind}.scm`); }
         catch { /* not shipped by this grammar */ }
       }

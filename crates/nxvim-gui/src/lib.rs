@@ -34,13 +34,16 @@
 
 mod input;
 mod mouse;
+pub mod remote;
 mod render;
+mod session;
 
 pub use input::{encode_key, is_paste};
 pub use mouse::{
     button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
     panel_content_rect, vertical_action, within,
 };
+pub use session::{parse_connect_uri, spawn_session, spawn_stdio_daemon_session, Session};
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
 pub use render::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
@@ -56,7 +59,6 @@ use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_view::{encode_paste, HlSpan, InlayHint, ScrollData, Style, View};
 use rmpv::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -149,117 +151,199 @@ impl GuiConfig {
 pub enum UserEvent {
     /// A decoded `redraw`: replace the view and repaint.
     Redraw(Box<View>),
+    /// A `:connect` brought up a new (daemon or local) session: swap the App's live
+    /// RPC handle to it, mark whether it is remote, and re-attach the UI.
+    Connected {
+        rpc: Box<Rpc>,
+        /// Whether the new session is an edit-host (daemon) one — drives the local
+        /// file-dialog suppression (see [`dialog_action`]).
+        remote: bool,
+    },
     /// The server asked the UI to exit (`nxvim_exit`), or the connection closed.
     Exit,
 }
 
-/// Run the GUI client until the window closes or the server disconnects,
-/// rendering with `config`'s font. Must be called on the main thread (winit's
-/// requirement).
+/// Run the GUI client until the window closes or the server disconnects, rendering with
+/// `config`'s font. Must be called on the main thread (winit's requirement).
 ///
-/// `connect_transport` is run *inside the IO thread's runtime* and yields the
-/// stream the RPC rides — a closure (not a ready stream) so the transport is built
-/// on the same runtime that polls it. The embedded caller passes
-/// `|| async { Ok(duplex_end) }`. A connect failure propagates back before any
-/// window opens.
-///
-/// `remote` marks an edit-host (daemon) session — buffers live on the daemon's fs, so
-/// the native local-fs open/save dialogs are suppressed (see [`dialog_action`]).
-pub fn run<C, Fut, S>(
-    connect_transport: C,
-    config: GuiConfig,
-    open_dir: Option<PathBuf>,
-    remote: bool,
-) -> Result<()>
-where
-    C: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<S>>,
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+/// `initial` is the already-built startup [`Session`] (its server thread is running) —
+/// embedded local, or a daemon session if launched with `--connect-daemon` / a
+/// `nxvim://` target. After startup, `:connect [user@]host[:port][/file]` or
+/// `:connect nxvim://…` swaps the window onto a **new** local server whose host seams
+/// point at a daemon (see [`session::spawn_session`]): the IO thread builds it off the UI
+/// thread, then the session loop retires the old server (it winds down on EOF) and
+/// re-attaches the UI onto the new one. The editor always runs local — only the
+/// fs/process/watch/LSP seams cross the wire.
+pub fn run(initial: Session, config: GuiConfig, open_dir: Option<PathBuf>) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     // Shutdown signal: when the event loop exits — the window's close button, or a
-    // server-sent `nxvim_exit` — the main thread notifies the IO thread so it
-    // drops the RPC connection. The IO thread (not `run`) owns the stream, so
-    // unless it closes that, the server never sees EOF, never winds down, and
-    // `main`'s join hangs forever — the close-button freeze.
+    // server-sent `nxvim_exit` — the main thread notifies the IO thread so it drops the
+    // RPC connection. The IO thread (not `run`) owns the stream, so unless it closes
+    // that, the server never sees EOF, never winds down, and the join below hangs
+    // forever — the close-button freeze.
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let io_shutdown = shutdown.clone();
 
-    // Hand the `Rpc` handle (or the connect error) from the IO thread back to the
-    // main thread once the connection is up, so the winit side can fire input
-    // synchronously — and so a failed connection surfaces before a window opens.
-    let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Result<Rpc>>();
+    // Hand the `Rpc` handle from the IO thread back to the main thread once the
+    // (first) connection is up, so the winit side can fire input synchronously.
+    let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Rpc>();
+    // `:connect <target>` from the App requests a switch to a daemon (or local) session.
+    let (reconnect_tx, mut reconnect_rx) =
+        tokio::sync::mpsc::unbounded_channel::<remote::ConnectTarget>();
+    let initial_remote = initial.remote;
+
     let io = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build client IO runtime");
         runtime.block_on(async move {
-            let stream = match connect_transport().await {
-                Ok(stream) => stream,
-                // Report the failure to the main thread and stop; no window opens.
-                Err(err) => {
-                    let _ = rpc_tx.send(Err(err));
-                    return;
+            // The current session's transport + server thread, plus the retired servers
+            // of earlier `:connect`s (each winds down on EOF; joined at teardown).
+            let mut stream = initial.stream;
+            let mut current_handle = Some(initial.handle);
+            let mut next_remote = initial.remote;
+            let mut retired: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            // A finished `:connect` build delivers its new session here, so the handshake
+            // (run off the UI thread on the blocking pool) doesn't stall the current
+            // session's redraws while it's in flight.
+            let (built_tx, mut built_rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<Session>>();
+            let mut first = true;
+
+            'session: loop {
+                let (reader, writer) = tokio::io::split(stream);
+                let (rpc, mut incoming) = connect(reader, writer);
+                // Hand the connection to the App: the first synchronously (so `App::new`
+                // has an `Rpc`); later ones as `Connected`, which swaps the live handle
+                // and re-attaches. Dropping the *old* session's `rpc`/`incoming` on the
+                // next iteration — together with the App swapping its clone — winds the
+                // previous connection (and its server) down.
+                if first {
+                    let _ = rpc_tx.send(rpc.clone());
+                    first = false;
+                } else {
+                    let event = UserEvent::Connected {
+                        rpc: Box::new(rpc.clone()),
+                        remote: next_remote,
+                    };
+                    if proxy.send_event(event).is_err() {
+                        break 'session; // event loop gone
+                    }
                 }
-            };
-            let (reader, writer) = tokio::io::split(stream);
-            let (rpc, mut incoming) = connect(reader, writer);
-            let _ = rpc_tx.send(Ok(rpc.clone()));
-            loop {
-                tokio::select! {
-                    message = incoming.recv() => match message {
-                        Some(Incoming::Notification { method, params }) => match method.as_str() {
-                            "redraw" => {
-                                let view = View::from_redraw(&params);
-                                if proxy.send_event(UserEvent::Redraw(Box::new(view))).is_err() {
-                                    break; // event loop gone
+
+                // Block until a `:connect` build succeeds (the only value-carrying
+                // break), or `break 'session` on disconnect / exit / shutdown.
+                let new_session: Session = loop {
+                    tokio::select! {
+                        message = incoming.recv() => match message {
+                            Some(Incoming::Notification { method, params }) => match method.as_str() {
+                                "redraw" => {
+                                    let view = View::from_redraw(&params);
+                                    if proxy.send_event(UserEvent::Redraw(Box::new(view))).is_err() {
+                                        break 'session; // event loop gone
+                                    }
                                 }
-                            }
-                            "nxvim_exit" => {
-                                let _ = proxy.send_event(UserEvent::Exit);
-                                break;
-                            }
-                            _ => {}
+                                "nxvim_exit" => {
+                                    let _ = proxy.send_event(UserEvent::Exit);
+                                    break 'session;
+                                }
+                                _ => {}
+                            },
+                            // Answer server-initiated requests with nil, like the TUI.
+                            Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
+                            None => break 'session, // connection closed → exit UI
                         },
-                        // Answer server-initiated requests with nil, like the TUI.
-                        Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
-                        None => break, // connection closed → exit UI
-                    },
-                    // The UI exited: stop, so dropping the runtime below closes the
-                    // connection and the server winds down.
-                    _ = io_shutdown.notified() => break,
+                        // `:connect <target>`: build the new session off the UI thread
+                        // (the ssh/quic handshake — and its askpass dialog — can take
+                        // seconds), so the current session keeps rendering meanwhile. The
+                        // result arrives on `built_rx`.
+                        target = reconnect_rx.recv() => match target {
+                            Some(target) => {
+                                let file = target.embedded_file();
+                                let tx = built_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = tx.send(session::spawn_session(Some(target), file));
+                                });
+                            }
+                            None => break 'session, // App (the only sender) is gone
+                        },
+                        // A `:connect` build finished. On success, restart the session on
+                        // it; on failure, keep the current session and report why.
+                        built = built_rx.recv() => match built {
+                            Some(Ok(session)) => break session,
+                            Some(Err(err)) => report_connect_error(&rpc, &err),
+                            None => {} // unreachable: `built_tx` is held above
+                        },
+                        // The UI exited: stop, so dropping the runtime below closes the
+                        // connection and the server winds down.
+                        _ = io_shutdown.notified() => break 'session,
+                    }
+                };
+
+                // Swap in the new session: retire the old server (it winds down when this
+                // iteration's `rpc`/`incoming` drop on `continue`) and re-loop on the new
+                // transport, which re-attaches the UI via `Connected`.
+                if let Some(handle) = current_handle.take() {
+                    retired.push(handle);
+                }
+                current_handle = Some(new_session.handle);
+                next_remote = new_session.remote;
+                stream = new_session.stream;
+                continue 'session;
+            }
+
+            // Tell the UI to exit if it hasn't already. Dropping this scope's
+            // `rpc`/`incoming` closes the current stream — the EOF that lets the current
+            // server wind down. Join every server thread (current + retired), surfacing a
+            // panic so a crashed server is a non-zero exit, not a silent clean quit.
+            let _ = proxy.send_event(UserEvent::Exit);
+            let mut panicked = false;
+            for handle in current_handle.into_iter().chain(retired) {
+                if handle.join().is_err() {
+                    panicked = true;
                 }
             }
-            // Tell the UI to exit if it hasn't already. Returning from this block
-            // drops the runtime, which aborts the connect tasks and closes the
-            // stream — the EOF that lets the server (and `main`) finish.
-            let _ = proxy.send_event(UserEvent::Exit);
-        });
+            panicked
+        })
     });
 
     let rpc = match rpc_rx.recv() {
-        Ok(Ok(rpc)) => rpc,
-        // The transport failed to connect: surface it instead of opening a dead window.
-        Ok(Err(err)) => {
-            let _ = io.join();
-            return Err(err);
-        }
+        Ok(rpc) => rpc,
         Err(_) => {
             let _ = io.join();
             return Err(anyhow::anyhow!("client IO thread exited before connecting"));
         }
     };
-    let mut app = App::new(rpc, config, open_dir, remote);
+    let mut app = App::new(rpc, config, open_dir, initial_remote, reconnect_tx);
     event_loop.run_app(&mut app)?;
 
-    // The UI is done: stop the IO thread and wait for it, so the stream is dropped
-    // (server sees EOF) before `main` joins the server thread.
+    // The UI is done: stop the IO thread and wait for it, so the streams are dropped
+    // (servers see EOF) and their threads are joined before returning.
     shutdown.notify_one();
-    let _ = io.join();
+    let panicked = io.join().unwrap_or(true);
+    if panicked {
+        eprintln!("nxvim-gui: a server thread panicked");
+        std::process::exit(101);
+    }
     Ok(())
+}
+
+/// Report a `:connect` failure (bad host, refused auth, a malformed `nxvim://` URI) in
+/// the GUI message line via the *current* session — the new one never came up. The error
+/// chain is flattened to one line (`echom` rejects newlines) and single quotes doubled
+/// (Vim string escaping) so a hostname or path can't break the command.
+fn report_connect_error(rpc: &Rpc, err: &anyhow::Error) {
+    let line = format!(":connect failed: {err:#}").replace('\n', "; ");
+    let escaped = line.replace('\'', "''");
+    rpc.notify(
+        "nvim_command",
+        vec![Value::from(format!(
+            "echohl ErrorMsg|echom '{escaped}'|echohl NONE"
+        ))],
+    );
 }
 
 /// An in-flight scroll slide, driven by the client clock. Mirrors the TUI's
@@ -427,11 +511,22 @@ struct App {
     /// Whether this is an edit-host (daemon) session — buffers live on the daemon's
     /// fs, not the local disk. Suppresses the native open/save file dialogs (see
     /// [`dialog_action`]), which would otherwise browse and write the wrong machine.
+    /// Updated on a `:connect` swap (see [`UserEvent::Connected`]).
     remote: bool,
+    /// Requests a `:connect <target>` switch to a daemon (or local) session. The IO
+    /// thread builds the new session and feeds the swapped handle back as
+    /// [`UserEvent::Connected`] (see [`run`]).
+    reconnect: tokio::sync::mpsc::UnboundedSender<remote::ConnectTarget>,
 }
 
 impl App {
-    fn new(rpc: Rpc, config: GuiConfig, open_dir: Option<PathBuf>, remote: bool) -> Self {
+    fn new(
+        rpc: Rpc,
+        config: GuiConfig,
+        open_dir: Option<PathBuf>,
+        remote: bool,
+        reconnect: tokio::sync::mpsc::UnboundedSender<remote::ConnectTarget>,
+    ) -> Self {
         Self {
             rpc,
             window: None,
@@ -452,6 +547,7 @@ impl App {
             applied_guifont: String::new(),
             open_dir,
             remote,
+            reconnect,
         }
     }
 
@@ -1022,6 +1118,23 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            // A `:connect` brought up a new server: swap to its RPC handle (dropping the
+            // old one — the App's last clone, which lets the old connection wind down),
+            // update remote-ness, and re-attach the UI. Clearing `reported` forces
+            // `report_size` to send a fresh `nvim_ui_attach`; resetting the view avoids
+            // painting the old server's buffer until the new one's first redraw arrives.
+            UserEvent::Connected { rpc, remote } => {
+                self.rpc = *rpc;
+                self.remote = remote;
+                self.view = View::default();
+                self.scroll = None;
+                self.reported = (0, 0);
+                self.report_size(true);
+                self.apply_guifont();
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
             UserEvent::Exit => event_loop.exit(),
         }
     }
@@ -1103,6 +1216,17 @@ impl ApplicationHandler<UserEvent> for App {
                     && self.view.cmdline_prefix == ':'
                     && self.view.cmdline_prompt.is_empty()
                 {
+                    // `:connect [user@]host[:port][/file]` / `:connect nxvim://…`
+                    // switches this window to an edit-host (daemon) session. It's a
+                    // client affordance (the server knows nothing of `:connect`), so
+                    // handle it here: dismiss the command line on the current server and
+                    // ask the IO thread to bring the new session up (see
+                    // `UserEvent::Connected`).
+                    if let Some(target) = remote::connect_command(&self.view.cmdline) {
+                        self.rpc.notify("nvim_input", vec![Value::from("<Esc>")]);
+                        let _ = self.reconnect.send(target);
+                        return;
+                    }
                     let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
                     // `dialog_action` returns `None` in a remote (daemon) session, so
                     // the native local-fs picker never fires for remote buffers — the

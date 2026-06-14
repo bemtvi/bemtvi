@@ -152,7 +152,13 @@ the wire. The local half (`nxvim --connect-daemon [file]`, or a `nxvim://…` UR
 the QUIC transport) is the same embedded editor as the default role, with its host
 seams (`nxvim_core::HostFs`, `nxvim_server::HostProc`, the async `HostFsAsync`, the
 LSP transport, and the Lua-facing `nxvim_lua::LuaFs`) pointed at the daemon instead
-of the local disk. See
+of the local disk. The **GUI** also reaches this split at runtime via `:connect` —
+`:connect [user@]host[:port][/file]` spawns `ssh … nxvim --daemon` over stdio (with
+interactive prompts routed to a native dialog via `SSH_ASKPASS`, so auth works from a
+windowed launch with no tty), and `:connect nxvim://…` dials the QUIC listener. The
+editor stays local; `:connect` swaps onto a *fresh local server* whose seams point at
+the daemon and re-attaches the same window (`nxvim_gui::run`'s session loop), since the
+editor transport is always the in-process duplex. See
 [the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
 **split-brain filesystem rule** for the Lua bridge, decided up front: *project-facing*
 fs APIs (`vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
@@ -812,8 +818,10 @@ and undercurl is drawn as a plain underline.
 Because the GUI can't be black-box
 tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
 frontend-specific translation layers have Tier-1 tests — the winit→notation input
-(`crates/nxvim-gui/tests/keys.rs`) and the pointer/overlay math
-(`crates/nxvim-gui/tests/mouse.rs`); the rendered frame is validated by running it.
+(`crates/nxvim-gui/tests/keys.rs`), the pointer/overlay math
+(`crates/nxvim-gui/tests/mouse.rs`), and the `:connect` target / `nxvim://` URI / SSH
+askpass parsing (`crates/nxvim-gui/tests/remote.rs`); the rendered frame, and the live
+`:connect` session swap, are validated by running it.
 
 ### The web build — a fully client-side WebAssembly editor
 

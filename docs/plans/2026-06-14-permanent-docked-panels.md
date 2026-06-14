@@ -261,3 +261,9 @@ Ship a runnable `examples/dock/` config + sample (per project convention).
 - `crates/nxvim-lua/src/ops.rs` + `crates/nxvim-server/src/effects.rs` +
   `crates/nxvim-lua/src/install.rs` — `DockOp` + `nx.dock` surface.
 - `crates/nxvim-server/tests/dock.rs` — new: integration tests.
+
+## Follow-up
+
+Per-region tab pages & tablines build on this — each dock (and the main area) gained its own
+independent tab stack and tabline, plus a per-dock option scope and tabline mouse clicks. See
+[`2026-06-14-per-region-tablines.md`](2026-06-14-per-region-tablines.md).

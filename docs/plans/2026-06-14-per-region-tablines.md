@@ -199,15 +199,23 @@ Commit, pause.
 
 ---
 
-## Phase 5 — Polish, example, docs, memory
+## Phase 5 — Polish, example, docs, memory ✅ (landed 2026-06-14)
 
-1. Mouse: click a region's tabline cell to switch that region's tab (extend `editor/mouse.rs`
-   hit-testing to the per-region tabline rows). Server test driving a click.
-2. `examples/per-region-tabs/`: a runnable config opening a couple of docks with multiple tabs +
-   a sample file, verified end-to-end (`[[example-config-for-testing]]`).
-3. Update `docs/architecture.md` (tabline/dock sections) and the docks plan's cross-reference.
-4. Update memory `[[permanent-docks-feature]]` with the per-region-tab generalization (TabStack,
-   one-`None`-slot invariant across two axes, per-region tabline = first row of region rect).
+1. ✅ Mouse: click a region's tabline cell to switch that region's tab. `editor/mouse.rs`'s
+   `tabline_tab_at` (main-only, row-0-assuming) became `region_tabline_at(row,col) → (Layer,
+   tab)`, mirroring the client `DockLayout` band geometry (main bar below a top dock, each dock's
+   tabline the first row of its band, past the dock title prefix). The click focuses the region and
+   switches its tab via a new `tabs.rs::focus_region_tab`. This also fixed a latent bug: the old
+   hit-test put main's tabline at row 0, wrong whenever a top dock offset it. Tests in `dock.rs`
+   (`click_a_dock_tabline_switches_that_docks_tab`, `main_tabline_click_survives_a_top_dock_offset`).
+2. ✅ `examples/per-region-tabs/` (init.lua + sample.txt): opens a left + bottom dock with
+   always-on titled strips and a `:T {n}` convenience (adds tabs to the *focused* region — focus +
+   tabnew can't be interleaved from one callback because `commands` and `dock_ops` drain on
+   separate fixed-order queues). Verified end-to-end by `per_region_tabs_example_config_runs`.
+3. ✅ Updated `docs/architecture.md` (rewrote *Tab pages* for the per-region `TabStack` model +
+   per-region tablines + the mouse click; added a *Permanent docks* bullet to *Windows*) and added
+   a cross-reference from the docks plan.
+4. ✅ Updated memory (`[[per-region-tablines-and-dock-options]]`) with Phase 5.
 
 ---
 

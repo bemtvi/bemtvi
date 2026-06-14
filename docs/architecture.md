@@ -488,6 +488,24 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   float pass, re-clamping `editor`-relative floats back on-screen. The lifecycle
   diff fires `WinNew`/`WinEnter`/`WinClosed` for floats and `WinResized` when
   `set_config` changes a float's size.
+- **Permanent docks.** A **dock** is a global (cross-tab) editable window region
+  pinned to a screen edge — nxvim's VSCode-style side bars and bottom tray. It
+  reuses the tab-swap trick along a second axis: `Layer::{Main, Dock(Left | Right |
+  Top | Bottom)}`, with the *focused* layer's tree always live on `Editor::windows`
+  (the rest park per *Tab pages* above), so `split`/`close`/`focus`/editing/redraw
+  act on whatever layer holds focus with zero retargeting. `<C-w><C-w>` is the
+  **layer-switch** prefix: `<C-w><C-w>{h,j,k,l}` crosses main↔dock-by-edge and
+  `<C-w><C-w>{cmd}` crosses then runs the command, while a single `<C-w>` stays in
+  the focused layer. `relayout` carves the four edge bands (each reserving a
+  separator cell toward the main area, clamped so the main rect keeps ≥1 col/row)
+  and lays every layer's tree out at origin `(0,0)` in its own region; `View`
+  carries the band sizes and tags each window with its `WindowRegion`, and each
+  client maps region → absolute origin (the core owns *which* cells, the client
+  owns *where*). Surface: the `nx.dock.*` Lua table
+  (`open{side,size?,buf?,title?,showtabline?}` / `close` / `focus`, plus the
+  per-dock option scope `nx.dock.opt(side)`) and the `:DockOpen`/`:DockClose`/
+  `:DockFocus` ex-commands, queued as a `DockOp` drained into the core. (Design:
+  [`docs/plans/2026-06-14-permanent-docked-panels.md`](plans/2026-06-14-permanent-docked-panels.md).)
 - **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from
   the same server-side lifecycle diff as the buffer events, ordered
   `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.
@@ -506,24 +524,40 @@ by the window-local `sidescroll` / `sidescrolloff`. The core decides `leftcol`
 fixed. (Design: [`docs/plans/2026-06-07-horizontal-scrolling-and-wrap.md`](plans/2026-06-07-horizontal-scrolling-and-wrap.md).)
 
 **Tab pages** multiply the window layout the same way `BufferStore` multiplied
-the buffer: `Editor::windows` stays the *active* tab's live `WindowTree`, while
-inactive tabs stash their tree in a `Vec<TabSlot>` (`current_tab` indexes the
-active one). A switch (`gt`/`gT`/`:tabnext`/`nvim_set_current_tabpage`) is a
-`mem::swap` of the live tree with the target's stash, then re-enters the incoming
-tab's focused window — the tab analogue of `focus_window`, so the entire editing
-machine is untouched (`self.windows` is always the active layout). `:tabnew` /
-`:tabedit` / `<C-w>T` create one (window ids are minted globally off
-`Editor::next_win_id` so they never collide across tabs); `:tabclose` / `:tabonly`
-refuse the final tab, and `:q` on a tab's last window closes the *tab* while
-others remain. The `View` carries a `Vec<TabView>` (focused buffer name +
-modified flag + window count) and the active index, gated — along with the
-reserved top row the server's `relayout` subtracts — by the global `showtabline`
-(0/1/2) through one `tabline_visible` check. The lifecycle diff fires
+the buffer — and they do it **per region**: the main area and *each* open dock
+(see *Permanent docks* below) carry their own independent tab stack. Each layer
+owns a `TabStack { tabs: Vec<TabSlot>, current }`, so `Editor` holds `main_tabs`
+plus `dock_tabs: [Option<TabStack>; 4]`. The *focused* layer's active tab is the
+live `WindowTree` on `Editor::windows`; every other `(layer, tab)` tree parks in
+its `TabSlot`, so across the whole editor exactly **one** slot is `None` (the live
+one) — the same invariant tabs always kept, now spanning two axes. A switch
+(`gt`/`gT`/`:tabnext`/`nvim_set_current_tabpage`) is a `mem::swap` of the live
+tree with the target's stash, then re-enters the incoming tab's focused window —
+the tab analogue of `focus_window`, so the entire editing machine is untouched.
+`:tabnew`/`:tabedit`/`<C-w>T` create one (window ids minted globally off
+`Editor::next_win_id` so they never collide across any layer/tab); `:tabclose` /
+`:tabonly` refuse main's final tab, `:q` on a tab's last window closes the *tab*,
+and closing a **dock's** last tab closes the dock. Tab ops act on the **focused**
+region — `gt` in a focused dock cycles only that dock's tabs — while the
+`nvim_tabpage_*` API stays main-only (it crosses to main first). Reads resolve
+against a `nx._tabs` mirror and `nvim_set_current_tabpage` queues a `TabOp`, the
+same "Lua queues, core mutates" flow as windows; the lifecycle diff fires
 `TabNew`/`TabLeave`/`TabEnter`/`TabClosed`, bracketing the window events
-(`TabLeave → WinLeave → … → WinEnter → TabEnter`); the `nvim_tabpage_*` reads
-resolve against a `nx._tabs` mirror and `nvim_set_current_tabpage` queues a
-`TabOp`, the same "Lua queues, core mutates" flow as windows. (Design:
-[`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md).)
+(`TabLeave → WinLeave → … → WinEnter → TabEnter`).
+
+**Tablines are per region too.** Each region draws its own tabline: the main
+area's is the editor's top bar (below a top dock, if any); each dock's is the
+first row of its band, with the tree laid out below it. The `View` carries a
+`RegionTablines { main, docks[4] }` — each a `Vec<TabView>` (focused buffer name +
+modified flag + window count), an active index, and the dock's title — gated by
+each region's own `showtabline` (a dock may override the global option, or force
+its strip on with a non-empty title), and the server's `relayout` reserves
+`tabline_rows_for(layer)` per region. A left-click on any region's tabline cell
+switches that region to the clicked tab and focuses it: `Editor::region_tabline_at`
+reconstructs the same per-region band geometry the clients paint, then maps the
+cell (past a dock's title prefix) to a `(layer, tab)`. (Design:
+[`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md),
+[`docs/plans/2026-06-14-per-region-tablines.md`](plans/2026-06-14-per-region-tablines.md).)
 
 Still pending: **line wrapping** (`wrap` — the display-row projection; Phase 2 of
 the horizontal-scroll plan) and **more window-local options** (`cursorline`, …)

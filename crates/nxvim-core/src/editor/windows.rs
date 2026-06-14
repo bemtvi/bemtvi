@@ -1944,7 +1944,7 @@ impl Editor {
 
     /// Rows the global status line reserves at the bottom of the windows area: one
     /// at `laststatus=3` ([`Editor::global_statusline_visible`]), zero otherwise.
-    fn global_statusline_rows(&self) -> usize {
+    pub(crate) fn global_statusline_rows(&self) -> usize {
         usize::from(self.global_statusline_visible())
     }
 

@@ -186,6 +186,26 @@ impl Editor {
         }
     }
 
+    /// Switch region `layer` to its tab at `idx`, moving focus into that region
+    /// first (a tabline click both selects the tab and focuses its window, like
+    /// vim's global tabline click — `switch_tab` always acts on the focused
+    /// layer's stack). A no-op when the layer is closed or `idx` is out of range
+    /// (an already-active tab of the now-focused region falls through `switch_tab`'s
+    /// own no-op). Backs the per-region tabline mouse click ([`Editor::mouse`]).
+    pub(crate) fn focus_region_tab(&mut self, layer: Layer, idx: usize) {
+        let Some(stack) = self.stack(layer) else {
+            return;
+        };
+        if idx >= stack.tabs.len() {
+            return;
+        }
+        match layer {
+            Layer::Main => self.ensure_main_layer(),
+            Layer::Dock(side) => self.focus_dock(side),
+        }
+        self.switch_tab(idx);
+    }
+
     /// Make tab `id` the active tab (`nvim_set_current_tabpage`). A no-op if `id`
     /// is already active or names no open tab. The neovim tabpage API addresses the
     /// **main** layer's tabs, so focus crosses back to main first (a focused dock

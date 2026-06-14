@@ -9,7 +9,9 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{drain_to_latest_redraw, exec_lua, feed, lines, map_get, start_attached};
+use nxvim_test_harness::{
+    drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, start_attached,
+};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -382,6 +384,53 @@ async fn example_config_opens_its_docks() {
 }
 
 #[tokio::test]
+async fn per_region_tabs_example_config_runs() {
+    // Run the shipped examples/per-region-tabs/init.lua end-to-end: it opens its
+    // left + bottom docks (each with an always-on titled tabline), and its `:T`
+    // command grows only the focused region's own tab stack (guards the example).
+    let (rpc, mut incoming) = start().await;
+    let init = include_str!("../../../examples/per-region-tabs/init.lua");
+    exec_lua(&rpc, init).await;
+    assert_eq!(win_count(&rpc).await, 3, "main + a left and a bottom dock");
+    let rd = latest(&mut incoming);
+    // All three regions show their always-on strips (showtabline=2), each with one
+    // tab to start; the docks carry their titles.
+    assert_eq!(region_tab_count(&rd, "main"), 1, "main's strip is on");
+    assert_eq!(
+        region_tab_count(&rd, "left"),
+        1,
+        "the left dock's strip is on"
+    );
+    assert_eq!(
+        region_tab_count(&rd, "bottom"),
+        1,
+        "the bottom dock's strip is on"
+    );
+    assert_eq!(region_title(&rd, "left"), "EXPLORER");
+    assert_eq!(region_title(&rd, "bottom"), "TERMINAL");
+    // Focus the bottom tray and grow ITS tab stack with the example's `:T` — the
+    // other regions' tablines stay put (per-region tab independence).
+    exec_lua(&rpc, "nx.dock.focus('bottom')").await;
+    feed_sync(&rpc, ":T 2<CR>").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_tab_count(&rd, "bottom"),
+        3,
+        ":T added two tabs to the focused bottom dock"
+    );
+    assert_eq!(
+        region_tab_count(&rd, "main"),
+        1,
+        "main's tabs are untouched"
+    );
+    assert_eq!(
+        region_tab_count(&rd, "left"),
+        1,
+        "the left dock's tabs are untouched"
+    );
+}
+
+#[tokio::test]
 async fn four_docks_keep_a_nondegenerate_main_area() {
     let (rpc, mut incoming) = start().await;
     for side in ["left", "right", "top", "bottom"] {
@@ -499,6 +548,90 @@ async fn dock_title_projects_and_forces_the_strip() {
     assert!(
         region_tab_count(&rd, "left") >= 1,
         "the title forces the strip on"
+    );
+}
+
+/// A left-click on an open dock's own tabline switches *that dock's* active tab
+/// and crosses focus into the dock — even while the main area is focused. The
+/// per-region generalization of vim's tabline click.
+#[tokio::test]
+async fn click_a_dock_tabline_switches_that_docks_tab() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    // A bottom dock with two (empty, unnamed) tabs: at the default showtabline=1
+    // its own tabline shows once it has the second tab; current tab = 1.
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 8 }").await;
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    // Cross back to the main area; the dock keeps its active tab (1).
+    feed_sync(&rpc, "<C-w><C-w>k").await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_current(&rd, "bottom"),
+        1,
+        "the dock starts on its 2nd tab"
+    );
+    // Geometry: the test attaches the full 24-row height as the windows area (a
+    // real client reserves the cmdline itself), no top dock, and a single-tab main
+    // (its tabline hidden). The middle band is 24 − 9 (bottom band) = 15 rows, then
+    // the bottom band spends its first row on the dock separator, so the dock's own
+    // tabline is row 16. Two ` [No Name] ` cells → tab 0 covers cols 0..11.
+    feed_mouse(&rpc, "left", "press", 16, 3);
+    req(&rpc, "nvim_get_mode", vec![]).await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_current(&rd, "bottom"),
+        0,
+        "the dock-tabline click switched the dock to its first tab"
+    );
+    // Focus crossed into the dock: typing lands in its (empty) first tab, not main.
+    feed(&rpc, "ihi<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hi"],
+        "focus crossed into the clicked dock's tab"
+    );
+}
+
+/// The main area's tabline click still works when a **top dock** offsets it off
+/// row 0 — the regression the pre-dock hit-test had (it assumed the main tabline
+/// was always row 0). A click on the top dock's own band (row 0) must not switch
+/// main's tab; the click on the main tabline's real row must.
+#[tokio::test]
+async fn main_tabline_click_survives_a_top_dock_offset() {
+    let (rpc, mut incoming) = start().await;
+    // Main gets a 2nd tab (active index 1) so its tabline shows; then a 3-row top
+    // dock pushes the main tabline down to row 4 (top band 3 + its 1-row separator).
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'top', size = 3 }").await;
+    feed_sync(&rpc, "itop<Esc>").await; // mark the dock's buffer to tell focus apart
+    let rd = latest(&mut incoming);
+    assert_eq!(region_tab_count(&rd, "main"), 2, "main has two tabs");
+    assert_eq!(region_current(&rd, "main"), 1, "main starts on its 2nd tab");
+    // Row 0 is the top dock's own band (its single tab shows no tabline) — a click
+    // there is not the main tabline and must not switch main's tab.
+    feed_mouse(&rpc, "left", "press", 0, 3);
+    req(&rpc, "nvim_get_mode", vec![]).await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_current(&rd, "main"),
+        1,
+        "a click in the top dock's band left main's tab alone"
+    );
+    // The main tabline really sits at row 4; clicking tab 0's cell (cols 0..11)
+    // switches main to it and crosses focus back to main.
+    feed_mouse(&rpc, "left", "press", 4, 3);
+    req(&rpc, "nvim_get_mode", vec![]).await;
+    let rd = latest(&mut incoming);
+    assert_eq!(
+        region_current(&rd, "main"),
+        0,
+        "the top-dock-offset main tabline is still clickable"
+    );
+    feed(&rpc, "ix<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["x"],
+        "focus crossed back to main's first tab"
     );
 }
 

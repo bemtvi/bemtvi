@@ -115,13 +115,14 @@ impl Editor {
             }
             (MouseButton::Left, MouseAction::Drag | MouseAction::Release)
                 if self.mode == Mode::MultiCursor => {}
-            // A press on a shown tabline switches to the clicked tab (vim's
-            // tabline click). Resolved before the text-press arms so a tab click
-            // never places a cursor or starts a selection, and it doesn't go
-            // through the window hit-test at all (the tabline is chrome, not a
-            // window). Drag/release on the tabline do nothing.
+            // A press on any region's shown tabline switches that region to the
+            // clicked tab (vim's tabline click, generalized per region — main and
+            // each open dock each have their own). Resolved before the text-press
+            // arms so a tab click never places a cursor or starts a selection, and
+            // it doesn't go through the window hit-test at all (the tabline is
+            // chrome, not a window). Drag/release on the tabline do nothing.
             (MouseButton::Left, MouseAction::Press)
-                if self.tabline_tab_at(ev.row, ev.col).is_some() =>
+                if self.region_tabline_at(ev.row, ev.col).is_some() =>
             {
                 self.mouse_click_tab(ev.row, ev.col)
             }
@@ -215,47 +216,115 @@ impl Editor {
         });
     }
 
-    /// If the global cell `(row, col)` lands on a built-in tabline cell, the
-    /// 0-based index (in tabline order) of the tab whose cell contains it.
-    /// `None` when:
+    /// If the global cell `(row, col)` lands on a built-in tabline cell of *some*
+    /// region — the main editor area or any open dock — the `(layer, tab index)`
+    /// (the index 0-based in that region's tabline order) it covers. `None` when:
     ///
-    /// - the tabline isn't shown ([`Editor::tabline_visible`]) or the cell isn't
-    ///   on its row;
-    /// - a custom `'tabline'` is in effect — its cells carry no built-in click
-    ///   regions (vim needs explicit `%nT` items there, which we don't model), so
-    ///   clicking it is a no-op;
-    /// - the cell is on the blank fill past the last tab (vim's `TabLineFill`).
+    /// - no region's tabline is shown on that cell's row/column;
+    /// - a custom `'tabline'` is in effect for the main bar — its cells carry no
+    ///   built-in click regions (vim needs explicit `%nT` items there, which we
+    ///   don't model), so clicking it is a no-op (docks have no custom tabline);
+    /// - the cell is on a dock's leading title label, or on the blank fill past
+    ///   the last tab (vim's `TabLineFill`).
     ///
-    /// The cell widths must stay in lockstep with what the client paints in
-    /// `render_tabline` (`nxvim-tui`): one cell per tab, ` {count}{name}{+} ` —
-    /// the window count (with a trailing space) only when >1, a `+` when the tab's
-    /// buffer is modified, a space on each side — so a click lands on the tab it
-    /// visually covers.
-    fn tabline_tab_at(&self, row: usize, col: usize) -> Option<usize> {
-        if row >= self.tabline_rows() {
-            return None; // no tabline shown, or the cell is below it (a window).
+    /// The geometry mirrors the client `DockLayout` (`nxvim-tui` `render.rs`): the
+    /// main tabline is the global top row (below any top dock), each dock's tabline
+    /// is the first row of its band, after a one-cell separator toward the main
+    /// area. Cell widths mirror `render_tab_cells` exactly — an optional ` title `
+    /// prefix then one ` {count}{name}{+} ` cell per tab — so a click lands on the
+    /// tab it visually covers.
+    fn region_tabline_at(&self, row: usize, col: usize) -> Option<(Layer, usize)> {
+        let bands = self.dock_bands();
+        let main_tabline = self.tabline_rows();
+        let chrome = main_tabline + self.panel_rows() + self.global_statusline_rows();
+        // The middle band (left dock | main | right docks): its top row and the
+        // main tree's width — what's left after the docks and the global chrome.
+        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_h = self
+            .height
+            .saturating_sub(bands.reserved_top())
+            .saturating_sub(bands.reserved_bottom())
+            .saturating_sub(chrome)
+            .max(1);
+        let main_w = self
+            .width
+            .saturating_sub(bands.reserved_left())
+            .saturating_sub(bands.reserved_right())
+            .max(1);
+        // The bottom dock's tabline is the first content row of its band, which
+        // sits past its separator, below the middle band and global status line.
+        let bottom_tl_y = mid_y + mid_h + self.global_statusline_rows() + 1;
+        let right_x = bands.reserved_left() + main_w + 1;
+        // Each candidate: the region, its tabline's absolute row, and the column
+        // span of its tabline strip. A dock contributes one only when its band has
+        // room for both a tabline row and ≥1 content row (the client's same
+        // `content.height > 1` guard); main's global bar has no such guard.
+        let dock_shown = |side: DockSide, content_rows: usize| {
+            self.tabline_rows_for(Layer::Dock(side)) > 0 && content_rows > 1
+        };
+        let candidates: [Option<(Layer, usize, usize, usize)>; 5] = [
+            (main_tabline > 0).then_some((Layer::Main, bands.reserved_top(), 0, self.width)),
+            dock_shown(DockSide::Top, bands.top).then_some((
+                Layer::Dock(DockSide::Top),
+                0,
+                0,
+                self.width,
+            )),
+            dock_shown(DockSide::Bottom, bands.bottom).then_some((
+                Layer::Dock(DockSide::Bottom),
+                bottom_tl_y,
+                0,
+                self.width,
+            )),
+            (dock_shown(DockSide::Left, mid_h) && bands.left > 0).then_some((
+                Layer::Dock(DockSide::Left),
+                mid_y,
+                0,
+                bands.left,
+            )),
+            (dock_shown(DockSide::Right, mid_h) && bands.right > 0).then_some((
+                Layer::Dock(DockSide::Right),
+                mid_y,
+                right_x,
+                right_x + bands.right,
+            )),
+        ];
+        let (layer, _, x0, x1) = candidates
+            .into_iter()
+            .flatten()
+            .find(|&(_, ty, x0, x1)| row == ty && (x0..x1).contains(&col))?;
+        if layer == Layer::Main && !self.global_options().tabline.is_empty() {
+            return None; // a custom main tabline has no built-in click regions.
         }
-        if !self.global_options().tabline.is_empty() {
-            return None; // a custom tabline has no built-in click regions.
+        // Walk the painted cells from the strip's left edge: a dock's bold title
+        // label first (` {title} `, no click region), then one cell per tab.
+        let mut x = x0;
+        if let Layer::Dock(s) = layer {
+            let title = self.dock_title(s);
+            if !title.is_empty() {
+                x += crate::unicode::display_width(&format!(" {title} "));
+            }
         }
-        let mut x = 0;
-        for (i, label) in self.tab_labels().into_iter().enumerate() {
+        for (i, label) in self.tab_labels_for(layer).into_iter().enumerate() {
             let width = tab_cell_width(&label);
             if (x..x + width).contains(&col) {
-                return Some(i);
+                return Some((layer, i));
             }
             x += width;
+            if x >= x1 {
+                break; // the rest is clipped past this region's strip.
+            }
         }
         None
     }
 
-    /// Switch to the tab whose tabline cell holds the click. Focus moves to that
-    /// tab's focused window (vim's tabline click); a click on the already-active
-    /// tab is a no-op. No cursor is placed in any text window — the press is
-    /// consumed by the tabline.
+    /// Switch the region whose tabline cell holds the click to that tab, moving
+    /// focus into it (vim's tabline click, per region). A click on the
+    /// already-active tab of the focused region is a no-op. No cursor is placed in
+    /// any text window — the press is consumed by the tabline.
     fn mouse_click_tab(&mut self, row: usize, col: usize) {
-        if let Some(idx) = self.tabline_tab_at(row, col) {
-            self.set_current_tabpage(self.tab_ids()[idx]);
+        if let Some((layer, idx)) = self.region_tabline_at(row, col) {
+            self.focus_region_tab(layer, idx);
         }
     }
 
@@ -1022,7 +1091,7 @@ impl Editor {
 /// `render_tabline` paints for this tab. Mirrors that formatter exactly:
 /// ` {count}{name}{+} ` — a leading and trailing space, the window count (with a
 /// trailing space) only when the tab holds more than one window, and a `+` when
-/// its buffer is modified. The two must stay in lockstep so [`Editor::tabline_tab_at`]
+/// its buffer is modified. The two must stay in lockstep so [`Editor::region_tabline_at`]
 /// maps a click to the tab it visually covers.
 fn tab_cell_width(label: &TabLabel) -> usize {
     let count = if label.window_count > 1 {

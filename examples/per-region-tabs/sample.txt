@@ -1,0 +1,33 @@
+This is the MAIN editor area — and it has its OWN tab pages.
+
+Around it are two permanent docks: a left EXPLORER side bar and a bottom
+TERMINAL tray. Every region — main and each dock — carries its own independent
+set of vim tab pages, each drawn as its own tabline.
+
+Each region's tabline:
+
+    * main's tabline    the top bar of the editor (this file's tabs live here)
+    * the left dock     the first row of the left band ("EXPLORER" + its tabs)
+    * the bottom dock   the first row of the bottom band ("TERMINAL" + its tabs)
+
+Tab operations act on the FOCUSED region. Try it:
+
+    <C-w><C-w>h     focus the LEFT dock      (j/k/l → bottom / top / right)
+    :tabnew         add a tab — to the focused region ONLY
+    :T 3            shortcut: three :tabnew in the focused region
+    gt   /   gT     cycle the focused region's tabs (next / previous)
+    <C-w><C-w>l     cross back to main; now gt cycles MAIN's tabs
+
+Switch a region's tab with the MOUSE, too:
+
+    left-click a tabline cell   switch THAT region to the clicked tab and move
+                                focus into it — main's bar or any dock's strip
+
+Closing tabs:
+
+    :tabclose       close the focused tab
+                    (closing a dock's LAST tab folds the dock away;
+                     the main area always keeps at least one tab)
+
+The regions never interfere: a stack of tabs in the bottom tray leaves main's
+tabline — and the left dock's — exactly as they were.

@@ -54,8 +54,8 @@ The serverless capability map (the default; daemon mode adds remote files + the 
 - ❌ LSP and **native** treesitter — gated off the build (slice 5a); `:TSInstall` echoes
   a loud "not available in the browser build yet". Syntax **highlighting** is still
   present: done JS-side in the UI thread via web-tree-sitter (`web/highlight.js` + the
-  `web/vendor/` grammars), exactly as `nxvim-web` does — the Worker ships the focused
-  buffer's text with each frame and the page parses + colors it.
+  `web/vendor/` grammars) — the Worker ships the focused buffer's text with each frame
+  and the page parses + colors it.
 
 ## Interop
 
@@ -63,8 +63,7 @@ emscripten `ccall`/`cwrap` over the `#[no_mangle] extern "C"` exports in `src/li
 (`eh_new` / `eh_input` / `eh_input_mouse` / `eh_source_lua` / `eh_boot_finish` /
 `eh_attach` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` / the OPFS fs leg
 `eh_take_fs_requests` / `eh_save_bytes` / `eh_save_len` / `eh_fs_read_complete` /
-`eh_fs_write_complete` / `eh_free*`) — **not** wasm-bindgen
-(that's `nxvim-web`'s `unknown-unknown` build). The
+`eh_fs_write_complete` / `eh_free*`) — **not** wasm-bindgen. The
 redraw comes back as a JSON return value. Slice 5c runs these exports **inside a Web
 Worker** and ferries the JSON redraw to the UI over `postMessage`. Slice 5d drives the
 Worker's run loop off a `SharedArrayBuffer` + `Atomics.wait` park: the same wait that
@@ -79,15 +78,15 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
   `Atomics.wait` against an SAB input ring, waking on a keystroke **or** the next timer
   deadline; otherwise (5c) it is `postMessage`-driven (input works, timers don't fire).
   The latest `redraw` frame + buffer lines post back to the UI either way.
-- `web/index.html` — the UI thread: the **DOM renderer** (the same per-cell-span renderer
-  `nxvim-web` uses — windows/gutter/status/tabline/panel/pmenu, selection + cursor-shape
+- `web/index.html` — the UI thread: the **DOM renderer** (a per-cell-span renderer —
+  windows/gutter/status/tabline/panel/pmenu, selection + cursor-shape
   classes, smooth scroll), driven off the server `redraw` frame; it translates keystrokes
   to vim key-notation and mouse gestures to `eh_input_mouse`, picks the SAB or postMessage
   transport by capability, and exposes `window.__nxvim` (`feed` / `mouse` / `execLua` /
   `attach` / `lines` / `frame` / `cursor` / `cmdline` / `sab` / …) for automation.
-- `web/highlight.js` — the client-side web-tree-sitter highlighter (copied from
-  `nxvim-web`); its grammars/runtime are generated into `web/vendor/` by `build.sh`
-  (gitignored). The import is optional — the renderer degrades to plain text if absent.
+- `web/highlight.js` — the client-side web-tree-sitter highlighter; its grammars/runtime
+  are generated into `web/vendor/` by `build.sh` (gitignored). The import is optional —
+  the renderer degrades to plain text if absent.
 - `web/serve.mjs` — a cross-origin-isolated dev server (COOP/COEP/CORP), so the page can
   use a `SharedArrayBuffer`. `crossOriginIsolated === true`.
 - `web/rpc.mjs` — the browser↔daemon msgpack-RPC client (Phase 6b): the JS twin of
@@ -146,8 +145,8 @@ load the Worker sources it at startup. Options / keymaps / autocmds / user comma
 highlights apply; `require` of further modules / plugins does not (empty runtimepath).
 
 `build.sh` also copies the web-tree-sitter highlighter assets into `web/vendor/`
-(generating them once in the sibling `nxvim-web` crate, which owns the pinned grammar
-deps). Highlighting is optional: skip it and the renderer falls back to plain text.
+(generating them once in the local `treesitter/` tooling dir, which owns the pinned
+grammar deps). Highlighting is optional: skip it and the renderer falls back to plain text.
 
 ## Serving in production
 

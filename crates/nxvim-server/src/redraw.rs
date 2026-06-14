@@ -27,7 +27,7 @@ impl EditHost {
 
         // Refresh the current buffer's highlights from the in-process engine for
         // the freshly-settled viewport (same-frame, memoized per content+view).
-        // Native only — the browser highlights JS-side (`nxvim-web`), and LSP sync
+        // Native only — the browser highlights JS-side (`nxvim-edithost`), and LSP sync
         // needs a language server (Phase 6).
         #[cfg(feature = "native")]
         self.refresh_highlights(h);

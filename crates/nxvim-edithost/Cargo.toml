@@ -5,9 +5,9 @@
 # `wasm32-unknown-emscripten`, driven behind a wasm `HostEffects` (`WasmEffects`,
 # src/lib.rs) inside a Web Worker (web/worker.mjs).
 #
-# Like crates/nxvim-web, this is EXCLUDED from the workspace (it targets
-# wasm32-unknown-emscripten and pulls the C-heavy lua51 backend + vim-regex), so it
-# can't inherit [workspace.package] / [workspace.dependencies] — fields are spelled out.
+# This crate is EXCLUDED from the workspace (it targets wasm32-unknown-emscripten and
+# pulls the C-heavy lua51 backend + vim-regex), so it can't inherit [workspace.package]
+# / [workspace.dependencies] — fields are spelled out.
 [package]
 name = "nxvim-edithost"
 description = "The wasm (emscripten) edit-host: nxvim's synchronous EditHost tick (core + Lua) behind a wasm HostEffects, for the browser Web Worker."
@@ -39,7 +39,7 @@ nxvim-lua = { path = "../nxvim-lua" }
 # the workspace version so the type matches nxvim-server's.
 rmpv = "=1.3.1"
 # Serialize the captured redraw frame (rmpv) to JSON for the JS/UI side. Pure Rust,
-# wasm-clean (nxvim-web uses it on wasm too); pinned to the workspace version.
+# wasm-clean; pinned to the workspace version.
 serde_json = "=1.0.150"
 
 # Small-ish artifact. LTO is OFF on purpose: Rust LTO emits LLVM bitcode objects into

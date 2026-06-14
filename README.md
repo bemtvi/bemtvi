@@ -72,30 +72,30 @@ cargo run -p nxvim -- file.txt
 cargo run -p nxvim-gui -- file.txt
 ```
 
-### Web build (`nxvim-web`) — runs entirely in the browser
+### Web build (`nxvim-edithost`) — runs entirely in the browser
 
-`nxvim-web` compiles the editor core to **WebAssembly** and runs it **fully
-client-side — there is no server**. The page (HTML/CSS, styled with Tailwind) is
-the renderer and input layer; the editor itself runs in the tab. File open/save
-go through the browser's **File System Access API**, the in-browser analogue of
-the GUI's `:eo` / `:wo` dialogs — so you **really edit local files** (no upload,
-no backend), and a static host (GitHub Pages, etc.) is enough to put it online.
+`nxvim-edithost` compiles the **whole editor** — `nxvim-core` + the PUC Lua 5.1
+VM + the full server tick — to **WebAssembly** (via emscripten) and drives it in a
+**Web Worker**, **fully client-side, no server**. The page is the renderer and
+input layer; the editor (including your `init.lua`) runs in the tab. File open/save
+go through the browser's **File System Access API** (`:eo` / `:wo`, the in-browser
+analogue of the GUI's dialogs) or persist to **OPFS** — so you **really edit local
+files** (no upload, no backend), and a static host is enough to put it online. It
+can also reach a real `nxvim --daemon` over **WebTransport** for filesystem access.
 
 It's a separate, wasm-targeted crate, deliberately **excluded from the Cargo
 workspace** (so `cargo build/test --workspace` never touches it). Build it with
-its own script:
+its own script (needs the emscripten `emcc` and Node):
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.123   # must match its Cargo.toml
-crates/nxvim-web/build.sh                           # → crates/nxvim-web/web/
-python3 -m http.server -d crates/nxvim-web/web 8000 # then open http://localhost:8000
+rustup target add wasm32-unknown-emscripten
+crates/nxvim-edithost/build.sh                      # → dist/eh.{mjs,wasm} + web/vendor/
+node crates/nxvim-edithost/web/serve.mjs            # cross-origin-isolated dev server
 ```
 
-In the page, `:eo` (or the **Open file** button) opens a file and `:w` / `:wo`
-saves it back. Full write-back to the original file needs a Chromium-based
-browser (the File System Access API); elsewhere, open still works and save
-downloads a copy.
+See [`crates/nxvim-edithost/README.md`](crates/nxvim-edithost/README.md) for the
+full architecture (the Worker run loop, the OPFS/daemon filesystem legs, and the
+client-side tree-sitter highlighter).
 
 Because there's no server, this build is the editor **core** only: modal editing,
 ex-commands, undo, search/substitute, registers/marks, multiple buffers, splits,
@@ -230,7 +230,7 @@ The short version:
 | `nxvim-ts`       | The in-process treesitter engine (loads grammars, parses incrementally).    |
 | `nxvim-tui`      | The terminal UI client (ratatui + crossterm). Owns no editor state.         |
 | `nxvim-gui`      | Native GUI client (winit + wgpu + glyphon).                                 |
-| `nxvim-web`      | Fully client-side WebAssembly build of the editor core (runs in the browser; no server). Excluded from the workspace. |
+| `nxvim-edithost` | Fully client-side WebAssembly build of the whole editor (core + Lua + server tick, in a Web Worker; no server). Excluded from the workspace. |
 | `nxvim-view`     | Frontend-neutral decode/input layer shared by the native clients.           |
 | `nxvim`          | The `nvim`-style entry point: wires an embedded server + the TUI client.    |
 

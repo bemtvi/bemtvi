@@ -63,24 +63,22 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
 
 # 3. Tree-sitter highlighter assets → web/vendor/ (the web-tree-sitter runtime + the
 #    per-language grammar .wasm + sanitized queries) for the in-page syntax highlighter
-#    (web/highlight.js). The pinned grammar devDeps + generator live in the sibling
-#    nxvim-web crate; build them there once (if absent) and copy them in, rather than
-#    duplicate ~13 MB of grammar packages. web/vendor/ is gitignored like dist/. The
+#    (web/highlight.js). The pinned grammar devDeps + generator live in the local
+#    treesitter/ tooling dir (its own package.json + .npmrc, isolated from web/'s
+#    Playwright install so the grammar packages' node-gyp scripts stay off); build them
+#    there once (if absent) and copy them in, rather than duplicate ~13 MB of grammar
+#    packages. treesitter/vendor/ and web/vendor/ are gitignored like dist/. The
 #    highlighter is optional — index.html degrades to plain rendering if this is skipped.
-WEB="../nxvim-web"
-if [ -d "$WEB" ]; then
-  if [ ! -d "$WEB/web/vendor" ]; then
-    echo "generating tree-sitter assets in $WEB (one-time)…"
-    ( cd "$WEB" && { [ -f package-lock.json ] && npm ci || npm install; } && npm run build:treesitter ) \
-      || echo "warn: tree-sitter asset generation failed — highlighting will be off (plain rendering)"
-  fi
-  if [ -d "$WEB/web/vendor" ]; then
-    mkdir -p web/vendor
-    cp -r "$WEB/web/vendor/." web/vendor/
-    echo "copied tree-sitter assets → web/vendor/"
-  fi
-else
-  echo "note: $WEB not found — skipping syntax-highlighter assets (plain rendering)"
+TS="treesitter"
+if [ ! -d "$TS/vendor" ]; then
+  echo "generating tree-sitter assets in $TS (one-time)…"
+  ( cd "$TS" && { [ -f package-lock.json ] && npm ci || npm install; } && npm run build:treesitter ) \
+    || echo "warn: tree-sitter asset generation failed — highlighting will be off (plain rendering)"
+fi
+if [ -d "$TS/vendor" ]; then
+  mkdir -p web/vendor
+  cp -r "$TS/vendor/." web/vendor/
+  echo "copied tree-sitter assets → web/vendor/"
 fi
 
 # 4. msgpack ESM → web/vendor/msgpack/ for the browser↔daemon WebTransport RPC client

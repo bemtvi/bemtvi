@@ -10,10 +10,10 @@ rust-version.workspace = true
 
 [features]
 # The real vim regexp engine (`nxvim-regex`, vendored C) behind
-# `:set regexsyntax=vim`. Off by default: it pulls in a C build, so a pure-Rust
-# consumer that needs `wasm32-unknown-unknown` (the `nxvim-web` client) gets a
-# C-free core. Host builds enable it via `nxvim-server`'s dependency, so the
-# whole workspace (and its tests) compiles it in through feature unification.
+# `:set regexsyntax=vim`. Off by default: it pulls in a C build, so a consumer that
+# wants a pure-Rust core can stay C-free. Host builds enable it via `nxvim-server`'s
+# dependency (and the wasm `nxvim-edithost` build, whose C compiles under emscripten),
+# so the whole workspace (and its tests) compiles it in through feature unification.
 default = []
 vim-regex = ["dep:nxvim-regex"]
 # Derive serde on the persistence snapshot ([`PersistState`] & friends) so a consumer can

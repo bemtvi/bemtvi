@@ -56,9 +56,8 @@ serde = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
 # `vim-regex` pulls the real vim regexp engine into the core's `:s`/`/` search
 # (`:set regexsyntax=vim`). Enabled here so the whole host workspace — and the
-# integration tests — build it in via feature unification; the wasm `nxvim-web`
-# client, which depends on the core directly, stays on the C-free default. The
-# C compiles under emscripten too (the demo proved it), so it stays on for wasm.
+# integration tests — build it in via feature unification. The C compiles under
+# emscripten too, so it stays on for the wasm `nxvim-edithost` build.
 nxvim-core = { workspace = true, features = ["vim-regex"] }
 nxvim-rpc = { workspace = true, optional = true }
 nxvim-lua.workspace = true
@@ -66,7 +65,7 @@ nxvim-lsp = { workspace = true, optional = true }
 # In-process treesitter: the server constructs the engine and installs it on the
 # editor, which owns and queries it synchronously (no worker process). Native only
 # — it shells out to a C compiler at `:TSInstall` and `dlopen`s the grammar, neither
-# of which exists in the browser (wasm highlighting is JS-side, in `nxvim-web`).
+# of which exists in the browser (wasm highlighting is JS-side, in `nxvim-edithost`).
 nxvim-ts = { workspace = true, optional = true }
 
 [dev-dependencies]

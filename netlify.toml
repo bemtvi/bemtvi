@@ -13,7 +13,7 @@
 
 [build.environment]
   # Node (selected by Netlify) for the tree-sitter vendoring script build.sh runs in
-  # the sibling nxvim-web crate.
+  # the crate's treesitter/ tooling dir.
   NODE_VERSION = "20"
   # Rust toolchain version — read by netlify-build.sh, which installs/selects it via
   # rustup (Netlify's image has rustup but no default toolchain, and doesn't provision

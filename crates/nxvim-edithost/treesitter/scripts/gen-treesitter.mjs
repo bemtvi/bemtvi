@@ -1,9 +1,10 @@
-// Vendor the tree-sitter assets the web demo's highlighter needs into web/vendor/.
+// Vendor the tree-sitter assets the edit-host's highlighter needs into ./vendor/.
 //
 // For each supported language this copies (1) the prebuilt grammar `.wasm` that
 // ships inside its pinned npm package and (2) a *sanitized* `highlights.scm`. The
 // runtime (web-tree-sitter.js + .wasm) is copied once. Everything is regenerated
-// from the pinned devDependencies, so web/vendor/ is gitignored — see build.sh.
+// from the pinned devDependencies, so ./vendor/ is gitignored — the parent crate's
+// build.sh runs this generator and copies its output into web/vendor/.
 //
 // Why sanitize the queries: the upstream `highlights.scm` files occasionally use a
 // predicate the browser query engine doesn't implement, or — when a grammar and
@@ -21,9 +22,9 @@ import { readFileSync, writeFileSync, mkdirSync, copyFileSync, rmSync } from 'no
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // crate dir
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // tooling dir
 const NM = join(ROOT, 'node_modules');
-const OUT = join(ROOT, 'web', 'vendor');
+const OUT = join(ROOT, 'vendor');
 
 // Each language: the grammar package's `.wasm`, the query file(s) to concatenate
 // (a base language's query first where a grammar is a superset — ts builds on js,
@@ -199,7 +200,7 @@ async function main() {
   }
 
   writeFileSync(join(OUT, 'manifest.json'), JSON.stringify({ languages: manifest }, null, 2) + '\n');
-  console.log(`vendored ${manifest.length} languages + runtime into web/vendor/`);
+  console.log(`vendored ${manifest.length} languages + runtime into ./vendor/`);
 }
 
 main().catch((e) => {

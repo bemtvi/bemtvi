@@ -14,17 +14,14 @@ members = [
     "crates/nxvim-regex",
     "crates/nxvim-test-harness",
 ]
-# nxvim-web is the fully client-side WebAssembly build of the editor. It targets
-# `wasm32-unknown-unknown` (built via `crates/nxvim-web/build.sh`), so it is NOT a
-# workspace member: excluding it keeps it out of the host `cargo build/test/clippy
-# --workspace` flow, which can't meaningfully compile or run a wasm cdylib. Being
-# excluded, it pins its own dependencies rather than inheriting the workspace's.
 # nxvim-edithost is the real wasm edit-host: the reusable synchronous `EditHost` tick
 # (core + Lua) compiled to `wasm32-unknown-emscripten` behind a wasm `HostEffects`, run
-# in a Web Worker (Phase 5), built via its own build.sh. Excluded for the same reason as
-# nxvim-web — wasm target + C deps, not host-buildable. (It superseded the throwaway
-# nxvim-edithost-demo, deleted in slice 5e.)
-exclude = ["crates/nxvim-web", "crates/nxvim-edithost"]
+# in a Web Worker (Phase 5), built via its own build.sh. It is NOT a workspace member:
+# excluding it keeps it out of the host `cargo build/test/clippy --workspace` flow,
+# which can't meaningfully compile or link a wasm + C-deps artifact; being excluded, it
+# pins its own dependencies rather than inheriting the workspace's. (It superseded the
+# throwaway nxvim-edithost-demo, deleted in slice 5e.)
+exclude = ["crates/nxvim-edithost"]
 
 [workspace.package]
 version = "0.1.0"
@@ -91,7 +88,7 @@ arboard = { version = "=3.6.1", default-features = false }
 winresource = "=0.1.31"
 # Build-dependency of nxvim-regex: compiles the vendored vim/neovim regexp
 # engine (csrc/) into the crate. Plain C99; also builds for
-# wasm32-unknown-emscripten (the nxvim-web target).
+# wasm32-unknown-emscripten (the nxvim-edithost target).
 cc = "=1.2.63"
 tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
 # Cross-platform filesystem notification backing `vim.uv.fs_event` in the server's

@@ -230,7 +230,7 @@ impl EditHost {
         // dropping the affected highlight memo(s) so the next redraw re-queries the
         // engine — the change isn't reflected in any buffer's changedtick.
         // Native only — the in-process treesitter engine isn't built for wasm (the
-        // browser highlights JS-side in `nxvim-web`); a `vim.treesitter.*` op fails loud.
+        // browser highlights JS-side in `nxvim-edithost`); a `vim.treesitter.*` op fails loud.
         #[cfg(feature = "native")]
         for op in self.lua.take_ts_ops() {
             match op {

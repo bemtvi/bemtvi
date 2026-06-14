@@ -1,4 +1,4 @@
-# Throwaway build outputs (the Cargo.lock IS committed, like the sibling wasm crates).
+# Throwaway build outputs (the Cargo.lock IS committed for this excluded wasm crate).
 /target
 /dist
 
@@ -11,6 +11,10 @@
 /web/node_modules
 /web/package-lock.json
 
-# Tree-sitter highlighter assets, copied from the sibling nxvim-web crate's generator
-# by build.sh (~13 MB of runtime + grammar .wasm + queries). Regenerated, not committed.
+# Tree-sitter highlighter tooling: npm install artifacts + the generated assets
+# (~13 MB of runtime + grammar .wasm + queries), produced by treesitter/ and copied
+# into web/vendor/ by build.sh. Regenerated, not committed (treesitter/package.json +
+# package-lock.json + scripts/ ARE tracked).
+/treesitter/node_modules
+/treesitter/vendor
 /web/vendor

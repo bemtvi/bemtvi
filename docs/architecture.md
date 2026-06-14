@@ -817,75 +817,59 @@ frontend-specific translation layers have Tier-1 tests — the winit→notation 
 
 ### The web build — a fully client-side WebAssembly editor
 
-**`nxvim-web` runs the editor *in the browser*, with no server**
-([`crates/nxvim-web`](../crates/nxvim-web)). Where the native clients move only the
-UI off the editor, this moves the whole thing into a browser tab: `nxvim-core` —
-which is pure, synchronous, and depends only on pure-Rust crates — compiles to
-`wasm32-unknown-unknown` and runs client-side. It's the same "the core is portable
-because it's pure" property the crate split was designed for, taken to its limit.
+**`nxvim-edithost` runs the editor *in the browser*, with no server**
+([`crates/nxvim-edithost`](../crates/nxvim-edithost)). Where the native clients move
+only the UI off the editor, this moves the whole thing into a browser tab — and not
+just the core: `nxvim-core` **+ the PUC Lua 5.1 VM + the full server tick** (the
+reusable synchronous `EditHost`, autocmds, mirrors, redraw projection) compile to
+`wasm32-unknown-emscripten` and run client-side. It's the edit-host split
+(§*Embedded vs. remote*) taken to its limit: the local half is a browser tab, the
+fs/process half is OPFS or a remote daemon over WebTransport.
 
-- **A thin wasm-bindgen wrapper.** `src/lib.rs` exposes one handle, `WebEditor`,
-  over `nxvim_core::Editor`: `key`/`paste` encode input, `command(cmd)` runs an
-  ex-command, `mouse(...)` forwards a gesture, `view_json()` serializes the editor's
-  `View` to JSON, and `load_file`/`buffer_text`/`mark_saved` are the in-memory file
-  path. The exported surface is just strings and numbers, so the only browser-facing
-  dependency is `wasm-bindgen` (no `web-sys`/`js-sys`).
-- **Input reuses the shared client layer.** `key`/`paste` go through
-  `nxvim-view`'s `Key`/`notation`/`encode_paste` — the *same* frontend-neutral
-  encoder the TUI (crossterm) and GUI (winit) use — so the web client doesn't
-  re-implement vim key-notation; the page only maps a browser `KeyboardEvent` to the
-  neutral modifier flags + key name, exactly as the native front ends map their
-  native events. (`nxvim-view`'s *other* half, the msgpack `redraw` decoder, is for
-  the server wire a serverless build never produces, so it's unused and dead-stripped.)
-- **Mouse and multi-cursor come for free from the core.** The hit-test from a
-  global screen cell back to a window + buffer position — plus multi-click word/line
-  selection, drag-select, wheel scroll, and the multi-cursor *toggle* in placement
-  mode — all live in `nxvim_core::editor::mouse`, not the server. So `mouse(...)`
-  just parses args into a `MouseEvent` and calls `editor.mouse(ev)`, exactly as the
-  server's `nvim_input_mouse` does, and the page forwards raw cells. The full
-  Helix-style multi-cursor (`<A-c>` to enter placement mode, `c`/motions to drop
-  cursors, edit-all, `Esc` to apply) works through the same `key` path; the renderer
-  paints placed cursors reverse-video and the active one amber.
-- **The browser is the renderer + the filesystem.** `web/index.html` decodes the
-  `view_json` and paints it as **HTML/CSS** (Tailwind, compiled to a static local
-  stylesheet at build time — no runtime CDN), the browser analogue of `nxvim-tui`'s
-  layout. File open/save use the **File System Access API**: a picked file's text is
-  fed in with `load_file` (the in-memory `:e`), and `buffer_text` is written back out
-  on save (the in-memory `:w`) — so a static page genuinely opens and writes the
-  user's local files, no backend involved. This is wired to the same `:eo`/`:wo`
-  command family the GUI uses (the page intercepts `<CR>` on those verbs and calls
-  the picker), plus toolbar buttons.
-- **In-memory open/save in the core.** The host has no filesystem, so the bytes
-  arrive from JS rather than through `Buffer`'s file I/O. Two small additions to
-  `nxvim-core` serve this: `Editor::load_str(name, contents)` (the `:e` analogue —
-  reuse the throwaway buffer, replace its text, bind the name, mark it clean) and
-  `Editor::mark_saved(name)` (the post-`:w` state), built on `Buffer::set_path` /
-  `Buffer::mark_clean`. Nothing else in core changes.
-- **Excluded from the workspace.** It targets wasm and is built via
-  `crates/nxvim-web/build.sh` (Tailwind CSS → `cargo build --target
-  wasm32-unknown-unknown` → `wasm-bindgen`), so it is in the root Cargo.toml's
-  `[workspace] exclude`: the host `cargo build/test/clippy --workspace` never touches
-  it, and it pins its own dependencies rather than inheriting the workspace's.
-
-Because there is no server, this build is the editor **core** only — modal editing,
-ex-commands, undo, search/substitute, registers/marks, buffers, splits, tab pages.
-The subsystems that live in `nxvim-server` — **Lua config, treesitter highlighting,
-and LSP** — are absent from a client-only build by construction (a browser tab has
-no subprocess, no dynamic grammar loading, and the LuaJIT backend doesn't target
-wasm).
-
-Like the GUI, the rendered frame needs a real browser to validate. The data path
-(load a file's contents → edit → read the buffer text back) is exercised through a
-small `window.__nxvim` test hook — so a headless browser can drive open→edit→save
-without the native picker, which can't be scripted — alongside rendering and
-keyboard editing.
-
-The web build is **serverless only** — the editor core in the browser, with no
-network back end. (Lua, treesitter, and LSP, which live in `nxvim-server`, are
-therefore absent in the browser; syntax highlighting is layered client-side via the
-WebAssembly build of tree-sitter — see above.) To use those features, run a native
-`nxvim` over an SSH session, or the edit-host split (§*Embedded vs. remote*), which
-keeps the keystroke path local.
+- **The editor lives in a Web Worker.** `web/worker.mjs` is the single `!Send` thread
+  that owns core + Lua. It loads the wasm module (`dist/eh.mjs`), constructs the real
+  `EditHost` behind a wasm `HostEffects` (`WasmEffects`, `src/lib.rs`), and runs the
+  production tick. The UI thread (`web/index.html`) is the renderer + input layer, and
+  the two talk over `postMessage` / a shared ring.
+- **Interop is emscripten `ccall`/`cwrap`, not wasm-bindgen.** `src/lib.rs` exposes
+  `#[no_mangle] extern "C"` exports — `eh_new` / `eh_input` / `eh_input_mouse` /
+  `eh_source_lua` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` / the fs + shada legs
+  / `eh_free*` — and the redraw comes back as a JSON return value. Because it links the
+  C-heavy lua51 backend + vim-regex, the final link is `emcc`, not wasm-bindgen.
+- **The renderer consumes the same `redraw` the native clients do.** `web/index.html`
+  paints the server `redraw` frame as **HTML/CSS** (a per-cell-span DOM renderer —
+  windows/gutter/status/tabline/panel/pmenu, selection + cursor-shape classes, smooth
+  scroll), the browser analogue of `nxvim-tui`'s layout, and translates a browser
+  `KeyboardEvent` to vim key-notation + mouse gestures to `eh_input_mouse`. It exposes
+  a `window.__nxvim` hook (`feed` / `mouse` / `execLua` / `lines` / `frame` / …) so a
+  headless browser can drive it.
+- **The run loop parks on `Atomics.wait`, and timers fire without Asyncify.** When the
+  page is cross-origin isolated the Worker runs a blocking loop parked on a
+  `SharedArrayBuffer` input ring, waking on a keystroke **or** the next timer deadline;
+  the same wait that blocks on input fires Worker-side timers (`vim.defer_fn` /
+  `nx.timer`) via `eh_set_clock` / `eh_next_deadline` / `eh_tick_timers` — one
+  mechanism. Without cross-origin isolation it falls back to a `postMessage`-driven
+  loop (input works, timers don't fire).
+- **The browser is the filesystem — three legs.** Open/save persist to **OPFS**
+  (serverless; shada is one JSON blob in OPFS), to **real local files** via the **File
+  System Access API** (`:eo` / `:wo` / bare `:w` on a bound path), or to a real
+  `nxvim --daemon` over **WebTransport** (a JS msgpack-RPC client, `web/rpc.mjs`,
+  reached with `?daemon=nxvim://…`). All three ride the same off-tick `HostEffects` fs
+  seam the native edit-host split uses; the Worker fulfills fs requests between ticks.
+- **Lua config runs.** Unlike the old core-only web build, `init.lua` is sourced at
+  startup: options / keymaps / autocmds / user commands / highlights apply (`require`
+  of further modules / plugins does not — empty runtimepath). **LSP and *native*
+  treesitter** are gated off the wasm build (`:TSInstall` fails loud); syntax
+  **highlighting** is still present, done JS-side via web-tree-sitter
+  (`web/highlight.js` + the generated `web/vendor/` grammars).
+- **Excluded from the workspace.** It targets `wasm32-unknown-emscripten` and links C
+  via `emcc`, so it is in the root Cargo.toml's `[workspace] exclude` (the host
+  `cargo build/test/clippy --workspace` never touches it) and pins its own
+  dependencies. Built via `crates/nxvim-edithost/build.sh` (cargo → `emcc` link →
+  `dist/eh.{mjs,wasm}`, plus the tree-sitter highlighter assets generated once in the
+  crate's `treesitter/` tooling dir and copied into `web/vendor/`). Deployed as static
+  files (see `netlify.toml`); the one hard requirement is cross-origin isolation
+  (COOP/COEP) for the `SharedArrayBuffer`.
 
 ---
 

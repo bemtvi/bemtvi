@@ -6,12 +6,12 @@
 # Netlify's Git integration runs this on every push to the production branch (see
 # ../../netlify.toml); the published directory is the assembled `_site/` set there.
 #
-# Unlike the sibling nxvim-web build, this one links C (the vendored Lua + vim-regex),
-# so it needs Emscripten's `emcc` final linker in addition to the Rust→wasm toolchain.
-# We provision both, run the crate's build.sh, then assemble a clean static publish root.
+# This build links C (the vendored Lua + vim-regex), so it needs Emscripten's `emcc`
+# final linker in addition to the Rust→wasm toolchain. We provision both, run the
+# crate's build.sh, then assemble a clean static publish root.
 #
 # Node is provided by the image (NODE_VERSION in netlify.toml) for the tree-sitter
-# vendoring step build.sh runs in the sibling nxvim-web crate.
+# vendoring step build.sh runs in the local treesitter/ tooling dir.
 set -euo pipefail
 
 # Pinned, overridable from netlify.toml's [build.environment].
@@ -21,9 +21,8 @@ EMSDK_VERSION="${EMSDK_VERSION:-6.0.0}"
 here="$(cd "$(dirname "$0")" && pwd)"
 
 # 1. Rust toolchain + the emscripten wasm target. Netlify's image ships `rustup` but
-#    with no default toolchain configured, so we install & select it explicitly (same
-#    approach as nxvim-web's netlify-build.sh). No wasm-bindgen here — this build links
-#    via emcc, not wasm-bindgen.
+#    with no default toolchain configured, so we install & select it explicitly. No
+#    wasm-bindgen here — this build links via emcc, not wasm-bindgen.
 if ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain none --profile minimal
@@ -48,7 +47,7 @@ fi
 
 # 3. Build the wasm edit-host: cargo (wasm32-unknown-emscripten) → emcc link →
 #    dist/eh.{mjs,wasm}, plus the web-tree-sitter highlighter assets copied into
-#    web/vendor/ (generated once in the sibling nxvim-web crate).
+#    web/vendor/ (generated once in the local treesitter/ tooling dir).
 bash "$here/build.sh"
 
 # 4. Assemble the static publish root. The page's relative imports require web/ and

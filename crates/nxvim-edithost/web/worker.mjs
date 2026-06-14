@@ -42,6 +42,14 @@ const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "n
 // Worker forwards each to the daemon and lands its `fs_changed` pushes back into the tick.
 const eh_take_watch_requests = M.cwrap("eh_take_watch_requests", "number", ["number"]);
 const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number", "string", "number", "number", "number"]);
+// Remote proc leg (Phase 6d): the editor enqueues async `vim.system` / `jobstart` spawns
+// off-tick (only when a daemon is connected — `eh_set_daemon_connected` gates it); the Worker
+// forwards each to the daemon and lands its `proc_spawned`/`proc_exited` pushes back into the
+// tick. `eh_proc_exited` takes stdout/stderr as pointer+length (process output is raw bytes).
+const eh_set_daemon_connected = M.cwrap("eh_set_daemon_connected", null, ["number", "number"]);
+const eh_take_proc_requests = M.cwrap("eh_take_proc_requests", "number", ["number"]);
+const eh_proc_spawned = M.cwrap("eh_proc_spawned", null, ["number", "number", "number"]);
+const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "number", "number", "number", "number", "number"]);
 // Treesitter `:TSInstall` leg: the editor enqueues each install off-tick; the Worker
 // forwards it to the UI thread (web-tree-sitter lives there), which fetches/caches/registers
 // the grammar and lands the outcome back via `eh_ts_install_complete`. `eh_ts_seed_installed`
@@ -332,8 +340,12 @@ async function connectDaemon() {
   if (!daemonUri) return;
   try {
     daemon = await dialDaemon(daemonUri);
-    // The watch leg's `fs_changed` pushes (and later proc/lsp pushes) arrive here.
+    // The watch leg's `fs_changed` pushes and the proc leg's `proc_spawned`/`proc_exited`
+    // pushes arrive here.
     daemon.onNotify = onDaemonNotify;
+    // A process host is now reachable: let the editor tick take its async-spawn branch
+    // (`vim.system` / `jobstart`) instead of failing loud.
+    eh_set_daemon_connected(h, 1);
   } catch (e) {
     daemonError = String(e && e.message ? e.message : e);
     postMessage({ type: "config_error", error: `daemon connection failed: ${daemonError}` });
@@ -352,7 +364,11 @@ async function runtimeConnect(uri) {
     daemon.close();
     daemon = null;
   }
+  // The old wire is gone: no process host until the new dial succeeds, and the new daemon
+  // knows none of the old watches or in-flight children.
+  eh_set_daemon_connected(h, 0);
   armedWatches.clear();
+  liveProcs.clear();
   daemonError = null;
   daemonUri = uri;
   await connectDaemon();
@@ -420,6 +436,7 @@ async function daemonWrite(path, bytes) {
 // wasm tick has a single consumer (no reentrancy with the loop's own drain).
 // =============================================================================
 const armedWatches = new Set(); // paths currently watched on the daemon (gates the async park)
+const liveProcs = new Set(); // spawn ids in flight on the daemon (also gates the async park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
 let pendingConnectUri = null; // a runtime `:connect nxvim://…` to dial on the next run-loop pass
@@ -436,9 +453,9 @@ function onDaemonNotify(method, params) {
   }
 }
 
-// Apply every queued daemon push through the real tick (run-loop side). Today only `fs_changed`
-// (the watch leg); proc/lsp pushes route here in later slices. An unknown push is surfaced
-// loudly (it can only arrive for something we subscribed to — fail loud, per CLAUDE.md).
+// Apply every queued daemon push through the real tick (run-loop side): the watch leg's
+// `fs_changed` and the proc leg's `proc_spawned`/`proc_exited` (Phase 6d). An unknown push is
+// surfaced loudly (it can only arrive for something we subscribed to — fail loud, per CLAUDE.md).
 function applyDaemonNotifications() {
   if (daemonNotifications.length === 0) return false;
   let any = false;
@@ -453,11 +470,63 @@ function applyDaemonNotifications() {
       const mtimeMs = hasStat ? (stat[0] ?? 0) * 1000 + Math.floor((stat[1] ?? 0) / 1e6) : -1;
       eh_remote_file_changed(h, String(path), hasStat, size, mtimeMs);
       any = true;
+    } else if (method === "proc_spawned") {
+      // params = [id, pid?] — nil pid = the child failed to spawn (passed as -1).
+      const id = params[0];
+      const pid = params[1];
+      eh_proc_spawned(h, Number(id), pid == null ? -1 : Number(pid));
+      any = true;
+    } else if (method === "proc_exited") {
+      // params = [id, code, stdout(bin), stderr(bin)] — a killed child arrives as code -1.
+      const id = params[0];
+      const code = params[1];
+      callProcExited(Number(id), Number(code), toU8(params[2]), toU8(params[3]));
+      liveProcs.delete(id);
+      any = true;
     } else {
       postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
     }
   }
   return any;
+}
+
+// Normalize a msgpack value to bytes: `bin` decodes to a Uint8Array, but guard against a
+// `str`/array/nil shape too so a daemon quirk degrades to bytes rather than throwing.
+function toU8(v) {
+  if (v == null) return new Uint8Array(0);
+  if (v instanceof Uint8Array) return v;
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (Array.isArray(v)) return new Uint8Array(v);
+  if (typeof v === "string") return new TextEncoder().encode(v);
+  return new Uint8Array(0);
+}
+
+// Run a child's `on_exit` with its raw stdout/stderr bytes. The bytes are copied into wasm
+// memory (process output is binary — it can't ride the cwrap "string" marshalling, which
+// stops at a NUL) and `eh_proc_exited` hands them to the Lua callback; free after the call.
+function callProcExited(id, code, stdout, stderr) {
+  const oPtr = stdout.length ? M._malloc(stdout.length) : 0;
+  const ePtr = stderr.length ? M._malloc(stderr.length) : 0;
+  if (oPtr) M.HEAPU8.set(stdout, oPtr);
+  if (ePtr) M.HEAPU8.set(stderr, ePtr);
+  eh_proc_exited(h, id, code, oPtr, stdout.length, ePtr, stderr.length);
+  if (oPtr) M._free(oPtr);
+  if (ePtr) M._free(ePtr);
+}
+
+// Forward the async process spawns/kills the tick enqueued to the daemon (`proc_spawn` /
+// `proc_kill`). The daemon answers with `proc_spawned`/`proc_exited` pushes (`onDaemonNotify`).
+// Only reached in a daemon session — the tick gates proc spawns on a connected daemon
+// (`has_remote_proc`), so a serverless `vim.system` fails loud in the core and never enqueues.
+async function drainProcRequests() {
+  const reqs = JSON.parse(readStr(eh_take_proc_requests(h)));
+  if (reqs.spawn.length === 0 && reqs.kill.length === 0) return;
+  if (!daemon) return; // defensive: the tick shouldn't enqueue a spawn without a daemon
+  for (const s of reqs.spawn) {
+    liveProcs.add(s.id);
+    await daemon.notify("proc_spawn", [s.id, s.argv, s.cwd ?? null, s.env, new Uint8Array(s.stdin)]);
+  }
+  for (const id of reqs.kill) await daemon.notify("proc_kill", [id]);
 }
 
 // Forward the watch arm/disarm requests the editor enqueued to the daemon (`fs_watch` /
@@ -502,6 +571,7 @@ function drainClipboardWrites() {
 async function pump5cDaemon() {
   applyDaemonNotifications();
   await fulfillFsRequests();
+  await drainProcRequests();
   postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
 }
 
@@ -708,6 +778,9 @@ async function runLoopSAB(ctrl, data) {
     // Forward any watches the tick armed/disarmed (file-backed buffers opened/closed) to the
     // daemon, so it begins/stops pushing `fs_changed` for them.
     await drainWatchRequests();
+    // Forward any async `vim.system` / `jobstart` the tick enqueued to the daemon (its
+    // `proc_spawned`/`proc_exited` pushes return on `onDaemonNotify`).
+    await drainProcRequests();
     // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
@@ -752,12 +825,13 @@ async function runLoopSAB(ctrl, data) {
     // keystroke / timer also wakes to flush cross-session state after a quiet period.
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
     let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
-    if (daemon && armedWatches.size > 0) {
-      // A daemon session with watches armed: don't *block* — a thread frozen in
-      // `Atomics.wait` can't run the WebTransport reader, so a `fs_changed` push would sit
-      // until the next keystroke. Park on the non-blocking `Atomics.waitAsync` so the event
-      // loop (hence the reader) keeps running; wake the instant a push lands (`daemonWake`)
-      // or input arrives (SEQ notify resolves `w.value`), capped so a dangling wait clears.
+    if (daemon && (armedWatches.size > 0 || liveProcs.size > 0)) {
+      // A daemon session expecting pushes — a watch armed, or a child in flight — must not
+      // *block*: a thread frozen in `Atomics.wait` can't run the WebTransport reader, so a
+      // `fs_changed` / `proc_exited` push would sit until the next keystroke. Park on the
+      // non-blocking `Atomics.waitAsync` so the event loop (hence the reader) keeps running;
+      // wake the instant a push lands (`daemonWake`) or input arrives (SEQ notify resolves
+      // `w.value`), capped so a dangling wait clears.
       timeout = timeout === undefined ? DAEMON_PUSH_POLL_MS : Math.min(timeout, DAEMON_PUSH_POLL_MS);
       const w = Atomics.waitAsync(ctrl, SEQ, seqBefore, timeout);
       if (w.async) await Promise.race([w.value, new Promise((res) => { daemonWaker = res; })]);
@@ -860,6 +934,7 @@ onmessage = async (ev) => {
       eh_input(h, String(msg.notation));
       await fulfillFsRequests();
       await drainWatchRequests();
+      await drainProcRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -871,6 +946,7 @@ onmessage = async (ev) => {
       eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
       await drainWatchRequests();
+      await drainProcRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -880,6 +956,7 @@ onmessage = async (ev) => {
       const result = readStr(eh_exec_lua(h, String(msg.code)));
       await fulfillFsRequests();
       await drainWatchRequests();
+      await drainProcRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id, result);

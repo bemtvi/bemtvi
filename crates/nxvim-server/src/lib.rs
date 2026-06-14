@@ -1053,6 +1053,44 @@ impl EditHost {
         self.settle_events(true);
     }
 
+    /// Record the OS pid of a daemon-spawned async `vim.system` child (the proc leg's
+    /// `proc_spawned` push) — the wasm entry the Worker calls from `RpcClient.onNotify`.
+    /// `pid < 0` means the child failed to spawn (no pid). Mirrors the native
+    /// `on_loop_event`'s [`LoopEvent::ProcessSpawned`](crate::evloop) arm: the pid can't be
+    /// known synchronously, so the handle's `.pid` reads `nil` until this lands. No repaint
+    /// — recording a pid changes no view (native doesn't repaint here either).
+    pub fn proc_spawned(&mut self, id: u64, pid: i64) {
+        let pid = if pid < 0 { None } else { Some(pid as u32) };
+        if let Err(e) = self.lua.set_process_pid(id, pid) {
+            self.editor
+                .echo(format!("E5108: Error recording process pid: {e}"));
+        }
+    }
+
+    /// Land a daemon child's exit (the proc leg's `proc_exited` push) — the wasm entry the
+    /// Worker calls from `RpcClient.onNotify` when the child spawned under `id` finishes
+    /// (or was killed → `code == -1`). Runs the `vim.system` `on_exit` callback with the
+    /// result table (`code` + raw `stdout`/`stderr` bytes), drains the effects it queues,
+    /// and settles + repaints — the wasm twin of the native `on_loop_event`'s
+    /// [`LoopEvent::ProcessExit`](crate::evloop) arm plus the run loop's trailing
+    /// `settle_events`. The callback may itself queue further async (a chained spawn, an
+    /// off-tick `:edit`), so `settle_events` drives the convergence + the off-tick drains
+    /// (the Worker then fulfils any enqueued read/write), exactly as `remote_file_changed`
+    /// does for a watch reconcile.
+    pub fn proc_exited(&mut self, id: u64, code: i32, stdout: Vec<u8>, stderr: Vec<u8>) {
+        let args = nxvim_lua::CallbackArgs::Process {
+            code,
+            stdout,
+            stderr,
+        };
+        if let Err(e) = self.lua.run_callback(id, false, args) {
+            self.editor
+                .echo(format!("E5108: Error in vim.system on_exit: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
     /// Seed the set of available treesitter grammars at boot — the offline bundle
     /// plus whatever the previous session installed into OPFS, both discovered by the
     /// Worker (it owns the manifests). Backs `:TSInstallInfo`; idempotent. No echo /

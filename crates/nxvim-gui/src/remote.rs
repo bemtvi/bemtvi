@@ -15,7 +15,11 @@
 
 use std::process::Stdio;
 
-#[cfg(any(unix, windows))]
+// The `Context` trait's `.context()` is called only in the macOS (`osascript`) and
+// Windows (`powershell`) dialog paths; other `.context()` uses are the inherent method on
+// `anyhow::Error`, which needs no import. Gating to those two targets keeps the import from
+// reading as unused on Linux (where neither dialog path compiles).
+#[cfg(any(target_os = "macos", windows))]
 use anyhow::Context as _;
 use anyhow::Result;
 use tokio::process::Command;

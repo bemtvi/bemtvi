@@ -1026,13 +1026,37 @@ impl EditHost {
             } => self.arm_wasm_timer(id, delay_ms, repeat_ms),
             #[cfg(not(feature = "native"))]
             LoopOp::TimerStop { id } => self.stop_wasm_timer(id),
-            // Processes / fs-watch still have no serverless analogue (those need the
-            // Phase 6 daemon): surface the unsupported request loudly, never silently.
+            // Processes ride the daemon proc leg (Phase 6d) — the browser has no local
+            // process to spawn, so a `vim.system` / `jobstart` is only possible against a
+            // connected daemon. When one is wired, enqueue the spawn for the Worker to
+            // forward over WebTransport (its pid/exit return inbound on `proc_spawned` /
+            // `proc_exited`); serverless (no daemon) has no analogue, so fail *loud* in the
+            // tick rather than silently dropping the request.
             #[cfg(not(feature = "native"))]
-            LoopOp::Spawn { .. } | LoopOp::Kill { .. } => self.editor.echo(
-                "E: jobs/processes (vim.system / jobstart / vim.uv.spawn) are not \
-                 available in the browser build yet",
-            ),
+            LoopOp::Spawn {
+                id,
+                cmd,
+                cwd,
+                env,
+                stdin,
+            } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.proc_spawn(id, cmd, cwd, env, stdin);
+                } else {
+                    self.editor.echo(
+                        "E: jobs/processes (vim.system / jobstart / vim.uv.spawn) require a \
+                         daemon — :connect to one",
+                    );
+                }
+            }
+            // A kill only makes sense for a child the daemon is running; serverless never
+            // spawned one, so it's a no-op there (nothing was enqueued).
+            #[cfg(not(feature = "native"))]
+            LoopOp::Kill { id } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.proc_kill(id);
+                }
+            }
         }
     }
 

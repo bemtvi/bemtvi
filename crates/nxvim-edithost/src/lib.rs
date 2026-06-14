@@ -96,6 +96,26 @@ struct Sink {
     /// file), recorded by [`fs_unwatch`](HostEffects::fs_unwatch); the disarm twin of
     /// [`watch_arms`](Sink::watch_arms), drained by [`eh_take_watch_requests`].
     watch_disarms: Vec<String>,
+    /// Async process spawns the editor enqueued this convergence (the proc leg — Phase 6d):
+    /// `(id, argv, cwd, env, stdin)` per `vim.system` / `jobstart` with an `on_exit`,
+    /// recorded by [`proc_spawn`](HostEffects::proc_spawn). Drained by
+    /// [`eh_take_proc_requests`] for the Worker to forward over WebTransport
+    /// (`proc_spawn [id, argv, cwd?, env, stdin]`); the child's pid/exit return via
+    /// [`eh_proc_spawned`] / [`eh_proc_exited`]. Only ever enqueued in a daemon session
+    /// (the tick gates on [`daemon_connected`](Sink::daemon_connected)).
+    #[allow(clippy::type_complexity)]
+    proc_spawns: Vec<(u64, Vec<String>, Option<String>, Vec<(String, String)>, Vec<u8>)>,
+    /// Ids the editor asked to **kill** (`handle:kill()`), recorded by
+    /// [`proc_kill`](HostEffects::proc_kill); the disarm twin of
+    /// [`proc_spawns`](Sink::proc_spawns), drained by [`eh_take_proc_requests`] for the
+    /// Worker to forward (`proc_kill [id]`).
+    proc_kills: Vec<u64>,
+    /// Whether a daemon (and thus a process host) is currently connected — flipped by the
+    /// Worker via [`eh_set_daemon_connected`] on a `?daemon=` boot / runtime `:connect` /
+    /// disconnect. Read by [`has_remote_proc`](HostEffects::has_remote_proc) to gate the
+    /// editor's async-spawn branch: serverless OPFS has no process host, so a `vim.system`
+    /// must fail loud in the tick, never silently enqueue a spawn no transport can fulfil.
+    daemon_connected: bool,
     /// Treesitter grammars the editor newly asked to **install** this convergence (one
     /// per `:TSInstall <lang>`), recorded by [`ts_install`](HostEffects::ts_install).
     /// Drained by [`eh_take_ts_requests`] for the Worker to forward to the UI thread,
@@ -218,6 +238,38 @@ impl HostEffects for WasmEffects {
         // takes the off-tick `:e`/`:w` branches — `fs_fetch` / `fs_save` above — exactly
         // as a daemon session does, only the transport is OPFS instead of the wire.
         true
+    }
+
+    fn proc_spawn(
+        &mut self,
+        id: u64,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+        stdin: Vec<u8>,
+    ) {
+        // An async `vim.system` / `jobstart` against the daemon (Phase 6d): record the
+        // spawn for the Worker to forward over WebTransport (`eh_take_proc_requests` →
+        // `proc_spawn`). The child's pid/exit return via `eh_proc_spawned` / `eh_proc_exited`
+        // — the wasm twin of the daemon's `proc_spawned`/`proc_exited` pushes. Only reached
+        // when a daemon is connected (the tick gates on `has_remote_proc`).
+        self.sink
+            .borrow_mut()
+            .proc_spawns
+            .push((id, cmd, cwd, env, stdin));
+    }
+
+    fn proc_kill(&mut self, id: u64) {
+        // `handle:kill()` on a daemon child: record the kill for the Worker to forward
+        // (`proc_kill [id]`); the resulting exit returns inbound on `eh_proc_exited`.
+        self.sink.borrow_mut().proc_kills.push(id);
+    }
+
+    fn has_remote_proc(&self) -> bool {
+        // A `vim.system` is only possible against a connected daemon — serverless OPFS has
+        // no process host. The Worker flips this on `:connect` / `?daemon=` (`eh_set_daemon_connected`);
+        // when false the tick fails the spawn loud instead of enqueuing it.
+        self.sink.borrow().daemon_connected
     }
 
     fn ts_install(&mut self, lang: String) {
@@ -765,6 +817,111 @@ pub unsafe extern "C" fn eh_remote_file_changed(
         size.max(0.0) as u64,
         mtime,
     );
+}
+
+// ============================================================================
+// Off-tick daemon process leg (Phase 6d). The async `vim.system` / `jobstart` path: the
+// editor enqueues a spawn off the keystroke tick (it can't run a process in the browser),
+// the Worker forwards it over WebTransport to a connected daemon, and the child's pid/exit
+// return as daemon→edit-host pushes the Worker lands back here. The browser twin of the
+// native event-loop actor's proc routing (the daemon side is unchanged — Phase 3c/3q).
+// ============================================================================
+
+/// Tell the core whether a daemon (process host) is connected, flipping the editor tick's
+/// async-spawn branch: `on != 0` enqueues a `vim.system` for the Worker to forward; `0`
+/// (serverless OPFS) fails it loud in the tick. The Worker calls this on a `?daemon=` boot /
+/// runtime `:connect` (1) and on disconnect (0). Unlike the off-tick fs (always on — OPFS is
+/// the serverless fallback), processes have no serverless analogue, so this gate is real.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_set_daemon_connected(h: *mut WasmEditHost, on: i32) {
+    if let Some(handle) = h.as_mut() {
+        handle.sink.borrow_mut().daemon_connected = on != 0;
+    }
+}
+
+/// Drain the async process spawns/kills the editor enqueued since the last call, as JSON the
+/// Worker forwards to the daemon:
+/// `{"spawn":[{"id":N,"argv":["…"],"cwd":"…"|null,"env":[["k","v"],…],"stdin":[byte,…]}],"kill":[N]}`.
+/// Each spawn is dispatched exactly once (the queue is emptied); the daemon answers with
+/// `proc_spawned`/`proc_exited` pushes the Worker lands via [`eh_proc_spawned`] /
+/// [`eh_proc_exited`]. `stdin` is a byte array (empty for `vim.system`, which takes none).
+/// Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_proc_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"spawn":[],"kill":[]}"#.into());
+    };
+    let mut sink = handle.sink.borrow_mut();
+    let spawn: Vec<serde_json::Value> = std::mem::take(&mut sink.proc_spawns)
+        .into_iter()
+        .map(|(id, argv, cwd, env, stdin)| {
+            serde_json::json!({
+                "id": id,
+                "argv": argv,
+                "cwd": cwd,
+                "env": env.into_iter().map(|(k, v)| vec![k, v]).collect::<Vec<_>>(),
+                "stdin": stdin,
+            })
+        })
+        .collect();
+    let kill: Vec<u64> = std::mem::take(&mut sink.proc_kills);
+    into_owned_cstr(serde_json::json!({ "spawn": spawn, "kill": kill }).to_string())
+}
+
+/// Land a daemon `proc_spawned` push: record the child's OS `pid` (`pid < 0` = failed to
+/// spawn / unknown) under the spawn `id` so a `vim.system` handle's `.pid` resolves it.
+/// `id` / `pid` are `double`s (small values; no 64-bit-int marshalling). See
+/// [`EditHost::proc_spawned`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_proc_spawned(h: *mut WasmEditHost, id: f64, pid: f64) {
+    if let Some(handle) = h.as_mut() {
+        handle.host.proc_spawned(id.max(0.0) as u64, pid as i64);
+    }
+}
+
+/// Land a daemon `proc_exited` push: run the spawn `id`'s `vim.system` `on_exit` with the
+/// child's exit `code` and raw `stdout`/`stderr` bytes, then settle + repaint. The output is
+/// passed as pointer+length (not a C string) because process output is arbitrary bytes —
+/// it may contain NULs / invalid UTF-8, which a C string would truncate or mangle (Lua
+/// strings are byte strings, so the callback sees them faithfully). `id` / `code` are
+/// `double`s. A killed child arrives as `code == -1`. See [`EditHost::proc_exited`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `out`/`err` must point to `out_len`/
+/// `err_len` readable bytes (or be null when the length is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_proc_exited(
+    h: *mut WasmEditHost,
+    id: f64,
+    code: f64,
+    out: *const u8,
+    out_len: usize,
+    err: *const u8,
+    err_len: usize,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let stdout = if out.is_null() || out_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(out, out_len).to_vec()
+    };
+    let stderr = if err.is_null() || err_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(err, err_len).to_vec()
+    };
+    handle
+        .host
+        .proc_exited(id.max(0.0) as u64, code as i32, stdout, stderr);
 }
 
 /// Execute a Lua chunk through the real effects path (queued `vim.cmd`s and deferred

@@ -94,6 +94,39 @@ pub trait HostEffects {
     /// off-tick open/save drains.
     fn has_remote_fs(&self) -> bool;
 
+    /// Async process spawn (`vim.system` / `jobstart` / `:!` with an `on_exit`) over the
+    /// daemon proc leg — the wasm twin of the native `loop_command(LoopCommand::Spawn)`.
+    /// Fire-and-forget: the child's pid and exit return *inbound* via
+    /// [`EditHost::proc_spawned`](crate::EditHost::proc_spawned) /
+    /// [`proc_exited`](crate::EditHost::proc_exited), not here. The editor tick gates this
+    /// on [`Self::has_remote_proc`], so it is only reached when a daemon is connected.
+    /// Native-only build routes processes through the event-loop actor's `loop_command`
+    /// instead, so this method is wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn proc_spawn(
+        &mut self,
+        id: u64,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+        stdin: Vec<u8>,
+    );
+
+    /// Terminate the daemon child running under `id` (`handle:kill()`) — the wasm twin of
+    /// `loop_command(LoopCommand::Kill)`. A no-op if it already exited; the resulting exit
+    /// returns inbound on `proc_exited`. Wasm-only (see [`Self::proc_spawn`]).
+    #[cfg(not(feature = "native"))]
+    fn proc_kill(&mut self, id: u64);
+
+    /// Whether a daemon (and thus a process host) is connected. Gates the wasm editor
+    /// tick's async-spawn branch: `true` enqueues a [`proc_spawn`](Self::proc_spawn);
+    /// `false` (serverless OPFS — no processes) fails the spawn *loud* in the tick rather
+    /// than silently dropping it. Distinct from [`has_remote_fs`](Self::has_remote_fs),
+    /// which is always `true` on wasm (OPFS is an off-tick fs even with no daemon), because
+    /// a process has no serverless fallback. Wasm-only (native always has local processes).
+    #[cfg(not(feature = "native"))]
+    fn has_remote_proc(&self) -> bool;
+
     /// LSP — ensure `key`'s language server is running (idempotent), spawning it via
     /// `spawn` on first use. Fire-and-forget; the server's notifications and reply
     /// stream return *inbound* on the run loop's `lsp_events` arm, not here. Native-only

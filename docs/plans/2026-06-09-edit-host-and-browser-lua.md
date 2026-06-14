@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; the daemon proc/lsp/sys_run/luafs legs over WebTransport remain) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the daemon lsp/sys_run/luafs legs over WebTransport remain) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2260,6 +2260,92 @@ WebTransport — **proc** (`HostProc`; the process legs add the daemon→browser
 bidi stream still); and an **event-driven push wakeup** to replace the async-park cap — a
 second worker (or the UI thread) owning the connection and poking the edit-host Worker's SAB,
 folded into the same deferred stream-split follow-up.
+
+### Phase 6d — browser edit-host ↔ daemon over WebTransport (the proc leg) — ✅ DONE (2026-06-14)
+
+The third daemon leg in the browser, and the first to carry a **process** over the wire:
+async `vim.system` / `jobstart` (with an `on_exit`) has no local process in the browser, so
+the spawn crosses to the daemon, runs there, and its pid/exit return as the daemon→browser
+pushes the watch leg (6c) built the push plumbing for. The browser twin of native Phase 3c,
+reusing 6b's `RpcClient` and 6c's push-routing + async-park machinery. (Slice direction
+confirmed with the requester, 2026-06-14.)
+
+**The daemon needed no change** — `run_daemon_io` already routes every `proc_*` method to
+`serve_proc_daemon_on`, which runs the child through the same `StdHostProc` the local server
+uses and relays its `LoopEvent`s as `proc_spawned`/`proc_exited` notifications (Phase 3c/3q/3r).
+This slice is purely the **browser/edit-host** half, the inverse-direction twin of 6b.
+
+The shape differs from the fs legs by one structural fact: processes do **not** flow through
+`HostEffects::fs_*` or the off-tick replica path — they ride the **event-loop command** seam
+(`LoopOp::Spawn`/`Kill`), which the native build routes to the tokio actor via
+`loop_command(LoopCommand::Spawn)`. The wasm build has no event-loop actor, so the proc
+spawn/kill became **new wasm-gated `HostEffects` methods** (`proc_spawn` / `proc_kill` /
+`has_remote_proc`) the editor tick enqueues into the `Sink`, mirroring how `fs_fetch`/`fs_save`
+work — and the child's pid/exit land back through new inbound `EditHost` methods
+(`proc_spawned` / `proc_exited`), the wasm twins of the native `on_loop_event` arms.
+
+Shipped:
+- **The wasm proc seam** (`nxvim-server` `edithost.rs` + `effects.rs`) — `HostEffects` grew
+  three `#[cfg(not(feature = "native"))]` methods: `proc_spawn(id, cmd, cwd, env, stdin)`,
+  `proc_kill(id)`, and `has_remote_proc()`. `apply_loop_op`'s wasm `LoopOp::Spawn`/`Kill`
+  branch — which used to fail loud unconditionally ("not available in the browser build yet")
+  — now gates on `has_remote_proc()`: with a daemon connected it enqueues the spawn/kill;
+  serverless OPFS (no process host) still fails *loud* in the tick ("require a daemon — :connect
+  to one"). `has_remote_proc` is distinct from `has_remote_fs` (always `true` on wasm — OPFS is
+  an off-tick fs even with no daemon) precisely because a process has **no serverless fallback**.
+- **The inbound `EditHost` methods** (`lib.rs`, wasm impl block) — `proc_spawned(id, pid)`
+  records the child's pid via `set_process_pid` (the handle's `.pid`; native's `ProcessSpawned`
+  arm) and `proc_exited(id, code, stdout, stderr)` runs the `on_exit` callback with the result
+  table, drains its effects, and `settle_events` + repaints (native's `ProcessExit` arm plus the
+  run loop's trailing settle) — a chained spawn / off-tick `:edit` the callback queues drains in
+  the same convergence, exactly as `remote_file_changed` does for a watch reconcile.
+- **The cdylib FFI** (`nxvim-edithost`) — `Sink` gained `proc_spawns` / `proc_kills` /
+  `daemon_connected`; `WasmEffects` implements the three seam methods over them. Four exports:
+  `eh_set_daemon_connected` (the Worker flips it on `:connect` / `?daemon=` / disconnect),
+  `eh_take_proc_requests` (drains the spawn/kill queue as JSON for the Worker to forward),
+  `eh_proc_spawned`, and `eh_proc_exited` — the last taking stdout/stderr as **pointer+length**,
+  not a C string, because process output is arbitrary bytes (NUL / non-UTF-8) a C string would
+  truncate (Lua strings are byte strings, so the callback sees them faithfully).
+- **Worker wiring** (`web/worker.mjs`) — `drainProcRequests` forwards each spawn/kill as a
+  `proc_spawn`/`proc_kill` notification; `applyDaemonNotifications` routes `proc_spawned`/
+  `proc_exited` pushes (copying the `bin` stdout/stderr into wasm memory for `eh_proc_exited`);
+  a `liveProcs` set joins `armedWatches` in gating the **async park** — a daemon session with a
+  child in flight parks on `Atomics.waitAsync` (not blocking `Atomics.wait`) so the WebTransport
+  reader stays live to receive the unsolicited `proc_exited` push, exactly as 6c does for watch
+  pushes. `eh_set_daemon_connected` is flipped on every connect/disconnect path.
+
+**The async-spawn *public* Lua surface (`nx.spawn`, ADR 0002) is still the proposed primitive —
+this slice carries the leg, not the wrapper.** When the neovim-plugin-compat runtime was ripped
+out (`300cdb0` / `e9bb90c`), the public `vim.system` wrapper went with it, leaving the **funnel**
+(`nx._system_async` / `nx._system_kill` / `nx._set_proc_pid` / `nx._proc_pids`) and the native
+event-loop handling in place. The native proc leg is in the same funnel-only state, so 6d brings
+the browser to **parity** (transport + funnel, no public wrapper yet) rather than inventing the
+`nx.spawn` API — that public surface is a separate, still-proposed slice. The leg is ready for it.
+
+**Exit criteria — met.** `web/verify-proc.mjs` (real headless Chromium + a real `--daemon
+--listen`, the browser twin of the native daemon proc test): driving the genuine `nx._system_async`
+funnel (the exact funnel any public wrapper calls — not a mock), (1) a `sh -c 'printf …'` child's
+**stdout round-trips** to the `on_exit` callback over WebTransport with exit code 0; (2) a child
+writes a **marker file on the daemon's disk** (a path the browser origin can't touch) that Node
+reads back — proving the process truly executed on the daemon, not faked; and (3) a `sleep 30`
+child is **killed from the browser** and its `on_exit` fires with a `-1` (killed) code in well
+under a second — proving `proc_kill` crossed the wire and terminated the child, not that the sleep
+elapsed. Native `cargo test --workspace` green (61 suites, zero failures — the wasm-gated changes
+don't touch the native build), fmt + clippy `-D warnings` clean on `nxvim-server` (native) and
+`nxvim-edithost` (wasm); the existing browser suites stay green — serverless OPFS (`verify.mjs`)
+and the 6b fs leg (`verify-daemon.mjs`) are untouched (proc requests no-op without a daemon, and
+the park is unchanged when no child is in flight). (A pre-existing, platform-specific clippy error
+in the unrelated `nxvim-gui/src/remote.rs` — `anyhow::Context` unused on Linux, used only in the
+macOS/Windows SSH-dialog `cfg` blocks — is present on clean `HEAD` and out of this slice's scope.)
+
+**Deferred to later Phase 6 slices (not stubbed):** the remaining three wire legs over
+WebTransport — **sys_run** (blocking `nx._system` — still fails loud in the browser), **lsp**, and
+**luafs** (`vim.uv.fs_stat` / `filereadable`); the public **`nx.spawn`** async surface over the
+funnel this leg carries (a shared native+browser slice, per ADR 0002); the per-`HostServices`-class
+**QUIC stream split** (one bidi stream still — a `proc_*` flood can still HOL-block an `fs_*` save);
+a **connection-drop sweep** that fails every in-flight child's `on_exit` with `code -1` (the native
+`RemoteHostProc` clears its `Inflight` on EOF; the browser leaves a dropped daemon's children
+dangling for now); and an **event-driven push wakeup** to replace the async-park cap.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 

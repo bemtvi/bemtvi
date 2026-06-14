@@ -843,13 +843,19 @@ impl Renderer {
                     // Splice the band row's inlay hints in, like the settled path, so
                     // they slide with the text instead of vanishing during the slide.
                     segments = splice_inlay(segments, inlay, win.leftcol, s.styles);
-                    let x = text_x0.saturating_sub(win.leftcol) as f32 * self.cell_w;
+                    let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
                     self.push_text(items, &segments, (x, y), fg, clip);
                 }
             }
             // Settled: paint the live viewport with selection/search overlays.
             None => {
                 let full = self.full_bounds();
+                // The window's text area, so a horizontally-scrolled (or just long)
+                // line clips at this window's edge instead of spilling over the
+                // gutter on the left or the next split on the right. Gutter/sign
+                // glyphs sit left of `text_x0` and keep the whole-surface clip.
+                let text_clip =
+                    self.text_bounds(text_x0, oy, (ox + wcols).saturating_sub(text_x0), text_rows);
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
                 let normal_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
@@ -945,8 +951,13 @@ impl Renderer {
                     let mut segments =
                         row_segments(&display, hl, &view.styles, fg, normal_bg, win.leftcol);
                     segments = splice_inlay(segments, inlay, win.leftcol, &view.styles);
-                    let pos = self.cell_px(text_x0.saturating_sub(win.leftcol), row as u16);
-                    self.push_text(items, &segments, pos, fg, full);
+                    // The run begins at the first *visible* column (`row_segments`
+                    // already dropped the off-screen-left ones), so it starts at the
+                    // text origin — not `leftcol` cells back over the gutter. Clip it
+                    // to this window's text area so a line wider than the window cuts
+                    // off at the edge instead of bleeding into the next split.
+                    let pos = self.cell_px(text_run_origin(text_x0, win.leftcol), row as u16);
+                    self.push_text(items, &segments, pos, fg, text_clip);
                     self.push_attr_rules(quads, win, view, text_x0, row, hl, inlay);
 
                     // LSP diagnostic underlines, painted last so they survive over
@@ -1041,7 +1052,7 @@ impl Renderer {
                     inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
                 }
             };
-            let cx = text_x0 + win.cursor_screen_col.saturating_sub(win.leftcol) + cur_shift;
+            let cx = col_to_screen(text_x0, win.cursor_screen_col, win.leftcol) + cur_shift;
             let px = cx as f32 * self.cell_w;
             let py = match scroll {
                 Some(s) => (oy as f32 + (s.cursor - s.top)) * self.cell_h,
@@ -2225,6 +2236,27 @@ fn gutter_cell(
         let field = width.saturating_sub(1); // reserve the trailing space
         format!("{value:>field$} ")
     }
+}
+
+/// Map a buffer screen-column to its absolute screen cell in a window whose text
+/// area starts at `text_x0` and is horizontally scrolled by `leftcol` columns: the
+/// column slides left by `leftcol`, clamping at `text_x0` for anything scrolled off
+/// the left edge. The cursor, the selection/search quads, and the underline rules
+/// all key off this one mapping, so the text origin ([`text_run_origin`]) must too —
+/// otherwise scrolled glyphs drift out from under their own overlays.
+pub fn col_to_screen(text_x0: u16, col: u16, leftcol: u16) -> u16 {
+    text_x0 + col.saturating_sub(leftcol)
+}
+
+/// The absolute screen cell where a window's text run begins under a `leftcol`
+/// horizontal scroll. [`row_segments`]/[`splice_inlay`] already drop the `leftcol`
+/// columns scrolled off the left, so the surviving run starts at the first *visible*
+/// buffer column (`== leftcol`), which maps to `text_x0` via [`col_to_screen`].
+/// Subtracting `leftcol` a second time here (as the origin once did) double-counts
+/// the scroll and shoves the glyphs `leftcol` cells left — over the number gutter
+/// and out from under the cursor. So this is `text_x0`, independent of `leftcol`.
+pub fn text_run_origin(text_x0: u16, leftcol: u16) -> u16 {
+    col_to_screen(text_x0, leftcol, leftcol)
 }
 
 /// Split a tab-expanded row into `(text, color)` segments from its highlight

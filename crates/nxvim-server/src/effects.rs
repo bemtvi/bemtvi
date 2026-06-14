@@ -183,6 +183,12 @@ impl EditHost {
                 },
             }
         }
+        // Terminal-open requests from `nx.terminal.open` open a terminal job in the
+        // current window; the core enqueues the PTY spawn, drained at the end of this
+        // convergence by `take_pending_terminal` → `dispatch_terminal_ops`.
+        for req in self.lua.take_terminal_open_reqs() {
+            self.editor.open_terminal(req.argv, req.cwd);
+        }
         // Server-start requests from `vim.lsp.start` (the `vim.lsp.enable` FileType
         // dispatcher) bind a buffer to its language server and ensure it is spawned.
         // Native only — a serverless browser build has no language servers (Phase 6);

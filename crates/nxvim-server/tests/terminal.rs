@@ -11,8 +11,8 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, drain_to_latest_redraw, feed, lines, map_get, mode, serial_lock,
-    spawn, start_attached, window0_field, write_temp, TestClock,
+    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, mode,
+    serial_lock, spawn, start_attached, temp_dir, window0_field, write_temp, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -329,6 +329,68 @@ async fn slow_escapes_stay_in_terminal_mode() {
             "a spaced-out escape stays in the job"
         );
     }
+}
+
+/// Phase 5 — the `nx.terminal` Lua control surface. `nx.terminal.open{ cmd = ... }`
+/// opens a terminal job programmatically (the API twin of `:terminal`): the editor
+/// enters terminal mode and the child's output mirrors into the buffer.
+#[tokio::test]
+async fn nx_terminal_open_runs_a_command_programmatically() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    exec_lua(&rpc, "nx.terminal.open{ cmd = 'cat' }").await;
+    assert_eq!(
+        mode(&rpc).await,
+        "t",
+        "nx.terminal.open enters terminal mode"
+    );
+    feed(&rpc, "hi<CR>");
+    wait_lines(&rpc, "cat to echo 'hi'", |ls| has_line(ls, "hi")).await;
+}
+
+/// A list `cmd` is taken as argv verbatim, so an argument keeps its spaces — unlike
+/// a string `cmd`, which whitespace-splits. `printf` echoes its format, so the
+/// single argument `hello world` lands as one line.
+#[tokio::test]
+async fn nx_terminal_open_list_cmd_preserves_argument_spaces() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    exec_lua(
+        &rpc,
+        r"nx.terminal.open{ cmd = {'printf', 'hello world\n'} }",
+    )
+    .await;
+    wait_lines(&rpc, "printf to emit 'hello world'", |ls| {
+        has_line(ls, "hello world")
+    })
+    .await;
+}
+
+/// `nx.terminal.open{ cwd = ... }` starts the child in the requested directory.
+#[tokio::test]
+async fn nx_terminal_open_respects_an_explicit_cwd() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    let dir = temp_dir("nx_term_cwd");
+    let want = std::fs::canonicalize(&dir)
+        .expect("canonicalize temp dir")
+        .to_string_lossy()
+        .into_owned();
+    exec_lua(
+        &rpc,
+        &format!("nx.terminal.open{{ cmd = 'pwd', cwd = {dir:?} }}"),
+    )
+    .await;
+    // A long path wraps across grid rows at the terminal width, so rejoin the rows
+    // before matching (the wrap splits mid-path with no separator).
+    wait_lines(&rpc, "pwd to print the requested cwd", |ls| {
+        let joined: String = ls.iter().map(|l| l.trim_end()).collect();
+        joined.contains(&want)
+    })
+    .await;
 }
 
 /// `:terminal` spawns the child with the editor's environment inherited, so a

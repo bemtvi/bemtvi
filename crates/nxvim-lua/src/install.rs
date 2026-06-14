@@ -20,7 +20,8 @@ use crate::convert::{
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
     BufOp, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp,
-    OptionValue, PanelOp, RegisterSetOp, TabOp, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    OptionValue, PanelOp, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq,
+    WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -280,6 +281,49 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         )?,
     )?;
     nx.set("dock", dock)?;
+
+    // `nx.terminal`: open a terminal job programmatically — the API twin of the
+    // `:terminal` ex-command, same "Lua queues, core mutates" flow as `nx.dock`.
+    // `open{ cmd?, cwd? }` queues a [`TerminalOpenReq`] the server drains into
+    // `Editor::open_terminal` after the chunk. `cmd` is a string (whitespace-split
+    // into argv, no shell — like `:terminal`) or a list (argv verbatim, so an
+    // argument may contain spaces); omitted ⇒ the default shell. `cwd` defaults to
+    // the editor's working directory.
+    let terminal = lua.create_table()?;
+    let sh = shared.clone();
+    terminal.set(
+        "open",
+        lua.create_function(move |_, opts: Option<mlua::Table>| {
+            let (argv, cwd) = match opts {
+                None => (Vec::new(), None),
+                Some(opts) => {
+                    let cwd: Option<String> = opts.get("cwd")?;
+                    let cmd: mlua::Value = opts.get("cmd")?;
+                    let argv = match cmd {
+                        mlua::Value::Nil => Vec::new(),
+                        mlua::Value::String(s) => {
+                            s.to_str()?.split_whitespace().map(str::to_string).collect()
+                        }
+                        mlua::Value::Table(t) => t
+                            .sequence_values::<String>()
+                            .collect::<mlua::Result<Vec<_>>>()?,
+                        other => {
+                            return Err(mlua::Error::runtime(format!(
+                                "nx.terminal.open: `cmd` must be a string or a list, got {}",
+                                other.type_name()
+                            )))
+                        }
+                    };
+                    (argv, cwd)
+                }
+            };
+            sh.borrow_mut()
+                .terminal_ops
+                .push(TerminalOpenReq { argv, cwd });
+            Ok(())
+        })?,
+    )?;
+    nx.set("terminal", terminal)?;
 
     // ----- the async runtime bridge (the "event loop") -----------------------
     // Lua queues a [`LoopOp`] carrying a callback id; the server drains it in

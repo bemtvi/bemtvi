@@ -82,6 +82,20 @@ pub enum DockOp {
     },
 }
 
+/// A request to open a terminal job, queued by `nx.terminal.open{...}` and
+/// drained by the server into [`Editor::open_terminal`](nxvim_core::Editor) — the
+/// programmatic twin of the `:terminal` ex-command, on the same "Lua queues, core
+/// mutates" flow as [`DockOp`]. nxvim's own surface (no neovim `termopen` shape).
+#[derive(Clone, Debug)]
+pub struct TerminalOpenReq {
+    /// Program + args, run directly (no shell). Empty ⇒ the default shell
+    /// (`$SHELL` / `%COMSPEC%`, resolved by the transport).
+    pub argv: Vec<String>,
+    /// Working directory; `None` ⇒ the editor's working directory (filled in
+    /// server-side, since `nxvim-core` can't read process state).
+    pub cwd: Option<String>,
+}
+
 /// A request to start (or attach a buffer to) a language server, queued by
 /// `vim.lsp.start` after user Lua — directly, or through the `vim.lsp.enable`
 /// FileType dispatcher — resolved the config. The root is resolved **in Lua**

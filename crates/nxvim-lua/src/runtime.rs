@@ -18,7 +18,8 @@ use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
     HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, RawKeymap, RawRhs,
-    RegisterSetOp, SemanticTokenData, TabOp, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    RegisterSetOp, SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq,
+    WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -322,6 +323,9 @@ pub(crate) struct Shared {
     pub(crate) panel_ops: Vec<PanelOp>,
     /// Dock requests from `nx.dock.*`, applied to the core after the chunk.
     pub(crate) dock_ops: Vec<DockOp>,
+    /// Terminal-open requests from `nx.terminal.open`, applied to the core
+    /// (`Editor::open_terminal`) after the chunk.
+    pub(crate) terminal_ops: Vec<TerminalOpenReq>,
     /// Server-start requests from `vim.lsp.start` (driven by `vim.lsp.enable`),
     /// drained by the server into its `LspManager` after the chunk.
     pub(crate) lsp_ops: Vec<LspOp>,
@@ -681,6 +685,12 @@ impl LuaRuntime {
         /// Take the dock requests queued by `nx.dock.*` since the last drain, for the
         /// server to apply to the core (which owns the dock state).
         take_dock_ops -> Vec<DockOp> = dock_ops
+    }
+
+    take_queue! {
+        /// Take the terminal-open requests queued by `nx.terminal.open` since the
+        /// last drain, for the server to apply to the core (`Editor::open_terminal`).
+        take_terminal_open_reqs -> Vec<TerminalOpenReq> = terminal_ops
     }
 
     take_queue! {

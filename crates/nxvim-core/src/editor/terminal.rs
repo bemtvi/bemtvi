@@ -135,11 +135,9 @@ impl Editor {
             // byte column. Clamp into the line so a wide-char / trailing-cell cursor
             // never lands past the text. (Wide-char column fidelity is deferred.)
             let col = cursor_col.min(line_text.len());
-            // Stash the child's cursor so re-entering terminal mode (`i`/`a`) can snap
-            // back to it. Move the *live* cursor only while in terminal-job mode — in
-            // terminal-normal mode the user is navigating, so the child's output must
-            // not yank their cursor away.
-            self.terminal_cursor = (line, col);
+            // Move the live cursor to the child's cursor only while in terminal-job
+            // mode — in terminal-normal mode the user is navigating the output, so the
+            // child's writes must not yank their cursor away.
             if self.mode == Mode::Terminal {
                 self.cursor.line = line;
                 self.cursor.col = col;
@@ -149,16 +147,14 @@ impl Editor {
         }
     }
 
-    /// Enter terminal-job mode from terminal-normal (`i`/`a`), snapping the cursor to
-    /// the child's live input position (stashed by [`Editor::terminal_update`]) rather
-    /// than leaving it where normal-mode navigation parked it.
-    pub(crate) fn enter_terminal_mode(&mut self) {
+    /// Enter terminal-job mode from terminal-normal (`i`/`a`/…) at `col` on the current
+    /// line. Like entering insert in a normal buffer, the cursor stays where it is
+    /// rather than jumping to the child's last input point.
+    pub(crate) fn enter_terminal_mode(&mut self, col: usize) {
         self.mode = Mode::Terminal;
         self.terminal_pending_backslash = false;
         self.terminal_esc_count = 0;
-        let (line, col) = self.terminal_cursor;
-        self.cursor.line = line;
-        self.cursor.col = col;
+        self.cursor.col = col.min(self.line_len());
         self.clamp_cursor();
         self.ensure_visible();
     }

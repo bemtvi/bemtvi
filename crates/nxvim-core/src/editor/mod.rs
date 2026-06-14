@@ -971,11 +971,6 @@ pub struct Editor {
     /// a program that needs `<Esc>`, like vim/htop, keeps working). Reset by any other
     /// key and on leaving terminal mode.
     terminal_esc_count: u8,
-    /// The current terminal's child-cursor position `(line, byte-col)`, stashed by
-    /// [`Editor::terminal_update`] each refresh. Re-entering terminal-job mode (`i` /
-    /// `a` from terminal-normal) snaps the cursor back here — to the live input
-    /// position — rather than leaving it wherever normal-mode navigation parked it.
-    terminal_cursor: (usize, usize),
 }
 
 impl Editor {
@@ -1157,7 +1152,6 @@ impl Editor {
             pending_terminal: Vec::new(),
             terminal_pending_backslash: false,
             terminal_esc_count: 0,
-            terminal_cursor: (0, 0),
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.
@@ -1284,7 +1278,18 @@ impl Editor {
             && !key.alt
             && matches!(key.code, KeyCode::Char('i' | 'a' | 'A' | 'I' | 'o' | 'O'))
         {
-            self.enter_terminal_mode();
+            // Enter terminal-job mode at the *current* cursor position (like `i`/`a` in
+            // a normal buffer), with vim's usual column adjustment — not snapped to the
+            // child's last input point.
+            let len = self.line_len();
+            let col = match key.code {
+                KeyCode::Char('a') => (self.cursor.col + 1).min(len),
+                KeyCode::Char('A') => len,
+                KeyCode::Char('I') => 0,
+                // `i`, and `o`/`O` (no line-open in a terminal) enter at the cursor.
+                _ => self.cursor.col,
+            };
+            self.enter_terminal_mode(col);
             return;
         }
 

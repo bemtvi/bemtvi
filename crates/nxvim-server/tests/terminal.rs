@@ -149,6 +149,26 @@ async fn ctrl_4_is_accepted_as_ctrl_backslash() {
     );
 }
 
+/// nxvim answers terminal status queries (like a real terminal) so apps that probe
+/// the cursor position before drawing — fzf's inline finder, for one — don't stall.
+/// Driving `cat`, we make it emit a real `ESC[6n` (DSR cursor-position request) on
+/// its output; nxvim must write back a CPR (`ESC[row;colR`), which `cat` then echoes,
+/// so a `;…R` reply lands in the buffer.
+#[tokio::test]
+async fn answers_cursor_position_report() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    // Type ESC[6n then <CR>: cat writes the line back raw, so the emulator sees a real
+    // cursor-position request (not the caret-echoed input).
+    feed(&rpc, "<Esc>[6n<CR>");
+    wait_lines(&rpc, "a cursor-position-report reply", |ls| {
+        ls.iter().any(|l| l.contains(';') && l.contains('R'))
+    })
+    .await;
+}
+
 /// Plain `<C-r>` reaches the child (shell reverse-search), while `<C-\><C-r>{reg}`
 /// pastes a register into the terminal — the analogue of insert mode's `<C-r>{reg}`.
 #[tokio::test]

@@ -101,6 +101,18 @@ impl Editor {
         std::mem::take(&mut self.pending_terminal)
     }
 
+    /// Send raw bytes to terminal buffer `buf`'s child — the same path a keystroke
+    /// takes. Used by the server to write **query replies** (the cursor-position /
+    /// device-attributes reports a real terminal answers automatically) back to the
+    /// child so apps like fzf don't stall waiting for them. A no-op for a non-terminal
+    /// buffer or empty input.
+    pub fn terminal_send(&mut self, buf: BufferId, bytes: Vec<u8>) {
+        if bytes.is_empty() || !self.is_terminal_buffer(buf) {
+            return;
+        }
+        self.pending_terminal.push(TerminalOp::Send { buf, bytes });
+    }
+
     /// Whether buffer `id` is a terminal-job buffer.
     pub fn is_terminal_buffer(&self, id: BufferId) -> bool {
         self.buffers

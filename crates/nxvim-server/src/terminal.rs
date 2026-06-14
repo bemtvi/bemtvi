@@ -18,17 +18,54 @@ use nxvim_core::{BufferId, TerminalOp};
 
 use crate::EditHost;
 
-/// Captures the child's window title (the OSC `\e]0;`/`\e]2;` sequence) that vt100
-/// reports through a callback rather than storing on the screen. The emulator reads
-/// the latest title back via [`vt100::Parser::callbacks`] after each `process`.
+/// The `vt100` callback sink: captures the things the screen model itself doesn't
+/// store but a real terminal must act on — the child's window title (OSC), and the
+/// **replies** to status/identity queries (`vt100` is a screen *model*, so it never
+/// answers them; we must, or apps like fzf that send `\e[6n` stall waiting). The
+/// emulator reads both back via [`vt100::Parser::callbacks_mut`] after each `process`.
 #[derive(Default)]
-struct TitleSink {
+struct TermSink {
     title: Option<String>,
+    /// Bytes to write back to the child (cursor-position / device-attributes reports),
+    /// drained and sent to the pty after the feed.
+    replies: Vec<u8>,
 }
 
-impl vt100::Callbacks for TitleSink {
+impl vt100::Callbacks for TermSink {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    /// Answer the terminal queries a screen model can't — the same replies a real
+    /// terminal emits automatically. Without these, inline TUIs (fzf, …) that probe
+    /// the cursor position before drawing block until the next keystroke.
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (c, i1) {
+            // Device Status Report.
+            ('n', None) => match p0 {
+                5 => self.replies.extend_from_slice(b"\x1b[0n"), // "terminal OK"
+                6 => {
+                    // Cursor Position Report — 1-based row;col.
+                    let (row, col) = screen.cursor_position();
+                    self.replies
+                        .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+                }
+                _ => {}
+            },
+            // Primary Device Attributes: identify as a VT102.
+            ('c', None) => self.replies.extend_from_slice(b"\x1b[?6c"),
+            // Secondary Device Attributes.
+            ('c', Some(b'>')) => self.replies.extend_from_slice(b"\x1b[>0;0;0c"),
+            _ => {}
+        }
     }
 }
 
@@ -36,8 +73,9 @@ impl vt100::Callbacks for TitleSink {
 /// screen grid) plus the last size it was projected at.
 pub(crate) struct TermEmu {
     /// The vt100 parser + screen grid. Fed the child's PTY bytes; queried for the
-    /// row text, cursor, per-cell colors, and (via its [`TitleSink`]) window title.
-    parser: vt100::Parser<TitleSink>,
+    /// row text, cursor, per-cell colors, and (via its [`TermSink`]) window title +
+    /// query replies.
+    parser: vt100::Parser<TermSink>,
     /// The `(rows, cols)` the emulator was last sized to, so a redraw-time resize
     /// only re-sizes (and reprojects) when the window's text area actually changed.
     last_size: (u16, u16),
@@ -49,7 +87,7 @@ impl TermEmu {
         TermEmu {
             // Scrollback is 0 for now — the visible screen only. Phase 6 raises it
             // and projects the scrolled-off history into the buffer.
-            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TitleSink::default()),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TermSink::default()),
             last_size: (rows, cols),
         }
     }
@@ -65,11 +103,20 @@ impl EditHost {
     }
 
     /// Feed `bytes` of the child's PTY output into `buf`'s emulator, then reproject
-    /// the screen into the buffer. A no-op if `buf` has no live emulator.
+    /// the screen into the buffer. Any status/identity queries the child emitted are
+    /// answered by writing the reply bytes back to it (the same path a keystroke
+    /// takes), so apps that probe the terminal before drawing don't stall. A no-op if
+    /// `buf` has no live emulator.
     pub fn terminal_feed(&mut self, buf: BufferId, bytes: &[u8]) {
-        match self.terminals.get_mut(&buf) {
-            Some(emu) => emu.parser.process(bytes),
+        let replies = match self.terminals.get_mut(&buf) {
+            Some(emu) => {
+                emu.parser.process(bytes);
+                std::mem::take(&mut emu.parser.callbacks_mut().replies)
+            }
             None => return,
+        };
+        if !replies.is_empty() {
+            self.editor.terminal_send(buf, replies);
         }
         self.terminal_project(buf);
     }

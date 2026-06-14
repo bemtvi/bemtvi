@@ -79,6 +79,39 @@ fn window_command(key: Key) -> Option<WindowCmd> {
     })
 }
 
+/// Where a `z`-family command parks the cursor's line within the window's text
+/// area. Resolved by [`view_command`] and applied in [`Editor::view_reposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewPlace {
+    /// `zt` / `z<CR>` — cursor line at the top row.
+    Top,
+    /// `zz` / `z.` — cursor line centered.
+    Center,
+    /// `zb` / `z-` — cursor line at the bottom row.
+    Bottom,
+}
+
+/// Resolve the key *after* `z` into a viewport placement and whether the cursor
+/// also moves to the line's first non-blank (`z<CR>`/`z.`/`z-`, vs. the
+/// keep-column `zt`/`zz`/`zb`). `None` for a key that is not a `z` command.
+fn view_command(key: Key) -> Option<(ViewPlace, bool)> {
+    // `z<CR>` tops the line and jumps to its first non-blank. Match the `Enter`
+    // key code as well as a raw `\r` so the notation `<CR>` and a terminal's bare
+    // carriage return both work.
+    if key.code == KeyCode::Enter {
+        return Some((ViewPlace::Top, true));
+    }
+    Some(match key.as_char()? {
+        't' => (ViewPlace::Top, false),
+        'z' => (ViewPlace::Center, false),
+        'b' => (ViewPlace::Bottom, false),
+        '\r' => (ViewPlace::Top, true),
+        '.' => (ViewPlace::Center, true),
+        '-' => (ViewPlace::Bottom, true),
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MotionKind {
     Exclusive,
@@ -247,45 +280,54 @@ impl ObjectKind {
 /// [`parse_command`], applied in [`Editor::execute_normal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NormalCmd {
-    InsertBefore,                                    // i
-    InsertLineStart,                                 // I
-    InsertAfter,                                     // a
-    InsertLineEnd,                                   // A
-    OpenBelow,                                       // o
-    OpenAbove,                                       // O
-    DeleteUnder,                                     // x
-    DeleteBefore,                                    // X
-    DeleteToEol,                                     // D
-    ChangeToEol,                                     // C
-    SubstituteChar,                                  // s
-    EnterReplace,                                    // R
-    PasteAfter,                                      // p
-    PasteBefore,                                     // P
-    Undo,                                            // u
-    Redo,                                            // <C-r>
-    Join,                                            // J
-    ToggleCase,                                      // ~
-    EnterVisual,                                     // v
-    EnterVisualLine,                                 // V
-    VisualSwapEnds,                                  // o / O (move to other end of selection)
-    EnterCommand,                                    // :
-    EnterSearch(SearchDir),                          // / ?
-    SearchNext,                                      // n
-    SearchPrev,                                      // N
-    SearchWord { dir: SearchDir, whole_word: bool }, // * # (g* g# drop boundaries)
-    ScrollHalf(bool),                                // <C-d> (true) / <C-u> (false)
-    ScrollPage(bool),                                // <C-f> (true) / <C-b> (false)
-    ScrollLine(bool),                                // <C-e> (true) / <C-y> (false)
-    JumpBack,                                        // <C-o> (older jumplist position)
-    JumpForward,                                     // <C-i> / <Tab> (newer position)
-    AltBuffer,                                       // <C-^> / <C-6>
-    TabNext(Option<usize>),                          // gt  ({count}gt → tab number)
-    TabPrev(Option<usize>),                          // gT  ({count}gT → count back)
-    ChangeOlder,                                     // g; (older change-list position)
-    ChangeNewer,                                     // g, (newer change-list position)
-    AddCursor,                                       // <A-c> (enter MULTICURSOR + place)
-    PlaceCursor,                                     // c (drop a cursor in MULTICURSOR)
-    DotRepeat,                                       // .  (replay the last change)
+    InsertBefore,           // i
+    InsertLineStart,        // I
+    InsertAfter,            // a
+    InsertLineEnd,          // A
+    OpenBelow,              // o
+    OpenAbove,              // O
+    DeleteUnder,            // x
+    DeleteBefore,           // X
+    DeleteToEol,            // D
+    ChangeToEol,            // C
+    SubstituteChar,         // s
+    EnterReplace,           // R
+    PasteAfter,             // p
+    PasteBefore,            // P
+    Undo,                   // u
+    Redo,                   // <C-r>
+    Join,                   // J
+    ToggleCase,             // ~
+    EnterVisual,            // v
+    EnterVisualLine,        // V
+    VisualSwapEnds,         // o / O (move to other end of selection)
+    EnterCommand,           // :
+    EnterSearch(SearchDir), // / ?
+    SearchNext,             // n
+    SearchPrev,             // N
+    SearchWord {
+        dir: SearchDir,
+        whole_word: bool,
+    }, // * # (g* g# drop boundaries)
+    ScrollHalf(bool),       // <C-d> (true) / <C-u> (false)
+    ScrollPage(bool),       // <C-f> (true) / <C-b> (false)
+    ScrollLine(bool),       // <C-e> (true) / <C-y> (false)
+    ViewScroll {
+        // z-family viewport repositioning: zt/zz/zb and z<CR>/z./z-.
+        place: ViewPlace,
+        first_nonblank: bool,
+        count: Option<usize>, // {count}z… targets that line (1-based)
+    },
+    JumpBack,               // <C-o> (older jumplist position)
+    JumpForward,            // <C-i> / <Tab> (newer position)
+    AltBuffer,              // <C-^> / <C-6>
+    TabNext(Option<usize>), // gt  ({count}gt → tab number)
+    TabPrev(Option<usize>), // gT  ({count}gT → count back)
+    ChangeOlder,            // g; (older change-list position)
+    ChangeNewer,            // g, (newer change-list position)
+    AddCursor,              // <A-c> (enter MULTICURSOR + place)
+    PlaceCursor,            // c (drop a cursor in MULTICURSOR)
+    DotRepeat,              // .  (replay the last change)
 }
 
 /// The stage of a partially-typed command — what the *next* key means. The
@@ -306,6 +348,9 @@ pub(crate) enum Stage {
     TextObjectPending(char),
     /// Saw the `<C-w>` window prefix; the next key is the window command.
     WindowPending,
+    /// Saw a lone `z`; the next key completes a viewport command (`zz`/`zt`/`zb`,
+    /// `z.`/`z<CR>`/`z-`).
+    ZPending,
     /// Saw `"`; the next key names the register for the coming yank/delete/paste.
     RegisterPending,
     /// Saw `m`; the next key names the mark to set at the cursor.
@@ -513,6 +558,18 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
                 None => Reset,
             };
         }
+        Stage::ZPending => {
+            return match view_command(key) {
+                Some((place, first_nonblank)) => {
+                    Complete(ResolvedCommand::Normal(NormalCmd::ViewScroll {
+                        place,
+                        first_nonblank,
+                        count: pending.count,
+                    }))
+                }
+                None => Reset,
+            };
+        }
         Stage::RegisterPending => {
             // The next key names the register. An unsupported name is a loud
             // dead-end (`Reset`), exactly like a missed find/text-object arg.
@@ -582,6 +639,16 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
     if !gpending && pending.operator.is_none() && key.as_char() == Some('m') {
         let mut next = pending.clone();
         next.stage = Stage::MarkSetPending;
+        return Prefix(next);
+    }
+
+    // `z` prefix: viewport repositioning (`zz`/`zt`/`zb`, `z.`/`z<CR>`/`z-`). The
+    // second key names the placement. Like `m`/`"`, `z` is not a motion and never
+    // follows an operator, so it arms only at a command boundary with no operator
+    // pending (and not mid-`g`). It carries any leading count as the target line.
+    if !gpending && pending.operator.is_none() && key.as_char() == Some('z') {
+        let mut next = pending.clone();
+        next.stage = Stage::ZPending;
         return Prefix(next);
     }
 
@@ -1239,6 +1306,11 @@ impl Editor {
             NormalCmd::ScrollHalf(down) => self.scroll_half(down),
             NormalCmd::ScrollPage(down) => self.scroll_page(down),
             NormalCmd::ScrollLine(down) => self.scroll_line(down),
+            NormalCmd::ViewScroll {
+                place,
+                first_nonblank,
+                count,
+            } => self.view_reposition(place, first_nonblank, count),
             NormalCmd::JumpBack => self.jump_back(count),
             NormalCmd::JumpForward => self.jump_forward(count),
             NormalCmd::AltBuffer => self.goto_alternate(),

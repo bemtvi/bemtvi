@@ -286,6 +286,47 @@ impl Editor {
         self.clamp_cursor();
     }
 
+    /// The `z`-family viewport repositioning (`zt`/`zz`/`zb` and the
+    /// first-non-blank `z<CR>`/`z.`/`z-`). With a `count` the cursor first moves to
+    /// that line (1-based), as in vim; then `top` is set so the cursor's line sits
+    /// at the top, center, or bottom of the text area. The pre-move `top` is
+    /// snapshotted by [`input`](Editor::input), so a move of more than a line
+    /// animates like the other scrolls.
+    pub(crate) fn view_reposition(
+        &mut self,
+        place: super::command::ViewPlace,
+        first_nonblank: bool,
+        count: Option<usize>,
+    ) {
+        use super::command::ViewPlace;
+
+        if let Some(n) = count {
+            self.cursor.line = n.saturating_sub(1).min(self.last_line());
+        }
+        if first_nonblank {
+            // `z<CR>`/`z.`/`z-` land on the line's first non-blank; leaving
+            // `preserve_desired` false lets `input` reset curswant to that column.
+            self.cursor.col = self.first_non_blank(self.cursor.line);
+            self.clamp_cursor();
+        } else {
+            // `zt`/`zz`/`zb` keep the cursor's remembered column — settling it onto
+            // the new line when a count moved there, and leaving it put otherwise.
+            if count.is_some() {
+                self.settle_desired_col(false);
+            }
+            self.preserve_desired = true;
+        }
+
+        let th = self.text_height();
+        let line = self.cursor.line;
+        self.top = match place {
+            ViewPlace::Top => line,
+            ViewPlace::Center => line.saturating_sub(th / 2),
+            ViewPlace::Bottom => (line + 1).saturating_sub(th),
+        }
+        .min(self.last_line());
+    }
+
     pub(crate) fn ensure_visible(&mut self) {
         let th = self.text_height();
         if self.cursor.line < self.top {

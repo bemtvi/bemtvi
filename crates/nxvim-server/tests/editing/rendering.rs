@@ -518,6 +518,159 @@ async fn jumplist_navigation_animates_the_scroll() {
 }
 
 #[tokio::test]
+async fn zz_centers_the_cursor_line() {
+    // `zz` parks the cursor's line in the middle of the window without moving the
+    // cursor. Window height 24 → the line sits `height/2 == 12` rows from the top.
+    let path = write_n_lines("zz", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // `50G` lands the cursor on line 50 (index 49) at the bottom of the screen.
+    let _ = scroll_after(&rpc, &mut incoming, "50G").await;
+    let map = scroll_after(&rpc, &mut incoming, "zz").await;
+
+    assert_eq!(scroll_u64(&map, "to_top"), 37, "line 49 centered: 49 - 12");
+    assert_eq!(scroll_u64(&map, "from_cursor"), 49);
+    assert_eq!(
+        scroll_u64(&map, "to_cursor"),
+        49,
+        "zz leaves the cursor put"
+    );
+    assert_eq!(cursor(&rpc).await, (50, 0), "cursor stays on line 50");
+}
+
+#[tokio::test]
+async fn zt_puts_the_cursor_line_at_the_top() {
+    // `zt` scrolls so the cursor's line becomes the top visible row.
+    let path = write_n_lines("zt", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let _ = scroll_after(&rpc, &mut incoming, "50G").await;
+    let map = scroll_after(&rpc, &mut incoming, "zt").await;
+
+    assert_eq!(scroll_u64(&map, "to_top"), 49, "line 49 to the top row");
+    assert_eq!(
+        scroll_u64(&map, "to_cursor"),
+        49,
+        "zt leaves the cursor put"
+    );
+    // The settled viewport shows line 50 on the first row.
+    let settled = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(first_visible_line(&settled), "line50");
+}
+
+#[tokio::test]
+async fn zb_puts_the_cursor_line_at_the_bottom() {
+    // `zb` scrolls so the cursor's line becomes the bottom visible row.
+    let path = write_n_lines("zb", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Center first (top 37) so there is room to scroll the line down to the bottom.
+    let _ = scroll_after(&rpc, &mut incoming, "50G").await;
+    let _ = scroll_after(&rpc, &mut incoming, "zz").await;
+    let map = scroll_after(&rpc, &mut incoming, "zb").await;
+
+    // Bottom row = top + height - 1, so top = 49 + 1 - 24 = 26.
+    assert_eq!(scroll_u64(&map, "to_top"), 26, "line 49 to the bottom row");
+    assert_eq!(
+        scroll_u64(&map, "to_cursor"),
+        49,
+        "zb leaves the cursor put"
+    );
+}
+
+#[tokio::test]
+async fn z_enter_tops_the_line_and_moves_to_first_non_blank() {
+    // `z<CR>` is `zt` that also drops the cursor on the line's first non-blank,
+    // unlike `zt`/`zz`/`zb` which keep the column. Build a buffer whose line 50 is
+    // indented so the two behaviors are distinguishable.
+    let body: String = (1..=100)
+        .map(|i| {
+            if i == 50 {
+                "    indented\n".to_string()
+            } else {
+                format!("line{i}\n")
+            }
+        })
+        .collect();
+    let path = write_temp("zcr", "txt", &body);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // Sit the cursor on the indented line at column 0, then `z<CR>`.
+    let _ = scroll_after(&rpc, &mut incoming, "50G0").await;
+    let map = scroll_after(&rpc, &mut incoming, "z<CR>").await;
+
+    assert_eq!(
+        scroll_u64(&map, "to_top"),
+        49,
+        "z<CR> tops the line like zt"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (50, 4),
+        "z<CR> moves to the first non-blank (column 4)"
+    );
+}
+
+#[tokio::test]
+async fn z_dot_centers_the_line_and_moves_to_first_non_blank() {
+    // `z.` is `zz` plus the first-non-blank jump.
+    let body: String = (1..=100)
+        .map(|i| {
+            if i == 50 {
+                "  two\n".to_string()
+            } else {
+                format!("line{i}\n")
+            }
+        })
+        .collect();
+    let path = write_temp("zdot", "txt", &body);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let _ = scroll_after(&rpc, &mut incoming, "50G0").await;
+    let map = scroll_after(&rpc, &mut incoming, "z.").await;
+
+    assert_eq!(scroll_u64(&map, "to_top"), 37, "z. centers like zz");
+    assert_eq!(
+        cursor(&rpc).await,
+        (50, 2),
+        "z. moves to the first non-blank (column 2)"
+    );
+}
+
+#[tokio::test]
+async fn counted_zt_targets_the_given_line() {
+    // `{count}zt` moves the cursor to line {count} (1-based) and tops it — vim's
+    // `{count}z<CR>`/`zt`. From the file head, `30zt` jumps to line 30 and scrolls.
+    let path = write_n_lines("countzt", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    let map = scroll_after(&rpc, &mut incoming, "30zt").await;
+
+    assert_eq!(scroll_u64(&map, "to_cursor"), 29, "cursor jumps to line 30");
+    assert_eq!(scroll_u64(&map, "to_top"), 29, "line 30 to the top row");
+    assert_eq!(cursor(&rpc).await, (30, 0));
+}
+
+#[tokio::test]
+async fn zz_in_visual_mode_keeps_the_selection() {
+    // The z-family works in visual mode: it repositions the view and leaves the
+    // selection (and visual mode) intact.
+    let path = write_n_lines("zzvis", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    feed(&rpc, "V"); // linewise visual from line 1
+    let _ = scroll_after(&rpc, &mut incoming, "50G").await; // extend selection to line 50
+    let map = scroll_after(&rpc, &mut incoming, "zz").await;
+
+    assert_eq!(scroll_u64(&map, "to_top"), 37, "zz centers in visual too");
+    assert_eq!(
+        mode(&rpc).await,
+        "V",
+        "still in linewise visual mode after zz"
+    );
+}
+
+#[tokio::test]
 async fn changelist_navigation_animates_the_scroll() {
     // `g;` steps to an older change; when it's off screen the viewport slides.
     let path = write_n_lines("changescroll", 100);

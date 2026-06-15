@@ -288,6 +288,40 @@ try {
   const chosen = String(await luaResult("return _G.chosen"));
   check("nx.picker: <CR> confirms the highlighted item", /cerulean/.test(chosen), chosen);
 
+  // ---- 11. nx.complete: trigger-char async source completes in the pure-wasm build ----
+  // A `trigger = { chars = { ':' } }` emoji source (Phase 4-E) registered serverless:
+  // it streams candidates off the input path (the async substrate the picker shares),
+  // and the engine wakes it only after a ':'. Proves trigger-char gating + the async
+  // completion path run in the browser, and that accept folds the ':' into the prefix.
+  await page.evaluate(() => window.__nxvim.execLua(
+    "nx.complete.source {\n" +
+    "  name = 'emoji', debounce = 0, trigger = { chars = { ':' } },\n" +
+    "  complete = function(ctx, push, done)\n" +
+    "    for _, e in ipairs({ { ':smile:', 'SMILE' }, { ':rocket:', 'ROCKET' } }) do\n" +
+    "      if e[1]:sub(1, #ctx.prefix) == ctx.prefix then push { text = e[1], insert = e[2] } end\n" +
+    "    end\n" +
+    "    done()\n" +
+    "  end }\n" +
+    "nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'emoji' } } }"));
+  // Fresh line, then a trigger-char prefix. `Esc` first to leave any prior mode.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>o:sm"));
+  await sleep(120);
+  const completeOpen = await page.evaluate(() =>
+    [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt)")]
+      .map((e) => e.textContent.trim()).filter((t) => t !== ""));
+  check("nx.complete: a trigger-char async source wakes after ':' and streams its row",
+    completeOpen.length === 1 && completeOpen[0] === ":smile:", JSON.stringify(completeOpen));
+
+  // Navigate to the row and accept: the ':' was folded into the prefix, so `:sm` is
+  // replaced by the emoji's insert text.
+  await page.evaluate(() => window.__nxvim.feed("<C-n><C-y>"));
+  await sleep(100);
+  const completedLine = String(await luaResult("return nx.current_line()"));
+  // The insert text is `SMILE` (uppercase) — distinct from the `:smile:` label, so a
+  // match proves the emoji's `insert` replaced the prefix, not the label being left.
+  check("nx.complete: <C-y> accepts, replacing the whole ':sm' from the trigger char",
+    /SMILE/.test(completedLine) && !/smile/.test(completedLine), JSON.stringify(completedLine));
+
   await browser.close();
 } finally {
   cleanup();

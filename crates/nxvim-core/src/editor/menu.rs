@@ -115,6 +115,20 @@ pub struct MenuItem {
     /// (the `lsp` source's `textEdit` + `additionalTextEdits`), which core can't —
     /// it is LSP/encoding-agnostic.
     pub source_accept: bool,
+    /// **Inline** documentation for the docs sidebar (`Complete` menus only): the
+    /// markdown/plain `doc` a plugin async source attached to this candidate
+    /// (`nx.complete.source` → `push { text, insert, doc }`). The server renders it
+    /// beside the popup for the selected row directly, no source cache — unlike the
+    /// `lsp` source, whose docs the server holds itself (`source_accept` rows leave
+    /// this `None`). `None` for `buffer` / `select` / picker rows.
+    pub doc: Option<String>,
+    /// A **lazy-docs resolve handle** for a plugin async row (`Complete` menus only):
+    /// the opaque id the Lua source side maps back to `(source.resolve, item)`. Set
+    /// when a row has a `resolve` callback but no inline `doc`; the server asks Lua to
+    /// resolve it (`nx._complete_resolve`) once the row is selected and caches the
+    /// reply for the sidebar. `None` for an inline-doc / `buffer` / `lsp` / `select`
+    /// row — there's nothing to resolve. Phase 4-E.
+    pub resolve: Option<u64>,
 }
 
 /// The outcome of accepting a completion row, returned by
@@ -448,6 +462,8 @@ impl Editor {
                 insert: None,
                 priority: 0,
                 source_accept: false,
+                doc: None,
+                resolve: None,
             })
             .collect();
         let last = all_items.len().saturating_sub(1);
@@ -648,6 +664,10 @@ impl Editor {
                 priority,
                 // The `buffer` source inserts its word natively (no source edit).
                 source_accept: false,
+                // `buffer` words carry no docs; async source rows (with a `doc` or a
+                // `resolve` handle) are appended later via `menu_push`.
+                doc: None,
+                resolve: None,
             });
             filtered.push(key);
             match_spans.push(spans);
@@ -960,6 +980,8 @@ impl Editor {
                 docs: m.docs,
                 selected_key: sel.map(|i| i.key),
                 selected_source_accept: sel.is_some_and(|i| i.source_accept),
+                selected_doc: sel.and_then(|i| i.doc.clone()),
+                selected_resolve: sel.and_then(|i| i.resolve),
             }
         })
     }
@@ -975,6 +997,19 @@ impl Editor {
             return None;
         }
         m.selected_item().map(|i| (i.key, i.source_accept))
+    }
+
+    /// The actively-highlighted completion row's **lazy-docs resolve handle** — the
+    /// id the server passes to `nx._complete_resolve` to fetch a plugin row's docs
+    /// off the input path (Phase 4-E). `None` unless a [`MenuKind::Complete`] menu is
+    /// open with an active selection whose row carries a `resolve` handle (an
+    /// inline-doc / `buffer` / `lsp` row yields `None`).
+    pub fn complete_selected_resolve(&self) -> Option<u64> {
+        let m = self.menu.as_ref()?;
+        if m.kind != MenuKind::Complete {
+            return None;
+        }
+        m.selected_item().and_then(|i| i.resolve)
     }
 
     /// The visible window of rows `[start, start+count)` of the open menu: each

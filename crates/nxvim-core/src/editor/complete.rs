@@ -88,6 +88,14 @@ pub struct CompleteConfig {
     /// from its LSP item cache (`completionItem/resolve` for lazy docs). On by
     /// default; a `buffer`-only config simply never has docs to show.
     pub docs: bool,
+    /// The union of every configured source's **trigger chars** (`nx.complete.source
+    /// { trigger = { chars = { ":" } } }`, Phase 4-E). When the char immediately left
+    /// of the word being completed is one of these, the engine folds it into the
+    /// prefix/anchor (so a source matches `:smi` and accept replaces from the `:`),
+    /// opens regardless of `min_chars`, and skips the native `buffer` seed — the
+    /// "wake a source only after its char" gate. Empty ⇒ no trigger-char sources, so
+    /// the prefix is the plain word run (the 4-A/B/C/D behavior, unchanged).
+    pub trigger_chars: Vec<char>,
 }
 
 impl Default for CompleteConfig {
@@ -100,6 +108,7 @@ impl Default for CompleteConfig {
             has_async: false,
             buffer_priority: 0,
             docs: true,
+            trigger_chars: Vec::new(),
         }
     }
 }
@@ -173,7 +182,15 @@ impl Editor {
             return;
         }
         let (anchor, prefix) = self.complete_prefix();
-        if prefix.chars().count() < self.complete_config.min_chars {
+        // A trigger char (`:` for the emoji example) wakes its source immediately,
+        // regardless of `min_chars` — the char *is* the signal. A plain word prefix
+        // still has to reach `min_chars` before the popup opens.
+        let min_chars = if self.prefix_triggered(&prefix) {
+            1
+        } else {
+            self.complete_config.min_chars
+        };
+        if prefix.chars().count() < min_chars {
             self.close_completion();
             return;
         }
@@ -211,7 +228,16 @@ impl Editor {
         self.complete_gen += 1;
         let gen = self.complete_gen;
         let has_async = self.complete_config.has_async;
-        let candidates = self.buffer_candidates(&prefix);
+        // In a *trigger* context (the prefix leads with a trigger char like `:`) the
+        // native `buffer` source is suppressed — buffer words can't contain the
+        // trigger char, so they'd never match anyway, and skipping the rope scan
+        // hands the popup cleanly to the trigger-char source(s). A plain prefix seeds
+        // the buffer words as before.
+        let candidates = if self.prefix_triggered(&prefix) {
+            Vec::new()
+        } else {
+            self.buffer_candidates(&prefix)
+        };
         // `keep_open` keeps an *empty* popup alive when an async source will stream
         // into it; without one, no buffer match closes the popup (the 4-A path).
         let buffer_priority = self.complete_config.buffer_priority;
@@ -286,15 +312,49 @@ impl Editor {
         let line = self.buffer().line(self.cursor.line);
         let col = self.cursor.col.min(line.len());
         let before = &line[..col];
-        let start = before
+        let mut start = before
             .char_indices()
             .rev()
             .take_while(|&(_, c)| is_word_char(c))
             .last()
             .map_or(col, |(i, _)| i);
+        // A trigger char (`nx.complete.source { trigger = { chars } }`) immediately
+        // left of the word run is folded into the prefix — so an emoji source sees
+        // `:smi`, not `smi`, and accepting it replaces from the `:`. Only one such
+        // char is absorbed (the marker, not a run of them); a leading word with no
+        // trigger char in front keeps the plain anchor.
+        if !self.complete_config.trigger_chars.is_empty() {
+            if let Some((i, c)) = before[..start].char_indices().next_back() {
+                if self.complete_config.trigger_chars.contains(&c) {
+                    start = i;
+                }
+            }
+        }
         let prefix = before[start..].to_string();
         let anchor = self.buffer().line_start(self.cursor.line) + start;
         (anchor, prefix)
+    }
+
+    /// Whether `prefix` begins with a configured trigger char — a "trigger context"
+    /// (`:smi` for the emoji source). Such a prefix opens the popup regardless of
+    /// `min_chars`, suppresses the native `buffer` seed, and (Lua-side) routes only
+    /// to the trigger-char source(s). Always `false` when no source declared a
+    /// trigger char (`trigger_chars` empty).
+    fn prefix_triggered(&self, prefix: &str) -> bool {
+        prefix
+            .chars()
+            .next()
+            .is_some_and(|c| self.complete_config.trigger_chars.contains(&c))
+    }
+
+    /// Whether the completion site at the cursor is in a **trigger context** (the
+    /// word being completed is preceded by a configured trigger char). The server
+    /// reads this to skip the built-in `lsp` source in a trigger context (an `:emoji`
+    /// completion is not a language-server request). `false` when the engine has no
+    /// trigger-char sources, so the `lsp` path is unchanged without them.
+    pub fn completion_prefix_triggered(&self) -> bool {
+        let (_, prefix) = self.complete_prefix();
+        self.prefix_triggered(&prefix)
     }
 
     /// Unique words in the current buffer that fuzzy-match `prefix` are gathered

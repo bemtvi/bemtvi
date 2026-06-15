@@ -168,6 +168,18 @@ pub struct MenuView {
     /// shows docs only for delegated (`lsp`) rows, the ones whose cache it holds.
     /// `false` when nothing is selected. Only meaningful when [`docs`](Self::docs).
     pub selected_source_accept: bool,
+    /// The actively-selected row's **inline** docs, when a plugin async source
+    /// attached one to the candidate (`push { doc = … }`). The server renders this
+    /// directly beside the popup — unlike an `lsp` row, whose docs it fetches from
+    /// its own item cache. `None` for a `buffer` / `lsp` / noselect row. Only
+    /// meaningful when [`docs`](Self::docs) is set.
+    pub selected_doc: Option<String>,
+    /// The actively-selected row's **lazy-docs resolve handle** (a plugin async row
+    /// with a `resolve` callback but no inline [`selected_doc`](Self::selected_doc)):
+    /// the server asks Lua to resolve it (`nx._complete_resolve`) off the input path
+    /// and caches the docs for the sidebar. `None` for an inline-doc / `buffer` /
+    /// `lsp` / noselect row. Only meaningful when [`docs`](Self::docs). Phase 4-E.
+    pub selected_resolve: Option<u64>,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

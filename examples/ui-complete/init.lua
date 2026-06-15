@@ -56,9 +56,46 @@ nx.complete.source {
   complete = function(ctx, push, done)
     for _, kw in ipairs(KEYWORDS) do
       -- Only offer keywords that actually extend the prefix — a faithful source
-      -- reacts to its input rather than dumping a canned list.
+      -- reacts to its input rather than dumping a canned list. No inline `doc`, so
+      -- docs are fetched lazily via `resolve` below — only for the row you land on.
       if kw ~= ctx.prefix and kw:sub(1, #ctx.prefix) == ctx.prefix then
-        push(kw)
+        push { text = kw, insert = kw }
+      end
+    end
+    done()
+  end,
+  -- `resolve(item, respond)` (Phase 4-E): supply the docs sidebar LAZILY. The engine
+  -- calls this only when you SELECT a row that had no inline `doc` — so a costly
+  -- lookup (here just a string) runs once per landed-on row, not for every candidate.
+  -- `respond` takes the resolved item (its `.doc`) or a bare doc string.
+  resolve = function(item, respond)
+    respond { doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)" }
+  end,
+}
+
+--------------------------------------------------------------------------------
+-- A TRIGGER-CHAR source (Phase 4-E) — the emoji shape from the plugin-API spec.
+-- `trigger = { chars = { ":" } }` makes the engine wake this source ONLY after a
+-- `:` (and fold the `:` into the prefix, so it matches `:smi` and accepting it
+-- replaces from the `:`). In a trigger context the `buffer` / `keywords` sources
+-- stay quiet — the colon belongs to the emoji source. Each item carries inline
+-- `doc`, shown in the docs sidebar beside the popup.
+--------------------------------------------------------------------------------
+local EMOJI = {
+  { ":smile:", "😄" },
+  { ":heart:", "❤️" },
+  { ":rocket:", "🚀" },
+  { ":tada:", "🎉" },
+  { ":thumbsup:", "👍" },
+}
+nx.complete.source {
+  name = "emoji",
+  debounce = 0,
+  trigger = { chars = { ":" } },
+  complete = function(ctx, push, done)
+    for _, e in ipairs(EMOJI) do
+      if e[1]:sub(1, #ctx.prefix) == ctx.prefix then
+        push { text = e[1], insert = e[2], doc = e[1] .. "  →  " .. e[2] }
       end
     end
     done()
@@ -77,6 +114,7 @@ nx.complete.setup {
   sources = {
     { "buffer", min_chars = 2 },
     { "keywords" },
+    { "emoji" },
   },
   auto = true,
   keys = {
@@ -97,4 +135,9 @@ nx.complete.setup {
 -- identifiers (`config`, `connection`, `completion`, …). The popup offers the
 -- matching words from the buffer AND the `keywords` async source (e.g. type
 -- `conn` to see `connection` from both, or `func` to get `function`); <C-y>
--- accepts. The async source runs ~80 ms after you pause typing.
+-- accepts. The async source runs ~80 ms after you pause typing. Land on a
+-- `keywords` row and its docs appear beside the popup, fetched lazily via `resolve`.
+--
+-- Then type a `:` and a letter (`:sm`, `:ro`, …): the emoji source wakes on the
+-- colon — the buffer/keyword sources go quiet — and offers `:smile:` / `:rocket:`
+-- with the glyph in the docs sidebar; <C-y> replaces `:sm` with 😄.

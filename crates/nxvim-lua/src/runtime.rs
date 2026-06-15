@@ -20,7 +20,6 @@ use crate::ops::{
     ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
     LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
     SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
-
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -432,6 +431,11 @@ pub(crate) struct Shared {
     /// into `Editor::complete_finish` so a prefix that matched nothing closes the
     /// confirmed-empty popup. Phase 4-B.
     pub(crate) complete_finishes: Vec<u64>,
+    /// Resolved lazy docs for a plugin completion row (`nx._complete_resolve_done`):
+    /// `(resolve id, doc text)`. The server issued `nx._complete_resolve(id)` for the
+    /// selected row; the source's `resolve` callback responded, and this carries the
+    /// docs back to the server's resolve cache for the sidebar. Phase 4-E.
+    pub(crate) complete_resolve_dones: Vec<(u64, String)>,
     /// Streamed picker candidates (`nx.picker` source `push`), drained by the
     /// server (generation-gated) into `Editor::menu_push` after the chunk / a
     /// streaming `on_stdout`.
@@ -879,6 +883,12 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the resolved lazy-docs `(id, doc)` pairs queued since the last drain,
+        /// for the server to fill its completion-docs resolve cache and repaint.
+        take_complete_resolve_dones -> Vec<(u64, String)> = complete_resolve_dones
+    }
+
+    take_queue! {
         /// Take the picker candidates streamed since the last drain, for the server
         /// to feed (generation-gated) into the open picker.
         take_picker_pushes -> Vec<PickerPush> = picker_pushes
@@ -993,6 +1003,18 @@ impl LuaRuntime {
         t.set("row", lua_int(row as i64))?;
         t.set("col", lua_int(col as i64))?;
         run.call::<()>((lua_int(gen as i64), t))
+    }
+
+    /// Ask the plugin source that produced resolve-handle `id` to resolve its lazy
+    /// docs (`nx._complete_resolve`). The wrapper looks up the stored
+    /// `(source.resolve, item)`, invokes `resolve(item, respond)`, and `respond`
+    /// queues the docs back as a [`complete_resolve_dones`](Shared::complete_resolve_dones)
+    /// entry the server folds into its sidebar cache. A no-op for an unknown / stale
+    /// id. Phase 4-E.
+    pub fn run_complete_resolve(&self, id: u64) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_complete_resolve")?;
+        run.call::<()>(lua_int(id as i64))
     }
 
     /// Deliver the picker's outcome to the active source: the chosen item's

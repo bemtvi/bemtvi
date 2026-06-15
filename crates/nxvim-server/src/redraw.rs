@@ -1089,12 +1089,30 @@ impl EditHost {
         text_width: usize,
         text_height: usize,
     ) -> Option<Value> {
-        if !m.docs || !m.selected_source_accept {
+        if !m.docs {
             return None;
         }
-        let key = m.selected_key?;
-        let item = self.lsp_complete.as_ref()?.items.get(key)?;
-        let lines = crate::lsp::complete_doc_lines(item);
+        // Three docs sources feed this sidebar: a plugin async row carries its docs
+        // **inline** (`selected_doc`, Phase 4-E), rendered verbatim; or it carries a
+        // **resolve handle** (`selected_resolve`) whose docs the server fetched lazily
+        // into `complete_resolve_docs`; or an `lsp` row (`selected_source_accept`) has
+        // its docs in the server's LSP item cache. A `buffer` row has none.
+        let lines: Vec<String> = if let Some(doc) = m.selected_doc.as_deref().or_else(|| {
+            m.selected_resolve
+                .and_then(|id| self.complete_resolve_docs.get(&id))
+                .map(String::as_str)
+        }) {
+            doc.lines()
+                .map(str::to_string)
+                .skip_while(|l| l.trim().is_empty())
+                .collect()
+        } else if m.selected_source_accept {
+            let key = m.selected_key?;
+            let item = self.lsp_complete.as_ref()?.items.get(key)?;
+            crate::lsp::complete_doc_lines(item)
+        } else {
+            return None;
+        };
         if lines.is_empty() {
             return None;
         }

@@ -394,7 +394,55 @@ bordered float** (right of the box, flipping left for room) rendering the select
 
 ---
 
-## Phase 4-E — Plugin sources, configurable triggers, wasm, polish
+## Phase 4-E — Plugin sources, configurable triggers, wasm, polish ✅ DONE (2026-06-15)
+
+**Shipped (with the user, 2026-06-15): per-source trigger-char gating, plugin-source
+docs (inline + lazy `resolve`), and verified wasm async parity.** What landed:
+
+- **Trigger-char gating** — `nx.complete.source { trigger = { chars = { ":" } } }`. The
+  union of every active source's trigger chars rides `CompleteConfig.trigger_chars`
+  (`CompleteSetupReq.trigger_chars` string → `chars().collect()`). Core
+  (`complete.rs::complete_prefix`) folds a single leading trigger char into the
+  prefix/anchor — so an emoji source matches `:smi` and accept replaces *from the `:`* —
+  and a "triggered" prefix opens regardless of `min_chars` (`complete_trigger`), skips
+  the native `buffer` seed (`refresh_complete`), and exposes
+  `Editor::completion_prefix_triggered` for the server to skip the `lsp` source in a
+  trigger context. Lua-side (`prelude/complete.lua`) `nx._complete_run` gates per source:
+  a `trigger.chars` source wakes only when the prefix leads with one of its chars; a
+  *plain* source stays dormant in any trigger context (so it doesn't compete). Only the
+  woken sources owe a `done()`; if none wake, the run finishes empty at once.
+- **Plugin-source docs** — a row pushed as `{ text, insert, doc }` carries **inline**
+  docs (`MenuItem.doc` → `MenuView.selected_doc` → `project_complete_docs` renders it
+  verbatim, beside the popup). A source with a `resolve = function(item, respond)`
+  callback supplies docs **lazily**: a doc-less row gets a monotonic resolve handle
+  (`MenuItem.resolve` / `MenuView.selected_resolve`, Lua maps id → `(resolve, item)`),
+  and when the row is *selected* the server (`complete_plugin_maybe_resolve`, in
+  `run_pending`, mirroring the LSP `completionItem/resolve` path) calls
+  `nx._complete_resolve(id)` → the callback's `respond` → `complete_resolve_dones` →
+  the server's `complete_resolve_docs` cache → repaint. The cache clears on each fresh
+  run (handles die with the old menu); the docs sidebar is native-only (4-D), so plugin
+  docs render on the TUI/GUI, not the wasm build.
+- **wasm async parity** — the completion async path is pure core + Lua + shared ops (no
+  native-only dep), so it already runs on the wasm edit-host (the picker demo source
+  proved the substrate). Confirmed: `cargo build -p nxvim-server --no-default-features`
+  and the full emscripten `crates/nxvim-edithost/build.sh` both build clean (no new
+  `EXPORTED_FUNCTIONS` — the bridges already exist), and a new **`verify-ui.mjs` §11**
+  drives a trigger-char emoji source in headless Chromium: it wakes after `:`, streams
+  `:smile:` off the input path, and `<C-y>` folds the `:` into the prefix on accept.
+- **Tests** — `crates/nxvim-server/tests/complete.rs` (+5, 22 total): trigger-char wake +
+  anchor-at-`:` + buffer suppression, a plain prefix leaving the trigger source dormant,
+  inline plugin docs in the sidebar, the lazy `resolve` round-trip, and a `resolve` type
+  check fails loud. `tests/lsp_complete.rs` (4) still green (the docs-sidebar projection
+  now branches inline/resolve/lsp). `clippy -D warnings` + `fmt` clean.
+- **Example** (`examples/ui-complete/`): the `keywords` source now supplies docs via
+  `resolve` (lazy), and a new **`emoji`** trigger-char source (`trigger = { chars = {
+  ":" } }`, inline glyph docs) demonstrates the whole shape end-to-end.
+
+**Deferred (unchanged):** the `snippets` built-in (still Phase 4-D — no snippet engine
+exists yet); the docs sidebar on the wasm build (the float projection is native-only);
+markdown styling / tree-sitter colouring of doc bodies; `<C-d>`/`<C-u>` doc-scroll.
+
+### Original plan (for reference)
 
 - `nx.complete.source { name, complete, debounce }` **already landed in Phase 4-B**
   (pulled forward as the testable surface for the async substrate). What remains here:

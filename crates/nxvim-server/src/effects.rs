@@ -412,6 +412,7 @@ impl EditHost {
                 has_async: req.has_async,
                 buffer_priority: req.buffer_priority,
                 docs: req.docs,
+                trigger_chars: req.trigger_chars.chars().collect(),
             });
             // The built-in `lsp` source is server-native (LSP plumbing + edit
             // application live here, not in Lua/core); remember it + its merge
@@ -452,6 +453,8 @@ impl EditHost {
                     insert: None,
                     priority: 0,
                     source_accept: false,
+                    doc: None,
+                    resolve: None,
                 })
                 .collect();
             if !items.is_empty() {
@@ -490,6 +493,11 @@ impl EditHost {
                     // accept are for the built-in `lsp` source; 4-E may extend them).
                     priority: 0,
                     source_accept: false,
+                    // A plugin source can attach inline docs (`push { doc = … }`),
+                    // rendered beside the popup for the selected row (Phase 4-E).
+                    doc: p.doc,
+                    // Or a lazy-docs `resolve` handle, resolved on selection.
+                    resolve: p.resolve,
                 })
                 .collect();
             if !items.is_empty() {
@@ -502,6 +510,19 @@ impl EditHost {
         for gen in self.lua.take_complete_finishes() {
             self.editor.complete_finish(gen);
         }
+        // A plugin row's `resolve` callback responded with lazy docs: cache them by
+        // handle (even `""` ⇒ resolved-but-docless, so the row is never re-resolved)
+        // and repaint the sidebar (Phase 4-E). Native-only — the docs sidebar is.
+        #[cfg(feature = "native")]
+        for (id, doc) in self.lua.take_complete_resolve_dones() {
+            if self.complete_resolve_inflight == Some(id) {
+                self.complete_resolve_inflight = None;
+            }
+            self.complete_resolve_docs.insert(id, doc);
+            self.lsp_dirty = true;
+        }
+        #[cfg(not(feature = "native"))]
+        let _ = self.lua.take_complete_resolve_dones();
         // `vim.fn.confirm` button dialogs: open the command line as a single-key
         // confirm prompt and remember the callback that resumes the blocked
         // `vim.fn.confirm` coroutine. Shares the `pending_ui_input` slot and the
@@ -1489,6 +1510,11 @@ impl EditHost {
             // the sidebar fills in shortly after the user lands on a row.
             #[cfg(feature = "native")]
             self.complete_lsp_maybe_resolve();
+            // The same lazy-docs fetch for a **plugin** row (`nx.complete.source`'s
+            // `resolve` callback) — ask Lua to resolve the highlighted row's docs if
+            // it carries a resolve handle and they aren't cached yet (Phase 4-E).
+            #[cfg(feature = "native")]
+            self.complete_plugin_maybe_resolve();
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 if let Err(e) = self.lua.exec(&chunk) {
                     self.editor.echo(format!("E5108: Error executing lua: {e}"));
@@ -1561,6 +1587,14 @@ impl EditHost {
             // when `apply_lua_effects` feeds it. The buffer-source rows are already
             // seeded; these sources only append. Phase 4-B.
             for (gen, ctx) in std::mem::take(&mut self.editor.complete_query_changes) {
+                // A fresh run rebuilds the menu, so the previous run's plugin resolve
+                // handles are dead (Lua drops them too) — clear the docs cache so a
+                // reused handle id can't surface stale docs (Phase 4-E).
+                #[cfg(feature = "native")]
+                {
+                    self.complete_resolve_docs.clear();
+                    self.complete_resolve_inflight = None;
+                }
                 if let Err(e) =
                     self.lua
                         .run_complete_run(gen, &ctx.prefix, ctx.buf, ctx.row, ctx.col)

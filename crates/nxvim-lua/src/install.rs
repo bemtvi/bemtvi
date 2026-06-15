@@ -1294,6 +1294,7 @@ pub(crate) fn install_runtime_api(
         i32,
         i32,
         bool,
+        String,
     );
     nx.set(
         "_complete_setup",
@@ -1311,6 +1312,7 @@ pub(crate) fn install_runtime_api(
                 buffer_priority,
                 lsp_priority,
                 docs,
+                trigger_chars,
             ): CompleteSetupArgs| {
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
@@ -1324,6 +1326,7 @@ pub(crate) fn install_runtime_api(
                     buffer_priority,
                     lsp_priority,
                     docs,
+                    trigger_chars,
                 });
                 Ok(())
             },
@@ -1342,20 +1345,38 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._complete_push(gen, labels, inserts)`: queue a BATCH of streamed async
+    // `nx._complete_push(gen, labels, inserts, docs)`: queue a BATCH of streamed async
     // completion candidates ([`CompletePush`]) — parallel `labels` (display) /
-    // `inserts` (applied on accept) arrays, stamped with the trigger `gen`eration.
-    // The server drops a batch whose `gen` is behind the live prefix and appends the
-    // rest to the open completion popup. Phase 4-B.
+    // `inserts` (applied on accept) / `docs` (inline docs-sidebar text, `""` ⇒ none)
+    // arrays, stamped with the trigger `gen`eration. The server drops a batch whose
+    // `gen` is behind the live prefix and appends the rest to the open completion
+    // popup. Phase 4-B; `docs` added 4-E.
     let sh = shared.clone();
     nx.set(
         "_complete_push",
         lua.create_function(
-            move |_, (gen, labels, inserts): (u64, Vec<String>, Vec<String>)| {
+            move |_,
+                  (gen, labels, inserts, docs, resolves): (
+                u64,
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+                Vec<u64>,
+            )| {
                 let mut sh = sh.borrow_mut();
                 sh.complete_pushes.reserve(labels.len());
-                for (label, insert) in labels.into_iter().zip(inserts) {
-                    sh.complete_pushes.push(CompletePush { gen, label, insert });
+                for (i, (label, insert)) in labels.into_iter().zip(inserts).enumerate() {
+                    // `docs` / `resolves` are parallel to `labels`: an empty doc string
+                    // ⇒ no inline docs; a `0` resolve id ⇒ no lazy-docs handle.
+                    let doc = docs.get(i).filter(|d| !d.is_empty()).cloned();
+                    let resolve = resolves.get(i).copied().filter(|&r| r != 0);
+                    sh.complete_pushes.push(CompletePush {
+                        gen,
+                        label,
+                        insert,
+                        doc,
+                        resolve,
+                    });
                 }
                 Ok(())
             },
@@ -1369,6 +1390,18 @@ pub(crate) fn install_runtime_api(
         "_complete_finish",
         lua.create_function(move |_, gen: u64| {
             sh.borrow_mut().complete_finishes.push(gen);
+            Ok(())
+        })?,
+    )?;
+    // `nx._complete_resolve_done(id, doc)`: a plugin source's `resolve` callback
+    // responded with the lazy docs for resolve-handle `id` — queue them for the
+    // server to fold into its docs-sidebar cache and repaint. `""` ⇒ resolved but
+    // docless (the server stamps it so the row is never re-resolved). Phase 4-E.
+    let sh = shared.clone();
+    nx.set(
+        "_complete_resolve_done",
+        lua.create_function(move |_, (id, doc): (u64, String)| {
+            sh.borrow_mut().complete_resolve_dones.push((id, doc));
             Ok(())
         })?,
     )?;

@@ -78,6 +78,10 @@ function nx.complete.setup(opts)
   local async = {}
   local saw_lsp = false
   local buffer_priority, lsp_priority = 0, 0
+  -- The union of every active source's trigger chars, as a set (dedup) and an
+  -- ordered string handed to the engine (`trigger_chars`). Each char wakes only the
+  -- source(s) that declared it; the engine folds it into the prefix/anchor.
+  local trigger_set, trigger_chars = {}, ""
   for _, src in ipairs(sources) do
     local name = type(src) == "table" and src[1] or src
     if type(name) ~= "string" then
@@ -108,7 +112,24 @@ function nx.complete.setup(opts)
       -- A per-entry `debounce` override (`{ "name", debounce = N }`) wins over the
       -- source's own, which wins over the global default (resolved at run time).
       local debounce = (type(src) == "table" and src.debounce) or registered.debounce
-      async[#async + 1] = { name = name, complete = registered.complete, debounce = debounce }
+      -- The source's trigger chars (if any) gate its dispatch (`nx._complete_run`)
+      -- and join the engine's `trigger_chars` so core folds them into the prefix.
+      local chars = registered.trigger and registered.trigger.chars or nil
+      if chars then
+        for _, c in ipairs(chars) do
+          if not trigger_set[c] then
+            trigger_set[c] = true
+            trigger_chars = trigger_chars .. c
+          end
+        end
+      end
+      async[#async + 1] = {
+        name = name,
+        complete = registered.complete,
+        resolve = registered.resolve,
+        debounce = debounce,
+        chars = chars,
+      }
     end
   end
 
@@ -128,7 +149,19 @@ function nx.complete.setup(opts)
   -- Activate the async sources for `nx._complete_run`; `has_async` (a Lua async
   -- source OR the server-native `lsp` source) tells the engine (core) to emit a
   -- `(gen, ctx)` per trigger so the server dispatches off the input path.
-  nx._complete = { sources = async, gen = 0, debounce = nx.complete.debounce }
+  nx._complete = {
+    sources = async,
+    gen = 0,
+    debounce = nx.complete.debounce,
+    -- The global trigger-char set: in a trigger context a *plain* source (no
+    -- `trigger`) stays quiet, so it doesn't compete with the trigger-char source.
+    triggers = trigger_set,
+    -- Lazy-docs (`resolve`) bookkeeping: a monotonic id stamped onto each
+    -- resolvable pushed row and a map id → { resolve, item } the server's
+    -- `nx._complete_resolve(id)` looks the callback + original item up in.
+    resolve_next = 0,
+    resolve_items = {},
+  }
   local has_async = #async > 0 or saw_lsp
 
   nx._complete_setup(
@@ -142,7 +175,8 @@ function nx.complete.setup(opts)
     saw_lsp,
     buffer_priority,
     lsp_priority,
-    docs == true
+    docs == true,
+    trigger_chars
   )
 
   -- `keys.trigger` (a string or list) installs an insert-mode mapping that opens
@@ -171,6 +205,14 @@ end
 -- prefix the user has typed past is dropped. Register a `ctx.on_cancel(fn)` reaper
 -- to kill an in-flight job when the next prefix supersedes this one. Activate the
 -- source by listing its name in `nx.complete.setup{ sources = { ... } }`.
+--
+-- `trigger = { chars = { ":" } }` (optional) gates the source: the engine wakes it
+-- only when the completion prefix leads with one of those chars (the emoji shape),
+-- folding the char into the prefix so the source matches `:smi` and accept replaces
+-- from the `:`. `resolve = function(item, respond)` (optional) supplies docs lazily:
+-- push an item with no `doc`, and when the user selects it the engine calls
+-- `resolve(item, respond)`; `respond(item)` (or `respond(doc_string)`) fills the
+-- docs sidebar. Use it when computing docs up front for every candidate is wasteful.
 function nx.complete.source(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("nx.complete.source: requires a { name = <string>, complete = <fn> } table", 2)
@@ -178,8 +220,31 @@ function nx.complete.source(spec)
   if type(spec.complete) ~= "function" then
     error("nx.complete.source('" .. spec.name .. "'): complete must be a function", 2)
   end
+  if spec.resolve ~= nil and type(spec.resolve) ~= "function" then
+    error("nx.complete.source('" .. spec.name .. "'): resolve must be a function", 2)
+  end
   if BUILTIN_SOURCES[spec.name] then
     error("nx.complete.source: '" .. spec.name .. "' is a reserved built-in source name", 2)
+  end
+  -- `trigger = { chars = { ":" } }` (optional): the engine wakes this source only
+  -- when the completion prefix leads with one of these chars (and folds the char
+  -- into the prefix, so the source matches `:smi`). Validate the shape up front —
+  -- a malformed trigger silently never firing is the quietly-broken shape forbidden.
+  if spec.trigger ~= nil then
+    if type(spec.trigger) ~= "table" or type(spec.trigger.chars) ~= "table" then
+      error(
+        "nx.complete.source('" .. spec.name .. "'): trigger must be { chars = { <string>... } }",
+        2
+      )
+    end
+    for _, c in ipairs(spec.trigger.chars) do
+      if type(c) ~= "string" or #c == 0 then
+        error(
+          "nx.complete.source('" .. spec.name .. "'): trigger.chars must be non-empty strings",
+          2
+        )
+      end
+    end
   end
   nx.complete._sources[spec.name] = spec
 end
@@ -205,12 +270,36 @@ local function complete_cancel_inflight(c)
   c.reapers, c.timers = {}, {}
 end
 
--- nx._complete_run(gen, ctx): dispatch every active async source for `ctx.prefix`
--- under `gen`. Called by the server once per trigger that has an async source. Each
--- source is debounced (a new prefix cancels the in-flight run and any pending
--- timer); its `push`es land via `nx._complete_push`, and when ALL sources for this
--- gen have called `done()`, a single `nx._complete_finish(gen)` lets the server
--- close a confirmed-empty popup.
+-- The first UTF-8 char of `s` (for trigger gating), or "" when empty. Byte-pattern
+-- so a multibyte char isn't split — trigger chars are usually ASCII punctuation,
+-- but the gate stays correct for any leading char.
+local function first_char(s)
+  return s:match("^[%z\1-\127\194-\244][\128-\191]*") or ""
+end
+
+-- Whether `source` should run for `prefix` under the trigger gate (Phase 4-E): a
+-- source with `trigger.chars` wakes only when the prefix leads with one of them; a
+-- plain source stays quiet in any trigger context (the prefix leads with *some*
+-- registered trigger char), so it never competes with the trigger-char source.
+local function source_wakes(c, source, prefix)
+  local lead = first_char(prefix)
+  if source.chars then
+    for _, ch in ipairs(source.chars) do
+      if ch == lead then
+        return true
+      end
+    end
+    return false
+  end
+  return lead == "" or not c.triggers[lead]
+end
+
+-- nx._complete_run(gen, ctx): dispatch the active async sources whose trigger gate
+-- the prefix satisfies, under `gen`. Called by the server once per trigger that has
+-- an async source. Each source is debounced (a new prefix cancels the in-flight run
+-- and any pending timer); its `push`es land via `nx._complete_push`, and when ALL
+-- dispatched sources for this gen have called `done()`, a single
+-- `nx._complete_finish(gen)` lets the server close a confirmed-empty popup.
 function nx._complete_run(gen, ctx)
   local c = nx._complete
   if not c or #c.sources == 0 then
@@ -218,8 +307,25 @@ function nx._complete_run(gen, ctx)
   end
   complete_cancel_inflight(c)
   c.gen = gen
-  -- One `done()` is owed per source; the last to finish signals the server.
-  local pending = #c.sources
+  -- A fresh run rebuilds the menu, so the previous run's resolve handles are dead
+  -- (their rows are gone); drop them before the new pushes assign fresh ids.
+  c.resolve_items = {}
+  -- Only the sources whose trigger gate matches this prefix run; the rest are
+  -- dormant, so they owe no `done()`.
+  local active = {}
+  for _, source in ipairs(c.sources) do
+    if source_wakes(c, source, ctx.prefix) then
+      active[#active + 1] = source
+    end
+  end
+  if #active == 0 then
+    -- Nothing wakes for this prefix (e.g. only trigger-char sources, no trigger
+    -- char typed) — tell the server so it can close a confirmed-empty popup.
+    nx._complete_finish(gen)
+    return
+  end
+  -- One `done()` is owed per dispatched source; the last to finish signals the server.
+  local pending = #active
 
   local function finish_one()
     if nx._complete ~= c or c.gen ~= gen then
@@ -231,7 +337,7 @@ function nx._complete_run(gen, ctx)
     end
   end
 
-  for _, source in ipairs(c.sources) do
+  for _, source in ipairs(active) do
     -- The actual invocation — deferred behind the debounce.
     local function dispatch()
       if nx._complete ~= c or c.gen ~= gen then
@@ -249,11 +355,11 @@ function nx._complete_run(gen, ctx)
           end
         end,
       }
-      local labels, inserts, batched = {}, {}, 0
+      local labels, inserts, docs, resolves, batched = {}, {}, {}, {}, 0
       local function flush()
         if batched > 0 then
-          nx._complete_push(gen, labels, inserts)
-          labels, inserts, batched = {}, {}, 0
+          nx._complete_push(gen, labels, inserts, docs, resolves)
+          labels, inserts, docs, resolves, batched = {}, {}, {}, {}, 0
         end
       end
       local function push(item)
@@ -261,10 +367,19 @@ function nx._complete_run(gen, ctx)
         if nx._complete ~= c or c.gen ~= gen then
           return
         end
-        local label, insert
+        local label, insert, doc, resolve_id = nil, nil, nil, 0
         if type(item) == "table" then
           label = item.text or item.label or tostring(item.insert)
           insert = item.insert or label
+          -- Inline docs for the sidebar (`""` ⇒ none); a source with a `resolve`
+          -- callback instead gets a resolve id, so the server fetches docs lazily
+          -- (only for the row the user actually lands on).
+          doc = item.doc
+          if not doc and source.resolve then
+            c.resolve_next = c.resolve_next + 1
+            resolve_id = c.resolve_next
+            c.resolve_items[resolve_id] = { resolve = source.resolve, item = item }
+          end
         else
           label = tostring(item)
           insert = label
@@ -272,6 +387,8 @@ function nx._complete_run(gen, ctx)
         batched = batched + 1
         labels[batched] = label
         inserts[batched] = insert
+        docs[batched] = doc or ""
+        resolves[batched] = resolve_id
         if batched >= FLUSH_N then
           flush()
         end
@@ -301,5 +418,40 @@ function nx._complete_run(gen, ctx)
     else
       dispatch()
     end
+  end
+end
+
+-- nx._complete_resolve(id): the server asks the plugin source that produced
+-- resolve-handle `id` to fetch its lazy docs (the selected row carried a `resolve`
+-- callback but no inline `doc`). Look the `(resolve, item)` up, invoke
+-- `resolve(item, respond)`, and route `respond`'s docs back to the server via
+-- `nx._complete_resolve_done(id, doc)`. `respond` accepts the resolved item (its
+-- `.doc` is used) or a bare doc string. A no-op for an unknown / stale id (the run
+-- that produced it was superseded). Phase 4-E.
+function nx._complete_resolve(id)
+  local c = nx._complete
+  local entry = c and c.resolve_items and c.resolve_items[id]
+  if not entry then
+    return
+  end
+  local responded = false
+  local function respond(resolved)
+    if responded then
+      return
+    end
+    responded = true
+    local doc
+    if type(resolved) == "table" then
+      doc = resolved.doc
+    elseif type(resolved) == "string" then
+      doc = resolved
+    end
+    nx._complete_resolve_done(id, doc or "")
+  end
+  local ok, err = pcall(entry.resolve, entry.item, respond)
+  if not ok then
+    nx.notify("nx.complete: resolve error: " .. tostring(err), "error")
+    -- Stamp it resolved-but-docless so the server never re-fires for this row.
+    nx._complete_resolve_done(id, "")
   end
 end

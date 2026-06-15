@@ -877,6 +877,11 @@ pub struct CompleteSetupReq {
     /// rendered server-side from the `lsp` source's cache + `completionItem/resolve`).
     /// On by default; a `buffer`-only config simply never has docs to show. Phase 4-D.
     pub docs: bool,
+    /// The union of every active source's **trigger chars** as a plain string (each
+    /// char is one trigger), e.g. `":"` for an emoji source's `trigger = { chars = {
+    /// ":" } }`. The server splits it into the engine's `trigger_chars`. Empty when no
+    /// source declares one (the prefix is the plain word run). Phase 4-E.
+    pub trigger_chars: String,
 }
 
 /// One streamed completion candidate (`nx.complete` async source `push`): its
@@ -889,6 +894,15 @@ pub struct CompletePush {
     pub gen: u64,
     pub label: String,
     pub insert: String,
+    /// Optional inline documentation for the docs sidebar (`push { doc = … }`),
+    /// rendered beside the popup when this row is selected. `None` for a bare
+    /// candidate. Phase 4-E.
+    pub doc: Option<String>,
+    /// Optional **lazy-docs resolve handle** — set when this row's source has a
+    /// `resolve` callback but no inline `doc`. The server asks Lua to resolve the
+    /// docs (`nx._complete_resolve(id)`) once the row is selected. `None` for an
+    /// inline-doc / no-resolve row. Phase 4-E.
+    pub resolve: Option<u64>,
 }
 
 /// The preview target a picker push carries for one candidate, when the source

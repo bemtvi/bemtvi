@@ -535,3 +535,166 @@ nx.complete.setup { sources = { { 'deferred' } }, min_chars = 2 }";
     );
     assert_eq!(lines(&rpc).await, vec!["abc"]);
 }
+
+// ---- Phase 4-E: trigger-char sources + inline docs ----------------------------
+
+/// An emoji-style trigger-char source: it declares `trigger = { chars = { ':' } }`,
+/// so the engine wakes it only after a `:` and folds the `:` into the prefix. It
+/// offers `:smile:` (inserting `SMILE`, with inline docs) while the prefix is a
+/// prefix of that label. Alongside the `buffer` source, so the tests also prove the
+/// buffer words are suppressed in a trigger context.
+const EMOJI_INIT: &str = "\
+nx.complete.source {\n\
+  name = 'emoji', debounce = 0,\n\
+  trigger = { chars = { ':' } },\n\
+  complete = function(ctx, push, done)\n\
+    if (':smile:'):find(ctx.prefix, 1, true) == 1 then\n\
+      push { text = ':smile:', insert = 'SMILE', doc = 'A smiley face' }\n\
+    end\n\
+    done()\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'emoji' } } }";
+
+/// The docs-sidebar lines of the latest redraw whose menu carries a `docs` sub-map.
+async fn poll_menu_docs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<String>> {
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
+            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
+            _ => false,
+        }) {
+            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
+                continue;
+            };
+            let Some(Value::Map(docs)) = map_get(menu, "docs") else {
+                continue;
+            };
+            if let Some(Value::Array(lines)) = map_get(docs, "lines") {
+                return Some(
+                    lines
+                        .iter()
+                        .map(|l| l.as_str().unwrap_or("").to_string())
+                        .collect(),
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_trigger_char_source_wakes_after_its_char_and_anchors_at_it() {
+    let dir = temp_dir("complete_trigger_char");
+    let (rpc, mut incoming) = start(&dir, EMOJI_INIT).await;
+
+    // `hello` is a buffer word; then `:sm` is a trigger-char prefix. The popup must
+    // carry ONLY `:smile:` — the emoji source woke on the `:`, and the `buffer`
+    // source is suppressed in a trigger context (its words can't lead with `:`).
+    feed(&rpc, "ihello :sm");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(
+        menu_items(&menu),
+        vec![":smile:"],
+        "only the trigger-char source's row shows in a trigger context"
+    );
+    // The document still holds the typed text, `:` and all (the popup didn't grab).
+    assert_eq!(lines(&rpc).await, vec!["hello :sm"]);
+
+    // Accept it: the anchor is at the `:`, so the whole `:sm` is replaced by the
+    // emoji's `insert` text — proof the trigger char was folded into the prefix.
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["hello SMILE"]);
+}
+
+#[tokio::test]
+async fn a_plain_prefix_leaves_the_trigger_char_source_dormant() {
+    let dir = temp_dir("complete_trigger_dormant");
+    let (rpc, mut incoming) = start(&dir, EMOJI_INIT).await;
+
+    // A plain word prefix (no `:`) must NOT wake the emoji source — it offers the
+    // buffer word `hello` and nothing else.
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"hello".to_string()) && !items.contains(&":smile:".to_string()),
+        "a trigger-char source stays dormant without its char: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_source_inline_doc_shows_in_the_docs_sidebar() {
+    let dir = temp_dir("complete_inline_docs");
+    let (rpc, mut incoming) = start(&dir, EMOJI_INIT).await;
+
+    feed(&rpc, "i:sm");
+    // Open + select row 0 so the docs sidebar (only shown for an active selection)
+    // renders the emoji's inline `doc`.
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let docs = poll_menu_docs(&rpc, &mut incoming)
+        .await
+        .expect("docs sidebar appears");
+    assert!(
+        docs.iter().any(|l| l.contains("A smiley face")),
+        "the plugin row's inline doc shows in the sidebar: {docs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_source_resolve_callback_fills_the_sidebar_lazily() {
+    let dir = temp_dir("complete_resolve_docs");
+    // The source pushes a row with NO inline `doc` but a `resolve` callback. The
+    // sidebar must stay empty until the row is selected, then fill from `resolve`'s
+    // response — proof the lazy-docs path round-trips (server asks, source answers).
+    let init = "\
+nx.complete.source {\n\
+  name = 'lazy', debounce = 0,\n\
+  complete = function(ctx, push, done)\n\
+    if ctx.prefix ~= '' then push { text = ctx.prefix .. '_lazy', insert = 'LAZY' } end\n\
+    done()\n\
+  end,\n\
+  resolve = function(item, respond)\n\
+    respond { doc = 'resolved docs for ' .. item.text }\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'lazy' } }, min_chars = 2 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    // Select the row — the server resolves its docs off the input path.
+    feed(&rpc, "<C-n>");
+    let docs = poll_menu_docs(&rpc, &mut incoming)
+        .await
+        .expect("docs sidebar appears after resolve");
+    assert!(
+        docs.iter().any(|l| l.contains("resolved docs for ab_lazy")),
+        "the resolve callback's docs fill the sidebar: {docs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_resolve_function_must_be_a_function() {
+    let dir = temp_dir("complete_resolve_bad");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() \
+           nx.complete.source { name = 's', complete = function() end, resolve = 42 } end) \
+         return (not ok) and e or 'no error'",
+    )
+    .await;
+    assert!(
+        err.as_str()
+            .unwrap_or_default()
+            .contains("resolve must be a function"),
+        "a non-function resolve must fail loud, got {err:?}"
+    );
+}

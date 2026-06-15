@@ -46,6 +46,12 @@ impl EditHost {
         if !self.complete_lsp_active || self.editor.mode != Mode::Insert {
             return;
         }
+        // A trigger context (`:emoji`) belongs to its trigger-char source, not the
+        // language server — don't fire a `textDocument/completion` for a prefix that
+        // leads with a plugin trigger char (Phase 4-E).
+        if self.editor.completion_prefix_triggered() {
+            return;
+        }
         let buffer = self.editor.current_buffer_id();
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let line = self.editor.buffer().line(row);
@@ -127,6 +133,10 @@ impl EditHost {
                     preview: None,
                     priority,
                     source_accept: true,
+                    // The docs sidebar reads an `lsp` row's docs from the server's
+                    // item cache (`source_accept`), not an inline `doc` / `resolve`.
+                    doc: None,
+                    resolve: None,
                 }
             })
             .collect();
@@ -239,6 +249,36 @@ impl EditHost {
             token,
             nxvim_lsp::LspRequest::ResolveCompletion { item: resolve_data },
         );
+    }
+
+    /// The docs sidebar's lazy-docs fetch for a **plugin** completion row (Phase 4-E,
+    /// the analogue of [`EditHost::complete_lsp_maybe_resolve`] for `nx.complete.source`
+    /// sources): when the highlighted row carries a `resolve` handle and its docs are
+    /// not cached yet, ask Lua to run the source's `resolve` callback
+    /// ([`LuaRuntime::run_complete_resolve`]). Called once per key from
+    /// [`EditHost::run_pending`]. A no-op for an inline-doc / `buffer` / `lsp` row (no
+    /// handle), an already-resolved handle, or one already in flight. The reply lands
+    /// via `nx._complete_resolve_done` → the resolve cache, drained in
+    /// [`EditHost::apply_lua_effects`].
+    pub(crate) fn complete_plugin_maybe_resolve(&mut self) {
+        let Some(id) = self.editor.complete_selected_resolve() else {
+            return;
+        };
+        if self.complete_resolve_docs.contains_key(&id)
+            || self.complete_resolve_inflight == Some(id)
+        {
+            return;
+        }
+        self.complete_resolve_inflight = Some(id);
+        if let Err(e) = self.lua.run_complete_resolve(id) {
+            self.editor
+                .echo(format!("E5108: Error in nx.complete resolve: {e}"));
+            self.complete_resolve_inflight = None;
+            return;
+        }
+        // A synchronous `respond` already queued the docs; drain + apply so the
+        // sidebar paints this same key. An async source's reply lands on a later tick.
+        self.apply_lua_effects();
     }
 
     /// Apply a `completionItem/resolve` reply (Phase 4-D): fill the resolved

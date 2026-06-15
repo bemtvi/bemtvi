@@ -461,6 +461,19 @@ pub struct EditHost {
     /// list lands ([`EditHost::on_completion_reply`]). Phase 4-D.
     #[cfg(feature = "native")]
     lsp_complete_resolve_key: Option<usize>,
+    /// Resolved lazy docs for **plugin** completion rows (`nx.complete.source`'s
+    /// `resolve` callback), keyed by the row's resolve handle. An entry (even `""` ⇒
+    /// resolved-but-docless) means the docs are in hand and the sidebar renders them
+    /// without re-asking. Cleared each fresh completion run (the handles die with the
+    /// old menu). Native-only, like the LSP docs cache. Phase 4-E.
+    #[cfg(feature = "native")]
+    complete_resolve_docs: std::collections::HashMap<u64, String>,
+    /// The resolve handle a plugin-row `resolve` is currently in flight for, so the
+    /// per-key trigger doesn't re-issue while it's pending. `None` when none is
+    /// outstanding; cleared when the reply lands or a fresh run resets the cache.
+    /// Phase 4-E.
+    #[cfg(feature = "native")]
+    complete_resolve_inflight: Option<u64>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
@@ -702,6 +715,10 @@ impl EditHost {
             lsp_complete: None,
             #[cfg(feature = "native")]
             lsp_complete_resolve_key: None,
+            #[cfg(feature = "native")]
+            complete_resolve_docs: std::collections::HashMap::new(),
+            #[cfg(feature = "native")]
+            complete_resolve_inflight: None,
             #[cfg(feature = "native")]
             lsp_code_actions: Vec::new(),
             #[cfg(feature = "native")]

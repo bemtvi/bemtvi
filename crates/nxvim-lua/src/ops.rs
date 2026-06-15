@@ -818,12 +818,21 @@ pub struct CompleteSetupReq {
     pub prev: Vec<String>,
     pub confirm: Vec<String>,
     pub abort: Vec<String>,
-    /// Whether at least one configured source is **async** (a Lua `complete`
-    /// function registered via `nx.complete.source{}`), so the engine emits a
-    /// `(gen, ctx)` onto `complete_query_changes` for the server to dispatch off
-    /// the input path. `false` for a buffer-only config — the whole keystroke path
-    /// stays pure core. Phase 4-B.
+    /// Whether at least one configured source needs off-input-path dispatch — a Lua
+    /// `complete` function (`nx.complete.source{}`) or the built-in `lsp` source — so
+    /// the engine emits a `(gen, ctx)` onto `complete_query_changes` for the server to
+    /// dispatch. `false` for a buffer-only config — the whole keystroke path stays
+    /// pure core. Phase 4-B.
     pub has_async: bool,
+    /// Whether the built-in `lsp` source is configured, so the server issues
+    /// `textDocument/completion` on each trigger and streams the results into the
+    /// engine menu (delegated accept applies the item's `textEdit`). Phase 4-C.
+    pub lsp: bool,
+    /// Merge priority of the `buffer` source (`0` when not configured) — stamped onto
+    /// its rows so the merged view ranks higher-priority sources first. Phase 4-C.
+    pub buffer_priority: i32,
+    /// Merge priority of the `lsp` source (`0` when not configured). Phase 4-C.
+    pub lsp_priority: i32,
 }
 
 /// One streamed completion candidate (`nx.complete` async source `push`): its

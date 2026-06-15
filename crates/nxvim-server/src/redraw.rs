@@ -155,14 +155,11 @@ impl EditHost {
             .rect
             .width
             .saturating_sub(view.focused().number_width);
-        // The popup is LSP-completion-driven — always `Nil` on the browser build.
-        #[cfg(feature = "native")]
-        let pmenu = self.pmenu_value(&view, text_width);
-        #[cfg(not(feature = "native"))]
-        let pmenu = {
-            let _ = text_width;
-            Value::Nil
-        };
+        // The legacy `pmenu` key is retired (Phase 4-C): all completion — including
+        // the `lsp` source — now renders through the unified `menu` widget below, so
+        // this is always `Nil`. Kept as a key for client wire compatibility.
+        let _ = text_width;
+        let pmenu = Value::Nil;
         // The bottom panel (`:messages`, `:ls`), `Nil` when none is open.
         let panel = match &view.panel {
             Some(p) => project_panel(p),

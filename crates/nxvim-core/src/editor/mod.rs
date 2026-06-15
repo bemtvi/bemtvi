@@ -806,11 +806,12 @@ pub struct Editor {
     /// source dispatch, so a push from a superseded prefix is dropped — the
     /// completion analogue of the picker's per-query generation.
     complete_gen: u64,
-    /// Whether the bespoke server-side LSP completion pmenu is currently open.
-    /// Synced by the server so the engine's auto-trigger ([`Editor::complete_trigger`])
-    /// stands down rather than stacking a second popup. Removed in Phase 4-C when
-    /// the LSP path migrates onto this engine and the bespoke pmenu is retired.
-    lsp_pmenu_open: bool,
+    /// A completion row whose accept is **delegated to its source** (`MenuItem`'s
+    /// `source_accept`): the row's `key`, set by [`Editor::complete_accept`] when
+    /// such a row is accepted and drained by the server, which applies the edit core
+    /// can't (the `lsp` source's `textEdit` + `additionalTextEdits`). `None` when the
+    /// last accept was a native `buffer` insert (already applied in core).
+    pub complete_accept_request: Option<usize>,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -1229,7 +1230,7 @@ impl Editor {
             complete_config: complete::CompleteConfig::default(),
             complete_query_changes: Vec::new(),
             complete_gen: 0,
-            lsp_pmenu_open: false,
+            complete_accept_request: None,
             should_quit: false,
             options: Options::default(),
             highlights: Highlights::new(),

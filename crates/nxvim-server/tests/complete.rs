@@ -207,7 +207,7 @@ async fn an_unknown_source_fails_loud() {
     let (rpc, _incoming) = start(&dir, "").await;
     let err = exec_lua(
         &rpc,
-        "local ok, e = pcall(function() nx.complete.setup { sources = { { 'lsp' } } } end) \
+        "local ok, e = pcall(function() nx.complete.setup { sources = { { 'made_up' } } } end) \
          return (not ok) and e or 'no error'",
     )
     .await;

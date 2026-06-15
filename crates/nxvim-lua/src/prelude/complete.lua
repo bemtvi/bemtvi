@@ -18,11 +18,17 @@ nx.complete = nx.complete or {}
 -- selects which become active.
 nx.complete._sources = nx.complete._sources or {}
 
--- The native built-in sources (matched in core, no Lua per keystroke). Any other
--- name in `setup{ sources }` must be a *registered* async source — an unknown name
--- is a hard error (no silent stub): a source that "registers" but never produces
--- candidates is exactly the quietly-broken shape the project forbids.
-local BUILTIN_SOURCES = { buffer = true }
+-- The built-in sources. `buffer` is matched in core (no Lua per keystroke); `lsp`
+-- is server-native (Phase 4-C: the engine issues `textDocument/completion` and
+-- applies the chosen item's `textEdit` on accept). Any other name in
+-- `setup{ sources }` must be a *registered* async source (`nx.complete.source{}`)
+-- — an unknown name is a hard error (no silent stub): a source that "registers" but
+-- never produces candidates is exactly the quietly-broken shape the project forbids.
+local BUILTIN_SOURCES = { buffer = true, lsp = true }
+
+-- Default merge priority per built-in source — higher wins, so `lsp` candidates lead
+-- `buffer` words of equal match quality. An entry's explicit `priority` overrides.
+local DEFAULT_PRIORITY = { lsp = 100, buffer = 10 }
 
 -- The default debounce (ms) before an async source re-runs on a prefix edit — the
 -- global knob, overridable per source (`debounce = N`). `0` runs on every
@@ -65,10 +71,13 @@ function nx.complete.setup(opts)
     error("nx.complete.setup: `sources` must be a list")
   end
 
-  -- Validate every source name; capture the buffer source's min_chars override and
-  -- collect the active async sources (registered via `nx.complete.source{}`).
+  -- Validate every source name; capture the buffer source's min_chars override, the
+  -- per-source merge priority, whether the `lsp` source is configured, and the active
+  -- async sources (registered via `nx.complete.source{}`).
   local min_chars = opts.min_chars
   local async = {}
+  local saw_lsp = false
+  local buffer_priority, lsp_priority = 0, 0
   for _, src in ipairs(sources) do
     local name = type(src) == "table" and src[1] or src
     if type(name) ~= "string" then
@@ -80,11 +89,20 @@ function nx.complete.setup(opts)
         "nx.complete source '"
           .. name
           .. "' not found — register it with nx.complete.source{} first, or use a "
-          .. "built-in ('buffer'). See docs/plans/2026-06-15-nx-complete-completion-engine.md"
+          .. "built-in ('buffer' / 'lsp'). See docs/plans/2026-06-15-nx-complete-completion-engine.md"
       )
     end
-    if name == "buffer" and type(src) == "table" and src.min_chars ~= nil then
-      min_chars = src.min_chars
+    -- Resolve this entry's merge priority (explicit override, else the built-in
+    -- default, else 0). Higher wins in the merged view.
+    local priority = (type(src) == "table" and src.priority) or DEFAULT_PRIORITY[name] or 0
+    if name == "buffer" then
+      buffer_priority = priority
+      if type(src) == "table" and src.min_chars ~= nil then
+        min_chars = src.min_chars
+      end
+    elseif name == "lsp" then
+      saw_lsp = true
+      lsp_priority = priority
     end
     if registered then
       -- A per-entry `debounce` override (`{ "name", debounce = N }`) wins over the
@@ -100,9 +118,11 @@ function nx.complete.setup(opts)
   end
   local keys = opts.keys or {}
 
-  -- Activate the async sources for `nx._complete_run`; `has_async` tells the engine
-  -- (core) to emit a `(gen, ctx)` per trigger so the server dispatches them.
+  -- Activate the async sources for `nx._complete_run`; `has_async` (a Lua async
+  -- source OR the server-native `lsp` source) tells the engine (core) to emit a
+  -- `(gen, ctx)` per trigger so the server dispatches off the input path.
   nx._complete = { sources = async, gen = 0, debounce = nx.complete.debounce }
+  local has_async = #async > 0 or saw_lsp
 
   nx._complete_setup(
     auto == true,
@@ -111,7 +131,10 @@ function nx.complete.setup(opts)
     key_list(keys.prev, "prev"),
     key_list(keys.confirm, "confirm"),
     key_list(keys.abort, "abort"),
-    #async > 0
+    has_async,
+    saw_lsp,
+    buffer_priority,
+    lsp_priority
   )
 
   -- `keys.trigger` (a string or list) installs an insert-mode mapping that opens

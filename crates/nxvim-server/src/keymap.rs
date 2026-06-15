@@ -56,8 +56,12 @@ use crate::lsp::LspReqKind;
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug)]
 pub enum BuiltinAction {
-    /// Issue an LSP request of this kind (the only native action kind today).
+    /// Issue an LSP request of this kind.
     Lsp(LspReqKind),
+    /// Open (or refresh) the `nx.complete` engine popup — the `<C-Space>` /
+    /// `<C-x><C-o>` manual trigger, now engine-driven (and including the built-in
+    /// `lsp` source). A no-op until `nx.complete.setup{}` enables the engine.
+    CompleteTrigger,
 }
 
 /// What a matched mapping does when it fires (design D7). The fire dispatch is a

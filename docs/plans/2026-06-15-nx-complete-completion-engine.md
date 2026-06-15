@@ -284,22 +284,60 @@ source, and wasm async parity (4-E).
 
 ---
 
-## Phase 4-C — The `lsp` source; retire the bespoke pmenu
+## Phase 4-C — The `lsp` source; retire the bespoke pmenu ✅ DONE (2026-06-15)
 
-- Add `"lsp"` as a built-in source feeding the engine: route
-  `textDocument/completion` + `completionItem/resolve` results into `menu_push`
-  with `MenuItem.insert` = the item's `insert_text`/`text_edit` text.
-- **Delete** `lsp/completion.rs`'s bespoke path — `CompletionMenu`, `pmenu_value`,
-  `completion_menu_key`, `lsp_menu_*`, the `lsp_pmenu_open` flag — and rebind
-  `<C-Space>`/`<C-x><C-o>` to *manually* trigger the engine. `additionalTextEdits`
-  (imports) applied on accept by the engine.
-- **Multi-source fan-out + priority**: `nx.complete.setup{ sources = { {"lsp",
-  priority=100}, {"buffer", priority=10, min_chars=3} } }`; merge ranked results
-  across sources by priority then fuzzy score, generation-gated so a slow LSP
-  reply for a typed-past prefix is dropped (spec §query-source axis, picker
-  Decision 3).
-- Regression: confirm `<C-Space>` LSP completion still inserts `textEdit` +
-  imports exactly as the bespoke pmenu did, now through the widget.
+**Shipped (one pass, with the user 2026-06-15):** LSP completion folded in as the
+built-in **server-native** `lsp` source on the unified menu, the bespoke pmenu
+retired, multi-source priority merge, and a **mock-LSP black-box test harness**
+(the repo's first — LSP had *zero* test coverage). Docs-beside-popup deferred to 4-D
+(the unified markdown sidebar) per the user's call — `completionItem/resolve` docs
+are not fetched yet.
+
+- **The `lsp` source is server-native, not Lua** — LSP plumbing + the encoding-aware
+  `textEdit`/`additionalTextEdits` accept live in `nxvim-server` (Lua's mutation API
+  is nil; core is LSP-agnostic). The engine carries the menu/prefix/generation;
+  accept is routed **per-item**: `buffer` rows insert natively in core, `lsp` rows
+  set `MenuItem.source_accept` → core records `Editor::complete_accept_request` → the
+  server applies the edit. (`crates/nxvim-server/src/lsp/completion.rs`, rewritten.)
+- **Dispatch / reply / cache** — the settle loop drains `complete_query_changes` and,
+  when the `lsp` source is configured (`complete_lsp_active`), calls
+  `complete_lsp_dispatch`: reuse the cached items when the cursor is still in the same
+  word and the last reply was complete (`!isIncomplete`) — re-push at the live gen, no
+  round-trip — else issue `textDocument/completion`. The reply (`on_completion_reply`)
+  caches the items + word anchor and `menu_push`es them at the live generation,
+  gen-gated so a typed-past prefix's reply is dropped.
+- **Delegated accept** (`complete_lsp_accept`) reuses the old accept logic verbatim:
+  the item's `textEdit` (or `[word..cursor]` fallback) + `additionalTextEdits`
+  (imports) in one undo step, cursor shifted past edits that precede it. **Caught a
+  real bug via the test**: the accept-request drain was in `apply_lua_effects` (only
+  runs when Lua/query work is queued) but a pure `<C-y>` queues neither — moved it to
+  `run_pending`, which always runs once per key.
+- **Retired**: `CompletionMenu`, `pmenu_value`, `completion_menu_key`, `lsp_menu_*`,
+  `on_completion_reply`'s menu path, the `lsp_pmenu_open` core flag (+ its server
+  sync), the `match_tier`/`is_subsequence`/`pmenu_item_width` helpers; the `pmenu`
+  redraw key is now always `Nil` (kept for wire compat). `<C-Space>`/`<C-x><C-o>`
+  rebound from `BuiltinAction::Lsp(Completion)` to a new `BuiltinAction::CompleteTrigger`
+  → `complete_manual_trigger` (a no-op until `nx.complete.setup{}` enables the engine
+  — **LSP completion is now opt-in via the engine**). Mouse routes rerouted to the
+  engine (`complete_select_index` / `complete_accept`).
+- **Priority merge** — `MenuItem.priority`; `Menu::sort_complete_view` (called from
+  `menu_push` for `Complete` menus) stable-sorts the view by priority desc, fuzzy
+  order within a source. Defaults `lsp=100`, `buffer=10`, overridable per entry
+  (`{ "buffer", priority = 5 }`). `CompleteSetupReq` gained `lsp` / `buffer_priority`
+  / `lsp_priority`; `complete.lua` recognizes `"lsp"` as a built-in.
+- **Tests** — `crates/nxvim/tests/lsp_complete.rs` (new, in the `nxvim` crate for
+  `CARGO_BIN_EXE_nxvim`): drives the scripted mock LSP (`nxvim --__lsp-mock`) via the
+  `$NXVIM_LSP_CMD` env hook + the raw `nx._lsp_start` bridge (the `vim.lsp.*` user API
+  isn't wired in Lua yet). Asserts (1) the server's items reach the unified menu and
+  the document keeps only the typed prefix, and (2) accept applies `textEdit` +
+  `additionalTextEdits` as one edit (`use foo;\nprint_value()`). Existing
+  `complete.rs` (17) still green; clippy/fmt/wasm-subset clean.
+
+**Known regressions (temporary, by decision):** no docs-beside-popup for LSP
+completions (4-D), LSP `sortText` ordering yields to the engine's fuzzy rank, and
+`completionItem/resolve` is not issued. **Behavior change:** LSP completion now
+requires `nx.complete.setup{ sources = { { "lsp" } } }` (opt-in) rather than working
+out of the box once a server attaches.
 
 ---
 

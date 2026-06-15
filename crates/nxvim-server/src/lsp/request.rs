@@ -337,13 +337,11 @@ impl EditHost {
                 documentation,
                 detail,
             } => {
-                // The menu follows the cursor while open (like a completion reply),
-                // so only a buffer change drops it; the merge itself is a no-op if
-                // the menu closed or the selection moved on.
-                if buffer_changed {
-                    return;
-                }
-                self.merge_resolved_completion(documentation, detail);
+                // Completion-item docs resolve is retired with the bespoke pmenu
+                // (Phase 4-C); the unified menu's docs sidebar lands in Phase 4-D.
+                // The engine never issues `completionItem/resolve` now, so this reply
+                // shouldn't arrive — ignore it rather than carry dead merge state.
+                let _ = (documentation, detail);
             }
             LspReply::SemanticTokens(data) => {
                 // Whole-buffer, focus-independent: cache to the issuing buffer

@@ -103,6 +103,29 @@ pub struct MenuItem {
     /// `None` ⇒ use `label`. `Select` / picker rows leave this `None` — they
     /// round-trip the opaque `key` to Lua, which applies the choice itself.
     pub insert: Option<String>,
+    /// Source priority for the merged completion view (`Complete` menus only): the
+    /// effective order is **priority descending, then fuzzy score** — so an `lsp`
+    /// row (high priority) outranks a `buffer` word with the same match quality.
+    /// `0` for `select` / picker rows (a single source, no merge).
+    pub priority: i32,
+    /// Whether accepting this row is **delegated to the source** rather than applied
+    /// natively (`Complete` menus only). `false` ⇒ core replaces `[anchor..cursor)`
+    /// with `insert` itself (the `buffer` source). `true` ⇒ core records the row's
+    /// `key` on [`Editor::complete_accept_request`] and the server applies the edit
+    /// (the `lsp` source's `textEdit` + `additionalTextEdits`), which core can't —
+    /// it is LSP/encoding-agnostic.
+    pub source_accept: bool,
+}
+
+/// The outcome of accepting a completion row, returned by
+/// [`Editor::complete_take_accept`]. Either core applies it natively
+/// (`source_accept = false`: replace `[anchor..cursor)` with `insert`) or the server
+/// applies it from the row's `key` (`source_accept = true`: the `lsp` source's edit).
+pub(crate) struct CompleteAcceptance {
+    pub anchor: usize,
+    pub insert: String,
+    pub key: usize,
+    pub source_accept: bool,
 }
 
 /// What the picker's preview pane should show for a candidate. The source's
@@ -353,6 +376,30 @@ impl Menu {
         }
     }
 
+    /// Re-order the ranked view by **source priority** (descending), preserving the
+    /// fuzzy order within each priority — so a merged completion menu lists an `lsp`
+    /// row (priority 100) above a `buffer` word (priority 10) of equal match quality.
+    /// A stable sort over the parallel `filtered` / `match_spans`. Called by
+    /// [`Editor::menu_push`] for [`MenuKind::Complete`] menus only (a single-source
+    /// picker keeps pure fuzzy order). Cheap — completion lists are small.
+    fn sort_complete_view(&mut self) {
+        if self.filtered.is_none() {
+            return;
+        }
+        let filtered = self.filtered.take().unwrap();
+        let spans = std::mem::take(&mut self.match_spans);
+        let mut rows: Vec<(usize, Vec<Range<usize>>)> = filtered.into_iter().zip(spans).collect();
+        // Descending priority; stable, so equal-priority rows keep their fuzzy order.
+        rows.sort_by(|a, b| {
+            self.all_items[b.0]
+                .priority
+                .cmp(&self.all_items[a.0].priority)
+        });
+        let (filtered, spans): (Vec<usize>, Vec<Vec<Range<usize>>>) = rows.into_iter().unzip();
+        self.filtered = Some(filtered);
+        self.match_spans = spans;
+    }
+
     /// The [`PreviewTarget`] for the highlighted row, when this picker carries a
     /// preview pane and that row declares one. `None` for a `select` / preview-less
     /// picker, an empty view, or a row whose source supplied no `path` (e.g. an
@@ -379,6 +426,8 @@ impl Editor {
                 key,
                 preview: None,
                 insert: None,
+                priority: 0,
+                source_accept: false,
             })
             .collect();
         let last = all_items.len().saturating_sub(1);
@@ -478,6 +527,11 @@ impl Editor {
         // active static query matches only the appended slice. Never re-ranks the
         // whole (100k+) list per streamed batch.
         menu.extend_view(new_start);
+        // A completion menu merges multiple sources: re-order the (small) view so a
+        // higher-priority source's rows lead, fuzzy order preserved within a source.
+        if menu.kind == MenuKind::Complete {
+            menu.sort_complete_view();
+        }
     }
 
     /// Mark generation `gen`'s search **complete** (the source called `done()`). If
@@ -541,6 +595,8 @@ impl Editor {
     /// `preselect` highlights the first row up front (an explicit manual trigger,
     /// vim-like); auto-typing passes `false` (noselect — nothing highlighted until the
     /// user navigates, so `<CR>` stays a newline).
+    #[allow(clippy::too_many_arguments)] // one focused builder; bundling these
+                                         // orthogonal completion knobs into a struct would only add indirection.
     pub(crate) fn set_complete_menu(
         &mut self,
         anchor: usize,
@@ -549,6 +605,7 @@ impl Editor {
         preselect: bool,
         gen: u64,
         keep_open: bool,
+        priority: i32,
     ) {
         let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         let ranked = crate::fuzzy::rank(prefix, &refs);
@@ -566,6 +623,9 @@ impl Editor {
                 label,
                 key,
                 preview: None,
+                priority,
+                // The `buffer` source inserts its word natively (no source edit).
+                source_accept: false,
             });
             filtered.push(key);
             match_spans.push(spans);
@@ -638,21 +698,38 @@ impl Editor {
         }
     }
 
+    /// Highlight completion row `idx` (clamped) and activate the selection — the
+    /// mouse hover/click counterpart to the relative `<C-n>`/`<C-p>`. A no-op unless a
+    /// completion menu is open.
+    pub fn complete_select_index(&mut self, idx: usize) {
+        if let Some(m) = self.completion_menu_mut() {
+            let len = m.view_len();
+            if len > 0 {
+                m.selected_active = true;
+                m.cursor = idx.min(len - 1);
+            }
+        }
+    }
+
     /// The actively-selected completion's `(anchor, insert_text)`, closing the
     /// menu. `None` when no completion menu is open **or nothing is selected yet**
     /// (the popup just auto-opened) — the caller then leaves the key to its normal
     /// insert handling, so `<CR>` makes a newline rather than accepting a row the
     /// user never picked. The caller applies the edit (replacing `[anchor .. cursor)`).
-    pub(crate) fn complete_take_accept(&mut self) -> Option<(usize, String)> {
+    pub(crate) fn complete_take_accept(&mut self) -> Option<CompleteAcceptance> {
         let m = self.completion_menu_mut()?;
         if !m.selected_active {
             return None;
         }
         let row = m.all_items.get(m.item_at(m.cursor))?;
-        let insert = row.insert.clone().unwrap_or_else(|| row.label.clone());
-        let anchor = m.anchor;
+        let acc = CompleteAcceptance {
+            anchor: m.anchor,
+            insert: row.insert.clone().unwrap_or_else(|| row.label.clone()),
+            key: row.key,
+            source_accept: row.source_accept,
+        };
         self.menu = None;
-        Some((anchor, insert))
+        Some(acc)
     }
 
     /// Close the popup **only if it is a completion menu** — leaves an open

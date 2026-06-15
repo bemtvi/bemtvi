@@ -73,12 +73,16 @@ pub struct CompleteConfig {
     /// The prefix must be at least this many characters before the menu opens.
     pub min_chars: usize,
     pub keys: CompleteKeys,
-    /// At least one configured source is **async** (a Lua `complete` function).
-    /// When set, a trigger emits a `(gen, ctx)` onto
-    /// [`Editor::complete_query_changes`] for the server to dispatch the source
-    /// off the input path (debounced, generation-gated); a buffer-only config
-    /// never does, so the whole keystroke path stays pure core.
+    /// At least one configured source needs **off-input-path dispatch** — a Lua
+    /// `complete` function or the built-in `lsp` source. When set, a trigger emits a
+    /// `(gen, ctx)` onto [`Editor::complete_query_changes`] for the server to
+    /// dispatch (debounced/async, generation-gated); a buffer-only config never
+    /// does, so the whole keystroke path stays pure core.
     pub has_async: bool,
+    /// Merge priority of the native `buffer` source — stamped onto its rows so the
+    /// merged view ranks higher-priority sources (e.g. `lsp`) first. `0` when the
+    /// `buffer` source is not configured.
+    pub buffer_priority: i32,
 }
 
 impl Default for CompleteConfig {
@@ -89,6 +93,7 @@ impl Default for CompleteConfig {
             min_chars: 1,
             keys: CompleteKeys::default(),
             has_async: false,
+            buffer_priority: 0,
         }
     }
 }
@@ -132,16 +137,6 @@ impl Editor {
         self.complete_config = config;
     }
 
-    /// Server-synced: whether the bespoke LSP completion pmenu is open. While it
-    /// is, the engine stands down (and any open engine popup is closed) so the two
-    /// never stack. Phase 4-C retires the bespoke pmenu and this flag.
-    pub fn set_lsp_pmenu_open(&mut self, open: bool) {
-        self.lsp_pmenu_open = open;
-        if open {
-            self.close_completion();
-        }
-    }
-
     /// Classify `key` against the configured control keys, when a completion menu
     /// is open. `None` ⇒ the key is not an engine control key (it edits the
     /// document and re-triggers the engine).
@@ -167,7 +162,7 @@ impl Editor {
     /// completion menu) when the engine is disabled, the prefix is shorter than
     /// `min_chars`, the bespoke LSP pmenu is up, or nothing matches.
     pub(crate) fn complete_trigger(&mut self) {
-        if !self.complete_config.enabled || self.lsp_pmenu_open {
+        if !self.complete_config.enabled {
             self.close_completion();
             return;
         }
@@ -188,7 +183,7 @@ impl Editor {
     /// when the engine is disabled, the LSP pmenu is up, or we are not in insert
     /// mode. No matches closes any open popup.
     pub fn complete_manual_trigger(&mut self) {
-        if !self.complete_config.enabled || self.lsp_pmenu_open || !self.mode.is_insert() {
+        if !self.complete_config.enabled || !self.mode.is_insert() {
             return;
         }
         let (anchor, prefix) = self.complete_prefix();
@@ -213,7 +208,16 @@ impl Editor {
         let candidates = self.buffer_candidates(&prefix);
         // `keep_open` keeps an *empty* popup alive when an async source will stream
         // into it; without one, no buffer match closes the popup (the 4-A path).
-        self.set_complete_menu(anchor, &prefix, candidates, preselect, gen, has_async);
+        let buffer_priority = self.complete_config.buffer_priority;
+        self.set_complete_menu(
+            anchor,
+            &prefix,
+            candidates,
+            preselect,
+            gen,
+            has_async,
+            buffer_priority,
+        );
         if has_async && self.completion_active() {
             self.complete_query_changes.push((
                 gen,
@@ -238,24 +242,33 @@ impl Editor {
         }
     }
 
-    /// Accept the highlighted completion: replace the typed prefix
-    /// `[anchor .. cursor)` with the row's insert text and park the cursor just
-    /// past it. Returns whether anything was accepted — `false` when no completion
-    /// menu is open or **nothing is selected yet** (noselect), so the caller can let
-    /// the key fall through (e.g. `<CR>` makes a newline). The edit groups into the
+    /// Accept the highlighted completion. For a native (`buffer`) row, replace the
+    /// typed prefix `[anchor .. cursor)` with the row's insert text and park the
+    /// cursor past it. For a **delegated** (`source_accept`) row — the `lsp` source —
+    /// core can't apply the edit (it is LSP/encoding-agnostic), so it records the
+    /// row's `key` on [`Editor::complete_accept_request`] for the server to apply and
+    /// closes the menu. Returns whether anything was accepted — `false` when no menu
+    /// is open or **nothing is selected yet** (noselect), so the caller lets the key
+    /// fall through (e.g. `<CR>` makes a newline). The native edit groups into the
     /// surrounding insert session (the snapshot is already held).
-    pub(crate) fn complete_accept(&mut self) -> bool {
-        let Some((anchor, insert)) = self.complete_take_accept() else {
+    pub fn complete_accept(&mut self) -> bool {
+        let Some(acc) = self.complete_take_accept() else {
             return false;
         };
+        if acc.source_accept {
+            // The server applies the source's edit (textEdit + additionalTextEdits)
+            // after this key returns; the menu is already closed by `take_accept`.
+            self.complete_accept_request = Some(acc.key);
+            return true;
+        }
         let cursor_byte = self.cursor_char();
         // `anchor` is always ≤ the cursor (the prefix is the word chars left of
         // it), so this replaces exactly the typed prefix.
-        self.buffer_mut().remove(anchor..cursor_byte);
-        self.buffer_mut().insert(anchor, &insert);
+        self.buffer_mut().remove(acc.anchor..cursor_byte);
+        self.buffer_mut().insert(acc.anchor, &acc.insert);
         self.buffer_mut().normalize();
         self.buffer_mut().modified = true;
-        self.set_cursor_char_insert(anchor + insert.len());
+        self.set_cursor_char_insert(acc.anchor + acc.insert.len());
         true
     }
 

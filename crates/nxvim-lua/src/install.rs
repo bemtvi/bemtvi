@@ -1289,11 +1289,26 @@ pub(crate) fn install_runtime_api(
         Vec<String>,
         Vec<String>,
         bool,
+        bool,
+        i32,
+        i32,
     );
     nx.set(
         "_complete_setup",
         lua.create_function(
-            move |_, (auto, min_chars, next, prev, confirm, abort, has_async): CompleteSetupArgs| {
+            move |_,
+                  (
+                auto,
+                min_chars,
+                next,
+                prev,
+                confirm,
+                abort,
+                has_async,
+                lsp,
+                buffer_priority,
+                lsp_priority,
+            ): CompleteSetupArgs| {
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
                     min_chars,
@@ -1302,6 +1317,9 @@ pub(crate) fn install_runtime_api(
                     confirm,
                     abort,
                     has_async,
+                    lsp,
+                    buffer_priority,
+                    lsp_priority,
                 });
                 Ok(())
             },

@@ -363,7 +363,20 @@ impl EditHost {
                 min_chars: req.min_chars,
                 keys,
                 has_async: req.has_async,
+                buffer_priority: req.buffer_priority,
             });
+            // The built-in `lsp` source is server-native (LSP plumbing + edit
+            // application live here, not in Lua/core); remember it + its merge
+            // priority so the trigger drain issues `textDocument/completion`. The
+            // `lsp` source needs the native LSP tree, so this is native-only — the
+            // wasm edit-host has no language servers (Phase 4-E may revisit).
+            #[cfg(feature = "native")]
+            {
+                self.complete_lsp_active = req.lsp;
+                self.complete_lsp_priority = req.lsp_priority;
+            }
+            #[cfg(not(feature = "native"))]
+            let _ = req.lsp_priority;
         }
         // `nx.complete.trigger()` / a mapped key: manually open the completion
         // popup. Coalesced — one open per drain regardless of how many requests
@@ -389,6 +402,8 @@ impl EditHost {
                         loc: pv.loc,
                     }),
                     insert: None,
+                    priority: 0,
+                    source_accept: false,
                 })
                 .collect();
             if !items.is_empty() {
@@ -423,6 +438,10 @@ impl EditHost {
                     key: 0,
                     preview: None,
                     insert: Some(p.insert),
+                    // Async Lua sources insert natively (priority merge / delegated
+                    // accept are for the built-in `lsp` source; 4-E may extend them).
+                    priority: 0,
+                    source_accept: false,
                 })
                 .collect();
             if !items.is_empty() {
@@ -1373,6 +1392,16 @@ impl EditHost {
                 reconciled = true;
                 self.reconcile_file_change(buf);
             }
+            // A completion row whose accept was **delegated** (the built-in `lsp`
+            // source): core recorded the chosen row's key on the keystroke; apply its
+            // `textEdit` + `additionalTextEdits` here, which core can't (LSP/encoding-
+            // aware edits). Drained in `run_pending` (not `apply_lua_effects`) because
+            // the accept keystroke queues no Lua, so `apply_lua_effects` may not run —
+            // but `run_pending` always does, once, after every key.
+            #[cfg(feature = "native")]
+            if let Some(key) = self.editor.complete_accept_request.take() {
+                self.complete_lsp_accept(key);
+            }
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 if let Err(e) = self.lua.exec(&chunk) {
                     self.editor.echo(format!("E5108: Error executing lua: {e}"));
@@ -1452,6 +1481,11 @@ impl EditHost {
                     self.editor
                         .echo(format!("E5108: Error in nx.complete source: {e}"));
                 }
+                // The built-in `lsp` source is server-native: issue (or re-serve a
+                // cached) `textDocument/completion` for this trigger; the reply
+                // streams into the menu (gen-gated) via `on_completion_reply`.
+                #[cfg(feature = "native")]
+                self.complete_lsp_dispatch(gen);
                 self.apply_lua_effects();
             }
             // Float-list widget results: a confirmed (`Some(key)`) or cancelled

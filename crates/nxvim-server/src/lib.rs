@@ -130,7 +130,7 @@ use keymap::Keymaps;
 use keymap::{BuiltinAction, NativeDefault};
 #[cfg(feature = "native")]
 use lsp::{
-    CompletionMenu, DiagnosticConfig, InlayResolveTarget, LspDocState, LspReqKind, PendingLspReq,
+    DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
 };
 use nxvim_core::{
@@ -438,11 +438,22 @@ pub struct EditHost {
     /// reply for a superseded resolve finds no target and is dropped).
     #[cfg(feature = "native")]
     inlay_resolve_seq: u64,
-    /// The open insert-mode completion popup (Phase 5), or `None`. Server-owned
-    /// like the diagnostics cache; projected into the `pmenu` redraw key and
-    /// driven by the popup-open key routing in [`EditHost::completion_menu_key`].
+    /// Whether the engine's built-in `lsp` completion source is configured
+    /// (`nx.complete.setup{ sources = { { "lsp" } } }`). When set, an engine trigger
+    /// issues `textDocument/completion` and streams the reply into the unified menu;
+    /// accepting an LSP row delegates back here to apply its `textEdit`. Phase 4-C —
+    /// the bespoke pmenu it replaces is gone.
     #[cfg(feature = "native")]
-    completion: Option<CompletionMenu>,
+    complete_lsp_active: bool,
+    /// Merge priority of the `lsp` source (rows rank above lower-priority sources).
+    #[cfg(feature = "native")]
+    complete_lsp_priority: i32,
+    /// The current LSP completion's raw items + word anchor, indexed by the
+    /// `MenuItem.key` the engine carries, so a delegated accept can apply the chosen
+    /// item's `textEdit` / `additionalTextEdits`. `None` when no LSP completion is in
+    /// view. Phase 4-C.
+    #[cfg(feature = "native")]
+    lsp_complete: Option<LspComplete>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
@@ -664,7 +675,11 @@ impl EditHost {
             #[cfg(feature = "native")]
             inlay_resolve_seq: 0,
             #[cfg(feature = "native")]
-            completion: None,
+            complete_lsp_active: false,
+            #[cfg(feature = "native")]
+            complete_lsp_priority: 0,
+            #[cfg(feature = "native")]
+            lsp_complete: None,
             #[cfg(feature = "native")]
             lsp_code_actions: Vec::new(),
             #[cfg(feature = "native")]
@@ -1599,12 +1614,12 @@ where
         NativeDefault {
             mode: "i",
             lhs: "<C-Space>",
-            action: BuiltinAction::Lsp(LspReqKind::Completion),
+            action: BuiltinAction::CompleteTrigger,
         },
         NativeDefault {
             mode: "i",
             lhs: "<C-x><C-o>",
-            action: BuiltinAction::Lsp(LspReqKind::Completion),
+            action: BuiltinAction::CompleteTrigger,
         },
         NativeDefault {
             mode: "i",

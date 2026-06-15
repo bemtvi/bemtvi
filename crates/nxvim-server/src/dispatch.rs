@@ -475,19 +475,19 @@ impl EditHost {
                 self.editor.set_panel_cursor_by_row(row);
                 Ok(Value::Nil)
             }
-            // ----- the insert-mode completion popup (mouse routing) ---------
+            // ----- the unified completion popup (mouse routing) -------------
             "nxvim_complete_select" => {
                 // (index): highlight a visible completion item by absolute index
                 // (clamped) — the mouse click / wheel counterpart to <C-n>/<C-p>.
                 let idx = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
-                self.lsp_menu_select(idx);
+                self.editor.complete_select_index(idx);
                 Ok(Value::Nil)
             }
             "nxvim_complete_accept" => {
                 // Accept the highlighted item — a click on the selected row, the
-                // <C-y> equivalent. `run_pending` drains the edit's effects, as the
-                // keyboard accept path does via `input`'s trailing drain.
-                self.lsp_menu_accept();
+                // <C-y> equivalent. A delegated (`lsp`) accept is applied by
+                // `run_pending`'s settle, exactly as the keyboard accept path is.
+                self.editor.complete_accept();
                 self.run_pending();
                 Ok(Value::Nil)
             }

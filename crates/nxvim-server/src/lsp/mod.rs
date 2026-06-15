@@ -23,12 +23,11 @@ use nxvim_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Position, Range, SemanticToken, TextDocumentContentChangeEvent,
     TextDocumentSyncKind, Url,
 };
-use nxvim_lsp::{
-    CompletionItemData, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn,
-};
+use nxvim_lsp::{PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn};
 use nxvim_lua::{DiagnosticData, LspServerCapabilities};
 
 mod completion;
+pub(crate) use completion::LspComplete;
 mod diagnostics;
 mod edit;
 mod inlay;
@@ -330,52 +329,6 @@ pub(crate) struct ServerRuntime {
     inlay_hints: bool,
 }
 
-/// The live insert-mode completion popup (Phase 5), server-owned like the
-/// diagnostics cache. Held in [`EditHost::completion`]; `None` when no menu is
-/// open. It keeps the server's last candidate list verbatim plus the live
-/// filtered/ranked view, and the anchor the menu is pinned to, so each keystroke
-/// re-ranks (or re-requests) in place rather than closing and reopening.
-//
-// Per-item documentation is fully wired (docs/plans/2026-06-06-completion-documentation.md):
-// each `raw` item carries `documentation`/`resolve_data` (Phase 1); the selected
-// item's lazy docs/detail are fetched via `completionItem/resolve` and merged in
-// place (Phase 2); and the selected item's documentation is projected as the
-// `doc` lines `pmenu_value` emits, which the client floats in a preview box beside
-// the popup (Phase 3). Markdown is rendered as plain lines (the markup distiller
-// yields lines, not styled spans), per the known-approximations registry.
-pub(crate) struct CompletionMenu {
-    /// The buffer the menu belongs to; a reply for any other buffer is dropped.
-    buffer: BufferId,
-    /// `(row, word-start byte column)` the completion word begins at — the menu's
-    /// screen anchor and the default replace range's start. Fixed while the menu
-    /// is open (typing only extends the word to the right).
-    anchor: (usize, usize),
-    /// The identifier run typed since `anchor` (`line[anchor.col..cursor.col]`):
-    /// both the filter string and, for an item without an explicit `textEdit`, the
-    /// text the accept replaces.
-    prefix: String,
-    /// The server's `isIncomplete` for the current list: when set, a narrowing
-    /// keystroke re-requests instead of filtering the cache client-side.
-    is_incomplete: bool,
-    /// The server's last candidate list, verbatim (ranking is recomputed from it).
-    raw: Vec<CompletionItemData>,
-    /// Indices into `raw`, filtered to those matching `prefix` and ordered by
-    /// importance (match tier, then `sortText`, then label). The projected menu.
-    visible: Vec<usize>,
-    /// The selected entry as an index into `visible`, or `None` until the user
-    /// navigates (accept then falls back to the first visible item).
-    selected: Option<usize>,
-    /// Parallel to `raw`: whether a `completionItem/resolve` has already settled
-    /// for that item, so its lazy docs/detail are fetched at most once per item.
-    /// Reset whenever `raw` is replaced (a refresh re-requests the world).
-    resolved: Vec<bool>,
-    /// The `raw` index of the resolve currently in flight (`None` when none). A
-    /// reply merges only into this index, and only the newest resolve survives the
-    /// generation gate — a navigation that supersedes an in-flight resolve drops
-    /// its (now stale) reply.
-    resolving: Option<usize>,
-}
-
 /// Human label for a negotiated position encoding (matches the LSP wire names).
 pub(crate) fn encoding_label(encoding: PositionEncoding) -> &'static str {
     match encoding {
@@ -509,49 +462,6 @@ pub(crate) fn completion_word(line: &str, cursor: usize) -> (usize, String) {
         }
     }
     (start, line[start..cursor].to_string())
-}
-
-/// The match tier of an item's `filter` string against the typed `prefix`, lower
-/// = better: `0` exact, `1` case-sensitive prefix, `2` case-insensitive prefix,
-/// `3` case-insensitive subsequence; `None` ⇒ no match (the item is dropped). An
-/// empty prefix matches everything at tier ≤ 1, so a just-triggered menu shows
-/// the whole list in the server's `sortText` order.
-pub(crate) fn match_tier(filter: &str, prefix: &str) -> Option<u8> {
-    if prefix.is_empty() {
-        return Some(if filter.is_empty() { 0 } else { 1 });
-    }
-    if filter == prefix {
-        return Some(0);
-    }
-    if filter.starts_with(prefix) {
-        return Some(1);
-    }
-    let (filter, prefix) = (filter.to_lowercase(), prefix.to_lowercase());
-    if filter.starts_with(&prefix) {
-        return Some(2);
-    }
-    if is_subsequence(&prefix, &filter) {
-        return Some(3);
-    }
-    None
-}
-
-/// Whether every character of `needle` appears in `haystack` in order (a
-/// subsequence). Callers lowercase both for a case-insensitive match.
-pub(crate) fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut hay = haystack.chars();
-    needle.chars().all(|nc| hay.by_ref().any(|hc| hc == nc))
-}
-
-/// Display width (cells) of a completion item's menu row: the label plus, when
-/// present, a gap and the right-aligned detail. Sizes the popup box.
-pub(crate) fn pmenu_item_width(item: &CompletionItemData) -> usize {
-    let label = item.label.chars().count();
-    let detail = match item.detail.as_deref() {
-        Some(d) if !d.is_empty() => 1 + d.chars().count(),
-        _ => 0,
-    };
-    label + detail
 }
 
 /// Map an LSP [`DiagnosticSeverity`] to nxvim's severity code (`1`=error,

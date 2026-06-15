@@ -5,7 +5,7 @@
 use crate::keymap::BuiltinAction;
 use crate::keymap::{MappingRhs, Step};
 use crate::EditHost;
-use nxvim_core::{key_to_notation, parse_keys, Key, KeyCode, Mode};
+use nxvim_core::{key_to_notation, parse_keys, Key};
 
 impl EditHost {
     pub(crate) fn input(&mut self, keys: &str) {
@@ -27,28 +27,13 @@ impl EditHost {
     /// processed here is also reported to the `vim.on_key` observers.
     pub(crate) fn process_key(&mut self, key: Key) {
         self.notify_on_key(key);
-        // Keep the native completion engine's "stand down" flag in sync with the
-        // bespoke LSP pmenu: while that pmenu is open, a word keystroke routes
-        // through `editor.input` (below) and would otherwise auto-open the engine's
-        // buffer popup on top of it. The two are mutually exclusive until Phase 4-C
-        // folds LSP into the engine and retires this pmenu. Native only — the
-        // browser build has no LSP pmenu, so the flag stays false there.
-        #[cfg(feature = "native")]
-        self.editor.set_lsp_pmenu_open(self.completion_menu_open());
-        // Insert-mode completion popup is modal, stateful UI routing: while it is
-        // open it owns every key (navigate / accept / dismiss / live-refresh) ahead
-        // of the mapping engine (design B5). A key the popup *doesn't* claim
-        // dismisses it and returns `false`, so we fall through to the matcher below
-        // — `<C-k>` then fires signature help, `<Esc>` then leaves insert, etc.
-        // (`completion_menu_key` is only reached while open.) Native only — the
-        // insert-mode completion popup is LSP-driven, which the browser build lacks.
-        #[cfg(feature = "native")]
-        if self.editor.mode == Mode::Insert
-            && self.completion_menu_open()
-            && self.completion_menu_key(key)
-        {
-            return;
-        }
+        // The `nx.complete` engine's popup (incl. the built-in `lsp` source, Phase
+        // 4-C) is **non-grabbing** and handled in core: while it is open,
+        // `editor.input` (below, via the matcher) intercepts only its control keys
+        // and lets every other key edit the document, re-triggering the engine after.
+        // So there is no server-side pmenu routing here any more — the bespoke LSP
+        // pmenu it replaced is retired.
+        //
         // The mapping layer interposes here, ahead of `editor.input`: each key is
         // run through the withhold/replay matcher, which hands back the steps to
         // apply (raw editor keys and/or a fired mapping). The built-in LSP keys —
@@ -135,73 +120,6 @@ impl EditHost {
         let mode = self.editor.mode;
         for step in self.keymaps.feed(mode, key) {
             self.apply_step(step);
-        }
-    }
-
-    /// Handle one key while the completion popup is open. Returns `true` when the
-    /// key is consumed (navigation, accept, refresh); `false` after **closing**
-    /// the menu, so the caller lets the key take its normal effect (`<Esc>` also
-    /// leaves insert, a non-word char is inserted, `<C-k>` fires signature help).
-    /// A word character or backspace is applied to the editor first, then the menu
-    /// re-ranks (or re-requests) against the new prefix in place. Native only — the
-    /// popup is LSP-driven (`lsp_menu_*`), absent from the browser build.
-    #[cfg(feature = "native")]
-    pub(crate) fn completion_menu_key(&mut self, key: Key) -> bool {
-        if key.ctrl {
-            return match key.code {
-                KeyCode::Char('n') => {
-                    self.lsp_menu_move(1);
-                    true
-                }
-                KeyCode::Char('p') => {
-                    self.lsp_menu_move(-1);
-                    true
-                }
-                KeyCode::Char('y') => {
-                    self.lsp_menu_accept();
-                    true
-                }
-                KeyCode::Char('e') => {
-                    self.lsp_menu_close();
-                    true
-                }
-                // Any other ctrl key (e.g. `<C-k>`): dismiss, then let it act.
-                _ => {
-                    self.lsp_menu_close();
-                    false
-                }
-            };
-        }
-        match key.code {
-            KeyCode::Down => {
-                self.lsp_menu_move(1);
-                true
-            }
-            KeyCode::Up => {
-                self.lsp_menu_move(-1);
-                true
-            }
-            KeyCode::Enter | KeyCode::Tab => {
-                self.lsp_menu_accept();
-                true
-            }
-            // A word character or backspace edits the buffer, then refreshes the
-            // menu against the new prefix (the editor inserts/deletes first).
-            KeyCode::Backspace => {
-                self.editor.input(key);
-                self.lsp_menu_after_edit();
-                true
-            }
-            KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '_' => {
-                self.editor.input(key);
-                self.lsp_menu_after_edit();
-                true
-            }
-            // `<Esc>` and any other key dismiss the menu, then take normal effect.
-            _ => {
-                self.lsp_menu_close();
-                false
-            }
         }
     }
 
@@ -361,6 +279,12 @@ impl EditHost {
             // `MappingRhs` match has no such arm to cover.
             #[cfg(feature = "native")]
             MappingRhs::Native(BuiltinAction::Lsp(kind)) => self.request_lsp(kind),
+            // The `<C-Space>` / `<C-x><C-o>` manual completion trigger: open the
+            // engine popup (which dispatches the `lsp` source via the settle loop).
+            #[cfg(feature = "native")]
+            MappingRhs::Native(BuiltinAction::CompleteTrigger) => {
+                self.editor.complete_manual_trigger()
+            }
         }
     }
 }

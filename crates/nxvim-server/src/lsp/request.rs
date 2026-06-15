@@ -392,22 +392,27 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
-    /// Render a hover reply: open the bottom panel with the markup's plain lines
-    /// (the panel is the hover surface until floats exist — Decision 7). An empty
-    /// reply shows a brief message instead of an empty panel.
+    /// Render a hover reply in the cursor-anchored **content float**
+    /// (`nx.ui.float`'s sibling surface — the float-widget spec's list-less content
+    /// float). An empty reply shows a brief message instead of an empty float.
     pub(crate) fn show_hover(&mut self, lines: Vec<String>) {
         if lines.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return;
         }
-        self.editor.open_panel("LSP hover", lines, false, 0);
+        self.editor.open_content_float(
+            lines,
+            None,
+            nxvim_core::BorderStyle::Rounded,
+            nxvim_core::MenuPlacement::Cursor,
+        );
     }
 
-    /// Render a signature-help reply on the message line: the active signature's
-    /// label, with its active parameter appended in brackets when known (a plain
-    /// message line can't style the parameter inline). Triggered manually in
-    /// insert mode, so it stays out of the way until asked for. Empty ⇒ a brief
-    /// message.
+    /// Render a signature-help reply in the content float: the active signature's
+    /// label, with its active parameter appended in brackets when known (the float
+    /// renders plain lines, so the parameter can't be styled inline yet). Triggered
+    /// manually in insert mode, so it stays out of the way until asked for. Empty ⇒
+    /// a brief message.
     pub(crate) fn show_signature_help(
         &mut self,
         signature: Option<String>,
@@ -417,11 +422,16 @@ impl EditHost {
             self.editor.echo(LspReqKind::SignatureHelp.empty_message());
             return;
         };
-        let message = match active_parameter {
+        let line = match active_parameter {
             Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
             _ => signature,
         };
-        self.editor.echo(message);
+        self.editor.open_content_float(
+            vec![line],
+            None,
+            nxvim_core::BorderStyle::Rounded,
+            nxvim_core::MenuPlacement::Cursor,
+        );
     }
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;

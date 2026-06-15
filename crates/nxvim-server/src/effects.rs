@@ -353,6 +353,24 @@ impl EditHost {
                 .open_menu(req.items, nxvim_core::MenuPlacement::Cursor, 0);
             self.pending_ui_select = Some(req.cb_id);
         }
+        // `nx.ui.float`: open the list-less content float. Fire-and-forget (no
+        // callback) and dismissed by the next key; the last queued wins. The border
+        // keyword is parsed loud here (no silent fallback) — an unknown one echoes
+        // and skips the float.
+        for req in self.lua.take_ui_floats() {
+            let Some(border) = nxvim_core::BorderStyle::from_keyword(&req.border) else {
+                self.editor
+                    .echo(format!("nx.ui.float: unknown border '{}'", req.border));
+                continue;
+            };
+            let placement = if req.editor {
+                nxvim_core::MenuPlacement::Editor
+            } else {
+                nxvim_core::MenuPlacement::Cursor
+            };
+            self.editor
+                .open_content_float(req.lines, req.title, border, placement);
+        }
         // `nx.picker.open`: open the centered fuzzy-finder widget and kick the
         // source's initial run (generation 0, empty query). The source streams
         // candidates back as `picker_pushes` (drained just below) — synchronously

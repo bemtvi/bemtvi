@@ -575,6 +575,9 @@
       // The nx.ui.select menu is server-agnostic (it works in the pure-wasm
       // build too), so it renders regardless of `serverStyled`.
       if (view.menu) renderMenu(view.menu, tablineRows);
+      // The nx.ui.float content float (LSP hover / signature help) — server-agnostic
+      // like the menu, so it renders regardless of `serverStyled`.
+      if (view.float) renderContentFloat(view.float, tablineRows);
       renderCommand(cmdRow);
     }
 
@@ -1014,6 +1017,31 @@
         }
         gridEl.appendChild(docBox);
       }
+    }
+
+    // The nx.ui.float content float: a bordered box of plain content lines (LSP
+    // hover / signature help) — the list-less sibling of the menu. Server-placed
+    // geometry (text-area-relative `row`/`col`), no list / selection / scrolling
+    // (the server already windowed the lines to `height`).
+    function renderContentFloat(float, tablineRows) {
+      const fw = view.windows.find((w) => w.focused) || view.windows[0];
+      const rect = fw ? winRect(fw) : { x: 0, y: 0 };
+      const x = rect.x + float.col;
+      const y = tablineRows + rect.y + float.row;
+      const box = document.createElement("div");
+      box.className = "pmenu";
+      // Drop the 1px border rule for a borderless float (the "none" keyword).
+      if (!float.border || float.border === "none") box.style.border = "0";
+      place(box, x, y, float.width, float.height);
+      const lines = float.lines || [];
+      for (let i = 0; i < float.height; i++) {
+        const rowEl = document.createElement("div");
+        rowEl.className = "row";
+        rowEl.style.width = float.width * cw + "px";
+        rowEl.textContent = String(lines[i] ?? "").slice(0, float.width).padEnd(float.width);
+        box.appendChild(rowEl);
+      }
+      gridEl.appendChild(box);
     }
 
     // The nx.ui.select menu: a bordered float-list under the cursor, reusing the

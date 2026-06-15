@@ -811,6 +811,28 @@ pub struct UiSelectReq {
     pub cb_id: u64,
 }
 
+/// A `nx.ui.float(contents, opts)` request: open the list-less **content float**
+/// rendering `lines` (the sibling of the selectable-list widget — hover /
+/// signature help / arbitrary plugin content). Fire-and-forget: it carries no
+/// callback (a content float has no selection or confirm) and is dismissed by the
+/// next key. Queued in [`crate::runtime::Shared::ui_floats`], drained by the
+/// server into [`Editor::open_content_float`](nxvim_core::Editor::open_content_float).
+#[derive(Clone, Debug)]
+pub struct UiFloatReq {
+    /// The content lines to render, in order (non-empty: the Lua wrapper resolves
+    /// empty content to a no-op without queuing).
+    pub lines: Vec<String>,
+    /// The title drawn on the top border (`opts.title`), or `None` when untitled.
+    pub title: Option<String>,
+    /// The border keyword (`opts.border`, defaulted to `"rounded"` by the wrapper):
+    /// `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"`. Parsed (and
+    /// validated loud) server-side via `BorderStyle::from_keyword`.
+    pub border: String,
+    /// Placement: `false` anchors at the cursor (the default — hover shape), `true`
+    /// centers over the editor (`opts.relative = "editor"`).
+    pub editor: bool,
+}
+
 /// A `nx.picker.open(name)` request: open the fuzzy-finder widget (a centered
 /// float with a prompt) over the unified float-list widget
 /// ([`Editor::open_picker`](nxvim_core::Editor::open_picker)). The source's

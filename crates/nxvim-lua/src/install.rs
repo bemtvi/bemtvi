@@ -21,8 +21,8 @@ use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode,
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp,
     GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush,
-    PreviewPush, QfItem, QfSetOp, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiInputReq,
-    UiSelectReq, WindowOp,
+    PreviewPush, QfItem, QfSetOp, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiFloatReq,
+    UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1240,6 +1240,27 @@ pub(crate) fn install_runtime_api(
                     items,
                     prompt,
                     cb_id,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `nx._ui_float(lines, title, border, editor)`: queue a `nx.ui.float` request
+    // ([`UiFloatReq`]). The server opens the list-less content float rendering
+    // `lines` with the given border / placement. Fire-and-forget — a content float
+    // has no selection or confirm and is dismissed by the next key, so no callback
+    // crosses the bridge.
+    let sh = shared.clone();
+    nx.set(
+        "_ui_float",
+        lua.create_function(
+            move |_, (lines, title, border, editor): (Vec<String>, Option<String>, String, bool)| {
+                sh.borrow_mut().ui_floats.push(UiFloatReq {
+                    lines,
+                    title,
+                    border,
+                    editor,
                 });
                 Ok(())
             },

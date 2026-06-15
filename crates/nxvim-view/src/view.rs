@@ -301,6 +301,10 @@ pub struct View {
     /// `None` when none is open. Drawn over the focused window's text area with
     /// input focus, like the popup. Global.
     pub menu: Option<MenuData>,
+    /// The list-less **content float** (`nx.ui.float`; LSP hover / signature help),
+    /// or `None` when none is open. A transient, non-grabbing overlay drawn over the
+    /// focused window's text area — the sibling of [`menu`](Self::menu). Global.
+    pub content_float: Option<ContentFloatData>,
     /// Labels for each **hidden** dock (toggle / auto-hide collapsed), in dock-side
     /// order. The client paints these as clickable `▸{label}` chips on the
     /// command-line row while it is idle (`message` empty and not `command_mode`),
@@ -370,6 +374,27 @@ pub struct MenuData {
     /// within the box like [`preview`](Self::preview). `None` for a `select` / picker
     /// or a row with no docs — the popup then stands alone.
     pub docs: Option<MenuDocs>,
+}
+
+/// The list-less content float mirrored from the redraw (`nx.ui.float`; LSP hover
+/// / signature help): the content lines, the float's absolute geometry (text-area
+/// content coordinates, same convention as [`MenuData::row`]/`col`), its border
+/// style keyword, and an optional title drawn on the top border. Rendered as its
+/// own bordered box, like [`MenuDocs`] but standalone. See [`View::content_float`].
+#[derive(Clone)]
+pub struct ContentFloatData {
+    /// The content lines (already windowed to `height`). Plain text, like a hover.
+    pub lines: Vec<String>,
+    /// The float's content top-left, **text-area-relative**.
+    pub row: u16,
+    pub col: u16,
+    /// The float's content width / height in cells (the client adds its border).
+    pub width: u16,
+    pub height: u16,
+    /// The border style, or `None` for a borderless float (the `"none"` keyword).
+    pub border: Option<Border>,
+    /// An optional title drawn on the top border (`None` when untitled).
+    pub title: Option<String>,
 }
 
 /// The completion docs sidebar mirrored from the redraw (Phase 4-D): the selected
@@ -582,6 +607,20 @@ impl View {
                     }),
                     _ => None,
                 },
+            }),
+            _ => None,
+        };
+        self.content_float = match map_get(map, "float") {
+            Some(Value::Map(f)) => Some(ContentFloatData {
+                lines: map_str_array(f, "lines"),
+                row: map_u16(f, "row"),
+                col: map_u16(f, "col"),
+                width: map_u16(f, "width"),
+                height: map_u16(f, "height"),
+                border: parse_border(map_get(f, "border")),
+                title: map_get(f, "title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             }),
             _ => None,
         };

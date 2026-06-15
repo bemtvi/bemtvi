@@ -11,7 +11,7 @@ use nxvim_core::view::{
     MenuView, RegionTabline, RegionTablines, ScrollAnim, Separator, TabView, ViewRect,
     WindowRegion, WindowView,
 };
-use nxvim_core::{BorderStyle, MenuPlacement, PanelView};
+use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, PanelView};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -172,6 +172,13 @@ impl EditHost {
             Some(m) => self.project_menu(m, &view, text_width, &mut styles),
             None => Value::Nil,
         };
+        // The list-less content float (`nx.ui.float`; LSP hover / signature help),
+        // `Nil` when none is open. A non-grabbing transient overlay — its geometry
+        // is computed here from the cursor (or centered over the editor).
+        let float = match &view.content_float {
+            Some(cf) => self.project_content_float(cf, &view, text_width),
+            None => Value::Nil,
+        };
 
         // Built last: every per-window/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
@@ -246,6 +253,7 @@ impl EditHost {
                 ),
             ),
             (Value::from("menu"), menu),
+            (Value::from("float"), float),
         ];
 
         self.fx.notify("redraw", vec![Value::Map(map)]);
@@ -1156,6 +1164,91 @@ impl EditHost {
             (Value::from("width"), Value::from(docs_w as u64)),
             (Value::from("height"), Value::from(docs_h as u64)),
         ]))
+    }
+
+    /// Project the list-less **content float** (`nx.ui.float`; LSP hover /
+    /// signature help) into its redraw sub-map. Geometry is computed here in
+    /// text-area cells (the client adds the gutter + text-area origin, then draws
+    /// the border): in `Cursor` placement it anchors at the cursor and prefers to
+    /// sit **above** it (vim shows a hover above the symbol), flipping below — then
+    /// clamping to the larger side — when there's no room; in `Editor` placement it
+    /// centers. Content is windowed to the resolved height. Sibling of
+    /// [`project_menu`](Self::project_menu); much simpler (no list, no scrolling).
+    fn project_content_float(
+        &self,
+        cf: &ContentFloatView,
+        view: &nxvim_core::View,
+        text_width: usize,
+    ) -> Value {
+        /// Cap the float width — long markup wraps off-screen otherwise; the body is
+        /// windowed, not a hard limit.
+        const MAX_W: usize = 80;
+        /// Cap the height — a huge docstring shouldn't fill the whole screen.
+        const MAX_H: usize = 20;
+        let focused = view.focused();
+        let text_height = focused.lines.len();
+        // Hug the content (title included), capped. A bordered float spends one cell
+        // on each side, so the fit tests below reserve 2 rows/cols of chrome.
+        let content_w = cf
+            .lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(cf.title.as_ref().map_or(0, |t| t.chars().count() + 2))
+            .clamp(1, MAX_W);
+        let count = cf.lines.len().min(MAX_H);
+        const CHROME: usize = 2;
+
+        let (row, col, width, height) = match cf.placement {
+            MenuPlacement::Cursor => {
+                let cursor_row = focused.cursor_row;
+                let anchor_col = focused.cursor_screen_col.saturating_sub(focused.leftcol);
+                // Anchor the box at the cursor, but shift it left when the right margin
+                // has no room (a full box shifted left beats a squished one). The box
+                // includes its border chrome; the content `width` is what's left.
+                let box_w = (content_w + CHROME).min(text_width.max(1));
+                let col = anchor_col.min(text_width.saturating_sub(box_w));
+                let width = box_w.saturating_sub(CHROME).max(1);
+                let above = cursor_row;
+                let below = text_height.saturating_sub(cursor_row + 1);
+                // Above if the bordered box fits (vim shows a hover above the symbol),
+                // else below, else clamp to whichever side has more room.
+                let (row, height) = if count + CHROME <= above {
+                    (cursor_row - (count + CHROME), count)
+                } else if count + CHROME <= below {
+                    (cursor_row + 1, count)
+                } else if above >= below {
+                    let h = above.saturating_sub(CHROME).clamp(1, count);
+                    (cursor_row.saturating_sub(h + CHROME), h)
+                } else {
+                    (cursor_row + 1, below.saturating_sub(CHROME).clamp(1, count))
+                };
+                (row, col, width, height)
+            }
+            MenuPlacement::Editor => {
+                let width = content_w.min(text_width.saturating_sub(CHROME).max(1));
+                let height = count.min(text_height.saturating_sub(CHROME).max(1));
+                let row = text_height.saturating_sub(height + CHROME) / 2;
+                let col = text_width.saturating_sub(width + CHROME) / 2;
+                (row, col, width, height)
+            }
+        };
+        let shown = &cf.lines[..height.min(cf.lines.len())];
+        Value::Map(vec![
+            (Value::from("lines"), display_lines_value(shown)),
+            (Value::from("row"), Value::from(row as u64)),
+            (Value::from("col"), Value::from(col as u64)),
+            (Value::from("width"), Value::from(width as u64)),
+            (Value::from("height"), Value::from(height as u64)),
+            (Value::from("border"), Value::from(cf.border.as_str())),
+            (
+                Value::from("title"),
+                cf.title
+                    .as_deref()
+                    .map_or(Value::Nil, |t| Value::from(t.to_string())),
+            ),
+        ])
     }
 
     /// Resolve the picker's preview pane into its redraw sub-map, or `None` for a

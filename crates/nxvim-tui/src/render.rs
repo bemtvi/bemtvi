@@ -277,6 +277,12 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         _ => None,
     };
 
+    // The list-less content float (`nx.ui.float`; LSP hover / signature help)
+    // floats over the focused window's text area, on top, with no input focus.
+    if let (Some(float), Some((inner, _, _))) = (&view.content_float, focused_inner) {
+        render_content_float(frame, inner, float);
+    }
+
     // A focused panel owns the cursor: draw it on the panel's current line and
     // skip the text/command cursor entirely.
     if let Some(panel) = &view.panel {
@@ -1888,6 +1894,48 @@ fn render_menu(
 /// completion popup's one-cell-left-shifted content anchor), so the bordered box is
 /// drawn one cell left of it — the left border then lands flush against the popup's
 /// right border. `docs.row` is the box's top row as-is.
+/// Render the list-less content float (`nx.ui.float`; LSP hover / signature help):
+/// a bordered box of plain content lines at the server-placed geometry (same
+/// text-area-relative convention as the docs sidebar). No selection, no scrolling —
+/// the server already windowed the lines to `height`. A `None` border draws the
+/// content with no box.
+fn render_content_float(frame: &mut Frame, text_area: Rect, float: &nxvim_view::ContentFloatData) {
+    let bordered = float.border.is_some();
+    let chrome = if bordered { 2 } else { 0 };
+    let x = text_area.x.saturating_add(float.col);
+    let y = text_area.y.saturating_add(float.row);
+    let width = (float.width.saturating_add(chrome)).min(text_area.right().saturating_sub(x));
+    let height = (float.height.saturating_add(chrome)).min(text_area.bottom().saturating_sub(y));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let min = if bordered { 3 } else { 1 };
+    if area.width < min || area.height < min {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let inner = match float.border.map(bt) {
+        Some(border) => {
+            let block = float_block(border, float.title.as_deref());
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            inner
+        }
+        None => area,
+    };
+    let w = inner.width as usize;
+    let lines: Vec<Line> = float
+        .lines
+        .iter()
+        .take(inner.height as usize)
+        .map(|l| Line::from(Span::raw(pmenu_row(l, "", w))))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 fn render_menu_docs(frame: &mut Frame, text_area: Rect, docs: &nxvim_view::MenuDocs) {
     let x = text_area.x.saturating_add(docs.col).saturating_sub(1);
     let y = text_area.y.saturating_add(docs.row);

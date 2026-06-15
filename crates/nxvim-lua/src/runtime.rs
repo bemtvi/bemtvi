@@ -19,7 +19,7 @@ use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp,
     ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
     LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -345,6 +345,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
     ),
+    // nx.lsp.buf.hover / signature_help — the position-family verbs whose replies
+    // render through the content float (over the guarded nx._lsp_buf bridge).
+    ("nxvim:prelude/lsp", include_str!("prelude/lsp.lua")),
     // vim.fn editor-query read builtins (line / col / expand / pos / …) that read
     // the state mirror; loads after the surfaces they build on.
     ("nxvim:prelude/vimfn", include_str!("prelude/vimfn.lua")),
@@ -412,6 +415,9 @@ pub(crate) struct Shared {
     /// `nx.ui.select` requests, drained by the server into the editor's floating
     /// selectable-list widget (`Editor::open_menu`) after the chunk.
     pub(crate) ui_selects: Vec<UiSelectReq>,
+    /// `nx.ui.float` requests, drained by the server into the editor's list-less
+    /// content float (`Editor::open_content_float`) after the chunk.
+    pub(crate) ui_floats: Vec<UiFloatReq>,
     /// `nx.picker.open` requests, drained by the server into the editor's fuzzy
     /// finder (`Editor::open_picker`) after the chunk.
     pub(crate) picker_opens: Vec<PickerOpenReq>,
@@ -850,6 +856,12 @@ impl LuaRuntime {
         /// Take the `nx.ui.select` requests queued since the last drain, for the
         /// server to open as floating selectable-list menus.
         take_ui_selects -> Vec<UiSelectReq> = ui_selects
+    }
+
+    take_queue! {
+        /// Take the `nx.ui.float` requests queued since the last drain, for the
+        /// server to open as list-less content floats.
+        take_ui_floats -> Vec<UiFloatReq> = ui_floats
     }
 
     take_queue! {

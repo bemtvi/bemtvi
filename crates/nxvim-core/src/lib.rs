@@ -48,4 +48,4 @@ pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseBut
 pub use mode::Mode;
 pub use options::{BufferOptions, Options, WindowOptions};
 pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
-pub use view::{MenuView, PanelView, TabView, View, ViewRect, WindowView};
+pub use view::{ContentFloatView, MenuView, PanelView, TabView, View, ViewRect, WindowView};

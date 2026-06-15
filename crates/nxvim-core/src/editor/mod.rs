@@ -36,6 +36,7 @@ mod dock;
 mod ex;
 mod explorer;
 pub mod expr;
+mod float;
 mod insert;
 mod jumps;
 mod marks;
@@ -787,6 +788,12 @@ pub struct Editor {
     /// `None` on cancel. Drained by the server to deliver the result to its
     /// callback — the menu analogue of [`Editor::prompt_results`].
     pub menu_results: Vec<Option<usize>>,
+    /// The list-less **content float** (`nx.ui.float`; the LSP hover / signature
+    /// help surface), when open, or `None`. A transient overlay rendering plain
+    /// content lines — no list, no selection, **never grabs input**: it is
+    /// dismissed by the next key (see [`Editor::input`]). The sibling of [`menu`]
+    /// on the shared float placement layer. See [`float`](crate::editor::float).
+    content_float: Option<float::ContentFloat>,
     /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
     /// query)`. A *static* source never appends here — the local fuzzy matcher
     /// handles its query edits in core. Drained by the server, which stamps the
@@ -1242,6 +1249,7 @@ impl Editor {
             panel_selects: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
+            content_float: None,
             picker_query_changes: Vec::new(),
             complete_config: complete::CompleteConfig::default(),
             complete_query_changes: Vec::new(),
@@ -1401,6 +1409,13 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
+        // A content float (hover / signature help / `nx.ui.float`) is a transient
+        // popup that never grabs input: the next key dismisses it, then is handled
+        // normally below (vim closes a hover float on the next motion). It opens
+        // off-tick on an LSP reply or synchronously from a mapping *after* this
+        // clear, so the float that just opened survives until the following key.
+        self.content_float = None;
+
         // A focused panel grabs every key (navigation + close), bypassing the
         // buffer's mode handling and the `curswant`/scroll bookkeeping below.
         if self.panel.is_some() {

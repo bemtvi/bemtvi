@@ -86,6 +86,26 @@ pub struct PanelView {
     pub height: usize,
 }
 
+/// The renderable form of the list-less **content float** (`nx.ui.float`; the LSP
+/// hover / signature-help surface) — the sibling of [`MenuView`] with no list and
+/// no selection, just content lines, an optional title, a border, and where it
+/// floats. The server projects the on-screen geometry (`project_content_float`)
+/// from this plus the cursor / editor size. `None` in [`View::content_float`] when
+/// none is open.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentFloatView {
+    /// The content lines to render, in order (non-empty — an empty float never
+    /// opens). The server windows them to the available height.
+    pub lines: Vec<String>,
+    /// An optional title drawn on the top border (`None` when untitled).
+    pub title: Option<String>,
+    /// The border style the client draws around the content.
+    pub border: crate::editor::BorderStyle,
+    /// Whether the float anchors at the cursor (hover / signature help) or centers
+    /// over the editor (an `nx.ui.float` caller that asked for `relative="editor"`).
+    pub placement: crate::editor::MenuPlacement,
+}
+
 /// The renderable form of the floating selectable-list [`Menu`](crate::editor):
 /// the visible (filtered) labels, the highlighted row, the optional picker prompt,
 /// per-row match highlighting, and where it floats. The server projects the
@@ -458,6 +478,10 @@ pub struct View {
     /// or `None` when none is open. When present it has input focus and floats
     /// over the focused window's text area; the server projects its geometry.
     pub menu: Option<MenuView>,
+    /// The list-less content float (`nx.ui.float`; LSP hover / signature help), or
+    /// `None` when none is open. A transient, non-grabbing overlay floating over
+    /// the text — the sibling of [`menu`](View::menu).
+    pub content_float: Option<ContentFloatView>,
     /// The single **global** status line's `%`-format context, present only at
     /// `'laststatus'`=3. It carries the *focused* window's facts (vim shows the
     /// current window's status line in the global bar); the server runs the engine
@@ -515,6 +539,7 @@ impl View {
             },
             panel: ed.panel_view(),
             menu: ed.menu_view(),
+            content_float: ed.content_float_view(),
             global_statusline,
             hidden_docks: ed
                 .hidden_dock_chips()

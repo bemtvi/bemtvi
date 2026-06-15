@@ -729,6 +729,10 @@ impl Renderer {
         // layer and anchored the same way (the focused window's region origin).
         self.build_menu(view, focus_origin, overlay_quads, overlay_items);
 
+        // The list-less content float (`nx.ui.float`; LSP hover / signature help),
+        // same overlay layer, anchored at the focused window's region origin.
+        self.build_content_float(view, focus_origin, overlay_quads, overlay_items);
+
         // The global command / message line on the reserved bottom row.
         self.build_cmdline(view, cmd_row, quads, items);
     }
@@ -1910,6 +1914,66 @@ impl Renderer {
                 let text = pmenu_row(line, "", docs.width as usize);
                 self.push_plain(items, &text, self.cell_px(dcx, dcy + i as u16), fg, full);
             }
+        }
+    }
+
+    /// Build the list-less content float (`nx.ui.float`; LSP hover / signature
+    /// help): a bordered box of plain content lines at the server-placed geometry,
+    /// anchored at the focused window's text-inner origin (the same derivation as
+    /// the popup / docs sidebar). No selection, no scrolling — the server already
+    /// windowed the lines. A `None` border draws the content with no box.
+    fn build_content_float(
+        &mut self,
+        view: &View,
+        origin: (u16, u16),
+        quads: &mut Vec<Quad>,
+        items: &mut Vec<TextItem>,
+    ) {
+        let Some(float) = &view.content_float else {
+            return;
+        };
+        let Some(win) = view.focused() else {
+            return;
+        };
+        let (mut wx, mut wy) = match win.rect {
+            Some(r) => (origin.0 + r.x, origin.1 + r.y),
+            None => (origin.0, origin.1),
+        };
+        if win.floating && win.border.is_some() {
+            wx += 1;
+            wy += 1;
+        }
+        let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+        let gutter = if win.number || win.relativenumber {
+            win.number_width
+        } else {
+            0
+        };
+        let text_x0 = wx + sign_w + gutter;
+
+        let popup_bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14);
+        let border = lighten(popup_bg, 0x30);
+        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+        let full = self.full_bounds();
+
+        let (bx, by) = (text_x0 + float.col, wy + float.row);
+        let (cx, cy) = if float.border.is_some() {
+            self.fill_box(
+                quads,
+                (bx, by, float.width + 2, float.height + 2),
+                popup_bg,
+                border,
+            );
+            (bx + 1, by + 1)
+        } else {
+            (bx, by)
+        };
+        for (i, line) in float.lines.iter().enumerate() {
+            if i as u16 >= float.height {
+                break;
+            }
+            let text = pmenu_row(line, "", float.width as usize);
+            self.push_plain(items, &text, self.cell_px(cx, cy + i as u16), fg, full);
         }
     }
 

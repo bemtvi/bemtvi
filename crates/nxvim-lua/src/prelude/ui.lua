@@ -1,9 +1,11 @@
 -- nxvim Lua prelude — timers + the async UI surface (nx.ui).
--- nx.timer (alias vim.defer_fn) over the event-loop bridge, plus nx.ui.select —
--- the callback-shaped chooser backed by the server's floating selectable-list
--- widget (docs/specs/2026-06-14-nx-ui-float-widget.md), aliased by vim.ui.select
--- per ADR 0002's whitelist. nx.ui.open and the nx.validate / nx.deprecate no-ops
--- are not part of nxvim's config API and remain intentionally absent.
+-- nx.timer (alias vim.defer_fn) over the event-loop bridge, plus the two consumers
+-- of the server's shared float layer (docs/specs/2026-06-14-nx-ui-float-widget.md):
+-- nx.ui.select — the callback-shaped chooser over the floating selectable-list
+-- widget, aliased by vim.ui.select per ADR 0002's whitelist — and nx.ui.float, the
+-- list-less content float (the widget's sibling, also the LSP hover surface). The
+-- nx.validate / nx.deprecate no-ops are not part of nxvim's config API and remain
+-- intentionally absent.
 local vim = vim
 nx = nx or {}
 nx.ui = nx.ui or {}
@@ -80,3 +82,38 @@ function nx.ui.select(items, opts, on_choice)
   nx._ui_select(labels, opts.prompt or "", id)
 end
 vim.ui.select = nx.ui.select
+
+-- ----- nx.ui.float -----------------------------------------------------------
+-- nx.ui.float(contents, opts): open the list-less content float — the sibling of
+-- the selectable-list widget (docs/specs/2026-06-14-nx-ui-float-widget.md, "What
+-- stays out of this widget") — rendering plain content with no list / selection.
+-- `contents` is a string (split on newlines) or a list of line strings. `opts`:
+--   border   = "none"|"single"|"rounded"|"double"|"solid"  (default "rounded")
+--   title    = a string drawn on the top border (optional)
+--   relative = "cursor" (default, anchors at the cursor) | "editor" (centered)
+-- The server owns the float, its geometry, and its dismissal (the next key closes
+-- it). Fire-and-forget: empty contents open nothing. This is the surface LSP hover
+-- and signature help render through natively.
+function nx.ui.float(contents, opts)
+  opts = opts or {}
+  local lines
+  if type(contents) == "string" then
+    lines = vim.split(contents, "\n", { plain = true })
+  elseif type(contents) == "table" then
+    lines = {}
+    for i, l in ipairs(contents) do
+      lines[i] = tostring(l)
+    end
+  else
+    error("nx.ui.float: contents must be a string or a list of strings", 2)
+  end
+  -- Drop a single trailing empty line (a string ending in "\n" splits to one), so
+  -- markdown bodies don't render a blank last row.
+  if #lines > 1 and lines[#lines] == "" then
+    lines[#lines] = nil
+  end
+  if #lines == 0 then
+    return
+  end
+  nx._ui_float(lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+end

@@ -414,3 +414,109 @@ async fn unprintable_control_bytes_render_as_caret_and_hex_tokens() {
         "the display substitution must not touch the on-disk bytes"
     );
 }
+
+// ===== multibyte / CJK encodings =============================================
+//
+// `encoding_rs` decodes *and* encodes the legacy CJK families (Shift_JIS, EUC-JP,
+// GBK, Big5, EUC-KR), so the seam already handles them once they're named. These
+// tests cover (a) detection + byte-for-byte round-trip when a CJK encoding is in
+// `'fileencodings'`, (b) vim's muscle-memory `cp932`/`cp936`/`cp949`/`cp950`
+// spellings resolving (they aren't WHATWG labels), and (c) the bogus `replacement`
+// codec failing loud. As elsewhere, CJK stays *out* of the default
+// `'fileencodings'` (matching neovim — strict-decode false-positives are common),
+// so a user opts in by setting `'fileencodings'` (or `'fileencoding'`) explicitly.
+
+#[tokio::test]
+async fn shift_jis_decodes_and_round_trips_via_fileencodings() {
+    // A real Shift_JIS file (no BOM, invalid as UTF-8). With shift_jis added to
+    // 'fileencodings' *before* the read, `:e` detects it: 日本語 decodes, the buffer
+    // carries fileencoding=shift_jis, and `:w` reproduces the canonical Shift_JIS
+    // multibyte sequences byte-for-byte.
+    let path = temp_path("enc_sjis");
+    let original: &[u8] = b"\x93\xfa\x96\x7b\x8c\xea\n"; // 日本語\n in Shift_JIS
+    std::fs::write(&path, original).expect("write shift_jis file");
+
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set fileencodings=ucs-bom,utf-8,shift_jis,latin1<CR>",
+    );
+    feed(&rpc, &format!(":e {}<CR>", path.to_string_lossy()));
+
+    assert_eq!(lines(&rpc).await, vec!["日本語"]);
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=shift_jis"),
+        "the file is detected as shift_jis from 'fileencodings'"
+    );
+
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "writing a Shift_JIS buffer reproduces the multibyte sequences exactly"
+    );
+}
+
+#[tokio::test]
+async fn euc_jp_decodes_and_round_trips_via_fileencodings() {
+    // A second multibyte family, to exercise the encoder for a different CJK codec.
+    let path = temp_path("enc_eucjp");
+    let original: &[u8] = b"\xc6\xfc\xcb\xdc\xb8\xec\n"; // 日本語\n in EUC-JP
+    std::fs::write(&path, original).expect("write euc-jp file");
+
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set fileencodings=ucs-bom,utf-8,euc-jp,latin1<CR>");
+    feed(&rpc, &format!(":e {}<CR>", path.to_string_lossy()));
+
+    assert_eq!(lines(&rpc).await, vec!["日本語"]);
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=euc-jp")
+    );
+
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "writing an EUC-JP buffer reproduces the multibyte sequences exactly"
+    );
+}
+
+#[tokio::test]
+async fn vim_cjk_aliases_resolve_to_canonical_names() {
+    // vim spells the CJK codepages `cp932`/`cp936`/`cp949`/`cp950` (and `euc-cn`);
+    // none are WHATWG labels, so they must be aliased. Each is accepted and reads
+    // back as its canonical WHATWG-style name through `:set fenc?`.
+    let (rpc, mut incoming) = start(None).await;
+    for (alias, canonical) in [
+        ("cp932", "shift_jis"),
+        ("cp936", "gbk"),
+        ("euc-cn", "gbk"),
+        ("cp949", "euc-kr"),
+        ("cp950", "big5"),
+    ] {
+        feed(&rpc, &format!(":set fenc={alias}<CR>"));
+        let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+        let expected = format!("fileencoding={canonical}");
+        assert_eq!(
+            field(&map, "message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "vim alias {alias} should resolve to {canonical}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replacement_encoding_is_rejected() {
+    // `encoding_rs` resolves the WHATWG `replacement` label, but that codec decodes
+    // any non-empty input to a single U+FFFD — pure data loss, never a real file
+    // encoding. Accepting it would silently destroy a buffer, so it must fail loud
+    // (E474) like any other bad `'fileencoding'` value.
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc=replacement<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E474"), "expected a loud E474, got {msg:?}");
+}

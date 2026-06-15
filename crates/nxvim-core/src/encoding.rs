@@ -39,12 +39,25 @@ impl Encoding {
     /// round-trip safely (see [`decode_to_rope`]).
     pub const LATIN1: Encoding = Encoding(encoding_rs::WINDOWS_1252);
 
-    /// Parse a vim/WHATWG encoding label (`"utf-8"`, `"latin1"`, `"utf-16le"`, …),
-    /// or `None` for an unknown label so the caller can fail loud (`E474`). The
-    /// `"ucs-bom"` *detection* pseudo-entry of `'fileencodings'` is **not** an
-    /// encoding and is rejected here — [`is_fileencodings_entry`] accepts it.
+    /// Parse a vim/WHATWG encoding label (`"utf-8"`, `"latin1"`, `"utf-16le"`,
+    /// `"shift_jis"`, `"cp932"`, …), or `None` for an unknown label so the caller can
+    /// fail loud (`E474`). The `"ucs-bom"` *detection* pseudo-entry of
+    /// `'fileencodings'` is **not** an encoding and is rejected here —
+    /// [`is_fileencodings_entry`] accepts it.
+    ///
+    /// vim's muscle-memory CJK codepage spellings (`cp932`/`cp936`/`cp949`/`cp950`,
+    /// `euc-cn`) aren't WHATWG labels, so they're aliased to the equivalent
+    /// `encoding_rs` codec via [`vim_cjk_alias`]. The WHATWG `replacement` codec is
+    /// rejected: it decodes any input to a single `U+FFFD` (pure data loss), so it's
+    /// never a real `'fileencoding'` and accepting it would silently destroy a buffer.
     pub fn from_label(label: &str) -> Option<Encoding> {
-        encoding_rs::Encoding::for_label(label.as_bytes()).map(Encoding)
+        let normalized = label.trim().to_ascii_lowercase();
+        let resolved = vim_cjk_alias(&normalized).unwrap_or(label);
+        let enc = encoding_rs::Encoding::for_label(resolved.as_bytes())?;
+        if enc == encoding_rs::REPLACEMENT {
+            return None;
+        }
+        Some(Encoding(enc))
     }
 
     /// The underlying `encoding_rs` handle, for the decode/encode helpers.
@@ -193,6 +206,24 @@ pub fn encode_from_str(text: &str, enc: Encoding, bomb: bool) -> Result<Vec<u8>>
     }
     out.extend_from_slice(&bytes);
     Ok(out)
+}
+
+/// Map a (lowercased, trimmed) vim CJK codepage spelling to the WHATWG label
+/// `encoding_rs` knows for the same codec. vim names the legacy double-byte codecs
+/// by Windows codepage (`cp932`, …) or Unix convention (`euc-cn`); the WHATWG
+/// Encoding Standard names the same codec differently, so these aliases bridge the
+/// muscle memory. (`euc-jp`/`euc-kr`/`gbk`/`big5`/`koi8-r`/`cp1251` already *are*
+/// WHATWG labels and need no alias.) The display spelling reads back as the
+/// canonical WHATWG-lowercased name (e.g. `cp932` → `shift_jis`), per [`Encoding`]'s
+/// `Display`.
+fn vim_cjk_alias(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "cp932" => "shift_jis",      // Japanese (Windows / sjis)
+        "cp936" | "euc-cn" => "gbk", // Simplified Chinese (GBK supersets GB2312/EUC-CN)
+        "cp949" => "euc-kr",         // Korean (WHATWG's euc-kr decoder *is* cp949)
+        "cp950" => "big5",           // Traditional Chinese
+        _ => return None,
+    })
 }
 
 /// The byte-order mark for `enc`, or empty for an encoding that has none. Used to

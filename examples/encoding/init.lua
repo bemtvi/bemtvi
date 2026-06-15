@@ -46,6 +46,20 @@
 -- target encoding can't represent (e.g. a CJK char like 中 into a latin1 buffer)
 -- aborts the write with `E513` and leaves the file untouched — rather than emitting
 -- the HTML numeric character references encoding libraries fall back to.
+--
+-- Multibyte / CJK encodings (Shift_JIS, EUC-JP, GBK, Big5, EUC-KR, KOI8-R, …) are
+-- supported too — decode AND encode. They stay OUT of the default `'fileencodings'`
+-- (just like neovim: a strict CJK decode false-positives on too many byte streams to
+-- auto-detect safely), so you opt in explicitly. Add the encoding to the detection
+-- list before opening the file:
+--
+--     :set fileencodings=ucs-bom,utf-8,shift_jis,latin1   -- then :e shift_jis.txt
+--
+-- `shift_jis.txt` is real Shift_JIS (こんにちは / 日本語). With shift_jis in the list
+-- it decodes to the Japanese text, `:set fenc?` reports `fileencoding=shift_jis`, and
+-- `:w` reproduces the original multibyte sequences byte-for-byte. vim's muscle-memory
+-- codepage spellings work as aliases — `cp932` (Shift_JIS), `cp936`/`euc-cn` (GBK),
+-- `cp949` (EUC-KR), `cp950` (Big5) — and read back as their canonical names.
 
 -- Nothing to configure here — the defaults already do the right thing. This block
 -- just makes the active detection list visible at startup.

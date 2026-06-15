@@ -339,11 +339,34 @@ governs the on-disk form.
   build substitutes the text but JS-side highlighting doesn't add the SpecialKey
   colour.
 
+- **Multibyte / CJK encodings ✅ (2026-06-15).** Shift_JIS, EUC-JP, GBK, Big5,
+  EUC-KR, KOI8-R, windows-125x, … decode *and* encode through the existing seam —
+  `encoding_rs` already supports them, so naming one in `'fileencoding'` or
+  `'fileencodings'` Just Works. The phase added the parts that didn't: vim's
+  muscle-memory codepage spellings (`cp932`→shift_jis, `cp936`/`euc-cn`→gbk,
+  `cp949`→euc-kr, `cp950`→big5) are aliased in `Encoding::from_label`
+  (`crates/nxvim-core/src/encoding.rs`, `vim_cjk_alias`) so `:set fenc=cp932` works,
+  reading back as the canonical WHATWG-lowercased name (`shift_jis`); and the WHATWG
+  `replacement` codec (decodes everything to a single `U+FFFD` — pure data loss) is
+  now **rejected** by `from_label`, so it fails loud (`E474`) instead of silently
+  destroying a buffer. **Detection policy:** CJK stays *out* of the default
+  `'fileencodings'` (`ucs-bom,utf-8,latin1`), matching neovim — a strict CJK decode
+  false-positives on too many latin1/binary byte streams to auto-detect safely; a
+  user opts in by setting `'fileencodings'` (or `'fileencoding'`) explicitly. Covered
+  by 4 black-box tests in `tests/editing/encoding.rs` (shift_jis + euc-jp
+  detection/round-trip, the vim-alias resolution table, replacement rejection) and a
+  runnable `examples/encoding/shift_jis.txt` sample with an `init.lua` walkthrough.
+  *Remaining:* EUC-TW and a handful of other legacy codecs `encoding_rs` doesn't
+  implement are unsupported (fail loud); ISO-2022-JP works via its WHATWG label but
+  the per-char `E513` re-scan on the write-error path isn't tuned for stateful codecs.
+
 Still open, not required for correctness:
 
-- Add CJK / other encodings to the `fileencodings` default and the validator.
 - Broaden the statusline `&option` resolver beyond the buffer-display options the
   `StatuslineCtx` carries (thread the buffer into `render_statusline`).
+- Render `^X` / `<xx>` control-char tokens in the `:messages` panel (the buffer
+  display already substitutes them); add the JS-side `SpecialKey` colour to the wasm
+  build (it substitutes the text but doesn't highlight it).
 
 ---
 

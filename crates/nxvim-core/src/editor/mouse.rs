@@ -34,24 +34,32 @@ pub(crate) struct MouseSelect {
 }
 
 /// In-flight separator / status-line drag (Phase 5): a left-press that landed on
-/// a split divider grabs the window edge next to it; subsequent drags resize that
-/// window to follow the pointer. The resize is **absolute** against the press
-/// `origin` (not incremental), so pushing past a window's minimum and dragging
-/// back tracks the pointer cleanly instead of drifting.
+/// a divider grabs the edge next to it; subsequent drags resize to follow the
+/// pointer. Both variants track the pointer **absolutely**, so pushing past a
+/// minimum and dragging back tracks cleanly instead of drifting.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ResizeDrag {
-    /// The window whose edge is grabbed — the one *left of* a vertical divider or
-    /// *above* a horizontal one, so a drag toward it (right / down) grows it.
-    win: WindowId,
-    /// The divider's orientation: `true` for a vertical separator (resize width),
-    /// `false` for a horizontal separator or a status line (resize height).
-    vertical: bool,
-    /// The press cell along the drag axis (the column for a vertical divider, the
-    /// row for a horizontal one), the fixed point the drag measures from.
-    origin: usize,
-    /// Total cells already applied to the resize, so each drag issues only the
-    /// remaining delta to reach the pointer's current offset from `origin`.
-    applied: isize,
+pub(crate) enum ResizeDrag {
+    /// A split divider *inside* a region (a window separator or a status line with
+    /// a window below it): the grabbed window edge is resized by the drag delta.
+    Window {
+        /// The window whose edge is grabbed — the one *left of* a vertical divider
+        /// or *above* a horizontal one, so a drag toward it (right / down) grows it.
+        win: WindowId,
+        /// The divider's orientation: `true` for a vertical separator (resize
+        /// width), `false` for a horizontal separator or status line (resize height).
+        vertical: bool,
+        /// The press cell along the drag axis (the column for a vertical divider,
+        /// the row for a horizontal one), the fixed point the drag measures from.
+        origin: usize,
+        /// Total cells already applied to the resize, so each drag issues only the
+        /// remaining delta to reach the pointer's current offset from `origin`.
+        applied: isize,
+    },
+    /// The **edge** of a dock band (the separator between a dock and the main
+    /// area): the drag sets that dock's size to the pointer's position directly.
+    /// No `origin`/`applied` is needed — the new size is read absolutely from the
+    /// pointer each drag, so it self-corrects when the band clamps.
+    Dock { side: DockSide },
 }
 
 /// The anchored extent a left-drag extends from, set by the press by click count.
@@ -126,12 +134,14 @@ impl Editor {
             {
                 self.mouse_click_tab(ev.row, ev.col)
             }
-            // A press on a split divider (a separator or a status line with a
-            // window below it) grabs that edge; drags resize, release lets go.
-            // Checked before the text-press arms so a divider click never places
-            // the cursor or starts a selection.
+            // A press on a divider grabs that edge; drags resize, release lets go.
+            // Two kinds: a dock band's edge (between a dock and the main area) and a
+            // split divider *inside* a region (a separator or a status line with a
+            // window below it). Checked before the text-press arms so a divider
+            // click never places the cursor or starts a selection.
             (MouseButton::Left, MouseAction::Press)
-                if self.resize_handle_at(ev.row, ev.col).is_some() =>
+                if self.dock_handle_at(ev.row, ev.col).is_some()
+                    || self.resize_handle_at(ev.row, ev.col).is_some() =>
             {
                 self.mouse_begin_resize(ev.row, ev.col)
             }
@@ -413,17 +423,75 @@ impl Editor {
         None
     }
 
-    /// Begin a separator / status-line drag: stash which window edge is grabbed and
-    /// the press cell the resize measures from. Clears any pending text selection so
-    /// the divider press can't leave a stale anchor behind. A no-op (leaving
-    /// `mouse_resize` unset) if the cell isn't actually a divider — the dispatch
-    /// guard already checked, so this only re-resolves it.
+    /// Resolve a **global** screen cell to the dock band **edge** it grabs — the
+    /// separator between a dock and the main area, the cell whose drag resizes that
+    /// dock's reserved width (left/right) or height (top/bottom). `None` if the cell
+    /// is not on any open dock's edge. The geometry mirrors [`Editor::region_geoms`]
+    /// (the inverse of the per-client band math): each open dock reserves its
+    /// content plus one separator cell toward the main area, and that separator is
+    /// the handle. The dock↔main edge is *between* regions, so [`Editor::region_at`]
+    /// (and thus [`Editor::resize_handle_at`]) never claims it — the two hit-tests
+    /// are disjoint.
+    fn dock_handle_at(&self, row: usize, col: usize) -> Option<DockSide> {
+        let bands = self.dock_bands();
+        let main_tabline = self.tabline_rows();
+        let gstatus = self.global_statusline_rows();
+        let chrome = main_tabline + self.panel_rows() + gstatus;
+        // The middle band (left dock | main | right dock): its top row and height.
+        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_h = self
+            .height
+            .saturating_sub(bands.reserved_top())
+            .saturating_sub(bands.reserved_bottom())
+            .saturating_sub(chrome)
+            .max(1);
+        let in_mid = (mid_y..mid_y + mid_h).contains(&row);
+        // Left/right dock edges are vertical separators spanning the middle band;
+        // top/bottom edges are horizontal separators spanning the full width.
+        if self.dock_is_open(DockSide::Left) && bands.left > 0 && in_mid && col == bands.left {
+            return Some(DockSide::Left);
+        }
+        if self.dock_is_open(DockSide::Right) && bands.right > 0 && in_mid {
+            // The right dock occupies the right-most columns; its edge sits one cell
+            // left of its content (`width − reserved_right`).
+            let sep = self.width.saturating_sub(bands.reserved_right());
+            if col == sep {
+                return Some(DockSide::Right);
+            }
+        }
+        if self.dock_is_open(DockSide::Top) && bands.top > 0 && col < self.width && row == bands.top
+        {
+            return Some(DockSide::Top);
+        }
+        if self.dock_is_open(DockSide::Bottom) && bands.bottom > 0 && col < self.width {
+            // The bottom dock occupies the bottom-most rows of the windows area; its
+            // edge sits one row above its content (`height − reserved_bottom`).
+            let sep = self.height.saturating_sub(bands.reserved_bottom());
+            if row == sep {
+                return Some(DockSide::Bottom);
+            }
+        }
+        None
+    }
+
+    /// Begin a divider drag: stash which edge is grabbed — a dock band edge or a
+    /// window split — and the press cell the resize measures from. Clears any
+    /// pending text selection so the divider press can't leave a stale anchor
+    /// behind. A no-op (leaving `mouse_resize` unset) if the cell isn't a divider —
+    /// the dispatch guard already checked, so this only re-resolves it.
     fn mouse_begin_resize(&mut self, row: usize, col: usize) {
+        // A dock edge takes precedence: it lives between regions, where no window
+        // split can also be, so checking it first is unambiguous.
+        if let Some(side) = self.dock_handle_at(row, col) {
+            self.mouse_select = None;
+            self.mouse_resize = Some(ResizeDrag::Dock { side });
+            return;
+        }
         let Some((win, vertical)) = self.resize_handle_at(row, col) else {
             return;
         };
         self.mouse_select = None;
-        self.mouse_resize = Some(ResizeDrag {
+        self.mouse_resize = Some(ResizeDrag::Window {
             win,
             vertical,
             origin: if vertical { col } else { row },
@@ -431,29 +499,49 @@ impl Editor {
         });
     }
 
-    /// Continue a separator / status-line drag: resize the grabbed window so its
-    /// edge follows the pointer. The target offset from the press `origin` is
-    /// absolute, and `applied` records how much has been issued, so each drag sends
-    /// only the remaining delta — pushing past a window's minimum and dragging back
-    /// tracks the pointer instead of drifting.
+    /// Continue a divider drag so the grabbed edge follows the pointer. For a window
+    /// split the target offset from the press `origin` is absolute and `applied`
+    /// records how much has been issued, so each drag sends only the remaining
+    /// delta. For a dock edge the new band size is read directly from the pointer's
+    /// position. Both push past a minimum and drag back without drifting.
     fn mouse_resize_drag(&mut self, row: usize, col: usize) {
-        let Some(rd) = self.mouse_resize else {
-            return;
-        };
-        let current = if rd.vertical { col } else { row };
-        let want = current as isize - rd.origin as isize;
-        let step = want - rd.applied;
-        if step == 0 {
-            return;
-        }
-        let axis = if rd.vertical {
-            SplitDir::Vertical
-        } else {
-            SplitDir::Horizontal
-        };
-        self.resize_window_id(rd.win, axis, step);
-        if let Some(rd) = self.mouse_resize.as_mut() {
-            rd.applied = want;
+        match self.mouse_resize {
+            Some(ResizeDrag::Window {
+                win,
+                vertical,
+                origin,
+                applied,
+            }) => {
+                let current = if vertical { col } else { row };
+                let want = current as isize - origin as isize;
+                let step = want - applied;
+                if step == 0 {
+                    return;
+                }
+                let axis = if vertical {
+                    SplitDir::Vertical
+                } else {
+                    SplitDir::Horizontal
+                };
+                self.resize_window_id(win, axis, step);
+                if let Some(ResizeDrag::Window { applied, .. }) = self.mouse_resize.as_mut() {
+                    *applied = want;
+                }
+            }
+            Some(ResizeDrag::Dock { side }) => {
+                // The new size places the dock's content edge at the pointer: for
+                // left/top the content runs from 0 to the pointer; for right/bottom
+                // it runs from the pointer to the far edge. Floored at 1; `set_dock_size`
+                // / `dock_bands` clamp it back if the main area would vanish.
+                let new_size = match side {
+                    DockSide::Left => col,
+                    DockSide::Right => self.width.saturating_sub(col).saturating_sub(1),
+                    DockSide::Top => row,
+                    DockSide::Bottom => self.height.saturating_sub(row).saturating_sub(1),
+                };
+                self.set_dock_size(side, new_size.max(1));
+            }
+            None => {}
         }
     }
 

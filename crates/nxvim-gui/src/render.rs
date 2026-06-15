@@ -33,7 +33,8 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    InlayHint, PanelData, StatusSegment, Style, TabData, View, WindowRegion, WindowView,
+    Geometry, InlayHint, PanelData, ResizeCursor, StatusSegment, Style, TabData, View,
+    WindowRegion, WindowView,
 };
 use winit::window::Window;
 
@@ -329,6 +330,23 @@ impl Renderer {
     /// `CursorMoved` pixels into the cell the server's mouse hit-test expects.
     pub fn cell_at(&self, x: f64, y: f64) -> (u16, u16) {
         crate::mouse::cell_at(x, y, self.cell_w, self.cell_h)
+    }
+
+    /// The resize cursor for the pointer at physical pixel `(px, py)`, or `None`
+    /// over an ordinary cell — for showing a resize cursor while hovering a
+    /// draggable split separator or dock edge. The chrome row counts mirror
+    /// [`Self::build_frame`] so the hit-test agrees with what was painted.
+    pub fn resize_cursor_at(&self, view: &View, px: f64, py: f64) -> Option<ResizeCursor> {
+        let (col, row) = self.cell_at(px, py);
+        let (cols, total_rows) = self.grid_size();
+        let geo = Geometry {
+            cols,
+            rows: total_rows.saturating_sub(1),
+            tabline_rows: u16::from(!view.tabline.is_empty()),
+            panel_rows: view.panel.as_ref().map_or(0, |p| p.height + 1),
+            global_status_rows: u16::from(!view.global_status.is_empty()),
+        };
+        nxvim_view::resize_handle_at(view, geo, row, col)
     }
 
     /// The measured cell size in physical pixels, for turning a trackpad's
@@ -852,10 +870,15 @@ impl Renderer {
                 let full = self.full_bounds();
                 // The window's text area, so a horizontally-scrolled (or just long)
                 // line clips at this window's edge instead of spilling over the
-                // gutter on the left or the next split on the right. Gutter/sign
-                // glyphs sit left of `text_x0` and keep the whole-surface clip.
+                // gutter on the left or the next split on the right.
                 let text_clip =
                     self.text_bounds(text_x0, oy, (ox + wcols).saturating_sub(text_x0), text_rows);
+                // The whole window cell rect (gutter + sign + text). The gutter and
+                // sign glyphs sit left of `text_x0`, so they clip here rather than to
+                // the surface — a window squeezed narrower than its gutter (a dock
+                // dragged to its minimum) then truncates instead of bleeding its line
+                // numbers over the separator and the neighbouring region.
+                let win_clip = self.text_bounds(ox, oy, wcols, text_rows);
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
                 let normal_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
@@ -927,7 +950,7 @@ impl Renderer {
                                 &text,
                                 self.cell_px(ox, row as u16),
                                 color,
-                                full,
+                                win_clip,
                             );
                         }
                     }
@@ -937,7 +960,14 @@ impl Renderer {
                     if gutter > 0 {
                         if let Some(Some(n)) = win.numbers.get(i) {
                             let pos = self.cell_px(gutter_x0, row as u16);
-                            self.push_gutter(items, (*n, win.cursor_line), win, view, pos, full);
+                            self.push_gutter(
+                                items,
+                                (*n, win.cursor_line),
+                                win,
+                                view,
+                                pos,
+                                win_clip,
+                            );
                         }
                     }
 
@@ -1033,7 +1063,12 @@ impl Renderer {
         // cursor while any is active (it reappears in that widget). While sliding it
         // tracks the interpolated cursor line so it moves with the text.
         let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
-        if win.focused && view.panel.is_none() && !view.command_mode && !picker_open {
+        if win.focused
+            && view.panel.is_none()
+            && !view.command_mode
+            && !picker_open
+            && text_rows > 0
+        {
             // The cursor shifts right by the inlay hints spliced in at or before its
             // column (a hint exactly at the cursor sits before the cursor glyph), so
             // it tracks the splice. Mid-slide that's the band's hints on the cursor's
@@ -1053,11 +1088,20 @@ impl Renderer {
                     inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
                 }
             };
-            let cx = col_to_screen(text_x0, win.cursor_screen_col, win.leftcol) + cur_shift;
+            // Clamp to the window's text area so a tiny window (a dock dragged to its
+            // minimum, or a split squeezed to a few cells) never paints the cursor on
+            // its status row or over the next region — quads aren't scissored, so the
+            // clamp is what keeps it in bounds (mirrors the TUI's cursor clamp).
+            let cx = (col_to_screen(text_x0, win.cursor_screen_col, win.leftcol) + cur_shift)
+                .min((ox + wcols).saturating_sub(1));
             let px = cx as f32 * self.cell_w;
+            let last_row = text_rows.saturating_sub(1);
             let py = match scroll {
-                Some(s) => (oy as f32 + (s.cursor - s.top)) * self.cell_h,
-                None => (oy + win.cursor_row) as f32 * self.cell_h,
+                Some(s) => {
+                    let r = (s.cursor - s.top).clamp(0.0, last_row as f32);
+                    (oy as f32 + r) * self.cell_h
+                }
+                None => (oy + win.cursor_row.min(last_row)) as f32 * self.cell_h,
             };
             // In MultiCursor placement mode the active (primary) cursor wears the
             // multi-cursor accent, distinct from the secondaries, so it reads as
@@ -1247,6 +1291,7 @@ impl Renderer {
             view.current_tab,
             0,
             0,
+            cols,
             base_bg,
             base_fg,
             quads,
@@ -1266,21 +1311,29 @@ impl Renderer {
         current: usize,
         x0: u16,
         row: u16,
+        right: u16,
         base_bg: u32,
         base_fg: u32,
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
+        // Clip every cell glyph to the strip's `[x0, right)` span so a dock tabline
+        // in a band squeezed narrower than its labels (a vertical dock dragged to its
+        // minimum) truncates at the band edge instead of bleeding over the separator
+        // and the main area. For the full-width main tabline this is a no-op.
+        let clip = self.text_bounds(x0, row, right.saturating_sub(x0), 1);
         let mut col = x0;
-        if !title.is_empty() {
+        if !title.is_empty() && col < right {
             let text = format!(" {title} ");
             let w = text.chars().count() as u16;
             let pos = self.cell_px(col, row);
-            let full = self.full_bounds();
-            self.push_plain(items, &text, pos, base_fg, full);
+            self.push_plain(items, &text, pos, base_fg, clip);
             col = col.saturating_add(w);
         }
         for (i, tab) in tabs.iter().enumerate() {
+            if col >= right {
+                break; // ran off the end of the strip — the rest is clipped away
+            }
             let count = if tab.window_count > 1 {
                 format!("{} ", tab.window_count)
             } else {
@@ -1289,18 +1342,19 @@ impl Renderer {
             let modified = if tab.modified { "+" } else { "" };
             let text = format!(" {count}{}{modified} ", tab.label);
             let w = text.chars().count() as u16;
-            // The active cell is reverse-video: the status fg becomes its ground.
+            // The active cell is reverse-video: the status fg becomes its ground. The
+            // fill is a quad (unscissored), so clamp its width to the strip edge.
             let fg = if i == current {
-                if w > 0 {
-                    self.fill_cells(quads, col, row, w, base_fg);
+                let fill_w = w.min(right.saturating_sub(col));
+                if fill_w > 0 {
+                    self.fill_cells(quads, col, row, fill_w, base_fg);
                 }
                 base_bg
             } else {
                 base_fg
             };
             let pos = self.cell_px(col, row);
-            let full = self.full_bounds();
-            self.push_plain(items, &text, pos, fg, full);
+            self.push_plain(items, &text, pos, fg, clip);
             col = col.saturating_add(w);
         }
     }
@@ -1321,7 +1375,16 @@ impl Renderer {
             if present && !rt.tabs.is_empty() {
                 self.fill_cells(quads, x0, row, width, base_bg);
                 self.build_tab_cells(
-                    &rt.title, &rt.tabs, rt.current, x0, row, base_bg, base_fg, quads, items,
+                    &rt.title,
+                    &rt.tabs,
+                    rt.current,
+                    x0,
+                    row,
+                    x0 + width,
+                    base_bg,
+                    base_fg,
+                    quads,
+                    items,
                 );
             }
         }

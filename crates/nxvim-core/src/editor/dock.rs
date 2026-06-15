@@ -327,6 +327,16 @@ impl Editor {
         DockSide::from_keyword(side).is_some_and(|s| self.dock_is_open(s))
     }
 
+    /// Set a dock's reserved size (columns for left/right, rows for top/bottom),
+    /// floored at 1, then relayout. The shared core of the `size` dock option and
+    /// the mouse edge-drag resize (`mouse_resize_drag`). [`Editor::dock_bands`]
+    /// clamps the stored value down at render time if the main area would vanish.
+    pub(crate) fn set_dock_size(&mut self, side: DockSide, size: usize) {
+        self.dock_sizes[side.idx()] = size.max(1);
+        self.relayout();
+        self.ensure_visible();
+    }
+
     /// `nx.dock.opt(side).<name> = <number>` — set a numeric dock option by side
     /// keyword: `showtabline` (0/1/2, the per-dock override) or `size` (the dock's
     /// reserved width/height, kept in `dock_sizes`). An unknown side or option is

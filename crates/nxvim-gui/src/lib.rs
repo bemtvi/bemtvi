@@ -57,14 +57,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_view::{encode_paste, HlSpan, InlayHint, ScrollData, Style, View};
+use nxvim_view::{encode_paste, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View};
 use rmpv::Value;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use render::{Renderer, ScrollFrame};
 
@@ -475,6 +475,10 @@ struct App {
     /// The cell the last left-drag was reported at, so motion within one cell is
     /// coalesced to a single drag (the server works in cells, not pixels).
     last_drag_cell: Option<(u16, u16)>,
+    /// The resize cursor currently shown (over a draggable separator / dock edge),
+    /// or `None` for the default arrow. Tracked so a hover only calls winit's
+    /// `set_cursor` when the shape actually changes, not on every pointer move.
+    resize_hint: Option<ResizeCursor>,
     /// While the left button is held with the pointer in the top/bottom edge band,
     /// the cell to re-issue the drag at so the buffer keeps auto-scrolling without
     /// further pointer motion. `None` when not at an edge or the button is up.
@@ -537,6 +541,7 @@ impl App {
             cursor_px: (0.0, 0.0),
             mouse_down: false,
             last_drag_cell: None,
+            resize_hint: None,
             autoscroll: None,
             autoscroll_deadline: None,
             wheel_accum: (0.0, 0.0),
@@ -775,6 +780,32 @@ impl App {
         } else {
             self.autoscroll = None;
             self.autoscroll_deadline = None;
+        }
+    }
+
+    /// Update the pointer shape on hover: a resize cursor over a draggable split
+    /// separator or dock edge, the default arrow elsewhere. A no-op while a button
+    /// is held (a drag in progress keeps its grab cursor) and only touches winit
+    /// when the shape changes, so an ordinary move over text costs nothing.
+    fn update_resize_cursor(&mut self) {
+        if self.mouse_down {
+            return;
+        }
+        let hint = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.resize_cursor_at(&self.view, self.cursor_px.0, self.cursor_px.1));
+        if hint == self.resize_hint {
+            return;
+        }
+        self.resize_hint = hint;
+        if let Some(window) = self.window.as_ref() {
+            let icon = match hint {
+                Some(ResizeCursor::Col) => CursorIcon::EwResize,
+                Some(ResizeCursor::Row) => CursorIcon::NsResize,
+                None => CursorIcon::Default,
+            };
+            window.set_cursor(icon);
         }
     }
 
@@ -1169,6 +1200,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
                 self.mouse_drag();
+                self.update_resize_cursor();
             }
             WindowEvent::MouseInput {
                 state,

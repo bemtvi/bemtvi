@@ -1257,6 +1257,135 @@ async fn wheel_over_a_dock_scrolls_it_without_focus() {
     assert_eq!(current_win(&rpc).await, main_win, "focus did not move");
 }
 
+/// Dragging the **edge** of a left dock (the separator between it and the main
+/// area) resizes the dock band itself — growing the dock and shrinking main —
+/// without moving focus or starting a selection.
+#[tokio::test]
+async fn drag_left_dock_edge_resizes_the_band() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // A left dock of width 20: content cols 0..20, its edge separator at col 20.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "<C-w><C-w>l"); // cross to main so the dock is not focused
+    let main_win = current_win(&rpc).await;
+    let dock_win = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != main_win)
+        .expect("a dock window");
+    assert_eq!(win_width(&rpc, dock_win).await, 20);
+
+    // Grab the edge at col 20 and drag it 6 cells right.
+    feed_mouse(&rpc, "left", "press", 2, 20);
+    feed_mouse(&rpc, "left", "drag", 2, 26);
+    feed_mouse(&rpc, "left", "release", 2, 26);
+
+    assert_eq!(
+        win_width(&rpc, dock_win).await,
+        26,
+        "the dock band grew to follow the pointer"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        main_win,
+        "the drag didn't move focus"
+    );
+    assert_eq!(mode(&rpc).await, "n", "the drag didn't start a selection");
+}
+
+/// The dock edge drag is absolute against the pointer: dragging the edge back
+/// past the press point shrinks the dock again (it tracks both ways).
+#[tokio::test]
+async fn drag_left_dock_edge_back_shrinks() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "<C-w><C-w>l");
+    let main_win = current_win(&rpc).await;
+    let dock_win = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != main_win)
+        .expect("a dock window");
+    feed_mouse(&rpc, "left", "press", 2, 20);
+    feed_mouse(&rpc, "left", "drag", 2, 30); // grow to 30
+    feed_mouse(&rpc, "left", "drag", 2, 12); // back past the origin → 12
+    feed_mouse(&rpc, "left", "release", 2, 12);
+    assert_eq!(
+        win_width(&rpc, dock_win).await,
+        12,
+        "the dock tracked the pointer back"
+    );
+}
+
+/// Dragging the edge of a **right** dock resizes it the mirrored way: dragging
+/// the edge left (toward main) grows the right dock.
+#[tokio::test]
+async fn drag_right_dock_edge_resizes_the_band() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // A right dock of width 20: it occupies the right-most columns, its edge
+    // separator sits at col 80 - 20 - 1 = 59.
+    exec_lua(&rpc, "nx.dock.open{ side = 'right', size = 20 }").await;
+    feed(&rpc, "<C-w><C-w>h"); // cross to main so the dock is not focused
+    let main_win = current_win(&rpc).await;
+    let dock_win = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != main_win)
+        .expect("a dock window");
+    assert_eq!(win_width(&rpc, dock_win).await, 20);
+
+    // Grab the edge at col 59 and drag it 5 cells left → right dock grows to 25.
+    feed_mouse(&rpc, "left", "press", 2, 59);
+    feed_mouse(&rpc, "left", "drag", 2, 54);
+    feed_mouse(&rpc, "left", "release", 2, 54);
+    assert_eq!(
+        win_width(&rpc, dock_win).await,
+        25,
+        "the right dock grew as its edge moved toward main"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        main_win,
+        "the drag didn't move focus"
+    );
+}
+
+/// Dragging the edge of a **bottom** dock up grows it (height), mirroring the
+/// horizontal-dock geometry.
+#[tokio::test]
+async fn drag_bottom_dock_edge_resizes_the_band() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 6 }").await;
+    feed(&rpc, "<C-w><C-w>k"); // cross to main so the dock is not focused
+    let main_win = current_win(&rpc).await;
+    let dock_win = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != main_win)
+        .expect("a dock window");
+    // The dock window's text height is its band size minus its own status row.
+    let h0 = win_height(&rpc, dock_win).await;
+    // The main window sits at the top (row 0); its rect spans its text plus its
+    // status row, so the bottom dock's edge separator is the row just past it.
+    let sep_row = win_height(&rpc, main_win).await as usize + 1;
+    feed_mouse(&rpc, "left", "press", sep_row, 5);
+    feed_mouse(&rpc, "left", "drag", sep_row - 4, 5); // drag the edge up 4 rows
+    feed_mouse(&rpc, "left", "release", sep_row - 4, 5);
+    assert_eq!(
+        win_height(&rpc, dock_win).await,
+        h0 + 4,
+        "the bottom dock grew as its edge moved up"
+    );
+    assert_eq!(
+        current_win(&rpc).await,
+        main_win,
+        "the drag didn't move focus"
+    );
+}
+
 /// Dragging a split divider *inside* a dock resizes that dock's windows — from the
 /// main area, without crossing focus (the region-aware resize hit-test).
 #[tokio::test]

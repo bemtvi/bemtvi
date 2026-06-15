@@ -13,11 +13,13 @@
 //! - A neutral [`Style`] / [`Border`] each client converts to its own toolkit.
 //! - Input encoding: the [`Key`] enum, [`notation`], and [`encode_paste`].
 
+mod hit_test;
 mod keys;
 mod parse;
 mod style;
 mod view;
 
+pub use hit_test::{resize_handle_at, Geometry, ResizeCursor};
 pub use keys::{encode_paste, notation, Key};
 pub use parse::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans,

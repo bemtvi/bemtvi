@@ -1394,6 +1394,47 @@
     }
     function mods(e) { return (e.ctrlKey ? "C" : "") + (e.shiftKey ? "S" : "") + (e.altKey ? "A" : ""); }
 
+    // Whether the cell (row, col) is over a draggable separator — a window-split
+    // divider, a status row above one, or a dock band edge — and which way it
+    // resizes ("col"/"row"/null). Mirrors nxvim-view's `resize_handle_at` (and the
+    // server's hit-test) on the client `view`, so a hover shows a resize cursor
+    // without a round-trip. Reuses the same `dockGeo`/`regionOrigin` the renderer
+    // uses to place the regions, run backwards from a cell.
+    function resizeHandleAt(row, col) {
+      if (!view || !view.windows) return null;
+      const hasTabline = serverStyled
+        ? (view.tabline_segments?.length || view.tabline.length)
+        : view.tabline.length;
+      const tablineRows = hasTabline ? 1 : 0;
+      const g = dockGeo(tablineRows);
+      const res = (n) => (n > 0 ? n + 1 : 0);
+      // Dock band edges sit between a dock and the main area.
+      const inMid = row >= g.midY && row < g.midY + g.midH;
+      if (g.dl > 0 && inMid && col === g.dl) return "col";
+      if (g.dr > 0 && inMid && col === cols - res(g.dr)) return "col";
+      if (g.dt > 0 && col < cols && row === g.dt) return "row";
+      if (g.db > 0 && col < cols && row === editorRows - res(g.db)) return "row";
+      // Split separators (and the status row one cell above a horizontal one).
+      for (const s of (view.separators || [])) {
+        const o = regionOrigin(s.region, tablineRows);
+        if (s.vertical) {
+          if (col === o.x + s.x && row >= o.y + s.y && row < o.y + s.y + s.length) return "col";
+        } else {
+          const sy = o.y + s.y;
+          const inX = col >= o.x + s.x && col < o.x + s.x + s.length;
+          if (inX && (row === sy || row + 1 === sy)) return "row";
+        }
+      }
+      return null;
+    }
+    // Set the grid's hover cursor from the cell under the pointer (left as-is while
+    // a drag is in progress — that keeps the cursor it grabbed with).
+    function updateResizeCursor(e) {
+      const { row, col } = cellAt(e);
+      const h = resizeHandleAt(row, col);
+      gridEl.style.cursor = h === "col" ? "col-resize" : h === "row" ? "row-resize" : "";
+    }
+
     // Drag-select autoscroll: re-send the held drag on a timer while it sits in the
     // top/bottom band, since the browser fires no mousemove while the pointer is still.
     const AUTOSCROLL_MS = 40;
@@ -1428,7 +1469,7 @@
       mouseOp(button, "press", mods(e), row, col);
     });
     gridEl.addEventListener("mousemove", (e) => {
-      if (!dragBtn) return;
+      if (!dragBtn) { updateResizeCursor(e); return; }
       const { row, col } = cellAt(e);
       // Only a drag into a *new* cell is meaningful; within-cell jitter is noise and
       // must not emit a drag (which the core would read as the start of a selection).

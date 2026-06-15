@@ -274,6 +274,8 @@ pub struct GoMirror {
     /// `'scrollanimduration'` — the scroll-animation duration ceiling in ms (`0`
     /// disables). Backs `vim.o.scrollanimduration`.
     pub scrollanimduration: u64,
+    /// `'scrollback'` — the terminal scrollback cap in rows. Backs `vim.o.scrollback`.
+    pub scrollback: u64,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
     /// float-positioning plugin can center its windows.
     pub columns: u64,

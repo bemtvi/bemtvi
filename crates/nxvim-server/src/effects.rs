@@ -1010,6 +1010,7 @@ impl EditHost {
             autoread: go.autoread,
             scrollanim: go.scrollanim,
             scrollanimduration: go.scrollanimduration as u64,
+            scrollback: go.scrollback as u64,
             columns: columns as u64,
             lines: lines as u64,
         });

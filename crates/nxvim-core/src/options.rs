@@ -105,6 +105,10 @@ pub struct Options {
     /// distance and is clamped to this ceiling; `0` disables animation entirely
     /// (equivalent to `noscrollanim`). Default `160`.
     pub scrollanimduration: usize,
+    /// The maximum number of scrolled-off lines a `:terminal` keeps in scrollback
+    /// (neovim's `'scrollback'`; default `10000`). `0` keeps none. Read when a
+    /// terminal opens; changing it affects terminals opened afterward.
+    pub scrollback: usize,
 }
 
 impl Default for Options {
@@ -148,6 +152,8 @@ impl Default for Options {
             // 160ms — the per-scroll duration scales with distance up to this.
             scrollanim: true,
             scrollanimduration: 160,
+            // Keep 10000 scrolled-off terminal lines, matching neovim's default.
+            scrollback: 10_000,
         }
     }
 }
@@ -560,6 +566,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "bomb" => Some(("bomb", Bool)),
         "scrollanim" | "sca" => Some(("scrollanim", Bool)),
         "scrollanimduration" | "scad" => Some(("scrollanimduration", Num)),
+        "scrollback" | "scbk" => Some(("scrollback", Num)),
         // Buffer-local: drives the treesitter language override rather than a
         // global string slot (handled specially in `apply_set_str`).
         "filetype" | "ft" => Some(("filetype", Str)),

@@ -1020,7 +1020,7 @@ impl Editor {
         // `mousetime` is an unbounded non-negative millisecond count — it doesn't
         // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
         // so handle it before the bounded block.
-        if name == "mousetime" || name == "scrollanimduration" {
+        if name == "mousetime" || name == "scrollanimduration" || name == "scrollback" {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));
                 return;
@@ -1028,6 +1028,7 @@ impl Editor {
             match name {
                 "mousetime" => self.options.mousetime = value as usize,
                 "scrollanimduration" => self.options.scrollanimduration = value as usize,
+                "scrollback" => self.options.scrollback = value as usize,
                 _ => unreachable!("guarded above"),
             }
             return;

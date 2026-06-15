@@ -32,13 +32,15 @@ const ESC_CHORD_WINDOW_MS: u64 = 500;
 pub enum TerminalOp {
     /// Spawn a PTY child for `buf`, sized `rows`×`cols`, running `argv` in `cwd`.
     /// An empty `argv` means the server's default shell; `cwd` `None` inherits the
-    /// server's working directory.
+    /// server's working directory. `scrollback` is the `'scrollback'` cap to give the
+    /// emulator (rows kept after they scroll off the screen).
     Open {
         buf: BufferId,
         argv: Vec<String>,
         cwd: Option<String>,
         rows: u16,
         cols: u16,
+        scrollback: usize,
     },
     /// Forward input bytes (a translated keystroke or paste) to `buf`'s PTY child.
     Send { buf: BufferId, bytes: Vec<u8> },
@@ -92,6 +94,7 @@ impl Editor {
             cwd,
             rows,
             cols,
+            scrollback: self.options.scrollback,
         });
     }
 

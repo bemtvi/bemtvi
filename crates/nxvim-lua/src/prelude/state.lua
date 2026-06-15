@@ -129,6 +129,8 @@ local O_GLOBAL = {
   sca = "scrollanim",
   scrollanimduration = "scrollanimduration",
   scad = "scrollanimduration",
+  scrollback = "scrollback",
+  scbk = "scrollback",
   -- The editor screen extent (the server pushes the live size into the mirror);
   -- read-mostly here — a float-positioning plugin reads them to
   -- center its windows, and `:set columns=` is not honored (the client owns the
@@ -154,6 +156,7 @@ local O_GLOBAL_DEFAULT = {
   fileencodings = "ucs-bom,utf-8,latin1",
   scrollanim = true,
   scrollanimduration = 160,
+  scrollback = 10000,
   columns = 80,
   lines = 24,
 }

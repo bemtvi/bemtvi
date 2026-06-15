@@ -20,11 +20,6 @@ use rmpv::Value;
 use crate::redraw::StyleTable;
 use crate::EditHost;
 
-/// Scrollback limit, in rows — the neovim `'scrollback'` default. Both vt100's
-/// internal scrollback and our captured-history cache are capped here; once a
-/// terminal has scrolled this many rows the oldest fall off, matching neovim.
-const SCROLLBACK_CAP: usize = 10_000;
-
 /// The `vt100` callback sink: captures the things the screen model itself doesn't
 /// store but a real terminal must act on — the child's window title (OSC), and the
 /// **replies** to status/identity queries (`vt100` is a screen *model*, so it never
@@ -81,7 +76,7 @@ impl vt100::Callbacks for TermSink {
 pub(crate) struct TermEmu {
     /// The vt100 parser + screen grid. Fed the child's PTY bytes; queried for the
     /// row text, cursor, per-cell colors, and (via its [`TermSink`]) window title +
-    /// query replies. It also holds the scrollback ([`SCROLLBACK_CAP`] rows).
+    /// query replies. It also holds the scrollback (the `'scrollback'` cap, rows).
     parser: vt100::Parser<TermSink>,
     /// The `(rows, cols)` the emulator was last sized to, so a redraw-time resize
     /// only re-sizes (and reprojects) when the window's text area actually changed.
@@ -105,15 +100,10 @@ pub(crate) struct TermEmu {
 }
 
 impl TermEmu {
-    fn new(rows: u16, cols: u16) -> Self {
+    fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let (rows, cols) = (rows.max(1), cols.max(1));
         TermEmu {
-            parser: vt100::Parser::new_with_callbacks(
-                rows,
-                cols,
-                SCROLLBACK_CAP,
-                TermSink::default(),
-            ),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, TermSink::default()),
             last_size: (rows, cols),
             history: Vec::new(),
             history_styles: Vec::new(),
@@ -128,8 +118,9 @@ impl EditHost {
     /// Create (or reset) the vt100 emulator for terminal buffer `buf`, sized
     /// `rows`×`cols`, and project its initial (blank) screen so the buffer shows the
     /// right number of rows immediately. Called when a `:terminal` spawns its PTY.
-    pub fn terminal_open_emu(&mut self, buf: BufferId, rows: u16, cols: u16) {
-        self.terminals.insert(buf, TermEmu::new(rows, cols));
+    pub fn terminal_open_emu(&mut self, buf: BufferId, rows: u16, cols: u16, scrollback: usize) {
+        self.terminals
+            .insert(buf, TermEmu::new(rows, cols, scrollback));
         self.terminal_project(buf);
     }
 
@@ -522,10 +513,11 @@ impl EditHost {
                     cwd,
                     rows,
                     cols,
+                    scrollback,
                 } => {
                     // Build the emulator first so the very next redraw projects the
                     // (blank) screen at the right size, then spawn the PTY behind it.
-                    self.terminal_open_emu(buf, rows, cols);
+                    self.terminal_open_emu(buf, rows, cols, scrollback);
                     // `portable-pty` defaults a `None` cwd to `$HOME`; the shell should
                     // instead open in the editor's working directory, so resolve it here
                     // (the server owns process I/O — core stays pure).

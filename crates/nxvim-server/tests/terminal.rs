@@ -634,6 +634,40 @@ async fn heavy_output_stays_bounded_and_does_not_freeze() {
     );
 }
 
+/// The `'scrollback'` option caps how many scrolled-off rows a terminal keeps. Set
+/// it small before opening, flood past it, and the retained scrollback honors the
+/// configured limit instead of the 10000 default. Read when the terminal opens.
+#[tokio::test]
+async fn scrollback_option_caps_the_history() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await; // 80x24
+
+    // Configure a small scrollback before opening the terminal.
+    exec_lua(&rpc, "vim.o.scrollback = 50").await;
+    let body: String = (1..=500).map(|i| format!("line{i}\n")).collect();
+    let path = write_temp("term_scbk", "txt", &body);
+    command(&rpc, &format!("terminal cat {path} -")).await;
+    wait_lines(&rpc, "the last line", |ls| has_line(ls, "line500")).await;
+
+    feed(&rpc, "<C-\\><C-n>G");
+    let lc = line_count(&rpc).await;
+    assert!(
+        lc <= 50 + 30,
+        "scrollback should honor the configured cap of 50, got {lc} lines"
+    );
+    // And it's the most recent output, not the start.
+    let top: usize = lines_range(&rpc, 0, 1)
+        .await
+        .first()
+        .and_then(|l| l.trim().strip_prefix("line"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        top > 400,
+        "kept the most recent ~50 lines, top is line {top}"
+    );
+}
+
 /// The `fg` color (`0xRRGGBB`) of the first highlight span in the focused
 /// window's `highlights`, resolved through the frame's `styles` palette, or
 /// `None` if there is no styled span yet.

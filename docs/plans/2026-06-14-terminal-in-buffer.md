@@ -143,8 +143,10 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   `Screen::set_scrollback`) vs. accumulating scrolled-off rows ourselves; pick whichever gives
   faithful per-cell styles for history, and capture the choice here.
 
-  **Decision (implemented):** vt100 owns the scrollback (`scrollback_len = SCROLLBACK_CAP = 10000`,
-  matching neovim); accumulating rows into its internal `VecDeque` is cheap. The buffer **always**
+  **Decision (implemented):** vt100 owns the scrollback, sized to the **`'scrollback'` option**
+  (default 10000, matching neovim — a global numeric option, read when the terminal opens and
+  threaded through `TerminalOp::Open`; settable via `:set scrollback=N` / `vim.o.scrollback`);
+  accumulating rows into its internal `VecDeque` is cheap. The buffer **always**
   mirrors the full `history ++ live screen` (like neovim) — *not* a screen-only-while-live /
   full-while-browsing flip. An earlier lazy design did flip, and was fast, but made the cursor and
   line numbers jump across `<C-\><C-n>` / `i` (the live screen-only buffer numbered the input line

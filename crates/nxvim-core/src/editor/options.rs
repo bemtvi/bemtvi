@@ -121,6 +121,7 @@ impl Editor {
                     || name == "laststatus"
                     || name == "mousetime"
                     || name == "scrollanimduration"
+                    || name == "scrollback"
                 {
                     self.set_global_option_num(name, v);
                     return;
@@ -157,6 +158,7 @@ impl Editor {
                     "laststatus" => self.options.laststatus as i64,
                     "mousetime" => self.options.mousetime as i64,
                     "scrollanimduration" => self.options.scrollanimduration as i64,
+                    "scrollback" => self.options.scrollback as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {

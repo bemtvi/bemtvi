@@ -88,11 +88,16 @@ pub(crate) struct TermEmu {
     last_size: (u16, u16),
     /// The scrollback rows' **text**, oldest first — the buffer's leading lines
     /// (before the live screen). The buffer always mirrors `history ++ screen`, so
-    /// line numbers and the cursor are stable across mode changes (like neovim). Only
-    /// the *text* is kept (not per-cell color): coloring 10k+ scrolled rows on every
-    /// frame is prohibitively expensive, so scrollback renders monochrome while the
-    /// live screen keeps full color (Phase 4).
+    /// line numbers and the cursor are stable across mode changes (like neovim). Text
+    /// is cheap to keep current every frame; per-cell color is *not* (see below).
     history: Vec<String>,
+    /// Per-cell color runs for the history rows, index-aligned with `history` — but
+    /// materialized **only while browsing** (terminal-normal). Coloring 10k+ scrolled
+    /// rows on every frame of a live flood is prohibitively expensive, and the live
+    /// screen (always colored, Phase 4) is what's on screen then anyway. So during
+    /// live output this stays empty (history renders monochrome) and is filled lazily
+    /// when the user leaves terminal-insert to read history. Empty ⇒ not materialized.
+    history_styles: Vec<Vec<(u16, u16, Style)>>,
     /// vt100's scrollback length at the last projection. The history mirror is
     /// re-read from vt100 only when this changes (something scrolled); an unchanged
     /// length means only the live screen moved, so we rewrite just that region.
@@ -111,6 +116,7 @@ impl TermEmu {
             ),
             last_size: (rows, cols),
             history: Vec::new(),
+            history_styles: Vec::new(),
             // usize::MAX forces the first projection to read the (empty) scrollback
             // and lay out the full buffer.
             last_held: usize::MAX,
@@ -201,6 +207,9 @@ impl EditHost {
             emu.history = read_scrollback_text(emu.parser.screen_mut(), held, rows, cols);
             emu.parser.screen_mut().set_scrollback(0); // restore the live view
             emu.last_held = held;
+            // History changed; any browse-time color cache is stale. It is re-filled
+            // lazily by `sync_terminal_styles` on the next browsing frame.
+            emu.history_styles.clear();
         }
 
         let screen = emu.parser.screen();
@@ -223,6 +232,37 @@ impl EditHost {
         if let Some(title) = title {
             self.editor.terminal_set_title(buf, &title);
         }
+    }
+
+    /// Materialize the focused terminal's history color while **browsing** (the buffer
+    /// is a terminal but the user has left terminal-job mode to navigate), and drop it
+    /// while output is live. Called each redraw. Reading per-cell color out of vt100's
+    /// scrollback is `O(retained rows)`, so we do it only here — never on the live
+    /// flood path — and only once per scrollback state (the cache is index-aligned with
+    /// `history` and rebuilt only when it has gone stale, i.e. its length no longer
+    /// matches). The result is colored scrollback when you read it, with no cost while
+    /// it streams.
+    pub(crate) fn sync_terminal_styles(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        let browsing = self.editor.mode != nxvim_core::Mode::Terminal;
+        let Some(emu) = self.terminals.get_mut(&buf) else {
+            return;
+        };
+        if !browsing {
+            emu.history_styles.clear(); // live: history is monochrome
+            return;
+        }
+        if emu.history_styles.len() == emu.history.len() {
+            return; // already materialized for the current scrollback
+        }
+        let (rows, cols) = emu.parser.screen().size();
+        let held = {
+            let screen = emu.parser.screen_mut();
+            screen.set_scrollback(usize::MAX);
+            screen.scrollback()
+        };
+        emu.history_styles = read_scrollback_styles(emu.parser.screen_mut(), held, rows, cols);
+        emu.parser.screen_mut().set_scrollback(0); // restore the live view
     }
 
     /// Project terminal buffer `buf`'s grid colors into a redraw `highlights`
@@ -252,17 +292,22 @@ impl EditHost {
             .iter()
             .map(|num| {
                 // `numbers` are 1-based buffer lines. A history row (idx < hist_len)
-                // renders monochrome (we keep only its text); a live screen row
-                // (idx - hist_len) reads its colors straight off the vt100 grid.
+                // uses its browse-time color cache (empty while output is live, so
+                // monochrome then); a live screen row (idx - hist_len) reads its colors
+                // straight off the vt100 grid.
                 let Some(idx) = num.map(|n| n - 1) else {
                     return Value::Array(Vec::new());
                 };
-                if idx < hist_len {
-                    return Value::Array(Vec::new());
-                }
-                let runs = match u16::try_from(idx - hist_len) {
-                    Ok(row) if row < rows => row_spans(screen, row, cols),
-                    _ => return Value::Array(Vec::new()),
+                let runs = if idx < hist_len {
+                    match emu.history_styles.get(idx) {
+                        Some(runs) => runs.clone(),
+                        None => return Value::Array(Vec::new()),
+                    }
+                } else {
+                    match u16::try_from(idx - hist_len) {
+                        Ok(row) if row < rows => row_spans(screen, row, cols),
+                        _ => return Value::Array(Vec::new()),
+                    }
                 };
                 let mut spans: Vec<Value> = Vec::new();
                 for (start, end, style) in runs {
@@ -294,6 +339,31 @@ fn read_scrollback_text(
         screen.set_scrollback(k);
         let take = k.min(rows as usize).min(held - idx);
         out.extend(screen.rows(0, cols).take(take));
+        idx += take;
+    }
+    out
+}
+
+/// Read vt100's retained scrollback as per-row coalesced color runs, oldest first —
+/// the browse-time twin of [`read_scrollback_text`]. Paged the same way through the
+/// view-window; reads each row's cells (`O(retained rows × cols)`), which is why the
+/// caller only invokes it while browsing, never on the live flood path. The caller
+/// restores the offset to the live view afterward.
+fn read_scrollback_styles(
+    screen: &mut vt100::Screen,
+    held: usize,
+    rows: u16,
+    cols: u16,
+) -> Vec<Vec<(u16, u16, Style)>> {
+    let mut out = Vec::with_capacity(held);
+    let mut idx = 0;
+    while idx < held {
+        let k = held - idx;
+        screen.set_scrollback(k);
+        let take = k.min(rows as usize).min(held - idx);
+        for r in 0..take {
+            out.push(row_spans(screen, r as u16, cols));
+        }
         idx += take;
     }
     out

@@ -162,11 +162,16 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
     splice from `replace_from = 0`. The text read is bounded by the cap (≤10000 rows); a flood does
     it once per frame (frames bounded by the 256 KiB repaint batching), so it stays fast.
 
-  **History is text-only (monochrome); the live screen keeps full color (Phase 4).** Capturing
-  per-cell styles for the whole scrollback every frame was measured at ~32s (debug) / unusable for
-  500k — the per-cell reads explode. Dropping scrollback color is the deliberate trade; the visible
-  live screen, where color matters most, is unaffected. Measured always-full: 100k ≈ 0.18s, 500k ≈
-  0.67s (release), buffer capped near 10k rows. `Editor::terminal_update` takes `(replace_from,
+  **History color is materialized lazily, only while browsing.** The buffer *text* is always full
+  (cheap to keep current every frame), but per-cell color for scrolled-off rows is expensive —
+  reading the whole scrollback's cells every frame measured ~32s (debug) for 500k. So `history`
+  text carries no color on the hot path; a separate `history_styles` cache (index-aligned) is filled
+  by `sync_terminal_styles` (a redraw hook) **only when the focused terminal is being browsed**
+  (mode ≠ Terminal) and only when stale (its length no longer matches `history`). During a live
+  flood the user is looking at the live screen (always colored, Phase 4) and `history_styles` stays
+  empty (monochrome history, zero cost); the moment they `<C-\><C-n>` to read history, its color is
+  materialized once (`O(retained rows)`). Measured always-full live flood: 100k ≈ 0.18s, 500k ≈
+  0.5s (release), buffer capped near 10k rows. `Editor::terminal_update` takes `(replace_from,
   tail)` and splices that region, enabling the screen-only-region rewrite on no-scroll frames.
 
 ## Phase 7 — Web terminal over the daemon (`nxvim-edithost` + daemon, wasm-gated)

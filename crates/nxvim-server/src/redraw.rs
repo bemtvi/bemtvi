@@ -31,6 +31,9 @@ impl EditHost {
         // the wasm terminal resize rides the daemon leg (Phase 7).
         #[cfg(feature = "native")]
         self.sync_terminal_sizes();
+        // Color the focused terminal's scrollback only while it's being browsed (never
+        // on the live flood path); a no-op when output is live or already materialized.
+        self.sync_terminal_styles();
         let view = self.editor.view(w, h);
 
         // Refresh the current buffer's highlights from the in-process engine for

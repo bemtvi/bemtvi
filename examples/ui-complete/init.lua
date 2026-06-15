@@ -12,10 +12,13 @@
 -- matcher (matched chars are highlighted), navigation, and the accept-edit. No
 -- input loop runs in Lua (ADR 0002 rule 4).
 --
--- This phase (4-A) ships the built-in `buffer` source — a rope-side scan of the
--- words already in your buffer. The `lsp` / `snippets` sources, plugin sources,
--- and the docs preview land in later sub-phases; referencing them here fails loud
--- on purpose (try it: add `{ "lsp" }` to `sources` below).
+-- The built-in `buffer` source (Phase 4-A) is a rope-side scan of the words
+-- already in your buffer — pure core, no Lua per keystroke. Phase 4-B adds
+-- `nx.complete.source{}`: register your own ASYNC source whose `complete` function
+-- streams candidates for the current prefix off the input path (debounced,
+-- generation-gated, so a reply for a prefix you've typed past is dropped). The
+-- `lsp` / `snippets` built-ins and the docs preview land in later sub-phases;
+-- referencing an unregistered source name in `sources` fails loud on purpose.
 --
 -- In insert mode, once you've typed `min_chars` of a word that prefixes another
 -- word in the buffer, a popup appears. It opens with NOTHING selected (noselect,
@@ -30,16 +33,50 @@
 vim.g.mapleader = "\\"
 
 --------------------------------------------------------------------------------
--- Enable the engine. `sources` lists the built-ins to draw from (only `buffer`
--- exists this phase). `min_chars` gates how long a prefix must be before the
--- popup opens; `auto` (default true) completes as you type. `keys` overrides any
--- of the four control actions — here we ALSO bind <CR> to accept, for folks who
--- prefer Enter-to-confirm (the default leaves <CR> as a literal newline so it
--- never eats a line break unexpectedly).
+-- A plugin ASYNC source (Phase 4-B). `complete(ctx, push, done)` runs off the
+-- input path: it receives the live prefix in `ctx.prefix`, streams matching
+-- candidates via `push` (a string, or `{ text = label, insert = applied-text }`),
+-- and calls `done()` when finished. Here it offers a small fixed keyword set — but
+-- the same shape drives an LSP/HTTP/`nx.spawn` source: register a `ctx.on_cancel`
+-- reaper and the engine kills the in-flight job when you type past the prefix.
+--------------------------------------------------------------------------------
+local KEYWORDS = {
+  "function",
+  "return",
+  "require",
+  "completion",
+  "connection",
+  "configuration",
+}
+nx.complete.source {
+  name = "keywords",
+  -- Trailing delay (ms) before this source runs after a keystroke; coalesces a
+  -- fast typist's keystrokes into one query. `0` would run on every key.
+  debounce = 80,
+  complete = function(ctx, push, done)
+    for _, kw in ipairs(KEYWORDS) do
+      -- Only offer keywords that actually extend the prefix — a faithful source
+      -- reacts to its input rather than dumping a canned list.
+      if kw ~= ctx.prefix and kw:sub(1, #ctx.prefix) == ctx.prefix then
+        push(kw)
+      end
+    end
+    done()
+  end,
+}
+
+--------------------------------------------------------------------------------
+-- Enable the engine. `sources` lists the sources to draw from — the native
+-- `buffer` built-in plus the `keywords` source registered above. `min_chars`
+-- gates how long a prefix must be before the popup opens; `auto` (default true)
+-- completes as you type. `keys` overrides any of the four control actions — here
+-- we ALSO bind <CR> to accept, for folks who prefer Enter-to-confirm (the default
+-- leaves <CR> as a literal newline so it never eats a line break unexpectedly).
 --------------------------------------------------------------------------------
 nx.complete.setup {
   sources = {
     { "buffer", min_chars = 2 },
+    { "keywords" },
   },
   auto = true,
   keys = {
@@ -58,4 +95,6 @@ nx.complete.setup {
 
 -- Try it: open the sample, enter insert mode, and start retyping one of the long
 -- identifiers (`config`, `connection`, `completion`, …). The popup offers the
--- matching words from the buffer; <C-y> accepts.
+-- matching words from the buffer AND the `keywords` async source (e.g. type
+-- `conn` to see `connection` from both, or `func` to get `function`); <C-y>
+-- accepts. The async source runs ~80 ms after you pause typing.

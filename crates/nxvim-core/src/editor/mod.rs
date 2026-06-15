@@ -62,7 +62,7 @@ pub(crate) use self::command::{
     DockChord, FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand,
     Stage,
 };
-pub use self::complete::{CompleteConfig, CompleteKeys};
+pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::menu::{
     MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
@@ -794,6 +794,18 @@ pub struct Editor {
     /// Disabled until a config arrives, so an editor with no completion config is
     /// byte-for-byte unchanged. See [`complete`](crate::editor::complete).
     complete_config: complete::CompleteConfig,
+    /// Completion triggers awaiting an **async** source run: each `(generation,
+    /// ctx)`. Empty unless `nx.complete.setup` configured at least one async
+    /// source (`has_async`); the native `buffer` source streams nothing here — it
+    /// is matched synchronously in core. The completion analogue of
+    /// [`Editor::picker_query_changes`]; the server drains it, stamps the
+    /// generation onto the source run + its pushes, and drops a stale response.
+    pub complete_query_changes: Vec<(u64, complete::CompleteCtx)>,
+    /// Monotonic completion generation, bumped on every trigger (each prefix
+    /// edit). The token stamped onto the open completion menu and onto any async
+    /// source dispatch, so a push from a superseded prefix is dropped — the
+    /// completion analogue of the picker's per-query generation.
+    complete_gen: u64,
     /// Whether the bespoke server-side LSP completion pmenu is currently open.
     /// Synced by the server so the engine's auto-trigger ([`Editor::complete_trigger`])
     /// stands down rather than stacking a second popup. Removed in Phase 4-C when
@@ -1215,6 +1227,8 @@ impl Editor {
             menu_results: Vec::new(),
             picker_query_changes: Vec::new(),
             complete_config: complete::CompleteConfig::default(),
+            complete_query_changes: Vec::new(),
+            complete_gen: 0,
             lsp_pmenu_open: false,
             should_quit: false,
             options: Options::default(),

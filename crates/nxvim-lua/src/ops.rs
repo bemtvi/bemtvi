@@ -818,6 +818,24 @@ pub struct CompleteSetupReq {
     pub prev: Vec<String>,
     pub confirm: Vec<String>,
     pub abort: Vec<String>,
+    /// Whether at least one configured source is **async** (a Lua `complete`
+    /// function registered via `nx.complete.source{}`), so the engine emits a
+    /// `(gen, ctx)` onto `complete_query_changes` for the server to dispatch off
+    /// the input path. `false` for a buffer-only config — the whole keystroke path
+    /// stays pure core. Phase 4-B.
+    pub has_async: bool,
+}
+
+/// One streamed completion candidate (`nx.complete` async source `push`): its
+/// display `label` and the `insert` text applied on accept (`label` when the
+/// source pushed a bare string), stamped with the `gen`eration of the trigger that
+/// produced it so the server drops a batch from a superseded prefix. Queued in
+/// [`crate::runtime::Shared::complete_pushes`]. Phase 4-B.
+#[derive(Clone, Debug)]
+pub struct CompletePush {
+    pub gen: u64,
+    pub label: String,
+    pub insert: String,
 }
 
 /// The preview target a picker push carries for one candidate, when the source

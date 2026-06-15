@@ -362,6 +362,7 @@ impl EditHost {
                 auto: req.auto,
                 min_chars: req.min_chars,
                 keys,
+                has_async: req.has_async,
             });
         }
         // `nx.complete.trigger()` / a mapped key: manually open the completion
@@ -403,6 +404,36 @@ impl EditHost {
             if gen == self.editor.menu_generation() {
                 self.editor.menu_finish(gen);
             }
+        }
+        // Async completion candidates streamed in: append them to the open
+        // completion popup, generation-gated exactly like the picker — a batch from a
+        // prefix the user has typed past (`gen` behind the live completion
+        // generation) is dropped. Each carries its accept `insert` text. Coalesced
+        // into one `menu_push` so the prefix matcher re-ranks the batch once.
+        let cpushes = self.lua.take_complete_pushes();
+        if !cpushes.is_empty() {
+            let live = self.editor.menu_generation();
+            let items: Vec<nxvim_core::MenuItem> = cpushes
+                .into_iter()
+                .filter(|p| p.gen == live)
+                .map(|p| nxvim_core::MenuItem {
+                    label: p.label,
+                    // The wrapper key is unused for completion (accept is native, by
+                    // `insert`); a stable per-batch index keeps `MenuItem` well-formed.
+                    key: 0,
+                    preview: None,
+                    insert: Some(p.insert),
+                })
+                .collect();
+            if !items.is_empty() {
+                self.editor.menu_push(items, live);
+            }
+        }
+        // An async source set (all sources for a generation) finished: close the
+        // popup if, across the buffer seed and every async source, the live prefix
+        // matched nothing (a confirmed-empty completion has no prompt to keep up).
+        for gen in self.lua.take_complete_finishes() {
+            self.editor.complete_finish(gen);
         }
         // `vim.fn.confirm` button dialogs: open the command line as a single-key
         // confirm prompt and remember the callback that resumes the blocked
@@ -1407,6 +1438,22 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            // Completion triggers with an **async** source: dispatch the configured
+            // sources for the new prefix off the input path (debounced + reaped
+            // Lua-side). The generation was bumped synchronously in core on the
+            // keystroke, so a late push from a superseded prefix is already gated out
+            // when `apply_lua_effects` feeds it. The buffer-source rows are already
+            // seeded; these sources only append. Phase 4-B.
+            for (gen, ctx) in std::mem::take(&mut self.editor.complete_query_changes) {
+                if let Err(e) =
+                    self.lua
+                        .run_complete_run(gen, &ctx.prefix, ctx.buf, ctx.row, ctx.col)
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.complete source: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             // Float-list widget results: a confirmed (`Some(key)`) or cancelled
             // (`None`) outcome fires the waiting consumer off the same tick, inside
             // the fixpoint (it may open another widget / queue lua). A `nx.picker`
@@ -1447,6 +1494,7 @@ impl EditHost {
                 && self.editor.prompt_results.is_empty()
                 && self.editor.menu_results.is_empty()
                 && self.editor.picker_query_changes.is_empty()
+                && self.editor.complete_query_changes.is_empty()
                 && self.scheduled.is_empty()
                 && !self.editor.has_pending_checktime()
             {
@@ -1462,6 +1510,7 @@ impl EditHost {
                 self.editor.prompt_results.clear();
                 self.editor.menu_results.clear();
                 self.editor.picker_query_changes.clear();
+                self.editor.complete_query_changes.clear();
                 self.editor.take_pending_checktime();
                 self.scheduled.clear();
                 self.editor

@@ -238,6 +238,14 @@ pub(crate) struct Menu {
     gpending: bool,
     /// The input-grab query field — `Some` for a picker, `None` for `select`.
     prompt: Option<Prompt>,
+    /// The match query for a [`MenuKind::Complete`] menu: the word prefix left of
+    /// the cursor. Completion has no input-grab [`Prompt`] (the buffer *is* the
+    /// query), so the prefix is stored here and [`Menu::match_query`] reads it in
+    /// place of `prompt.query` — so async candidates streaming in via
+    /// [`Editor::menu_push`] rank against the prefix exactly as a static picker's do
+    /// against its prompt. Empty (`""`) for `select` / picker, leaving their match
+    /// behavior unchanged.
+    complete_prefix: String,
     /// Where the picker prompt sits relative to the list ([`PromptPos`]). Only
     /// meaningful when `prompt` is `Some`; ignored for a promptless `select`.
     prompt_pos: PromptPos,
@@ -283,10 +291,20 @@ impl Menu {
         self.filtered.as_ref().map_or(i, |f| f[i])
     }
 
+    /// The query the matcher ranks against: a picker's input-grab `prompt`, or — for
+    /// a [`MenuKind::Complete`] menu, which has no prompt — the stored word prefix.
+    /// Empty for a `select` (no prompt, no prefix), keeping it in passthrough.
+    fn match_query(&self) -> &str {
+        match &self.prompt {
+            Some(p) => p.query.as_str(),
+            None => self.complete_prefix.as_str(),
+        }
+    }
+
     /// Recompute the ranked view from scratch against the current query (a static
     /// query edit). An empty query drops to passthrough (`None`) — no per-item work.
     fn refilter(&mut self) {
-        let query = self.prompt.as_ref().map_or("", |p| p.query.as_str());
+        let query = self.match_query();
         if query.is_empty() {
             self.filtered = None;
             self.match_spans.clear();
@@ -314,10 +332,7 @@ impl Menu {
             self.clamp_cursor();
             return;
         }
-        let query = self
-            .prompt
-            .as_ref()
-            .map_or(String::new(), |p| p.query.clone());
+        let query = self.match_query().to_string();
         let candidates: Vec<&str> = self.all_items[new_start..]
             .iter()
             .map(|i| i.label.as_str())
@@ -379,6 +394,7 @@ impl Editor {
             placement,
             gpending: false,
             prompt: None,
+            complete_prefix: String::new(),
             prompt_pos: PromptPos::default(),
             dynamic: false,
             preview: false,
@@ -419,6 +435,7 @@ impl Editor {
             placement,
             gpending: false,
             prompt: Some(Prompt::default()),
+            complete_prefix: String::new(),
             prompt_pos,
             dynamic,
             preview,
@@ -508,23 +525,34 @@ impl Editor {
             .is_some_and(|m| m.kind != MenuKind::Complete)
     }
 
-    /// Open or refresh the completion popup: `candidates` are fuzzy-ranked against
-    /// `prefix`, the matches become a [`MenuKind::Complete`] menu anchored at
-    /// `anchor` (the buffer byte offset where the prefix begins). No matches closes
-    /// the popup. Each row's `insert` text is its label (the `buffer` source
-    /// completes to the whole word). `preselect` highlights the first row up front
-    /// (an explicit manual trigger, vim-like); auto-typing passes `false` (noselect
-    /// — nothing highlighted until the user navigates, so `<CR>` stays a newline).
+    /// Open or refresh the completion popup at generation `gen`: the synchronous
+    /// `buffer`-source `candidates` are fuzzy-ranked against `prefix` and become a
+    /// [`MenuKind::Complete`] menu anchored at `anchor` (the buffer byte offset where
+    /// the prefix begins). Each row's `insert` text is its label (the `buffer` source
+    /// completes to the whole word).
+    ///
+    /// `keep_open` decides the no-match case: a buffer-only config (`false`) closes
+    /// the popup when nothing matched (the 4-A behavior); a config with an **async**
+    /// source (`true`) keeps an empty popup open so the streamed candidates have a
+    /// menu to land in ([`Editor::menu_push`] appends them at `gen`). `gen` is stamped
+    /// as both the live generation and the displayed `items_gen`, so a same-`gen`
+    /// async push *appends* and a stale push (an earlier prefix) is dropped.
+    ///
+    /// `preselect` highlights the first row up front (an explicit manual trigger,
+    /// vim-like); auto-typing passes `false` (noselect — nothing highlighted until the
+    /// user navigates, so `<CR>` stays a newline).
     pub(crate) fn set_complete_menu(
         &mut self,
         anchor: usize,
         prefix: &str,
         candidates: Vec<String>,
         preselect: bool,
+        gen: u64,
+        keep_open: bool,
     ) {
         let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         let ranked = crate::fuzzy::rank(prefix, &refs);
-        if ranked.is_empty() {
+        if ranked.is_empty() && !keep_open {
             self.close_completion();
             return;
         }
@@ -547,6 +575,9 @@ impl Editor {
             anchor,
             anchor_width: crate::unicode::display_width(prefix),
             all_items,
+            // `Some` (an active query = the prefix) even when empty, so a later
+            // `menu_push` matches the streamed async batch against the prefix via
+            // `extend_view` rather than dropping to passthrough.
             filtered: Some(filtered),
             match_spans,
             cursor: 0,
@@ -557,15 +588,23 @@ impl Editor {
             placement: MenuPlacement::Cursor,
             gpending: false,
             prompt: None,
+            complete_prefix: prefix.to_string(),
             prompt_pos: PromptPos::default(),
             dynamic: false,
             preview: false,
             preview_scroll: None,
-            generation: 0,
-            items_gen: 0,
+            generation: gen,
+            items_gen: gen,
             width: None,
             height: None,
         });
+    }
+
+    /// Whether the open menu's effective view has no rows. Used by
+    /// [`Editor::complete_finish`] to close a confirmed-empty completion popup once
+    /// an async source has streamed nothing. `false` when no menu is open.
+    pub(crate) fn menu_view_is_empty(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.view_len() == 0)
     }
 
     /// Move the completion selection (wrapping), `<C-n>` / `<C-p>`-style. The popup

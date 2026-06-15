@@ -210,9 +210,62 @@ buffer source is pure core).
 
 ---
 
-## Phase 4-B — Async sources: evloop debounce + generation tokens
+## Phase 4-B — Async sources: evloop debounce + generation tokens ✅ DONE (2026-06-15)
 
 Mirror the picker's async machinery so non-native sources can stream candidates.
+
+**Shipped (with the user, 2026-06-15): the async substrate *plus* the public
+`nx.complete.source{}` API pulled forward from Phase 4-E** — pure async plumbing
+with no consumer is untestable under the project's no-silent-stub / faithful-test
+rules, and the source API *is* the substrate the later sources build on, so it lands
+here as the testable surface (the buffer source is synchronous and exercises none of
+the async path). What landed:
+
+- **Core** (`nxvim-core`, pure/sync): `CompleteCtx { buf, row, col, prefix }` snapshot;
+  `CompleteConfig.has_async`; a monotonic `Editor::complete_gen` bumped per trigger;
+  `Editor::complete_query_changes: Vec<(u64, CompleteCtx)>` (the completion analogue of
+  `picker_query_changes`). The completion menu moved onto the **streaming model**: a
+  `Menu.complete_prefix` field + `Menu::match_query()` (prompt query for a picker, the
+  stored prefix for completion) so `extend_view`/`refilter` rank a streamed async batch
+  against the prefix; `set_complete_menu` now takes `(gen, keep_open)` — it stamps
+  `generation`/`items_gen = gen` and, with `keep_open`, holds an empty popup so async
+  candidates have a widget to land in. `complete_trigger`/`complete_manual_trigger` route
+  through one `refresh_complete` that seeds the buffer rows, bumps the generation, and
+  emits a `(gen, ctx)` when `has_async`. `Editor::complete_finish(gen)` closes a
+  confirmed-empty popup (completion has no prompt to keep up). Native buffer + async
+  coexist by **concatenation** (buffer seeds, async appends) — priority-merge is 4-C.
+- **Server** (`nxvim-server`, native): the settle fixpoint drains `complete_query_changes`
+  → `lua.run_complete_run(gen, ctx)` → `apply_lua_effects` (so the source's debounce
+  timer / `nx.spawn` actually starts), added to the convergence + recursion-limit clears;
+  `take_complete_pushes()` feeds `menu_push` generation-gated (a batch behind the live
+  prefix dropped), `take_complete_finishes()` → `complete_finish`.
+- **Lua** (`nxvim-lua`): `CompletePush { gen, label, insert }` op + `complete_pushes` /
+  `complete_finishes` Shared queues + `nx._complete_push` / `nx._complete_finish` bridges;
+  `run_complete_run` passes the ctx as primitives (the crate can't see `CompleteCtx`).
+  `nx._complete_setup` gained a `has_async` arg.
+- **Prelude** (`prelude/complete.lua`): `nx.complete.source { name, complete, debounce }`
+  registration (reserved built-in names fail loud); `setup{}` validates against built-ins
+  **and** registered sources, collects the active async sources into `nx._complete`, and
+  passes `has_async`. `nx._complete_run(gen, ctx)` debounces each source via `nx.timer`,
+  builds `push`/`done`/`ctx.on_cancel`, batches pushes (`FLUSH_N = 256`), reaps a superseded
+  run, and reduces all sources' `done()` to one `nx._complete_finish(gen)`.
+  `nx.complete.debounce` default = 120 ms.
+- **Tests** (`tests/complete.rs`, +5, 17 total): async source streams alongside buffer +
+  accept; async-only source reacts to the live prefix + atomic gen swap; an empty source
+  closes the confirmed-empty popup; a reserved built-in name fails loud; and a
+  **deterministic generation-gating test** (a source that defers its push under test
+  control proves a stale in-flight reply is dropped — no timers, no flakiness).
+- **Example** (`examples/ui-complete/`): a `keywords` async source (debounce 80 ms,
+  reacts to the prefix) registered alongside `buffer`.
+- Builds clean native, `--no-default-features` (wasm subset — buffer stays pure core; async
+  needs the native evloop, so **wasm async parity remains Phase 4-E**, exactly like the
+  picker's live-grep), `clippy -D warnings`, `fmt --check`.
+
+**Deferred to later sub-phases (unchanged):** multi-source **priority** merge (4-C, today
+buffer+async just concatenate), the `lsp` / `snippets` built-ins, `trigger`-char gating per
+source, and wasm async parity (4-E).
+
+### Original plan (for reference)
 
 - `complete_query_changes: Vec<(u64 /*gen*/, CompleteCtx)>` on `Editor` (the
   completion analogue of `picker_query_changes`); bumped on each trigger when at
@@ -266,9 +319,11 @@ Mirror the picker's async machinery so non-native sources can stream candidates.
 
 ## Phase 4-E — Plugin sources, configurable triggers, wasm, polish
 
-- `nx.complete.source { name, trigger = { chars = {…} }, complete, resolve }` —
-  third-party sources (the emoji example from the plugin-API spec §1). Trigger
-  chars wake a source only after the configured char.
+- `nx.complete.source { name, complete, debounce }` **already landed in Phase 4-B**
+  (pulled forward as the testable surface for the async substrate). What remains here:
+  `trigger = { chars = {…} }` per-source trigger-char gating (wake a source only after
+  the configured char — the emoji example from the plugin-API spec §1) and the
+  `resolve` callback for lazily-resolved docs.
 - wasm parity for async sources over the off-tick / WebTransport proc seam (as
   picker live-grep does); build `--no-default-features`; `lua_int` for index
   Values (wasm `mlua::Integer` is i32).

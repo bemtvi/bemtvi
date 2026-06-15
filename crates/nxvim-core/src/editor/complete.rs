@@ -73,6 +73,12 @@ pub struct CompleteConfig {
     /// The prefix must be at least this many characters before the menu opens.
     pub min_chars: usize,
     pub keys: CompleteKeys,
+    /// At least one configured source is **async** (a Lua `complete` function).
+    /// When set, a trigger emits a `(gen, ctx)` onto
+    /// [`Editor::complete_query_changes`] for the server to dispatch the source
+    /// off the input path (debounced, generation-gated); a buffer-only config
+    /// never does, so the whole keystroke path stays pure core.
+    pub has_async: bool,
 }
 
 impl Default for CompleteConfig {
@@ -82,8 +88,27 @@ impl Default for CompleteConfig {
             auto: true,
             min_chars: 1,
             keys: CompleteKeys::default(),
+            has_async: false,
         }
     }
+}
+
+/// A snapshot of the completion site handed to an **async** source's `complete`
+/// callback. It is a *copy*, never live editor state — the source runs off the
+/// input path (debounced), by which point the cursor may have moved; the
+/// generation token ([`Editor::complete_query_changes`]) is what keeps a stale
+/// reply from landing, not this snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteCtx {
+    /// The buffer the completion fired in (the current buffer's number).
+    pub buf: u64,
+    /// 0-based cursor row at trigger time.
+    pub row: usize,
+    /// 0-based cursor byte column at trigger time.
+    pub col: usize,
+    /// The word prefix left of the cursor being completed (also the match query
+    /// the streamed candidates are ranked against, in core).
+    pub prefix: String,
 }
 
 /// Which engine control key a keystroke matched (while a completion menu is open).
@@ -151,14 +176,9 @@ impl Editor {
             self.close_completion();
             return;
         }
-        let candidates = self.buffer_candidates(&prefix);
-        if candidates.is_empty() {
-            self.close_completion();
-            return;
-        }
         // Auto-typing is noselect — nothing highlighted until the user navigates,
         // so `<CR>` stays a newline.
-        self.set_complete_menu(anchor, &prefix, candidates, false);
+        self.refresh_complete(anchor, prefix, false);
     }
 
     /// Manually open (or refresh) the completion popup — the `<C-x><C-n>` /
@@ -172,14 +192,50 @@ impl Editor {
             return;
         }
         let (anchor, prefix) = self.complete_prefix();
-        let candidates = self.buffer_candidates(&prefix);
-        if candidates.is_empty() {
-            self.close_completion();
-            return;
-        }
         // An explicit trigger preselects the first match (vim-like) so `<C-y>` /
         // `<CR>` accept it immediately, without a separate navigation step.
-        self.set_complete_menu(anchor, &prefix, candidates, true);
+        self.refresh_complete(anchor, prefix, true);
+    }
+
+    /// Shared open/refresh for both the auto and the manual trigger: bump the
+    /// completion generation, seed the synchronous `buffer`-source candidates into
+    /// a [`MenuKind::Complete`] menu anchored at the prefix, and — when at least one
+    /// **async** source is configured — emit a `(gen, ctx)` onto
+    /// [`Editor::complete_query_changes`] so the server dispatches that source off
+    /// the input path. The popup stays open with just the buffer rows while async
+    /// candidates stream in (they append, generation-gated, via
+    /// [`Editor::menu_push`]); a buffer-only config with no match closes it as
+    /// before. `preselect` highlights the first row up front (manual trigger).
+    fn refresh_complete(&mut self, anchor: usize, prefix: String, preselect: bool) {
+        self.complete_gen += 1;
+        let gen = self.complete_gen;
+        let has_async = self.complete_config.has_async;
+        let candidates = self.buffer_candidates(&prefix);
+        // `keep_open` keeps an *empty* popup alive when an async source will stream
+        // into it; without one, no buffer match closes the popup (the 4-A path).
+        self.set_complete_menu(anchor, &prefix, candidates, preselect, gen, has_async);
+        if has_async && self.completion_active() {
+            self.complete_query_changes.push((
+                gen,
+                CompleteCtx {
+                    buf: self.cur_buffer().0,
+                    row: self.cursor.line,
+                    col: self.cursor.col,
+                    prefix,
+                },
+            ));
+        }
+    }
+
+    /// An async source finished streaming (all sources for `gen` called `done()`):
+    /// if `gen` is still the live generation and nothing matched, the completion
+    /// popup is now confirmed-empty, so close it (completion has no prompt to keep
+    /// up — an empty popup just lingers). A no-op for a superseded generation, or
+    /// when rows did arrive. Driven by the server from the Lua `done()` reduction.
+    pub fn complete_finish(&mut self, gen: u64) {
+        if self.completion_active() && self.menu_generation() == gen && self.menu_view_is_empty() {
+            self.close_completion();
+        }
     }
 
     /// Accept the highlighted completion: replace the typed prefix

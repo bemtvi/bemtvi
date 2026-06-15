@@ -19,9 +19,9 @@ use crate::convert::{
 };
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
-    BufOp, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
-    LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, RegisterSetOp,
-    TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp,
+    GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush,
+    PreviewPush, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1273,24 +1273,27 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `nx._complete_setup(auto, min_chars, next, prev, confirm, abort)`: queue a
-    // native completion-engine configuration ([`CompleteSetupReq`]). Each key
+    // `nx._complete_setup(auto, min_chars, next, prev, confirm, abort, has_async)`:
+    // queue a native completion-engine configuration ([`CompleteSetupReq`]). Each key
     // argument is a list of vim notation strings (`{ "<C-n>", "<Tab>" }`); an empty
-    // list keeps that action's built-in default. The Lua wrapper (`prelude/complete.lua`)
+    // list keeps that action's built-in default. `has_async` is true when at least one
+    // configured source is a Lua `complete` function (`nx.complete.source{}`), so the
+    // engine dispatches it off the input path. The Lua wrapper (`prelude/complete.lua`)
     // validates the source list before calling this.
     let sh = shared.clone();
+    type CompleteSetupArgs = (
+        bool,
+        usize,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        bool,
+    );
     nx.set(
         "_complete_setup",
         lua.create_function(
-            move |_,
-                  (auto, min_chars, next, prev, confirm, abort): (
-                bool,
-                usize,
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-            )| {
+            move |_, (auto, min_chars, next, prev, confirm, abort, has_async): CompleteSetupArgs| {
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
                     min_chars,
@@ -1298,6 +1301,7 @@ pub(crate) fn install_runtime_api(
                     prev,
                     confirm,
                     abort,
+                    has_async,
                 });
                 Ok(())
             },
@@ -1313,6 +1317,36 @@ pub(crate) fn install_runtime_api(
         "_complete_trigger",
         lua.create_function(move |_, ()| {
             sh.borrow_mut().complete_triggers.push(());
+            Ok(())
+        })?,
+    )?;
+    // `nx._complete_push(gen, labels, inserts)`: queue a BATCH of streamed async
+    // completion candidates ([`CompletePush`]) — parallel `labels` (display) /
+    // `inserts` (applied on accept) arrays, stamped with the trigger `gen`eration.
+    // The server drops a batch whose `gen` is behind the live prefix and appends the
+    // rest to the open completion popup. Phase 4-B.
+    let sh = shared.clone();
+    nx.set(
+        "_complete_push",
+        lua.create_function(
+            move |_, (gen, labels, inserts): (u64, Vec<String>, Vec<String>)| {
+                let mut sh = sh.borrow_mut();
+                sh.complete_pushes.reserve(labels.len());
+                for (label, insert) in labels.into_iter().zip(inserts) {
+                    sh.complete_pushes.push(CompletePush { gen, label, insert });
+                }
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._complete_finish(gen)`: every async source for generation `gen` has
+    // finished (the Lua wrapper reduces their `done()`s to one call) — the server
+    // closes the popup if the prefix matched nothing across all sources. Phase 4-B.
+    let sh = shared.clone();
+    nx.set(
+        "_complete_finish",
+        lua.create_function(move |_, gen: u64| {
+            sh.borrow_mut().complete_finishes.push(gen);
             Ok(())
         })?,
     )?;

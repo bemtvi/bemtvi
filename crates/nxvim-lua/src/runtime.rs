@@ -16,10 +16,10 @@ use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp,
-    FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp,
-    PickerOpenReq, PickerPush, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp,
-    TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp,
+    ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
+    LspOp, PanelOp, PickerOpenReq, PickerPush, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
+    TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -398,6 +398,15 @@ pub(crate) struct Shared {
     /// payload-free; the server runs `Editor::complete_manual_trigger` once if any
     /// arrived since the last drain.
     pub(crate) complete_triggers: Vec<()>,
+    /// Streamed **async** completion candidates (`nx.complete` source `push`),
+    /// drained by the server (generation-gated) into `Editor::menu_push` to append
+    /// to the open completion popup. Empty for a buffer-only config. Phase 4-B.
+    pub(crate) complete_pushes: Vec<CompletePush>,
+    /// Generations whose async completion sources have *all* finished streaming
+    /// (`done()` reduced to zero pending sources, Lua-side), drained by the server
+    /// into `Editor::complete_finish` so a prefix that matched nothing closes the
+    /// confirmed-empty popup. Phase 4-B.
+    pub(crate) complete_finishes: Vec<u64>,
     /// Streamed picker candidates (`nx.picker` source `push`), drained by the
     /// server (generation-gated) into `Editor::menu_push` after the chunk / a
     /// streaming `on_stdout`.
@@ -827,6 +836,18 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the async completion candidates streamed since the last drain, for
+        /// the server to append (generation-gated) to the open completion popup.
+        take_complete_pushes -> Vec<CompletePush> = complete_pushes
+    }
+
+    take_queue! {
+        /// Take the completion generations whose async sources have all finished
+        /// since the last drain, for the server to close a confirmed-empty popup.
+        take_complete_finishes -> Vec<u64> = complete_finishes
+    }
+
+    take_queue! {
         /// Take the picker candidates streamed since the last drain, for the server
         /// to feed (generation-gated) into the open picker.
         take_picker_pushes -> Vec<PickerPush> = picker_pushes
@@ -914,6 +935,33 @@ impl LuaRuntime {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_run")?;
         run.call::<()>((lua_int(gen as i64), query.to_string()))
+    }
+
+    /// Run the configured `nx.complete` **async** sources for generation `gen`
+    /// against the snapshot `ctx` (`nx._complete_run`). The Lua wrapper debounces
+    /// each source, invokes its `complete(ctx, push, done)`, and reaps a superseded
+    /// run; the `push`es land back as [`CompletePush`](crate::ops::CompletePush)es and
+    /// the reduced `done()` as a `complete_finishes` entry — both generation-stamped.
+    /// The `ctx` snapshot (`{ prefix, buf, row, col }`) is passed as primitives (the
+    /// server unpacks `CompleteCtx`, which `nxvim-lua` cannot see), never live editor
+    /// state. `row` / `col` are 0-based, matching the core cursor; an LSP source
+    /// (Phase 4-C) translates to the protocol's coordinates. Phase 4-B.
+    pub fn run_complete_run(
+        &self,
+        gen: u64,
+        prefix: &str,
+        buf: u64,
+        row: usize,
+        col: usize,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_complete_run")?;
+        let t = self.lua.create_table()?;
+        t.set("prefix", self.lua.create_string(prefix)?)?;
+        t.set("buf", lua_int(buf as i64))?;
+        t.set("row", lua_int(row as i64))?;
+        t.set("col", lua_int(col as i64))?;
+        run.call::<()>((lua_int(gen as i64), t))
     }
 
     /// Deliver the picker's outcome to the active source: the chosen item's

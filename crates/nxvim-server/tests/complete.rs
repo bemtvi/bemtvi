@@ -212,9 +212,7 @@ async fn an_unknown_source_fails_loud() {
     )
     .await;
     assert!(
-        err.as_str()
-            .unwrap_or_default()
-            .contains("not yet implemented"),
+        err.as_str().unwrap_or_default().contains("not found"),
         "unknown source must fail loud, got {err:?}"
     );
 }
@@ -385,4 +383,155 @@ async fn a_mapped_trigger_key_opens_the_popup() {
     assert_eq!(lines(&rpc).await, vec!["alpha al"]);
     feed(&rpc, "<C-y>");
     assert_eq!(lines(&rpc).await, vec!["alpha alpha"]);
+}
+
+// ---- Phase 4-B: async sources (nx.complete.source{}) --------------------------
+
+/// An async source registered with `debounce = 0` (so it dispatches synchronously
+/// within the settle and the assertions stay timing-free) that echoes the prefix
+/// back as a candidate — a faithful source that *reacts to its input* rather than
+/// returning a canned value.
+const ECHO_INIT: &str = "\
+nx.complete.source {\n\
+  name = 'echo', debounce = 0,\n\
+  complete = function(ctx, push, done)\n\
+    if ctx.prefix ~= '' then push(ctx.prefix .. '_async') end\n\
+    done()\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'echo' } } }";
+
+#[tokio::test]
+async fn async_source_streams_candidates_alongside_buffer_and_accepts() {
+    let dir = temp_dir("complete_async_stream");
+    let (rpc, mut incoming) = start(&dir, ECHO_INIT).await;
+
+    // `hello` is a buffer word; `he` is the partial being typed. The popup carries
+    // the buffer match *and* the async echo (`he_async`) — proof the async source
+    // ran off the input path and its push landed in the same widget.
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"hello".to_string()) && items.contains(&"he_async".to_string()),
+        "popup carries both the buffer word and the async candidate: {items:?}"
+    );
+    // The document still holds only the typed prefix — the popup did not grab keys.
+    assert_eq!(lines(&rpc).await, vec!["hello he"]);
+
+    // Navigate to the async row and accept it: its `insert` text replaces the prefix.
+    let async_row = items.iter().position(|i| i == "he_async").unwrap();
+    for _ in 0..=async_row {
+        feed(&rpc, "<C-n>");
+    }
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["hello he_async"]);
+}
+
+#[tokio::test]
+async fn async_only_source_drives_the_popup_and_reacts_to_the_prefix() {
+    let dir = temp_dir("complete_async_only");
+    // No `buffer` source — the popup is driven entirely by the async echo, so its
+    // single row must equal the *current* prefix (it reacts to input, not a canned
+    // value), and re-running on a longer prefix swaps the row by generation.
+    let init = "\
+nx.complete.source {\n\
+  name = 'echo', debounce = 0,\n\
+  complete = function(ctx, push, done)\n\
+    if ctx.prefix ~= '' then push(ctx.prefix .. '_async') end\n\
+    done()\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'echo' } }, min_chars = 2 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["ab_async"]);
+
+    // One more char re-dispatches the source at a new generation; the stale `ab_async`
+    // row is atomically replaced by the new prefix's candidate (no stacking).
+    feed(&rpc, "c");
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("popup refreshes"),
+    );
+    assert_eq!(menu_items(&menu), vec!["abc_async"]);
+    assert_eq!(lines(&rpc).await, vec!["abc"]);
+}
+
+#[tokio::test]
+async fn async_source_with_no_matches_closes_the_confirmed_empty_popup() {
+    let dir = temp_dir("complete_async_empty");
+    // An async-only source that never pushes: after it `done()`s with nothing, the
+    // popup is confirmed-empty and must close (completion has no prompt to keep up).
+    let init = "\
+nx.complete.source {\n\
+  name = 'silent', debounce = 0,\n\
+  complete = function(_ctx, _push, done) done() end,\n\
+}\n\
+nx.complete.setup { sources = { { 'silent' } }, min_chars = 2 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "a source that streams nothing leaves no popup open"
+    );
+    assert_eq!(lines(&rpc).await, vec!["ab"]);
+}
+
+#[tokio::test]
+async fn registering_a_reserved_builtin_name_fails_loud() {
+    let dir = temp_dir("complete_reserved");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() \
+           nx.complete.source { name = 'buffer', complete = function() end } end) \
+         return (not ok) and e or 'no error'",
+    )
+    .await;
+    assert!(
+        err.as_str().unwrap_or_default().contains("reserved"),
+        "shadowing a built-in source name must fail loud, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_in_flight_async_push_is_dropped_by_generation() {
+    let dir = temp_dir("complete_async_gen");
+    // A source that DEFERS its push: it stashes a `flush` closure (capturing this
+    // run's generation) in a global so the test controls exactly when each reply
+    // lands — no timers, no flakiness. Typing past a prefix while its reply is in
+    // flight must drop that reply (it is a generation behind the live prefix).
+    let init = "\
+_G.deferred = {}\n\
+nx.complete.source {\n\
+  name = 'deferred', debounce = 0,\n\
+  complete = function(ctx, push, done)\n\
+    table.insert(_G.deferred, function() push(ctx.prefix .. '_X'); done() end)\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'deferred' } }, min_chars = 2 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Two triggers, two in-flight replies: gen-for-`ab` (stale) and gen-for-`abc`.
+    feed(&rpc, "iab");
+    feed(&rpc, "c");
+
+    // Land the STALE reply first — it is a generation behind, so it is dropped and
+    // nothing appears.
+    exec_lua(&rpc, "_G.deferred[1]()").await;
+    // Then land the live reply — its candidate is the only row shown.
+    exec_lua(&rpc, "_G.deferred[2]()").await;
+
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["abc_X"],
+        "only the live generation's candidate survives"
+    );
+    assert_eq!(lines(&rpc).await, vec!["abc"]);
 }

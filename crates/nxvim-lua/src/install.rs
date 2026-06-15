@@ -1303,6 +1303,19 @@ pub(crate) fn install_runtime_api(
             },
         )?,
     )?;
+
+    // `nx._complete_trigger()`: queue a manual completion open
+    // (`nx.complete.trigger()` / a mapped key). The server runs
+    // `Editor::complete_manual_trigger` after the chunk — it ignores `auto` /
+    // `min_chars`, so an explicit request always offers what's there.
+    let sh = shared.clone();
+    nx.set(
+        "_complete_trigger",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().complete_triggers.push(());
+            Ok(())
+        })?,
+    )?;
     // `nx._picker_push(gen, labels, keys, paths, rows, cols)`: queue a BATCH of
     // streamed picker candidates ([`PickerPush`]) — parallel arrays, stamped with
     // the run `gen`eration. Batching keeps a 100k-result stream to ~one bridge

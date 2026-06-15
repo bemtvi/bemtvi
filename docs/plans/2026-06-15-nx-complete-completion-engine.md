@@ -94,11 +94,25 @@ native `buffer` word-scan source + trigger/prefix/accept in
 `prelude/complete.lua` (`nx.complete.setup{}`, `buffer` only, unknown sources +
 `nx.complete.source{}` fail loud); the completion menu renders through the existing
 Cursor-placement `project_menu` (no new client code). Tests:
-`crates/nxvim-server/tests/complete.rs` (6, incl. the example). Example:
+`crates/nxvim-server/tests/complete.rs` (9, incl. the example). Example:
 `examples/ui-complete/`. Defaults: `<C-y>` accepts (not `<CR>`, to avoid eating
 newlines), `<C-n>`/`<Tab>`/`<Down>` move, `<C-e>` aborts; engine disabled until
 `setup{}`. Builds clean native **and** `--no-default-features` (wasm parity: the
 buffer source is pure core).
+
+**Follow-ups added (2026-06-15):**
+
+- **Manual trigger** — `nx.complete.trigger()` (Lua API) and a `keys.trigger`
+  mapping in `setup{}` open the popup on demand, ignoring `auto` / `min_chars` (an
+  explicit request always offers what's there, even an empty prefix → every buffer
+  word). `Editor::complete_manual_trigger` (core) is driven by a payload-free
+  `complete_triggers` queue (`nx._complete_trigger` → drained in `effects.rs`).
+  This is the manual half that Phase 4-C reuses when `<C-Space>`/`<C-x><C-o>`
+  retarget the engine.
+- **Word-start anchor** — the popup anchors under the start of the word being
+  completed, not the caret: `Menu.anchor_width` (the prefix's display width) →
+  `MenuView.anchor_offset`, which `project_menu` subtracts from the cursor column in
+  the Cursor branch. `0` for `select`, so that path is byte-for-byte unchanged.
 
 ### Core (`nxvim-core`)
 

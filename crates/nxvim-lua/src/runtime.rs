@@ -389,6 +389,10 @@ pub(crate) struct Shared {
     /// `nx.complete.setup{}` configurations, drained by the server into
     /// `Editor::configure_complete` (the native completion engine, Phase 4-A).
     pub(crate) complete_setups: Vec<CompleteSetupReq>,
+    /// Pending `nx.complete.trigger()` requests (a manual completion open). Each is
+    /// payload-free; the server runs `Editor::complete_manual_trigger` once if any
+    /// arrived since the last drain.
+    pub(crate) complete_triggers: Vec<()>,
     /// Streamed picker candidates (`nx.picker` source `push`), drained by the
     /// server (generation-gated) into `Editor::menu_push` after the chunk / a
     /// streaming `on_stdout`.
@@ -809,6 +813,12 @@ impl LuaRuntime {
         /// Take the `nx.complete.setup{}` configurations queued since the last
         /// drain, for the server to apply to the native completion engine.
         take_complete_setups -> Vec<CompleteSetupReq> = complete_setups
+    }
+
+    take_queue! {
+        /// Take the pending `nx.complete.trigger()` requests since the last drain;
+        /// a non-empty result means the server runs a manual completion open.
+        take_complete_triggers -> Vec<()> = complete_triggers
     }
 
     take_queue! {

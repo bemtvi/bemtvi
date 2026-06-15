@@ -96,6 +96,21 @@ function nx.complete.setup(opts)
     key_list(keys.confirm, "confirm"),
     key_list(keys.abort, "abort")
   )
+
+  -- `keys.trigger` (a string or list) installs an insert-mode mapping that opens
+  -- the popup on demand — the keypress half of "trigger by keypress / Lua API".
+  -- Handy with `auto = false` (manual-only completion). The Lua API is
+  -- `nx.complete.trigger()` (below); mapping it yourself works too.
+  for _, lhs in ipairs(key_list(keys.trigger, "trigger")) do
+    nx.keymap.set("i", lhs, nx.complete.trigger, { desc = "nx.complete: open completion" })
+  end
+end
+
+-- nx.complete.trigger(): manually open (or refresh) the completion popup at the
+-- cursor, ignoring `auto` / `min_chars` (an explicit request always offers what's
+-- there). A no-op outside insert mode or before `nx.complete.setup{}`.
+function nx.complete.trigger()
+  nx._complete_trigger()
 end
 
 -- Plugin / async sources are a later sub-phase. Fail loud rather than pretending

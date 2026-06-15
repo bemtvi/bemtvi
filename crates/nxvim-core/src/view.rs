@@ -135,6 +135,11 @@ pub struct MenuView {
     /// projection time. Both `None` for a content-anchored `nx.ui.select`.
     pub width: Option<crate::editor::MenuExtent>,
     pub height: Option<crate::editor::MenuExtent>,
+    /// Screen columns to shift a `Cursor`-placed completion popup **left** of the
+    /// cursor, so the list anchors under the start of the word being completed
+    /// rather than under the caret — the display width of the typed prefix. `0`
+    /// for a `select` / picker (anchored at the cursor / centered).
+    pub anchor_offset: usize,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

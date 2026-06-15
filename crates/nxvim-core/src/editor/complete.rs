@@ -159,6 +159,25 @@ impl Editor {
         self.set_complete_menu(anchor, &prefix, candidates);
     }
 
+    /// Manually open (or refresh) the completion popup — the `<C-x><C-n>` /
+    /// `nx.complete.trigger()` path. Unlike the auto-trigger, this ignores both
+    /// `auto` and `min_chars`: an explicit request completes whatever prefix is
+    /// there, even an empty one (which offers every buffer word). Still a no-op
+    /// when the engine is disabled, the LSP pmenu is up, or we are not in insert
+    /// mode. No matches closes any open popup.
+    pub fn complete_manual_trigger(&mut self) {
+        if !self.complete_config.enabled || self.lsp_pmenu_open || !self.mode.is_insert() {
+            return;
+        }
+        let (anchor, prefix) = self.complete_prefix();
+        let candidates = self.buffer_candidates(&prefix);
+        if candidates.is_empty() {
+            self.close_completion();
+            return;
+        }
+        self.set_complete_menu(anchor, &prefix, candidates);
+    }
+
     /// Accept the highlighted completion: replace the typed prefix
     /// `[anchor .. cursor)` with the row's insert text and park the cursor just
     /// past it. A no-op when no completion menu is open. The edit groups into the

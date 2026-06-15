@@ -364,6 +364,12 @@ impl EditHost {
                 keys,
             });
         }
+        // `nx.complete.trigger()` / a mapped key: manually open the completion
+        // popup. Coalesced — one open per drain regardless of how many requests
+        // arrived; it ignores `auto` / `min_chars` (an explicit request).
+        if !self.lua.take_complete_triggers().is_empty() {
+            self.editor.complete_manual_trigger();
+        }
         // Picker candidates streamed in: feed them into the open widget,
         // generation-gated — a batch from a query the user has already typed past
         // (`gen` behind the live generation) is dropped, never shown. Coalesced

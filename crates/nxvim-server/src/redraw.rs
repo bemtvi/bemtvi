@@ -756,7 +756,14 @@ impl EditHost {
                     .max(query_w)
                     .max(1);
                 let cursor_row = focused.cursor_row;
-                let anchor_col = focused.cursor_screen_col.saturating_sub(focused.leftcol);
+                // Anchor under the start of the word being completed (the caret
+                // minus the typed prefix's display width), not under the caret —
+                // so the list lines up with the text it will replace. `anchor_offset`
+                // is `0` for a `select`, leaving it cursor-anchored as before.
+                let anchor_col = focused
+                    .cursor_screen_col
+                    .saturating_sub(focused.leftcol)
+                    .saturating_sub(m.anchor_offset);
                 let max_w = text_width.saturating_sub(anchor_col).max(1);
                 let width = content_w.min(max_w);
                 // Below if the bordered box fits, else above, else clamp to whichever

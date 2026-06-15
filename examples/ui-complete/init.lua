@@ -45,8 +45,14 @@ nx.complete.setup {
     prev = { "<C-p>", "<S-Tab>" },
     confirm = { "<C-y>", "<CR>" },
     abort = "<C-e>",
+    -- A key that opens the popup ON DEMAND, ignoring `auto` / `min_chars` — handy
+    -- to force completion on a 1-char (or empty) prefix, or with `auto = false`.
+    trigger = "<C-Space>",
   },
 }
+
+-- The same thing is available as a Lua API — map it yourself if you prefer:
+--   nx.keymap.set("i", "<C-x><C-n>", nx.complete.trigger)
 
 -- Try it: open the sample, enter insert mode, and start retyping one of the long
 -- identifiers (`config`, `connection`, `completion`, …). The popup offers the

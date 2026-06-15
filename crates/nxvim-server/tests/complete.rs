@@ -239,3 +239,71 @@ async fn example_config_loads_and_completes() {
     feed(&rpc, "<CR>");
     assert_eq!(lines(&rpc).await, vec!["config config"]);
 }
+
+fn menu_col(menu: &[(Value, Value)]) -> u64 {
+    map_get(menu, "col")
+        .and_then(Value::as_u64)
+        .expect("menu has a col")
+}
+
+#[tokio::test]
+async fn popup_anchors_at_the_word_start_not_the_cursor() {
+    let dir = temp_dir("complete_anchor");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+
+    // Line is "hello he" (8 cols), caret at col 8; the prefix "he" starts at col 6.
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["hello"]);
+    // The box anchors under the START of the word (col 6), not under the caret (8),
+    // so the list lines up with the text it will replace.
+    assert_eq!(menu_col(&menu), 6, "popup anchored at the word start");
+}
+
+#[tokio::test]
+async fn manual_trigger_opens_even_with_auto_off_and_below_min_chars() {
+    let dir = temp_dir("complete_manual");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 5 } }, auto = false }",
+    )
+    .await;
+
+    // auto = false → typing a matching prefix opens nothing on its own.
+    feed(&rpc, "ialpha al");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "no auto popup when auto = false"
+    );
+
+    // An explicit trigger opens it, ignoring both `auto` and the 5-char gate.
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("manual popup"));
+    assert_eq!(menu_items(&menu), vec!["alpha"]);
+}
+
+#[tokio::test]
+async fn a_mapped_trigger_key_opens_the_popup() {
+    let dir = temp_dir("complete_trigger_key");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer' } }, auto = false, \
+         keys = { trigger = '<C-b>' } }",
+    )
+    .await;
+
+    // No auto popup as we type; the mapped key opens it on demand.
+    feed(&rpc, "ialpha al");
+    assert!(poll_no_menu(&rpc, &mut incoming).await, "no auto popup");
+    feed(&rpc, "<C-b>");
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("key opens popup"),
+    );
+    assert_eq!(menu_items(&menu), vec!["alpha"]);
+    // And it still completes through the document, untouched until accept.
+    assert_eq!(lines(&rpc).await, vec!["alpha al"]);
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["alpha alpha"]);
+}

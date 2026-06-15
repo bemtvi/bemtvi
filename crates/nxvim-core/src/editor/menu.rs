@@ -208,6 +208,11 @@ pub(crate) struct Menu {
     /// menus only; `0` and unused otherwise). Accepting a row replaces
     /// `[anchor .. cursor)` with the row's insert text.
     anchor: usize,
+    /// Display width (screen columns) of the completed prefix — the distance the
+    /// float is shifted **left** of the cursor so the list anchors under the word
+    /// start, not the caret (`Complete` menus only; `0` otherwise). See
+    /// [`MenuView::anchor_offset`].
+    anchor_width: usize,
     /// Every candidate (label + source key). For a picker this grows via
     /// [`Editor::menu_push`] as the source streams items in — up to 100k+.
     all_items: Vec<MenuItem>,
@@ -359,6 +364,7 @@ impl Editor {
         let last = all_items.len().saturating_sub(1);
         let mut menu = Menu {
             kind: MenuKind::Select,
+            anchor_width: 0,
             anchor: 0,
             all_items,
             filtered: None,
@@ -398,6 +404,7 @@ impl Editor {
         self.menu = Some(Menu {
             kind: MenuKind::Picker,
             anchor: 0,
+            anchor_width: 0,
             all_items: Vec::new(),
             filtered: None,
             match_spans: Vec::new(),
@@ -528,6 +535,7 @@ impl Editor {
         self.menu = Some(Menu {
             kind: MenuKind::Complete,
             anchor,
+            anchor_width: crate::unicode::display_width(prefix),
             all_items,
             filtered: Some(filtered),
             match_spans,
@@ -775,6 +783,7 @@ impl Editor {
             preview_scroll: m.preview_scroll,
             width: m.width,
             height: m.height,
+            anchor_offset: m.anchor_width,
         })
     }
 

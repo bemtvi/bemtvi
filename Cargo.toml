@@ -37,7 +37,7 @@ nxvim-rpc = { path = "crates/nxvim-rpc" }
 # nxvim-server is `default-features = false` so the `native` feature is off by
 # default (the wasm edit-host builds without it); native binaries re-enable it
 # via `features = ["native"]`. (There is no Lua-backend toggle to thread — see
-# the mlua note below; PUC lua51 is baked into the shared mlua dep.)
+# the mlua note below; PUC lua54 is baked into the shared mlua dep.)
 nxvim-server = { path = "crates/nxvim-server", default-features = false }
 nxvim-lua = { path = "crates/nxvim-lua" }
 nxvim-tui = { path = "crates/nxvim-tui" }
@@ -46,17 +46,19 @@ nxvim-ts = { path = "crates/nxvim-ts" }
 nxvim-lsp = { path = "crates/nxvim-lsp" }
 nxvim-view = { path = "crates/nxvim-view" }
 nxvim-regex = { path = "crates/nxvim-regex" }
-# Test-only harness (a single Lua backend, PUC lua51, baked in via mlua).
+# Test-only harness (a single Lua backend, PUC lua54, baked in via mlua).
 nxvim-test-harness = { path = "crates/nxvim-test-harness" }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
 # builds. Pre-release lines (ropey 2.0-beta, mlua 0.12-rc) are intentionally
 # avoided in favor of the latest stable releases.
 #
-# Lua backend: vendored PUC Lua 5.1, the single backend (LuaJIT was dropped —
+# Lua backend: vendored PUC Lua 5.4, the single backend (LuaJIT was dropped —
 # nxvim is PUC-Lua-only, matching the wasm build, which never supported LuaJIT).
-# `lua51` is selected here so every crate that links mlua shares it; there is no
-# backend toggle to thread anymore.
+# 5.4 brings real 64-bit integers, native bitwise operators, the `utf8` library,
+# yieldable `pcall`, and a generational GC over the old 5.1 baseline. `lua54` is
+# selected here so every crate that links mlua shares it; there is no backend
+# toggle to thread anymore.
 anyhow = "=1.0.102"
 ropey = "=2.0.0-beta.1"
 # Fuzzy matcher (nucleo-class) shared by every static-source widget consumer —
@@ -114,7 +116,7 @@ tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", 
 notify = { version = "=8.2.0", features = ["macos_kqueue"] }
 futures = "=0.3.32"
 rmpv = "=1.3.1"
-mlua = { version = "=0.11.6", features = ["vendored", "serde", "lua51"] }
+mlua = { version = "=0.11.6", features = ["vendored", "serde", "lua54"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 # Persistence (shada). `redb` is the pure-Rust, ACID, single-file embedded store
 # each daemon's per-instance shada file lives in; `rmp-serde` encodes the table

@@ -74,7 +74,7 @@ cargo run -p nxvim-gui -- file.txt
 
 ### Web build (`nxvim-edithost`) — runs entirely in the browser
 
-`nxvim-edithost` compiles the **whole editor** — `nxvim-core` + the PUC Lua 5.1
+`nxvim-edithost` compiles the **whole editor** — `nxvim-core` + the PUC Lua 5.4
 VM + the full server tick — to **WebAssembly** (via emscripten) and drives it in a
 **Web Worker**, **fully client-side, no server**. The page is the renderer and
 input layer; the editor (including your `init.lua`) runs in the tab. File open/save
@@ -124,7 +124,7 @@ treesitter syntax highlighting, and LSP** — are not part of a client-only buil
   installable grammars, and `:TSInstall <lang>` to fetch + compile a grammar on
   demand. A full tree-scripting Lua API (parsers, queries, predicates,
   injections) runs on nxvim's primitives.
-- **A real Lua config runtime** — Lua 5.1 (LuaJIT by default) running *inside*
+- **A real Lua config runtime** — vendored PUC Lua 5.4 running *inside*
   the server: a config dir + runtimepath, `require`/`init.lua`, keymaps, user
   commands, autocmds, an async event loop (timers, process spawn, scheduling),
   and the compatibility glue that runs **real, unmodified neovim
@@ -226,7 +226,7 @@ The short version:
 | `nxvim-core`     | The editor model — buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-server`   | The headless server — owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
 | `nxvim-rpc`      | Async msgpack-RPC transport (nxvim's own protocol).                         |
-| `nxvim-lua`      | Embedded Lua 5.1 runtime and the `vim.*` standard library.                  |
+| `nxvim-lua`      | Embedded PUC Lua 5.4 runtime and the `vim.*` standard library.               |
 | `nxvim-ts`       | The in-process treesitter engine (loads grammars, parses incrementally).    |
 | `nxvim-tui`      | The terminal UI client (ratatui + crossterm). Owns no editor state.         |
 | `nxvim-gui`      | Native GUI client (winit + wgpu + glyphon).                                 |
@@ -250,10 +250,9 @@ cargo fmt --all                                      # format
 cargo clippy --all-targets -- -D warnings            # lint
 ```
 
-- **Do not use `--all-features`.** The Lua backend is a Cargo feature with
-  mutually-exclusive variants (`luajit` default, `lua51` alternative); enabling
-  both breaks the `mlua-sys` build. Lint/test on default features. To check PUC
-  Lua deliberately: `--no-default-features --features lua51`.
+- **The Lua backend is fixed at vendored PUC Lua 5.4** (mlua's `lua54`, baked
+  into the shared `mlua` dep) — there is no backend feature to select or thread.
+  Lint and test on default features.
 - **A pre-commit hook** runs `cargo fmt --check` + `cargo clippy -D warnings`.
   After a fresh clone, run `pre-commit install` once.
 - **Tests are black-box and end-to-end** — they start a real server over RPC,

@@ -1,5 +1,5 @@
 // The edit-host Web Worker (Phase 5). This is the single `!Send` thread that owns
-// nxvim's core + the PUC Lua 5.1 VM: it loads the emscripten module (`dist/eh.mjs`),
+// nxvim's core + the PUC Lua 5.4 VM: it loads the emscripten module (`dist/eh.mjs`),
 // constructs the real `EditHost` (`eh_new`), and drives the production tick through the
 // `extern "C"` FFI. The UI thread holds no editor/Lua state — it ferries input and
 // renders the redraw frame the worker posts back.

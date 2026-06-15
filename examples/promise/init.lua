@@ -79,9 +79,9 @@ nx.promise
 --    so a sequence of async steps reads like straight-line code. The function
 --    returns a promise for its result.
 --
---    LIMITATION (PUC Lua 5.1): you can't pcall() around an nx.await — 5.1 can't
---    yield across pcall. Handle a rejected await with :catch on the RESULT (as
---    below), or attach :catch to the awaited promise.
+--    A rejected await raises inside the coroutine: catch it with a pcall around
+--    the await (PUC 5.4 yields across pcall), with :catch on the RESULT (as
+--    below), or by attaching :catch to the awaited promise.
 --------------------------------------------------------------------------------
 local load_settings = nx.async(function(name)
   print("[5] loading '" .. name .. "' …")

@@ -955,8 +955,7 @@ function nx.call_function(name, args)
   if type(f) ~= "function" then
     nx._notimpl("vim.fn." .. tostring(name))
   end
-  local unpack = table.unpack or unpack
-  return f(unpack(args or {}))
+  return f(table.unpack(args or {}))
 end
 api.nvim_call_function = nx.call_function
 

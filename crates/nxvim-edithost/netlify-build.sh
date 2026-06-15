@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Netlify build entry for the nxvim wasm edit-host (crates/nxvim-edithost) — the real
-# in-browser editor: nxvim-core + the PUC Lua 5.1 VM + the full server tick compiled to
+# in-browser editor: nxvim-core + the PUC Lua 5.4 VM + the full server tick compiled to
 # wasm32-unknown-emscripten and driven in a Web Worker.
 #
 # Netlify's Git integration runs this on every push to the production branch (see

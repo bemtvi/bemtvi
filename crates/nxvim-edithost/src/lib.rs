@@ -2,7 +2,7 @@
 //! `docs/plans/2026-06-09-edit-host-and-browser-lua.md`.
 //!
 //! This drives the **real** synchronous [`EditHost`] tick (the same one
-//! `nxvim-server`'s native [`run`](nxvim_server) loop drives — core + the PUC Lua 5.1
+//! `nxvim-server`'s native [`run`](nxvim_server) loop drives — core + the PUC Lua 5.4
 //! VM + the full server glue: autocmds, mirrors, lifecycle, the redraw projection)
 //! behind a wasm [`HostEffects`] ([`WasmEffects`]); the keystroke path is the production
 //! tick, not a hand-wired minimal tie-in.

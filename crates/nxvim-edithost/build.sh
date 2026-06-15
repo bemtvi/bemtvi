@@ -25,10 +25,10 @@ command -v emcc >/dev/null 2>&1 || {
   exit 1
 }
 
-# 1. Staticlib: Rust core + Lua + the server tick, plus the lua51/regex C, as wasm
+# 1. Staticlib: Rust core + Lua + the server tick, plus the lua54/regex C, as wasm
 #    objects. This crate's nxvim-server dep is `default-features = false`, so the
 #    `native` feature and its non-emscripten deps drop out; the Lua backend (PUC
-#    lua51, the only backend) comes from the shared mlua dep. -fwasm-exceptions
+#    lua54, the only backend) comes from the shared mlua dep. -fwasm-exceptions
 #    aligns Rust's wasm EH with the vendored C's (puc-lua-compiles-to-wasm-emscripten).
 EMCC_CFLAGS="-fwasm-exceptions" \
   cargo build --release --target wasm32-unknown-emscripten
@@ -41,9 +41,9 @@ LIB=target/wasm32-unknown-emscripten/release/libnxvim_edithost.a
 # carry a build-hash, so find the newest match rather than pin it.
 newest() { find target/wasm32-unknown-emscripten/release/build -path "$1" -print0 2>/dev/null \
   | xargs -0 ls -t 2>/dev/null | head -1; }
-LUA_A=$(newest '*/out/lib/liblua5.1.a')
+LUA_A=$(newest '*/out/lib/liblua5.*.a')
 REGEX_A=$(newest '*/out/libnxvim_regex_c.a')
-[ -n "$LUA_A" ]   || { echo "error: liblua5.1.a not found (did the cargo build run?)" >&2; exit 1; }
+[ -n "$LUA_A" ]   || { echo "error: liblua5.*.a not found (did the cargo build run?)" >&2; exit 1; }
 [ -n "$REGEX_A" ] || { echo "error: libnxvim_regex_c.a not found" >&2; exit 1; }
 
 # 2. Final link → an importable ES module. Archive order: the edit-host lib first, then

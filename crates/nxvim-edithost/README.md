@@ -1,7 +1,7 @@
 # nxvim-edithost — the wasm edit-host
 
 The real editor in the browser: the reusable synchronous [`EditHost`] tick (nxvim's
-core + the PUC Lua 5.1 VM + the `vim.*` bindings + the full server glue — autocmds,
+core + the PUC Lua 5.4 VM + the `vim.*` bindings + the full server glue — autocmds,
 mirrors, lifecycle, the redraw projection) compiled to `wasm32-unknown-emscripten`,
 driven behind a wasm [`HostEffects`] (`WasmEffects`) inside a Web Worker. This is Phase 5
 of

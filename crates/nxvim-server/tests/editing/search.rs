@@ -167,7 +167,9 @@ async fn regex_cmp_path_pattern_compiles_and_matches() {
     let out = exec_lua(
         &rpc,
         r#"local NAME = [==[\%([^/\\:\*?<>'"`\|]\)]==]
-           local pat = ([==[\%(\%(/PAT*[^/\\:\*?<>'"`\| .~]\)\|\%(/\.\.\)\)*/\zePAT*$]==]):gsub('PAT', NAME)
+           -- NAME has a literal `%`, so use a function replacement: a plain-string
+           -- replacement makes 5.2+ treat `%(` as an invalid `%`-escape and error.
+           local pat = ([==[\%(\%(/PAT*[^/\\:\*?<>'"`\| .~]\)\|\%(/\.\.\)\)*/\zePAT*$]==]):gsub('PAT', function() return NAME end)
            local ok, re = pcall(vim.regex, pat)
            if not ok then return "compile-error: " .. tostring(re) end
            -- cmp-path feeds the text left of the cursor; `s` is the boundary it uses.

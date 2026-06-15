@@ -83,7 +83,7 @@ subsystems:
 | `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library, embedded on its own thread by the `nxvim` / `nxvim-gui` binaries; the `--daemon` role reuses it as the remote fs/process half of the edit-host split. |
-| `nxvim-lua`     | `lua/`                                                | Embedded Lua 5.1 runtime (LuaJIT by default, vendored PUC Lua 5.1 via the `lua51` feature) and the `vim.*` standard library. |
+| `nxvim-lua`     | `lua/`                                                | Embedded Lua runtime (vendored PUC Lua 5.4, the single backend) and the `vim.*` standard library. |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
 | `nxvim-ts`      | `tree_sitter/`                                       | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
 | `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
@@ -674,21 +674,20 @@ the panel while it has focus.
 
 ## Lua
 
-nxvim embeds **Lua 5.1** via [mlua] — the dialect neovim runs. Scripts run
+nxvim embeds **vendored PUC Lua 5.4** via [mlua] — the single backend. Scripts run
 **inside the server**, exactly as in neovim, and influence the editor through the
 same mechanisms RPC clients use. The VM loads the full safe stdlib **plus
 `debug`** (real plugins call `debug.getinfo` to locate their own install dir, and
-neovim exposes it). The backend is a Cargo feature: `nxvim-lua` exposes `luajit`
-(**default**, closest neovim parity — it has `ffi` and `bit` natively) and
-`lua51` (vendored PUC Lua 5.1), threaded up unchanged through `nxvim-server` and
-the `nxvim` binary. Build the whole stack on PUC Lua with
-`cargo build -p nxvim --no-default-features --features lua51` (likewise
-`cargo test -p nxvim-server --no-default-features --features lua51`); the prelude
-ships a LuaJIT-compatible `bit` library and loads `ffi` so the PUC backend stays
-behavior-compatible. The two mlua version features are mutually exclusive, so
-`[workspace.dependencies].mlua` selects only `vendored` and each crate sets
-`default-features = false` on the inter-crate deps to keep the default `luajit`
-from leaking into a `lua51` build.
+neovim exposes it). There is no backend toggle: `lua54` is baked into the shared
+`[workspace.dependencies].mlua` (`vendored`), so every crate that links mlua —
+and the wasm edit-host — shares one backend. LuaJIT was dropped (it never
+compiled to the wasm target); the prelude ships a `bit` library shim since PUC
+has no `bit` *table* (5.4's native bitwise operators notwithstanding). 5.4 over
+the old 5.1 baseline brings real 64-bit integers, native bitwise operators, the
+`utf8` library, **yieldable `pcall`** (so `pcall` can wrap a coroutine-yielding
+`nx.await`), and a generational GC; the one stdlib removal that touched the
+prelude — `loadstring` (folded into `load` in 5.2) — is restored by a one-line
+`loadstring = loadstring or load` shim at VM creation in `runtime.rs`.
 
 **Effects flow through queues.** `vim.cmd(...)` / `vim.api.nvim_command(...)`
 queue ex-commands; `print(...)` / `vim.api.nvim_echo(...)` capture output;
@@ -878,7 +877,7 @@ askpass parsing (`crates/nxvim-gui/tests/remote.rs`); the rendered frame, and th
 **`nxvim-edithost` runs the editor *in the browser*, with no server**
 ([`crates/nxvim-edithost`](../crates/nxvim-edithost)). Where the native clients move
 only the UI off the editor, this moves the whole thing into a browser tab — and not
-just the core: `nxvim-core` **+ the PUC Lua 5.1 VM + the full server tick** (the
+just the core: `nxvim-core` **+ the PUC Lua 5.4 VM + the full server tick** (the
 reusable synchronous `EditHost`, autocmds, mirrors, redraw projection) compile to
 `wasm32-unknown-emscripten` and run client-side. It's the edit-host split
 (§*Embedded vs. remote*) taken to its limit: the local half is a browser tab, the
@@ -893,7 +892,7 @@ fs/process half is OPFS or a remote daemon over WebTransport.
   `#[no_mangle] extern "C"` exports — `eh_new` / `eh_input` / `eh_input_mouse` /
   `eh_source_lua` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` / the fs + shada legs
   / `eh_free*` — and the redraw comes back as a JSON return value. Because it links the
-  C-heavy lua51 backend + vim-regex, the final link is `emcc`, not wasm-bindgen.
+  C-heavy lua54 backend + vim-regex, the final link is `emcc`, not wasm-bindgen.
 - **The renderer consumes the same `redraw` the native clients do.** `web/index.html`
   paints the server `redraw` frame as **HTML/CSS** (a per-cell-span DOM renderer —
   windows/gutter/status/tabline/panel/pmenu, selection + cursor-shape classes, smooth
@@ -973,7 +972,7 @@ screen," and that is exactly the shape of these tests.
 
 - Headless, authoritative editor server with thin UI clients.
 - Single-threaded editor core; concurrency via async I/O.
-- Lua 5.1 scripting running inside the server.
+- Lua 5.4 scripting running inside the server.
 - Source organization mirroring neovim's subsystems (one crate per area).
 - Vim modes, motions, operators, counts, registers, and ex-commands.
 
@@ -1110,8 +1109,8 @@ screen," and that is exactly the shape of these tests.
   ([ADR 0002](decisions/0002-native-plugin-system.md)).
 - The `vim.*` glue, kept only as far as colorschemes need
   ([ADR 0002](decisions/0002-native-plugin-system.md)).
-  (LuaJIT is already the **default** backend —
-  vendored PUC Lua 5.1 is the `lua51` opt-in — see [*Lua*](#lua).)
+  (The backend is vendored PUC Lua 5.4, the single baked-in backend — see
+  [*Lua*](#lua).)
 
 [`tokio::io::duplex`]: https://docs.rs/tokio/latest/tokio/io/fn.duplex.html
 [mlua]: https://docs.rs/mlua

@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# The Lua backend (PUC lua51) is baked into the shared `mlua` dep — no backend
+# The Lua backend (PUC lua54) is baked into the shared `mlua` dep — no backend
 # feature to select here. The dep inherits `default-features = false` from
 # [workspace.dependencies] so `--no-default-features` (the wasm build) drops
 # `native` below; the Lua VM is unaffected either way.
@@ -81,7 +81,7 @@ nxvim-lsp = { workspace = true, optional = true }
 nxvim-ts = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Shared black-box test harness. Backend features are threaded in via this
-# crate's own lua51/luajit features (above) so the harness's nxvim-server
-# dependency resolves to the same single backend as the crate under test.
+# Shared black-box test harness. The single Lua backend (PUC lua54) comes from
+# the shared `mlua` dep, so the harness's nxvim-server dependency resolves to the
+# same backend as the crate under test.
 nxvim-test-harness.workspace = true

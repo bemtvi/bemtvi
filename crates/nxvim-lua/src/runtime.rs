@@ -466,10 +466,14 @@ impl LuaRuntime {
         // so nxvim does the same. mlua only permits `debug` via its unsafe
         // constructor (it also re-enables C-module loading, which a user config
         // is already trusted to do); the VM is otherwise the standard safe set.
-        // nxvim runs vendored PUC Lua 5.1, which has no `ffi` library (that is a
+        // nxvim runs vendored PUC Lua 5.4, which has no `ffi` library (that is a
         // LuaJIT extension), so the safe set + `debug` is the whole VM.
         let libs = StdLib::ALL_SAFE | StdLib::DEBUG;
         let lua = unsafe { Lua::unsafe_new_with(libs, LuaOptions::default()) };
+        // `loadstring` was folded into `load` in 5.2; restore the 5.1 spelling so
+        // plugin/colorscheme code that compiles chunks at runtime (e.g. a colorscheme
+        // caching itself via `loadstring` + `string.dump`) keeps working.
+        lua.load("loadstring = loadstring or load").exec()?;
         let shared = Rc::new(RefCell::new(Shared::default()));
         install_vim(&lua, &shared)?;
         install_runtime_api(&lua, &shared, &runtimepath)?;

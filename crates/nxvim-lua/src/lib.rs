@@ -1,7 +1,7 @@
 //! The Lua runtime and the beginnings of the `vim.*` standard library.
 //!
-//! nxvim embeds the Lua 5.1 dialect (mlua's `luajit` backend by default — the
-//! dialect neovim runs; `lua51` is a swappable alternative). Scripts run inside
+//! nxvim embeds vendored PUC Lua 5.4 (the single backend, via mlua's `lua54`
+//! feature — LuaJIT was dropped, matching the wasm build). Scripts run inside
 //! the *server*, exactly as in neovim, and influence the editor through the same
 //! mechanisms RPC clients use.
 //!

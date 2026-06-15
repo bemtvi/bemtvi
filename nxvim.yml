@@ -1,8 +1,13 @@
 # selene standard library for nxvim's Lua prelude.
-# Layers the globals nxvim injects on top of the base PUC Lua 5.1 runtime so
-# selene doesn't flag them as undefined / unscoped. `any: true` permits
-# arbitrary field reads, writes, and calls (the `vim.*` API is open-ended).
+# Layers the globals nxvim injects on top of the base PUC Lua runtime so selene
+# doesn't flag them as undefined / unscoped. `any: true` permits arbitrary field
+# reads, writes, and calls (the `vim.*` API is open-ended).
 #
+# Base is `lua51` (the std selene ships reliably); the handful of 5.2+ stdlib
+# functions nxvim's PUC Lua 5.4 prelude actually uses (`table.unpack`,
+# `coroutine.isyieldable`) are declared under `globals` below, since selene's
+# bundled `lua53` std is incomplete (no `coroutine.isyieldable`) and needs a
+# build feature this distribution lacks.
 # Referenced as `std = "lua51+nxvim"` from selene.toml — selene resolves the
 # `nxvim` segment to this file (nxvim.yml, alongside selene.toml at the repo root).
 base: lua51
@@ -25,7 +30,11 @@ globals:
   # LuaJIT introspection global, referenced for runtime feature detection.
   jit:
     any: true
-  # Lua 5.2+ moved unpack to table.unpack; the prelude guards with
-  # `table.unpack or unpack`, so the field must be a known (optional) member.
+  # Lua 5.2+ moved `unpack` to `table.unpack`; nxvim runs PUC 5.4, so the prelude
+  # calls `table.unpack` directly (the `table` field isn't in selene's lua51 std).
   table.unpack:
     any: true
+  # 5.2+ coroutine introspection; `nx.await` uses it to detect an enclosing
+  # nx.async coroutine. Not in selene's lua51 std, so declare it here.
+  coroutine.isyieldable:
+    args: []

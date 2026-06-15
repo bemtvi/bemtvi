@@ -6,15 +6,15 @@
 local vim = vim
 nx = nx or {}
 
--- ----- bit: LuaJIT-compatible bit ops on PUC Lua 5.1 ------------------------
+-- ----- bit: LuaJIT-compatible bit ops on PUC Lua 5.4 ------------------------
 
 -- neovim runs LuaJIT, which ships a global `bit` library; nxvim runs PUC Lua
--- 5.1, which has neither `bit` nor 5.2's `bit32`. Plugins reach for it as
--- `bit or bit32` (catppuccin hashes its config with djb2 + xor), so provide a
--- faithful pure-Lua implementation with LuaJIT's 32-bit two's-complement
--- semantics: results are normalized to the signed [-2^31, 2^31) range and shift
--- counts are taken mod 32. Only installed when absent, so a real LuaJIT host
--- keeps its native (faster) version.
+-- 5.4, which has native bitwise *operators* but no `bit` *table* (nor 5.2's
+-- `bit32`). Plugins reach for it as `bit or bit32` (catppuccin hashes its config
+-- with djb2 + xor), so provide a faithful pure-Lua implementation with LuaJIT's
+-- 32-bit two's-complement semantics: results are normalized to the signed
+-- [-2^31, 2^31) range and shift counts are taken mod 32. Only installed when
+-- absent (always, on PUC).
 if not bit then
   local POW = {}
   for i = 0, 32 do
@@ -435,9 +435,10 @@ vim.split = nx.str.split
 
 -- ----- vim.fn string-width / character builtins ------------------------------
 -- The display/character helpers a popup plugin calls to lay out its
--- grid over UTF-8 text. nxvim runs PUC Lua 5.1 (byte strings, no `utf8` library),
--- so these decode UTF-8 by hand. (vim.fn already exists — the Rust bridge created
--- it before the prelude loads — so these extend it.)
+-- grid over UTF-8 text. These decode UTF-8 by hand over Lua's byte strings (5.4
+-- ships a `utf8` library, but these predate the bump and could later use it).
+-- (vim.fn already exists — the Rust bridge created it before the prelude loads —
+-- so these extend it.)
 
 -- Decode the codepoint starting at byte index `i` (1-based) of `s`, returning
 -- (codepoint, byte_length), or (nil, 0) past the end. A malformed / truncated

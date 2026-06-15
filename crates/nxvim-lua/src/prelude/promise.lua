@@ -387,7 +387,7 @@ function M.wrap(fn)
           resolve({ ... })
         end
       end
-      fn(table.unpack and table.unpack(args, 1, argc + 1) or unpack(args, 1, argc + 1))
+      fn(table.unpack(args, 1, argc + 1))
     end)
   end
 end
@@ -418,11 +418,11 @@ nx.promise = M
 --     end)
 --     load("init.lua"):next(use):catch(report)
 --
--- LIMITATION (PUC Lua 5.1, nxvim's only backend): you cannot wrap an `nx.await`
--- inside `pcall` — 5.1 can't yield across a pcall boundary. To handle a rejected
--- await, let it raise to the coroutine edge (the returned promise rejects, so
--- `:catch` on the result catches it) or attach `:catch` to the awaited promise
--- itself. Don't `pcall(function() nx.await(p) end)`.
+-- A rejected await raises inside the coroutine, so you can handle it either way:
+-- wrap the await in `pcall` to catch it locally (PUC 5.2+ yields across a `pcall`
+-- boundary, so this works on nxvim's 5.4 backend), or let it propagate to the
+-- coroutine edge (the returned promise rejects, caught by `:catch` on the result)
+-- or attach `:catch` to the awaited promise itself.
 
 function nx.async(fn)
   if not is_callable(fn) then
@@ -453,7 +453,7 @@ function nx.async(fn)
           step(false, reason)
         end)
       end
-      step(table.unpack and table.unpack(args, 1, argc) or unpack(args, 1, argc))
+      step(table.unpack(args, 1, argc))
     end)
   end
 end
@@ -463,7 +463,11 @@ end
 -- error (which, uncaught, rejects the async function's promise). Errors loudly if
 -- called outside an nx.async coroutine — there is nothing to suspend.
 function nx.await(awaitable)
-  if coroutine.running() == nil then
+  -- `coroutine.isyieldable()` is false on the main thread and true inside a
+  -- coroutine — exactly "is there an nx.async frame to suspend?". (The 5.1
+  -- spelling `coroutine.running() == nil` broke in 5.2+, where `running()`
+  -- returns the main thread itself rather than nil.)
+  if not coroutine.isyieldable() then
     error("nx.await must be called inside an nx.async function", 2)
   end
   local ok, value = coroutine.yield(awaitable)

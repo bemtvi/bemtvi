@@ -102,7 +102,7 @@ function nx.schedule_wrap(fn)
     local args = { ... }
     local n = select("#", ...)
     nx.schedule(function()
-      fn(table.unpack and table.unpack(args, 1, n) or unpack(args, 1, n))
+      fn(table.unpack(args, 1, n))
     end)
   end
 end

@@ -1,5 +1,5 @@
 # Netlify configuration for the nxvim wasm edit-host (crates/nxvim-edithost) — the real
-# in-browser editor: nxvim-core + the PUC Lua 5.1 VM + the full server tick compiled to
+# in-browser editor: nxvim-core + the PUC Lua 5.4 VM + the full server tick compiled to
 # WebAssembly and driven in a Web Worker. Connect the repo once in the Netlify dashboard;
 # thereafter every push to the production branch runs the build below and deploys it.
 #

@@ -13,7 +13,9 @@
     "verify-daemon": "node verify-daemon.mjs",
     "verify-connect": "node verify-connect.mjs",
     "verify-treesitter": "node verify-treesitter.mjs",
-    "verify-clipboard": "node verify-clipboard.mjs"
+    "verify-clipboard": "node verify-clipboard.mjs",
+    "verify-proc": "node verify-proc.mjs",
+    "verify-terminal": "node verify-terminal.mjs"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",

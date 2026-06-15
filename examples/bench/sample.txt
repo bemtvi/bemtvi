@@ -1,0 +1,13 @@
+nxvim Lua micro-benchmark playground
+=====================================
+
+This buffer is just a place to land. The benchmarks live in init.lua and are
+exposed as ex-commands:
+
+    :bench1 … :bench10    run a single benchmark   (one line on the message area)
+    :benchall             run the whole suite      (then :messages for the table)
+    :messages             review the full table
+
+Each line reports: iterations, total ms, microseconds/iteration, and a `chk=`
+checksum. The checksum is identical across backends when the work matches, so a
+PUC-vs-Luau run that agrees on every checksum differs only in speed.

@@ -197,6 +197,13 @@ impl EditHost {
         match ev {
             TermEvent::Data { buf, bytes } => self.terminal_feed(buf, &bytes),
             TermEvent::Exit { buf, code } => {
+                // Mirror the child's final screen into the buffer *before* the emulator
+                // is dropped. A fast-exiting child's last `Data` and its `Exit` arrive in
+                // the same `on_term_events` batch, and the batch's post-drain projection
+                // can't read a removed emulator — so without this, that output is fed but
+                // never projected (the buffer shows only the exit notice). `terminal_closed`
+                // appends the notice after this mirrored content.
+                self.terminal_project(buf);
                 self.editor.terminal_closed(buf, code);
                 self.terminal_remove(buf);
             }

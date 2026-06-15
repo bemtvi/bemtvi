@@ -803,10 +803,21 @@ pub(crate) mod native {
         }
     }
 
-    /// Spawn one PTY child for `buf` and wire its I/O: a reader thread streams output
-    /// as [`TermEvent::Data`], a waiter thread reports the exit as [`TermEvent::Exit`].
-    /// Both are plain OS threads (portable-pty's reader/wait are blocking); they end
-    /// when the child exits (EOF on the master) or the event channel closes.
+    /// Spawn one PTY child for `buf` and wire its I/O: a single OS thread streams the
+    /// child's output as [`TermEvent::Data`] and, once the output is fully drained,
+    /// reaps the child and reports its exit as [`TermEvent::Exit`].
+    ///
+    /// Reading and waiting share one thread *on purpose*: the editor's exit handler
+    /// drops the buffer's emulator ([`terminal_remove`](EditHost::terminal_remove)), so
+    /// any `Data` it processes *after* an `Exit` is fed to a gone emulator and lost. Two
+    /// independent threads (one read, one wait) gave no ordering guarantee on the shared
+    /// channel — a fast-exiting child (`printf 'x\n'`) could enqueue `Exit` before the
+    /// reader enqueued its final `Data`, dropping the output. Sending `Exit` only after
+    /// the read loop hits EOF/EIO makes `Data`-before-`Exit` ordering deterministic: the
+    /// kernel returns the child's buffered output before signalling end-of-stream on the
+    /// master (Linux `EIO`-after-drain, macOS `EOF`-after-drain), so by the time the loop
+    /// breaks every byte has already been sent. The thread ends when the child exits or
+    /// the event channel closes (server shutdown).
     fn open_pty(
         buf: BufferId,
         argv: Vec<String>,
@@ -840,32 +851,32 @@ pub(crate) mod native {
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
 
-        let data_tx = event_tx.clone();
+        let event_tx = event_tx.clone();
+        let mut child = child;
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if data_tx
+                        if event_tx
                             .send(TermEvent::Data {
                                 buf,
                                 bytes: chunk[..n].to_vec(),
                             })
                             .is_err()
                         {
+                            // The editor side is gone (shutdown) — stop, but still reap
+                            // the child below so it isn't left a zombie.
                             break;
                         }
                     }
                 }
             }
-        });
-
-        let exit_tx = event_tx.clone();
-        let mut child = child;
-        std::thread::spawn(move || {
+            // Output fully drained (EOF/EIO on the master ⇒ the child has closed its end);
+            // reap it for the real exit code and report the exit *after* every `Data`.
             let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
-            let _ = exit_tx.send(TermEvent::Exit { buf, code });
+            let _ = event_tx.send(TermEvent::Exit { buf, code });
         });
 
         Ok(Session {

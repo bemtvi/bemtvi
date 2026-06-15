@@ -145,6 +145,11 @@ pub struct MenuView {
     /// top border, and shifted one cell left so the left border doesn't push the
     /// list off the word it completes. `false` for `select` / picker.
     pub completion: bool,
+    /// Whether [`selected`](Self::selected) is an **active** selection the client
+    /// highlights. Always `true` for a `select` / picker. `false` for a freshly
+    /// opened completion popup (noselect — no row highlighted until the user
+    /// navigates), so an auto-open never makes `<CR>` accept a row.
+    pub selected_active: bool,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

@@ -1794,7 +1794,9 @@ impl Renderer {
             });
         }
 
-        let start = pmenu_start(Some(menu.selected), list_rows as usize);
+        // A noselect completion popup highlights no row and scrolls from the top.
+        let sel = menu.selected_active.then_some(menu.selected);
+        let start = pmenu_start(sel, list_rows as usize);
         // A warm accent on matched characters, so the fuzzy match reads at a glance.
         let match_fg = 0x00E5_C07B;
         for r in 0..list_rows {
@@ -1803,7 +1805,7 @@ impl Renderer {
                 continue;
             };
             let row = content_y0 + list_y0 + r;
-            if idx == menu.selected {
+            if sel == Some(idx) {
                 self.fill_cells(quads, cx, row, list_w, sel_bg);
             }
             let text = pmenu_row(label, "", list_w as usize);

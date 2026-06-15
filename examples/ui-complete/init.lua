@@ -18,12 +18,14 @@
 -- on purpose (try it: add `{ "lsp" }` to `sources` below).
 --
 -- In insert mode, once you've typed `min_chars` of a word that prefixes another
--- word in the buffer, a popup appears:
---   <C-n> / <Tab> / <Down>   move the selection down
---   <C-p> / <S-Tab> / <Up>   move the selection up
---   <C-y>                    accept the highlighted completion
+-- word in the buffer, a popup appears. It opens with NOTHING selected (noselect,
+-- like nvim-cmp) — so <CR> keeps inserting newlines until you actually pick a row:
+--   <C-n> / <Tab> / <Down>   select / move down the list
+--   <C-p> / <S-Tab> / <Up>   select / move up the list
+--   <C-y> / <CR>             accept the highlighted row (only once one is selected)
 --   <C-e>                    dismiss the popup (keep what you typed)
 --   any other key            dismisses + takes its normal effect (type / <Esc> / …)
+-- (A manual <C-Space> trigger preselects the first row, so <C-y>/<CR> accept at once.)
 
 vim.g.mapleader = "\\"
 

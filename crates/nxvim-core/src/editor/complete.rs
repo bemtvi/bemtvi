@@ -156,7 +156,9 @@ impl Editor {
             self.close_completion();
             return;
         }
-        self.set_complete_menu(anchor, &prefix, candidates);
+        // Auto-typing is noselect — nothing highlighted until the user navigates,
+        // so `<CR>` stays a newline.
+        self.set_complete_menu(anchor, &prefix, candidates, false);
     }
 
     /// Manually open (or refresh) the completion popup — the `<C-x><C-n>` /
@@ -175,16 +177,20 @@ impl Editor {
             self.close_completion();
             return;
         }
-        self.set_complete_menu(anchor, &prefix, candidates);
+        // An explicit trigger preselects the first match (vim-like) so `<C-y>` /
+        // `<CR>` accept it immediately, without a separate navigation step.
+        self.set_complete_menu(anchor, &prefix, candidates, true);
     }
 
     /// Accept the highlighted completion: replace the typed prefix
     /// `[anchor .. cursor)` with the row's insert text and park the cursor just
-    /// past it. A no-op when no completion menu is open. The edit groups into the
+    /// past it. Returns whether anything was accepted — `false` when no completion
+    /// menu is open or **nothing is selected yet** (noselect), so the caller can let
+    /// the key fall through (e.g. `<CR>` makes a newline). The edit groups into the
     /// surrounding insert session (the snapshot is already held).
-    pub(crate) fn complete_accept(&mut self) {
+    pub(crate) fn complete_accept(&mut self) -> bool {
         let Some((anchor, insert)) = self.complete_take_accept() else {
-            return;
+            return false;
         };
         let cursor_byte = self.cursor_char();
         // `anchor` is always ≤ the cursor (the prefix is the word chars left of
@@ -194,6 +200,7 @@ impl Editor {
         self.buffer_mut().normalize();
         self.buffer_mut().modified = true;
         self.set_cursor_char_insert(anchor + insert.len());
+        true
     }
 
     /// The word prefix being completed: `(anchor, prefix)`, where `anchor` is the

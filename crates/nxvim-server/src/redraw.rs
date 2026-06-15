@@ -866,6 +866,10 @@ impl EditHost {
         let mut map = vec![
             (Value::from("items"), Value::Array(items)),
             (Value::from("selected"), Value::from(selected as u64)),
+            (
+                Value::from("selected_active"),
+                Value::from(m.selected_active),
+            ),
             (Value::from("row"), Value::from(row as u64)),
             (Value::from("col"), Value::from(col as u64)),
             (Value::from("width"), Value::from(width as u64)),

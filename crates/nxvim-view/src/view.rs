@@ -330,6 +330,10 @@ pub struct PmenuData {
 pub struct MenuData {
     pub items: Vec<String>,
     pub selected: usize,
+    /// Whether `selected` is an active selection to highlight. `false` for a
+    /// freshly opened completion popup (noselect) — no row is highlighted until the
+    /// user navigates. Absent in the map ⇒ `true` (the `select` / picker default).
+    pub selected_active: bool,
     pub row: u16,
     pub col: u16,
     pub width: u16,
@@ -515,6 +519,8 @@ impl View {
             Some(Value::Map(m)) => Some(MenuData {
                 items: map_str_array(m, "items"),
                 selected: map_u64(m, "selected") as usize,
+                selected_active: map_get(m, "selected_active").and_then(Value::as_bool)
+                    != Some(false),
                 row: map_u16(m, "row"),
                 col: map_u16(m, "col"),
                 width: map_u16(m, "width"),

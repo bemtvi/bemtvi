@@ -228,6 +228,11 @@ pub(crate) struct Menu {
     /// The highlighted row, as an index into the effective view (`filtered` when
     /// `Some`, else `all_items`).
     cursor: usize,
+    /// Whether `cursor` is an **active** selection the client highlights. Always
+    /// `true` for a `select` / picker (they always have a highlighted row). For the
+    /// completion popup it starts `false` (noselect — nothing highlighted, `<CR>`
+    /// makes a newline) and flips `true` on the first navigation.
+    selected_active: bool,
     placement: MenuPlacement,
     /// The `gg`-pending flag (two-key motion), select-mode only.
     gpending: bool,
@@ -370,6 +375,7 @@ impl Editor {
             filtered: None,
             match_spans: Vec::new(),
             cursor: cursor.min(last),
+            selected_active: true,
             placement,
             gpending: false,
             prompt: None,
@@ -409,6 +415,7 @@ impl Editor {
             filtered: None,
             match_spans: Vec::new(),
             cursor: 0,
+            selected_active: true,
             placement,
             gpending: false,
             prompt: Some(Prompt::default()),
@@ -503,14 +510,17 @@ impl Editor {
 
     /// Open or refresh the completion popup: `candidates` are fuzzy-ranked against
     /// `prefix`, the matches become a [`MenuKind::Complete`] menu anchored at
-    /// `anchor` (the buffer byte offset where the prefix begins), the first match
-    /// preselected. No matches closes the popup. Each row's `insert` text is its
-    /// label (the `buffer` source completes to the whole word).
+    /// `anchor` (the buffer byte offset where the prefix begins). No matches closes
+    /// the popup. Each row's `insert` text is its label (the `buffer` source
+    /// completes to the whole word). `preselect` highlights the first row up front
+    /// (an explicit manual trigger, vim-like); auto-typing passes `false` (noselect
+    /// — nothing highlighted until the user navigates, so `<CR>` stays a newline).
     pub(crate) fn set_complete_menu(
         &mut self,
         anchor: usize,
         prefix: &str,
         candidates: Vec<String>,
+        preselect: bool,
     ) {
         let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         let ranked = crate::fuzzy::rank(prefix, &refs);
@@ -540,6 +550,10 @@ impl Editor {
             filtered: Some(filtered),
             match_spans,
             cursor: 0,
+            // Noselect by default: nothing is highlighted until the user navigates,
+            // so an auto-opened popup never hijacks `<CR>` (it stays a newline). A
+            // manual trigger passes `preselect = true` to highlight the first row.
+            selected_active: preselect,
             placement: MenuPlacement::Cursor,
             gpending: false,
             prompt: None,
@@ -554,12 +568,19 @@ impl Editor {
         });
     }
 
-    /// Move the completion selection (wrapping), `<C-n>` / `<C-p>`-style. A no-op
-    /// unless a completion menu is open.
+    /// Move the completion selection (wrapping), `<C-n>` / `<C-p>`-style. The popup
+    /// opens with **no** active selection (noselect, like nvim-cmp): the first
+    /// `next` highlights row 0, the first `prev` the last row, and only then does
+    /// `<CR>` accept (otherwise it's a plain newline). A no-op unless a completion
+    /// menu is open.
     pub(crate) fn complete_select_next(&mut self) {
         if let Some(m) = self.completion_menu_mut() {
             let len = m.view_len();
-            if len > 0 {
+            if len == 0 {
+            } else if !m.selected_active {
+                m.selected_active = true;
+                m.cursor = 0;
+            } else {
                 m.cursor = (m.cursor + 1) % len;
             }
         }
@@ -568,19 +589,26 @@ impl Editor {
     pub(crate) fn complete_select_prev(&mut self) {
         if let Some(m) = self.completion_menu_mut() {
             let len = m.view_len();
-            if len > 0 {
+            if len == 0 {
+            } else if !m.selected_active {
+                m.selected_active = true;
+                m.cursor = len - 1;
+            } else {
                 m.cursor = (m.cursor + len - 1) % len;
             }
         }
     }
 
-    /// The selected completion's `(anchor, insert_text)`, closing the menu. `None`
-    /// when no completion menu is open (the caller then leaves the key to its
-    /// normal insert handling). The caller applies the edit — replacing the buffer
-    /// `[anchor .. cursor)` prefix with `insert_text` — since core's buffer
-    /// mutators live on [`Editor`].
+    /// The actively-selected completion's `(anchor, insert_text)`, closing the
+    /// menu. `None` when no completion menu is open **or nothing is selected yet**
+    /// (the popup just auto-opened) — the caller then leaves the key to its normal
+    /// insert handling, so `<CR>` makes a newline rather than accepting a row the
+    /// user never picked. The caller applies the edit (replacing `[anchor .. cursor)`).
     pub(crate) fn complete_take_accept(&mut self) -> Option<(usize, String)> {
         let m = self.completion_menu_mut()?;
+        if !m.selected_active {
+            return None;
+        }
         let row = m.all_items.get(m.item_at(m.cursor))?;
         let insert = row.insert.clone().unwrap_or_else(|| row.label.clone());
         let anchor = m.anchor;
@@ -785,6 +813,7 @@ impl Editor {
             height: m.height,
             anchor_offset: m.anchor_width,
             completion: m.kind == MenuKind::Complete,
+            selected_active: m.selected_active,
         })
     }
 

@@ -1009,8 +1009,11 @@
       // Render the FULL box height (`menu.height` is the fixed picker size), padding
       // empty rows past the item count so the box doesn't shrink to its content.
       const listRows = Math.max(1, menu.height - promptRows);
+      // A noselect completion popup (`selected_active === false`) highlights no row
+      // and scrolls from the top.
+      const selActive = menu.selected_active !== false;
       const first = Math.max(0, Math.min(menu.selected - listRows + 1, menu.items.length - listRows));
-      const start = menu.selected >= listRows ? first : 0;
+      const start = selActive && menu.selected >= listRows ? first : 0;
       const box = document.createElement("div");
       box.className = "pmenu";
       // The completion popup omits its top border so it sits flush with the line
@@ -1031,7 +1034,7 @@
         const idx = start + i;
         const label = String(menu.items[idx] ?? "");
         const rowEl = document.createElement("div");
-        rowEl.className = "row" + (idx === menu.selected ? " pmenu-sel" : "");
+        rowEl.className = "row" + (selActive && idx === menu.selected ? " pmenu-sel" : "");
         rowEl.style.width = listW * cw + "px";
         // Bold + accent the matched characters (the fuzzy match), per the server's
         // char-based spans; plain text when this picker/select has no spans.

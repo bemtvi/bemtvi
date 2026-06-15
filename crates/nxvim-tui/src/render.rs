@@ -1759,7 +1759,9 @@ fn render_menu(
     let has_prompt = menu.query.is_some();
     let chrome = usize::from(has_prompt) * 2;
     let list_rows = inner_h.saturating_sub(chrome);
-    let start = pmenu_start(Some(menu.selected), list_rows);
+    // A noselect completion popup highlights no row and scrolls from the top.
+    let sel = menu.selected_active.then_some(menu.selected);
+    let start = pmenu_start(sel, list_rows);
 
     // Build one list row (or a blank filler past the end of the list).
     let list_line = |r: usize| -> Line<'static> {
@@ -1768,7 +1770,7 @@ fn render_menu(
             Some(label) => {
                 let empty = Vec::new();
                 let spans = menu.match_spans.get(idx).unwrap_or(&empty);
-                menu_row_line(label, spans, idx == menu.selected, width)
+                menu_row_line(label, spans, sel == Some(idx), width)
             }
             None => Line::from(" ".repeat(width)),
         }

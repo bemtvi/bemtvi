@@ -52,21 +52,43 @@ impl Editor {
         // normally and then re-triggers the engine at the end of this fn. (The
         // popup does not grab input — the buffer is the query.)
         if self.completion_active() {
-            if let Some(action) = self.complete_action(&key) {
-                use super::complete::CompleteAction;
-                match action {
-                    CompleteAction::Next => self.complete_select_next(),
-                    CompleteAction::Prev => self.complete_select_prev(),
-                    CompleteAction::Abort => self.close_completion(),
-                    CompleteAction::Confirm => self.complete_accept(),
+            use super::complete::CompleteAction;
+            match self.complete_action(&key) {
+                Some(CompleteAction::Next) => {
+                    self.complete_select_next();
+                    return;
                 }
-                return;
+                Some(CompleteAction::Prev) => {
+                    self.complete_select_prev();
+                    return;
+                }
+                Some(CompleteAction::Abort) => {
+                    self.close_completion();
+                    return;
+                }
+                Some(CompleteAction::Confirm) => {
+                    // Accept only when a row is actively selected. With nothing
+                    // selected (a just-opened popup, noselect), dismiss and let the
+                    // key act normally — `<CR>` then inserts a newline rather than
+                    // the popup eating it; other confirm keys (`<C-y>`) just dismiss
+                    // without self-inserting.
+                    if self.complete_accept() {
+                        return;
+                    }
+                    self.close_completion();
+                    if key.code != KeyCode::Enter {
+                        return;
+                    }
+                    // `<CR>` falls through to the newline handling below.
+                }
+                None => {
+                    // Any non-control key (typing, `<BS>`, motion, `<Esc>`) closes
+                    // the popup; the edit/motion then proceeds below, and a word
+                    // keystroke re-opens it via `complete_trigger`. `<Esc>` thus
+                    // closes the popup and still leaves Insert mode in one press.
+                    self.close_completion();
+                }
             }
-            // Any non-control key (typing, `<BS>`, motion, `<Esc>`) closes the
-            // popup; the edit/motion then proceeds below, and a word keystroke
-            // re-opens it via `complete_trigger`. `<Esc>` thus closes the popup and
-            // still leaves Insert mode in one press.
-            self.close_completion();
         }
 
         // `<C-r>{register}`: the keystroke after `<C-r>` names the register whose

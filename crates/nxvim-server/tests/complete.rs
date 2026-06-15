@@ -126,7 +126,9 @@ async fn buffer_completion_opens_then_accepts_without_touching_the_buffer_until_
     // The document holds only what was typed — the popup did not swallow the keys.
     assert_eq!(lines(&rpc).await, vec!["hello he"]);
 
-    // Accept: the typed `he` prefix is replaced with the completed word.
+    // Select the first row, then accept: the typed `he` prefix is replaced with the
+    // completed word. (Noselect — accept needs an explicit selection first.)
+    feed(&rpc, "<C-n>");
     feed(&rpc, "<C-y>");
     assert_eq!(lines(&rpc).await, vec!["hello hello"]);
     // The popup is gone after accept.
@@ -163,9 +165,10 @@ async fn navigation_moves_the_selection_and_accept_inserts_that_row() {
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
     let items = menu_items(&menu);
     assert_eq!(items.len(), 2, "two candidates: {items:?}");
-    assert_eq!(menu_selected(&menu), 0);
 
-    // `<C-n>` advances the selection to the second row.
+    // First `<C-n>` activates the first row (noselect → row 0); a second advances
+    // to the second row.
+    feed(&rpc, "<C-n>");
     feed(&rpc, "<C-n>");
     let menu = menu_of(
         &poll_menu(&rpc, &mut incoming)
@@ -235,9 +238,64 @@ async fn example_config_loads_and_completes() {
     feed(&rpc, "iconfig con");
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
     assert_eq!(menu_items(&menu), vec!["config"]);
-    // The example maps <CR> as an accept key too.
+    // The example maps <CR> as an accept key — but only after selecting a row
+    // (noselect), so navigate first, then <CR> accepts.
+    feed(&rpc, "<C-n>");
     feed(&rpc, "<CR>");
     assert_eq!(lines(&rpc).await, vec!["config config"]);
+}
+
+/// With `<CR>` mapped as a confirm key, an *unnavigated* popup must NOT eat the
+/// Enter — nothing is selected yet, so `<CR>` inserts a newline (cmp-style
+/// `select = false`). You only accept after explicitly moving the selection.
+#[tokio::test]
+async fn cr_inserts_a_newline_until_you_navigate() {
+    let dir = temp_dir("complete_cr_noselect");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, \
+         keys = { confirm = { '<C-y>', '<CR>' } } }",
+    )
+    .await;
+
+    // Popup opens, but nothing is selected yet.
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["hello"]);
+    assert_eq!(
+        map_get(&menu, "selected_active").and_then(Value::as_bool),
+        Some(false),
+        "nothing is preselected"
+    );
+
+    // <CR> with nothing selected → a newline, not an accept.
+    feed(&rpc, "<CR>");
+    assert_eq!(lines(&rpc).await, vec!["hello he", ""]);
+}
+
+#[tokio::test]
+async fn cr_accepts_once_you_have_navigated() {
+    let dir = temp_dir("complete_cr_navigated");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, \
+         keys = { confirm = { '<C-y>', '<CR>' } } }",
+    )
+    .await;
+
+    feed(&rpc, "ihello he");
+    poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    // Navigate to the first row (now there IS an active selection)…
+    feed(&rpc, "<C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup open"));
+    assert_eq!(
+        map_get(&menu, "selected_active").and_then(Value::as_bool),
+        Some(true),
+        "navigation activates the selection"
+    );
+    // …so <CR> now accepts it.
+    feed(&rpc, "<CR>");
+    assert_eq!(lines(&rpc).await, vec!["hello hello"]);
 }
 
 fn menu_col(menu: &[(Value, Value)]) -> u64 {

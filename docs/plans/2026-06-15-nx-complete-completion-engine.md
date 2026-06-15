@@ -113,6 +113,15 @@ buffer source is pure core).
   completed, not the caret: `Menu.anchor_width` (the prefix's display width) →
   `MenuView.anchor_offset`, which `project_menu` subtracts from the cursor column in
   the Cursor branch. `0` for `select`, so that path is byte-for-byte unchanged.
+- **Noselect (cmp-style)** — the auto-opened popup highlights **nothing** until you
+  navigate, so a mapped `<CR>` confirm key stays a newline until you've actually
+  picked a row (the original preselect-first made `<CR>` hijack every Enter).
+  `Menu.selected_active` (false at auto-open, true on first nav / for a manual
+  trigger which preselects row 0) → `MenuView`/`MenuData.selected_active`; the
+  confirm handler accepts only when active and otherwise lets the key fall through
+  (`<CR>` → newline, `<C-y>` → just dismiss). All three clients skip the highlight +
+  scroll-from-top when `selected_active` is false. `set_complete_menu(…, preselect)`:
+  `false` for auto-typing, `true` for an explicit `nx.complete.trigger()`.
 - **Flush, borderless-top popup** — the completion popup drops its **top border**
   (so it abuts the line below the cursor) and each client offsets the box one cell
   **left** of `menu.col` so the left border doesn't push the list off the word.

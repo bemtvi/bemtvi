@@ -343,15 +343,54 @@ out of the box once a server attaches.
 
 ## Phase 4-D — Snippets + the docs sidebar (widget-spec preview kind `"markdown"`)
 
+### Docs sidebar ✅ DONE (2026-06-15)
+
+`preview = "markdown"` beside a `Cursor`-placed completion popup — a **separate
+bordered float** (right of the box, flipping left for room) rendering the selected
+`lsp` row's `detail` + `documentation`, server-side, zero Lua at frame time.
+
+- **Server-keyed, not threaded through core.** The `lsp` source is server-native, so
+  the docs content lives in the server's `lsp_complete.items` cache — core never sees
+  the markdown. Core exposes only the *selected row's identity*
+  (`MenuView { docs, selected_key, selected_source_accept }` + `Editor::complete_selected`,
+  gated on an **active** selection so a noselect popup shows none); the server reads
+  `items[key]` and renders. This sidesteps the picker's file-path `PreviewTarget` model
+  (which doesn't fit inline docs) and a re-push-on-resolve that would disturb selection.
+- **Lazy `completionItem/resolve`.** The dormant resolve plumbing (`LspReqKind::CompletionResolve`,
+  `LspRequest::ResolveCompletion`, `LspReply::ResolvedCompletion`, the mock's
+  `completion_resolve`) — left from the retired pmenu, ignored at `request.rs` — is
+  re-pointed at the unified widget. `complete_lsp_maybe_resolve` (in `run_pending`, once
+  per key) issues a resolve for the highlighted `lsp` row when its cached `documentation`
+  is `None` but it has `resolve_data`; the reply fills the cache (stamping `Some("")` even
+  when docless, so it never re-fires) and repaints. A fresh completion list / accept
+  resets the in-flight `lsp_complete_resolve_key`, so a stale reply is dropped.
+- **Config**: `CompleteConfig.docs` (default on; `nx.complete.setup{ docs = false }` to
+  hide). A `buffer`-only config simply never has docs to show, so the flag is harmless
+  without `lsp`.
+- **Projection + clients**: `EditHost::project_complete_docs` (native-only) emits a `docs`
+  sub-map `{ lines, row, col, width, height }` on the menu redraw, placed beside the box
+  and clamped to the viewport; `nxvim-view` parses it into `MenuData.docs`
+  (`MenuDocs`), and the **TUI** (`render_menu_docs`) and **GUI** (`build_menu`) draw it as
+  a dim bordered float. The wasm build is LSP-less, so the field is simply absent there.
+- **Tests** (`crates/nxvim/tests/lsp_complete.rs`, +2): the inline-`documentation` path
+  shows the sidebar at once; the no-inline-docs path fills it only after the scripted
+  `completion_resolve` round-trip lands. Verified additionally against a **real
+  lua-language-server** (the sidebar renders `stringlib` + the resolved type signature)
+  — that check is non-hermetic (a real server), so it stays a one-off, not committed.
+- **Example**: `examples/ui-complete-lsp/` (lua_ls via a `FileType` autocmd + the `lsp`
+  source) demonstrates it end-to-end.
+- **Known v1 limits**: docs render as **plain lines** (like hover) — markdown fences
+  (` ```lua `) are shown verbatim, not styled; no tree-sitter colouring of code blocks;
+  `<C-d>`/`<C-u>` preview-scroll is not wired for the (non-grabbing) completion popup —
+  docs are short. These are polish, deferred.
+
+### Snippets (still pending)
+
 - **Snippet expansion on accept**: parse LSP `insertTextFormat = Snippet`
   (`$1` / `${1:default}` / `$0`) and expand into the buffer with tab-through
   placeholders; the `snippets` source (built-in). This is the first snippet engine
   in the repo (none exists today) — fail loud on unsupported snippet constructs
   rather than inserting raw `$1`.
-- **Docs sidebar**: `preview = "markdown"` beside the completion menu (cursor
-  placement = float beside, flipping for room — the pmenu's existing doc-float
-  behavior, now via the unified preview pane from picker Phase 3). Resolved docs
-  (`completionItem/resolve`) render server-side, zero Lua at frame time.
 
 ---
 

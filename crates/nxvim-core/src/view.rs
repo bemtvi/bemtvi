@@ -150,6 +150,24 @@ pub struct MenuView {
     /// opened completion popup (noselect — no row highlighted until the user
     /// navigates), so an auto-open never makes `<CR>` accept a row.
     pub selected_active: bool,
+    /// Whether this completion popup carries a **docs sidebar** (the widget-spec
+    /// `preview = "markdown"` kind, Phase 4-D) — a float beside the list rendering
+    /// the selected item's documentation. `false` for a `select` / picker (they use
+    /// the file [`preview`](Self::preview) pane) and for a completion config with
+    /// docs disabled. The server fills the content from its LSP item cache keyed by
+    /// [`selected_key`](Self::selected_key) / [`selected_source_accept`](Self::selected_source_accept).
+    pub docs: bool,
+    /// The actively-selected row's source `key` (its index into the source's item
+    /// list — for the `lsp` source, the position in the server's cached LSP items).
+    /// `None` when nothing is actively selected (noselect) or the view is empty, so
+    /// the docs sidebar stays hidden until a row is chosen. Only meaningful when
+    /// [`docs`](Self::docs) is set.
+    pub selected_key: Option<usize>,
+    /// Whether the actively-selected row's accept is delegated to its source
+    /// (`true` for an `lsp` row, `false` for a native `buffer` row) — the server
+    /// shows docs only for delegated (`lsp`) rows, the ones whose cache it holds.
+    /// `false` when nothing is selected. Only meaningful when [`docs`](Self::docs).
+    pub selected_source_accept: bool,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

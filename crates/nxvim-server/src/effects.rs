@@ -364,6 +364,7 @@ impl EditHost {
                 keys,
                 has_async: req.has_async,
                 buffer_priority: req.buffer_priority,
+                docs: req.docs,
             });
             // The built-in `lsp` source is server-native (LSP plumbing + edit
             // application live here, not in Lua/core); remember it + its merge
@@ -1402,6 +1403,12 @@ impl EditHost {
             if let Some(key) = self.editor.complete_accept_request.take() {
                 self.complete_lsp_accept(key);
             }
+            // The docs sidebar's lazy-docs fetch (Phase 4-D): when the highlighted
+            // `lsp` row has unresolved docs, issue a `completionItem/resolve`. Like the
+            // accept drain, this runs once per key (the guard skips while in flight), so
+            // the sidebar fills in shortly after the user lands on a row.
+            #[cfg(feature = "native")]
+            self.complete_lsp_maybe_resolve();
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
                 if let Err(e) = self.lua.exec(&chunk) {
                     self.editor.echo(format!("E5108: Error executing lua: {e}"));

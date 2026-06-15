@@ -454,6 +454,13 @@ pub struct EditHost {
     /// view. Phase 4-C.
     #[cfg(feature = "native")]
     lsp_complete: Option<LspComplete>,
+    /// The `lsp_complete.items` index of the completion row a `completionItem/resolve`
+    /// is currently in flight for (the docs sidebar's lazy-docs fetch, Phase 4-D), so a
+    /// reply updates the right item and the trigger doesn't re-issue while it is
+    /// pending. `None` when no resolve is outstanding. Reset whenever a fresh completion
+    /// list lands ([`EditHost::on_completion_reply`]). Phase 4-D.
+    #[cfg(feature = "native")]
+    lsp_complete_resolve_key: Option<usize>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
@@ -680,6 +687,8 @@ impl EditHost {
             complete_lsp_priority: 0,
             #[cfg(feature = "native")]
             lsp_complete: None,
+            #[cfg(feature = "native")]
+            lsp_complete_resolve_key: None,
             #[cfg(feature = "native")]
             lsp_code_actions: Vec::new(),
             #[cfg(feature = "native")]

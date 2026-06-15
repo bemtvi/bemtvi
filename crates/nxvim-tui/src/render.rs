@@ -1865,12 +1865,60 @@ fn render_menu(
         render_preview(frame, preview_area, pv, &palette);
     }
 
+    // The completion docs sidebar (Phase 4-D): a separate bordered float beside the
+    // popup rendering the selected `lsp` row's documentation. The server placed it
+    // (right of the box, flipping left for room) and clamped it to the viewport.
+    if let Some(docs) = &menu.docs {
+        render_menu_docs(frame, text_area, docs);
+    }
+
     // The terminal caret sits in the prompt (in the list column), past the `> `
     // prefix at the query's text-cursor column (clamped inside the column).
     prompt_row.map(|row| {
         let caret = (2 + menu.query_cursor).min(list_area.width.saturating_sub(1));
         (list_area.x + caret, list_area.y + row as u16)
     })
+}
+
+/// Draw the completion docs sidebar (Phase 4-D) as its own fully-bordered float at
+/// `docs`'s text-area-relative **content** geometry: the documentation lines (dimmed,
+/// like a hover) inside a box. A sibling of the completion popup, not a column within
+/// it; the server already positioned it beside the popup and clamped it on screen.
+/// `docs.col` names the inner content **column** (the same convention as the
+/// completion popup's one-cell-left-shifted content anchor), so the bordered box is
+/// drawn one cell left of it — the left border then lands flush against the popup's
+/// right border. `docs.row` is the box's top row as-is.
+fn render_menu_docs(frame: &mut Frame, text_area: Rect, docs: &nxvim_view::MenuDocs) {
+    let x = text_area.x.saturating_add(docs.col).saturating_sub(1);
+    let y = text_area.y.saturating_add(docs.row);
+    let width = (docs.width.saturating_add(2)).min(text_area.right().saturating_sub(x));
+    let height = (docs.height.saturating_add(2)).min(text_area.bottom().saturating_sub(y));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let block = Block::new().borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let w = inner.width as usize;
+    let lines: Vec<Line> = docs
+        .lines
+        .iter()
+        .take(inner.height as usize)
+        .map(|l| {
+            Line::from(Span::styled(
+                pmenu_row(l, "", w),
+                Style::default().add_modifier(Modifier::DIM),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Render the picker preview column: a dim title row (the file path) then the

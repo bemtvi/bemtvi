@@ -1040,7 +1040,89 @@ impl EditHost {
         if let Some(preview) = preview {
             map.push((Value::from("preview"), preview));
         }
+        // The completion docs sidebar (Phase 4-D): a separate float beside a
+        // `Cursor`-placed completion popup rendering the selected `lsp` row's docs.
+        // Native-only (the docs come from the server's LSP item cache; the wasm
+        // edit-host has no language servers). Absent ⇒ the client draws no sidebar.
+        #[cfg(feature = "native")]
+        if matches!(m.placement, MenuPlacement::Cursor) {
+            if let Some(docs) =
+                self.project_complete_docs(m, row, col, width, text_width, text_height)
+            {
+                map.push((Value::from("docs"), docs));
+            }
+        }
         Value::Map(map)
+    }
+
+    /// The completion **docs sidebar** (Phase 4-D — the widget-spec `preview =
+    /// "markdown"` kind in cursor placement): a float beside the popup rendering the
+    /// selected row's documentation. `None` unless the menu opted into docs
+    /// (`m.docs`), a row is actively selected (`m.selected_key`) and is an `lsp` row
+    /// (`m.selected_source_accept` — the only source whose item cache the server
+    /// holds), and that cached item actually carries docs. Rendered as plain lines
+    /// (like hover), placed to the right of the box `(row, col, width)` and flipping to
+    /// its left when the right has no room; `(text_width, text_height)` is the editor
+    /// viewport the float is clamped to.
+    #[cfg(feature = "native")]
+    fn project_complete_docs(
+        &self,
+        m: &MenuView,
+        row: usize,
+        col: usize,
+        width: usize,
+        text_width: usize,
+        text_height: usize,
+    ) -> Option<Value> {
+        if !m.docs || !m.selected_source_accept {
+            return None;
+        }
+        let key = m.selected_key?;
+        let item = self.lsp_complete.as_ref()?.items.get(key)?;
+        let lines = crate::lsp::complete_doc_lines(item);
+        if lines.is_empty() {
+            return None;
+        }
+        /// Cap the docs float's content width — a long signature wraps off-screen
+        /// otherwise; the body is windowed, not a hard limit.
+        const MAX_DOCS_W: usize = 60;
+        /// Cap its height — a huge docstring shouldn't fill the screen beside a popup.
+        const MAX_DOCS_H: usize = 12;
+        let content_w = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .clamp(1, MAX_DOCS_W);
+        // Place to the right of the box (its content spans `[col, col+width)`; each
+        // client draws a 1-cell border, so the box's right border sits at `col+width`
+        // and the docs float's own left border one cell past it → content at
+        // `col+width+2`). Flip to the left when the right edge overruns the viewport.
+        let right_start = col + width + 2;
+        // `< text_width` keeps a 1-col margin past the float's right border (the
+        // `+ 1 <= text_width` form clippy rejects).
+        let (docs_col, docs_w) = if right_start + content_w < text_width {
+            (right_start, content_w)
+        } else {
+            // Left of the box: the docs float's right border one cell left of the box's
+            // left border (at `col-1`), so its content ends at `col-3`.
+            let w = content_w.min(col.saturating_sub(3)).max(1);
+            (col.saturating_sub(2 + w), w)
+        };
+        // Clamp the height to the rows available below the float's top (a full border
+        // costs 2), then window the lines to it.
+        let docs_h = lines
+            .len()
+            .min(MAX_DOCS_H)
+            .min(text_height.saturating_sub(row).saturating_sub(2).max(1));
+        let shown = &lines[..docs_h.min(lines.len())];
+        Some(Value::Map(vec![
+            (Value::from("lines"), display_lines_value(shown)),
+            (Value::from("row"), Value::from(row as u64)),
+            (Value::from("col"), Value::from(docs_col as u64)),
+            (Value::from("width"), Value::from(docs_w as u64)),
+            (Value::from("height"), Value::from(docs_h as u64)),
+        ]))
     }
 
     /// Resolve the picker's preview pane into its redraw sub-map, or `None` for a

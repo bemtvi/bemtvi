@@ -27,7 +27,7 @@ use nxvim_lsp::{PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, Serve
 use nxvim_lua::{DiagnosticData, LspServerCapabilities};
 
 mod completion;
-pub(crate) use completion::LspComplete;
+pub(crate) use completion::{complete_doc_lines, LspComplete};
 mod diagnostics;
 mod edit;
 mod inlay;

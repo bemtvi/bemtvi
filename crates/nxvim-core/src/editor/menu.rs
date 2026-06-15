@@ -285,6 +285,15 @@ pub(crate) struct Menu {
     /// [`Editor::view`] drops it after each projection — a one-shot, like the viewport
     /// scroll gesture. Only ever `Some` for a `preview` picker.
     preview_scroll: Option<PreviewScroll>,
+    /// Whether this [`MenuKind::Complete`] menu carries a **docs sidebar** — a float
+    /// beside the popup rendering the selected item's documentation (the widget-spec
+    /// `preview = "markdown"` kind, Phase 4-D). Unlike a picker's file `preview`, the
+    /// content is *not* a [`PreviewTarget`] path: the server renders it from its own
+    /// LSP item cache keyed by the selected row's `(key, source_accept)` (exposed via
+    /// [`Editor::menu_view`] / [`Editor::complete_selected`]), lazily fetching
+    /// `completionItem/resolve` docs off the input path. Always `false` for a
+    /// `select` / picker.
+    docs: bool,
     /// Bumped on every query edit; the staleness token threaded to the server so a
     /// push from a superseded source run is dropped.
     generation: u64,
@@ -410,6 +419,17 @@ impl Menu {
         }
         self.all_items[self.item_at(self.cursor)].preview.as_ref()
     }
+
+    /// The highlighted item, when a row is **actively** selected and in range.
+    /// `None` for noselect (a completion popup before the first navigation) or an
+    /// empty view — so the docs sidebar stays hidden until a row is chosen. Drives
+    /// both the [`MenuView`] docs-selection fields and [`Editor::complete_selected`].
+    fn selected_item(&self) -> Option<&MenuItem> {
+        if !self.selected_active || self.cursor >= self.view_len() {
+            return None;
+        }
+        Some(&self.all_items[self.item_at(self.cursor)])
+    }
 }
 
 impl Editor {
@@ -448,6 +468,7 @@ impl Editor {
             dynamic: false,
             preview: false,
             preview_scroll: None,
+            docs: false,
             generation: 0,
             items_gen: 0,
             width: None,
@@ -489,6 +510,7 @@ impl Editor {
             dynamic,
             preview,
             preview_scroll: None,
+            docs: false,
             generation: 0,
             items_gen: 0,
             width,
@@ -653,6 +675,9 @@ impl Editor {
             dynamic: false,
             preview: false,
             preview_scroll: None,
+            // The docs sidebar follows the engine config; the server fills it from
+            // its LSP item cache for the selected row (a `buffer` row has no docs).
+            docs: self.complete_config.docs,
             generation: gen,
             items_gen: gen,
             width: None,
@@ -915,22 +940,41 @@ impl Editor {
     }
 
     pub(crate) fn menu_view(&self) -> Option<MenuView> {
-        self.menu.as_ref().map(|m| MenuView {
-            selected: m.cursor,
-            total: m.view_len(),
-            placement: m.placement,
-            query: m.prompt.as_ref().map(|p| p.query.clone()),
-            query_cursor: m.prompt.as_ref().map_or(0, |p| p.cursor_chars()),
-            prompt_pos: m.prompt_pos,
-            has_preview: m.preview,
-            preview: m.selected_preview().cloned(),
-            preview_scroll: m.preview_scroll,
-            width: m.width,
-            height: m.height,
-            anchor_offset: m.anchor_width,
-            completion: m.kind == MenuKind::Complete,
-            selected_active: m.selected_active,
+        self.menu.as_ref().map(|m| {
+            let sel = m.selected_item();
+            MenuView {
+                selected: m.cursor,
+                total: m.view_len(),
+                placement: m.placement,
+                query: m.prompt.as_ref().map(|p| p.query.clone()),
+                query_cursor: m.prompt.as_ref().map_or(0, |p| p.cursor_chars()),
+                prompt_pos: m.prompt_pos,
+                has_preview: m.preview,
+                preview: m.selected_preview().cloned(),
+                preview_scroll: m.preview_scroll,
+                width: m.width,
+                height: m.height,
+                anchor_offset: m.anchor_width,
+                completion: m.kind == MenuKind::Complete,
+                selected_active: m.selected_active,
+                docs: m.docs,
+                selected_key: sel.map(|i| i.key),
+                selected_source_accept: sel.is_some_and(|i| i.source_accept),
+            }
         })
+    }
+
+    /// The actively-highlighted completion row's `(key, source_accept)` — what the
+    /// server needs to fetch / `completionItem/resolve` the docs for the selected
+    /// item, called off the input path after a navigation key. `None` unless a
+    /// [`MenuKind::Complete`] menu is open with an **active** selection (a noselect
+    /// popup shows no docs), so the server only resolves a row the user landed on.
+    pub fn complete_selected(&self) -> Option<(usize, bool)> {
+        let m = self.menu.as_ref()?;
+        if m.kind != MenuKind::Complete {
+            return None;
+        }
+        m.selected_item().map(|i| (i.key, i.source_accept))
     }
 
     /// The visible window of rows `[start, start+count)` of the open menu: each

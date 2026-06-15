@@ -1886,6 +1886,31 @@ impl Renderer {
                 }
             }
         }
+
+        // The completion docs sidebar (Phase 4-D): a separate fully-bordered float
+        // beside the popup with the selected `lsp` row's documentation (dimmed, like a
+        // hover). The server placed it (right of the box, flipping left for room). Its
+        // `col` is the inner content column (same convention as the one-cell-left-
+        // shifted list anchor), so the box is drawn one cell left of it — the left
+        // border then lands flush against the popup's right border. `row` is the box top.
+        if let Some(docs) = &menu.docs {
+            let dbx = (text_x0 + docs.col).saturating_sub(1);
+            let dby = wy + docs.row;
+            self.fill_box(
+                quads,
+                (dbx, dby, docs.width + 2, docs.height + 2),
+                popup_bg,
+                border,
+            );
+            let (dcx, dcy) = (dbx + 1, dby + 1);
+            for (i, line) in docs.lines.iter().enumerate() {
+                if i as u16 >= docs.height {
+                    break;
+                }
+                let text = pmenu_row(line, "", docs.width as usize);
+                self.push_plain(items, &text, self.cell_px(dcx, dcy + i as u16), fg, full);
+            }
+        }
     }
 
     /// Fill `count` cells of `row` from column `col` with `color`.

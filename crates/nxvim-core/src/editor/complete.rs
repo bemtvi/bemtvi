@@ -83,6 +83,11 @@ pub struct CompleteConfig {
     /// merged view ranks higher-priority sources (e.g. `lsp`) first. `0` when the
     /// `buffer` source is not configured.
     pub buffer_priority: i32,
+    /// Show the **docs sidebar** beside the popup (the widget-spec `preview =
+    /// "markdown"` kind): the selected item's documentation, rendered by the server
+    /// from its LSP item cache (`completionItem/resolve` for lazy docs). On by
+    /// default; a `buffer`-only config simply never has docs to show.
+    pub docs: bool,
 }
 
 impl Default for CompleteConfig {
@@ -94,6 +99,7 @@ impl Default for CompleteConfig {
             keys: CompleteKeys::default(),
             has_async: false,
             buffer_priority: 0,
+            docs: true,
         }
     }
 }

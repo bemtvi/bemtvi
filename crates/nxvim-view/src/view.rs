@@ -364,6 +364,30 @@ pub struct MenuData {
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
     /// the list alone, exactly as before.
     pub preview: Option<MenuPreview>,
+    /// The completion **docs sidebar** (Phase 4-D), present when a `Cursor`-placed
+    /// completion popup's selected `lsp` row carries documentation. A *separate*
+    /// bordered float beside the popup (right, flipping left for room), not a column
+    /// within the box like [`preview`](Self::preview). `None` for a `select` / picker
+    /// or a row with no docs — the popup then stands alone.
+    pub docs: Option<MenuDocs>,
+}
+
+/// The completion docs sidebar mirrored from the redraw (Phase 4-D): the selected
+/// item's documentation lines and the float's absolute geometry (text-area-relative
+/// content coordinates, same convention as [`MenuData::row`]/`col`). Rendered as its
+/// own bordered box beside the completion popup. See [`MenuData::docs`].
+#[derive(Clone)]
+pub struct MenuDocs {
+    /// The documentation lines (`detail` heading, then the body) — already windowed
+    /// to `height`. Plain text, like a hover.
+    pub lines: Vec<String>,
+    /// The float's content top-left, **text-area-relative** (the server placed it
+    /// beside the popup and clamped it to the viewport).
+    pub row: u16,
+    pub col: u16,
+    /// The float's content width / height in cells (the client adds its border).
+    pub width: u16,
+    pub height: u16,
 }
 
 /// The picker preview pane mirrored from the redraw: the windowed file content for
@@ -545,6 +569,16 @@ impl View {
                         width: map_u16(p, "width"),
                         loc: parse_pair(map_get(p, "loc")),
                         highlights: parse_highlights(map_get(p, "highlights")),
+                    }),
+                    _ => None,
+                },
+                docs: match map_get(m, "docs") {
+                    Some(Value::Map(d)) => Some(MenuDocs {
+                        lines: map_str_array(d, "lines"),
+                        row: map_u16(d, "row"),
+                        col: map_u16(d, "col"),
+                        width: map_u16(d, "width"),
+                        height: map_u16(d, "height"),
                     }),
                     _ => None,
                 },

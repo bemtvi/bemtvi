@@ -833,6 +833,10 @@ pub struct CompleteSetupReq {
     pub buffer_priority: i32,
     /// Merge priority of the `lsp` source (`0` when not configured). Phase 4-C.
     pub lsp_priority: i32,
+    /// Show the docs sidebar beside the popup (the selected item's documentation,
+    /// rendered server-side from the `lsp` source's cache + `completionItem/resolve`).
+    /// On by default; a `buffer`-only config simply never has docs to show. Phase 4-D.
+    pub docs: bool,
 }
 
 /// One streamed completion candidate (`nx.complete` async source `push`): its

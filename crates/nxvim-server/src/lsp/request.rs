@@ -337,11 +337,12 @@ impl EditHost {
                 documentation,
                 detail,
             } => {
-                // Completion-item docs resolve is retired with the bespoke pmenu
-                // (Phase 4-C); the unified menu's docs sidebar lands in Phase 4-D.
-                // The engine never issues `completionItem/resolve` now, so this reply
-                // shouldn't arrive — ignore it rather than carry dead merge state.
-                let _ = (documentation, detail);
+                // The docs sidebar's lazy-docs fetch (Phase 4-D): fill the resolved
+                // docs into the selected item's cache and repaint. Not cursor/buffer
+                // gated — the completion menu follows the moving cursor while open
+                // (like the `Completion` reply), and the resolve is keyed to its row;
+                // a replaced list is dropped via the reset `lsp_complete_resolve_key`.
+                self.on_completion_resolve_reply(documentation, detail);
             }
             LspReply::SemanticTokens(data) => {
                 // Whole-buffer, focus-independent: cache to the issuing buffer

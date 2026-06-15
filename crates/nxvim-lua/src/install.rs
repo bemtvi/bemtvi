@@ -1292,6 +1292,7 @@ pub(crate) fn install_runtime_api(
         bool,
         i32,
         i32,
+        bool,
     );
     nx.set(
         "_complete_setup",
@@ -1308,6 +1309,7 @@ pub(crate) fn install_runtime_api(
                 lsp,
                 buffer_priority,
                 lsp_priority,
+                docs,
             ): CompleteSetupArgs| {
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
@@ -1320,6 +1322,7 @@ pub(crate) fn install_runtime_api(
                     lsp,
                     buffer_priority,
                     lsp_priority,
+                    docs,
                 });
                 Ok(())
             },

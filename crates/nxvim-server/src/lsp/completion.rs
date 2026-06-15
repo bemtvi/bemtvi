@@ -7,9 +7,11 @@
 //! feeds it candidates and applies the chosen item's edit when accept is delegated
 //! back (`MenuItem.source_accept`).
 //!
-//! This replaces the retired bespoke completion pmenu. The docs-beside-popup that the
-//! old `pmenu_value` projected is deferred to Phase 4-D (the unified markdown preview
-//! sidebar); `completionItem/resolve` docs are not fetched here yet.
+//! This replaces the retired bespoke completion pmenu. The docs-beside-popup the old
+//! `pmenu_value` projected is back as the unified **docs sidebar** (Phase 4-D): the
+//! selected `lsp` row's `detail` + `documentation`, lazily fetched via
+//! `completionItem/resolve` (`complete_lsp_maybe_resolve` / `on_completion_resolve_reply`)
+//! and rendered server-side beside the popup (`EditHost::project_complete_docs`).
 
 use nxvim_core::{BufferId, Mode};
 use nxvim_lsp::{CompletionItemData, PositionEncoding};
@@ -85,6 +87,10 @@ impl EditHost {
             anchor: (row, word_start),
             is_incomplete,
         });
+        // A fresh list supersedes any in-flight docs resolve: its key indexed the old
+        // items, so drop it (the late reply is ignored — `on_completion_resolve_reply`
+        // takes a `None` key) and let the new selection re-issue against the new list.
+        self.lsp_complete_resolve_key = None;
         // Push into the live menu generation — the engine bumped it on the keystroke
         // that fired the request, and a `Complete` menu is open (core seeded it, or
         // will re-seed on the next key). A `0` generation means no menu is open.
@@ -188,6 +194,108 @@ impl EditHost {
         let cursor_byte = (primary_range.start + primary_text.len()) as isize + shift;
         self.editor.apply_edits(edits, cursor_byte.max(0) as usize);
         self.lsp_complete = None;
+        self.lsp_complete_resolve_key = None;
         self.lsp_dirty = true;
     }
+
+    /// The docs sidebar's lazy-docs fetch (Phase 4-D): when the **highlighted** row is
+    /// an `lsp` row whose cached item carries no inline `documentation` yet but has
+    /// `resolve_data`, issue a `completionItem/resolve` to pull its docs. Called once
+    /// per key from [`EditHost::run_pending`] (the selection is final by then). A no-op
+    /// for a native `buffer` row, an already-resolved item, a row the server gave no
+    /// `data` to resolve against, or while a resolve is already in flight for this row.
+    /// The reply ([`EditHost::on_completion_resolve_reply`]) fills the item and repaints.
+    pub(crate) fn complete_lsp_maybe_resolve(&mut self) {
+        if !self.complete_lsp_active {
+            return;
+        }
+        // Only an actively-selected `lsp` row has docs to resolve (a noselect popup or
+        // a `buffer` row yields `None` / `source_accept = false`).
+        let Some((key, true)) = self.editor.complete_selected() else {
+            return;
+        };
+        // A resolve for this exact row is already pending — let it land.
+        if self.lsp_complete_resolve_key == Some(key) {
+            return;
+        }
+        let Some(item) = self.lsp_complete.as_ref().and_then(|c| c.items.get(key)) else {
+            return;
+        };
+        // Inline docs already present, or a prior resolve filled them (it stamps
+        // `Some("")` even when docless) — nothing to fetch.
+        if item.documentation.is_some() {
+            return;
+        }
+        let Some(resolve_data) = item.resolve_data.clone() else {
+            return; // the server gave no `data` to resolve against — stays docless
+        };
+        let Some((server_key, _uri, _enc)) = self.current_lsp_target() else {
+            return;
+        };
+        let token = self.register_lsp_request(LspReqKind::CompletionResolve);
+        self.lsp_complete_resolve_key = Some(key);
+        self.fx.lsp_request(
+            server_key,
+            token,
+            nxvim_lsp::LspRequest::ResolveCompletion { item: resolve_data },
+        );
+    }
+
+    /// Apply a `completionItem/resolve` reply (Phase 4-D): fill the resolved
+    /// `documentation` / `detail` into the cached item the docs sidebar reads, keyed by
+    /// the row the resolve was issued for ([`EditHost::lsp_complete_resolve_key`]).
+    /// `documentation` is stamped `Some` even when the server returned nothing (an
+    /// empty string ⇒ resolved-but-docless), so the row is never re-requested. A reply
+    /// whose list was replaced meanwhile finds a `None` key and is ignored. `lsp_dirty`
+    /// repaints the sidebar with the freshly resolved docs.
+    pub(crate) fn on_completion_resolve_reply(
+        &mut self,
+        documentation: Option<String>,
+        detail: Option<String>,
+    ) {
+        let Some(key) = self.lsp_complete_resolve_key.take() else {
+            return;
+        };
+        if let Some(item) = self
+            .lsp_complete
+            .as_mut()
+            .and_then(|c| c.items.get_mut(key))
+        {
+            item.documentation = Some(documentation.unwrap_or_default());
+            if detail.is_some() {
+                item.detail = detail;
+            }
+        }
+        self.lsp_dirty = true;
+    }
+}
+
+/// Reduce a completion item's `detail` + `documentation` to the plain display lines
+/// the docs sidebar renders (Phase 4-D): `detail` first (a one-line signature), a
+/// blank separator, then the `documentation` body — each split on its own newlines,
+/// trailing blanks trimmed. Both are already plain text (the LSP layer distilled any
+/// markdown to lines, exactly like hover). Empty when the item carries neither, which
+/// suppresses the sidebar (no empty float).
+pub(crate) fn complete_doc_lines(item: &CompletionItemData) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(detail) = item
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.extend(detail.lines().map(str::to_string));
+    }
+    if let Some(doc) = item
+        .documentation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !out.is_empty() {
+            out.push(String::new()); // a blank line between the signature and the body
+        }
+        out.extend(doc.lines().map(str::to_string));
+    }
+    out
 }

@@ -116,6 +116,13 @@ function nx.complete.setup(opts)
   if auto == nil then
     auto = true
   end
+  -- The docs sidebar (the selected item's documentation, beside the popup) is on by
+  -- default; `docs = false` turns it off. Only the server-native `lsp` source ever
+  -- has docs to show, so a buffer-only config never renders one regardless.
+  local docs = opts.docs
+  if docs == nil then
+    docs = true
+  end
   local keys = opts.keys or {}
 
   -- Activate the async sources for `nx._complete_run`; `has_async` (a Lua async
@@ -134,7 +141,8 @@ function nx.complete.setup(opts)
     has_async,
     saw_lsp,
     buffer_priority,
-    lsp_priority
+    lsp_priority,
+    docs == true
   )
 
   -- `keys.trigger` (a string or list) installs an insert-mode mapping that opens

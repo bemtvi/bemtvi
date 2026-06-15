@@ -64,6 +64,57 @@ async fn poll_menu_items(
     }
 }
 
+/// The docs-sidebar lines of the latest redraw whose menu carries a `docs` sub-map,
+/// or `None` if none arrives within the poll window. The sidebar's `lines` are the
+/// selected item's `detail` + `documentation` (Phase 4-D).
+async fn poll_menu_docs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<String>> {
+    nxvim_test_harness::barrier(rpc).await;
+    let map = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
+        Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
+        _ => false,
+    })?;
+    let Some(Value::Map(menu)) = map_get(&map, "menu") else {
+        return None;
+    };
+    let Some(Value::Map(docs)) = map_get(menu, "docs") else {
+        return None;
+    };
+    match map_get(docs, "lines") {
+        Some(Value::Array(lines)) => Some(
+            lines
+                .iter()
+                .map(|l| l.as_str().unwrap_or("").to_string())
+                .collect(),
+        ),
+        _ => Some(Vec::new()),
+    }
+}
+
+/// Retry the manual trigger until the docs sidebar appears and contains `want` (a
+/// substring of some line) — the inline-docs path shows it at once, the lazy
+/// `completionItem/resolve` path after the round-trip lands. Panics after the window.
+async fn await_docs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Vec<String> {
+    let mut last = Vec::new();
+    for _ in 0..200 {
+        exec_lua(rpc, "nx.complete.trigger()").await;
+        if let Some(docs) = poll_menu_docs(rpc, incoming).await {
+            if docs.iter().any(|l| l.contains(want)) {
+                return docs;
+            }
+            last = docs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("docs sidebar never contained {want:?}; last sidebar lines: {last:?}");
+}
+
 /// Start a server editing a fresh `.rs` file, attach a UI, bind the mock LSP server
 /// to the buffer, enable `nx.complete` with the `lsp` source, and enter insert mode
 /// with `prefix` typed. Returns the rpc + redraw stream. The caller drives the
@@ -74,6 +125,24 @@ async fn start_typed(
     prefix: &str,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
     write_script(dir, completion_json);
+    start_after_script(dir, prefix).await
+}
+
+/// Like [`start_typed`], but the caller supplies the **whole** mock script object
+/// (so a test can add a `completion_resolve` field for the lazy-docs path), not just
+/// the `completion` array.
+async fn start_typed_raw(
+    dir: &Path,
+    raw_script: &str,
+    prefix: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::write(dir.join("mock.json"), raw_script).expect("write mock script");
+    start_after_script(dir, prefix).await
+}
+
+/// The shared post-script setup for [`start_typed`] / [`start_typed_raw`]: open the
+/// `.rs` buffer, attach, bind the mock server, enable the `lsp` source, type `prefix`.
+async fn start_after_script(dir: &Path, prefix: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
     let file_path = dir.join("a.rs");
     std::fs::write(&file_path, "").expect("write test file");
 
@@ -181,6 +250,74 @@ async fn accepting_an_lsp_item_applies_its_text_edit() {
         lines(&rpc).await,
         vec!["use foo;", "print_value()"],
         "textEdit + additionalTextEdits applied as one delegated edit"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
+async fn lsp_completion_docs_sidebar_shows_inline_documentation() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_docs_inline");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "NXVIM_LSP_CMD",
+        format!("{NXVIM_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    // The item carries its docs *inline* (`detail` + `documentation`), so the docs
+    // sidebar renders them with no `completionItem/resolve` round-trip.
+    let completion = r#"[ { "label": "println", "insertText": "println",
+                          "detail": "macro println!",
+                          "documentation": "Prints to stdout with a trailing newline." } ]"#;
+    let (rpc, mut incoming) = start_typed(&dir, completion, "pr").await;
+
+    // The manual trigger preselects row 0, so the selected item's docs float beside
+    // the popup.
+    await_items(&rpc, &mut incoming, "println").await;
+    let docs = await_docs(&rpc, &mut incoming, "Prints to stdout").await;
+    assert!(
+        docs.iter().any(|l| l.contains("macro println!")),
+        "the item's `detail` heads the docs sidebar: {docs:?}"
+    );
+    assert!(
+        docs.iter().any(|l| l.contains("Prints to stdout")),
+        "the item's `documentation` body shows in the docs sidebar: {docs:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
+async fn lsp_completion_docs_resolve_fills_the_sidebar() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_docs_resolve");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "NXVIM_LSP_CMD",
+        format!("{NXVIM_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    // The completion item carries **no** inline docs (rust_analyzer's shape): the
+    // server must issue `completionItem/resolve` for the selected row, and the mock's
+    // scripted `completion_resolve` supplies the lazy docs that fill the sidebar.
+    let script = r#"{ "completion": [ { "label": "compute", "insertText": "compute" } ],
+                      "completion_resolve": { "label": "compute",
+                        "detail": "fn compute() -> i32",
+                        "documentation": "Resolved: computes the answer." } }"#;
+    let (rpc, mut incoming) = start_typed_raw(&dir, script, "com").await;
+
+    await_items(&rpc, &mut incoming, "compute").await;
+    // No inline docs → the sidebar fills only after the resolve round-trip lands.
+    let docs = await_docs(&rpc, &mut incoming, "Resolved: computes").await;
+    assert!(
+        docs.iter().any(|l| l.contains("fn compute() -> i32")),
+        "the resolved `detail` heads the docs sidebar: {docs:?}"
+    );
+    assert!(
+        docs.iter()
+            .any(|l| l.contains("Resolved: computes the answer")),
+        "the resolved `documentation` fills the docs sidebar: {docs:?}"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

@@ -547,7 +547,7 @@
       // never resolves a server colorscheme — chrome/tabline/status stay JS-synthesized);
       // a terminal window paints from the palette per-window below. So discount
       // terminal-only style contributions when deciding the global mode.
-      const termWin = (view.windows || []).some((w) => w.terminal);
+      const termWin = (view.windows || []).some((w) => w.term_colors ?? w.terminal);
       serverStyled = (view.styles?.length ?? 0) > 0 && !termWin;
       gridEl.innerHTML = "";
       if (serverStyled) applyChrome();
@@ -663,10 +663,12 @@
           rowEl.className = "row";
           rowEl.style.top = r * ch + "px";
           rowEl.style.width = rect.width * cw + "px";
-          if (serverStyled || w.terminal) {
+          if (serverStyled || (w.term_colors ?? w.terminal)) {
             // Terminal: its vt100 colors arrive as server palette spans (`w.highlights`
             // + `view.styles`), so paint via the palette path even when the global mode
             // is JS-highlighting (a terminal can sit in a split beside a code buffer).
+            // `term_colors` also covers a *closed* terminal whose colors were frozen at
+            // exit, so the dead buffer's final output keeps its highlighting.
             rowEl.innerHTML = renderLineServer(w, r, gutterW, rect);
           } else {
             const bufLine = w.numbers[r];

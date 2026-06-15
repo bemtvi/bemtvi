@@ -20,6 +20,11 @@ use rmpv::Value;
 use crate::redraw::StyleTable;
 use crate::EditHost;
 
+/// One terminal row's coalesced color, as `(start_col, end_col, style)` runs in
+/// screen columns — the shape [`row_spans`] produces and the redraw projects. A
+/// buffer's worth is a `Vec` of these, index-aligned with its lines.
+pub(crate) type RowStyles = Vec<(u16, u16, Style)>;
+
 /// The `vt100` callback sink: captures the things the screen model itself doesn't
 /// store but a real terminal must act on — the child's window title (OSC), and the
 /// **replies** to status/identity queries (`vt100` is a screen *model*, so it never
@@ -92,7 +97,7 @@ pub(crate) struct TermEmu {
     /// screen (always colored, Phase 4) is what's on screen then anyway. So during
     /// live output this stays empty (history renders monochrome) and is filled lazily
     /// when the user leaves terminal-insert to read history. Empty ⇒ not materialized.
-    history_styles: Vec<Vec<(u16, u16, Style)>>,
+    history_styles: Vec<RowStyles>,
     /// vt100's scrollback length at the last projection. The history mirror is
     /// re-read from vt100 only when this changes (something scrolled); an unchanged
     /// length means only the live screen moved, so we rewrite just that region.
@@ -134,6 +139,9 @@ impl EditHost {
     /// `rows`×`cols`, and project its initial (blank) screen so the buffer shows the
     /// right number of rows immediately. Called when a `:terminal` spawns its PTY.
     pub fn terminal_open_emu(&mut self, buf: BufferId, rows: u16, cols: u16, scrollback: usize) {
+        // A fresh terminal on this id starts blank — drop any colors frozen from a
+        // previous dead terminal that reused the same buffer.
+        self.terminal_frozen.remove(&buf);
         self.terminals
             .insert(buf, TermEmu::new(rows, cols, scrollback));
         self.terminal_project(buf);
@@ -179,9 +187,50 @@ impl EditHost {
         true
     }
 
-    /// Drop `buf`'s emulator — the terminal closed, or the buffer was wiped.
+    /// Drop `buf`'s live emulator — the child exited. The colors captured by
+    /// [`terminal_freeze`](EditHost::terminal_freeze) live on in `terminal_frozen`,
+    /// so the dead buffer's final output stays highlighted; use
+    /// [`terminal_forget`](EditHost::terminal_forget) to discard those too.
     pub fn terminal_remove(&mut self, buf: BufferId) {
         self.terminals.remove(&buf);
+    }
+
+    /// Forget `buf` entirely: drop both the live emulator and any frozen colors. Used
+    /// when the terminal buffer is killed/wiped — there's no surviving buffer to keep
+    /// colored, unlike a natural child exit (which keeps the capture).
+    pub fn terminal_forget(&mut self, buf: BufferId) {
+        self.terminals.remove(&buf);
+        self.terminal_frozen.remove(&buf);
+    }
+
+    /// Capture `buf`'s full per-line colors (the retained scrollback ++ the live
+    /// screen) into the persistent `terminal_frozen` store, just before its emulator
+    /// is dropped on the child's exit. The colors otherwise live only in the vt100
+    /// grid; freezing them lets the dead buffer's final output keep its highlighting
+    /// as a plain buffer. The capture is index-aligned with the buffer's lines; the
+    /// `[Process exited]` notice appended afterward has no entry and stays uncolored
+    /// (matching its plain text). A no-op if `buf` has no live emulator.
+    pub fn terminal_freeze(&mut self, buf: BufferId) {
+        let Some(emu) = self.terminals.get_mut(&buf) else {
+            return;
+        };
+        let (rows, cols) = emu.parser.screen().size();
+        // Materialize the scrollback history's colors — a paged read over the retained
+        // rows, done once here (never on the live flood path). Mirrors the browse-time
+        // `sync_terminal_styles` capture, but unconditional: the buffer is going cold.
+        let held = {
+            let screen = emu.parser.screen_mut();
+            screen.set_scrollback(usize::MAX);
+            screen.scrollback()
+        };
+        let mut frozen = read_scrollback_styles(emu.parser.screen_mut(), held, rows, cols);
+        emu.parser.screen_mut().set_scrollback(0); // restore the live view
+                                                   // Append the live screen rows' colors, in buffer order (history then screen).
+        let screen = emu.parser.screen();
+        for row in 0..rows {
+            frozen.push(row_spans(screen, row, cols));
+        }
+        self.terminal_frozen.insert(buf, frozen);
     }
 
     /// React to a keystroke about to be sent to `buf`'s child. A bare `^C` (the
@@ -384,40 +433,62 @@ impl EditHost {
         numbers: &[Option<usize>],
         styles: &mut StyleTable,
     ) -> Option<Value> {
-        let emu = self.terminals.get(&buf)?;
-        let screen = emu.parser.screen();
-        let (rows, cols) = screen.size();
-        let hist_len = emu.history.len();
+        // A live terminal reads colors off its grid (history from the browse-time
+        // cache, the live screen straight off vt100). A *closed* terminal has no
+        // emulator — it reads them from the capture frozen at exit instead. Both emit
+        // the same span shape.
+        if let Some(emu) = self.terminals.get(&buf) {
+            let screen = emu.parser.screen();
+            let (rows, cols) = screen.size();
+            let hist_len = emu.history.len();
+            let out = numbers
+                .iter()
+                .map(|num| {
+                    // `numbers` are 1-based buffer lines. A history row (idx < hist_len)
+                    // uses its browse-time color cache (empty while output is live, so
+                    // monochrome then); a live screen row (idx - hist_len) reads its
+                    // colors straight off the vt100 grid.
+                    let Some(idx) = num.map(|n| n - 1) else {
+                        return Value::Array(Vec::new());
+                    };
+                    let runs = if idx < hist_len {
+                        match emu.history_styles.get(idx) {
+                            Some(runs) => runs.clone(),
+                            None => return Value::Array(Vec::new()),
+                        }
+                    } else {
+                        match u16::try_from(idx - hist_len) {
+                            Ok(row) if row < rows => row_spans(screen, row, cols),
+                            _ => return Value::Array(Vec::new()),
+                        }
+                    };
+                    spans_from_runs(&runs, styles)
+                })
+                .collect();
+            return Some(Value::Array(out));
+        }
+        // Closed terminal: project from the per-line capture frozen at exit.
+        let frozen = self.terminal_frozen.get(&buf)?;
         let out = numbers
             .iter()
-            .map(|num| {
-                // `numbers` are 1-based buffer lines. A history row (idx < hist_len)
-                // uses its browse-time color cache (empty while output is live, so
-                // monochrome then); a live screen row (idx - hist_len) reads its colors
-                // straight off the vt100 grid.
-                let Some(idx) = num.map(|n| n - 1) else {
-                    return Value::Array(Vec::new());
-                };
-                let runs = if idx < hist_len {
-                    match emu.history_styles.get(idx) {
-                        Some(runs) => runs.clone(),
-                        None => return Value::Array(Vec::new()),
-                    }
-                } else {
-                    match u16::try_from(idx - hist_len) {
-                        Ok(row) if row < rows => row_spans(screen, row, cols),
-                        _ => return Value::Array(Vec::new()),
-                    }
-                };
-                let mut spans: Vec<Value> = Vec::new();
-                for (start, end, style) in runs {
-                    push_span(&mut spans, start, end, style, styles);
-                }
-                Value::Array(spans)
+            .map(|num| match num.and_then(|n| frozen.get(n - 1)) {
+                Some(runs) => spans_from_runs(runs, styles),
+                None => Value::Array(Vec::new()),
             })
             .collect();
         Some(Value::Array(out))
     }
+}
+
+/// Turn coalesced color runs into a `[start, end, group, style_id]` span array,
+/// interning each style into the frame palette. Shared by the live-grid and frozen
+/// color paths of [`terminal_highlights`](EditHost::terminal_highlights).
+fn spans_from_runs(runs: &[(u16, u16, Style)], styles: &mut StyleTable) -> Value {
+    let mut spans: Vec<Value> = Vec::new();
+    for (start, end, style) in runs {
+        push_span(&mut spans, *start, *end, style.clone(), styles);
+    }
+    Value::Array(spans)
 }
 
 /// Read vt100's entire retained scrollback as row **text**, oldest first. vt100 only
@@ -454,7 +525,7 @@ fn read_scrollback_styles(
     held: usize,
     rows: u16,
     cols: u16,
-) -> Vec<Vec<(u16, u16, Style)>> {
+) -> Vec<RowStyles> {
     let mut out = Vec::with_capacity(held);
     let mut idx = 0;
     while idx < held {
@@ -474,11 +545,11 @@ fn read_scrollback_styles(
 /// base). A wide glyph's continuation column inherits its lead cell's style, so the
 /// runs line up with the projected row text. Shared by the live color path and the
 /// scrollback capture, reading whichever row the current view-window exposes.
-fn row_spans(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, Style)> {
+fn row_spans(screen: &vt100::Screen, row: u16, cols: u16) -> RowStyles {
     let mut runs = Vec::new();
     let mut run: Option<(u16, Style)> = None;
     let mut carry = Style::default();
-    let flush = |runs: &mut Vec<(u16, u16, Style)>, start: u16, end: u16, style: Style| {
+    let flush = |runs: &mut RowStyles, start: u16, end: u16, style: Style| {
         if style != Style::default() {
             runs.push((start, end, style));
         }
@@ -638,7 +709,7 @@ impl EditHost {
                         .terminal_command(native::TermCommand::Write { buf, bytes });
                 }
                 TerminalOp::Kill { buf } => {
-                    self.terminal_remove(buf);
+                    self.terminal_forget(buf);
                     self.fx.terminal_command(native::TermCommand::Kill { buf });
                 }
             }
@@ -709,7 +780,7 @@ impl EditHost {
                     self.fx.term_write(buf.0, bytes);
                 }
                 TerminalOp::Kill { buf } => {
-                    self.terminal_remove(buf);
+                    self.terminal_forget(buf);
                     self.fx.term_kill(buf.0);
                 }
             }
@@ -750,6 +821,10 @@ impl EditHost {
     /// + repaint. The wasm twin of the native `on_term_event` Exit arm.
     pub fn terminal_exit(&mut self, buf: BufferId, code: i32) {
         self.editor.terminal_closed(buf, code);
+        // Freeze the grid's colors before dropping the emulator, so the dead buffer's
+        // final output keeps its highlighting as a plain buffer (the native exit arm
+        // in `on_term_event` does the same).
+        self.terminal_freeze(buf);
         self.terminal_remove(buf);
         self.settle_events(true);
     }

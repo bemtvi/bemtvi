@@ -624,6 +624,19 @@ pub struct EditHost {
     /// pure CPU and shared by both — hence feature-agnostic. See
     /// [`terminal`](crate::terminal) and docs/plans/2026-06-14-terminal-in-buffer.md.
     terminals: HashMap<BufferId, terminal::TermEmu>,
+    /// Per-line color runs captured from a terminal's grid the moment its child
+    /// exited, keyed by buffer id — the dead terminal's frozen highlighting. A
+    /// natural exit drops the live emulator (where the colors live) but the buffer
+    /// survives as a plain buffer holding the final output; without this the output
+    /// would revert to monochrome. Index-aligned with the buffer's lines (the
+    /// captured scrollback ++ screen); the appended `[Process exited]` notice has no
+    /// entry and stays uncolored. Populated by [`terminal_freeze`], read by
+    /// [`terminal_highlights`] when there is no live emulator, and cleared when the
+    /// buffer is killed/wiped or a fresh terminal reopens on the same id.
+    ///
+    /// [`terminal_freeze`]: EditHost::terminal_freeze
+    /// [`terminal_highlights`]: EditHost::terminal_highlights
+    terminal_frozen: HashMap<BufferId, Vec<terminal::RowStyles>>,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -726,6 +739,7 @@ impl EditHost {
             remote_watches: HashSet::new(),
             reload_posts: HashSet::new(),
             terminals: HashMap::new(),
+            terminal_frozen: HashMap::new(),
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]

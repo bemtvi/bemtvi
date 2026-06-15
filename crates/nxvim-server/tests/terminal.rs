@@ -508,6 +508,45 @@ async fn terminal_projects_ansi_color_into_highlight_spans() {
     panic!("timed out waiting for a red-fg terminal highlight span");
 }
 
+/// After the child exits, the buffer becomes a plain (editable) buffer — but it must
+/// keep the colors its output had. The vt100 emulator is dropped on exit, so the
+/// per-cell colors are captured into a persistent per-buffer store *before* the drop;
+/// otherwise the final output reverts to monochrome the instant the child dies. Here
+/// `cat <file>` prints ANSI red and exits on its own (no trailing `-`), and the red
+/// span must survive past the `[Process exited 0]` notice.
+#[tokio::test]
+async fn exited_terminal_keeps_its_colors() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start().await;
+
+    let path = write_temp("term_color_exit", "txt", "\x1b[31mred\x1b[0m\n");
+    command(&rpc, &format!("terminal cat {path}")).await;
+    // `cat` finishes the file and exits with no input waiting.
+    wait_lines(&rpc, "the process-exit notice", |ls| {
+        ls.iter().any(|l| l.contains("[Process exited 0]"))
+    })
+    .await;
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "a dead terminal leaves terminal mode"
+    );
+
+    // Force a fresh redraw with the (red) first line in view, then confirm the span
+    // is still red — the captured colors outlive the emulator.
+    feed(&rpc, "gg");
+    const RED: u64 = 0x00cd_0000;
+    for _ in 0..200 {
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            if first_red_fg_span(&map) == Some(RED) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for the exited terminal to keep its red span");
+}
+
 /// Phase 6 — scrollback. Output taller than the screen scrolls the earliest rows
 /// off the live vt100 grid; they must be preserved so terminal-normal navigation
 /// reaches them. While output is live the buffer mirrors only the screen (so floods

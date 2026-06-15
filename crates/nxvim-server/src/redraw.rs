@@ -346,13 +346,28 @@ impl EditHost {
             // so a client that highlights JS-side (the wasm edit-host) can pick the
             // grammar. Native clients ignore it (they paint server highlight spans).
             (Value::from("filetype"), Value::from(win.filetype.as_str())),
-            // Whether this window's buffer is a live terminal. The browser renderer
-            // paints a terminal from the server vt100 color palette (`highlights` +
-            // `styles`) rather than the JS highlighter, and the Worker skips shipping
-            // its (potentially huge scrollback) text — neither is needed for a terminal.
+            // Whether this window's buffer is a *live* terminal. Gates the live
+            // terminal-only behaviors: the Worker skips shipping its (potentially huge
+            // scrollback) text, since its colors come from the palette, not the JS
+            // highlighter. Goes false the instant the child exits (the buffer becomes
+            // plain, editable text whose lines ship normally again).
             (
                 Value::from("terminal"),
                 Value::from(self.terminals.contains_key(&win.buffer)),
+            ),
+            // Whether this window paints from the server vt100 color palette
+            // (`highlights` + `styles`) rather than the JS highlighter — a live
+            // terminal, *or* a closed one that kept its frozen colors. Distinct from
+            // `terminal`: a dead terminal ships its text and stays navigable, yet its
+            // final output keeps its highlighting (the colors are frozen at exit; see
+            // `terminal_frozen`). The browser uses this for the per-window render path
+            // and to keep terminal style contributions out of the global chrome mode.
+            (
+                Value::from("term_colors"),
+                Value::from(
+                    self.terminals.contains_key(&win.buffer)
+                        || self.terminal_frozen.contains_key(&win.buffer),
+                ),
             ),
             (Value::from("unnamed"), Value::from(win.unnamed)),
             (Value::from("modified"), Value::from(win.modified)),

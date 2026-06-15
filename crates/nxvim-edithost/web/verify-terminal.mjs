@@ -166,6 +166,18 @@ try {
     /REDCELL/.test(buf) && !/REDCELL/.test(shipped),
     `inBuffer=${/REDCELL/.test(buf)} inShippedLines=${/REDCELL/.test(shipped)}`);
 
+  // ── 1b-exit. color persists past the child's exit. The vt100 emulator is dropped when the
+  // child dies, but its per-cell colors are frozen into a per-buffer store first, so the dead
+  // terminal's final output keeps its highlighting as a plain buffer — `term_colors` stays true
+  // (distinct from the now-false `terminal`), so `renderLineServer` still paints it. Here the
+  // child prints red then exits immediately; the red span must survive the `[Process exited 0]`.
+  await luaResult(page, `local e=string.char(27); nx.terminal.open{ cmd = { "sh", "-c", "printf '"..e.."[31mREDGONE"..e.."[0m\\n'" } } return 1`);
+  await pollBuf(page, /REDGONE/);
+  await pollBuf(page, /\[Process exited 0\]/);
+  const redAfterExit = await pollColor(page, "REDGONE", "rgb(205, 0, 0)");
+  check("terminal: a dead terminal keeps its color after the child exits (frozen vt100 colors)",
+    redAfterExit === "rgb(205, 0, 0)", `computed color=${redAfterExit}`);
+
   // ── 1d. cancel: ^C on a flooding terminal trims the scrollback to the tail + a marker ─────
   // A child floods 1000 lines (past the 200-line keep window) then `trap "" INT; cat` keeps it
   // alive (and ignoring SIGINT) so the terminal stays live across the ^C. ^C while flooding

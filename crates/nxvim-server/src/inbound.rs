@@ -201,6 +201,9 @@ impl EditHost {
                 // appends the notice after this mirrored content.
                 self.terminal_project(buf);
                 self.editor.terminal_closed(buf, code);
+                // Freeze the grid's colors before dropping the emulator, so the dead
+                // buffer's final output keeps its highlighting as a plain buffer.
+                self.terminal_freeze(buf);
                 self.terminal_remove(buf);
             }
         }

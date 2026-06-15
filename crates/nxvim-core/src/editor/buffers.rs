@@ -223,9 +223,40 @@ impl Editor {
             .map(|ob| ob.buffer.take_lua_ts_edits())
     }
 
-    /// All open buffer ids, ascending (the `nvim_list_bufs` order).
+    /// All open buffer ids, ascending (the `nvim_list_bufs` order). Global across
+    /// every layer — the neovim API lists *all* buffers regardless of which dock or
+    /// the main area they live in.
     pub fn buffer_ids(&self) -> Vec<BufferId> {
         self.buffers.map.keys().copied().collect()
+    }
+
+    /// Open buffer ids that belong to `layer`, ascending. The buffer list is
+    /// **per-layer**: each buffer's home is the window layer it was last shown in
+    /// (`OpenBuffer::layer`), so a dock's buffers and the main area's buffers form
+    /// disjoint lists. Backs the focused-layer `:ls` and the same-layer close
+    /// fallback.
+    pub(crate) fn buffers_in_layer(&self, layer: Layer) -> Vec<BufferId> {
+        self.buffers
+            .map
+            .iter()
+            .filter(|(_, ob)| ob.layer == layer)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Record that buffer `id` now lives in `layer` (its window layer). A no-op if
+    /// `id` is not an open buffer.
+    pub(crate) fn set_buffer_layer(&mut self, id: BufferId, layer: Layer) {
+        if let Some(ob) = self.buffers.map.get_mut(&id) {
+            ob.layer = layer;
+        }
+    }
+
+    /// Open buffer ids that belong to the **focused** layer, ascending — the
+    /// per-region buffer list that `:ls` shows and the `nx.buf.list{ focused = true }`
+    /// Lua API exposes. (The global [`Editor::buffer_ids`] lists every layer.)
+    pub fn focused_buffer_ids(&self) -> Vec<BufferId> {
+        self.buffers_in_layer(self.focused_layer)
     }
 
     /// Make `id` the current buffer (the `nvim_set_current_buf` entry point).
@@ -1118,18 +1149,26 @@ impl Editor {
         let live_cursor = self.cursor.line;
         let mut lines = Vec::new();
         let mut current_row = 0;
-        for (row, (id, ob)) in self.buffers.map.iter().enumerate() {
-            if *id == current {
+        // `:ls` is scoped to the **focused layer** — a dock lists only its own
+        // buffers, the main area only its own. (The neovim `nvim_list_bufs` API
+        // stays global; this is the interactive, per-region list.)
+        for (row, id) in self
+            .buffers_in_layer(self.focused_layer)
+            .into_iter()
+            .enumerate()
+        {
+            let ob = self.buffers.get(id);
+            if id == current {
                 current_row = row;
             }
-            let flag = if *id == current {
+            let flag = if id == current {
                 '%'
-            } else if Some(*id) == alternate {
+            } else if Some(id) == alternate {
                 '#'
             } else {
                 ' '
             };
-            let active = if *id == current { 'a' } else { 'h' };
+            let active = if id == current { 'a' } else { 'h' };
             let modified = if ob.buffer.modified { '+' } else { ' ' };
             let name = ob
                 .buffer
@@ -1137,7 +1176,7 @@ impl Editor {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "[No Name]".to_string());
-            let lnum = if *id == current {
+            let lnum = if id == current {
                 live_cursor
             } else {
                 ob.saved_cursor.line
@@ -1254,9 +1293,9 @@ impl Editor {
     }
 
     /// `:bnext` — switch to the buffer `count` positions later in id order,
-    /// wrapping around.
+    /// wrapping around. Scoped to the focused layer, matching `:ls`.
     pub(crate) fn ex_bnext(&mut self, count: usize) {
-        let ids = self.buffer_ids();
+        let ids = self.buffers_in_layer(self.focused_layer);
         let len = ids.len();
         if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
             self.switch_buffer(ids[(i + count) % len]);
@@ -1264,24 +1303,25 @@ impl Editor {
     }
 
     /// `:bprevious` — switch `count` positions earlier in id order, wrapping.
+    /// Scoped to the focused layer, matching `:ls`.
     pub(crate) fn ex_bprev(&mut self, count: usize) {
-        let ids = self.buffer_ids();
+        let ids = self.buffers_in_layer(self.focused_layer);
         let len = ids.len();
         if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
             self.switch_buffer(ids[(i + len - count % len) % len]);
         }
     }
 
-    /// `:bfirst` — switch to the lowest-numbered buffer.
+    /// `:bfirst` — switch to the lowest-numbered buffer in the focused layer.
     pub(crate) fn ex_bfirst(&mut self) {
-        if let Some(&id) = self.buffers.map.keys().next() {
+        if let Some(&id) = self.buffers_in_layer(self.focused_layer).first() {
             self.switch_buffer(id);
         }
     }
 
-    /// `:blast` — switch to the highest-numbered buffer.
+    /// `:blast` — switch to the highest-numbered buffer in the focused layer.
     pub(crate) fn ex_blast(&mut self) {
-        if let Some(&id) = self.buffers.map.keys().next_back() {
+        if let Some(&id) = self.buffers_in_layer(self.focused_layer).last() {
             self.switch_buffer(id);
         }
     }
@@ -1316,12 +1356,20 @@ impl Editor {
         }
 
         // When removing the current buffer, move to the alternate if it's a
-        // distinct, still-open buffer (vim's behavior), else the nearest id.
+        // distinct, still-open buffer (vim's behavior), else the nearest id —
+        // **within the same layer**: closing a document in the main area must never
+        // pull in a dock's buffer (or vice versa). The replacement layer is the
+        // focused one, since the focused window is the one losing `target`.
         let was_current = target == self.cur_buffer();
+        let layer = self.focused_layer;
         let replacement = if was_current {
             self.alternate
-                .filter(|a| *a != target && self.buffers.map.contains_key(a))
-                .or_else(|| self.neighbor_of(target))
+                .filter(|a| {
+                    *a != target
+                        && self.buffers.map.contains_key(a)
+                        && self.buffers.get(*a).layer == layer
+                })
+                .or_else(|| self.neighbor_of(target, layer))
         } else {
             None
         };
@@ -1331,38 +1379,39 @@ impl Editor {
             self.alternate = None;
         }
 
-        if self.buffers.map.is_empty() {
-            // Never leave zero buffers: open a fresh, empty one in the window.
-            let id = self.add_buffer(Buffer::empty());
-            self.set_cur_buffer(id);
-            self.alternate = None;
-            self.cursor = Cursor::default();
-            self.top = 0;
-            self.leftcol = 0;
-            self.mode = Mode::Normal;
-            self.reset_pending();
-            self.scroll_from = None;
-            self.pending_scroll = None;
-        } else if was_current {
-            // `current` now dangles; move to the chosen replacement (no stash —
-            // the outgoing buffer is gone).
-            self.enter_buffer(replacement.expect("a non-empty store has a neighbor"));
+        if was_current {
+            match replacement {
+                // `current` now dangles; move to the chosen same-layer replacement
+                // (no stash — the outgoing buffer is gone).
+                Some(rep) => self.enter_buffer(rep),
+                // No sibling buffer remains in this layer: open a fresh, empty one
+                // in the window rather than borrowing another layer's buffer. This
+                // also covers the never-leave-zero-buffers case.
+                None => {
+                    let id = self.add_buffer(Buffer::empty());
+                    self.set_cur_buffer(id);
+                    self.alternate = None;
+                    self.cursor = Cursor::default();
+                    self.top = 0;
+                    self.leftcol = 0;
+                    self.mode = Mode::Normal;
+                    self.reset_pending();
+                    self.scroll_from = None;
+                    self.pending_scroll = None;
+                }
+            }
         }
         true
     }
 
-    /// The nearest buffer to `id` in id order among the *other* open buffers:
-    /// the largest id below it, else the smallest above it. `None` if `id` is the
-    /// only buffer.
-    fn neighbor_of(&self, id: BufferId) -> Option<BufferId> {
-        let below = self.buffers.map.range(..id).next_back().map(|(k, _)| *k);
-        below.or_else(|| {
-            self.buffers
-                .map
-                .range((std::ops::Bound::Excluded(id), std::ops::Bound::Unbounded))
-                .next()
-                .map(|(k, _)| *k)
-        })
+    /// The nearest buffer to `id` among the *other* open buffers **in `layer`**: the
+    /// largest id below it, else the smallest above it. `None` if `id` is the only
+    /// buffer in that layer. Per-layer so the close fallback never crosses into a
+    /// dock (see [`Editor::delete_buffer`]).
+    fn neighbor_of(&self, id: BufferId, layer: Layer) -> Option<BufferId> {
+        let ids = self.buffers_in_layer(layer);
+        let below = ids.iter().rev().find(|&&b| b < id).copied();
+        below.or_else(|| ids.iter().find(|&&b| b > id).copied())
     }
 }
 

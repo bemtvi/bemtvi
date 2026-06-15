@@ -964,6 +964,13 @@ impl Editor {
             return;
         }
         let lines = self.buffers.get(buf).buffer.line_count();
+        // The buffer now lives in this window's layer — record its home so the
+        // per-layer buffer list (`:ls`, the close-fallback) stays scoped correctly.
+        let layer = self
+            .tree_of_window(id)
+            .map(|(l, _)| l)
+            .expect("checked above");
+        self.set_buffer_layer(buf, layer);
         let w = self
             .tree_of_window_mut(id)
             .expect("checked above")

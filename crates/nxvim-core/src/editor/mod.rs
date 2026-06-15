@@ -322,6 +322,14 @@ struct OpenBuffer {
     saved_cursor: Cursor,
     saved_top: usize,
     saved_leftcol: usize,
+    /// Which window [`Layer`] this buffer belongs to — the layer of the window it
+    /// was last shown in. The buffer list is **per-layer**: `:ls` lists only the
+    /// focused layer's buffers, and closing a buffer falls back to a sibling in the
+    /// *same* layer (never pulling a dock buffer into the main area, or vice versa).
+    /// Updated whenever the buffer is bound into a window ([`Editor::set_cur_buffer`]
+    /// / [`Editor::set_window_buffer`]); defaults to `Main` for a freshly created
+    /// buffer until it is first displayed.
+    layer: Layer,
 }
 
 impl OpenBuffer {
@@ -335,6 +343,9 @@ impl OpenBuffer {
             saved_cursor: Cursor::default(),
             saved_top: 0,
             saved_leftcol: 0,
+            // Assigned to the live layer as soon as the buffer is shown in a window;
+            // the startup buffer (created before any dock) is a main buffer.
+            layer: Layer::Main,
         }
     }
 }
@@ -1283,6 +1294,11 @@ impl Editor {
     /// through here; it changes only *which* buffer the window shows.
     fn set_cur_buffer(&mut self, id: BufferId) {
         self.windows.cur_mut().buffer = id;
+        // The buffer now lives in the focused layer's window — record that as its
+        // home so `:ls` and the close-fallback stay scoped to this layer.
+        if let Some(ob) = self.buffers.map.get_mut(&id) {
+            ob.layer = self.focused_layer;
+        }
     }
 
     /// The current buffer's text model. The focused window shows exactly one

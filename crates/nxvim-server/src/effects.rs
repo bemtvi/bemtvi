@@ -756,6 +756,10 @@ impl EditHost {
         // per-buffer journals, so a call with no pending edits is a cheap no-op.
         self.editor.adjust_jumplists_for_edits();
         let mut bufs: Vec<BufMirror> = Vec::new();
+        // Which buffers live in the focused layer, for `nx.buf.list{ focused = true }`
+        // (the per-region buffer list — see `OpenBuffer::layer` in core).
+        let focused_bufs: HashSet<BufferId> =
+            self.editor.focused_buffer_ids().into_iter().collect();
         // Buffer-local option values, mirrored so `vim.bo` / `nvim_get_option_value`
         // read the core's current value (the default until set, and values set via
         // the `:set` ex path). Cheap (three scalars per buffer), so it isn't gated.
@@ -855,6 +859,7 @@ impl EditHost {
                 bufnr: id.0,
                 lines,
                 name,
+                focused: focused_bufs.contains(&id),
             });
         }
         // Drop tick entries for buffers that no longer exist, so the map can't grow

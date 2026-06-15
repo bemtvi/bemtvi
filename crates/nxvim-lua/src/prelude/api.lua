@@ -974,16 +974,27 @@ function nx.win.position(win)
 end
 api.nvim_win_get_position = nx.win.position
 
--- nx.buf.list(): every buffer handle the snapshot mirror knows, ascending.
-function nx.buf.list()
+-- nx.buf.list([opts]): buffer handles the snapshot mirror knows, ascending.
+-- By default every buffer across every layer (main area + all docks). Pass
+-- `{ focused = true }` to list only the buffers of the **focused** layer — the
+-- per-region list (`:ls` is scoped the same way), so a dock reports just its own
+-- buffers and the main area just its own.
+function nx.buf.list(opts)
+  local focused_only = type(opts) == "table" and opts.focused == true
   local ids = {}
-  for id in pairs(nx._bufs or {}) do
-    ids[#ids + 1] = id
+  for id, b in pairs(nx._bufs or {}) do
+    if not focused_only or b.focused then
+      ids[#ids + 1] = id
+    end
   end
   table.sort(ids)
   return ids
 end
-api.nvim_list_bufs = nx.buf.list
+-- nvim_list_bufs takes no arguments and lists *all* buffers; bind the default
+-- (all-layers) behavior so a stray caller can never accidentally scope it.
+function api.nvim_list_bufs()
+  return nx.buf.list()
+end
 
 -- nx.list_uis() [alias nvim_list_uis]: the attached UIs. nxvim drives one client
 -- at a time, so this reports a single UI sized to the editor screen

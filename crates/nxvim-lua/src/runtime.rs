@@ -189,6 +189,11 @@ pub struct BufMirror {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<Vec<String>>,
     pub name: String,
+    /// Whether this buffer belongs to the **focused** window layer (the main area
+    /// or whichever dock currently holds focus). Backs `nx.buf.list{ focused = true }`,
+    /// the per-region buffer list — the buffer list is scoped per layer (see
+    /// `OpenBuffer::layer` in core).
+    pub focused: bool,
 }
 
 /// One buffer's wired buffer-local options (`nx._bo_mirror[bufnr]`) read by

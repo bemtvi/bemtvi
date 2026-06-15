@@ -10,8 +10,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, mode,
-    serial_lock, start_attached, wait_redraw,
+    command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, lua_u64, map_get,
+    mode, serial_lock, start_attached, wait_redraw, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -52,6 +52,29 @@ async fn buf_count(rpc: &Rpc) -> usize {
 /// The latest redraw map (any frame).
 fn latest(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<(Value, Value)> {
     drain_to_latest_redraw(incoming, |_| true).expect("a redraw frame")
+}
+
+/// The bottom panel's content lines, read off the latest redraw carrying a panel
+/// (a barrier is sent first so this action's frame is already queued). `None` when
+/// no panel is open.
+async fn panel_lines(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<String>> {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let map = drain_to_latest_redraw(incoming, |m| map_get(m, "panel").is_some())?;
+    match map_get(&map, "panel") {
+        Some(Value::Map(panel)) => Some(
+            panel
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("lines"))
+                .and_then(|(_, v)| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    }
 }
 
 /// The set of window `region` strings present in a redraw map.
@@ -1180,4 +1203,141 @@ async fn clicking_a_hidden_dock_chip_reshows_it() {
         vec!["panel"],
         "the chip click focuses the re-shown dock, content intact"
     );
+}
+
+/// The buffer list is **per-layer**: `:ls` lists only the buffers of the focused
+/// region — a dock reports just its own, the main area just its own.
+#[tokio::test]
+async fn ls_lists_only_the_focused_layers_buffers() {
+    let (rpc, mut incoming) = start().await;
+    // Widen so each buffer's absolute-path listing fits on one (un-wrapped) panel
+    // row — otherwise the one-row-per-buffer count this asserts on breaks.
+    req(
+        &rpc,
+        "nvim_ui_try_resize",
+        vec![Value::from(400u64), Value::from(40u64)],
+    )
+    .await;
+    let a = write_temp("dock_ls_a", "txt", "AAA\n");
+    let b = write_temp("dock_ls_b", "txt", "BBB\n");
+    let c = write_temp("dock_ls_c", "txt", "CCC\n");
+
+    // Main area: two buffers (A reuses the startup [No Name]; B is current).
+    command(&rpc, &format!("e {a}")).await;
+    command(&rpc, &format!("e {b}")).await;
+
+    // Open a left dock and load a third file into its scratch buffer.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await;
+    command(&rpc, &format!("e {c}")).await;
+    assert_eq!(lines(&rpc).await, vec!["CCC"], "the dock shows C");
+
+    // `:ls` in the dock lists only the dock's buffer (C), never the main A/B.
+    command(&rpc, "ls").await;
+    let rows = panel_lines(&rpc, &mut incoming).await.expect("panel opens");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the dock lists only its own buffer: {rows:?}"
+    );
+    assert!(rows[0].contains(&c), "the dock's row is C: {rows:?}");
+    feed(&rpc, "<Esc>"); // dismiss the panel
+
+    // Cross to the main area; `:ls` there lists A and B, never the dock's C.
+    feed(&rpc, "<C-w><C-w>l");
+    command(&rpc, "ls").await;
+    let rows = panel_lines(&rpc, &mut incoming).await.expect("panel opens");
+    assert_eq!(rows.len(), 2, "main lists its two buffers: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains(&a)), "A present: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains(&b)), "B present: {rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains(&c)),
+        "the dock's C must not appear in main's :ls: {rows:?}"
+    );
+
+    for f in [a, b, c] {
+        std::fs::remove_file(&f).ok();
+    }
+}
+
+/// Closing a document in the main area must never pull a dock's buffer into the
+/// main window: with no other *main* buffer left, it opens a fresh `[No Name]`.
+#[tokio::test]
+async fn closing_a_main_document_does_not_load_a_dock_buffer() {
+    let (rpc, _incoming) = start().await;
+    let a = write_temp("dock_close_a", "txt", "AAA\n");
+    let c = write_temp("dock_close_c", "txt", "CCC\n");
+
+    // Main area: a single document, A.
+    command(&rpc, &format!("e {a}")).await;
+
+    // A dock holding its own document, C.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await;
+    command(&rpc, &format!("e {c}")).await;
+    assert_eq!(lines(&rpc).await, vec!["CCC"], "the dock shows C");
+
+    // Back in the main area, A is the only main buffer.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(lines(&rpc).await, vec!["AAA"], "main shows A");
+
+    // Closing A leaves the main window on a fresh empty buffer — *not* the dock's C.
+    command(&rpc, "bd").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "main fell back to a fresh [No Name], not the dock's C"
+    );
+    // C is still loaded (closing A never touched the dock), alongside the new buffer.
+    assert_eq!(buf_count(&rpc).await, 2, "C plus the fresh [No Name]");
+
+    for f in [a, c] {
+        std::fs::remove_file(&f).ok();
+    }
+}
+
+/// `nx.buf.list` defaults to every buffer across all layers; `{ focused = true }`
+/// scopes it to the focused region (the per-region list `:ls` shows).
+#[tokio::test]
+async fn buf_list_focused_option_scopes_to_the_focused_layer() {
+    let (rpc, _incoming) = start().await;
+    let a = write_temp("dock_blist_a", "txt", "AAA\n");
+    let c = write_temp("dock_blist_c", "txt", "CCC\n");
+
+    command(&rpc, &format!("e {a}")).await; // buffer 1 = A (main)
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await; // scratch buffer 2 (dock)
+    command(&rpc, &format!("e {c}")).await; // buffer 2 = C (dock)
+
+    // Focused on the dock: the default list spans both layers; the focused list is
+    // the dock's single buffer.
+    assert_eq!(
+        lua_u64(&rpc, "return #nx.buf.list()").await,
+        Some(2),
+        "the default list spans every layer"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return #nx.buf.list{ focused = true }").await,
+        Some(1),
+        "the focused list is the dock alone"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return nx.buf.list{ focused = true }[1]").await,
+        Some(2),
+        "and that buffer is the dock's (#2)"
+    );
+
+    // Cross to the main area; the focused list now reports main's buffer.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        lua_u64(&rpc, "return nx.buf.list{ focused = true }[1]").await,
+        Some(1),
+        "main's focused list is buffer #1"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return #nx.buf.list()").await,
+        Some(2),
+        "the default list still spans every layer"
+    );
+
+    for f in [a, c] {
+        std::fs::remove_file(&f).ok();
+    }
 }

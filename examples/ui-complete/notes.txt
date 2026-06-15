@@ -1,0 +1,37 @@
+nx.complete — the native completion engine (unified float-list widget, Phase 4)
+===============================================================================
+
+What this example shows
+-----------------------
+The built-in `buffer` completion source: as you type in insert mode, nxvim offers
+words already present in the buffer, fuzzy-ranked with the matched characters
+highlighted. The whole `buffer` path is native (Rust, in nxvim-core) — no Lua runs
+per keystroke (ADR 0002 rule 4) — so it works the same in the TUI, the GUI, and the
+browser (wasm) build.
+
+How completion differs from the picker
+--------------------------------------
+The picker grabs input: its prompt is a separate query field and the document is
+untouched while it is open. Completion is the inverse — the BUFFER is the query.
+The popup floats over the text, your keystrokes keep editing the document, and only
+the configured control keys (move / accept / dismiss) are intercepted while the
+popup is visible. That single difference is what makes completion its own
+orchestration on the shared widget.
+
+Default keys (overridable in init.lua via `nx.complete.setup{ keys = … }`)
+--------------------------------------------------------------------------
+  <C-n> / <Tab> / <Down>   next candidate
+  <C-p> / <S-Tab> / <Up>   previous candidate
+  <C-y>                    accept the highlighted candidate
+  <C-e>                    dismiss (keep what you typed)
+
+<CR> is deliberately NOT a default accept key (with auto-complete on, that would
+swallow newlines). This example opts <CR> in anyway, to show the override.
+
+What is NOT in this phase (4-A)
+-------------------------------
+The `lsp` and `snippets` built-in sources, third-party `nx.complete.source{}`
+plugins, and the markdown docs preview beside the popup. They arrive in Phases
+4-B…4-E (docs/plans/2026-06-15-nx-complete-completion-engine.md). Referencing an
+unimplemented source in `nx.complete.setup{}` fails loud rather than silently
+doing nothing.

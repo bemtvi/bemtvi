@@ -36,6 +36,21 @@ pub enum MenuPlacement {
     Editor,
 }
 
+/// Which orchestration drives this `Menu`. The widget is one shape; the kind
+/// decides only two things core cares about: whether the menu **grabs input**
+/// (`Select` / `Picker` do — every keystroke navigates the list or edits the
+/// prompt; `Complete` does **not** — the buffer is the query, so typing flows on
+/// to the document and only the engine's control keys are intercepted while it is
+/// open), and how `<CR>`-equivalent confirmation resolves (a `Complete` row
+/// carries its own [`MenuItem::insert`] text and is applied natively, with no Lua
+/// round-trip — the others push a key onto [`Editor::menu_results`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuKind {
+    Select,
+    Picker,
+    Complete,
+}
+
 /// Where a picker's prompt sits relative to its results list — above it (`Top`,
 /// the default) or below it (`Bottom`, the telescope-style "input at the bottom"
 /// layout). Only meaningful for a picker (a promptless `nx.ui.select` has no
@@ -84,6 +99,10 @@ pub struct MenuItem {
     pub label: String,
     pub key: usize,
     pub preview: Option<PreviewTarget>,
+    /// The text a completion row inserts when accepted (`Complete` menus only).
+    /// `None` ⇒ use `label`. `Select` / picker rows leave this `None` — they
+    /// round-trip the opaque `key` to Lua, which applies the choice itself.
+    pub insert: Option<String>,
 }
 
 /// What the picker's preview pane should show for a candidate. The source's
@@ -182,6 +201,13 @@ impl Prompt {
 /// and `cursor` highlights a row **within `filtered`**.
 #[derive(Clone)]
 pub(crate) struct Menu {
+    /// Which orchestration owns this menu — decides input-grab and confirm
+    /// resolution. See [`MenuKind`].
+    kind: MenuKind,
+    /// Byte offset in the buffer where the completed prefix starts (`Complete`
+    /// menus only; `0` and unused otherwise). Accepting a row replaces
+    /// `[anchor .. cursor)` with the row's insert text.
+    anchor: usize,
     /// Every candidate (label + source key). For a picker this grows via
     /// [`Editor::menu_push`] as the source streams items in — up to 100k+.
     all_items: Vec<MenuItem>,
@@ -327,10 +353,13 @@ impl Editor {
                 label,
                 key,
                 preview: None,
+                insert: None,
             })
             .collect();
         let last = all_items.len().saturating_sub(1);
         let mut menu = Menu {
+            kind: MenuKind::Select,
+            anchor: 0,
             all_items,
             filtered: None,
             match_spans: Vec::new(),
@@ -367,6 +396,8 @@ impl Editor {
         prompt_pos: PromptPos,
     ) {
         self.menu = Some(Menu {
+            kind: MenuKind::Picker,
+            anchor: 0,
             all_items: Vec::new(),
             filtered: None,
             match_spans: Vec::new(),
@@ -444,6 +475,123 @@ impl Editor {
     /// Whether a menu is currently open (and grabbing input).
     pub fn menu_is_open(&self) -> bool {
         self.menu.is_some()
+    }
+
+    /// The open menu's [`MenuKind`], or `None` when no menu is open.
+    pub(crate) fn menu_kind(&self) -> Option<MenuKind> {
+        self.menu.as_ref().map(|m| m.kind)
+    }
+
+    /// Whether the open menu **grabs all input** (`Select` / `Picker`) — the
+    /// signal the input dispatch uses to route every key to [`handle_menu`]. A
+    /// `Complete` menu does not: it floats over the text while typing flows on to
+    /// the document, so the dispatch lets the key through to `handle_insert`.
+    ///
+    /// [`handle_menu`]: Editor::handle_menu
+    pub(crate) fn menu_grabs_input(&self) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|m| m.kind != MenuKind::Complete)
+    }
+
+    /// Open or refresh the completion popup: `candidates` are fuzzy-ranked against
+    /// `prefix`, the matches become a [`MenuKind::Complete`] menu anchored at
+    /// `anchor` (the buffer byte offset where the prefix begins), the first match
+    /// preselected. No matches closes the popup. Each row's `insert` text is its
+    /// label (the `buffer` source completes to the whole word).
+    pub(crate) fn set_complete_menu(
+        &mut self,
+        anchor: usize,
+        prefix: &str,
+        candidates: Vec<String>,
+    ) {
+        let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let ranked = crate::fuzzy::rank(prefix, &refs);
+        if ranked.is_empty() {
+            self.close_completion();
+            return;
+        }
+        let mut all_items = Vec::with_capacity(ranked.len());
+        let mut filtered = Vec::with_capacity(ranked.len());
+        let mut match_spans = Vec::with_capacity(ranked.len());
+        for (key, (idx, spans)) in ranked.into_iter().enumerate() {
+            let label = candidates[idx].clone();
+            all_items.push(MenuItem {
+                insert: Some(label.clone()),
+                label,
+                key,
+                preview: None,
+            });
+            filtered.push(key);
+            match_spans.push(spans);
+        }
+        self.menu = Some(Menu {
+            kind: MenuKind::Complete,
+            anchor,
+            all_items,
+            filtered: Some(filtered),
+            match_spans,
+            cursor: 0,
+            placement: MenuPlacement::Cursor,
+            gpending: false,
+            prompt: None,
+            prompt_pos: PromptPos::default(),
+            dynamic: false,
+            preview: false,
+            preview_scroll: None,
+            generation: 0,
+            items_gen: 0,
+            width: None,
+            height: None,
+        });
+    }
+
+    /// Move the completion selection (wrapping), `<C-n>` / `<C-p>`-style. A no-op
+    /// unless a completion menu is open.
+    pub(crate) fn complete_select_next(&mut self) {
+        if let Some(m) = self.completion_menu_mut() {
+            let len = m.view_len();
+            if len > 0 {
+                m.cursor = (m.cursor + 1) % len;
+            }
+        }
+    }
+
+    pub(crate) fn complete_select_prev(&mut self) {
+        if let Some(m) = self.completion_menu_mut() {
+            let len = m.view_len();
+            if len > 0 {
+                m.cursor = (m.cursor + len - 1) % len;
+            }
+        }
+    }
+
+    /// The selected completion's `(anchor, insert_text)`, closing the menu. `None`
+    /// when no completion menu is open (the caller then leaves the key to its
+    /// normal insert handling). The caller applies the edit — replacing the buffer
+    /// `[anchor .. cursor)` prefix with `insert_text` — since core's buffer
+    /// mutators live on [`Editor`].
+    pub(crate) fn complete_take_accept(&mut self) -> Option<(usize, String)> {
+        let m = self.completion_menu_mut()?;
+        let row = m.all_items.get(m.item_at(m.cursor))?;
+        let insert = row.insert.clone().unwrap_or_else(|| row.label.clone());
+        let anchor = m.anchor;
+        self.menu = None;
+        Some((anchor, insert))
+    }
+
+    /// Close the popup **only if it is a completion menu** — leaves an open
+    /// `select` / picker untouched. A no-op when nothing (or a non-completion
+    /// menu) is open.
+    pub(crate) fn close_completion(&mut self) {
+        if self.menu_kind() == Some(MenuKind::Complete) {
+            self.menu = None;
+        }
+    }
+
+    /// `&mut` to the open menu iff it is a completion menu.
+    fn completion_menu_mut(&mut self) -> Option<&mut Menu> {
+        self.menu.as_mut().filter(|m| m.kind == MenuKind::Complete)
     }
 
     /// Handle a keystroke while the menu has focus. `<CR>` confirms the highlighted

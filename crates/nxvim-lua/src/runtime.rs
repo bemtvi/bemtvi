@@ -16,10 +16,10 @@ use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
-    HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush,
-    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq,
-    UiSelectReq, WindowOp,
+    BufOp, CallbackArgs, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp,
+    FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, PanelOp,
+    PickerOpenReq, PickerPush, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp,
+    TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -310,6 +310,11 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
     // nx.picker: the fuzzy finder (sources + open) over the float-list widget.
     ("nxvim:prelude/picker", include_str!("prelude/picker.lua")),
+    // nx.complete: the native completion engine (Phase 4-A, buffer source).
+    (
+        "nxvim:prelude/complete",
+        include_str!("prelude/complete.lua"),
+    ),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
@@ -381,6 +386,9 @@ pub(crate) struct Shared {
     /// `nx.picker.open` requests, drained by the server into the editor's fuzzy
     /// finder (`Editor::open_picker`) after the chunk.
     pub(crate) picker_opens: Vec<PickerOpenReq>,
+    /// `nx.complete.setup{}` configurations, drained by the server into
+    /// `Editor::configure_complete` (the native completion engine, Phase 4-A).
+    pub(crate) complete_setups: Vec<CompleteSetupReq>,
     /// Streamed picker candidates (`nx.picker` source `push`), drained by the
     /// server (generation-gated) into `Editor::menu_push` after the chunk / a
     /// streaming `on_stdout`.
@@ -795,6 +803,12 @@ impl LuaRuntime {
         /// Take the `nx.picker.open` requests queued since the last drain, for the
         /// server to open as fuzzy-finder widgets.
         take_picker_opens -> Vec<PickerOpenReq> = picker_opens
+    }
+
+    take_queue! {
+        /// Take the `nx.complete.setup{}` configurations queued since the last
+        /// drain, for the server to apply to the native completion engine.
+        take_complete_setups -> Vec<CompleteSetupReq> = complete_setups
     }
 
     take_queue! {

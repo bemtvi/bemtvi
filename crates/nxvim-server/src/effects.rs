@@ -335,6 +335,35 @@ impl EditHost {
             // queues (already past this pass's `take_loop_ops`) actually starts.
             self.editor.picker_query_changes.push((0, String::new()));
         }
+        // `nx.complete.setup{}`: apply the native completion-engine config. Key
+        // notation is parsed here (core stays parser-aware only via `parse_keys`);
+        // an empty list keeps that action's built-in default.
+        for req in self.lua.take_complete_setups() {
+            let mut keys = nxvim_core::CompleteKeys::default();
+            let parse = |list: &[String]| -> Vec<nxvim_core::input::Key> {
+                list.iter()
+                    .flat_map(|s| nxvim_core::input::parse_keys(s))
+                    .collect()
+            };
+            if !req.next.is_empty() {
+                keys.next = parse(&req.next);
+            }
+            if !req.prev.is_empty() {
+                keys.prev = parse(&req.prev);
+            }
+            if !req.confirm.is_empty() {
+                keys.confirm = parse(&req.confirm);
+            }
+            if !req.abort.is_empty() {
+                keys.abort = parse(&req.abort);
+            }
+            self.editor.configure_complete(nxvim_core::CompleteConfig {
+                enabled: true,
+                auto: req.auto,
+                min_chars: req.min_chars,
+                keys,
+            });
+        }
         // Picker candidates streamed in: feed them into the open widget,
         // generation-gated — a batch from a query the user has already typed past
         // (`gen` behind the live generation) is dropped, never shown. Coalesced
@@ -352,6 +381,7 @@ impl EditHost {
                         path: pv.path,
                         loc: pv.loc,
                     }),
+                    insert: None,
                 })
                 .collect();
             if !items.is_empty() {

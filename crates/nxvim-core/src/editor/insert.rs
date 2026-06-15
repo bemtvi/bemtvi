@@ -47,6 +47,28 @@ impl Editor {
     }
 
     pub(crate) fn handle_insert(&mut self, key: Key) {
+        // Native completion popup: while it is open, its control keys navigate /
+        // accept / abort and are consumed here; every other key edits the document
+        // normally and then re-triggers the engine at the end of this fn. (The
+        // popup does not grab input — the buffer is the query.)
+        if self.completion_active() {
+            if let Some(action) = self.complete_action(&key) {
+                use super::complete::CompleteAction;
+                match action {
+                    CompleteAction::Next => self.complete_select_next(),
+                    CompleteAction::Prev => self.complete_select_prev(),
+                    CompleteAction::Abort => self.close_completion(),
+                    CompleteAction::Confirm => self.complete_accept(),
+                }
+                return;
+            }
+            // Any non-control key (typing, `<BS>`, motion, `<Esc>`) closes the
+            // popup; the edit/motion then proceeds below, and a word keystroke
+            // re-opens it via `complete_trigger`. `<Esc>` thus closes the popup and
+            // still leaves Insert mode in one press.
+            self.close_completion();
+        }
+
         // `<C-r>{register}`: the keystroke after `<C-r>` names the register whose
         // text is inserted at every cursor. Consume it before the normal handling
         // (and before the soft-tab take below) — a non-register key cancels and
@@ -138,6 +160,24 @@ impl Editor {
                 self.insert_text.push(c); // `".` last-insert register
             }
             _ => {}
+        }
+
+        // Auto-completion: after a word keystroke, a deletion, or a horizontal
+        // move, recompute the popup (open / refresh / close based on the new
+        // prefix). Cheap when the engine is disabled or the prefix is too short;
+        // skipped while arming a `<C-r>` register insert (not a prefix edit).
+        if self.complete_config.auto
+            && !self.awaiting_register
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+            )
+        {
+            self.complete_trigger();
         }
     }
 

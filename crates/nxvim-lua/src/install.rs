@@ -19,9 +19,9 @@ use crate::convert::{
 };
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
-    BufOp, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp,
-    OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, RegisterSetOp, TabOp,
-    TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    BufOp, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet,
+    LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, RegisterSetOp,
+    TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1267,6 +1267,37 @@ pub(crate) fn install_runtime_api(
                     height: height.unwrap_or_default(),
                     prompt_bottom: prompt_bottom.unwrap_or(false),
                     preview: preview.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `nx._complete_setup(auto, min_chars, next, prev, confirm, abort)`: queue a
+    // native completion-engine configuration ([`CompleteSetupReq`]). Each key
+    // argument is a list of vim notation strings (`{ "<C-n>", "<Tab>" }`); an empty
+    // list keeps that action's built-in default. The Lua wrapper (`prelude/complete.lua`)
+    // validates the source list before calling this.
+    let sh = shared.clone();
+    nx.set(
+        "_complete_setup",
+        lua.create_function(
+            move |_,
+                  (auto, min_chars, next, prev, confirm, abort): (
+                bool,
+                usize,
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+            )| {
+                sh.borrow_mut().complete_setups.push(CompleteSetupReq {
+                    auto,
+                    min_chars,
+                    next,
+                    prev,
+                    confirm,
+                    abort,
                 });
                 Ok(())
             },

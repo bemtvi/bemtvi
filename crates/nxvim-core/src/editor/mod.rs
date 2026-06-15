@@ -30,6 +30,7 @@ mod buffers;
 mod changelist;
 mod cmdline;
 mod command;
+mod complete;
 mod cursor;
 mod dock;
 mod ex;
@@ -61,6 +62,7 @@ pub(crate) use self::command::{
     DockChord, FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand,
     Stage,
 };
+pub use self::complete::{CompleteConfig, CompleteKeys};
 pub use self::menu::{
     MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
@@ -777,6 +779,15 @@ pub struct Editor {
     /// handles its query edits in core. Drained by the server, which stamps the
     /// generation onto the source run + its pushes so a stale response is dropped.
     pub picker_query_changes: Vec<(u64, String)>,
+    /// The native completion engine's configuration (`nx.complete.setup`).
+    /// Disabled until a config arrives, so an editor with no completion config is
+    /// byte-for-byte unchanged. See [`complete`](crate::editor::complete).
+    complete_config: complete::CompleteConfig,
+    /// Whether the bespoke server-side LSP completion pmenu is currently open.
+    /// Synced by the server so the engine's auto-trigger ([`Editor::complete_trigger`])
+    /// stands down rather than stacking a second popup. Removed in Phase 4-C when
+    /// the LSP path migrates onto this engine and the bespoke pmenu is retired.
+    lsp_pmenu_open: bool,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -1192,6 +1203,8 @@ impl Editor {
             menu: None,
             menu_results: Vec::new(),
             picker_query_changes: Vec::new(),
+            complete_config: complete::CompleteConfig::default(),
+            lsp_pmenu_open: false,
             should_quit: false,
             options: Options::default(),
             highlights: Highlights::new(),
@@ -1345,9 +1358,13 @@ impl Editor {
             return;
         }
 
-        // A focused menu (`nx.ui.select`, later the picker) grabs every key the
-        // same way — navigation + confirm / cancel — floating over the text.
-        if self.menu.is_some() {
+        // A focused menu (`nx.ui.select` / the picker) grabs every key the same
+        // way — navigation + confirm / cancel — floating over the text. A
+        // *completion* menu is the exception: it floats over the text but the
+        // buffer is the query, so typing must flow on to `handle_insert` (which
+        // intercepts only the engine's control keys); `menu_grabs_input()` is
+        // false for it.
+        if self.menu_grabs_input() {
             self.handle_menu(key);
             return;
         }

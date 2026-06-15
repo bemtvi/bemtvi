@@ -27,6 +27,14 @@ impl EditHost {
     /// processed here is also reported to the `vim.on_key` observers.
     pub(crate) fn process_key(&mut self, key: Key) {
         self.notify_on_key(key);
+        // Keep the native completion engine's "stand down" flag in sync with the
+        // bespoke LSP pmenu: while that pmenu is open, a word keystroke routes
+        // through `editor.input` (below) and would otherwise auto-open the engine's
+        // buffer popup on top of it. The two are mutually exclusive until Phase 4-C
+        // folds LSP into the engine and retires this pmenu. Native only — the
+        // browser build has no LSP pmenu, so the flag stays false there.
+        #[cfg(feature = "native")]
+        self.editor.set_lsp_pmenu_open(self.completion_menu_open());
         // Insert-mode completion popup is modal, stateful UI routing: while it is
         // open it owns every key (navigate / accept / dismiss / live-refresh) ahead
         // of the mapping engine (design B5). A key the popup *doesn't* claim

@@ -1,0 +1,26 @@
+nx.complete buffer-source playground
+=====================================
+
+The buffer source completes from words already present in THIS buffer. To see it
+work, enter insert mode (press `i`) and start retyping one of the longer
+identifiers below — once two characters match, a popup of candidates appears.
+
+  configuration
+  connection
+  completion
+  concatenate
+  consequently
+
+  parameter
+  parameterize
+  partition
+  participant
+
+Try, for example, typing `con` on a blank line: the popup offers `configuration`,
+`connection`, `completion`, `concatenate`, and `consequently`. Press <C-n>/<Tab>
+to move down the list, <C-y> (or <CR>, mapped in init.lua) to accept, or <C-e> to
+dismiss and keep what you typed.
+
+Because the source is just a scan of the buffer, the more prose you write here the
+richer the completion gets — every word you have already typed becomes a
+candidate for the next one.

@@ -799,6 +799,27 @@ pub struct PickerOpenReq {
     pub preview: bool,
 }
 
+/// A `nx.complete.setup{}` configuration request for the native completion engine
+/// (Phase 4-A). The Lua wrapper validates the source list (only `"buffer"` so far)
+/// and resolves the options; the server parses the key `notation` lists into
+/// [`Key`](nxvim_core::input::Key)s and applies a
+/// [`CompleteConfig`](nxvim_core::CompleteConfig). An empty key list for an action
+/// keeps that action's built-in default. Queued in
+/// [`crate::runtime::Shared::complete_setups`].
+#[derive(Clone, Debug)]
+pub struct CompleteSetupReq {
+    /// Complete as you type (the engine auto-opens / refreshes on word keystrokes).
+    pub auto: bool,
+    /// The prefix must reach this many characters before the menu opens.
+    pub min_chars: usize,
+    /// Key notation (`"<C-n>"`, `"<Tab>"`, …) for each engine action; empty ⇒ keep
+    /// the built-in default for that action.
+    pub next: Vec<String>,
+    pub prev: Vec<String>,
+    pub confirm: Vec<String>,
+    pub abort: Vec<String>,
+}
+
 /// The preview target a picker push carries for one candidate, when the source
 /// declared a `preview` kind: the file `path` and, for the `"location"` kind, the
 /// 0-based `loc` (row, col) to scroll to and range-highlight. `loc` is `None` for

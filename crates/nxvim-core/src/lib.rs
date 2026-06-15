@@ -38,7 +38,10 @@ pub use editor::{
     UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 pub use encoding::Encoding;
-pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
+pub use extmark::{
+    Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, SPECIAL_KEY_PRIORITY,
+    TS_HL_PRIORITY,
+};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
 pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent};

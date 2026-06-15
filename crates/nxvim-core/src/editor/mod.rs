@@ -35,7 +35,7 @@ mod cursor;
 mod dock;
 mod ex;
 mod explorer;
-mod expr;
+pub mod expr;
 mod insert;
 mod jumps;
 mod marks;

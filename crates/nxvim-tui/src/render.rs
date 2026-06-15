@@ -321,6 +321,26 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
                 .min(inner.width.saturating_sub(1));
         let row = inner.y + cursor_row.min(inner.height.saturating_sub(1));
         frame.set_cursor_position((col, row));
+        // A block cursor (normal / visual) envelops the full display width of the
+        // grapheme it sits on — a wide CJK/emoji glyph, or a `^X` / `<xx>`
+        // control-char token. The terminal's one hardware cursor covers `col`; its
+        // trailing cells are painted as a clean reverse-video block so the whole
+        // token reads as covered. The cells are reset to the *default* fg/bg before
+        // reversing — otherwise a `<xx>` token's `SpecialKey` foreground would
+        // reverse into a coloured background instead of matching the cursor's plain
+        // block (a wide glyph has no such fg, which is why it already looked right).
+        // The thin bar (insert) / underline (replace) shapes don't envelop.
+        if !view.is_insert() && !view.is_replace() {
+            for extra in 1..win.cursor_width {
+                let x = col + extra;
+                if x >= inner.right() {
+                    break;
+                }
+                if let Some(cell) = frame.buffer_mut().cell_mut((x, row)) {
+                    cell.set_style(Style::reset().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
     }
 }
 
@@ -1437,6 +1457,10 @@ pub(crate) fn group_style(group: &str) -> Style {
         "comment" => style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         "tag" => style.fg(Color::Red),
         "operator" | "punctuation" => style.fg(Color::Gray),
+        // The `^X` / `<xx>` overlay on an unprintable control char, when no
+        // colorscheme defines `SpecialKey`: a standout foreground so the token
+        // reads clearly as "this isn't ordinary text" (vim's `SpecialKey` look).
+        "SpecialKey" => style.fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
         _ => style,
     }
 }

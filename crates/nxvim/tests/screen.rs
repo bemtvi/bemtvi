@@ -141,6 +141,92 @@ async fn default_statusline_shows_a_non_utf8_fileencoding() {
 }
 
 #[tokio::test]
+async fn unprintable_control_byte_paints_as_a_highlighted_hex_token() {
+    // A C1 control byte (0x81, an undefined windows-1252 high byte the latin1
+    // fallback passes through as U+0081) would paint as a font tofu box. The
+    // display projection shows it vim-style as `<81>`, painted in the SpecialKey
+    // look (here the built-in LightMagenta fallback, no colorscheme loaded) so it
+    // reads as non-text — distinct from the plain `a` / `b` around it.
+    let path = nxvim_test_harness::temp_path("screen_control");
+    std::fs::write(&path, b"a\x81b\n").expect("write control-byte file");
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // Row 0: the hybrid gutter (4 cells) then `a<81>b`.
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   a<81>b");
+    // `a` is at the first text cell; the `<81>` token's `<` is the next cell.
+    assert_ne!(
+        fg(&buf, GUTTER, 0),
+        Some(Color::LightMagenta),
+        "plain text is not painted in the SpecialKey color"
+    );
+    for (i, ch) in "<81>".chars().enumerate() {
+        let x = GUTTER + 1 + i as u16;
+        assert_eq!(
+            buf.cell((x, 0)).map(|c| c.symbol()),
+            Some(ch.to_string().as_str()),
+            "the {ch:?} cell of the <81> token"
+        );
+        assert_eq!(
+            fg(&buf, x, 0),
+            Some(Color::LightMagenta),
+            "the <81> token paints in the SpecialKey fallback color"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_block_cursor_envelops_a_multi_cell_token() {
+    // The cursor opens on the first byte — a 0x81 control shown as the 4-cell
+    // `<81>` token. A block cursor envelops the whole token: the terminal's one
+    // hardware cursor sits on the first cell (so it isn't reverse-painted in the
+    // headless buffer), and its three trailing cells are painted reverse-video.
+    let path = nxvim_test_harness::temp_path("screen_cursor_width");
+    std::fs::write(&path, b"\x81abc\n").expect("write control-byte file");
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // Row 0: gutter, then the `<81>` token (text cols GUTTER..GUTTER+4) and `abc`.
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   <81>abc");
+    // The token's trailing three cells are reverse-video (the cursor block); the
+    // first cell is the hardware cursor's, and the `a` after the token is not.
+    assert!(
+        reversed(&buf, GUTTER + 1, 0),
+        "<81> cell 2 is under the cursor"
+    );
+    assert!(
+        reversed(&buf, GUTTER + 2, 0),
+        "<81> cell 3 is under the cursor"
+    );
+    assert!(
+        reversed(&buf, GUTTER + 3, 0),
+        "<81> cell 4 is under the cursor"
+    );
+    assert!(
+        !reversed(&buf, GUTTER + 4, 0),
+        "the 'a' after the token is outside the cursor"
+    );
+    // The cursor block is a clean reversed *default* cell, not the SpecialKey
+    // colour reversed — otherwise the trailing cells would paint the token's
+    // LightMagenta foreground as a coloured background instead of matching the
+    // hardware cursor's plain block.
+    assert_ne!(
+        fg(&buf, GUTTER + 1, 0),
+        Some(Color::LightMagenta),
+        "the cursor block clears the SpecialKey colour"
+    );
+    // The terminal cursor is placed on the token's first cell.
+    barrier(&rpc).await;
+    let params = latest_redraw(&mut incoming).await.expect("a redraw");
+    let (_buf, cursor) = paint_with_cursor(&View::from_redraw(&params), COLS, ROWS);
+    assert_eq!(
+        cursor,
+        Some((GUTTER, 0)),
+        "cursor on the token's first cell"
+    );
+}
+
+#[tokio::test]
 async fn a_custom_statusline_is_painted_end_to_end() {
     // A custom `'statusline'` runs the server's %-format engine, and the client
     // paints the projected segments verbatim. A field format (`%l,%c`) expands

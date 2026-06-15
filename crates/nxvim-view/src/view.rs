@@ -78,6 +78,11 @@ pub struct WindowView {
     pub lines: Vec<String>,
     pub cursor_row: u16,
     pub cursor_screen_col: u16,
+    /// Display width (screen cells) of the grapheme under the cursor. `1` for an
+    /// ordinary char or end-of-line; wider for a tab, a wide CJK/emoji glyph, or a
+    /// `^X` / `<xx>` control-char token. The renderer's block cursor envelops this
+    /// many cells. Defaults to `1` from an older server that omits the key.
+    pub cursor_width: u16,
     /// Secondary multi-cursor positions as `(row, screen_col)` within this
     /// window's text body — the terminal's one real cursor is the primary
     /// (`cursor_row`/`cursor_screen_col`); the renderer paints these as
@@ -637,6 +642,12 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         lines: map_str_array(m, "lines"),
         cursor_row: map_u16(m, "cursor_row"),
         cursor_screen_col: map_u16(m, "cursor_screen_col"),
+        // Default 1 so an older server (no key) gives an ordinary one-cell cursor.
+        cursor_width: map_get(m, "cursor_width")
+            .and_then(Value::as_u64)
+            .map(|n| n as u16)
+            .unwrap_or(1)
+            .max(1),
         secondary_cursors: parse_cursor_list(map_get(m, "cursors")),
         leftcol: map_u16(m, "leftcol"),
         status: parse_status(map_get(m, "status"), styles),

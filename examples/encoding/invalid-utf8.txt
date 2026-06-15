@@ -1,3 +1,4 @@
 This file is mostly plain ASCII.
 But here are some stray bytes: ÿþ <- not valid UTF-8.
+Control bytes like  (a C0) and  (a C1) paint as ^A and <81>.
 nxvim opens it anyway, and :w reproduces these bytes exactly.

@@ -3,8 +3,10 @@
 //! deduped style palette ([`StyleTable`]).
 
 use crate::EditHost;
+use nxvim_core::editor::expr::{self, OptVal};
 use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
+use nxvim_core::unicode;
 use nxvim_core::view::{
     MenuView, RegionTabline, RegionTablines, ScrollAnim, Separator, TabView, ViewRect,
     WindowRegion, WindowView,
@@ -284,7 +286,7 @@ impl EditHost {
             (Value::from("rect"), rect_value(&win.rect)),
             (Value::from("region"), Value::from(region_str(win.region))),
             (Value::from("focused"), Value::from(win.focused)),
-            (Value::from("lines"), lines_value(&win.lines)),
+            (Value::from("lines"), display_lines_value(&win.lines)),
             (
                 Value::from("cursor_row"),
                 Value::from(win.cursor_row as u64),
@@ -296,6 +298,10 @@ impl EditHost {
             (
                 Value::from("cursor_screen_col"),
                 Value::from(win.cursor_screen_col as u64),
+            ),
+            (
+                Value::from("cursor_width"),
+                Value::from(win.cursor_width as u64),
             ),
             (
                 Value::from("cursors"),
@@ -430,7 +436,7 @@ impl EditHost {
             Err(err) => return Value::Array(vec![segment_value(&err, Value::Nil)]),
         };
 
-        let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw);
+        let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw, ctx);
         let pieces = statusline::expand(&items, ctx, &mut eval);
         let segments = statusline::layout(&pieces, width);
 
@@ -450,21 +456,36 @@ impl EditHost {
         )
     }
 
-    /// Evaluate one `%{}`/`%!` statusline expression. nxvim has no Vimscript, so
-    /// **only `v:lua.…` expressions are supported** — anything else returns a loud
-    /// `E:…` marker naming the offending expression (rendered on the status line)
-    /// rather than silently expanding to nothing. A `v:lua.` prefix is stripped to
-    /// the bare Lua expression (`v:lua.require('m').f()` → `require('m').f()`),
-    /// which the synchronous evaluator runs inline during redraw.
-    fn eval_statusline_expr(&self, raw: &str) -> String {
+    /// Evaluate one `%{}`/`%!` statusline expression against the window's
+    /// [`StatuslineCtx`]. Two expression flavours are supported:
+    ///
+    /// - **`v:lua.…`** — the `v:lua.` prefix is stripped to the bare Lua
+    ///   expression (`v:lua.require('m').f()` → `require('m').f()`), which the
+    ///   synchronous evaluator runs inline during redraw. (nxvim has no Vimscript;
+    ///   `v:lua.` is the bridge to a config's own logic.)
+    /// - **Pure Vim expressions** — literals, arithmetic, comparison, logical and
+    ///   ternary operators, and `&option` references (`%{&fileencoding}`,
+    ///   `%{&bomb?"[bom]":""}`). These run through the pure core evaluator
+    ///   ([`nxvim_core::editor::expr::eval_expr`]); `&option` resolves against the
+    ///   buffer-display options the `StatuslineCtx` carries.
+    ///
+    /// Anything else — a bare variable, an unknown option, a malformed expression —
+    /// returns a loud `E:…` marker naming the offender (rendered on the status
+    /// line) rather than silently expanding to nothing.
+    fn eval_statusline_expr(
+        &self,
+        raw: &str,
+        ctx: &nxvim_core::statusline::StatuslineCtx,
+    ) -> String {
         let expr = raw.trim();
-        let Some(lua) = expr.strip_prefix("v:lua.") else {
-            return format!(
-                "E:statusline: unsupported expression {{{expr}}} (only v:lua.* is supported)"
-            );
-        };
-        match self.lua.eval_to_value(lua) {
-            Ok(value) => stringify_eval(&value),
+        if let Some(lua) = expr.strip_prefix("v:lua.") {
+            return match self.lua.eval_to_value(lua) {
+                Ok(value) => stringify_eval(&value),
+                Err(err) => format!("E:{err}"),
+            };
+        }
+        match expr::eval_expr(expr, &|name| statusline_option(ctx, name)) {
+            Ok(text) => text,
             Err(err) => format!("E:{err}"),
         }
     }
@@ -500,7 +521,7 @@ impl EditHost {
             (Value::from("to_cursor"), Value::from(s.to_cursor as u64)),
             (Value::from("duration_ms"), Value::from(s.duration_ms)),
             (Value::from("base_line"), Value::from(s.base_line as u64)),
-            (Value::from("lines"), lines_value(&s.lines)),
+            (Value::from("lines"), display_lines_value(&s.lines)),
             (Value::from("selection"), spans_value(&s.selection)),
             (
                 Value::from("sel_extends_down"),
@@ -602,6 +623,24 @@ fn default_statusline(mode_label: &str, fileencoding: &str, bomb: bool) -> Strin
     )
 }
 
+/// Resolve an `&option` reference in a statusline `%{…}` against the buffer's
+/// display state, as captured in [`StatuslineCtx`]. Only the options a status
+/// line meaningfully shows — and that the projected context actually carries —
+/// are known; anything else returns `None`, which the evaluator turns into a loud
+/// `E518: Unknown option` (per CLAUDE.md's no-silent-stub rule). Boolean options
+/// resolve to `0`/`1`, matching Vim's numeric view of `&bomb`, `&modified`, ….
+fn statusline_option(ctx: &nxvim_core::statusline::StatuslineCtx, name: &str) -> Option<OptVal> {
+    match name {
+        "fileencoding" | "fenc" => Some(OptVal::Str(ctx.fileencoding.clone())),
+        "filetype" | "ft" => Some(OptVal::Str(ctx.filetype.clone())),
+        "bomb" => Some(OptVal::Int(ctx.bomb as i64)),
+        "modified" | "mod" => Some(OptVal::Int(ctx.modified as i64)),
+        "readonly" | "ro" => Some(OptVal::Int(ctx.readonly as i64)),
+        "modifiable" | "ma" => Some(OptVal::Int(ctx.modifiable as i64)),
+        _ => None,
+    }
+}
+
 /// Coerce a `%{}`/`%!` Lua result to the text that goes on the status line.
 /// Strings pass through; numbers stringify; `nil`/`false` (lualine's "nothing
 /// here") and anything more exotic render empty — matching neovim's lenient
@@ -693,9 +732,30 @@ fn rect_value(rect: &ViewRect) -> Value {
     ])
 }
 
-/// Encode a slice of text rows as a msgpack array of strings for the redraw map.
+/// Encode a slice of text rows as a msgpack array of strings — verbatim, the raw
+/// buffer bytes. This is the **content** encoding (`nvim_buf_get_lines` and the
+/// like), so a plugin reading buffer text sees the real scalars. The redraw paint
+/// path uses [`display_lines_value`] instead, which substitutes unprintable
+/// control chars.
 pub(crate) fn lines_value(lines: &[String]) -> Value {
     Value::Array(lines.iter().map(|l| Value::from(l.as_str())).collect())
+}
+
+/// Encode a slice of text rows for the **display** path (the redraw `lines` array
+/// the client paints), passing each through [`unicode::display_line`]. An
+/// unprintable control byte — a C1 control from the latin1 fallback, an embedded
+/// C0 control — reaches the client as its vim-style `^X` / `<xx>` text instead of
+/// a font tofu box. The substitution is display-only (the buffer keeps the
+/// original bytes) and its widths match the server's column math (`grapheme_width`),
+/// so the cursor and highlight spans still line up. Used for the window rows and
+/// the scroll band; content reads stay on [`lines_value`].
+pub(crate) fn display_lines_value(lines: &[String]) -> Value {
+    Value::Array(
+        lines
+            .iter()
+            .map(|l| Value::from(unicode::display_line(l).as_ref()))
+            .collect(),
+    )
 }
 
 /// Project the bottom panel (`:messages`, `:ls`) into its redraw sub-map.
@@ -1019,7 +1079,10 @@ impl EditHost {
             None => Value::Nil,
         };
         Some(Value::Map(vec![
-            (Value::from("lines"), lines_value(&lines)),
+            // The preview paints file content and its syntax spans key off the same
+            // `grapheme_width`, so it substitutes control chars like the main text —
+            // otherwise a control byte's spans would misalign with the painted row.
+            (Value::from("lines"), display_lines_value(&lines)),
             (Value::from("first_line"), Value::from(first_line as u64)),
             (Value::from("title"), Value::from(title.as_str())),
             (Value::from("width"), Value::from(preview_w as u64)),

@@ -1111,10 +1111,17 @@ impl Renderer {
             } else {
                 style_fg(&view.normal).unwrap_or(DEFAULT_FG)
             };
+            // A block cursor envelops the full display width of the grapheme it
+            // sits on — a wide CJK/emoji glyph, or a `^X` / `<xx>` control token —
+            // clamped to the window's right edge (quads aren't scissored). The
+            // insert bar stays thin. Mirrors the TUI's enveloping block cursor.
+            let block_cells = (win.cursor_width as usize)
+                .min((ox + wcols).saturating_sub(cx).max(1) as usize)
+                as f32;
             let (w, alpha) = if view.is_insert() {
                 (self.cell_w * 0.15, 0.9)
             } else {
-                (self.cell_w, 0.5) // block, semi-transparent so the glyph shows
+                (self.cell_w * block_cells, 0.5) // block, translucent so glyphs show
             };
             let mut c = srgb_to_color_rgba(cursor_color, alpha);
             // Replace mode → underline-ish thin block at the bottom.

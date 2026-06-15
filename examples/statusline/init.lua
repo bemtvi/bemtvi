@@ -12,10 +12,19 @@
 -- expand(), fnamemodify() — and fold in %#Group# colour switches, %= alignment,
 -- and %m (the built-in modified flag) from the earlier statusline phases.
 --
+-- The encoding block shows the OTHER kind of %{} expression: a pure Vim
+-- expression with no Lua. `%{&fileencoding}` reads the buffer option directly, and
+-- `%{&bomb?"[bom]":""}` uses the ternary to tag a byte-order mark — exactly like
+-- neovim, which has no %-letter for the encoding. (Anything that isn't `v:lua.…`
+-- runs through nxvim's pure expression evaluator: literals, &options, comparison,
+-- ternary. A bare variable or unknown option fails loud on the line, never silently.)
+--
 -- TRY IT interactively:
 --   move around (hjkl, w, G)      the ruler block updates live every redraw
 --   i / v / V / R   then <Esc>    the mode block recolours and relabels
 --   edit the buffer (x, dd, i…)   a [+] modified flag appears next to the name
+--   :set fileencoding=latin1      the %{&fileencoding} block switches to "latin1"
+--   :set bomb                     a "[bom]" tag appears via the %{&bomb?…} ternary
 --   :e examples/tabs/sample.txt   the file block follows the current buffer
 --   :set statusline=              fall back to nxvim's built-in default look
 
@@ -67,6 +76,7 @@ function _G.statusline()
     "%#", mode[2], "# ", mode[1], " ",            -- coloured mode block
     "%#StlFile# ", where, tail, "%m ",            -- file (+ built-in modified flag)
     "%#StatusLine#%=",                            -- neutral spacer; %= pushes right
+    [[%#StlFile# %{&fileencoding}%{&bomb?"[bom]":""} ]], -- encoding via pure %{&opt}
     "%#StlRuler# ", tostring(line), ":", tostring(col),
     "  ", tostring(pct), "%% ",                   -- %% is a literal percent sign
   })

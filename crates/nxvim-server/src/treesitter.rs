@@ -132,6 +132,13 @@ impl EditHost {
                 let tab = b.options.effective_tabstop();
                 let ts_len = ts_spans.map_or(0, |s| s.len()) as u32;
 
+                // Unprintable control chars are shown as `^X` / `<xx>` tokens
+                // (see `unicode::display_line`, applied to the wire text in
+                // `lines_value`); overlay `SpecialKey` on those cells so the
+                // substitution is visibly distinct from real text. Forces the
+                // merge path even with no other highlight source.
+                let control = unicode::unprintable_positions(&text);
+
                 // LSP semantic tokens (ADR 0001 bridge #2): a third highlight
                 // source at SEMANTIC_HL_PRIORITY, between treesitter and extmarks.
                 // Built before the extmark scan so its count offsets the extmark
@@ -149,7 +156,7 @@ impl EditHost {
                     // treesitter spans take orders [0, n); semantic + extmarks above.
                     ts_len + sem.len() as u32,
                 );
-                if ext.is_empty() && sem.is_empty() {
+                if ext.is_empty() && sem.is_empty() && control.is_empty() {
                     let Some(spans) = ts_spans else {
                         return Value::Array(Vec::new());
                     };
@@ -192,6 +199,18 @@ impl EditHost {
                 }
                 intervals.extend(sem);
                 intervals.extend(ext);
+                // The control-char overlay wins over every other source (it isn't
+                // real content), so it paints at the top priority.
+                for &(sb, eb) in &control {
+                    intervals.push(crate::extmarks::HlInterval {
+                        start: sb,
+                        end: eb,
+                        group: "SpecialKey",
+                        priority: nxvim_core::SPECIAL_KEY_PRIORITY,
+                        order: 0,
+                        capture: false,
+                    });
+                }
                 let mut vc = unicode::LineVirtcol::new(&text, tab);
                 let row = crate::extmarks::merge_intervals(&intervals)
                     .into_iter()

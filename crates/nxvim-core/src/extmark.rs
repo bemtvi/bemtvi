@@ -50,6 +50,12 @@ pub const TS_HL_PRIORITY: u32 = 100;
 /// still wins over both.
 pub const SEMANTIC_HL_PRIORITY: u32 = 125;
 
+/// Priority the `SpecialKey` overlay on an unprintable control char's `^X` /
+/// `<xx>` substitution paints at — above everything, since the highlighted cells
+/// aren't real buffer content (the char isn't there to be syntax-colored), so no
+/// treesitter span, semantic token, or user extmark should bleed onto them.
+pub const SPECIAL_KEY_PRIORITY: u32 = u32::MAX;
+
 /// A single extmark, identified within its buffer by `(namespace, id)`.
 ///
 /// `start`/`end` are byte offsets into the buffer rope, kept current by

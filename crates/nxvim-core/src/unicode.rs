@@ -8,6 +8,7 @@
 //! single-byte grapheme); [`floor_grapheme`] additionally takes an all-ASCII
 //! fast path to skip grapheme segmentation on the cursor hot path.
 
+use std::borrow::Cow;
 use std::iter::Peekable;
 
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
@@ -77,6 +78,21 @@ pub fn virtcol(line: &str, byte: usize, tabstop: usize) -> usize {
         col += grapheme_width(g, col, tabstop);
     }
     col
+}
+
+/// Display width of the grapheme the cursor sits on at byte offset `byte` — how
+/// many screen cells a block cursor should cover. A tab, a wide (CJK / emoji)
+/// grapheme, and the `^X` / `<xx>` control-char substitutions all report their
+/// full cell span, so the cursor envelops the whole token rather than its first
+/// cell. At or past end-of-line (no grapheme there) the width is `1` — the
+/// cursor's own empty cell. Never returns `0`, so a zero-width combining grapheme
+/// still gets a one-cell cursor.
+pub fn cursor_cell_width(line: &str, byte: usize, tabstop: usize) -> usize {
+    let start = floor_grapheme(line, byte);
+    match line[start..].graphemes(true).next() {
+        Some(g) => grapheme_width(g, virtcol(line, start, tabstop), tabstop).max(1),
+        None => 1,
+    }
 }
 
 /// A byte-offset → virtual-column mapper for a single line that answers a
@@ -166,12 +182,90 @@ pub fn byte_at_virtcol(line: &str, target: usize, tabstop: usize) -> usize {
 }
 
 /// Cells occupied by a single grapheme starting at virtual column `col`.
+///
+/// An unprintable control character is displayed vim-style — `^X` caret notation
+/// (2 cells) or `<xx>` hex (4 cells), see [`control_width`] — rather than the
+/// font's tofu box, so its width here is that of the substitution. `unicode-width`
+/// reports control chars as zero-width, which is correct only if they're hidden;
+/// nxvim shows them, so this is the authoritative width that cursor / span /
+/// scroll column math all key off (it must match the text [`display_line`] emits).
 fn grapheme_width(g: &str, col: usize, tabstop: usize) -> usize {
     if g == "\t" {
-        tabstop - (col % tabstop)
-    } else {
-        UnicodeWidthStr::width(g)
+        return tabstop - (col % tabstop);
     }
+    if let Some(w) = single_char(g).and_then(control_width) {
+        return w;
+    }
+    UnicodeWidthStr::width(g)
+}
+
+/// The single `char` of `g` when it is exactly one, else `None`. Control
+/// characters never combine, so an unprintable byte is always its own one-char
+/// grapheme — this lets the width / display helpers classify it cheaply.
+fn single_char(g: &str) -> Option<char> {
+    let mut it = g.chars();
+    let c = it.next()?;
+    it.next().is_none().then_some(c)
+}
+
+/// Display width of an unprintable control char's vim-style substitution, or
+/// `None` when `c` renders as itself (any printable char, or a tab — tabs expand
+/// separately). C0 controls (`U+0000..=U+001F`) and DEL (`U+007F`) use caret
+/// notation `^@`..`^_` / `^?` (2 cells); the C1 controls (`U+0080..=U+009F`,
+/// where the latin1 fallback's undefined high bytes land) use `<xx>` hex (4
+/// cells). Newlines never reach here — lines are stored EOL-stripped.
+pub fn control_width(c: char) -> Option<usize> {
+    match c {
+        '\t' => None,
+        '\u{00}'..='\u{1f}' | '\u{7f}' => Some(2),
+        '\u{80}'..='\u{9f}' => Some(4),
+        _ => None,
+    }
+}
+
+/// The vim-style display text for an unprintable control char (the substitution
+/// whose width [`control_width`] reports), or `None` when `c` renders as itself.
+/// This is display-only: the buffer/rope keeps the original char, so the on-disk
+/// bytes round-trip exactly regardless of how they're shown.
+pub fn control_repr(c: char) -> Option<String> {
+    match c {
+        '\t' => None,
+        '\u{00}'..='\u{1f}' => Some(format!("^{}", (b'@' + c as u8) as char)),
+        '\u{7f}' => Some("^?".to_string()),
+        '\u{80}'..='\u{9f}' => Some(format!("<{:02x}>", c as u32)),
+        _ => None,
+    }
+}
+
+/// Render `line` for display: every unprintable control char replaced by its
+/// vim-style `^X` / `<xx>` text ([`control_repr`]), tabs and printables passing
+/// through untouched. Returns the input borrowed when nothing needs substituting
+/// (the overwhelmingly common case — no allocation). The substituted text's
+/// per-char widths sum to what [`grapheme_width`] reports for the originals, so a
+/// client that measures the returned string lands every cell where the server's
+/// column math expects it.
+pub fn display_line(line: &str) -> Cow<'_, str> {
+    if !line.chars().any(|c| control_width(c).is_some()) {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    for c in line.chars() {
+        match control_repr(c) {
+            Some(rep) => out.push_str(&rep),
+            None => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Byte ranges `[start, end)` of each unprintable control char in `line` (the
+/// chars [`display_line`] substitutes), in order. Used to overlay a `SpecialKey`
+/// highlight on the `^X` / `<xx>` tokens. Empty for the common all-printable line.
+pub fn unprintable_positions(line: &str) -> Vec<(usize, usize)> {
+    line.char_indices()
+        .filter(|&(_, c)| control_width(c).is_some())
+        .map(|(i, c)| (i, i + c.len_utf8()))
+        .collect()
 }
 
 /// Number of UTF-16 code units in `line[..byte]` — i.e. the LSP

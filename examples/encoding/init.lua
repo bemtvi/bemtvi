@@ -20,7 +20,11 @@
 --   * `invalid-utf8.txt` has a few bytes that aren't valid UTF-8. It used to refuse
 --     to open; now it falls through `'fileencodings'` to the latin1 fallback, opens,
 --     and `:w` reproduces the original bytes EXACTLY (windows-1252 is a total,
---     reversible single-byte codec — no lossy decode corrupts the file).
+--     reversible single-byte codec — no lossy decode corrupts the file). It also
+--     carries a C0 control (0x01) and a C1 control (0x81): rather than the font's
+--     tofu box, those paint vim-style as the highlighted tokens `^A` and `<81>`
+--     (C0/DEL → `^X` caret, C1 → `<xx>` hex). The display is purely cosmetic — the
+--     buffer keeps the raw bytes, so the round-trip stays byte-identical.
 --
 -- The detection order is `'fileencodings'` (a comma list), tried left to right:
 --

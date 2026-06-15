@@ -180,14 +180,100 @@ async fn statusline_default_shows_mode_file_and_ruler() {
 }
 
 #[tokio::test]
-async fn statusline_non_vlua_expression_errors_loudly() {
+async fn statusline_bare_variable_expression_errors_loudly() {
     let (rpc, mut incoming) = start(None).await;
-    // A non-`v:lua` expression is unsupported (no Vimscript); it renders a loud
-    // error naming the expression rather than silently expanding to nothing.
+    // A bare variable in `%{}` is not evaluable in pure core (nxvim has no
+    // Vimscript variables; those would need a `v:lua.` bridge). It renders a loud
+    // error naming the variable rather than silently expanding to nothing.
     let map = redraw_after(&rpc, &mut incoming, ":set statusline=%{somevar}<CR>").await;
     let text = status_text(&map);
-    assert!(text.contains("E:statusline:"), "loud, not empty: {text:?}");
-    assert!(text.contains("somevar"), "names the expression: {text:?}");
+    assert!(text.contains("E:"), "loud, not empty: {text:?}");
+    assert!(text.contains("somevar"), "names the variable: {text:?}");
+}
+
+// ----- `%{&option}` expressions (Phase 5: option references in the statusline) -----
+//
+// `%{…}` items that aren't `v:lua.…` run through the pure core Vim-expression
+// evaluator, which now understands `&option` references (resolved against the
+// buffer-display state the statusline context carries), the ternary `?:`, and the
+// comparison/logical operators — the faithful subset a real statusline format uses.
+
+#[tokio::test]
+async fn statusline_ampersand_fileencoding_renders_buffer_encoding() {
+    let (rpc, mut incoming) = start(None).await;
+    // A fresh buffer is utf-8; `%{&fileencoding}` (and the `&fenc` abbreviation)
+    // splice that in like neovim, which has no `%`-letter for the encoding.
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        ":set statusline=[%{&fileencoding}]<CR>",
+    )
+    .await;
+    assert_eq!(status_text(&map), "[utf-8]");
+
+    // Changing the buffer's `'fileencoding'` flows straight through to the next paint.
+    feed(&rpc, ":set fileencoding=latin1<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=[%{&fenc}]<CR>").await;
+    assert_eq!(status_text(&map), "[latin1]");
+}
+
+#[tokio::test]
+async fn statusline_ampersand_bomb_ternary() {
+    let (rpc, mut incoming) = start(None).await;
+    // The headline example: `&bomb` is a boolean option (0/1), and the ternary
+    // turns it into a `[bom]` tag or nothing. `bomb` is off by default → empty.
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        r#":set statusline=enc%{&bomb?"[bom]":""}<CR>"#,
+    )
+    .await;
+    assert_eq!(status_text(&map), "enc");
+
+    // Turn `'bomb'` on and the same format now shows the tag.
+    feed(&rpc, ":set bomb<CR>");
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        r#":set statusline=enc%{&bomb?"[bom]":""}<CR>"#,
+    )
+    .await;
+    assert_eq!(status_text(&map), "enc[bom]");
+}
+
+#[tokio::test]
+async fn statusline_option_comparison_and_concat() {
+    let (rpc, mut incoming) = start(None).await;
+    // String-option comparison plus a ternary: a utf-8 buffer is "unicode". The
+    // result concatenates into the surrounding literal text.
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        r#":set statusline=%{&fileencoding=="utf-8"?"unicode":"legacy"}<CR>"#,
+    )
+    .await;
+    assert_eq!(status_text(&map), "unicode");
+
+    feed(&rpc, ":set fileencoding=latin1<CR>");
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        r#":set statusline=%{&fileencoding=="utf-8"?"unicode":"legacy"}<CR>"#,
+    )
+    .await;
+    assert_eq!(status_text(&map), "legacy");
+}
+
+#[tokio::test]
+async fn statusline_unknown_option_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    // An `&option` the statusline context doesn't carry is not silently empty — it
+    // names the unknown option (E518), per CLAUDE.md's no-silent-stub rule.
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=%{&shiftwidth}<CR>").await;
+    let text = status_text(&map);
+    assert!(text.contains("E:"), "loud, not empty: {text:?}");
+    assert!(text.contains("E518"), "unknown-option error: {text:?}");
+    assert!(text.contains("shiftwidth"), "names the option: {text:?}");
 }
 
 // ----- laststatus (per-window status visibility + global status, Phase 6) -----
@@ -574,5 +660,15 @@ async fn statusline_example_config_runs() {
     assert!(
         text.contains("1:1"),
         "live ruler from vim.fn.line/col: {text:?}"
+    );
+    // The encoding block uses the pure `%{&fileencoding}` expression (no Lua): a
+    // fresh buffer is utf-8, with no `[bom]` tag since 'bomb' is off.
+    assert!(
+        text.contains("utf-8"),
+        "encoding block from %{{&fileencoding}}: {text:?}"
+    );
+    assert!(
+        !text.contains("[bom]"),
+        "no bom tag when 'bomb' is off: {text:?}"
     );
 }

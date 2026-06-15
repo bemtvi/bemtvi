@@ -230,6 +230,11 @@ pub struct WindowView {
     /// Cursor's screen-cell column on its line (wide-char and tab aware), for
     /// placing the terminal cursor.
     pub cursor_screen_col: usize,
+    /// Display width (screen cells) of the grapheme under the cursor — `1` for an
+    /// ordinary char or at end-of-line, `2` for a wide CJK/emoji glyph or a `^X`
+    /// caret token, `4` for a `<xx>` hex token, a tab's width for a tab. A block
+    /// cursor envelops this many cells so a multi-cell token is fully covered.
+    pub cursor_width: usize,
     /// Secondary (multi-)cursors visible in this window, each as `(row, screen
     /// col)` relative to the top of the text body — the primary cursor is carried
     /// separately by [`cursor_row`]/[`cursor_screen_col`]. Empty for an
@@ -637,9 +642,13 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // extension-derived language. Drives `%y` and the web build's grammar choice.
     let filetype = ed.ts_language_for(w.buffer).unwrap_or_default();
 
-    let cursor_screen_col = {
+    let (cursor_screen_col, cursor_width) = {
         let line = buf.line(cur_line);
-        unicode::virtcol(&line, w.cursor.col, buf.options.effective_tabstop())
+        let tab = buf.options.effective_tabstop();
+        (
+            unicode::virtcol(&line, w.cursor.col, tab),
+            unicode::cursor_cell_width(&line, w.cursor.col, tab),
+        )
     };
 
     // Secondary multi-cursors visible in the focused window, as (row, screen
@@ -689,6 +698,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         leftcol: w.leftcol,
         cursor_col: w.cursor.col,
         cursor_screen_col,
+        cursor_width,
         secondary_cursors,
         file_name,
         filetype,

@@ -52,6 +52,9 @@ hl(0, "Directory",    { fg = p.blue })
 hl(0, "ErrorMsg",     { fg = p.red })
 hl(0, "WarningMsg",   { fg = p.yellow })
 hl(0, "NonText",      { fg = p.gutter })
+-- The `^X` / `<xx>` overlay on unprintable control chars (latin1-fallback high
+-- bytes, embedded C0 controls): a standout colour so they read as special.
+hl(0, "SpecialKey",   { fg = p.purple, bold = true })
 hl(0, "Folded",       { fg = p.comment, bg = p.cursor_line })
 
 -- Legacy syntax groups — the terminus of the treesitter capture fallback chain

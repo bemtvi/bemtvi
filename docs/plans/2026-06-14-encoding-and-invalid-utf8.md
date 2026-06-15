@@ -287,14 +287,63 @@ governs the on-disk form.
   `'statusline'` would use `%{&fenc}`, which needs the `&opt` expr path, still TODO).
   Covered by `nxvim/tests/screen.rs` (utf-8 default + a latin1 file).
 
+- **`%{&option}` in custom `'statusline'` expressions ✅ (2026-06-15).** A
+  statusline `%{…}` item that isn't `v:lua.…` now runs through the pure core
+  Vim-expression evaluator (`crates/nxvim-core/src/editor/expr.rs`, the one that
+  already backed `:echo`), extended with `&option` references, the ternary
+  `a ? b : c`, the comparison operators (`==` `!=` `<` `<=` `>` `>=`), and the
+  logical operators (`&&` `||` `!`). `eval_expr(input, resolver)` takes a
+  caller-supplied `&option` resolver; the statusline path
+  (`redraw.rs::eval_statusline_expr` → `statusline_option`) resolves against the
+  buffer-display options the `StatuslineCtx` already carries — `&fileencoding`/`&fenc`,
+  `&bomb`, `&filetype`/`&ft`, `&modified`/`&mod`, `&readonly`/`&ro`,
+  `&modifiable`/`&ma`. So a user format can write neovim-style
+  `'%f %{&fileencoding}%{&bomb?"[bom]":""} %l,%c'`. An unknown option fails loud
+  (`E518`), as does a bare variable (`E121`) — no silent empty expansion. `:echo`
+  is unchanged (it passes no resolver, so `&option` there still fails loud).
+  Covered by black-box tests in `tests/editing/statusline.rs` (fileencoding,
+  bomb-ternary, option-comparison, unknown-option). `&option` access beyond the
+  display options the ctx carries (e.g. `%{&shiftwidth}`) is the remaining gap —
+  it needs the buffer threaded into `render_statusline`.
+
+- **Unprintable control chars render as `^X` / `<xx>` tokens ✅ (2026-06-15).**
+  An unprintable control char — a C1 control from the latin1 fallback (the
+  undefined windows-1252 high bytes `0x81`/`0x8d`/… pass through to `U+0081`/…),
+  or an embedded C0 control — used to paint as a font tofu box. It now shows
+  vim-style: C0 controls + DEL as `^@`..`^?` caret notation (2 cells), C1 controls
+  as `<xx>` hex (4 cells). `crates/nxvim-core/src/unicode.rs` owns the model —
+  `control_width` (the authoritative display width, so cursor / span / scroll
+  column math all key off it), `control_repr`, `display_line`,
+  `unprintable_positions` — and `grapheme_width` now counts these chars at their
+  substitution width. The server substitutes the text only on the **display**
+  path (`redraw.rs::display_lines_value`, used for the window rows, the scroll
+  band, and the picker preview); the **content** path (`lines_value` →
+  `nvim_buf_get_lines`) stays raw, so plugins and `:w` see the original scalars
+  and the round-trip is byte-identical. The `^X`/`<xx>` tokens are overlaid with a
+  top-priority (`SPECIAL_KEY_PRIORITY`) `SpecialKey` highlight (native build) so
+  they read as non-text — themed by the `nxvim` colorscheme, with a standout
+  LightMagenta `group_style` fallback when no colorscheme is loaded. The block
+  cursor (normal / visual) **envelops the whole multi-cell token** rather than its
+  first cell: the server projects `cursor_width` (the display width of the
+  grapheme under the cursor — also covers wide CJK/emoji glyphs and tabs, via
+  `unicode::cursor_cell_width`), the TUI paints reverse-video over the token's
+  trailing cells beneath its one hardware cursor, and the GUI widens its cursor
+  quad to match. Covered by a black-box test (`tests/editing/encoding.rs`: display
+  line + SpecialKey spans + byte-identical `:w`) and two TUI paint tests
+  (`nxvim/tests/screen.rs`: the highlighted token, and the enveloping cursor).
+  Printable
+  high bytes (`é`, `ÿ`) still render as their glyph — they were never tofu — so
+  only the genuinely-unprintable bytes get the hex treatment. *Remaining:* the
+  `:messages` panel still shows raw lines (plain text, no span math, so no
+  misalignment — only a stray control char in a message would tofu); the wasm
+  build substitutes the text but JS-side highlighting doesn't add the SpecialKey
+  colour.
+
 Still open, not required for correctness:
 
-- Render the latin1-fallback's high bytes as `<xx>` hex tokens (extmark/syntax
-  overlay) instead of the font's tofu box — closer to vim's display of an
-  unprintable byte, without giving up the exact round-trip.
 - Add CJK / other encodings to the `fileencodings` default and the validator.
-- Support `%{&option}` in custom `'statusline'` expressions (only `v:lua.…` today),
-  so a user format can show `%{&fileencoding}` like neovim.
+- Broaden the statusline `&option` resolver beyond the buffer-display options the
+  `StatuslineCtx` carries (thread the buffer into `render_statusline`).
 
 ---
 

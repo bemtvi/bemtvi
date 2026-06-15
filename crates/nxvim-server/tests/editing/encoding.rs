@@ -330,3 +330,87 @@ async fn valid_utf8_with_spua_scalar_round_trips_unchanged() {
     redraw_after(&rpc, &mut incoming, ":w<CR>").await;
     assert_eq!(std::fs::read(&path).expect("re-read"), original);
 }
+
+/// The first window's projected display rows — the `^X` / `<xx>`-substituted wire
+/// text the client paints, *not* the raw buffer content `nvim_buf_get_lines`
+/// returns.
+fn window_display_lines(map: &[(Value, Value)]) -> Vec<String> {
+    let windows = map_get(map, "windows")
+        .and_then(Value::as_array)
+        .expect("a windows array");
+    let Value::Map(w0) = &windows[0] else {
+        panic!("window 0 is not a map")
+    };
+    map_get(w0, "lines")
+        .and_then(Value::as_array)
+        .expect("a lines array")
+        .iter()
+        .map(|l| l.as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// The highlight group names on display row `row` of the first window.
+fn window_hl_groups(map: &[(Value, Value)], row: usize) -> Vec<String> {
+    let windows = map_get(map, "windows")
+        .and_then(Value::as_array)
+        .expect("a windows array");
+    let Value::Map(w0) = &windows[0] else {
+        panic!("window 0 is not a map")
+    };
+    map_get(w0, "highlights")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.get(row))
+        .and_then(Value::as_array)
+        .map(|spans| {
+            spans
+                .iter()
+                .filter_map(|s| s.as_array()?.get(2)?.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn unprintable_control_bytes_render_as_caret_and_hex_tokens() {
+    // A file with an embedded C0 control (0x01) and a C1 control (0x81, an
+    // undefined windows-1252 high byte that the latin1 fallback passes through as
+    // U+0081) decodes resiliently — but those bytes would paint as a font tofu box.
+    // The display projection substitutes them vim-style: C0/DEL as `^X` caret
+    // notation (2 cells), C1 as `<xx>` hex (4 cells). The buffer still holds the
+    // raw scalars (so `:w` round-trips), only the rendered row changes.
+    let path = temp_path("enc_control");
+    let original: &[u8] = b"a\x01b\x81c\n";
+    std::fs::write(&path, original).expect("write control-byte file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    // The rope keeps the decoded scalars — content reads are unaffected.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a\u{1}b\u{81}c"],
+        "the buffer holds the raw control scalars, not their display form"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        window_display_lines(&map).first().map(String::as_str),
+        Some("a^Ab<81>c"),
+        "0x01 → ^A caret, 0x81 → <81> hex in the painted row"
+    );
+
+    // Each token is overlaid with `SpecialKey` so it reads as non-text (one span
+    // for `^A`, one for `<81>`).
+    let groups = window_hl_groups(&map, 0);
+    assert_eq!(
+        groups.iter().filter(|g| *g == "SpecialKey").count(),
+        2,
+        "both substituted tokens carry a SpecialKey highlight: {groups:?}"
+    );
+
+    // Round-trip is still byte-identical (display is purely cosmetic).
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "the display substitution must not touch the on-disk bytes"
+    );
+}

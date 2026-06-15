@@ -1,5 +1,15 @@
 # Shada persistence — cross-session state in a multi-writer redb store
 
+> **Status: DONE on every surface (2026-06-13).** Phases 1–5 and 7a landed as the
+> native redb store; Phase 6 landed as the serverless **OPFS** backend in the wasm
+> edit-host (`f93b21c`) — by a simpler route than the plan sketched (see that phase).
+> Registers, global + per-file marks (incl. `` `" `` last-cursor), search/ex history,
+> the jumplist, the changelist, and the numbered marks `'0`–`'9` all survive a restart
+> (native) and a page reload (web). Verified by `crates/nxvim-server/tests/shada.rs`
+> (native respawn/merge) and `crates/nxvim-edithost/web/verify-shada.mjs` (OPFS reload).
+> **Only Phase 7b (file-mark count caps, the `'100`-style newest-N-files cap) remains —
+> explicitly deferred, not a silent stub; file marks are currently uncapped.**
+
 Today nxvim keeps no state across sessions. Registers (`Registers`,
 `crates/nxvim-core/src/editor/registers.rs:34`), the global `A`–`Z` file marks
 (`global_marks`, `mod.rs:424`), per-buffer `a`–`z`/special marks
@@ -382,9 +392,20 @@ host, is being removed, so there is no "shada on the remote host" case.)
    carrying register `a` *mid-session* (no quit, idle past the debounce), and asserts
    every live checkpoint leaves `exit_cursor` unset. *(`shada: None` arms nothing, so
    every other suite stays untouched.)*
-6. **Phase 6 — the OPFS backend (browser).** A second `ShadaStore`/`StorageBackend`
-   impl over an OPFS sync access handle, landing with the wasm-Worker server
-   (Phase 5 of the edit-host plan). The native `RedbFileStore` is unchanged.
+6. **Phase 6 — the OPFS backend (browser). ✅ DONE** (`f93b21c`). *Deviation from the
+   sketch:* rather than port redb (+ its sync `StorageBackend`) to wasm, the edit-host
+   serializes the pure `PersistState` that core already exports to **one JSON blob in
+   OPFS**, written via the existing off-tick write path — a single tab needs no
+   multi-instance merge, so the redb B-tree + sibling recency-fold earn nothing here.
+   Core gains an optional `serde` feature (derives only, dormant for the native build);
+   `nxvim-server` exposes `EditHost::export_persist`/`import_persist` pass-throughs; the
+   edit-host adds the `eh_export_shada` / `eh_load_shada` FFI and performs the same
+   numbered-mark shift (`'0` ← last-exit cursor) on load that native's store does.
+   `worker.mjs` restores the blob at boot and runs a debounced checkpoint + a
+   flush-with-exit-cursor on tab hide; `index.html` wires `visibilitychange` + the
+   `__nxvim.shadaFlush` hook. The native `RedbFileStore` is unchanged. Verified by
+   `verify-shada.mjs` (set registers + history → reload the page → assert they return
+   from OPFS).
 7. **Phase 7a — `:wshada`/`:rshada` + the concurrent merge. ✅ DONE.** The explicit
    `:wshada` / `:rshada[!]` ex-commands (loud, real — never a no-op): core enqueues a
    `ShadaRequest` (it can't touch the store, which lives behind the `ShadaStore` seam)

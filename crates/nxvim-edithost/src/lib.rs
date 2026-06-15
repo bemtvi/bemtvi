@@ -163,6 +163,10 @@ struct Sink {
     /// [`term_kill`](HostEffects::term_kill); the close twin of [`term_opens`](Sink::term_opens),
     /// drained as `term_kill [buf]`.
     term_kills: Vec<u64>,
+    /// Terminals a `^C` just trimmed as a flood-cancel, recorded by
+    /// [`term_interrupted`](HostEffects::term_interrupted); drained in the terminal-requests
+    /// JSON (`interrupt`) so the Worker discards the child's in-flight backlog.
+    term_interrupts: Vec<u64>,
     /// Whether a daemon (and thus a process host) is currently connected — flipped by the
     /// Worker via [`eh_set_daemon_connected`] on a `?daemon=` boot / runtime `:connect` /
     /// disconnect. Read by [`has_remote_proc`](HostEffects::has_remote_proc) to gate the
@@ -489,6 +493,11 @@ impl HostEffects for WasmEffects {
     fn term_write(&mut self, buf: u64, bytes: Vec<u8>) {
         // A forwarded keystroke / paste / query-reply for `buf`'s daemon PTY.
         self.sink.borrow_mut().term_writes.push((buf, bytes));
+    }
+
+    fn term_interrupted(&mut self, buf: u64) {
+        // A `^C` trimmed this flooding terminal; tell the Worker to drop its in-flight backlog.
+        self.sink.borrow_mut().term_interrupts.push(buf);
     }
 
     fn term_resize(&mut self, buf: u64, rows: u16, cols: u16) {
@@ -1199,7 +1208,7 @@ pub unsafe extern "C" fn eh_proc_exited(
 #[no_mangle]
 pub unsafe extern "C" fn eh_take_terminal_requests(h: *mut WasmEditHost) -> *mut c_char {
     let Some(handle) = h.as_mut() else {
-        return into_owned_cstr(r#"{"open":[],"write":[],"resize":[],"kill":[]}"#.into());
+        return into_owned_cstr(r#"{"open":[],"write":[],"resize":[],"kill":[],"interrupt":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
     let open: Vec<serde_json::Value> = std::mem::take(&mut sink.term_opens)
@@ -1217,8 +1226,9 @@ pub unsafe extern "C" fn eh_take_terminal_requests(h: *mut WasmEditHost) -> *mut
         .map(|(buf, rows, cols)| serde_json::json!({ "buf": buf, "rows": rows, "cols": cols }))
         .collect();
     let kill: Vec<u64> = std::mem::take(&mut sink.term_kills);
+    let interrupt: Vec<u64> = std::mem::take(&mut sink.term_interrupts);
     into_owned_cstr(
-        serde_json::json!({ "open": open, "write": write, "resize": resize, "kill": kill })
+        serde_json::json!({ "open": open, "write": write, "resize": resize, "kill": kill, "interrupt": interrupt })
             .to_string(),
     )
 }

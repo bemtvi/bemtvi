@@ -196,6 +196,34 @@ function currentFrame() {
 const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
 const utf8 = (bytes) => new TextDecoder().decode(bytes);
 
+// The full buffer text the UI's JS highlighter needs (`eh_lines` = the whole current
+// buffer joined). It's `O(buffer size)` to build + structured-clone over postMessage, so
+// ship it only when it'll actually be used and has actually changed:
+//   * never for a terminal — its colors come from the server vt100 palette, not the JS
+//     highlighter, and its scrollback can be thousands of lines (this was the terminal
+//     "slowness": every keystroke echo / output burst re-shipped the entire scrollback);
+//   * otherwise only when `(bufnr, changedtick)` moved, so a cursor-only or
+//     terminal-driven redraw doesn't re-ship an unchanged code buffer.
+// `null` tells the UI to keep its cached `bufferText` (see `setFrame`).
+let lastLinesKey = null;
+function linesForFrame(frame) {
+  if (!frame) return null;
+  const wins = frame.windows || [];
+  const focused = wins.find((w) => w.focused) || wins[0];
+  if (focused && focused.terminal) return null;
+  const key = `${frame.bufnr ?? -1}:${frame.changedtick ?? -1}`;
+  if (key === lastLinesKey) return null;
+  lastLinesKey = key;
+  return readStr(eh_lines(h));
+}
+
+// Build a `redraw` postMessage: the frame once (so `linesForFrame` reads the same frame
+// it ships), plus any per-site extras (`acks`/`results`/`id`/…).
+function redrawMsg(extra) {
+  const frame = currentFrame();
+  return { type: "redraw", frame, lines: linesForFrame(frame), ...extra };
+}
+
 // =============================================================================
 // Real local filesystem (File System Access API) — the `:eo` / `:wo` / … picker family.
 //
@@ -250,7 +278,7 @@ async function landRealFsReply() {
     }
   } else {
     await fulfillFsRequests();
-    postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+    postMessage(redrawMsg());
   }
 }
 
@@ -495,18 +523,120 @@ const liveProcs = new Set(); // spawn ids in flight on the daemon (also gates th
 const liveTerms = new Set(); // terminal buffer ids open on the daemon (also gates the async park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
+let sabCtrl = null; // the SAB control array (set by runLoopSAB) so a push can wake the futex park
 let pendingConnectUri = null; // a runtime `:connect nxvim://…` to dial on the next run-loop pass
 const DAEMON_PUSH_POLL_MS = 1000; // async-park cap: clears a dangling waitAsync + backstops a push
 const INDENT_LOAD_POLL_MS = 25;   // async-park cap while the indenter loads a grammar (resolve its promises promptly)
+// Backpressure window for daemon pushes the apply side hasn't consumed yet. When the queue
+// reaches HIGH the RPC reader is parked (see `onDaemonNotify`) so it stops pulling the
+// WebTransport stream → QUIC backpressures the daemon → the terminal child is throttled at the
+// PTY (the browser end of the end-to-end terminal backpressure). Released once the run loop
+// drains it below LOW. Without this the browser would pull a flood into an unbounded queue
+// faster than it can render, the daemon would never feel backpressure, and a `^C` couldn't stop
+// the output. Sized well above a normal burst so steady output never parks the reader.
+const NOTIF_HIGH = 64;
+const NOTIF_LOW = 16;
+let backpressureWaiter = null; // resolve() to un-park the RPC reader once the queue drains below LOW
+
+// Terminal projection (the `eh_terminal_flush` that mirrors the vt100 grid into the buffer +
+// repaints) is `O(scrollback)` per call, so doing it once per PTY chunk makes a flood crawl —
+// and a `^C` then can't drain the in-flight backlog fast. Decouple it from the cheap feed:
+// `term_data` only *feeds* the emulator (fast); the project/repaint is throttled to ~frame rate
+// (`maybeFlushTerminals`), and a trailing flush fires when output pauses. So the consumer keeps
+// up with the child (no backlog builds) and the post-`^C` backlog drains in a couple of frames.
+const TERM_FLUSH_MS = 16;
+let termFlushDue = false; // a `term_data` feed needs projecting; deferred until the throttle allows
+let lastTermFlushMs = 0;
+
+// ^C-cancel of a flooding terminal. The trim ([`terminal_trim`]) keeps the recent tail + a
+// marker, but the in-flight backlog the daemon already sent (bounded by the browser's QUIC
+// receive window, which auto-tunes to ~seconds of output and can't be shrunk from our side)
+// would keep arriving and bury it. So on a `^C` to a terminal that's actively flooding we
+// *discard* that backlog — drop the queued `term_data` until output goes quiet — leaving the
+// trimmed tail. The reader keeps draining the wire at full speed (drop is cheap), so the cancel
+// takes hold in a beat instead of the ~seconds it takes to render the whole window.
+const DISCARD_QUIET_MS = 250; // end the discard once no term_data has arrived for this long
+const discardingTerms = new Set(); // bufs whose in-flight backlog is being dropped after a ^C
+let lastDiscardActivityMs = 0;
+let discardCheckScheduled = false;
+
+// Poll for the end of a discard window: once term_data stops arriving for `DISCARD_QUIET_MS`
+// (the backlog has drained and the killed child is silent), stop discarding and wake the run
+// loop to repaint the settled (trimmed) buffer.
+function scheduleDiscardCheck() {
+  if (discardCheckScheduled) return;
+  discardCheckScheduled = true;
+  const check = () => {
+    if (discardingTerms.size === 0) { discardCheckScheduled = false; return; }
+    if (nowMs() - lastDiscardActivityMs >= DISCARD_QUIET_MS) {
+      discardingTerms.clear();
+      discardCheckScheduled = false;
+      if (sabCtrl) { Atomics.add(sabCtrl, SEQ, 1); Atomics.notify(sabCtrl, SEQ, 1); }
+    } else {
+      setTimeout(check, DISCARD_QUIET_MS);
+    }
+  };
+  setTimeout(check, DISCARD_QUIET_MS);
+}
+
+// Project + repaint all live terminals if a feed is pending and either forced (a non-`term_data`
+// event needs an immediate frame) or the frame-rate throttle has elapsed. Returns whether it flushed.
+function maybeFlushTerminals(now, force) {
+  if (!termFlushDue) return false;
+  if (!force && now - lastTermFlushMs < TERM_FLUSH_MS) return false;
+  eh_terminal_flush(h);
+  lastTermFlushMs = now;
+  termFlushDue = false;
+  return true;
+}
 
 // A daemon→edit-host push landed on the RPC reader. Queue it (the run loop applies it — single
-// consumer of the wasm tick) and wake the loop. Under 5c (no run loop) apply it inline.
+// consumer of the wasm tick) and wake the loop. Under 5c (no run loop) apply it inline. Returns
+// a promise when the queue is over HIGH so the RPC reader parks (backpressure); else undefined.
 function onDaemonNotify(method, params) {
+  // Draining a cancelled flood: drop this terminal's in-flight backlog (the ^C already trimmed
+  // the buffer to the tail + marker). Drop = no queue, no feed, no repaint, no backpressure —
+  // so the reader keeps pulling the wire at full speed and the window drains fast.
+  if (method === "term_data" && discardingTerms.has(Number(params[0]))) {
+    lastDiscardActivityMs = nowMs();
+    return undefined;
+  }
+  // Wake only on the empty→non-empty transition. The run loop never parks with a non-empty
+  // queue (`if (daemonNotifications.length > 0) continue`), so once it's draining, further
+  // pushes don't need a wake — they're picked up by the same drain. Gating on `wasEmpty`
+  // coalesces a flood into a few big batches (one `eh_terminal_flush` each, like the native
+  // 256 KiB budget) instead of one flush per PTY chunk, while a lone echo (queue was empty)
+  // still wakes instantly — so typing stays snappy AND a flood drains cheaply.
+  const wasEmpty = daemonNotifications.length === 0;
   daemonNotifications.push([method, params]);
   if (sabMode) {
-    if (daemonWaker) { const r = daemonWaker; daemonWaker = null; r(); }
+    // Wake the run loop's async park. `daemonWaker` is a fast microtask path, but it races —
+    // a push can land in a window where the resolver being awaited isn't the current one — so
+    // ALSO bump the SEQ futex the park's `Atomics.waitAsync` watches (the same reliable wake UI
+    // input uses). Without this backstop an *isolated* push slept until the poll cap (~1s): a
+    // stream of pushes hid the bug by re-waking each other, but a one-shot echo (a single
+    // keystroke into a terminal) did not — that was the typing lag.
+    if (wasEmpty) {
+      if (daemonWaker) { const r = daemonWaker; daemonWaker = null; r(); }
+      if (sabCtrl) { Atomics.add(sabCtrl, SEQ, 1); Atomics.notify(sabCtrl, SEQ, 1); }
+    }
   } else {
     pump5cDaemon();
+  }
+  // Apply side falling behind: park the RPC reader until the run loop drains below LOW.
+  if (daemonNotifications.length >= NOTIF_HIGH && !backpressureWaiter) {
+    return new Promise((res) => { backpressureWaiter = res; });
+  }
+  return undefined;
+}
+
+// Release a parked RPC reader once the queue has drained below the low-water mark. Called after
+// the run loop applies pushes, so the reader resumes pulling the stream (lifting QUIC backpressure).
+function releaseBackpressure() {
+  if (backpressureWaiter && daemonNotifications.length < NOTIF_LOW) {
+    const r = backpressureWaiter;
+    backpressureWaiter = null;
+    r();
   }
 }
 
@@ -515,30 +645,32 @@ function onDaemonNotify(method, params) {
 // `term_data`/`term_exit` (Phase 7). An unknown push is surfaced loudly (it can only arrive for
 // something we subscribed to — fail loud, per CLAUDE.md).
 //
-// Terminal output is batched: each `term_data` push only *feeds* the vt100 emulator (a cheap
-// parse, `eh_terminal_data`); after the whole queue is drained we project + repaint *once*
-// (`eh_terminal_flush`), so a flood costs one repaint per drain, never one per PTY chunk (the
-// "project once per repaint" rule the native leg follows — the anti-freeze invariant).
+// Terminal output is doubly batched: each `term_data` push only *feeds* the vt100 emulator (a
+// cheap parse, `eh_terminal_data`) and marks a flush pending; the `O(scrollback)` project +
+// repaint is throttled to ~frame rate by `maybeFlushTerminals` (called by the run loop), never
+// per PTY chunk. That keeps the consumer fast enough to stay with the child (so no backlog
+// builds and a `^C` drains in a couple of frames) — the wire-crossing twin of the native leg's
+// 256 KiB budget. `any` (return) excludes bare `term_data` so the run loop doesn't post a
+// redraw for a feed whose projection is still pending — the flush posts its own.
 function applyDaemonNotifications() {
   if (daemonNotifications.length === 0) return false;
   let any = false;
-  let termFed = false; // a `term_data` push fed the emulator this drain → flush once at the end
   for (let n; (n = daemonNotifications.shift()); ) {
     const [method, params] = n;
     if (method === "term_data") {
-      // params = [buf, bytes(bin)] — the child's raw PTY output. Feed only (flush below).
+      // params = [buf, bytes(bin)] — the child's raw PTY output. Feed only; project later.
       const buf = Number(params[0]);
       const bytes = toU8(params[1]);
       callTerminalData(buf, bytes);
-      termFed = true;
-      any = true;
+      termFlushDue = true;
     } else if (method === "term_exit") {
       // params = [buf, code] — the child exited (a killed child arrives as code -1).
       const buf = Number(params[0]);
       const code = Number(params[1]);
       eh_terminal_exit(h, buf, code);
       liveTerms.delete(params[0]);
-      any = true;
+      termFlushDue = true; // the `[Process exited]` notice needs projecting
+      any = true; // exit forces an immediate flush + frame (see the run loop)
     } else if (method === "fs_changed") {
       // params = [path, stat?] where stat = [secs, nanos, size] | nil (nil = vanished).
       const path = params[0];
@@ -572,8 +704,9 @@ function applyDaemonNotifications() {
       postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
     }
   }
-  // One projection + repaint for all the terminal output fed this drain (see above).
-  if (termFed) eh_terminal_flush(h);
+  // The terminal projection is deferred to `maybeFlushTerminals` (throttled); see above.
+  // Drained: if the RPC reader parked on backpressure, let it resume pulling the stream.
+  releaseBackpressure();
   return any;
 }
 
@@ -640,11 +773,13 @@ async function drainProcRequests() {
 // kill — the order the editor enqueues them.
 async function drainTerminalRequests() {
   const reqs = JSON.parse(readStr(eh_take_terminal_requests(h)));
+  const interrupt = reqs.interrupt || [];
   if (
     reqs.open.length === 0 &&
     reqs.write.length === 0 &&
     reqs.resize.length === 0 &&
-    reqs.kill.length === 0
+    reqs.kill.length === 0 &&
+    interrupt.length === 0
   ) {
     return;
   }
@@ -655,6 +790,14 @@ async function drainTerminalRequests() {
   }
   for (const w of reqs.write) {
     await daemon.notify("term_write", [w.buf, new Uint8Array(w.bytes)]);
+  }
+  // A `^C` trimmed a flooding terminal (the core decided it was a flood-cancel): discard the
+  // child's in-flight backlog so the cancel takes hold promptly instead of the browser rendering
+  // the seconds of output the daemon already put on the wire (bounded only by the QUIC window).
+  for (const buf of interrupt) {
+    discardingTerms.add(Number(buf));
+    lastDiscardActivityMs = nowMs();
+    scheduleDiscardCheck();
   }
   for (const r of reqs.resize) await daemon.notify("term_resize", [r.buf, r.rows, r.cols]);
   for (const buf of reqs.kill) {
@@ -707,7 +850,7 @@ async function pump5cDaemon() {
   await fulfillFsRequests();
   await drainProcRequests();
   await drainTerminalRequests();
-  postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+  postMessage(redrawMsg());
 }
 
 // Drain every off-tick fs request the editor enqueued, run its op (OPFS serverless, or the
@@ -835,6 +978,7 @@ const SEQ = 0, WRITE = 1, READ = 2;
 
 async function runLoopSAB(ctrl, data) {
   sabMode = true;
+  sabCtrl = ctrl; // expose to `onDaemonNotify` so a daemon push can wake the futex park
   const cap = data.length;
   const rdByte = (pos) => data[((pos % cap) + cap) % cap];
   const rdU32 = (pos) =>
@@ -902,7 +1046,7 @@ async function runLoopSAB(ctrl, data) {
 
   // Initial paint (the attach the UI requested rode in as the first frame, but paint a
   // baseline regardless so the UI has a frame even before any input).
-  postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks: [], results: [] });
+  postMessage(redrawMsg({ acks: [], results: [] }));
 
   for (;;) {
     const seqBefore = Atomics.load(ctrl, SEQ);
@@ -920,13 +1064,17 @@ async function runLoopSAB(ctrl, data) {
       const uri = pendingConnectUri;
       pendingConnectUri = null;
       await runtimeConnect(uri);
-      postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
+      postMessage(redrawMsg({ acks, results }));
       continue;
     }
     // Apply any daemon pushes received since the last pass (the watch leg's `fs_changed`):
     // a reconcile may enqueue an off-tick reload, which `fulfillFsRequests` then re-fetches
     // over the wire in this same pass. Done before `fulfillFsRequests` so the reload lands now.
     const notified = applyDaemonNotifications();
+    // Project the terminal: forced (so an exit / fs / proc push paints this pass) when
+    // `notified`, otherwise throttled to ~frame rate so a `term_data` flood paints at 60fps
+    // while feeding far faster. A trailing flush before the park (below) catches the last batch.
+    const termFlushed = maybeFlushTerminals(nowMs(), notified);
     // Fulfill any `:e`/`:w` the tick (or a fired timer / a push reconcile) deferred against
     // OPFS or the daemon. We're not parked here, so the event loop runs and the promises
     // resolve; the completions land the buffer/save back into the tick before we post the ack,
@@ -945,8 +1093,8 @@ async function runLoopSAB(ctrl, data) {
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
     drainClipboardWrites();
-    if (fired || acks.length || fsWork || notified || tsLanded) {
-      postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks, results });
+    if (fired || acks.length || fsWork || notified || tsLanded || termFlushed) {
+      postMessage(redrawMsg({ acks, results }));
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
     // flush (tab hidden) writes immediately with the exit cursor. The checkpoint write is
@@ -971,16 +1119,29 @@ async function runLoopSAB(ctrl, data) {
       await new Promise((res) => {
         fsReplyWaiter = res;
       });
-      postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)), acks: [], results: [] });
+      postMessage(redrawMsg({ acks: [], results: [] }));
       continue;
     }
     // A push that arrived during this pass (e.g. while awaiting `fulfillFsRequests`) is
     // queued — re-process it next iteration rather than parking on a now-stale wait.
     if (daemonNotifications.length > 0) continue;
+    // The queue drained: do the throttled terminal flush if its frame interval has elapsed
+    // (a momentary empty mid-flood respects the throttle — it won't fire every gap), and
+    // re-loop so the repaint goes out this pass.
+    if (maybeFlushTerminals(nowMs(), false)) {
+      postMessage(redrawMsg({ acks: [], results: [] }));
+      continue;
+    }
     // Park until the UI notifies (SEQ changes) or the next timer is due. If input
     // arrived while we processed (SEQ already moved off seqBefore), the wait
     // returns "not-equal" at once — no missed wakeup.
     let deadline = eh_next_deadline(h);
+    // A terminal feed is pending but the throttle hasn't elapsed: wake by then to paint it,
+    // so the last batch of a flood isn't stranded unprojected until the next push.
+    if (termFlushDue) {
+      const flushDue = lastTermFlushMs + TERM_FLUSH_MS;
+      deadline = deadline < 0 ? flushDue : Math.min(deadline, flushDue);
+    }
     // Fold the shada debounce deadline into the same park, so the one wait that wakes on a
     // keystroke / timer also wakes to flush cross-session state after a quiet period.
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
@@ -1018,7 +1179,7 @@ function rdU32Bytes(arr, off) {
 // Slice 5c — the postMessage fallback (no SAB / not cross-origin isolated).
 // =============================================================================
 function postFrame(id, result) {
-  postMessage({ type: "redraw", id, result, frame: currentFrame(), lines: readStr(eh_lines(h)) });
+  postMessage(redrawMsg({ id, result }));
 }
 
 let started = false;
@@ -1073,14 +1234,14 @@ onmessage = async (ev) => {
   // the echo + record, then repaint so the status line shows it.
   if (msg.type === "ts_install_result") {
     eh_ts_install_complete(h, String(msg.lang), msg.ok ? 1 : 0, String(msg.msg ?? ""));
-    postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+    postMessage(redrawMsg());
     return;
   }
   // Runtime `:connect nxvim://…` (5c; SAB routes it via a ring frame in `drain()`). Dial the
   // daemon and re-point the off-tick fs/watch seam onto the wire, then repaint.
   if (msg.type === "connect") {
     await runtimeConnect(String(msg.uri));
-    postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
+    postMessage(redrawMsg());
     return;
   }
   // Clipboard mirror push (5c; SAB routes it via a ring type-8 frame in `drain()`). The UI

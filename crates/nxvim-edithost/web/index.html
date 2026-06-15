@@ -542,7 +542,13 @@
 
     function render() {
       if (!view) return;
-      serverStyled = (view.styles?.length ?? 0) > 0;
+      // A terminal projects its vt100 colors into `styles` + per-window `highlights`,
+      // but that must NOT flip the *global* server-styled chrome path (the wasm build
+      // never resolves a server colorscheme — chrome/tabline/status stay JS-synthesized);
+      // a terminal window paints from the palette per-window below. So discount
+      // terminal-only style contributions when deciding the global mode.
+      const termWin = (view.windows || []).some((w) => w.terminal);
+      serverStyled = (view.styles?.length ?? 0) > 0 && !termWin;
       gridEl.innerHTML = "";
       if (serverStyled) applyChrome();
       const hasTabline = serverStyled
@@ -657,7 +663,10 @@
           rowEl.className = "row";
           rowEl.style.top = r * ch + "px";
           rowEl.style.width = rect.width * cw + "px";
-          if (serverStyled) {
+          if (serverStyled || w.terminal) {
+            // Terminal: its vt100 colors arrive as server palette spans (`w.highlights`
+            // + `view.styles`), so paint via the palette path even when the global mode
+            // is JS-highlighting (a terminal can sit in a split beside a code buffer).
             rowEl.innerHTML = renderLineServer(w, r, gutterW, rect);
           } else {
             const bufLine = w.numbers[r];
@@ -755,9 +764,17 @@
     }
 
     // ---- server-styled (palette) paint helpers — dormant on the wasm build ----
+    // Palette colors arrive as `0xRRGGBB` integers (neovim's convention, the shared
+    // `style_value` encoding) — the terminal vt100 colors take this path. Coerce to a CSS
+    // color: a number → `#rrggbb`, a string passes through, null/undefined → null.
+    function cssColor(c) {
+      if (c == null) return null;
+      if (typeof c === "number") return "#" + (c >>> 0).toString(16).padStart(6, "0");
+      return c;
+    }
     function styleToCss(s) {
       if (!s) return "";
-      let fg = s.fg, bg = s.bg;
+      let fg = cssColor(s.fg), bg = cssColor(s.bg);
       if (s.reverse) { const t = fg; fg = bg || "var(--bg)"; bg = t || "var(--fg)"; }
       let css = "";
       if (fg) css += `color:${fg};`;
@@ -766,7 +783,7 @@
       if (s.italic) css += "font-style:italic;";
       if (s.strikethrough) css += "text-decoration:line-through;";
       else if (s.underline) css += "text-decoration:underline;";
-      else if (s.undercurl) css += `text-decoration:underline wavy;${s.sp ? `text-decoration-color:${s.sp};` : ""}`;
+      else if (s.undercurl) { const sp = cssColor(s.sp); css += `text-decoration:underline wavy;${sp ? `text-decoration-color:${sp};` : ""}`; }
       return css;
     }
     function paletteStyle(id) { return id == null ? null : (view.styles[id] || null); }

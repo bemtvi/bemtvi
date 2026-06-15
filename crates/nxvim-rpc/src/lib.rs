@@ -38,10 +38,24 @@ pub enum Incoming {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, Value>>>>>;
 
+/// Bounded capacity of the [`Rpc::notify_stream`] channel — how many bulk frames
+/// (e.g. terminal PTY chunks) may sit queued for the writer before a producer
+/// `await`s. Small on purpose: it is the *backpressure window*, the amount of
+/// high-volume data allowed in flight ahead of the consumer. Too large defeats the
+/// point (a flood buffers without bound, so a `^C` keeps draining for seconds); too
+/// small thrashes. ~16 PTY chunks ≈ 128 KiB is enough to keep the wire busy while
+/// keeping the post-cancel drain sub-second.
+const STREAM_CAP: usize = 4;
+
 /// A cloneable handle for sending requests, notifications and responses.
 #[derive(Clone)]
 pub struct Rpc {
     out: mpsc::UnboundedSender<Vec<u8>>,
+    /// Backpressured channel for bulk one-way streaming ([`Rpc::notify_stream`]).
+    /// Bounded, so a producer faster than the writer is throttled rather than
+    /// queuing without limit. Drained by the writer task at lower priority than
+    /// `out` (control frames go first).
+    stream: mpsc::Sender<Vec<u8>>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
 }
@@ -55,6 +69,24 @@ impl Rpc {
             Value::Array(params),
         ]);
         let _ = self.out.send(encode(&msg));
+    }
+
+    /// Backpressured notification for **bulk, one-way streaming** data — terminal
+    /// PTY output, specifically. Unlike [`notify`](Self::notify) (which queues
+    /// without bound and returns at once), this `await`s when the writer is behind,
+    /// so the producer is throttled to the consumer's drain rate instead of letting
+    /// a flood pile up unbounded. That backpressure is what lets a `^C` actually
+    /// stop a runaway command: only [`STREAM_CAP`] frames are ever in flight, so the
+    /// queued-but-undrained backlog stays tiny. Resolves (dropping the frame) if the
+    /// connection has closed. Use only for high-volume data that can tolerate pacing;
+    /// control/latency-sensitive frames must use [`notify`](Self::notify).
+    pub async fn notify_stream(&self, method: &str, params: Vec<Value>) {
+        let msg = Value::Array(vec![
+            Value::from(2u64),
+            Value::from(method),
+            Value::Array(params),
+        ]);
+        let _ = self.stream.send(encode(&msg)).await;
     }
 
     /// Send a request and await its response.
@@ -97,10 +129,11 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (stream_tx, stream_rx) = mpsc::channel::<Vec<u8>>(STREAM_CAP);
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut writer_handle = tokio::spawn(writer_task(writer, out_rx));
+    let mut writer_handle = tokio::spawn(writer_task(writer, out_rx, stream_rx));
     let mut reader_handle = tokio::spawn(reader_task(reader, in_tx, pending.clone()));
 
     // Couple the two halves and fail in-flight requests on teardown. When either
@@ -120,32 +153,56 @@ where
 
     let rpc = Rpc {
         out: out_tx,
+        stream: stream_tx,
         pending,
         next_id: Arc::new(AtomicU64::new(1)),
     };
     (rpc, in_rx)
 }
 
-async fn writer_task<W>(mut writer: W, mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>)
-where
+async fn writer_task<W>(
+    mut writer: W,
+    mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut stream_rx: mpsc::Receiver<Vec<u8>>,
+) where
     W: AsyncWrite + Unpin,
 {
-    while let Some(bytes) = out_rx.recv().await {
+    loop {
+        // Wait for the next frame on either channel; `biased` so the unbounded
+        // control channel (`out`) is always preferred over the bounded streaming
+        // channel (`stream`), keeping control/latency-sensitive frames ahead of a
+        // bulk terminal flood. `else` fires only once *both* channels are closed
+        // (all `Rpc` handles dropped) → the connection is going away.
+        let bytes = tokio::select! {
+            biased;
+            Some(b) = out_rx.recv() => b,
+            Some(b) = stream_rx.recv() => b,
+            else => break,
+        };
         if writer.write_all(&bytes).await.is_err() {
             break;
         }
         // Coalesce the flush: write everything *already* queued before paying a
         // single flush, so a burst of frames (e.g. a redraw per keystroke under
-        // fast typing) costs one flush syscall for the whole batch instead of
-        // one per frame. `try_recv` only drains what is queued right now — it
-        // never waits for new frames — so this adds no latency to the last frame
-        // in a burst, and a lone frame behaves exactly as before (drain empties
-        // immediately, then flush).
+        // fast typing) costs one flush syscall for the whole batch instead of one
+        // per frame. `try_recv` only drains what is queued right now — it never
+        // waits — so this adds no latency to the last frame in a burst. Control
+        // first, then stream, preserving the same priority within a batch.
         let mut write_err = false;
         while let Ok(more) = out_rx.try_recv() {
             if writer.write_all(&more).await.is_err() {
                 write_err = true;
                 break;
+            }
+        }
+        while !write_err {
+            match stream_rx.try_recv() {
+                Ok(more) => {
+                    if writer.write_all(&more).await.is_err() {
+                        write_err = true;
+                    }
+                }
+                Err(_) => break,
             }
         }
         if write_err || writer.flush().await.is_err() {

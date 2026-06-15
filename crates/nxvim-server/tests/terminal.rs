@@ -668,6 +668,88 @@ async fn scrollback_option_caps_the_history() {
     );
 }
 
+/// `^C` on a terminal that is *actively flooding* trims the scrollback to the recent
+/// tail and leaves a marker, so cancelling a runaway command yields a readable buffer
+/// instead of thousands of lines. The child traps SIGINT and then blocks on `cat`, so
+/// it stays live across the `^C` (the trim is driven by the keystroke regardless of
+/// whether the child dies). The marker only appears when the live buffer exceeded the
+/// keep window, so its presence proves both that the flood was mirrored and that the
+/// trim ran.
+#[tokio::test]
+async fn ctrl_c_trims_a_flooding_terminal_and_marks_the_cut() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await; // 80x24
+
+    // Flood 1000 lines (far past the 200-line keep window), then `trap "" INT; cat`
+    // keeps the child alive (and ignoring SIGINT) so the terminal stays live.
+    exec_lua(
+        &rpc,
+        r#"nx.terminal.open{ cmd = {'sh','-c','seq 1000; trap "" INT; cat'} }"#,
+    )
+    .await;
+    wait_lines(&rpc, "the full flood (line 1000)", |ls| {
+        has_line(ls, "1000")
+    })
+    .await;
+    let before = line_count(&rpc).await;
+    assert!(
+        before > 500,
+        "the live flood mirrors its full history, got only {before} lines"
+    );
+
+    // `^C` while flooding: trims to the recent tail + a marker.
+    feed(&rpc, "<C-c>");
+    let ls = wait_lines(&rpc, "the trim marker", |ls| {
+        ls.iter().any(|l| l.contains("earlier lines trimmed"))
+    })
+    .await;
+
+    let after = line_count(&rpc).await;
+    assert!(
+        after < 300 && after < before,
+        "the trim should collapse the buffer to ~the 200-line keep window \
+         (was {before}, now {after})"
+    );
+    assert!(
+        has_line(&ls, "1000"),
+        "the most recent output (line 1000) must survive the trim"
+    );
+    assert!(
+        !has_line(&ls, "1"),
+        "the earliest flooded line (line 1) must be trimmed away"
+    );
+}
+
+/// A `^C` at an *idle* prompt (no flood since the last keystroke) must NOT trim — only
+/// an active flood does. We type a short line, send `^C`, and the prior output stays.
+#[tokio::test]
+async fn ctrl_c_at_an_idle_prompt_does_not_trim() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    // `cat` echoes input; no flood. Type a line so there is some recent output.
+    exec_lua(&rpc, "nx.terminal.open{ cmd = 'cat' }").await;
+    feed(&rpc, "marker-line<CR>");
+    wait_lines(&rpc, "cat to echo the typed line", |ls| {
+        has_line(ls, "marker-line")
+    })
+    .await;
+
+    // `^C` here interrupts nothing (no flood) — the buffer must be left intact.
+    feed(&rpc, "<C-c>");
+    // Give any (incorrect) trim a chance to land before asserting it did not.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let ls = lines(&rpc).await;
+    assert!(
+        has_line(&ls, "marker-line"),
+        "an idle ^C must not trim the existing output"
+    );
+    assert!(
+        !ls.iter().any(|l| l.contains("earlier lines trimmed")),
+        "an idle ^C must not insert a trim marker"
+    );
+}
+
 /// The `fg` color (`0xRRGGBB`) of the first highlight span in the focused
 /// window's `highlights`, resolved through the frame's `styles` palette, or
 /// `None` if there is no styled span yet.

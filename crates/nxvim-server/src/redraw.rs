@@ -210,6 +210,18 @@ impl EditHost {
             ),
             (Value::from("message"), Value::from(message.as_str())),
             (Value::from("guifont"), Value::from(guifont.as_str())),
+            // The current buffer's identity + edit version, so the browser Worker ships
+            // the full buffer text to its JS highlighter only when the text actually
+            // changed (not on cursor-only / terminal-driven redraws). `(bufnr,
+            // changedtick)` distinguishes an edit *and* a buffer switch.
+            (
+                Value::from("bufnr"),
+                Value::from(self.editor.current_buffer_id().0),
+            ),
+            (
+                Value::from("changedtick"),
+                Value::from(self.editor.buffer().changedtick),
+            ),
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
             (Value::from("panel"), panel),
@@ -256,8 +268,15 @@ impl EditHost {
         // paints from the buffer text instead).
         #[cfg(feature = "native")]
         let highlights = self.highlights_for(win.buffer, &win.numbers, styles);
+        // The browser build highlights code JS-side and leaves these empty — *except*
+        // a terminal, whose per-cell colors live only in the wasm-side vt100 grid and
+        // can't be recovered from the buffer text. Project those (and intern their
+        // styles into the shared palette); `terminal_highlights` returns `None` for a
+        // non-terminal window, so a code buffer keeps its empty array + JS highlighting.
         #[cfg(not(feature = "native"))]
-        let highlights = Value::Array(Vec::new());
+        let highlights = self
+            .terminal_highlights(win.buffer, &win.numbers, styles)
+            .unwrap_or_else(|| Value::Array(Vec::new()));
         // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
         // to colour as `SpecialKey`; the native client paints them from `highlights`,
         // so it gets an empty array (keeping the redraw map shape stable).
@@ -327,6 +346,14 @@ impl EditHost {
             // so a client that highlights JS-side (the wasm edit-host) can pick the
             // grammar. Native clients ignore it (they paint server highlight spans).
             (Value::from("filetype"), Value::from(win.filetype.as_str())),
+            // Whether this window's buffer is a live terminal. The browser renderer
+            // paints a terminal from the server vt100 color palette (`highlights` +
+            // `styles`) rather than the JS highlighter, and the Worker skips shipping
+            // its (potentially huge scrollback) text — neither is needed for a terminal.
+            (
+                Value::from("terminal"),
+                Value::from(self.terminals.contains_key(&win.buffer)),
+            ),
             (Value::from("unnamed"), Value::from(win.unnamed)),
             (Value::from("modified"), Value::from(win.modified)),
             (

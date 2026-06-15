@@ -43,6 +43,14 @@ function check(label, ok, detail) {
 const luaResult = (page, code) =>
   page.evaluate((c) => window.__nxvim.execLua(c).then((r) => r.result), code);
 
+// `execLua` returns the result rendered as `ok:String(Utf8String { s: Ok("…") })`; pull an
+// integer out of that wrapper (the harness's results are debug-rendered, not clean values).
+const luaInt = async (page, expr) => {
+  const r = String(await luaResult(page, `return tostring(${expr})`));
+  const m = r.match(/Ok\("(-?\d+)"\)/);
+  return m ? Number(m[1]) : NaN;
+};
+
 // The whole terminal buffer as one string (history + live screen), for substring assertions.
 const READ_BUF = 'return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\\n")';
 
@@ -54,6 +62,27 @@ async function pollBuf(page, re, ms = 8000) {
   for (;;) {
     last = String(await luaResult(page, READ_BUF));
     if (re.test(last)) return last;
+    if (Date.now() - start > ms) return last;
+    await sleep(50);
+  }
+}
+
+// The computed CSS `color` of the rendered grid span carrying `text` — how the page
+// actually paints it (vt100 color → server palette → `renderLineServer`). Polls until it
+// matches `want` (the render is async after the PTY output lands), else returns the last seen.
+async function pollColor(page, text, want, ms = 4000) {
+  const start = Date.now();
+  let last = null;
+  for (;;) {
+    last = await page.evaluate((t) => {
+      const grid = document.querySelector("#grid");
+      if (!grid) return null;
+      for (const sp of grid.querySelectorAll("span")) {
+        if (sp.textContent && sp.textContent.includes(t)) return getComputedStyle(sp).color;
+      }
+      return null;
+    }, text);
+    if (last === want) return last;
     if (Date.now() - start > ms) return last;
     await sleep(50);
   }
@@ -112,6 +141,73 @@ try {
   const exited = await pollBuf(page, /\[Process exited 0\]/);
   check("terminal: the child's clean exit round-trips (term_exit → [Process exited 0])",
     /\[Process exited 0\]/.test(exited), `buf=${JSON.stringify(exited)}`);
+
+  // ── 1b. color: ANSI SGR colors render as styled cells (vt100 grid → server palette) ───────
+  // The terminal's colors live only in the wasm-side vt100 emulator — the JS highlighter can't
+  // recover them from buffer text. They must ride the server `highlights`/`styles` palette and
+  // paint via `renderLineServer`. `\033[31m` is ANSI red = xterm idx 1 = (205,0,0) = #cd0000.
+  // A long-lived child (`sleep 30`, killed at cleanup) keeps the terminal *live* — the real
+  // case (a shell emitting color), where the emulator stays mapped and colors project.
+  // Build the SGR sequence with an explicit ESC byte (`string.char(27)`) so escaping through
+  // JS→execLua→Lua can't mangle it: `<ESC>[31m REDCELL <ESC>[0m`.
+  await luaResult(page, `local e=string.char(27); nx.terminal.open{ cmd = { "sh", "-c", "printf '"..e.."[31mREDCELL"..e.."[0m\\n'; sleep 30" } } return 1`);
+  await pollBuf(page, /REDCELL/);
+  const redColor = await pollColor(page, "REDCELL", "rgb(205, 0, 0)");
+  check("terminal: ANSI-colored output renders as a colored span (#cd0000 red)",
+    redColor === "rgb(205, 0, 0)", `computed color=${redColor}`);
+
+  // ── 1c. perf: a terminal's (huge) scrollback is NOT shipped through the JS-highlighter line
+  // channel. The buffer text reaches the editor (READ_BUF, via the RPC), but the per-frame
+  // `lines` blob the UI feeds its tree-sitter highlighter must skip a terminal — re-shipping the
+  // whole scrollback on every keystroke echo / output burst was the terminal "slowness".
+  const buf = String(await luaResult(page, READ_BUF));
+  const shipped = String(await page.evaluate(() => window.__nxvim.lines()));
+  check("terminal: output reaches the buffer but is NOT re-shipped via the full-buffer line channel",
+    /REDCELL/.test(buf) && !/REDCELL/.test(shipped),
+    `inBuffer=${/REDCELL/.test(buf)} inShippedLines=${/REDCELL/.test(shipped)}`);
+
+  // ── 1d. cancel: ^C on a flooding terminal trims the scrollback to the tail + a marker ─────
+  // A child floods 1000 lines (past the 200-line keep window) then `trap "" INT; cat` keeps it
+  // alive (and ignoring SIGINT) so the terminal stays live across the ^C. ^C while flooding
+  // trims the mirror to the recent tail and inserts a marker; the earliest lines are dropped.
+  await luaResult(page, `nx.terminal.open{ cmd = {'sh','-c','seq 1000; trap "" INT; cat'} } return 1`);
+  await pollBuf(page, /1000/);
+  const beforeCount = await luaInt(page, "vim.api.nvim_buf_line_count(0)");
+  await page.evaluate(() => window.__nxvim.feed("<C-c>"));
+  const trimmed = await pollBuf(page, /earlier lines trimmed/);
+  const afterCount = await luaInt(page, "vim.api.nvim_buf_line_count(0)");
+  check("terminal: ^C on a flood trims the scrollback to the tail + a marker",
+    /earlier lines trimmed/.test(trimmed) && /1000/.test(trimmed) && afterCount < 300 && afterCount < beforeCount,
+    `before=${beforeCount} after=${afterCount} marker=${/earlier lines trimmed/.test(trimmed)} tailKept=${/1000/.test(trimmed)}`);
+
+  // ── 1e. cancel: ^C STOPS a continuous flood promptly (drops the in-flight backlog) ────────
+  // The real bug: a never-ending flood. End-to-end backpressure bounds the steady state, but the
+  // browser's QUIC receive window still holds seconds of already-sent output that keeps arriving
+  // after ^C. On a ^C to a flooding terminal the Worker discards that backlog, so output settles
+  // in a beat. The child has no SIGINT trap, so ^C also kills it.
+  await luaResult(page, `nx.terminal.open{ cmd = {'sh','-c','i=0; while :; do echo floodline-$i; i=$((i+1)); done'} } return 1`);
+  await pollBuf(page, /floodline-/);
+  await sleep(800); // let a real in-flight backlog build up in the QUIC window
+  await page.evaluate(() => window.__nxvim.feed("<C-c>"));
+  // The highest flood index visible in the buffer; output has stopped once it stops rising.
+  const maxFloodIdx = async () => {
+    const r = String(await luaResult(page, 'return table.concat(vim.api.nvim_buf_get_lines(0,-3,-1,false),"|")'));
+    let m = -1;
+    for (const x of r.matchAll(/floodline-(\d+)/g)) m = Math.max(m, Number(x[1]));
+    return m;
+  };
+  let prev = -2, stoppedMs = -1;
+  const t0 = Date.now();
+  for (let i = 0; i < 40; i++) {
+    const cur = await maxFloodIdx();
+    if (cur === prev) { stoppedMs = Date.now() - t0; break; }
+    prev = cur;
+    await sleep(150);
+  }
+  const stoppedCount = await luaInt(page, "vim.api.nvim_buf_line_count(0)");
+  check("terminal: ^C stops a continuous flood promptly (drops the in-flight backlog)",
+    stoppedMs >= 0 && stoppedMs < 2500 && stoppedCount < 500,
+    `stoppedMs=${stoppedMs} bufLines=${stoppedCount}`);
 
   // ── 2. interactive: input typed into the terminal crosses the wire and the child echoes ───
   // A fresh terminal running `cat`, which echoes its stdin back through the PTY. The open enters

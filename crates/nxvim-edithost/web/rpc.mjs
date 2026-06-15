@@ -51,8 +51,15 @@ export class RpcClient {
           p.resolve(result);
         }
       } else if (type === 2) {
-        // [2, method, params] — a daemon push (fs_changed / proc_* / lsp_*).
-        if (this.onNotify) this.onNotify(frame[1], frame[2] ?? []);
+        // [2, method, params] — a daemon push (fs_changed / proc_* / lsp_* / term_data).
+        // `onNotify` may return a promise: awaiting it pauses this read loop, which stops
+        // pulling the WebTransport stream → QUIC flow-control backpressures the daemon. That
+        // is the browser end of terminal backpressure — without it the daemon would keep
+        // sending a flood the apply side can't keep up with, and a `^C` couldn't stop it.
+        if (this.onNotify) {
+          const r = this.onNotify(frame[1], frame[2] ?? []);
+          if (r && typeof r.then === "function") await r;
+        }
       }
       // type 0 (request from the daemon) never happens — every daemon→edit-host message
       // is a response or a notification — so it is ignored.

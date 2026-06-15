@@ -23,7 +23,7 @@ use nxvim_core::BufferId;
 use nxvim_lsp::LspEvent;
 use nxvim_rpc::Incoming;
 use std::io;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 use crate::daemon::{FsRead, WatchEvent};
 use crate::evloop::LoopEvent;
@@ -158,11 +158,7 @@ impl EditHost {
     /// the run loop's `select!` immediately re-fires this arm for the next batch (and
     /// can interleave the user's keystrokes between batches), so the live screen
     /// visibly scrolls while loading.
-    pub(crate) fn on_term_events(
-        &mut self,
-        first: TermEvent,
-        rx: &mut UnboundedReceiver<TermEvent>,
-    ) {
+    pub(crate) fn on_term_events(&mut self, first: TermEvent, rx: &mut Receiver<TermEvent>) {
         let mut budget: usize = 0;
         let mut ev = first;
         // Buffers fed this batch, projected once after the drain (feeding only

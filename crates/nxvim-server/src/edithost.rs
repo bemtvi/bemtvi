@@ -155,6 +155,13 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn term_write(&mut self, buf: u64, bytes: Vec<u8>);
 
+    /// Signal that a `^C` just trimmed `buf`'s flooding scrollback ([`EditHost::terminal_on_input`]),
+    /// so the Worker can also *discard* the child's in-flight backlog (the part already sent over
+    /// the wire) — otherwise the browser's QUIC receive window keeps feeding seconds of output
+    /// after the cancel. Wasm-only (the native leg drains its local PTY fast enough not to need it).
+    #[cfg(not(feature = "native"))]
+    fn term_interrupted(&mut self, buf: u64);
+
     /// Resize `buf`'s daemon PTY so the child re-lays-out (the terminal window changed size).
     /// The wasm twin of `terminal_command(TermCommand::Resize)`. Wasm-only.
     #[cfg(not(feature = "native"))]

@@ -97,6 +97,14 @@ pub(crate) struct TermEmu {
     /// re-read from vt100 only when this changes (something scrolled); an unchanged
     /// length means only the live screen moved, so we rewrite just that region.
     last_held: usize,
+    /// The `'scrollback'` cap this emulator was created with — kept so an interrupt
+    /// trim can re-seed a fresh parser with the same cap (see [`EditHost::terminal_trim`]).
+    scrollback: usize,
+    /// Newlines fed since the last user keystroke went to the child — the flood
+    /// signal a `^C` consults: a command that dumped many lines since you last typed
+    /// is "actively flooding", so `^C` trims the scrollback to the recent tail. Reset
+    /// to 0 on every input (so steady typing never reads as a flood).
+    lines_since_input: usize,
 }
 
 impl TermEmu {
@@ -110,9 +118,16 @@ impl TermEmu {
             // usize::MAX forces the first projection to read the (empty) scrollback
             // and lay out the full buffer.
             last_held: usize::MAX,
+            scrollback,
+            lines_since_input: 0,
         }
     }
 }
+
+/// How many recent lines an interrupt (`^C`) keeps when it trims a flooding
+/// terminal's scrollback — and, reused as the flood threshold, how many lines must
+/// have streamed since the last keystroke for a `^C` to trigger the trim at all.
+const TERM_TRIM_KEEP: usize = 200;
 
 impl EditHost {
     /// Create (or reset) the vt100 emulator for terminal buffer `buf`, sized
@@ -133,6 +148,8 @@ impl EditHost {
         let replies = match self.terminals.get_mut(&buf) {
             Some(emu) => {
                 emu.parser.process(bytes);
+                // Track output volume since the last keystroke (the `^C` flood signal).
+                emu.lines_since_input += bytes.iter().filter(|&&b| b == b'\n').count();
                 std::mem::take(&mut emu.parser.callbacks_mut().replies)
             }
             None => return,
@@ -165,6 +182,84 @@ impl EditHost {
     /// Drop `buf`'s emulator — the terminal closed, or the buffer was wiped.
     pub fn terminal_remove(&mut self, buf: BufferId) {
         self.terminals.remove(&buf);
+    }
+
+    /// React to a keystroke about to be sent to `buf`'s child. A bare `^C` (the
+    /// single byte `0x03`) on a terminal that has been *actively flooding* — at least
+    /// [`TERM_TRIM_KEEP`] lines streamed since the last keystroke — trims the
+    /// scrollback to the recent tail with a marker ([`terminal_trim`]), so cancelling
+    /// a runaway command leaves a readable buffer instead of thousands of lines. A
+    /// `^C` at an idle prompt (nothing flooded) is left alone, so normal shell use
+    /// keeps its full scrollback. Either way the flood counter resets — the next
+    /// command's output is measured from here.
+    ///
+    /// Returns whether it trimmed — the daemon/edit-host uses that as the signal to also
+    /// discard the child's in-flight backlog (the browser leg can't otherwise stop a flood
+    /// promptly; see the Worker's `discardingTerms`).
+    ///
+    /// [`terminal_trim`]: EditHost::terminal_trim
+    pub(crate) fn terminal_on_input(&mut self, buf: BufferId, bytes: &[u8]) -> bool {
+        let flooding = match self.terminals.get(&buf) {
+            Some(emu) => emu.lines_since_input >= TERM_TRIM_KEEP,
+            None => return false,
+        };
+        let trimmed = bytes == [0x03] && flooding;
+        if trimmed {
+            self.terminal_trim(buf);
+        }
+        if let Some(emu) = self.terminals.get_mut(&buf) {
+            emu.lines_since_input = 0;
+        }
+        trimmed
+    }
+
+    /// Trim `buf`'s scrollback to the last [`TERM_TRIM_KEEP`] lines, prepending a
+    /// marker that records how many earlier lines were dropped. Used by `^C` to bail
+    /// out of a flood ([`terminal_on_input`]). Implemented by re-seeding a fresh vt100
+    /// parser with the marker + kept tail as plain text: vt100 exposes no scrollback
+    /// truncation, and a re-seed naturally lays the tail back out (the last screenful
+    /// on the live screen, the rest in scrollback). The child is untouched — its next
+    /// output (the shell prompt after the interrupt) simply appends. Color on the kept
+    /// tail is dropped (re-fed as plain text), which matches the monochrome look
+    /// scrolled-off history already has during a live flood.
+    ///
+    /// [`terminal_on_input`]: EditHost::terminal_on_input
+    pub(crate) fn terminal_trim(&mut self, buf: BufferId) {
+        let Some(emu) = self.terminals.get(&buf) else {
+            return;
+        };
+        let (rows, cols) = emu.parser.screen().size();
+        let scrollback = emu.scrollback;
+        // The full current mirror: scrollback history followed by the live screen.
+        let mut all: Vec<String> = emu.history.clone();
+        all.extend(emu.parser.screen().rows(0, cols));
+        if all.len() <= TERM_TRIM_KEEP {
+            return; // nothing meaningful to drop
+        }
+        let dropped = all.len() - TERM_TRIM_KEEP;
+        let marker = format!("──── ^C: {dropped} earlier lines trimmed ────");
+
+        // Re-seed: marker line, then each kept line on its own (`\r\n` so the parser
+        // scrolls them exactly as the child's output would have).
+        let mut parser =
+            vt100::Parser::new_with_callbacks(rows, cols, scrollback, TermSink::default());
+        let mut seed: Vec<u8> = marker.into_bytes();
+        for line in &all[dropped..] {
+            seed.extend_from_slice(b"\r\n");
+            seed.extend_from_slice(line.as_bytes());
+        }
+        parser.process(&seed);
+
+        let emu = self
+            .terminals
+            .get_mut(&buf)
+            .expect("emulator present above");
+        emu.parser = parser;
+        emu.history.clear();
+        emu.history_styles.clear();
+        emu.last_held = usize::MAX;
+        emu.lines_since_input = 0;
+        self.terminal_project(buf);
     }
 
     /// Project `buf`'s emulator into the buffer: the scrollback history followed by
@@ -535,6 +630,10 @@ impl EditHost {
                     });
                 }
                 TerminalOp::Send { buf, bytes } => {
+                    // A `^C` on a flooding terminal trims the scrollback (+ resets the
+                    // flood counter); the keystroke still reaches the child to interrupt it.
+                    // (Native drains its local PTY fast, so no backlog discard is needed.)
+                    let _ = self.terminal_on_input(buf, &bytes);
                     self.fx
                         .terminal_command(native::TermCommand::Write { buf, bytes });
                 }
@@ -599,7 +698,16 @@ impl EditHost {
                     self.terminal_open_emu(buf, rows, cols, scrollback);
                     self.fx.term_open(buf.0, argv, cwd, rows, cols);
                 }
-                TerminalOp::Send { buf, bytes } => self.fx.term_write(buf.0, bytes),
+                TerminalOp::Send { buf, bytes } => {
+                    // A `^C` on a flooding terminal trims the scrollback (+ resets the flood
+                    // counter); the keystroke still crosses the wire to interrupt it. A trim
+                    // also signals the Worker to discard the child's in-flight backlog so the
+                    // cancel takes hold promptly (the browser's QUIC window holds seconds of it).
+                    if self.terminal_on_input(buf, &bytes) {
+                        self.fx.term_interrupted(buf.0);
+                    }
+                    self.fx.term_write(buf.0, bytes);
+                }
                 TerminalOp::Kill { buf } => {
                     self.terminal_remove(buf);
                     self.fx.term_kill(buf.0);
@@ -659,9 +767,20 @@ pub(crate) mod native {
     use std::io::{Read, Write};
 
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+    use tokio::sync::mpsc::{
+        channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+    };
 
     use nxvim_core::BufferId;
+
+    /// Bounded capacity of the PTY-reader → consumer event channel. This is the
+    /// backpressure window for a terminal child's output: when it fills (the
+    /// consumer — the run loop locally, or the daemon's wire forwarder — is behind),
+    /// the reader thread *blocks* on `blocking_send`, so it stops draining the PTY,
+    /// the PTY buffer fills, and the OS blocks the child's `write()`. That throttles
+    /// the child to the display's drain rate (like a real terminal), so a flood never
+    /// queues without bound and a `^C` stops it promptly. Small for a tight window.
+    const TERM_EVENT_CAP: usize = 4;
 
     /// A command from the editor tick to the terminal actor. Fire-and-forget, like
     /// [`LoopCommand`](crate::evloop::LoopCommand): the editor never awaits a reply.
@@ -701,16 +820,18 @@ pub(crate) mod native {
     /// [`EventLoop`]: crate::evloop::EventLoop
     pub struct TerminalManager {
         cmd_tx: UnboundedSender<TermCommand>,
-        start: Option<(UnboundedReceiver<TermCommand>, UnboundedSender<TermEvent>)>,
+        start: Option<(UnboundedReceiver<TermCommand>, Sender<TermEvent>)>,
         started: bool,
     }
 
     impl TerminalManager {
         /// Create the manager and the receiver the run loop selects on. No task is
-        /// spawned until the first [`send`](Self::send).
-        pub fn new() -> (TerminalManager, UnboundedReceiver<TermEvent>) {
+        /// spawned until the first [`send`](Self::send). The event channel is
+        /// *bounded* ([`TERM_EVENT_CAP`]) so a child that outruns the consumer is
+        /// throttled at the PTY rather than queuing output without limit.
+        pub fn new() -> (TerminalManager, Receiver<TermEvent>) {
             let (cmd_tx, cmd_rx) = unbounded_channel();
-            let (event_tx, event_rx) = unbounded_channel();
+            let (event_tx, event_rx) = channel(TERM_EVENT_CAP);
             let mgr = TerminalManager {
                 cmd_tx,
                 start: Some((cmd_rx, event_tx)),
@@ -749,7 +870,7 @@ pub(crate) mod native {
     /// command sender (shutdown).
     async fn run_terminal_actor(
         mut cmd_rx: UnboundedReceiver<TermCommand>,
-        event_tx: UnboundedSender<TermEvent>,
+        event_tx: Sender<TermEvent>,
     ) {
         let mut sessions: HashMap<BufferId, Session> = HashMap::new();
         while let Some(cmd) = cmd_rx.recv().await {
@@ -770,11 +891,13 @@ pub(crate) mod native {
                         Err(e) => {
                             // Surface the failure in the buffer, then end the job —
                             // never a silent drop.
-                            let _ = event_tx.send(TermEvent::Data {
-                                buf,
-                                bytes: format!("nxvim: {e}\r\n").into_bytes(),
-                            });
-                            let _ = event_tx.send(TermEvent::Exit { buf, code: -1 });
+                            let _ = event_tx
+                                .send(TermEvent::Data {
+                                    buf,
+                                    bytes: format!("nxvim: {e}\r\n").into_bytes(),
+                                })
+                                .await;
+                            let _ = event_tx.send(TermEvent::Exit { buf, code: -1 }).await;
                         }
                     }
                 }
@@ -824,7 +947,7 @@ pub(crate) mod native {
         cwd: Option<String>,
         rows: u16,
         cols: u16,
-        event_tx: &UnboundedSender<TermEvent>,
+        event_tx: &Sender<TermEvent>,
     ) -> anyhow::Result<Session> {
         let pair = native_pty_system().openpty(PtySize {
             rows: rows.max(1),
@@ -859,8 +982,12 @@ pub(crate) mod native {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // `blocking_send` is the backpressure: it parks this thread
+                        // when the bounded event channel is full (the consumer is
+                        // behind), so we stop reading the PTY and the child blocks on
+                        // its next `write()` instead of flooding an unbounded queue.
                         if event_tx
-                            .send(TermEvent::Data {
+                            .blocking_send(TermEvent::Data {
                                 buf,
                                 bytes: chunk[..n].to_vec(),
                             })
@@ -876,7 +1003,7 @@ pub(crate) mod native {
             // Output fully drained (EOF/EIO on the master ⇒ the child has closed its end);
             // reap it for the real exit code and report the exit *after* every `Data`.
             let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
-            let _ = event_tx.send(TermEvent::Exit { buf, code });
+            let _ = event_tx.blocking_send(TermEvent::Exit { buf, code });
         });
 
         Ok(Session {

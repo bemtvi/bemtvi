@@ -498,8 +498,16 @@ pub async fn serve_term_daemon_on(
     tokio::spawn(async move {
         while let Some(ev) = term_events.recv().await {
             match ev {
+                // Data goes over the *backpressured* stream channel: when the wire is
+                // behind (browser slow / QUIC congested), this `await` blocks, so we
+                // stop draining `term_events`, the bounded event channel fills, the PTY
+                // reader blocks, and the child is throttled — no unbounded backlog, so a
+                // `^C` actually stops the output. Exit stays on the control channel so it
+                // is delivered promptly even behind a backed-up data stream.
                 TermEvent::Data { buf, bytes } => {
-                    reply.notify(TERM_DATA, vec![Value::from(buf.0), Value::Binary(bytes)])
+                    reply
+                        .notify_stream(TERM_DATA, vec![Value::from(buf.0), Value::Binary(bytes)])
+                        .await
                 }
                 TermEvent::Exit { buf, code } => reply.notify(
                     TERM_EXIT,

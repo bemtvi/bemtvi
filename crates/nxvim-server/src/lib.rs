@@ -37,6 +37,9 @@ mod keymap;
 mod lifecycle;
 mod redraw;
 mod save;
+// The `snippets` completion source + snippet-engine effect drains. Feature-agnostic:
+// the native snippet engine lives in core (no async / LSP), so it builds on wasm too.
+mod snippet;
 // Feature-agnostic: the vt100 emulator + screen→buffer projection compile on the
 // wasm build too (pure CPU, no PTY). The native PTY transport added to this module
 // in Phase 3 is gated `#[cfg(feature = "native")]` inside it.
@@ -489,6 +492,19 @@ pub struct EditHost {
     /// `LspDocState::semantic_enabled` is the narrower override).
     #[cfg(feature = "native")]
     semantic_tokens_enabled: bool,
+    /// Registered snippets per filetype (`nx.snippet.add`), feeding the `snippets`
+    /// completion source. String bodies only in this phase. Feature-agnostic (the
+    /// engine is core), so present on the wasm build too.
+    snippet_store: HashMap<String, Vec<snippet::SnippetEntry>>,
+    /// Whether the `snippets` completion source is configured (`nx.complete.setup`).
+    complete_snippets_active: bool,
+    /// Merge priority of the `snippets` source (rows rank against other sources).
+    complete_snippets_priority: i32,
+    /// The snippet entries last pushed as completion candidates this trigger, indexed
+    /// by `MenuItem.key - SNIPPET_COMPLETE_KEY_BASE`, so a delegated accept finds the
+    /// body to expand.
+    snippet_complete: Vec<snippet::SnippetEntry>,
+
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
     /// every entry).
@@ -725,6 +741,10 @@ impl EditHost {
             diag_config: DiagnosticConfig::default(),
             #[cfg(feature = "native")]
             semantic_tokens_enabled: true,
+            snippet_store: HashMap::new(),
+            complete_snippets_active: false,
+            complete_snippets_priority: 0,
+            snippet_complete: Vec::new(),
             last_buffer_id: None,
             announced: HashSet::new(),
             known_buffers: Vec::new(),

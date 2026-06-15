@@ -19,7 +19,8 @@ use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp,
     ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
     LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
+    SemanticTokenData, SnippetAddReq, SnippetSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq,
+    UiInputReq, UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -341,6 +342,8 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "nxvim:prelude/complete",
         include_str!("prelude/complete.lua"),
     ),
+    // nx.snippet: the native snippet engine (tabstop session + snippets source).
+    ("nxvim:prelude/snippet", include_str!("prelude/snippet.lua")),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
@@ -442,6 +445,15 @@ pub(crate) struct Shared {
     /// selected row; the source's `resolve` callback responded, and this carries the
     /// docs back to the server's resolve cache for the sidebar. Phase 4-E.
     pub(crate) complete_resolve_dones: Vec<(u64, String)>,
+    /// `nx.snippet.setup{}` jump-key configurations, drained by the server into
+    /// `Editor::set_snippet_keys`.
+    pub(crate) snippet_setups: Vec<SnippetSetupReq>,
+    /// `nx.snippet.add(ft, …)` registrations, drained by the server into its
+    /// per-filetype snippet store for the `snippets` completion source.
+    pub(crate) snippet_adds: Vec<SnippetAddReq>,
+    /// `nx.snippet.expand(body)` requests — a snippet body to expand at the cursor,
+    /// drained by the server which parses and expands it via `Editor::expand_snippet`.
+    pub(crate) snippet_expands: Vec<String>,
     /// Streamed picker candidates (`nx.picker` source `push`), drained by the
     /// server (generation-gated) into `Editor::menu_push` after the chunk / a
     /// streaming `on_stdout`.
@@ -898,6 +910,21 @@ impl LuaRuntime {
         /// Take the resolved lazy-docs `(id, doc)` pairs queued since the last drain,
         /// for the server to fill its completion-docs resolve cache and repaint.
         take_complete_resolve_dones -> Vec<(u64, String)> = complete_resolve_dones
+    }
+
+    take_queue! {
+        /// Take the `nx.snippet.setup{}` jump-key configs queued since the last drain.
+        take_snippet_setups -> Vec<SnippetSetupReq> = snippet_setups
+    }
+
+    take_queue! {
+        /// Take the `nx.snippet.add(ft, …)` registrations queued since the last drain.
+        take_snippet_adds -> Vec<SnippetAddReq> = snippet_adds
+    }
+
+    take_queue! {
+        /// Take the `nx.snippet.expand(body)` requests queued since the last drain.
+        take_snippet_expands -> Vec<String> = snippet_expands
     }
 
     take_queue! {

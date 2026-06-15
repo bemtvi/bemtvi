@@ -24,11 +24,11 @@ nx.complete._sources = nx.complete._sources or {}
 -- `setup{ sources }` must be a *registered* async source (`nx.complete.source{}`)
 -- — an unknown name is a hard error (no silent stub): a source that "registers" but
 -- never produces candidates is exactly the quietly-broken shape the project forbids.
-local BUILTIN_SOURCES = { buffer = true, lsp = true }
+local BUILTIN_SOURCES = { buffer = true, lsp = true, snippets = true }
 
 -- Default merge priority per built-in source — higher wins, so `lsp` candidates lead
 -- `buffer` words of equal match quality. An entry's explicit `priority` overrides.
-local DEFAULT_PRIORITY = { lsp = 100, buffer = 10 }
+local DEFAULT_PRIORITY = { lsp = 100, snippets = 90, buffer = 10 }
 
 -- The default debounce (ms) before an async source re-runs on a prefix edit — the
 -- global knob, overridable per source (`debounce = N`). `0` runs on every
@@ -77,7 +77,8 @@ function nx.complete.setup(opts)
   local min_chars = opts.min_chars
   local async = {}
   local saw_lsp = false
-  local buffer_priority, lsp_priority = 0, 0
+  local saw_snippets = false
+  local buffer_priority, lsp_priority, snippets_priority = 0, 0, 0
   -- The union of every active source's trigger chars, as a set (dedup) and an
   -- ordered string handed to the engine (`trigger_chars`). Each char wakes only the
   -- source(s) that declared it; the engine folds it into the prefix/anchor.
@@ -107,6 +108,9 @@ function nx.complete.setup(opts)
     elseif name == "lsp" then
       saw_lsp = true
       lsp_priority = priority
+    elseif name == "snippets" then
+      saw_snippets = true
+      snippets_priority = priority
     end
     if registered then
       -- A per-entry `debounce` override (`{ "name", debounce = N }`) wins over the
@@ -162,7 +166,9 @@ function nx.complete.setup(opts)
     resolve_next = 0,
     resolve_items = {},
   }
-  local has_async = #async > 0 or saw_lsp
+  -- The server-native `lsp` and `snippets` sources both dispatch off the input
+  -- path, so either (like a Lua async source) needs the `(gen, ctx)` emit.
+  local has_async = #async > 0 or saw_lsp or saw_snippets
 
   nx._complete_setup(
     auto == true,
@@ -176,7 +182,9 @@ function nx.complete.setup(opts)
     buffer_priority,
     lsp_priority,
     docs == true,
-    trigger_chars
+    trigger_chars,
+    saw_snippets,
+    snippets_priority
   )
 
   -- `keys.trigger` (a string or list) installs an insert-mode mapping that opens

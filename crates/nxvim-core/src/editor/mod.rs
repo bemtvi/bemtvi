@@ -51,6 +51,7 @@ mod persist;
 mod quickfix;
 mod registers;
 mod search;
+pub mod snippet;
 mod syntax;
 mod tabs;
 mod terminal;
@@ -970,6 +971,16 @@ pub struct Editor {
     /// single-cursor yanks never touch the per-cursor set.
     cursor_register_collect: Option<Vec<(usize, RegisterCell)>>,
 
+    /// The active snippet expansion, or `None` when no snippet is being filled.
+    /// Drives `<Tab>`/`<S-Tab>` tabstop navigation and live mirror sync while the
+    /// user types into an expanded snippet; ends on `<Esc>` to Normal or on
+    /// reaching the final `$0` stop. See [`crate::editor::snippet`].
+    snippet: Option<snippet::SnippetSession>,
+    /// Configurable tabstop-jump keys (`nx.snippet.setup{ jump_next, jump_prev }`),
+    /// defaulting to `<Tab>` / `<S-Tab>`. Consulted only while a [`snippet`] session
+    /// is live, so they don't shadow soft-tab insertion otherwise.
+    snippet_keys: snippet::SnippetKeys,
+
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
 
@@ -1292,6 +1303,8 @@ impl Editor {
             placement_redo: Vec::new(),
             cursor_registers: Vec::new(),
             cursor_register_collect: None,
+            snippet: None,
+            snippet_keys: snippet::SnippetKeys::default(),
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
             pending_sleep: None,

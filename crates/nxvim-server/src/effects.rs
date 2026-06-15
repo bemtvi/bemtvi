@@ -444,6 +444,34 @@ impl EditHost {
             }
             #[cfg(not(feature = "native"))]
             let _ = req.lsp_priority;
+            // The built-in `snippets` source is feature-agnostic (the engine is in
+            // core), so it works on the wasm build too.
+            self.complete_snippets_active = req.snippets;
+            self.complete_snippets_priority = req.snippets_priority;
+        }
+        // `nx.snippet.setup{}` jump keys, `nx.snippet.add` registrations, and
+        // `nx.snippet.expand(body)` immediate expansions.
+        for req in self.lua.take_snippet_setups() {
+            let parse = |list: &[String]| -> Vec<nxvim_core::input::Key> {
+                list.iter()
+                    .flat_map(|s| nxvim_core::input::parse_keys(s))
+                    .collect()
+            };
+            self.editor
+                .set_snippet_keys(parse(&req.next), parse(&req.prev));
+        }
+        for req in self.lua.take_snippet_adds() {
+            self.snippet_add(req.filetype, req.triggers, req.bodies);
+        }
+        for body in self.lua.take_snippet_expands() {
+            match nxvim_core::parse_snippet(&body) {
+                Ok(parsed) => {
+                    let row = self.editor.cursor.line;
+                    let at = self.editor.buffer().line_start(row) + self.editor.cursor.col;
+                    self.editor.expand_snippet(at, at, parsed);
+                }
+                Err(e) => self.editor.echo(format!("E5900: nx.snippet.expand: {e}")),
+            }
         }
         // `nx.complete.trigger()` / a mapped key: manually open the completion
         // popup. Coalesced — one open per drain regardless of how many requests
@@ -967,6 +995,7 @@ impl EditHost {
                         .filter(|(ns, _)| {
                             *ns != nxvim_core::extmark::CURSOR_NS
                                 && *ns != nxvim_core::extmark::ANCHOR_NS
+                                && *ns != nxvim_core::extmark::SNIPPET_NS
                         })
                         .map(|(ns, m)| {
                             let (row, col) = byte_rowcol(b, m.start);
@@ -1518,6 +1547,17 @@ impl EditHost {
             // aware edits). Drained in `run_pending` (not `apply_lua_effects`) because
             // the accept keystroke queues no Lua, so `apply_lua_effects` may not run —
             // but `run_pending` always does, once, after every key.
+            // A `snippets`-source row's key is offset by `SNIPPET_COMPLETE_KEY_BASE`
+            // so it routes here (feature-agnostic — the engine is in core) rather than
+            // to the LSP applier; expand its body into the tabstop session.
+            if self
+                .editor
+                .complete_accept_request
+                .is_some_and(|key| key >= crate::snippet::SNIPPET_COMPLETE_KEY_BASE)
+            {
+                let key = self.editor.complete_accept_request.take().unwrap();
+                self.complete_snippet_accept(key - crate::snippet::SNIPPET_COMPLETE_KEY_BASE);
+            }
             #[cfg(feature = "native")]
             if let Some(key) = self.editor.complete_accept_request.take() {
                 self.complete_lsp_accept(key);
@@ -1625,6 +1665,8 @@ impl EditHost {
                 // streams into the menu (gen-gated) via `on_completion_reply`.
                 #[cfg(feature = "native")]
                 self.complete_lsp_dispatch(gen);
+                // The built-in `snippets` source is feature-agnostic (core engine).
+                self.complete_snippet_dispatch(gen);
                 self.apply_lua_effects();
             }
             // Float-list widget results: a confirmed (`Some(key)`) or cancelled

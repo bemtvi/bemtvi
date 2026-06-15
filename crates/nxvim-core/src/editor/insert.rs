@@ -47,6 +47,18 @@ impl Editor {
     }
 
     pub(crate) fn handle_insert(&mut self, key: Key) {
+        // While a snippet expansion is being filled, the jump keys (`<Tab>` /
+        // `<S-Tab>` by default) move between tabstops. They take precedence over both
+        // the completion popup (which shares `<Tab>`/`<S-Tab>` for navigation) and
+        // soft-tab insertion: a snippet session is the more specific context, and the
+        // popup stays navigable via `<C-n>`/`<C-p>` (accept with `<C-y>`/`<CR>`). Any
+        // open popup is dismissed first so it doesn't linger over the jumped-to stop.
+        if let Some(dir) = self.snippet_jump_for(&key) {
+            self.close_completion();
+            self.snippet_jump(dir);
+            return;
+        }
+
         // Native completion popup: while it is open, its control keys navigate /
         // accept / abort and are consumed here; every other key edits the document
         // normally and then re-triggers the engine at the end of this fn. (The
@@ -113,6 +125,8 @@ impl Editor {
         let soft_tab = self.soft_tab.take();
         match key.code {
             KeyCode::Esc => {
+                // Leaving Insert ends any snippet session (its tabstops are dropped).
+                self.end_snippet();
                 self.mode = Mode::Normal;
                 // `` `^ `` — where Insert mode was last left — is the insert-stop
                 // column, captured before the normal-mode backstep below.
@@ -200,6 +214,11 @@ impl Editor {
             )
         {
             self.complete_trigger();
+        }
+
+        // Keep the active tabstop's mirrors in sync with whatever was just typed.
+        if self.snippet_active() {
+            self.snippet_sync();
         }
     }
 

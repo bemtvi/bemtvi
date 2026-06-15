@@ -56,6 +56,9 @@ hl(0, "NonText",      { fg = p.gutter })
 -- bytes, embedded C0 controls): a standout colour so they read as special.
 hl(0, "SpecialKey",   { fg = p.purple, bold = true })
 hl(0, "Folded",       { fg = p.comment, bg = p.cursor_line })
+-- Snippet tabstops: an underlined placeholder, the one you're on highlighted.
+hl(0, "SnippetTabstop",       { underline = true })
+hl(0, "SnippetTabstopActive", { bg = p.visual, underline = true })
 
 -- Legacy syntax groups — the terminus of the treesitter capture fallback chain
 -- (`@function.call` -> `@function` -> `Function`), so defining these colors every

@@ -454,6 +454,11 @@ pub struct CompletionItemData {
     pub filter_text: Option<String>,
     pub sort_text: Option<String>,
     pub insert_text: Option<String>,
+    /// Whether `insert_text` / `text_edit.new_text` is an LSP **snippet** body
+    /// (`insertTextFormat == 2`) rather than plain text — `$1` / `${1:default}` /
+    /// `$0` tabstops to expand through the native snippet engine, rather than inserting
+    /// the markers literally. `false` for plain text (the default / format `1`).
+    pub is_snippet: bool,
     pub text_edit: Option<TextEdit>,
     pub additional_text_edits: Vec<TextEdit>,
     /// The item's `documentation` (a plain string or `MarkupContent`) reduced to

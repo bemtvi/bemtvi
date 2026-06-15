@@ -904,6 +904,32 @@ pub struct CompleteSetupReq {
     /// ":" } }`. The server splits it into the engine's `trigger_chars`. Empty when no
     /// source declares one (the prefix is the plain word run). Phase 4-E.
     pub trigger_chars: String,
+    /// Whether the built-in `snippets` source is configured, so the server offers the
+    /// registered snippet triggers for the buffer's filetype and expands the body on
+    /// accept (the native snippet engine).
+    pub snippets: bool,
+    /// Merge priority of the `snippets` source (`0` when not configured).
+    pub snippets_priority: i32,
+}
+
+/// A `nx.snippet.setup{}` request: the tabstop-jump keys as vim notation lists
+/// (`"<Tab>"`, …), empty ⇒ keep the built-in default. Queued in
+/// [`crate::runtime::Shared::snippet_setups`].
+#[derive(Clone, Debug)]
+pub struct SnippetSetupReq {
+    pub next: Vec<String>,
+    pub prev: Vec<String>,
+}
+
+/// A `nx.snippet.add(ft, …)` registration: the filetype and parallel `triggers` /
+/// `bodies` arrays (string bodies only in this phase). Queued in
+/// [`crate::runtime::Shared::snippet_adds`]; the server stores them for the
+/// `snippets` completion source.
+#[derive(Clone, Debug)]
+pub struct SnippetAddReq {
+    pub filetype: String,
+    pub triggers: Vec<String>,
+    pub bodies: Vec<String>,
 }
 
 /// One streamed completion candidate (`nx.complete` async source `push`): its

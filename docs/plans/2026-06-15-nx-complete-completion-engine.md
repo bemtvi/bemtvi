@@ -384,13 +384,20 @@ bordered float** (right of the box, flipping left for room) rendering the select
   `<C-d>`/`<C-u>` preview-scroll is not wired for the (non-grabbing) completion popup —
   docs are short. These are polish, deferred.
 
-### Snippets (still pending)
+### Snippets ✅ DONE (2026-06-15)
 
-- **Snippet expansion on accept**: parse LSP `insertTextFormat = Snippet`
-  (`$1` / `${1:default}` / `$0`) and expand into the buffer with tab-through
-  placeholders; the `snippets` source (built-in). This is the first snippet engine
-  in the repo (none exists today) — fail loud on unsupported snippet constructs
-  rather than inserting raw `$1`.
+Landed as the native snippet engine — see the dedicated plan
+`docs/plans/2026-06-15-nx-snippet-engine.md`.
+
+- **Snippet expansion on accept**: LSP `insertTextFormat = Snippet`
+  (`$1` / `${1:default}` / `$0` / `${1|a,b|}` / mirrors) parses
+  (`nxvim_core::parse_snippet`) and expands into a tabstop session
+  (`<Tab>`/`<S-Tab>` to navigate, mirrors kept in sync). The `snippets` source is
+  built in (server-native, feature-agnostic), expanding the registered body for the
+  buffer's filetype on accept. Unsupported constructs (variables / transforms) fail
+  loud rather than inserting raw `$1`.
+- **Deferred** (snippet plan S-5): `${1|a,b|}` choice menu on jump, select-default-on-jump,
+  function snippet bodies.
 
 ---
 

@@ -18,7 +18,8 @@ use std::path::Path;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, lines, map_get, serial_lock, spawn, temp_dir,
+    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, serial_lock, spawn,
+    temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -251,6 +252,42 @@ async fn accepting_an_lsp_item_applies_its_text_edit() {
         vec!["use foo;", "print_value()"],
         "textEdit + additionalTextEdits applied as one delegated edit"
     );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
+async fn accepting_a_snippet_item_expands_tabstops() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_snippet");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "NXVIM_LSP_CMD",
+        format!("{NXVIM_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    // A snippet item (`insertTextFormat = 2`): its textEdit body has a `$1` tabstop
+    // inside the parens and a final `$0` after them.
+    let completion = r#"[ {
+        "label": "print_value",
+        "insertTextFormat": 2,
+        "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 2 } },
+                      "newText": "print_value($1)$0" }
+    } ]"#;
+    let (rpc, mut incoming) = start_typed(&dir, completion, "pr").await;
+
+    await_items(&rpc, &mut incoming, "print_value").await;
+    feed(&rpc, "<C-y>");
+    // The markers are gone and the cursor sits at `$1`, inside the parens.
+    assert_eq!(lines(&rpc).await, vec!["print_value()"]);
+    assert_eq!(cursor(&rpc).await, (1, 12));
+
+    // Typing fills the tabstop; <Tab> jumps to the final `$0` after the parens.
+    feed(&rpc, "x");
+    assert_eq!(lines(&rpc).await, vec!["print_value(x)"]);
+    feed(&rpc, "<Tab>");
+    assert_eq!(cursor(&rpc).await, (1, 14));
 
     std::env::remove_var("NXVIM_LSP_CMD");
 }

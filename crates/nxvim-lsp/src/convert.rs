@@ -131,6 +131,7 @@ fn completion_item(item: CompletionItem) -> CompletionItemData {
     // resolve round-trip; a server matches the resolve against the exact item it
     // issued, so the original is preserved verbatim, not rebuilt from our distill.
     let resolve_data = serde_json::to_value(&item).ok();
+    let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
     let documentation = item.documentation.and_then(documentation_lines);
     let text_edit = item.text_edit.map(|edit| match edit {
         CompletionTextEdit::Edit(e) => e,
@@ -146,6 +147,7 @@ fn completion_item(item: CompletionItem) -> CompletionItemData {
         filter_text: item.filter_text,
         sort_text: item.sort_text,
         insert_text: item.insert_text,
+        is_snippet,
         text_edit,
         additional_text_edits: item.additional_text_edits.unwrap_or_default(),
         documentation,

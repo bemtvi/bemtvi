@@ -1039,7 +1039,13 @@ screen," and that is exactly the shape of these tests.
   built-in package manager. Design:
   [the native plugin API](specs/2026-06-11-native-plugin-api.md); decision:
   [ADR 0002](decisions/0002-native-plugin-system.md). Suggested build order is
-  in the spec (picker → completion → statusline/snippets/tree).
+  in the spec (picker → completion → statusline/snippets/tree). **Landed so far:**
+  the fuzzy **picker** (`nx.picker`), the **completion engine** (`nx.complete`,
+  buffer + lsp + snippets sources), and the **snippet engine** (`nx.snippet` — LSP
+  snippet-syntax parsing, the tabstop session with `<Tab>`/`<S-Tab>` navigation and
+  mirrored placeholders; see
+  [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)). Still ahead: statusline
+  segments, tree docks, `nx.decor`, and the manifest loader / package manager.
 - `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
   dir today; installing them there is manual / a follow-up) and a `:set`-driven
   highlight toggle. (Treesitter **injections** have landed — engine-native, see

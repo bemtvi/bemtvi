@@ -21,8 +21,8 @@ use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode,
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp,
     GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush,
-    PreviewPush, QfItem, QfSetOp, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiFloatReq,
-    UiInputReq, UiSelectReq, WindowOp,
+    PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, TabOp,
+    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1316,6 +1316,8 @@ pub(crate) fn install_runtime_api(
         i32,
         bool,
         String,
+        bool,
+        i32,
     );
     nx.set(
         "_complete_setup",
@@ -1334,6 +1336,8 @@ pub(crate) fn install_runtime_api(
                 lsp_priority,
                 docs,
                 trigger_chars,
+                snippets,
+                snippets_priority,
             ): CompleteSetupArgs| {
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
@@ -1348,6 +1352,8 @@ pub(crate) fn install_runtime_api(
                     lsp_priority,
                     docs,
                     trigger_chars,
+                    snippets,
+                    snippets_priority,
                 });
                 Ok(())
             },
@@ -1423,6 +1429,47 @@ pub(crate) fn install_runtime_api(
         "_complete_resolve_done",
         lua.create_function(move |_, (id, doc): (u64, String)| {
             sh.borrow_mut().complete_resolve_dones.push((id, doc));
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._snippet_setup(next, prev)`: queue the tabstop-jump key configuration
+    // ([`SnippetSetupReq`]) for the native snippet engine. Each is a list of vim
+    // notation strings; empty keeps the built-in default (`<Tab>` / `<S-Tab>`).
+    let sh = shared.clone();
+    nx.set(
+        "_snippet_setup",
+        lua.create_function(move |_, (next, prev): (Vec<String>, Vec<String>)| {
+            sh.borrow_mut()
+                .snippet_setups
+                .push(SnippetSetupReq { next, prev });
+            Ok(())
+        })?,
+    )?;
+    // `nx._snippet_add(ft, triggers, bodies)`: register string-body snippets for a
+    // filetype ([`SnippetAddReq`]); the server stores them for the `snippets`
+    // completion source. The Lua wrapper validates shapes and rejects function bodies.
+    let sh = shared.clone();
+    nx.set(
+        "_snippet_add",
+        lua.create_function(
+            move |_, (filetype, triggers, bodies): (String, Vec<String>, Vec<String>)| {
+                sh.borrow_mut().snippet_adds.push(SnippetAddReq {
+                    filetype,
+                    triggers,
+                    bodies,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._snippet_expand(body)`: queue a snippet body to expand at the cursor; the
+    // server parses and expands it via `Editor::expand_snippet` after the chunk.
+    let sh = shared.clone();
+    nx.set(
+        "_snippet_expand",
+        lua.create_function(move |_, body: String| {
+            sh.borrow_mut().snippet_expands.push(body);
             Ok(())
         })?,
     )?;

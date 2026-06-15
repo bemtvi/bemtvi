@@ -186,6 +186,57 @@ impl EditHost {
             }
         };
 
+        // A snippet item (`insertTextFormat = Snippet`): expand `primary_text`'s
+        // `$1`/`${1:default}`/`$0` through the native engine rather than inserting it
+        // literally. `additionalTextEdits` (imports) apply first, shifting the primary
+        // range; then the snippet expands over the (typed-prefix) primary range.
+        if item.is_snippet {
+            match nxvim_core::parse_snippet(&primary_text) {
+                Ok(parsed) => {
+                    let mut prim = primary_range.clone();
+                    let mut adds: Vec<(std::ops::Range<usize>, String)> = item
+                        .additional_text_edits
+                        .iter()
+                        .map(|ate| {
+                            (
+                                self.lsp_range_to_bytes(&ate.range, encoding),
+                                ate.new_text.clone(),
+                            )
+                        })
+                        .collect();
+                    if !adds.is_empty() {
+                        let shift: isize = adds
+                            .iter()
+                            .filter(|(r, _)| r.start <= prim.start)
+                            .map(|(r, t)| t.len() as isize - (r.end - r.start) as isize)
+                            .sum();
+                        adds.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+                        self.editor.apply_edits(adds, prim.start);
+                        prim.start = (prim.start as isize + shift).max(0) as usize;
+                        prim.end = (prim.end as isize + shift).max(0) as usize;
+                    }
+                    self.editor.expand_snippet(prim.start, prim.end, parsed);
+                    self.lsp_complete = None;
+                    self.lsp_complete_resolve_key = None;
+                    self.lsp_dirty = true;
+                    return;
+                }
+                Err(e) => {
+                    // Unsupported / malformed server snippet: report loud and insert the
+                    // plain label rather than dumping raw `$1` markers into the buffer.
+                    self.editor
+                        .echo(format!("E5901: LSP snippet '{}': {e}", item.label));
+                    let edits = vec![(primary_range.clone(), item.label.clone())];
+                    self.editor
+                        .apply_edits(edits, primary_range.start + item.label.len());
+                    self.lsp_complete = None;
+                    self.lsp_complete_resolve_key = None;
+                    self.lsp_dirty = true;
+                    return;
+                }
+            }
+        }
+
         let mut edits = vec![(primary_range.clone(), primary_text.clone())];
         for ate in &item.additional_text_edits {
             edits.push((

@@ -34,6 +34,17 @@ pub const CURSOR_NS: u32 = u32::MAX;
 /// above any plugin namespace.
 pub const ANCHOR_NS: u32 = u32::MAX - 1;
 
+/// Reserved namespace for the active snippet session's tabstops. Each tabstop
+/// occurrence (primary or mirror) is a **range** extmark here, so the buffer's
+/// single edit choke point ([`ExtmarkStore::shift`]) keeps every tabstop's byte
+/// range correct as the user types into the snippet. Unlike [`CURSOR_NS`] these
+/// carry an `hl_group` (`SnippetTabstop` / `SnippetTabstopActive`) so clients can
+/// paint the placeholders, and they are surfaced through the dedicated snippet
+/// span projection rather than the user-facing extmark mirror. They exist only
+/// for the lifetime of a [`crate::editor::snippet::SnippetSession`]. Sits just
+/// below [`ANCHOR_NS`], far above any plugin namespace.
+pub const SNIPPET_NS: u32 = u32::MAX - 2;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

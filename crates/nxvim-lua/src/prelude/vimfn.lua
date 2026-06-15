@@ -399,3 +399,64 @@ function nx.fname.modify(fname, mods)
   return fname
 end
 vim.fn.fnamemodify = nx.fname.modify
+
+-- nx.getqflist([what]) [alias vim.fn.getqflist]: the quickfix list. With no
+-- argument (or a non-table), returns the array of entry dicts (a shallow copy of
+-- the `nx._qflist` mirror the server pushes). With a `what` dict, returns a dict
+-- carrying only the requested keys (`title` / `items` / `size`) — the subset of
+-- vim's introspection surface Phase 1 needs.
+function nx.getqflist(what)
+  if type(what) == "table" then
+    local r = {}
+    if what.title ~= nil then
+      r.title = nx._qflist_title
+    end
+    if what.size ~= nil then
+      r.size = #nx._qflist
+    end
+    if what.items ~= nil then
+      local items = {}
+      for i, e in ipairs(nx._qflist) do
+        items[i] = e
+      end
+      r.items = items
+    end
+    return r
+  end
+  local out = {}
+  for i, e in ipairs(nx._qflist) do
+    out[i] = e
+  end
+  return out
+end
+vim.fn.getqflist = nx.getqflist
+
+-- nx.setqflist(list, action, what) [alias vim.fn.setqflist]: populate the
+-- quickfix list. `list` is an array of entry dicts; `action` is " " (new / the
+-- default), "a" (append), or "r" (replace current). `what` may instead carry
+-- `lines` (raw output parsed against `efm`), `items`, `title`, or `efm`. The work
+-- happens server-side (a queued op), so the parsed result is visible to
+-- getqflist() only after the server drains the op — read it on a later tick.
+function nx.setqflist(list, action, what)
+  action = action or " "
+  local title, efm, items, lines = nil, nil, nil, nil
+  if type(what) == "table" then
+    title = what.title
+    efm = what.efm
+    if type(what.lines) == "table" then
+      lines = what.lines
+    end
+    if type(what.items) == "table" then
+      items = what.items
+    end
+  end
+  if lines == nil and items == nil and type(list) == "table" then
+    items = list -- including the empty list, which clears
+  end
+  if title ~= nil and type(title) ~= "string" then
+    title = tostring(title)
+  end
+  nx._set_qflist(items, lines, efm, action, title)
+  return 0
+end
+vim.fn.setqflist = nx.setqflist

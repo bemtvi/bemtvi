@@ -1,0 +1,366 @@
+//! Phase 1 of the quickfix / `errorformat` feature: the engine + list model,
+//! exercised black-box through `setqflist`/`getqflist` (the parser fed explicit
+//! lines + efm) and `:cgetbuffer` (the parser fed a buffer). These prove the
+//! ported `efm_to_regpat` + parse state machine produce the right structured
+//! entries — single-line, multi-line (`%A/%C/%Z`), the `%t`/`%n` field codes, the
+//! `%D`/`%X` directory stack — and that a malformed `'errorformat'` fails loud.
+//!
+//! `setqflist` queues a server-side op drained after the chunk, so each test sets
+//! the list in one `exec_lua` and reads it back in a *second* one (the `nx._qflist`
+//! mirror is refreshed before every chunk). Assertions fold the entry into a single
+//! string so they don't depend on rmpv map navigation.
+
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{
+    cursor, drain_to_latest_redraw, exec_lua, lines, message, start_attached, write_temp,
+};
+use rmpv::Value;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+/// The current window's buffer name (`nvim_buf_get_name`).
+async fn buf_name(rpc: &Rpc) -> String {
+    rpc.request("nvim_buf_get_name", vec![Value::from(0u64)])
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The number of open windows (`nvim_list_wins`).
+async fn win_count(rpc: &Rpc) -> usize {
+    match rpc.request("nvim_list_wins", vec![]).await {
+        Ok(Value::Array(a)) => a.len(),
+        _ => 0,
+    }
+}
+
+async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// Run `set_code` (a `setqflist` call), then evaluate `read_code` against the
+/// refreshed list and return its string result.
+async fn set_then_read(rpc: &Rpc, set_code: &str, read_code: &str) -> String {
+    exec_lua(rpc, set_code).await;
+    exec_lua(rpc, read_code)
+        .await
+        .as_str()
+        .unwrap_or("<not a string>")
+        .to_string()
+}
+
+/// Feed `keys`, then return the message line off the most-recent queued `redraw`
+/// (take-latest, per the harness convention).
+async fn message_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> String {
+    while incoming.try_recv().is_ok() {}
+    rpc.request("nvim_input", vec![Value::from(keys)])
+        .await
+        .expect("input");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    for _ in 0..200 {
+        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
+            return message(&map);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no redraw arrived for {keys:?}");
+}
+
+#[tokio::test]
+async fn gcc_style_single_line_is_parsed_into_fields() {
+    let (rpc, _incoming) = start().await;
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", { lines = { "main.c:10:5: error: expected ';'" }, efm = "%f:%l:%c: %m" })"#,
+        r#"local q = vim.fn.getqflist()
+           local e = q[1]
+           return string.format("%d|%d|%d|%s|%s|%s", #q, e.lnum, e.col, e.type, e.text, e.filename)"#,
+    )
+    .await;
+    assert_eq!(got, "1|10|5||error: expected ';'|main.c");
+}
+
+#[tokio::test]
+async fn type_and_number_field_codes_are_parsed() {
+    let (rpc, _incoming) = start().await;
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", { lines = { "x.c:3:E:42:bad token" }, efm = "%f:%l:%t:%n:%m" })"#,
+        r#"local q = vim.fn.getqflist()
+           local e = q[1]
+           return string.format("%d|%d|%s|%d|%s", #q, e.lnum, e.type, e.nr, e.text)"#,
+    )
+    .await;
+    assert_eq!(got, "1|3|E|42|bad token");
+}
+
+#[tokio::test]
+async fn multiline_prefixes_fold_into_one_entry() {
+    let (rpc, _incoming) = start().await;
+    // `%E` starts the message, `%C` continues it, `%Z` (literal "end") closes it.
+    // `%Z` precedes `%C` so the closing line isn't swallowed as a continuation.
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", {
+             lines = { "fatal: something broke", "  caused by X", "end" },
+             efm = "%Efatal: %m,%Zend,%C%m",
+           })"#,
+        r#"local q = vim.fn.getqflist()
+           local e = q[1]
+           return string.format("%d|%s|%s", #q, e.type, (e.text:gsub("\n", "/")))"#,
+    )
+    .await;
+    assert_eq!(got, "1|E|something broke/  caused by X");
+}
+
+#[tokio::test]
+async fn directory_stack_resolves_relative_filenames() {
+    let (rpc, _incoming) = start().await;
+    // `%D` pushes a directory; the relative `src/a.c` resolves under it; `%X` pops.
+    // The two directory lines become invalid (non-error) entries, the source line
+    // the one valid entry — three in all.
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", {
+             lines = { "Entering dir /tmp/proj", "src/a.c:10:oops", "Leaving dir /tmp/proj" },
+             efm = "%DEntering dir %f,%XLeaving dir %f,%f:%l:%m",
+           })"#,
+        r#"local q = vim.fn.getqflist()
+           for _, e in ipairs(q) do
+             if e.valid then return string.format("%d|%s|%d", #q, e.filename, e.lnum) end
+           end
+           return "no valid entry""#,
+    )
+    .await;
+    assert_eq!(got, "3|/tmp/proj/src/a.c|10");
+}
+
+#[tokio::test]
+async fn structured_setqflist_round_trips() {
+    let (rpc, _incoming) = start().await;
+    // The non-parsing form: a list of explicit item dicts.
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({
+             { filename = "a.rs", lnum = 7, col = 2, text = "boom", type = "W" },
+           }, " ")"#,
+        r#"local q = vim.fn.getqflist()
+           local e = q[1]
+           return string.format("%d|%s|%d|%d|%s|%s", #q, e.filename, e.lnum, e.col, e.type, e.text)"#,
+    )
+    .await;
+    assert_eq!(got, "1|a.rs|7|2|W|boom");
+}
+
+#[tokio::test]
+async fn append_action_extends_the_list() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", { lines = { "a.c:1:one" }, efm = "%f:%l:%m" })"#,
+    )
+    .await;
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({}, "a", { lines = { "b.c:2:two" }, efm = "%f:%l:%m" })"#,
+        r#"local q = vim.fn.getqflist()
+           return string.format("%d|%s|%s", #q, q[1].text, q[2].text)"#,
+    )
+    .await;
+    assert_eq!(got, "2|one|two");
+}
+
+#[tokio::test]
+async fn cgetbuffer_parses_the_current_buffer() {
+    let (rpc, mut incoming) = start().await;
+    // Put compiler-style output in the buffer, set a matching efm, then ingest it.
+    message_after(&rpc, &mut incoming, ":set efm=%f:%l:%c:%m<CR>").await;
+    message_after(&rpc, &mut incoming, "ilib.rs:42:7:warn<Esc>").await;
+    message_after(&rpc, &mut incoming, ":cgetbuffer<CR>").await;
+
+    let got = exec_lua(
+        &rpc,
+        r#"local q = vim.fn.getqflist()
+           local e = q[1]
+           return string.format("%d|%s|%d|%d|%s", #q, e.filename, e.lnum, e.col, e.text)"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("1|lib.rs|42|7|warn"));
+}
+
+#[tokio::test]
+async fn malformed_errorformat_fails_loud() {
+    let (rpc, mut incoming) = start().await;
+    // A bad directive (`%y` is not a field, not a prefix at this position) must
+    // surface vim's E37x rather than silently producing an empty list.
+    message_after(&rpc, &mut incoming, ":set efm=x%y<CR>").await;
+    let msg = message_after(&rpc, &mut incoming, ":cgetbuffer<CR>").await;
+    assert!(
+        msg.contains("E377"),
+        "an invalid errorformat should report E377, got {msg:?}"
+    );
+    // And the list stays empty — the bad parse didn't half-populate it.
+    let count = exec_lua(&rpc, "return #vim.fn.getqflist()").await;
+    assert_eq!(count.as_i64(), Some(0));
+}
+
+// --- Phase 2: the quickfix window + navigation -----------------------------
+
+#[tokio::test]
+async fn copen_renders_the_list() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({
+             { filename = "a.c", lnum = 10, col = 5, text = "boom" },
+             { filename = "b.c", lnum = 3, text = "later" },
+           }, " ")"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    // The quickfix window is focused; its buffer holds the rendered lines.
+    let rendered = lines(&rpc).await;
+    assert_eq!(rendered[0], "a.c|10 col 5| boom");
+    assert_eq!(rendered[1], "b.c|3| later");
+}
+
+#[tokio::test]
+async fn enter_in_qf_window_jumps_to_the_entry() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("qf_jump", "txt", "one\ntwo\nthree\nfour\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "here" }} }}, " ")"#
+        ),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    // <CR> on the first entry jumps into the source file at line 2.
+    message_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, path, "landed in the entry's file");
+    assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
+}
+
+#[tokio::test]
+async fn cc_and_cnext_navigate_entries() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("qf_nav", "txt", "1\n2\n3\n4\n5\n6\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{
+                 {{ filename = "{path}", lnum = 2, text = "a" }},
+                 {{ filename = "{path}", lnum = 4, text = "b" }},
+               }}, " ")"#
+        ),
+    )
+    .await;
+    // :cc 1 jumps to the first entry (line 2); :cnext steps to the second (line 4).
+    message_after(&rpc, &mut incoming, ":cc 1<CR>").await;
+    assert_eq!(cursor(&rpc).await.0, 2);
+    message_after(&rpc, &mut incoming, ":cnext<CR>").await;
+    assert_eq!(cursor(&rpc).await.0, 4);
+    // :cprev steps back to the first.
+    message_after(&rpc, &mut incoming, ":cprev<CR>").await;
+    assert_eq!(cursor(&rpc).await.0, 2);
+}
+
+#[tokio::test]
+async fn cnext_past_the_end_reports_e553() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("qf_e553", "txt", "1\n2\n3\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, text = "only" }} }}, " ")"#
+        ),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":cc<CR>").await; // on the sole entry
+    let msg = message_after(&rpc, &mut incoming, ":cnext<CR>").await;
+    assert!(
+        msg.contains("E553"),
+        "past the last item should be E553, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn copen_then_cclose_opens_and_closes_the_window() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
+    )
+    .await;
+    let before = win_count(&rpc).await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    assert_eq!(win_count(&rpc).await, before + 1, ":copen adds a window");
+    message_after(&rpc, &mut incoming, ":cclose<CR>").await;
+    assert_eq!(win_count(&rpc).await, before, ":cclose removes it");
+}
+
+#[tokio::test]
+async fn quickfix_window_is_nomodifiable() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    let before = lines(&rpc).await;
+    // An edit attempt (`dd`) is refused with E21, exactly like vim's nomodifiable
+    // quickfix buffer — the list is left intact, not silently no-op'd.
+    let msg = message_after(&rpc, &mut incoming, "dd").await;
+    assert!(
+        msg.contains("E21"),
+        "an edit should be refused with E21, got {msg:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        before,
+        "the quickfix buffer is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn copen_opens_a_small_window_at_the_bottom() {
+    // A tall screen makes the size unambiguous: vim's default is ~10 rows, well
+    // under half of 40. (The earlier draft split the focused window 50/50 with the
+    // new window on *top* — this asserts the botright placement that replaced it.)
+    let (rpc, mut incoming) = start_attached(ServerInit::default(), 80, 40).await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    // The quickfix window is focused (win 0).
+    let height = rpc
+        .request("nvim_win_get_height", vec![Value::from(0u64)])
+        .await
+        .ok()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let row = match rpc
+        .request("nvim_win_get_position", vec![Value::from(0u64)])
+        .await
+    {
+        Ok(Value::Array(a)) => a.first().and_then(Value::as_u64).unwrap_or(0),
+        _ => 0,
+    };
+    assert!(
+        height <= 12,
+        "quickfix window should be small (~10), got {height}"
+    );
+    assert!(
+        row >= 20,
+        "quickfix window should sit at the bottom, got top row {row}"
+    );
+}

@@ -18,8 +18,9 @@ use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp,
     ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
-    LspOp, PanelOp, PickerOpenReq, PickerPush, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
-    TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
+    SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -122,6 +123,27 @@ pub struct TabMirror {
     pub buffers: Vec<u64>,
     /// The tab's focused window id (`nvim_tabpage_get_win`).
     pub current_window: u64,
+}
+
+/// One quickfix entry's row in the Rust→Lua `nx._qflist` mirror, pushed before
+/// each chunk so `vim.fn.getqflist()` reads the live list. Fields mirror the dict
+/// vim's `getqflist()` returns (minus the buffer-resolved extras Phase 1 omits).
+#[derive(Clone, Debug, Default)]
+pub struct QfMirror {
+    pub filename: String,
+    pub bufnr: i32,
+    pub module: String,
+    pub lnum: i64,
+    pub end_lnum: i64,
+    pub col: i64,
+    pub end_col: i64,
+    pub vcol: bool,
+    pub nr: i32,
+    pub pattern: String,
+    pub text: String,
+    /// Type char as a string (`"E"`/`"W"`/`"I"`/`"N"`), empty if none.
+    pub typ: String,
+    pub valid: bool,
 }
 
 /// One extmark's row in the Rust→Lua extmark mirror, pushed before each chunk so
@@ -382,6 +404,9 @@ pub(crate) struct Shared {
     /// editor's register file after the chunk. Reads resolve from the
     /// `nx._registers` mirror, so only the write needs an op.
     pub(crate) reg_ops: Vec<RegisterSetOp>,
+    /// `vim.fn.setqflist` requests, drained by the server into the editor's
+    /// quickfix list after the chunk. Reads resolve from the `nx._qflist` mirror.
+    pub(crate) qf_ops: Vec<QfSetOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
@@ -803,6 +828,12 @@ impl LuaRuntime {
         /// Take the register writes queued by `vim.fn.setreg` since the last drain,
         /// for the server to apply to the editor's register file.
         take_reg_ops -> Vec<RegisterSetOp> = reg_ops
+    }
+
+    take_queue! {
+        /// Take the `setqflist` requests queued since the last drain, for the server
+        /// to apply to the editor's quickfix list.
+        take_qf_ops -> Vec<QfSetOp> = qf_ops
     }
 
     take_queue! {
@@ -1525,6 +1556,33 @@ impl LuaRuntime {
         }
         let set: mlua::Function = nx.get("_set_reg_mirror")?;
         set.call(entries)
+    }
+
+    /// Refresh the `nx._qflist` mirror that `vim.fn.getqflist()` reads. Each entry
+    /// is one dict in list order (`{filename, lnum, col, text, type, …}`); the
+    /// prelude stores the array and the title behind `nx._qflist`.
+    pub fn set_qflist_mirror(&self, items: &[QfMirror], title: &str) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let arr = self.lua.create_table()?;
+        for (i, it) in items.iter().enumerate() {
+            let e = self.lua.create_table()?;
+            e.set("filename", it.filename.as_str())?;
+            e.set("bufnr", it.bufnr)?;
+            e.set("module", it.module.as_str())?;
+            e.set("lnum", it.lnum)?;
+            e.set("end_lnum", it.end_lnum)?;
+            e.set("col", it.col)?;
+            e.set("end_col", it.end_col)?;
+            e.set("vcol", it.vcol)?;
+            e.set("nr", it.nr)?;
+            e.set("pattern", it.pattern.as_str())?;
+            e.set("text", it.text.as_str())?;
+            e.set("type", it.typ.as_str())?;
+            e.set("valid", it.valid)?;
+            arr.set(i + 1, e)?;
+        }
+        let set: mlua::Function = nx.get("_set_qflist_mirror")?;
+        set.call((arr, title))
     }
 
     /// Refresh the Rust→Lua `vim.v` mirror with the editor-sourced predefined

@@ -37,11 +37,11 @@ pub use luafs::{FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp,
     HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue,
-    PanelOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp, TerminalOpenReq, TsOp,
-    UiInputReq, WindowOp,
+    PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, TabOp,
+    TerminalOpenReq, TsOp, UiInputReq, WindowOp,
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
-    JumpMirror, LuaRuntime, TabMirror, WindowMirror,
+    JumpMirror, LuaRuntime, QfMirror, TabMirror, WindowMirror,
 };
 pub use system::{BlockingSystem, StdBlockingSystem, SystemOutput, SystemSpec};

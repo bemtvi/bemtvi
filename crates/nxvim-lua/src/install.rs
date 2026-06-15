@@ -21,7 +21,8 @@ use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode,
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp,
     GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush,
-    PreviewPush, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
+    PreviewPush, QfItem, QfSetOp, RegisterSetOp, TabOp, TerminalOpenReq, TsOp, UiInputReq,
+    UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1504,6 +1505,49 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `nx._set_qflist(items, lines, efm, action, title)`: queue a [`QfSetOp`] for
+    // the server to apply to the editor's quickfix list after the chunk — the
+    // write half of `vim.fn.setqflist`. `items` is an array of entry dicts (the
+    // structured form) or nil; `lines` is an array of strings parsed against `efm`
+    // (the `{lines=…}` form) or nil. The Lua wrapper normalizes the public
+    // `setqflist(list, action, what)` signature down to these positionals.
+    let sh = shared.clone();
+    nx.set(
+        "_set_qflist",
+        lua.create_function(move |_, (items, lines, efm, action, title): QfSetArgs| {
+            let items = match items {
+                Some(tbl) => {
+                    let mut out = Vec::with_capacity(tbl.raw_len());
+                    for pair in tbl.sequence_values::<mlua::Table>() {
+                        out.push(qf_item_from_table(&pair?)?);
+                    }
+                    Some(out)
+                }
+                None => None,
+            };
+            let lines = match lines {
+                Some(tbl) => {
+                    let mut out = Vec::with_capacity(tbl.raw_len());
+                    for s in tbl.sequence_values::<String>() {
+                        out.push(s?);
+                    }
+                    Some(out)
+                }
+                None => None,
+            };
+            // Default action is `' '` (new list); a non-empty arg's first char.
+            let action = action.and_then(|a| a.chars().next()).unwrap_or(' ');
+            sh.borrow_mut().qf_ops.push(QfSetOp {
+                items,
+                lines,
+                efm,
+                action,
+                title,
+            });
+            Ok(())
+        })?,
+    )?;
+
     // `nx._nx_set_ts_query(lang, name, text|nil)`: the native query setter behind
     // `nx.treesitter.set_query`. Queues a [`TsOp::SetQuery`] the server pushes
     // straight to the engine — no Lua merge/resolution. `nil` text drops the override.
@@ -1701,6 +1745,45 @@ fn store_panel_callback(lua: &Lua, cb: Option<mlua::Function>) -> mlua::Result<(
         Some(f) => lua.set_named_registry_value(PANEL_ON_SELECT, f),
         None => lua.set_named_registry_value(PANEL_ON_SELECT, mlua::Value::Nil),
     }
+}
+
+/// The positional arguments `nx._set_qflist` receives: `(items, lines, efm,
+/// action, title)`, where `items`/`lines` are Lua arrays and the rest strings.
+type QfSetArgs = (
+    Option<mlua::Table>,
+    Option<mlua::Table>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Convert one `setqflist` entry dict into a [`QfItem`]. Absent keys take their
+/// zero value; `valid` defaults to "has a line number" (vim's rule) when omitted.
+fn qf_item_from_table(t: &Table) -> mlua::Result<QfItem> {
+    let str_or =
+        |k: &str| -> mlua::Result<String> { Ok(t.get::<Option<String>>(k)?.unwrap_or_default()) };
+    let int_or =
+        |k: &str, d: i64| -> mlua::Result<i64> { Ok(t.get::<Option<i64>>(k)?.unwrap_or(d)) };
+    let lnum = int_or("lnum", 0)?;
+    let valid = match t.get::<Option<bool>>("valid")? {
+        Some(v) => v,
+        None => lnum > 0,
+    };
+    Ok(QfItem {
+        filename: t.get::<Option<String>>("filename")?,
+        bufnr: int_or("bufnr", 0)? as i32,
+        module: str_or("module")?,
+        lnum: lnum.max(0) as usize,
+        end_lnum: int_or("end_lnum", 0)?.max(0) as usize,
+        col: int_or("col", 0)?.max(0) as usize,
+        end_col: int_or("end_col", 0)?.max(0) as usize,
+        vcol: t.get::<Option<bool>>("vcol")?.unwrap_or(false),
+        nr: int_or("nr", -1)? as i32,
+        pattern: str_or("pattern")?,
+        text: str_or("text")?,
+        typ: str_or("type")?,
+        valid,
+    })
 }
 
 /// The Lua mirror table backing `nvim_get_hl(ns, …)` for namespace `ns`:

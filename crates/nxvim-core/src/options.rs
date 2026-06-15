@@ -109,7 +109,23 @@ pub struct Options {
     /// (neovim's `'scrollback'`; default `10000`). `0` keeps none. Read when a
     /// terminal opens; changing it affects terminals opened afterward.
     pub scrollback: usize,
+    /// The scanf-style `'errorformat'` used to parse `:make`/`:grep`/`:cbuffer`
+    /// output into quickfix entries (see [`crate::editor::quickfix`]). A
+    /// comma-separated list of format parts; default [`DFLT_EFM`]. Global-only for
+    /// now (vim's per-buffer `'errorformat'` lands with `:lmake`/buffer compilers).
+    pub errorformat: String,
+    /// How a quickfix jump (`<CR>` / `:cc` / `:cnext`) chooses the window to land
+    /// in (`'switchbuf'`): a comma list of `useopen` (reuse a window already on the
+    /// target buffer), `usetab`, `split`, `vsplit`, `newtab`, `uselast`. Empty
+    /// (vim's default) reuses the window the quickfix list was opened from. Honored
+    /// by [`crate::editor::quickfix`]; `usetab` is not yet acted on.
+    pub switchbuf: String,
 }
+
+/// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
+/// (`option_vars.h`), recognizing gcc/clang, the `make[N]: Entering directory`
+/// stack, the `In file included from` chains, and the quickfix-window save form.
+pub const DFLT_EFM: &str = "%*[^\"]\"%f\"%*\\D%l: %m,\"%f\"%*\\D%l: %m,%-Gg%\\?make[%*\\d]: *** [%f:%l:%m,%-Gg%\\?make: *** [%f:%l:%m,%-G%f:%l: (Each undeclared identifier is reported only once,%-G%f:%l: for each function it appears in.),%-GIn file included from %f:%l:%c:,%-GIn file included from %f:%l:%c\\,,%-GIn file included from %f:%l:%c,%-GIn file included from %f:%l,%-G%*[ ]from %f:%l:%c,%-G%*[ ]from %f:%l:,%-G%*[ ]from %f:%l\\,,%-G%*[ ]from %f:%l,%f:%l:%c:%m,%f(%l):%m,%f:%l:%m,\"%f\"\\, line %l%*\\D%c%*[^ ] %m,%D%*\\a[%*\\d]: Entering directory %*[`']%f',%X%*\\a[%*\\d]: Leaving directory %*[`']%f',%D%*\\a: Entering directory %*[`']%f',%X%*\\a: Leaving directory %*[`']%f',%DMaking %*\\a in %f,%f|%l| %m";
 
 impl Default for Options {
     fn default() -> Self {
@@ -154,6 +170,10 @@ impl Default for Options {
             scrollanimduration: 160,
             // Keep 10000 scrolled-off terminal lines, matching neovim's default.
             scrollback: 10_000,
+            // The compiled-in gcc/make-aware errorformat.
+            errorformat: DFLT_EFM.to_string(),
+            // Empty: a quickfix jump reuses the window the list was opened from.
+            switchbuf: String::new(),
         }
     }
 }
@@ -572,6 +592,8 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "scrollanim" | "sca" => Some(("scrollanim", Bool)),
         "scrollanimduration" | "scad" => Some(("scrollanimduration", Num)),
         "scrollback" | "scbk" => Some(("scrollback", Num)),
+        "errorformat" | "efm" => Some(("errorformat", Str)),
+        "switchbuf" | "swb" => Some(("switchbuf", Str)),
         // Buffer-local: drives the treesitter language override rather than a
         // global string slot (handled specially in `apply_set_str`).
         "filetype" | "ft" => Some(("filetype", Str)),

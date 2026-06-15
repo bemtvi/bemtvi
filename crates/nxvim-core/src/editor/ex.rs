@@ -506,6 +506,27 @@ impl Editor {
             "bf" | "bfirst" | "br" | "brewind" => self.ex_bfirst(),
             "bl" | "blast" => self.ex_blast(),
             "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => self.ex_bdelete(args, bang),
+            // Quickfix ingest from a buffer (Phase 1). `:cbuffer` replaces the list,
+            // `:caddbuffer` appends; the `:cget*` variants are identical here (the
+            // window-open / jump-to-first coupling lands with the quickfix window in
+            // Phase 2). The optional argument is a buffer number; default current.
+            "cb" | "cbu" | "cbuf" | "cbuff" | "cbuffe" | "cbuffer" | "cgetb" | "cgetbu"
+            | "cgetbuf" | "cgetbuff" | "cgetbuffe" | "cgetbuffer" => {
+                self.ex_cbuffer(args, QfAction::New)
+            }
+            "cad" | "cadd" | "caddb" | "caddbu" | "caddbuf" | "caddbuff" | "caddbuffe"
+            | "caddbuffer" => self.ex_cbuffer(args, QfAction::Add),
+            // Quickfix window + navigation (Phase 2).
+            "cope" | "copen" => self.ex_copen(args),
+            "ccl" | "cclo" | "cclos" | "cclose" => self.ex_cclose(),
+            "cw" | "cwin" | "cwindow" => self.ex_cwindow(args),
+            "cc" => self.ex_cc(parse_opt_count_arg(args)),
+            "cn" | "cne" | "cnex" | "cnext" => self.ex_cstep(true, parse_count_arg(args)),
+            "cp" | "cpr" | "cprev" | "cprevious" | "cN" | "cNext" => {
+                self.ex_cstep(false, parse_count_arg(args))
+            }
+            "cfir" | "cfirst" | "cr" | "crewind" => self.ex_cfirst(),
+            "cla" | "clast" => self.ex_clast(),
             "lua" => self.lua_queue.push(args.to_string()),
             "sleep" | "sl" => match parse_sleep(args) {
                 Ok(ms) => self.pending_sleep = Some(ms),

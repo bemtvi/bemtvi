@@ -9,13 +9,13 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::EditHost;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
-    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, TabId, UndoEntry,
-    UndoTreeView, WindowConfigSpec, WindowId,
+    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
+    TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DockOp, ExtmarkMirror, ExtmarkOp,
-    FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp, TabMirror,
-    TabOp, TsOp, WindowMirror, WindowOp,
+    FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp, QfItem,
+    QfMirror, TabMirror, TabOp, TsOp, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -24,6 +24,26 @@ use std::collections::HashSet;
 /// the buffer (row into `[0, line_count]`, col into the line's byte length) the
 /// way neovim tolerates out-of-range extmark positions. `col` is a byte offset
 /// within the line, matching the rest of nxvim's column model.
+/// Convert a Lua-side [`QfItem`] (from `setqflist`) into a core [`QfEntry`]. The
+/// type char is the first byte of the (possibly empty) `type` string.
+fn qf_entry_from_item(it: QfItem) -> QfEntry {
+    QfEntry {
+        filename: it.filename,
+        bufnr: it.bufnr,
+        module: it.module,
+        lnum: it.lnum,
+        end_lnum: it.end_lnum,
+        col: it.col,
+        end_col: it.end_col,
+        vcol: it.vcol,
+        nr: it.nr,
+        pattern: it.pattern,
+        text: it.text,
+        typ: it.typ.bytes().next().unwrap_or(0),
+        valid: it.valid,
+    }
+}
+
 fn byte_of(buf: &nxvim_core::Buffer, row: i64, col: i64) -> usize {
     let n = buf.line_count();
     let row = (row.max(0) as usize).min(n);
@@ -287,6 +307,33 @@ impl EditHost {
         for op in self.lua.take_reg_ops() {
             self.editor
                 .set_register_api(op.name, op.text, op.linewise, op.append);
+        }
+        // `setqflist` writes: structured items, or raw lines parsed against `efm`
+        // (the editor's `'errorformat'` when the op omits one). A malformed efm
+        // fails loud on the message line rather than silently dropping the call.
+        for op in self.lua.take_qf_ops() {
+            let action = match op.action {
+                'a' => QfAction::Add,
+                'r' => QfAction::Replace,
+                _ => QfAction::New,
+            };
+            if let Some(items) = op.items {
+                let entries = items.into_iter().map(qf_entry_from_item).collect();
+                self.editor.qf_set_items(entries, action, op.title);
+            } else if let Some(lines) = op.lines {
+                let efm = op
+                    .efm
+                    .unwrap_or_else(|| self.editor.global_options().errorformat);
+                if let Err(e) = self
+                    .editor
+                    .qf_set_from_lines(&lines, &efm, action, op.title)
+                {
+                    self.editor.echo(e);
+                }
+            } else {
+                // Neither items nor lines: an explicit clear.
+                self.editor.qf_set_items(Vec::new(), action, op.title);
+            }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
         // labelled text prompt and remember which callback awaits the result. Only
@@ -1134,6 +1181,7 @@ impl EditHost {
                 .unwrap_or_default(),
         );
         self.push_undotree_mirror();
+        self.push_qflist_mirror();
         // Now that every mirror is consistent, fire the `nvim_buf_attach` callbacks.
         // `on_bytes` (and `on_reload`) go first — they edit the `vim.treesitter`
         // parser's trees so the next `:parse()` reparses incrementally — then
@@ -1173,6 +1221,38 @@ impl EditHost {
         if !updates.is_empty() || pruned {
             let _ = self.lua.set_undotree_mirror(&updates, &live);
         }
+    }
+
+    /// Refresh the `nx._qflist` mirror that `vim.fn.getqflist()` reads from the
+    /// editor's current quickfix list. Cheap (a handful of short strings each), so
+    /// it isn't gated on a dirty flag — pushed alongside the other per-tick mirrors.
+    pub(crate) fn push_qflist_mirror(&mut self) {
+        let list = self.editor.qf_list();
+        let items: Vec<QfMirror> = list
+            .items
+            .iter()
+            .map(|e| QfMirror {
+                filename: e.filename.clone().unwrap_or_default(),
+                bufnr: e.bufnr,
+                module: e.module.clone(),
+                lnum: e.lnum as i64,
+                end_lnum: e.end_lnum as i64,
+                col: e.col as i64,
+                end_col: e.end_col as i64,
+                vcol: e.vcol,
+                nr: e.nr,
+                pattern: e.pattern.clone(),
+                text: e.text.clone(),
+                typ: if e.typ == 0 {
+                    String::new()
+                } else {
+                    (e.typ as char).to_string()
+                },
+                valid: e.valid,
+            })
+            .collect();
+        let title = list.title.clone();
+        let _ = self.lua.set_qflist_mirror(&items, &title);
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

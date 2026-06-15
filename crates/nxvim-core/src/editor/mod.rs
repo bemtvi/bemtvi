@@ -47,6 +47,7 @@ mod operators;
 mod options;
 mod panel;
 mod persist;
+mod quickfix;
 mod registers;
 mod search;
 mod syntax;
@@ -82,6 +83,7 @@ pub(crate) use self::jumps::JumpEntry;
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
+pub use self::quickfix::{QfAction, QfEntry, QfList};
 pub(crate) use self::search::{SearchDir, SearchOffset};
 pub(crate) use self::syntax::fill_indent;
 
@@ -815,6 +817,20 @@ pub struct Editor {
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
+    /// The quickfix list: errors parsed from command output / ingested text via
+    /// `'errorformat'`. One global list for now; the location-list twin and the
+    /// list stack land in Phase 4. See [`quickfix`](crate::editor::quickfix).
+    quickfix: QfList,
+    /// The display buffer for the quickfix window (`:copen`), created lazily on
+    /// first open and kept thereafter so its window/cursor persist. The buffer is
+    /// an ordinary scratch buffer whose id is remembered here; that id is what
+    /// marks it read-only (`is_quickfix_buffer`) and re-rendered on list change. A
+    /// window shows the quickfix list iff its buffer is this id.
+    qf_bufnr: Option<BufferId>,
+    /// The window focused just before `:copen`, used as the default jump target so
+    /// `<CR>` in the quickfix window lands in the code window the list was opened
+    /// from (vim's behavior with an empty `'switchbuf'`). Re-validated on use.
+    qf_prev_win: Option<WindowId>,
     /// The highlight-group registry a colorscheme populates via `nvim_set_hl`.
     /// Mutated only by the server through the Lua drain path, keeping the core
     /// state machine pure; queried when resolving captures/chrome to styles.
@@ -1233,6 +1249,9 @@ impl Editor {
             complete_accept_request: None,
             should_quit: false,
             options: Options::default(),
+            quickfix: QfList::default(),
+            qf_bufnr: None,
+            qf_prev_win: None,
             highlights: Highlights::new(),
             width: 80,
             height: 24,
@@ -1408,6 +1427,20 @@ impl Editor {
         // boundary. See [`Editor::handle_explorer`].
         if self.mode == Mode::Normal && self.is_explorer_buffer() {
             self.handle_explorer(key);
+            return;
+        }
+
+        // The quickfix window is an ordinary window onto a `nomodifiable` buffer
+        // (vim's model): every normal-mode key — motions, search, `<C-w>…`, `:` —
+        // flows through unchanged, and edits are refused with `E21` at the
+        // `modifiable()` chokepoints. The one special key is `<CR>`, which jumps to
+        // the entry on the cursor's line (vim's buffer-local quickfix mapping).
+        if self.mode == Mode::Normal
+            && self.is_quickfix_buffer()
+            && self.pending.is_clean()
+            && key.code == KeyCode::Enter
+        {
+            self.qf_jump_to_index(self.cursor.line);
             return;
         }
 

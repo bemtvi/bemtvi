@@ -181,6 +181,18 @@ function nx._set_reg_mirror(t)
   nx._registers = t or {}
 end
 
+-- Rust→Lua mirror of the core quickfix list, refreshed by the server
+-- (nx._set_qflist_mirror) before any Lua that can read it. `nx._qflist` is the
+-- array of entry dicts in list order; `nx._qflist_title` the list title. Backs
+-- vim.fn.getqflist; vim.fn.setqflist queues a server-side op (no write-through —
+-- the parsed result only exists once the server drains the QfSetOp).
+nx._qflist = nx._qflist or {}
+nx._qflist_title = nx._qflist_title or ""
+function nx._set_qflist_mirror(items, title)
+  nx._qflist = items or {}
+  nx._qflist_title = title or ""
+end
+
 -- Arbitrary (Lua-only) global options plugins set via vim.o; the wired options
 -- live in their scope (vim.wo / vim.bo / nx._go_mirror) instead. Seeded with
 -- the few defaults colorschemes read (termguicolors / background / *blend).

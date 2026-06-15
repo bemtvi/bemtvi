@@ -448,6 +448,46 @@ pub struct GlobalOptionOp {
     pub value: OptionValue,
 }
 
+/// One structured quickfix item from `setqflist(list, …)` — the Lua-side dict
+/// form, before the server resolves it into a `nxvim_core::QfEntry`. Mirrors the
+/// keys vim's `setqflist` accepts; absent keys arrive as their zero value.
+#[derive(Clone, Debug, Default)]
+pub struct QfItem {
+    pub filename: Option<String>,
+    pub bufnr: i32,
+    pub module: String,
+    pub lnum: usize,
+    pub end_lnum: usize,
+    pub col: usize,
+    pub end_col: usize,
+    pub vcol: bool,
+    pub nr: i32,
+    pub pattern: String,
+    pub text: String,
+    /// Type char as a (possibly empty) string — `"E"`/`"W"`/`"I"`/`"N"`.
+    pub typ: String,
+    /// Whether vim considers the item valid (jumpable). The Lua side defaults this
+    /// to "has a line number" when the dict omits `valid`.
+    pub valid: bool,
+}
+
+/// A `setqflist(list, action, what)` request, drained by the server into the
+/// editor's quickfix list after the chunk. Exactly one of `items` (the structured
+/// form) or `lines` (raw text parsed against `efm`) is set.
+#[derive(Clone, Debug)]
+pub struct QfSetOp {
+    /// Structured items (the `list` / `what.items` form).
+    pub items: Option<Vec<QfItem>>,
+    /// Raw output lines to parse (the `what.lines` form).
+    pub lines: Option<Vec<String>>,
+    /// `'errorformat'` for `lines`; `None` uses the editor's option.
+    pub efm: Option<String>,
+    /// Action: `' '` (new / replace) / `'a'` (append) / `'r'` (replace current).
+    pub action: char,
+    /// List title (`what.title`), if given.
+    pub title: Option<String>,
+}
+
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the
 /// `nx.treesitter.set_query` → native-engine seam. The Lua side queues an
 /// override that the server pushes straight to the engine — no Lua merge or

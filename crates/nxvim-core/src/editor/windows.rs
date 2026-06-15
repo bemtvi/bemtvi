@@ -1096,6 +1096,8 @@ impl Editor {
             "mousescroll" => self.options.mousescroll = value.to_string(),
             "regexsyntax" => self.options.regexsyntax = value.to_string(),
             "fileencodings" => self.options.fileencodings = value.to_string(),
+            "errorformat" => self.options.errorformat = value.to_string(),
+            "switchbuf" => self.options.switchbuf = value.to_string(),
             _ => {}
         }
     }
@@ -1549,6 +1551,50 @@ impl Editor {
         // `cursor`/`top` already describe it — only the viewport shrank.
         self.relayout();
         self.ensure_visible();
+    }
+
+    /// Open a window showing `buf` as a full-width split at the very bottom of the
+    /// tiled layout — vim's `botright` placement — `height` rows tall, and focus
+    /// it. Unlike [`Editor::split`] (which splits the *focused* window, new sibling
+    /// on top, 50/50) this wraps the whole layout so the new window spans the full
+    /// width below everything, regardless of any vertical splits. Backs `:copen`.
+    /// Returns the new window's id.
+    pub(crate) fn open_bottom_window(&mut self, buf: BufferId, height: usize) -> WindowId {
+        let options = self.windows.get(self.windows.current).options;
+        let new_id = self.alloc_window_id();
+        self.windows.windows.insert(
+            new_id,
+            Window {
+                buffer: buf,
+                saved_cursor: Cursor::default(),
+                saved_top: 0,
+                saved_leftcol: 0,
+                saved_cursors: Vec::new(),
+                rect: Rect::default(),
+                options,
+                float: None,
+                jumps: Vec::new(),
+                jump_idx: 0,
+                resume: None,
+            },
+        );
+        // Wrap the entire tiled layout: [existing, new] stacked vertically, the new
+        // window last (bottom). A placeholder briefly stands in for the root while
+        // it is moved into the split's first child.
+        let old_root = std::mem::replace(&mut self.windows.root, Node::Leaf(new_id));
+        self.windows.root = Node::Split {
+            dir: SplitDir::Horizontal,
+            children: vec![old_root, Node::Leaf(new_id)],
+            sizes: vec![1, 1],
+        };
+        // Lay out so rects exist, focus (stashing the old window's view, seeding the
+        // new one's), then shrink to the requested height and lay out again.
+        self.relayout();
+        self.focus_window(new_id);
+        self.set_window_height(new_id, height);
+        self.relayout();
+        self.ensure_visible();
+        new_id
     }
 
     /// `<C-w>c` / `:close` — close the focused window and expand a neighbor to

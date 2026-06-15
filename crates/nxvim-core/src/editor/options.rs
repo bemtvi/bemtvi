@@ -283,6 +283,16 @@ impl Editor {
             }
             return;
         }
+        // `errorformat` resets to the compiled-in default (not the empty string,
+        // which would leave the quickfix parser with no pattern — E378).
+        if name == "errorformat" {
+            match op {
+                StrOp::Set(value) => self.set_global_option_str("errorformat", &value),
+                StrOp::Reset => self.options.errorformat = crate::options::DFLT_EFM.to_string(),
+                StrOp::Query => self.echo(format!("errorformat={}", self.options.errorformat)),
+            }
+            return;
+        }
         match op {
             StrOp::Set(value) => self.set_global_option_str(name, &value),
             StrOp::Reset => self.set_global_option_str(name, ""),
@@ -294,6 +304,7 @@ impl Editor {
                     "mouse" => self.options.mouse.clone(),
                     "mousemodel" => self.options.mousemodel.clone(),
                     "mousescroll" => self.options.mousescroll.clone(),
+                    "switchbuf" => self.options.switchbuf.clone(),
                     _ => return,
                 };
                 self.echo(format!("{name}={value}"));

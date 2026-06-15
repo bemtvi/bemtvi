@@ -106,6 +106,38 @@ try {
   check("wasm write: invalid-UTF-8 round-trips byte-identical through the seam",
     eq(after, INVALID), `orig=${JSON.stringify(INVALID)} after=${JSON.stringify(after)}`);
 
+  // 3. An embedded C0 control (0x01) renders as the `^A` caret token AND gets the
+  //    SpecialKey colour. The native build overlays the `SpecialKey` highlight group
+  //    via server-computed spans; the wasm build paints JS-side, so the server hands
+  //    it the token's display columns in `special_key` and renderLine() colours them.
+  const CONTROL = [0x61, 0x01, 0x62, 0x0a]; // "a\x01b\n"
+  await opfsSeed("enc", "control.txt", CONTROL);
+  await page.evaluate(() => window.__nxvim.feed(":e /enc/control.txt<CR>"));
+  await sleep(150);
+  // The display row substitutes the control char (`a^Ab`); the buffer keeps the raw scalar.
+  const dispLine = await page.evaluate(() => {
+    const fw = (window.__nxvim.frame()?.windows || []).find((w) => w.focused);
+    return fw ? fw.lines[0] : null;
+  });
+  check("wasm display: 0x01 substitutes to the ^A caret token",
+    dispLine === "a^Ab", `got ${JSON.stringify(dispLine)}`);
+  // The server marks the token's display columns (^A starts at col 1, width 2 → [1,3]).
+  const sk = await page.evaluate(() => {
+    const fw = (window.__nxvim.frame()?.windows || []).find((w) => w.focused);
+    return fw ? fw.special_key?.[0] : null;
+  });
+  check("wasm redraw: special_key carries the token's display columns",
+    Array.isArray(sk) && sk.length === 1 && sk[0][0] === 1 && sk[0][1] === 3,
+    `special_key[0]=${JSON.stringify(sk)}`);
+  // The rendered DOM paints the token in the SpecialKey colour (#d787ff = rgb(215,135,255)).
+  const skColored = await page.evaluate(() => {
+    const want = "rgb(215, 135, 255)";
+    return [...document.querySelectorAll("#grid span")].some(
+      (s) => s.textContent.includes("^A") && getComputedStyle(s).color === want);
+  });
+  check("wasm paint: the ^A token is coloured as SpecialKey", skColored,
+    "no #grid span with text ^A and color rgb(215, 135, 255)");
+
   await browser.close();
 } finally {
   cleanup();

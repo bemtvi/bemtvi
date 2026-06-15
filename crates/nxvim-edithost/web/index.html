@@ -710,6 +710,13 @@
       const secCols = new Set((w.secondary_cursors || []).filter(([r]) => r === row).map(([, c]) => c));
       const inSpan = (sp, c) => c >= sp[0] && c < sp[1];
       const COLOR_OWNED = new Set(["cur-block", "cur-mc", "seccur", "search", "incsearch"]);
+      // Display columns of the `^X` / `<xx>` control-char tokens the server already
+      // substituted into `line`; colour them as `SpecialKey` so they read as
+      // non-text (the native build overlays the same group via its highlight
+      // spans). LightMagenta, matching the native fallback when no colorscheme
+      // resolves the group.
+      const special = w.special_key?.[row] || [];
+      const SPECIAL_KEY = "#d787ff";
 
       let run = "", runCls = "", runColor = "", out = "";
       const flush = () => {
@@ -727,7 +734,7 @@
         if (secCols.has(c)) cls = "seccur";
         if (isFocused && row === cursorRow && c === cursorCol) cls = cursorClass();
         else if (!w.focused && row === cursorRow && c === cursorCol && !view.command_mode && !view.panel) cls = "cur-hollow";
-        const color = COLOR_OWNED.has(cls) ? "" : (cells[c].color || "");
+        const color = COLOR_OWNED.has(cls) ? "" : (special.some((s) => inSpan(s, c)) ? SPECIAL_KEY : (cells[c].color || ""));
         if (cls !== runCls || color !== runColor) { flush(); runCls = cls; runColor = color; }
         run += cells[c].ch;
       }

@@ -258,6 +258,13 @@ impl EditHost {
         let highlights = self.highlights_for(win.buffer, &win.numbers, styles);
         #[cfg(not(feature = "native"))]
         let highlights = Value::Array(Vec::new());
+        // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
+        // to colour as `SpecialKey`; the native client paints them from `highlights`,
+        // so it gets an empty array (keeping the redraw map shape stable).
+        #[cfg(feature = "native")]
+        let special_key = Value::Array(Vec::new());
+        #[cfg(not(feature = "native"))]
+        let special_key = special_key_spans(&win.lines, win.tabstop);
         let status = self.status_value(win, mode_label, statusline_fmt, styles);
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
@@ -344,6 +351,7 @@ impl EditHost {
                 Value::from(win.number_width as u64),
             ),
             (Value::from("tabstop"), Value::from(win.tabstop as u64)),
+            (Value::from("special_key"), special_key),
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("diagnostics_virt"), diagnostics_virt),
@@ -755,11 +763,54 @@ pub(crate) fn display_lines_value(lines: &[String]) -> Value {
     )
 }
 
-/// Project the bottom panel (`:messages`, `:ls`) into its redraw sub-map.
+/// Per-line **display-column** spans (`[start, end)`, half-open, same virtcol
+/// space as `selection`/`search`) of the unprintable control chars that
+/// [`display_lines_value`] substitutes as `^X` / `<xx>` tokens. The native build
+/// colours these tokens by overlaying the `SpecialKey` highlight group in its
+/// server-computed highlight spans (`treesitter.rs`); the wasm edit-host has no
+/// server highlights and paints from the buffer text JS-side, so it needs the
+/// token columns spelled out to give them the same colour. Emitted only on the
+/// non-native build for that reason — over a daemon the web takes the
+/// server-styled path and gets `SpecialKey` from the highlight spans instead.
+#[cfg(not(feature = "native"))]
+fn special_key_spans(lines: &[String], tabstop: usize) -> Value {
+    Value::Array(
+        lines
+            .iter()
+            .map(|l| {
+                let positions = unicode::unprintable_positions(l);
+                if positions.is_empty() {
+                    return Value::Array(Vec::new());
+                }
+                // `LineVirtcol::at` walks forward; `unprintable_positions` returns
+                // byte ranges in increasing order, so the (sb, eb, next sb, …) calls
+                // are monotonic and stay on the cheap forward path.
+                let mut vc = unicode::LineVirtcol::new(l, tabstop);
+                Value::Array(
+                    positions
+                        .iter()
+                        .map(|&(sb, eb)| {
+                            let start = vc.at(sb) as u64;
+                            let end = vc.at(eb) as u64;
+                            Value::Array(vec![Value::from(start), Value::from(end)])
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Project the bottom panel (`:messages`, `:ls`) into its redraw sub-map. Panel
+/// rows go through [`display_lines_value`] so an unprintable control byte in a
+/// message — a C1 control from the latin1 fallback, an embedded C0 control —
+/// shows as its `^X` / `<xx>` token rather than a font tofu box, exactly as the
+/// window text does. The panel paints plain text (no per-cell span overlay), so
+/// the substitution needs no accompanying column math.
 fn project_panel(p: &PanelView) -> Value {
     Value::Map(vec![
         (Value::from("title"), Value::from(p.title.as_str())),
-        (Value::from("lines"), lines_value(&p.lines)),
+        (Value::from("lines"), display_lines_value(&p.lines)),
         (Value::from("cursor_row"), Value::from(p.cursor_row as u64)),
         (
             Value::from("cursor_span"),

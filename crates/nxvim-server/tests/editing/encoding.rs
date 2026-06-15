@@ -415,6 +415,75 @@ async fn unprintable_control_bytes_render_as_caret_and_hex_tokens() {
     );
 }
 
+/// The `[start, end)` display-column ranges of the `SpecialKey` spans on row `row`.
+fn special_key_spans(map: &[(Value, Value)], row: usize) -> Vec<(u64, u64)> {
+    let windows = map_get(map, "windows")
+        .and_then(Value::as_array)
+        .expect("a windows array");
+    let Value::Map(w0) = &windows[0] else {
+        panic!("window 0 is not a map")
+    };
+    map_get(w0, "highlights")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.get(row))
+        .and_then(Value::as_array)
+        .map(|spans| {
+            spans
+                .iter()
+                .filter_map(|s| {
+                    let s = s.as_array()?;
+                    (s.get(2)?.as_str()? == "SpecialKey").then_some(())?;
+                    Some((s.first()?.as_u64()?, s.get(1)?.as_u64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn c0_only_line_keys_the_special_key_overlay_at_the_token_width() {
+    // Regression: a line whose only unprintable char is a *C0* control (0x01) — all
+    // ASCII bytes — must still map the `^A` token to its 2-cell display width. The
+    // `LineVirtcol` fast path used to assume 1 cell per ASCII byte, so a C0-only line
+    // mis-placed the `SpecialKey` overlay (a C1 control, being non-ASCII, masked it).
+    let path = temp_path("enc_c0_only");
+    std::fs::write(&path, b"a\x01b\n").expect("write C0-only file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        window_display_lines(&map).first().map(String::as_str),
+        Some("a^Ab"),
+        "0x01 → ^A caret token"
+    );
+    // 'a' at col 0, `^A` spanning cols 1..3 (2 cells), 'b' at col 3.
+    assert_eq!(
+        special_key_spans(&map, 0),
+        vec![(1, 3)],
+        "the SpecialKey overlay must cover both cells of the ^A token, not just one"
+    );
+}
+
+#[tokio::test]
+async fn messages_panel_substitutes_control_chars() {
+    // The `:messages` panel runs its rows through the same display projection as
+    // the window text, so a control char in a recorded message shows as its
+    // `^X` / `<xx>` token rather than a font tofu box. `:echomsg "a\eb"` records a
+    // line with an embedded ESC (0x1b) — caret notation `^[`.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":echomsg \"a\\eb\"<CR>");
+    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
+    let history = panel_lines(&map);
+    assert!(
+        history.iter().any(|l| l == "a^[b"),
+        "the ESC must render as the ^[ caret token in :messages; history was {history:?}"
+    );
+    assert!(
+        !history.iter().any(|l| l.contains('\u{1b}')),
+        "no raw ESC byte may reach the rendered panel; history was {history:?}"
+    );
+}
+
 // ===== multibyte / CJK encodings =============================================
 //
 // `encoding_rs` decodes *and* encodes the legacy CJK families (Shift_JIS, EUC-JP,

@@ -127,7 +127,12 @@ impl<'a> LineVirtcol<'a> {
     /// Build a mapper for `line`. The O(line_len) `simple` scan is paid once per
     /// line, replacing the per-offset re-walk.
     pub fn new(line: &'a str, tabstop: usize) -> Self {
-        let simple = line.bytes().all(|b| b.is_ascii() && b != b'\t');
+        // The 1-byte-1-cell shortcut holds only for printable ASCII: a tab expands,
+        // and C0 controls / DEL are ASCII yet render as 2-cell `^X` tokens (see
+        // [`grapheme_width`] / [`control_width`]). `is_ascii_control` covers both the
+        // C0 range and DEL, so excluding it (plus the high bytes) keeps the fast path
+        // correct on lines with embedded control chars.
+        let simple = line.bytes().all(|b| b.is_ascii() && !b.is_ascii_control());
         LineVirtcol {
             line,
             tabstop,

@@ -333,11 +333,25 @@ governs the on-disk form.
   (`nxvim/tests/screen.rs`: the highlighted token, and the enveloping cursor).
   Printable
   high bytes (`é`, `ÿ`) still render as their glyph — they were never tofu — so
-  only the genuinely-unprintable bytes get the hex treatment. *Remaining:* the
-  `:messages` panel still shows raw lines (plain text, no span math, so no
-  misalignment — only a stray control char in a message would tofu); the wasm
-  build substitutes the text but JS-side highlighting doesn't add the SpecialKey
-  colour.
+  only the genuinely-unprintable bytes get the hex treatment. **Closed
+  (2026-06-15):** the `:messages` panel now runs its rows through the same
+  `display_lines_value` projection (`project_panel`), so a control char in a
+  recorded message shows as its `^X`/`<xx>` token rather than tofu (the panel
+  paints plain text with a row-span highlight, so no per-cell column math is
+  needed). And the **wasm** build now colours the tokens: the redraw carries a
+  per-window `special_key` field (display-column ranges of the substituted
+  tokens, emitted only on the non-native build — native paints them from its
+  `SpecialKey` highlight spans), and the web `renderLine()` paints those columns
+  in LightMagenta (`#d787ff`), matching the native fallback. Fixing this also
+  surfaced a latent `LineVirtcol` bug: its 1-byte-1-cell fast path treated **C0
+  controls / DEL** (ASCII, but 2-cell `^X` tokens) as one cell, so a C0-*only*
+  line mis-placed the overlay — a C1 control, being non-ASCII, had always forced
+  the slow path and masked it. The `simple` predicate now excludes
+  `is_ascii_control()`. Covered by `tests/editing/encoding.rs`
+  (`messages_panel_substitutes_control_chars`,
+  `c0_only_line_keys_the_special_key_overlay_at_the_token_width`) and three new
+  checks in `web/verify-encoding.mjs` (substitution + `special_key` columns +
+  the painted SpecialKey colour).
 
 - **Multibyte / CJK encodings ✅ (2026-06-15).** Shift_JIS, EUC-JP, GBK, Big5,
   EUC-KR, KOI8-R, windows-125x, … decode *and* encode through the existing seam —
@@ -364,9 +378,6 @@ Still open, not required for correctness:
 
 - Broaden the statusline `&option` resolver beyond the buffer-display options the
   `StatuslineCtx` carries (thread the buffer into `render_statusline`).
-- Render `^X` / `<xx>` control-char tokens in the `:messages` panel (the buffer
-  display already substitutes them); add the JS-side `SpecialKey` colour to the wasm
-  build (it substitutes the text but doesn't highlight it).
 
 ---
 

@@ -203,6 +203,24 @@ native) runs the real PTY via Phase 3's `TerminalManager`; the browser owns the 
 - **Native gating:** non-web `:terminal` continues to use the local `TerminalManager`. The
   serverless browser (OPFS, no daemon) reports `:terminal` is unavailable, loud.
 
+  **Implemented (Phase 7).** Wire methods: `term_open`/`term_write`/`term_resize`/`term_kill`
+  (edit-host → daemon) and `term_data`/`term_exit` (daemon → edit-host pushes), the buffer id
+  carried verbatim. The daemon side is `serve_term_daemon_on` (a streaming sibling of
+  `serve_proc_daemon_on`) wired into `run_daemon_io`'s multiplexer under the `term_` namespace —
+  so it rides the same QUIC/WebTransport bidi stream and reuses the native `TerminalManager`
+  PTY engine unchanged. Outbound: a wasm-only `HostEffects` terminal seam, the non-native
+  `dispatch_terminal_ops` building the local emulator then routing through it (gated on
+  `has_remote_proc` — serverless still fails loud), plus a non-native `sync_terminal_sizes`
+  (`redraw` now calls it for both builds). Inbound: the FFI feeds each `term_data` push
+  (`eh_terminal_data`, feed-only — a cheap vt100 parse) and the worker calls `eh_terminal_flush`
+  **once** after draining the push batch, so a flood costs one projection per repaint, never one
+  per chunk (the native leg's anti-freeze rule); `term_exit` lands via `eh_terminal_exit`. The
+  worker's `liveTerms` set joins `armedWatches`/`liveProcs` in the async-park gate so an open
+  terminal keeps the WebTransport reader live. New wasm exports (`build.sh` `EXPORTED_FUNCTIONS`):
+  `eh_take_terminal_requests`/`eh_terminal_data`/`eh_terminal_flush`/`eh_terminal_exit`. Proven
+  natively by `daemon_terminal.rs` (real PTY output/echo/kill over a duplex); the browser FFI leg
+  is covered by `web/verify-terminal.mjs` (run after `build.sh`, which needs emscripten).
+
 ## Out of scope / deferred (note in code, no silent stubs)
 
 - Cursor-shape styling in the terminal cell, `TermOpen`/`TermClose` autocmds, `:terminal` split

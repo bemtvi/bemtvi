@@ -604,18 +604,27 @@ async fn heavy_output_stays_bounded_and_does_not_freeze() {
     .await;
 
     // Browse: materialize the scrollback. It is bounded near the cap (not 40000),
-    // keeps the most recent output, and has dropped the oldest.
+    // keeps the most RECENT output, and has dropped the oldest. The flood spans
+    // several repaint batches and saturates the scrollback partway through, so the
+    // retained history must keep updating past saturation (an earlier bug froze it
+    // at the first cap-full state — the top stayed an early line).
     feed(&rpc, "<C-\\><C-n>G");
     let lc = line_count(&rpc).await;
     assert!(
         lc <= CAP + 64,
         "scrollback should stay capped near the limit, got {lc} lines"
     );
-    let head = lines_range(&rpc, 0, 1).await;
-    assert_ne!(
-        head.first().map(String::as_str),
-        Some("line1"),
-        "the oldest line is evicted once output passes the cap"
+    let top = lines_range(&rpc, 0, 1).await;
+    let top_n: usize = top
+        .first()
+        .and_then(|l| l.trim().strip_prefix("line"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        top_n >= N - CAP - 64,
+        "the retained scrollback must be the most recent ~cap lines; \
+         top is {top:?} (≈line {top_n}, expected ≈ {})",
+        N - CAP
     );
     feed(&rpc, "gg");
     assert_eq!(

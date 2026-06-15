@@ -194,7 +194,11 @@ impl EditHost {
         };
         let (rows, cols) = emu.parser.screen().size();
 
-        // Re-read the scrollback mirror only when its length changed since last frame.
+        // Re-read the scrollback mirror only when it actually scrolled since the last
+        // frame. The length alone can't tell: once the scrollback saturates at the cap
+        // it stays `cap` forever while its *contents* keep shifting, so we also compare
+        // the newest scrolled row (the row just above the live screen) against the last
+        // one we captured — that changes on every scroll, saturated or not.
         let held = {
             let screen = emu.parser.screen_mut();
             screen.set_scrollback(usize::MAX);
@@ -202,7 +206,17 @@ impl EditHost {
             screen.set_scrollback(0);
             held
         };
-        let scrolled = held != emu.last_held;
+        let newest = if held == 0 {
+            None
+        } else {
+            let screen = emu.parser.screen_mut();
+            screen.set_scrollback(1); // window row 0 = the newest scrolled row
+            let row = screen.rows(0, cols).next();
+            screen.set_scrollback(0);
+            row
+        };
+        let scrolled =
+            held != emu.last_held || newest.as_deref() != emu.history.last().map(String::as_str);
         if scrolled {
             emu.history = read_scrollback_text(emu.parser.screen_mut(), held, rows, cols);
             emu.parser.screen_mut().set_scrollback(0); // restore the live view

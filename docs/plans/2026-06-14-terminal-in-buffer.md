@@ -156,11 +156,15 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
     `on_term_events` collects the buffers fed in a batch and calls `terminal_project` once after the
     (byte-budgeted) drain. So a flood is one projection per frame, not per chunk.
   - **Re-read the history mirror only when the scrollback actually scrolled.** `terminal_project`
-    checks vt100's scrollback length against `last_held`; unchanged ⇒ rewrite only the live-screen
-    region (`replace_from = history.len()`) — steady typing stays `O(screen)`. Changed ⇒ re-read
-    the retained scrollback **text** via `read_scrollback_text` (vt100's view-window, paged) and
-    splice from `replace_from = 0`. The text read is bounded by the cap (≤10000 rows); a flood does
-    it once per frame (frames bounded by the 256 KiB repaint batching), so it stays fast.
+    detects a scroll by the length (`held != last_held`) **and** by whether the newest scrolled row
+    changed — the latter is essential because once the scrollback saturates at the cap the length
+    pins at `cap` forever while the contents keep shifting, so a length-only check would freeze the
+    history (an early bug: past 10k lines the top of history stayed an early line while the live
+    screen advanced). No scroll ⇒ rewrite only the live-screen region (`replace_from = history.len()`)
+    — steady typing stays `O(screen)`. Scrolled ⇒ re-read the retained scrollback **text** via
+    `read_scrollback_text` (vt100's view-window, paged) and splice from `replace_from = 0`. The text
+    read is bounded by the cap (≤10000 rows); a flood does it once per frame (frames bounded by the
+    256 KiB repaint batching), so it stays fast.
 
   **History color is materialized lazily, only while browsing.** The buffer *text* is always full
   (cheap to keep current every frame), but per-cell color for scrolled-off rows is expensive —

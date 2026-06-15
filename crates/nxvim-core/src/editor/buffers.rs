@@ -649,6 +649,36 @@ impl Editor {
         }
     }
 
+    /// `<C-w><C-w>{H,J,K,L}` — move the focused buffer to `target` layer and focus
+    /// it there. The source window first falls back to a sibling buffer in its own
+    /// layer — the alternate if it's a live same-layer buffer, else the nearest
+    /// sibling, else a fresh `[No Name]` — so the moved buffer ends up living only
+    /// in `target`. Crossing and showing it there retags its home layer (see
+    /// `OpenBuffer::layer`), so the per-layer buffer list (`:ls`) follows it. The
+    /// caller guarantees `target` is an open layer.
+    pub(crate) fn move_buffer_to_layer(&mut self, target: Layer) {
+        let buf = self.cur_buffer();
+        let src_layer = self.focused_layer;
+        let replacement = self
+            .alternate
+            .filter(|a| {
+                *a != buf
+                    && self.buffers.map.contains_key(a)
+                    && self.buffers.get(*a).layer == src_layer
+            })
+            .or_else(|| self.neighbor_of(buf, src_layer));
+        match replacement {
+            Some(rep) => self.switch_buffer(rep),
+            None => {
+                let id = self.add_buffer(Buffer::empty());
+                self.switch_buffer(id);
+            }
+        }
+        // Cross to the target layer and show `buf` there, restoring its saved view.
+        self.switch_layer(target);
+        self.switch_buffer(buf);
+    }
+
     /// The id of an already-open buffer bound to `path`, if any. Matches by
     /// *lexically* normalized path (so `./a` and `a` are the same buffer),
     /// **without touching the filesystem** — the pure core never does the

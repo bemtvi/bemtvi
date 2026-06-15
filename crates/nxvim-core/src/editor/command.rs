@@ -21,6 +21,10 @@ enum WindowCmd {
     Split(SplitDir),
     /// `<C-w>h/j/k/l` — move focus to the window in that direction.
     FocusDir(WinDir),
+    /// `<C-w>H/J/K/L` — swap the focused window's buffer (and its view) with the
+    /// nearest window in that direction, then follow it there. A no-op with no
+    /// neighbor on that side. See [`Editor::swap_window_dir`].
+    SwapDir(WinDir),
     /// `<C-w>w` (forward) / `<C-w>W` (backward) — cyclic focus.
     FocusCycle(bool),
     /// `<C-w>c` — close the focused window (refuses the last one).
@@ -55,6 +59,11 @@ enum LayerWindowCmd {
     /// `<C-w><C-w>{h,j,k,l}` — cross by edge: from the main area focus the dock on
     /// that side; from a dock return to the main area.
     CrossDir(WinDir),
+    /// `<C-w><C-w>{H,J,K,L}` — *move* the focused buffer to the layer on that edge:
+    /// from the main area to the dock on that side (a no-op if it is closed), from a
+    /// dock back to the main area. The source window falls back to a sibling buffer
+    /// in its own layer. See [`Editor::move_buffer_to_layer`].
+    MoveDir(WinDir),
     /// `<C-w><C-w>{v,s,c,…}` — cross to the other layer (the last-focused dock from
     /// the main area, or back to main from a dock) and run this window command
     /// there.
@@ -81,6 +90,10 @@ fn window_command(key: Key) -> Option<WindowCmd> {
         'j' => WindowCmd::FocusDir(WinDir::Down),
         'k' => WindowCmd::FocusDir(WinDir::Up),
         'l' => WindowCmd::FocusDir(WinDir::Right),
+        'H' => WindowCmd::SwapDir(WinDir::Left),
+        'J' => WindowCmd::SwapDir(WinDir::Down),
+        'K' => WindowCmd::SwapDir(WinDir::Up),
+        'L' => WindowCmd::SwapDir(WinDir::Right),
         'c' => WindowCmd::Close,
         'o' => WindowCmd::Only,
         'q' => WindowCmd::Quit,
@@ -106,6 +119,12 @@ fn layer_window_command(key: Key) -> Option<LayerWindowCmd> {
             Some('j') => return Some(LayerWindowCmd::CrossDir(WinDir::Down)),
             Some('k') => return Some(LayerWindowCmd::CrossDir(WinDir::Up)),
             Some('l') => return Some(LayerWindowCmd::CrossDir(WinDir::Right)),
+            // Capitals *move* the buffer to that layer (the dock on that edge, or
+            // back to main from a dock) — distinct from the lowercase focus cross.
+            Some('H') => return Some(LayerWindowCmd::MoveDir(WinDir::Left)),
+            Some('J') => return Some(LayerWindowCmd::MoveDir(WinDir::Down)),
+            Some('K') => return Some(LayerWindowCmd::MoveDir(WinDir::Up)),
+            Some('L') => return Some(LayerWindowCmd::MoveDir(WinDir::Right)),
             _ => {}
         }
     }
@@ -1376,6 +1395,18 @@ impl Editor {
                 // From a dock, any directional cross returns to the main area.
                 Layer::Dock(_) => self.switch_layer(Layer::Main),
             },
+            LayerWindowCmd::MoveDir(dir) => match self.focused_layer {
+                // From the main area, move the buffer to the dock on that edge — but
+                // only if that dock is open (mirrors `CrossDir`'s closed-dock no-op).
+                Layer::Main => {
+                    let side = DockSide::from_dir(dir);
+                    if self.dock_is_open(side) {
+                        self.move_buffer_to_layer(Layer::Dock(side));
+                    }
+                }
+                // From a dock, any directional move sends the buffer back to main.
+                Layer::Dock(_) => self.move_buffer_to_layer(Layer::Main),
+            },
             LayerWindowCmd::CrossThenWindow(wcmd) => match self.focused_layer {
                 Layer::Main => {
                     if self.dock_is_open(self.last_dock) {
@@ -1417,6 +1448,7 @@ impl Editor {
         match cmd {
             WindowCmd::Split(dir) => self.split(dir),
             WindowCmd::FocusDir(dir) => self.focus_dir(dir),
+            WindowCmd::SwapDir(dir) => self.swap_window_dir(dir),
             WindowCmd::FocusCycle(forward) => self.focus_cycle(forward),
             WindowCmd::Close => self.close_window(),
             WindowCmd::Only => self.only_window(),

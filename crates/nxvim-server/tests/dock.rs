@@ -1341,3 +1341,116 @@ async fn buf_list_focused_option_scopes_to_the_focused_layer() {
         std::fs::remove_file(&f).ok();
     }
 }
+
+/// `<C-w>H/J/K/L` swaps the focused window's buffer with the neighbor in that
+/// direction (within the layer), and focus follows the buffer to the neighbor.
+#[tokio::test]
+async fn ctrl_w_capital_swaps_buffers_between_splits() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iAAA<Esc>"); // window 1 (left) shows buffer A
+    feed(&rpc, "<C-w>v"); // vsplit; the right window is focused (also A)
+    command(&rpc, "enew").await; // give the right window a distinct buffer B
+    feed(&rpc, "iBBB<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["BBB"],
+        "focused right window shows B"
+    );
+
+    // Swap with the window to the LEFT; B should move there and focus follow it.
+    feed(&rpc, "<C-w>H");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["BBB"],
+        "B moved into the left window, focus followed it"
+    );
+    // The right window now holds A.
+    feed(&rpc, "<C-w>l");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["AAA"],
+        "A is now in the right window"
+    );
+}
+
+/// `<C-w><C-w>H/J/K/L` moves the focused buffer to the dock on that edge: the
+/// buffer follows into the dock, and the source window falls back to a fresh
+/// `[No Name]` when it had no other buffer of its own.
+#[tokio::test]
+async fn ctrl_w_ctrl_w_capital_moves_a_buffer_to_the_dock() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iMAIN<Esc>"); // main buffer = "MAIN"
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>"); // the dock's scratch buffer = "dock"
+    feed(&rpc, "<C-w><C-w>l"); // back to the main area
+    assert_eq!(lines(&rpc).await, vec!["MAIN"], "main shows MAIN");
+
+    // Move MAIN to the left dock — it follows there.
+    feed(&rpc, "<C-w><C-w>H");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["MAIN"],
+        "the buffer followed into the dock"
+    );
+    assert_eq!(
+        buf_count(&rpc).await,
+        3,
+        "MAIN, the dock scratch, and the main area's fresh [No Name]"
+    );
+
+    // The main area fell back to a fresh empty buffer, not the dock's content.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "main fell back to a fresh [No Name]"
+    );
+}
+
+/// From a dock, `<C-w><C-w>H/J/K/L` moves the buffer back to the main area (any
+/// direction), leaving the dock on a fresh empty buffer.
+#[tokio::test]
+async fn ctrl_w_ctrl_w_capital_moves_a_dock_buffer_back_to_main() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iMAIN<Esc>");
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "iDOCKBUF<Esc>"); // the dock's buffer
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["DOCKBUF"],
+        "focused on the dock buffer"
+    );
+
+    // From the dock, any capital direction sends the buffer to the main area.
+    feed(&rpc, "<C-w><C-w>L");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["DOCKBUF"],
+        "the buffer followed into the main area"
+    );
+
+    // The dock fell back to a fresh empty buffer.
+    feed(&rpc, "<C-w><C-w>h");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "the dock fell back to a fresh [No Name]"
+    );
+}
+
+/// `<C-w><C-w>H/J/K/L` is a no-op when the dock on that edge is closed (mirroring
+/// the lowercase focus cross), leaving the buffer in the main area.
+#[tokio::test]
+async fn ctrl_w_ctrl_w_capital_is_a_noop_when_the_target_dock_is_closed() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iMAIN<Esc>");
+    assert_eq!(win_count(&rpc).await, 1, "no dock open");
+
+    feed(&rpc, "<C-w><C-w>H"); // left dock is closed → nothing happens
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["MAIN"],
+        "buffer stayed in the main area"
+    );
+    assert_eq!(win_count(&rpc).await, 1, "still no dock");
+}

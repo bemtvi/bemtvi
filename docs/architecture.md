@@ -461,7 +461,9 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   arithmetic and a terminal resize rescales proportionally. Each leaf's text
   height is `rect.height - 1` (its own status line).
 - **Surface.** Splits: `:split`/`:vsplit`/`:new`/`:vnew` and `<C-w>s`/`<C-w>v`.
-  Focus: `<C-w>h/j/k/l` (spatial), `<C-w>w`/`<C-w>W` (cyclic). Close: `<C-w>c`/
+  Focus: `<C-w>h/j/k/l` (spatial), `<C-w>w`/`<C-w>W` (cyclic). Move:
+  `<C-w>H/J/K/L` swaps the focused window's buffer (and its view) with the spatial
+  neighbor on that edge, focus following the buffer (`swap_window_dir`). Close: `<C-w>c`/
   `:close`, `<C-w>o`/`:only`, `:hide`, `<C-w>q`/`:q`. Sizing: `<C-w>=`,
   `<C-w>+`/`-`/`<`/`>` (with counts), `<C-w>_`/`<C-w>|`, `:resize`/`:vertical
   resize`. `focus_window` is the window analogue of the buffer switch: it stashes
@@ -507,9 +509,12 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   Top | Bottom)}`, with the *focused* layer's tree always live on `Editor::windows`
   (the rest park per *Tab pages* above), so `split`/`close`/`focus`/editing/redraw
   act on whatever layer holds focus with zero retargeting. `<C-w><C-w>` is the
-  **layer-switch** prefix: `<C-w><C-w>{h,j,k,l}` crosses main↔dock-by-edge and
-  `<C-w><C-w>{cmd}` crosses then runs the command, while a single `<C-w>` stays in
-  the focused layer. The layer-switch chord is **mode-independent** — a small
+  **layer-switch** prefix: `<C-w><C-w>{h,j,k,l}` crosses main↔dock-by-edge,
+  `<C-w><C-w>{H,J,K,L}` *moves* the focused buffer to the layer on that edge (the
+  dock on that side — a no-op if it is closed — or back to main from a dock; the
+  source window falls back to a sibling/empty buffer of its own layer via
+  `move_buffer_to_layer`), and `<C-w><C-w>{cmd}` crosses then runs the command,
+  while a single `<C-w>` stays in the focused layer. The layer-switch chord is **mode-independent** — a small
   state machine (`Editor::dock_chord_intercept`, run ahead of the per-mode
   dispatch in `input`) reaches the docks from insert, visual, command and
   terminal mode too, leaving the source mode cleanly before it crosses; only
@@ -544,7 +549,12 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   for every focus cross). A hidden dock isn't invisible: `View.hidden_docks` carries a
   label per collapsed dock, which each client paints as a clickable `▸{label}` chip on
   the idle command-line row (`hidden_chip_at` maps a click back to `show_dock`).
-  (Design:
+  The **buffer list is per-layer**: each buffer carries the window layer it was last
+  shown in (`OpenBuffer::layer`, set by `set_cur_buffer`/`set_window_buffer`), so `:ls`
+  and `:bnext`/`:bprev` list only the focused region's buffers, closing a document
+  falls back to a sibling in the *same* layer (never pulling a dock's buffer into the
+  main area), and `nx.buf.list{focused=true}` exposes the focused-layer list to Lua
+  (`nvim_list_bufs` stays global). (Design:
   [`docs/plans/2026-06-14-permanent-docked-panels.md`](plans/2026-06-14-permanent-docked-panels.md),
   [`docs/plans/2026-06-14-dock-toggle-autohide.md`](plans/2026-06-14-dock-toggle-autohide.md).)
 - **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from

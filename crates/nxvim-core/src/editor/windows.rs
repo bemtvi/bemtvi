@@ -1746,11 +1746,20 @@ impl Editor {
     /// windows wholly on that side qualify; the closest by center wins. A no-op
     /// if there is none that way.
     pub(crate) fn focus_dir(&mut self, dir: WinDir) {
+        if let Some(id) = self.window_in_dir(dir) {
+            self.focus_window(id);
+        }
+    }
+
+    /// The nearest tiled window to the focused one in `dir` — the directional pick
+    /// shared by `<C-w>h/j/k/l` focus ([`Editor::focus_dir`]) and `<C-w>H/J/K/L`
+    /// buffer-swap ([`Editor::swap_window_dir`]): the candidate wholly on that side
+    /// whose center is closest. `None` when there is no window on that side.
+    fn window_in_dir(&self, dir: WinDir) -> Option<WindowId> {
         let cur = self.windows.current;
         let from = self.windows.get(cur).rect;
         let (fx, fy) = from.center();
-        let target = self
-            .windows
+        self.windows
             .leaves()
             .into_iter()
             .filter(|id| *id != cur)
@@ -1766,10 +1775,67 @@ impl Editor {
             .min_by_key(|id| {
                 let (cx, cy) = self.windows.get(*id).rect.center();
                 fx.abs_diff(cx) + fy.abs_diff(cy)
-            });
-        if let Some(id) = target {
-            self.focus_window(id);
+            })
+    }
+
+    /// `<C-w>H/J/K/L` — swap the focused window's buffer **and its view** (cursor,
+    /// scroll, secondary multi-cursors) with the nearest window in `dir`, then focus
+    /// that window so the buffer appears to have moved there (vim's `<C-w>H` feel).
+    /// Window positions, sizes, options and jumplists stay put — only the buffer +
+    /// view trade places. A no-op when there is no window on that side.
+    pub(crate) fn swap_window_dir(&mut self, dir: WinDir) {
+        let Some(target) = self.window_in_dir(dir) else {
+            return;
+        };
+        let cur = self.windows.current;
+        // Stash the focused window's live view into its [`Window`] (mirrors
+        // `focus_window`), so both windows hold their full view in the tree before
+        // the swap; secondary cursors are stashed and their live marks cleared.
+        self.stash_secondary_cursors();
+        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        {
+            let w = self.windows.get_mut(cur);
+            w.saved_cursor = cursor;
+            w.saved_top = top;
+            w.saved_leftcol = leftcol;
         }
+        self.swap_window_view(cur, target);
+        // Focus follows the buffer: enter the target, loading the just-swapped-in
+        // view as live.
+        self.enter_window(target);
+    }
+
+    /// Swap the buffer and view payload (cursor, scroll, secondary cursors) between
+    /// windows `a` and `b`, leaving each window's position, size, options and
+    /// jumplist in place. Both must be windows of the focused tree.
+    fn swap_window_view(&mut self, a: WindowId, b: WindowId) {
+        let wa = self.windows.get_mut(a);
+        let pa = (
+            wa.buffer,
+            wa.saved_cursor,
+            wa.saved_top,
+            wa.saved_leftcol,
+            std::mem::take(&mut wa.saved_cursors),
+        );
+        let wb = self.windows.get_mut(b);
+        let pb = (
+            wb.buffer,
+            wb.saved_cursor,
+            wb.saved_top,
+            wb.saved_leftcol,
+            std::mem::take(&mut wb.saved_cursors),
+        );
+        wb.buffer = pa.0;
+        wb.saved_cursor = pa.1;
+        wb.saved_top = pa.2;
+        wb.saved_leftcol = pa.3;
+        wb.saved_cursors = pa.4;
+        let wa = self.windows.get_mut(a);
+        wa.buffer = pb.0;
+        wa.saved_cursor = pb.1;
+        wa.saved_top = pb.2;
+        wa.saved_leftcol = pb.3;
+        wa.saved_cursors = pb.4;
     }
 
     /// Cyclic window focus (vim's `<C-w>w` forward / `<C-w>W` backward), wrapping

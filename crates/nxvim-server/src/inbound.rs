@@ -165,9 +165,15 @@ impl EditHost {
     ) {
         let mut budget: usize = 0;
         let mut ev = first;
+        // Buffers fed this batch, projected once after the drain (feeding only
+        // processes bytes — projecting per chunk would be one full re-read per chunk).
+        let mut dirty: Vec<BufferId> = Vec::new();
         loop {
-            if let TermEvent::Data { bytes, .. } = &ev {
+            if let TermEvent::Data { buf, bytes } = &ev {
                 budget += bytes.len();
+                if !dirty.contains(buf) {
+                    dirty.push(*buf);
+                }
             }
             self.on_term_event(ev);
             if budget >= TERM_BATCH_BYTES {
@@ -178,11 +184,15 @@ impl EditHost {
                 Err(_) => break,
             }
         }
+        for buf in dirty {
+            self.terminal_project(buf);
+        }
         self.settle_events(true);
     }
 
-    /// Apply one terminal event: feed output bytes to `buf`'s emulator, or record the
-    /// child's exit (append the notice, leave terminal mode) and drop the emulator.
+    /// Apply one terminal event: feed output bytes to `buf`'s emulator (the caller
+    /// projects after the batch), or record the child's exit (append the notice,
+    /// leave terminal mode) and drop the emulator.
     fn on_term_event(&mut self, ev: TermEvent) {
         match ev {
             TermEvent::Data { buf, bytes } => self.terminal_feed(buf, &bytes),

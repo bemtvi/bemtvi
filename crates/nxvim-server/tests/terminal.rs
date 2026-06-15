@@ -543,12 +543,13 @@ async fn scrollback_preserves_lines_that_scrolled_off_the_screen() {
     );
 }
 
-/// A scrolled-off row keeps its color: history rows project from the per-cell
-/// styles captured when they scrolled, not from live vt100 cells (which no longer
-/// hold them). `gg` brings the red first line into the viewport so its highlight
-/// is in the frame.
+/// Scrollback history is monochrome by design: the live screen keeps full color
+/// (Phase 4), but rows that have scrolled off store only their text — re-coloring a
+/// 10k-row scrollback on every frame is prohibitively expensive. A red line scrolled
+/// into history therefore renders with no color span, while the same escape on the
+/// live screen still does (covered by `terminal_projects_ansi_color_into_highlight_spans`).
 #[tokio::test]
-async fn scrollback_rows_keep_their_color() {
+async fn scrollback_history_is_monochrome() {
     let _guard = serial_lock().lock().await;
     let (rpc, mut incoming) = start().await;
 
@@ -560,24 +561,25 @@ async fn scrollback_rows_keep_their_color() {
     command(&rpc, &format!("terminal cat {path} -")).await;
     wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line40")).await;
 
-    // Browse (materialize scrollback) and scroll to the top so the red history row
-    // is rendered this frame.
+    // Scroll to the top: the red line is in history (its text is preserved)...
     feed(&rpc, "<C-\\><C-n>gg");
     assert_eq!(
         lines(&rpc).await.first().map(String::as_str),
         Some("redline"),
-        "the red line scrolled into history at the top"
+        "the red line scrolled into history, text preserved"
     );
+    // ...but it carries no color span — history is monochrome.
     const RED: u64 = 0x00cd_0000;
-    for _ in 0..200 {
+    for _ in 0..6 {
         if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
-            if first_red_fg_span(&map) == Some(RED) {
-                return;
-            }
+            assert_ne!(
+                first_red_fg_span(&map),
+                Some(RED),
+                "scrolled-off history must not carry color spans"
+            );
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    panic!("timed out waiting for the scrolled-off red line's color");
 }
 
 /// A flood of output far larger than the scrollback cap must not freeze the editor.

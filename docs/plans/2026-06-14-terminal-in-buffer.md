@@ -144,28 +144,30 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   faithful per-cell styles for history, and capture the choice here.
 
   **Decision (implemented):** vt100 owns the scrollback (`scrollback_len = SCROLLBACK_CAP = 10000`,
-  matching neovim); accumulating rows into its internal `VecDeque` is cheap. We do **not** mirror
-  it continuously. The critical realization for never-freeze: vt100 only exposes scrollback as a
-  moving **view-window** (`set_scrollback` shifts an offset; `rows`/`cell` read that window), and
-  reading it back — especially per-cell for styles — is the expensive part. So the rule is **never
-  read scrollback on the hot live-output path**:
+  matching neovim); accumulating rows into its internal `VecDeque` is cheap. The buffer **always**
+  mirrors the full `history ++ live screen` (like neovim) — *not* a screen-only-while-live /
+  full-while-browsing flip. An earlier lazy design did flip, and was fast, but made the cursor and
+  line numbers jump across `<C-\><C-n>` / `i` (the live screen-only buffer numbered the input line
+  ~58 while the materialized buffer numbered it ~200, and the cursor didn't follow its content) —
+  user-visibly broken. Always-full keeps them stable.
 
-  - **Live output** (the focused buffer is in terminal-job mode): `terminal_project` mirrors **only
-    the visible screen** into the buffer (`O(screen)` per PTY burst, no scrollback reads, no
-    per-line capture). A flood — `rg` printing 500k matches — stays linear and fast (measured ~0.4s
-    release for 500k); the buffer is just the 24-row screen, vt100 holds the history internally.
-  - **Browsing** (the user left terminal-insert with `<C-\><C-n>`, or it is a background terminal):
-    `terminal_project` materializes the retained scrollback from vt100 into `history:
-    Vec<ScrollLine>` (text + coalesced style runs, via `read_scrollback`) and projects `history ++
-    screen`, so `gg`/`G`/`<C-u>`/search/yank traverse it and the color path (taking `&self`) reads
-    the materialized rows. The cursor offset by `history.len()` keeps the live input position.
+  Speed without the per-row cost comes from two rules:
+  - **Project once per repaint, not per PTY chunk.** `terminal_feed` only runs the vt100 parser;
+    `on_term_events` collects the buffers fed in a batch and calls `terminal_project` once after the
+    (byte-budgeted) drain. So a flood is one projection per frame, not per chunk.
+  - **Re-read the history mirror only when the scrollback actually scrolled.** `terminal_project`
+    checks vt100's scrollback length against `last_held`; unchanged ⇒ rewrite only the live-screen
+    region (`replace_from = history.len()`) — steady typing stays `O(screen)`. Changed ⇒ re-read
+    the retained scrollback **text** via `read_scrollback_text` (vt100's view-window, paged) and
+    splice from `replace_from = 0`. The text read is bounded by the cap (≤10000 rows); a flood does
+    it once per frame (frames bounded by the 256 KiB repaint batching), so it stays fast.
 
-  `sync_terminal_view` (called each redraw) flips the focused terminal between the two views when
-  the mode changes without any PTY output to trigger a projection (e.g. `<C-\><C-n>` / `i`). The
-  one-time materialization on entering browse reads ≤ cap rows (~9ms release); re-materializing
-  while a child floods *during* browsing is the only `O(cap)`-per-burst path, and is a rare/odd
-  usage (you browse when output is paused). `Editor::terminal_update` stays a simple full-replace —
-  cheap because the live buffer is small (one screen) and browse reprojections are occasional.
+  **History is text-only (monochrome); the live screen keeps full color (Phase 4).** Capturing
+  per-cell styles for the whole scrollback every frame was measured at ~32s (debug) / unusable for
+  500k — the per-cell reads explode. Dropping scrollback color is the deliberate trade; the visible
+  live screen, where color matters most, is unaffected. Measured always-full: 100k ≈ 0.18s, 500k ≈
+  0.67s (release), buffer capped near 10k rows. `Editor::terminal_update` takes `(replace_from,
+  tail)` and splices that region, enabling the screen-only-region rewrite on no-scroll frames.
 
 ## Phase 7 — Web terminal over the daemon (`nxvim-edithost` + daemon, wasm-gated)
 

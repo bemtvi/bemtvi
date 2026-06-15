@@ -31,9 +31,6 @@ impl EditHost {
         // the wasm terminal resize rides the daemon leg (Phase 7).
         #[cfg(feature = "native")]
         self.sync_terminal_sizes();
-        // Flip the focused terminal between live (pinned) and browsing (scrollback
-        // materialized) when the mode changed without any PTY output to reproject.
-        self.sync_terminal_view();
         let view = self.editor.view(w, h);
 
         // Refresh the current buffer's highlights from the in-process engine for

@@ -146,31 +146,36 @@ impl Editor {
         self.echo("E21: Cannot make changes, 'modifiable' is off".to_string());
     }
 
-    /// Replace terminal buffer `buf`'s mirror with `lines` and place the terminal
-    /// cursor at `(cursor_row, cursor_col)` (0-based). The server keeps this buffer
-    /// small while output is live — it mirrors only the visible screen, materializing
-    /// the scrollback history into `lines` *only* when the user browses (terminal-
-    /// normal mode). So even under a flood (`rg` printing 500k matches) the per-burst
-    /// cost is `O(screen)`, never `O(history)`. Never touches undo or `modified` — a
-    /// terminal buffer mirrors a live screen, not edited text. A no-op if `buf` is not
-    /// an open terminal buffer.
+    /// Splice terminal buffer `buf`'s mirror: replace lines `[replace_from, end)`
+    /// with `tail_lines` and place the terminal cursor at the absolute
+    /// `(cursor_row, cursor_col)` (0-based). The buffer always mirrors the full
+    /// `scrollback history ++ live screen`, so the cursor and line numbers are stable
+    /// across `<C-\><C-n>` / `i` (like neovim). The server only **rewrites the live
+    /// screen region** (`replace_from = history length`) on a refresh where nothing
+    /// scrolled, and rebuilds from `replace_from = 0` only when the scrollback
+    /// changed — so steady typing and most output stay cheap even with a full
+    /// scrollback. Never touches undo or `modified` — a terminal buffer mirrors a
+    /// live screen, not edited text. A no-op if `buf` is not an open terminal buffer.
     pub fn terminal_update(
         &mut self,
         buf: BufferId,
-        lines: &[String],
+        replace_from: usize,
+        tail_lines: &[String],
         cursor_row: usize,
         cursor_col: usize,
     ) {
         if !self.is_terminal_buffer(buf) {
             return;
         }
-        let mut text = lines.join("\n");
+        let mut text = tail_lines.join("\n");
         text.push('\n');
         let is_current = buf == self.cur_buffer();
         let ob = self.buffers.get_mut(buf);
+        let from = replace_from.min(ob.buffer.line_count());
+        let start = ob.buffer.line_start(from);
         let len = ob.buffer.len_bytes();
-        ob.buffer.remove(0..len);
-        ob.buffer.insert(0, &text);
+        ob.buffer.remove(start..len);
+        ob.buffer.insert(start, &text);
         ob.buffer.normalize();
         // A terminal buffer is never "modified" relative to a backing store — it has
         // none — and these refreshes must not flip the `[+]` flag or arm a write.

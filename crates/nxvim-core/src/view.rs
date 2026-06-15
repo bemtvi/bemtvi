@@ -106,6 +106,13 @@ pub struct MenuView {
     /// The picker prompt's query text — `Some` for a `nx.picker`, `None` for a
     /// promptless `nx.ui.select`. Presence tells the client to draw a prompt line.
     pub query: Option<String>,
+    /// The picker prompt's text-cursor position, as a count of chars before it
+    /// (the caret column within `query`). `0` for a promptless `nx.ui.select`.
+    pub query_cursor: usize,
+    /// Where the picker prompt sits relative to the list
+    /// ([`PromptPos`](crate::editor::PromptPos)). `Top` (the default) for a
+    /// promptless `nx.ui.select`; only meaningful when `query` is `Some`.
+    pub prompt_pos: crate::editor::PromptPos,
     /// The picker box's fixed width / height ([`MenuExtent`](crate::editor::MenuExtent),
     /// `None` ⇒ the picker default), resolved against the viewport by the server at
     /// projection time. Both `None` for a content-anchored `nx.ui.select`.

@@ -316,6 +316,11 @@ impl EditHost {
                 req.dynamic,
                 parse_menu_extent(&req.width),
                 parse_menu_extent(&req.height),
+                if req.prompt_bottom {
+                    nxvim_core::PromptPos::Bottom
+                } else {
+                    nxvim_core::PromptPos::Top
+                },
             );
             self.pending_ui_select = None;
             self.picker_active = true;

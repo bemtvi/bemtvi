@@ -1227,11 +1227,18 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_picker_open",
         lua.create_function(
-            move |_, (dynamic, width, height): (bool, Option<String>, Option<String>)| {
+            move |_,
+                  (dynamic, width, height, prompt_bottom): (
+                bool,
+                Option<String>,
+                Option<String>,
+                Option<bool>,
+            )| {
                 sh.borrow_mut().picker_opens.push(PickerOpenReq {
                     dynamic,
                     width: width.unwrap_or_default(),
                     height: height.unwrap_or_default(),
+                    prompt_bottom: prompt_bottom.unwrap_or(false),
                 });
                 Ok(())
             },

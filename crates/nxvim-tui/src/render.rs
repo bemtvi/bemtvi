@@ -270,10 +270,12 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     }
 
     // The floating selectable-list menu (`nx.ui.select`) floats the same way,
-    // over the focused window's text area, with input focus.
-    if let (Some(menu), Some((inner, _, _))) = (&view.menu, focused_inner) {
-        render_menu(frame, inner, menu);
-    }
+    // over the focused window's text area, with input focus. A picker returns its
+    // prompt caret position so we can draw the terminal cursor there.
+    let menu_cursor = match (&view.menu, focused_inner) {
+        (Some(menu), Some((inner, _, _))) => render_menu(frame, inner, menu),
+        _ => None,
+    };
 
     // A focused panel owns the cursor: draw it on the panel's current line and
     // skip the text/command cursor entirely.
@@ -283,6 +285,13 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
             content.x,
             content.y + panel.cursor_row.min(content.height.saturating_sub(1)),
         ));
+        return;
+    }
+
+    // An open picker owns the cursor: draw it in the prompt, not the text window
+    // behind the float.
+    if let Some(pos) = menu_cursor {
+        frame.set_cursor_position(pos);
         return;
     }
 
@@ -1656,7 +1665,7 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 /// highlighted row is reverse-video. The box is `Clear`ed first so the text
 /// beneath doesn't bleed through, and the list scrolls to keep the selection
 /// visible when there are more items than rows.
-fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) {
+fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) -> Option<(u16, u16)> {
     let x = text_area.x.saturating_add(menu.col);
     let y = text_area.y.saturating_add(menu.row);
     let width = menu
@@ -1674,7 +1683,7 @@ fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) {
         height,
     };
     if area.width < 3 || area.height < 3 {
-        return;
+        return None;
     }
     let block = Block::new().borders(Borders::ALL);
     let inner = block.inner(area);
@@ -1682,36 +1691,77 @@ fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) {
     frame.render_widget(block, area);
 
     let width = inner.width as usize;
-    // A picker carries a prompt row at the top; the list scrolls in the rows below
-    // it. A promptless `nx.ui.select` uses the whole box for the list.
-    let prompt_rows = usize::from(menu.query.is_some());
-    let list_rows = (inner.height as usize).saturating_sub(prompt_rows);
+    let inner_h = inner.height as usize;
+    // A picker carries a prompt row and a separator row (the `chrome`); the list
+    // fills the rest. A promptless `nx.ui.select` has neither — the list is the
+    // whole box. The prompt sits above the list by default, or below it when the
+    // source/open asked for it (telescope-style).
+    let has_prompt = menu.query.is_some();
+    let chrome = usize::from(has_prompt) * 2;
+    let list_rows = inner_h.saturating_sub(chrome);
     let start = pmenu_start(Some(menu.selected), list_rows);
-    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    if let Some(query) = &menu.query {
-        // `> query` prompt line, the query in bold so it reads as the live input.
-        let mut spans = vec![Span::styled(
-            "> ",
-            Style::default().add_modifier(Modifier::DIM),
-        )];
-        spans.push(Span::styled(
-            pmenu_row(query, "", width.saturating_sub(2)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::from(spans));
-    }
-    for r in 0..list_rows {
+
+    // Build one list row (or a blank filler past the end of the list).
+    let list_line = |r: usize| -> Line<'static> {
         let idx = start + r;
-        let Some(label) = menu.items.get(idx) else {
-            lines.push(Line::from(" ".repeat(width)));
-            continue;
-        };
-        let selected = idx == menu.selected;
-        let empty = Vec::new();
-        let spans = menu.match_spans.get(idx).unwrap_or(&empty);
-        lines.push(menu_row_line(label, spans, selected, width));
+        match menu.items.get(idx) {
+            Some(label) => {
+                let empty = Vec::new();
+                let spans = menu.match_spans.get(idx).unwrap_or(&empty);
+                menu_row_line(label, spans, idx == menu.selected, width)
+            }
+            None => Line::from(" ".repeat(width)),
+        }
+    };
+    // `> query` prompt line — the query in bold so it reads as the live input.
+    let prompt_line = || -> Line<'static> {
+        let query = menu.query.as_deref().unwrap_or("");
+        Line::from(vec![
+            Span::styled("> ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                pmenu_row(query, "", width.saturating_sub(2)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+    // A full-width horizontal rule separating the prompt from the list.
+    let sep_line = || -> Line<'static> {
+        Line::from(Span::styled(
+            "─".repeat(width),
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
+    // The prompt row's offset within `inner` (for the caret); `None` when promptless.
+    let mut prompt_row = None;
+    if has_prompt && menu.prompt_bottom {
+        for r in 0..list_rows {
+            lines.push(list_line(r));
+        }
+        lines.push(sep_line());
+        prompt_row = Some(lines.len());
+        lines.push(prompt_line());
+    } else if has_prompt {
+        prompt_row = Some(0);
+        lines.push(prompt_line());
+        lines.push(sep_line());
+        for r in 0..list_rows {
+            lines.push(list_line(r));
+        }
+    } else {
+        for r in 0..list_rows {
+            lines.push(list_line(r));
+        }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+
+    // The terminal caret sits in the prompt, past the `> ` prefix at the query's
+    // text-cursor column (clamped inside the box).
+    prompt_row.map(|row| {
+        let caret = (2 + menu.query_cursor).min(inner.width.saturating_sub(1));
+        (inner.x + caret, inner.y + row as u16)
+    })
 }
 
 /// Build one menu row: the `label` padded to `width`, reverse-video when

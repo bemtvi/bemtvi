@@ -4,7 +4,6 @@
 -- nx.pum / nx.pos / nx.match / nx.jumplist registries that plugins query. Each is
 -- authored as an nx.* noun with its vim.fn.* alias.
 local vim = vim
-local api = vim.api
 local fn = vim.fn
 nx = nx or {}
 
@@ -154,7 +153,10 @@ fn.getpos = nx.pos.get
 -- Other marks are accepted but not stored (no writable-mark mirror), returning 0.
 function nx.pos.set(expr, pos)
   if expr == "." then
-    api.nvim_win_set_cursor(0, { pos[2], math.max(0, (pos[3] or 1) - 1) })
+    -- The mutating `vim.api.nvim_win_set_cursor` is intentionally nil in Lua
+    -- (ADR 0002); move the cursor through the supported `nx._win_set_cursor`
+    -- bridge instead (0-based line, 0-based col).
+    nx._win_set_cursor(0, math.max(0, (pos[2] or 1) - 1), math.max(0, (pos[3] or 1) - 1))
   end
   return 0
 end

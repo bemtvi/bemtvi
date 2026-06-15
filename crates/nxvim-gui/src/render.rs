@@ -1028,11 +1028,12 @@ impl Renderer {
             self.build_status_row(&win.status, (ox, srow), wcols, view, quads, items);
         }
 
-        // The cursor lives only in the focused window — but a focused panel or the
-        // command line owns it instead, so suppress the window cursor while either
-        // is active (it reappears on the command line / panel). While sliding it
+        // The cursor lives only in the focused window — but a focused panel, the
+        // command line, or an open picker owns it instead, so suppress the window
+        // cursor while any is active (it reappears in that widget). While sliding it
         // tracks the interpolated cursor line so it moves with the text.
-        if win.focused && view.panel.is_none() && !view.command_mode {
+        let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
+        if win.focused && view.panel.is_none() && !view.command_mode && !picker_open {
             // The cursor shifts right by the inlay hints spliced in at or before its
             // column (a hint exactly at the cursor sits before the cursor glyph), so
             // it tracks the splice. Mid-slide that's the band's hints on the cursor's
@@ -1639,13 +1640,50 @@ impl Renderer {
         self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
 
         let full = self.full_bounds();
-        // A picker carries a prompt row at the top; the list fills the rows below.
-        let prompt_rows = u16::from(menu.query.is_some());
-        if let Some(query) = &menu.query {
+        let cx = bx + 1;
+        // A picker carries a prompt row plus a separator (the `chrome`); the list
+        // fills the rest. The prompt sits above the list by default, or below it
+        // (telescope-style) when asked. A promptless `nx.ui.select` has neither.
+        let has_prompt = menu.query.is_some();
+        let chrome = u16::from(has_prompt) * 2;
+        let list_rows = menu.height.saturating_sub(chrome);
+        // Row offsets within the box content (below the top border at `by + 1`): the
+        // first list row, the prompt row, and the separator row.
+        let (list_y0, prompt_y, sep_y) = if !has_prompt {
+            (0, 0, 0)
+        } else if menu.prompt_bottom {
+            (0, list_rows + 1, list_rows)
+        } else {
+            (2, 0, 1)
+        };
+
+        if has_prompt {
+            let query = menu.query.as_deref().unwrap_or("");
             let text = pmenu_row(&format!("> {query}"), "", menu.width as usize);
-            self.push_plain(items, &text, self.cell_px(bx + 1, by + 1), fg, full);
+            self.push_plain(items, &text, self.cell_px(cx, by + 1 + prompt_y), fg, full);
+            // The separator: a thin horizontal rule across the box, in the border tint.
+            let (px, py) = self.cell_px(cx, by + 1 + sep_y);
+            quads.push(Quad {
+                x: px,
+                y: py + self.cell_h * 0.5,
+                w: self.cell_w * menu.width as f32,
+                h: (self.cell_h * 0.08).max(1.0),
+                color: color_to_rgba(srgb_to_color(border)),
+            });
+            // The caret: a thin bar past the `> ` prefix at the query's cursor column.
+            let caret = (2 + menu.query_cursor).min(menu.width.saturating_sub(1));
+            let (cpx, cpy) = self.cell_px(cx + caret, by + 1 + prompt_y);
+            let mut c = srgb_to_color_rgba(fg, 0.9);
+            c[3] = 0.9;
+            quads.push(Quad {
+                x: cpx,
+                y: cpy,
+                w: self.cell_w * 0.15,
+                h: self.cell_h,
+                color: c,
+            });
         }
-        let list_rows = menu.height.saturating_sub(prompt_rows);
+
         let start = pmenu_start(Some(menu.selected), list_rows as usize);
         // A warm accent on matched characters, so the fuzzy match reads at a glance.
         let match_fg = 0x00E5_C07B;
@@ -1654,8 +1692,7 @@ impl Renderer {
             let Some(label) = menu.items.get(idx) else {
                 continue;
             };
-            let cx = bx + 1;
-            let row = by + 1 + prompt_rows + r;
+            let row = by + 1 + list_y0 + r;
             if idx == menu.selected {
                 self.fill_cells(quads, cx, row, menu.width, sel_bg);
             }

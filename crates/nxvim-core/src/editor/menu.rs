@@ -36,6 +36,18 @@ pub enum MenuPlacement {
     Editor,
 }
 
+/// Where a picker's prompt sits relative to its results list — above it (`Top`,
+/// the default) or below it (`Bottom`, the telescope-style "input at the bottom"
+/// layout). Only meaningful for a picker (a promptless `nx.ui.select` has no
+/// prompt); the client lays the box out accordingly and draws the separator
+/// between the prompt and the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PromptPos {
+    #[default]
+    Top,
+    Bottom,
+}
+
 /// A picker box dimension: a fixed size, never content-derived (a content-hugging
 /// picker looks ragged). Resolved against the editor viewport at projection time.
 /// `Cells` is an absolute column/row count; `Frac` is a fraction `(0, 1]` of the
@@ -124,6 +136,13 @@ impl Prompt {
             .next_back()
             .map(|(i, _)| i)
     }
+
+    /// The text cursor as a count of characters before it — the caret's column
+    /// within the single-line query, which the client draws the prompt caret at
+    /// (the prompt is char-indexed like the menu's match spans).
+    fn cursor_chars(&self) -> usize {
+        self.query[..self.col].chars().count()
+    }
 }
 
 /// An open menu. `all_items` holds every candidate (fixed for `select`, growing as
@@ -151,6 +170,9 @@ pub(crate) struct Menu {
     gpending: bool,
     /// The input-grab query field — `Some` for a picker, `None` for `select`.
     prompt: Option<Prompt>,
+    /// Where the picker prompt sits relative to the list ([`PromptPos`]). Only
+    /// meaningful when `prompt` is `Some`; ignored for a promptless `select`.
+    prompt_pos: PromptPos,
     /// A dynamic source forwards the query and bypasses the local matcher.
     dynamic: bool,
     /// Bumped on every query edit; the staleness token threaded to the server so a
@@ -258,6 +280,7 @@ impl Editor {
             placement,
             gpending: false,
             prompt: None,
+            prompt_pos: PromptPos::default(),
             dynamic: false,
             generation: 0,
             items_gen: 0,
@@ -280,6 +303,7 @@ impl Editor {
         dynamic: bool,
         width: Option<MenuExtent>,
         height: Option<MenuExtent>,
+        prompt_pos: PromptPos,
     ) {
         self.menu = Some(Menu {
             all_items: Vec::new(),
@@ -289,6 +313,7 @@ impl Editor {
             placement,
             gpending: false,
             prompt: Some(Prompt::default()),
+            prompt_pos,
             dynamic,
             generation: 0,
             items_gen: 0,
@@ -509,6 +534,8 @@ impl Editor {
             total: m.view_len(),
             placement: m.placement,
             query: m.prompt.as_ref().map(|p| p.query.clone()),
+            query_cursor: m.prompt.as_ref().map_or(0, |p| p.cursor_chars()),
+            prompt_pos: m.prompt_pos,
             width: m.width,
             height: m.height,
         })

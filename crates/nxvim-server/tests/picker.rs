@@ -15,7 +15,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, lines, map_get, spawn, temp_dir,
+    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -641,6 +641,126 @@ nx.picker.source {
         "the closed picker A's late push must not leak into picker B, got {items:?}"
     );
     assert_eq!(items, vec!["run2"], "picker B shows only its own run's row");
+}
+
+#[tokio::test]
+async fn prompt_carries_the_caret_column_and_it_tracks_edits() {
+    // The picker projects the prompt's text-cursor as `query_cursor` (a char count)
+    // so the client can draw a caret in the input box. It advances as you type and
+    // moves with <Left>/<Right>.
+    let dir = temp_dir("picker_caret");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    // Empty query → caret at column 0.
+    assert_eq!(
+        map_get(&menu, "query_cursor").and_then(Value::as_u64),
+        Some(0)
+    );
+
+    feed(&rpc, "ap");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("typed"));
+    assert_eq!(
+        map_get(&menu, "query_cursor").and_then(Value::as_u64),
+        Some(2),
+        "caret sits past the two typed chars"
+    );
+
+    // <Left> moves the caret without changing the query.
+    feed(&rpc, "<Left>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("moved left"));
+    assert_eq!(
+        map_get(&menu, "query_cursor").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(map_get(&menu, "query").and_then(Value::as_str), Some("ap"));
+}
+
+#[tokio::test]
+async fn prompt_position_defaults_to_top_and_is_configurable_to_bottom() {
+    let dir = temp_dir("picker_prompt_pos");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    // Default: prompt above the list.
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("default"));
+    assert_eq!(
+        map_get(&menu, "prompt_pos").and_then(Value::as_str),
+        Some("top"),
+        "the prompt sits above the list by default"
+    );
+    feed(&rpc, "<Esc>");
+    poll_menu(&rpc, &mut incoming).await;
+
+    // Per-open override: input below the results.
+    exec_lua(&rpc, "nx.picker.open('fruits', { prompt_pos = 'bottom' })").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("bottom"));
+    assert_eq!(
+        map_get(&menu, "prompt_pos").and_then(Value::as_str),
+        Some("bottom"),
+        "the open option places the input below the results"
+    );
+}
+
+#[tokio::test]
+async fn the_separator_row_is_reserved_between_prompt_and_list() {
+    // A picker box of height H shows H-2 list rows: one row for the prompt and one
+    // for the separator between it and the results. With 50 items and height 12 the
+    // window is exactly 10 rows (not 11).
+    let dir = temp_dir("picker_sep");
+    let src = r#"
+nx.picker.source {
+  name = "many",
+  items = function(ctx, push, done)
+    for i = 1, 50 do push { text = string.format("row-%02d", i) } end
+    done()
+  end,
+  confirm = function(item) end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "nx.picker.open('many', { width = 30, height = 12 })").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(menu_size(&menu), (30, 12), "the box is the requested size");
+    assert_eq!(
+        menu_items(&menu).len(),
+        10,
+        "height 12 = prompt + separator + 10 list rows"
+    );
+}
+
+#[tokio::test]
+async fn edit_helper_opens_a_file_and_jumps_to_the_location() {
+    // The shipped confirm action `nx.picker.edit` (used by `files` / `live_grep`)
+    // must open the file and jump to a 1-based row/col WITHOUT the mutating
+    // `vim.api.nvim_win_set_cursor`, which is intentionally nil in Lua (ADR 0002) —
+    // the bug behind "attempt to call field 'nvim_win_set_cursor' (a nil value)".
+    let dir = temp_dir("picker_edit_goto");
+    let file = dir.join("target.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Drive the exact shipped helper with a live_grep-shaped item (path + row/col).
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.picker.edit({{ path = '{}', row = 3, col = 2 }})",
+            file.display()
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "four"],
+        "the file opened"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 1),
+        "cursor jumped to the 1-based row / 1-based col location"
+    );
 }
 
 /// The menu's projected box size `(width, height)` in content cells.

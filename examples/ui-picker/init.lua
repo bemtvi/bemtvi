@@ -59,11 +59,16 @@ end)
 --    CSS-style viewport fraction string — "80vw" / "60vh" / "50%". Omit them for
 --    the default (~80vw x 60vh). `nx.picker.open(name, { width=, height= })`
 --    overrides per-open.
+--
+--    `prompt_pos` chooses where the input box sits: "top" (the default) puts it
+--    above the results, "bottom" puts it below them (telescope-style). This source
+--    asks for the input BELOW the results.
 --------------------------------------------------------------------------------
 nx.picker.source({
   name = "colours",
   width = "50vw", -- half the editor width …
   height = "40vh", -- … and 40% of its height
+  prompt_pos = "bottom", -- input box UNDER the results
   items = function(ctx, push, done)
     for _, c in ipairs({
       "crimson",

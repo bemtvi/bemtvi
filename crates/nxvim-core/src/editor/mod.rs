@@ -60,7 +60,7 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
-pub use self::menu::{MenuExtent, MenuItem, MenuPlacement};
+pub use self::menu::{MenuExtent, MenuItem, MenuPlacement, PromptPos};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{

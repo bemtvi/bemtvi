@@ -33,6 +33,8 @@ nx.picker.debounce = nx.picker.debounce or 250
 -- chosen item. Optional `width` / `height` fix the box size — a cell count
 -- (number) or a CSS-style viewport fraction string ("80vw" / "60vh" / "50%");
 -- omitted ⇒ the default (~80vw x 60vh). The picker is never content-sized.
+-- Optional `prompt_pos` = "top" (default) or "bottom" places the input above or
+-- below the results list.
 --
 -- For a `dynamic` source (which spawns per query), `debounce` (ms) sets the
 -- trailing delay before a query edit re-runs the source — so a fast typist spawns
@@ -72,7 +74,8 @@ end
 -- `opts.width` / `opts.height` set a FIXED box size — a cell count (e.g. 100) or a
 -- CSS-style viewport fraction string ("80vw" / "60vh" / "50%") — overriding the
 -- source's own `width`/`height`, which override the picker default. The picker is
--- never content-sized (a content-hugging box looks ragged).
+-- never content-sized (a content-hugging box looks ragged). `opts.prompt_pos`
+-- ("top" / "bottom") likewise overrides the source's `prompt_pos`.
 function nx.picker.open(name, opts)
   local source = nx.picker._sources[name]
   if not source then
@@ -92,8 +95,16 @@ function nx.picker.open(name, opts)
     debounce = nx.picker.debounce
   end
   nx._picker.debounce_ms = debounce or 250
+  -- Prompt position: per-open overrides per-source overrides the default ("top").
+  -- "bottom" puts the input under the results (telescope-style); anything else is
+  -- top. Resolved to a bool for the bridge.
+  local prompt_pos = opts.prompt_pos
+  if prompt_pos == nil then
+    prompt_pos = source.prompt_pos
+  end
+  local prompt_bottom = prompt_pos == "bottom"
   -- The server opens the centered widget and kicks the initial run (gen 0, "").
-  nx._picker_open(source.dynamic == true, width, height)
+  nx._picker_open(source.dynamic == true, width, height, prompt_bottom)
 end
 
 -- Cap on streamed results past which the job is reaped — a *safety* bound against
@@ -250,6 +261,20 @@ function nx._picker_result(key)
   end
 end
 
+-- nx.picker.edit(item): the common confirm action — open `item.path`, and if the
+-- item carries a 1-based `row` (and optional 1-based `col`, as live_grep's items
+-- do), jump the cursor there. Uses the supported `nx._win_set_cursor` bridge: the
+-- mutating `vim.api.nvim_*` surface (incl. `nvim_win_set_cursor`) is intentionally
+-- nil in Lua (ADR 0002), so a plugin must go through `nx.*` / keystrokes to move
+-- the cursor. The `:edit` runs (and loads the buffer) before the queued cursor op
+-- is applied, so window 0 already shows the opened file when the cursor moves.
+function nx.picker.edit(item)
+  vim.cmd("edit " .. item.path)
+  if item.row then
+    nx._win_set_cursor(0, item.row - 1, math.max(0, (item.col or 1) - 1))
+  end
+end
+
 -- ----- built-in sources ------------------------------------------------------
 -- Shipped defaults exercising the three source shapes; a config can register more.
 
@@ -279,7 +304,7 @@ nx.picker.source({
     end)
   end,
   confirm = function(item)
-    vim.cmd("edit " .. item.path)
+    nx.picker.edit(item)
   end,
 })
 
@@ -314,10 +339,7 @@ nx.picker.source({
     end)
   end,
   confirm = function(item)
-    vim.cmd("edit " .. item.path)
-    if item.row then
-      vim.api.nvim_win_set_cursor(0, { item.row, math.max(0, (item.col or 1) - 1) })
-    end
+    nx.picker.edit(item)
   end,
 })
 

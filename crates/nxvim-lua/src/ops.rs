@@ -780,6 +780,10 @@ pub struct PickerOpenReq {
     /// `"60vh"` / `"50%"`), or empty for the picker default. Never content-derived.
     pub width: String,
     pub height: String,
+    /// Whether the prompt sits **below** the results list (the telescope-style
+    /// layout) rather than above it (the default). The Lua wrapper resolves the
+    /// `prompt_pos = "top" | "bottom"` option down to this flag.
+    pub prompt_bottom: bool,
 }
 
 /// One streamed picker candidate (`nx.picker` source `push`): its display `label`

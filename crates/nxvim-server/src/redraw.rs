@@ -707,9 +707,11 @@ fn project_menu(
     const MAX_H: usize = 10;
     let focused = view.focused();
     let text_height = focused.lines.len();
-    // A picker carries a prompt line (the first content row); `nx.ui.select` does
-    // not. The prompt row counts toward the box height and its text toward the width.
+    // A picker carries a prompt line plus a separator row between it and the list;
+    // `nx.ui.select` carries neither. Both count toward the box height (`chrome`),
+    // the prompt's text toward the width.
     let prompt_rows = usize::from(m.query.is_some());
+    let chrome = prompt_rows * 2;
     let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
 
     // The box height (content rows), the scroll offset of the first visible row,
@@ -766,13 +768,14 @@ fn project_menu(
                 .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
                     e.resolve(text_height)
                 })
-                .clamp(prompt_rows + 1, max_h);
+                .clamp(chrome + 1, max_h);
             let row = text_height.saturating_sub(height + 2) / 2;
             let col = text_width.saturating_sub(width + 2) / 2;
             // Scroll the window so the selected row stays visible, clamped to the end,
             // and send `selected` rebased into that window (the client renders the
             // window directly). Only `list_rows` rows are cloned, never all `total`.
-            let list_rows = height.saturating_sub(prompt_rows).max(1);
+            // `chrome` reserves the prompt + separator rows.
+            let list_rows = height.saturating_sub(chrome).max(1);
             let mut start = if m.selected >= list_rows {
                 m.selected + 1 - list_rows
             } else {
@@ -817,9 +820,22 @@ fn project_menu(
         (Value::from("match_spans"), match_spans),
     ];
     // The prompt query: present (even when empty) for a picker, absent for a
-    // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row.
+    // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
+    // a separator, and the caret; `query_cursor` is the caret's char column and
+    // `prompt_pos` whether the prompt sits above or below the list.
     if let Some(query) = &m.query {
         map.push((Value::from("query"), Value::from(query.as_str())));
+        map.push((
+            Value::from("query_cursor"),
+            Value::from(m.query_cursor as u64),
+        ));
+        map.push((
+            Value::from("prompt_pos"),
+            Value::from(match m.prompt_pos {
+                nxvim_core::PromptPos::Top => "top",
+                nxvim_core::PromptPos::Bottom => "bottom",
+            }),
+        ));
     }
     Value::Map(map)
 }

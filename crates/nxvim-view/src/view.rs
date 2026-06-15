@@ -330,8 +330,14 @@ pub struct MenuData {
     pub height: u16,
     /// The picker prompt query — `Some` (even when empty) for a `nx.picker`,
     /// `None` for a promptless `nx.ui.select`. Presence tells the client to draw a
-    /// prompt row above the list.
+    /// prompt row, a separator, and the caret.
     pub query: Option<String>,
+    /// The prompt caret's column — a count of chars before it within `query`. `0`
+    /// for a promptless `nx.ui.select`.
+    pub query_cursor: u16,
+    /// Whether the prompt sits **below** the results list (telescope-style) rather
+    /// than above it (the default). `false` for a promptless `nx.ui.select`.
+    pub prompt_bottom: bool,
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
@@ -477,6 +483,8 @@ impl View {
                 query: map_get(m, "query")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                query_cursor: map_u16(m, "query_cursor"),
+                prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
             }),
             _ => None,

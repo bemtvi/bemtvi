@@ -6,6 +6,10 @@ flip between. Open `\ff` (files) or `\fp` (the custom preview source below) and
 move the selection with <C-n> / <C-p>: the pane on the right swaps to show the
 highlighted file's contents.
 
+Scroll the preview pane itself with <C-d> / <C-u> (half page) and <C-f> / <C-b>
+(full page) — handy when the file is taller than the pane. The offset is per
+selection: moving to another result re-centers on its own target.
+
 For a "location" preview (a file scrolled to a specific line, the match marked),
 try `\fg` (live grep) and type a word that appears in these sample files — the
 preview jumps to each match as you move through the results.

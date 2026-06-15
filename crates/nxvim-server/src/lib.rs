@@ -546,6 +546,16 @@ pub struct EditHost {
     /// Reset when the path differs; dropped implicitly when the picker closes (the
     /// next picker repopulates it). See [`redraw::project_menu`](crate::redraw).
     preview_cache: redraw::PreviewCache,
+    /// The picker preview pane's manual scroll offset: a signed line delta added to
+    /// the auto-computed window start (which centers a `location` match ~a third down).
+    /// `<C-d>`/`<C-u>`/`<C-f>`/`<C-b>` fold into it in [`redraw::project_preview`]; it
+    /// resets to `0` whenever the selected row's preview target changes ([`preview_anchor`]),
+    /// so each selection re-centers. Clamped to the file every frame.
+    preview_scroll: isize,
+    /// The preview target the [`preview_scroll`] offset belongs to. When the live target
+    /// differs (the selection moved to another row / file), the offset is reset. `None`
+    /// before the first preview / on a row with no target.
+    preview_anchor: Option<nxvim_core::PreviewTarget>,
     /// Keys queued by `nvim_feedkeys`, drained after the input batch / off-tick
     /// settle. Each carries whether it should be remapped (the `m` flag) or fed
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
@@ -681,6 +691,8 @@ impl EditHost {
             pending_ui_select: None,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
+            preview_scroll: 0,
+            preview_anchor: None,
             feed_buffer: VecDeque::new(),
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),

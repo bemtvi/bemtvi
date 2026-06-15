@@ -123,6 +123,13 @@ pub struct MenuView {
     /// `select` / preview-less picker, or a row with no path. The server reads +
     /// renders the target into the pane; this only names *what* to show.
     pub preview: Option<crate::editor::PreviewTarget>,
+    /// A one-shot preview-scroll gesture ([`PreviewScroll`](crate::editor::PreviewScroll))
+    /// from the keystroke that produced this view — `<C-d>`/`<C-u>`/`<C-f>`/`<C-b>` while
+    /// a preview picker is open. The server folds it into its persistent preview scroll
+    /// offset (resolving the line delta from the live pane height, clamping to the file);
+    /// `None` on every frame that doesn't carry the gesture. Always `None` for a
+    /// preview-less picker / `nx.ui.select`.
+    pub preview_scroll: Option<crate::editor::PreviewScroll>,
     /// The picker box's fixed width / height ([`MenuExtent`](crate::editor::MenuExtent),
     /// `None` ⇒ the picker default), resolved against the viewport by the server at
     /// projection time. Both `None` for a content-anchored `nx.ui.select`.

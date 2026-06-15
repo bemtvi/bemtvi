@@ -901,6 +901,14 @@ fn preview_lines(preview: &[(Value, Value)]) -> Vec<String> {
     }
 }
 
+/// The 1-based file line shown at the top of the preview window.
+fn preview_first_line(preview: &[(Value, Value)]) -> u64 {
+    match map_get(preview, "first_line") {
+        Some(v) => v.as_u64().expect("first_line is a number"),
+        other => panic!("expected preview first_line, got {other:?}"),
+    }
+}
+
 /// The preview's `loc` (`[row, col]`) rebased into the window, or `None`.
 fn preview_loc(preview: &[(Value, Value)]) -> Option<(u64, u64)> {
     match map_get(preview, "loc") {
@@ -990,6 +998,140 @@ nx.picker.source {{
     let lines = preview_lines(&preview);
     assert_eq!(lines[4], "L4");
     assert_eq!(preview_loc(&preview), Some((4, 1)));
+}
+
+#[tokio::test]
+async fn preview_scrolls_with_ctrl_dufb() {
+    let dir = temp_dir("picker_preview_scroll");
+    // A file far taller than the preview pane so the window never bottoms out.
+    let body: String = (0..200).map(|i| format!("L{i}\n")).collect();
+    std::fs::write(dir.join("tall.txt"), body).unwrap();
+    let tall = dir.join("tall.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "scroll_test",
+  preview = "file",
+  items = function(ctx, push, done)
+    push {{ text = "tall.txt", path = "{tall}" }}
+    done()
+  end,
+}}
+"#,
+        tall = tall.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('scroll_test')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("file picker carries a preview pane");
+    // A "file" target starts at the top, and the window is full (the file dwarfs it).
+    let pane_h = preview_lines(&preview).len() as u64;
+    let half = (pane_h / 2).max(1);
+    let page = pane_h.saturating_sub(2).max(1);
+    assert_eq!(preview_first_line(&preview), 1, "starts at the file head");
+
+    // `<C-u>` at the top is clamped — it can't scroll above line 1.
+    feed(&rpc, "<C-u>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-u"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1, "clamped at the top");
+
+    // `<C-d>` scrolls down half a pane; a second `<C-d>` advances by another half.
+    feed(&rpc, "<C-d>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-d"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1 + half);
+
+    feed(&rpc, "<C-d>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-d C-d"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1 + 2 * half);
+
+    // `<C-u>` walks it back a half page.
+    feed(&rpc, "<C-u>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-u"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1 + half);
+
+    // `<C-f>` jumps a full page (a two-line overlap, like the editor's own `<C-f>`).
+    feed(&rpc, "<C-f>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-f"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1 + half + page);
+
+    // `<C-b>` jumps a full page back.
+    feed(&rpc, "<C-b>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-b"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1 + half);
+
+    // The document buffer was never touched by any of this scrolling.
+    assert_eq!(lines(&rpc).await, vec![""]);
+}
+
+#[tokio::test]
+async fn preview_scroll_resets_when_the_selection_moves() {
+    let dir = temp_dir("picker_preview_scroll_reset");
+    let body: String = (0..200).map(|i| format!("L{i}\n")).collect();
+    std::fs::write(dir.join("one.txt"), &body).unwrap();
+    std::fs::write(dir.join("two.txt"), &body).unwrap();
+    let one = dir.join("one.txt");
+    let two = dir.join("two.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "reset_test",
+  preview = "file",
+  items = function(ctx, push, done)
+    push {{ text = "one.txt", path = "{one}" }}
+    push {{ text = "two.txt", path = "{two}" }}
+    done()
+  end,
+}}
+"#,
+        one = one.display(),
+        two = two.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('reset_test')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("preview pane");
+    let half = (preview_lines(&preview).len() as u64 / 2).max(1);
+
+    // Scroll the first file's preview down.
+    feed(&rpc, "<C-d>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-d"),
+    ))
+    .expect("preview present");
+    assert_eq!(preview_first_line(&preview), 1 + half);
+
+    // Moving to the next row re-centers on its target — the scroll offset is per
+    // selection, so the new file previews from its own head, not the carried offset.
+    feed(&rpc, "<C-n>");
+    let preview = preview_of(&menu_of(
+        &poll_menu(&rpc, &mut incoming).await.expect("after C-n"),
+    ))
+    .expect("preview present");
+    assert_eq!(
+        preview_first_line(&preview),
+        1,
+        "the new selection starts at top"
+    );
 }
 
 #[tokio::test]

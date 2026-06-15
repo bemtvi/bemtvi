@@ -97,6 +97,21 @@ pub struct PreviewTarget {
     pub loc: Option<(usize, usize)>,
 }
 
+/// A one-shot request to scroll the picker's preview pane, emitted by core when the
+/// user presses `<C-d>`/`<C-u>` (half page) or `<C-f>`/`<C-b>` (full page). Core
+/// can't resolve the line delta — the pane height and the file length live on the
+/// server — so it only names the *gesture*; the server maintains the actual scroll
+/// offset (clamped to the file, reset when the selection moves to a new target).
+/// Consumed once per keystroke, like the viewport [`ScrollAnim`](crate::view::ScrollAnim)
+/// gesture: it lives only in the keystroke's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewScroll {
+    HalfDown,
+    HalfUp,
+    PageDown,
+    PageUp,
+}
+
 /// The picker's input-grab query field — a single editable line, modeled on the
 /// command line ([`Editor::cmdline`]). `col` is the byte offset of the text
 /// cursor within `query`.
@@ -197,6 +212,12 @@ pub(crate) struct Menu {
     /// [`PreviewTarget`] and the server reserves a preview column. Always `false`
     /// for a promptless `nx.ui.select`.
     preview: bool,
+    /// A pending preview-scroll gesture (`<C-d>`/`<C-u>`/`<C-f>`/`<C-b>`), set by
+    /// [`Editor::handle_picker_key`] and exposed once via [`Editor::menu_view`]. The
+    /// server resolves it against the live pane height and file length, then clears as
+    /// [`Editor::view`] drops it after each projection — a one-shot, like the viewport
+    /// scroll gesture. Only ever `Some` for a `preview` picker.
+    preview_scroll: Option<PreviewScroll>,
     /// Bumped on every query edit; the staleness token threaded to the server so a
     /// push from a superseded source run is dropped.
     generation: u64,
@@ -320,6 +341,7 @@ impl Editor {
             prompt_pos: PromptPos::default(),
             dynamic: false,
             preview: false,
+            preview_scroll: None,
             generation: 0,
             items_gen: 0,
             width: None,
@@ -355,6 +377,7 @@ impl Editor {
             prompt_pos,
             dynamic,
             preview,
+            preview_scroll: None,
             generation: 0,
             items_gen: 0,
             width,
@@ -481,6 +504,21 @@ impl Editor {
                 KeyCode::Up => menu.cursor = menu.cursor.saturating_sub(1),
                 KeyCode::Char('n') if key.ctrl => menu.cursor = (menu.cursor + 1).min(last),
                 KeyCode::Char('p') if key.ctrl => menu.cursor = menu.cursor.saturating_sub(1),
+                // Preview-pane scrolling (only when a preview is shown): half page
+                // `<C-d>`/`<C-u>`, full page `<C-f>`/`<C-b>`. Core only names the
+                // gesture — the server resolves it against the pane height and file.
+                KeyCode::Char('d') if key.ctrl && menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::HalfDown);
+                }
+                KeyCode::Char('u') if key.ctrl && menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::HalfUp);
+                }
+                KeyCode::Char('f') if key.ctrl && menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::PageDown);
+                }
+                KeyCode::Char('b') if key.ctrl && menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::PageUp);
+                }
                 // Query editing.
                 KeyCode::Backspace => query_changed = menu.prompt.as_mut().unwrap().backspace(),
                 KeyCode::Delete => query_changed = menu.prompt.as_mut().unwrap().delete(),
@@ -568,6 +606,14 @@ impl Editor {
     /// the total visible count, the optional query line, placement, and size. The
     /// rows themselves are fetched windowed via [`Editor::menu_rows`] so a 100k-item
     /// picker never clones its whole list into a frame. `None` when closed.
+    /// Drop the one-shot preview-scroll gesture after a frame has consumed it (called
+    /// from [`Editor::view`], alongside `pending_scroll`).
+    pub(crate) fn clear_preview_scroll(&mut self) {
+        if let Some(menu) = self.menu.as_mut() {
+            menu.preview_scroll = None;
+        }
+    }
+
     pub(crate) fn menu_view(&self) -> Option<MenuView> {
         self.menu.as_ref().map(|m| MenuView {
             selected: m.cursor,
@@ -578,6 +624,7 @@ impl Editor {
             prompt_pos: m.prompt_pos,
             has_preview: m.preview,
             preview: m.selected_preview().cloned(),
+            preview_scroll: m.preview_scroll,
             width: m.width,
             height: m.height,
         })

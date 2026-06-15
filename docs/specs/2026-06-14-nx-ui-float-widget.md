@@ -101,7 +101,10 @@ The only piece with no existing analogue. A native prompt that:
 1. **Grabs all input** while open — keystrokes edit the query buffer, navigation
    keys (`<C-n>`/`<C-p>`/`<Down>`/`<Up>`, `<CR>`, `<Esc>`, the configured keys)
    drive the list, and **nothing reaches the document**. This generalizes the
-   bottom panel's selection-key handling to a full input line.
+   bottom panel's selection-key handling to a full input line. When a preview pane
+   is shown, `<C-d>`/`<C-u>` (half page) and `<C-f>`/`<C-b>` (full page) scroll the
+   *preview*; core only names the gesture (it can't see the pane height or file
+   length), and the server folds it into a per-selection scroll offset.
 2. **Emits "query changed" natively** — the matcher re-ranks (static sources) or
    the engine re-runs the source (dynamic sources) off the input path, debounced.
    **No Lua runs per keystroke** (rule 4); a static-source picker never re-enters

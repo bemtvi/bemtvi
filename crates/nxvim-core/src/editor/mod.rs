@@ -60,7 +60,9 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
-pub use self::menu::{MenuExtent, MenuItem, MenuPlacement, PreviewTarget, PromptPos};
+pub use self::menu::{
+    MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
+};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -1551,6 +1553,9 @@ impl Editor {
         self.resize(width, height);
         let view = View::from_editor(self);
         self.pending_scroll = None; // animate exactly once
+                                    // The preview-scroll gesture is one-shot: the server folded it into its
+                                    // persistent offset while projecting `view`, so drop it before the next frame.
+        self.clear_preview_scroll();
         view
     }
 

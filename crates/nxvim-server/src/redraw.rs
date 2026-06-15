@@ -889,14 +889,40 @@ impl EditHost {
         let (lines, first_line, loc, title, highlights) = match &m.preview {
             Some(target) => {
                 self.ensure_preview(&target.path);
-                let cache = &self.preview_cache;
-                let len = cache.lines.len();
-                // Window around the target line (show it ~a third down), clamped to the
-                // file; a file-kind target (no `loc`) starts at the top.
-                let start = match target.loc {
+                let len = self.preview_cache.lines.len();
+                // The manual scroll offset belongs to one target; reset it when the
+                // selection moves to a different row/file so each selection re-centers.
+                if self.preview_anchor.as_ref() != Some(target) {
+                    self.preview_scroll = 0;
+                    self.preview_anchor = Some(target.clone());
+                }
+                // Fold this frame's one-shot scroll gesture (`<C-d>`/`<C-u>` half page,
+                // `<C-f>`/`<C-b>` full page) into the persistent offset. Full page keeps
+                // a two-line overlap, matching the editor's normal `<C-f>`/`<C-b>`.
+                if let Some(gesture) = m.preview_scroll {
+                    let half = (pane_h / 2).max(1) as isize;
+                    let page = pane_h.saturating_sub(2).max(1) as isize;
+                    self.preview_scroll += match gesture {
+                        nxvim_core::PreviewScroll::HalfDown => half,
+                        nxvim_core::PreviewScroll::HalfUp => -half,
+                        nxvim_core::PreviewScroll::PageDown => page,
+                        nxvim_core::PreviewScroll::PageUp => -page,
+                    };
+                }
+                // The auto window start (show a `location` match ~a third down), clamped
+                // to the file; a file-kind target (no `loc`) starts at the top.
+                let base = match target.loc {
                     Some((r, _)) if r >= pane_h => (r - pane_h / 3).min(len.saturating_sub(pane_h)),
                     _ => 0,
-                };
+                } as isize;
+                // Apply the manual offset and clamp the visible window to the file, then
+                // fold the clamp back into the stored offset so reversing direction
+                // (e.g. `<C-u>` after scrolling past the end) responds on the first key.
+                let max_start = len.saturating_sub(pane_h) as isize;
+                let start = (base + self.preview_scroll).clamp(0, max_start.max(0));
+                self.preview_scroll = start - base;
+                let start = start as usize;
+                let cache = &self.preview_cache;
                 let end = (start + pane_h).min(len);
                 let win = cache.lines.get(start..end).unwrap_or(&[]);
                 // Per windowed line, the cached tree-sitter spans mapped to char
@@ -931,13 +957,16 @@ impl EditHost {
                 )
             }
             // The picker has a preview pane, but this row carries no target.
-            None => (
-                vec!["No preview".to_string()],
-                1,
-                None,
-                String::new(),
-                Value::Array(Vec::new()),
-            ),
+            None => {
+                self.preview_anchor = None;
+                (
+                    vec!["No preview".to_string()],
+                    1,
+                    None,
+                    String::new(),
+                    Value::Array(Vec::new()),
+                )
+            }
         };
 
         let loc_value = match loc {

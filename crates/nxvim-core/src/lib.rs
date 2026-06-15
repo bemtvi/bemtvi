@@ -13,6 +13,7 @@
 pub mod buffer;
 pub mod clipboard;
 pub mod editor;
+pub mod encoding;
 pub mod extmark;
 pub mod fuzzy;
 pub mod highlight;
@@ -35,6 +36,7 @@ pub use editor::{
     PendingOpen, PendingQuitAll, PendingSave, PersistState, PromptPos, RegisterEntry, ShadaRequest,
     TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
+pub use encoding::Encoding;
 pub use extmark::{Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, TS_HL_PRIORITY};
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};

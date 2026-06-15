@@ -206,6 +206,13 @@ pub struct BoMirror {
     /// local override resolved against the global, so `vim.bo.regexsyntax` reads
     /// what `/`/`:s` actually use in this buffer.
     pub regexsyntax: String,
+    /// The buffer's `'fileencoding'` (the on-disk charset, e.g. `"utf-8"` /
+    /// `"latin1"`), mirrored so `vim.bo.fileencoding` reads the core's value
+    /// regardless of who set it (`:set fenc`, `vim.bo`, read-detection).
+    pub fileencoding: String,
+    /// The buffer's `'bomb'` flag (whether a BOM is written), mirrored for
+    /// `vim.bo.bomb`.
+    pub bomb: bool,
     pub modified: bool,
     /// The buffer's filetype (the treesitter language noun) — explicit override
     /// or extension-derived, mirrored so `nx.bo.filetype` / `vim.bo.filetype` read
@@ -255,6 +262,9 @@ pub struct GoMirror {
     pub guifont: String,
     /// The `'regexsyntax'` dialect (`"pcre"`/`"vim"`) backing `vim.o.regexsyntax`.
     pub regexsyntax: String,
+    /// The `'fileencodings'` read-detection list (comma-separated) backing
+    /// `vim.o.fileencodings`.
+    pub fileencodings: String,
     /// `'autoread'` — whether `:checktime` silently reloads an externally-changed,
     /// unmodified buffer. Backs `vim.o.autoread`.
     pub autoread: bool,

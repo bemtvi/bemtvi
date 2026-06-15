@@ -123,6 +123,8 @@ local O_GLOBAL = {
   gfn = "guifont",
   regexsyntax = "regexsyntax",
   rxs = "regexsyntax",
+  fileencodings = "fileencodings",
+  fencs = "fileencodings",
   scrollanim = "scrollanim",
   sca = "scrollanim",
   scrollanimduration = "scrollanimduration",
@@ -149,6 +151,7 @@ local O_GLOBAL_DEFAULT = {
   tabline = "",
   guifont = "",
   regexsyntax = "pcre",
+  fileencodings = "ucs-bom,utf-8,latin1",
   scrollanim = true,
   scrollanimduration = 160,
   columns = 80,
@@ -682,13 +685,27 @@ local BUF_OPT_CANON = {
   -- *effective* dialect (the override resolved against the global).
   regexsyntax = "regexsyntax",
   rxs = "regexsyntax",
+  -- The on-disk charset (`nx.bo.fileencoding = "latin1"`) and whether a BOM is
+  -- written (`nx.bo.bomb`). Reads return the core's per-buffer value (set via
+  -- `:set fenc`, read-detection, or here).
+  fileencoding = "fileencoding",
+  fenc = "fileencoding",
+  bomb = "bomb",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
 -- their sentinels (0 = follow tabstop, -1 = follow shiftwidth); regexsyntax
--- "pcre" (the buffer follows the global, whose default is pcre).
-local BUF_OPT_DEFAULT =
-  { tabstop = 4, shiftwidth = 0, softtabstop = -1, expandtab = false, regexsyntax = "pcre" }
+-- "pcre" (the buffer follows the global, whose default is pcre); fileencoding
+-- "utf-8" with no BOM.
+local BUF_OPT_DEFAULT = {
+  tabstop = 4,
+  shiftwidth = 0,
+  softtabstop = -1,
+  expandtab = false,
+  regexsyntax = "pcre",
+  fileencoding = "utf-8",
+  bomb = false,
+}
 
 local function bo_get(bufnr, opt)
   local canon = BUF_OPT_CANON[opt]

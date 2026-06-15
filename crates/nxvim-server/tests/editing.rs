@@ -23,6 +23,8 @@ mod clipboard;
 mod core_editing;
 #[path = "editing/dot_repeat.rs"]
 mod dot_repeat;
+#[path = "editing/encoding.rs"]
+mod encoding;
 #[path = "editing/ex_substitute.rs"]
 mod ex_substitute;
 #[path = "editing/explorer.rs"]

@@ -1,6 +1,7 @@
 //! The `:set` command and its bool/number option-application helpers.
 
 use super::*;
+use crate::encoding::Encoding;
 use crate::options::{
     resolve_set, split_set_args, NumOp, RegexSyntax, SetCmd, SetOp, StrOp, WindowOptions,
 };
@@ -86,6 +87,7 @@ impl Editor {
             "autoread" => &mut self.options.autoread,
             "scrollanim" => &mut self.options.scrollanim,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
+            "bomb" => &mut self.buffer_mut().options.bomb,
             _ => return,
         };
         match op {
@@ -220,6 +222,62 @@ impl Editor {
                 }
                 StrOp::Reset => self.buffer_mut().options.regexsyntax = RegexSyntax::Inherit,
                 StrOp::Query => self.echo(format!("regexsyntax={}", self.effective_regexsyntax())),
+            }
+            return;
+        }
+        // `fileencoding` is buffer-local and enumerated: only a real encoding
+        // label (or empty, meaning UTF-8) is valid, and a bad value must fail
+        // loud (E474) rather than silently sticking the buffer on the wrong
+        // charset. Changing it implies the next write re-encodes, so it marks the
+        // buffer modified (vim does the same). `&` resets to UTF-8.
+        if name == "fileencoding" {
+            match op {
+                StrOp::Set(value) => {
+                    let enc = if value.is_empty() {
+                        Encoding::UTF8
+                    } else {
+                        match Encoding::from_label(&value) {
+                            Some(e) => e,
+                            None => {
+                                self.echo(format!("E474: Invalid argument: fileencoding={value}"));
+                                return;
+                            }
+                        }
+                    };
+                    let changed = self.buffer().options.fileencoding != enc;
+                    self.buffer_mut().options.fileencoding = enc;
+                    if changed {
+                        self.buffer_mut().modified = true;
+                    }
+                }
+                StrOp::Reset => self.buffer_mut().options.fileencoding = Encoding::UTF8,
+                StrOp::Query => {
+                    let enc = self.buffer().options.fileencoding;
+                    self.echo(format!("fileencoding={enc}"));
+                }
+            }
+            return;
+        }
+        // `fileencodings` is the global read-detection list: every comma-separated
+        // entry must be `ucs-bom` or a known encoding label, else fail loud rather
+        // than leave an unusable list. The store/echo go through the shared global
+        // setter so `:set` and `vim.o` agree.
+        if name == "fileencodings" {
+            match op {
+                StrOp::Set(value) => {
+                    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                        if !crate::encoding::is_fileencodings_entry(entry) {
+                            self.echo(format!("E474: Invalid argument: fileencodings={value}"));
+                            return;
+                        }
+                    }
+                    self.set_global_option_str("fileencodings", &value);
+                }
+                // Reset to the built-in default (kept in sync with `Options::default`).
+                StrOp::Reset => {
+                    self.options.fileencodings = "ucs-bom,utf-8,latin1".to_string();
+                }
+                StrOp::Query => self.echo(format!("fileencodings={}", self.options.fileencodings)),
             }
             return;
         }

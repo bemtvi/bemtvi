@@ -3,6 +3,8 @@
 //! actually honors live here, and they grow alongside the features that read
 //! them.
 
+use crate::encoding::Encoding;
+
 /// Global editor options that affect editing and search. Window-local rendering
 /// options (the number gutter) live on [`WindowOptions`]; per-buffer ones on
 /// [`BufferOptions`].
@@ -78,6 +80,14 @@ pub struct Options {
     /// [`crate::Editor::search_engine`]; the only accepted values are `"pcre"`
     /// and `"vim"` (validated in `apply_set_str`).
     pub regexsyntax: String,
+    /// The ordered list of encodings to try when reading a file (`'fileencodings'`),
+    /// a comma-separated string in vim's spelling. The special first entry
+    /// `"ucs-bom"` means "sniff a byte-order mark"; the rest are encoding labels
+    /// tried in order, with a never-failing fallback (`latin1`) last. The detected
+    /// encoding becomes the buffer's [`BufferOptions::fileencoding`]. Read by the
+    /// open path (wired in a later phase); stored here so `:set fencs=…` / `vim.o`
+    /// accept it now. Default `"ucs-bom,utf-8,latin1"`.
+    pub fileencodings: String,
     /// Re-read a file from disk when it changed outside nxvim and the buffer has
     /// no unsaved edits (`'autoread'`). On (neovim's default), `:checktime`
     /// silently reloads such a buffer; off, it warns (W11) and leaves the buffer
@@ -127,6 +137,10 @@ impl Default for Options {
             // Canonical/PCRE regex for `/` and `:s` out of the box; opt into vim's
             // magic dialect with `:set regexsyntax=vim`.
             regexsyntax: "pcre".to_string(),
+            // BOM sniff first, then strict UTF-8, then latin1 (windows-1252) as
+            // the always-succeeds fallback — a sane subset of neovim's
+            // `ucs-bom,utf-8,default,latin1`.
+            fileencodings: "ucs-bom,utf-8,latin1".to_string(),
             // Reload externally-changed, unmodified buffers on `:checktime`
             // (neovim's default — vim's is off).
             autoread: true,
@@ -254,6 +268,15 @@ pub struct BufferOptions {
     /// [`Inherit`](RegexSyntax::Inherit) (the default) to follow the global
     /// [`Options::regexsyntax`]. Resolved by [`crate::Editor::search_engine`].
     pub regexsyntax: RegexSyntax,
+    /// The charset the buffer's bytes are in *on disk* (`'fileencoding'`). The
+    /// rope is always UTF-8; this names the form the read/write seam transcodes
+    /// to/from. Default [`Encoding::UTF8`]. (The seam itself is wired in a later
+    /// phase; this stores the per-buffer value `:set fenc=…` / `vim.bo.fileencoding`
+    /// set.)
+    pub fileencoding: Encoding,
+    /// Whether to prepend a byte-order mark when writing (`'bomb'`). Set on read
+    /// when a BOM was detected, and honored on write. Default `false`.
+    pub bomb: bool,
 }
 
 impl Default for BufferOptions {
@@ -268,6 +291,10 @@ impl Default for BufferOptions {
             expandtab: false,
             // No buffer-local override out of the box: follow the global option.
             regexsyntax: RegexSyntax::Inherit,
+            // UTF-8 on disk by default; no BOM. Read detection (a later phase)
+            // overrides both per buffer.
+            fileencoding: Encoding::UTF8,
+            bomb: false,
         }
     }
 }
@@ -525,6 +552,12 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "mousescroll" => Some(("mousescroll", Str)),
         "mousetime" | "mouset" => Some(("mousetime", Num)),
         "regexsyntax" | "rxs" => Some(("regexsyntax", Str)),
+        // Buffer-local: the on-disk charset (handled specially in `apply_set_str`).
+        "fileencoding" | "fenc" => Some(("fileencoding", Str)),
+        // Global: the read-detection list (handled specially in `apply_set_str`).
+        "fileencodings" | "fencs" => Some(("fileencodings", Str)),
+        // Buffer-local: whether to write a BOM (a plain bool slot).
+        "bomb" => Some(("bomb", Bool)),
         "scrollanim" | "sca" => Some(("scrollanim", Bool)),
         "scrollanimduration" | "scad" => Some(("scrollanimduration", Num)),
         // Buffer-local: drives the treesitter language override rather than a

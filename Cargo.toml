@@ -64,6 +64,13 @@ ropey = "=2.0.0-beta.1"
 # pure Rust, no async/IO, so it lives inside the synchronous `nxvim-core`. Pure
 # Rust ⇒ compiles under emscripten for the wasm edit-host too.
 nucleo-matcher = "=0.3.1"
+# Charset transcoding (the WHATWG Encoding Standard, Firefox's library) backing
+# per-buffer `'fileencoding'` and the convert-on-read/write seam. Pure Rust, no
+# C, no async/IO ⇒ lives inside the synchronous `nxvim-core` and compiles under
+# emscripten for the wasm edit-host. `simd-accel` is left OFF (it needs nightly);
+# the default `alloc` build is stable and portable. See
+# docs/plans/2026-06-14-encoding-and-invalid-utf8.md.
+encoding_rs = "=0.8.35"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.0"
 # Native GUI client stack (`nxvim-gui`). winit owns the window + input event loop,

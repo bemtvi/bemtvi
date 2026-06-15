@@ -156,15 +156,17 @@ impl Editor {
         };
         if name == "expandtab" {
             ob.buffer.options.expandtab = value;
+        } else if name == "bomb" {
+            ob.buffer.options.bomb = value;
         }
     }
 
-    /// Set a string buffer-local option (currently `regexsyntax`) on buffer `id` —
-    /// the `vim.bo` string companion to [`Editor::set_buffer_option_num`]. An
-    /// unknown option, an unknown buffer, or (for `regexsyntax`) a value other than
-    /// `"pcre"`/`"vim"` is ignored; the `:set` ex path is where a bad value fails
-    /// loud (`E474`), so a raw `vim.bo` write of garbage leaves the override
-    /// untouched (the buffer keeps following the global).
+    /// Set a string buffer-local option (`regexsyntax` / `fileencoding`) on buffer
+    /// `id` — the `vim.bo` string companion to [`Editor::set_buffer_option_num`]. An
+    /// unknown option, an unknown buffer, or an invalid value (a `regexsyntax` other
+    /// than `"pcre"`/`"vim"`, an unknown `fileencoding` label) is ignored; the
+    /// `:set` ex path is where a bad value fails loud (`E474`), so a raw `vim.bo`
+    /// write of garbage leaves the option untouched.
     pub fn set_buffer_option_str(&mut self, id: BufferId, name: &str, value: &str) {
         // `filetype` is the treesitter language noun (`nx.bo.filetype`); route it
         // through `set_filetype` (which refreshes the parse). `""` = no filetype.
@@ -182,6 +184,18 @@ impl Editor {
                 "pcre" => crate::options::RegexSyntax::Pcre,
                 "vim" => crate::options::RegexSyntax::Vim,
                 _ => return,
+            };
+        } else if name == "fileencoding" {
+            // Like `regexsyntax`: a raw `vim.bo` write of an unknown label is
+            // ignored (the buffer keeps its encoding); the `:set` ex path is where
+            // a bad value fails loud (E474). Empty means UTF-8.
+            ob.buffer.options.fileencoding = if value.is_empty() {
+                crate::encoding::Encoding::UTF8
+            } else {
+                match crate::encoding::Encoding::from_label(value) {
+                    Some(e) => e,
+                    None => return,
+                }
             };
         }
     }

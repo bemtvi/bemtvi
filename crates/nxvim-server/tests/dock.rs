@@ -10,7 +10,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, start_attached,
+    cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, start_attached,
+    wait_redraw,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -40,6 +41,14 @@ async fn win_count(rpc: &Rpc) -> usize {
     }
 }
 
+/// `nvim_list_bufs` count — to tell *hidden* (buffer stays loaded) from *closed*.
+async fn buf_count(rpc: &Rpc) -> usize {
+    match req(rpc, "nvim_list_bufs", vec![]).await {
+        Value::Array(a) => a.len(),
+        v => panic!("expected array, got {v:?}"),
+    }
+}
+
 /// The latest redraw map (any frame).
 fn latest(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<(Value, Value)> {
     drain_to_latest_redraw(incoming, |_| true).expect("a redraw frame")
@@ -62,6 +71,17 @@ fn regions(map: &[(Value, Value)]) -> Vec<String> {
 
 fn band(map: &[(Value, Value)], key: &str) -> u64 {
     map_get(map, key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// The collapsed-dock chip labels projected in a redraw map (`hidden_docks`).
+fn hidden_docks(map: &[(Value, Value)]) -> Vec<String> {
+    match map_get(map, "hidden_docks") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The rect height of the first window painted in `region` (`main`/`dock_left`/…).
@@ -358,7 +378,9 @@ async fn dock_and_main_tab_counts_are_independent() {
     // Dock focused: two `:tabnew`s give the dock three tabs.
     exec_lua(&rpc, "vim.cmd('tabnew')").await;
     exec_lua(&rpc, "vim.cmd('tabnew')").await;
-    let rd = latest(&mut incoming);
+    // Wait for the frame that actually reflects both tabnews — the redraw channel
+    // can lag a stale single-tab frame under load (CLAUDE.md's take-latest race).
+    let rd = wait_redraw(&mut incoming, |m| region_tab_count(m, "left") == 3).await;
     assert_eq!(region_tab_count(&rd, "left"), 3, "the dock has three tabs");
     assert_eq!(region_tab_count(&rd, "main"), 1, "main is left at one tab");
     assert_eq!(
@@ -567,11 +589,11 @@ async fn per_dock_showtabline_override_forces_the_strip() {
     let (rpc, mut incoming) = start().await;
     // Default showtabline=1: a single-tab dock shows no tabline.
     exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") > 0).await;
     assert_eq!(region_tab_count(&rd, "left"), 0, "1 tab, default: no strip");
     // Per-dock showtabline=2 forces this dock's strip on, even with one tab.
     exec_lua(&rpc, "nx.dock.opt('left').showtabline = 2").await;
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| region_tab_count(m, "left") == 1).await;
     assert_eq!(
         region_tab_count(&rd, "left"),
         1,
@@ -594,7 +616,7 @@ async fn per_dock_showtabline_zero_hides_even_with_two_tabs() {
     )
     .await;
     exec_lua(&rpc, "vim.cmd('tabnew')").await; // two dock tabs
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") > 0).await;
     assert_eq!(
         region_tab_count(&rd, "left"),
         0,
@@ -606,10 +628,10 @@ async fn per_dock_showtabline_zero_hides_even_with_two_tabs() {
 async fn dock_size_option_resizes_the_band() {
     let (rpc, mut incoming) = start().await;
     exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 8 }").await;
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_bottom") == 8).await;
     assert_eq!(band(&rd, "dock_bottom"), 8, "opened at size 8");
     exec_lua(&rpc, "nx.dock.opt('bottom').size = 15").await;
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_bottom") == 15).await;
     assert_eq!(band(&rd, "dock_bottom"), 15, "size option regrew the band");
 }
 
@@ -622,7 +644,7 @@ async fn dock_title_projects_and_forces_the_strip() {
         "nx.dock.open{ side = 'left', size = 20, title = 'EXPLORER' }",
     )
     .await;
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| region_title(m, "left") == "EXPLORER").await;
     assert_eq!(
         region_title(&rd, "left"),
         "EXPLORER",
@@ -723,12 +745,307 @@ async fn dock_winhighlight_is_reported_not_silently_ignored() {
     let (rpc, mut incoming) = start().await;
     exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
     exec_lua(&rpc, "nx.dock.opt('left').winhighlight = 'Normal:NormalSB'").await;
-    let rd = latest(&mut incoming);
+    let rd = wait_redraw(&mut incoming, |m| {
+        map_get(m, "message")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("winhighlight"))
+    })
+    .await;
     let msg = map_get(&rd, "message")
         .and_then(Value::as_str)
         .unwrap_or("");
     assert!(
         msg.contains("winhighlight") && msg.contains("not implemented"),
         "winhighlight fails loud, got {msg:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Toggle / auto-hide — collapse a dock from view while keeping its content, the
+// VSCode-style counterpart of close (which drops the content).
+// ---------------------------------------------------------------------------
+
+/// `nx.dock.toggle` hides a visible dock (it leaves the window list and the band
+/// collapses) and, toggled again, brings the *same content* back — not a fresh
+/// scratch. The whole point of toggle over close/open.
+#[tokio::test]
+async fn toggle_hides_then_shows_a_dock_preserving_content() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "ialpha<Esc>02l"); // type into the dock; cursor to a non-trivial col
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 2),
+        "cursor parked at col 2 before hiding"
+    );
+    assert_eq!(win_count(&rpc).await, 2, "main + the dock window");
+    let bufs = buf_count(&rpc).await;
+
+    // Hide it (toggle from main works on the layer state directly).
+    exec_lua(&rpc, "nx.dock.toggle('left')").await;
+    assert_eq!(
+        win_count(&rpc).await,
+        1,
+        "the hidden dock leaves the window list"
+    );
+    assert_eq!(
+        buf_count(&rpc).await,
+        bufs,
+        "hiding keeps every buffer loaded"
+    );
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") == 0).await;
+    assert_eq!(band(&rd, "dock_left"), 0, "a hidden dock reserves no band");
+    assert!(
+        !regions(&rd).iter().any(|r| r == "dock_left"),
+        "no dock_left window is painted while hidden"
+    );
+
+    // Show it again: the dock returns, focused, with its text and cursor intact.
+    exec_lua(&rpc, "nx.dock.toggle('left')").await;
+    assert_eq!(win_count(&rpc).await, 2, "the dock is back");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha"],
+        "the typed text survived the hide"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 2),
+        "the cursor position survived too"
+    );
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") == 20).await;
+    assert_eq!(band(&rd, "dock_left"), 20, "the band is restored");
+}
+
+/// Hiding preserves a dock's *internal* layout: an internal split survives the
+/// round-trip, which a close/reopen (fresh single scratch) would not.
+#[tokio::test]
+async fn toggle_preserves_internal_splits() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await;
+    feed(&rpc, "<C-w>v"); // split inside the dock → two dock windows
+    assert_eq!(win_count(&rpc).await, 3, "main + two dock windows");
+
+    exec_lua(&rpc, "nx.dock.hide('left')").await;
+    assert_eq!(win_count(&rpc).await, 1, "both dock windows are hidden");
+
+    exec_lua(&rpc, "nx.dock.show('left')").await;
+    assert_eq!(
+        win_count(&rpc).await,
+        3,
+        "the internal split is restored, not collapsed to one scratch"
+    );
+}
+
+/// A *hidden* dock is not a *closed* one: its buffer stays loaded and reopening
+/// `nx.dock.open` reveals the same content, whereas closing drops it so a reopen
+/// mints a fresh scratch.
+#[tokio::test]
+async fn hidden_is_distinct_from_closed() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "ikeep<Esc>");
+
+    // Hide, then re-open by side: the same buffer (text) comes back.
+    exec_lua(&rpc, "nx.dock.hide('left')").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left' }").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["keep"],
+        "open un-hides the existing content"
+    );
+
+    // Now close it: the buffer stays loaded, but a fresh open mints a new scratch.
+    exec_lua(&rpc, "nx.dock.close('left')").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left' }").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "after a real close, reopening is a fresh empty scratch"
+    );
+}
+
+/// An `autohide` dock collapses itself the moment focus crosses out of it (here
+/// via `<C-w><C-w>`), and re-shows with its content intact.
+#[tokio::test]
+async fn autohide_dock_collapses_when_focus_leaves() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, autohide = true }",
+    )
+    .await;
+    feed(&rpc, "ipanel<Esc>");
+    assert_eq!(
+        win_count(&rpc).await,
+        2,
+        "the autohide dock is open and focused"
+    );
+
+    // Cross back to main: leaving the dock auto-hides it.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(lines(&rpc).await, vec!["main"], "focus is back in main");
+    assert_eq!(
+        win_count(&rpc).await,
+        1,
+        "the dock collapsed on focus-leave"
+    );
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") == 0).await;
+    assert_eq!(
+        band(&rd, "dock_left"),
+        0,
+        "the autohide dock reserves no band"
+    );
+
+    // Toggling it back restores the content.
+    exec_lua(&rpc, "nx.dock.toggle('left')").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["panel"],
+        "the dock's content survived autohide"
+    );
+}
+
+/// Auto-hide also fires for a mouse crossing — clicking into the main area
+/// collapses the focused autohide dock.
+#[tokio::test]
+async fn autohide_collapses_on_a_mouse_click_in_main() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, autohide = true }",
+    )
+    .await;
+    feed(&rpc, "ipanel<Esc>");
+    assert_eq!(win_count(&rpc).await, 2);
+
+    // The main area starts past the 20-col dock + separator (col 21); click inside.
+    feed_mouse(&rpc, "left", "press", 3, 40);
+    assert_eq!(lines(&rpc).await, vec!["main"], "the click focused main");
+    assert_eq!(
+        win_count(&rpc).await,
+        1,
+        "the autohide dock collapsed when the click left it"
+    );
+}
+
+/// A non-autohide dock stays put when focus leaves it (the default).
+#[tokio::test]
+async fn a_plain_dock_stays_open_when_focus_leaves() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "ipanel<Esc>");
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        win_count(&rpc).await,
+        2,
+        "a dock without autohide stays open across a focus cross"
+    );
+}
+
+/// Toggling a side that has no dock is a reported no-op, not a panic or a new dock.
+#[tokio::test]
+async fn toggle_on_an_absent_side_is_a_noop() {
+    let (rpc, _incoming) = start().await;
+    assert_eq!(win_count(&rpc).await, 1);
+    exec_lua(&rpc, "nx.dock.toggle('right')").await;
+    assert_eq!(
+        win_count(&rpc).await,
+        1,
+        "toggling an absent dock neither panics nor opens one"
+    );
+}
+
+/// The `:DockToggle` ex-command drives the same path as `nx.dock.toggle`.
+#[tokio::test]
+async fn dock_toggle_ex_command_drives_it() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 6 }").await;
+    feed(&rpc, "ibot<Esc>");
+    assert_eq!(win_count(&rpc).await, 2);
+
+    feed(&rpc, ":DockToggle bottom<CR>");
+    assert_eq!(win_count(&rpc).await, 1, ":DockToggle hid the dock");
+    feed(&rpc, ":DockToggle bottom<CR>");
+    assert_eq!(win_count(&rpc).await, 2, ":DockToggle showed it again");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["bot"],
+        "content preserved across the ex-command"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Collapsed-dock indicator — a hidden dock still advertises itself as a clickable
+// chip on the idle command-line row (Phase 5).
+// ---------------------------------------------------------------------------
+
+/// Hiding a dock projects a `▸{title}` chip; showing it clears the chip.
+#[tokio::test]
+async fn a_hidden_dock_projects_a_chip() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, title = 'EXPLORER' }",
+    )
+    .await;
+    exec_lua(&rpc, "nx.dock.hide('left')").await;
+    let rd = wait_redraw(&mut incoming, |m| !hidden_docks(m).is_empty()).await;
+    assert_eq!(
+        hidden_docks(&rd),
+        vec!["EXPLORER"],
+        "the hidden dock advertises its title as a chip"
+    );
+
+    // Showing it again removes the chip.
+    exec_lua(&rpc, "nx.dock.show('left')").await;
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") == 20).await;
+    assert!(
+        hidden_docks(&rd).is_empty(),
+        "a visible dock contributes no chip, got {:?}",
+        hidden_docks(&rd)
+    );
+}
+
+/// An untitled hidden dock falls back to its side keyword for the chip label.
+#[tokio::test]
+async fn an_untitled_hidden_dock_chip_uses_the_side_keyword() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 6 }").await;
+    exec_lua(&rpc, "nx.dock.hide('bottom')").await;
+    let rd = wait_redraw(&mut incoming, |m| !hidden_docks(m).is_empty()).await;
+    assert_eq!(hidden_docks(&rd), vec!["bottom"], "untitled → side keyword");
+}
+
+/// Clicking a collapsed-dock chip on the command-line row re-shows that dock.
+#[tokio::test]
+async fn clicking_a_hidden_dock_chip_reshows_it() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "imain<Esc>");
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'left', size = 20, title = 'EXPLORER' }",
+    )
+    .await;
+    feed(&rpc, "ipanel<Esc>");
+    // Hide it; focus is back in main, the chip `▸EXPLORER` sits at cols 0.. of the
+    // command-line row (row 24 = the windows-area height the harness attaches).
+    exec_lua(&rpc, "nx.dock.hide('left')").await;
+    assert_eq!(win_count(&rpc).await, 1, "the dock is hidden");
+
+    feed_mouse(&rpc, "left", "press", 24, 3); // inside `▸EXPLORER`
+    assert_eq!(
+        win_count(&rpc).await,
+        2,
+        "clicking the chip re-showed the dock"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["panel"],
+        "the chip click focuses the re-shown dock, content intact"
     );
 }

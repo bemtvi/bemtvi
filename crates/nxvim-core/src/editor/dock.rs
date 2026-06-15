@@ -18,11 +18,23 @@ use super::*;
 use crate::options::WindowOptions;
 
 impl Editor {
-    /// Whether the dock on `side` is open: it has a [`TabStack`] in
-    /// [`Editor::dock_tabs`] (presence *is* open — even when it is the focused
-    /// layer, the stack stays, just with its active tab's tree swapped live onto
-    /// [`Editor::windows`]). Always prefer this over inspecting the `Option`.
+    /// Whether the dock on `side` is **open and visible**: it has a [`TabStack`] in
+    /// [`Editor::dock_tabs`] *and* is not [hidden](Editor::dock_hidden). This is the
+    /// visibility predicate every layout / render / mouse / focus-cross site reads —
+    /// a hidden dock reads as not-open here so it's excluded from all of them, while
+    /// its parked content stays resolvable through the `dock_tabs`-reading helpers
+    /// ([`Editor::stack`], [`Editor::layer_tree`], [`Editor::parked_trees_mut`]).
+    /// Always prefer this over inspecting the `Option`. For "does any state exist
+    /// (visible *or* hidden)" use [`Editor::dock_exists`].
     pub(crate) fn dock_is_open(&self, side: DockSide) -> bool {
+        self.dock_exists(side) && !self.dock_hidden[side.idx()]
+    }
+
+    /// Whether the dock on `side` has state at all — a [`TabStack`] in
+    /// [`Editor::dock_tabs`], whether visible or hidden. The lifecycle guards
+    /// (`open`/`close`/`focus`/`hide`/`show`) test this so they still act on a
+    /// *hidden* dock; visibility decisions use [`Editor::dock_is_open`] instead.
+    pub(crate) fn dock_exists(&self, side: DockSide) -> bool {
         self.dock_tabs[side.idx()].is_some()
     }
 
@@ -175,6 +187,7 @@ impl Editor {
         if target == self.focused_layer {
             return;
         }
+        let prev = self.focused_layer;
         self.stash_focused_view();
         // The live tree parks into the outgoing layer's active slot; the incoming
         // layer's active slot (currently parked) becomes live.
@@ -190,6 +203,16 @@ impl Editor {
         self.focused_layer = target;
         if let Layer::Dock(s) = target {
             self.last_dock = s;
+        }
+        // Auto-hide: a dock marked `autohide` collapses as soon as focus leaves it.
+        // Its tree is already parked by the swap above, so this is just the flag; the
+        // `relayout()` below reflects the now-hidden band. Re-entrancy is safe —
+        // `hide_dock` reaches here via `switch_layer(Main)` and would set the same
+        // flag idempotently.
+        if let Layer::Dock(s) = prev {
+            if self.dock_options[s.idx()].auto_hide {
+                self.dock_hidden[s.idx()] = true;
+            }
         }
         self.relayout();
         let cur = self.windows.current;
@@ -215,9 +238,10 @@ impl Editor {
     /// `nx.dock.open` / `:DockOpen`.
     pub(crate) fn open_dock(&mut self, side: DockSide, size: usize, buf: Option<BufferId>) {
         self.dock_sizes[side.idx()] = size.max(1);
-        if self.dock_is_open(side) {
-            // Already open: honor the new size, ensure the requested buffer shows,
-            // and focus it.
+        if self.dock_exists(side) {
+            // Already present (visible or hidden): un-hide it, honor the new size,
+            // ensure the requested buffer shows, and focus it.
+            self.dock_hidden[side.idx()] = false;
             self.focus_dock(side);
             if let Some(buf) = buf {
                 let win = self.windows.current;
@@ -262,7 +286,7 @@ impl Editor {
     /// the live [`Editor::windows`] is always valid. A no-op if the dock isn't
     /// open. Backs `nx.dock.close` / `:DockClose`.
     pub(crate) fn close_dock(&mut self, side: DockSide) {
-        if !self.dock_is_open(side) {
+        if !self.dock_exists(side) {
             return;
         }
         if self.focused_layer == Layer::Dock(side) {
@@ -272,15 +296,64 @@ impl Editor {
         // showed stay loaded in the store, like closing a window.
         self.dock_tabs[side.idx()] = None;
         self.dock_sizes[side.idx()] = 0;
+        self.dock_hidden[side.idx()] = false;
         self.relayout();
         self.ensure_visible();
     }
 
     /// Focus the dock on `side` (`nx.dock.focus` / `:DockFocus`, and the
-    /// `<C-w><C-w>` directional cross). A no-op if the dock isn't open.
+    /// `<C-w><C-w>` directional cross). Focusing a hidden dock un-hides it first
+    /// (you can't focus what isn't shown). A no-op if the dock isn't present.
     pub(crate) fn focus_dock(&mut self, side: DockSide) {
-        if self.dock_is_open(side) {
+        if self.dock_exists(side) {
+            self.dock_hidden[side.idx()] = false;
             self.switch_layer(Layer::Dock(side));
+        }
+    }
+
+    /// Hide the dock on `side` — collapse it from view while keeping its whole
+    /// [`TabStack`] parked (content, internal splits, tab pages, cursor and scroll
+    /// all survive), the toggle / auto-hide counterpart of [`Editor::close_dock`]
+    /// (which drops the stack). If it is the focused layer, focus crosses back to
+    /// main first so the hidden dock is a *parked* layer, never the live
+    /// [`Editor::windows`]. A no-op if the dock isn't currently visible. Backs
+    /// `nx.dock.hide` / `:DockHide`.
+    pub(crate) fn hide_dock(&mut self, side: DockSide) {
+        if !self.dock_is_open(side) {
+            return;
+        }
+        if self.focused_layer == Layer::Dock(side) {
+            self.switch_layer(Layer::Main);
+        }
+        self.dock_hidden[side.idx()] = true;
+        self.relayout();
+        self.ensure_visible();
+    }
+
+    /// Show (un-hide) the dock on `side` and focus it, restoring the content it had
+    /// when hidden. A no-op if the dock isn't present (toggling has nothing to
+    /// restore; open a fresh dock with [`Editor::open_dock`] instead). Backs
+    /// `nx.dock.show` / `:DockShow`.
+    pub(crate) fn show_dock(&mut self, side: DockSide) {
+        if !self.dock_exists(side) {
+            return;
+        }
+        self.dock_hidden[side.idx()] = false;
+        self.focus_dock(side);
+        self.relayout();
+    }
+
+    /// Toggle the dock on `side`: a visible dock is hidden, a hidden one is shown
+    /// (with its preserved content), and an absent side is reported (toggle has no
+    /// size/buffer to mint a fresh dock from — that's [`Editor::open_dock`]'s job).
+    /// Backs `nx.dock.toggle` / `:DockToggle`.
+    pub(crate) fn toggle_dock(&mut self, side: DockSide) {
+        if self.dock_is_open(side) {
+            self.hide_dock(side);
+        } else if self.dock_exists(side) {
+            self.show_dock(side);
+        } else {
+            self.echo(format!("nx.dock: no dock on {} to toggle", side.keyword()));
         }
     }
 
@@ -321,6 +394,37 @@ impl Editor {
         }
     }
 
+    /// `nx.dock.toggle(side)` — toggle a dock's visibility by side keyword.
+    pub fn toggle_dock_named(&mut self, side: &str) {
+        match DockSide::from_keyword(side) {
+            Some(s) => self.toggle_dock(s),
+            None => self.echo(format!("E474: Invalid dock side: {side}")),
+        }
+    }
+
+    /// `nx.dock.hide(side)` — hide a dock (keep its content) by side keyword.
+    pub fn hide_dock_named(&mut self, side: &str) {
+        match DockSide::from_keyword(side) {
+            Some(s) => self.hide_dock(s),
+            None => self.echo(format!("E474: Invalid dock side: {side}")),
+        }
+    }
+
+    /// `nx.dock.show(side)` — show (un-hide) and focus a dock by side keyword.
+    pub fn show_dock_named(&mut self, side: &str) {
+        match DockSide::from_keyword(side) {
+            Some(s) => self.show_dock(s),
+            None => self.echo(format!("E474: Invalid dock side: {side}")),
+        }
+    }
+
+    /// Whether the dock on `side` (keyword) is present but hidden — the string-keyed
+    /// read for the server / RPC boundary, distinguishing hidden from closed.
+    pub fn dock_is_hidden_named(&self, side: &str) -> bool {
+        DockSide::from_keyword(side)
+            .is_some_and(|s| self.dock_exists(s) && self.dock_hidden[s.idx()])
+    }
+
     /// Whether the dock on `side` (keyword) is open — the string-keyed
     /// [`Editor::dock_is_open`] for the server's `nx._docks` mirror.
     pub fn dock_is_open_named(&self, side: &str) -> bool {
@@ -349,6 +453,7 @@ impl Editor {
         match name {
             "showtabline" => self.dock_options[s.idx()].showtabline = Some(value.clamp(0, 2) as u8),
             "size" => self.dock_sizes[s.idx()] = value.max(1) as usize,
+            "autohide" => self.dock_options[s.idx()].auto_hide = value != 0,
             other => return self.echo(format!("E474: unknown dock option: {other}")),
         }
         self.relayout();
@@ -391,5 +496,27 @@ impl Editor {
     /// when unset or the dock isn't open.
     pub(crate) fn dock_title(&self, side: DockSide) -> &str {
         &self.dock_options[side.idx()].title
+    }
+
+    /// Every **hidden** dock as `(side, label)` in [`DockSide::ALL`] order, for the
+    /// collapsed-dock indicator. The label is the dock's `title` if set, else the
+    /// side keyword (`"left"`/…). Empty when no dock is hidden. A hidden dock keeps
+    /// its content parked; this is the only on-screen hint that it still exists, so
+    /// the client paints these as clickable chips on the idle command-line row and
+    /// [`Editor::hidden_chip_at`] maps a click back to the side to re-show.
+    pub(crate) fn hidden_dock_chips(&self) -> Vec<(DockSide, String)> {
+        DockSide::ALL
+            .into_iter()
+            .filter(|&s| self.dock_exists(s) && self.dock_hidden[s.idx()])
+            .map(|s| {
+                let title = self.dock_title(s);
+                let label = if title.is_empty() {
+                    s.keyword().to_string()
+                } else {
+                    title.to_string()
+                };
+                (s, label)
+            })
+            .collect()
     }
 }

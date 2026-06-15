@@ -17,7 +17,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_at,
-    lines, message, mode, spawn, temp_dir, write_temp, FakeClipboard, TestClock,
+    lines, message, mode, spawn, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -120,7 +120,8 @@ async fn mousetime_option_roundtrips() {
     let (rpc, mut incoming) = start("hello").await;
     command(&rpc, "set mousetime=250").await;
     command(&rpc, "set mousetime?").await;
-    let map = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw");
+    // Wait for the frame carrying the echoed value (the redraw can lag under load).
+    let map = wait_redraw(&mut incoming, |m| message(m) == "mousetime=250").await;
     assert_eq!(message(&map), "mousetime=250");
 }
 

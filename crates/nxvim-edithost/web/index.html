@@ -1224,8 +1224,15 @@
         }
         if (curIdx >= chars.length) html += `<span class="cur-block"> </span>`;
         el.innerHTML = html;
+      } else if (view.message) {
+        el.textContent = view.message;
+      } else if (view.hidden_docks && view.hidden_docks.length) {
+        // Idle row: collapsed (hidden) docks shown as `▸{label}` chips — the only
+        // hint a hidden dock exists; a click re-shows it (core's hidden_chip_at maps
+        // the cell). Geometry mirrors the core hit-test: from col 0, space-separated.
+        el.textContent = view.hidden_docks.map((l) => "▸" + l).join(" ");
       } else {
-        el.textContent = view.message || "";
+        el.textContent = "";
       }
       gridEl.appendChild(el);
     }

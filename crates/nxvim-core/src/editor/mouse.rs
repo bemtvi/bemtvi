@@ -190,6 +190,13 @@ impl Editor {
     /// click no selection starts until the first drag; double/triple enter Visual
     /// immediately.
     fn mouse_left_press(&mut self, row: usize, col: usize, stamp_ms: u64) {
+        // A press on a collapsed-dock chip (on the idle command-line row) re-shows
+        // that dock — the click affordance for the toggle / auto-hide indicator.
+        if let Some(side) = self.hidden_chip_at(row, col) {
+            self.mouse_select = None;
+            self.show_dock(side);
+            return;
+        }
         let target = self.hit_test(row, col);
         if let Some(MouseTarget::StatusLine { win }) = target {
             // A press on a window's status line focuses that window (vim) — crossing
@@ -346,6 +353,36 @@ impl Editor {
                 }
             })
             .collect()
+    }
+
+    /// If the global cell `(row, col)` lands on a collapsed-dock chip, the
+    /// [`DockSide`] it would re-show. Chips live on the command-line row
+    /// (`row == self.height`, the row just below the windows area) and only while
+    /// that row is idle — the projected message is empty and we're not in
+    /// command-line mode — mirroring the client, which yields the row to a message
+    /// or a typed command. They start at col 0, each `▸{label}` (the dock title or
+    /// side keyword) separated by a single space, in [`Editor::hidden_dock_chips`]
+    /// order. The geometry mirrors the client chip painter exactly so a click lands
+    /// on the chip it visually covers (cf. [`Editor::region_tabline_at`]).
+    fn hidden_chip_at(&self, row: usize, col: usize) -> Option<DockSide> {
+        if row != self.height {
+            return None;
+        }
+        // The View blanks `message` everywhere except a real message / the terminal
+        // hint; chips show only when that row would otherwise be blank.
+        let message_shown = !self.message.is_empty() || self.mode == Mode::Terminal;
+        if message_shown || self.mode == Mode::Command {
+            return None;
+        }
+        let mut x = 0;
+        for (side, label) in self.hidden_dock_chips() {
+            let w = crate::unicode::display_width(&format!("▸{label}"));
+            if (x..x + w).contains(&col) {
+                return Some(side);
+            }
+            x += w + 1; // chip width plus the one-cell space separator
+        }
+        None
     }
 
     /// The open region — and the absolute top-left of its window-tree area — whose

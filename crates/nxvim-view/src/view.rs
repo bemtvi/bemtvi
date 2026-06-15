@@ -296,6 +296,12 @@ pub struct View {
     /// `None` when none is open. Drawn over the focused window's text area with
     /// input focus, like the popup. Global.
     pub menu: Option<MenuData>,
+    /// Labels for each **hidden** dock (toggle / auto-hide collapsed), in dock-side
+    /// order. The client paints these as clickable `▸{label}` chips on the
+    /// command-line row while it is idle (`message` empty and not `command_mode`),
+    /// so a collapsed dock still shows it exists; a click re-shows it. Empty when no
+    /// dock is hidden.
+    pub hidden_docks: Vec<String>,
 }
 
 /// The insert-mode completion popup mirrored from the server's redraw: the ranked
@@ -529,6 +535,8 @@ impl View {
             }),
             _ => None,
         };
+        // Collapsed-dock chips (toggle / auto-hide); absent on an older server.
+        self.hidden_docks = map_str_array(map, "hidden_docks");
     }
 
     /// The focused window — where the terminal cursor is drawn and the reference

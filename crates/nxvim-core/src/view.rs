@@ -415,6 +415,13 @@ pub struct View {
     /// row above the command line. `None` for modes `0/1/2`, where status lines
     /// are per-window (or hidden) instead.
     pub global_statusline: Option<StatuslineCtx>,
+    /// Labels for each **hidden** dock (toggle / auto-hide collapsed), in
+    /// `DockSide::ALL` order — the dock's `nx.dock` title, or its side keyword when
+    /// untitled. Empty when no dock is hidden. The client paints these as clickable
+    /// `▸{label}` chips on the command-line row while it is idle (message empty, not
+    /// command mode), so a collapsed dock still advertises that it exists; clicking
+    /// a chip re-shows that dock.
+    pub hidden_docks: Vec<String>,
 }
 
 impl View {
@@ -459,6 +466,11 @@ impl View {
             panel: ed.panel_view(),
             menu: ed.menu_view(),
             global_statusline,
+            hidden_docks: ed
+                .hidden_dock_chips()
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect(),
             dock_left: bands.left,
             dock_right: bands.right,
             dock_top: bands.top,

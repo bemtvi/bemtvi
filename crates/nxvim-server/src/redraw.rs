@@ -225,6 +225,15 @@ impl EditHost {
                 Value::from("dock_bottom"),
                 Value::from(view.dock_bottom as u64),
             ),
+            (
+                Value::from("hidden_docks"),
+                Value::Array(
+                    view.hidden_docks
+                        .iter()
+                        .map(|l| Value::from(l.as_str()))
+                        .collect(),
+                ),
+            ),
             (Value::from("menu"), menu),
         ];
 

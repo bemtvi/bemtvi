@@ -426,6 +426,17 @@ impl DockSide {
         })
     }
 
+    /// The side keyword (`"left"`/`"right"`/`"top"`/`"bottom"`) — the inverse of
+    /// [`DockSide::from_keyword`], for messages and the RPC/Lua surface.
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            DockSide::Left => "left",
+            DockSide::Right => "right",
+            DockSide::Top => "top",
+            DockSide::Bottom => "bottom",
+        }
+    }
+
     /// A sensible default reserved extent when `nx.dock.open` omits `size`: a wide
     /// gutter for the vertical side bars, a short tray for the horizontal ones.
     pub(crate) fn default_size(self) -> usize {
@@ -565,6 +576,15 @@ pub struct Editor {
     /// `nx.dock.open{...}`; persists across close/reopen of a side. The dock's
     /// *size* lives in `dock_sizes`, not here.
     dock_options: [DockOptions; 4],
+    /// Which docks are **hidden** — present (their [`TabStack`] still parked in
+    /// [`Editor::dock_tabs`], so their content/splits/tabs/cursor survive) but
+    /// excluded from layout, render, mouse hit-testing and focus-crossing. A hidden
+    /// dock is the toggle / auto-hide collapsed state (VSCode-style), distinct from
+    /// *closed* (which drops the `TabStack`). Read it through
+    /// [`Editor::dock_is_open`] (which is false for a hidden side); never inspect a
+    /// raw `dock_tabs[idx].is_some()` for a visibility decision. Indexed by
+    /// [`DockSide::idx`].
+    dock_hidden: [bool; 4],
     /// The dock a non-directional `<C-w><C-w>{cmd}` (e.g. `<C-w><C-w>v`) crosses
     /// to — the most recently focused dock. Directional crosses pick by edge
     /// instead ([`DockSide::from_dir`]).
@@ -1103,6 +1123,7 @@ impl Editor {
             focused_layer: Layer::Main,
             dock_sizes: [0; 4],
             dock_options: Default::default(),
+            dock_hidden: [false; 4],
             last_dock: DockSide::Left,
             alternate: None,
             global_marks: HashMap::new(),

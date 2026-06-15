@@ -46,9 +46,11 @@ end
 -- `nx.dock.opt(side).<name> = <value>` or inline in `nx.dock.open{...}`; read back
 -- through the same proxy. `nx._dock_opts` is a write-through cache keyed by side,
 -- and `nx.dock._set_opt` (Rust) queues the change to the core. Known options:
--- `showtabline` (0/1/2), `size`, `title`, `winhighlight`.
+-- `showtabline` (0/1/2), `size`, `title`, `winhighlight`, `autohide` (collapse the
+-- dock when focus leaves it).
 nx._dock_opts = nx._dock_opts or {}
-local DOCK_OPT_DEFAULT = { showtabline = nil, size = 0, title = "", winhighlight = "" }
+local DOCK_OPT_DEFAULT =
+  { showtabline = nil, size = 0, title = "", winhighlight = "", autohide = false }
 
 -- Apply one dock option: write-through the cache, then queue it to the core.
 local function dock_set_opt(side, name, value)
@@ -87,7 +89,7 @@ nx.dock.open = function(o)
     nx._dock_opts[o.side] = nx._dock_opts[o.side] or {}
     nx._dock_opts[o.side].size = o.size
   end
-  for _, name in ipairs({ "showtabline", "title", "winhighlight" }) do
+  for _, name in ipairs({ "showtabline", "title", "winhighlight", "autohide" }) do
     if o[name] ~= nil then
       dock_set_opt(o.side, name, o[name])
     end
@@ -112,6 +114,23 @@ end)
 nx.command("DockFocus", function(o)
   if o.fargs[1] then
     nx.dock.focus(o.fargs[1])
+  end
+end)
+-- `:DockToggle`/`:DockHide`/`:DockShow {side}` — collapse a dock from view (keeping
+-- its content) and bring it back, distinct from `:DockClose` (which drops it).
+nx.command("DockToggle", function(o)
+  if o.fargs[1] then
+    nx.dock.toggle(o.fargs[1])
+  end
+end)
+nx.command("DockHide", function(o)
+  if o.fargs[1] then
+    nx.dock.hide(o.fargs[1])
+  end
+end)
+nx.command("DockShow", function(o)
+  if o.fargs[1] then
+    nx.dock.show(o.fargs[1])
   end
 end)
 

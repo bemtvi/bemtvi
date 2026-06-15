@@ -336,6 +336,45 @@ pub fn drain_to_latest_redraw(
     }
 }
 
+/// Wait for the most recent `redraw` whose map satisfies `keep`, up to a generous
+/// timeout. *Map convention.*
+///
+/// Unlike [`drain_to_latest_redraw`] — which only inspects frames already queued
+/// in `incoming` — this also *awaits* frames the client reader task has not
+/// delivered yet. That makes it the robust choice after an action whose redraw is
+/// emitted on a later server tick (e.g. an `exec_lua` that mutates layout), where
+/// a plain drain can momentarily see only the stale prior frame under load (the
+/// take-latest race described in the crate docs / CLAUDE.md). Panics if no
+/// matching frame arrives before the timeout.
+pub async fn wait_redraw(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keep: impl Fn(&[(Value, Value)]) -> bool,
+) -> Vec<(Value, Value)> {
+    // A matching frame may already be queued — take the most recent one.
+    if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
+        return map;
+    }
+    // Otherwise await further notifications until one matches.
+    let wait = async {
+        loop {
+            match incoming.recv().await {
+                Some(Incoming::Notification { method, params }) if method == "redraw" => {
+                    match params.into_iter().next() {
+                        Some(Value::Map(map)) if keep(&map) => return map,
+                        Some(Value::Map(_)) => continue,
+                        _ => panic!("redraw without a map"),
+                    }
+                }
+                Some(_) => continue, // a non-redraw notification — ignore
+                None => panic!("notification channel closed before a matching redraw"),
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("timed out waiting for a matching redraw")
+}
+
 // ===== redraw: accessors (params convention) =================================
 
 /// A top-level value in the redraw map, addressed through the raw params

@@ -1228,16 +1228,32 @@ impl Renderer {
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
-        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         let pos = self.cell_px(0, cmd_row);
-        let text = if view.command_mode || !view.cmdline.is_empty() {
-            if !view.cmdline_prompt.is_empty() {
+        // Idle, with docks collapsed: advertise them as `▸{label}` chips (the click
+        // affordance core's `hidden_chip_at` maps back). Geometry must match: from
+        // col 0, each `▸{label}`, space-separated. A message / typed command wins.
+        let (text, fg) = if view.command_mode || !view.cmdline.is_empty() {
+            let line = if !view.cmdline_prompt.is_empty() {
                 format!("{}{}", view.cmdline_prompt, view.cmdline)
             } else {
                 format!("{}{}", view.cmdline_prefix, view.cmdline)
-            }
+            };
+            (line, style_fg(&view.normal).unwrap_or(DEFAULT_FG))
+        } else if !view.message.is_empty() {
+            (
+                view.message.clone(),
+                style_fg(&view.normal).unwrap_or(DEFAULT_FG),
+            )
+        } else if !view.hidden_docks.is_empty() {
+            let chips = view
+                .hidden_docks
+                .iter()
+                .map(|l| format!("▸{l}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (chips, style_fg(&view.status_line).unwrap_or(DEFAULT_FG))
         } else {
-            view.message.clone()
+            (String::new(), style_fg(&view.normal).unwrap_or(DEFAULT_FG))
         };
         let full = self.full_bounds();
         self.push_plain(items, &text, pos, fg, full);

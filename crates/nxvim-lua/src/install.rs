@@ -251,6 +251,32 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
+    // `toggle`/`hide`/`show` — collapse a dock from view while keeping its content
+    // parked (VSCode-style), the counterpart of `close` (which drops the content).
+    let sh = shared.clone();
+    dock.set(
+        "toggle",
+        lua.create_function(move |_, side: String| {
+            sh.borrow_mut().dock_ops.push(DockOp::Toggle { side });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    dock.set(
+        "hide",
+        lua.create_function(move |_, side: String| {
+            sh.borrow_mut().dock_ops.push(DockOp::Hide { side });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    dock.set(
+        "show",
+        lua.create_function(move |_, side: String| {
+            sh.borrow_mut().dock_ops.push(DockOp::Show { side });
+            Ok(())
+        })?,
+    )?;
     // `nx._dock_set_opt(side, name, value)`: queue a [`DockOp::SetOption`] for the
     // dock scope. The prelude's `nx.dock.opt(side)` proxy (and the inline keys of
     // `nx.dock.open{...}`) call this after write-through to `nx._dock_opts`. A

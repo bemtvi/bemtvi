@@ -1495,12 +1495,28 @@ fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view
 }
 
 fn render_command(frame: &mut Frame, area: Rect, view: &View) {
-    let content = if view.command_mode {
-        format!("{}{}", cmdline_prompt_str(view), view.cmdline)
-    } else {
-        view.message.clone()
-    };
-    frame.render_widget(Paragraph::new(content), area);
+    if view.command_mode {
+        frame.render_widget(
+            Paragraph::new(format!("{}{}", cmdline_prompt_str(view), view.cmdline)),
+            area,
+        );
+    } else if !view.message.is_empty() {
+        frame.render_widget(Paragraph::new(view.message.clone()), area);
+    } else if !view.hidden_docks.is_empty() {
+        // The idle command row advertises collapsed (hidden) docks as `▸{label}`
+        // chips — the only on-screen hint a hidden dock still exists. A click on one
+        // re-shows that dock (see the core `hidden_chip_at` hit-test). Geometry must
+        // match that hit-test: chips from col 0, each `▸{label}`, space-separated.
+        let chip_style = view.status_line.map(rt).unwrap_or_default();
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, label) in view.hidden_docks.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(format!("▸{label}"), chip_style));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 }
 
 /// Render the tabline across the top row. With a custom `'tabline'` set, the

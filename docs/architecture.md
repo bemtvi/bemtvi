@@ -502,13 +502,26 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   carries the band sizes and tags each window with its `WindowRegion`, and each
   client maps region → absolute origin (the core owns *which* cells, the client
   owns *where*). Surface: the `nx.dock.*` Lua table
-  (`open{side,size?,buf?,title?,showtabline?}` / `close` / `focus`, plus the
+  (`open{side,size?,buf?,title?,showtabline?,autohide?}` / `close` / `focus`, plus the
   per-dock option scope `nx.dock.opt(side)`) and the `:DockOpen`/`:DockClose`/
   `:DockFocus` ex-commands, queued as a `DockOp` drained into the core. Mouse:
   `hit_test` resolves a click across **every** region (the focused layer plus each
   parked dock tree, via `region_geoms`), so a left-click in any dock focuses it and
-  places the cursor — `set_current_window` crosses to that layer first. (Design:
-  [`docs/plans/2026-06-14-permanent-docked-panels.md`](plans/2026-06-14-permanent-docked-panels.md).)
+  places the cursor — `set_current_window` crosses to that layer first. A dock can
+  also be **hidden** (toggle / auto-hide): `dock_hidden[side]` collapses it from view
+  while keeping its whole `TabStack` parked, so its splits/tabs/cursor/text all return
+  when shown again — distinct from *closed* (which drops the trees). `dock_is_open` is
+  the visibility predicate (= present **and** not hidden) that every layout / render /
+  mouse / enumeration site reads, while the tree-resolution helpers read `dock_tabs`
+  directly so a hidden dock's content stays addressable. `nx.dock.toggle`/`hide`/`show`
+  (and `:DockToggle`/`:DockHide`/`:DockShow`) drive it; the per-dock `autohide` option
+  hides a dock the moment focus leaves it (a hook in `switch_layer`, the one chokepoint
+  for every focus cross). A hidden dock isn't invisible: `View.hidden_docks` carries a
+  label per collapsed dock, which each client paints as a clickable `▸{label}` chip on
+  the idle command-line row (`hidden_chip_at` maps a click back to `show_dock`).
+  (Design:
+  [`docs/plans/2026-06-14-permanent-docked-panels.md`](plans/2026-06-14-permanent-docked-panels.md),
+  [`docs/plans/2026-06-14-dock-toggle-autohide.md`](plans/2026-06-14-dock-toggle-autohide.md).)
 - **Autocmds.** `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`/`WinResized` fire from
   the same server-side lifecycle diff as the buffer events, ordered
   `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.

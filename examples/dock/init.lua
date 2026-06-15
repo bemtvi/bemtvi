@@ -16,6 +16,17 @@
 --   <C-w>v / <C-w>s   while focused in a dock, split WITHIN it (single <C-w>!)
 --   <C-w><C-w>v   from the main area, cross to the last dock and split it
 --   :DockOpen left 30      open/resize a dock      (:DockClose / :DockFocus {side})
+--   :DockToggle left       collapse the dock from view / bring it back
+--   <leader>e              toggle the left explorer (the same, by keymap)
+--
+-- TOGGLE vs CLOSE: :DockToggle (and nx.dock.hide/show) collapse a dock from view
+-- while KEEPING its content — its splits, tabs, cursor and text all come back when
+-- you toggle it open again. :DockClose instead drops the content. The bottom tray
+-- below is set `autohide` — it collapses by itself the moment focus leaves it, and
+-- pops back when you cross into it again.
+--
+-- A collapsed dock isn't gone: it shows a ▸LABEL chip on the command-line row
+-- (bottom-left, when idle). Click the chip to bring that dock back.
 --
 -- The double <C-w><C-w> is the LAYER switch (main <-> docks); a single <C-w>
 -- always acts within the layer you are focused in. Each dock starts on an empty
@@ -48,6 +59,10 @@ nx.dock.opt("left").showtabline = 2
 -- The bottom tray gets a title too; open a second tab in it (`:tabnew` while it
 -- is focused) and its strip lights up on its own.
 nx.dock.opt("bottom").title = "TERMINAL"
+-- ...and `autohide`: it collapses the instant focus leaves it, and re-appears when
+-- you cross back in (`<C-w><C-w>j`) or `:DockShow bottom`. Great for a panel you
+-- want out of the way until you need it.
+nx.dock.opt("bottom").autohide = true
 
 -- `:DockGrow {side} {n}` — resize a dock live through the `size` option.
 nx.command("DockGrow", function(o)
@@ -57,12 +72,13 @@ nx.command("DockGrow", function(o)
 end)
 
 --------------------------------------------------------------------------------
--- :DockToggle {side} — open the dock (or resize/focus it if already open). Shows
--- that the whole dock surface is driveable from Lua, not just the keymaps.
+-- Toggle the left explorer from a keymap, using the built-in `nx.dock.toggle`
+-- (the same path as the `:DockToggle` ex-command). A hidden dock keeps its
+-- content; toggling it back restores exactly what was there.
 --------------------------------------------------------------------------------
-nx.command("DockToggle", function(o)
-  local side = o.fargs[1] or "right"
-  nx.dock.open({ side = side, size = 30 })
-end)
+vim.g.mapleader = " "
+vim.keymap.set("n", "<leader>e", function()
+  nx.dock.toggle("left")
+end, { desc = "toggle the left explorer dock" })
 
 vim.o.number = true

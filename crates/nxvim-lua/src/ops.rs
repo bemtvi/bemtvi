@@ -71,6 +71,13 @@ pub enum DockOp {
     Close { side: String },
     /// `nx.dock.focus(side)` — focus the dock (no-op if it isn't open).
     Focus { side: String },
+    /// `nx.dock.toggle(side)` — hide a visible dock / show a hidden one (preserving
+    /// its content); a no-op (reported) on a side with no dock.
+    Toggle { side: String },
+    /// `nx.dock.hide(side)` — collapse a visible dock, keeping its content parked.
+    Hide { side: String },
+    /// `nx.dock.show(side)` — un-hide and focus a hidden dock, restoring its content.
+    Show { side: String },
     /// `nx.dock.opt(side).<name> = <value>` (and the inline keys of
     /// `nx.dock.open{...}`) — set a dock-scoped option. `name` is `showtabline` /
     /// `size` (numbers), `title` / `winhighlight` (strings); the core validates the

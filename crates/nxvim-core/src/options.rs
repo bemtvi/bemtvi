@@ -213,6 +213,11 @@ pub struct DockOptions {
     /// non-empty title also makes the strip appear even with a single tab (unless
     /// `showtabline` is `0`).
     pub title: String,
+    /// VSCode-style **auto-hide**: when `true`, this dock collapses itself the moment
+    /// focus crosses out of it (it becomes [hidden](crate::editor::Editor), its
+    /// content preserved), and re-appears on the next `nx.dock.toggle`/`focus`/`show`.
+    /// Default `false` (a dock stays put when focus leaves).
+    pub auto_hide: bool,
 }
 
 /// A buffer-local `'regexsyntax'` value: an explicit dialect for this buffer, or

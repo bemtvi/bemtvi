@@ -97,11 +97,18 @@ impl Editor {
     /// (main first, then docks by [`DockSide::ALL`]) then tab order then in-tab
     /// layout order (`nvim_list_wins`, which spans every tabpage in neovim). Each
     /// dock's *inactive* tabs are listed too (their windows exist though unpainted),
-    /// mirroring how main's inactive tabs are listed. Within a tab the order matches
-    /// [`Editor::tab_window_ids`].
+    /// mirroring how main's inactive tabs are listed. A **hidden** dock contributes
+    /// nothing — like [`Editor::window_ids`] it is excluded from the active window
+    /// set, so a toggled-away dock leaves `nvim_list_wins` until shown again. Within
+    /// a tab the order matches [`Editor::tab_window_ids`].
     pub fn all_window_ids(&self) -> Vec<WindowId> {
         let mut ids = Vec::new();
         for layer in std::iter::once(Layer::Main).chain(DockSide::ALL.map(Layer::Dock)) {
+            if let Layer::Dock(s) = layer {
+                if !self.dock_is_open(s) {
+                    continue; // closed or hidden — not in the active window set.
+                }
+            }
             let Some(stack) = self.stack(layer) else {
                 continue;
             };

@@ -1,10 +1,14 @@
 # Multi-encoding support & resilience to invalid UTF-8
 
-> **Status: DONE for the native + daemon paths (2026-06-15).** Phase 0 (foundation)
-> and Phase 1 (options) landed 2026-06-14; Phases 2 (read seam), 3 (write seam), and
-> 4 (tests/example/docs) landed 2026-06-15. The one remaining gap is the **wasm read
-> path** (the browser decodes OPFS bytes to text in JS before they cross the FFI) —
-> see "Remaining work" at the bottom; wasm *writes* already encode correctly.
+> **Status: DONE on every path (2026-06-15).** Phase 0 (foundation) and Phase 1
+> (options) landed 2026-06-14; Phases 2 (read seam), 3 (write seam), and 4
+> (tests/example/docs) landed 2026-06-15, followed by the **wasm read path** the same
+> day (`eh_fs_read_complete` now takes the file's raw bytes ptr+len; the Worker stops
+> `TextDecoder`-ing OPFS/daemon/real-FS reads and routes them through
+> `Editor::load_bytes_into`). Verified in headless Chromium by
+> `crates/nxvim-edithost/web/verify-encoding.mjs` (latin1 decode + invalid-UTF-8
+> byte-identical round-trip). All read/write surfaces — native, daemon, wasm — now
+> share the one decoder and the one encoder.
 >
 > ### Key deviation from the original design: **no PUA escape.**
 > The plan sketched a Supplementary-PUA-A escape (`U+F0000 + b`) to round-trip
@@ -260,33 +264,37 @@ governs the on-disk form.
 
 **Dependencies:** Phases 0–3.
 
-## Remaining work — wasm read path
+## Wasm read path  ✅ DONE (2026-06-15)
 
-The browser read path is the one place that still doesn't share the decoder. The
-Worker (`crates/nxvim-edithost/web/worker.mjs`) reads an OPFS file as an
-`ArrayBuffer`, decodes it to a **string** with `TextDecoder` (lossy on invalid
-bytes), and passes that string across the `eh_fs_read_complete` FFI (`"string"`
-arg) into `complete_fs_read` → `load_replica_wasm` → `load_str_into`. So a wasm
-buffer's `'fileencoding'` stays the utf-8 default and non-UTF-8/invalid files are
-mangled by JS before Rust ever sees them. wasm **writes** are already correct (they
-share `Buffer::to_save_bytes`), so a wasm-opened utf-8 file is consistent; the gap
-is only multi-encoding/invalid-byte *resilience* in the browser.
-
-To close it (a self-contained slice, needs Playwright verification per the web-test
-convention): change `eh_fs_read_complete`'s file case to take raw bytes
-(`ptr` + `len`) instead of a C string, have the Worker pass the `ArrayBuffer` bytes
-(allocated into wasm memory) instead of `TextDecoder`-ing them, and route them
-through `Editor::load_bytes_into` (the same decoder the native/daemon paths use).
-The directory (`kind == 2`, JSON) and error (string) cases stay string-based.
+> **Landed.** `eh_fs_read_complete`'s file case now takes the raw bytes as a
+> `data` ptr + `len` (the dir-JSON / error message stay on the `contents` C string);
+> `complete_fs_read` / `load_replica_wasm` route them through `Editor::load_bytes_into`
+> — the same decoder native and daemon use. The Worker (`worker.mjs`) keeps the raw
+> bytes from OPFS (`opfsRead`), the daemon (`daemonRead` `reply[1]`), and the real-FS
+> picker (`index.html` `realFsRead` → `arrayBuffer()`), marshalling them into wasm
+> memory via a shared `landFsRead` helper instead of `TextDecoder`-ing them. So a
+> browser-opened latin1/utf-16/invalid-UTF-8 file decodes and round-trips exactly like
+> native. Covered by `web/verify-encoding.mjs`; `verify.mjs` (OPFS) and `verify-fs.mjs`
+> (real-FS picker) stay green.
 
 ## Phase 5 — (Later / optional) legibility & breadth
 
-Not required for the feature to be correct; tracked here so it isn't lost:
+- **Status line shows the encoding ✅ (2026-06-15).** nxvim's built-in default
+  `'statusline'` now renders the buffer's `'fileencoding'` (with a `[bom]` suffix
+  when `'bomb'` is set): ` MODE  %f%m%=<enc>  %l,%c `. `StatuslineCtx` carries
+  `fileencoding`/`bomb` (filled in `view.rs`), and `default_statusline` splices the
+  label in as an escaped literal (no new `%`-item — neovim has none; a custom
+  `'statusline'` would use `%{&fenc}`, which needs the `&opt` expr path, still TODO).
+  Covered by `nxvim/tests/screen.rs` (utf-8 default + a latin1 file).
+
+Still open, not required for correctness:
 
 - Render the latin1-fallback's high bytes as `<xx>` hex tokens (extmark/syntax
   overlay) instead of the font's tofu box — closer to vim's display of an
   unprintable byte, without giving up the exact round-trip.
 - Add CJK / other encodings to the `fileencodings` default and the validator.
+- Support `%{&option}` in custom `'statusline'` expressions (only `v:lua.…` today),
+  so a user format can show `%{&fileencoding}` like neovim.
 
 ---
 

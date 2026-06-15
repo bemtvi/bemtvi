@@ -129,6 +129,13 @@ pub struct StatuslineCtx {
     /// The filetype, bare (e.g. `rust`); `%y` wraps it in brackets. Empty ⇒ `%y`
     /// expands to nothing.
     pub filetype: String,
+    /// The buffer's `'fileencoding'` (e.g. `utf-8`, `latin1`, `utf-16le`) — the
+    /// charset its bytes are in on disk. nxvim's built-in default status line shows
+    /// it (neovim has no `%`-letter for it; it's conventionally `%{&fenc}`).
+    pub fileencoding: String,
+    /// Whether the buffer writes a byte-order mark (`'bomb'`); shown as a `[bom]`
+    /// suffix on the encoding in the default status line.
+    pub bomb: bool,
     /// The buffer number (`%n`).
     pub bufnr: usize,
     /// 1-based cursor line (`%l`).
@@ -786,6 +793,8 @@ mod tests {
             readonly: false,
             help: false,
             filetype: "rust".into(),
+            fileencoding: "utf-8".into(),
+            bomb: false,
             bufnr: 1,
             line: 2,
             line_count: 5,

@@ -740,6 +740,8 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
         readonly: false,
         help: false,
         filetype: inp.filetype.to_string(),
+        fileencoding: inp.buf.options.fileencoding.to_string(),
+        bomb: inp.buf.options.bomb,
         bufnr: inp.w.buffer.0 as usize,
         line: inp.cur_line + 1,
         line_count: inp.line_count,

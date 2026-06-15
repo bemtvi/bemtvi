@@ -963,30 +963,39 @@ impl EditHost {
     /// arrive here — the cdylib routes it to [`complete_fs_read_dir`](Self::complete_fs_read_dir)
     /// with its entries; a stray `kind == 2` here is a defensive loud echo, never a silent
     /// empty buffer. Repaints once the buffer lands.
-    pub fn complete_fs_read(&mut self, buffer: BufferId, path: String, kind: u8, contents: &str) {
+    pub fn complete_fs_read(
+        &mut self,
+        buffer: BufferId,
+        path: String,
+        kind: u8,
+        bytes: &[u8],
+        err: &str,
+    ) {
         match kind {
-            0 => self.load_replica_wasm(buffer, path, contents),
-            1 => self.load_replica_wasm(buffer, path, ""),
+            0 => self.load_replica_wasm(buffer, path, bytes),
+            1 => self.load_replica_wasm(buffer, path, b""),
             2 => self.editor.echo(format!(
                 "nxvim: directory read of {path} reached the file applier (use complete_fs_read_dir)"
             )),
             _ => self
                 .editor
-                .echo(format!("nxvim: could not open {path}: {contents}")),
+                .echo(format!("nxvim: could not open {path}: {err}")),
         }
         self.redraw();
     }
 
-    /// Load `contents` into `buffer` as a freshly-read replica of OPFS file `path`, then
-    /// fire the lifecycle a read implies — the wasm-eligible subset of the native
-    /// `load_replica`: [`Editor::load_str_into`](nxvim_core::Editor) replaces the buffer
-    /// in place; clearing it from `announced` lets the now-named buffer's
-    /// `BufReadPost` / `FileType` fire (the latter drives syntax); then refresh the Lua
-    /// snapshot / mirror and drain any autocmd-queued work (which may itself enqueue
-    /// further opens/saves the Worker picks up next).
-    fn load_replica_wasm(&mut self, buffer: BufferId, path: String, contents: &str) {
+    /// Load the OPFS file's raw `bytes` into `buffer` as a freshly-read replica of `path`,
+    /// then fire the lifecycle a read implies — the wasm-eligible subset of the native
+    /// `load_replica_bytes`: [`Editor::load_bytes_into`](nxvim_core::Editor) decodes through
+    /// the shared encoding seam (so a browser open matches native/daemon — latin1/utf-16/BOM
+    /// detection + invalid-UTF-8 resilience) and replaces the buffer in place; clearing it
+    /// from `announced` lets the now-named buffer's `BufReadPost` / `FileType` fire (the
+    /// latter drives syntax); then refresh the Lua snapshot / mirror and drain any
+    /// autocmd-queued work (which may itself enqueue further opens/saves the Worker picks up
+    /// next).
+    fn load_replica_wasm(&mut self, buffer: BufferId, path: String, bytes: &[u8]) {
         self.editor
-            .load_str_into(buffer, Some(path.clone()), contents);
+            .load_bytes_into(buffer, Some(path.clone()), bytes);
         self.announced.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);

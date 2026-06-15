@@ -291,7 +291,9 @@
         const res = handle
           ? await realFsRead(handle)
           : { kind: 3, text: `no file handle for ${msg.path}` };
-        worker.postMessage({ type: "fs_read_result", buffer: msg.buffer, path: msg.path, kind: res.kind, text: res.text });
+        // Transfer the file bytes (kind 0) so they cross zero-copy; dir/new/error send text.
+        const reply = { type: "fs_read_result", buffer: msg.buffer, path: msg.path, kind: res.kind, text: res.text, bytes: res.bytes };
+        worker.postMessage(reply, res.bytes ? [res.bytes.buffer] : []);
         return;
       }
       if (msg.type === "fs_write") {
@@ -1392,12 +1394,13 @@
       }).catch((e) => { if (e?.name !== "AbortError") flashStatus("save failed: " + (e?.message || e), "#e06c75"); });
     }
 
-    // Read a bound file's real bytes for the Worker (off-tick `:e`): { kind, text } where
-    // kind 0 = file contents, 3 = error (per eh_fs_read_complete's contract).
+    // Read a bound file's real bytes for the Worker (off-tick `:e`): { kind, bytes } where
+    // kind 0 = file contents (RAW bytes, so the Worker's encoding seam decodes them — never
+    // `.text()`, which would mangle non-UTF-8), 3 = error (per eh_fs_read_complete's contract).
     async function realFsRead(handle) {
       try {
         const file = await handle.getFile();
-        return { kind: 0, text: await file.text() };
+        return { kind: 0, bytes: new Uint8Array(await file.arrayBuffer()) };
       } catch (e) { return { kind: 3, text: String(e?.message || e) }; }
     }
     // Write the Worker's snapshot bytes to a bound file (off-tick `:w`): { ok, size, error }.

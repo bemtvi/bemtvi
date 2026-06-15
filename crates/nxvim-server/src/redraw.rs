@@ -417,7 +417,7 @@ impl EditHost {
     ) -> Value {
         let default;
         let fmt = if statusline_fmt.is_empty() {
-            default = default_statusline(mode_label);
+            default = default_statusline(mode_label, &ctx.fileencoding, ctx.bomb);
             &default
         } else {
             statusline_fmt
@@ -584,11 +584,22 @@ fn segment_value(text: &str, style: Value) -> Value {
 }
 
 /// The built-in `'statusline'` look, expressed as a format string so the one
-/// engine renders it too: ` MODE  file[+]  …  line,col `. The mode label is an
-/// nxvim addition (neovim shows the mode elsewhere), spliced in as a literal —
-/// escaped, though mode names never contain `%` — since it is not a `%`-item.
-fn default_statusline(mode_label: &str) -> String {
-    format!(" {}  %f%m%=%l,%c ", mode_label.replace('%', "%%"))
+/// engine renders it too: ` MODE  file[+]  …  enc  line,col `. The mode label and
+/// the encoding are nxvim additions spliced in as literals — escaped, though
+/// neither a mode name nor an encoding label ever contains `%` — since they are not
+/// `%`-items (neovim has no encoding item; it's conventionally `%{&fenc}`). `enc`
+/// carries the buffer's `'fileencoding'`, with a `[bom]` suffix when `'bomb'` is set.
+fn default_statusline(mode_label: &str, fileencoding: &str, bomb: bool) -> String {
+    let enc = if bomb {
+        format!("{fileencoding}[bom]")
+    } else {
+        fileencoding.to_string()
+    };
+    format!(
+        " {}  %f%m%={}  %l,%c ",
+        mode_label.replace('%', "%%"),
+        enc.replace('%', "%%"),
+    )
 }
 
 /// Coerce a `%{}`/`%!` Lua result to the text that goes on the status line.

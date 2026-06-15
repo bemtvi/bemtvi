@@ -113,6 +113,34 @@ async fn typed_text_is_painted_with_the_mode_in_the_status_line() {
 }
 
 #[tokio::test]
+async fn default_statusline_shows_the_fileencoding() {
+    // nxvim's built-in status line shows the buffer's 'fileencoding'. A fresh
+    // [No Name] buffer is utf-8.
+    let (rpc, mut incoming) = start(None).await;
+    let buf = screen(&rpc, &mut incoming).await;
+    let status = row_text(&buf, ROWS - 2);
+    assert!(
+        status.contains("utf-8"),
+        "default status line should show the encoding: {status:?}"
+    );
+}
+
+#[tokio::test]
+async fn default_statusline_shows_a_non_utf8_fileencoding() {
+    // A latin1 file (0xe9 = é) decodes through the encoding seam, and the default
+    // status line reports its detected fileencoding rather than the utf-8 default.
+    let path = nxvim_test_harness::temp_path("screen_enc");
+    std::fs::write(&path, b"caf\xe9\n").expect("write latin1 file");
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    let buf = screen(&rpc, &mut incoming).await;
+    let status = row_text(&buf, ROWS - 2);
+    assert!(
+        status.contains("latin1"),
+        "status line should show the detected latin1 encoding: {status:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_custom_statusline_is_painted_end_to_end() {
     // A custom `'statusline'` runs the server's %-format engine, and the client
     // paints the projected segments verbatim. A field format (`%l,%c`) expands

@@ -36,7 +36,10 @@ const eh_free_string = M.cwrap("eh_free_string", null, ["number"]);
 const eh_take_fs_requests = M.cwrap("eh_take_fs_requests", "number", ["number"]);
 const eh_save_bytes = M.cwrap("eh_save_bytes", "number", ["number", "number"]);
 const eh_save_len = M.cwrap("eh_save_len", "number", ["number", "number"]);
-const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string"]);
+// (h, buffer, path, kind, contents, data, len) — a file's raw bytes cross as the data/len
+// pair (so non-UTF-8 reaches Rust intact for the encoding seam); contents carries only the
+// dir JSON / error message. See `landFsRead`.
+const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string", "number", "number"]);
 const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "number", "number", "number", "number", "string"]);
 // Remote watch leg (Phase 6): the editor arms one watch per file-backed buffer off-tick; the
 // Worker forwards each to the daemon and lands its `fs_changed` pushes back into the tick.
@@ -331,7 +334,9 @@ async function opfsRead(path) {
     const buf = new Uint8Array(ah.getSize());
     ah.read(buf, { at: 0 });
     ah.close();
-    return { kind: 0, text: new TextDecoder().decode(buf) };
+    // Keep the RAW bytes — the encoding seam in Rust (`decode_to_rope`) detects the charset
+    // and handles invalid UTF-8; decoding to text here (TextDecoder) would mangle them.
+    return { kind: 0, bytes: buf };
   } catch (e) {
     return { kind: 3, text: String(e) };
   }
@@ -423,13 +428,16 @@ async function runtimeConnect(uri) {
 }
 
 // Fulfil one off-tick read over the daemon, projecting `fs_read`'s reply onto the same
-// `{ kind, text, path? }` shape `opfsRead` returns (so the applier path is identical).
+// `{ kind, bytes?, text?, path? }` shape `opfsRead` returns (so the applier path is
+// identical): a file carries raw `bytes`, a dir/new/error carries `text`.
 async function daemonRead(path) {
   if (!daemon) return { kind: 3, text: daemonError || "daemon not connected" };
   try {
     const reply = await daemon.request("fs_read", [path]);
     const tag = Array.isArray(reply) ? reply[0] : null;
-    if (tag === "file") return { kind: 0, text: utf8(reply[1]) };
+    // Keep the RAW bytes (`reply[1]` is a Uint8Array off the msgpack bin) for the encoding
+    // seam — don't `utf8()`-decode here, that would mangle non-UTF-8 content.
+    if (tag === "file") return { kind: 0, bytes: reply[1] };
     if (tag === "new") return { kind: 1, text: "" };
     if (tag === "dir") {
       // Daemon entries are `[[is_dir, name], …]`; the wasm dir applier wants `[{is_dir,name}]`.
@@ -707,6 +715,28 @@ async function pump5cDaemon() {
 // Loops until the queue is dry, because landing a read fires `BufReadPost` autocmds (and
 // `run_pending`) that may enqueue further opens/saves. Returns whether any request was
 // handled (so the caller posts a fresh redraw).
+// Land one fs read into the editor tick via the FFI. A file (kind 0) passes its raw bytes
+// (`res.bytes`) through wasm memory so Rust decodes them with the encoding seam; a dir (2) /
+// new (1) / error (3) passes `res.text` (JSON / "" / message). The bytes are copied into a
+// malloc'd buffer for the synchronous call, then freed — there's no `await` between the
+// `HEAPU8.set` and the call, so ALLOW_MEMORY_GROWTH can't detach the heap mid-sequence.
+function landFsRead(buffer, path, kind, res) {
+  if (kind === 0) {
+    const src = res.bytes;
+    const bytes = src instanceof Uint8Array ? src : src ? new Uint8Array(src) : new Uint8Array(0);
+    const len = bytes.length;
+    const ptr = len ? M._malloc(len) : 0;
+    if (ptr) M.HEAPU8.set(bytes, ptr);
+    try {
+      eh_fs_read_complete(h, buffer, path, kind, "", ptr, len);
+    } finally {
+      if (ptr) M._free(ptr);
+    }
+  } else {
+    eh_fs_read_complete(h, buffer, path, kind, res.text ?? "", 0, 0);
+  }
+}
+
 async function fulfillFsRequests() {
   let didWork = false;
   for (;;) {
@@ -723,7 +753,7 @@ async function fulfillFsRequests() {
       const res = daemonUri ? await daemonRead(r.path) : await opfsRead(r.path);
       // A directory read carries its canonical dir in res.path (the explorer navigates
       // from it); a file/new/err keeps the requested path.
-      eh_fs_read_complete(h, r.buffer, res.path ?? r.path, res.kind, res.text);
+      landFsRead(r.buffer, res.path ?? r.path, res.kind, res);
     }
     for (const w of reqs.writes) {
       // A picker-bound path is written by the UI against its handle; route it there and
@@ -1010,7 +1040,9 @@ onmessage = async (ev) => {
   // SAB these are received while the run loop is event-loop-live (pendingRealFs > 0); under
   // 5c the Worker isn't parked, so they're received normally.
   if (msg.type === "fs_read_result") {
-    eh_fs_read_complete(h, msg.buffer, String(msg.path), msg.kind | 0, String(msg.text ?? ""));
+    // A real-FS file read (kind 0) carries raw bytes (`msg.bytes`) so the encoding seam sees
+    // them intact; a dir/new/error carries `msg.text`.
+    landFsRead(msg.buffer, String(msg.path), msg.kind | 0, { bytes: msg.bytes, text: msg.text });
     await landRealFsReply();
     return;
   }

@@ -938,14 +938,20 @@ pub unsafe extern "C" fn eh_save_len(h: *mut WasmEditHost, seq: f64) -> usize {
 }
 
 /// Land a finished off-tick OPFS **read** into `buffer`: `kind` is `0` an existing file
-/// (`contents` is its UTF-8 text), `1` a not-yet-existing path (new-file buffer), `2` a
-/// **directory** (`path` is the canonical dir, `contents` is a JSON array of its entries
+/// (`data`/`len` are its **raw bytes**), `1` a not-yet-existing path (new-file buffer), `2`
+/// a **directory** (`path` is the canonical dir, `contents` is a JSON array of its entries
 /// `[{ "is_dir": bool, "name": str }, …]` → the file-explorer listing), any other a read
-/// error (`contents` is the message). Drives the real lifecycle and repaints — see
+/// error (`contents` is the message). A file's bytes cross as a pointer+length (not a C
+/// string) so non-UTF-8 / invalid-UTF-8 content reaches Rust intact and is decoded through
+/// the shared encoding seam ([`crate::encoding::decode_to_rope`]) exactly like the native
+/// and daemon read paths — the browser no longer `TextDecoder`s (and thus mangles) the
+/// bytes in JS first. `contents` carries only the dir JSON (`kind == 2`) and the error
+/// message; it is empty for a file/new read. Drives the real lifecycle and repaints — see
 /// [`EditHost::complete_fs_read`] / [`EditHost::complete_fs_read_dir`].
 ///
 /// # Safety
-/// `h` must come from [`eh_new`] and not yet be freed; `path` / `contents` valid C strings.
+/// `h` must come from [`eh_new`] and not yet be freed; `path` / `contents` valid C strings;
+/// `data` must point to `len` readable bytes (or be null when `len` is 0).
 #[no_mangle]
 pub unsafe extern "C" fn eh_fs_read_complete(
     h: *mut WasmEditHost,
@@ -953,6 +959,8 @@ pub unsafe extern "C" fn eh_fs_read_complete(
     path: *const c_char,
     kind: u8,
     contents: *const c_char,
+    data: *const u8,
+    len: usize,
 ) {
     let Some(handle) = h.as_mut() else { return };
     let buffer = BufferId(buffer.max(0.0) as u64);
@@ -962,9 +970,14 @@ pub unsafe extern "C" fn eh_fs_read_complete(
             .host
             .complete_fs_read_dir(buffer, path, parse_dir_entries(as_str(contents)));
     } else {
+        let bytes = if data.is_null() || len == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(data, len)
+        };
         handle
             .host
-            .complete_fs_read(buffer, path, kind, as_str(contents));
+            .complete_fs_read(buffer, path, kind, bytes, as_str(contents));
     }
 }
 

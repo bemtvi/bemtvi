@@ -31,6 +31,13 @@ use crate::save::SaveDone;
 use crate::terminal::native::TermEvent;
 use crate::{EditHost, InstallOutcome};
 
+/// How many bytes of terminal output to process per [`EditHost::on_term_events`]
+/// call before settling + repainting. Bounds the work between repaints so a flood
+/// shows visible progress (the live screen scrolls as it loads) and the editor stays
+/// responsive to keystrokes, while staying large enough that ordinary output still
+/// coalesces into a single repaint.
+const TERM_BATCH_BYTES: usize = 256 * 1024;
+
 impl EditHost {
     /// Apply one client message (an `nvim_*` request or notification), then report whether
     /// it asked the editor to quit. The run loop breaks on `true`.
@@ -142,14 +149,34 @@ impl EditHost {
     /// one settle + repaint: feed each output chunk to the buffer's vt100 emulator
     /// (refreshing its mirrored screen) and record an exit. Output arrives in a stream,
     /// so coalescing a burst keeps a chatty child from repainting per chunk.
+    ///
+    /// The drain is **bounded** by a byte budget so a flood still repaints as it
+    /// loads: under a torrent (`rg` printing 500k matches) the channel refills faster
+    /// than we drain it, and draining it dry in one go would block the editor with no
+    /// repaint until the flood ended — the screen would look frozen. We instead
+    /// process up to [`TERM_BATCH_BYTES`] per call, then settle + repaint and return;
+    /// the run loop's `select!` immediately re-fires this arm for the next batch (and
+    /// can interleave the user's keystrokes between batches), so the live screen
+    /// visibly scrolls while loading.
     pub(crate) fn on_term_events(
         &mut self,
         first: TermEvent,
         rx: &mut UnboundedReceiver<TermEvent>,
     ) {
-        self.on_term_event(first);
-        while let Ok(ev) = rx.try_recv() {
+        let mut budget: usize = 0;
+        let mut ev = first;
+        loop {
+            if let TermEvent::Data { bytes, .. } = &ev {
+                budget += bytes.len();
+            }
             self.on_term_event(ev);
+            if budget >= TERM_BATCH_BYTES {
+                break; // repaint progress; the arm re-fires for the rest
+            }
+            match rx.try_recv() {
+                Ok(next) => ev = next,
+                Err(_) => break,
+            }
         }
         self.settle_events(true);
     }

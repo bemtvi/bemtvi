@@ -172,6 +172,19 @@ const PROC_SPAWNED: &str = "proc_spawned";
 const PROC_STDOUT: &str = "proc_stdout";
 const PROC_EXITED: &str = "proc_exited";
 
+// The terminal leg (`term_*`): a *streaming* PTY per buffer — the web `:terminal`
+// (Phase 7). Unlike the run-to-completion process leg above, a terminal stays open
+// for its whole life with raw PTY bytes flowing both ways: the edit-host pushes
+// keystrokes/resizes in, the daemon streams the child's output back. The daemon runs
+// the real PTY via the native [`TerminalManager`](crate::terminal::native::TerminalManager)
+// (the same engine a local `:terminal` uses); the browser owns the vt100 emulation.
+const TERM_OPEN: &str = "term_open";
+const TERM_WRITE: &str = "term_write";
+const TERM_RESIZE: &str = "term_resize";
+const TERM_KILL: &str = "term_kill";
+const TERM_DATA: &str = "term_data";
+const TERM_EXIT: &str = "term_exit";
+
 // The blocking-system leg (`sys_run`): a request/response shell-out that runs to
 // completion on the daemon. Distinct from the process leg above — that one is
 // event-routed (the async `vim.system` / `jobstart`), this one blocks the edit-host's
@@ -458,6 +471,116 @@ pub async fn serve_proc_daemon_on(
         kills.retain(|_, tx| !tx.is_closed());
     }
     Ok(())
+}
+
+/// The terminal leg's connection-agnostic core: drives the `term_*` wire over a
+/// pre-built shared [`Rpc`] + its own demuxed inbound stream — the streaming sibling of
+/// [`serve_proc_daemon_on`]. The single-stdio daemon multiplexer ([`run_daemon_io`]) fans
+/// one connection across every leg's `*_on`; this leg owns a native
+/// [`TerminalManager`](crate::terminal::native::TerminalManager) (the same PTY engine a
+/// local `:terminal` uses) and bridges it to the wire: incoming `term_open`/`term_write`/
+/// `term_resize`/`term_kill` notifications drive the manager, and the children's
+/// [`TermEvent`](crate::terminal::native::TermEvent) output/exit stream back as
+/// `term_data`/`term_exit` pushes the browser feeds to its own vt100 emulator. The buffer
+/// id (`BufferId(u64)`) is the per-terminal key, carried verbatim on the wire.
+pub async fn serve_term_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    use crate::terminal::native::{TermCommand, TermEvent, TerminalManager};
+    use nxvim_core::BufferId;
+
+    let (mut terminals, mut term_events) = TerminalManager::new();
+
+    // One forwarder turns the children's `TermEvent`s — the same events the local run
+    // loop's `on_term_events` arm consumes — into wire notifications back to the browser.
+    let reply = rpc.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = term_events.recv().await {
+            match ev {
+                TermEvent::Data { buf, bytes } => {
+                    reply.notify(TERM_DATA, vec![Value::from(buf.0), Value::Binary(bytes)])
+                }
+                TermEvent::Exit { buf, code } => reply.notify(
+                    TERM_EXIT,
+                    vec![Value::from(buf.0), Value::from(code as i64)],
+                ),
+            }
+        }
+    });
+
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue; // the edit-host drives the daemon with notifications only
+        };
+        match method.as_str() {
+            TERM_OPEN => {
+                if let Some(cmd) = decode_term_open(params) {
+                    terminals.send(cmd);
+                }
+            }
+            TERM_WRITE => {
+                let buf = params.first().and_then(Value::as_u64);
+                let bytes = params.get(1).and_then(|v| match v {
+                    Value::Binary(b) => Some(b.clone()),
+                    Value::String(s) => Some(s.as_bytes().to_vec()),
+                    _ => None,
+                });
+                if let (Some(buf), Some(bytes)) = (buf, bytes) {
+                    terminals.send(TermCommand::Write {
+                        buf: BufferId(buf),
+                        bytes,
+                    });
+                }
+            }
+            TERM_RESIZE => {
+                let buf = params.first().and_then(Value::as_u64);
+                let rows = params.get(1).and_then(Value::as_u64);
+                let cols = params.get(2).and_then(Value::as_u64);
+                if let (Some(buf), Some(rows), Some(cols)) = (buf, rows, cols) {
+                    terminals.send(TermCommand::Resize {
+                        buf: BufferId(buf),
+                        rows: rows as u16,
+                        cols: cols as u16,
+                    });
+                }
+            }
+            TERM_KILL => {
+                if let Some(buf) = params.first().and_then(Value::as_u64) {
+                    terminals.send(TermCommand::Kill { buf: BufferId(buf) });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `term_open` params → a [`TermCommand::Open`]: `[buf(u64), argv([str]), cwd(str|nil),
+/// rows(u64), cols(u64)]`. Returns `None` (the open is dropped) on a malformed frame —
+/// the peer is the same build, so this only guards against a truncated message.
+fn decode_term_open(params: Vec<Value>) -> Option<crate::terminal::native::TermCommand> {
+    use crate::terminal::native::TermCommand;
+    use nxvim_core::BufferId;
+
+    let buf = params.first().and_then(Value::as_u64)?;
+    let argv = match params.get(1) {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let cwd = params.get(2).and_then(Value::as_str).map(str::to_string);
+    let rows = params.get(3).and_then(Value::as_u64)? as u16;
+    let cols = params.get(4).and_then(Value::as_u64)? as u16;
+    Some(TermCommand::Open {
+        buf: BufferId(buf),
+        argv,
+        cwd,
+        rows,
+        cols,
+    })
 }
 
 /// `ProcSpec` → `proc_spawn` params. Consumes the spec so `stdin` (potentially

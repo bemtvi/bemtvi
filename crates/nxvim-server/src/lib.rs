@@ -101,8 +101,9 @@ pub use shada::{default_shada, is_store_file, shada_dir, RedbFileStore, ShadaSto
 pub use daemon::{
     connect_daemon, serve_daemon, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
     serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
-    serve_sys_daemon, serve_sys_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteBlockingSystem,
-    RemoteHostFs, RemoteHostProc, RemoteLspTransport, RemoteLuaFs, WatchEvent,
+    serve_sys_daemon, serve_sys_daemon_on, serve_term_daemon_on, DaemonClient, FsRead, HostFsAsync,
+    RemoteBlockingSystem, RemoteHostFs, RemoteHostProc, RemoteLspTransport, RemoteLuaFs,
+    WatchEvent,
 };
 
 /// The native daemon transport (Open Decision #2): a WebTransport/QUIC listener that
@@ -1754,6 +1755,7 @@ where
     // behaves identically run here or across the wire.
     let (fs_tx, fs_rx) = unbounded_channel();
     let (proc_tx, proc_rx) = unbounded_channel();
+    let (term_tx, term_rx) = unbounded_channel();
     let (sys_tx, sys_rx) = unbounded_channel();
     let (lsp_tx, lsp_rx) = unbounded_channel();
     let (luafs_tx, luafs_rx) = unbounded_channel();
@@ -1765,6 +1767,7 @@ where
             Box::new(StdHostFs),
         )),
         tokio::spawn(daemon::serve_proc_daemon_on(rpc.clone(), proc_rx)),
+        tokio::spawn(daemon::serve_term_daemon_on(rpc.clone(), term_rx)),
         tokio::spawn(daemon::serve_sys_daemon_on(
             rpc.clone(),
             sys_rx,
@@ -1790,6 +1793,8 @@ where
                 Some(&fs_tx)
             } else if method.starts_with("proc_") {
                 Some(&proc_tx)
+            } else if method.starts_with("term_") {
+                Some(&term_tx)
             } else if method == "sys_run" {
                 Some(&sys_tx)
             } else if method.starts_with("lsp_") {
@@ -1809,7 +1814,7 @@ where
 
     // The edit-host hung up: drop the senders so each leg sees EOF and winds down,
     // then wait for them so child reaping completes before we return.
-    drop((fs_tx, proc_tx, sys_tx, lsp_tx, luafs_tx));
+    drop((fs_tx, proc_tx, term_tx, sys_tx, lsp_tx, luafs_tx));
     for leg in legs {
         let _ = leg.await;
     }

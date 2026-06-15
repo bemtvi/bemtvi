@@ -307,6 +307,14 @@ pub struct GoMirror {
     /// float-positioning plugin can center its windows.
     pub columns: u64,
     pub lines: u64,
+    /// The quickfix `'errorformat'` / `'switchbuf'` and the `:make`/`:grep`
+    /// programs + grep parser, so a config reading them through `vim.o` sees the
+    /// live value (and a `vim.o.makeprg = …` write round-trips).
+    pub errorformat: String,
+    pub switchbuf: String,
+    pub makeprg: String,
+    pub grepprg: String,
+    pub grepformat: String,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -1130,6 +1138,25 @@ impl LuaRuntime {
         let run: mlua::Function = nx.get("_run_stdout")?;
         let table = self.lua.create_sequence_from(lines)?;
         run.call::<()>((id, table))
+    }
+
+    /// Drive the `:make` / `:grep` async producer (`nx._qf_make`): spawn `cmd` (a
+    /// shell command line — the server has already expanded `'makeprg'`/`'grepprg'`
+    /// and appended the `2>&1` stderr merge) and, on exit, parse its combined output
+    /// against `efm` into the quickfix list, then open the window / jump to the first
+    /// error per `open` / `jump`. The spawn rides the same job machinery as
+    /// `nx.spawn`; the caller drains the resulting effects.
+    pub fn run_qf_make(
+        &self,
+        cmd: &str,
+        efm: &str,
+        title: &str,
+        open: bool,
+        jump: bool,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_qf_make")?;
+        run.call::<()>((cmd, efm, title, open, jump))
     }
 
     /// Record the OS pid of an async `vim.system` child (keyed by its callback

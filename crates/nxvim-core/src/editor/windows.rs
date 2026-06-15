@@ -1098,6 +1098,9 @@ impl Editor {
             "fileencodings" => self.options.fileencodings = value.to_string(),
             "errorformat" => self.options.errorformat = value.to_string(),
             "switchbuf" => self.options.switchbuf = value.to_string(),
+            "makeprg" => self.options.makeprg = value.to_string(),
+            "grepprg" => self.options.grepprg = value.to_string(),
+            "grepformat" => self.options.grepformat = value.to_string(),
             _ => {}
         }
     }

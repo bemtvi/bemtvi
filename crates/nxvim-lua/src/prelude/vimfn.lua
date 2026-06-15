@@ -460,3 +460,26 @@ function nx.setqflist(list, action, what)
   return 0
 end
 vim.fn.setqflist = nx.setqflist
+
+-- nx._qf_make(cmd, efm, title, open, jump): the async :make / :grep producer
+-- (dispatched from the server, which already expanded 'makeprg'/'grepprg' and
+-- merged stderr into stdout via the shell). Spawn `cmd` through the same job
+-- machinery as nx.spawn / vim.system; on exit, split its combined output into
+-- lines and hand them to nx._qf_populate, which parses them against `efm` into the
+-- quickfix list and then opens the window / jumps to the first error per
+-- `open`/`jump`. On a build with no local process spawn (the serverless web build)
+-- the underlying spawn op fails loud, exactly like vim.system.
+function nx._qf_make(cmd, efm, title, open, jump)
+  local id = nx._next_cb_id()
+  nx._cb_fns[id] = function(result)
+    local out = (result.stdout or "") .. (result.stderr or "")
+    local lines = vim.split(out, "\n", { plain = true })
+    -- A trailing newline leaves one empty final segment; drop just that one so the
+    -- parser doesn't see a phantom blank line (internal blanks are preserved).
+    if lines[#lines] == "" then
+      lines[#lines] = nil
+    end
+    nx._qf_populate(lines, efm, title, open, jump)
+  end
+  nx._system_async(id, { "sh", "-c", cmd }, nil, nil, nil)
+end

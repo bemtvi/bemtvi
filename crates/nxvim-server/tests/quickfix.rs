@@ -364,3 +364,164 @@ async fn copen_opens_a_small_window_at_the_bottom() {
         "quickfix window should sit at the bottom, got top row {row}"
     );
 }
+
+// --- Phase 3: :vimgrep (in-process) and :make / :grep (async producers) -----
+
+/// One folded entry string (`#|filename|lnum|col|text`) from the live list, for
+/// compact assertions.
+async fn first_entry(rpc: &Rpc) -> String {
+    exec_lua(
+        rpc,
+        r#"local q = vim.fn.getqflist()
+           if #q == 0 then return "<empty>" end
+           local e = q[1]
+           return string.format("%d|%s|%d|%d|%s", #q, e.filename or "", e.lnum, e.col, e.text)"#,
+    )
+    .await
+    .as_str()
+    .unwrap_or("<not a string>")
+    .to_string()
+}
+
+/// Poll `getqflist()` until it holds at least `want` entries (an async `:make` /
+/// `:grep` fills it off the run loop), returning the final count.
+async fn poll_qf_count(rpc: &Rpc, want: i64) -> i64 {
+    for _ in 0..200 {
+        let n = exec_lua(rpc, "return #vim.fn.getqflist()")
+            .await
+            .as_i64()
+            .unwrap_or(0);
+        if n >= want {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    exec_lua(rpc, "return #vim.fn.getqflist()")
+        .await
+        .as_i64()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn vimgrep_finds_matches_and_jumps() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("vg", "txt", "alpha\nbeta TODO\ngamma\nTODO again\n");
+    message_after(&rpc, &mut incoming, &format!(":vimgrep /TODO/ {path}<CR>")).await;
+    // Two lines match → two entries; the cursor jumps to the first (line 2, the
+    // match starts at byte col 6).
+    assert_eq!(first_entry(&rpc).await, format!("2|{path}|2|6|beta TODO"));
+    assert_eq!(buf_name(&rpc).await, path, "jumped into the searched file");
+    assert_eq!(cursor(&rpc).await, (2, 5), "landed on the first match");
+}
+
+#[tokio::test]
+async fn vimgrep_g_flag_matches_every_occurrence() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("vgg", "txt", "a a a\nb\n");
+    // Without /g, one entry per matching line; with /g, one per match.
+    message_after(&rpc, &mut incoming, &format!(":vimgrep /a/ {path}<CR>")).await;
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.fn.getqflist()").await.as_i64(),
+        Some(1)
+    );
+    message_after(&rpc, &mut incoming, &format!(":vimgrep /a/g {path}<CR>")).await;
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.fn.getqflist()").await.as_i64(),
+        Some(3)
+    );
+}
+
+#[tokio::test]
+async fn vimgrepadd_appends_to_the_list() {
+    let (rpc, mut incoming) = start().await;
+    let a = write_temp("vga", "txt", "x here\n");
+    let b = write_temp("vgb", "txt", "x there\n");
+    message_after(&rpc, &mut incoming, &format!(":vimgrep /x/ {a}<CR>")).await;
+    message_after(&rpc, &mut incoming, &format!(":vimgrepadd /x/ {b}<CR>")).await;
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.fn.getqflist()").await.as_i64(),
+        Some(2),
+        ":vimgrepadd keeps the prior entry and adds the new one"
+    );
+}
+
+#[tokio::test]
+async fn vimgrep_glob_argument_fails_loud() {
+    let (rpc, mut incoming) = start().await;
+    // Globbing isn't supported yet — it must say so, not silently match nothing.
+    let msg = message_after(&rpc, &mut incoming, ":vimgrep /x/ *.txt<CR>").await;
+    assert!(
+        msg.contains("globbing is not yet supported"),
+        "a glob arg should fail loud, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn make_runs_the_program_populates_and_jumps() {
+    let (rpc, mut incoming) = start().await;
+    let src = write_temp("mk", "c", "line1\nline2\nline3\nline4\nline5\n");
+    // A makeprg that prints one gcc-style error against the temp file; a clean efm
+    // makes the parse unambiguous.
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.o.errorformat = "%f:%l:%c:%m"
+               vim.o.makeprg = [[printf '{src}:3:5:boom\n']]"#
+        ),
+    )
+    .await;
+    let before = win_count(&rpc).await;
+    message_after(&rpc, &mut incoming, ":make<CR>").await;
+    // The async job fills the list; assert the parsed entry, the auto-opened
+    // window, and the jump to the first error.
+    assert_eq!(
+        poll_qf_count(&rpc, 1).await,
+        1,
+        "the job populated the list"
+    );
+    assert_eq!(first_entry(&rpc).await, format!("1|{src}|3|5|boom"));
+    assert!(
+        win_count(&rpc).await > before,
+        ":make opened the quickfix window"
+    );
+    assert_eq!(buf_name(&rpc).await, src, "jumped into the error's file");
+    assert_eq!(cursor(&rpc).await, (3, 4), "landed on the first error");
+}
+
+#[tokio::test]
+async fn make_bang_does_not_jump() {
+    let (rpc, mut incoming) = start().await;
+    let src = write_temp("mkb", "c", "l1\nl2\nl3\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.o.errorformat = "%f:%l:%c:%m"
+               vim.o.makeprg = [[printf '{src}:2:1: nope\n']]"#
+        ),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":make!<CR>").await;
+    assert_eq!(poll_qf_count(&rpc, 1).await, 1);
+    // `:make!` still parses + opens, but leaves the cursor where it was (not in src).
+    assert_ne!(
+        buf_name(&rpc).await,
+        src,
+        ":make! must not jump to the error"
+    );
+}
+
+#[tokio::test]
+async fn grep_uses_grepprg_and_grepformat() {
+    let (rpc, mut incoming) = start().await;
+    let src = write_temp("gp", "txt", "one\ntwo\nthree\n");
+    // grepprg output is parsed against grepformat (default `%f:%l:%c:%m,%f:%l:%m,…`).
+    exec_lua(
+        &rpc,
+        &format!(r#"vim.o.grepprg = [[printf '{src}:2:found\n']]"#),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":grep<CR>").await;
+    assert_eq!(poll_qf_count(&rpc, 1).await, 1, ":grep filled the list");
+    assert_eq!(first_entry(&rpc).await, format!("1|{src}|2|0|found"));
+    assert_eq!(cursor(&rpc).await.0, 2, ":grep jumped to the match");
+}

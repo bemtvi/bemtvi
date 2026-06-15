@@ -486,6 +486,12 @@ pub struct QfSetOp {
     pub action: char,
     /// List title (`what.title`), if given.
     pub title: Option<String>,
+    /// After populating, open the quickfix window iff the list is non-empty
+    /// (`:cwindow`). Set by `:make`/`:grep`; always `false` for plain `setqflist`.
+    pub open: bool,
+    /// After populating, jump to the first valid entry (`:cfirst`). Set by a
+    /// no-bang `:make`/`:grep`; always `false` for plain `setqflist`.
+    pub goto_first: bool,
 }
 
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the

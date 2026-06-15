@@ -527,6 +527,17 @@ impl Editor {
             }
             "cfir" | "cfirst" | "cr" | "crewind" => self.ex_cfirst(),
             "cla" | "clast" => self.ex_clast(),
+            // `:vimgrep[!] /{pat}/[gj] {file}…` (no external process — searches with
+            // the active `'regexsyntax'` engine). `:vimgrepadd` appends to the list.
+            "vim" | "vimg" | "vimgr" | "vimgre" | "vimgrep" | "vimgrepa" | "vimgrepad"
+            | "vimgrepadd" => {
+                let action = if name.starts_with("vimgrepa") {
+                    QfAction::Add
+                } else {
+                    QfAction::New
+                };
+                self.ex_vimgrep(args, action);
+            }
             "lua" => self.lua_queue.push(args.to_string()),
             "sleep" | "sl" => match parse_sleep(args) {
                 Ok(ms) => self.pending_sleep = Some(ms),

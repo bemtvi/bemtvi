@@ -120,12 +120,29 @@ pub struct Options {
     /// (vim's default) reuses the window the quickfix list was opened from. Honored
     /// by [`crate::editor::quickfix`]; `usetab` is not yet acted on.
     pub switchbuf: String,
+    /// The program `:make` runs (`'makeprg'`; default `make`). A `$*` in the value
+    /// is replaced by `:make`'s arguments (else they are appended). Run through the
+    /// shell, its combined output parsed against [`Options::errorformat`].
+    pub makeprg: String,
+    /// The program `:grep` runs (`'grepprg'`; default `grep -n $* /dev/null`). `$*`
+    /// is replaced by `:grep`'s arguments. Output is parsed against
+    /// [`Options::grepformat`].
+    pub grepprg: String,
+    /// The scanf-style format parsing `:grep` output into quickfix entries
+    /// (`'grepformat'`; default [`DFLT_GREPFORMAT`]). Same grammar as
+    /// [`Options::errorformat`].
+    pub grepformat: String,
 }
 
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
 /// (`option_vars.h`), recognizing gcc/clang, the `make[N]: Entering directory`
 /// stack, the `In file included from` chains, and the quickfix-window save form.
 pub const DFLT_EFM: &str = "%*[^\"]\"%f\"%*\\D%l: %m,\"%f\"%*\\D%l: %m,%-Gg%\\?make[%*\\d]: *** [%f:%l:%m,%-Gg%\\?make: *** [%f:%l:%m,%-G%f:%l: (Each undeclared identifier is reported only once,%-G%f:%l: for each function it appears in.),%-GIn file included from %f:%l:%c:,%-GIn file included from %f:%l:%c\\,,%-GIn file included from %f:%l:%c,%-GIn file included from %f:%l,%-G%*[ ]from %f:%l:%c,%-G%*[ ]from %f:%l:,%-G%*[ ]from %f:%l\\,,%-G%*[ ]from %f:%l,%f:%l:%c:%m,%f(%l):%m,%f:%l:%m,\"%f\"\\, line %l%*\\D%c%*[^ ] %m,%D%*\\a[%*\\d]: Entering directory %*[`']%f',%X%*\\a[%*\\d]: Leaving directory %*[`']%f',%D%*\\a: Entering directory %*[`']%f',%X%*\\a: Leaving directory %*[`']%f',%DMaking %*\\a in %f,%f|%l| %m";
+
+/// The default `'grepformat'` — neovim's compiled-in value, recognizing
+/// `file:line:col:msg` (ripgrep / `grep -n` with column), `file:line:msg`, and the
+/// bare `file line msg` forms.
+pub const DFLT_GREPFORMAT: &str = "%f:%l:%c:%m,%f:%l:%m,%f:%l%m,%f %l%m";
 
 impl Default for Options {
     fn default() -> Self {
@@ -174,6 +191,10 @@ impl Default for Options {
             errorformat: DFLT_EFM.to_string(),
             // Empty: a quickfix jump reuses the window the list was opened from.
             switchbuf: String::new(),
+            // The compiled-in `:make` / `:grep` programs and grep parser.
+            makeprg: "make".to_string(),
+            grepprg: "grep -n $* /dev/null".to_string(),
+            grepformat: DFLT_GREPFORMAT.to_string(),
         }
     }
 }
@@ -594,6 +615,9 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "scrollback" | "scbk" => Some(("scrollback", Num)),
         "errorformat" | "efm" => Some(("errorformat", Str)),
         "switchbuf" | "swb" => Some(("switchbuf", Str)),
+        "makeprg" | "mp" => Some(("makeprg", Str)),
+        "grepprg" | "gp" => Some(("grepprg", Str)),
+        "grepformat" | "gfm" => Some(("grepformat", Str)),
         // Buffer-local: drives the treesitter language override rather than a
         // global string slot (handled specially in `apply_set_str`).
         "filetype" | "ft" => Some(("filetype", Str)),

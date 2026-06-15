@@ -1644,9 +1644,36 @@ pub(crate) fn install_runtime_api(
                 efm,
                 action,
                 title,
+                open: false,
+                goto_first: false,
             });
             Ok(())
         })?,
+    )?;
+
+    // `nx._qf_populate(lines, efm, title, open, jump)`: the `:make`/`:grep`
+    // completion path. Like `nx._set_qflist` with a raw-lines payload, but it also
+    // carries the post-populate window/jump behavior vim's `:make` adds — open the
+    // quickfix window iff there are entries (`open`), then jump to the first valid
+    // one (`jump`, suppressed by a `!`). The async producer's `on_exit` calls it
+    // with the child's combined output already split into lines.
+    let sh = shared.clone();
+    nx.set(
+        "_qf_populate",
+        lua.create_function(
+            move |_, (lines, efm, title, open, jump): (Vec<String>, String, String, bool, bool)| {
+                sh.borrow_mut().qf_ops.push(QfSetOp {
+                    items: None,
+                    lines: Some(lines),
+                    efm: Some(efm),
+                    action: ' ',
+                    title: Some(title),
+                    open,
+                    goto_first: jump,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._nx_set_ts_query(lang, name, text|nil)`: the native query setter behind

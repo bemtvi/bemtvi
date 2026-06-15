@@ -295,7 +295,19 @@ impl Editor {
         }
         match op {
             StrOp::Set(value) => self.set_global_option_str(name, &value),
-            StrOp::Reset => self.set_global_option_str(name, ""),
+            // Most string options reset to the empty string; the `:make`/`:grep`
+            // programs and the grep parser reset to their compiled-in defaults (an
+            // empty value would make `:make` spawn nothing / leave the parser with
+            // no pattern), mirroring the `errorformat` reset above.
+            StrOp::Reset => {
+                let value = match name {
+                    "makeprg" => "make",
+                    "grepprg" => "grep -n $* /dev/null",
+                    "grepformat" => crate::options::DFLT_GREPFORMAT,
+                    _ => "",
+                };
+                self.set_global_option_str(name, value);
+            }
             StrOp::Query => {
                 let value = match name {
                     "statusline" => self.options.statusline.clone(),
@@ -305,6 +317,9 @@ impl Editor {
                     "mousemodel" => self.options.mousemodel.clone(),
                     "mousescroll" => self.options.mousescroll.clone(),
                     "switchbuf" => self.options.switchbuf.clone(),
+                    "makeprg" => self.options.makeprg.clone(),
+                    "grepprg" => self.options.grepprg.clone(),
+                    "grepformat" => self.options.grepformat.clone(),
                     _ => return,
                 };
                 self.echo(format!("{name}={value}"));

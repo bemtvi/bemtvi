@@ -317,6 +317,7 @@ impl EditHost {
                 'r' => QfAction::Replace,
                 _ => QfAction::New,
             };
+            let mut ok = true;
             if let Some(items) = op.items {
                 let entries = items.into_iter().map(qf_entry_from_item).collect();
                 self.editor.qf_set_items(entries, action, op.title);
@@ -329,10 +330,17 @@ impl EditHost {
                     .qf_set_from_lines(&lines, &efm, action, op.title)
                 {
                     self.editor.echo(e);
+                    ok = false;
                 }
             } else {
                 // Neither items nor lines: an explicit clear.
                 self.editor.qf_set_items(Vec::new(), action, op.title);
+            }
+            // The `:make`/`:grep` post-populate behavior: open the window iff there
+            // are entries, then jump to the first valid one. Skipped when the parse
+            // failed (the list is unchanged).
+            if ok && (op.open || op.goto_first) {
+                self.editor.qf_post_populate(op.open, op.goto_first);
             }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
@@ -1228,6 +1236,11 @@ impl EditHost {
             scrollback: go.scrollback as u64,
             columns: columns as u64,
             lines: lines as u64,
+            errorformat: go.errorformat.clone(),
+            switchbuf: go.switchbuf.clone(),
+            makeprg: go.makeprg.clone(),
+            grepprg: go.grepprg.clone(),
+            grepformat: go.grepformat.clone(),
         });
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small

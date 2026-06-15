@@ -322,6 +322,20 @@ impl Editor {
         }
     }
 
+    /// The post-populate step `:make`/`:grep` add after filling the list: open the
+    /// quickfix window iff there are entries (`open`, vim's `:cwindow`), then jump to
+    /// the first valid entry (`jump`, suppressed by a `!`). A clean run (no valid
+    /// entries) opens nothing and jumps nowhere — just the count echo the producer
+    /// already emitted.
+    pub fn qf_post_populate(&mut self, open: bool, jump: bool) {
+        if open {
+            self.ex_cwindow("");
+        }
+        if jump && self.quickfix.items.iter().any(|e| e.valid) {
+            self.ex_cfirst();
+        }
+    }
+
     /// Jump to entry `idx` (0-based): mark it current, focus a code window per
     /// `'switchbuf'`, and land the cursor at the entry's `file:line:col`.
     pub(crate) fn qf_jump_to_index(&mut self, idx: usize) {
@@ -366,6 +380,171 @@ impl Editor {
             self.split(SplitDir::Horizontal);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `:vimgrep` — the in-process search producer (Phase 3).
+
+impl Editor {
+    /// `:vimgrep[!] /{pattern}/[g][j] {file} …` (and `:vimgrepadd`, which appends).
+    /// Search each named file for `{pattern}` using the active `'regexsyntax'`
+    /// engine — honoring `'ignorecase'`/`'smartcase'` exactly like `/` — and add a
+    /// quickfix entry for the first match on each line, or for *every* match with
+    /// the `g` flag. Unless the `j` flag is given, jump to the first match. No
+    /// external process is involved, so this works on every build (including the
+    /// web edit-host). File globbing is not yet supported: a path with a glob
+    /// metacharacter fails loud rather than silently matching nothing.
+    pub(crate) fn ex_vimgrep(&mut self, args: &str, action: QfAction) {
+        let Some((pattern, every, jump, files)) = self.parse_vimgrep_args(args) else {
+            return;
+        };
+        // Globbing is deferred (Phase 4); a glob argument fails loud and aborts the
+        // whole command rather than searching the rest and reporting a misleading
+        // "no match".
+        if let Some(g) = files.iter().find(|f| is_glob(f)) {
+            self.echo(format!(
+                "E: :vimgrep file globbing is not yet supported: {g}"
+            ));
+            return;
+        }
+        let ic = self.search_ignorecase(&pattern);
+        let re = match crate::search::SearchRegex::compile(&pattern, ic, self.search_engine()) {
+            Ok(re) => re,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+        let mut entries = Vec::new();
+        for file in &files {
+            let path = Path::new(file);
+            let Some(lines) = self.vimgrep_file_lines(path) else {
+                continue;
+            };
+            for (i, line) in lines.iter().enumerate() {
+                let spans = if every {
+                    re.find_all(line)
+                } else {
+                    re.find_from(line, 0).into_iter().collect()
+                };
+                for (start, _end) in spans {
+                    entries.push(QfEntry {
+                        filename: Some(file.clone()),
+                        lnum: i + 1,
+                        col: start + 1,
+                        text: line.clone(),
+                        nr: -1,
+                        valid: true,
+                        ..QfEntry::default()
+                    });
+                }
+            }
+        }
+        let n = entries.len();
+        let title = format!(":vimgrep {}", args.trim());
+        self.qf_set_items(entries, action, Some(title));
+        if n == 0 {
+            self.echo(format!("E480: No match: {pattern}"));
+            return;
+        }
+        self.echo(format!("(quickfix) {n} matches"));
+        if jump {
+            self.qf_jump_to_index(self.quickfix.idx.saturating_sub(1));
+        }
+    }
+
+    /// Parse a `:vimgrep` argument into `(pattern, every, jump, files)`. The pattern
+    /// is delimited by its first non-keyword character (`/.../`, `#...#`, …); a
+    /// bare leading word is taken as the pattern up to the first blank (vim's
+    /// separator-less form). Flags `g` (every match per line) and `j` (don't jump)
+    /// follow the closing delimiter. Returns `None` (after echoing) on a malformed
+    /// or empty argument.
+    fn parse_vimgrep_args(&mut self, args: &str) -> Option<(String, bool, bool, Vec<String>)> {
+        let s = args.trim();
+        if s.is_empty() {
+            self.echo("E471: Argument required".to_string());
+            return None;
+        }
+        let first = s.chars().next().unwrap();
+        let (pattern, mut every, mut jump, rest);
+        if first.is_alphanumeric() || first == '_' || first == '\\' {
+            // Separator-less form: the pattern is the first blank-delimited word.
+            let end = s.find(char::is_whitespace).unwrap_or(s.len());
+            pattern = s[..end].to_string();
+            every = false;
+            jump = true;
+            rest = s[end..].trim_start().to_string();
+        } else {
+            // Delimited form: find the matching unescaped closing delimiter.
+            let delim = first;
+            let bytes = s.as_bytes();
+            let mut i = 1;
+            let mut close = None;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] as char == delim {
+                    close = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let Some(close) = close else {
+                self.echo(format!("E682: Invalid search pattern or delimiter: {s}"));
+                return None;
+            };
+            pattern = s[1..close].to_string();
+            // Flags run from just after the delimiter up to the first blank.
+            let after = &s[close + 1..];
+            let fend = after.find(char::is_whitespace).unwrap_or(after.len());
+            every = false;
+            jump = true;
+            for c in after[..fend].chars() {
+                match c {
+                    'g' => every = true,
+                    'j' => jump = false,
+                    _ => {}
+                }
+            }
+            rest = after[fend..].trim_start().to_string();
+        }
+        if pattern.is_empty() {
+            self.echo("E35: No previous regular expression".to_string());
+            return None;
+        }
+        let files: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+        if files.is_empty() {
+            self.echo("E471: Argument required: file name".to_string());
+            return None;
+        }
+        Some((pattern, every, jump, files))
+    }
+
+    /// The lines of `path` for `:vimgrep`: the live contents if a buffer is already
+    /// loaded on it (so unsaved edits are searched, and it works without disk I/O),
+    /// else read fresh from disk through the host fs. Echoes and returns `None` on a
+    /// read failure.
+    fn vimgrep_file_lines(&mut self, path: &Path) -> Option<Vec<String>> {
+        if let Some(id) = self.find_buffer_by_path(path) {
+            return Some(self.buffers.get(id).buffer.lines());
+        }
+        let fs = self.host_fs();
+        match Buffer::from_file(path, &*fs, &self.options.fileencodings) {
+            Ok(b) => Some(b.lines()),
+            Err(e) => {
+                self.echo(format!("E484: Can't open file {}: {e}", path.display()));
+                None
+            }
+        }
+    }
+}
+
+/// Whether `arg` carries a shell/file glob metacharacter (`*`, `?`, `[`). Globbing
+/// in `:vimgrep` file arguments is deferred (Phase 4); such an argument fails loud.
+fn is_glob(arg: &str) -> bool {
+    arg.contains('*') || arg.contains('?') || arg.contains('[')
 }
 
 /// Render one quickfix entry as a `:copen` line: `file|lnum col N| message`

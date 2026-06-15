@@ -32,6 +32,13 @@ impl EditHost {
         let cur_buf = self.editor.current_buffer_id().0;
         match name {
             "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
+            // `:make[!] [args]` / `:grep[!] [args]` — run `'makeprg'` / `'grepprg'`
+            // (with `$*` replaced by the args, else appended), capture the combined
+            // output, parse it against `'errorformat'` / `'grepformat'`, open the
+            // quickfix window if there are errors, and jump to the first one (a `!`
+            // suppresses the jump). Async, via the job machinery (`nx._qf_make`).
+            _ if matches!(base, "mak" | "make") => self.ex_make(args, bang, false),
+            _ if matches!(base, "gr" | "gre" | "grep") => self.ex_make(args, bang, true),
             // `:so[urce] {file}` — run a script file (`.lua` executes through the
             // runtime; vimscript is fail-loud, not a silent skip).
             "so" | "sou" | "sour" | "sourc" | "source" => self.ex_source(args.trim()),
@@ -181,6 +188,48 @@ impl EditHost {
                 .editor
                 .echo(format!("E492: Not an editor command: {name}")),
         }
+    }
+
+    /// `:make[!]` / `:grep[!]` — run `'makeprg'` / `'grepprg'` and route the output
+    /// into the quickfix list. `'makeprg'` (or `'grepprg'`) is the shell command;
+    /// `$*` is replaced by `args` (else `args` is appended). The expanded command is
+    /// run through `sh -c` with stderr merged into stdout (vim's `'shellpipe'`
+    /// semantics) so the directory-stack / multi-line `'errorformat'` matchers see
+    /// the output in its original interleaving. Without a `!`, the cursor jumps to
+    /// the first valid entry. The actual spawn is async (`nx._qf_make`); on a build
+    /// with no local process spawn (the serverless web build) it fails loud.
+    fn ex_make(&mut self, args: &str, bang: bool, is_grep: bool) {
+        let opts = self.editor.global_options();
+        let (prg, efm) = if is_grep {
+            (&opts.grepprg, &opts.grepformat)
+        } else {
+            (&opts.makeprg, &opts.errorformat)
+        };
+        if prg.trim().is_empty() {
+            let which = if is_grep { "grepprg" } else { "makeprg" };
+            self.editor.echo(format!("E91: '{which}' option is empty"));
+            return;
+        }
+        let args = args.trim();
+        let expanded = if prg.contains("$*") {
+            prg.replace("$*", args)
+        } else if args.is_empty() {
+            prg.clone()
+        } else {
+            format!("{prg} {args}")
+        };
+        let title = format!(":{} {args}", if is_grep { "grep" } else { "make" });
+        // Merge stderr into stdout in the child so the parser sees one ordered
+        // stream (the make/gcc `Entering directory` lines and errors interleave).
+        let cmd = format!("{expanded} 2>&1");
+        if let Err(e) = self
+            .lua
+            .run_qf_make(&cmd, efm, title.trim_end(), true, !bang)
+        {
+            self.editor
+                .echo(format!("E5108: Error starting :make: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// `:TSInstall <lang>…` — fetch + compile each named grammar into the data dir

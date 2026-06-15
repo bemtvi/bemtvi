@@ -1,13 +1,15 @@
 # Quickfix & errorformat — implementation plan
 
-> **Status: Phases 1–2 complete.**
+> **Status: Phases 1–3 complete.**
 > nxvim parses `errorformat` (a faithful port of vim's `quickfix.c`) into a
 > structured quickfix list, populated via `setqflist` (structured items or
 > raw-lines-plus-efm) and `:cbuffer`/`:cgetbuffer`/`:caddbuffer`, read back via
 > `getqflist` (Phase 1); browses it in a real, persistent quickfix window
 > (`:copen`/`:cclose`/`:cwindow`) with `<CR>`/`:cc`/`:cnext`/`:cprev`/`:cfirst`/
-> `:clast` navigation honoring `'switchbuf'` (Phase 2). Phases 3–4 (`:make`/`:grep`
-> + `:cfile`, then the location list + list stack + `nx.qf`) are still to do. This
+> `:clast` navigation honoring `'switchbuf'` (Phase 2); runs `:make`/`:grep` (async,
+> via the job machinery) and the in-process `:vimgrep`, parsing their output into the
+> list and jumping to the first error (Phase 3). Phase 4 (the location list + list
+> stack + `:cfile` + `nx.qf`) is still to do. This
 > plan builds the whole feature: a structured error list populated from command
 > output (`:make`, `:grep`) or ingested text (`:cfile`/`:cbuffer`/`:cexpr`), parsed
 > against a faithfully-ported vim `errorformat`, browsed in a quickfix window, and
@@ -182,7 +184,35 @@ the end of the list.
 
 ---
 
-## Phase 3 — `:make` / `:grep` (async producers) ⬜
+## Phase 3 — `:make` / `:grep` (async producers) ✅
+
+> **Done.** New options `'makeprg'` (default `make`), `'grepprg'` (default
+> `grep -n $* /dev/null`), `'grepformat'` (default [`DFLT_GREPFORMAT`]) wired through
+> `:set` *and* `vim.o`/`nx.o` (added to the prelude's `O_GLOBAL` + the `GoMirror`
+> push so the values round-trip — this also closed the latent gap where
+> `vim.o.errorformat`/`switchbuf` never reached the core). `:make[!]`/`:grep[!]` live
+> server-side (`EditHost::ex_make`, `excmd.rs`): they expand `'makeprg'`/`'grepprg'`
+> (`$*` → args, else appended), wrap the result in `sh -c '<cmd> 2>&1'` (vim's
+> `'shellpipe'` stderr-merge, so the directory-stack / multi-line matchers see one
+> ordered stream), and hand it to the Lua producer `nx._qf_make`. That dogfoods the
+> existing job machinery (`nx._system_async`): on the child's exit its combined
+> output is split and passed to a new `nx._qf_populate` Rust bridge, which queues a
+> `QfSetOp` carrying two new post-populate flags (`open` → `:cwindow`, `goto_first`
+> → `:cfirst`); the server applies them via `Editor::qf_post_populate` after parsing.
+> A no-bang run jumps to the first valid entry; `!` parses + opens but doesn't jump.
+> On the web build (no local spawn) the underlying spawn op fails loud, exactly like
+> `vim.system`. `:vimgrep[!] /{pat}/[g][j] {file}…` (and `:vimgrepadd`) is the
+> in-process path (`Editor::ex_vimgrep`, core): it compiles the pattern through the
+> active `'regexsyntax'` engine (`SearchRegex`, honoring `'ignorecase'`/`'smartcase'`
+> like `/`), reads each file (a loaded buffer's live contents if present, else off
+> the host fs), adds one entry per matching line — or per match with `g` — and jumps
+> to the first unless `j`; it needs no process, so it runs on every build. Covered by
+> 8 black-box tests in `tests/quickfix.rs` (vimgrep match+jump, the `g` flag,
+> `:vimgrepadd` append, glob-arg fail-loud; `:make` populate+open+jump via a `printf`
+> makeprg, `:make!` no-jump, `:grep` via `'grepprg'`/`'grepformat'`).
+> **Deferred to Phase 4:** the location-list twins (`:lmake`/`:lgrep`/`:lvimgrep`),
+> which need the per-window list infrastructure that phase builds; and `:vimgrep`
+> file globbing (`**/*.rs`), which fails loud today.
 
 **Goal:** run a build/search command, capture output, parse, populate, jump to the
 first error.

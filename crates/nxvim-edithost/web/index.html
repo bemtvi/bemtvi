@@ -257,8 +257,10 @@
     }
     // Refresh the editor's `"+`/`"*` read mirror from `navigator.clipboard`. The editor's
     // synchronous register read can't await the (async, Window-only) clipboard, so we push its
-    // contents *ahead* of a paste — on focus / tab-return / click, when the document is focused
-    // and clipboard-read permission holds — so a `"+p` sees a copy made in another app. A copy
+    // contents *ahead* of a paste — on focus / tab-return, when the document is focused and
+    // clipboard-read permission holds — so a `"+p` sees a copy made in another app. (Not on a
+    // plain click: `readText()` raises the browser's native "Paste" permission chip, which on
+    // every click both nagged the user and stole focus mid-press → a stuck drag.) A copy
     // made *inside* nxvim needs no refresh: the yank already updated the mirror (and wrote out
     // to the OS clipboard). Best-effort: no permission / not focused leaves the mirror as-is.
     let clipboardRefreshing = false;
@@ -1459,7 +1461,6 @@
 
     gridEl.addEventListener("mousedown", (e) => {
       gridEl.focus();
-      refreshClipboard(); // a click is a user gesture — a good moment to re-read the OS clipboard
       const button = BTN[e.button];
       if (!button) return;
       e.preventDefault();
@@ -1483,6 +1484,18 @@
       disarmAutoscroll();
       const { row, col } = cellAt(e);
       mouseOp(dragBtn, "release", mods(e), row, col);
+      dragBtn = null;
+      lastDragCell = null;
+    });
+    // Release the drag latch if focus is stolen mid-press. A `mousedown` arms `dragBtn`; the
+    // matching `mouseup` clears it — but if the OS clipboard-read permission chip, an alert, or
+    // an alt-tab grabs focus in between, that `mouseup` never reaches the page and the button
+    // stays latched, so every later `mousemove` re-enters Visual ("the button is stuck down").
+    // Clearing on `blur` (and `release` the core's drag) makes the latch self-healing.
+    window.addEventListener("blur", () => {
+      if (!dragBtn) return;
+      disarmAutoscroll();
+      if (lastDragCell) mouseOp(dragBtn, "release", "", lastDragCell.row, lastDragCell.col);
       dragBtn = null;
       lastDragCell = null;
     });
@@ -1558,7 +1571,7 @@
       // path, exposed for tests so they can persist + reload without racing the debounce.
       shadaFlush: () => requestShadaFlush(),
       // Re-read the OS clipboard into the `"+`/`"*` mirror now (resolves once pushed). The
-      // focus/visibility/click triggers do this in normal use; exposed so a test can prime an
+      // focus/visibility triggers do this in normal use; exposed so a test can prime an
       // external copy deterministically before a `"+p`.
       clipboardRefresh: () => refreshClipboard(),
       mouse: (button, action, modifier, row, col) => mouseOp(button, action, modifier, row | 0, col | 0),

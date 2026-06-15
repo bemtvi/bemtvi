@@ -155,6 +155,34 @@ try {
     realDragMode === "VISUAL", JSON.stringify({ realDragMode }));
   await page.evaluate(() => window.__nxvim.feed("<Esc>"));
 
+  // ---- 6d. A focus-steal *between* mousedown and mouseup must release the drag latch.
+  // In a real browser the OS clipboard-read permission chip (and alt-tab, alerts, …) can
+  // grab focus mid-press, so the page never sees the `mouseup`. Without a `blur` reset the
+  // left button stayed latched and every later move re-entered VISUAL (the "button is
+  // stuck down" report). Simulate it: press, fire `blur` (no `mouseup` reaches the page),
+  // then move to a new cell — it must stay in NORMAL, not drag out a selection.
+  // Seed a known line and press a *distinct* cell from 6c's (0,0) press, so this is a fresh
+  // single click — pressing the same cell again so soon reads as a double-click (word-select →
+  // VISUAL) and would mask the latch behaviour we're checking.
+  await page.evaluate(() => window.__nxvim.feed("ggdGihello world<Esc>gg0"));
+  const stuckFrom = cellCenter(6, 0), stuckTo = cellCenter(10, 0);
+  await page.mouse.move(stuckFrom.x, stuckFrom.y);
+  await page.mouse.down();
+  await page.evaluate(() => window.dispatchEvent(new Event("blur"))); // focus stolen — mouseup lost
+  await page.mouse.move(stuckTo.x, stuckTo.y);
+  // The post-blur move is a no-op (the latch is released), so it queues no redraw of its own;
+  // poll for the latch-release frame to settle. With the bug the move drags out a selection and
+  // VISUAL latches *permanently*, so this stays VISUAL through the timeout → the check fails.
+  let afterStealMode = "VISUAL";
+  for (let i = 0; i < 25 && afterStealMode !== "NORMAL"; i++) {
+    afterStealMode = await page.evaluate(() => window.__nxvim.frame().mode_label);
+    if (afterStealMode !== "NORMAL") await sleep(20);
+  }
+  await page.mouse.up();
+  check("mouse: a focus-steal mid-press releases the drag (move stays NORMAL, no stuck VISUAL)",
+    afterStealMode === "NORMAL", JSON.stringify({ afterStealMode }));
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+
   // ---- 7. Mouse wheel scrolls the buffer (bug #2) ----
   // Fill enough lines to scroll (via real keystrokes — `100o` opens 100 lines), then a
   // wheel-down over the window must advance the top visible line.

@@ -1454,3 +1454,39 @@ async fn ctrl_w_ctrl_w_capital_is_a_noop_when_the_target_dock_is_closed() {
     );
     assert_eq!(win_count(&rpc).await, 1, "still no dock");
 }
+
+/// Regression: a buffer split in the main area, then moved to a dock, lingers in
+/// the other split window while also living in the dock. Deleting it must rebind
+/// the lingering window instead of leaving it dangling on the freed id (which
+/// crashed the editor).
+#[tokio::test]
+async fn bdelete_a_buffer_split_then_moved_to_a_dock_does_not_crash() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iMAIN<Esc>"); // buffer "MAIN"
+    feed(&rpc, "<C-w>v"); // split: two main windows both show MAIN
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "<C-w><C-w>l"); // back to the main area
+    feed(&rpc, "<C-w><C-w>H"); // move MAIN into the left dock
+
+    // MAIN now lives in the dock *and* still shows in the other main split window.
+    command(&rpc, "bd!").await;
+
+    // The editor is still responsive — these reads would panic on a dangling window.
+    assert_eq!(
+        buf_count(&rpc).await,
+        2,
+        "MAIN gone; the dock scratch and main's fresh empty remain"
+    );
+    feed(&rpc, "<C-w><C-w>l"); // hop to the main area
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "the focused main window shows a valid (empty) buffer"
+    );
+    feed(&rpc, "<C-w>w"); // the formerly-lingering split window
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "the lingering split window was rebound, not left dangling"
+    );
+}

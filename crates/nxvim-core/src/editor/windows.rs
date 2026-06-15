@@ -367,6 +367,13 @@ impl WindowTree {
         self.windows.values_mut()
     }
 
+    /// Every window in this tree (tiled and floating), read-only — used to find
+    /// which windows show a buffer about to be deleted (see
+    /// [`Editor::rebind_windows_off_buffer`]).
+    pub(crate) fn all_windows(&self) -> impl Iterator<Item = &Window> {
+        self.windows.values()
+    }
+
     /// All window ids in layout order (the `nvim_list_wins` order).
     pub(crate) fn leaves(&self) -> Vec<WindowId> {
         let mut out = Vec::new();

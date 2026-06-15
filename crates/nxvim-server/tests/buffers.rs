@@ -598,6 +598,30 @@ async fn bdelete_last_buffer_leaves_a_fresh_no_name() {
     assert_eq!(buf_name(&rpc, 0).await, "");
 }
 
+/// Deleting a buffer that is *also* shown in another window (a split) must rebind
+/// that other window, not leave it dangling on the freed id — which used to crash
+/// the editor on the next redraw.
+#[tokio::test]
+async fn bdelete_rebinds_other_windows_showing_the_buffer() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iAAA<Esc>"); // buffer 1 = AAA
+    feed(&rpc, "<C-w>s"); // split; both windows show buffer 1
+    command(&rpc, "enew").await; // current window → buffer 2 (empty)
+    feed(&rpc, "iBBB<Esc>"); // buffer 2 = BBB
+
+    // Buffer 1 still shows in the OTHER split window; deleting it must not crash.
+    command(&rpc, "bd! 1").await;
+    assert_eq!(list_bufs(&rpc).await, vec![2], "buffer 1 is gone");
+
+    // The lingering window survived and was rebound to a valid buffer.
+    feed(&rpc, "<C-w>w");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["BBB"],
+        "the other window was rebound"
+    );
+}
+
 #[tokio::test]
 async fn buffer_rpc_api_lists_reads_switches_and_creates() {
     let a = temp_file("a", "a1\na2\n");

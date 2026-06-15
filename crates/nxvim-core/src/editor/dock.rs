@@ -143,6 +143,27 @@ impl Editor {
         }
     }
 
+    /// Mutable [`Editor::layer_tab_tree`]: the tree of tab `idx` in `layer` (the
+    /// live [`Editor::windows`] for the focused layer's active tab, the parked slot
+    /// otherwise). Used by the buffer-delete sweep to rebind windows across every
+    /// layer and tab off a freed buffer.
+    pub(crate) fn layer_tab_tree_mut(
+        &mut self,
+        layer: Layer,
+        idx: usize,
+    ) -> Option<&mut WindowTree> {
+        let live = {
+            let stack = self.stack(layer)?;
+            idx == stack.current && self.focused_layer == layer
+        };
+        if live {
+            Some(&mut self.windows)
+        } else {
+            let stack = self.stack_mut(layer)?;
+            stack.tabs.get_mut(idx).and_then(|s| s.tree.as_mut())
+        }
+    }
+
     /// Every **parked** window tree — every tab of every layer whose tree isn't
     /// the one live on [`Editor::windows`]: all inactive tabs of every layer, plus
     /// the active tab of each *non-focused* layer. The live tree is excluded (its

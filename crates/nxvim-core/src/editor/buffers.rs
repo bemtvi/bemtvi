@@ -1431,7 +1431,81 @@ impl Editor {
                 }
             }
         }
+        // The focused window is now off `target`, but any *other* window — a split
+        // in this layer, or a window in another layer/tab (e.g. a buffer moved to a
+        // dock while still shown in the main area) — may still bind the freed id and
+        // would panic the next time it is read. Rebind every such window.
+        self.rebind_windows_off_buffer(target);
         true
+    }
+
+    /// After `target` has been removed from the store, rebind every window across
+    /// every layer and tab that still shows it to a valid buffer, so none dangles on
+    /// the freed id. Each affected window gets a replacement from **its own** layer
+    /// (a sibling buffer there, else a fresh `[No Name]` tagged to that layer); the
+    /// focused layer reuses whatever the current window already landed on. The caller
+    /// has already handled the focused window itself.
+    fn rebind_windows_off_buffer(&mut self, target: BufferId) {
+        // A tiny per-layer replacement cache (layers number ≤ 5, so a Vec beats a
+        // map). Seed the focused layer with the buffer the current window now shows.
+        let mut repl: Vec<(Layer, BufferId)> = vec![(self.focused_layer, self.cur_buffer())];
+        for (layer, idx) in self.all_layer_tabs() {
+            let affected = self
+                .layer_tab_tree(layer, idx)
+                .is_some_and(|t| t.all_windows().any(|w| w.buffer == target));
+            if !affected {
+                continue;
+            }
+            let rep = match repl.iter().find(|(l, _)| *l == layer) {
+                Some((_, r)) => *r,
+                None => {
+                    // First buffer in this layer (target is already gone from the
+                    // store), or a fresh empty tagged to the layer if it has none.
+                    let r = self
+                        .buffers_in_layer(layer)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| {
+                            let id = self.add_buffer(Buffer::empty());
+                            self.set_buffer_layer(id, layer);
+                            id
+                        });
+                    repl.push((layer, r));
+                    r
+                }
+            };
+            let lines = self.buffers.get(rep).buffer.line_count();
+            if let Some(tree) = self.layer_tab_tree_mut(layer, idx) {
+                for w in tree.all_windows_mut() {
+                    if w.buffer == target {
+                        w.buffer = rep;
+                        if w.saved_cursor.line >= lines {
+                            w.saved_cursor.line = lines.saturating_sub(1);
+                            w.saved_cursor.col = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every `(layer, tab index)` that currently has a window tree — the main layer
+    /// plus every dock that exists (visible *or* hidden), across all their tabs. The
+    /// iteration space for sweeps that must touch every window everywhere.
+    fn all_layer_tabs(&self) -> Vec<(Layer, usize)> {
+        let mut layers = vec![Layer::Main];
+        for side in DockSide::ALL {
+            if self.dock_exists(side) {
+                layers.push(Layer::Dock(side));
+            }
+        }
+        let mut out = Vec::new();
+        for layer in layers {
+            if let Some(stack) = self.stack(layer) {
+                out.extend((0..stack.tabs.len()).map(|idx| (layer, idx)));
+            }
+        }
+        out
     }
 
     /// The nearest buffer to `id` among the *other* open buffers **in `layer`**: the

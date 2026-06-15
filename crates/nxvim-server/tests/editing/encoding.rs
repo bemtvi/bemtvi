@@ -141,3 +141,192 @@ async fn bomb_toggles_and_is_buffer_local() {
     feed(&rpc, ":set nobomb<CR>");
     assert_eq!(lua_bool(&rpc, "return vim.bo.bomb").await, Some(false));
 }
+
+// ===== Phases 2–3: the read/write transcode seam =============================
+//
+// Each test writes a temp file with raw bytes, opens it through the server's
+// normal (synchronous, native) startup read, and asserts on what the buffer shows
+// and — after `:w` — on the exact bytes back on disk. nxvim keeps the rope UTF-8
+// and `'fileencoding'` governs the on-disk form; these prove the round-trip.
+//
+// Note on trailing newlines: nxvim always maintains a trailing newline in the rope
+// (the phantom final line), so a byte-identical round-trip requires the original
+// file to already end in one — every fixture here does.
+
+/// Open `path` through a real server and return the connected client. (A thin alias
+/// for `start(Some(path))` that documents intent at these call sites.)
+async fn open_file(path: &std::path::Path) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start(Some(path.to_string_lossy().into_owned())).await
+}
+
+#[tokio::test]
+async fn invalid_utf8_opens_and_round_trips_byte_identical() {
+    // A file with bytes that aren't valid UTF-8 no longer refuses to open: it falls
+    // through `'fileencodings'` to the latin1 (windows-1252) terminal fallback, which
+    // is a total, bijective single-byte codec — so it opens *and* `:w` reproduces the
+    // original bytes exactly, with no lossy `from_utf8_lossy` corruption.
+    let path = temp_path("enc_invalid");
+    let original: &[u8] = b"hello \xff\xfe world\n";
+    std::fs::write(&path, original).expect("write invalid-utf8 file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello ÿþ world"],
+        "0xff/0xfe decode to ÿ/þ via the latin1 fallback"
+    );
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=latin1"),
+        "an undecodable-as-utf8 file lands on the latin1 fallback"
+    );
+
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "writing back an unedited resilience buffer must be byte-identical"
+    );
+}
+
+#[tokio::test]
+async fn latin1_decodes_and_round_trips() {
+    // A real latin1 file: 0xe9 is é. It opens showing é, carries fileencoding=latin1,
+    // and `:w` reproduces the 0xe9 byte (not the two-byte utf-8 é).
+    let path = temp_path("enc_latin1");
+    std::fs::write(&path, b"caf\xe9\n").expect("write latin1 file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    assert_eq!(lines(&rpc).await, vec!["café"]);
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=latin1")
+    );
+
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        b"caf\xe9\n",
+        "a latin1 buffer re-encodes é back to the single byte 0xe9"
+    );
+}
+
+#[tokio::test]
+async fn utf16le_bom_decodes_sets_bomb_and_reemits() {
+    // A UTF-16LE file with a BOM: it decodes, fileencoding=utf-16le, bomb is set, and
+    // `:w` re-emits the BOM and writes the text back as UTF-16LE (incl. the 0a 00
+    // newline) — exactly the original bytes.
+    let path = temp_path("enc_utf16");
+    let mut original = vec![0xFF, 0xFE]; // UTF-16LE BOM
+    for unit in "Hi\n".encode_utf16() {
+        original.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &original).expect("write utf-16le file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    assert_eq!(lines(&rpc).await, vec!["Hi"]);
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=utf-16le")
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return vim.bo.bomb").await,
+        Some(true),
+        "a BOM'd file carries bomb=true"
+    );
+
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "writing back re-emits the BOM and the UTF-16LE encoding exactly"
+    );
+}
+
+#[tokio::test]
+async fn utf8_bom_decodes_sets_bomb_and_reemits() {
+    // A UTF-8 file with a BOM: fileencoding=utf-8, bomb=true, and `:w` keeps the BOM.
+    let path = temp_path("enc_utf8bom");
+    let mut original = vec![0xEF, 0xBB, 0xBF];
+    original.extend_from_slice("héllo\n".as_bytes());
+    std::fs::write(&path, &original).expect("write utf-8 BOM file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["héllo"],
+        "the BOM is stripped from the text"
+    );
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=utf-8")
+    );
+    assert_eq!(lua_bool(&rpc, "return vim.bo.bomb").await, Some(true));
+
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(std::fs::read(&path).expect("re-read"), original);
+}
+
+#[tokio::test]
+async fn set_fenc_utf8_converts_a_latin1_buffer_on_write() {
+    // Opening a latin1 file then `:set fenc=utf-8` re-encodes it to utf-8 on `:w`:
+    // the single byte 0xe9 becomes the two-byte utf-8 é (c3 a9).
+    let path = temp_path("enc_convert");
+    std::fs::write(&path, b"caf\xe9\n").expect("write latin1 file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    feed(&rpc, ":set fenc=utf-8<CR>");
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        "café\n".as_bytes(),
+        "the buffer is rewritten as utf-8"
+    );
+}
+
+#[tokio::test]
+async fn write_fails_loud_on_unrepresentable_char() {
+    // A char the target encoding can't represent aborts the write loud (E513) and
+    // leaves the file untouched — never a silently NCR-mangled save. (Note: € is
+    // representable in windows-1252 as 0x80; a CJK char like 中 genuinely isn't.)
+    let path = temp_path("enc_faillou");
+    let original: &[u8] = b"caf\xe9\n";
+    std::fs::write(&path, original).expect("write latin1 file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    feed(&rpc, "o中<Esc>"); // append a line with an unrepresentable-in-latin1 char
+    let map = redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E513"), "expected a loud E513, got {msg:?}");
+
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "a failed encode must leave the file untouched"
+    );
+}
+
+#[tokio::test]
+async fn valid_utf8_with_spua_scalar_round_trips_unchanged() {
+    // A valid utf-8 file that genuinely contains a Supplementary-PUA-A scalar
+    // (U+F0041) decodes as utf-8 and writes back byte-identical — no spurious escape
+    // or re-mapping corrupts it. (Guards the bijection the original PUA scheme worried
+    // about; with the windows-1252 fallback the scalar is never touched.)
+    let path = temp_path("enc_spua");
+    let original = "x\u{F0041}y\n".as_bytes().to_vec();
+    std::fs::write(&path, &original).expect("write spua file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=utf-8"),
+        "a valid utf-8 file is detected as utf-8, not the fallback"
+    );
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(std::fs::read(&path).expect("re-read"), original);
+}

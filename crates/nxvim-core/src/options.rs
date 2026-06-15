@@ -144,7 +144,7 @@ impl Default for Options {
             // BOM sniff first, then strict UTF-8, then latin1 (windows-1252) as
             // the always-succeeds fallback — a sane subset of neovim's
             // `ucs-bom,utf-8,default,latin1`.
-            fileencodings: "ucs-bom,utf-8,latin1".to_string(),
+            fileencodings: crate::encoding::DEFAULT_FILEENCODINGS.to_string(),
             // Reload externally-changed, unmodified buffers on `:checktime`
             // (neovim's default — vim's is off).
             autoread: true,

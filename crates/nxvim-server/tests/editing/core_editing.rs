@@ -8,16 +8,16 @@ async fn inserting_text_appears_in_the_buffer() {
 }
 
 #[tokio::test]
-async fn unreadable_startup_file_keeps_its_name_and_echoes_the_error() {
-    // A file whose bytes aren't valid UTF-8 can't be read as text, so
-    // `Buffer::from_file` fails. The buffer must still be bound to the path — not
-    // fall through to an unnamed scratch buffer that a later `:w` would clobber a
-    // stray file from — and the failure must be surfaced on the message line. (R4
-    // in the 2026-06-02 review.) (A *directory* is no longer an error: it opens
-    // the file explorer — see the `explorer` suite.)
+async fn invalid_utf8_startup_file_opens_named_and_resilient() {
+    // A file whose bytes aren't valid UTF-8 used to refuse to open (and fall back to
+    // an empty named buffer with an echoed error). Since the encoding seam landed
+    // (docs/plans/2026-06-14-encoding-and-invalid-utf8.md, Phase 2) it *opens*: the
+    // bytes decode through the latin1 fallback, so the buffer is named for the file,
+    // non-empty, and round-trips on `:w`. The full round-trip is covered in the
+    // `encoding` suite; here we just guard that startup no longer rejects such a file.
     let path = temp_path("openfail").to_string_lossy().into_owned();
     std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write invalid-utf8 file");
-    let (rpc, mut incoming) = start(Some(path.clone())).await;
+    let (rpc, _incoming) = start(Some(path.clone())).await;
 
     // The buffer is named after the file the user asked for, not `[No Name]`.
     let name = rpc
@@ -27,14 +27,11 @@ async fn unreadable_startup_file_keeps_its_name_and_echoes_the_error() {
         .as_str()
         .unwrap_or("")
         .to_string();
-    assert_eq!(name, path, "unreadable startup file must keep its name");
+    assert_eq!(name, path, "the opened file must keep its name");
 
-    // And the error is echoed, naming the file, rather than silently swallowed.
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(
-        msg.contains(&path),
-        "startup error should name the file, got {msg:?}"
-    );
+    // And it actually opened with content (0xff/0xfe/0xfd → ÿ/þ/ý via latin1), rather
+    // than the old empty-buffer-with-error fallback.
+    assert_eq!(lines(&rpc).await, vec!["ÿþý"]);
 }
 
 #[tokio::test]

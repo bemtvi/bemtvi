@@ -31,10 +31,12 @@ impl EditHost {
         result: io::Result<FsRead>,
     ) {
         match result {
-            Ok(FsRead::File(bytes)) => {
-                self.load_replica(buffer, path, &String::from_utf8_lossy(&bytes))
-            }
-            Ok(FsRead::New) => self.load_replica(buffer, path, ""),
+            // Decode through the shared seam (latin1/utf-16/BOM detection +
+            // invalid-UTF-8 resilience), exactly as the local `Buffer::from_file`
+            // does — no more `from_utf8_lossy` fork that silently mangled non-UTF-8
+            // bytes and corrupted them on the next `:w`.
+            Ok(FsRead::File(bytes)) => self.load_replica_bytes(buffer, path, &bytes),
+            Ok(FsRead::New) => self.load_replica_bytes(buffer, path, b""),
             // A directory: build the in-window file explorer listing into the buffer
             // (Phase 3g). The daemon's canonical `dir` path supersedes the requested one
             // (`:e somedir` resolves to its absolute form), so the listing names and
@@ -54,17 +56,18 @@ impl EditHost {
         }
     }
 
-    /// Load `contents` into `buffer` as a replica of the remote file named `path`, then
-    /// fire the events a fresh read implies. `load_str_into` replaces the named buffer's
-    /// content in place; clearing it from `announced` lets the now-named buffer's
-    /// `BufReadPost`/`FileType` fire — `FileType` is what drives syntax and LSP. The
-    /// filetype comes from `path` directly (the buffer is named for it), so this works
-    /// whether or not `buffer` is current. Then refresh the Lua snapshot/mirror and
-    /// drive the queued autocmd work.
+    /// Load the remote file's raw `bytes` into `buffer` as a replica of the file named
+    /// `path`, then fire the events a fresh read implies. `load_bytes_into` decodes
+    /// through the shared encoding seam (so a remote open matches a local one) and
+    /// replaces the named buffer's content in place; clearing it from `announced` lets
+    /// the now-named buffer's `BufReadPost`/`FileType` fire — `FileType` is what drives
+    /// syntax and LSP. The filetype comes from `path` directly (the buffer is named for
+    /// it), so this works whether or not `buffer` is current. Then refresh the Lua
+    /// snapshot/mirror and drive the queued autocmd work.
     #[cfg(feature = "native")]
-    fn load_replica(&mut self, buffer: BufferId, path: String, contents: &str) {
+    fn load_replica_bytes(&mut self, buffer: BufferId, path: String, bytes: &[u8]) {
         self.editor
-            .load_str_into(buffer, Some(path.clone()), contents);
+            .load_bytes_into(buffer, Some(path.clone()), bytes);
         self.announced.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
@@ -80,7 +83,7 @@ impl EditHost {
     }
 
     /// Build the file-explorer listing of remote directory `dir` into `buffer` from the
-    /// off-tick `read_dir` reply (Phase 3g — the directory analogue of [`load_replica`]).
+    /// off-tick `read_dir` reply (Phase 3g — the directory analogue of [`load_replica_bytes`]).
     /// `load_dir_into` replaces the buffer with the listing (its `dir` marker routes
     /// keys to the explorer); clearing `announced` lets the now-named buffer's
     /// `BufReadPost` fire. A directory has no filetype, so no `FileType`/LSP work — just

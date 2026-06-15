@@ -1748,7 +1748,11 @@ impl Editor {
             for id in ids {
                 let buf = &self.buffers.get(id).buffer;
                 if let (true, Some(path)) = (buf.modified, buf.path.clone()) {
-                    seqs.push(self.enqueue_save_of(id, path, None));
+                    // A buffer that can't be encoded to its `'fileencoding'` is skipped
+                    // (the error is echoed inside `enqueue_save_of`); the rest still save.
+                    if let Some(seq) = self.enqueue_save_of(id, path, None) {
+                        seqs.push(seq);
+                    }
                 }
             }
             return seqs;

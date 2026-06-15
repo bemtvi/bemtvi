@@ -251,17 +251,30 @@ impl Buffer {
         self.save_tick = self.changedtick;
     }
 
-    /// Load a buffer from `path`. A missing file yields an empty buffer bound to
-    /// that path (written on first save), matching `vim file-that-does-not-exist`.
-    pub fn from_file(path: impl AsRef<Path>, fs: &dyn HostFs) -> Result<Self> {
+    /// Load a buffer from `path`, decoding its bytes by trying `fileencodings` (the
+    /// editor's `'fileencodings'`) in order — see [`crate::encoding::decode_to_rope`].
+    /// A missing file yields an empty buffer bound to that path (written on first
+    /// save), matching `vim file-that-does-not-exist`. A file whose bytes aren't
+    /// valid UTF-8 (or any non-UTF-8 file) no longer fails: it decodes through the
+    /// `fileencodings` fallback chain, opens, and carries the detected
+    /// `'fileencoding'` / `'bomb'` so `:w` reproduces its original bytes.
+    pub fn from_file(path: impl AsRef<Path>, fs: &dyn HostFs, fileencodings: &str) -> Result<Self> {
+        use std::io::Read;
         let path = path.as_ref();
+        let mut options = crate::options::BufferOptions::default();
         let mut text = if fs.exists(path) {
-            // Stream the file straight into the rope rather than reading it into
-            // an intermediate `String` first. `from_reader` pulls through a small
-            // fixed buffer, so peak memory at open is ~1x the file size (just the
-            // rope) instead of ~2x (transient `String` + rope). It still validates
-            // UTF-8 and errors on invalid input, matching `read_to_string`.
-            Rope::from_reader(fs.open_read(path)?)?
+            // Read the raw bytes, then decode through the shared seam — the same
+            // decoder every read path (local, daemon, wasm) funnels through, so a
+            // file opens identically however it's reached. (This forfeits the old
+            // `from_reader` 1x-memory streaming open for ~2x peak at open; correct
+            // multi-encoding decoding needs the whole byte stream in hand.)
+            let mut bytes = Vec::new();
+            fs.open_read(path)?.read_to_end(&mut bytes)?;
+            let (decoded, fileencoding, bomb) =
+                crate::encoding::decode_to_rope(&bytes, fileencodings);
+            options.fileencoding = fileencoding;
+            options.bomb = bomb;
+            Rope::from_str(&decoded)
         } else {
             Rope::new()
         };
@@ -273,7 +286,7 @@ impl Buffer {
             text,
             path: Some(path.to_path_buf()),
             modified: false,
-            options: crate::options::BufferOptions::default(),
+            options,
             changedtick: 0,
             save_tick: 0,
             disk,
@@ -624,13 +637,18 @@ impl Buffer {
         (self.changelist, self.changelistidx) = saved_changelist;
     }
 
-    /// Write the buffer to `path` (or its bound path). Returns `(bytes, lines)`.
+    /// Write the buffer to `path` (or its bound path). Returns `(bytes, lines)` where
+    /// `bytes` is the **encoded** on-disk byte count (which differs from the rope
+    /// length for any non-UTF-8 `'fileencoding'` — e.g. ~2x for utf-16, +3 for a
+    /// utf-8 BOM). Encoding happens *before* the file is touched, so an unrepresentable
+    /// character aborts the write loudly with the file left untouched (no NCR-mangled
+    /// half-write).
     pub fn write(&mut self, path: Option<PathBuf>, fs: &dyn HostFs) -> Result<(usize, usize)> {
         let target = path
             .or_else(|| self.path.clone())
             .ok_or_else(|| anyhow::anyhow!("E32: No file name"))?;
-        let contents = self.text.to_string();
-        fs.write_atomic(&target, contents.as_bytes())?;
+        let bytes = self.to_save_bytes()?;
+        fs.write_atomic(&target, &bytes)?;
         let lines = self.line_count();
         // Re-stat the file we just wrote so its mtime/size become the new baseline
         // for [`disk_changed`]: after a save, *we* are what's on disk, so the very
@@ -641,16 +659,23 @@ impl Buffer {
         // Only on a successful write, so a consumer mirroring `save_tick` sees a
         // save exactly when the bytes reached disk (a failed write is no save).
         self.save_tick += 1;
-        Ok((contents.len(), lines))
+        Ok((bytes.len(), lines))
     }
 
-    /// The exact bytes [`Buffer::write`] would persist — the rope's contents,
-    /// including the maintained trailing newline. For an *off-core* write that
-    /// pushes the bytes elsewhere (the daemon save path snapshots them at command
-    /// time and sends them over the wire; the browser writes via the File System
-    /// Access API), paired with [`Buffer::mark_written`] once the write lands.
-    pub fn to_save_bytes(&self) -> Vec<u8> {
-        self.text.to_string().into_bytes()
+    /// The exact bytes [`Buffer::write`] would persist — the rope (including its
+    /// maintained trailing newline) encoded back to the buffer's `'fileencoding'`,
+    /// with the BOM re-emitted when `'bomb'` is set. **Fails loud** (`E513`) on a
+    /// character the target encoding can't represent rather than silently corrupting
+    /// the file (see [`crate::encoding::encode_from_str`]). For an *off-core* write that
+    /// pushes the bytes elsewhere (the daemon save path snapshots them at command time
+    /// and sends them over the wire; the browser writes via the File System Access API),
+    /// paired with [`Buffer::mark_written`] once the write lands.
+    pub fn to_save_bytes(&self) -> Result<Vec<u8>> {
+        crate::encoding::encode_from_str(
+            &self.text.to_string(),
+            self.options.fileencoding,
+            self.options.bomb,
+        )
     }
 
     /// Record a completed *external* write of this buffer to `path` (the in-buffer

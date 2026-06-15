@@ -40,10 +40,16 @@ impl DaemonFs {
     /// Store (or overwrite) `path`'s contents — both the test's initial seeding and a
     /// mid-test mutation a `:e!` reload should then see across the wire.
     fn set(&self, path: &str, contents: &str) -> &Self {
+        self.set_bytes(path, contents.as_bytes())
+    }
+
+    /// Store raw `bytes` (not necessarily valid UTF-8) — for the encoding-seam test
+    /// that a non-UTF-8 file opens identically over the wire as it does locally.
+    fn set_bytes(&self, path: &str, bytes: &[u8]) -> &Self {
         self.files
             .lock()
             .unwrap()
-            .insert(PathBuf::from(path), contents.as_bytes().to_vec());
+            .insert(PathBuf::from(path), bytes.to_vec());
         self
     }
 }
@@ -147,6 +153,32 @@ async fn edit_fetches_a_second_file_over_the_wire() {
         buf_name(&rpc).await,
         "/virtual/other.txt",
         "the buffer is named for the edited remote path"
+    );
+}
+
+/// A non-UTF-8 file fetched **over the wire** decodes through the same encoding seam
+/// as a local open: the daemon path used to `from_utf8_lossy` (silently mangling the
+/// bytes), now it routes the raw bytes through `decode_to_rope` exactly like
+/// `Buffer::from_file` — so latin1's 0xe9 shows as `é` and the fileencoding is `latin1`,
+/// matching the local `encoding` suite. This is the local↔daemon-agree guarantee.
+#[tokio::test]
+async fn nonutf8_file_decodes_over_the_wire_like_local() {
+    let fake = DaemonFs::default();
+    fake.set_bytes("/virtual/latin1.txt", b"caf\xe9\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/latin1.txt").await;
+
+    assert_eq!(
+        await_lines(&rpc, &["café"]).await,
+        vec!["café"],
+        "0xe9 must decode to é over the wire (no from_utf8_lossy mangling)"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.fileencoding")
+            .await
+            .as_str()
+            .unwrap_or_default(),
+        "latin1",
+        "the remote replica carries the detected fileencoding, like a local open"
     );
 }
 

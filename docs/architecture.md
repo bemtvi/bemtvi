@@ -361,6 +361,19 @@ invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is
 `"\n"` (one empty line) and the editable line count is `rope.len_lines() - 1`.
 The phantom final line is never displayed or edited.
 
+The rope is **always UTF-8** (mirroring neovim, whose internal encoding is UTF-8);
+the on-disk byte form is a separate concern named by the buffer's `'fileencoding'`.
+All charset conversion lives at the byte↔rope seam (`nxvim-core`'s `encoding`
+module): on read, `decode_to_rope` tries `'fileencodings'` in order — BOM sniff,
+strict UTF-8, then a `latin1` (windows-1252) fallback that, being a *total,
+bijective* single-byte codec, opens any byte stream (latin1, utf-16, even
+invalid-UTF-8) and round-trips it exactly; on write, `encode_from_str` converts the
+rope back to `'fileencoding'` (re-emitting the BOM when `'bomb'` is set) and **fails
+loud** (`E513`) on a character the target can't represent rather than corrupting the
+file. Every read path (local `Buffer::from_file`, the daemon replica, …) funnels
+through the one decoder and every write through the one encoder, so a file behaves
+identically however it's reached.
+
 Motion steps by **grapheme cluster** and the cursor's display column is computed
 as a **virtual column** (wide characters via `unicode-width`, tabs expanded to
 the buffer's `tabstop`), carried in the `View` as `cursor_screen_col`. `cursor.col`

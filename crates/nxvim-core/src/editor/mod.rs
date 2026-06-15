@@ -1055,6 +1055,7 @@ impl Editor {
         Ok(Editor::with_buffer(Buffer::from_file(
             path.into(),
             &StdHostFs,
+            crate::encoding::DEFAULT_FILEENCODINGS,
         )?))
     }
 
@@ -1097,7 +1098,7 @@ impl Editor {
                 }
             }
         } else {
-            match Buffer::from_file(&path, &*fs) {
+            match Buffer::from_file(&path, &*fs, crate::encoding::DEFAULT_FILEENCODINGS) {
                 Ok(buffer) => Editor::with_buffer(buffer),
                 Err(e) => {
                     let mut editor = Editor::with_buffer(Buffer::named(path.clone()));

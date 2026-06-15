@@ -388,23 +388,36 @@ impl Editor {
     /// ([`Editor::finalize_save`]), so a write that fails or never acks leaves the
     /// buffer honestly dirty. `then_quit` carries a deferred `:wq` / `:x`. Returns the
     /// minted [`PendingSave::seq`] so a multi-buffer `:wqa` can gate its quit on the
-    /// whole batch (the single-buffer `:w` caller ignores it).
-    pub(crate) fn enqueue_save(&mut self, path: PathBuf, then_quit: Option<bool>) -> u64 {
+    /// whole batch (the single-buffer `:w` caller ignores it). `None` when the buffer's
+    /// text can't be encoded to its `'fileencoding'`: the failure is echoed and nothing
+    /// is enqueued (so a `:wq`'s deferred quit never fires — the file is untouched and
+    /// the buffer stays honestly dirty), matching the synchronous `:w` fail-loud path.
+    pub(crate) fn enqueue_save(&mut self, path: PathBuf, then_quit: Option<bool>) -> Option<u64> {
         self.enqueue_save_of(self.cur_buffer(), path, then_quit)
     }
 
     /// Snapshot a *specific* buffer for an off-tick write (the multi-buffer `:wall` path,
     /// which writes every modified buffer, not just the current one). The single-buffer
-    /// [`Editor::enqueue_save`] is this for `cur_buffer()`.
+    /// [`Editor::enqueue_save`] is this for `cur_buffer()`. `None` (with the error echoed)
+    /// when the buffer can't be encoded to its `'fileencoding'`.
     pub(crate) fn enqueue_save_of(
         &mut self,
         buffer: BufferId,
         path: PathBuf,
         then_quit: Option<bool>,
-    ) -> u64 {
+    ) -> Option<u64> {
+        // Encode at snapshot time so an unrepresentable character fails loud *here*,
+        // before anything is enqueued — never a silently-mangled write off the tick.
         let (bytes, lines) = {
             let buf = &self.buffers.get(buffer).buffer;
             (buf.to_save_bytes(), buf.line_count())
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.echo(e.to_string());
+                return None;
+            }
         };
         let seq = self.next_save_seq;
         self.next_save_seq += 1;
@@ -416,7 +429,7 @@ impl Editor {
             lines,
             then_quit,
         });
-        seq
+        Some(seq)
     }
 
     /// Drain the deferred `:wqa` / `:xa` quit (off-tick mode), if one was set this tick.
@@ -490,6 +503,28 @@ impl Editor {
             self.cursor = Cursor::default();
             self.top = 0;
             self.leftcol = 0;
+        }
+    }
+
+    /// Load raw file `bytes` into `buffer` as a freshly-read replica named `name` — the
+    /// byte-level counterpart to [`Editor::load_str_into`] used by every *off-tick* read
+    /// (daemon / wasm initial open and `:edit`). Decodes through the shared
+    /// [`crate::encoding::decode_to_rope`] seam (so a remote file opens identically to a
+    /// local one — same `'fileencodings'` detection, same invalid-UTF-8 resilience),
+    /// replaces the buffer's text, and records the detected `'fileencoding'` / `'bomb'`
+    /// so `:w` reproduces the original bytes. A no-op if `buffer` was closed before the
+    /// fetch landed. `load_str_into` is kept for genuinely-already-text callers (scratch
+    /// buffers, in-editor swaps).
+    pub fn load_bytes_into(&mut self, buffer: BufferId, name: Option<String>, bytes: &[u8]) {
+        let (text, fileencoding, bomb) =
+            crate::encoding::decode_to_rope(bytes, &self.options.fileencodings);
+        self.load_str_into(buffer, name, &text);
+        // `load_str_into` no-ops on a closed buffer; mirror its guard before stamping
+        // the encoding so a late fetch onto a gone buffer doesn't panic.
+        if self.buffers.map.contains_key(&buffer) {
+            let ob = self.buffers.get_mut(buffer);
+            ob.buffer.options.fileencoding = fileencoding;
+            ob.buffer.options.bomb = bomb;
         }
     }
 
@@ -611,7 +646,7 @@ impl Editor {
     /// because it is freshly read from disk).
     pub(crate) fn load_into_current(&mut self, path: &Path) {
         let fs = self.host_fs.clone();
-        match Buffer::from_file(path, &*fs) {
+        match Buffer::from_file(path, &*fs, &self.options.fileencodings) {
             Ok(buf) => {
                 self.cursor = Cursor::default();
                 self.top = 0;
@@ -649,7 +684,7 @@ impl Editor {
             return;
         };
         let fs = self.host_fs.clone();
-        let new_buf = match Buffer::from_file(&path, &*fs) {
+        let new_buf = match Buffer::from_file(&path, &*fs, &self.options.fileencodings) {
             Ok(b) => b,
             Err(e) => {
                 self.echo(e.to_string());
@@ -867,7 +902,7 @@ impl Editor {
             Some(id)
         } else {
             let fs = self.host_fs.clone();
-            match Buffer::from_file(path, &*fs) {
+            match Buffer::from_file(path, &*fs, &self.options.fileencodings) {
                 Ok(buf) => Some(self.add_buffer(buf)),
                 Err(e) => {
                     self.echo(e.to_string());

@@ -1,7 +1,28 @@
 # Multi-encoding support & resilience to invalid UTF-8
 
-> **Status: IN PROGRESS.** Phase 0 (foundation) and Phase 1 (options) landed
-> (2026-06-14). Phases 2–4 remain. This document is the live to-do.
+> **Status: DONE for the native + daemon paths (2026-06-15).** Phase 0 (foundation)
+> and Phase 1 (options) landed 2026-06-14; Phases 2 (read seam), 3 (write seam), and
+> 4 (tests/example/docs) landed 2026-06-15. The one remaining gap is the **wasm read
+> path** (the browser decodes OPFS bytes to text in JS before they cross the FFI) —
+> see "Remaining work" at the bottom; wasm *writes* already encode correctly.
+>
+> ### Key deviation from the original design: **no PUA escape.**
+> The plan sketched a Supplementary-PUA-A escape (`U+F0000 + b`) to round-trip
+> undecodable bytes. It turned out to be **unnecessary**: `encoding_rs`'s
+> windows-1252 (our `latin1` terminal fallback) is a *total, bijective* single-byte
+> codec — all 256 byte values decode to distinct scalars (even `0x81`/`0x8d`/… map to
+> pass-through C1 controls, never `U+FFFD`) and encode back exactly (verified over
+> all 256). So "strict decode of each `'fileencodings'` entry + windows-1252 total
+> fallback + exact encode-back" already guarantees byte-identical round-trips, with
+> no escape layer. PUA couldn't have helped the only residual lossy case anyway
+> (lone surrogates in BOM'd UTF-16 — which can't be stored in a Rust `String`). This
+> keeps the seam simpler; the "PUA bijection" test became a "valid-UTF-8 SPUA scalar
+> round-trips untouched" regression guard.
+>
+> ### Second deviation: **UTF-16 is encoded by hand on write.**
+> `encoding_rs::encode` cannot *emit* UTF-16 (its `output_encoding` is UTF-8 for the
+> UTF-16 families), so `encode_from_str` writes UTF-16LE/BE code-unit by code-unit
+> itself (decode still goes through `encoding_rs`). The BOM is re-emitted explicitly.
 
 ## Why this document exists
 
@@ -140,7 +161,15 @@ Model everything on the existing `regexsyntax` enum-string buffer option:
 
 **Dependencies:** Phase 0 (for the encoding name parse/validate).
 
-## Phase 2 — Read seam: unify on bytes (resilience lands here)
+## Phase 2 — Read seam: unify on bytes (resilience lands here)  ✅ DONE (2026-06-15)
+
+> **Landed.** `Buffer::from_file` now reads raw bytes and decodes through
+> `decode_to_rope` (threading `'fileencodings'` from every call site; the two
+> `Editor` constructors use `encoding::DEFAULT_FILEENCODINGS`). `Editor::load_bytes_into`
+> sits beside `load_str_into` and the daemon read path (`apply_open` →
+> `load_replica_bytes`) routes raw bytes through it — the `from_utf8_lossy` fork is
+> gone. `:e!` reload re-runs the decode via `from_file`. The **wasm** read path still
+> takes a JS-decoded string (see "Remaining work").
 
 **Goal:** every read path decodes through `decode_to_rope`; invalid-UTF-8 and
 non-UTF-8 files **open** and carry their detected `fileencoding`/`bomb`. Local and
@@ -166,7 +195,15 @@ daemon agree.
 `unreadable_startup_file_keeps_its_name_and_echoes_the_error` test changes
 meaning — such a file now *opens* (and round-trips in Phase 3). Update it.
 
-## Phase 3 — Write seam: encode, fail loud, BOM, byte count
+## Phase 3 — Write seam: encode, fail loud, BOM, byte count  ✅ DONE (2026-06-15)
+
+> **Landed.** `Buffer::to_save_bytes` now returns `Result<Vec<u8>>` and encodes via
+> `encode_from_str` (BOM re-emit on `'bomb'`, UTF-16 by hand); `Buffer::write`
+> encodes *before* touching disk and reports the **encoded** byte count.
+> `enqueue_save`/`enqueue_save_of` return `Option<u64>` — an unrepresentable char
+> echoes `E513` and enqueues nothing (so a `:wq`'s deferred quit never fires, file
+> untouched, buffer stays dirty). The daemon and wasm off-tick saves share
+> `to_save_bytes`, so both write surfaces are covered by the one change.
 
 **Goal:** `:w` encodes the rope back to `fileencoding`, re-emits the BOM, and
 reproduces original bytes exactly for resilience buffers; unrepresentable chars
@@ -184,7 +221,18 @@ abort loudly.
 
 **Dependencies:** Phases 0–2.
 
-## Phase 4 — Tests, example, docs
+## Phase 4 — Tests, example, docs  ✅ DONE (2026-06-15)
+
+> **Landed.** 7 new round-trip tests in `crates/nxvim-server/tests/editing/encoding.rs`
+> (invalid-UTF-8 byte-identical, latin1, utf-16le+BOM, utf-8+BOM, `fenc` conversion,
+> fail-loud `E513`, valid-UTF-8 SPUA scalar). The `unreadable_startup_file…` test
+> became `invalid_utf8_startup_file_opens_named_and_resilient`. A daemon test
+> (`nonutf8_file_decodes_over_the_wire_like_local`) proves local↔daemon agreement.
+> `examples/encoding/` ships a latin1 + an invalid-UTF-8 sample with an `init.lua`
+> walkthrough (both verified to round-trip byte-identically through the seam).
+> `architecture.md` → *Text model* gained the UTF-8-internal / `'fileencoding'` note.
+> **Note:** because nxvim maintains a trailing newline in the rope, a byte-identical
+> round-trip needs the source file to already end in one (every fixture/sample does).
 
 **Goal:** end-to-end coverage and a runnable example.
 
@@ -212,13 +260,32 @@ governs the on-disk form.
 
 **Dependencies:** Phases 0–3.
 
+## Remaining work — wasm read path
+
+The browser read path is the one place that still doesn't share the decoder. The
+Worker (`crates/nxvim-edithost/web/worker.mjs`) reads an OPFS file as an
+`ArrayBuffer`, decodes it to a **string** with `TextDecoder` (lossy on invalid
+bytes), and passes that string across the `eh_fs_read_complete` FFI (`"string"`
+arg) into `complete_fs_read` → `load_replica_wasm` → `load_str_into`. So a wasm
+buffer's `'fileencoding'` stays the utf-8 default and non-UTF-8/invalid files are
+mangled by JS before Rust ever sees them. wasm **writes** are already correct (they
+share `Buffer::to_save_bytes`), so a wasm-opened utf-8 file is consistent; the gap
+is only multi-encoding/invalid-byte *resilience* in the browser.
+
+To close it (a self-contained slice, needs Playwright verification per the web-test
+convention): change `eh_fs_read_complete`'s file case to take raw bytes
+(`ptr` + `len`) instead of a C string, have the Worker pass the `ArrayBuffer` bytes
+(allocated into wasm memory) instead of `TextDecoder`-ing them, and route them
+through `Editor::load_bytes_into` (the same decoder the native/daemon paths use).
+The directory (`kind == 2`, JSON) and error (string) cases stay string-based.
+
 ## Phase 5 — (Later / optional) legibility & breadth
 
 Not required for the feature to be correct; tracked here so it isn't lost:
 
-- Render escaped bytes as `<xx>` hex tokens (extmark/syntax overlay) instead of
-  the font's tofu box, while keeping the PUA scalar in the rope — closer to vim's
-  display, without giving up exact round-trip.
+- Render the latin1-fallback's high bytes as `<xx>` hex tokens (extmark/syntax
+  overlay) instead of the font's tofu box — closer to vim's display of an
+  unprintable byte, without giving up the exact round-trip.
 - Add CJK / other encodings to the `fileencodings` default and the validator.
 
 ---

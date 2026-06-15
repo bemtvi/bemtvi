@@ -74,10 +74,27 @@ impl MenuExtent {
 /// 0-based index; for a picker it is the 1-based index into the Lua wrapper's
 /// per-generation item array, so the chosen item's arbitrary fields never cross
 /// the bridge (only the key does — the wrapper resolves `confirm(items[key])`).
+///
+/// `preview` is the declarative target the **server** renders into the preview
+/// pane (Phase 3) — `None` for a preview-less picker / `select`. Only the target
+/// (path + optional location) crosses the bridge, never the file's contents: the
+/// server reads and renders it natively, so no Lua runs as the selection moves.
 #[derive(Clone)]
 pub struct MenuItem {
     pub label: String,
     pub key: usize,
+    pub preview: Option<PreviewTarget>,
+}
+
+/// What the picker's preview pane should show for a candidate. The source's
+/// declared `preview` kind decides the shape: `"file"` sets `loc = None` (render
+/// the file's head); `"location"` sets `loc = Some((row, col))` (scroll to and
+/// range-highlight the match). Both 0-based. The server resolves `path` against
+/// its host FS and renders the content — core never reads the file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewTarget {
+    pub path: String,
+    pub loc: Option<(usize, usize)>,
 }
 
 /// The picker's input-grab query field — a single editable line, modeled on the
@@ -175,6 +192,11 @@ pub(crate) struct Menu {
     prompt_pos: PromptPos,
     /// A dynamic source forwards the query and bypasses the local matcher.
     dynamic: bool,
+    /// Whether this picker carries a preview pane (the source declared a `preview`
+    /// kind). When set, [`Editor::menu_view`] exposes the selected row's
+    /// [`PreviewTarget`] and the server reserves a preview column. Always `false`
+    /// for a promptless `nx.ui.select`.
+    preview: bool,
     /// Bumped on every query edit; the staleness token threaded to the server so a
     /// push from a superseded source run is dropped.
     generation: u64,
@@ -258,6 +280,17 @@ impl Menu {
             self.cursor = len.saturating_sub(1);
         }
     }
+
+    /// The [`PreviewTarget`] for the highlighted row, when this picker carries a
+    /// preview pane and that row declares one. `None` for a `select` / preview-less
+    /// picker, an empty view, or a row whose source supplied no `path` (e.g. an
+    /// unnamed buffer). The server reads + renders the target; core never does.
+    fn selected_preview(&self) -> Option<&PreviewTarget> {
+        if !self.preview || self.cursor >= self.view_len() {
+            return None;
+        }
+        self.all_items[self.item_at(self.cursor)].preview.as_ref()
+    }
 }
 
 impl Editor {
@@ -269,7 +302,11 @@ impl Editor {
         let all_items: Vec<MenuItem> = items
             .into_iter()
             .enumerate()
-            .map(|(key, label)| MenuItem { label, key })
+            .map(|(key, label)| MenuItem {
+                label,
+                key,
+                preview: None,
+            })
             .collect();
         let last = all_items.len().saturating_sub(1);
         let mut menu = Menu {
@@ -282,6 +319,7 @@ impl Editor {
             prompt: None,
             prompt_pos: PromptPos::default(),
             dynamic: false,
+            preview: false,
             generation: 0,
             items_gen: 0,
             width: None,
@@ -301,6 +339,7 @@ impl Editor {
         &mut self,
         placement: MenuPlacement,
         dynamic: bool,
+        preview: bool,
         width: Option<MenuExtent>,
         height: Option<MenuExtent>,
         prompt_pos: PromptPos,
@@ -315,6 +354,7 @@ impl Editor {
             prompt: Some(Prompt::default()),
             prompt_pos,
             dynamic,
+            preview,
             generation: 0,
             items_gen: 0,
             width,
@@ -536,6 +576,8 @@ impl Editor {
             query: m.prompt.as_ref().map(|p| p.query.clone()),
             query_cursor: m.prompt.as_ref().map_or(0, |p| p.cursor_chars()),
             prompt_pos: m.prompt_pos,
+            has_preview: m.preview,
+            preview: m.selected_preview().cloned(),
             width: m.width,
             height: m.height,
         })

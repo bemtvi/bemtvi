@@ -1,0 +1,16 @@
+nx.picker preview pane (Phase 3)
+================================
+
+This second file exists so the file-preview pickers have more than one file to
+flip between. Open `\ff` (files) or `\fp` (the custom preview source below) and
+move the selection with <C-n> / <C-p>: the pane on the right swaps to show the
+highlighted file's contents.
+
+For a "location" preview (a file scrolled to a specific line, the match marked),
+try `\fg` (live grep) and type a word that appears in these sample files — the
+preview jumps to each match as you move through the results.
+
+  line 9  — a distinctive marker line to grep for: SENTINEL_NEEDLE
+ line 10
+ line 11
+ line 12

@@ -171,7 +171,7 @@ impl EditHost {
         // `Nil` when none is open. Geometry is computed here from the focused
         // window, the same way the completion popup is placed.
         let menu = match &view.menu {
-            Some(m) => project_menu(&self.editor, m, &view, text_width),
+            Some(m) => self.project_menu(m, &view, text_width, &mut styles),
             None => Value::Nil,
         };
 
@@ -701,146 +701,378 @@ fn project_panel(p: &PanelView) -> Value {
 /// below; `Editor` placement centers the box over the focused window's text area
 /// (the picker refines this when it lands). `text_width` bounds the box to the
 /// editable region. Mirrors `EditHost::pmenu_value`.
-fn project_menu(
-    editor: &nxvim_core::Editor,
-    m: &MenuView,
-    view: &nxvim_core::View,
-    text_width: usize,
-) -> Value {
-    const MAX_H: usize = 10;
-    let focused = view.focused();
-    let text_height = focused.lines.len();
-    // A picker carries a prompt line plus a separator row between it and the list;
-    // `nx.ui.select` carries neither. Both count toward the box height (`chrome`),
-    // the prompt's text toward the width.
-    let prompt_rows = usize::from(m.query.is_some());
-    let chrome = prompt_rows * 2;
-    let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
+impl EditHost {
+    fn project_menu(
+        &mut self,
+        m: &MenuView,
+        view: &nxvim_core::View,
+        text_width: usize,
+        styles: &mut StyleTable,
+    ) -> Value {
+        let editor = &self.editor;
+        const MAX_H: usize = 10;
+        let focused = view.focused();
+        let text_height = focused.lines.len();
+        // A picker carries a prompt line plus a separator row between it and the list;
+        // `nx.ui.select` carries neither. Both count toward the box height (`chrome`),
+        // the prompt's text toward the width.
+        let prompt_rows = usize::from(m.query.is_some());
+        let chrome = prompt_rows * 2;
+        let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
 
-    // The box height (content rows), the scroll offset of the first visible row,
-    // and the windowed rows themselves — only the visible slice is materialized, so
-    // a 100k-item picker costs the same per frame as a 10-item one.
-    let (row, col, width, height, rows, selected) = match m.placement {
-        MenuPlacement::Cursor => {
-            // `select` is small — project the whole list (no scrolling subtlety) and
-            // let the client place the cursor; keeps the four-tier flip exact.
-            let rows = editor.menu_rows(0, m.total);
-            let count = (rows.len() + prompt_rows).min(MAX_H);
-            let content_w = rows
-                .iter()
-                .map(|(l, _)| l.chars().count())
-                .max()
-                .unwrap_or(1)
-                .max(query_w)
-                .max(1);
-            let cursor_row = focused.cursor_row;
-            let anchor_col = focused.cursor_screen_col.saturating_sub(focused.leftcol);
-            let max_w = text_width.saturating_sub(anchor_col).max(1);
-            let width = content_w.min(max_w);
-            // Below if the bordered box fits, else above, else clamp to whichever
-            // side has more room (the popup's four-tier fallback).
-            let below = text_height.saturating_sub(cursor_row + 1);
-            let above = cursor_row;
-            let (row, height) = if count + 2 <= below {
-                (cursor_row + 1, count)
-            } else if count + 2 <= above {
-                (cursor_row - (count + 2), count)
-            } else if below >= above {
-                (cursor_row + 1, below.saturating_sub(2).clamp(1, count))
-            } else {
-                let h = above.saturating_sub(2).clamp(1, count);
-                (cursor_row.saturating_sub(h + 2), h)
-            };
-            (row, anchor_col, width, height, rows, m.selected)
-        }
-        MenuPlacement::Editor => {
-            // A picker is a FIXED box — never content-hugging (that looks ragged).
-            // Resolve the configured extent against the viewport, default ~80% × 60%.
-            const DEFAULT_W: f32 = 0.8;
-            const DEFAULT_H: f32 = 0.6;
-            let max_w = text_width.saturating_sub(2).max(1);
-            let max_h = text_height.saturating_sub(2).max(1);
-            let width = m
-                .width
-                .map_or((text_width as f32 * DEFAULT_W).round() as usize, |e| {
-                    e.resolve(text_width)
-                })
-                .clamp(1, max_w);
-            let height = m
-                .height
-                .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
-                    e.resolve(text_height)
-                })
-                .clamp(chrome + 1, max_h);
-            let row = text_height.saturating_sub(height + 2) / 2;
-            let col = text_width.saturating_sub(width + 2) / 2;
-            // Scroll the window so the selected row stays visible, clamped to the end,
-            // and send `selected` rebased into that window (the client renders the
-            // window directly). Only `list_rows` rows are cloned, never all `total`.
-            // `chrome` reserves the prompt + separator rows.
-            let list_rows = height.saturating_sub(chrome).max(1);
-            let mut start = if m.selected >= list_rows {
-                m.selected + 1 - list_rows
-            } else {
-                0
-            };
-            start = start.min(m.total.saturating_sub(list_rows));
-            let rows = editor.menu_rows(start, list_rows);
-            (row, col, width, height, rows, m.selected - start)
-        }
-    };
+        // The box height (content rows), the scroll offset of the first visible row,
+        // and the windowed rows themselves — only the visible slice is materialized, so
+        // a 100k-item picker costs the same per frame as a 10-item one.
+        let (row, col, width, height, rows, selected) = match m.placement {
+            MenuPlacement::Cursor => {
+                // `select` is small — project the whole list (no scrolling subtlety) and
+                // let the client place the cursor; keeps the four-tier flip exact.
+                let rows = editor.menu_rows(0, m.total);
+                let count = (rows.len() + prompt_rows).min(MAX_H);
+                let content_w = rows
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(1)
+                    .max(query_w)
+                    .max(1);
+                let cursor_row = focused.cursor_row;
+                let anchor_col = focused.cursor_screen_col.saturating_sub(focused.leftcol);
+                let max_w = text_width.saturating_sub(anchor_col).max(1);
+                let width = content_w.min(max_w);
+                // Below if the bordered box fits, else above, else clamp to whichever
+                // side has more room (the popup's four-tier fallback).
+                let below = text_height.saturating_sub(cursor_row + 1);
+                let above = cursor_row;
+                let (row, height) = if count + 2 <= below {
+                    (cursor_row + 1, count)
+                } else if count + 2 <= above {
+                    (cursor_row - (count + 2), count)
+                } else if below >= above {
+                    (cursor_row + 1, below.saturating_sub(2).clamp(1, count))
+                } else {
+                    let h = above.saturating_sub(2).clamp(1, count);
+                    (cursor_row.saturating_sub(h + 2), h)
+                };
+                (row, anchor_col, width, height, rows, m.selected)
+            }
+            MenuPlacement::Editor => {
+                // A picker is a FIXED box — never content-hugging (that looks ragged).
+                // Resolve the configured extent against the viewport, default ~80% × 60%.
+                const DEFAULT_W: f32 = 0.8;
+                const DEFAULT_H: f32 = 0.6;
+                let max_w = text_width.saturating_sub(2).max(1);
+                let max_h = text_height.saturating_sub(2).max(1);
+                let width = m
+                    .width
+                    .map_or((text_width as f32 * DEFAULT_W).round() as usize, |e| {
+                        e.resolve(text_width)
+                    })
+                    .clamp(1, max_w);
+                let height = m
+                    .height
+                    .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
+                        e.resolve(text_height)
+                    })
+                    .clamp(chrome + 1, max_h);
+                let row = text_height.saturating_sub(height + 2) / 2;
+                let col = text_width.saturating_sub(width + 2) / 2;
+                // Scroll the window so the selected row stays visible, clamped to the end,
+                // and send `selected` rebased into that window (the client renders the
+                // window directly). Only `list_rows` rows are cloned, never all `total`.
+                // `chrome` reserves the prompt + separator rows.
+                let list_rows = height.saturating_sub(chrome).max(1);
+                let mut start = if m.selected >= list_rows {
+                    m.selected + 1 - list_rows
+                } else {
+                    0
+                };
+                start = start.min(m.total.saturating_sub(list_rows));
+                let rows = editor.menu_rows(start, list_rows);
+                (row, col, width, height, rows, m.selected - start)
+            }
+        };
 
-    let items: Vec<Value> = rows
-        .iter()
-        .map(|(label, _)| Value::from(label.as_str()))
-        .collect();
-    // Matched-character spans per visible row (parallel to `items`): `[start, end]`
-    // half-open **char** ranges the client bolds.
-    let match_spans = Value::Array(
-        rows.iter()
-            .map(|(_, spans)| {
-                Value::Array(
-                    spans
-                        .iter()
-                        .map(|r| {
-                            Value::Array(vec![
-                                Value::from(r.start as u64),
-                                Value::from(r.end as u64),
-                            ])
+        // The preview pane (Phase 3): a column on the right of an editor-placement
+        // picker rendering the selected row's file. `None` for a `select` / preview-less
+        // picker (and for `Cursor` placement — the cursor float-beside is Phase 4).
+        // Sized against the resolved box; the map carries its own `width` so the client
+        // knows how many columns the list keeps (`box width − preview width − 1`).
+        let preview = if matches!(m.placement, MenuPlacement::Editor) {
+            self.project_preview(m, width, height, styles)
+        } else {
+            None
+        };
+
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|(label, _)| Value::from(label.as_str()))
+            .collect();
+        // Matched-character spans per visible row (parallel to `items`): `[start, end]`
+        // half-open **char** ranges the client bolds.
+        let match_spans = Value::Array(
+            rows.iter()
+                .map(|(_, spans)| {
+                    Value::Array(
+                        spans
+                            .iter()
+                            .map(|r| {
+                                Value::Array(vec![
+                                    Value::from(r.start as u64),
+                                    Value::from(r.end as u64),
+                                ])
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        let mut map = vec![
+            (Value::from("items"), Value::Array(items)),
+            (Value::from("selected"), Value::from(selected as u64)),
+            (Value::from("row"), Value::from(row as u64)),
+            (Value::from("col"), Value::from(col as u64)),
+            (Value::from("width"), Value::from(width as u64)),
+            (Value::from("height"), Value::from(height as u64)),
+            (Value::from("match_spans"), match_spans),
+        ];
+        // The prompt query: present (even when empty) for a picker, absent for a
+        // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
+        // a separator, and the caret; `query_cursor` is the caret's char column and
+        // `prompt_pos` whether the prompt sits above or below the list.
+        if let Some(query) = &m.query {
+            map.push((Value::from("query"), Value::from(query.as_str())));
+            map.push((
+                Value::from("query_cursor"),
+                Value::from(m.query_cursor as u64),
+            ));
+            map.push((
+                Value::from("prompt_pos"),
+                Value::from(match m.prompt_pos {
+                    nxvim_core::PromptPos::Top => "top",
+                    nxvim_core::PromptPos::Bottom => "bottom",
+                }),
+            ));
+        }
+        // The preview sub-map (`{ lines, first_line, title, loc, width, highlights }`),
+        // present only when this picker carries a preview pane. Its presence tells the
+        // client to split the box into a list column + this preview column.
+        if let Some(preview) = preview {
+            map.push((Value::from("preview"), preview));
+        }
+        Value::Map(map)
+    }
+
+    /// Resolve the picker's preview pane into its redraw sub-map, or `None` for a
+    /// preview-less picker. Reads the selected row's file through the host FS (cached by
+    /// path), windows it to the pane height around the target location, and emits the
+    /// pane's `width` so the client sizes the list column. `highlights` is empty here;
+    /// Phase 3b fills it with native tree-sitter spans. A row with no target, an
+    /// unreadable file, or an off-tick FS yields a visible placeholder, never a blank.
+    fn project_preview(
+        &mut self,
+        m: &MenuView,
+        box_w: usize,
+        box_h: usize,
+        styles: &mut StyleTable,
+    ) -> Option<Value> {
+        if !m.has_preview {
+            return None;
+        }
+        // Reserve ~60% of the box for the preview, keeping a sane (≥1-col) list column
+        // and a 1-col separator. The pane spans the full box content height.
+        let preview_w = (((box_w as f32) * 0.6) as usize)
+            .min(box_w.saturating_sub(2))
+            .max(1);
+        let pane_h = box_h.max(1);
+
+        let (lines, first_line, loc, title, highlights) = match &m.preview {
+            Some(target) => {
+                self.ensure_preview(&target.path);
+                let cache = &self.preview_cache;
+                let len = cache.lines.len();
+                // Window around the target line (show it ~a third down), clamped to the
+                // file; a file-kind target (no `loc`) starts at the top.
+                let start = match target.loc {
+                    Some((r, _)) if r >= pane_h => (r - pane_h / 3).min(len.saturating_sub(pane_h)),
+                    _ => 0,
+                };
+                let end = (start + pane_h).min(len);
+                let win = cache.lines.get(start..end).unwrap_or(&[]);
+                // Per windowed line, the cached tree-sitter spans mapped to char
+                // columns + per-frame style ids — the same `[start, end, group,
+                // style_id]` shape as a window's text highlights, so the clients reuse
+                // their span renderer. Empty rows (no grammar / blank line) stay plain.
+                let highlights = Value::Array(
+                    win.iter()
+                        .enumerate()
+                        .map(|(i, text)| {
+                            preview_line_spans(
+                                text,
+                                cache.highlights.get(&(start + i)),
+                                &self.editor.highlights,
+                                styles,
+                            )
                         })
                         .collect(),
+                );
+                // The match position, rebased into the window — only when the read
+                // succeeded (a placeholder has no meaningful location to highlight).
+                let loc = match target.loc {
+                    Some((r, c)) if cache.ok && r >= start && r < end => Some((r - start, c)),
+                    _ => None,
+                };
+                (
+                    win.to_vec(),
+                    start + 1,
+                    loc,
+                    target.path.clone(),
+                    highlights,
                 )
+            }
+            // The picker has a preview pane, but this row carries no target.
+            None => (
+                vec!["No preview".to_string()],
+                1,
+                None,
+                String::new(),
+                Value::Array(Vec::new()),
+            ),
+        };
+
+        let loc_value = match loc {
+            Some((r, c)) => Value::Array(vec![Value::from(r as u64), Value::from(c as u64)]),
+            None => Value::Nil,
+        };
+        Some(Value::Map(vec![
+            (Value::from("lines"), lines_value(&lines)),
+            (Value::from("first_line"), Value::from(first_line as u64)),
+            (Value::from("title"), Value::from(title.as_str())),
+            (Value::from("width"), Value::from(preview_w as u64)),
+            (Value::from("loc"), loc_value),
+            (Value::from("highlights"), highlights),
+        ]))
+    }
+
+    /// Ensure [`preview_cache`](EditHost::preview_cache) holds the file for `path`,
+    /// reading it through the editor's host FS on a path miss (a hit — the common case
+    /// as the selection moves within one file's matches — does nothing). A read error or
+    /// an off-tick FS fills a single visible placeholder line with `ok = false`.
+    fn ensure_preview(&mut self, path: &str) {
+        let p = std::path::Path::new(path);
+        if self.preview_cache.path.as_deref() == Some(p) {
+            return;
+        }
+        let (lines, ok) = read_preview_file(&self.editor, p);
+        // Syntax-highlight the whole file once, here on the path miss (Phase 3b), so
+        // moving the selection within one file's matches never re-parses. Keyed by
+        // file line; empty when the read failed or no grammar is installed for the
+        // path's language (the preview then renders plain).
+        let highlights = if ok {
+            nxvim_core::language_of_path(Some(p)).map_or_else(HashMap::new, |lang| {
+                // Trailing newline to match the engine's buffer invariant (it treats
+                // the last line as a phantom: `len_lines - 1`); without it a
+                // single-line file parses to zero lines and drops every span.
+                let text = lines.join("\n") + "\n";
+                let mut by_line: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
+                for span in self.editor.preview_highlights(lang, &text, 0, lines.len()) {
+                    by_line.entry(span.line).or_default().push(span);
+                }
+                by_line
+            })
+        } else {
+            HashMap::new()
+        };
+        self.preview_cache = PreviewCache {
+            path: Some(p.to_path_buf()),
+            lines,
+            ok,
+            highlights,
+        };
+    }
+}
+
+/// The picker preview pane's read cache: the file last read for the preview, so
+/// moving the selection within the results re-reads only when the target path
+/// changes. See [`EditHost::preview_cache`].
+#[derive(Default)]
+pub(crate) struct PreviewCache {
+    /// The path whose contents `lines` holds; `None` before the first read.
+    path: Option<std::path::PathBuf>,
+    /// The file's lines (newline-split, trailing newline dropped). On a read failure
+    /// or an off-tick FS this is a single placeholder line.
+    lines: Vec<String>,
+    /// `false` when `lines` is a placeholder (unreadable / loading) — suppresses the
+    /// location range-highlight, which would be meaningless over the placeholder.
+    ok: bool,
+    /// Native tree-sitter highlight spans (Phase 3b), keyed by 0-based file line —
+    /// the engine's raw byte-offset spans, computed **once** per file read (the whole
+    /// file is parsed on a path miss). `project_preview` maps the windowed slice to
+    /// char columns + per-frame style ids; an empty map ⇒ no grammar (plain preview).
+    highlights: HashMap<usize, Vec<nxvim_core::Span>>,
+}
+
+/// Read a file's lines for the read-only preview pane through the editor's host FS,
+/// capped at [`MAX_PREVIEW_BYTES`]. Returns `(lines, ok)`; `ok = false` (with a
+/// single visible placeholder line) when the FS is off-tick (daemon/wasm — preview
+/// rides the async seam later) or the read fails. Lossy-decodes non-UTF-8 so a
+/// binary file previews as best-effort text rather than erroring.
+fn read_preview_file(editor: &nxvim_core::Editor, path: &std::path::Path) -> (Vec<String>, bool) {
+    use std::io::Read as _;
+    /// Cap on the bytes pulled into a single preview read — a guard against a huge
+    /// file stalling the frame, not a UI limit (the pane only shows a window anyway).
+    const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
+    if editor.host_fs_offtick() {
+        return (vec![format!("{}: loading…", path.display())], false);
+    }
+    let reader = match editor.host_fs().open_read(path) {
+        Ok(r) => r,
+        Err(e) => return (vec![format!("{}: {e}", path.display())], false),
+    };
+    let mut buf = Vec::new();
+    if let Err(e) = reader.take(MAX_PREVIEW_BYTES).read_to_end(&mut buf) {
+        return (vec![format!("{}: {e}", path.display())], false);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    (text.lines().map(|l| l.to_string()).collect(), true)
+}
+
+/// Map one preview line's cached tree-sitter `spans` (byte offsets within the line)
+/// to the redraw highlight shape — `[start_char, end_char, group, style_id]` per
+/// span, in **char** columns (the preview renders char-by-char, no tab expansion).
+/// `style_id` interns the resolved [`Style`] into the frame palette, or `Nil` when
+/// the capture has no colorscheme mapping (the client falls back to its own theme).
+/// `None`/blank ⇒ an empty array (a plain row).
+fn preview_line_spans(
+    text: &str,
+    spans: Option<&Vec<nxvim_core::Span>>,
+    highlights: &nxvim_core::Highlights,
+    styles: &mut StyleTable,
+) -> Value {
+    let Some(spans) = spans else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        spans
+            .iter()
+            .filter_map(|s| {
+                // Byte → char column within the line; skip a span that doesn't land
+                // on char boundaries (defensive — engine spans always should).
+                let start = text.get(..s.start_byte)?.chars().count();
+                let end = text.get(..s.end_byte)?.chars().count();
+                let style_id = match highlights.resolve_capture(&s.group) {
+                    Some(style) => Value::from(styles.intern(style) as u64),
+                    None => Value::Nil,
+                };
+                Some(Value::Array(vec![
+                    Value::from(start as u64),
+                    Value::from(end as u64),
+                    Value::from(s.group.as_str()),
+                    style_id,
+                ]))
             })
             .collect(),
-    );
-    let mut map = vec![
-        (Value::from("items"), Value::Array(items)),
-        (Value::from("selected"), Value::from(selected as u64)),
-        (Value::from("row"), Value::from(row as u64)),
-        (Value::from("col"), Value::from(col as u64)),
-        (Value::from("width"), Value::from(width as u64)),
-        (Value::from("height"), Value::from(height as u64)),
-        (Value::from("match_spans"), match_spans),
-    ];
-    // The prompt query: present (even when empty) for a picker, absent for a
-    // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
-    // a separator, and the caret; `query_cursor` is the caret's char column and
-    // `prompt_pos` whether the prompt sits above or below the list.
-    if let Some(query) = &m.query {
-        map.push((Value::from("query"), Value::from(query.as_str())));
-        map.push((
-            Value::from("query_cursor"),
-            Value::from(m.query_cursor as u64),
-        ));
-        map.push((
-            Value::from("prompt_pos"),
-            Value::from(match m.prompt_pos {
-                nxvim_core::PromptPos::Top => "top",
-                nxvim_core::PromptPos::Bottom => "bottom",
-            }),
-        ));
-    }
-    Value::Map(map)
+    )
 }
 
 /// Encode per-row selection spans as an array of `[start, end]` pairs (`Nil`

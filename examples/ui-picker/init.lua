@@ -120,4 +120,37 @@ nx.keymap.set("n", "<leader>fe", function()
   nx.picker.open("echo")
 end)
 
-nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe")
+--------------------------------------------------------------------------------
+-- 4. The PREVIEW pane (Phase 3). A source declares `preview = "file"` or
+--    `preview = "location"`; each item then carries the fields that kind needs —
+--    `path` (both kinds) and `row` / `col` (location) — and the SERVER renders the
+--    file natively into a column beside the list (no Lua runs as the selection
+--    moves). The shipped sources already opt in: `files` / `buffers` preview the
+--    file ("file"); `live_grep` scrolls to and marks each match ("location").
+--
+--    Below is a custom "file" source over this example's own files, so you can see
+--    the pane swap as you move the selection.
+--    \fp  preview
+--------------------------------------------------------------------------------
+-- This config's own directory, so the source can reference its sibling files
+-- regardless of how the config was loaded (`debug.getinfo` is how plugins locate
+-- their install path; nxvim exposes the full `debug` library to user config).
+local here = debug.getinfo(1, "S").source:sub(2):match("(.*)[/\\]") or "."
+nx.picker.source({
+  name = "preview",
+  preview = "file", -- the pane on the right shows the highlighted file's head
+  items = function(_ctx, push, done)
+    for _, name in ipairs({ "sample.txt", "notes.txt", "init.lua" }) do
+      push({ text = name, path = here .. "/" .. name })
+    end
+    done()
+  end,
+  confirm = function(item)
+    vim.cmd("edit " .. item.path)
+  end,
+})
+nx.keymap.set("n", "<leader>fp", function()
+  nx.picker.open("preview")
+end)
+
+nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp")

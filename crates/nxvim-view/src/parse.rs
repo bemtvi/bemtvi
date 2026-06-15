@@ -156,6 +156,19 @@ pub(crate) fn parse_spans(value: Option<&Value>) -> Vec<Option<(u16, u16)>> {
         .unwrap_or_default()
 }
 
+/// Parse a `[a, b]` pair (e.g. the picker preview's `loc` row/col) into
+/// `Some((a, b))`, or `None` when the value is `Nil` / absent / malformed.
+pub(crate) fn parse_pair(value: Option<&Value>) -> Option<(u16, u16)> {
+    let pair = value?.as_array()?;
+    if pair.len() != 2 {
+        return None;
+    }
+    Some((
+        pair[0].as_u64().unwrap_or(0) as u16,
+        pair[1].as_u64().unwrap_or(0) as u16,
+    ))
+}
+
 /// Parse the per-row search-match payload: an array with one entry per visible
 /// row, each an array of `[start, end]` screen-column pairs (empty for rows with
 /// no match).

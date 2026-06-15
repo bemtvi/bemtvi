@@ -270,6 +270,24 @@ impl Editor {
         }
     }
 
+    /// Highlight an **off-buffer** snippet — `text` in `language`, over `[first,
+    /// last)` — without registering a buffer. For read-only surfaces (the picker
+    /// preview pane) that paint a file which is not an open buffer. Empty when there
+    /// is no engine, no grammar for `language`, or the engine can't parse a detached
+    /// snippet (the wasm JS-side highlighter). Spans are in `text` coordinates.
+    pub fn preview_highlights(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        match self.syntax.as_mut() {
+            Some(engine) => engine.highlight_text(language, text, first, last),
+            None => Vec::new(),
+        }
+    }
+
     /// Forget a deleted buffer's engine state (called from `:bdelete`).
     pub(crate) fn syntax_close(&mut self, id: BufferId) {
         if let Some(engine) = self.syntax.as_mut() {

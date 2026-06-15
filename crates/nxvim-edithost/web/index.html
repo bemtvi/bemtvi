@@ -999,6 +999,11 @@
       // A picker carries a prompt query (even when empty); a nx.ui.select does not.
       const hasPrompt = menu.query !== null && menu.query !== undefined;
       const promptRows = hasPrompt ? 1 : 0;
+      // A preview pane (Phase 3) splits the box into a list column (left) + a 1-col
+      // separator + a preview column (right). The list keeps `width - previewW - 1`.
+      const hasPreview = menu.preview != null;
+      const previewW = hasPreview ? Math.max(1, Math.min(menu.preview.width, menu.width - 2)) : 0;
+      const listW = hasPreview ? Math.max(1, menu.width - previewW - 1) : menu.width;
       // Render the FULL box height (`menu.height` is the fixed picker size), padding
       // empty rows past the item count so the box doesn't shrink to its content.
       const listRows = Math.max(1, menu.height - promptRows);
@@ -1008,10 +1013,10 @@
       box.className = "pmenu";
       place(box, x, y, menu.width, listRows + promptRows);
       if (hasPrompt) {
-        const text = ("> " + menu.query).slice(0, menu.width).padEnd(menu.width);
+        const text = ("> " + menu.query).slice(0, listW).padEnd(listW);
         const promptEl = document.createElement("div");
         promptEl.className = "row pmenu-prompt";
-        promptEl.style.width = menu.width * cw + "px";
+        promptEl.style.width = listW * cw + "px";
         promptEl.style.fontWeight = "bold";
         promptEl.textContent = text;
         box.appendChild(promptEl);
@@ -1021,13 +1026,13 @@
         const label = String(menu.items[idx] ?? "");
         const rowEl = document.createElement("div");
         rowEl.className = "row" + (idx === menu.selected ? " pmenu-sel" : "");
-        rowEl.style.width = menu.width * cw + "px";
+        rowEl.style.width = listW * cw + "px";
         // Bold + accent the matched characters (the fuzzy match), per the server's
         // char-based spans; plain text when this picker/select has no spans.
         const spans = (menu.match_spans && menu.match_spans[idx]) || [];
-        const chars = [...label].slice(0, menu.width);
+        const chars = [...label].slice(0, listW);
         if (spans.length === 0) {
-          rowEl.textContent = chars.join("").padEnd(menu.width);
+          rowEl.textContent = chars.join("").padEnd(listW);
         } else {
           chars.forEach((chr, ci) => {
             const matched = spans.some(([s, e]) => ci >= s && ci < e);
@@ -1040,12 +1045,56 @@
               rowEl.appendChild(document.createTextNode(chr));
             }
           });
-          const pad = menu.width - chars.length;
+          const pad = listW - chars.length;
           if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
         }
         box.appendChild(rowEl);
       }
       gridEl.appendChild(box);
+
+      // The preview column: a separate panel to the right of the list, with a header
+      // row (the file path) and the windowed file lines, the match line (`loc`)
+      // background-highlighted. Plain text in Phase 3a (no syntax colours yet).
+      if (hasPreview) {
+        const pv = menu.preview;
+        const pre = document.createElement("div");
+        pre.className = "pmenu";
+        pre.style.borderLeftWidth = "1px";
+        place(pre, x + listW + 1, y, previewW, listRows + promptRows);
+        const header = document.createElement("div");
+        header.className = "row pmenu-sel";
+        header.style.width = previewW * cw + "px";
+        header.textContent = String(pv.title ?? "").slice(0, previewW).padEnd(previewW);
+        pre.appendChild(header);
+        const lines = pv.lines || [];
+        const loc = pv.loc; // [row, col] (relative to lines[0]) or null
+        for (let i = 0; i < menu.height - 1; i++) {
+          const rowEl = document.createElement("div");
+          const isLoc = loc && loc[0] === i;
+          rowEl.className = "row" + (isLoc ? " pmenu-sel" : "");
+          rowEl.style.width = previewW * cw + "px";
+          // Colour each char by its tree-sitter span (Phase 3b) via the same
+          // `cellBaseCss` the window text uses (no diagnostics in a preview); empty
+          // highlights (no grammar / wasm engine) render plain.
+          const hlSpans = (pv.highlights && pv.highlights[i]) || [];
+          const chars = [...String(lines[i] ?? "")].slice(0, previewW);
+          chars.forEach((chr, ci) => {
+            const css = cellBaseCss(ci, hlSpans, []);
+            if (css) {
+              const sp = document.createElement("span");
+              sp.setAttribute("style", css);
+              sp.textContent = chr;
+              rowEl.appendChild(sp);
+            } else {
+              rowEl.appendChild(document.createTextNode(chr));
+            }
+          });
+          const pad = previewW - chars.length;
+          if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
+          pre.appendChild(rowEl);
+        }
+        gridEl.appendChild(pre);
+      }
     }
 
     // A synthesized status line (the wasm build emits no %-format statusline segments

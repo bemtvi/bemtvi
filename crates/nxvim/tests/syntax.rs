@@ -351,6 +351,95 @@ async fn a_rust_buffer_gets_treesitter_highlights() {
     );
 }
 
+/// The picker preview pane's `highlights` (Phase 3b) — per windowed line, the
+/// `(start_char, end_char, group)` spans — from a redraw map, or `None` when no
+/// menu/preview is open. Mirrors [`highlights_of`] but reaches into `menu.preview`.
+fn preview_highlights_of(params: &[Value]) -> Option<Vec<Vec<(u64, u64, String)>>> {
+    let field = |m: &Value, key: &str| -> Option<Value> {
+        match m {
+            Value::Map(m) => m
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone()),
+            _ => None,
+        }
+    };
+    let menu = field(params.first()?, "menu")?;
+    let rows = field(&field(&menu, "preview")?, "highlights")?;
+    let rows = rows.as_array()?;
+    Some(
+        rows.iter()
+            .map(|row| {
+                row.as_array()
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .filter_map(|s| {
+                                let a = s.as_array()?;
+                                Some((a[0].as_u64()?, a[1].as_u64()?, a[2].as_str()?.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn the_file_preview_pane_is_syntax_highlighted() {
+    // Phase 3b: a `preview = "file"` picker renders the selected file's content with
+    // native tree-sitter colours, not plain text. Open a picker over a rust file and
+    // assert the preview's `highlights` carry the `fn` keyword span.
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let file = temp_rs("preview_hl", "fn main() {}\n");
+    let (rpc, mut incoming) = start(None).await;
+
+    // Register a preview source over the rust file and open it (no `rg` spawn).
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.picker.source{{ name='prev', preview='file', \
+               items=function(_,push,done) push{{ text='f', path='{file}' }}; done() end }}; \
+             nx.picker.open('prev')"
+        ),
+    )
+    .await;
+
+    // Poll until the menu's preview carries highlights for the first (`fn main`) row.
+    let hl = {
+        let mut found = None;
+        for _ in 0..100 {
+            barrier(&rpc).await;
+            tokio::task::yield_now().await;
+            if let Some(params) = drain_latest_redraw(&mut incoming) {
+                if let Some(hl) = preview_highlights_of(&params) {
+                    if hl.first().is_some_and(|row| !row.is_empty()) {
+                        found = Some(hl);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        found.expect("the preview pane never carried tree-sitter highlights")
+    };
+
+    // `fn` (char cols 0..2) is a keyword — the preview is genuinely colourised.
+    let fn_span = hl[0]
+        .iter()
+        .find(|(s, _, _)| *s == 0)
+        .expect("a preview span at column 0 (the `fn` keyword)");
+    assert_eq!(fn_span.1, 2, "`fn` spans two chars");
+    assert_eq!(
+        fn_span.2.split('.').next().unwrap(),
+        "keyword",
+        "`fn` is a keyword, got group {:?}",
+        fn_span.2
+    );
+}
+
 #[tokio::test]
 async fn the_keyword_is_painted_in_its_theme_color() {
     let _guard = test_lock().lock().await;

@@ -540,6 +540,12 @@ pub struct EditHost {
     /// this is set, and to `pending_ui_select` (`run_ui_select`) otherwise — only
     /// one float-list widget is open at a time, so the two are mutually exclusive.
     picker_active: bool,
+    /// The picker preview pane's read cache (Phase 3): the file last read for the
+    /// preview, so moving the selection within the results — or simply re-projecting
+    /// every frame — re-reads only when the selected row's target *path* changes.
+    /// Reset when the path differs; dropped implicitly when the picker closes (the
+    /// next picker repopulates it). See [`redraw::project_menu`](crate::redraw).
+    preview_cache: redraw::PreviewCache,
     /// Keys queued by `nvim_feedkeys`, drained after the input batch / off-tick
     /// settle. Each carries whether it should be remapped (the `m` flag) or fed
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
@@ -674,6 +680,7 @@ impl EditHost {
             pending_ui_input: None,
             pending_ui_select: None,
             picker_active: false,
+            preview_cache: redraw::PreviewCache::default(),
             feed_buffer: VecDeque::new(),
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),

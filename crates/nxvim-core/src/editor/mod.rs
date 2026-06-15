@@ -60,7 +60,7 @@ pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
     FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
 };
-pub use self::menu::{MenuExtent, MenuItem, MenuPlacement, PromptPos};
+pub use self::menu::{MenuExtent, MenuItem, MenuPlacement, PreviewTarget, PromptPos};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -1011,6 +1011,22 @@ impl Editor {
     /// instead of this on an already-built editor.
     pub fn set_host_fs(&mut self, fs: Rc<dyn HostFs>) {
         self.host_fs = fs;
+    }
+
+    /// A clone of the filesystem backend handle, for callers that read files
+    /// **outside** the buffer model — the picker's read-only preview pane reads the
+    /// selected file through the same FS the editor opens buffers with, so a
+    /// daemon-backed `HostFs` is honoured. (Mutation still goes through buffers.)
+    pub fn host_fs(&self) -> Rc<dyn HostFs> {
+        self.host_fs.clone()
+    }
+
+    /// Whether file I/O is routed **off the editor tick** (the daemon / wasm
+    /// edit-host: [`set_host_fs_offtick`](Editor::set_host_fs_offtick)). When `true`
+    /// a synchronous `host_fs` read is unavailable, so a synchronous preview read
+    /// must be skipped (the preview rides the async FS seam instead).
+    pub fn host_fs_offtick(&self) -> bool {
+        self.host_fs_offtick
     }
 
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {

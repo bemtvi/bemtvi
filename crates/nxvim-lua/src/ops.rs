@@ -784,6 +784,23 @@ pub struct PickerOpenReq {
     /// layout) rather than above it (the default). The Lua wrapper resolves the
     /// `prompt_pos = "top" | "bottom"` option down to this flag.
     pub prompt_bottom: bool,
+    /// Whether the source declared a `preview` kind (`"file"` / `"location"`), so
+    /// the widget reserves a preview column and each push may carry a
+    /// [`PreviewPush`]. `false` for a preview-less picker — rendered exactly as
+    /// before. The kind itself (file vs location) is implicit in whether the
+    /// pushes carry a `loc`.
+    pub preview: bool,
+}
+
+/// The preview target a picker push carries for one candidate, when the source
+/// declared a `preview` kind: the file `path` and, for the `"location"` kind, the
+/// 0-based `loc` (row, col) to scroll to and range-highlight. `loc` is `None` for
+/// the `"file"` kind (show the head). Becomes
+/// [`nxvim_core::PreviewTarget`](nxvim_core::PreviewTarget) on the way to the widget.
+#[derive(Clone, Debug)]
+pub struct PreviewPush {
+    pub path: String,
+    pub loc: Option<(usize, usize)>,
 }
 
 /// One streamed picker candidate (`nx.picker` source `push`): its display `label`
@@ -796,6 +813,10 @@ pub struct PickerPush {
     pub gen: u64,
     pub label: String,
     pub key: usize,
+    /// The candidate's preview target ([`PreviewPush`]) when the picker carries a
+    /// preview pane and this row supplied a `path`; `None` otherwise (preview-less
+    /// picker, or a row with no path — e.g. an unnamed buffer).
+    pub preview: Option<PreviewPush>,
 }
 
 /// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a

@@ -113,6 +113,16 @@ pub struct MenuView {
     /// ([`PromptPos`](crate::editor::PromptPos)). `Top` (the default) for a
     /// promptless `nx.ui.select`; only meaningful when `query` is `Some`.
     pub prompt_pos: crate::editor::PromptPos,
+    /// Whether this picker carries a preview pane at all (the source declared a
+    /// `preview` kind). The server reserves the preview column whenever this is set —
+    /// even on a row with no target, which shows a "no preview" placeholder rather
+    /// than collapsing the layout. `false` for a `select` / preview-less picker.
+    pub has_preview: bool,
+    /// The **selected** row's preview target ([`PreviewTarget`](crate::editor::PreviewTarget)),
+    /// when this picker carries a preview pane and the row supplied one. `None` for a
+    /// `select` / preview-less picker, or a row with no path. The server reads +
+    /// renders the target into the pane; this only names *what* to show.
+    pub preview: Option<crate::editor::PreviewTarget>,
     /// The picker box's fixed width / height ([`MenuExtent`](crate::editor::MenuExtent),
     /// `None` ⇒ the picker default), resolved against the viewport by the server at
     /// projection time. Both `None` for a content-anchored `nx.ui.select`.

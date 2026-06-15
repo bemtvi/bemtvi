@@ -27,6 +27,6 @@ pub use parse::{
 };
 pub use style::{Border, Style};
 pub use view::{
-    MenuData, PanelData, PmenuData, RegionTabline, RegionTablines, ScrollData, Separator, TabData,
-    View, WinRect, WindowRegion, WindowView,
+    MenuData, MenuPreview, PanelData, PmenuData, RegionTabline, RegionTablines, ScrollData,
+    Separator, TabData, View, WinRect, WindowRegion, WindowView,
 };

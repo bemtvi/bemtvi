@@ -851,6 +851,14 @@ async fn example_config_loads_and_opens_a_picker() {
     feed(&rpc, "ceru"); // a subsequence unique to "cerulean"
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
     assert_eq!(menu_items(&menu), vec!["cerulean"]);
+    feed(&rpc, "<Esc>");
+
+    // The "preview" source resolves its files via `<sfile>` and renders the pane —
+    // the first row (sample.txt) previews with that file's real first line.
+    exec_lua(&rpc, "nx.picker.open('preview')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("preview opens"));
+    let preview = preview_of(&menu).expect("the preview source carries a pane");
+    assert_eq!(preview_lines(&preview)[0], "nx.picker sample buffer");
 }
 
 #[tokio::test]
@@ -870,4 +878,213 @@ async fn buffers_source_lists_open_buffers() {
         items.iter().any(|i| i.contains("hello.txt")),
         "buffers picker lists the open buffer, got {items:?}"
     );
+}
+
+// ===== Phase 3: the preview pane ============================================
+
+/// The menu's `preview` sub-map, or `None` for a preview-less picker / select.
+fn preview_of(menu: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    match map_get(menu, "preview") {
+        Some(Value::Map(m)) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+/// The preview pane's windowed lines, in order.
+fn preview_lines(preview: &[(Value, Value)]) -> Vec<String> {
+    match map_get(preview, "lines") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        other => panic!("expected preview lines array, got {other:?}"),
+    }
+}
+
+/// The preview's `loc` (`[row, col]`) rebased into the window, or `None`.
+fn preview_loc(preview: &[(Value, Value)]) -> Option<(u64, u64)> {
+    match map_get(preview, "loc") {
+        Some(Value::Array(a)) if a.len() == 2 => {
+            Some((a[0].as_u64().unwrap(), a[1].as_u64().unwrap()))
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn file_preview_shows_selected_file_and_swaps_on_move() {
+    let dir = temp_dir("picker_preview_file");
+    std::fs::write(dir.join("a.txt"), "alpha one\nalpha two\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "bravo only\n").unwrap();
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "files_test",
+  preview = "file",
+  items = function(ctx, push, done)
+    push {{ text = "a.txt", path = "{a}" }}
+    push {{ text = "b.txt", path = "{b}" }}
+    done()
+  end,
+  confirm = function(item) _G.picked = item.path end,
+}}
+"#,
+        a = a.display(),
+        b = b.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('files_test')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+
+    // The first row (a.txt) previews with its file's head, titled by its path.
+    let preview = preview_of(&menu).expect("file picker carries a preview pane");
+    assert_eq!(preview_lines(&preview)[0], "alpha one");
+    assert_eq!(
+        map_get(&preview, "title").and_then(Value::as_str),
+        Some(a.display().to_string().as_str())
+    );
+
+    // Moving the selection swaps the preview to the newly-selected file.
+    feed(&rpc, "<C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu updates"));
+    let preview = preview_of(&menu).expect("preview still present");
+    assert_eq!(preview_lines(&preview)[0], "bravo only");
+
+    // The document buffer was never touched by any of this.
+    assert_eq!(lines(&rpc).await, vec![""]);
+}
+
+#[tokio::test]
+async fn location_preview_windows_to_the_match_and_marks_it() {
+    let dir = temp_dir("picker_preview_loc");
+    // Ten lines "L0".."L9"; the source points at 1-based line 5 (= "L4").
+    let body: String = (0..10).map(|i| format!("L{i}\n")).collect();
+    std::fs::write(dir.join("big.txt"), body).unwrap();
+    let big = dir.join("big.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "loc_test",
+  preview = "location",
+  items = function(ctx, push, done)
+    push {{ text = "big:5", path = "{big}", row = 5, col = 2 }}
+    done()
+  end,
+  confirm = function(item) _G.picked = item.path end,
+}}
+"#,
+        big = big.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('loc_test')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("location picker carries a preview pane");
+
+    // The window holds the file and the match line; the 1-based row 5 / col 2
+    // rebases to the 0-based loc (4, 1) within the window (which starts at the top
+    // for this short file).
+    let lines = preview_lines(&preview);
+    assert_eq!(lines[4], "L4");
+    assert_eq!(preview_loc(&preview), Some((4, 1)));
+}
+
+#[tokio::test]
+async fn preview_reserves_a_column_so_the_list_keeps_the_rest() {
+    let dir = temp_dir("picker_preview_geom");
+    std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+    let a = dir.join("a.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "geom",
+  preview = "file",
+  items = function(ctx, push, done) push {{ text = "a", path = "{a}" }}; done() end,
+}}
+"#,
+        a = a.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    exec_lua(&rpc, "nx.picker.open('geom')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+
+    let box_w = map_get(&menu, "width").and_then(Value::as_u64).unwrap();
+    let preview = preview_of(&menu).expect("preview present");
+    let pw = map_get(&preview, "width").and_then(Value::as_u64).unwrap();
+    assert!(
+        pw >= 1 && pw < box_w,
+        "preview {pw} fits inside box {box_w}"
+    );
+    // The list keeps `box - preview - 1` (the separator) and stays non-empty.
+    assert!(box_w - pw >= 2, "list column keeps at least one cell");
+}
+
+#[tokio::test]
+async fn preview_less_picker_emits_no_preview_key() {
+    let dir = temp_dir("picker_no_preview");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    assert!(
+        preview_of(&menu).is_none(),
+        "a source with no preview kind emits no preview pane"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_preview_path_shows_a_visible_placeholder() {
+    let dir = temp_dir("picker_preview_missing");
+    let missing = dir.join("does-not-exist.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "missing",
+  preview = "file",
+  items = function(ctx, push, done) push {{ text = "gone", path = "{p}" }}; done() end,
+}}
+"#,
+        p = missing.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    exec_lua(&rpc, "nx.picker.open('missing')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+
+    // The unreadable file yields a single visible placeholder line naming the path —
+    // never a silent blank — and no location highlight.
+    let preview = preview_of(&menu).expect("preview pane still reserved");
+    let lines = preview_lines(&preview);
+    assert!(
+        lines.iter().any(|l| l.contains("does-not-exist.txt")),
+        "placeholder names the path, got {lines:?}"
+    );
+    assert_eq!(preview_loc(&preview), None);
+}
+
+#[tokio::test]
+async fn confirm_on_a_file_preview_picker_still_fires() {
+    let dir = temp_dir("picker_preview_confirm");
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let a = dir.join("a.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "fc",
+  preview = "file",
+  items = function(ctx, push, done) push {{ text = "a", path = "{a}" }}; done() end,
+  confirm = function(item) _G.picked = item.path end,
+}}
+"#,
+        a = a.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    exec_lua(&rpc, "_G.picked = nil; nx.picker.open('fc')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+
+    feed(&rpc, "<CR>");
+    // Confirm fired with the chosen item and the menu closed (preview untouched it).
+    let picked = exec_lua(&rpc, "return _G.picked").await;
+    assert_eq!(picked.as_str(), Some(a.display().to_string().as_str()));
 }

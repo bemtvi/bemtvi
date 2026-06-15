@@ -314,6 +314,7 @@ impl EditHost {
             self.editor.open_picker(
                 nxvim_core::MenuPlacement::Editor,
                 req.dynamic,
+                req.preview,
                 parse_menu_extent(&req.width),
                 parse_menu_extent(&req.height),
                 if req.prompt_bottom {
@@ -344,6 +345,10 @@ impl EditHost {
                 .map(|p| nxvim_core::MenuItem {
                     label: p.label,
                     key: p.key,
+                    preview: p.preview.map(|pv| nxvim_core::PreviewTarget {
+                        path: pv.path,
+                        loc: pv.loc,
+                    }),
                 })
                 .collect();
             if !items.is_empty() {

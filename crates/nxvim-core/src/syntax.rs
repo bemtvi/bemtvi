@@ -75,6 +75,23 @@ pub trait SyntaxEngine {
     /// Highlight spans for the line range `[first, last)`.
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span>;
 
+    /// Highlight an **off-buffer** snippet — `text` in `language`, over the line
+    /// range `[first, last)` — without registering a [`BufferId`]. A stateless,
+    /// full parse (no incremental reuse, no injections) for read-only surfaces like
+    /// the picker preview pane, which highlight a file that is not an open buffer.
+    /// Spans are in `text` coordinates (line indices count from `text`'s first
+    /// line). The default returns nothing — an engine that can't parse a detached
+    /// snippet (e.g. the wasm JS-side highlighter) simply leaves the surface plain.
+    fn highlight_text(
+        &mut self,
+        _language: &str,
+        _text: &str,
+        _first: usize,
+        _last: usize,
+    ) -> Vec<Span> {
+        Vec::new()
+    }
+
     /// Target indent **width in columns** for `line`, or `None` when there is no
     /// grammar / no `indents.scm` / the query is inconclusive — in which case the
     /// caller falls back (copy-previous-line autoindent, then column 0).

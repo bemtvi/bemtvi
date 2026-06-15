@@ -12,9 +12,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::anim::{arm_animation, lerp, Animation};
 use nxvim_view::{
-    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, PanelData,
-    PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View, WindowRegion,
-    WindowView,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
+    PanelData, PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View,
+    WindowRegion, WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -273,7 +273,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
     // over the focused window's text area, with input focus. A picker returns its
     // prompt caret position so we can draw the terminal cursor there.
     let menu_cursor = match (&view.menu, focused_inner) {
-        (Some(menu), Some((inner, _, _))) => render_menu(frame, inner, menu),
+        (Some(menu), Some((inner, _, _))) => render_menu(frame, inner, menu, &view.styles),
         _ => None,
     };
 
@@ -1665,7 +1665,12 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 /// highlighted row is reverse-video. The box is `Clear`ed first so the text
 /// beneath doesn't bleed through, and the list scrolls to keep the selection
 /// visible when there are more items than rows.
-fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) -> Option<(u16, u16)> {
+fn render_menu(
+    frame: &mut Frame,
+    text_area: Rect,
+    menu: &MenuData,
+    styles: &[nxvim_view::Style],
+) -> Option<(u16, u16)> {
     let x = text_area.x.saturating_add(menu.col);
     let y = text_area.y.saturating_add(menu.row);
     let width = menu
@@ -1690,8 +1695,33 @@ fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) -> Option<(u
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let width = inner.width as usize;
     let inner_h = inner.height as usize;
+    let box_w = inner.width as usize;
+    // Split the box into a list column (left) + a 1-col vertical separator + a
+    // preview column (right) when the picker carries a preview pane; otherwise the
+    // list fills the box. The prompt + results live in the list column; the preview
+    // spans the full inner height on the right.
+    let (width, list_area, preview_layout) = match &menu.preview {
+        Some(pv) => {
+            let preview_w = (pv.width as usize).min(box_w.saturating_sub(2)).max(1);
+            let list_w = box_w.saturating_sub(preview_w + 1).max(1);
+            let list_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: list_w as u16,
+                height: inner.height,
+            };
+            let sep_x = inner.x + list_w as u16;
+            let preview_area = Rect {
+                x: sep_x + 1,
+                y: inner.y,
+                width: preview_w as u16,
+                height: inner.height,
+            };
+            (list_w, list_area, Some((sep_x, preview_area, pv)))
+        }
+        None => (box_w, inner, None),
+    };
     // A picker carries a prompt row and a separator row (the `chrome`); the list
     // fills the rest. A promptless `nx.ui.select` has neither — the list is the
     // whole box. The prompt sits above the list by default, or below it when the
@@ -1754,14 +1784,116 @@ fn render_menu(frame: &mut Frame, text_area: Rect, menu: &MenuData) -> Option<(u
             lines.push(list_line(r));
         }
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)), list_area);
 
-    // The terminal caret sits in the prompt, past the `> ` prefix at the query's
-    // text-cursor column (clamped inside the box).
+    // The preview column: a vertical separator rule, then the windowed file.
+    if let Some((sep_x, preview_area, pv)) = preview_layout {
+        let sep: Vec<Line> = (0..inner.height)
+            .map(|_| {
+                Line::from(Span::styled(
+                    "│",
+                    Style::default().add_modifier(Modifier::DIM),
+                ))
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Text::from(sep)),
+            Rect {
+                x: sep_x,
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            },
+        );
+        let palette: Vec<Style> = styles.iter().copied().map(rt).collect();
+        render_preview(frame, preview_area, pv, &palette);
+    }
+
+    // The terminal caret sits in the prompt (in the list column), past the `> `
+    // prefix at the query's text-cursor column (clamped inside the column).
     prompt_row.map(|row| {
-        let caret = (2 + menu.query_cursor).min(inner.width.saturating_sub(1));
-        (inner.x + caret, inner.y + row as u16)
+        let caret = (2 + menu.query_cursor).min(list_area.width.saturating_sub(1));
+        (list_area.x + caret, list_area.y + row as u16)
     })
+}
+
+/// Render the picker preview column: a dim title row (the file path) then the
+/// windowed file lines, syntax-coloured from the server's tree-sitter `highlights`
+/// (Phase 3b), with the match line (`loc`) reverse-highlighted so the grep /
+/// reference hit stands out. `palette` is the frame's resolved style table (span
+/// `style_id`s index it); a span with no id falls back to [`group_style`].
+fn render_preview(frame: &mut Frame, area: Rect, pv: &MenuPreview, palette: &[Style]) {
+    let w = area.width as usize;
+    let cap = area.height as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(cap);
+    lines.push(Line::from(Span::styled(
+        pmenu_row(&pv.title, "", w),
+        Style::default()
+            .add_modifier(Modifier::DIM)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let empty = Vec::new();
+    for (i, text) in pv.lines.iter().enumerate() {
+        if lines.len() >= cap {
+            break;
+        }
+        let is_loc = pv.loc.is_some_and(|(r, _)| r as usize == i);
+        let hl = pv.highlights.get(i).unwrap_or(&empty);
+        lines.push(preview_line(text, hl, palette, is_loc, w));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// One preview line: each char coloured by the tree-sitter span covering it (char
+/// columns, no tab expansion — matching the server's char-based spans), padded to
+/// `width`. The `loc` match line is reverse-video over the syntax colours.
+fn preview_line(
+    text: &str,
+    hl: &[HlSpan],
+    palette: &[Style],
+    loc: bool,
+    width: usize,
+) -> Line<'static> {
+    let base = if loc {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = base;
+    let mut used = 0usize;
+    for (ci, ch) in text.chars().enumerate() {
+        if used >= width {
+            break;
+        }
+        let token = hl
+            .iter()
+            .find(|(s, e, _, _)| ci >= *s as usize && ci < *e as usize);
+        let mut style = match token {
+            Some((_, _, group, id)) => match id {
+                Some(i) => palette.get(*i).copied().unwrap_or_default(),
+                None => group_style(group),
+            },
+            None => Style::default(),
+        };
+        if loc {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = style;
+        run.push(ch);
+        used += 1;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(std::mem::take(&mut run), run_style));
+    }
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), base));
+    }
+    Line::from(spans)
 }
 
 /// Build one menu row: the `label` padded to `width`, reverse-video when

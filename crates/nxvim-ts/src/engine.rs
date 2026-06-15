@@ -655,6 +655,56 @@ impl Engine {
         extract_spans(&layers, &state.shadow, first_line, last_line)
     }
 
+    /// Highlight an off-buffer snippet (`text` in `lang`) over `[first_line,
+    /// last_line)` — a **stateless** full parse with no `BufferId`, no incremental
+    /// reuse, and no injection layers (the host grammar only). For the picker
+    /// preview pane, which paints a file that is not an open buffer. Returns the
+    /// host highlight spans in `text` coordinates, or empty when no grammar is
+    /// installed for `lang` or the parse is cancelled / fails.
+    pub fn highlight_text(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Vec<Span> {
+        let language = match self.grammar(lang) {
+            Slot::Loaded(g) => g.language.clone(),
+            _ => return Vec::new(), // silent: no grammar (or load failed)
+        };
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_err() {
+            return Vec::new();
+        }
+        let shadow = Rope::from_str(text);
+        // Parse under the same wall-clock deadline as `reparse`, so a pathologically
+        // large preview file can't stall the frame (it just renders plain).
+        let started = Instant::now();
+        let mut budget = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
+            if started.elapsed() >= PARSE_DEADLINE {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = ParseOptions::new().progress_callback(&mut budget);
+        let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(&shadow, byte) };
+        let Some(tree) = parser.parse_with_options(&mut callback, None, Some(options)) else {
+            return Vec::new();
+        };
+        // Re-borrow the grammar's compiled query immutably (the `&mut self` from
+        // `grammar` has ended); the host covers the whole snippet — no injections.
+        let Some(Slot::Loaded(host)) = self.grammars.get(lang) else {
+            return Vec::new();
+        };
+        let layers = vec![Layer {
+            query: &host.query,
+            tree: &tree,
+            ranges: &[],
+        }];
+        extract_spans(&layers, &shadow, first_line, last_line)
+    }
+
     /// Target indent **width in columns** for the 0-indexed `line`, by running the
     /// grammar's `indents.scm` over the tree — a faithful port of
     /// nvim-treesitter's `indent.lua` `get_indent`. Returns `None` when there is
@@ -922,6 +972,10 @@ impl SyntaxEngine for Engine {
 
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span> {
         Engine::highlights(self, buffer, first, last)
+    }
+
+    fn highlight_text(&mut self, lang: &str, text: &str, first: usize, last: usize) -> Vec<Span> {
+        Engine::highlight_text(self, lang, text, first, last)
     }
 
     fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {

@@ -54,6 +54,9 @@ function nx.picker.source(spec)
   if type(spec.items) ~= "function" then
     error("nx.picker.source('" .. spec.name .. "'): items must be a function", 2)
   end
+  if spec.preview ~= nil and spec.preview ~= "file" and spec.preview ~= "location" then
+    error("nx.picker.source('" .. spec.name .. '\'): preview must be "file" or "location"', 2)
+  end
   nx.picker._sources[spec.name] = spec
 end
 
@@ -82,7 +85,15 @@ function nx.picker.open(name, opts)
     error("nx.picker.open: no such source '" .. tostring(name) .. "'", 2)
   end
   opts = opts or {}
-  nx._picker = { source = source, items = {}, gen = 0, on_cancel = nil }
+  -- Resolve the preview kind: per-open overrides per-source. nil ⇒ no preview pane.
+  local preview = opts.preview
+  if preview == nil then
+    preview = source.preview
+  end
+  if preview ~= nil and preview ~= "file" and preview ~= "location" then
+    error('nx.picker.open: preview must be "file" or "location"', 2)
+  end
+  nx._picker = { source = source, items = {}, gen = 0, on_cancel = nil, preview = preview }
   local width = size_str(opts.width ~= nil and opts.width or source.width)
   local height = size_str(opts.height ~= nil and opts.height or source.height)
   -- Resolve the debounce: per-open overrides per-source overrides the global
@@ -104,7 +115,7 @@ function nx.picker.open(name, opts)
   end
   local prompt_bottom = prompt_pos == "bottom"
   -- The server opens the centered widget and kicks the initial run (gen 0, "").
-  nx._picker_open(source.dynamic == true, width, height, prompt_bottom)
+  nx._picker_open(source.dynamic == true, width, height, prompt_bottom, preview ~= nil)
 end
 
 -- Cap on streamed results past which the job is reaped — a *safety* bound against
@@ -172,12 +183,26 @@ function nx._picker_run(gen, query)
 
     -- Candidates are buffered and crossed to the server in batches (one bridge call
     -- per ~`FLUSH_N` items, not per item) — the key to streaming 100k results fast.
+    -- When the picker carries a preview pane, the per-item target travels in parallel
+    -- arrays: `paths` (both kinds; "" ⇒ that row has no target) and, for the
+    -- "location" kind, 0-based `rows` / `cols`. nil arrays ⇒ no preview (the common
+    -- nx.ui.select / preview-less picker path is unchanged).
+    local pv = p.preview -- nil | "file" | "location"
     local labels, keys, batched = {}, {}, 0
+    local paths = pv and {} or nil
+    local rows = pv == "location" and {} or nil
+    local cols = pv == "location" and {} or nil
     local pushed = 0 -- this run's result count, for the cap (p.items is session-wide)
     local function flush()
       if batched > 0 then
-        nx._picker_push(gen, labels, keys)
+        nx._picker_push(gen, labels, keys, paths, rows, cols)
         labels, keys, batched = {}, {}, 0
+        if paths then
+          paths = {}
+        end
+        if rows then
+          rows, cols = {}, {}
+        end
       end
     end
     local function push(item)
@@ -209,6 +234,16 @@ function nx._picker_run(gen, query)
       batched = batched + 1
       labels[batched] = entry.text or tostring(entry)
       keys[batched] = p.nitems
+      if paths then
+        -- "" ⇒ this row has no target (e.g. an unnamed buffer): the pane shows a
+        -- "no preview" placeholder, never a silent blank.
+        paths[batched] = entry.path or ""
+        if rows then
+          -- Items are 1-based (vim/rg convention); the widget's loc is 0-based.
+          rows[batched] = math.max(0, (entry.row or 1) - 1)
+          cols[batched] = math.max(0, (entry.col or 1) - 1)
+        end
+      end
       if batched >= FLUSH_N then
         flush()
       end
@@ -281,6 +316,7 @@ end
 -- files: a static source — `rg --files` streamed in, fuzzy-matched locally.
 nx.picker.source({
   name = "files",
+  preview = "file", -- the preview pane shows the file's head
   items = function(ctx, push, done)
     local handle = nx.spawn({
       cmd = "rg",
@@ -313,6 +349,7 @@ nx.picker.source({
 nx.picker.source({
   name = "live_grep",
   dynamic = true,
+  preview = "location", -- scroll the pane to the match and range-highlight it
   items = function(ctx, push, done)
     if ctx.query == "" then
       return done()
@@ -349,13 +386,14 @@ nx.picker.source({
 -- so reading the mirror lists every named buffer including the focused one.
 nx.picker.source({
   name = "buffers",
+  preview = "file", -- preview the buffer's backing file (named buffers only)
   items = function(_ctx, push, done)
     local bufs = nx._bufs or {}
     for _, b in ipairs(nx.buf.list()) do
       local entry = bufs[b]
       local name = (entry and entry.name) or nx.buf.name(b)
       if name and name ~= "" then
-        push({ text = name, bufnr = b })
+        push({ text = name, bufnr = b, path = name })
       end
     end
     done()

@@ -20,8 +20,8 @@ use crate::convert::{
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
     BufOp, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp,
-    OptionValue, PanelOp, PickerOpenReq, PickerPush, RegisterSetOp, TabOp, TerminalOpenReq, TsOp,
-    UiInputReq, UiSelectReq, WindowOp,
+    OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, RegisterSetOp, TabOp,
+    TerminalOpenReq, TsOp, UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1228,10 +1228,11 @@ pub(crate) fn install_runtime_api(
         "_picker_open",
         lua.create_function(
             move |_,
-                  (dynamic, width, height, prompt_bottom): (
+                  (dynamic, width, height, prompt_bottom, preview): (
                 bool,
                 Option<String>,
                 Option<String>,
+                Option<bool>,
                 Option<bool>,
             )| {
                 sh.borrow_mut().picker_opens.push(PickerOpenReq {
@@ -1239,31 +1240,60 @@ pub(crate) fn install_runtime_api(
                     width: width.unwrap_or_default(),
                     height: height.unwrap_or_default(),
                     prompt_bottom: prompt_bottom.unwrap_or(false),
+                    preview: preview.unwrap_or(false),
                 });
                 Ok(())
             },
         )?,
     )?;
-    // `nx._picker_push(gen, labels, keys)`: queue a BATCH of streamed picker
-    // candidates ([`PickerPush`]) — parallel `labels` / `keys` arrays, stamped with
+    // `nx._picker_push(gen, labels, keys, paths, rows, cols)`: queue a BATCH of
+    // streamed picker candidates ([`PickerPush`]) — parallel arrays, stamped with
     // the run `gen`eration. Batching keeps a 100k-result stream to ~one bridge
-    // crossing per source chunk instead of one per item. The server drops a batch
-    // whose `gen` is behind the live query and feeds the rest into the open picker.
+    // crossing per source chunk instead of one per item. `paths` (and, for the
+    // `"location"` kind, `rows` / `cols` — all 0-based) are present only when the
+    // picker carries a preview pane; an empty `paths[i]` means that row has no
+    // target. The server drops a batch whose `gen` is behind the live query and
+    // feeds the rest into the open picker.
     let sh = shared.clone();
+    // `(gen, labels, keys, paths, rows, cols)` — the parallel-array push batch; the
+    // last three are `Some` only for a preview-carrying picker.
+    type PushArgs = (
+        u64,
+        Vec<String>,
+        Vec<usize>,
+        Option<Vec<String>>,
+        Option<Vec<usize>>,
+        Option<Vec<usize>>,
+    );
     nx.set(
         "_picker_push",
-        lua.create_function(
-            move |_, (gen, labels, keys): (u64, Vec<String>, Vec<usize>)| {
-                let mut sh = sh.borrow_mut();
-                sh.picker_pushes.extend(
-                    labels
-                        .into_iter()
-                        .zip(keys)
-                        .map(|(label, key)| PickerPush { gen, label, key }),
-                );
-                Ok(())
-            },
-        )?,
+        lua.create_function(move |_, (gen, labels, keys, paths, rows, cols): PushArgs| {
+            let mut sh = sh.borrow_mut();
+            sh.picker_pushes.reserve(labels.len());
+            for (i, (label, key)) in labels.into_iter().zip(keys).enumerate() {
+                let preview = paths.as_ref().and_then(|ps| {
+                    let path = ps.get(i)?;
+                    if path.is_empty() {
+                        return None;
+                    }
+                    let loc = match (rows.as_ref(), cols.as_ref()) {
+                        (Some(rs), Some(cs)) => Some((*rs.get(i)?, *cs.get(i)?)),
+                        _ => None,
+                    };
+                    Some(PreviewPush {
+                        path: path.clone(),
+                        loc,
+                    })
+                });
+                sh.picker_pushes.push(PickerPush {
+                    gen,
+                    label,
+                    key,
+                    preview,
+                });
+            }
+            Ok(())
+        })?,
     )?;
     // `nx._picker_finish(gen)`: the source's `done()` for generation `gen` — the
     // server settles the picker (a query that matched nothing clears its stale

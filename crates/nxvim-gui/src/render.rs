@@ -1704,6 +1704,17 @@ impl Renderer {
 
         let full = self.full_bounds();
         let cx = bx + 1;
+        // Split the box content into a list column (left) + a 1-col vertical
+        // separator + a preview column (right) when the picker carries a preview
+        // pane; otherwise the list spans the full content width. The prompt + results
+        // live in the list column; the preview spans the full content height.
+        let (list_w, preview_w) = match &menu.preview {
+            Some(pv) => {
+                let pw = pv.width.min(menu.width.saturating_sub(2)).max(1);
+                (menu.width.saturating_sub(pw + 1).max(1), pw)
+            }
+            None => (menu.width, 0),
+        };
         // A picker carries a prompt row plus a separator (the `chrome`); the list
         // fills the rest. The prompt sits above the list by default, or below it
         // (telescope-style) when asked. A promptless `nx.ui.select` has neither.
@@ -1722,19 +1733,19 @@ impl Renderer {
 
         if has_prompt {
             let query = menu.query.as_deref().unwrap_or("");
-            let text = pmenu_row(&format!("> {query}"), "", menu.width as usize);
+            let text = pmenu_row(&format!("> {query}"), "", list_w as usize);
             self.push_plain(items, &text, self.cell_px(cx, by + 1 + prompt_y), fg, full);
-            // The separator: a thin horizontal rule across the box, in the border tint.
+            // The separator: a thin horizontal rule across the list column.
             let (px, py) = self.cell_px(cx, by + 1 + sep_y);
             quads.push(Quad {
                 x: px,
                 y: py + self.cell_h * 0.5,
-                w: self.cell_w * menu.width as f32,
+                w: self.cell_w * list_w as f32,
                 h: (self.cell_h * 0.08).max(1.0),
                 color: color_to_rgba(srgb_to_color(border)),
             });
             // The caret: a thin bar past the `> ` prefix at the query's cursor column.
-            let caret = (2 + menu.query_cursor).min(menu.width.saturating_sub(1));
+            let caret = (2 + menu.query_cursor).min(list_w.saturating_sub(1));
             let (cpx, cpy) = self.cell_px(cx + caret, by + 1 + prompt_y);
             let mut c = srgb_to_color_rgba(fg, 0.9);
             c[3] = 0.9;
@@ -1757,9 +1768,9 @@ impl Renderer {
             };
             let row = by + 1 + list_y0 + r;
             if idx == menu.selected {
-                self.fill_cells(quads, cx, row, menu.width, sel_bg);
+                self.fill_cells(quads, cx, row, list_w, sel_bg);
             }
-            let text = pmenu_row(label, "", menu.width as usize);
+            let text = pmenu_row(label, "", list_w as usize);
             self.push_plain(items, &text, self.cell_px(cx, row), fg, full);
             // Overdraw the matched characters in the accent color (monospace, so
             // char `i` sits at column `cx + i`).
@@ -1775,6 +1786,58 @@ impl Renderer {
                             full,
                         );
                     }
+                }
+            }
+        }
+
+        // The preview column: a vertical separator rule, a header row with the file
+        // path, then the windowed file lines — syntax-coloured from the server's
+        // tree-sitter `highlights` (Phase 3b) via `row_segments`, the same colouring
+        // the window text uses — with the match line (`loc`) background-highlighted.
+        if let Some(pv) = &menu.preview {
+            let sep_col = cx + list_w;
+            let px0 = sep_col + 1;
+            // Vertical rule down the box content height, in the border tint.
+            let (spx, spy) = self.cell_px(sep_col, by + 1);
+            quads.push(Quad {
+                x: spx + self.cell_w * 0.5,
+                y: spy,
+                w: (self.cell_w * 0.08).max(1.0),
+                h: self.cell_h * menu.height as f32,
+                color: color_to_rgba(srgb_to_color(border)),
+            });
+            // The title header: the path on a sel-tinted bar across the pane.
+            self.fill_cells(quads, px0, by + 1, preview_w, sel_bg);
+            let title = pmenu_row(&pv.title, "", preview_w as usize);
+            self.push_plain(items, &title, self.cell_px(px0, by + 1), fg, full);
+            // The windowed file lines below the header (rows 1..content height).
+            let content_h = menu.height.saturating_sub(1);
+            let empty = Vec::new();
+            for (i, text) in pv.lines.iter().enumerate() {
+                if i as u16 >= content_h {
+                    break;
+                }
+                let row = by + 2 + i as u16;
+                if pv.loc.is_some_and(|(r, _)| r as usize == i) {
+                    self.fill_cells(quads, px0, row, preview_w, sel_bg);
+                }
+                // Colour each run by its tree-sitter span (char columns, no leftcol),
+                // clamped to the pane width; a span with no theme id falls back to its
+                // capture group's built-in colour (`row_segments`).
+                let hl = pv.highlights.get(i).map(Vec::as_slice).unwrap_or(&empty);
+                let mut col = 0u16;
+                for seg in row_segments(text, hl, &view.styles, fg, popup_bg, 0) {
+                    if col >= preview_w {
+                        break;
+                    }
+                    let room = (preview_w - col) as usize;
+                    let shown: String = seg.text.chars().take(room).collect();
+                    if shown.is_empty() {
+                        continue;
+                    }
+                    let n = shown.chars().count() as u16;
+                    self.push_plain(items, &shown, self.cell_px(px0 + col, row), seg.fg, full);
+                    col += n;
                 }
             }
         }

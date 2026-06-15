@@ -10,9 +10,9 @@ use rmpv::Value;
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
-    parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers, parse_pmenu_items,
-    parse_spans, parse_status, parse_styles, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans,
-    InlayHint, PmenuItem, SearchSpans, StatusSegment,
+    parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers, parse_pair,
+    parse_pmenu_items, parse_spans, parse_status, parse_styles, DiagSign, DiagSpan, DiagVirt,
+    HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment,
 };
 use crate::style::{Border, Style};
 
@@ -341,6 +341,35 @@ pub struct MenuData {
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
+    /// The picker preview pane (Phase 3), present when the source declared a
+    /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
+    /// the list alone, exactly as before.
+    pub preview: Option<MenuPreview>,
+}
+
+/// The picker preview pane mirrored from the redraw: the windowed file content for
+/// the selected row, the column width the pane occupies (so the list keeps `width −
+/// preview.width − 1`), a title, and the match location to highlight. A column on
+/// the right of an editor-placement picker box. See [`MenuData::preview`].
+#[derive(Clone)]
+pub struct MenuPreview {
+    /// The windowed file lines (already sliced to the pane height). A single line
+    /// like `"<path>: <err>"` / `"No preview"` is a visible placeholder.
+    pub lines: Vec<String>,
+    /// 1-based file line of `lines[0]` — context for an optional line-number gutter.
+    pub first_line: u32,
+    /// The previewed file's path, drawn as the pane's title.
+    pub title: String,
+    /// The pane's column width (cells). The list column is `MenuData::width −
+    /// width − 1` (the `1` is the vertical separator).
+    pub width: u16,
+    /// The match position to range-highlight, as `(row, col)` **relative to
+    /// `lines[0]`**; `None` for a file-kind preview (no location) or a placeholder.
+    pub loc: Option<(u16, u16)>,
+    /// Per-line native tree-sitter highlight spans (Phase 3b) — same shape as a
+    /// window's text highlights (`[start_col, end_col, group, style_id]`), so a
+    /// client reuses its span renderer. Empty (plain text) until 3b lands.
+    pub highlights: Vec<Vec<HlSpan>>,
 }
 
 /// One tabline cell mirrored from the server's redraw: the buffer label, its
@@ -486,6 +515,17 @@ impl View {
                 query_cursor: map_u16(m, "query_cursor"),
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
+                preview: match map_get(m, "preview") {
+                    Some(Value::Map(p)) => Some(MenuPreview {
+                        lines: map_str_array(p, "lines"),
+                        first_line: map_u64(p, "first_line") as u32,
+                        title: map_str(p, "title"),
+                        width: map_u16(p, "width"),
+                        loc: parse_pair(map_get(p, "loc")),
+                        highlights: parse_highlights(map_get(p, "highlights")),
+                    }),
+                    _ => None,
+                },
             }),
             _ => None,
         };

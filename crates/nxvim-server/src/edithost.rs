@@ -139,6 +139,32 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn has_remote_proc(&self) -> bool;
 
+    /// Open a daemon-side PTY for terminal buffer `buf` (the web `:terminal` — Phase 7),
+    /// running `argv` (empty ⇒ the daemon's default shell) in `cwd`, sized `rows`×`cols`.
+    /// The wasm twin of the native `terminal_command(TermCommand::Open)`: the browser owns
+    /// the vt100 emulation but has no PTY, so the real child runs on the daemon and its
+    /// output streams back inbound via [`EditHost::terminal_feed`](crate::EditHost::terminal_feed)
+    /// (fed from `term_data` pushes). Fire-and-forget; only reached when a daemon is connected
+    /// (the dispatch gates on [`Self::has_remote_proc`] — serverless OPFS has no PTY host and
+    /// fails the open loud). Wasm-only (native opens a local PTY through `terminal_command`).
+    #[cfg(not(feature = "native"))]
+    fn term_open(&mut self, buf: u64, argv: Vec<String>, cwd: Option<String>, rows: u16, cols: u16);
+
+    /// Write input bytes to `buf`'s daemon PTY (a forwarded keystroke / paste / query reply).
+    /// The wasm twin of `terminal_command(TermCommand::Write)`. Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn term_write(&mut self, buf: u64, bytes: Vec<u8>);
+
+    /// Resize `buf`'s daemon PTY so the child re-lays-out (the terminal window changed size).
+    /// The wasm twin of `terminal_command(TermCommand::Resize)`. Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn term_resize(&mut self, buf: u64, rows: u16, cols: u16);
+
+    /// Kill `buf`'s daemon PTY child and forget the session (the terminal closed). The wasm
+    /// twin of `terminal_command(TermCommand::Kill)`. Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn term_kill(&mut self, buf: u64);
+
     /// LSP — ensure `key`'s language server is running (idempotent), spawning it via
     /// `spawn` on first use. Fire-and-forget; the server's notifications and reply
     /// stream return *inbound* on the run loop's `lsp_events` arm, not here. Native-only

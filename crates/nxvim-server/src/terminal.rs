@@ -564,19 +564,86 @@ impl EditHost {
     }
 }
 
-/// No terminal transport in the serverless browser build yet — Phase 7 wires the
-/// daemon PTY over WebTransport. Until then an open fails *loud* (no silent stub).
+/// The wasm terminal transport: the browser owns the vt100 emulation (the shared
+/// [`EditHost`] above) but has no PTY, so the real child runs on the daemon over
+/// WebTransport (Phase 7). Each op routes through the [`HostEffects`](crate::edithost::HostEffects)
+/// terminal seam (`term_open`/`term_write`/`term_resize`/`term_kill`), the worker forwards
+/// it to the daemon, and the child's output streams back inbound (`term_data` →
+/// [`EditHost::terminal_feed`]). A serverless OPFS session (no daemon) has no PTY host, so
+/// an open fails *loud* — never a silent stub.
 #[cfg(not(feature = "native"))]
 impl EditHost {
     pub(crate) fn dispatch_terminal_ops(&mut self, ops: Vec<TerminalOp>) {
         for op in ops {
-            if let TerminalOp::Open { buf, .. } = op {
-                self.editor.terminal_closed(buf, -1);
-                self.editor
-                    .echo("E: :terminal requires a daemon connection in this build".to_string());
+            match op {
+                TerminalOp::Open {
+                    buf,
+                    argv,
+                    cwd,
+                    rows,
+                    cols,
+                    scrollback,
+                } => {
+                    if !self.fx.has_remote_proc() {
+                        // No daemon ⇒ no PTY host. Fail loud rather than open a dead
+                        // terminal whose input goes nowhere.
+                        self.editor.terminal_closed(buf, -1);
+                        self.editor.echo(
+                            "E: :terminal requires a daemon connection in this build".to_string(),
+                        );
+                        continue;
+                    }
+                    // Build the emulator first (the browser projects the grid locally), then
+                    // ask the daemon to spawn the PTY behind it. The vt100 scrollback is a
+                    // local concern; the daemon's PTY doesn't need it.
+                    self.terminal_open_emu(buf, rows, cols, scrollback);
+                    self.fx.term_open(buf.0, argv, cwd, rows, cols);
+                }
+                TerminalOp::Send { buf, bytes } => self.fx.term_write(buf.0, bytes),
+                TerminalOp::Kill { buf } => {
+                    self.terminal_remove(buf);
+                    self.fx.term_kill(buf.0);
+                }
             }
-            // Send / Kill for a terminal that never opened are no-ops.
         }
+    }
+
+    /// Keep the focused terminal's daemon PTY winsize matching its window text area —
+    /// the wasm twin of the native [`sync_terminal_sizes`](EditHost::sync_terminal_sizes).
+    /// Called each redraw: on a real change, reflow the local emulator and forward a
+    /// `term_resize` to the daemon so the child reflows too.
+    pub(crate) fn sync_terminal_sizes(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        if !self.terminals.contains_key(&buf) {
+            return;
+        }
+        let (rows, cols) = self.editor.current_text_area();
+        if self.terminal_resize(buf, rows, cols) {
+            self.fx.term_resize(buf.0, rows, cols);
+        }
+    }
+
+    /// Inbound: project every live terminal once and settle + repaint — the wasm twin of
+    /// the native [`on_term_events`](EditHost::on_term_events) post-drain projection. The
+    /// FFI feeds each queued `term_data` push (cheap vt100 parse) via
+    /// [`terminal_feed`](EditHost::terminal_feed), then calls this **once** after the batch,
+    /// so a flood costs one projection per push-drain (one repaint), never one per chunk —
+    /// the same "project once per repaint" rule the native leg follows.
+    pub fn terminal_flush(&mut self) {
+        let bufs: Vec<BufferId> = self.terminals.keys().copied().collect();
+        for buf in bufs {
+            self.terminal_project(buf);
+        }
+        self.settle_events(true);
+    }
+
+    /// Inbound: a daemon `term_exit` push — the child exited with `code`. Record it (leave
+    /// terminal mode, append the `[Process exited]` notice), drop the emulator, then settle
+    /// + repaint. The wasm twin of the native `on_term_event` Exit arm.
+    pub fn terminal_exit(&mut self, buf: BufferId, code: i32) {
+        self.editor.terminal_closed(buf, code);
+        self.terminal_remove(buf);
+        self.settle_events(true);
     }
 }
 

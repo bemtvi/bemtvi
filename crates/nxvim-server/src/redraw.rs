@@ -27,9 +27,8 @@ impl EditHost {
             None => return,
         };
         // Match the current terminal's PTY winsize to its window before projecting,
-        // so a resized terminal reflows its mirrored screen this frame. Native only —
-        // the wasm terminal resize rides the daemon leg (Phase 7).
-        #[cfg(feature = "native")]
+        // so a resized terminal reflows its mirrored screen this frame. Both builds:
+        // native resizes the local PTY, wasm forwards a `term_resize` to the daemon.
         self.sync_terminal_sizes();
         // Color the focused terminal's scrollback only while it's being browsed (never
         // on the live flood path); a no-op when output is live or already materialized.

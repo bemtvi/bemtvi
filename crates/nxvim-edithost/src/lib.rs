@@ -142,6 +142,27 @@ struct Sink {
     /// [`proc_spawns`](Sink::proc_spawns), drained by [`eh_take_proc_requests`] for the
     /// Worker to forward (`proc_kill [id]`).
     proc_kills: Vec<u64>,
+    /// Terminal PTYs the editor newly asked to **open** this convergence (the web `:terminal`
+    /// — Phase 7): `(buf, argv, cwd, rows, cols)` per `:terminal`, recorded by
+    /// [`term_open`](HostEffects::term_open). Drained by [`eh_take_terminal_requests`] for the
+    /// Worker to forward over WebTransport (`term_open [buf, argv, cwd?, rows, cols]`); the
+    /// child's output/exit return as `term_data`/`term_exit` pushes (`eh_terminal_data` /
+    /// `eh_terminal_exit`). Only enqueued in a daemon session (the dispatch gates on
+    /// [`daemon_connected`](Sink::daemon_connected); serverless OPFS has no PTY host).
+    #[allow(clippy::type_complexity)]
+    term_opens: Vec<(u64, Vec<String>, Option<String>, u16, u16)>,
+    /// Input bytes the editor asked to **write** to a terminal PTY (a forwarded keystroke /
+    /// paste / vt100 query reply), recorded by [`term_write`](HostEffects::term_write);
+    /// `(buf, bytes)`, drained by [`eh_take_terminal_requests`] (`term_write [buf, bytes]`).
+    term_writes: Vec<(u64, Vec<u8>)>,
+    /// Terminal **resizes** the editor enqueued (the window's text area changed), recorded by
+    /// [`term_resize`](HostEffects::term_resize); `(buf, rows, cols)`, drained as
+    /// `term_resize [buf, rows, cols]` so the daemon PTY reflows.
+    term_resizes: Vec<(u64, u16, u16)>,
+    /// Terminal PTYs the editor asked to **kill** (the terminal closed), recorded by
+    /// [`term_kill`](HostEffects::term_kill); the close twin of [`term_opens`](Sink::term_opens),
+    /// drained as `term_kill [buf]`.
+    term_kills: Vec<u64>,
     /// Whether a daemon (and thus a process host) is currently connected — flipped by the
     /// Worker via [`eh_set_daemon_connected`] on a `?daemon=` boot / runtime `:connect` /
     /// disconnect. Read by [`has_remote_proc`](HostEffects::has_remote_proc) to gate the
@@ -444,6 +465,40 @@ impl HostEffects for WasmEffects {
         // no process host. The Worker flips this on `:connect` / `?daemon=` (`eh_set_daemon_connected`);
         // when false the tick fails the spawn loud instead of enqueuing it.
         self.sink.borrow().daemon_connected
+    }
+
+    fn term_open(
+        &mut self,
+        buf: u64,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        rows: u16,
+        cols: u16,
+    ) {
+        // The web `:terminal` (Phase 7): the browser built the vt100 emulator; record the
+        // open for the Worker to forward to the daemon (`eh_take_terminal_requests` →
+        // `term_open`), which spawns the real PTY and streams its output back via `term_data`
+        // pushes (`eh_terminal_data`). Only reached with a daemon connected (the dispatch
+        // gates on `has_remote_proc`).
+        self.sink
+            .borrow_mut()
+            .term_opens
+            .push((buf, argv, cwd, rows, cols));
+    }
+
+    fn term_write(&mut self, buf: u64, bytes: Vec<u8>) {
+        // A forwarded keystroke / paste / query-reply for `buf`'s daemon PTY.
+        self.sink.borrow_mut().term_writes.push((buf, bytes));
+    }
+
+    fn term_resize(&mut self, buf: u64, rows: u16, cols: u16) {
+        // The terminal window changed size; the daemon PTY must reflow too.
+        self.sink.borrow_mut().term_resizes.push((buf, rows, cols));
+    }
+
+    fn term_kill(&mut self, buf: u64) {
+        // The terminal closed; terminate the daemon PTY child (its exit returns on `term_exit`).
+        self.sink.borrow_mut().term_kills.push(buf);
     }
 
     fn ts_install(&mut self, lang: String) {
@@ -1116,6 +1171,98 @@ pub unsafe extern "C" fn eh_proc_exited(
     handle
         .host
         .proc_exited(id.max(0.0) as u64, code as i32, stdout, stderr);
+}
+
+/// Drain the terminal ops the editor enqueued since the last call (the web `:terminal` —
+/// Phase 7), as JSON the Worker forwards to the daemon:
+/// `{"open":[{"buf":N,"argv":["…"],"cwd":"…"|null,"rows":R,"cols":C}],
+///   "write":[{"buf":N,"bytes":[byte,…]}],"resize":[{"buf":N,"rows":R,"cols":C}],"kill":[N]}`.
+/// Each op is dispatched exactly once (the queues are emptied). The daemon answers with
+/// `term_data`/`term_exit` pushes the Worker lands via [`eh_terminal_data`] / [`eh_terminal_exit`].
+/// Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_terminal_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"open":[],"write":[],"resize":[],"kill":[]}"#.into());
+    };
+    let mut sink = handle.sink.borrow_mut();
+    let open: Vec<serde_json::Value> = std::mem::take(&mut sink.term_opens)
+        .into_iter()
+        .map(|(buf, argv, cwd, rows, cols)| {
+            serde_json::json!({ "buf": buf, "argv": argv, "cwd": cwd, "rows": rows, "cols": cols })
+        })
+        .collect();
+    let write: Vec<serde_json::Value> = std::mem::take(&mut sink.term_writes)
+        .into_iter()
+        .map(|(buf, bytes)| serde_json::json!({ "buf": buf, "bytes": bytes }))
+        .collect();
+    let resize: Vec<serde_json::Value> = std::mem::take(&mut sink.term_resizes)
+        .into_iter()
+        .map(|(buf, rows, cols)| serde_json::json!({ "buf": buf, "rows": rows, "cols": cols }))
+        .collect();
+    let kill: Vec<u64> = std::mem::take(&mut sink.term_kills);
+    into_owned_cstr(
+        serde_json::json!({ "open": open, "write": write, "resize": resize, "kill": kill })
+            .to_string(),
+    )
+}
+
+/// Land a daemon `term_data` push: feed `buf`'s vt100 emulator the child's raw PTY output.
+/// **Feed only** — it does not project or repaint; the Worker calls [`eh_terminal_flush`]
+/// once after draining the whole push batch, so a flood costs one projection per repaint
+/// (the native leg's "project once per repaint" rule). The bytes are passed as pointer +
+/// length (not a C string) because PTY output is arbitrary bytes (NULs / invalid UTF-8). `buf`
+/// is a `double` (a small buffer id). See [`EditHost::terminal_feed`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
+/// bytes (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_terminal_data(
+    h: *mut WasmEditHost,
+    buf: f64,
+    data: *const u8,
+    len: usize,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let bytes = if data.is_null() || len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(data, len)
+    };
+    handle
+        .host
+        .terminal_feed(BufferId(buf.max(0.0) as u64), bytes);
+}
+
+/// Project every live terminal once and settle + repaint — call after a batch of
+/// [`eh_terminal_data`] feeds (one `term_data` push-drain). See [`EditHost::terminal_flush`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_terminal_flush(h: *mut WasmEditHost) {
+    if let Some(handle) = h.as_mut() {
+        handle.host.terminal_flush();
+    }
+}
+
+/// Land a daemon `term_exit` push: record `buf`'s child exit (leave terminal mode, append the
+/// `[Process exited]` notice), drop the emulator, then settle + repaint. `buf` / `code` are
+/// `double`s; a killed child arrives as `code == -1`. See [`EditHost::terminal_exit`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_terminal_exit(h: *mut WasmEditHost, buf: f64, code: f64) {
+    if let Some(handle) = h.as_mut() {
+        handle
+            .host
+            .terminal_exit(BufferId(buf.max(0.0) as u64), code as i32);
+    }
 }
 
 /// Execute a Lua chunk through the real effects path (queued `vim.cmd`s and deferred

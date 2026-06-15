@@ -509,7 +509,19 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   act on whatever layer holds focus with zero retargeting. `<C-w><C-w>` is the
   **layer-switch** prefix: `<C-w><C-w>{h,j,k,l}` crosses main↔dock-by-edge and
   `<C-w><C-w>{cmd}` crosses then runs the command, while a single `<C-w>` stays in
-  the focused layer. `relayout` carves the four edge bands (each reserving a
+  the focused layer. The layer-switch chord is **mode-independent** — a small
+  state machine (`Editor::dock_chord_intercept`, run ahead of the per-mode
+  dispatch in `input`) reaches the docks from insert, visual, command and
+  terminal mode too, leaving the source mode cleanly before it crosses; only
+  Normal/MultiCursor keep the grammar's own `<C-w>` path (which also owns the
+  single-`<C-w>` window commands). A lone `<C-w>` in those modes is held one key
+  and replayed on a non-chord follow-up, so its original meaning is preserved.
+  The round trip is **mode-transparent**: every cross parks the source window's
+  mode (`Window::resume`) and the target window resumes its own parked mode
+  (`execute_window_layer` → `enter_window` → `reestablish_mode`), so popping over
+  to a dock and back lands you in the same insert/visual/terminal state you left,
+  the cursor where it was — while ordinary window/tab/mouse focus changes still
+  land in Normal (the resume is gated on a one-shot the chord sets). `relayout` carves the four edge bands (each reserving a
   separator cell toward the main area, clamped so the main rect keeps ≥1 col/row)
   and lays every layer's tree out at origin `(0,0)` in its own region; `View`
   carries the band sizes and tags each window with its `WindowRegion`, and each

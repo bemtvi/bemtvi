@@ -112,6 +112,28 @@ fn layer_window_command(key: Key) -> Option<LayerWindowCmd> {
     window_command(key).map(LayerWindowCmd::CrossThenWindow)
 }
 
+/// Where the cross-mode `<C-w><C-w>` dock-navigation chord stands. In Normal /
+/// MultiCursor mode the command grammar ([`parse_step`]) already owns `<C-w>`
+/// (both the single-`<C-w>` window prefix and the doubled layer cross). This
+/// tiny state machine, checked ahead of mode dispatch in [`Editor::input`],
+/// gives the *other* modes — insert, replace, visual, command, terminal — the
+/// same `<C-w><C-w>{cmd}` reach into the docks, so the chord works in any mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DockChord {
+    /// No chord in progress.
+    #[default]
+    Idle,
+    /// Held one `<C-w>` (in a non-grammar mode); the next key may complete it.
+    FirstCw,
+    /// Saw `<C-w><C-w>`; the next key is the layer command (cross / cross-then-run).
+    SecondCw,
+}
+
+/// Whether `key` is the `<C-w>` that the dock chord is built from.
+fn is_dock_chord_key(key: Key) -> bool {
+    key.ctrl && key.code == KeyCode::Char('w')
+}
+
 /// Where a `z`-family command parks the cursor's line within the window's text
 /// area. Resolved by [`view_command`] and applied in [`Editor::view_reposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1233,10 +1255,118 @@ impl Editor {
         self.run_window_cmd(cmd, count);
     }
 
+    /// Mode-independent `<C-w><C-w>` dock-navigation chord, run ahead of mode
+    /// dispatch in [`Editor::input`]. Returns `true` when the key was consumed by
+    /// the chord — a held prefix `<C-w>`, or the completed cross — in which case
+    /// `input` stops. Normal / MultiCursor mode keep their grammar path (which
+    /// also handles single-`<C-w>` window commands); every other mode gets the
+    /// docks here, so `<C-w><C-w>` reaches them from insert, visual, command and
+    /// terminal mode too. A miss replays the held `<C-w>`(s) into the current mode
+    /// so a lone `<C-w>` keeps its original meaning (e.g. sent to the PTY child).
+    pub(crate) fn dock_chord_intercept(&mut self, key: Key) -> bool {
+        // Normal / MultiCursor route `<C-w>` through `parse_step`, which owns both
+        // the window prefix and the layer cross — don't double-handle them.
+        let grammar_owns_cw = matches!(self.mode, Mode::Normal | Mode::MultiCursor);
+        let cw = is_dock_chord_key(key);
+        match self.dock_chord {
+            DockChord::Idle => {
+                if grammar_owns_cw || !cw {
+                    return false;
+                }
+                // First `<C-w>` in a non-grammar mode: hold it for the second.
+                self.dock_chord = DockChord::FirstCw;
+                true
+            }
+            DockChord::FirstCw => {
+                if cw {
+                    self.dock_chord = DockChord::SecondCw;
+                    return true;
+                }
+                // Not the chord: replay the held `<C-w>` into the current mode,
+                // then let `input` handle this key normally.
+                self.dock_chord = DockChord::Idle;
+                self.dispatch_mode_key(Key::ctrl('w'));
+                false
+            }
+            DockChord::SecondCw => {
+                self.dock_chord = DockChord::Idle;
+                if let Some(cmd) = layer_window_command(key) {
+                    // `execute_window_layer` parks the current mode for resume and
+                    // leaves it cleanly — the same path the Normal-mode grammar takes,
+                    // so a cross *out* of insert/visual/terminal and the cross *back*
+                    // (always from Normal in the dock) are symmetric.
+                    self.execute_window_layer(cmd);
+                    return true;
+                }
+                // Dead-end after `<C-w><C-w>`: replay both held `<C-w>`s, then let
+                // `input` handle this key normally.
+                self.dispatch_mode_key(Key::ctrl('w'));
+                self.dispatch_mode_key(Key::ctrl('w'));
+                false
+            }
+        }
+    }
+
+    /// Route one key into the handler for the current mode, bypassing the dock
+    /// chord interceptor — used to replay a held `<C-w>` on a chord miss. Mirrors
+    /// the mode dispatch in [`Editor::input`].
+    fn dispatch_mode_key(&mut self, key: Key) {
+        match self.mode {
+            Mode::Terminal => self.handle_terminal_key(key),
+            Mode::Insert | Mode::Replace => self.handle_insert(key),
+            Mode::Command => self.handle_command(key),
+            _ => self.handle_normal(key),
+        }
+    }
+
+    /// Leave the current mode for a dock-navigation cross: finalize insert/replace
+    /// (the `".`/`` `^ `` bookkeeping), drop a visual selection, close the command
+    /// line, or leave terminal-job mode — so crossing into a dock never carries an
+    /// open insert session or live selection with it. A no-op in Normal mode.
+    fn leave_mode_for_dock_nav(&mut self) {
+        match self.mode {
+            Mode::Insert | Mode::Replace => self.handle_insert(Key::new(KeyCode::Esc)),
+            Mode::Visual | Mode::VisualLine => self.handle_normal(Key::new(KeyCode::Esc)),
+            Mode::Command => self.handle_command(Key::new(KeyCode::Esc)),
+            Mode::Terminal => self.leave_terminal_mode(),
+            _ => {}
+        }
+    }
+
     /// Apply a `<C-w><C-w>` dock layer command: cross between the main area and a
     /// dock, then (for the non-directional forms) run the window command in the
-    /// now-focused layer.
+    /// now-focused layer. Shared by the Normal-mode grammar and the cross-mode
+    /// chord ([`Editor::dock_chord_intercept`]), so mode parking/resume lives here:
+    /// every cross parks the source window's current mode and asks the target's
+    /// parked mode to resume, making the round trip mode-transparent.
     fn execute_window_layer(&mut self, cmd: LayerWindowCmd) {
+        // Capture the resume mode *before* leaving it (leaving insert backsteps the
+        // cursor; we want the pre-backstep column so an end-of-line append resumes
+        // where it was), then finalize the current mode cleanly.
+        let resume = match self.mode {
+            Mode::Insert | Mode::Replace => Some(ResumeState {
+                mode: self.mode,
+                col: self.cursor.col,
+                visual_anchor: Cursor::default(),
+            }),
+            Mode::Visual | Mode::VisualLine => Some(ResumeState {
+                mode: self.mode,
+                col: 0,
+                visual_anchor: self.visual_anchor,
+            }),
+            Mode::Terminal => Some(ResumeState {
+                mode: Mode::Terminal,
+                col: self.cursor.col,
+                visual_anchor: Cursor::default(),
+            }),
+            // A Normal-mode cross parks `None`, clearing any stale parked mode.
+            _ => None,
+        };
+        let src_win = self.windows.current;
+        self.leave_mode_for_dock_nav();
+        self.windows.get_mut(src_win).resume = resume;
+        self.restore_mode_on_enter = true;
+
         let count = self.effective_count() as isize;
         self.reset_pending();
         match cmd {
@@ -1259,6 +1389,9 @@ impl Editor {
                 }
             },
         }
+        // If the cross was a no-op (e.g. a closed dock), no `enter_window` ran to
+        // consume the resume request — clear it so it can't leak into a later focus.
+        self.restore_mode_on_enter = false;
     }
 
     /// Drive one [`WindowCmd`] on the focused layer's tree. Shared by single

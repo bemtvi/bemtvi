@@ -235,6 +235,13 @@ pub(crate) struct Window {
     /// The navigation pointer into [`Window::jumps`]: `jumps.len()` means "at the
     /// present, not navigating"; `<C-o>` walks it toward 0, `<C-i>` back up.
     pub(crate) jump_idx: usize,
+    /// A non-Normal mode to **resume** the next time this window is focused via the
+    /// `<C-w><C-w>` dock chord (see [`Editor::dock_chord_intercept`]). Set when the
+    /// chord crosses *out* of a window that was in insert / visual / terminal mode,
+    /// and consumed by [`Editor::enter_window`] — so popping over to a dock and back
+    /// lands you in the same mode you left. `None` for the common Normal case; any
+    /// focus-in consumes it, so it can never go stale.
+    pub(crate) resume: Option<ResumeState>,
 }
 
 /// A node in the window layout tree: either a single window (`Leaf`) or a
@@ -312,6 +319,7 @@ impl WindowTree {
                 float: None,
                 jumps: Vec::new(),
                 jump_idx: 0,
+                resume: None,
             },
         );
         WindowTree {
@@ -1273,6 +1281,7 @@ impl Editor {
                 float: Some(config),
                 jumps: Vec::new(),
                 jump_idx: 0,
+                resume: None,
             },
         );
         self.windows.floats.push(id);
@@ -1517,6 +1526,7 @@ impl Editor {
                 float: None,
                 jumps,
                 jump_idx,
+                resume: None,
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -1835,11 +1845,21 @@ impl Editor {
         let (buffer, cursor, top, leftcol) =
             (w.buffer, w.saved_cursor, w.saved_top, w.saved_leftcol);
         let saved_cursors = std::mem::take(&mut w.saved_cursors);
+        // Consume any parked mode unconditionally (so it can never go stale); it is
+        // only *resumed* when the dock chord asked for it via `restore_mode_on_enter`
+        // — an ordinary focus change lands in Normal as always.
+        let resume = w.resume.take();
+        let restore = std::mem::take(&mut self.restore_mode_on_enter);
         self.set_cur_buffer(buffer);
         self.cursor = cursor;
         self.top = top;
         self.leftcol = leftcol;
-        self.mode = Mode::Normal;
+        match resume {
+            // Re-enter the mode this window was left in (insert/visual/terminal),
+            // before `clamp_cursor` below so an insert append-column survives.
+            Some(r) if restore => self.reestablish_mode(r),
+            _ => self.mode = Mode::Normal,
+        }
         self.reset_pending();
         self.scroll_from = None;
         self.pending_scroll = None;
@@ -1850,6 +1870,33 @@ impl Editor {
         self.restore_secondary_cursors(saved_cursors);
         self.clamp_cursor();
         self.ensure_visible();
+    }
+
+    /// Re-enter a [`ResumeState`] mode parked on a window by the dock chord — the
+    /// counterpart of [`Editor::dock_chord_intercept`]'s leave path. Insert/Replace
+    /// open a fresh, correctly-grouped undo session at the saved resume column;
+    /// Visual restores its anchor; Terminal simply re-arms job-mode forwarding (the
+    /// buffer is still a live terminal). Runs inside [`Editor::enter_window`], with
+    /// the target buffer already current and the cursor already at its saved spot.
+    fn reestablish_mode(&mut self, r: ResumeState) {
+        match r.mode {
+            Mode::Insert | Mode::Replace => {
+                self.mode = r.mode;
+                self.cursor.col = r.col.min(self.line_len());
+                // A fresh insert session: snapshot for undo and start the `".`
+                // accumulator empty, so resumed typing groups and repeats cleanly.
+                self.push_undo();
+                self.snapshot_taken = true;
+                self.insert_text.clear();
+            }
+            Mode::Visual | Mode::VisualLine => {
+                self.mode = r.mode;
+                self.visual_anchor = r.visual_anchor;
+            }
+            Mode::Terminal => self.mode = Mode::Terminal,
+            // Defensive: only the non-Normal modes above are ever parked.
+            _ => self.mode = Mode::Normal,
+        }
     }
 
     /// Resize the *text viewport*. The client owns the screen layout and tells

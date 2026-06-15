@@ -58,7 +58,8 @@ mod windows;
 // types stay private to `command`; only the shared vocabulary is re-exported.
 pub use self::command::{command_status, CommandStatus};
 pub(crate) use self::command::{
-    FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand, Stage,
+    DockChord, FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand,
+    Stage,
 };
 pub use self::menu::{
     MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
@@ -121,6 +122,19 @@ fn normalize_path(path: &Path) -> PathBuf {
 pub struct Cursor {
     pub line: usize,
     pub col: usize,
+}
+
+/// A non-Normal mode parked on a [`Window`] by the `<C-w><C-w>` dock chord, to be
+/// resumed when focus returns to that window (see [`Editor::dock_chord_intercept`]
+/// and [`Editor::reestablish_mode`]). Carries just enough to re-enter the mode
+/// faithfully: the mode itself, the insert/replace **resume column** (captured
+/// before the leave-insert backstep, so an append at end-of-line resumes where it
+/// was), and the **visual anchor** (the fixed end of a restored selection).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResumeState {
+    pub(crate) mode: Mode,
+    pub(crate) col: usize,
+    pub(crate) visual_anchor: Cursor,
 }
 
 /// Stable identifier for an open buffer. Monotonic and 1-based (buffer 1 is the
@@ -589,6 +603,17 @@ pub struct Editor {
     /// to — the most recently focused dock. Directional crosses pick by edge
     /// instead ([`DockSide::from_dir`]).
     last_dock: DockSide,
+    /// In-progress state of the mode-independent `<C-w><C-w>` dock-navigation
+    /// chord — the cross-mode path that lets the chord reach the docks from
+    /// insert / visual / command / terminal mode, not just Normal (where the
+    /// command grammar already owns `<C-w>`). See [`Editor::dock_chord_intercept`].
+    dock_chord: DockChord,
+    /// One-shot: the next [`Editor::enter_window`] should **resume** the target
+    /// window's parked [`Window::resume`] mode rather than forcing Normal. Set only
+    /// by the dock chord right before it crosses, and consumed by the first
+    /// `enter_window` of that cross — so mode resumption is scoped to the chord and
+    /// never leaks into ordinary window/tab/mouse focus changes.
+    restore_mode_on_enter: bool,
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
@@ -1126,6 +1151,8 @@ impl Editor {
             dock_options: Default::default(),
             dock_hidden: [false; 4],
             last_dock: DockSide::Left,
+            dock_chord: DockChord::default(),
+            restore_mode_on_enter: false,
             alternate: None,
             global_marks: HashMap::new(),
             pending_global_marks: HashMap::new(),
@@ -1333,6 +1360,18 @@ impl Editor {
         // boundary. See [`Editor::handle_explorer`].
         if self.mode == Mode::Normal && self.is_explorer_buffer() {
             self.handle_explorer(key);
+            return;
+        }
+
+        // The mode-independent `<C-w><C-w>` dock-navigation chord, ahead of the
+        // per-mode routing below so it reaches the docks from *any* mode — insert,
+        // visual, command, terminal — not just Normal (where the command grammar
+        // already owns `<C-w>`). Consumes the held prefix and the completed cross;
+        // a miss replays the held `<C-w>`(s) into the current mode and falls
+        // through. Sits after the panel/menu grabs (which own every key) but
+        // before the terminal forward, so a terminal `<C-w><C-w>` crosses instead
+        // of going to the child.
+        if self.dock_chord_intercept(key) {
             return;
         }
 

@@ -10,8 +10,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, start_attached,
-    wait_redraw,
+    command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, mode,
+    serial_lock, start_attached, wait_redraw,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -183,6 +183,138 @@ async fn focus_crosses_into_and_out_of_a_dock() {
     // `<C-w><C-w>h` from the main area focuses the left dock again.
     feed(&rpc, "<C-w><C-w>h");
     assert_eq!(lines(&rpc).await, vec!["dock"], "back in the dock buffer");
+}
+
+/// The `<C-w><C-w>` dock chord works from **insert** mode: it leaves insert
+/// cleanly and crosses to the dock, so navigation is one chord away even
+/// mid-typing.
+#[tokio::test]
+async fn dock_chord_crosses_from_insert_mode() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>"); // dock buffer reads "dock"
+    feed(&rpc, "<C-w><C-w>l"); // cross to the (empty) main area
+    feed(&rpc, "imain"); // start typing in main, still in insert mode
+    assert_eq!(mode(&rpc).await, "i", "in insert mode in main");
+
+    // The chord, from insert, leaves insert and focuses the dock (Normal there).
+    feed(&rpc, "<C-w><C-w>h");
+    assert_eq!(mode(&rpc).await, "n", "the chord left insert mode");
+    assert_eq!(lines(&rpc).await, vec!["dock"], "focused the dock");
+
+    // Crossing back **resumes insert** where it was left — and the held `<C-w>`s
+    // never reached the main buffer, so typing continues "main" cleanly.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(mode(&rpc).await, "i", "returning to main resumes insert");
+    feed(&rpc, "tail<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["maintail"],
+        "resumed insert appended where it left off"
+    );
+}
+
+/// The `<C-w><C-w>` dock chord works from **visual** mode (where a single `<C-w>`
+/// is otherwise unbound): it drops the selection and crosses to the dock.
+#[tokio::test]
+async fn dock_chord_crosses_from_visual_mode() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>");
+    feed(&rpc, "<C-w><C-w>l"); // main area
+    feed(&rpc, "ihello<Esc>0v$"); // select the line in visual mode
+    assert_eq!(mode(&rpc).await, "v", "in visual mode in main");
+
+    feed(&rpc, "<C-w><C-w>h");
+    assert_eq!(mode(&rpc).await, "n", "the chord left visual mode");
+    assert_eq!(lines(&rpc).await, vec!["dock"], "focused the dock");
+}
+
+/// A lone `<C-w>` in insert mode is *not* swallowed: when the next key isn't a
+/// second `<C-w>`, the held one is replayed into insert, so typing past it is
+/// unaffected.
+#[tokio::test]
+async fn lone_ctrl_w_in_insert_is_replayed() {
+    let (rpc, _incoming) = start().await;
+    // `<C-w>` in insert mode inserts a literal "w" (its pre-existing behavior);
+    // the chord interceptor holds it one key then replays it, so `abc` still
+    // lands right after it.
+    feed(&rpc, "i<C-w>abc<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["wabc"],
+        "the held <C-w> was replayed, typing continued"
+    );
+}
+
+/// The `<C-w><C-w>` dock chord works from **terminal-job** mode: it leaves the
+/// job for Normal and crosses to the dock, instead of forwarding `<C-w>` to the
+/// child. Hermetic — only POSIX `cat` is spawned.
+#[tokio::test]
+async fn dock_chord_crosses_from_terminal_mode() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>");
+    feed(&rpc, "<C-w><C-w>l"); // main area
+    command(&rpc, "terminal cat").await; // enters terminal-job mode in main
+    assert_eq!(mode(&rpc).await, "t", "in terminal-job mode");
+
+    feed(&rpc, "<C-w><C-w>h");
+    assert_eq!(mode(&rpc).await, "n", "the chord left terminal mode");
+    assert_eq!(lines(&rpc).await, vec!["dock"], "focused the dock");
+
+    // Crossing back **resumes terminal-job mode** — you land back at the shell.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        mode(&rpc).await,
+        "t",
+        "returning to main resumes the terminal job"
+    );
+}
+
+/// Visual mode is resumed (with its selection) when the dock chord crosses back —
+/// the round trip is mode-transparent.
+#[tokio::test]
+async fn dock_chord_resumes_visual_mode_on_return() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock<Esc>");
+    feed(&rpc, "<C-w><C-w>l"); // main area
+    feed(&rpc, "ihello<Esc>0v$"); // visual selection over the line
+    assert_eq!(mode(&rpc).await, "v", "visual in main");
+
+    feed(&rpc, "<C-w><C-w>h"); // to the dock (Normal)
+    assert_eq!(mode(&rpc).await, "n", "Normal in the dock");
+    feed(&rpc, "<C-w><C-w>l"); // back to main
+    assert_eq!(mode(&rpc).await, "v", "returning to main resumes visual");
+    // The resumed selection is still over "hello": deleting it empties the line.
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec![""], "the resumed selection deleted");
+}
+
+/// An ordinary (non-chord) focus change does **not** resume a parked mode: leaving
+/// a dock via the chord while in insert parks insert on that dock, but `<C-w>w`
+/// (single-prefix) focus from the main area lands Normal, and the parked mode is
+/// consumed so it can never resurrect later.
+#[tokio::test]
+async fn parked_mode_does_not_leak_into_plain_focus() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    // In the dock, start insert, then chord away to main: insert is parked on the
+    // dock window.
+    feed(&rpc, "idock");
+    assert_eq!(mode(&rpc).await, "i", "insert in the dock");
+    feed(&rpc, "<C-w><C-w>l"); // to main (Normal); dock parked insert
+    assert_eq!(mode(&rpc).await, "n", "Normal in main");
+    // A single-`<C-w>` window focus cycle is Normal-only and never resumes a parked
+    // mode; crossing back via the chord now finds the park already cleared.
+    feed(&rpc, "<C-w><C-w>h"); // back to the dock via the chord
+    assert_eq!(mode(&rpc).await, "i", "the dock resumes its parked insert");
+    feed(&rpc, "<Esc>"); // leave insert in the dock; nothing parked now
+    feed(&rpc, "<C-w><C-w>l"); // to main
+    feed(&rpc, "<C-w><C-w>h"); // back to the dock — must be Normal, not insert
+    assert_eq!(mode(&rpc).await, "n", "no stale insert resurrected");
 }
 
 /// A left-click inside a dock's window focuses that dock (and places the cursor),

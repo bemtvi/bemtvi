@@ -363,7 +363,7 @@ impl Editor {
 
     /// Leave terminal-job mode for terminal-normal (Normal on a terminal buffer),
     /// clearing the chord/esc-run state. Shared by `<C-\><C-n>` and triple-`<Esc>`.
-    fn leave_terminal_mode(&mut self) {
+    pub(crate) fn leave_terminal_mode(&mut self) {
         self.mode = Mode::Normal;
         self.terminal_pending_backslash = false;
         self.terminal_esc_count = 0;

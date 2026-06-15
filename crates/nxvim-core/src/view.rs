@@ -140,6 +140,11 @@ pub struct MenuView {
     /// rather than under the caret — the display width of the typed prefix. `0`
     /// for a `select` / picker (anchored at the cursor / centered).
     pub anchor_offset: usize,
+    /// Whether this is the insert-mode completion popup (vs a `select` / picker).
+    /// The server projects it to sit *flush* with the line below the cursor — no
+    /// top border, and shifted one cell left so the left border doesn't push the
+    /// list off the word it completes. `false` for `select` / picker.
+    pub completion: bool,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

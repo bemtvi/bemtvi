@@ -1712,14 +1712,28 @@ impl Renderer {
         let sel_bg = lighten(popup_bg, 0x28);
         let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
 
-        let bx = text_x0 + menu.col;
+        // The completion popup drops its top border + top padding so it sits flush
+        // against the line below the cursor, and shifts one cell left so the left
+        // padding doesn't push the list off the word (`menu.col` is the content
+        // anchor; the box origin sits one cell before it). `select` / picker are
+        // fully bordered and anchored at `menu.col`.
+        let top_pad = u16::from(menu.border_top);
+        let left_shift = u16::from(!menu.border_top);
+        let bx = (text_x0 + menu.col).saturating_sub(left_shift);
         let by = wy + menu.row;
         let box_w = menu.width + 2;
-        let box_h = menu.height + 2;
-        self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
+        let box_h = menu.height + 1 + top_pad;
+        if menu.border_top {
+            self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
+        } else {
+            self.fill_box_no_top(quads, (bx, by, box_w, box_h), popup_bg, border);
+        }
 
         let full = self.full_bounds();
         let cx = bx + 1;
+        // The first content row: below the top border for a fully bordered box,
+        // or flush at the box top for the top-borderless completion popup.
+        let content_y0 = by + top_pad;
         // Split the box content into a list column (left) + a 1-col vertical
         // separator + a preview column (right) when the picker carries a preview
         // pane; otherwise the list spans the full content width. The prompt + results
@@ -1750,9 +1764,15 @@ impl Renderer {
         if has_prompt {
             let query = menu.query.as_deref().unwrap_or("");
             let text = pmenu_row(&format!("> {query}"), "", list_w as usize);
-            self.push_plain(items, &text, self.cell_px(cx, by + 1 + prompt_y), fg, full);
+            self.push_plain(
+                items,
+                &text,
+                self.cell_px(cx, content_y0 + prompt_y),
+                fg,
+                full,
+            );
             // The separator: a thin horizontal rule across the list column.
-            let (px, py) = self.cell_px(cx, by + 1 + sep_y);
+            let (px, py) = self.cell_px(cx, content_y0 + sep_y);
             quads.push(Quad {
                 x: px,
                 y: py + self.cell_h * 0.5,
@@ -1762,7 +1782,7 @@ impl Renderer {
             });
             // The caret: a thin bar past the `> ` prefix at the query's cursor column.
             let caret = (2 + menu.query_cursor).min(list_w.saturating_sub(1));
-            let (cpx, cpy) = self.cell_px(cx + caret, by + 1 + prompt_y);
+            let (cpx, cpy) = self.cell_px(cx + caret, content_y0 + prompt_y);
             let mut c = srgb_to_color_rgba(fg, 0.9);
             c[3] = 0.9;
             quads.push(Quad {
@@ -1782,7 +1802,7 @@ impl Renderer {
             let Some(label) = menu.items.get(idx) else {
                 continue;
             };
-            let row = by + 1 + list_y0 + r;
+            let row = content_y0 + list_y0 + r;
             if idx == menu.selected {
                 self.fill_cells(quads, cx, row, list_w, sel_bg);
             }
@@ -1814,7 +1834,7 @@ impl Renderer {
             let sep_col = cx + list_w;
             let px0 = sep_col + 1;
             // Vertical rule down the box content height, in the border tint.
-            let (spx, spy) = self.cell_px(sep_col, by + 1);
+            let (spx, spy) = self.cell_px(sep_col, content_y0);
             quads.push(Quad {
                 x: spx + self.cell_w * 0.5,
                 y: spy,
@@ -1823,9 +1843,9 @@ impl Renderer {
                 color: color_to_rgba(srgb_to_color(border)),
             });
             // The title header: the path on a sel-tinted bar across the pane.
-            self.fill_cells(quads, px0, by + 1, preview_w, sel_bg);
+            self.fill_cells(quads, px0, content_y0, preview_w, sel_bg);
             let title = pmenu_row(&pv.title, "", preview_w as usize);
-            self.push_plain(items, &title, self.cell_px(px0, by + 1), fg, full);
+            self.push_plain(items, &title, self.cell_px(px0, content_y0), fg, full);
             // The windowed file lines below the header (rows 1..content height).
             let content_h = menu.height.saturating_sub(1);
             let empty = Vec::new();
@@ -1833,7 +1853,7 @@ impl Renderer {
                 if i as u16 >= content_h {
                     break;
                 }
-                let row = by + 2 + i as u16;
+                let row = content_y0 + 1 + i as u16;
                 if pv.loc.is_some_and(|(r, _)| r as usize == i) {
                     self.fill_cells(quads, px0, row, preview_w, sel_bg);
                 }
@@ -1889,6 +1909,45 @@ impl Renderer {
             color: color_to_rgba(srgb_to_color(bg)),
         });
         self.box_frame(quads, x, y, w, h, border);
+    }
+
+    /// Like [`fill_box`] but without the **top** edge — the completion popup's flush
+    /// look, abutting the line below the cursor. Fills the bg and draws the left /
+    /// right / bottom border edges only.
+    fn fill_box_no_top(
+        &self,
+        quads: &mut Vec<Quad>,
+        rect: (u16, u16, u16, u16),
+        bg: u32,
+        border: u32,
+    ) {
+        let (x, y, w, h) = rect;
+        let (px, py) = self.cell_px(x, y);
+        let pw = self.cell_w * w as f32;
+        let ph = self.cell_h * h as f32;
+        quads.push(Quad {
+            x: px,
+            y: py,
+            w: pw,
+            h: ph,
+            color: color_to_rgba(srgb_to_color(bg)),
+        });
+        let t = (self.cell_w * 0.12).max(1.0);
+        let c = color_to_rgba(srgb_to_color(border));
+        let edges = [
+            (px, py + ph - t, pw, t), // bottom
+            (px, py, t, ph),          // left
+            (px + pw - t, py, t, ph), // right
+        ];
+        for (x, y, w, h) in edges {
+            quads.push(Quad {
+                x,
+                y,
+                w,
+                h,
+                color: c,
+            });
+        }
     }
 
     /// Draw a thin `border` frame around a `w`×`h`-cell box at `(x, y)` (four edge

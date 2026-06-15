@@ -113,6 +113,16 @@ buffer source is pure core).
   completed, not the caret: `Menu.anchor_width` (the prefix's display width) →
   `MenuView.anchor_offset`, which `project_menu` subtracts from the cursor column in
   the Cursor branch. `0` for `select`, so that path is byte-for-byte unchanged.
+- **Flush, borderless-top popup** — the completion popup drops its **top border**
+  (so it abuts the line below the cursor) and each client offsets the box one cell
+  **left** of `menu.col` so the left border doesn't push the list off the word.
+  Driven by `MenuView.completion` → a `border_top: false` key in the menu redraw map
+  (absent ⇒ a full border, the `select`/picker default) → `MenuData.border_top`.
+  `project_menu` uses a `vchrome` of 1 (not 2) for the fit/placement math; the three
+  clients render it: TUI (`Borders` minus top + 1-cell left shift), GUI
+  (`fill_box_no_top` + drop the top pad + left shift), web (`border-top: 0`; its 1px
+  rule needs no shift). `col` stays the logical word-start anchor — the border
+  compensation is per-client (cell border vs 1px rule).
 
 ### Core (`nxvim-core`)
 

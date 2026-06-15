@@ -759,26 +759,36 @@ impl EditHost {
                 // Anchor under the start of the word being completed (the caret
                 // minus the typed prefix's display width), not under the caret —
                 // so the list lines up with the text it will replace. `anchor_offset`
-                // is `0` for a `select`, leaving it cursor-anchored as before.
+                // is `0` for a `select`, leaving it cursor-anchored as before. This
+                // is the logical content anchor (the word start); each client offsets
+                // the box left by its own left-border width so the *content* lands
+                // here (a full cell in the TUI / GUI, ~nothing for the web's 1px rule).
                 let anchor_col = focused
                     .cursor_screen_col
                     .saturating_sub(focused.leftcol)
                     .saturating_sub(m.anchor_offset);
                 let max_w = text_width.saturating_sub(anchor_col).max(1);
                 let width = content_w.min(max_w);
+                // The vertical border chrome: 2 (top + bottom) normally, 1 for the
+                // top-borderless completion popup. Drives both the fit test and the
+                // above-placement origin.
+                let vchrome = if m.completion { 1 } else { 2 };
                 // Below if the bordered box fits, else above, else clamp to whichever
                 // side has more room (the popup's four-tier fallback).
                 let below = text_height.saturating_sub(cursor_row + 1);
                 let above = cursor_row;
-                let (row, height) = if count + 2 <= below {
+                let (row, height) = if count + vchrome <= below {
                     (cursor_row + 1, count)
-                } else if count + 2 <= above {
-                    (cursor_row - (count + 2), count)
+                } else if count + vchrome <= above {
+                    (cursor_row - (count + vchrome), count)
                 } else if below >= above {
-                    (cursor_row + 1, below.saturating_sub(2).clamp(1, count))
+                    (
+                        cursor_row + 1,
+                        below.saturating_sub(vchrome).clamp(1, count),
+                    )
                 } else {
-                    let h = above.saturating_sub(2).clamp(1, count);
-                    (cursor_row.saturating_sub(h + 2), h)
+                    let h = above.saturating_sub(vchrome).clamp(1, count);
+                    (cursor_row.saturating_sub(h + vchrome), h)
                 };
                 (row, anchor_col, width, height, rows, m.selected)
             }
@@ -862,6 +872,11 @@ impl EditHost {
             (Value::from("height"), Value::from(height as u64)),
             (Value::from("match_spans"), match_spans),
         ];
+        // The completion popup omits its top border so it sits flush with the line
+        // below the cursor. Absent ⇒ a full border (the `select` / picker default).
+        if m.completion {
+            map.push((Value::from("border_top"), Value::from(false)));
+        }
         // The prompt query: present (even when empty) for a picker, absent for a
         // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
         // a separator, and the caret; `query_cursor` is the caret's char column and

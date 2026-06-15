@@ -256,8 +256,29 @@ async fn popup_anchors_at_the_word_start_not_the_cursor() {
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
     assert_eq!(menu_items(&menu), vec!["hello"]);
     // The box anchors under the START of the word (col 6), not under the caret (8),
-    // so the list lines up with the text it will replace.
+    // so the list lines up with the text it will replace. (`col` is the logical
+    // content anchor; each client offsets the box left by its own border width.)
     assert_eq!(menu_col(&menu), 6, "popup anchored at the word start");
+    // It also drops its top border so it sits flush with the line below the cursor.
+    assert_eq!(
+        map_get(&menu, "border_top").and_then(Value::as_bool),
+        Some(false),
+        "completion popup has no top border"
+    );
+}
+
+#[tokio::test]
+async fn select_menu_keeps_its_full_border() {
+    // A `select` (the other Cursor-placed menu) must stay fully bordered — the
+    // borderless/flush treatment is completion-only.
+    let dir = temp_dir("complete_select_border");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    exec_lua(&rpc, "nx.ui.select({ 'one', 'two' }, {}, function() end)").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("select opens"));
+    assert!(
+        map_get(&menu, "border_top").is_none(),
+        "select keeps its top border (no border_top override)"
+    );
 }
 
 #[tokio::test]

@@ -1013,6 +1013,10 @@
       const start = menu.selected >= listRows ? first : 0;
       const box = document.createElement("div");
       box.className = "pmenu";
+      // The completion popup omits its top border so it sits flush with the line
+      // below the cursor (the web border is a 1px rule, so unlike the cell-grid
+      // clients no left-shift is needed — content already sits at `menu.col`).
+      if (menu.border_top === false) box.style.borderTopWidth = "0";
       place(box, x, y, menu.width, listRows + promptRows);
       if (hasPrompt) {
         const text = ("> " + menu.query).slice(0, listW).padEnd(listW);

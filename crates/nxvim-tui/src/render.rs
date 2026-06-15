@@ -1687,7 +1687,21 @@ fn render_menu(
     menu: &MenuData,
     styles: &[nxvim_view::Style],
 ) -> Option<(u16, u16)> {
-    let x = text_area.x.saturating_add(menu.col);
+    // The completion popup omits its top border (it sits flush against the line
+    // below the cursor), so it costs one fewer row than a fully bordered box. It
+    // also shifts one cell left so the *left* border doesn't push the list off the
+    // word: `menu.col` is the content anchor (the word start), and the box's left
+    // border sits one cell before it.
+    let (borders, vborder) = if menu.border_top {
+        (Borders::ALL, 2)
+    } else {
+        (Borders::LEFT | Borders::RIGHT | Borders::BOTTOM, 1)
+    };
+    let left_shift = u16::from(!menu.border_top);
+    let x = text_area
+        .x
+        .saturating_add(menu.col)
+        .saturating_sub(left_shift);
     let y = text_area.y.saturating_add(menu.row);
     let width = menu
         .width
@@ -1695,7 +1709,7 @@ fn render_menu(
         .min(text_area.right().saturating_sub(x));
     let height = menu
         .height
-        .saturating_add(2)
+        .saturating_add(vborder)
         .min(text_area.bottom().saturating_sub(y));
     let area = Rect {
         x,
@@ -1703,10 +1717,10 @@ fn render_menu(
         width,
         height,
     };
-    if area.width < 3 || area.height < 3 {
+    if area.width < 3 || area.height < vborder + 1 {
         return None;
     }
-    let block = Block::new().borders(Borders::ALL);
+    let block = Block::new().borders(borders);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);

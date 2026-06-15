@@ -344,6 +344,10 @@ pub struct MenuData {
     /// Whether the prompt sits **below** the results list (telescope-style) rather
     /// than above it (the default). `false` for a promptless `nx.ui.select`.
     pub prompt_bottom: bool,
+    /// Whether to draw the box's **top** border. `false` for the completion popup,
+    /// which sits flush against the line below the cursor; `true` (the default,
+    /// when the key is absent) for a `select` / picker.
+    pub border_top: bool,
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
@@ -520,6 +524,7 @@ impl View {
                     .map(str::to_string),
                 query_cursor: map_u16(m, "query_cursor"),
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
+                border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
                 preview: match map_get(m, "preview") {
                     Some(Value::Map(p)) => Some(MenuPreview {

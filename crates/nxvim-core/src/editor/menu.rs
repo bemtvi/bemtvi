@@ -784,6 +784,7 @@ impl Editor {
             width: m.width,
             height: m.height,
             anchor_offset: m.anchor_width,
+            completion: m.kind == MenuKind::Complete,
         })
     }
 

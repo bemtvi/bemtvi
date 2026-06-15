@@ -53,6 +53,15 @@ const eh_proc_spawned = M.cwrap("eh_proc_spawned", null, ["number", "number", "n
 // lines ride as a JSON string array (newline-stripped) into the Lua callback.
 const eh_proc_stdout = M.cwrap("eh_proc_stdout", null, ["number", "number", "string"]);
 const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "number", "number", "number", "number", "number"]);
+// Terminal leg (the web `:terminal` — Phase 7): the editor enqueues PTY ops off-tick (only
+// with a daemon connected); the Worker forwards each to the daemon and lands its
+// `term_data`/`term_exit` pushes back into the tick. `eh_terminal_data` takes the child's
+// output as pointer+length (raw PTY bytes); the Worker feeds each push then `eh_terminal_flush`
+// projects once per drain (one repaint, never per chunk).
+const eh_take_terminal_requests = M.cwrap("eh_take_terminal_requests", "number", ["number"]);
+const eh_terminal_data = M.cwrap("eh_terminal_data", null, ["number", "number", "number", "number"]);
+const eh_terminal_flush = M.cwrap("eh_terminal_flush", null, ["number"]);
+const eh_terminal_exit = M.cwrap("eh_terminal_exit", null, ["number", "number", "number"]);
 // Treesitter `:TSInstall` leg: the editor enqueues each install off-tick; the Worker
 // forwards it to the UI thread (web-tree-sitter lives there), which fetches/caches/registers
 // the grammar and lands the outcome back via `eh_ts_install_complete`. `eh_ts_seed_installed`
@@ -475,6 +484,7 @@ async function daemonWrite(path, bytes) {
 // =============================================================================
 const armedWatches = new Set(); // paths currently watched on the daemon (gates the async park)
 const liveProcs = new Set(); // spawn ids in flight on the daemon (also gates the async park)
+const liveTerms = new Set(); // terminal buffer ids open on the daemon (also gates the async park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
 let pendingConnectUri = null; // a runtime `:connect nxvim://…` to dial on the next run-loop pass
@@ -493,14 +503,35 @@ function onDaemonNotify(method, params) {
 }
 
 // Apply every queued daemon push through the real tick (run-loop side): the watch leg's
-// `fs_changed` and the proc leg's `proc_spawned`/`proc_exited` (Phase 6d). An unknown push is
-// surfaced loudly (it can only arrive for something we subscribed to — fail loud, per CLAUDE.md).
+// `fs_changed`, the proc leg's `proc_spawned`/`proc_exited` (Phase 6d), and the terminal leg's
+// `term_data`/`term_exit` (Phase 7). An unknown push is surfaced loudly (it can only arrive for
+// something we subscribed to — fail loud, per CLAUDE.md).
+//
+// Terminal output is batched: each `term_data` push only *feeds* the vt100 emulator (a cheap
+// parse, `eh_terminal_data`); after the whole queue is drained we project + repaint *once*
+// (`eh_terminal_flush`), so a flood costs one repaint per drain, never one per PTY chunk (the
+// "project once per repaint" rule the native leg follows — the anti-freeze invariant).
 function applyDaemonNotifications() {
   if (daemonNotifications.length === 0) return false;
   let any = false;
+  let termFed = false; // a `term_data` push fed the emulator this drain → flush once at the end
   for (let n; (n = daemonNotifications.shift()); ) {
     const [method, params] = n;
-    if (method === "fs_changed") {
+    if (method === "term_data") {
+      // params = [buf, bytes(bin)] — the child's raw PTY output. Feed only (flush below).
+      const buf = Number(params[0]);
+      const bytes = toU8(params[1]);
+      callTerminalData(buf, bytes);
+      termFed = true;
+      any = true;
+    } else if (method === "term_exit") {
+      // params = [buf, code] — the child exited (a killed child arrives as code -1).
+      const buf = Number(params[0]);
+      const code = Number(params[1]);
+      eh_terminal_exit(h, buf, code);
+      liveTerms.delete(params[0]);
+      any = true;
+    } else if (method === "fs_changed") {
       // params = [path, stat?] where stat = [secs, nanos, size] | nil (nil = vanished).
       const path = params[0];
       const stat = params[1];
@@ -533,7 +564,20 @@ function applyDaemonNotifications() {
       postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
     }
   }
+  // One projection + repaint for all the terminal output fed this drain (see above).
+  if (termFed) eh_terminal_flush(h);
   return any;
+}
+
+// Feed a `term_data` push's bytes into the vt100 emulator. The bytes are copied into wasm
+// memory (PTY output is binary — NULs / invalid UTF-8 can't ride the cwrap "string"
+// marshalling) and `eh_terminal_data` feeds them; free after the call. Feed only — the caller
+// flushes once per drain.
+function callTerminalData(buf, bytes) {
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  eh_terminal_data(h, buf, ptr, bytes.length);
+  if (ptr) M._free(ptr);
 }
 
 // Normalize a msgpack value to bytes: `bin` decodes to a Uint8Array, but guard against a
@@ -579,6 +623,38 @@ async function drainProcRequests() {
   for (const id of reqs.kill) await daemon.notify("proc_kill", [id]);
 }
 
+// Forward the terminal ops the tick enqueued to the daemon (`term_open` / `term_write` /
+// `term_resize` / `term_kill` — the web `:terminal`, Phase 7). The daemon runs the real PTY
+// and answers with `term_data`/`term_exit` pushes (`onDaemonNotify`). Only reached in a daemon
+// session — the dispatch gates terminal opens on a connected daemon (`has_remote_proc`), so a
+// serverless `:terminal` fails loud in the core and never enqueues. Order matters within a
+// drain (open before its writes/resizes), so the queues are forwarded open → write → resize →
+// kill — the order the editor enqueues them.
+async function drainTerminalRequests() {
+  const reqs = JSON.parse(readStr(eh_take_terminal_requests(h)));
+  if (
+    reqs.open.length === 0 &&
+    reqs.write.length === 0 &&
+    reqs.resize.length === 0 &&
+    reqs.kill.length === 0
+  ) {
+    return;
+  }
+  if (!daemon) return; // defensive: the tick shouldn't enqueue a terminal op without a daemon
+  for (const o of reqs.open) {
+    liveTerms.add(o.buf);
+    await daemon.notify("term_open", [o.buf, o.argv, o.cwd ?? null, o.rows, o.cols]);
+  }
+  for (const w of reqs.write) {
+    await daemon.notify("term_write", [w.buf, new Uint8Array(w.bytes)]);
+  }
+  for (const r of reqs.resize) await daemon.notify("term_resize", [r.buf, r.rows, r.cols]);
+  for (const buf of reqs.kill) {
+    liveTerms.delete(buf);
+    await daemon.notify("term_kill", [buf]);
+  }
+}
+
 // Forward the watch arm/disarm requests the editor enqueued to the daemon (`fs_watch` /
 // `fs_unwatch`). Serverless OPFS has no change source, so a watch is dropped — not a silent
 // stub: the tab is the sole writer, there is genuinely nothing external to watch.
@@ -622,6 +698,7 @@ async function pump5cDaemon() {
   applyDaemonNotifications();
   await fulfillFsRequests();
   await drainProcRequests();
+  await drainTerminalRequests();
   postMessage({ type: "redraw", frame: currentFrame(), lines: readStr(eh_lines(h)) });
 }
 
@@ -831,6 +908,9 @@ async function runLoopSAB(ctrl, data) {
     // Forward any async `vim.system` / `jobstart` the tick enqueued to the daemon (its
     // `proc_spawned`/`proc_exited` pushes return on `onDaemonNotify`).
     await drainProcRequests();
+    // Forward any `:terminal` PTY ops the tick enqueued to the daemon (its `term_data`/
+    // `term_exit` pushes return on `onDaemonNotify`).
+    await drainTerminalRequests();
     // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
@@ -875,7 +955,8 @@ async function runLoopSAB(ctrl, data) {
     // keystroke / timer also wakes to flush cross-session state after a quiet period.
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
     let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
-    const daemonPushing = daemon && (armedWatches.size > 0 || liveProcs.size > 0);
+    const daemonPushing =
+      daemon && (armedWatches.size > 0 || liveProcs.size > 0 || liveTerms.size > 0);
     if (daemonPushing || indenterBusy()) {
       // Don't *block* — a thread frozen in `Atomics.wait` can't run the event loop, so any
       // pending promise stalls. Cases that need it live: a daemon session expecting pushes
@@ -989,6 +1070,7 @@ onmessage = async (ev) => {
       await fulfillFsRequests();
       await drainWatchRequests();
       await drainProcRequests();
+      await drainTerminalRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -1001,6 +1083,7 @@ onmessage = async (ev) => {
       await fulfillFsRequests();
       await drainWatchRequests();
       await drainProcRequests();
+      await drainTerminalRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -1011,6 +1094,7 @@ onmessage = async (ev) => {
       await fulfillFsRequests();
       await drainWatchRequests();
       await drainProcRequests();
+      await drainTerminalRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id, result);

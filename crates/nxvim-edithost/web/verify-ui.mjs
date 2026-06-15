@@ -119,6 +119,42 @@ try {
     dragMode === "VISUAL" && dragSel.length > 0, JSON.stringify({ dragMode, dragSel }));
   await page.evaluate(() => window.__nxvim.feed("<Esc>"));
 
+  // ---- 6b. A click that wobbles WITHIN one cell must NOT enter Visual. Drives the
+  // real DOM mousedown/mousemove/mouseup path (not the `mouse` hook, which bypasses
+  // it): the browser fires `mousemove` per sub-cell pixel, so before the same-cell
+  // coalescing every casual click / touchpad tap-and-move dropped into VISUAL.
+  await page.evaluate(() => window.__nxvim.feed("0")); // back to NORMAL, cursor col 0
+  const geom = await page.evaluate(() => {
+    const m = window.__nxvim.cellMetrics();
+    const r = document.getElementById("grid").getBoundingClientRect();
+    return { cw: m.cw, ch: m.ch, left: r.left, top: r.top };
+  });
+  const cellCenter = (col, row) => ({
+    x: geom.left + (col + 0.5) * geom.cw,
+    y: geom.top + (row + 0.5) * geom.ch,
+  });
+  const press = cellCenter(2, 0);
+  await page.mouse.move(press.x, press.y);
+  await page.mouse.down();
+  await page.mouse.move(press.x + geom.cw * 0.25, press.y); // sub-cell jitter, same cell
+  await page.mouse.up();
+  const jitterMode = await page.evaluate(() => window.__nxvim.frame().mode_label);
+  check("mouse: a within-cell jitter during a click stays in NORMAL (no spurious VISUAL)",
+    jitterMode === "NORMAL", JSON.stringify({ jitterMode }));
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+
+  // ---- 6c. A real cross-cell drag still enters Visual — the coalescing only drops
+  // within-cell noise, it must not break dragging out a selection.
+  const from = cellCenter(0, 0), to = cellCenter(4, 0);
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(to.x, to.y);
+  const realDragMode = await page.evaluate(() => window.__nxvim.frame().mode_label);
+  await page.mouse.up();
+  check("mouse: a cross-cell DOM drag still enters VISUAL",
+    realDragMode === "VISUAL", JSON.stringify({ realDragMode }));
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+
   // ---- 7. Mouse wheel scrolls the buffer (bug #2) ----
   // Fill enough lines to scroll (via real keystrokes — `100o` opens 100 lines), then a
   // wheel-down over the window must advance the top visible line.

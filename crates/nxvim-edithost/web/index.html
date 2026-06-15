@@ -1378,6 +1378,13 @@
     // ============================================================================
     const BTN = { 0: "left", 1: "middle", 2: "right" };
     let dragBtn = null;
+    // Cell of the last drag (seeded by the press), so within-cell pointer motion is
+    // coalesced away: the core works in cells, and a same-cell drag right after a
+    // press would spuriously enter Visual mode. The browser fires `mousemove` for
+    // every sub-cell pixel (a click that wobbles, a touchpad tap-and-move), so
+    // without this every casual click drops into VISUAL. Mirrors nxvim-gui's
+    // `last_drag_cell` coalescing (see crates/nxvim-gui/src/lib.rs `mouse_drag`).
+    let lastDragCell = null;
     function cellAt(e) {
       const r = gridEl.getBoundingClientRect();
       return {
@@ -1417,12 +1424,16 @@
       e.preventDefault();
       disarmAutoscroll();
       const { row, col } = cellAt(e);
-      if (button === "left") dragBtn = "left";
+      if (button === "left") { dragBtn = "left"; lastDragCell = { row, col }; }
       mouseOp(button, "press", mods(e), row, col);
     });
     gridEl.addEventListener("mousemove", (e) => {
       if (!dragBtn) return;
       const { row, col } = cellAt(e);
+      // Only a drag into a *new* cell is meaningful; within-cell jitter is noise and
+      // must not emit a drag (which the core would read as the start of a selection).
+      if (lastDragCell && lastDragCell.row === row && lastDragCell.col === col) return;
+      lastDragCell = { row, col };
       mouseOp(dragBtn, "drag", mods(e), row, col);
       armAutoscroll(row, col);
     });
@@ -1432,6 +1443,7 @@
       const { row, col } = cellAt(e);
       mouseOp(dragBtn, "release", mods(e), row, col);
       dragBtn = null;
+      lastDragCell = null;
     });
 
     // Wheel → whole-line notches. The browser fires many sub-line wheel events per
@@ -1509,6 +1521,9 @@
       // external copy deterministically before a `"+p`.
       clipboardRefresh: () => refreshClipboard(),
       mouse: (button, action, modifier, row, col) => mouseOp(button, action, modifier, row | 0, col | 0),
+      // Cell size in CSS px, so a test can drive *real* DOM mouse events (the
+      // mousedown/mousemove/mouseup path, not the `mouse` hook) at sub-cell precision.
+      cellMetrics: () => ({ cw, ch }),
       execLua: (code) => execLuaOp(code),
       attach: (c, r) => attachOp(c, r),
       lines: () => latest.lines,

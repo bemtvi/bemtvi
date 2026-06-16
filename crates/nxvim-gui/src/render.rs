@@ -2057,6 +2057,13 @@ impl Renderer {
                 popup_bg,
                 border,
             );
+            // Draw the title on the top border, inset one cell — same placement as a
+            // regular floating window (`build_float`). The TUI already does this; the
+            // GUI was dropping it.
+            if let Some(title) = &float.title {
+                let t = format!(" {title} ");
+                self.push_plain(items, &t, self.cell_px(bx + 1, by), fg, full);
+            }
             (bx + 1, by + 1)
         } else {
             (bx, by)

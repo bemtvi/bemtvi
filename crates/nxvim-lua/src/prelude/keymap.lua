@@ -579,10 +579,19 @@ end
 -- where `keys` is the withheld prefix in vim notation ("" when the context cleared,
 -- which a which-key popup treats as "close") and each continuation is one key that
 -- extends the prefix — `kind = "map"` completes a mapping (carrying its `desc`),
--- `kind = "group"` only leads on to longer mappings. This is the render-time oracle
--- a native which-key plugin debounces (nx.utils.debounce) and draws as a persistent,
--- bottom-anchored nx.ui.float. Continuations come from the mapped-prefix trie today
--- (user + native-default maps); the built-in g/z/operator grammar is a later source.
+-- `kind = "group"` only leads on to longer mappings.
+--
+-- `ctx.label` (a string, or nil) is the **source B** channel: the built-in command
+-- grammar's open pending states — `f`/`t`/`F`/`T` find-char, `r` replace, `i`/`a`
+-- text-object, marks, registers, `<C-w>` — have no finite key list to enumerate, so
+-- they arrive with `continuations = {}` and a human label instead (`"Find
+-- character"`). A which-key renders the label as a hint card when `continuations` is
+-- empty; sources A/C (mapped prefixes) leave `label` nil and list keys.
+--
+-- This is the render-time oracle a native which-key plugin debounces
+-- (nx.utils.debounce) and draws as a persistent nx.ui.float. Continuations come from
+-- the mapped-prefix trie (user + native-default maps, sources A/C); the built-in
+-- grammar is surfaced via `label` (source B).
 nx._on_key_pending = nx._on_key_pending or {}
 
 function nx.on_key_pending(fn)

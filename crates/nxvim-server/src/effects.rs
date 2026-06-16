@@ -510,10 +510,15 @@ impl EditHost {
                     .echo(format!("nx.ui.float: unknown border '{}'", req.border));
                 continue;
             };
-            let placement = if req.editor {
-                nxvim_core::MenuPlacement::Editor
-            } else {
-                nxvim_core::MenuPlacement::Cursor
+            let placement = match req.relative.as_str() {
+                "cursor" => nxvim_core::MenuPlacement::Cursor,
+                "editor" => nxvim_core::MenuPlacement::Editor,
+                "bottom" => nxvim_core::MenuPlacement::Bottom,
+                other => {
+                    self.editor
+                        .echo(format!("nx.ui.float: unknown relative '{other}'"));
+                    continue;
+                }
             };
             if req.id == 0 {
                 self.editor
@@ -1807,26 +1812,48 @@ impl EditHost {
             Some(bucket) => crate::keymap::MatchScope::Widget(bucket),
             None => crate::keymap::MatchScope::Editing(self.editor.mode),
         };
-        let ctx = self.keymaps.pending_context(scope);
+        // Source A/C: the matcher's withheld mapped prefix. When it withholds
+        // nothing, fall back to **source B** — the built-in command grammar's pending
+        // state (`f` find-char, marks, …), which has reached the editor and left it
+        // mid-command. The two are mutually exclusive (a withheld prefix hasn't run
+        // yet), so this is a clean `or`. Source B carries a `label` and no
+        // continuations; an empty continuation set on the open built-in leaves is what
+        // a which-key renders as a hint card rather than a key list.
+        let ctx = self.keymaps.pending_context(scope).or_else(|| {
+            self.editor
+                .command_pending()
+                .map(|cp| crate::keymap::KeyPending {
+                    mode: scope.mode_code().to_string(),
+                    keys: cp.keys,
+                    continuations: Vec::new(),
+                    label: Some(cp.label.to_string()),
+                })
+        });
         if ctx == self.last_key_pending {
             return;
         }
         self.last_key_pending = ctx.clone();
-        // A cleared context (empty `pending`) is pushed as `keys = ""` with no
-        // continuations, in the scope it cleared in — a which-key popup reads that as
-        // "close". A live context carries its prefix + continuations.
-        let (mode, keys, conts) = match &ctx {
+        // A cleared context (no withheld prefix and no pending command) is pushed as
+        // `keys = ""` with no continuations / label, in the scope it cleared in — a
+        // which-key popup reads that as "close". A live context carries its prefix and
+        // either continuations (A/C) or a label (B).
+        let (mode, keys, conts, label) = match &ctx {
             Some(kp) => {
                 let conts: Vec<(&str, Option<&str>, &str)> = kp
                     .continuations
                     .iter()
                     .map(|c| (c.key.as_str(), c.desc.as_deref(), c.kind.as_str()))
                     .collect();
-                (kp.mode.as_str(), kp.keys.as_str(), conts)
+                (
+                    kp.mode.as_str(),
+                    kp.keys.as_str(),
+                    conts,
+                    kp.label.as_deref(),
+                )
             }
-            None => (scope.mode_code(), "", Vec::new()),
+            None => (scope.mode_code(), "", Vec::new(), None),
         };
-        if let Err(e) = self.lua.run_key_pending(mode, keys, &conts) {
+        if let Err(e) = self.lua.run_key_pending(mode, keys, &conts, label) {
             self.editor
                 .echo(format!("E5108: Error in nx.on_key_pending handler: {e}"));
         }

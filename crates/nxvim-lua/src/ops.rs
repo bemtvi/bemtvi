@@ -889,9 +889,12 @@ pub struct UiFloatReq {
     /// `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"`. Parsed (and
     /// validated loud) server-side via `BorderStyle::from_keyword`.
     pub border: String,
-    /// Placement: `false` anchors at the cursor (the default — hover shape), `true`
-    /// centers over the editor (`opts.relative = "editor"`).
-    pub editor: bool,
+    /// Placement keyword (`opts.relative`, defaulted to `"cursor"` by the wrapper):
+    /// `"cursor"` anchors at the cursor (the hover shape), `"editor"` centers over
+    /// the editor (the picker shape), `"bottom"` pins to the editor's bottom-right
+    /// corner (the which-key shape). Parsed (and validated loud) server-side into a
+    /// [`MenuPlacement`](nxvim_core::MenuPlacement).
+    pub relative: String,
 }
 
 /// A `nx.picker.open(name)` request: open the fuzzy-finder widget (a centered

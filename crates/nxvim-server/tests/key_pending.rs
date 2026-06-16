@@ -30,6 +30,15 @@ const RECORDER: &str = "_G.kp = {}\n\
        table.insert(_G.kp, ctx.mode .. '|' .. ctx.keys .. '|' .. table.concat(parts, ','))\n\
      end)\n";
 
+/// Source-B recorder: each event flattened to `"mode|keys|label"`, for the built-in
+/// command-grammar pending states (find-char, replace, marks) whose continuation set
+/// is open and which carry a `ctx.label` instead of a key list. No leader needed —
+/// these keys reach the editor directly.
+const RECORDER_B: &str = "_G.kp = {}\n\
+     nx.on_key_pending(function(ctx)\n\
+       table.insert(_G.kp, ctx.mode .. '|' .. ctx.keys .. '|' .. (ctx.label or ''))\n\
+     end)\n";
+
 /// `;;`-joined record of every `nx.on_key_pending` event so far.
 async fn events(rpc: &Rpc) -> String {
     exec_lua(rpc, "return table.concat(_G.kp, ';;')")
@@ -240,4 +249,96 @@ async fn no_listener_input_unaffected() {
     feed(&rpc, "<Space>w");
     let fired = exec_lua(&rpc, "return _G.fired").await;
     assert_eq!(fired, Value::Boolean(true));
+}
+
+// ----- source B: the built-in command grammar ------------------------------
+
+/// `f` arms the find-char grammar — an *open* pending state (any char answers it),
+/// so the event carries a `label` ("Find character") and no continuations, with the
+/// keys typed so far as `keys`. Typing the target char completes the motion and
+/// clears the context (one trailing `n||` — the popup closes).
+#[tokio::test]
+async fn find_char_fires_a_label_then_clears_on_the_target() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER_B).await;
+    feed(&rpc, "ihello world<Esc>0"); // a line to search, cursor at col 0
+    feed(&rpc, "f");
+    assert_eq!(events(&rpc).await, "n|f|Find character");
+    feed(&rpc, "w"); // jump to the 'w' — completes the find, clearing the state
+    assert_eq!(events(&rpc).await, "n|f|Find character;;n||");
+}
+
+/// The find-char label composes with a pending operator: `d` (operator-pending, no
+/// stage yet) fires *nothing* — only `f` arms the stage — and the event's `keys`
+/// shows the whole `df` showcmd prefix, so a which-key reads "delete → to character".
+#[tokio::test]
+async fn find_char_under_an_operator_shows_the_operator_in_keys() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER_B).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "d"); // operator-pending only — Stage::Start, so no source-B event
+    assert_eq!(events(&rpc).await, "");
+    feed(&rpc, "f"); // arms FindPending; keys carry the operator prefix
+    assert_eq!(events(&rpc).await, "n|df|Find character");
+}
+
+/// A count and the operator both land in the showcmd-style `keys` ahead of the
+/// trigger (`2df`), exactly like vim's showcmd.
+#[tokio::test]
+async fn find_char_keys_carry_count_and_operator() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER_B).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "2df");
+    assert_eq!(events(&rpc).await, "n|2df|Find character");
+}
+
+/// `r` (replace one char) is another open built-in state with its own label.
+#[tokio::test]
+async fn replace_char_fires_its_label() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER_B).await;
+    feed(&rpc, "ihello<Esc>0");
+    feed(&rpc, "r");
+    assert_eq!(events(&rpc).await, "n|r|Replace character");
+}
+
+/// The A→B transition — the find-char swallow made legible. With `<leader>ff`/
+/// `<leader>fg` mapped, `<Space>` withholds (source A). The idle flush replays it:
+/// `<Space>` runs, `f` reaches the editor and arms find-char, so the *next* event is
+/// the source-B "Find character" hint — which-key swaps the leader menu for it
+/// instead of leaving the user staring at a closed popup with a swallowed key.
+#[tokio::test]
+async fn leader_group_timeout_becomes_a_find_char_hint() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "{RECORDER_B}\
+             vim.g.mapleader = ' '\n\
+             nx.keymap.set('n', '<leader>ff', function() end, {{ desc = 'find file' }})\n\
+             nx.keymap.set('n', '<leader>fg', function() end, {{ desc = 'grep' }})"
+        ),
+    )
+    .await;
+    feed(&rpc, "ihello world<Esc>0"); // a line to search; setup fires no events
+    feed(&rpc, "<Space>"); // source A: withheld leader prefix
+    feed(&rpc, "f"); // descends to the f-group (still source A, withheld)
+    assert_eq!(events(&rpc).await, "n|<Space>|;;n|<Space>f|");
+    flush(&rpc).await; // replays <Space>f → <Space> runs, f arms find-char (source B)
+    assert_eq!(
+        events(&rpc).await,
+        "n|<Space>|;;n|<Space>f|;;n|f|Find character"
+    );
+}
+
+/// With no `nx.on_key_pending` listener, the built-in grammar runs untouched — the
+/// server never asks the editor for its command-pending state.
+#[tokio::test]
+async fn source_b_no_listener_input_unaffected() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "ihello world<Esc>"); // no listener, no maps
+    feed(&rpc, "0fw"); // find 'w' with no listener registered
+    let col = exec_lua(&rpc, "return vim.fn.col('.')").await;
+    assert_eq!(col.as_i64(), Some(7)); // landed on the 'w' of "world"
 }

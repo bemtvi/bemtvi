@@ -1,0 +1,17 @@
+which-key demo buffer
+=====================
+
+Press <Space> (the leader) and pause — a popup of key hints fades in.
+
+  <Space> w     write
+  <Space> q     quit
+  <Space> f ...  a group: ff = find file, fg = live grep
+  <Space> g ...  a group: gs = git status, gc = git commit
+
+Type into a group (e.g. <Space> then f) and the popup refreshes to that
+group's keys. Complete a mapping, press a key that breaks the sequence, or
+just wait out the timeout, and the popup closes.
+
+Nothing here intercepts your keys — the popup is driven entirely by the
+engine's pending-key oracle (nx.on_key_pending), so every key still does
+exactly what it normally would.

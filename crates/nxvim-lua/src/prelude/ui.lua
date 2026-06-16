@@ -237,7 +237,7 @@ function float_handle:update(contents, opts)
     return self:close()
   end
   nx._float_open_id = self._id
-  nx._ui_float(self._id, lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+  nx._ui_float(self._id, lines, opts.title, opts.border or "rounded", opts.relative or "cursor")
 end
 function float_handle:close()
   if nx._float_open_id == self._id then
@@ -255,7 +255,9 @@ end
 -- `contents` is a string (split on newlines) or a list of line strings. `opts`:
 --   border   = "none"|"single"|"rounded"|"double"|"solid"  (default "rounded")
 --   title    = a string drawn on the top border (optional)
---   relative = "cursor" (default, anchors at the cursor) | "editor" (centered)
+--   relative = "cursor" (default, anchors at the cursor) | "editor" (centered) |
+--              "bottom" (pinned to the editor's bottom-right corner — the
+--              which-key shape)
 --   persist  = when truthy, the float survives keystrokes (it is not dismissed by
 --              the next key) and nx.ui.float returns a HANDLE with :update(contents,
 --              opts) / :close() / :is_open(). This is the surface a key-observer
@@ -273,9 +275,9 @@ function nx.ui.float(contents, opts)
     nx._next_float_id = nx._next_float_id + 1
     local handle = setmetatable({ _id = nx._next_float_id }, float_handle)
     nx._float_open_id = handle._id
-    nx._ui_float(handle._id, lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+    nx._ui_float(handle._id, lines, opts.title, opts.border or "rounded", opts.relative or "cursor")
     return handle
   end
   -- Transient (id 0): dismissed by the next key, no handle.
-  nx._ui_float(0, lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+  nx._ui_float(0, lines, opts.title, opts.border or "rounded", opts.relative or "cursor")
 end

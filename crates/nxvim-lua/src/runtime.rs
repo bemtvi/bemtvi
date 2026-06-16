@@ -1193,20 +1193,29 @@ impl LuaRuntime {
 
     /// Fire the **`KeyPending`** event into Lua (`nx._key_pending_dispatch`). The
     /// server calls this only when the pending key-context *changed* (a mapped prefix
-    /// grew or cleared). The payload is `{ mode, keys, continuations }` where each
-    /// continuation is `{ key, desc, kind = "map"|"group" }`; a *cleared* context is
-    /// `keys = ""` with no continuations, which a which-key popup treats as "close".
+    /// grew or cleared). The payload is `{ mode, keys, continuations, label }` where
+    /// each continuation is `{ key, desc, kind = "map"|"group" }`; a *cleared* context
+    /// is `keys = ""` with no continuations, which a which-key popup treats as
+    /// "close". `label` is set (and `continuations` empty) for a **source B** built-in
+    /// pending state — find-char, marks, registers — whose continuation set is open;
+    /// sources A/C leave it `nil`.
     pub fn run_key_pending(
         &self,
         mode: &str,
         keys: &str,
         continuations: &[(&str, Option<&str>, &str)],
+        label: Option<&str>,
     ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_key_pending_dispatch")?;
         let ctx = self.lua.create_table()?;
         ctx.set("mode", self.lua.create_string(mode)?)?;
         ctx.set("keys", self.lua.create_string(keys)?)?;
+        // Source-B built-in states carry a label; sources A/C leave it nil.
+        match label {
+            Some(l) => ctx.set("label", self.lua.create_string(l)?)?,
+            None => ctx.set("label", mlua::Value::Nil)?,
+        }
         let arr = self.lua.create_table()?;
         for (i, (key, desc, kind)) in continuations.iter().enumerate() {
             let cont = self.lua.create_table()?;

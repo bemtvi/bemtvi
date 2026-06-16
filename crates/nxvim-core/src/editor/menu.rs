@@ -31,13 +31,16 @@ use crate::input::{Key, KeyCode};
 use crate::mode::KeyContext;
 use crate::view::MenuView;
 
-/// Where the menu floats. `Cursor` anchors it under the cursor (the
-/// `nx.ui.select` / completion shape); `Editor` centers it over the editor (the
-/// picker shape).
+/// Where the float (menu or content float) anchors on the shared placement layer.
+/// `Cursor` anchors it under the cursor (the `nx.ui.select` / completion shape);
+/// `Editor` centers it over the editor (the picker shape); `Bottom` pins it to the
+/// editor's bottom-right corner (the which-key content-float shape — menus never
+/// request it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuPlacement {
     Cursor,
     Editor,
+    Bottom,
 }
 
 /// Which orchestration drives this `Menu`. The widget is one shape; the kind

@@ -301,6 +301,18 @@ impl FindKind {
         matches!(self, FindKind::Till | FindKind::TillBack)
     }
 
+    /// The key that triggered this find-pending state (`f`/`t`/`F`/`T`) — the
+    /// inverse of [`from_key`](Self::from_key), used to render the pending keys for
+    /// the `nx.on_key_pending` (which-key) signal.
+    pub(crate) fn as_char(self) -> char {
+        match self {
+            FindKind::Find => 'f',
+            FindKind::Till => 't',
+            FindKind::FindBack => 'F',
+            FindKind::TillBack => 'T',
+        }
+    }
+
     /// The direction-flipped kind used by `,` (and by `;` after a `,`): f↔F, t↔T.
     pub(crate) fn reversed(self) -> FindKind {
         match self {
@@ -437,6 +449,22 @@ pub(crate) enum Stage {
     /// `` ` ``/`'`, `false` for the `` g` ``/`g'` spellings (vim's jump-without-
     /// touching-the-jumplist).
     MarkJumpPending(MarkJumpKind, bool),
+}
+
+/// A snapshot of the built-in command grammar's "waiting for the next key" state,
+/// for the `nx.on_key_pending` (which-key / showcmd) signal — **source B** of the
+/// oracle. Unlike a mapped-prefix continuation list (sources A/C), the built-in
+/// leaf states (`f` find-char, `r` replace, marks, registers) have an *open*
+/// continuation set — any printable char answers them — so this carries a
+/// human-readable [`label`](Self::label) instead of a finite key list. Built by
+/// [`Editor::command_pending`] from [`PendingCommand`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandPending {
+    /// The hint shown for this state (`"Find character"`, `"Replace character"`).
+    pub label: &'static str,
+    /// The command keys typed so far, in vim notation (`"df"`, `"2d3f"`, `` "`" ``,
+    /// `"<C-w>"`) — the showcmd-style prefix a which-key draws as the popup title.
+    pub keys: String,
 }
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
@@ -1038,6 +1066,70 @@ pub fn command_status(mode: Mode, keys: &[Key]) -> CommandStatus {
 }
 
 impl Editor {
+    /// The built-in command grammar's current pending state for the
+    /// `nx.on_key_pending` (which-key / showcmd) signal — **source B** of the
+    /// oracle. `Some` whenever a key has armed an argument stage (`f`/`t`/`F`/`T`,
+    /// `r`, `i`/`a`, `z`, `g`, marks, registers, `<C-w>`) and the grammar is waiting
+    /// for the next key; `None` at a clean boundary ([`Stage::Start`]), where there
+    /// is nothing to hint. The keymap matcher's withheld mapped prefix (sources A/C)
+    /// takes precedence and the server only consults this when no mapped prefix is
+    /// live — the two are mutually exclusive, since a withheld prefix has not yet
+    /// reached the grammar. The returned `keys` mirror vim's showcmd: register, the
+    /// pre-operator count, the operator, the post-operator count, then the stage's
+    /// trigger key.
+    pub fn command_pending(&self) -> Option<CommandPending> {
+        let p = &self.pending;
+        let (trigger, label): (String, &'static str) = match p.stage {
+            Stage::Start => return None,
+            Stage::FindPending(k) => {
+                let label = match k {
+                    FindKind::Find => "Find character",
+                    FindKind::Till => "Till character",
+                    FindKind::FindBack => "Find character backward",
+                    FindKind::TillBack => "Till character backward",
+                };
+                (k.as_char().to_string(), label)
+            }
+            Stage::ReplacePending => ("r".to_string(), "Replace character"),
+            Stage::TextObjectPending(c) => (c.to_string(), "Text object"),
+            Stage::GPending => ("g".to_string(), "g commands"),
+            Stage::ZPending => ("z".to_string(), "z — scroll / fold"),
+            Stage::RegisterPending => ("\"".to_string(), "Register"),
+            Stage::MarkSetPending => ("m".to_string(), "Set mark"),
+            Stage::MarkJumpPending(kind, set_jump) => {
+                let base = match kind {
+                    MarkJumpKind::Exact => "`",
+                    MarkJumpKind::Line => "'",
+                };
+                // The jumplist-skipping spellings are `g`/`g'`; plain `` ` ``/`'` set it.
+                let keys = if set_jump {
+                    base.to_string()
+                } else {
+                    format!("g{base}")
+                };
+                (keys, "Jump to mark")
+            }
+            Stage::WindowPending => ("<C-w>".to_string(), "Window command"),
+            Stage::WindowLayerPending => ("<C-w><C-w>".to_string(), "Dock layer"),
+        };
+        let mut keys = String::new();
+        if let Some(r) = p.register {
+            keys.push('"');
+            keys.push(r);
+        }
+        if let Some(n) = p.op_count {
+            keys.push_str(&n.to_string());
+        }
+        if let Some(op) = p.operator {
+            keys.push(op);
+        }
+        if let Some(n) = p.count {
+            keys.push_str(&n.to_string());
+        }
+        keys.push_str(&trigger);
+        Some(CommandPending { label, keys })
+    }
+
     /// Drive one key through the normal/visual grammar. A thin loop: the pure
     /// [`parse_step`] decides; [`Editor::execute`] (and the cancel arms here)
     /// apply. All the old inline pending-state bookkeeping now lives in

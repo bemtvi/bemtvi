@@ -191,8 +191,16 @@ pub struct KeyPending {
     /// The withheld prefix as re-parseable vim notation (`"g"`, `"<Space>w"`).
     pub keys: String,
     /// Every immediate continuation of the prefix, sorted by key notation so the
-    /// event payload is deterministic (the trie's child map is unordered).
+    /// event payload is deterministic (the trie's child map is unordered). Empty for
+    /// a **source B** built-in pending state (find-char, marks, …), whose
+    /// continuation set is open — those carry a [`label`](Self::label) instead.
     pub continuations: Vec<Continuation>,
+    /// A human-readable hint for an **open** pending state — the built-in command
+    /// grammar's source-B leaves (`"Find character"`, `"Replace character"`), where
+    /// there is no finite continuation list to show. `None` for sources A/C (mapped
+    /// prefixes), which enumerate `continuations` instead. which-key renders this
+    /// when `continuations` is empty.
+    pub label: Option<String>,
 }
 
 /// One key that extends a pending prefix in the [`KeyPending`] event.
@@ -546,6 +554,8 @@ impl Keymaps {
             mode: scope.mode_code().to_string(),
             keys: self.pending.iter().copied().map(key_to_notation).collect(),
             continuations,
+            // Sources A/C enumerate continuations; the label is the source-B channel.
+            label: None,
         })
     }
 

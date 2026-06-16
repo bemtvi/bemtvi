@@ -1346,12 +1346,12 @@ pub(crate) fn install_runtime_api(
         "_ui_float",
         lua.create_function(
             move |_,
-                  (id, lines, title, border, editor): (
+                  (id, lines, title, border, relative): (
                 u64,
                 Vec<String>,
                 Option<String>,
                 String,
-                bool,
+                String,
             )| {
                 sh.borrow_mut().ui_floats.push(UiFloatReq {
                     id,
@@ -1359,7 +1359,7 @@ pub(crate) fn install_runtime_api(
                     lines,
                     title,
                     border,
-                    editor,
+                    relative,
                 });
                 Ok(())
             },
@@ -1380,7 +1380,7 @@ pub(crate) fn install_runtime_api(
                 lines: Vec::new(),
                 title: None,
                 border: String::new(),
-                editor: false,
+                relative: String::new(),
             });
             Ok(())
         })?,

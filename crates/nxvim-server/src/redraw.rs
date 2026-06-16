@@ -1161,7 +1161,9 @@ impl EditHost {
                 };
                 (row, anchor_col, width, height, rows, m.selected)
             }
-            MenuPlacement::Editor => {
+            // `Bottom` is a content-float-only placement; a menu never requests it, so
+            // it falls in with the centered `Editor` box here.
+            MenuPlacement::Editor | MenuPlacement::Bottom => {
                 // A picker is a FIXED box — never content-hugging (that looks ragged).
                 // Resolve the configured extent against the viewport, default ~80% × 60%.
                 const DEFAULT_W: f32 = 0.8;
@@ -1442,6 +1444,16 @@ impl EditHost {
                 let height = count.min(text_height.saturating_sub(CHROME).max(1));
                 let row = text_height.saturating_sub(height + CHROME) / 2;
                 let col = text_width.saturating_sub(width + CHROME) / 2;
+                (row, col, width, height)
+            }
+            MenuPlacement::Bottom => {
+                // Pinned to the editor's bottom-RIGHT corner (the which-key shape):
+                // content-hugging like `Editor`, but the box (content + border chrome)
+                // sits flush against both the last text row and the right edge.
+                let width = content_w.min(text_width.saturating_sub(CHROME).max(1));
+                let height = count.min(text_height.saturating_sub(CHROME).max(1));
+                let row = text_height.saturating_sub(height + CHROME);
+                let col = text_width.saturating_sub(width + CHROME);
                 (row, col, width, height)
             }
         };

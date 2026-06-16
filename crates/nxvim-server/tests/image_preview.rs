@@ -50,6 +50,20 @@ async fn image_file_previews_when_enabled() {
         Some(path.as_str()),
         "the image marker carries the opened file's path"
     );
+    // The marker also carries the file's version (size + mtime), so the client can
+    // re-decode when the file changes on disk. "PNGPLACEHOLDER\n" is 15 bytes.
+    assert_eq!(
+        map_get(img, "size").and_then(Value::as_u64),
+        Some(15),
+        "the image marker carries the file size"
+    );
+    assert!(
+        map_get(img, "mtime_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0,
+        "the image marker carries a nonzero mtime"
+    );
 }
 
 #[tokio::test]

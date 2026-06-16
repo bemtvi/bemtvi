@@ -178,6 +178,11 @@ pub struct WindowView {
 #[derive(Clone)]
 pub struct ImageData {
     pub path: String,
+    /// The file's on-disk version — size in bytes and mtime as Unix milliseconds —
+    /// so the client re-decodes its cached picture when the file changes on disk
+    /// (rather than showing a stale image). `0` from an older server that omits them.
+    pub size: u64,
+    pub mtime_ms: u64,
 }
 
 /// Which screen region a window/separator belongs to (mirrors
@@ -783,6 +788,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         image: match map_get(m, "image") {
             Some(Value::Map(im)) => Some(ImageData {
                 path: map_str(im, "path"),
+                size: map_u64(im, "size"),
+                mtime_ms: map_u64(im, "mtime_ms"),
             }),
             _ => None,
         },

@@ -396,6 +396,12 @@ pub struct WindowView {
 pub struct ImageView {
     /// The image file's path (the buffer's path).
     pub path: String,
+    /// The file's on-disk size in bytes, and its mtime as Unix milliseconds (`0`
+    /// when unknown). Together they version the file so the client re-decodes its
+    /// cached picture when the file changes on disk (e.g. an external edit the
+    /// always-on watch reloaded) rather than showing the stale image.
+    pub size: u64,
+    pub mtime_ms: u64,
 }
 
 /// One tab page's cell in the tabline. `label` is the tab's focused window's
@@ -750,12 +756,20 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
 
     // An image-preview buffer carries no text to paint; hand the client the path
     // so it renders the picture over this window's body instead of `lines`.
-    let image = buf.image.then(|| ImageView {
-        path: buf
-            .path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+    let image = buf.image.then(|| {
+        let disk = buf.disk_stat();
+        ImageView {
+            path: buf
+                .path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            size: disk.map_or(0, |d| d.size),
+            mtime_ms: disk
+                .and_then(|d| d.mtime)
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as u64),
+        }
     });
 
     let status_ctx = window_status_ctx(StatusCtxInputs {

@@ -376,9 +376,13 @@ impl EditHost {
             (
                 Value::from("image"),
                 match &win.image {
-                    Some(img) => {
-                        Value::Map(vec![(Value::from("path"), Value::from(img.path.as_str()))])
-                    }
+                    Some(img) => Value::Map(vec![
+                        (Value::from("path"), Value::from(img.path.as_str())),
+                        // The file's version (size + mtime-ms), so the client
+                        // re-decodes when the file changed on disk.
+                        (Value::from("size"), Value::from(img.size)),
+                        (Value::from("mtime_ms"), Value::from(img.mtime_ms)),
+                    ]),
                     None => Value::Nil,
                 },
             ),

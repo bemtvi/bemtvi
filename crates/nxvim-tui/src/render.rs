@@ -623,7 +623,7 @@ fn render_window(
             frame.render_widget(Block::default().style(normal), text_area);
         }
         if let Some(store) = images {
-            store.render(frame, text_area, &image.path);
+            store.render(frame, text_area, image);
         }
         if let Some(status_area) = status_area {
             render_status(frame, status_area, &win.status, view);

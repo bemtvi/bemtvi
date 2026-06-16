@@ -167,6 +167,35 @@ try {
   check("persist: zig highlights after reload (from OPFS cache)", zig2.ok, zig2.detail);
   check("persist: reload re-fetched nothing from the CDN", cdnFetches.length === 0, JSON.stringify(cdnFetches));
 
+  // ---- 5. Re-`:TSInstall` repairs a MISSING indents.scm (regression) ----
+  // The offline bundle ships grammars without indents, and older installs predate the full
+  // query set, so an "available" grammar can still be missing its indents.scm. A second
+  // `:TSInstall` must then FETCH the missing query — not short-circuit "already installed"
+  // and no-op. Simulate the gap by deleting zig's cached indents.scm, then re-install.
+  const delIndents = async () => page.evaluate(async () => {
+    const dir = await (await (await navigator.storage.getDirectory())
+      .getDirectoryHandle(".nxvim")).getDirectoryHandle("treesitter");
+    await (await dir.getDirectoryHandle("zig")).removeEntry("indents.scm");
+  });
+  const hasIndents = async () => page.evaluate(async () => {
+    try {
+      const dir = await (await (await navigator.storage.getDirectory())
+        .getDirectoryHandle(".nxvim")).getDirectoryHandle("treesitter");
+      await (await dir.getDirectoryHandle("zig")).getFileHandle("indents.scm");
+      return true;
+    } catch { return false; }
+  });
+  await delIndents();
+  check("repair: indents.scm absent after deletion (precondition)", !(await hasIndents()));
+
+  cdnFetches = [];
+  await page.evaluate(() => window.__nxvim.feed(":TSInstall zig<CR>"));
+  let repaired = false;
+  for (let i = 0; i < 40; i++) { if ((repaired = await hasIndents())) break; await sleep(100); }
+  check("repair: re-:TSInstall re-cached the missing indents.scm in OPFS", repaired);
+  check("repair: indents.scm was actually re-fetched (not a silent no-op)",
+    cdnFetches.some((p) => /indents\.scm$/.test(p)), JSON.stringify(cdnFetches));
+
   await browser.close();
 } finally {
   cleanup();

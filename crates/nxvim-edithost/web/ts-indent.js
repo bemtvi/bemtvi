@@ -274,7 +274,10 @@ export function createIndenter() {
         try { indentScm = await opfsReadText([...TS_DIR, reg, 'indents.scm']); } catch { indentScm = null; }
       } else if (bundled.has(reg)) {
         parserSrc = new URL('grammars/' + reg + '.wasm', V).href;
-        indentScm = bundledIndents.has(reg) ? await fetchText(new URL('indents/' + reg + '.scm', V).href) : null;
+        // Prefer an OPFS-cached indents.scm — a `:TSInstall` that supplied the indents the
+        // offline bundle lacks for this grammar — over the vendored one (or none).
+        try { indentScm = await opfsReadText([...TS_DIR, reg, 'indents.scm']); }
+        catch { indentScm = bundledIndents.has(reg) ? await fetchText(new URL('indents/' + reg + '.scm', V).href) : null; }
       } else {
         langs.set(reg, null);
         return;

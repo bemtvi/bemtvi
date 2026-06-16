@@ -122,6 +122,7 @@ async function fetchBytes(url) {
 export function createHighlighter({ onReady } = {}) {
   let runtimeReady = false;
   const bundled = new Set(); // languages vendored offline in ./vendor/
+  const bundledIndents = new Set(); // bundled languages that ALSO vendor an indents.scm
   const installed = new Set(); // languages cached in OPFS by `:TSInstall`
   const langs = new Map(); // name → { parser, query } once loaded, or null if it failed
   const loading = new Set();
@@ -145,6 +146,14 @@ export function createHighlighter({ onReady } = {}) {
     } catch (e) {
       console.error('[nxvim] vendor manifest load failed:', e);
     }
+    // Which bundled grammars also vendor an indents.scm (gen-treesitter only writes one
+    // when nvim-treesitter shipped indents for that language). Bundled grammars NOT listed
+    // here highlight offline but have no indents until `:TSInstall` fetches them — see
+    // `hasIndents` / `install`.
+    try {
+      const res = await fetch(new URL('indents.json', V));
+      if (res.ok) for (const l of await res.json()) bundledIndents.add(l);
+    } catch { /* no bundled indents manifest */ }
     // The OPFS install cache's manifest (absent until the first `:TSInstall`).
     try {
       for (const l of JSON.parse(await opfsReadText([...TS_DIR, 'manifest.json']))) installed.add(l);
@@ -183,13 +192,52 @@ export function createHighlighter({ onReady } = {}) {
     }
   }
 
-  // `:TSInstall <name>` — make a grammar available. If it's already bundled/installed,
-  // (re)register it (no network). Otherwise fetch the prebuilt `.wasm` + the standard
-  // query set from the CDN, sanitize highlights against the grammar, cache everything in
-  // OPFS (so it survives reload), and register it. Returns `{ ok, msg }` for the status
-  // line. highlights.scm feeds this UI highlighter; indents.scm is consumed by the worker's
-  // tree-sitter indenter (web/ts-indent.js); injections/folds/locals are cached for
-  // forward-compat (no browser consumer yet).
+  // Whether `name`'s indents.scm is already available (so a re-`:TSInstall` is a genuine
+  // no-op rather than needing to fetch the missing query). An installed grammar's indents
+  // live in OPFS next to its parser.wasm; a bundled grammar's only if gen-treesitter
+  // vendored one (`indents.json`). A bundled grammar that lacks indents reports false, so
+  // `install` falls through and fetches them — see the queries-only path below.
+  async function hasIndents(name) {
+    if (installed.has(name)) {
+      try { return !!(await opfsReadText([...TS_DIR, name, 'indents.scm'])).trim(); }
+      catch { return false; }
+    }
+    return bundledIndents.has(name);
+  }
+
+  // Fetch the standard NON-highlights query set (indents/injections/folds/locals) for a
+  // grammar from the CDN. `indents` is special — the grammar packages don't ship a usable
+  // one, so it comes from nvim-treesitter (the worker indenter consumes it), falling back
+  // to the grammar package. The rest are best-effort (a grammar that doesn't ship one is
+  // skipped, not an error). Returns `{ kind: text, … }` for whatever was found.
+  async function fetchQuerySet(name, cfg) {
+    const ver = versionOf(cfg.pkg);
+    const extras = {};
+    for (const kind of QUERY_KINDS) {
+      if (kind === 'highlights') continue;
+      if (kind === 'indents') {
+        try { extras.indents = await fetchText(indentSource(name, GH_BASE)); }
+        catch {
+          try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
+          catch { /* no indents from either source */ }
+        }
+        continue;
+      }
+      try { extras[kind] = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/${kind}.scm`); }
+      catch { /* not shipped by this grammar */ }
+    }
+    return extras;
+  }
+
+  // `:TSInstall <name>` — make a grammar available. If it's already bundled/installed *with
+  // its indents.scm*, (re)register it (no network). If it's available but MISSING its
+  // indents (the offline bundle ships grammars without indents), fetch just the standard
+  // query set and cache it to OPFS next to the existing grammar — no parser.wasm refetch.
+  // Otherwise fetch the prebuilt `.wasm` + the standard query set from the CDN, sanitize
+  // highlights against the grammar, cache everything in OPFS (so it survives reload), and
+  // register it. Returns `{ ok, msg }` for the status line. highlights.scm feeds this UI
+  // highlighter; indents.scm is consumed by the worker's tree-sitter indenter
+  // (web/ts-indent.js); injections/folds/locals are cached for forward-compat.
   async function install(rawName) {
     await ready;
     // Canonicalize first (`c#`/`csharp`/`cs` → `c_sharp`, …); `name` is what we cache,
@@ -198,14 +246,40 @@ export function createHighlighter({ onReady } = {}) {
     const name = resolveName(rawName);
     const cfg = REGISTRY[name];
     if (!cfg) return { ok: false, name, msg: `unknown language '${rawName}'` };
-    // Already available — re-register from cache (also the `:TSUpdate` of a bundled lang).
-    if (isAvail(name)) {
+    const enc = (s) => new TextEncoder().encode(s);
+
+    // Already available WITH indents — re-register from cache, no network (also the
+    // `:TSUpdate` of a complete bundled lang).
+    if (isAvail(name) && await hasIndents(name)) {
       langs.delete(name);
       await load(name);
       return langs.get(name)
         ? { ok: true, name, msg: installed.has(name) ? 'already installed' : 'bundled' }
         : { ok: false, name, msg: 'cached grammar failed to load' };
     }
+
+    // Available but missing its indents.scm (a bundled grammar gen-treesitter couldn't
+    // fetch indents for, or an older install). The grammar itself is fine — fetch only the
+    // standard query set and cache it to OPFS beside the existing (bundled or installed)
+    // grammar. The worker indenter prefers an OPFS-cached indents.scm over the absent
+    // vendored one (see ts-indent.js), so it picks these up on the post-install reload.
+    if (isAvail(name)) {
+      try {
+        const extras = await fetchQuerySet(name, cfg);
+        if (!extras.indents) return { ok: false, name, msg: 'no indents.scm available for this language' };
+        for (const [kind, text] of Object.entries(extras)) {
+          await opfsWriteBytes([...TS_DIR, name, kind + '.scm'], enc(text));
+        }
+        // Keep the in-memory highlighter as-is (highlights are unchanged); the indenter
+        // reloads off OPFS. memo is cleared so any pending repaint re-runs cleanly.
+        memo = { lang: null, text: null, spans: null };
+        notify();
+        return { ok: true, name, msg: `queries: ${Object.keys(extras).join('+')}` };
+      } catch (e) {
+        return { ok: false, name, msg: String(e && e.message ? e.message : e) };
+      }
+    }
+
     try {
       const ver = versionOf(cfg.pkg);
       const wasmBytes = await fetchBytes(`${CDN_BASE}/${cfg.pkg}@${ver}/${cfg.wasm}`);
@@ -226,28 +300,10 @@ export function createHighlighter({ onReady } = {}) {
       tree.delete();
       if (caps === 0) return { ok: false, name, msg: 'grammar/query mismatch (0 captures)' };
 
-      // The rest of the standard query set — cached for forward-compat, best-effort
-      // (a grammar that doesn't ship one is skipped, not an error). `indents` is special:
-      // the grammar packages don't ship a usable one, so it comes from nvim-treesitter (the
-      // worker indenter consumes it); fall back to the grammar package if nvim-treesitter
-      // has none for this language.
-      const extras = {};
-      for (const kind of QUERY_KINDS) {
-        if (kind === 'highlights') continue;
-        if (kind === 'indents') {
-          try { extras.indents = await fetchText(indentSource(name, GH_BASE)); }
-          catch {
-            try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
-            catch { /* no indents from either source */ }
-          }
-          continue;
-        }
-        try { extras[kind] = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/${kind}.scm`); }
-        catch { /* not shipped by this grammar */ }
-      }
+      // The rest of the standard query set (indents/injections/folds/locals).
+      const extras = await fetchQuerySet(name, cfg);
 
       // Persist to OPFS, then register in memory + the installed manifest.
-      const enc = (s) => new TextEncoder().encode(s);
       await opfsWriteBytes([...TS_DIR, name, 'parser.wasm'], wasmBytes);
       await opfsWriteBytes([...TS_DIR, name, 'highlights.scm'], enc(res.text));
       for (const [kind, text] of Object.entries(extras)) {

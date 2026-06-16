@@ -85,3 +85,7 @@ nxvim-ts = { workspace = true, optional = true }
 # the shared `mlua` dep, so the harness's nxvim-server dependency resolves to the
 # same backend as the crate under test.
 nxvim-test-harness.workspace = true
+# The treesitter engine, for the (ignored) progressive-highlight test that installs
+# a real grammar into a temp data dir. It is a feature-gated *runtime* dep above; a
+# dev-dep makes its `install` reachable from the integration tests unconditionally.
+nxvim-ts.workspace = true

@@ -79,9 +79,12 @@ impl EditHost {
         // real event runs its callback via `on_loop_event`.
         let mut had_real = false;
         let mut shada_due = false;
+        let mut resume_due = false;
         for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             if crate::is_shada_flush_timer(&event) {
                 shada_due = true;
+            } else if crate::is_parse_resume_timer(&event) {
+                resume_due = true;
             } else {
                 self.on_loop_event(event);
                 had_real = true;
@@ -90,9 +93,12 @@ impl EditHost {
         if shada_due {
             self.shada_checkpoint();
         }
-        // Only settle/repaint when a real event ran; a shada-only wake changed no
-        // editor state, so a redraw would be spurious.
-        if had_real {
+        // Repaint when a real event ran, or when a parse-resume wake is due: the latter
+        // changed no editor state by itself, but the redraw it triggers is the whole
+        // point — it resumes the in-flight treesitter parse and paints the new spans
+        // (re-arming the timer if the parse still isn't done). A shada-only wake, by
+        // contrast, touches nothing visible, so it never forces a frame.
+        if had_real || resume_due {
             self.settle_events(true);
         }
     }

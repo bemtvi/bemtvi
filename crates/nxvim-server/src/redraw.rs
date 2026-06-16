@@ -43,6 +43,11 @@ impl EditHost {
         // needs a language server (Phase 6).
         #[cfg(feature = "native")]
         self.refresh_highlights(h);
+        // A large file's treesitter parse is resumed across frames; if it's still in
+        // flight after this frame's `refresh_highlights`, wake again shortly to paint
+        // the next budget's progress (and re-arm until it converges).
+        #[cfg(feature = "native")]
+        self.arm_parse_resume_if_pending();
         // Drive LSP document sync for the current buffer (non-blocking).
         #[cfg(feature = "native")]
         self.sync_lsp();

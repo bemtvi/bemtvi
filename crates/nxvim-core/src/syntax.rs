@@ -75,6 +75,17 @@ pub trait SyntaxEngine {
     /// Highlight spans for the line range `[first, last)`.
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span>;
 
+    /// Whether `buffer`'s parse is still in progress — a large file whose parse was
+    /// cancelled by the engine's per-frame deadline and is being resumed across
+    /// frames. The server polls this after a redraw to keep scheduling frames (each
+    /// of which resumes the parse via [`highlights`](Self::highlights)) until it
+    /// converges, so a big file colours in progressively. The default is `false` —
+    /// an engine that parses synchronously (or highlights elsewhere, like the wasm
+    /// JS-side highlighter) is never "pending".
+    fn parse_pending(&self, _buffer: BufferId) -> bool {
+        false
+    }
+
     /// Highlight an **off-buffer** snippet — `text` in `language`, over the line
     /// range `[first, last)` — without registering a [`BufferId`]. A stateless,
     /// full parse (no incremental reuse, no injections) for read-only surfaces like

@@ -49,6 +49,13 @@ struct BufferState {
     parser: Parser,
     tree: Option<Tree>,
     language: String,
+    /// The last reparse hit [`PARSE_DEADLINE`] and was cancelled, so this buffer's
+    /// parse is **unfinished** — tree-sitter retains the outstanding parse on the
+    /// `parser`, and re-invoking parse *resumes* it. While set, the engine keeps
+    /// making progress (each [`Engine::highlights`] resumes a frame's worth) and the
+    /// server keeps redrawing (see [`Engine::parse_pending`]) until it converges, so
+    /// a large file highlights progressively instead of staying dark forever.
+    incomplete: bool,
     /// Injected sub-language layers, re-derived from the root tree after each
     /// reparse (and when the injection query changes). Empty when the grammar
     /// ships no injection query or no region matches. See
@@ -94,15 +101,22 @@ impl BufferState {
             }
         };
         let options = ParseOptions::new().progress_callback(&mut budget);
-        // Keep the last good tree if the parse yields `None` (the deadline fired):
-        // overwriting it with `None` would throw away all incremental reuse and
-        // leave the buffer un-highlightable until a full re-open. So a cancelled
-        // parse costs one frame of stale highlights, not a permanently dark buffer.
-        if let Some(tree) =
-            self.parser
-                .parse_with_options(&mut callback, self.tree.as_ref(), Some(options))
+        // A `None` result means the deadline fired mid-parse. tree-sitter keeps the
+        // outstanding parse on the parser, so the *next* `parse` call resumes where
+        // this one stopped (the budget only ever costs one frame of work, never a
+        // restart). Keep the last good tree for this frame's highlights and flag the
+        // buffer `incomplete` so the engine resumes on the next `highlights` and the
+        // server keeps redrawing until the parse converges — a large file colours in
+        // progressively instead of staying permanently dark.
+        match self
+            .parser
+            .parse_with_options(&mut callback, self.tree.as_ref(), Some(options))
         {
-            self.tree = Some(tree);
+            Some(tree) => {
+                self.tree = Some(tree);
+                self.incomplete = false;
+            }
+            None => self.incomplete = true,
         }
     }
 }
@@ -550,6 +564,7 @@ impl Engine {
             parser,
             tree: None,
             language: lang.to_string(),
+            incomplete: false,
             injections: Vec::new(),
         };
         state.reparse();
@@ -606,6 +621,13 @@ impl Engine {
             }
             applied.push(input_edit);
         }
+        // A still-`incomplete` parse left an outstanding parse on the `parser` that
+        // was reading the *pre-edit* shadow; resuming it now would parse stale bytes.
+        // Reset so the next reparse starts fresh from the just-patched shadow (still
+        // reusing `tree` incrementally if a prior parse ever completed).
+        if state.incomplete {
+            state.parser.reset();
+        }
         state.reparse();
         // The injected regions move with every edit, so re-derive the child layers
         // from the fresh root tree — incrementally, replaying `applied` onto the
@@ -616,6 +638,15 @@ impl Engine {
     /// Forget a buffer's shadow text and parse tree (the editor deleted it).
     pub fn close(&mut self, buffer: BufferId) {
         self.buffers.remove(&buffer);
+    }
+
+    /// Whether `buffer`'s parse was cancelled by [`PARSE_DEADLINE`] and still has
+    /// work pending — a large file mid-parse. The server polls this after each
+    /// redraw to decide whether to schedule another frame, which resumes the parse
+    /// via [`Self::highlights`], until it converges. False for an unknown buffer or
+    /// a fully-parsed one.
+    pub fn parse_pending(&self, buffer: BufferId) -> bool {
+        self.buffers.get(&buffer).is_some_and(|s| s.incomplete)
     }
 
     /// Whether a buffer is known (opened) and which language it uses.
@@ -632,6 +663,24 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> Vec<Span> {
+        // Resume a deadline-cancelled parse one budget at a time: each redraw's
+        // highlight pull advances the outstanding parse, so a large file converges
+        // over a few frames (the server keeps redrawing while `parse_pending`). Until
+        // the root parse first completes there is no tree, so the spans below are
+        // empty for those first frames; once it lands they become real highlights.
+        let resumed_to_completion = match self.buffers.get_mut(&buffer) {
+            Some(state) if state.incomplete => {
+                state.reparse();
+                !state.incomplete
+            }
+            _ => false,
+        };
+        if resumed_to_completion {
+            // The freshly-completed root tree needs its injection layers built, just
+            // as the open/edit paths do after their reparse.
+            self.rebuild_injection_layers(buffer);
+        }
+
         let Some(state) = self.buffers.get(&buffer) else {
             return Vec::new();
         };
@@ -981,6 +1030,10 @@ impl SyntaxEngine for Engine {
 
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span> {
         Engine::highlights(self, buffer, first, last)
+    }
+
+    fn parse_pending(&self, buffer: BufferId) -> bool {
+        Engine::parse_pending(self, buffer)
     }
 
     fn highlight_text(&mut self, lang: &str, text: &str, first: usize, last: usize) -> Vec<Span> {

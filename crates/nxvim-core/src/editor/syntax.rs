@@ -288,6 +288,17 @@ impl Editor {
         }
     }
 
+    /// Whether `buf`'s treesitter parse is still in progress — a large file whose
+    /// parse was cancelled by the engine's per-frame deadline and is being resumed
+    /// across frames. The server reads this after a redraw to keep scheduling frames
+    /// until the parse converges (progressive highlighting). `false` with no engine
+    /// or no pending parse.
+    pub fn ts_parse_pending(&self, buf: BufferId) -> bool {
+        self.syntax
+            .as_ref()
+            .is_some_and(|engine| engine.parse_pending(buf))
+    }
+
     /// Forget a deleted buffer's engine state (called from `:bdelete`).
     pub(crate) fn syntax_close(&mut self, id: BufferId) {
         if let Some(engine) = self.syntax.as_mut() {

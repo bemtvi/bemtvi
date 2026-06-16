@@ -1368,6 +1368,29 @@ pub(crate) const SHADA_FLUSH_TIMER_ID: u64 = 1 << 49;
 #[cfg(feature = "native")]
 const SHADA_FLUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// The loop id of the **progressive-parse resume** timer. Set above the shada flush
+/// id (which is above the Lua callback ids and per-buffer watch ids), so a
+/// [`LoopEvent::Timer`] carrying it is unambiguously the parse-resume wake. While a
+/// large file's treesitter parse is still in flight (cancelled by the engine's
+/// per-frame deadline), each redraw re-arms this one-shot to wake the run loop and
+/// repaint — every repaint resumes the parse one budget further — until it converges.
+#[cfg(feature = "native")]
+pub(crate) const PARSE_RESUME_TIMER_ID: u64 = 1 << 50;
+
+/// How soon to wake for the next parse-resume frame. Each frame already spends the
+/// engine's parse budget (~one deadline) doing real work, so this delay is just a
+/// yield back to the run loop between budgets — short enough to converge quickly,
+/// non-zero so input/other events can interleave.
+#[cfg(feature = "native")]
+const PARSE_RESUME_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Whether `event` is the progressive-parse resume timer firing (vs. the shada
+/// checkpoint or a real Lua timer / process / watch event).
+#[cfg(feature = "native")]
+pub(crate) fn is_parse_resume_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == PARSE_RESUME_TIMER_ID)
+}
+
 /// Whether `event` is the shada debounced-checkpoint timer firing (vs. a real Lua
 /// timer / process / watch event the run loop hands to [`EditHost::on_loop_event`]).
 #[cfg(feature = "native")]
@@ -1411,6 +1434,23 @@ impl EditHost {
             self.fx.loop_command(LoopCommand::TimerStart {
                 id: SHADA_FLUSH_TIMER_ID,
                 delay: SHADA_FLUSH_DEBOUNCE,
+                repeat: std::time::Duration::ZERO,
+            });
+        }
+    }
+
+    /// Arm the one-shot parse-resume timer when the current buffer's treesitter
+    /// parse is still in flight (a large file the engine couldn't finish in one
+    /// frame's budget). The wake repaints, which resumes the parse a budget further
+    /// and re-arms this if it's still going — so a big file colours in progressively
+    /// even while the user sits idle. A no-op once the parse converges; routed
+    /// through `fx` like the shada timer, so the wasm Worker could drive it too.
+    pub(crate) fn arm_parse_resume_if_pending(&mut self) {
+        let buffer = self.editor.current_buffer_id();
+        if self.editor.ts_parse_pending(buffer) {
+            self.fx.loop_command(LoopCommand::TimerStart {
+                id: PARSE_RESUME_TIMER_ID,
+                delay: PARSE_RESUME_DELAY,
                 repeat: std::time::Duration::ZERO,
             });
         }

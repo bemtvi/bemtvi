@@ -3,10 +3,17 @@
 //! viewport)`, and project cached spans into the redraw `highlights` payload.
 //!
 //! The parse tree and incremental reparse live **inside** the editor now
-//! ([`nxvim_core::Editor`] owns a `SyntaxEngine`); there is no worker process,
-//! no RPC, and no async catch-up frame — `editor.highlights()` returns spans
-//! correct for the same frame as the edit. This module is just the slim cache +
-//! the byte→screen-column projection that the redraw needs.
+//! ([`nxvim_core::Editor`] owns a `SyntaxEngine`); there is no worker process and
+//! no RPC — `editor.highlights()` returns spans correct for the same frame as the
+//! edit. This module is just the slim cache + the byte→screen-column projection
+//! that the redraw needs.
+//!
+//! The one place that *does* span frames is a **large file**: the engine bounds each
+//! parse to a per-frame deadline, so a file too big to parse in one frame is parsed
+//! progressively — [`EditHost::refresh_highlights`] bypasses the memo while the
+//! engine reports [`ts_parse_pending`](nxvim_core::Editor::ts_parse_pending), and the
+//! redraw re-arms a short timer to resume on the next frame, until the parse
+//! converges and the file colours in. Normal-sized files never take that path.
 
 use crate::redraw::StyleTable;
 use crate::EditHost;
@@ -63,8 +70,15 @@ impl EditHost {
             self.editor.ts_language_for(buffer),
         );
 
+        // While a large file's parse is still in flight, bypass the memo every frame:
+        // the re-query below resumes the parse one budget further and picks up the
+        // spans the growing tree now exposes. A memo hit here (the key is unchanged —
+        // same text, same viewport) would freeze the buffer half-parsed and dark. Once
+        // the parse converges `parse_pending` goes false and the memo takes over again.
+        let pending = self.editor.ts_parse_pending(buffer);
+
         // Memo hit: the spans are already current for this content + viewport.
-        if self.syntax_states.get(&buffer).and_then(|s| s.key.as_ref()) == Some(&key) {
+        if !pending && self.syntax_states.get(&buffer).and_then(|s| s.key.as_ref()) == Some(&key) {
             return;
         }
 

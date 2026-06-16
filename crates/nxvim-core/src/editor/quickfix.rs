@@ -425,7 +425,10 @@ impl Editor {
         }
         self.window_ids()
             .into_iter()
-            .find(|&w| self.windows.get(w).loclist_bufnr == Some(buf))
+            .find(|&w| {
+                self.window(w)
+                    .is_some_and(|win| win.loclist_bufnr == Some(buf))
+            })
             .map(QfWhich::Location)
     }
 
@@ -454,7 +457,7 @@ impl Editor {
         let disp = self.qf_display_bufnr(which)?;
         self.window_ids()
             .into_iter()
-            .find(|&w| self.windows.get(w).buffer == disp)
+            .find(|&w| self.window(w).is_some_and(|win| win.buffer == disp))
     }
 
     /// (Re)render `which`'s display buffer from its current list. No-op until the

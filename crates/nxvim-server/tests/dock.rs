@@ -237,6 +237,37 @@ async fn dock_chord_crosses_from_insert_mode() {
     );
 }
 
+/// Regression: with a dock open, every keystroke runs `is_quickfix_buffer`, which
+/// walks the *cross-layer* `window_ids()` (main tree + every open dock). It used to
+/// index `self.windows` — the *current* layer's tree only — and panicked on the
+/// dock's foreign-layer window id ("current window id is always valid"), killing the
+/// server on the next input. A window-scoped location list and an open dock must
+/// coexist: input keeps flowing and the loclist still resolves across the layers.
+#[tokio::test]
+async fn quickfix_context_survives_an_open_dock() {
+    let (rpc, _incoming) = start().await;
+    // The main window owns a one-entry location list (a real `loclist_bufnr` for
+    // `qf_context_of_buffer` to scan for).
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setloclist(vim.api.nvim_get_current_win(),
+             { { filename = "a.rs", lnum = 1, text = "A" } })"#,
+    )
+    .await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+
+    // Before the fix this very input panicked the server: `is_quickfix_buffer` on
+    // the input path called `windows.get` with the dock's id.
+    feed(&rpc, "<C-w><C-w>l"); // cross into the (empty) main area
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(mode(&rpc).await, "n", "input still flows with a dock open");
+    assert_eq!(lines(&rpc).await, vec!["hello"], "the edit landed in main");
+
+    // The location list is intact and still resolvable across the layers.
+    let n = exec_lua(&rpc, "return #vim.fn.getloclist(0)").await;
+    assert_eq!(n.as_i64(), Some(1), "loclist survived the open dock");
+}
+
 /// The `<C-w><C-w>` dock chord works from **visual** mode (where a single `<C-w>`
 /// is otherwise unbound): it drops the selection and crosses to the dock.
 #[tokio::test]

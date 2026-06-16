@@ -15,6 +15,7 @@
 //! window command "just works" within the now-live layer.
 
 use super::*;
+use crate::editor::windows::Window;
 use crate::options::WindowOptions;
 
 impl Editor {
@@ -183,6 +184,15 @@ impl Editor {
             .into_iter()
             .filter_map(|l| self.layer_tree(l).map(|t| (l, t)))
             .find(|(_, t)| t.try_get(id).is_some())
+    }
+
+    /// The [`Window`] for `id` in whichever open layer owns it (the main tree or
+    /// any open dock), or `None` if no open layer holds it. This is the
+    /// layer-aware counterpart to `self.windows.get`, which only sees the
+    /// *current* layer and panics on an id that lives in another layer — exactly
+    /// what happens when code iterates the cross-layer [`Editor::window_ids`].
+    pub(crate) fn window(&self, id: WindowId) -> Option<&Window> {
+        self.tree_of_window(id).and_then(|(_, t)| t.try_get(id))
     }
 
     /// Mutable [`Editor::tree_of_window`]: the tree (live or parked) owning `id`.

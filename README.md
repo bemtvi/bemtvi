@@ -1,8 +1,8 @@
 # nxvim
 
-A modal, vim-style editor **100% vibe-coded in less than two weeks**
-using Claude Code — modal editing, Lua config, treesitter highlighting, and
-LSP, built on a fully async, client-server design.
+A modal, vim-style editor **100% vibe-coded** using Claude Code — modal editing,
+Lua plugins, treesitter highlighting, and LSP, built on a fully async,
+client-server design.
 
 nxvim is a headless, asynchronous editor **server** with thin UI **clients**
 talking over nxvim's own msgpack-RPC. The editor logic lives in one place; the

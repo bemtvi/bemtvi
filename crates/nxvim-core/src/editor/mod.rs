@@ -1467,15 +1467,14 @@ impl Editor {
         // intercepts only the engine's control keys); `menu_grabs_input()` is
         // false for it.
         //
-        // The **picker** routes its nameable keys through the `picker` keymap bucket
-        // (the matcher fires them as `apply_picker_action` ahead of this), so only an
-        // unmapped key reaches here — handled as query text. A promptless `select`
-        // still grabs every key in core (legacy; converted in a later phase).
+        // Both grabbing menus route their nameable keys through their own keymap
+        // bucket (the matcher fires them as `apply_picker_action` / `apply_select_
+        // action` ahead of this), so only an *unmapped* key reaches here. A picker
+        // handles it as query text; a promptless `select` has no query, so an
+        // unmapped key is inert.
         if self.menu_grabs_input() {
             if self.key_context() == KeyContext::Picker {
                 self.handle_picker_text(key);
-            } else {
-                self.handle_menu(key);
             }
             return;
         }

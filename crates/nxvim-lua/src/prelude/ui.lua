@@ -90,6 +90,42 @@ function vim.ui.select(items, opts, on_choice)
   select_into(items, opts, on_choice or function() end)
 end
 
+-- ----- rebindable select keys -----------------------------------------------
+-- Like the picker, a promptless `nx.ui.select` list is driven through the keymap
+-- engine, NOT a hardcoded grab: the server selects the `select` bucket while the
+-- list owns input, so navigation / confirm / cancel are configurable with
+-- `nx.keymap.set('select', '<key>', nx.ui.select_actions.<name>)`. Each action fires
+-- through the engine (nx._select_action -> Editor::apply_select_action). A select
+-- list has NO query, so there is no text fallthrough — an unmapped key is inert.
+nx.ui.select_actions = nx.ui.select_actions or {}
+for _, name in ipairs({ "next", "prev", "first", "last", "confirm", "cancel" }) do
+  nx.ui.select_actions[name] = function()
+    nx._select_action(name)
+  end
+end
+
+-- The default select bindings — `default = true` so a user `nx.keymap.set('select',
+-- …)` wins, and an empty-function map disables a key. `gg` is a two-key default map
+-- (the multi-key widget map the same trie handles); these mirror the vim-style list
+-- keys select used to hardcode.
+for _, m in ipairs({
+  { "<C-n>", "next", "Next item" },
+  { "<Down>", "next", "Next item" },
+  { "j", "next", "Next item" },
+  { "<C-p>", "prev", "Previous item" },
+  { "<Up>", "prev", "Previous item" },
+  { "k", "prev", "Previous item" },
+  { "gg", "first", "First item" },
+  { "<Home>", "first", "First item" },
+  { "G", "last", "Last item" },
+  { "<End>", "last", "Last item" },
+  { "<CR>", "confirm", "Confirm selection" },
+  { "<Esc>", "cancel", "Cancel" },
+  { "q", "cancel", "Cancel" },
+}) do
+  nx.keymap.set("select", m[1], nx.ui.select_actions[m[2]], { default = true, desc = m[3] })
+end
+
 -- ----- nx.ui.input [alias vim.ui.input] --------------------------------------
 -- nx.ui.input(opts) -> a PROMISE that resolves to the entered string on <CR>, or
 -- to nil on <Esc> (cancel). Promise-only: there is no on_confirm argument (passing

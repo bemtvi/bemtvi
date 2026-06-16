@@ -7,9 +7,12 @@
 //!
 //! Two orthogonal capabilities make it one shape instead of three:
 //!
-//! - **prompt** (`Some` ⇒ picker, `None` ⇒ select). With a prompt, keystrokes edit
-//!   a query field and **never reach the document**; navigation is `<C-n>`/`<C-p>`/
-//!   arrows. Without one, the list is driven vim-style (`j`/`k`/`gg`/`G`).
+//! - **prompt** (`Some` ⇒ picker, `None` ⇒ select). Both grab input through their
+//!   own keymap bucket (`picker` / `select`) — every nameable key is a default map
+//!   (`apply_picker_action` / `apply_select_action`), rebindable like any mode. With
+//!   a prompt the one residual key is a printable char editing the query (it **never
+//!   reaches the document**); a promptless list has no query, so an unmapped key is
+//!   inert.
 //! - **dynamic** — a *static* source is fuzzy-matched **locally in Rust** as the
 //!   query changes ([`crate::fuzzy`]); a *dynamic* source (live grep) bypasses the
 //!   matcher and the widget forwards each query edit to the source under a
@@ -272,8 +275,6 @@ pub(crate) struct Menu {
     /// makes a newline) and flips `true` on the first navigation.
     selected_active: bool,
     placement: MenuPlacement,
-    /// The `gg`-pending flag (two-key motion), select-mode only.
-    gpending: bool,
     /// The input-grab query field — `Some` for a picker, `None` for `select`.
     prompt: Option<Prompt>,
     /// The match query for a [`MenuKind::Complete`] menu: the word prefix left of
@@ -478,7 +479,6 @@ impl Editor {
             cursor: cursor.min(last),
             selected_active: true,
             placement,
-            gpending: false,
             prompt: None,
             complete_prefix: String::new(),
             prompt_pos: PromptPos::default(),
@@ -520,7 +520,6 @@ impl Editor {
             cursor: 0,
             selected_active: true,
             placement,
-            gpending: false,
             prompt: Some(Prompt::default()),
             complete_prefix: String::new(),
             prompt_pos,
@@ -689,7 +688,6 @@ impl Editor {
             // manual trigger passes `preselect = true` to highlight the first row.
             selected_active: preselect,
             placement: MenuPlacement::Cursor,
-            gpending: false,
             prompt: None,
             complete_prefix: prefix.to_string(),
             prompt_pos: PromptPos::default(),
@@ -793,45 +791,57 @@ impl Editor {
     }
 
     /// Which key context owns input — [`KeyContext::Picker`] while a prompted picker
-    /// grabs input (it routes keys through the `picker` keymap bucket), otherwise
-    /// [`KeyContext::Editing`]. A promptless `select` menu still grabs in core
-    /// (legacy, converted in a later phase), so it reports `Editing` like the buffer.
+    /// grabs input, [`KeyContext::Select`] while a promptless `nx.ui.select` list
+    /// does (each routes keys through its own keymap bucket), otherwise
+    /// [`KeyContext::Editing`] (the buffer, or a non-grabbing completion menu whose
+    /// typing flows on to the document).
     pub fn key_context(&self) -> KeyContext {
-        if self.menu_kind() == Some(MenuKind::Picker) {
-            KeyContext::Picker
-        } else {
-            KeyContext::Editing
+        match self.menu_kind() {
+            Some(MenuKind::Picker) => KeyContext::Picker,
+            Some(MenuKind::Select) => KeyContext::Select,
+            _ => KeyContext::Editing,
         }
     }
 
-    /// Handle a keystroke while a promptless `select` menu has focus. `<CR>` confirms
-    /// the highlighted row (pushing its source key onto [`Editor::menu_results`]);
-    /// `<Esc>` / `q` cancels; otherwise the list is driven `j`/`k`/`gg`/`G`. The
-    /// **picker** no longer routes here — its keys are `picker`-bucket maps dispatched
-    /// via [`apply_picker_action`](Self::apply_picker_action), so this is select-only.
-    pub(crate) fn handle_menu(&mut self, key: Key) {
+    /// Apply a named `select` action, dispatched by a `select`-bucket keymap (the
+    /// default maps in `prelude/ui.lua`, or a user override). The rebindable
+    /// operations of the promptless list: `next`/`prev` move the highlight,
+    /// `first`/`last` jump to the ends, `confirm` resolves the highlighted row
+    /// (pushing its source key onto [`Editor::menu_results`]) and `cancel` dismisses
+    /// it. An unknown name fails loud per the no-silent-stub rule.
+    pub fn apply_select_action(&mut self, action: &str) -> Result<(), String> {
         self.message.clear();
-
-        // Confirm: resolve the highlighted filtered row to its source key.
-        if key.code == KeyCode::Enter {
-            let chosen = self.menu.as_ref().and_then(|m| {
-                (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
-            });
-            if let Some(key) = chosen {
-                self.menu_results.push(Some(key));
-                self.close_menu();
+        match action {
+            "confirm" => {
+                let chosen = self.menu.as_ref().and_then(|m| {
+                    (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
+                });
+                if let Some(key) = chosen {
+                    self.menu_results.push(Some(key));
+                    self.close_menu();
+                }
+                return Ok(());
             }
-            return;
+            "cancel" => {
+                self.menu_results.push(None);
+                self.close_menu();
+                return Ok(());
+            }
+            _ => {}
         }
 
-        // Cancel: `<Esc>` or bare `q` (a promptless select has no query to type into).
-        if key.code == KeyCode::Esc || matches!(key.as_char(), Some('q')) {
-            self.menu_results.push(None);
-            self.close_menu();
-            return;
+        let Some(menu) = self.menu.as_mut() else {
+            return Ok(());
+        };
+        let last = menu.view_len().saturating_sub(1);
+        match action {
+            "next" => menu.cursor = (menu.cursor + 1).min(last),
+            "prev" => menu.cursor = menu.cursor.saturating_sub(1),
+            "first" => menu.cursor = 0,
+            "last" => menu.cursor = last,
+            other => return Err(format!("unknown select action {other:?}")),
         }
-
-        self.handle_select_key(key);
+        Ok(())
     }
 
     /// The picker's text fallthrough: an unmapped printable key inserts into the
@@ -962,35 +972,6 @@ impl Editor {
         };
         if let Some(sig) = signal {
             self.picker_query_changes.push(sig);
-        }
-    }
-
-    /// Promptless `select`-mode keys: vim-style list navigation, no query.
-    fn handle_select_key(&mut self, key: Key) {
-        let Some(menu) = self.menu.as_mut() else {
-            return;
-        };
-        let last = menu.view_len().saturating_sub(1);
-
-        // `gg` is two keys; the first `g` arms `gpending`.
-        if menu.gpending {
-            menu.gpending = false;
-            if key.as_char() == Some('g') {
-                menu.cursor = 0;
-            }
-        } else if key.as_char() == Some('g') {
-            menu.gpending = true;
-        } else {
-            match (key.code, key.as_char()) {
-                (KeyCode::Down, _) | (_, Some('j')) => menu.cursor = (menu.cursor + 1).min(last),
-                (KeyCode::Char('n'), _) if key.ctrl => menu.cursor = (menu.cursor + 1).min(last),
-                (KeyCode::Up, _) | (_, Some('k')) => menu.cursor = menu.cursor.saturating_sub(1),
-                (KeyCode::Char('p'), _) if key.ctrl => menu.cursor = menu.cursor.saturating_sub(1),
-                (_, Some('G')) => menu.cursor = last,
-                (KeyCode::Home, _) => menu.cursor = 0,
-                (KeyCode::End, _) => menu.cursor = last,
-                _ => {}
-            }
         }
     }
 

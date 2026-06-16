@@ -39,6 +39,9 @@ pub enum KeyContext {
     Editing,
     /// A prompted fuzzy picker (`nx.picker`) grabs input; its `picker` bucket applies.
     Picker,
+    /// A promptless selectable list (`nx.ui.select`) grabs input; its `select`
+    /// bucket applies. No query — every key is a map (an unmapped key is inert).
+    Select,
 }
 
 impl Mode {

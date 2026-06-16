@@ -120,11 +120,17 @@ same cost any mapped key already pays).
   default no longer fires; `<Nop>` disables; an unmapped printable still edits the
   query; a normal-mode `<C-n>` map does **not** leak into the picker.
 
-### Phase 2 — `nx.ui.select` (the promptless list, `'S'` bucket)
+### Phase 2 — `nx.ui.select` (the promptless list, `'S'` bucket)  ✅ LANDED (2026-06-16)
 
-Convert `handle_select_key` (`j`/`k`/`gg`/`G`/`<C-n>`/`<C-p>`/`<CR>`/`<Esc>`/`q`) to
-`select` default maps + `SelectAction`. `gg` becomes a two-key default map (proving
-multi-key widget maps through the same trie).
+Converted `handle_select_key` (`j`/`k`/`gg`/`G`/`<C-n>`/`<C-p>`/`<CR>`/`<Esc>`/`q`) to
+`select` default maps (`prelude/ui.lua`) + `Editor::apply_select_action` (next / prev
+/ first / last / confirm / cancel), dispatched via `nx.ui.select_actions` →
+`nx._select_action` → `Shared.select_actions`. `KeyContext::Select` + the `'S'`
+bucket; the select arm of `Editor::input` is now inert (a promptless list has no text
+fallthrough). `gg` is a two-key default map — the multi-key widget map the same trie
+handles. `handle_menu` / `handle_select_key` and the `Menu::gpending` field are gone.
+Tests: `tests/widget_keys.rs` (default nav+confirm, `gg` jump, user rebind, no
+editing-map leak); all 8 existing `ui_select.rs` tests pass unchanged.
 
 ### Phase 3 — the panel (`'L'`) and explorer (`'E'`)
 

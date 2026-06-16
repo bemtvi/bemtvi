@@ -155,3 +155,99 @@ async fn unmapped_printable_edits_query() {
     // The keystroke never reached the document.
     assert_eq!(lines(&rpc).await, vec![""]);
 }
+
+// ===== Phase 2: nx.ui.select (the promptless list, 'select' bucket) ==========
+
+/// Open a three-item `nx.ui.select` whose `:next` records the chosen item in
+/// `_G.chosen`; a barrier settles the open.
+async fn open_select(rpc: &Rpc, extra: &str) {
+    exec_lua(
+        rpc,
+        &format!(
+            "{extra}\n\
+             _G.chosen = nil\n\
+             nx.ui.select({{ 'alpha', 'beta', 'gamma' }}, {{}}):next(function(item)\n\
+               _G.chosen = item\n\
+             end)"
+        ),
+    )
+    .await;
+    barrier(rpc).await;
+}
+
+async fn chosen(rpc: &Rpc) -> Option<String> {
+    exec_lua(rpc, "return _G.chosen")
+        .await
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The default select keys still navigate + confirm through the keymap engine:
+/// `j` moves down one (alpha -> beta), `<CR>` confirms.
+#[tokio::test]
+async fn select_default_keys_navigate_and_confirm() {
+    let dir = temp_dir("widget_keys_select_default");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_select(&rpc, "").await;
+
+    feed(&rpc, "j");
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(chosen(&rpc).await.as_deref(), Some("beta"));
+}
+
+/// `gg` is a two-key `select` default map (the multi-key widget map the trie
+/// handles): from the last item it jumps back to the first.
+#[tokio::test]
+async fn select_gg_two_key_map_jumps_to_first() {
+    let dir = temp_dir("widget_keys_select_gg");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_select(&rpc, "").await;
+
+    feed(&rpc, "G"); // last (gamma)
+    feed(&rpc, "gg"); // back to first (alpha)
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(chosen(&rpc).await.as_deref(), Some("alpha"));
+}
+
+/// A user `nx.keymap.set('select', …)` rebinds a select action to a new key.
+#[tokio::test]
+async fn select_user_rebind() {
+    let dir = temp_dir("widget_keys_select_rebind");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_select(
+        &rpc,
+        "nx.keymap.set('select', '<C-j>', nx.ui.select_actions.last)",
+    )
+    .await;
+
+    feed(&rpc, "<C-j>"); // rebound: jump to last (gamma)
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(chosen(&rpc).await.as_deref(), Some("gamma"));
+}
+
+/// An editing-mode `j` map does NOT leak into the select list: `j` still moves the
+/// highlight (the select map), and the normal-mode map never fires.
+#[tokio::test]
+async fn select_editing_map_does_not_leak() {
+    let dir = temp_dir("widget_keys_select_noleak");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_select(
+        &rpc,
+        "_G.leaked = false\n\
+         nx.keymap.set('n', 'j', function() _G.leaked = true end)",
+    )
+    .await;
+
+    feed(&rpc, "j"); // select's next, NOT the normal-mode map
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(chosen(&rpc).await.as_deref(), Some("beta"));
+    assert_eq!(
+        exec_lua(&rpc, "return _G.leaked").await.as_bool(),
+        Some(false),
+        "the normal-mode j map never fired inside the select list"
+    );
+}

@@ -200,6 +200,13 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
+        // Select actions a `select`-bucket keymap fired (`nx._select_action`): apply
+        // each to the open `nx.ui.select` list. Unknown names fail loud.
+        for action in self.lua.take_select_actions() {
+            if let Err(e) = self.editor.apply_select_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
         // Panel requests from `vim.panel.*` drive the core's panel state.
         for op in self.lua.take_panel_ops() {
             match op {

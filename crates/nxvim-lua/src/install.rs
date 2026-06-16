@@ -1616,6 +1616,18 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._select_action(name)`: a `select`-bucket keymap fired the named action
+    // (next / prev / first / last / confirm / cancel) on the open `nx.ui.select`
+    // list; the server applies it via `Editor::apply_select_action`. The select-mode
+    // sibling of `nx._picker_action`.
+    let sh = shared.clone();
+    nx.set(
+        "_select_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().select_actions.push(name);
+            Ok(())
+        })?,
+    )?;
 
     // `nx._decor_register()`: a `nx.decor.provider` was registered — flip the live
     // gate so the server starts dispatching viewport-change signals to providers.

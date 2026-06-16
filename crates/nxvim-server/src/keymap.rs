@@ -89,6 +89,7 @@ pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
     match ctx {
         KeyContext::Editing => None,
         KeyContext::Picker => Some('P'),
+        KeyContext::Select => Some('S'),
     }
 }
 
@@ -741,6 +742,7 @@ fn mode_buckets(code: &str) -> &'static [char] {
         // editor-mode bucket above so widget maps never leak into editing and vice
         // versa. Phase 1 adds `picker`; select / panel / explorer follow.
         "picker" => &['P'],
+        "select" => &['S'],
         "" => &['n', 'v', 'V', 'm'],
         _ => &[],
     }

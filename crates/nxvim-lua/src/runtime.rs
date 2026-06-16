@@ -500,6 +500,10 @@ pub(crate) struct Shared {
     /// drained by the server into `Editor::apply_picker_action` — the rebindable
     /// picker keys (next / prev / confirm / cancel / preview scroll / query edit).
     pub(crate) picker_actions: Vec<String>,
+    /// Named `select` actions a `select`-bucket keymap fired (`nx._select_action`),
+    /// drained by the server into `Editor::apply_select_action` — the rebindable
+    /// `nx.ui.select` keys (next / prev / first / last / confirm / cancel).
+    pub(crate) select_actions: Vec<String>,
     /// Whether any `nx.decor` provider has been registered (`nx._decor_register`).
     /// The gate the server checks before dispatching a viewport-change signal: while
     /// no provider is set it skips the whole off-tick decor path (never slices the
@@ -1004,6 +1008,12 @@ impl LuaRuntime {
         /// Take the named picker actions fired since the last drain, for the server
         /// to apply to the open picker via `Editor::apply_picker_action`.
         take_picker_actions -> Vec<String> = picker_actions
+    }
+
+    take_queue! {
+        /// Take the named select actions fired since the last drain, for the server
+        /// to apply to the open `nx.ui.select` list via `Editor::apply_select_action`.
+        take_select_actions -> Vec<String> = select_actions
     }
 
     take_queue! {

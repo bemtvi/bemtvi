@@ -130,8 +130,17 @@ pub struct Engine {
     /// (an existing neovim `site/`). A grammar's parser *and* its queries are
     /// loaded from the first root that has the parser, so the pair stays matched.
     roots: Vec<PathBuf>,
-    grammars: HashMap<String, Slot>,
+    // Field order matters for drop. `buffers` (each `BufferState`'s `Parser`, and
+    // the `Tree`s under it) must drop **before** `grammars`, which owns the dlopen'd
+    // grammar libraries (`Slot::Loaded(Grammar)._lib`) that every `Language`, tree,
+    // and external scanner lives inside. A parser left mid-parse — e.g. a reparse
+    // cancelled by `PARSE_DEADLINE` on a large file — keeps a non-null external
+    // scanner payload, so `Parser::drop` → `ts_parser_delete` calls the grammar's
+    // `external_scanner.destroy` through the `TSLanguage`. If the library had already
+    // been unloaded, that call dereferences unmapped memory and segfaults at exit.
+    // Rust drops fields in declaration order, so `buffers` is declared first.
     buffers: HashMap<BufferId, BufferState>,
+    grammars: HashMap<String, Slot>,
     /// Query-text overrides from the resolution bridge, consulted by
     /// [`Grammar::load`] and applied in place by [`Engine::set_query`].
     query_overrides: QueryOverrides,
@@ -144,8 +153,8 @@ impl Engine {
         Engine {
             data_dir,
             roots,
-            grammars: HashMap::new(),
             buffers: HashMap::new(),
+            grammars: HashMap::new(),
             query_overrides: QueryOverrides::new(),
         }
     }

@@ -224,6 +224,10 @@ pub struct NativeDefault {
     pub lhs: &'static str,
     /// What fires when the LHS matches.
     pub action: BuiltinAction,
+    /// A friendly description, surfaced to the [`KeyPending`] event (which-key /
+    /// showcmd) as the continuation's label — so a built-in default reads as nicely
+    /// as a user map. Never empty for a shipped default.
+    pub desc: &'static str,
 }
 
 /// A unit of work [`Keymaps::feed`] hands back for the server to apply, in order.
@@ -452,7 +456,7 @@ impl Keymaps {
                 nowait: false,
                 silent: false,
                 expr: false,
-                desc: None,
+                desc: (!d.desc.is_empty()).then(|| d.desc.to_string()),
             };
             for &bucket in mode_buckets(d.mode) {
                 self.tries

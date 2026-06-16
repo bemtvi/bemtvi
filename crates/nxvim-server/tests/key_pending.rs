@@ -192,6 +192,22 @@ async fn map_without_desc_has_empty_desc() {
     assert_eq!(events(&rpc).await, "n|<Space>|w//map");
 }
 
+/// The built-in **native default** maps carry friendly descriptions too: typing `g`
+/// withholds it (a prefix of the LSP `gd`/`gD`/`gr` defaults) and the pending event
+/// lists those continuations with their shipped `desc`, exactly like a user map — so
+/// which-key shows nice labels for the built-ins with no user config. (Sorted by key
+/// notation: `D` < `d` < `r`.)
+#[tokio::test]
+async fn native_default_continuations_carry_descriptions() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER).await;
+    feed(&rpc, "g");
+    assert_eq!(
+        events(&rpc).await,
+        "n|g|D/Go to declaration/map,d/Go to definition/map,r/Find references/map"
+    );
+}
+
 /// With no `nx.on_key_pending` listener registered the editor still maps + fires
 /// normally — the gate adds no behavior of its own (and the server never walks the
 /// trie for continuations).

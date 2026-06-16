@@ -1722,36 +1722,43 @@ where
             mode: "n",
             lhs: "gd",
             action: BuiltinAction::Lsp(LspReqKind::Definition),
+            desc: "Go to definition",
         },
         NativeDefault {
             mode: "n",
             lhs: "gD",
             action: BuiltinAction::Lsp(LspReqKind::Declaration),
+            desc: "Go to declaration",
         },
         NativeDefault {
             mode: "n",
             lhs: "gr",
             action: BuiltinAction::Lsp(LspReqKind::References),
+            desc: "Find references",
         },
         NativeDefault {
             mode: "n",
             lhs: "K",
             action: BuiltinAction::Lsp(LspReqKind::Hover),
+            desc: "Hover documentation",
         },
         NativeDefault {
             mode: "i",
             lhs: "<C-Space>",
             action: BuiltinAction::CompleteTrigger,
+            desc: "Trigger completion",
         },
         NativeDefault {
             mode: "i",
             lhs: "<C-x><C-o>",
             action: BuiltinAction::CompleteTrigger,
+            desc: "Trigger completion (omni)",
         },
         NativeDefault {
             mode: "i",
             lhs: "<C-k>",
             action: BuiltinAction::Lsp(LspReqKind::SignatureHelp),
+            desc: "Signature help",
         },
     ]);
 

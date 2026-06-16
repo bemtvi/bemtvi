@@ -315,6 +315,14 @@ impl EditHost {
         let virt_text = self.virt_text_for(win.buffer, &win.numbers, styles);
         #[cfg(not(feature = "native"))]
         let virt_text = Value::Array(Vec::new());
+        // Extmark `virt_lines` (whole virtual rows). Core already interleaved them
+        // into the window's rows (`win.virt_lines`, aligned with `lines`); the server
+        // only resolves each chunk's `hl_group` to a frame style id. Native-only, like
+        // the other extmark projections; the wasm edit-host emits an empty array.
+        #[cfg(feature = "native")]
+        let virt_lines = self.virt_lines_value(&win.virt_lines, styles);
+        #[cfg(not(feature = "native"))]
+        let virt_lines = Value::Array(Vec::new());
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
             self.diagnostics_for(win.buffer, &win.numbers, styles),
@@ -452,6 +460,7 @@ impl EditHost {
             (Value::from("diagnostics"), diagnostics),
             (Value::from("diagnostics_virt"), diagnostics_virt),
             (Value::from("virt_text"), virt_text),
+            (Value::from("virt_lines"), virt_lines),
             (Value::from("diagnostics_signs"), diagnostics_signs),
             (Value::from("sign_column"), Value::from(sign_column)),
             (Value::from("inlay_hints"), inlay_hints),

@@ -1,6 +1,7 @@
 # Virtual text rendering (extmark `virt_text` + `virt_lines`)
 
-Status: **in progress** — Phases 1–4 **done** 2026-06-16; Phase 5 next.
+Status: **in progress** — Phases 1–5 **done** 2026-06-16; Phase 6 (polish + GUI/web
+paint parity) next.
 
 **Client coverage note:** rendering is implemented in the **TUI** (`nxvim-tui`,
 the agent-verifiable reference client) for every phase. The **GUI** (`nxvim-gui`)
@@ -142,17 +143,43 @@ tests per project convention).
   `replace`, the default — noted at `virt_chunk_style`); `virt_text_hide` (its
   "covered" semantics are a refinement — stored in core, not yet honored).
 
-- **Phase 5 — `virt_lines` (screen-row expansion).** The big one.
-  - 5a (core): a `plines`-style helper — extra screen rows a buffer line's
-    `virt_lines` adds (above+below). Integrate into `window_view` scroll/`top`
-    math and `cursor_row` so the cursor stays visible with virtual lines present.
-  - 5b (server): `window_value` interleaves virtual rows into the per-row arrays;
-    virtual rows get `numbers[i]=None` + a row-kind flag distinguishing them from
-    `~` fillers, and carry their chunk content (new `virt_lines` wire key or a
-    row-kind + chunks array).
-  - 5c (clients): render virtual rows from chunks — no gutter number, no cursor,
-    `virt_lines_leftcol` honored. TUI + GUI + web.
-  - Tests: above/below placement, scroll keeps cursor visible past virtual lines.
+- **Phase 5 — `virt_lines` (screen-row expansion). ✅ DONE.** The big one.
+  **Design deviation from the 5a/5b split below:** the per-row interleaving lives
+  in **core** (`view::window_rows`), not the server. Every server per-row
+  projection (`highlights_for` / `virt_text_for` / `diagnostics_*` / `inlay_hints_for`)
+  already keys off `win.numbers` as the row→buffer-line map, so emitting virtual rows
+  as `numbers[i] == None` entries makes them skip those rows automatically — strictly
+  less churn than re-interleaving every array server-side, and it keeps all row layout
+  in `view.rs` (its stated role: the single source of truth for row content). The
+  server only resolves the new rows' chunk styles.
+  - 5a (core): `Buffer::virt_lines_by_line` buckets each line's `virt_lines` into
+    `(above, below)` chunk rows. `cursor.rs` `cursor_screen_row` / `scroll_top_for_bottom`
+    make `ensure_visible` plines-aware (a line spends `1 + above + below` screen rows),
+    so the cursor stays visible past virtual lines; `window_view` computes `cursor_row`
+    and the secondary cursors as *screen* rows via `screen_row_of`.
+  - 5b (core view, not server): `window_rows` lays out `height` screen rows,
+    expanding each buffer line into `[above…][text][below…]`. A virtual row gets
+    `numbers[i]=None`, `lines[i]=""`, and its chunks in the new `WindowView.virt_lines`
+    parallel array; `scatter_rows` re-aligns the buffer-line-indexed selection / search
+    arrays onto the expanded rows. The server adds the `virt_lines` wire key
+    (`extmarks.rs::virt_lines_value` — shares `virt_chunks_value` with `virt_text`);
+    native-only, empty on wasm like the other extmark projections.
+  - 5c (clients): `nxvim-view` `parse_virt_lines` + `WindowView.virt_lines`; **TUI**
+    `render_text` paints a virtual row via `virt_line` (chunk text in its resolved
+    style, no gutter number, no cursor, no `~`) — the agent-verifiable reference. GUI +
+    web paint parity is batched into Phase 6 (the wire data already reaches them).
+    `virt_lines_leftcol` / horizontal scroll of virtual rows is a Phase-6 refinement
+    (today they start at the text body's left edge).
+  - Tests (`crates/nxvim/tests/extmarks.rs`):
+    `virt_lines_interleave_above_and_below_their_line` (above/below placement +
+    surrounding line order/numbers) and
+    `scroll_accounts_for_virt_lines_to_keep_the_cursor_visible` (fills the buffer to
+    exactly the text height, attaches 3 virtual lines below line 1, jumps to the last
+    line, and asserts line 1 scrolled off — which only happens with plines-aware
+    scrolling).
+  - **Deferred to Phase 6:** virtual rows do **not** ride the scroll-animation band
+    (`ScrollAnim` is buffer-line-based; virtual rows simply don't slide and appear at
+    the settled frame); `virt_lines_leftcol`; GUI/web paint.
 
 - **Phase 6 — Polish + parity.** `hl_mode` `combine`/`blend` (deferred from Phase
   4 — merge the chunk highlight with the cells under an overlay; today all render
@@ -161,8 +188,12 @@ tests per project convention).
   wire data already reaches them; only `nxvim-gui` / web render code is pending —
   see the client-coverage note up top); priority ordering of multiple virt_text
   marks on one row; `virt_text_repeat_linebreak` (no-op without wrap, documented);
-  wasm edit-host parity (cfg-gate as needed); runnable `examples/virt-text/` config
-  + sample file verified end-to-end (per repo convention).
+  wasm edit-host parity (cfg-gate as needed).
+  - **`examples/virt-text/` added** (`init.lua` + `sample.txt`) covering every
+    `virt_text` position **and** `virt_lines` (above / below). ⚠️ Written but **not yet
+    verified end-to-end** — the build/run was blocked by an unavailable environment;
+    run `NXVIM_CONFIG=examples/virt-text cargo run -p nxvim -- examples/virt-text/sample.txt`
+    to confirm before considering the repo-convention box ticked.
 
 ## Risks / open questions
 

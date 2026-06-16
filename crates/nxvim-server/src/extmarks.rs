@@ -201,6 +201,19 @@ impl EditHost {
         chunks: &[VirtChunk],
         styles: &mut StyleTable,
     ) -> Value {
+        Value::Array(vec![
+            Value::from(pos),
+            Value::from(col),
+            Value::from(hl_mode),
+            self.virt_chunks_value(chunks, styles),
+        ])
+    }
+
+    /// Resolve a chunk run to the wire form `[[text, style_id], …]`: each chunk's
+    /// `hl_group` interned into the per-frame `styles` palette (`Nil` when absent or
+    /// unresolved, so the client paints in normal colors). Shared by `virt_text` and
+    /// `virt_lines`.
+    fn virt_chunks_value(&self, chunks: &[VirtChunk], styles: &mut StyleTable) -> Value {
         let chunks: Vec<Value> = chunks
             .iter()
             .map(|c| {
@@ -214,12 +227,28 @@ impl EditHost {
                 Value::Array(vec![Value::from(c.text.as_str()), style_id])
             })
             .collect();
-        Value::Array(vec![
-            Value::from(pos),
-            Value::from(col),
-            Value::from(hl_mode),
-            Value::Array(chunks),
-        ])
+        Value::Array(chunks)
+    }
+
+    /// Build the per-row `virt_lines` payload from the view's interleaved layout:
+    /// for each visible screen row, the chunk run `[[text, style_id], …]` when that
+    /// row is a **virtual line** (the core view set `win.virt_lines[row]`), else
+    /// `Nil`. Unlike `virt_text_for`, the *placement* (which rows are virtual, and in
+    /// what order) is already decided in core — this only resolves the chunk styles.
+    pub(crate) fn virt_lines_value(
+        &self,
+        virt_lines: &[Option<Vec<VirtChunk>>],
+        styles: &mut StyleTable,
+    ) -> Value {
+        Value::Array(
+            virt_lines
+                .iter()
+                .map(|row| match row {
+                    Some(chunks) => self.virt_chunks_value(chunks, styles),
+                    None => Value::Nil,
+                })
+                .collect(),
+        )
     }
 }
 

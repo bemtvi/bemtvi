@@ -77,6 +77,16 @@ pub struct VirtChunk {
     pub hl_group: Option<String>,
 }
 
+/// The `virt_lines` (whole extra screen rows) anchored on one buffer line, split
+/// by where they draw: `above` the line or `below` it. Each inner `Vec<VirtChunk>`
+/// is one virtual line's chunk run. Returned per line by
+/// [`Buffer::virt_lines_by_line`](crate::Buffer::virt_lines_by_line).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtLineRows {
+    pub above: Vec<Vec<VirtChunk>>,
+    pub below: Vec<Vec<VirtChunk>>,
+}
+
 /// Where a mark's `virt_text` is drawn, relative to the buffer line it anchors
 /// to (neovim's `virt_text_pos`, plus the fixed-column `virt_text_win_col`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

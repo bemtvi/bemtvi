@@ -334,13 +334,64 @@ impl Editor {
         let th = self.text_height();
         if self.cursor.line < self.top {
             self.top = self.cursor.line;
-        } else if self.cursor.line >= self.top + th {
-            self.top = self.cursor.line + 1 - th;
+        } else if self.cursor_screen_row() >= th {
+            // The cursor's text row fell off the bottom — pull `top` down (up the
+            // buffer) far enough that the cursor and every line above it (with their
+            // `virt_lines`) fit in `th` rows, leaving the cursor on the last row, as
+            // vim does. Without `virt_lines` this is exactly `top = cursor + 1 - th`.
+            self.top = self.scroll_top_for_bottom(self.cursor.line, th);
         }
         // Horizontal scroll follows the cursor on the same beat as the vertical
         // one, so every motion that calls `ensure_visible` also keeps the cursor's
         // column on screen under `nowrap`.
         self.ensure_visible_horizontal();
+    }
+
+    /// The cursor's text row within the focused window's text body, counting the
+    /// `virt_lines` rows of every buffer line from `top` up to the cursor (and the
+    /// cursor line's own `virt_lines_above`). Equals `cursor.line - top` when no
+    /// virtual lines are in play. Saturates past the bottom (the caller compares it
+    /// against the text height to decide whether to scroll).
+    pub(crate) fn cursor_screen_row(&self) -> usize {
+        if self.cursor.line < self.top {
+            return 0;
+        }
+        let buf = self.buffer();
+        let virt = buf.virt_lines_by_line();
+        let mut rows = 0;
+        for line in self.top..self.cursor.line {
+            rows += virt
+                .get(&line)
+                .map_or(1, |r| 1 + r.above.len() + r.below.len());
+        }
+        // The cursor's own row sits *after* its `virt_lines_above`.
+        rows + virt.get(&self.cursor.line).map_or(0, |r| r.above.len())
+    }
+
+    /// The largest `top` (≤ `target`) such that buffer line `target`'s text row and
+    /// every line above it down to `top` — each counted with its `virt_lines` rows —
+    /// fit within `th` screen rows, i.e. `target` lands on the bottom text row. The
+    /// `virt_lines_below` of `target` may spill past the bottom (its text stays
+    /// visible). Used to scroll down just enough to reveal a cursor below the fold.
+    fn scroll_top_for_bottom(&self, target: usize, th: usize) -> usize {
+        let buf = self.buffer();
+        let virt = buf.virt_lines_by_line();
+        // The target line itself spends its `virt_lines_above` + text row at the
+        // bottom of the window; its `virt_lines_below` are allowed to overflow.
+        let mut rows = 1 + virt.get(&target).map_or(0, |r| r.above.len());
+        let mut top = target;
+        while top > 0 {
+            let prev = top - 1;
+            let p = virt
+                .get(&prev)
+                .map_or(1, |r| 1 + r.above.len() + r.below.len());
+            if rows + p > th {
+                break;
+            }
+            rows += p;
+            top = prev;
+        }
+        top
     }
 
     /// Keep the cursor's screen column within the focused window's text area by

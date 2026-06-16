@@ -350,6 +350,40 @@ pub(crate) fn parse_virt_text(value: Option<&Value>) -> Vec<Vec<VirtPlacement>> 
         .unwrap_or_default()
 }
 
+/// Parse the `virt_lines` redraw key into per-row optional virtual-line content:
+/// each row is `Nil` (a real text row or a `~` filler) or `[[text, style_id], …]`
+/// — the chunk run for a **virtual line** (a whole extra screen row the server
+/// interleaved above / below its buffer line). `Some(chunks)` is what tells the
+/// client a `None`-number row is a virtual line to paint (in its chunk styles) and
+/// not a `~` filler. Malformed chunks are dropped.
+pub(crate) fn parse_virt_lines(value: Option<&Value>) -> Vec<Option<Vec<VirtChunk>>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let chunks = row.as_array()?;
+                    Some(
+                        chunks
+                            .iter()
+                            .filter_map(|c| {
+                                let c = c.as_array()?;
+                                if c.len() != 2 {
+                                    return None;
+                                }
+                                Some((
+                                    c[0].as_str()?.to_string(),
+                                    c[1].as_u64().map(|id| id as usize),
+                                ))
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse the `inlay_hints` redraw key into per-row inline hints: each row is an
 /// array of `[col, text, style_id]` (empty for rows with none). Malformed entries
 /// are dropped. Same per-row-list shape as [`parse_diagnostics`], but each entry

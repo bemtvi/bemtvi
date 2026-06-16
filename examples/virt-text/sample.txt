@@ -1,0 +1,43 @@
+virtual text & virtual lines — an nxvim extmark demo
+
+This line gets an end-of-line (eol) note after its text.
+Inline text is spliced into the middle of this sentence.
+The word OVERLAY here is painted over by a virtual chunk.
+This line carries a right-aligned tag and a fixed-column marker.
+
+The block below is wrapped in virt_lines (whole virtual rows):
+def compute(value):
+    return value * 2 + 1
+
+Scroll past this point (jk / <C-d> / G) and the cursor stays
+visible even though the virtual lines above eat extra screen rows.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30

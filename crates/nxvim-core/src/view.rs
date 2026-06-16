@@ -14,6 +14,7 @@ use crate::buffer::Buffer;
 use crate::editor::{
     BorderStyle, BufferId, Cursor, Editor, MenuPlacement, TabLabel, WindowId, WindowLayout,
 };
+use crate::extmark::VirtChunk;
 use crate::mode::Mode;
 use crate::statusline::StatuslineCtx;
 use crate::unicode;
@@ -385,6 +386,14 @@ pub struct WindowView {
     /// text body. `None` for an ordinary text / terminal / directory buffer. See
     /// [`ImageView`].
     pub image: Option<ImageView>,
+    /// Per visible row (aligned with [`lines`](WindowView::lines)), the extmark
+    /// `virt_lines` content when that row is a **virtual line** (a whole extra
+    /// screen row interleaved above / below its buffer line), else `None`. A virtual
+    /// row also has `numbers[i] == None` and an empty [`lines`](WindowView::lines)
+    /// entry — but unlike a `~` filler past end-of-buffer, it carries chunks here, so
+    /// the client paints those chunks (no gutter number, no cursor) instead of `~`.
+    /// The server resolves each chunk's `hl_group` to a frame style id for the wire.
+    pub virt_lines: Vec<Option<Vec<VirtChunk>>>,
 }
 
 /// An image-preview window's payload ([`WindowView::image`]): just the filesystem
@@ -642,21 +651,38 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // inactive; clamp it for the rendered ruler / cursor row.
     let cur_line = w.cursor.line.min(line_count.saturating_sub(1));
 
-    let lines = window_lines(buf, top, height, line_count);
-    let numbers = window_numbers(top, height, line_count);
+    // The screen-row layout: each visible buffer line expands into its
+    // `virt_lines_above` rows, the text row, then its `virt_lines_below` rows
+    // (`window_rows`). With no `virt_lines` this is the old one-row-per-line band.
+    // Every other per-row array is built buffer-line-indexed and then *scattered*
+    // onto these screen rows via `numbers` (virtual / filler rows take the default),
+    // so they stay aligned with the interleaved `lines`.
+    let RowLayout {
+        lines,
+        numbers,
+        virt: virt_lines,
+    } = window_rows(buf, top, height, line_count);
     // The selection and incsearch preview belong to the focused window only.
     let selection = if w.focused {
-        selection_spans(ed, buf, width, line_count, top, height)
+        let by_line = selection_spans(ed, buf, width, line_count, top, height);
+        scatter_rows(&numbers, top, &by_line, None)
     } else {
-        vec![None; height]
+        vec![None; numbers.len()]
     };
     // Per-cursor visual selections of the secondary multi-cursors (focused only).
     let secondary_selection = if w.focused {
-        secondary_selection_spans(ed, buf, width, line_count, top, height)
+        let by_line = secondary_selection_spans(ed, buf, width, line_count, top, height);
+        scatter_rows(&numbers, top, &by_line, Vec::new())
     } else {
-        vec![Vec::new(); height]
+        vec![Vec::new(); numbers.len()]
     };
-    let (search, incsearch) = ed.search_highlights_in(buf, w.cursor, w.focused, top, height);
+    let (search, incsearch) = {
+        let (s, i) = ed.search_highlights_in(buf, w.cursor, w.focused, top, height);
+        (
+            scatter_rows(&numbers, top, &s, Vec::new()),
+            scatter_rows(&numbers, top, &i, None),
+        )
+    };
 
     let scroll = if w.focused {
         ed.pending_scroll().map(|ps| {
@@ -745,13 +771,13 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             .into_iter()
             .filter_map(|byte| {
                 let line = buf.byte_to_line(byte);
-                if line < top || line >= top + height {
-                    return None;
-                }
+                // The cursor's *screen* row in the interleaved layout (skips it when
+                // off-screen) — not `line - top`, which ignores virtual rows.
+                let row = screen_row_of(&numbers, line)?;
                 let col = byte - buf.line_start(line);
                 let s = buf.line(line);
                 let screen_col = unicode::virtcol(&s, col, buf.options.effective_tabstop());
-                Some((line - top, screen_col))
+                Some((row, screen_col))
             })
             .collect()
     } else {
@@ -813,7 +839,17 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         buffer: w.buffer,
         focused: w.focused,
         lines,
-        cursor_row: cur_line.saturating_sub(top).min(height.saturating_sub(1)),
+        // The cursor's *screen* row: where its buffer line lands in the interleaved
+        // layout (past any `virt_lines` above it). A stashed cursor of an unfocused
+        // window can sit outside the visible band (the buffer shrank, or it never
+        // scrolled to it) — clamp it to the nearest edge for the rendered ruler.
+        cursor_row: screen_row_of(&numbers, cur_line).unwrap_or_else(|| {
+            if cur_line < top {
+                0
+            } else {
+                height.saturating_sub(1)
+            }
+        }),
         leftcol: w.leftcol,
         cursor_col: w.cursor.col,
         cursor_screen_col,
@@ -840,6 +876,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         status_ctx,
         status_visible,
         image,
+        virt_lines,
     }
 }
 
@@ -924,6 +961,107 @@ fn window_lines(buf: &Buffer, base: usize, count: usize, line_count: usize) -> V
         }
     }
     lines
+}
+
+/// The interleaved screen-row layout of a window's text body (the parallel
+/// `lines` / `numbers` / `virt` arrays, each `height` long).
+struct RowLayout {
+    lines: Vec<String>,
+    numbers: Vec<Option<usize>>,
+    virt: Vec<Option<Vec<VirtChunk>>>,
+}
+
+/// Lay out `height` screen rows starting at buffer line `top`, **expanding** each
+/// buffer line that carries extmark `virt_lines` into extra rows: its
+/// `virt_lines_above` rows, then its text row, then its `virt_lines_below` rows.
+/// With no `virt_lines` this is one screen row per buffer line, `~`-padded past
+/// end-of-buffer — identical to [`window_lines`] / [`window_numbers`] combined.
+///
+/// A virtual row gets `numbers[i] == None` (so every server per-row projection,
+/// which keys on `numbers`, skips it like a `~` filler) and `lines[i] == ""`, and
+/// carries its chunk run in `virt[i]`. `virt[i].is_some()` is exactly what lets a
+/// client tell a virtual row from a `~` filler (both have a `None` number).
+fn window_rows(buf: &Buffer, top: usize, height: usize, line_count: usize) -> RowLayout {
+    let virt_by_line = buf.virt_lines_by_line();
+    let mut lines = Vec::with_capacity(height);
+    let mut numbers = Vec::with_capacity(height);
+    let mut virt: Vec<Option<Vec<VirtChunk>>> = Vec::with_capacity(height);
+    let push_virt = |lines: &mut Vec<String>,
+                     numbers: &mut Vec<Option<usize>>,
+                     virt: &mut Vec<Option<Vec<VirtChunk>>>,
+                     row: &[VirtChunk]| {
+        lines.push(String::new());
+        numbers.push(None);
+        virt.push(Some(row.to_vec()));
+    };
+    let mut buf_line = top;
+    while lines.len() < height {
+        if buf_line >= line_count {
+            // `~` filler past the end of the buffer (no number, no virtual content).
+            lines.push("~".to_string());
+            numbers.push(None);
+            virt.push(None);
+            continue;
+        }
+        let rows = virt_by_line.get(&buf_line);
+        if let Some(rows) = rows {
+            for vl in &rows.above {
+                if lines.len() >= height {
+                    break;
+                }
+                push_virt(&mut lines, &mut numbers, &mut virt, vl);
+            }
+        }
+        if lines.len() >= height {
+            break;
+        }
+        lines.push(buf.line(buf_line));
+        numbers.push(Some(buf_line + 1));
+        virt.push(None);
+        if let Some(rows) = rows {
+            for vl in &rows.below {
+                if lines.len() >= height {
+                    break;
+                }
+                push_virt(&mut lines, &mut numbers, &mut virt, vl);
+            }
+        }
+        buf_line += 1;
+    }
+    RowLayout {
+        lines,
+        numbers,
+        virt,
+    }
+}
+
+/// Screen row (index into the interleaved [`RowLayout::numbers`]) showing buffer
+/// line `line` (0-based), or `None` when it isn't on screen.
+fn screen_row_of(numbers: &[Option<usize>], line: usize) -> Option<usize> {
+    numbers.iter().position(|n| *n == Some(line + 1))
+}
+
+/// Scatter a buffer-line-indexed array (`by_line[0]` = buffer line `top`) onto the
+/// interleaved screen rows described by `numbers`, filling every virtual / `~`
+/// filler row (and any row whose buffer line falls past `by_line`) with `default`.
+/// This re-aligns the per-row arrays computed one-per-buffer-line (selection,
+/// search, …) with the expanded layout.
+fn scatter_rows<T: Clone>(
+    numbers: &[Option<usize>],
+    top: usize,
+    by_line: &[T],
+    default: T,
+) -> Vec<T> {
+    numbers
+        .iter()
+        .map(|num| match num {
+            Some(n) => by_line
+                .get((n - 1) - top)
+                .cloned()
+                .unwrap_or_else(|| default.clone()),
+            None => default.clone(),
+        })
+        .collect()
 }
 
 /// Compute, for each of the `count` rows starting at buffer line `base`, the

@@ -468,6 +468,43 @@ impl Buffer {
         self.text.byte_to_line_idx(byte_idx, LINE_TYPE)
     }
 
+    /// Collect every extmark's `virt_lines` (whole extra screen rows) keyed by the
+    /// buffer line they anchor on, split into the rows drawn **above** that line and
+    /// the rows drawn **below** it. Within a line the marks are visited in
+    /// `(start, priority, id)` order so stacked virtual lines are stable, and each
+    /// mark contributes its `virt_lines` rows in their stored top-to-bottom order.
+    /// Empty map when no mark carries `virt_lines` (the common case). Used by the
+    /// view to expand a buffer line into several screen rows and by the scroll math
+    /// to keep the cursor visible past those rows.
+    pub fn virt_lines_by_line(
+        &self,
+    ) -> std::collections::BTreeMap<usize, crate::extmark::VirtLineRows> {
+        use crate::extmark::Extmark;
+        let mut marks: Vec<&Extmark> = self
+            .extmarks
+            .iter_all()
+            .filter(|m| m.decor.as_deref().is_some_and(|d| !d.virt_lines.is_empty()))
+            .collect();
+        if marks.is_empty() {
+            return std::collections::BTreeMap::new();
+        }
+        marks.sort_by_key(|m| (m.start, m.priority, m.id));
+        let mut by_line: std::collections::BTreeMap<usize, crate::extmark::VirtLineRows> =
+            std::collections::BTreeMap::new();
+        for m in marks {
+            let decor = m.decor.as_deref().expect("filtered to virt_lines marks");
+            let line = self.byte_to_line(m.start);
+            let entry = by_line.entry(line).or_default();
+            let dst = if decor.virt_lines_above {
+                &mut entry.above
+            } else {
+                &mut entry.below
+            };
+            dst.extend(decor.virt_lines.iter().cloned());
+        }
+        by_line
+    }
+
     /// Byte offset for `(line, col)`, where `col` is a byte offset within the line.
     pub fn byte_at(&self, line: usize, col: usize) -> usize {
         self.line_start(line) + col

@@ -15,7 +15,7 @@ use crate::images::ImageStore;
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
     PanelData, PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View,
-    VirtPlacement, WindowRegion, WindowView,
+    VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -640,6 +640,7 @@ fn render_window(
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
     let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
     let empty_virt_text: Vec<Vec<VirtPlacement>> = Vec::new();
+    let empty_virt_lines: Vec<Option<Vec<VirtChunk>>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
@@ -816,6 +817,13 @@ fn render_window(
         Some(_) => &empty_virt_text,
         None => &win.virt_text,
     };
+    // Extmark `virt_lines` (whole virtual rows). The slide band is buffer-line-based
+    // and doesn't interleave virtual rows, so none ride the animation; the settled
+    // frame uses the view's interleaved layout.
+    let frame_virt_lines: &[Option<Vec<VirtChunk>>] = match anim {
+        Some(_) => &empty_virt_lines,
+        None => &win.virt_lines,
+    };
     // Signs, like diagnostics, are painted on the settled viewport only — a slide
     // band carries none (the reserved column stays blank while animating, so the
     // text below it doesn't jump). Painted now that the palette resolves style ids.
@@ -838,6 +846,7 @@ fn render_window(
         frame_diag,
         frame_virt,
         frame_virt_text,
+        frame_virt_lines,
         frame_inlay,
         frame_numbers,
         win.tabstop.max(1) as usize,
@@ -1112,6 +1121,7 @@ fn render_text(
     diagnostics: &[Vec<DiagSpan>],
     diagnostics_virt: &[Option<DiagVirt>],
     virt_text: &[Vec<VirtPlacement>],
+    virt_lines: &[Option<Vec<VirtChunk>>],
     inlay_hints: &[Vec<InlayHint>],
     numbers: &[Option<usize>],
     tabstop: usize,
@@ -1129,6 +1139,13 @@ fn render_text(
             .iter()
             .enumerate()
             .map(|(row, l)| {
+                // A virtual row (`virt_lines`) is a whole extra screen line of
+                // extmark chunks interleaved above / below its buffer line — no
+                // buffer text, gutter number, selection, or cursor. It also has a
+                // `None` number, so check it *before* the `~`-filler test below.
+                if let Some(Some(chunks)) = virt_lines.get(row) {
+                    return virt_line(chunks, width, theme);
+                }
                 let sel = selection.get(row).copied().flatten();
                 let sec_sel = secondary_selection.get(row).unwrap_or(&empty_search);
                 let matches = search.get(row).unwrap_or(&empty_search);
@@ -1138,7 +1155,8 @@ fn render_text(
                 let virt = diagnostics_virt.get(row).and_then(Option::as_ref);
                 let vtext = virt_text.get(row).unwrap_or(&empty_virt_text);
                 let inlay = inlay_hints.get(row).unwrap_or(&empty_inlay);
-                // A row with no buffer line is a `~` end-of-buffer filler.
+                // A row with no buffer line (and no virtual content) is a `~`
+                // end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
                     l, sel, sec_sel, matches, cur, hl, diag, virt, vtext, inlay, width, is_filler,
@@ -1148,6 +1166,30 @@ fn render_text(
             .collect::<Vec<_>>(),
     );
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Build one **virtual line** (`virt_lines`) row from its chunk run: each chunk's
+/// text painted in its resolved style (`virt_chunk_style` — the palette entry the
+/// server interned, else the window's normal colors), laid out from the left edge
+/// of the text body and clamped to the viewport width. A virtual row carries no
+/// buffer text, so there is no tab expansion, selection, search, or cursor to
+/// overlay — just the chunks. (`virt_lines_leftcol` / horizontal scroll of virtual
+/// rows is a later refinement; today they start at the text body's left edge.)
+fn virt_line(chunks: &[VirtChunk], max_width: usize, theme: &LineTheme) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut painted = 0usize;
+    for (text, id) in chunks {
+        if painted >= max_width {
+            break;
+        }
+        let shown = truncate_to_width(text, max_width - painted);
+        if shown.is_empty() {
+            continue;
+        }
+        painted += str_width(&shown);
+        spans.push(Span::styled(shown, virt_chunk_style(*id, theme)));
+    }
+    Line::from(spans)
 }
 
 /// Build a display line, painting each screen cell with its highlight span's

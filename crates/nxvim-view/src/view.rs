@@ -11,9 +11,9 @@ use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
     parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers, parse_pair,
-    parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_text, DiagSign,
-    DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment,
-    VirtPlacement,
+    parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_lines, parse_virt_text,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans,
+    StatusSegment, VirtChunk, VirtPlacement,
 };
 use crate::style::{Border, Style};
 
@@ -146,6 +146,12 @@ pub struct WindowView {
     /// and inline ones spliced into the row (later positions: overlay / right_align
     /// / win_col).
     pub virt_text: Vec<Vec<VirtPlacement>>,
+    /// Per visible row, the extmark `virt_lines` content (`virt_lines`): `Some(chunks)`
+    /// when the row is a **virtual line** (a whole extra screen row interleaved above /
+    /// below its buffer line), else `None`. A virtual row also has `numbers[i] == None`
+    /// and an empty `lines` entry; this `Some` is what distinguishes it from a `~`
+    /// filler, so the renderer paints the chunks (no gutter number, no cursor) there.
+    pub virt_lines: Vec<Option<Vec<VirtChunk>>>,
     /// A scroll gesture for this window, when its viewport just moved.
     pub scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
@@ -777,6 +783,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         diagnostics: parse_diagnostics(map_get(m, "diagnostics")),
         diagnostics_virt: parse_diagnostics_virt(map_get(m, "diagnostics_virt")),
         virt_text: parse_virt_text(map_get(m, "virt_text")),
+        virt_lines: parse_virt_lines(map_get(m, "virt_lines")),
         diagnostics_signs: parse_diagnostics_signs(map_get(m, "diagnostics_signs")),
         sign_column: map_get(m, "sign_column")
             .and_then(Value::as_bool)

@@ -533,3 +533,200 @@ async fn overlay_rightalign_wincol_positions_project() {
         "win_col projects at its fixed window column (40)"
     );
 }
+
+// ----- Phase 5: virt_lines (whole virtual rows) -----------------------------
+
+/// The focused window's interleaved row layout from a redraw: per visible screen
+/// row, `(number, line_text, virt_lines)`. `number` is the 1-based buffer line
+/// (`None` for a `~` filler *or* a virtual row), `line_text` the rendered text, and
+/// `virt_lines` the chunk texts when the row is a virtual line (`None` otherwise) —
+/// the field that tells a `None`-number row apart from a `~` filler.
+#[allow(clippy::type_complexity)]
+fn row_layout(params: &[Value]) -> Vec<(Option<u64>, String, Option<Vec<String>>)> {
+    let Some(win) = window0(params) else {
+        return Vec::new();
+    };
+    let get = |key: &str| {
+        win.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v)
+    };
+    let lines: Vec<String> = get("lines")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let numbers: Vec<Option<u64>> = get("numbers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(Value::as_u64).collect())
+        .unwrap_or_default();
+    let virt: Vec<Option<Vec<String>>> = get("virt_lines")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|row| {
+                    row.as_array().map(|chunks| {
+                        chunks
+                            .iter()
+                            .filter_map(|c| c.as_array()?[0].as_str().map(str::to_string))
+                            .collect()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (0..lines.len())
+        .map(|i| {
+            (
+                numbers.get(i).copied().flatten(),
+                lines.get(i).cloned().unwrap_or_default(),
+                virt.get(i).cloned().flatten(),
+            )
+        })
+        .collect()
+}
+
+/// Poll (bounded) for a redraw whose row layout satisfies `done`.
+#[allow(clippy::type_complexity)]
+async fn wait_for_layout(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    done: impl Fn(&[(Option<u64>, String, Option<Vec<String>>)]) -> bool,
+) -> Vec<(Option<u64>, String, Option<Vec<String>>)> {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            let layout = row_layout(&params);
+            if done(&layout) {
+                return layout;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("row layout never satisfied the condition within timeout");
+}
+
+/// Phase 5: `virt_lines` expand a buffer line into extra screen rows — one drawn
+/// *above* the line, one *below* it — interleaved into the window's rows. The
+/// virtual rows carry no buffer line number (like a `~` filler) but do carry their
+/// chunk text in the `virt_lines` payload, and the real lines keep their order and
+/// numbers around the inserted rows.
+#[tokio::test]
+async fn virt_lines_interleave_above_and_below_their_line() {
+    let (rpc, mut incoming) = start().await;
+    // Build the buffer through keystrokes — the `nvim_buf_set_*` mutation API is
+    // intentionally absent in nxvim (extmark reads/creates exist, mutation doesn't).
+    feed(&rpc, "iAAA<CR>BBB<CR>CCC<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('vlines')
+        -- A virtual line drawn ABOVE the second buffer line ('BBB', 0-based row 1).
+        vim.api.nvim_buf_set_extmark(0, ns, 1, 0, {
+          virt_lines = {{{'== above BBB ==', 'Comment'}}}, virt_lines_above = true,
+        })
+        -- A virtual line drawn BELOW the second buffer line.
+        vim.api.nvim_buf_set_extmark(0, ns, 1, 0, {
+          virt_lines = {{{'== below BBB =='}}},
+        })
+        "#,
+    )
+    .await;
+
+    let layout = wait_for_layout(&rpc, &mut incoming, |rows| {
+        let has = |needle: &str| {
+            rows.iter().any(|(_, _, v)| {
+                v.as_ref()
+                    .is_some_and(|c| c.iter().any(|t| t.contains(needle)))
+            })
+        };
+        has("above BBB") && has("below BBB")
+    })
+    .await;
+
+    let bbb = layout
+        .iter()
+        .position(|(n, l, _)| *n == Some(2) && l == "BBB")
+        .expect("the BBB text row (buffer line 2)");
+    // Directly above BBB: the 'above' virtual row (no number, its chunk text).
+    assert_eq!(
+        (layout[bbb - 1].0, &layout[bbb - 1].2),
+        (None, &Some(vec!["== above BBB ==".to_string()])),
+        "the above virtual line sits directly above its buffer line, with no number"
+    );
+    // Directly below BBB: the 'below' virtual row.
+    assert_eq!(
+        (layout[bbb + 1].0, &layout[bbb + 1].2),
+        (None, &Some(vec!["== below BBB ==".to_string()])),
+        "the below virtual line sits directly below its buffer line"
+    );
+    // The real lines keep their order and numbers around the inserted virtual rows.
+    assert_eq!(
+        layout[bbb - 2].0,
+        Some(1),
+        "AAA stays line 1, above the virtual row"
+    );
+    assert_eq!(
+        layout[bbb + 2].0,
+        Some(3),
+        "CCC stays line 3, below the virtual row"
+    );
+}
+
+/// Phase 5a: the scroll math counts a line's `virt_lines` as extra screen rows, so
+/// the cursor stays visible past them. With the buffer filled to exactly the text
+/// height (so it would all fit at the top with no scroll) and 3 virtual lines
+/// attached below the first line, jumping to the last line must scroll the viewport
+/// — pushing line 1 (and its virtual rows) off the top. Without plines-aware
+/// scrolling the editor would think the `h` lines fit and leave line 1 visible.
+#[tokio::test]
+async fn scroll_accounts_for_virt_lines_to_keep_the_cursor_visible() {
+    let (rpc, mut incoming) = start().await;
+    // The window's text-body height (one row per buffer line, no virtual lines yet).
+    let h = wait_for_layout(&rpc, &mut incoming, |rows| !rows.is_empty())
+        .await
+        .len();
+    assert!(h >= 4, "need a few rows of text body to exercise scrolling");
+
+    // Fill the buffer to exactly `h` lines through keystrokes (no `nvim_buf_set_lines`
+    // in nxvim) — so with no virtual lines the whole buffer fits at top=0.
+    let body = (1..=h)
+        .map(|i| format!("L{i:02}"))
+        .collect::<Vec<_>>()
+        .join("<CR>");
+    feed(&rpc, &format!("i{body}<Esc>"));
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('vlscroll')
+        -- Three virtual lines below the FIRST buffer line: the buffer + its virtual
+        -- rows are now `h + 3` screen rows, taller than the window.
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_lines = {{{'~~ v1 ~~'}}, {{'~~ v2 ~~'}}, {{'~~ v3 ~~'}}},
+        })
+        "#,
+    )
+    .await;
+    // Top of the buffer, then jump to the last line: revealing it must scroll past
+    // line 1 and its virtual rows.
+    feed(&rpc, "ggG");
+
+    let layout = wait_for_layout(&rpc, &mut incoming, |rows| {
+        let visible = |n: u64| rows.iter().any(|(num, _, _)| *num == Some(n));
+        // The cursor's last line stays visible AND line 1 scrolled off the top.
+        visible(h as u64) && !visible(1)
+    })
+    .await;
+    assert!(
+        layout.iter().any(|(n, _, _)| *n == Some(h as u64)),
+        "the cursor's last line stays visible after jumping to it"
+    );
+    assert!(
+        !layout.iter().any(|(n, _, _)| *n == Some(1)),
+        "line 1 scrolled off the top — the scroll accounted for the virtual rows below it"
+    );
+}

@@ -496,6 +496,10 @@ pub(crate) struct Shared {
     /// into `Editor::menu_finish` so a query that matched nothing clears the now
     /// stale results (one that matched swaps them via `picker_pushes` instead).
     pub(crate) picker_finishes: Vec<u64>,
+    /// Named picker actions a `picker`-bucket keymap fired (`nx._picker_action`),
+    /// drained by the server into `Editor::apply_picker_action` — the rebindable
+    /// picker keys (next / prev / confirm / cancel / preview scroll / query edit).
+    pub(crate) picker_actions: Vec<String>,
     /// Whether any `nx.decor` provider has been registered (`nx._decor_register`).
     /// The gate the server checks before dispatching a viewport-change signal: while
     /// no provider is set it skips the whole off-tick decor path (never slices the
@@ -994,6 +998,12 @@ impl LuaRuntime {
         /// Take the completed source generations since the last drain, for the
         /// server to settle the open picker (clear a now-empty query's stale rows).
         take_picker_finishes -> Vec<u64> = picker_finishes
+    }
+
+    take_queue! {
+        /// Take the named picker actions fired since the last drain, for the server
+        /// to apply to the open picker via `Editor::apply_picker_action`.
+        take_picker_actions -> Vec<String> = picker_actions
     }
 
     take_queue! {

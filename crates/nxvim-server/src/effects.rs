@@ -192,6 +192,14 @@ impl EditHost {
         for line in self.lua.take_output() {
             self.editor.echo(line);
         }
+        // Picker actions a `picker`-bucket keymap fired (`nx._picker_action`): apply
+        // each to the open picker. An unknown action name fails loud (core returns
+        // `Err`) and is surfaced here rather than silently ignored.
+        for action in self.lua.take_picker_actions() {
+            if let Err(e) = self.editor.apply_picker_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
         // Panel requests from `vim.panel.*` drive the core's panel state.
         for op in self.lua.take_panel_ops() {
             match op {

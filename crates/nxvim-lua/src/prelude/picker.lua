@@ -24,6 +24,62 @@ nx._picker = nx._picker or nil
 -- the more specific wins. `0` disables the debounce (re-run on every keystroke).
 nx.picker.debounce = nx.picker.debounce or 250
 
+-- ----- rebindable picker keys -----------------------------------------------
+-- Every picker key is an ordinary `picker`-mode keymap, NOT a hardcoded grab: the
+-- server selects the `picker` bucket while a picker owns input, so navigation /
+-- confirm / cancel / preview-scroll / query-edit are all configurable with
+-- `nx.keymap.set('picker', '<key>', nx.picker.actions.<name>)` exactly like any
+-- other mode. `nx.picker.actions.<name>` fires the named action through the keymap
+-- engine (nx._picker_action -> Editor::apply_picker_action). The only key NOT a map
+-- is an arbitrary printable char — there is no way to enumerate every char, so an
+-- unmapped printable simply inserts into the query (the picker's text fallthrough).
+nx.picker.actions = nx.picker.actions or {}
+for _, name in ipairs({
+  "next",
+  "prev",
+  "confirm",
+  "cancel",
+  "preview_half_down",
+  "preview_half_up",
+  "preview_page_down",
+  "preview_page_up",
+  "backspace",
+  "delete",
+  "left",
+  "right",
+  "to_start",
+  "to_end",
+}) do
+  nx.picker.actions[name] = function()
+    nx._picker_action(name)
+  end
+end
+
+-- The default picker bindings — `default = true` so a user `nx.keymap.set('picker',
+-- …)` for the same key wins by the precedence ladder; binding a key to an empty
+-- function (`nx.keymap.set('picker', '<C-n>', function() end)`) disables it. These
+-- mirror the keys the picker used to hardcode.
+for _, m in ipairs({
+  { "<C-n>", "next", "Next item" },
+  { "<Down>", "next", "Next item" },
+  { "<C-p>", "prev", "Previous item" },
+  { "<Up>", "prev", "Previous item" },
+  { "<CR>", "confirm", "Confirm selection" },
+  { "<Esc>", "cancel", "Cancel" },
+  { "<C-d>", "preview_half_down", "Preview half-page down" },
+  { "<C-u>", "preview_half_up", "Preview half-page up" },
+  { "<C-f>", "preview_page_down", "Preview page down" },
+  { "<C-b>", "preview_page_up", "Preview page up" },
+  { "<BS>", "backspace", "Delete char before cursor" },
+  { "<Del>", "delete", "Delete char under cursor" },
+  { "<Left>", "left", "Cursor left" },
+  { "<Right>", "right", "Cursor right" },
+  { "<Home>", "to_start", "Cursor to start" },
+  { "<End>", "to_end", "Cursor to end" },
+}) do
+  nx.keymap.set("picker", m[1], nx.picker.actions[m[2]], { default = true, desc = m[3] })
+end
+
 -- nx.picker.source { name, items = function(ctx), dynamic, confirm }: register a
 -- source. `items` streams candidates: it calls `ctx.push(item)` per result (an
 -- item is a table with a `text` display field, plus any data the `confirm` needs)

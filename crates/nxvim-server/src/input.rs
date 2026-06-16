@@ -3,7 +3,7 @@
 
 #[cfg(feature = "native")]
 use crate::keymap::BuiltinAction;
-use crate::keymap::{MappingRhs, Step};
+use crate::keymap::{MappingRhs, MatchScope, Step};
 use crate::EditHost;
 use nxvim_core::{parse_keys, Key};
 
@@ -93,13 +93,23 @@ impl EditHost {
     /// invariant: a literal arg only ever follows a lead key that already left the
     /// matcher, so nothing is withheld at this point.
     pub(crate) fn feed_matcher(&mut self, key: Key) {
+        // A grabbing widget (the picker) matches in its own keymap bucket — no
+        // literal-arg bypass and no command-grammar oracle (a widget has no core
+        // grammar; an unmatched key replays to the widget's handler).
+        if let Some(bucket) = crate::keymap::widget_bucket(self.editor.key_context()) {
+            for step in self.keymaps.feed(MatchScope::Widget(bucket), key) {
+                self.apply_step(step);
+            }
+            return;
+        }
+        // Editing context: the literal-argument raw read, then the per-mode matcher.
         if self.editor.awaiting_literal_arg() && self.keymaps.pending_empty() {
             self.editor.input(key);
             self.emit_lifecycle_events();
             return;
         }
         let mode = self.editor.mode;
-        for step in self.keymaps.feed(mode, key) {
+        for step in self.keymaps.feed(MatchScope::Editing(mode), key) {
             self.apply_step(step);
         }
     }
@@ -111,8 +121,13 @@ impl EditHost {
     /// last batch; with nothing pending the whole call is a no-op.
     pub(crate) fn input_flush(&mut self) {
         self.refresh_keymaps();
-        let mode = self.editor.mode;
-        for step in self.keymaps.flush(mode) {
+        // Flush in the active context's scope — a picker's withheld prefix resolves
+        // in its bucket, the buffer's in its mode.
+        let scope = match crate::keymap::widget_bucket(self.editor.key_context()) {
+            Some(bucket) => MatchScope::Widget(bucket),
+            None => MatchScope::Editing(self.editor.mode),
+        };
+        for step in self.keymaps.flush(scope) {
             self.apply_step(step);
         }
         self.run_pending();
@@ -225,6 +240,7 @@ impl EditHost {
         let _ = self.lua.take_commands();
         let _ = self.lua.take_output();
         let _ = self.lua.take_panel_ops();
+        let _ = self.lua.take_picker_actions();
     }
 
     pub(crate) fn fire_mapping_inner(&mut self, rhs: MappingRhs) {

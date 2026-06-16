@@ -15,7 +15,7 @@ use crate::clipboard::Clipboard;
 use crate::highlight::Highlights;
 use crate::host::{HostFs, StdHostFs};
 use crate::input::{Key, KeyCode};
-use crate::mode::Mode;
+use crate::mode::{KeyContext, Mode};
 use crate::options::{DockOptions, Options};
 use crate::search::{RegexEngine, SearchRegex};
 
@@ -1466,8 +1466,17 @@ impl Editor {
         // buffer is the query, so typing must flow on to `handle_insert` (which
         // intercepts only the engine's control keys); `menu_grabs_input()` is
         // false for it.
+        //
+        // The **picker** routes its nameable keys through the `picker` keymap bucket
+        // (the matcher fires them as `apply_picker_action` ahead of this), so only an
+        // unmapped key reaches here — handled as query text. A promptless `select`
+        // still grabs every key in core (legacy; converted in a later phase).
         if self.menu_grabs_input() {
-            self.handle_menu(key);
+            if self.key_context() == KeyContext::Picker {
+                self.handle_picker_text(key);
+            } else {
+                self.handle_menu(key);
+            }
             return;
         }
 

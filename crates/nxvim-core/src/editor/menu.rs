@@ -25,6 +25,7 @@ use std::ops::Range;
 
 use super::*;
 use crate::input::{Key, KeyCode};
+use crate::mode::KeyContext;
 use crate::view::MenuView;
 
 /// Where the menu floats. `Cursor` anchors it under the cursor (the
@@ -791,11 +792,23 @@ impl Editor {
         self.menu.as_mut().filter(|m| m.kind == MenuKind::Complete)
     }
 
-    /// Handle a keystroke while the menu has focus. `<CR>` confirms the highlighted
-    /// row (pushing its source key onto [`Editor::menu_results`]); `<Esc>` / `q`
-    /// (picker: `<Esc>` only) cancels. With a prompt, printable keys edit the query
-    /// and never touch the document; navigation is `<C-n>`/`<C-p>`/arrows. Without
-    /// one, the list is driven `j`/`k`/`gg`/`G`.
+    /// Which key context owns input — [`KeyContext::Picker`] while a prompted picker
+    /// grabs input (it routes keys through the `picker` keymap bucket), otherwise
+    /// [`KeyContext::Editing`]. A promptless `select` menu still grabs in core
+    /// (legacy, converted in a later phase), so it reports `Editing` like the buffer.
+    pub fn key_context(&self) -> KeyContext {
+        if self.menu_kind() == Some(MenuKind::Picker) {
+            KeyContext::Picker
+        } else {
+            KeyContext::Editing
+        }
+    }
+
+    /// Handle a keystroke while a promptless `select` menu has focus. `<CR>` confirms
+    /// the highlighted row (pushing its source key onto [`Editor::menu_results`]);
+    /// `<Esc>` / `q` cancels; otherwise the list is driven `j`/`k`/`gg`/`G`. The
+    /// **picker** no longer routes here — its keys are `picker`-bucket maps dispatched
+    /// via [`apply_picker_action`](Self::apply_picker_action), so this is select-only.
     pub(crate) fn handle_menu(&mut self, key: Key) {
         self.message.clear();
 
@@ -804,8 +817,6 @@ impl Editor {
             let chosen = self.menu.as_ref().and_then(|m| {
                 (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
             });
-            // A picker with no matches under the current query confirms nothing —
-            // stay open. `select` always has a row, so this only no-ops the picker.
             if let Some(key) = chosen {
                 self.menu_results.push(Some(key));
                 self.close_menu();
@@ -813,72 +824,107 @@ impl Editor {
             return;
         }
 
-        let has_prompt = self.menu.as_ref().is_some_and(|m| m.prompt.is_some());
-
-        // Cancel: `<Esc>` everywhere; bare `q` only in promptless `select` (in a
-        // picker `q` is a literal query character).
-        if key.code == KeyCode::Esc || (!has_prompt && matches!(key.as_char(), Some('q'))) {
+        // Cancel: `<Esc>` or bare `q` (a promptless select has no query to type into).
+        if key.code == KeyCode::Esc || matches!(key.as_char(), Some('q')) {
             self.menu_results.push(None);
             self.close_menu();
             return;
         }
 
-        if has_prompt {
-            self.handle_picker_key(key);
-        } else {
-            self.handle_select_key(key);
-        }
+        self.handle_select_key(key);
     }
 
-    /// Picker-mode keys: navigation drives the list, everything printable edits the
-    /// query. A query edit re-ranks locally (static) or forwards to the source
-    /// under a bumped generation (dynamic).
-    fn handle_picker_key(&mut self, key: Key) {
-        // Mutate the menu inside a block so its borrow ends before we may re-borrow
-        // `self` to emit a query-changed signal.
-        let query_changed = {
+    /// The picker's text fallthrough: an unmapped printable key inserts into the
+    /// query. Every *nameable* picker key (navigation, confirm, cancel, preview
+    /// scroll, the query-edit operations) is a `picker`-bucket default map that fires
+    /// [`apply_picker_action`](Self::apply_picker_action) through the keymap engine,
+    /// so the only key that reaches here is one no map claimed — by default that is a
+    /// printable character (you cannot enumerate every char as a map), which edits
+    /// the query. A non-printable unmapped key is inert.
+    pub(crate) fn handle_picker_text(&mut self, key: Key) {
+        let KeyCode::Char(c) = key.code else { return };
+        if key.ctrl || key.alt {
+            return;
+        }
+        self.message.clear();
+        {
             let Some(menu) = self.menu.as_mut() else {
                 return;
             };
+            menu.prompt.as_mut().unwrap().insert(c);
+        }
+        self.on_query_changed();
+    }
+
+    /// Apply a named picker action, dispatched by a `picker`-bucket keymap (the
+    /// default maps registered in `prelude/picker.lua`, or a user override). The name
+    /// space is the picker's rebindable operations: `next`/`prev` move the selection,
+    /// `confirm`/`cancel` resolve it, `preview_half_down`/`_half_up`/`_page_down`/
+    /// `_page_up` scroll the preview pane (a no-op without one), and `backspace`/
+    /// `delete`/`left`/`right`/`home`/`end` edit the query. An unknown name fails loud
+    /// (returns `Err`) rather than silently no-op'ing, per the no-silent-stub rule.
+    pub fn apply_picker_action(&mut self, action: &str) -> Result<(), String> {
+        self.message.clear();
+        // Confirm / cancel don't fit the shared `menu.as_mut()` nav block (they push a
+        // result + close), so handle them first.
+        match action {
+            "confirm" => {
+                let chosen = self.menu.as_ref().and_then(|m| {
+                    (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
+                });
+                // A picker with no matches under the current query confirms nothing.
+                if let Some(key) = chosen {
+                    self.menu_results.push(Some(key));
+                    self.close_menu();
+                }
+                return Ok(());
+            }
+            "cancel" => {
+                self.menu_results.push(None);
+                self.close_menu();
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // Navigation / preview / query-edit mutate the open menu; the query-edit ones
+        // report whether the query changed so we can re-rank after the borrow ends.
+        let query_changed = {
+            let Some(menu) = self.menu.as_mut() else {
+                return Ok(());
+            };
             let last = menu.view_len().saturating_sub(1);
             let mut query_changed = false;
-
-            match key.code {
-                // List navigation (does not touch the query).
-                KeyCode::Down => menu.cursor = (menu.cursor + 1).min(last),
-                KeyCode::Up => menu.cursor = menu.cursor.saturating_sub(1),
-                KeyCode::Char('n') if key.ctrl => menu.cursor = (menu.cursor + 1).min(last),
-                KeyCode::Char('p') if key.ctrl => menu.cursor = menu.cursor.saturating_sub(1),
-                // Preview-pane scrolling (only when a preview is shown): half page
-                // `<C-d>`/`<C-u>`, full page `<C-f>`/`<C-b>`. Core only names the
-                // gesture — the server resolves it against the pane height and file.
-                KeyCode::Char('d') if key.ctrl && menu.preview => {
-                    menu.preview_scroll = Some(PreviewScroll::HalfDown);
+            match action {
+                "next" => menu.cursor = (menu.cursor + 1).min(last),
+                "prev" => menu.cursor = menu.cursor.saturating_sub(1),
+                // Preview-pane scrolling, only when a preview is shown; core names the
+                // gesture and the server resolves it against the pane height and file.
+                "preview_half_down" if menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::HalfDown)
                 }
-                KeyCode::Char('u') if key.ctrl && menu.preview => {
-                    menu.preview_scroll = Some(PreviewScroll::HalfUp);
+                "preview_half_up" if menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::HalfUp)
                 }
-                KeyCode::Char('f') if key.ctrl && menu.preview => {
-                    menu.preview_scroll = Some(PreviewScroll::PageDown);
+                "preview_page_down" if menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::PageDown)
                 }
-                KeyCode::Char('b') if key.ctrl && menu.preview => {
-                    menu.preview_scroll = Some(PreviewScroll::PageUp);
+                "preview_page_up" if menu.preview => {
+                    menu.preview_scroll = Some(PreviewScroll::PageUp)
                 }
-                // Query editing.
-                KeyCode::Backspace => query_changed = menu.prompt.as_mut().unwrap().backspace(),
-                KeyCode::Delete => query_changed = menu.prompt.as_mut().unwrap().delete(),
-                KeyCode::Left => menu.prompt.as_mut().unwrap().cursor_left(),
-                KeyCode::Right => menu.prompt.as_mut().unwrap().cursor_right(),
-                KeyCode::Home => menu.prompt.as_mut().unwrap().col = 0,
-                KeyCode::End => {
+                // A preview gesture with no preview pane is a no-op, not an error.
+                "preview_half_down" | "preview_half_up" | "preview_page_down"
+                | "preview_page_up" => {}
+                "backspace" => query_changed = menu.prompt.as_mut().unwrap().backspace(),
+                "delete" => query_changed = menu.prompt.as_mut().unwrap().delete(),
+                "left" => menu.prompt.as_mut().unwrap().cursor_left(),
+                "right" => menu.prompt.as_mut().unwrap().cursor_right(),
+                "to_start" => menu.prompt.as_mut().unwrap().col = 0,
+                "to_end" => {
                     let p = menu.prompt.as_mut().unwrap();
                     p.col = p.query.len();
                 }
-                KeyCode::Char(c) if !key.ctrl && !key.alt => {
-                    menu.prompt.as_mut().unwrap().insert(c);
-                    query_changed = true;
-                }
-                _ => {}
+                other => return Err(format!("unknown picker action {other:?}")),
             }
             query_changed
         };
@@ -886,6 +932,7 @@ impl Editor {
         if query_changed {
             self.on_query_changed();
         }
+        Ok(())
     }
 
     /// React to a picker query edit: a dynamic source bumps the generation and

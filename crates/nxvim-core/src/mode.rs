@@ -23,6 +23,24 @@ pub enum Mode {
     Terminal,
 }
 
+/// Which key-handling context owns input right now — the buffer being edited, or a
+/// grabbing widget that routes keys through its **own** keymap bucket.
+///
+/// The keymap engine selects a trie by this rather than [`Mode`] alone: an
+/// `Editing` context uses the per-mode trie with the command-grammar disambiguation
+/// oracle and the literal-argument bypass; a widget context uses that widget's
+/// dedicated bucket (`vim.keymap.set('picker', …)`) with neither (a widget has no
+/// core command grammar). Until a widget is converted to the keymap engine it stays
+/// `Editing` and its keys are grabbed in core as before. Phase 1 adds `Picker`; the
+/// other grabbing widgets (select / panel / explorer / cmdline) follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyContext {
+    /// The buffer — the normal/insert/visual/… per-mode trie applies.
+    Editing,
+    /// A prompted fuzzy picker (`nx.picker`) grabs input; its `picker` bucket applies.
+    Picker,
+}
+
 impl Mode {
     /// Short uppercase label shown in the status line, e.g. `NORMAL`.
     pub fn label(self) -> &'static str {

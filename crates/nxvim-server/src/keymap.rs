@@ -39,8 +39,58 @@
 
 use std::collections::HashMap;
 
-use nxvim_core::{command_status, key_to_notation, parse_keys, CommandStatus, Key, Mode};
+use nxvim_core::{
+    command_status, key_to_notation, parse_keys, CommandStatus, Key, KeyContext, Mode,
+};
 use nxvim_lua::{RawKeymap, RawRhs};
+
+/// What the matcher is matching *against* on a given keystroke — the buffer in some
+/// editor [`Mode`], or a grabbing widget in its own keymap bucket.
+///
+/// An `Editing` scope is the full editing matcher: bucket `mode_key(mode)`, the
+/// [`command_status`] disambiguation oracle on the break path, and (in the server)
+/// the literal-argument bypass. A `Widget` scope drives the *same* withhold/replay
+/// trie over the widget's bucket but with **no oracle** (a widget has no core
+/// command grammar to disambiguate against) — a withheld prefix that breaks simply
+/// replays raw to the widget's handler. The bucket char pairs with
+/// [`mode_buckets`] / [`widget_bucket`].
+#[derive(Clone, Copy)]
+pub enum MatchScope {
+    /// The buffer, in this mode — the per-mode trie + oracle.
+    Editing(Mode),
+    /// A grabbing widget, in this bucket — the trie only, no oracle.
+    Widget(char),
+}
+
+impl MatchScope {
+    /// The trie bucket this scope matches in.
+    fn bucket(self) -> char {
+        match self {
+            MatchScope::Editing(mode) => mode_key(mode),
+            MatchScope::Widget(bucket) => bucket,
+        }
+    }
+
+    /// The editor mode for the disambiguation oracle, or `None` for a widget scope
+    /// (where the oracle does not apply).
+    fn oracle_mode(self) -> Option<Mode> {
+        match self {
+            MatchScope::Editing(mode) => Some(mode),
+            MatchScope::Widget(_) => None,
+        }
+    }
+}
+
+/// The keymap bucket char a grabbing-widget [`KeyContext`] routes through, or `None`
+/// for [`KeyContext::Editing`] (the buffer's per-mode trie). Pairs with
+/// [`mode_buckets`], which lands a `vim.keymap.set('picker', …)` in the same bucket
+/// so its default maps and a user override compile into the trie this selects.
+pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
+    match ctx {
+        KeyContext::Editing => None,
+        KeyContext::Picker => Some('P'),
+    }
+}
 
 #[cfg(feature = "native")]
 use crate::lsp::LspReqKind;
@@ -473,14 +523,16 @@ impl Keymaps {
         })
     }
 
-    /// Feed one input key in `mode` and return the steps it produced. The server
-    /// calls this for every parsed key, executing the steps in order.
-    pub fn feed(&mut self, mode: Mode, key: Key) -> Vec<Step> {
+    /// Feed one input key in `scope` and return the steps it produced. The server
+    /// calls this for every parsed key, executing the steps in order. `scope` is the
+    /// buffer's [`Mode`](MatchScope::Editing) for ordinary editing, or a grabbing
+    /// widget's [`bucket`](MatchScope::Widget) while a widget owns input.
+    pub fn feed(&mut self, scope: MatchScope, key: Key) -> Vec<Step> {
         // Fresh remap budget per real keystroke (vim resets `maxmapdepth` once a
         // typed char is consumed; a keystroke is exactly that boundary).
         self.remap_budget = MAX_MAP_DEPTH;
         let mut steps = Vec::new();
-        self.feed_key(mode, key, &mut steps);
+        self.feed_key(scope, key, &mut steps);
         steps
     }
 
@@ -501,22 +553,22 @@ impl Keymaps {
     /// leave a deeper prefix buffered); it terminates because each pass consumes at
     /// least one key, so `pending` strictly shrinks. The defensive break guards the
     /// invariant in case that ever fails to hold.
-    pub fn flush(&mut self, mode: Mode) -> Vec<Step> {
+    pub fn flush(&mut self, scope: MatchScope) -> Vec<Step> {
         self.remap_budget = MAX_MAP_DEPTH;
         let mut steps = Vec::new();
-        let mode_key = mode_key(mode);
+        let bucket = scope.bucket();
         while !self.pending.is_empty() {
             let before = self.pending.len();
             let buffered: Vec<Key> = self.pending.drain(..).collect();
-            if self.tries.contains_key(&mode_key) {
+            if self.tries.contains_key(&bucket) {
                 // No next key on the flush path, so the break-path oracle does not
                 // apply here: a trailing live-prefix replays raw and the editor
                 // completes any built-in itself (the re-feeds inside `resolve_
                 // buffered` still route through `feed_key`, where the oracle runs).
-                let _ = self.resolve_buffered(mode, &buffered, &mut steps);
+                let _ = self.resolve_buffered(scope, &buffered, &mut steps);
             } else {
-                // No trie for the current mode (the prefix was withheld in another
-                // mode, then the mode changed): the keys can't be a mapping here.
+                // No trie for this scope (the prefix was withheld in another mode /
+                // widget, then the context changed): the keys can't be a mapping here.
                 steps.extend(buffered.into_iter().map(Step::Editor));
             }
             if self.pending.len() >= before {
@@ -527,22 +579,22 @@ impl Keymaps {
         steps
     }
 
-    fn feed_key(&mut self, mode: Mode, key: Key, steps: &mut Vec<Step>) {
-        let mode_key = mode_key(mode);
-        // No mappings for this mode: flush any prefix buffered in another mode and
-        // pass the key straight through. (In practice `pending` is empty here.)
-        if !self.tries.contains_key(&mode_key) {
+    fn feed_key(&mut self, scope: MatchScope, key: Key, steps: &mut Vec<Step>) {
+        let bucket = scope.bucket();
+        // No mappings for this scope: flush any prefix buffered in another and pass
+        // the key straight through. (In practice `pending` is empty here.)
+        if !self.tries.contains_key(&bucket) {
             steps.extend(self.pending.drain(..).map(Step::Editor));
             steps.push(Step::Editor(key));
             return;
         }
         self.pending.push(key);
-        let classify = self.tries[&mode_key].classify(&self.pending);
+        let classify = self.tries[&bucket].classify(&self.pending);
         match classify {
             Classify::Prefix => {} // hold: wait for the next key
             Classify::Complete(mapping) => {
                 self.pending.clear();
-                self.fire(mode, mapping, steps);
+                self.fire(scope, mapping, steps);
             }
             Classify::None => {
                 // This key broke every live prefix. Resolve the previously
@@ -553,20 +605,21 @@ impl Keymaps {
                     // The key on its own starts no mapping: straight to the editor.
                     steps.push(Step::Editor(key));
                 } else {
-                    let raw = self.resolve_buffered(mode, &buffered, steps);
-                    // Disambiguation oracle (design §"Matcher integration"). The
-                    // buffered prefix just replayed *raw* to the editor (no shorter
-                    // mapping fired — the raw-replay gate is `raw.is_some()`). If
-                    // re-feeding `key` would only re-withhold it as a fresh mapping
-                    // prefix, but that raw run *plus* `key` already forms a complete
-                    // built-in command, release `key` to the editor instead — so a
+                    let raw = self.resolve_buffered(scope, &buffered, steps);
+                    // Disambiguation oracle (design §"Matcher integration"), editing
+                    // scopes only — a widget has no core command grammar (`oracle_
+                    // mode()` is `None` for `Widget`), so a broken widget prefix just
+                    // replays raw and re-feeds. The buffered prefix just replayed
+                    // *raw* to the editor (no shorter mapping fired — gate `raw.is_
+                    // some()`). If re-feeding `key` would only re-withhold it as a
+                    // fresh mapping prefix, but that raw run *plus* `key` already forms
+                    // a complete built-in, release `key` to the editor at once — so a
                     // built-in like `gg` (under a colliding `gh` map) reaches the
-                    // editor whole and fires instantly, with no flush or next key.
-                    // The `would_hold` guard keeps user maps winning: a `key` that
-                    // completes or breaks a mapping takes the normal path untouched.
-                    if let Some(raw_run) = raw {
+                    // editor whole and fires instantly. The `would_hold` guard keeps
+                    // user maps winning.
+                    if let (Some(raw_run), Some(mode)) = (raw, scope.oracle_mode()) {
                         let would_hold = matches!(
-                            self.tries[&mode_key].classify(std::slice::from_ref(&key)),
+                            self.tries[&bucket].classify(std::slice::from_ref(&key)),
                             Classify::Prefix
                         );
                         if would_hold {
@@ -578,7 +631,7 @@ impl Keymaps {
                             }
                         }
                     }
-                    self.feed_key(mode, key, steps);
+                    self.feed_key(scope, key, steps);
                 }
             }
         }
@@ -597,12 +650,12 @@ impl Keymaps {
     /// maps they trigger surface with their own flags, matching the fact that the
     /// outer map's effect is just to type those keys. The flag bites on the terminal
     /// fire (Lua / `noremap` string), which is where a message would be produced.
-    fn fire(&mut self, mode: Mode, mapping: Mapping, steps: &mut Vec<Step>) {
+    fn fire(&mut self, scope: MatchScope, mapping: Mapping, steps: &mut Vec<Step>) {
         match mapping.rhs {
             MappingRhs::Keys(keys, false) if self.remap_budget > 0 => {
                 self.remap_budget -= 1;
                 for key in keys {
-                    self.feed_key(mode, key, steps);
+                    self.feed_key(scope, key, steps);
                 }
             }
             rhs => steps.push(Step::Fire {
@@ -628,15 +681,15 @@ impl Keymaps {
     /// the oracle).
     fn resolve_buffered(
         &mut self,
-        mode: Mode,
+        scope: MatchScope,
         buffered: &[Key],
         steps: &mut Vec<Step>,
     ) -> Option<Vec<Key>> {
-        match self.tries[&mode_key(mode)].longest_complete(buffered) {
+        match self.tries[&scope.bucket()].longest_complete(buffered) {
             Some((mapping, used)) => {
-                self.fire(mode, mapping, steps);
+                self.fire(scope, mapping, steps);
                 for &key in &buffered[used..] {
-                    self.feed_key(mode, key, steps);
+                    self.feed_key(scope, key, steps);
                 }
                 None
             }
@@ -682,6 +735,12 @@ fn mode_buckets(code: &str) -> &'static [char] {
         "c" => &['c'],
         "v" | "x" => &['v', 'V'],
         "m" => &['m'],
+        // Grabbing-widget buckets (configurable widget keys): a `vim.keymap.set
+        // ('picker', …)` lands here, and the matcher selects it via a `Widget` scope
+        // while that widget grabs input (see [`widget_bucket`]). Distinct from every
+        // editor-mode bucket above so widget maps never leak into editing and vice
+        // versa. Phase 1 adds `picker`; select / panel / explorer follow.
+        "picker" => &['P'],
         "" => &['n', 'v', 'V', 'm'],
         _ => &[],
     }

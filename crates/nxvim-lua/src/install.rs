@@ -1602,6 +1602,20 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._picker_action(name)`: a `picker`-bucket keymap fired the named picker
+    // action (next / prev / confirm / cancel / preview scroll / query edit); the
+    // server applies it to the open picker via `Editor::apply_picker_action`. The
+    // default `picker` maps in `prelude/picker.lua` call this; a user override does
+    // too (or runs anything else). Queued so it drains in the same convergence as the
+    // keystroke that fired it.
+    let sh = shared.clone();
+    nx.set(
+        "_picker_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().picker_actions.push(name);
+            Ok(())
+        })?,
+    )?;
 
     // `nx._decor_register()`: a `nx.decor.provider` was registered — flip the live
     // gate so the server starts dispatching viewport-change signals to providers.

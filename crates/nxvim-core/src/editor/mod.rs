@@ -32,6 +32,7 @@ mod cmdline;
 mod command;
 mod complete;
 mod cursor;
+mod decor;
 mod dock;
 mod ex;
 mod explorer;
@@ -66,6 +67,7 @@ pub(crate) use self::command::{
     Stage,
 };
 pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
+pub use self::decor::DecorViewport;
 pub use self::menu::{
     MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
@@ -949,6 +951,19 @@ pub struct Editor {
     /// `View` and then cleared (so it animates exactly once).
     pending_scroll: Option<PendingScroll>,
 
+    /// `nx.decor` viewport-changed signal (`editor/decor.rs`). Last-seen
+    /// `(buffer, top, bot)` per visible window — recomputed when input settles; a
+    /// diff bumps `decor_gen[win]` and queues a [`decor::DecorViewport`] in
+    /// `decor_dirty` for the server to dispatch to matching providers off-tick.
+    decor_viewports: HashMap<WindowId, (BufferId, usize, usize)>,
+    /// Per-window viewport generation, bumped on every visible-range change; a
+    /// decor publish carries the generation it was computed for and is dropped at
+    /// apply time unless it still matches (the viewport hasn't moved since).
+    decor_gen: HashMap<WindowId, u64>,
+    /// Windows whose viewport changed since the last drain (latest-wins per window),
+    /// drained by the server in `run_pending`.
+    decor_dirty: Vec<decor::DecorViewport>,
+
     /// Undo/redo history for cursor *placement* in [`Mode::MultiCursor`]: each
     /// entry snapshots the placed-cursor set (primary + secondaries) before a
     /// placement command (`<A-c>`, `c`, `{count}c{motion}`, `cc`) mutated it, so
@@ -1300,6 +1315,9 @@ impl Editor {
             mouse_resize: None,
             scroll_from: None,
             pending_scroll: None,
+            decor_viewports: HashMap::new(),
+            decor_gen: HashMap::new(),
+            decor_dirty: Vec::new(),
             placement_undo: Vec::new(),
             placement_redo: Vec::new(),
             cursor_registers: Vec::new(),
@@ -1634,6 +1652,11 @@ impl Editor {
         // than a line (an explicit scroll, or a motion/jump/search that landed
         // off-screen); the client animates the slide.
         self.finalize_scroll_gesture();
+
+        // Detect any visible window whose viewport changed this keystroke (scroll,
+        // motion off-screen, buffer/window switch, edit reflow) and queue it for the
+        // server to dispatch to `nx.decor` providers off-tick (`editor/decor.rs`).
+        self.recompute_decor_dirty();
     }
 
     /// Turn a recorded `scroll_from` into a `pending_scroll` animation when the

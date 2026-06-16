@@ -1228,6 +1228,18 @@ impl Editor {
         })
     }
 
+    /// Window `id`'s viewport top (first visible 0-based buffer line): the live
+    /// `self.top` for the focused window, the stashed `saved_top` otherwise. `0`
+    /// for an unknown window.
+    pub(crate) fn window_top(&self, id: WindowId) -> usize {
+        if id == self.windows.current {
+            self.top
+        } else {
+            self.tree_of_window(id)
+                .map_or(0, |(_, t)| t.get(id).saved_top)
+        }
+    }
+
     /// Window `id`'s **content** size as `(width, height)` — what
     /// `nvim_win_get_width` / `nvim_win_get_height` report. The width includes the
     /// number gutter (as neovim's does) but excludes a bordered float's side
@@ -2098,6 +2110,9 @@ impl Editor {
         self.height = height.max(1);
         self.relayout();
         self.ensure_visible();
+        // A resize changes every window's visible height (and may clamp `top`), so
+        // re-detect viewports for the `nx.decor` signal (`editor/decor.rs`).
+        self.recompute_decor_dirty();
     }
 
     /// Whether the tabline is drawn right now, per `showtabline`: never at `0`,

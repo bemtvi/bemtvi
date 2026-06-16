@@ -355,6 +355,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.run / nx.run_stream / nx.await_each: promise-only process API (replaces the
     // callback-shaped nx.spawn). After promise.lua (builds on nx.promise/async).
     ("nxvim:prelude/process", include_str!("prelude/process.lua")),
+    // nx.fs: promise-always filesystem API over the nx._fs_* bridge. After
+    // promise.lua (every op returns a promise).
+    ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
     // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
     // the timer and promise surfaces loaded just above.
     ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
@@ -1437,6 +1440,38 @@ impl LuaRuntime {
         let run: mlua::Function = nx.get("_run_stdout")?;
         let table = self.lua.create_sequence_from(lines)?;
         run.call::<()>((id, table))
+    }
+
+    /// Fire a `nx.fs.watch` stream's pump (`nx._run_fs_watch(id, ev, err)`): an `ev`
+    /// table `{ kind, paths }` on a change, or `err` (a string) when the watch failed
+    /// to arm / a backend error ended it. Persistent until the stream is `:stop()`ed
+    /// (which drops the registry entry); a no-op when the id isn't registered. The
+    /// `kind`/`paths` are already coalesced (the actor's 10 ms window).
+    pub fn run_fs_watch_event(
+        &self,
+        id: u64,
+        error: Option<String>,
+        kind: Option<&str>,
+        paths: Vec<std::path::PathBuf>,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_fs_watch")?;
+        match error {
+            Some(msg) => {
+                let err = mlua::Value::String(self.lua.create_string(&msg)?);
+                run.call::<()>((id, mlua::Value::Nil, err))
+            }
+            None => {
+                let ev = self.lua.create_table()?;
+                ev.set("kind", kind)?;
+                let plist = self.lua.create_table()?;
+                for p in paths {
+                    plist.push(p.to_string_lossy().into_owned())?;
+                }
+                ev.set("paths", plist)?;
+                run.call::<()>((id, mlua::Value::Table(ev), mlua::Value::Nil))
+            }
+        }
     }
 
     /// Drive the `:make` / `:grep` async producer (`nx._qf_make`): spawn `cmd` (a

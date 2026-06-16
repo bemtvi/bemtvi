@@ -1680,6 +1680,20 @@ impl EditHost {
             }),
             #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
+            // `nx.fs.watch` rides the actor's native watcher (inotify/FSEvents/kqueue),
+            // coalesced there; the change events return on the `loop_events` arm.
+            #[cfg(feature = "native")]
+            LoopOp::FsWatch {
+                id,
+                path,
+                recursive,
+            } => self.fx.loop_command(LoopCommand::FsEventStart {
+                id,
+                path,
+                recursive,
+            }),
+            #[cfg(feature = "native")]
+            LoopOp::FsUnwatch { id } => self.fx.loop_command(LoopCommand::FsEventStop { id }),
             // The browser build has no tokio event loop; timers ride the Worker-side
             // wheel instead (slice 5d) — `vim.defer_fn` / `nx.timer` arm and fire there.
             #[cfg(not(feature = "native"))]
@@ -1722,6 +1736,31 @@ impl EditHost {
                     self.fx.proc_kill(id);
                 }
             }
+            // The browser build has no native filesystem watcher (and OPFS has no
+            // change-notification at all), and forwarding the watch over the daemon
+            // wire is not wired yet. Fail the watch *loud* — reject its stream's first
+            // pull via the error arg — rather than arm a watch that silently never
+            // fires. (`nx.fs.watch` over a daemon transport is a tracked follow-up.)
+            #[cfg(not(feature = "native"))]
+            LoopOp::FsWatch { id, .. } => {
+                if let Err(e) = self.lua.run_fs_watch_event(
+                    id,
+                    Some(
+                        "nx.fs.watch is not supported in this session \
+                         (no native filesystem watcher)"
+                            .to_string(),
+                    ),
+                    None,
+                    Vec::new(),
+                ) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.fs.watch handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            // Nothing was armed, so a stop is a no-op (mirrors wasm `Kill`).
+            #[cfg(not(feature = "native"))]
+            LoopOp::FsUnwatch { .. } => {}
         }
     }
 
@@ -1776,9 +1815,25 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            LoopEvent::FsEvent {
+                id,
+                error,
+                kind,
+                paths,
+            } if id < crate::INTERNAL_WATCH_BASE => {
+                // A Lua `nx.fs.watch` change (id below the internal-watch base): fire
+                // the watch's stream pump with the coalesced `{ kind, paths }` batch,
+                // or its terminal `error`. Effects the handler queues drain right
+                // after, like the process-event arms.
+                if let Err(e) = self.lua.run_fs_watch_event(id, error, kind, paths) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.fs.watch handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             LoopEvent::FsEvent { id, error, .. } => {
-                // An internal per-buffer file watch's auto-trigger (the only
-                // `fs_event` producer — the Lua `vim.uv.fs_event` surface is gone).
+                // An internal per-buffer file watch's auto-trigger (id ≥ BASE; the Lua
+                // `vim.uv.fs_event` surface is gone — `nx.fs.watch` is handled above).
                 // The file under buffer `id - BASE` changed, so enqueue its reconcile
                 // — the trailing `settle_events` → `run_pending` fires the
                 // `FileChangedShell` round-trip (autoreload / a handler's

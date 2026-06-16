@@ -321,6 +321,19 @@ pub enum LoopOp {
     /// carried here: the actor terminates the child unconditionally (it has no
     /// libc binding to deliver an arbitrary signal), a documented approximation.
     Kill { id: u64 },
+    /// `nx.fs.watch(path, opts)` — arm a native filesystem watch on `path` (a
+    /// subtree when `recursive`) that fires the watch stream under `id` with
+    /// coalesced `{ kind, paths }` change batches. Forwarded to the event-loop actor
+    /// ([`LoopCommand::FsEventStart`](../../nxvim_server) — native only; a wasm /
+    /// serverless session has no native watcher and fails the watch loud).
+    FsWatch {
+        id: u64,
+        path: String,
+        recursive: bool,
+    },
+    /// A `nx.fs.watch` stream's `:stop()` — cancel the watch armed under `id`. A
+    /// no-op if it was never armed.
+    FsUnwatch { id: u64 },
 }
 
 /// A buffer-local *option* write queued by the Lua side, drained by the server in

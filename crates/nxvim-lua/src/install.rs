@@ -705,6 +705,218 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // ===== nx.fs (one-shot ops) ===========================================
+    // The promise-always Lua filesystem surface (docs/plans/2026-06-16-nx-fs-api.md,
+    // Phase 1). Each `nx._fs_*` runs the op SYNCHRONOUSLY through the `LuaFs` seam
+    // (`resolve_lua_fs`) — local syscalls, or a brief blocking wire round-trip in a
+    // daemon session, exactly like the `vim.fn` fs builtins below — and returns the
+    // two-value `(value, err)` contract that the pure-Lua `nx.fs.*` wrappers
+    // (prelude/fs.lua) turn into a resolved / rejected promise. `err` is `nil` on
+    // success, else a `{ code, message }` table whose `code` is a libuv/errno-style
+    // hint (`ENOENT`/`EACCES`/`EEXIST`/…) the caller can branch on.
+    let sh = shared.clone();
+    nx.set(
+        "_fs_stat",
+        lua.create_function(
+            move |lua, path: String| match resolve_lua_fs(&sh).stat(&path) {
+                Ok(st) => Ok((
+                    mlua::Value::Table(fs_stat_table(lua, &st)?),
+                    mlua::Value::Nil,
+                )),
+                Err(e) => fs_err(lua, &e),
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_lstat",
+        lua.create_function(
+            move |lua, path: String| match resolve_lua_fs(&sh).lstat(&path) {
+                Ok(st) => Ok((
+                    mlua::Value::Table(fs_stat_table(lua, &st)?),
+                    mlua::Value::Nil,
+                )),
+                Err(e) => fs_err(lua, &e),
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_exists",
+        lua.create_function(move |_, path: String| {
+            // Existence of the path entry itself (`lstat` — a dangling symlink still
+            // "exists"). Never errors, per the promise-always `exists` contract.
+            Ok(resolve_lua_fs(&sh).lstat(&path).is_ok())
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_readdir",
+        lua.create_function(
+            move |lua, path: String| match resolve_lua_fs(&sh).scandir(&path) {
+                // One `scandir` round-trip carries each entry's kind, so a tree never
+                // has to `stat` every child (the whole point over the `nx._readdir`
+                // name-only seam).
+                Ok(entries) => {
+                    let list = lua.create_table()?;
+                    for e in entries {
+                        let t = lua.create_table()?;
+                        t.set("name", e.name)?;
+                        t.set("type", e.kind.as_str())?;
+                        list.push(t)?;
+                    }
+                    Ok((mlua::Value::Table(list), mlua::Value::Nil))
+                }
+                Err(e) => fs_err(lua, &e),
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_read",
+        lua.create_function(
+            move |lua, path: String| match resolve_lua_fs(&sh).read_file(&path) {
+                Ok(bytes) => Ok((
+                    mlua::Value::String(lua.create_string(bytes)?),
+                    mlua::Value::Nil,
+                )),
+                Err(e) => fs_err(lua, &e),
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_read_text",
+        lua.create_function(move |lua, (path, label): (String, Option<String>)| {
+            let bytes = match resolve_lua_fs(&sh).read_file(&path) {
+                Ok(b) => b,
+                Err(e) => return fs_err(lua, &e),
+            };
+            // Decode through the encoding seam (default UTF-8). A label we don't know
+            // or bytes that don't decode are HARD errors — `read_text` never returns
+            // lossy replacement-char text (use `nx.fs.read` for raw bytes).
+            let label = label.unwrap_or_else(|| "utf-8".to_string());
+            let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) else {
+                return fs_err(
+                    lua,
+                    &std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unknown encoding '{label}'"),
+                    ),
+                );
+            };
+            let (text, _, had_errors) = enc.decode(&bytes);
+            if had_errors {
+                return fs_err(
+                    lua,
+                    &std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid {label} byte sequence in '{path}'"),
+                    ),
+                );
+            }
+            Ok((
+                mlua::Value::String(lua.create_string(text.as_bytes())?),
+                mlua::Value::Nil,
+            ))
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_write",
+        lua.create_function(move |lua, (path, data): (String, mlua::String)| {
+            let bytes = data.as_bytes().to_vec();
+            let fs = resolve_lua_fs(&sh);
+            fs_unit(lua, write_whole(fs.as_ref(), &path, &bytes, false))
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_append",
+        lua.create_function(move |lua, (path, data): (String, mlua::String)| {
+            let bytes = data.as_bytes().to_vec();
+            let fs = resolve_lua_fs(&sh);
+            fs_unit(lua, write_whole(fs.as_ref(), &path, &bytes, true))
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_mkdir",
+        lua.create_function(move |lua, (path, recursive): (String, Option<bool>)| {
+            fs_unit(
+                lua,
+                resolve_lua_fs(&sh).mkdir(&path, 0o755, recursive.unwrap_or(false)),
+            )
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_rename",
+        lua.create_function(move |lua, (from, to): (String, String)| {
+            fs_unit(lua, resolve_lua_fs(&sh).rename(&from, &to))
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_remove",
+        lua.create_function(move |lua, (path, recursive): (String, Option<bool>)| {
+            let fs = resolve_lua_fs(&sh);
+            fs_unit(
+                lua,
+                remove_path(fs.as_ref(), &path, recursive.unwrap_or(false)),
+            )
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_copy",
+        lua.create_function(
+            move |lua, (src, dst, recursive): (String, String, Option<bool>)| {
+                let fs = resolve_lua_fs(&sh);
+                fs_unit(
+                    lua,
+                    copy_path(fs.as_ref(), &src, &dst, recursive.unwrap_or(false)),
+                )
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_realpath",
+        lua.create_function(
+            move |lua, path: String| match resolve_lua_fs(&sh).realpath(&path) {
+                Ok(s) => Ok((mlua::Value::String(lua.create_string(s)?), mlua::Value::Nil)),
+                Err(e) => fs_err(lua, &e),
+            },
+        )?,
+    )?;
+    // `nx._fs_watch(id, path, recursive)` / `nx._fs_unwatch(id)`: arm / cancel a
+    // native filesystem watch feeding the Lua watch stream `id`. Changes fire back
+    // as `nx._run_fs_watch(id, ev, err)` (prelude/fs.lua) until stopped. Queued like
+    // the other loop ops; the event-loop actor coalesces bursts (10 ms).
+    let sh = shared.clone();
+    nx.set(
+        "_fs_watch",
+        lua.create_function(
+            move |_, (id, path, recursive): (u64, String, Option<bool>)| {
+                sh.borrow_mut().loop_ops.push(LoopOp::FsWatch {
+                    id,
+                    path,
+                    recursive: recursive.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_fs_unwatch",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::FsUnwatch { id });
+            Ok(())
+        })?,
+    )?;
+
     // `nx._lsp_start(name, cmd, root, filetype, bufnr, init_options, settings,
     // capabilities)`: queue an [`LspOp::Start`] for the server to drain. The
     // Lua-facing `vim.lsp.start` wrapper (prelude) resolves the config and root,
@@ -2220,6 +2432,147 @@ pub(crate) fn install_runtime_api(
     )?;
 
     Ok(())
+}
+
+// ===== nx.fs helpers ========================================================
+// Shared by the `nx._fs_*` bridges above: the `(value, err)` two-value contract,
+// the stat-table projection, the errno hint, and the compound ops the `LuaFs`
+// trait doesn't offer as a single primitive (whole-file write, recursive
+// remove/copy). All run synchronously through the seam, so they work identically
+// for a local `StdLuaFs` and a remote daemon bridge.
+
+/// The `(nil, { code, message })` error half of the `nx._fs_*` two-value contract.
+fn fs_err(lua: &Lua, e: &std::io::Error) -> mlua::Result<(mlua::Value, mlua::Value)> {
+    let t = lua.create_table()?;
+    t.set("code", errno_code(e))?;
+    t.set("message", e.to_string())?;
+    Ok((mlua::Value::Nil, mlua::Value::Table(t)))
+}
+
+/// Settle a unit-result op into the contract: `(nil, nil)` on success (the Lua
+/// wrapper resolves with `nil`), `(nil, err)` on failure.
+fn fs_unit(lua: &Lua, r: std::io::Result<()>) -> mlua::Result<(mlua::Value, mlua::Value)> {
+    match r {
+        Ok(()) => Ok((mlua::Value::Nil, mlua::Value::Nil)),
+        Err(e) => fs_err(lua, &e),
+    }
+}
+
+/// Project a [`crate::LuaStat`] into the Lua table `nx.fs.stat` resolves with.
+/// Times are fractional seconds since the epoch; `ino`/`uid`/… are omitted (not
+/// what a file tree needs, and `0` off unix). No `ctime` field — `LuaStat` carries
+/// only modify/access times.
+fn fs_stat_table(lua: &Lua, st: &crate::LuaStat) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("type", st.kind.as_str())?;
+    t.set("size", st.size)?;
+    t.set("mode", st.mode)?;
+    if let Some((s, n)) = st.mtime {
+        t.set("mtime", s as f64 + f64::from(n) / 1e9)?;
+    }
+    if let Some((s, n)) = st.atime {
+        t.set("atime", s as f64 + f64::from(n) / 1e9)?;
+    }
+    Ok(t)
+}
+
+/// A libuv/errno-style code hint for a fs error (`nx.fs` rejections carry it as
+/// `err.code`). Prefers the stable [`std::io::ErrorKind`] mapping; for the kinds
+/// std still has no stable variant (`ENOTEMPTY`/`ENOTDIR`/`EISDIR`) it reads the
+/// raw OS errno where recognized, and surfaces the number (`E<n>`) rather than
+/// guess a name.
+fn errno_code(e: &std::io::Error) -> String {
+    use std::io::ErrorKind as K;
+    let named = match e.kind() {
+        K::NotFound => "ENOENT",
+        K::PermissionDenied => "EACCES",
+        K::AlreadyExists => "EEXIST",
+        K::InvalidInput => "EINVAL",
+        K::InvalidData => "EILSEQ",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return named.to_string();
+    }
+    match e.raw_os_error() {
+        Some(20) => "ENOTDIR".to_string(),
+        Some(21) => "EISDIR".to_string(),
+        Some(28) => "ENOSPC".to_string(),
+        Some(39 | 66) => "ENOTEMPTY".to_string(), // linux 39, macos 66
+        Some(n) => format!("E{n}"),
+        None => "EIO".to_string(),
+    }
+}
+
+/// Write `data` to `path` as one whole file (truncate, or append when `append`),
+/// through the fd-based `LuaFs` seam. Closes the fd even on a write error, and
+/// loops on short writes so a partial-write seam can never silently truncate.
+fn write_whole(
+    fs: &dyn crate::LuaFs,
+    path: &str,
+    data: &[u8],
+    append: bool,
+) -> std::io::Result<()> {
+    let flags = if append { "a" } else { "w" };
+    let fd = fs.open(path, flags, 0o644)?;
+    let res = (|| {
+        let mut off = 0usize;
+        while off < data.len() {
+            let n = fs.write(fd, &data[off..], None)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write made no progress",
+                ));
+            }
+            off += n;
+        }
+        Ok(())
+    })();
+    let _ = fs.close(fd);
+    res
+}
+
+/// Remove `path`: a file via `unlink`, a directory via `rmdir` (emptying it first
+/// when `recursive`). Uses `lstat`, so a symlink to a directory is unlinked, not
+/// walked into.
+fn remove_path(fs: &dyn crate::LuaFs, path: &str, recursive: bool) -> std::io::Result<()> {
+    let st = fs.lstat(path)?;
+    if st.kind == crate::FileKind::Dir {
+        if recursive {
+            for e in fs.scandir(path)? {
+                let child = std::path::Path::new(path).join(&e.name);
+                remove_path(fs, &child.to_string_lossy(), true)?;
+            }
+        }
+        fs.rmdir(path)
+    } else {
+        fs.unlink(path)
+    }
+}
+
+/// Copy `src` to `dst`: a file via `copyfile` (overwriting), or a directory tree
+/// when `recursive`. A directory `src` without `recursive` is an error, not a
+/// silent skip.
+fn copy_path(fs: &dyn crate::LuaFs, src: &str, dst: &str, recursive: bool) -> std::io::Result<()> {
+    let st = fs.lstat(src)?;
+    if st.kind == crate::FileKind::Dir {
+        if !recursive {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("'{src}' is a directory (pass {{ recursive = true }})"),
+            ));
+        }
+        fs.mkdir(dst, 0o755, true)?;
+        for e in fs.scandir(src)? {
+            let cs = std::path::Path::new(src).join(&e.name);
+            let cd = std::path::Path::new(dst).join(&e.name);
+            copy_path(fs, &cs.to_string_lossy(), &cd.to_string_lossy(), true)?;
+        }
+        Ok(())
+    } else {
+        fs.copyfile(src, dst, false)
+    }
 }
 
 /// Store (or clear) the panel's `on_select` callback in the Lua registry. `None`

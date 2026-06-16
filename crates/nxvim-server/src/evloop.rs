@@ -16,7 +16,7 @@
 //! next to the syntax and LSP arms.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,9 +109,21 @@ pub enum LoopEvent {
     },
     /// A path watched via [`LoopCommand::FsEventStart`] changed (a content/attribute
     /// edit, or a create/delete/rename), or `error` when the watch couldn't be
-    /// established (the path doesn't exist, a watch limit was hit). Drives the
-    /// internal per-buffer file watch (`:checktime`); the watch fires until stopped.
-    FsEvent { id: u64, error: Option<String> },
+    /// established (the path doesn't exist, a watch limit was hit). The watch fires
+    /// until stopped.
+    ///
+    /// Two consumers, split by `id` (see [`INTERNAL_WATCH_BASE`](crate::INTERNAL_WATCH_BASE)):
+    /// the internal per-buffer file watch (`:checktime`) ignores `kind`/`paths` (it
+    /// re-stats a known buffer); the Lua `nx.fs.watch` surface reads them. `kind` is
+    /// the coalesced change class (`"create"`/`"modify"`/`"remove"`/`"rename"`) and
+    /// `paths` the deduped affected paths — both empty for the internal watch, which
+    /// doesn't pay to carry them.
+    FsEvent {
+        id: u64,
+        error: Option<String>,
+        kind: Option<&'static str>,
+        paths: Vec<PathBuf>,
+    },
 }
 
 /// Handle the server holds to drive the event loop. Cheap to construct; the actor
@@ -253,7 +265,16 @@ async fn run_evloop(
                 // Re-arming an id replaces its watch: drop the old watcher first
                 // (a fresh :start on a handle).
                 fs_watchers.remove(&id);
-                match start_fs_watch(id, &path, recursive, event_tx.clone()) {
+                // The internal per-buffer watch (id ≥ BASE) wants a raw, path-less
+                // event per change — its consumer re-stats. A Lua `nx.fs.watch` (id <
+                // BASE) wants coalesced `{kind, paths}` batches, so it arms the
+                // debouncing variant.
+                let armed = if id >= crate::INTERNAL_WATCH_BASE {
+                    start_fs_watch(id, &path, recursive, event_tx.clone())
+                } else {
+                    start_fs_watch_coalesced(id, &path, recursive, event_tx.clone())
+                };
+                match armed {
                     Ok(watcher) => {
                         fs_watchers.insert(id, watcher);
                     }
@@ -266,6 +287,8 @@ async fn run_evloop(
                         let _ = event_tx.send(LoopEvent::FsEvent {
                             id,
                             error: Some(e.to_string()),
+                            kind: None,
+                            paths: Vec::new(),
                         });
                     }
                 }
@@ -304,6 +327,8 @@ fn start_fs_watch(
                 let _ = event_tx.send(LoopEvent::FsEvent {
                     id,
                     error: Some(e.to_string()),
+                    kind: None,
+                    paths: Vec::new(),
                 });
                 return;
             }
@@ -311,7 +336,14 @@ fn start_fs_watch(
         if classify_fs_event(&event.kind).is_none() {
             return; // an access/metadata-only event libuv wouldn't report
         }
-        let _ = event_tx.send(LoopEvent::FsEvent { id, error: None });
+        // The internal per-buffer watch re-stats a known buffer, so the change
+        // class / paths are not carried (it would pay to clone them for nothing).
+        let _ = event_tx.send(LoopEvent::FsEvent {
+            id,
+            error: None,
+            kind: None,
+            paths: Vec::new(),
+        });
     })?;
     let mode = if recursive {
         RecursiveMode::Recursive
@@ -320,6 +352,135 @@ fn start_fs_watch(
     };
     watcher.watch(Path::new(path), mode)?;
     Ok(watcher)
+}
+
+/// Arm a native filesystem watch for the Lua `nx.fs.watch` surface: like
+/// [`start_fs_watch`], but it carries each change's class and paths, and
+/// **coalesces** a burst into one [`LoopEvent::FsEvent`] over a 10 ms window. The
+/// `notify` backend thread feeds raw `(kind, paths)` (or a backend error) into an
+/// internal channel; a spawned task drains it, accumulating until 10 ms idle, then
+/// emits a single deduped batch. (10 ms only — a plugin that wants a longer settle
+/// composes `nx.utils.debounce` on top.)
+///
+/// The task is self-reaping: when the watcher is dropped (`FsEventStop`, a re-arm,
+/// or actor shutdown), its callback closure — and the raw sender it holds — drops,
+/// the channel closes, and the task ends. So the caller only has to keep the
+/// returned watcher alive, exactly like the internal path.
+fn start_fs_watch_coalesced(
+    id: u64,
+    path: &str,
+    recursive: bool,
+    event_tx: UnboundedSender<LoopEvent>,
+) -> notify::Result<RecommendedWatcher> {
+    let (raw_tx, mut raw_rx) = unbounded_channel::<RawFsChange>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        match res {
+            Ok(event) => {
+                if let Some(kind) = classify_fs_kind(&event.kind) {
+                    let _ = raw_tx.send(RawFsChange::Change(kind, event.paths));
+                }
+            }
+            // Surface a backend error to the consumer (terminal — same as the arm
+            // failure), never a silent drop.
+            Err(e) => {
+                let _ = raw_tx.send(RawFsChange::Error(e.to_string()));
+            }
+        }
+    })?;
+    let mode = if recursive {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    };
+    watcher.watch(Path::new(path), mode)?;
+
+    const WINDOW: Duration = Duration::from_millis(10);
+    tokio::spawn(async move {
+        while let Some(first) = raw_rx.recv().await {
+            // A backend error ends the watch — forward it and stop draining.
+            let (mut kind, mut paths) = match first {
+                RawFsChange::Error(msg) => {
+                    let _ = event_tx.send(LoopEvent::FsEvent {
+                        id,
+                        error: Some(msg),
+                        kind: None,
+                        paths: Vec::new(),
+                    });
+                    break;
+                }
+                RawFsChange::Change(k, p) => (k, dedup_paths(Vec::new(), p)),
+            };
+            // Coalesce everything that arrives within the window into this batch.
+            let mut errored = None;
+            loop {
+                match tokio::time::timeout(WINDOW, raw_rx.recv()).await {
+                    Ok(Some(RawFsChange::Change(k, p))) => {
+                        // Mixed kinds in one burst coarsen to "modify" (the generic
+                        // "something changed" the tree consumer rescans on anyway).
+                        if k != kind {
+                            kind = "modify";
+                        }
+                        paths = dedup_paths(paths, p);
+                    }
+                    Ok(Some(RawFsChange::Error(msg))) => {
+                        errored = Some(msg);
+                        break;
+                    }
+                    // Window elapsed (Err) or channel closed (Ok(None)) → flush.
+                    _ => break,
+                }
+            }
+            let _ = event_tx.send(LoopEvent::FsEvent {
+                id,
+                error: None,
+                kind: Some(kind),
+                paths,
+            });
+            if let Some(msg) = errored {
+                let _ = event_tx.send(LoopEvent::FsEvent {
+                    id,
+                    error: Some(msg),
+                    kind: None,
+                    paths: Vec::new(),
+                });
+                break;
+            }
+        }
+    });
+    Ok(watcher)
+}
+
+/// A raw `notify` change handed from the backend thread to the coalescing task.
+enum RawFsChange {
+    Change(&'static str, Vec<PathBuf>),
+    Error(String),
+}
+
+/// Append `more` to `acc`, skipping paths already present (bursts are small, so a
+/// linear check beats a `HashSet`'s allocation), preserving first-seen order.
+fn dedup_paths(mut acc: Vec<PathBuf>, more: Vec<PathBuf>) -> Vec<PathBuf> {
+    for p in more {
+        if !acc.contains(&p) {
+            acc.push(p);
+        }
+    }
+    acc
+}
+
+/// The `nx.fs.watch` change class for a `notify` [`EventKind`]: `"create"` /
+/// `"remove"` / `"rename"` for the structural kinds, `"modify"` for content/metadata
+/// edits and the coarse `Any`/`Other` kinds (macOS FSEvents emits those when it
+/// can't classify — defaulted to `"modify"` so a real edit is never dropped), and
+/// `None` for the pure-access events libuv/Deno don't surface.
+fn classify_fs_kind(kind: &EventKind) -> Option<&'static str> {
+    use notify::event::ModifyKind;
+    match kind {
+        EventKind::Create(_) => Some("create"),
+        EventKind::Remove(_) => Some("remove"),
+        EventKind::Modify(ModifyKind::Name(_)) => Some("rename"),
+        EventKind::Access(_) => None,
+        _ => Some("modify"),
+    }
 }
 
 /// Map a `notify` [`EventKind`] onto libuv's two `fs_event` flags — `(change,

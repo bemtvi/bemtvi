@@ -124,8 +124,14 @@ impl Editor {
             }
             // Backspacing an empty command line exits, like Esc. With text, it
             // deletes the char before the cursor (a no-op at the very start).
+            // Exception: a scripted `vim.ui.input` prompt stays open when
+            // backspaced past its start (only `<Esc>` cancels an input) — so a
+            // user who clears the line can keep typing rather than losing the
+            // prompt. The ex/search command lines keep vim's empty-exit.
             KeyCode::Backspace if self.cmdline.is_empty() => {
-                self.cancel_cmdline();
+                if !matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+                    self.cancel_cmdline();
+                }
                 return;
             }
             KeyCode::Backspace => self.cmdline_backspace(),

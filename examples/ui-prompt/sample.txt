@@ -1,0 +1,12 @@
+nx.ui.input / nx.ui.confirm — the command-line prompt primitives.
+
+Try the maps (leader is "\"):
+
+  \i   nx.ui.input    — type a name, <CR> to submit, <Esc> to cancel
+  \r   nx.ui.input    — prefilled with this file's name; edit or accept
+  \d   nx.ui.confirm  — yes/no; y / <CR> confirms, n / <Esc> declines
+  \q   nx.ui.confirm  — defaults to No on <CR> (the safe choice)
+
+Delete me with \d.
+And me.
+Both are callback-shaped: nothing blocks while the prompt is open.

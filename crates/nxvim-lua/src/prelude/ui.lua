@@ -1,9 +1,19 @@
 -- nxvim Lua prelude — timers + the async UI surface (nx.ui).
--- nx.timer (alias vim.defer_fn) over the event-loop bridge, plus the two consumers
--- of the server's shared float layer (docs/specs/2026-06-14-nx-ui-float-widget.md):
--- nx.ui.select — the callback-shaped chooser over the floating selectable-list
--- widget, aliased by vim.ui.select per ADR 0002's whitelist — and nx.ui.float, the
--- list-less content float (the widget's sibling, also the LSP hover surface). The
+-- nx.timer (alias vim.defer_fn) over the event-loop bridge, plus the four small
+-- async UI primitives the native-plugin-API names (nx.ui.input / select / confirm
+-- / float — docs/specs/2026-06-11-native-plugin-api.md). None blocks (ADR 0002
+-- rule 3): each returns at once and fires its callback on a later tick.
+--   nx.ui.input   — a one-line text prompt over the editor's command line
+--                   (alias vim.ui.input per ADR 0002's whitelist).
+--   nx.ui.select  — the callback-shaped chooser over the floating selectable-list
+--                   widget (alias vim.ui.select), one consumer of the server's
+--                   shared float layer (docs/specs/2026-06-14-nx-ui-float-widget.md).
+--   nx.ui.confirm — a yes/no confirmation over the command line (nx-native; neovim
+--                   spells this blocking vim.fn.confirm, which the nx model omits).
+--   nx.ui.float   — the list-less content float (the widget's sibling, also the LSP
+--                   hover surface).
+-- input and select map the chosen value back through nx._cb_fns; confirm shares the
+-- command-line prompt plumbing with input (one prompt open at a time). The
 -- nx.validate / nx.deprecate no-ops are not part of nxvim's config API and remain
 -- intentionally absent.
 local vim = vim
@@ -82,6 +92,69 @@ function nx.ui.select(items, opts, on_choice)
   nx._ui_select(labels, opts.prompt or "", id)
 end
 vim.ui.select = nx.ui.select
+
+-- ----- nx.ui.input [alias vim.ui.input] --------------------------------------
+-- nx.ui.input(opts, on_confirm): open a one-line text prompt and call
+-- on_confirm(text) with the entered string on <CR>, or on_confirm(nil) on <Esc>
+-- (cancel). opts:
+--   prompt  = the label drawn ahead of the editable line (default "")
+--   default = text prefilled into the line, cursor at its end (default "")
+-- The server owns the prompt: it opens the editor's command line as a labelled
+-- Prompt (Editor::open_prompt), and delivers the result to nx._cb_fns[id] through
+-- the shared prompt_results channel. Non-blocking and callback-shaped (ADR 0002
+-- rule 3): the call returns at once and on_confirm fires on a later tick. Note an
+-- empty submission (<CR> on an empty line) is "" (not nil) — only <Esc> cancels,
+-- matching neovim's vim.ui.input.
+function nx.ui.input(opts, on_confirm)
+  opts = opts or {}
+  on_confirm = on_confirm or function() end
+  if type(opts) ~= "table" then
+    error("nx.ui.input: opts must be a table", 2)
+  end
+  local id = nx._next_cb_id()
+  nx._cb_fns[id] = function(text)
+    -- text: the entered string ("" on an empty <CR>), or nil on cancel.
+    return on_confirm(text)
+  end
+  nx._ui_input(tostring(opts.prompt or ""), tostring(opts.default or ""), id)
+end
+vim.ui.input = nx.ui.input
+
+-- ----- nx.ui.confirm ---------------------------------------------------------
+-- nx.ui.confirm(message, opts, on_choice) — or nx.ui.confirm(message, on_choice):
+-- a yes/no confirmation over the command line. on_choice(confirmed) gets a boolean
+-- — true on Yes, false on No or cancel (<Esc>). opts (optional):
+--   default = true | false  -- which button <CR> selects (default true = Yes)
+-- nx-native: neovim spells this blocking vim.fn.confirm, which the nx model omits
+-- (rule 3). For an arbitrary multi-choice menu use nx.ui.select instead — confirm
+-- is deliberately just yes/no. The server opens a single-keypress Confirm dialog
+-- (Editor::open_confirm) sharing the prompt_results channel with nx.ui.input (one
+-- prompt open at a time); the chosen 1-based button index arrives as a string,
+-- which the wrapper folds to the boolean (button 1 = Yes; 2 = No; 0 = cancel).
+function nx.ui.confirm(message, opts, on_choice)
+  -- The 2-arg form nx.ui.confirm(message, on_choice): opts omitted.
+  if type(opts) == "function" then
+    on_choice = opts
+    opts = nil
+  end
+  opts = opts or {}
+  on_choice = on_choice or function() end
+  if type(message) ~= "string" then
+    error("nx.ui.confirm: message must be a string", 2)
+  end
+  -- Default to Yes (<CR> accepts), unless opts.default is explicitly false.
+  local default_yes = opts.default ~= false
+  -- A shell-style hint: the default button is upper-cased.
+  local hint = default_yes and "[Y/n]" or "[y/N]"
+  local label = message .. " " .. hint .. " "
+  local id = nx._next_cb_id()
+  nx._cb_fns[id] = function(idx_str)
+    -- idx_str: the chosen 1-based button index as a string ("0" = Esc-cancel).
+    return on_choice(tonumber(idx_str) == 1)
+  end
+  -- accelerators are matched lowercase against the keypress, in button order.
+  nx._confirm(label, { "y", "n" }, default_yes and 1 or 2, id)
+end
 
 -- ----- nx.ui.float -----------------------------------------------------------
 -- nx.ui.float(contents, opts): open the list-less content float — the sibling of

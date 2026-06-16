@@ -932,16 +932,17 @@ pub struct StatuslineSetupReq {
 /// at `setup{}`, on `nx.statusline.invalidate(name)`, on a declared autocmd
 /// event, or when the window set / focus / a window's buffer changes. The
 /// segment is rendered once per window (its `render(ctx)` sees that window's
-/// `{ buf, win, focused }`), so a publish carries the `win` it is for. `cells`
-/// is `(text, group)` per cell, an empty `group` meaning the base `StatusLine`
-/// highlight. Queued in [`crate::runtime::Shared::statusline_publishes`]; the
-/// server caches it by `(win, name)` and reads it during redraw (no per-frame
-/// Lua — ADR 0002 rule 4).
+/// `{ buf, win, focused }`), so a publish carries the `win` it is for. `cells` is
+/// `(text, group, on_click)` per cell — an empty `group` meaning the base
+/// `StatusLine` highlight, and `on_click` a `v:lua.…` click-handler reference
+/// (`None` for a non-clickable cell). Queued in
+/// [`crate::runtime::Shared::statusline_publishes`]; the server caches it by
+/// `(win, name)` and reads it during redraw (no per-frame Lua — ADR 0002 rule 4).
 #[derive(Clone, Debug)]
 pub struct StatuslinePublishReq {
     pub win: u64,
     pub name: String,
-    pub cells: Vec<(String, Option<String>)>,
+    pub cells: Vec<(String, Option<String>, Option<String>)>,
 }
 
 /// A `nx.complete.setup{}` configuration request for the native completion engine

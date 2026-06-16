@@ -71,6 +71,7 @@ pub use self::decor::DecorViewport;
 pub use self::menu::{
     MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
+pub use self::mouse::{ClickSurface, StatuslineClick};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -800,6 +801,12 @@ pub struct Editor {
     /// handles its query edits in core. Drained by the server, which stamps the
     /// generation onto the source run + its pushes so a stale response is dropped.
     pub picker_query_changes: Vec<(u64, String)>,
+    /// Status-line clicks awaiting the server's `%@handler@…%X` resolution. The
+    /// core hit-tests a status-line press to a window + column (it can't run the
+    /// Lua handler), pushes a [`StatuslineClick`] here, and the server drains it
+    /// after the gesture — recomputing that window's click regions and firing the
+    /// handler whose span covers the column. See [`mouse`](crate::editor::mouse).
+    pub statusline_clicks: Vec<StatuslineClick>,
     /// The native completion engine's configuration (`nx.complete.setup`).
     /// Disabled until a config arrives, so an editor with no completion config is
     /// byte-for-byte unchanged. See [`complete`](crate::editor::complete).
@@ -929,6 +936,13 @@ pub struct Editor {
     /// `None` before the first press / after a click outside any window. See
     /// [`crate::editor::mouse`].
     mouse_select: Option<mouse::MouseSelect>,
+
+    /// Multi-click state for status-line `%@…%X` click regions, kept separate from
+    /// [`Editor::mouse_select`] so a status-line click never seeds a text drag/
+    /// selection: `(row, col, stamp_ms, count)` of the last status-line press, for
+    /// counting a same-cell repeat within `'mousetime'` as a double-/triple-click.
+    /// `None` until the first status-line press. See [`crate::editor::mouse`].
+    statusline_click_seq: Option<(usize, usize, u64, u8)>,
 
     /// State for an in-flight separator / status-line drag (Phase 5): which window
     /// edge is grabbed and the press origin the drag resizes against. `None` unless
@@ -1283,6 +1297,7 @@ impl Editor {
             menu_results: Vec::new(),
             content_float: None,
             picker_query_changes: Vec::new(),
+            statusline_clicks: Vec::new(),
             complete_config: complete::CompleteConfig::default(),
             complete_query_changes: Vec::new(),
             complete_gen: 0,
@@ -1316,6 +1331,7 @@ impl Editor {
             awaiting_register: false,
             visual_anchor: Cursor::default(),
             mouse_select: None,
+            statusline_click_seq: None,
             mouse_resize: None,
             scroll_from: None,
             pending_scroll: None,

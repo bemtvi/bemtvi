@@ -100,10 +100,58 @@ pub(crate) enum MouseTarget {
         line: usize,
         col: usize,
     },
-    /// The window's status row (its bottom line). No-op until split-resize drag
-    /// lands; modeled now so a status-line click doesn't fall through to the text
-    /// below it.
-    StatusLine { win: WindowId },
+    /// The window's status row (its bottom line), with the **window-relative**
+    /// (0-based) column the cell sits at — which is the status line's own column,
+    /// so the server can resolve it to a `%@…%X` click region. A status row with a
+    /// window below it is grabbed as a resize handle earlier in [`Editor::mouse`],
+    /// before the hit-test runs, so this is only ever a real status-line click.
+    StatusLine { win: WindowId, col: usize },
+    /// The single **global** status bar (`'laststatus'`=3), with the (0-based)
+    /// column the cell sits at. The bar spans the full editor width and shows the
+    /// focused window's `%`-context, so the server resolves the click against that
+    /// window's status line at the full width (not a per-window rect).
+    GlobalStatusLine { col: usize },
+}
+
+/// Which `%`-format-rendered chrome row a [`StatuslineClick`] landed on — it tells
+/// the server which format to re-run and at what width when resolving the click's
+/// column to a [`ClickAction`](crate::statusline::ClickAction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickSurface {
+    /// A per-window status line (`'statusline'` / its segment layout) at the
+    /// window's content width.
+    Window,
+    /// The single global status bar (`'laststatus'`=3) — the focused window's
+    /// `'statusline'` at the full editor width.
+    Global,
+    /// The main region's custom tabline (`'tabline'`) — the focused window's
+    /// context at the full editor width. Carries `%nT` tab-select regions.
+    Tabline,
+}
+
+/// A status/tabline click awaiting the server's region resolution. The core
+/// hit-tests the click to a window + column but can't run the `%`-format (it needs
+/// the Lua eval for `%{}`/`%!`), so it records the click here; the server drains
+/// [`Editor::statusline_clicks`] after the gesture, recomputes the relevant
+/// format's click regions for the [`surface`](ClickSurface), and runs the action
+/// whose span covers `col` (a Lua handler, or a tab-select via
+/// [`Editor::select_main_tab`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatuslineClick {
+    /// The window the click resolves against (its context the format renders from).
+    pub win: WindowId,
+    /// The display column of the click — window-relative for a per-window status
+    /// line, editor-absolute for the global bar / tabline (both 0-based; each starts
+    /// at the window/editor left edge, so they coincide with its own column).
+    pub col: usize,
+    /// Which chrome row this was, deciding the format + width the server re-runs.
+    pub surface: ClickSurface,
+    /// Multi-click count (1 = single, 2 = double, …), per `'mousetime'`.
+    pub clicks: u8,
+    /// The mouse button: `'l'` / `'r'` / `'m'` (v1 fires on left only).
+    pub button: char,
+    /// Active modifiers as a string — `s` shift, `c` ctrl, `a` alt, in that order.
+    pub modifiers: String,
 }
 
 impl Editor {
@@ -134,6 +182,14 @@ impl Editor {
             {
                 self.mouse_click_tab(ev.row, ev.col)
             }
+            // A press on the main *custom* `'tabline'` (which carries no built-in
+            // click cells, so the arm above misses it): record a tabline click for
+            // the server to resolve against the format's `%nT` regions.
+            (MouseButton::Left, MouseAction::Press)
+                if self.custom_main_tabline_col(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_tabline_press(ev)
+            }
             // A press on a divider grabs that edge; drags resize, release lets go.
             // Two kinds: a dock band's edge (between a dock and the main area) and a
             // split divider *inside* a region (a separator or a status line with a
@@ -150,6 +206,20 @@ impl Editor {
             }
             (MouseButton::Left, MouseAction::Release) if self.mouse_resize.is_some() => {
                 self.mouse_resize = None
+            }
+            // A left-press on a window's status line (one without a window below it —
+            // a status-with-window-below is grabbed as a resize handle above) focuses
+            // the window and records a click for the server to resolve against the
+            // line's `%@…%X` regions. Checked before the selection arms so a status
+            // click never places the cursor or starts a drag; before the shift arm so
+            // a `<S-click>` records its modifier rather than trying to extend.
+            (MouseButton::Left, MouseAction::Press)
+                if matches!(
+                    self.hit_test(ev.row, ev.col),
+                    Some(MouseTarget::StatusLine { .. } | MouseTarget::GlobalStatusLine { .. })
+                ) =>
+            {
+                self.mouse_statusline_press(ev)
             }
             // Shift+left-press extends the selection to the click (vim's
             // `<S-LeftMouse>` under the default `popup_setpos` mousemodel) instead
@@ -198,22 +268,16 @@ impl Editor {
             return;
         }
         let target = self.hit_test(row, col);
-        if let Some(MouseTarget::StatusLine { win }) = target {
-            // A press on a window's status line focuses that window (vim) — crossing
-            // into its region if it is a dock — without moving into the text or
-            // starting a selection. (A status row with a window below it is grabbed
-            // as a resize handle earlier in `mouse`, before reaching here.)
-            self.mouse_select = None;
-            self.set_current_window(win);
-            return;
-        }
+        // A status-line press is dispatched by its own arm in `mouse` (it needs the
+        // event's modifiers), so it never reaches here.
         let Some(MouseTarget::Text {
             win,
             line,
             col: bcol,
         }) = target
         else {
-            // A press outside any window clears the gesture (and resets the count).
+            // A press outside any window (or on a status line) clears the gesture
+            // (and resets the count).
             self.mouse_select = None;
             return;
         };
@@ -241,6 +305,116 @@ impl Editor {
             count,
             anchor,
         });
+    }
+
+    /// A left-press that hit-tested to a window's status line: focus the window
+    /// (vim — crossing into its region if it is a dock) and record a
+    /// [`StatuslineClick`] for the server to resolve against the line's `%@…%X`
+    /// click regions. No cursor move, no selection. The multi-click count is read
+    /// from the same `'mousetime'` machinery the text path uses, so a double-click on
+    /// a region reports `clicks = 2`.
+    fn mouse_statusline_press(&mut self, ev: MouseEvent) {
+        // Per-window status line vs the single global bar (`laststatus=3`). The
+        // global bar shows the focused window's facts, so its click resolves against
+        // the current window — at the full editor width (the server keys off
+        // `global`).
+        let (win, col, surface) = match self.hit_test(ev.row, ev.col) {
+            Some(MouseTarget::StatusLine { win, col }) => (win, col, ClickSurface::Window),
+            Some(MouseTarget::GlobalStatusLine { col }) => {
+                (self.current_window_id(), col, ClickSurface::Global)
+            }
+            _ => return,
+        };
+        // Clear any in-flight text selection, but count status-line multi-clicks on
+        // their own tracker so this press doesn't seed a text drag.
+        self.mouse_select = None;
+        self.set_current_window(win);
+        let clicks = match self.statusline_click_seq {
+            Some((r, c, stamp, count))
+                if r == ev.row
+                    && c == ev.col
+                    && ev.stamp_ms.saturating_sub(stamp) <= self.options.mousetime as u64 =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.statusline_click_seq = Some((ev.row, ev.col, ev.stamp_ms, clicks));
+        let mut modifiers = String::new();
+        if ev.shift {
+            modifiers.push('s');
+        }
+        if ev.ctrl {
+            modifiers.push('c');
+        }
+        if ev.alt {
+            modifiers.push('a');
+        }
+        self.statusline_clicks.push(StatuslineClick {
+            win,
+            col,
+            surface,
+            clicks,
+            button: 'l',
+            modifiers,
+        });
+    }
+
+    /// A left-press on the **main custom tabline** (a non-empty `'tabline'`): record
+    /// a [`ClickSurface::Tabline`] click for the server to resolve against the
+    /// `'tabline'` format's `%nT` regions (→ [`Editor::select_main_tab`]). The
+    /// built-in (structured) tabline is handled earlier by [`Editor::mouse_click_tab`];
+    /// this is only reached when a custom `'tabline'` is in effect, where the cells
+    /// carry no built-in click regions. No focus change here — switching the tab does
+    /// that. The multi-click counter is shared with the status-line tracker (keyed on
+    /// the cell, so the tabline row and a status row never cross-count).
+    fn mouse_tabline_press(&mut self, ev: MouseEvent) {
+        let Some(col) = self.custom_main_tabline_col(ev.row, ev.col) else {
+            return;
+        };
+        self.mouse_select = None;
+        let clicks = match self.statusline_click_seq {
+            Some((r, c, stamp, count))
+                if r == ev.row
+                    && c == ev.col
+                    && ev.stamp_ms.saturating_sub(stamp) <= self.options.mousetime as u64 =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.statusline_click_seq = Some((ev.row, ev.col, ev.stamp_ms, clicks));
+        let mut modifiers = String::new();
+        if ev.shift {
+            modifiers.push('s');
+        }
+        if ev.ctrl {
+            modifiers.push('c');
+        }
+        if ev.alt {
+            modifiers.push('a');
+        }
+        self.statusline_clicks.push(StatuslineClick {
+            win: self.current_window_id(),
+            col,
+            surface: ClickSurface::Tabline,
+            clicks,
+            button: 'l',
+            modifiers,
+        });
+    }
+
+    /// The (0-based) column of a cell on the **main custom tabline**, or `None`. The
+    /// main tabline is the top row at [`region_geoms`](Self::region_geoms)'s
+    /// `bands.reserved_top()`, spanning the full width; this fires only when a custom
+    /// `'tabline'` is set (an empty one uses the built-in structured tabline, handled
+    /// by [`Editor::region_tabline_at`]) and the tabline is shown.
+    fn custom_main_tabline_col(&self, row: usize, col: usize) -> Option<usize> {
+        if self.global_options().tabline.is_empty() || self.tabline_rows() == 0 {
+            return None;
+        }
+        let trow = self.dock_bands().reserved_top();
+        (row == trow && col < self.width).then_some(col)
     }
 
     /// If the global cell `(row, col)` lands on a built-in tabline cell of *some*
@@ -294,6 +468,28 @@ impl Editor {
     /// the client owns *where*), shared by the mouse hit-tests so a global cell maps
     /// back to the region the user sees. Geometry is read for `self.height`, which
     /// is the windows-area height the client reports (cmdline excluded).
+    /// The absolute screen row of the single global status bar (`'laststatus'`=3),
+    /// or `None` when it isn't shown. It sits just below the middle band (main +
+    /// side docks), above the bottom-dock band — the `mid_y + mid_h` row in
+    /// [`Editor::region_geoms`]'s layout (the same chrome math, run for that one
+    /// row). The inverse of where the client docks the global bar.
+    fn global_statusline_row(&self) -> Option<usize> {
+        if !self.global_statusline_visible() {
+            return None;
+        }
+        let bands = self.dock_bands();
+        let main_tabline = self.tabline_rows();
+        let chrome = main_tabline + self.panel_rows() + self.global_statusline_rows();
+        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_h = self
+            .height
+            .saturating_sub(bands.reserved_top())
+            .saturating_sub(bands.reserved_bottom())
+            .saturating_sub(chrome)
+            .max(1);
+        Some(mid_y + mid_h)
+    }
+
     fn region_geoms(&self) -> Vec<RegionGeom> {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
@@ -1178,6 +1374,12 @@ impl Editor {
     /// region — not just the focused one — is what lets a click in any dock land
     /// there; the press handler then focuses that region via `set_current_window`.
     fn hit_test(&self, row: usize, col: usize) -> Option<MouseTarget> {
+        // The global status bar (`laststatus=3`) is chrome below every region, so it
+        // matches no region tree; resolve it first. It spans the full width and shows
+        // the focused window's facts, so the click resolves against that window.
+        if self.global_statusline_row() == Some(row) {
+            return Some(MouseTarget::GlobalStatusLine { col });
+        }
         // Each region's tree lays out at its own origin (0, 0) and the client offsets
         // it by the region's screen origin; this runs that offset backwards. A cell
         // on chrome (a tabline, a separator, the panel) matches no region's tree.
@@ -1186,8 +1388,10 @@ impl Editor {
         let (win, rel_x, rel_y) = window_at_in(tree, col - ox, row - oy)?;
         let (_, text_height) = self.window_content_size(win)?;
         if rel_y >= text_height {
-            // Below the text body: the status row (the last content line).
-            return Some(MouseTarget::StatusLine { win });
+            // Below the text body: the status row (the last content line). `rel_x`
+            // is the window-relative column, which is the status line's own column
+            // (it spans the window's content width from the left edge).
+            return Some(MouseTarget::StatusLine { win, col: rel_x });
         }
         let (line, col) = self.text_cell_to_buf(win, rel_x, rel_y)?;
         Some(MouseTarget::Text { win, line, col })

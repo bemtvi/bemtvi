@@ -106,6 +106,9 @@ impl EditHost {
                 // multi-click detection compares these deltas against `'mousetime'`.
                 ev.stamp_ms = self.mouse_stamp_ms();
                 self.editor.mouse(ev);
+                // A status-line click on a `%@…%X` region fires its Lua handler (and
+                // settles the handler's effects); a no-op for every other gesture.
+                self.dispatch_statusline_clicks();
                 Ok(Value::Nil)
             }
             "nxvim_input_flush" => {

@@ -33,12 +33,22 @@ function _G.statusline()
   if tail == "" then tail = "[No Name]" end
   local line, col = vim.fn.line("."), vim.fn.col(".")
   return table.concat({
-    "%#StlMode# ", mode, " ",
+    -- The mode block is a click region (`%@v:lua.fn@…%X`): clicking it cycles
+    -- 'laststatus'. Click regions work on the per-window status lines (modes 1/2)
+    -- AND on this single global bar (mode 3) — the same engine drives both.
+    "%@v:lua.on_mode_click@%#StlMode# ", mode, " %X",
     "%#StlFile# ", tail, "%m ",
     "%#StatusLine#%=",
     "%#StlMode# ", tostring(line), ":", tostring(col), " ",
     "  ls=", tostring(vim.o.laststatus), " ",
   })
+end
+
+-- Cycle 'laststatus' 3 → 2 → 1 → 0 → 3 when the mode block is clicked. `on click`
+-- handlers get (minwid, clicks, button, modifiers); here we ignore them all.
+function _G.on_mode_click()
+  vim.o.laststatus = (vim.o.laststatus + 1) % 4
+  vim.notify("laststatus = " .. vim.o.laststatus)
 end
 
 vim.o.statusline = "%!v:lua.statusline()"

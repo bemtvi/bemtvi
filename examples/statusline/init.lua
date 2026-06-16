@@ -26,6 +26,7 @@
 --   :set fileencoding=latin1      the %{&fileencoding} block switches to "latin1"
 --   :set bomb                     a "[bom]" tag appears via the %{&bomb?…} ternary
 --   :e examples/tabs/sample.txt   the file block follows the current buffer
+--   click the filename block       a `%@v:lua.…@…%X` click region echoes the path
 --   :set statusline=              fall back to nxvim's built-in default look
 
 --------------------------------------------------------------------------------
@@ -54,9 +55,23 @@ local MODES = {
 }
 
 --------------------------------------------------------------------------------
+-- 3a. A click handler. `%@v:lua.fn@ … %X` in the format makes the wrapped text a
+--    clickable region: a mouse click on those cells calls _G.on_name_click with
+--    neovim's click arguments (minwid, clicks, button, modifiers). Here clicking
+--    the filename block toggles the buffer's modified-look by echoing its path —
+--    a real config might open a buffer picker or a git menu. (The handler must be
+--    a `v:lua.` reference, like the %{}/%! expressions.)
+--------------------------------------------------------------------------------
+function _G.on_name_click(minwid, clicks, button, mods)
+  local where = vim.fn.expand("%:p")
+  if where == "" then where = "[No Name]" end
+  vim.cmd(string.format("echo 'clicked %s (button=%s clicks=%d)'", where, button, clicks))
+end
+
+--------------------------------------------------------------------------------
 -- 3. The builder. Returns a %-format string; because the option is `%!…`, the
---    engine re-parses the result, so the %#…#, %=, %m and %% items below are
---    honoured. Everything dynamic is read live through vim.fn.
+--    engine re-parses the result, so the %#…#, %=, %m, %% and %@…%X items below
+--    are honoured. Everything dynamic is read live through vim.fn.
 --------------------------------------------------------------------------------
 function _G.statusline()
   local mode = MODES[vim.fn.mode()] or { vim.fn.mode():upper(), "StlModeNormal" }
@@ -74,7 +89,9 @@ function _G.statusline()
 
   return table.concat({
     "%#", mode[2], "# ", mode[1], " ",            -- coloured mode block
+    "%@v:lua.on_name_click@",                     -- start a clickable region…
     "%#StlFile# ", where, tail, "%m ",            -- file (+ built-in modified flag)
+    "%X",                                         -- …end it: the file block is clickable
     "%#StatusLine#%=",                            -- neutral spacer; %= pushes right
     [[%#StlFile# %{&fileencoding}%{&bomb?"[bom]":""} ]], -- encoding via pure %{&opt}
     "%#StlRuler# ", tostring(line), ":", tostring(col),

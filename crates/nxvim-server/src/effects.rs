@@ -564,7 +564,13 @@ impl EditHost {
             let cells = req
                 .cells
                 .into_iter()
-                .map(|(text, group)| nxvim_core::statusline::StatusSegment { text, group })
+                .map(
+                    |(text, group, on_click)| nxvim_core::statusline::StatusSegment {
+                        text,
+                        group,
+                        on_click,
+                    },
+                )
                 .collect();
             self.statusline_cache.insert((req.win, req.name), cells);
         }
@@ -764,6 +770,55 @@ impl EditHost {
                     self.feed_buffer.push_back((key, op.remap));
                 }
             }
+        }
+    }
+
+    /// Drain the status-line clicks the core recorded for the last mouse gesture
+    /// (`%@handler@…%X` regions) and fire each one's Lua handler. For every click,
+    /// recompute the window's click regions and resolve the clicked column to a
+    /// handler (a `v:lua.…` reference) + `minwid`; a click that lands outside every
+    /// region is a no-op (the window was already focused by the core). The handler is
+    /// called with neovim's arguments `(minwid, clicks, button, modifiers)`; its
+    /// queued effects drain through `apply_lua_effects` + `run_pending`, so a handler
+    /// that runs `vim.cmd(...)` / opens a picker settles like any other Lua entry.
+    pub(crate) fn dispatch_statusline_clicks(&mut self) {
+        use nxvim_core::statusline::ClickAction;
+        let clicks = std::mem::take(&mut self.editor.statusline_clicks);
+        if clicks.is_empty() {
+            return;
+        }
+        let mut fired = false;
+        for click in clicks {
+            let Some(action) = self.statusline_click_at(click.win.0, click.col, click.surface)
+            else {
+                continue;
+            };
+            match action {
+                // `%@handler@` / a segment `on_click`: fire the Lua handler with
+                // neovim's click arguments.
+                ClickAction::Handler { handler, minwid } => {
+                    if let Err(e) = self.lua.run_statusline_click(
+                        &handler,
+                        minwid,
+                        click.clicks,
+                        click.button,
+                        &click.modifiers,
+                    ) {
+                        self.editor.echo(format!("E:statusline click handler: {e}"));
+                    }
+                }
+                // `%nT`: switch the main region to tab page `n` (core action).
+                ClickAction::Tab(n) => self.editor.select_main_tab(n),
+            }
+            fired = true;
+        }
+        // Apply the handlers' queued effects and drive them to convergence — the
+        // mouse arm in `dispatch` doesn't `run_pending` on its own (a bare click
+        // changes only core state), so a handler's `vim.cmd`/`:lua` would otherwise
+        // wait for the next keystroke to settle.
+        if fired {
+            self.apply_lua_effects();
+            self.run_pending();
         }
     }
 
@@ -2158,7 +2213,13 @@ impl EditHost {
             let cells = req
                 .cells
                 .into_iter()
-                .map(|(text, group)| nxvim_core::statusline::StatusSegment { text, group })
+                .map(
+                    |(text, group, on_click)| nxvim_core::statusline::StatusSegment {
+                        text,
+                        group,
+                        on_click,
+                    },
+                )
                 .collect();
             self.statusline_cache.insert((req.win, req.name), cells);
         }

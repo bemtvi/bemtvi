@@ -213,6 +213,17 @@ impl Editor {
         self.switch_tab(idx);
     }
 
+    /// Switch the **main** region to its tab page `n` (1-based) and focus it — the
+    /// `%nT` tabline click ([`crate::statusline::ClickAction::Tab`]). A no-op when
+    /// `n` is `0` or past the last main tab. Reuses [`Editor::focus_region_tab`], so
+    /// it crosses focus back to main first (vim's tabline click both selects and
+    /// focuses).
+    pub fn select_main_tab(&mut self, n: usize) {
+        if let Some(idx) = n.checked_sub(1) {
+            self.focus_region_tab(Layer::Main, idx);
+        }
+    }
+
     /// Make tab `id` the active tab (`nvim_set_current_tabpage`). A no-op if `id`
     /// is already active or names no open tab. The neovim tabpage API addresses the
     /// **main** layer's tabs, so focus crosses back to main first (a focused dock

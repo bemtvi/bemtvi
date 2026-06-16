@@ -163,6 +163,16 @@ Mirror the `nx.complete` shape:
   (window override → global → `%`-format); window-local overrides are pruned when a
   window closes. The custom `'tabline'` is now also kept on the `%`-format path
   (never a segment layout).
-- Mouse-click segment regions (shared with the deferred tabline `%@…@` work).
+- ~~Mouse-click segment regions (shared with the deferred tabline `%@…@` work).~~
+  **Done** (follow-up, 2026-06-16): a segment spec (or an individual `render` cell)
+  can carry `on_click = "v:lua.<fn>"`; a left-click on the cell fires it with
+  `(minwid=0, clicks, button, modifiers)`, the same dispatch as the `%`-format
+  `%@…%X` regions. The cell's handler rides the publish bridge
+  (`StatuslinePublishReq.cells` = `(text, group, on_click)`);
+  `compose_segments_with_clicks` wraps a clickable cell in a
+  `Piece::ClickStart`/`ClickEnd` so `layout_with_clicks` tracks its column span, and
+  `EditHost::statusline_click_at` resolves the clicked column for both surfaces.
+  (`examples/nx-statusline/` makes the git segment clickable; tests in
+  `nxvim-server/tests/mouse.rs`.)
 - A built-in `git` / `lsp_progress` segment — these are *plugin* segments by
   design (the spec ships them as custom-segment examples), not built-ins.

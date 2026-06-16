@@ -570,6 +570,99 @@ impl EditHost {
         self.project_status_segments(&segments, styles)
     }
 
+    /// Resolve a status/tabline click in window `win_id` at display column `col` to
+    /// the [`ClickAction`](nxvim_core::statusline::ClickAction) of the region
+    /// covering it, or `None` if the column is in no region.
+    ///
+    /// Recomputed on demand (a click is rare) rather than cached during redraw: it
+    /// rebuilds the relevant context at the painted width and finds the region
+    /// covering `col`. The [`surface`](nxvim_core::ClickSurface) picks the format and
+    /// width, mirroring [`Self::render_statusline`]'s paths so the recomputed spans
+    /// match the painted line:
+    /// - **Window** — the window's `'statusline'` (`%@…%X`) or its `nx.statusline`
+    ///   segment layout (a cell `on_click`), at the window's content width.
+    /// - **Global** — the focused window's `'statusline'` at the full editor width.
+    /// - **Tabline** — the focused window's `'tabline'` `%`-format (`%nT` tab-select,
+    ///   `%@…%X`) at the full editor width; never a segment layout.
+    pub(crate) fn statusline_click_at(
+        &mut self,
+        win_id: u64,
+        col: usize,
+        surface: nxvim_core::ClickSurface,
+    ) -> Option<nxvim_core::statusline::ClickAction> {
+        use nxvim_core::ClickSurface;
+        let (w, h) = self.ui?;
+        let view = self.editor.view(w, h);
+        let win = view.windows.iter().find(|win| win.id.0 == win_id)?;
+        let ctx = &win.status_ctx;
+
+        let clicks = match surface {
+            // The main custom `'tabline'` — full width, focused window's context,
+            // never a segment layout. Empty / malformed ⇒ no regions.
+            ClickSurface::Tabline => {
+                let tabline_fmt = self.editor.global_options().tabline;
+                if tabline_fmt.is_empty() {
+                    return None;
+                }
+                let items = statusline::parse(&tabline_fmt).ok()?;
+                let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw, ctx);
+                let pieces = statusline::expand(&items, ctx, &mut eval);
+                let (_segments, clicks) = statusline::layout_with_clicks(&pieces, w);
+                clicks
+            }
+            // A per-window status line (its content width) or the global bar (full
+            // width); both honour the window's segment layout, else its `%`-format.
+            ClickSurface::Window | ClickSurface::Global => {
+                let width = if matches!(surface, ClickSurface::Global) {
+                    w
+                } else {
+                    let inset = if win.floating && win.border != BorderStyle::None {
+                        1
+                    } else {
+                        0
+                    };
+                    win.rect.width.saturating_sub(2 * inset)
+                };
+                if let Some(layout) = self.resolve_window_layout(win_id) {
+                    // Segment layout: a clickable cell carries an `on_click` handler,
+                    // which `compose_segments_with_clicks` turns into a column span.
+                    let mut seg_ctx = ctx.clone();
+                    seg_ctx.diag_counts =
+                        self.statusline_diag_counts(nxvim_core::BufferId(ctx.bufnr as u64));
+                    let cache = &self.statusline_cache;
+                    let custom = |name: &str| cache.get(&(win_id, name.to_string())).cloned();
+                    let (_segments, clicks) = statusline::compose_segments_with_clicks(
+                        layout,
+                        &seg_ctx,
+                        &view.mode_label,
+                        width,
+                        &custom,
+                    );
+                    clicks
+                } else {
+                    let statusline_fmt = self.editor.global_options().statusline;
+                    let default;
+                    let fmt = if statusline_fmt.is_empty() {
+                        default = default_statusline(&view.mode_label, &ctx.fileencoding, ctx.bomb);
+                        &default
+                    } else {
+                        &statusline_fmt
+                    };
+                    // A malformed format renders as its error text (no click regions).
+                    let items = statusline::parse(fmt).ok()?;
+                    let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw, ctx);
+                    let pieces = statusline::expand(&items, ctx, &mut eval);
+                    let (_segments, clicks) = statusline::layout_with_clicks(&pieces, width);
+                    clicks
+                }
+            }
+        };
+        clicks
+            .into_iter()
+            .find(|r| col >= r.start_col && col < r.end_col)
+            .map(|r| r.action)
+    }
+
     /// Project resolved [`StatusSegment`](nxvim_core::statusline::StatusSegment)s
     /// into the `status` array clients paint: `{ text, style }` per run, the
     /// highlight group resolved to a style-palette id (`Nil` when it has none /

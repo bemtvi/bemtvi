@@ -81,6 +81,19 @@ pub enum ExprKind {
     Whole,
 }
 
+/// What a click region ([`ClickRegion`]) does when its cells are clicked. A region
+/// is opened by an `%@…@` (a Lua handler) or an `%nT` (a tabline tab-select) and
+/// closed by the next [`Item::ClickEnd`] (`%X`/`%T`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickAction {
+    /// `%@handler@` / `%N@handler@` — call the Lua handler (a `v:lua.…` reference,
+    /// like `%{}`/`%!`) with `minwid` (the optional numeric prefix, `0` if omitted).
+    Handler { handler: String, minwid: u32 },
+    /// `%nT` (`n ≥ 1`) — switch to **tab page `n`** (1-based), the tabline's
+    /// tab-select region. Backed by [`Editor::select_main_tab`](crate::Editor).
+    Tab(usize),
+}
+
 /// One parsed element of a statusline format string. The output of [`parse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -95,13 +108,17 @@ pub enum Item {
     Align,
     /// `%<` — the point at which the line is truncated when it is too wide.
     Truncate,
-    /// A tabline click-region marker: `%T` / `%X` (and the numbered `%nT` /
-    /// `%nX`). In neovim these delimit the mouse-click region for a tab label or
-    /// its close button; they render to **no visible text**. nxvim's tabline is
-    /// render-only (no mouse), so the region is not tracked — the marker is parsed
-    /// (rather than erroring, so a real `'tabline'` format renders) and expands to
-    /// nothing.
-    TabRegion,
+    /// The **start** of a clickable region: `%@handler@` / `%N@handler@` (a Lua
+    /// handler) or `%nT` (`n ≥ 1`, a tabline tab-select) — see [`ClickAction`]. The
+    /// region's text renders normally; only its column span is tracked (see
+    /// [`ClickRegion`]). Terminated by the next [`Item::ClickEnd`].
+    ClickStart { action: ClickAction },
+    /// `%X` / `%nX` / `%T` / `%0T` — the **end** of a click region (neovim's region
+    /// terminators: `%X` ends a handler / close-button region, a bare or `%0T` ends
+    /// the tab labels). Closes the open [`Item::ClickStart`]; with none open it
+    /// renders to nothing (carrying no text), so a label-only `%T…%X` format is
+    /// unaffected.
+    ClickEnd,
     /// `%{…}` / `%!…` / `%{%…%}` — an expression evaluated by the injected
     /// callback. `raw` is the expression text between the delimiters.
     Expr { kind: ExprKind, raw: String },
@@ -169,23 +186,36 @@ pub enum Piece {
     Align,
     /// A `%<` truncation point.
     Truncate,
+    /// The start of a click region (`%@handler@` or `%nT`): the text that follows,
+    /// up to the matching [`Piece::ClickEnd`], is clickable with [`ClickAction`].
+    /// [`layout_with_clicks`] tracks its column span.
+    ClickStart { action: ClickAction },
+    /// The end of a click region (`%X` / `%T`).
+    ClickEnd,
 }
 
 /// One painted run of the final status line: a string and the highlight group it
 /// is drawn in (`None` ⇒ the base `StatusLine`). The output of [`layout`] and
 /// what the server projects / the client paints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusSegment {
     pub text: String,
     pub group: Option<String>,
+    /// A click handler for an `nx.statusline` segment cell (a `v:lua.…` reference),
+    /// or `None` for a non-clickable cell. Set only on custom-segment cells (built-in
+    /// segments and the `%`-format path leave it `None` — the latter tracks clicks as
+    /// [`ClickRegion`]s instead). [`compose_segments_with_clicks`] turns a `Some` cell
+    /// into a [`ClickRegion`] by wrapping it in a [`Piece::ClickStart`]/`ClickEnd`.
+    pub on_click: Option<String>,
 }
 
 /// Parse a `'statusline'` format string into a flat list of [`Item`]s.
 ///
 /// Recognised `%`-items: the [`Field`] letters, `%%` (a literal `%`), `%=`
 /// (align), `%<` (truncate), highlight switches `%#Group#` / `%*` / `%0*` /
-/// `%N*`, the tabline click regions `%T` / `%X` / `%nT` / `%nX`, and the
-/// expression forms `%{…}`, `%{%…%}`, `%!…`. Any other `%X` sequence is an error
+/// `%N*`, the tabline tab-select markers `%T` / `%nT`, the click-region items
+/// `%@handler@` / `%N@handler@` … `%X` / `%nX`, and the expression forms
+/// `%{…}`, `%{%…%}`, `%!…`. Any other `%`-sequence is an error
 /// (no silent passthrough — an unknown item would otherwise render as misleading
 /// text), returned as a human-readable message naming the offending item.
 pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
@@ -248,10 +278,27 @@ pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
                 i += 2;
             }
             Some(b'T') | Some(b'X') => {
-                // Bare `%T` / `%X` — a tabline click-region marker (no text).
+                // Bare `%T` / `%X` — the end of a click region (neovim's tab-label
+                // / close-button terminators). No text.
                 flush_lit!();
-                items.push(Item::TabRegion);
+                items.push(Item::ClickEnd);
                 i += 2;
+            }
+            Some(b'@') => {
+                // `%@handler@` — the start of a Lua-handler click region; the handler
+                // name runs to the next `@`. No numeric prefix ⇒ `minwid` 0.
+                flush_lit!();
+                let rest = &fmt[i + 2..];
+                let end = rest.find('@').ok_or_else(|| {
+                    "statusline: unterminated %@handler@ click region".to_string()
+                })?;
+                items.push(Item::ClickStart {
+                    action: ClickAction::Handler {
+                        handler: rest[..end].to_string(),
+                        minwid: 0,
+                    },
+                });
+                i += 2 + end + 1;
             }
             Some(b'!') => {
                 // `%!expr` — the whole statusline is the eval result. The
@@ -271,9 +318,10 @@ pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
                 i += consumed;
             }
             Some(d) if d.is_ascii_digit() => {
-                // A `%`-item carrying a leading number: `%N*` (User highlight) or
-                // the numbered tabline regions `%nT` / `%nX`. Read the whole digit
-                // run, then dispatch on the letter that closes it.
+                // A `%`-item carrying a leading number: `%N*` (User highlight), the
+                // numbered tabline regions `%nT` / `%nX`, or a `%N@handler@` click
+                // region with `minwid` N. Read the whole digit run, then dispatch on
+                // the letter that closes it.
                 let mut j = i + 1;
                 while bytes.get(j).is_some_and(u8::is_ascii_digit) {
                     j += 1;
@@ -291,12 +339,42 @@ pub fn parse(fmt: &str) -> Result<Vec<Item>, String> {
                         items.push(Item::HlSwitch(group));
                         i = j + 1;
                     }
-                    // `%nT` / `%nX` — a numbered tabline click region (e.g. `%1T`
-                    // the tab-1 label, `%999X` the close button). No visible text.
-                    Some(b'T') | Some(b'X') => {
+                    // `%nT` — a numbered tabline tab-select region: `n ≥ 1` opens a
+                    // click region for tab page `n`; `%0T` is the label-end marker.
+                    Some(b'T') => {
                         flush_lit!();
-                        items.push(Item::TabRegion);
+                        // The digit run is in-range ASCII; saturate an absurd one.
+                        let n = fmt[i + 1..j].parse::<usize>().unwrap_or(usize::MAX);
+                        items.push(if n == 0 {
+                            Item::ClickEnd
+                        } else {
+                            Item::ClickStart {
+                                action: ClickAction::Tab(n),
+                            }
+                        });
                         i = j + 1;
+                    }
+                    // `%nX` — a numbered region terminator / close button.
+                    Some(b'X') => {
+                        flush_lit!();
+                        items.push(Item::ClickEnd);
+                        i = j + 1;
+                    }
+                    // `%N@handler@` — a Lua-handler click region carrying `minwid` N.
+                    Some(b'@') => {
+                        flush_lit!();
+                        let minwid = fmt[i + 1..j].parse::<u32>().unwrap_or(u32::MAX);
+                        let rest = &fmt[j + 1..];
+                        let end = rest.find('@').ok_or_else(|| {
+                            "statusline: unterminated %@handler@ click region".to_string()
+                        })?;
+                        items.push(Item::ClickStart {
+                            action: ClickAction::Handler {
+                                handler: rest[..end].to_string(),
+                                minwid,
+                            },
+                        });
+                        i = j + 1 + end + 1;
                     }
                     // A digit prefix on any other item is a width field, which v1
                     // does not support.
@@ -431,9 +509,10 @@ fn expand_into(
             Item::HlSwitch(g) => *group = g.clone(),
             Item::Align => out.push(Piece::Align),
             Item::Truncate => out.push(Piece::Truncate),
-            // A tabline click region is a no-op in render-only mode: it carries no
-            // text and no structural marker, so it contributes nothing.
-            Item::TabRegion => {}
+            Item::ClickStart { action } => out.push(Piece::ClickStart {
+                action: action.clone(),
+            }),
+            Item::ClickEnd => out.push(Piece::ClickEnd),
             Item::Expr { kind, raw } => {
                 let result = eval(*kind, raw);
                 match kind {
@@ -547,10 +626,44 @@ fn alt_percentage(ctx: &StatuslineCtx) -> String {
 /// after a `<`; under-budget lines with `%=` markers split the slack between the
 /// markers, the last marker taking the remainder.
 pub fn layout(pieces: &[Piece], width: usize) -> Vec<StatusSegment> {
-    let flat = flatten(pieces);
-    let total: usize = flat.chars.iter().map(|c| c.width).sum();
+    coalesce(resolve_chars(flatten(pieces), width))
+}
 
-    let chars = if width == 0 {
+/// A clickable region of the laid-out status line: the half-open display-column
+/// span `[start_col, end_col)` (0-based, in the line the client paints) and what a
+/// click there does ([`ClickAction`] — a Lua handler or a tab-select). The output
+/// of [`layout_with_clicks`]; the server resolves a status/tabline click's column
+/// to one of these. Spans are tracked through truncation/fill (they ride each
+/// cell), so a truncated region reports its surviving span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickRegion {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub action: ClickAction,
+}
+
+/// [`layout`], also returning the [`ClickRegion`]s (`%@…%X` / `%nT`) with their
+/// final display-column spans. Used by the server's `%`-format render so a later
+/// status/tabline click can be resolved to its action. (The plain [`layout`] is
+/// kept for the callers — and the parser unit tests — that don't need click regions.)
+pub fn layout_with_clicks(
+    pieces: &[Piece],
+    width: usize,
+) -> (Vec<StatusSegment>, Vec<ClickRegion>) {
+    let flat = flatten(pieces);
+    let regions = flat.regions.clone();
+    let chars = resolve_chars(flat, width);
+    let clicks = collect_clicks(&chars, &regions);
+    (coalesce(chars), clicks)
+}
+
+/// The width-dependent pass shared by [`layout`] / [`layout_with_clicks`]: apply
+/// `%<` truncation when the text overflows, otherwise distribute `%=` fill. A
+/// `width` of `0` means "unconstrained" — the markers collapse and the raw cells
+/// are returned.
+fn resolve_chars(flat: Flat, width: usize) -> Vec<Cell> {
+    let total: usize = flat.chars.iter().map(|c| c.width).sum();
+    if width == 0 {
         flat.chars
     } else if total > width {
         truncate(
@@ -564,18 +677,64 @@ pub fn layout(pieces: &[Piece], width: usize) -> Vec<StatusSegment> {
         distribute_fill(flat.chars, &flat.align_positions, width - total)
     } else {
         flat.chars
-    };
-
-    coalesce(chars)
+    }
 }
 
-/// A char of resolved status text: the character, its display width, and the
-/// highlight group active over it.
+/// Walk the laid-out cells and group maximal runs sharing a click-region index
+/// into [`ClickRegion`]s, summing display widths into column spans. Cells outside
+/// any region (`click == None`) — the inter-region text, `%=` fill, the `<`/`>`
+/// truncation markers — break a run. A region whose every cell was truncated away
+/// simply yields no span.
+fn collect_clicks(chars: &[Cell], regions: &[ClickAction]) -> Vec<ClickRegion> {
+    let mut out: Vec<ClickRegion> = Vec::new();
+    let mut col = 0usize;
+    // The open region: its index and the column it started at.
+    let mut cur: Option<(usize, usize)> = None;
+    let close = |out: &mut Vec<ClickRegion>, idx: usize, start: usize, end: usize| {
+        if let Some(action) = regions.get(idx) {
+            out.push(ClickRegion {
+                start_col: start,
+                end_col: end,
+                action: action.clone(),
+            });
+        }
+    };
+    for c in chars {
+        match (c.click, cur) {
+            // Continue the open region.
+            (Some(idx), Some((cur_idx, _))) if idx == cur_idx => {}
+            // A different region begins immediately after another: close, reopen.
+            (Some(idx), Some((cur_idx, start))) => {
+                close(&mut out, cur_idx, start, col);
+                let _ = cur_idx;
+                cur = Some((idx, col));
+            }
+            // A region opens out of bare text.
+            (Some(idx), None) => cur = Some((idx, col)),
+            // Bare text closes any open region.
+            (None, Some((cur_idx, start))) => {
+                close(&mut out, cur_idx, start, col);
+                cur = None;
+            }
+            (None, None) => {}
+        }
+        col += c.width;
+    }
+    if let Some((idx, start)) = cur {
+        close(&mut out, idx, start, col);
+    }
+    out
+}
+
+/// A char of resolved status text: the character, its display width, the highlight
+/// group active over it, and the click-region index it belongs to (`None` ⇒ not in
+/// a `%@…%X` region). The region index keys into [`Flat::regions`].
 #[derive(Clone)]
 struct Cell {
     ch: char,
     width: usize,
     group: Option<String>,
+    click: Option<usize>,
 }
 
 /// The char-level view of expanded pieces that [`layout`] operates on: every text
@@ -589,15 +748,22 @@ struct Flat {
     /// Char index of the first `%`-item of any kind — neovim's default
     /// truncation point when there is no `%<`. `None` ⇒ pure literal text.
     first_item: Option<usize>,
+    /// Each click region's [`ClickAction`], indexed by the [`Cell::click`] that
+    /// references it (assigned in encounter order as a `ClickStart` opens).
+    regions: Vec<ClickAction>,
 }
 
 /// Lower [`Piece`]s to the char-level [`Flat`] form, recording marker positions
-/// as char offsets into the emitted text.
+/// as char offsets into the emitted text and tagging each cell with the click
+/// region in force (if any).
 fn flatten(pieces: &[Piece]) -> Flat {
     let mut chars = Vec::new();
     let mut align_positions = Vec::new();
     let mut trunc_position = None;
     let mut first_item = None;
+    let mut regions: Vec<ClickAction> = Vec::new();
+    // The click region currently open (its index into `regions`), or `None`.
+    let mut click: Option<usize> = None;
     for piece in pieces {
         match piece {
             Piece::Text { text, group } => {
@@ -606,6 +772,7 @@ fn flatten(pieces: &[Piece]) -> Flat {
                         ch,
                         width: UnicodeWidthChar::width(ch).unwrap_or(0),
                         group: group.clone(),
+                        click,
                     });
                 }
             }
@@ -617,6 +784,11 @@ fn flatten(pieces: &[Piece]) -> Flat {
                 first_item.get_or_insert(chars.len());
                 trunc_position.get_or_insert(chars.len());
             }
+            Piece::ClickStart { action } => {
+                regions.push(action.clone());
+                click = Some(regions.len() - 1);
+            }
+            Piece::ClickEnd => click = None,
         }
     }
     Flat {
@@ -624,6 +796,7 @@ fn flatten(pieces: &[Piece]) -> Flat {
         align_positions,
         trunc_position,
         first_item,
+        regions,
     }
 }
 
@@ -664,10 +837,12 @@ fn truncate(
             .or_else(|| chars.last())
             .and_then(|c| c.group.clone());
         let mut out: Vec<Cell> = chars.into_iter().take(kept).collect();
+        // The truncation marker is chrome, never part of a click region.
         out.push(Cell {
             ch: '>',
             width: 1,
             group,
+            click: None,
         });
         out
     } else {
@@ -686,15 +861,18 @@ fn truncate(
             .or_else(|| cut.checked_sub(1).and_then(|j| chars.get(j)))
             .and_then(|c| c.group.clone());
         let mut out: Vec<Cell> = chars[..cut].to_vec();
+        // The truncation marker is chrome, never part of a click region.
         out.push(Cell {
             ch: '<',
             width: 1,
             group,
+            click: None,
         });
         out.extend(chars[drop_end..].iter().map(|c| Cell {
             ch: c.ch,
             width: c.width,
             group: c.group.clone(),
+            click: c.click,
         }));
         out
     }
@@ -729,6 +907,8 @@ fn distribute_fill(chars: Vec<Cell>, align_positions: &[usize], slack: usize) ->
                     ch: ' ',
                     width: 1,
                     group: group.clone(),
+                    // `%=` fill sits between regions, never inside one.
+                    click: None,
                 });
             }
             next_marker += 1;
@@ -748,6 +928,8 @@ fn distribute_fill(chars: Vec<Cell>, align_positions: &[usize], slack: usize) ->
                 ch: ' ',
                 width: 1,
                 group: group.clone(),
+                // `%=` fill sits between regions, never inside one.
+                click: None,
             });
         }
         next_marker += 1;
@@ -769,6 +951,7 @@ fn coalesce(chars: Vec<Cell>) -> Vec<StatusSegment> {
         segments.push(StatusSegment {
             text: c.ch.to_string(),
             group: c.group,
+            on_click: None,
         });
     }
     segments
@@ -835,6 +1018,7 @@ pub fn builtin_segment(
             vec![StatusSegment {
                 text,
                 group: group.map(str::to_string),
+                on_click: None,
             }]
         }
     };
@@ -884,6 +1068,7 @@ fn diagnostics_cells(ctx: &StatuslineCtx) -> Vec<StatusSegment> {
             cells.push(StatusSegment {
                 text: format!("{sep}{sigil}{n}"),
                 group: Some((*group).to_string()),
+                on_click: None,
             });
         }
     }
@@ -906,15 +1091,45 @@ pub fn compose_segments(
     width: usize,
     custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
 ) -> Vec<StatusSegment> {
+    layout(&segment_pieces(spec, ctx, mode_label, custom), width)
+}
+
+/// [`compose_segments`], also returning the [`ClickRegion`]s for any cells that
+/// carry an [`on_click`](StatusSegment::on_click) handler (an `nx.statusline`
+/// segment's `on_click`). The server uses the spans to resolve a status-line click
+/// to its handler. Shares the exact piece-building of [`compose_segments`], so the
+/// painted line and the click spans always agree.
+pub fn compose_segments_with_clicks(
+    spec: &SegmentLayout,
+    ctx: &StatuslineCtx,
+    mode_label: &str,
+    width: usize,
+    custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
+) -> (Vec<StatusSegment>, Vec<ClickRegion>) {
+    layout_with_clicks(&segment_pieces(spec, ctx, mode_label, custom), width)
+}
+
+/// Build the [`Piece`] stream for a [`SegmentLayout`]: the left side, a `%=`
+/// [`Piece::Align`], then the right side. Shared by [`compose_segments`] and
+/// [`compose_segments_with_clicks`].
+fn segment_pieces(
+    spec: &SegmentLayout,
+    ctx: &StatuslineCtx,
+    mode_label: &str,
+    custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
+) -> Vec<Piece> {
     let mut pieces: Vec<Piece> = Vec::new();
     push_side(&spec.left, ctx, mode_label, custom, &mut pieces);
     pieces.push(Piece::Align);
     push_side(&spec.right, ctx, mode_label, custom, &mut pieces);
-    layout(&pieces, width)
+    pieces
 }
 
 /// Append one side's resolved segments to `pieces`, space-separated, skipping
-/// the empties so they leave no stray separator.
+/// the empties so they leave no stray separator. A cell carrying an
+/// [`on_click`](StatusSegment::on_click) handler is wrapped in a
+/// [`Piece::ClickStart`]/`ClickEnd` pair so [`layout_with_clicks`] tracks its
+/// column span (the segment analogue of the `%`-format's `%@…%X`).
 fn push_side(
     names: &[String],
     ctx: &StatuslineCtx,
@@ -930,6 +1145,7 @@ fn push_side(
                 vec![StatusSegment {
                     text: format!("E:{name}"),
                     group: Some("ErrorMsg".to_string()),
+                    on_click: None,
                 }]
             });
         if cells.iter().all(|c| c.text.is_empty()) {
@@ -939,7 +1155,16 @@ fn push_side(
         // so the bar doesn't butt against the edge).
         push_text(pieces, " ".to_string(), None);
         for cell in cells {
-            push_text(pieces, cell.text, cell.group);
+            match cell.on_click {
+                Some(handler) => {
+                    pieces.push(Piece::ClickStart {
+                        action: ClickAction::Handler { handler, minwid: 0 },
+                    });
+                    push_text(pieces, cell.text, cell.group);
+                    pieces.push(Piece::ClickEnd);
+                }
+                None => push_text(pieces, cell.text, cell.group),
+            }
         }
         wrote = true;
     }

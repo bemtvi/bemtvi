@@ -32,6 +32,10 @@ nx.statusline.segment {
   -- Recompute the branch when you enter a buffer or change directory; the async
   -- job below also invalidates explicitly when it finishes.
   events = { "BufEnter", "DirChanged" },
+  -- Clicking the branch re-runs the fetch. `on_click` is a `v:lua.<fn>` reference
+  -- (the same bridge the `%@…%X` format handlers use), called on a left-click with
+  -- (minwid, clicks, button, modifiers); a segment has no minwid, so it is 0.
+  on_click = "v:lua.on_git_click",
   render = function()
     return git_branch and { { text = " " .. git_branch, hl = "StatusGit" } } or nil
   end,
@@ -49,6 +53,13 @@ local refresh_git = nx.async(function()
 end)
 refresh_git()
 nx.autocmd.create("DirChanged", { callback = refresh_git })
+
+-- The git segment's click handler: re-fetch the branch and say so. (Defined after
+-- refresh_git; `on_click` resolves the `v:lua.` reference lazily, at click time.)
+function _G.on_git_click(_minwid, _clicks, _button, _mods)
+  refresh_git()
+  vim.cmd("echo 'git: refreshing branch…'")
+end
 
 --------------------------------------------------------------------------------
 -- A trivial "clock-ish" custom segment driven purely by explicit invalidation —

@@ -211,11 +211,63 @@ neovim. `getbufvar` deferred (no test demands it yet). The window-relative
   point `tabline = '%!v:lua.require("myutils").my_tab_line()'` works verbatim.
 - Full-config readiness pass.
 
+## Phase 7 — Statusline click regions (`%@handler@…%X`) ✅ done
+
+The deferred `%@click@` handlers, now implemented for the per-window
+`'statusline'` `%`-format. `%@handler@text%X` (and `%N@handler@…%X` carrying a
+`minwid`) makes the wrapped cells clickable; a left-click calls the handler with
+neovim's arguments `(minwid, clicks, button, modifiers)`. The handler is a
+`v:lua.…` reference, consistent with the `%{}`/`%!` bridge.
+
+**Shipped:**
+- **Parse/expand/layout** (`crates/nxvim-core/src/statusline.rs`):
+  `Item::ClickStart { handler, minwid }` / `Item::ClickEnd` (and `Piece` twins);
+  `%X`/`%nX` now parse as `ClickEnd` (still no-op text, so render-only `%T…%X`
+  tablines are unaffected), `%T`/`%nT` stay `TabRegion`. `flatten` tags each
+  `Cell` with the click region in force; the new `layout_with_clicks` returns the
+  laid-out segments **and** a `Vec<ClickRegion>` (the surviving display-column
+  spans, tracked through truncation/`%=` fill). The plain `layout` is unchanged
+  for the callers / parser tests that don't need regions.
+- **Mouse** (`crates/nxvim-core/src/editor/mouse.rs`): `MouseTarget::StatusLine`
+  carries the window-relative column; a left-press on a status line records a
+  `StatuslineClick` (win, col, click count, button, modifiers) on
+  `Editor::statusline_clicks`, with its own multi-click tracker so it never seeds
+  a text selection.
+- **Server** (`redraw.rs` / `effects.rs` / `dispatch.rs`):
+  `statusline_click_at` recomputes the clicked window's regions on demand and
+  resolves the column to a handler; `dispatch_statusline_clicks` (drained right
+  after `editor.mouse`) fires each via `LuaRuntime::run_statusline_click`
+  (`nx._statusline_click` resolves the `v:lua.` reference loud), then
+  `apply_lua_effects` + `run_pending` so a handler's `vim.cmd`/`:lua` settles on
+  the same gesture.
+- **Tests** (`tests/mouse.rs`): fire-with-args, outside-region no-op,
+  column-resolves-the-region, effects-settle, double-click count, and a loud
+  error for a non-`v:lua` handler. **Example**: `examples/statusline/` wraps the
+  file block in a `%@v:lua.on_name_click@…%X` region.
+
+**Follow-ons (done, 2026-06-16):**
+- Click regions also work for `nx.statusline` **segment** layouts — a segment/cell
+  `on_click = "v:lua.<fn>"` fires through the same dispatch (see
+  `docs/plans/2026-06-15-nx-statusline-segments.md`).
+- The single **global bar** (`laststatus=3`) is clickable too: `hit_test` resolves
+  its chrome row to `MouseTarget::GlobalStatusLine { col }`. Both the `%`-format and
+  segment surfaces are covered. (`examples/laststatus/` makes its mode block
+  clickable; tests in `nxvim-server/tests/mouse.rs`.)
+- The **custom tabline** (`'tabline'` `%`-format) is now clickable: `%nT` opens a
+  tab-select region (→ `Editor::select_main_tab(n)`), `%@…%X` a Lua handler. A click
+  region carries a `ClickAction` (`Handler { handler, minwid }` | `Tab(n)`), and a
+  `StatuslineClick` carries a `ClickSurface` (`Window` | `Global` | `Tabline`) so the
+  server re-runs the right format at the right width. The built-in (structured)
+  tabline keeps its own click path; `hit_test` routes a custom-tabline press to the
+  server. (`examples/tabline/` is now click-to-switch; tests in `mouse.rs`.)
+
+**Out of scope (still):** right/middle-button click regions (v1 fires on
+left-click only); `%nX` close-button regions still just terminate (no per-tab close
+action).
+
 ## Out of scope (for now)
 
 - Full Vimscript `%{}` expressions — only `v:lua.*` is supported (loud error
   otherwise). Covers the user's config.
-- `%@click@` mouse-click handlers in the statusline (revisit with `%nT`/`%X` in
-  Phase 6, where the tabline genuinely needs click regions).
 - Per-window (`setlocal statusline`) overrides — global-only in v1.
 - `'rulerformat'`, `'winbar'`.

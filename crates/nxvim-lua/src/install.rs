@@ -1491,21 +1491,31 @@ pub(crate) fn install_runtime_api(
             },
         )?,
     )?;
-    // `nx._statusline_publish(win, name, texts, groups)`: queue a custom segment's
-    // resolved cells for one window ([`StatuslinePublishReq`]) — parallel `texts` /
-    // `groups` arrays (an empty group ⇒ the base `StatusLine` highlight). The server
-    // caches them by `(win, name)` and paints them until the next re-render.
+    // `nx._statusline_publish(win, name, texts, groups, clicks)`: queue a custom
+    // segment's resolved cells for one window ([`StatuslinePublishReq`]) — parallel
+    // `texts` / `groups` / `clicks` arrays (an empty group ⇒ the base `StatusLine`
+    // highlight; an empty click ⇒ a non-clickable cell, else a `v:lua.…` handler
+    // reference). The server caches them by `(win, name)` and paints them until the
+    // next re-render.
     let sh = shared.clone();
     nx.set(
         "_statusline_publish",
         lua.create_function(
-            move |_, (win, name, texts, groups): (u64, String, Vec<String>, Vec<String>)| {
+            move |_,
+                  (win, name, texts, groups, clicks): (
+                u64,
+                String,
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+            )| {
                 let cells = texts
                     .into_iter()
                     .enumerate()
                     .map(|(i, text)| {
                         let group = groups.get(i).filter(|g| !g.is_empty()).cloned();
-                        (text, group)
+                        let on_click = clicks.get(i).filter(|c| !c.is_empty()).cloned();
+                        (text, group, on_click)
                     })
                     .collect();
                 sh.borrow_mut()

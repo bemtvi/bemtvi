@@ -1059,17 +1059,17 @@ async fn click_past_last_tab_is_noop() {
 }
 
 #[tokio::test]
-async fn click_custom_tabline_is_noop() {
+async fn click_custom_tabline_without_regions_is_noop() {
     let (rpc, _incoming) = start_tabs().await;
-    // A custom `'tabline'` renders arbitrary text with no built-in click regions
-    // (vim needs explicit `%nT` items), so the same column that would switch tabs
-    // with the built-in cells is now inert.
+    // A custom `'tabline'` has no *built-in* click cells: switching a tab needs
+    // explicit `%nT` regions (see `custom_tabline_nt_click_switches_tab`). This one
+    // has none, so the column that would switch tabs with the built-in cells is inert.
     command(&rpc, "set tabline=MYTABLINE").await;
     feed_mouse(&rpc, "left", "press", 0, 3);
     assert_eq!(
         lines(&rpc).await,
         vec!["gamma"],
-        "a custom tabline isn't clickable"
+        "a region-less custom tabline isn't clickable"
     );
 }
 
@@ -1415,5 +1415,376 @@ async fn drag_resizes_a_split_inside_a_dock() {
         current_win(&rpc).await,
         main_win,
         "focus stayed in the main area"
+    );
+}
+
+// ── Phase 9: statusline click regions (%@handler@…%X) ───────────────────────
+
+/// Set the global `'statusline'` via `vim.opt` (no `:set` escaping), through a
+/// barrier so the option lands before the next gesture.
+async fn set_statusline(rpc: &Rpc, fmt: &str) {
+    exec_lua(rpc, &format!("vim.opt.statusline = {fmt:?}")).await;
+}
+
+/// The single window's status row (its last content row): a lone window sits at
+/// y = 0, so the status line is at row `win_height` (text rows are `0..height`).
+async fn lone_status_row(rpc: &Rpc) -> usize {
+    win_height(rpc, current_win(rpc).await).await as usize
+}
+
+/// A left-click inside a `%@v:lua.Fn@…%X` region fires its handler with neovim's
+/// click arguments: the `%N@` `minwid`, the click count, the button, and the
+/// (here empty) modifier string.
+#[tokio::test]
+async fn statusline_click_region_fires_handler() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.sl = nil
+        function _G.OnClick(minwid, clicks, button, mods)
+          _G.sl = string.format("%d/%d/%s/%s", minwid, clicks, button, mods)
+        end
+        "#,
+    )
+    .await;
+    // "AB" then the clickable "[X]" (minwid 7) then a right-aligned tail.
+    set_statusline(&rpc, "AB%7@v:lua.OnClick@[X]%X%=end").await;
+    let row = lone_status_row(&rpc).await;
+    // "[X]" sits at columns 2,3,4 (after "AB"); col 3 is inside it.
+    feed_mouse(&rpc, "left", "press", row, 3);
+    let got = exec_lua(&rpc, "return _G.sl").await;
+    assert_eq!(got.as_str(), Some("7/1/l/"), "handler ran with click args");
+}
+
+/// A click on the status line *outside* every region does not fire a handler (it
+/// still focuses the window — already focused here, so the observable result is
+/// simply that no handler ran).
+#[tokio::test]
+async fn statusline_click_outside_region_is_noop() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"_G.sl = nil; function _G.OnClick() _G.sl = "fired" end"#,
+    )
+    .await;
+    set_statusline(&rpc, "AB%@v:lua.OnClick@[X]%X").await;
+    let row = lone_status_row(&rpc).await;
+    // Column 0 is on the literal "AB", before the region at columns 2..5.
+    feed_mouse(&rpc, "left", "press", row, 0);
+    let got = exec_lua(&rpc, "return _G.sl").await;
+    assert_eq!(got, Value::Nil, "no handler fires outside a region");
+}
+
+/// Two regions on one status line resolve by the clicked column: each click fires
+/// the handler whose span covers it, distinguished by `minwid`.
+#[tokio::test]
+async fn statusline_click_resolves_region_by_column() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"_G.last = nil; function _G.Pick(minwid) _G.last = minwid end"#,
+    )
+    .await;
+    // "[L]" (minwid 1) at cols 0,1,2; a gap; "[R]" (minwid 2) at cols 5,6,7.
+    set_statusline(&rpc, "%1@v:lua.Pick@[L]%X  %2@v:lua.Pick@[R]%X").await;
+    let row = lone_status_row(&rpc).await;
+    feed_mouse(&rpc, "left", "press", row, 1);
+    assert_eq!(
+        as_num(&exec_lua(&rpc, "return _G.last").await),
+        1,
+        "click in the left region"
+    );
+    feed_mouse(&rpc, "left", "press", row, 6);
+    assert_eq!(
+        as_num(&exec_lua(&rpc, "return _G.last").await),
+        2,
+        "click in the right region"
+    );
+}
+
+/// A click handler's queued effects settle on the same gesture: a handler that
+/// runs `vim.cmd` has its effect applied + driven to convergence by the click
+/// dispatch (the mouse arm doesn't otherwise `run_pending`), so a following barrier
+/// read already sees it rather than waiting for a keystroke.
+#[tokio::test]
+async fn statusline_click_handler_effects_settle() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"function _G.SetSw() vim.cmd("set shiftwidth=13") end"#,
+    )
+    .await;
+    set_statusline(&rpc, "%@v:lua.SetSw@[go]%X").await;
+    let row = lone_status_row(&rpc).await;
+    feed_mouse(&rpc, "left", "press", row, 1);
+    // The `exec_lua` request is a barrier ordered after the mouse notification, so
+    // by the time it returns the handler's `set shiftwidth=13` has been applied.
+    assert_eq!(
+        as_num(&exec_lua(&rpc, "return vim.o.shiftwidth").await),
+        13,
+        "the handler's vim.cmd effect was applied + settled by the click"
+    );
+}
+
+/// A double-click on a region reports `clicks = 2` (the same `'mousetime'`
+/// multi-click machinery the text path uses), driven by a fake clock.
+#[tokio::test]
+async fn statusline_click_counts_double_click() {
+    let (rpc, clock, _incoming) = start_clocked("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"_G.n = nil; function _G.Click(_, clicks) _G.n = clicks end"#,
+    )
+    .await;
+    set_statusline(&rpc, "%@v:lua.Click@[X]%X").await;
+    let row = lone_status_row(&rpc).await;
+    // Two presses on the same cell within 'mousetime' (100ms apart) count as a
+    // double-click.
+    feed_mouse_at(&rpc, &clock, 0, "left", "press", row, 1);
+    feed_mouse_at(&rpc, &clock, 100, "left", "press", row, 1);
+    assert_eq!(
+        as_num(&exec_lua(&rpc, "return _G.n").await),
+        2,
+        "second same-cell press inside 'mousetime' is a double-click"
+    );
+}
+
+/// A non-`v:lua` click handler errors loud (CLAUDE.md no-silent-stub) rather than
+/// being silently ignored — the failure surfaces on the message line.
+#[tokio::test]
+async fn statusline_click_bad_handler_errors_loud() {
+    let (rpc, mut incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // A bare name (not a `v:lua.` reference) is rejected by the bridge.
+    set_statusline(&rpc, "%@NotVLua@[X]%X").await;
+    let row = lone_status_row(&rpc).await;
+    feed_mouse(&rpc, "left", "press", row, 1);
+    let map = wait_redraw(&mut incoming, |m| message(m).contains("v:lua")).await;
+    assert!(
+        message(&map).contains("v:lua"),
+        "the bad handler errored loud: {:?}",
+        message(&map)
+    );
+}
+
+// ── Phase 9b: clickable nx.statusline segments (on_click) ───────────────────
+
+/// A left-click on a `nx.statusline` segment whose spec carries `on_click` fires
+/// that handler — the segment analogue of the `%@…%X` format region, resolved
+/// through the same click dispatch. The handler gets `(minwid=0, clicks, button,
+/// mods)` (a segment has no `minwid`).
+#[tokio::test]
+async fn statusline_segment_on_click_fires() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.seg = nil
+        function _G.OnSeg(minwid, clicks, button, mods)
+          _G.seg = string.format("%d/%d/%s/%s", minwid, clicks, button, mods)
+        end
+        nx.statusline.segment{
+          name = "clicky",
+          on_click = "v:lua.OnSeg",
+          render = function() return { { text = "[GIT]" } } end,
+        }
+        nx.statusline.setup{ left = { "clicky" } }
+        "#,
+    )
+    .await;
+    let row = lone_status_row(&rpc).await;
+    // push_side writes a leading space, so "[GIT]" sits at columns 1..6; col 3 is
+    // inside it.
+    feed_mouse(&rpc, "left", "press", row, 3);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.seg").await.as_str(),
+        Some("0/1/l/"),
+        "segment on_click fired with click args"
+    );
+}
+
+/// A per-cell `on_click` resolves by column, and a cell with no handler (and no
+/// segment-wide default) is not clickable.
+#[tokio::test]
+async fn statusline_segment_per_cell_on_click() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.hit = nil
+        function _G.Pick(_, _, _, _) _G.hit = "L" end
+        nx.statusline.segment{
+          name = "two",
+          render = function()
+            return {
+              { text = "[A]", on_click = "v:lua.Pick" },  -- clickable
+              { text = "[B]" },                            -- not clickable
+            }
+          end,
+        }
+        nx.statusline.setup{ left = { "two" } }
+        "#,
+    )
+    .await;
+    let row = lone_status_row(&rpc).await;
+    // " [A][B] " — "[A]" at cols 1..4 (clickable), "[B]" at cols 4..7 (not).
+    feed_mouse(&rpc, "left", "press", row, 5); // inside [B]
+    assert_eq!(
+        exec_lua(&rpc, "return _G.hit").await,
+        Value::Nil,
+        "the non-clickable cell fires nothing"
+    );
+    feed_mouse(&rpc, "left", "press", row, 2); // inside [A]
+    assert_eq!(
+        exec_lua(&rpc, "return _G.hit").await.as_str(),
+        Some("L"),
+        "the per-cell on_click fired"
+    );
+}
+
+// ── Phase 9c: laststatus=3 global-bar click regions ─────────────────────────
+
+/// At `laststatus=3` the single global status bar (one row, full editor width,
+/// the focused window's facts) carries click regions too: a `%@…%X` region on it
+/// fires, resolved against the focused window at the full width.
+#[tokio::test]
+async fn statusline_global_bar_click_region_fires() {
+    let (rpc, _incoming) = start("hello\nworld\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set laststatus=3").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.g = nil
+        function _G.OnGlobal(minwid, clicks, button, mods)
+          _G.g = string.format("%d/%d/%s/%s", minwid, clicks, button, mods)
+        end
+        "#,
+    )
+    .await;
+    set_statusline(&rpc, "AB%9@v:lua.OnGlobal@[X]%X%=tail").await;
+    // At laststatus=3 the per-window status row is reclaimed as text; the single
+    // global bar sits one row below the window text — at row `win_height`.
+    let row = win_height(&rpc, current_win(&rpc).await).await as usize;
+    // "[X]" sits at columns 2..5 (after "AB"); col 3 is inside it.
+    feed_mouse(&rpc, "left", "press", row, 3);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.g").await.as_str(),
+        Some("9/1/l/"),
+        "global-bar region fired with its minwid + click args"
+    );
+}
+
+/// A click on the global bar *outside* every region is a no-op (no handler runs).
+#[tokio::test]
+async fn statusline_global_bar_click_outside_region_is_noop() {
+    let (rpc, _incoming) = start("hello\nworld\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set laststatus=3").await;
+    exec_lua(&rpc, r#"_G.g = nil; function _G.OnG() _G.g = "x" end"#).await;
+    set_statusline(&rpc, "AB%@v:lua.OnG@[X]%X").await;
+    let row = win_height(&rpc, current_win(&rpc).await).await as usize;
+    feed_mouse(&rpc, "left", "press", row, 0); // on "AB", before the region
+    assert_eq!(
+        exec_lua(&rpc, "return _G.g").await,
+        Value::Nil,
+        "no handler fires outside a region on the global bar"
+    );
+}
+
+/// The global bar also honours `nx.statusline` **segment** `on_click` (resolved at
+/// the full editor width, against the focused window's layout).
+#[tokio::test]
+async fn statusline_global_bar_segment_click_fires() {
+    let (rpc, _incoming) = start("hello\nworld\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set laststatus=3").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.s = nil
+        function _G.OnSeg() _G.s = "seg" end
+        nx.statusline.segment{
+          name = "clicky",
+          on_click = "v:lua.OnSeg",
+          render = function() return { { text = "[GIT]" } } end,
+        }
+        nx.statusline.setup{ left = { "clicky" } }
+        "#,
+    )
+    .await;
+    let row = win_height(&rpc, current_win(&rpc).await).await as usize;
+    // Leading space at col 0, "[GIT]" at cols 1..6; col 3 is inside it.
+    feed_mouse(&rpc, "left", "press", row, 3);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.s").await.as_str(),
+        Some("seg"),
+        "global-bar segment on_click fired"
+    );
+}
+
+// ── Phase 9d: clickable custom tabline (%nT tab-select) ─────────────────────
+
+/// A click on a `%nT` region of a custom `'tabline'` switches to that tab page —
+/// the tabline analogue of the statusline click, resolved against the `'tabline'`
+/// format at the full editor width.
+#[tokio::test]
+async fn custom_tabline_nt_click_switches_tab() {
+    let (rpc, _incoming) = start_tabs().await; // 3 tabs; ccc.txt current
+                                               // A custom tabline of three tab-select regions: "[1][2][3]". `%nT` opens tab
+                                               // page n's region, `%T` ends the labels.
+    exec_lua(&rpc, r#"vim.opt.tabline = "%1T[1]%2T[2]%3T[3]%T""#).await;
+    assert_eq!(lines(&rpc).await, vec!["gamma"], "starts on tab 3");
+    // "[1]" cols 0..3, "[2]" cols 3..6, "[3]" cols 6..9 — click inside "[1]".
+    feed_mouse(&rpc, "left", "press", 0, 1);
+    assert_eq!(lines(&rpc).await, vec!["alpha"], "clicked %1T → tab page 1");
+    // Click inside "[2]".
+    feed_mouse(&rpc, "left", "press", 0, 4);
+    assert_eq!(lines(&rpc).await, vec!["beta"], "clicked %2T → tab page 2");
+    assert_eq!(mode(&rpc).await, "n", "the click started no selection");
+}
+
+/// The original motivation: a `tabline = '%!v:lua.…'` builder that emits `%nT`
+/// regions works verbatim — the Lua-produced format is re-parsed and its tab
+/// regions are clickable.
+#[tokio::test]
+async fn custom_tabline_vlua_nt_click_switches_tab() {
+    let (rpc, _incoming) = start_tabs().await;
+    exec_lua(
+        &rpc,
+        r#"
+        function _G.tabline()
+          return "%1T aaa %2T bbb %3T ccc %T"
+        end
+        vim.opt.tabline = "%!v:lua.tabline()"
+        "#,
+    )
+    .await;
+    // " aaa " cols 0..5, " bbb " cols 5..10, " ccc " cols 10..15 — click " bbb ".
+    feed_mouse(&rpc, "left", "press", 0, 7);
+    assert_eq!(lines(&rpc).await, vec!["beta"], "clicked %2T → tab page 2");
+}
+
+/// A click on the custom tabline *outside* every `%nT` region (the `%T` fill) does
+/// not switch tabs.
+#[tokio::test]
+async fn custom_tabline_click_outside_region_is_noop() {
+    let (rpc, _incoming) = start_tabs().await;
+    exec_lua(&rpc, r#"vim.opt.tabline = "%1T[1]%T   fill""#).await;
+    assert_eq!(lines(&rpc).await, vec!["gamma"]);
+    // "[1]" is cols 0..3; col 6 is in the non-clickable "   fill" past `%T`.
+    feed_mouse(&rpc, "left", "press", 0, 6);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["gamma"],
+        "fill area switched nothing"
     );
 }

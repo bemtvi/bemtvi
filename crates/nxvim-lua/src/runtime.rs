@@ -1337,6 +1337,33 @@ impl LuaRuntime {
         }
     }
 
+    /// Fire a `'statusline'` `%@handler@…%X` click region's callback
+    /// (`nx._statusline_click`) with neovim's click arguments. `handler` is the raw
+    /// `v:lua.…` reference from the format; the Lua side resolves it to a function
+    /// and calls it (erroring loud if it isn't a callable `v:lua` reference). `button`
+    /// is the mouse button ("l"/"r"/"m"); `modifiers` the active modifier string
+    /// ("s"/"c"/"a"). Effects the callback queues land in [`Shared`] for the server's
+    /// `apply_lua_effects` to drain. A throwing handler returns its error for the
+    /// server to surface.
+    pub fn run_statusline_click(
+        &self,
+        handler: &str,
+        minwid: u32,
+        clicks: u8,
+        button: char,
+        modifiers: &str,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_statusline_click")?;
+        run.call::<()>((
+            handler.to_string(),
+            minwid as i64,
+            clicks as i64,
+            button.to_string(),
+            modifiers.to_string(),
+        ))
+    }
+
     /// Fire a streaming child's `on_stdout` callback with the latest batch of
     /// stdout `lines` (`nx._run_stdout(id, lines)`). Persistent (not a one-shot):
     /// fires once per [`LoopEvent::ProcessStdout`](crate) until the child exits,

@@ -55,6 +55,13 @@ function nx.statusline.segment(spec)
   if spec.events ~= nil and type(spec.events) ~= "table" then
     error("nx.statusline.segment: 'events' must be a list of event names")
   end
+  -- `on_click` (optional) is a `v:lua.<fn>` reference fired on a left-click of the
+  -- segment's cells — the same bridge the `%@…%X` format handlers use, kept as a
+  -- string (not a function) so it crosses to the server with no per-cell registry.
+  -- A cell may override it with its own `on_click`.
+  if spec.on_click ~= nil and type(spec.on_click) ~= "string" then
+    error("nx.statusline.segment: 'on_click' must be a 'v:lua.<fn>' string")
+  end
   nx.statusline._segments[spec.name] = spec
 end
 
@@ -99,26 +106,31 @@ local function custom_names(left, right)
   return out
 end
 
--- Normalize a segment's `render(ctx)` result (a list of `{ text, hl }` cells, or
--- nil) into the parallel `texts` / `groups` arrays the publish bridge takes. A
--- render error becomes a loud `E:<name>` cell rather than failing silently
--- (CLAUDE.md no-silent-stub rule).
+-- Normalize a segment's `render(ctx)` result (a list of `{ text, hl, on_click }`
+-- cells, or nil) into the parallel `texts` / `groups` / `clicks` arrays the publish
+-- bridge takes. A render error becomes a loud `E:<name>` cell rather than failing
+-- silently (CLAUDE.md no-silent-stub rule). A cell's click handler is its own
+-- `on_click` (a `v:lua.<fn>` string), falling back to the segment-wide `on_click`;
+-- an empty string means the cell is not clickable.
 local function resolve(name, spec, ctx)
   local ok, cells = pcall(spec.render, ctx)
-  local texts, groups = {}, {}
+  local texts, groups, clicks = {}, {}, {}
   if not ok then
     texts[1] = "E:" .. name
     groups[1] = "ErrorMsg"
+    clicks[1] = ""
   elseif type(cells) == "table" then
     for _, cell in ipairs(cells) do
       if type(cell) == "table" and type(cell.text) == "string" then
         texts[#texts + 1] = cell.text
         -- An empty group string means "the base StatusLine highlight".
         groups[#groups + 1] = type(cell.hl) == "string" and cell.hl or ""
+        local click = (type(cell.on_click) == "string" and cell.on_click) or spec.on_click
+        clicks[#clicks + 1] = type(click) == "string" and click or ""
       end
     end
   end
-  return texts, groups
+  return texts, groups, clicks
 end
 
 -- Re-run one custom segment's render **for every window** and publish its
@@ -135,8 +147,8 @@ function nx.statusline._rerender(name)
   local cur = nx.win.current()
   for _, win in ipairs(nx.win.list()) do
     local ctx = { buf = nx.win.buf(win), win = win, focused = win == cur }
-    local texts, groups = resolve(name, spec, ctx)
-    nx._statusline_publish(win, name, texts, groups)
+    local texts, groups, clicks = resolve(name, spec, ctx)
+    nx._statusline_publish(win, name, texts, groups, clicks)
   end
 end
 
@@ -214,6 +226,33 @@ function nx.statusline.setup(opts)
   local right = name_list(opts.right, "right")
   nx._statusline_setup(target, "segments", left, right)
   register_events(target_key, custom_names(left, right))
+end
+
+-- Fire a `'statusline'` `%@handler@…%X` click region's callback. `handler` is the
+-- raw string between `%@` and `@` in the format — required to be a `v:lua.<expr>`
+-- reference (the same bridge `%{}`/`%!` use), naming a Lua function. Called by the
+-- server (`run_statusline_click`) with neovim's click arguments:
+--   (minwid, clicks, button, modifiers)
+-- where `button` is "l"/"r"/"m" and `modifiers` is a string of "s"/"c"/"a" (shift /
+-- ctrl / alt). Resolves the expression to a function and calls it; a non-`v:lua`
+-- handler, an unresolvable expression, or a non-function result errors loud
+-- (CLAUDE.md no-silent-stub) so a misconfigured region is visible, not ignored.
+function nx._statusline_click(handler, minwid, clicks, button, mods)
+  local expr = type(handler) == "string" and handler:match("^v:lua%.(.+)$")
+  if not expr then
+    error("statusline click handler must be a 'v:lua.<fn>' reference, got: " .. tostring(handler))
+  end
+  -- `loadstring` (the Lua 5.1 string loader; PUC 5.4 keeps it via runtime.rs's
+  -- `loadstring = loadstring or load` shim) compiles the bare `v:lua` expression.
+  local chunk, err = loadstring("return " .. expr)
+  if not chunk then
+    error("statusline click handler 'v:lua." .. expr .. "': " .. tostring(err))
+  end
+  local fn = chunk()
+  if type(fn) ~= "function" then
+    error("statusline click handler 'v:lua." .. expr .. "' is not a function")
+  end
+  fn(minwid, clicks, button, mods)
 end
 
 -- nx.statusline.reset([win]): drop a window-local override (0 = current window) so

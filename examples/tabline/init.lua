@@ -6,7 +6,8 @@
 --       cargo run -p nxvim -- examples/tabline/sample.txt
 --
 -- The tabline is driven by the 'tabline' option's %-format engine — the SAME
--- engine as 'statusline', plus the %T / %X tab click-region items. This config
+-- engine as 'statusline', plus the %nT / %X tab click-region items (clicking a
+-- %nT-tagged label switches to that tab page — see "TRY IT" below). This config
 -- sets `tabline = '%!v:lua.require("myutils").my_tab_line()'`, so on every redraw
 -- the engine calls myutils.my_tab_line() and re-parses what it returns. That
 -- result assembles the whole line in Lua: one %#TabLine(Sel)#-coloured, %nT-tagged
@@ -20,6 +21,7 @@
 -- TRY IT interactively:
 --   :tabedit examples/tabs/sample.txt   a second tab appears; the tabline lists both
 --   gt / gT                             switch tabs — the active label recolours (TabLineSel)
+--   click a tab label                   switches to it (the %nT click region)
 --   edit a tab's buffer (i…<Esc>)       that tab's label gains a `*` modified marker
 --   :tabclose                           back to one tab — showtabline=1 hides the line
 --   :set tabline=                       fall back to nxvim's built-in tab cells

@@ -108,13 +108,14 @@ async fn counted_c_motion_places_many() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<Esc>gg");
 
-    // `{count}c{motion}` places `count` cursors starting at the current line: the
-    // entry already dropped one on line 1, so `2cj` covers lines 1 and 2.
+    // `{count}c{motion}` treats the count as the motion *distance*: `2cj` drops a
+    // cursor on the current line and at each of the two lines `j` visits — relative
+    // lines 0, 1, 2 — so the bottom lands where `2j` would (relative line 2), not 1.
     let map = redraw_after(&rpc, &mut incoming, "<A-c>2cj").await;
     assert_eq!(
         secondary_cursors(&map),
-        vec![(0, 0), (1, 0)],
-        "counted placement covers the current line plus count-1 steps"
+        vec![(0, 0), (1, 0), (2, 0)],
+        "counted placement covers the current line plus count motion steps"
     );
 }
 
@@ -124,15 +125,15 @@ async fn counted_c_motion_includes_the_starting_position() {
     feed(&rpc, "ione two three<Esc>gg");
 
     // Sit the primary on the first word's `o` with no cursor there yet (enter
-    // placement, which drops one, then `c` toggles it back off). `2cw` should then
-    // place 2 cursors at the *current* word and the next — "one" (col 0) and "two"
-    // (col 4) — not skip ahead to "two" and "three".
+    // placement, which drops one, then `c` toggles it back off). The count is the
+    // motion distance, so `2cw` covers the current word and the two `w` visits —
+    // "one" (col 0), "two" (col 4), and "three" (col 8).
     feed(&rpc, "<A-c>c");
     let map = redraw_after(&rpc, &mut incoming, "2cw").await;
     assert_eq!(
         secondary_cursors(&map),
-        vec![(0, 0), (0, 4)],
-        "the starting word gets a cursor; the count is inclusive of it"
+        vec![(0, 0), (0, 4), (0, 8)],
+        "the starting word gets a cursor, then `count` motion steps"
     );
 }
 
@@ -386,10 +387,10 @@ async fn placement_undo_treats_a_counted_drop_as_one_step() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<Esc>gg");
 
-    // Entry drops one on line 1; `2cj` covers lines 1 and 2 (current + one step).
+    // Entry drops one on line 1; `2cj` covers lines 1, 2, and 3 (current + two steps).
     feed(&rpc, "<A-c>2cj");
-    // A single `u` undoes the whole `2cj` batch — "10cj undoes the 10 cursors
-    // placed" — back to just the entry cursor, with the primary where it started.
+    // A single `u` undoes the whole `2cj` batch — "3cj undoes the cursors placed" —
+    // back to just the entry cursor, with the primary where it started.
     let map = redraw_after(&rpc, &mut incoming, "u").await;
     assert_eq!(
         secondary_cursors(&map),
@@ -415,7 +416,7 @@ async fn placement_undo_then_redo_replaces_the_cursors() {
     let map = redraw_after(&rpc, &mut incoming, "<C-r>").await;
     assert_eq!(
         secondary_cursors(&map),
-        vec![(0, 0), (1, 0)],
+        vec![(0, 0), (1, 0), (2, 0)],
         "redo re-placed the counted drop"
     );
 }

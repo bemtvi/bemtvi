@@ -137,7 +137,7 @@ all-mode map, and a normal-only map shown inert while placing.
 | motions (`h`/`j`/`w`/`/`…/`n`) | Move **only** the active cursor |
 | `c` | **Toggle** a cursor at the active cell — drop if empty, clear if occupied |
 | `c{motion}` | Move by `{motion}` and drop a cursor there (`cj` = one line down) |
-| `{count}c{motion}` | Repeat `{count}×` — `10cj` drops ten cursors stepping down |
+| `{count}c{motion}` | Count = motion *distance* — `3cj` drops cursors on relative lines 0–3 (4 cursors), matching where `3j` lands |
 | `cc` (`{count}cc`) | Drop one cursor per line over `count` lines |
 | `<Esc>` | Finish placement → Normal (cursors persist); cancels a half-typed `{n}c…` first |
 

@@ -1105,21 +1105,22 @@ impl Editor {
                 if let Motion::Find(kind, target) = m {
                     self.last_find = Some((kind, target));
                 }
-                // MULTICURSOR `{count}c{motion}`: place `count` cursors starting at
-                // the current position — `10cj` drops one here and at each of nine
-                // lines down. The first cursor is the *current* spot (so `2cw` on
-                // "one two three" covers "one" and "two", not "two" and "three"),
-                // then the motion steps `count - 1` times. Non-toggling, so a step
-                // onto an existing cursor (or the entry cursor under the primary)
-                // adds without clearing it.
+                // MULTICURSOR `{count}c{motion}`: the count is the motion *distance*,
+                // matching vim's relative-line intuition — `3cj` drops a cursor on the
+                // current line and at each of the three lines the motion visits, so the
+                // bottom cursor lands on relative line 3 (where `3j` would put you), not
+                // 2. A cursor is placed at the start *and* after each of `count` motion
+                // steps → `count + 1` cursors (e.g. `2cw` on "one two three" covers
+                // "one", "two", and "three"). Non-toggling, so a step onto an existing
+                // cursor (or the entry cursor under the primary) adds without clearing it.
                 if self.mode == Mode::MultiCursor && self.pending.operator == Some('c') {
                     let n = self.effective_count().max(1);
                     self.reset_pending(); // each step is a single, un-counted motion
                                           // Record once before the batch so the whole `{count}c{motion}`
-                                          // run undoes as a single placement step (`10cj` → one `u`).
+                                          // run undoes as a single placement step (`3cj` → one `u`).
                     self.record_placement_undo();
                     self.ensure_cursor_here();
-                    for _ in 1..n {
+                    for _ in 0..n {
                         if let Some(mr) = self.resolve_motion(m) {
                             self.apply_movement(mr);
                         }

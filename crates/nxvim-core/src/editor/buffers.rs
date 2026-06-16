@@ -700,14 +700,28 @@ impl Editor {
         b.path.is_none() && !b.modified && b.line_count() == 1 && b.line(0).is_empty()
     }
 
+    /// Load a buffer for `path`, honoring `'imagepreview'`: an image-extension file
+    /// ([`crate::editor::is_image_path`]) opens as an inert **preview** buffer (its
+    /// bytes are never read as text — [`Buffer::from_image_file`]) when the option is
+    /// on, otherwise as ordinary text ([`Buffer::from_file`]). The shared local-FS
+    /// load seam every synchronous open path funnels through. (Off-tick / daemon
+    /// opens fetch over the wire and don't preview yet.)
+    fn read_buffer(&self, path: &Path) -> anyhow::Result<Buffer> {
+        let fs = self.host_fs.clone();
+        if self.options.imagepreview && super::is_image_path(Some(path)) {
+            Buffer::from_image_file(path, &*fs)
+        } else {
+            Buffer::from_file(path, &*fs, &self.options.fileencodings)
+        }
+    }
+
     /// Replace the current buffer's contents with `path`'s, preserving the buffer
     /// id. Used by `:e` reload-in-place and to reuse a throwaway buffer. The
     /// loaded buffer is unmodified; the whole-content swap is flagged for syntax
     /// re-sync (`mark_resync` bumps `changedtick`, but we keep `modified` clear
     /// because it is freshly read from disk).
     pub(crate) fn load_into_current(&mut self, path: &Path) {
-        let fs = self.host_fs.clone();
-        match Buffer::from_file(path, &*fs, &self.options.fileencodings) {
+        match self.read_buffer(path) {
             Ok(buf) => {
                 self.cursor = Cursor::default();
                 self.top = 0;
@@ -744,8 +758,7 @@ impl Editor {
         let Some(path) = self.buffers.get(buffer).buffer.path.clone() else {
             return;
         };
-        let fs = self.host_fs.clone();
-        let new_buf = match Buffer::from_file(&path, &*fs, &self.options.fileencodings) {
+        let new_buf = match self.read_buffer(&path) {
             Ok(b) => b,
             Err(e) => {
                 self.echo(e.to_string());
@@ -962,8 +975,7 @@ impl Editor {
             self.enqueue_open(id, path.to_path_buf());
             Some(id)
         } else {
-            let fs = self.host_fs.clone();
-            match Buffer::from_file(path, &*fs, &self.options.fileencodings) {
+            match self.read_buffer(path) {
                 Ok(buf) => Some(self.add_buffer(buf)),
                 Err(e) => {
                     self.echo(e.to_string());

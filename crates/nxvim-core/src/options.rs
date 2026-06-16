@@ -94,6 +94,14 @@ pub struct Options {
     /// for the user to `:edit!`. A *modified* buffer is never autoreloaded — that
     /// is the W12 conflict — regardless of this flag.
     pub autoread: bool,
+    /// Open an image file (`.png`, `.jpg`, …) as a rendered **preview** rather than
+    /// as its raw bytes (nxvim's `'imagepreview'`, not a standard vim option). Off
+    /// by default. When on, [`crate::editor::is_image_path`] files load through
+    /// [`crate::Buffer::from_image_file`] — an inert, empty buffer bound to the path
+    /// whose bytes are never read as text — and the window projects an
+    /// [`crate::view::ImageView`] the client renders as a picture. When off, an
+    /// image file opens as ordinary (binary) text, exactly as before.
+    pub imagepreview: bool,
     /// Animate viewport scrolls (`<C-d>`/`<C-u>`/`<C-f>`/`<C-b>`, the wheel, and
     /// off-screen jumps) as a slide instead of a teleport (nxvim's `'scrollanim'`,
     /// not a standard vim option — neoscroll.nvim's behavior built in). On by
@@ -181,6 +189,8 @@ impl Default for Options {
             // Reload externally-changed, unmodified buffers on `:checktime`
             // (neovim's default — vim's is off).
             autoread: true,
+            // Show image files as text, not pictures, until a config opts in.
+            imagepreview: false,
             // Slide the viewport on scroll commands (neoscroll-style), capped at
             // 160ms — the per-scroll duration scales with distance up to this.
             scrollanim: true,
@@ -588,6 +598,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "hlsearch" | "hls" => Some(("hlsearch", Bool)),
         "incsearch" | "is" => Some(("incsearch", Bool)),
         "autoread" | "ar" => Some(("autoread", Bool)),
+        "imagepreview" | "imgp" => Some(("imagepreview", Bool)),
         "tabstop" | "ts" => Some(("tabstop", Num)),
         "shiftwidth" | "sw" => Some(("shiftwidth", Num)),
         "softtabstop" | "sts" => Some(("softtabstop", Num)),

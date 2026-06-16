@@ -1051,6 +1051,7 @@ impl Editor {
             "hlsearch" => self.options.hlsearch = value,
             "incsearch" => self.options.incsearch = value,
             "autoread" => self.options.autoread = value,
+            "imagepreview" => self.options.imagepreview = value,
             "scrollanim" => self.options.scrollanim = value,
             _ => {}
         }

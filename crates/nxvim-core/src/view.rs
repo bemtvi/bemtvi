@@ -380,6 +380,22 @@ pub struct WindowView {
     ///
     /// [`Editor::window_statusline_visible`]: crate::Editor::window_statusline_visible
     pub status_visible: bool,
+    /// When `Some`, this window's buffer is an image opened for preview
+    /// (`'imagepreview'`): the client renders the picture instead of the (empty)
+    /// text body. `None` for an ordinary text / terminal / directory buffer. See
+    /// [`ImageView`].
+    pub image: Option<ImageView>,
+}
+
+/// An image-preview window's payload ([`WindowView::image`]): just the filesystem
+/// path of the image to render. The client reads and decodes it locally (a local
+/// TUI shares the filesystem); remote/daemon byte transport is a later phase. Kept
+/// as a struct (not a bare `String`) so the cache key can grow `size`/`mtime`
+/// fields without re-threading the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageView {
+    /// The image file's path (the buffer's path).
+    pub path: String,
 }
 
 /// One tab page's cell in the tabline. `label` is the tab's focused window's
@@ -732,6 +748,16 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         Vec::new()
     };
 
+    // An image-preview buffer carries no text to paint; hand the client the path
+    // so it renders the picture over this window's body instead of `lines`.
+    let image = buf.image.then(|| ImageView {
+        path: buf
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    });
+
     let status_ctx = window_status_ctx(StatusCtxInputs {
         buf,
         w,
@@ -782,6 +808,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         title: w.title.clone(),
         status_ctx,
         status_visible,
+        image,
     }
 }
 

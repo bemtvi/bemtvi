@@ -1370,6 +1370,7 @@ impl EditHost {
             regexsyntax: go.regexsyntax.clone(),
             fileencodings: go.fileencodings.clone(),
             autoread: go.autoread,
+            imagepreview: go.imagepreview,
             scrollanim: go.scrollanim,
             scrollanimduration: go.scrollanimduration as u64,
             scrollback: go.scrollback as u64,

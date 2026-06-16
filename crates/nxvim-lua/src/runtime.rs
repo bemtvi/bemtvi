@@ -296,6 +296,9 @@ pub struct GoMirror {
     /// `'autoread'` — whether `:checktime` silently reloads an externally-changed,
     /// unmodified buffer. Backs `vim.o.autoread`.
     pub autoread: bool,
+    /// `'imagepreview'` — whether image files open as rendered previews rather than
+    /// raw bytes. Backs `vim.o.imagepreview` / `nx.o.imagepreview`.
+    pub imagepreview: bool,
     /// `'scrollanim'` — whether viewport scrolls animate as a slide. Backs
     /// `vim.o.scrollanim`.
     pub scrollanim: bool,

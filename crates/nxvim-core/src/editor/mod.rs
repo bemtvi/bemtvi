@@ -1912,3 +1912,32 @@ pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// Whether `path`'s extension names a raster image nxvim can preview — the gate
+/// for `'imagepreview'` ([`crate::options::Options::imagepreview`]). Extension-only
+/// (no content sniffing): cheap, and the same way the filetype is decided
+/// ([`language_of_path`]). The set mirrors the `image` crate's common decoders
+/// (the renderer's actual decode lives client-side); case-insensitive.
+pub fn is_image_path(path: Option<&Path>) -> bool {
+    let Some(ext) = path.and_then(Path::extension).and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "bmp"
+            | "webp"
+            | "tiff"
+            | "tif"
+            | "ico"
+            | "tga"
+            | "qoi"
+            | "ppm"
+            | "pgm"
+            | "pbm"
+            | "pnm"
+    )
+}

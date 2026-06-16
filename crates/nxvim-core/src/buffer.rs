@@ -179,6 +179,13 @@ pub struct Buffer {
     /// spawned command at [`crate::editor::Editor::open_terminal`] and updated as the
     /// child changes it. `None` for every non-terminal buffer.
     pub terminal_title: Option<String>,
+    /// When `true`, this buffer is an **image opened for preview** (`'imagepreview'`):
+    /// it is bound to an image file but its bytes are deliberately *not* read into
+    /// the rope — the client renders the picture instead (see
+    /// [`Buffer::from_image_file`] and [`crate::view::WindowView::image`]). The rope
+    /// stays the empty `"\n"`, so the buffer reads as empty/inert. `false` for every
+    /// ordinary file / scratch / directory / terminal buffer.
+    pub image: bool,
     /// The file as last seen on disk (mtime + size), captured on read and
     /// refreshed on each successful [`Buffer::write`]. Drives
     /// [`Buffer::disk_changed`], which lets the editor refuse to overwrite a file
@@ -216,6 +223,7 @@ impl Buffer {
             dir: None,
             terminal: false,
             terminal_title: None,
+            image: false,
             disk: None,
         }
     }
@@ -304,6 +312,23 @@ impl Buffer {
             dir: None,
             terminal: false,
             terminal_title: None,
+            image: false,
+        })
+    }
+
+    /// Open `path` as an **image preview** buffer ([`crate::options::Options::imagepreview`]):
+    /// capture its on-disk snapshot (for the status line / change detection) but do
+    /// **not** read its bytes into the rope — an image is shown as a picture by the
+    /// client, never as text. The result is a valid, empty, unmodified buffer bound
+    /// to `path` (so the status line names it and a stray `:w` has a target), flagged
+    /// [`image`](Buffer::image) so the window projects an [`crate::view::ImageView`].
+    /// A missing file still opens (empty, bound), matching [`Buffer::from_file`].
+    pub fn from_image_file(path: impl AsRef<Path>, fs: &dyn HostFs) -> Result<Self> {
+        let path = path.as_ref();
+        Ok(Buffer {
+            image: true,
+            disk: fs.stat(path),
+            ..Buffer::named(path)
         })
     }
 
@@ -371,6 +396,7 @@ impl Buffer {
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
+            image: false,
             // A directory listing is never written back to disk, so it needs no
             // change tracking.
             disk: None,

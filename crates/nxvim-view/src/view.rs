@@ -165,6 +165,19 @@ pub struct WindowView {
     /// client need not match the displayed name; an older server omitting it
     /// defaults to `false`.
     pub unnamed: bool,
+    /// When `Some`, this window's buffer is an image opened for preview
+    /// (`'imagepreview'`): the client renders the picture at [`ImageData::path`]
+    /// instead of the (empty) `lines`. `None` for an ordinary buffer (and from an
+    /// older server that omits the key).
+    pub image: Option<ImageData>,
+}
+
+/// An image-preview window's payload (mirrors `nxvim_core::view::ImageView`): the
+/// filesystem path of the image to render. The client reads and decodes it locally
+/// (a local TUI shares the filesystem) and caches the decoded result.
+#[derive(Clone)]
+pub struct ImageData {
+    pub path: String,
 }
 
 /// Which screen region a window/separator belongs to (mirrors
@@ -767,6 +780,12 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         unnamed: map_get(m, "unnamed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        image: match map_get(m, "image") {
+            Some(Value::Map(im)) => Some(ImageData {
+                path: map_str(im, "path"),
+            }),
+            _ => None,
+        },
     }
 }
 

@@ -369,6 +369,19 @@ impl EditHost {
             // so a client that highlights JS-side (the wasm edit-host) can pick the
             // grammar. Native clients ignore it (they paint server highlight spans).
             (Value::from("filetype"), Value::from(win.filetype.as_str())),
+            // When this window's buffer is an image opened for preview
+            // (`'imagepreview'`), the path to render. A reference, never the bytes —
+            // the client reads/decodes once and caches (the bytes must not ride the
+            // redraw frame). `Nil` for an ordinary buffer; clients ignore it.
+            (
+                Value::from("image"),
+                match &win.image {
+                    Some(img) => {
+                        Value::Map(vec![(Value::from("path"), Value::from(img.path.as_str()))])
+                    }
+                    None => Value::Nil,
+                },
+            ),
             // Whether this window's buffer is a *live* terminal. Gates the live
             // terminal-only behaviors: the Worker skips shipping its (potentially huge
             // scrollback) text, since its colors come from the palette, not the JS

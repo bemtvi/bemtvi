@@ -82,22 +82,29 @@ if [ -d "$TS/vendor" ]; then
   echo "copied tree-sitter assets → web/vendor/"
 fi
 
-# 4. msgpack ESM → web/vendor/msgpack/ for the browser↔daemon WebTransport RPC client
-#    (web/rpc.mjs, used in daemon mode `?daemon=nxvim://…`). Vendored from the web/
-#    devDependency rather than committed (web/vendor is gitignored, regenerated like the
-#    tree-sitter assets); needs `cd web && npm install` to have populated node_modules.
-#    Multi-file ESM (it has a utils/ subdir) — copy the whole dist.esm tree, then drop the
-#    .d.ts/.map/tsbuildinfo the browser never imports. Optional: serverless OPFS mode
-#    (no `?daemon=`) doesn't touch it.
+# 4. msgpack ESM → web/vendor/msgpack/ for the WebTransport RPC client (web/rpc.mjs).
+#    Required, not optional: worker.mjs statically imports rpc.mjs, which statically
+#    imports vendor/msgpack — so the Worker fails to load without it even in serverless
+#    OPFS mode. Vendored from the web/ devDependency rather than committed (web/vendor is
+#    gitignored, regenerated like the tree-sitter assets). Self-heal like the tree-sitter
+#    step: populate web/node_modules when absent (e.g. on Netlify, where nothing runs the
+#    web install). Skip Playwright's browser binaries — the other web devDep is the test
+#    harness, irrelevant to the build. Multi-file ESM (a utils/ subdir): copy the whole
+#    dist.esm tree, then drop the .d.ts/.map/tsbuildinfo the browser never imports.
 MSGPACK_SRC="web/node_modules/@msgpack/msgpack/dist.esm"
-if [ -d "$MSGPACK_SRC" ]; then
-  rm -rf web/vendor/msgpack && mkdir -p web/vendor/msgpack
-  cp -r "$MSGPACK_SRC/." web/vendor/msgpack/
-  find web/vendor/msgpack \( -name '*.d.ts' -o -name '*.map' -o -name '*.tsbuildinfo' \) -delete
-  echo "copied @msgpack/msgpack → web/vendor/msgpack/"
-else
-  echo "note: $MSGPACK_SRC not found — run 'cd web && npm install' to enable daemon mode (WebTransport)" >&2
+if [ ! -d "$MSGPACK_SRC" ]; then
+  echo "installing web deps for @msgpack/msgpack (one-time)…"
+  ( cd web && export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+    { [ -f package-lock.json ] && npm ci || npm install; } )
 fi
+[ -d "$MSGPACK_SRC" ] || {
+  echo "error: $MSGPACK_SRC missing after web install — the Worker can't load without it" >&2
+  exit 1
+}
+rm -rf web/vendor/msgpack && mkdir -p web/vendor/msgpack
+cp -r "$MSGPACK_SRC/." web/vendor/msgpack/
+find web/vendor/msgpack \( -name '*.d.ts' -o -name '*.map' -o -name '*.tsbuildinfo' \) -delete
+echo "copied @msgpack/msgpack → web/vendor/msgpack/"
 
 echo
 echo "built dist/eh.mjs — run the harness:  node harness.mjs"

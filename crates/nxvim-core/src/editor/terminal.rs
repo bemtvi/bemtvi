@@ -141,16 +141,18 @@ impl Editor {
     /// flag is cleared by [`Editor::terminal_closed`]). The edit chokepoints
     /// (`edit_each_cursor`, `apply_operator_to_range`, `paste`, …) consult this.
     pub(crate) fn modifiable(&self) -> bool {
-        // A live terminal buffer, the quickfix list window, and a plugin-owned
-        // `nx.view` surface are all read-only: edits are refused at the chokepoints
-        // with `E21`, exactly as vim treats a `nomodifiable` buffer. The view also
-        // routes its *interactive* keys away through the `view` keymap bucket (so
-        // `dd` is inert before it even reaches a chokepoint), but consulting this
-        // here is what closes the *ex-command* path — `:d`, `:s`, `:normal` reach the
-        // edit chokepoints, not the input router, so without this a `:d` would
-        // corrupt the plugin's content. These windows otherwise behave normally
-        // (motions, search, `<C-w>`, `:` all work); only `<CR>` is special.
-        !self.buffer().terminal && !self.is_quickfix_buffer() && !self.is_view_buffer()
+        // Every non-ordinary buffer is read-only, enforced in *one* place: edits are
+        // refused at the chokepoints with `E21`, exactly as vim treats a
+        // `nomodifiable` buffer. [`Buffer::read_only`] covers the kinds carried as
+        // buffer markers — a directory listing (the explorer / netrw), a plugin-owned
+        // `nx.view`, a live terminal mirror, an image preview — and the quickfix /
+        // loclist display buffers are added here (their identity is an `Editor`-side
+        // registry, not a `Buffer` field). Consulting this at the chokepoints is what
+        // closes the *ex-command* path — `:d`, `:s`, `:put`, `:normal` reach the edit
+        // chokepoints, not the input router, so without it a `:d` would corrupt the
+        // content even for a kind whose interactive keys are routed away. These
+        // windows otherwise behave normally (motions, search, `<C-w>`, `:` all work).
+        !self.buffer().read_only() && !self.is_quickfix_buffer()
     }
 
     /// Echo vim's `E21` when an edit is refused on a read-only (live terminal) buffer.

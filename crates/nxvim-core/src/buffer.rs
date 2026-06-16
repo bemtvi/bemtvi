@@ -269,6 +269,19 @@ impl Buffer {
         self.path = path;
     }
 
+    /// Whether this buffer is **read-only** by virtue of its kind — a directory
+    /// listing (`dir`), a plugin-owned [`view`](Buffer::view), a live terminal
+    /// mirror (`terminal`), or an image preview (`image`). Each is a non-ordinary
+    /// buffer whose content is owned by something other than the user (the
+    /// filesystem, a plugin, a PTY child, an image file), so the edit chokepoints
+    /// refuse mutations with `E21` via [`crate::editor::Editor::modifiable`]. The
+    /// quickfix/loclist display buffers are *also* read-only but aren't a `Buffer`
+    /// marker (they live in an `Editor`-side registry), so `modifiable()` checks
+    /// them separately.
+    pub fn read_only(&self) -> bool {
+        self.dir.is_some() || self.view.is_some() || self.terminal || self.image
+    }
+
     /// Mark the buffer as matching its backing store: clear `modified` and pin the
     /// save point (`save_tick`) at the current change. This is the state right after
     /// a load or a save — `[+]` clears and any later `disk_changed` check has a

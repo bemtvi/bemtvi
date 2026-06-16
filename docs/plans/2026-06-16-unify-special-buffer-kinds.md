@@ -1,9 +1,12 @@
 # Unify the special-buffer-kind grab-bag
 
-Status: **planned** — 2026-06-16. A refactor to consolidate nxvim's accreted
+Status: **Phase 1 landed** — 2026-06-16. A refactor to consolidate nxvim's accreted
 "non-ordinary buffer" mechanisms before more is built on them (the `nx.view` work
 exposed how out of hand this has gotten). No new user-facing feature — this is a
-consistency / correctness cleanup that also closes a real read-only hole.
+consistency / correctness cleanup that also closes a real read-only hole. Phase 1
+(one read-only mechanism + the regression net) is implemented and tested
+(`crates/nxvim-server/tests/readonly.rs`); Phase 2 (the big deletion) is still
+planned.
 
 ## Problem
 
@@ -77,21 +80,25 @@ buffer-local mapping (`nnoremap <buffer> <CR> …`) installed by its ftplugin �
 is the model, not a branch in the input loop. nxvim's current hard-coded quickfix
 `<CR>` (`mod.rs:1565`) is itself a bespoke hard-code to remove.
 
-## Phase 1 — one read-only mechanism, consulted everywhere (the quickfix way; small)
+## Phase 1 — one read-only mechanism, consulted everywhere (the quickfix way; small) — **DONE**
 
 This *is* ingredient 1, applied uniformly. No new abstraction.
 
-- Add `Buffer::read_only(&self) -> bool` from the existing markers
-  (`dir.is_some() || view.is_some() || terminal || image`), and rewrite
-  `Editor::modifiable()` as `!self.buffer().read_only() && !self.is_quickfix_buffer()`.
-  This folds the **explorer** (and image) into the same chokepoint enforcement quickfix
-  already uses — closing the demonstrated `:d`-corrupts-a-listing hole.
-- **Audit every edit chokepoint** consults `modifiable()` (inventory: `insert.rs:18`,
+- ✅ Added `Buffer::read_only(&self) -> bool` from the existing markers
+  (`dir.is_some() || view.is_some() || terminal || image`; `buffer.rs`), and rewrote
+  `Editor::modifiable()` as `!self.buffer().read_only() && !self.is_quickfix_buffer()`
+  (`terminal.rs`). This folds the **explorer** (and image) into the same chokepoint
+  enforcement quickfix already uses — closing the demonstrated `:d`-corrupts-a-listing
+  hole.
+- ✅ **Audited every edit chokepoint** consults `modifiable()` (`insert.rs:18`,
   `operators.rs:55/711/796`, `ex.rs` s/d/put, `multicursor.rs:524`, `snippet.rs:113`,
-  the Replace/normal paths) — confirm each refuses with `refuse_edit()` (E21).
-- Tests: `:d`/`:s`/`:put`/`dd`/`p`/`R`/`i` refused with E21 on explorer, view, quickfix,
-  terminal, image. (Inventory found **no** existing such tests — this is the regression
-  net for Phase 2.)
+  `command.rs:2081`) — each refuses with `refuse_edit()` (E21). No new chokepoints
+  needed.
+- ✅ Tests: `crates/nxvim-server/tests/readonly.rs` — `:d`/`:s`/`:put` refused with
+  E21 on explorer, view, quickfix, image (terminal already covered in `terminal.rs`).
+  Confirmed failing before the `modifiable()` change (explorer + image were the open
+  holes); the regression net for Phase 2. (`:normal` isn't an nxvim ex-command, so the
+  battery is the three native chokepoint commands.)
 
 Ships independently; fixes the bug. After this, the explorer/view input-routing
 inertness is **redundant** — which sets up Phase 2.

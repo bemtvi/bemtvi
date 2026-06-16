@@ -384,7 +384,12 @@ impl Editor {
             self.echo("E471: Argument required".to_string());
             return;
         }
-        let Some(lines) = self.vimgrep_file_lines(Path::new(file)) else {
+        // Expand `%`/`#` (and `:h`/`:t`/… mods) so `:cfile %` reads the current
+        // file; a bad token fails loud.
+        let Some(file) = self.expand_file_arg_or_echo(file) else {
+            return;
+        };
+        let Some(lines) = self.vimgrep_file_lines(Path::new(&file)) else {
             return; // vimgrep_file_lines already echoed E484
         };
         let efm = self.options.errorformat.clone();
@@ -843,7 +848,19 @@ impl Editor {
             self.echo("E35: No previous regular expression".to_string());
             return None;
         }
-        let files: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+        // Expand `%` (current file) / `#` (alternate) plus their `:h`/`:t`/… mods in
+        // each file argument, exactly as vim does for `:vimgrep …  %`. A bad token
+        // (no name to substitute) fails loud and aborts the command.
+        let mut files = Vec::new();
+        for tok in rest.split_whitespace() {
+            match self.expand_file_arg(tok) {
+                Ok(f) => files.push(f),
+                Err(e) => {
+                    self.echo(e);
+                    return None;
+                }
+            }
+        }
         if files.is_empty() {
             self.echo("E471: Argument required: file name".to_string());
             return None;

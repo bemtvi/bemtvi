@@ -324,7 +324,7 @@ impl Editor {
     /// has no name to substitute, or when an env-dependent modifier (`:p` / `:~` /
     /// `:.`) is used — those need the working directory / `$HOME`, which the pure
     /// core deliberately can't read, so they fail loud rather than mis-expand.
-    fn expand_file_arg(&self, arg: &str) -> Result<String, String> {
+    pub(crate) fn expand_file_arg(&self, arg: &str) -> Result<String, String> {
         let chars: Vec<char> = arg.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -375,7 +375,7 @@ impl Editor {
 
     /// Expand `%`/`#` in a file argument for dispatch, echoing and returning `None`
     /// on a bad expansion so the caller aborts the command (vim's behavior).
-    fn expand_file_arg_or_echo(&mut self, arg: &str) -> Option<String> {
+    pub(crate) fn expand_file_arg_or_echo(&mut self, arg: &str) -> Option<String> {
         match self.expand_file_arg(arg) {
             Ok(s) => Some(s),
             Err(e) => {

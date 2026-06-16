@@ -415,6 +415,22 @@ async fn vimgrep_finds_matches_and_jumps() {
 }
 
 #[tokio::test]
+async fn vimgrep_expands_percent_to_the_current_file() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("vgpct", "txt", "one\nTODO here\nthree\n");
+    // Edit the file, then search it via `%` (vim's current-file token) instead of
+    // spelling the path out.
+    message_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
+    message_after(&rpc, &mut incoming, ":vimgrep /TODO/ %<CR>").await;
+    assert_eq!(first_entry(&rpc).await, format!("1|{path}|2|1|TODO here"));
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "landed on the match in the current file"
+    );
+}
+
+#[tokio::test]
 async fn vimgrep_g_flag_matches_every_occurrence() {
     let (rpc, mut incoming) = start().await;
     let path = write_temp("vgg", "txt", "a a a\nb\n");

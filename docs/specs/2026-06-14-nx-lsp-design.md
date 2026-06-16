@@ -1,7 +1,7 @@
 # `nx.lsp` — the native LSP control surface
 
-**Status:** **proposed (2026-06-14).** Re-introduces nxvim's LSP *control
-surface* in the `nx.*` namespace, after the nx break
+**Status:** **Phase A landed (2026-06-16); Phases B–C pending.** Re-introduces
+nxvim's LSP *control surface* in the `nx.*` namespace, after the nx break
 ([`e9bb90c`](#background)) deleted the old `vim.lsp` Lua clone. The LSP
 **engine** is untouched and carries forward whole: the
 [`nxvim-lsp` crate + the `lsp/` server subtree](2026-06-02-lsp-support-design.md)
@@ -238,13 +238,18 @@ generation tokens (engine Decisions 1–7) are untouched.
 Riding the [native plugin API](2026-06-11-native-plugin-api.md) build order
 (`nx.lsp` is step 1; picker is step 2; completion is step 3):
 
-- **Phase A — parity, on machinery that all exists.** New `prelude/lsp.lua`:
-  `nx.lsp.config` (merge registry, `"*"` base, neovim deep-merge), `nx.lsp.enable`
-  / `disable` with engine-side FileType dispatch, the flattened language verbs
-  routing to **today's** surfaces (jump / loclist / float / `nx.ui.select` /
-  `nx.ui.input`), `nx.lsp.request` / `notify` / `clients`, `on_attach`. Restores
-  the deleted feature set, nx-shaped. Mostly Lua over the intact `LspOp` seam;
-  bundled presets re-land as `config()` data.
+- **Phase A — parity, on machinery that all exists. _(done 2026-06-16.)_** New
+  `prelude/lsp.lua`: `nx.lsp.config` (merge registry, `"*"` base, neovim
+  deep-merge), `nx.lsp.enable` / `disable` with engine-side FileType dispatch, the
+  flattened language verbs routing to **today's** surfaces (jump / loclist / float /
+  `nx.ui.select` / `nx.ui.input`), `nx.lsp.request` / `notify` / `clients`,
+  `on_attach` / `on_init` / `on_exit`. Restores the deleted feature set, nx-shaped.
+  Mostly Lua over the intact `LspOp` seam; bundled presets re-land as `config()`
+  data. The mirror hooks (`_set_client` / `_run_on_init` / `_run_on_exit` /
+  `_remove_client`) that `nxvim-server` hard-calls are now defined (they were
+  dangling). Covered by `crates/nxvim/tests/lsp_config.rs` (merge precedence,
+  enable→FileType→Start, a verb's reply on its surface, `"*"` inheritance,
+  `on_attach` + `clients`, no-client request fails loud).
 - **Phase B — the nouns.** `nx.bo.lsp_semantic_tokens` / `nx.o.lsp_semantic_tokens`
   / `nx.bo.lsp_inlay_hints` in `options.rs`, wired to the toggle ops; the verbs
   survive only as the option writes.

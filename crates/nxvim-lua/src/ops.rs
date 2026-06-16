@@ -157,16 +157,16 @@ pub struct TerminalOpenReq {
 }
 
 /// A request to start (or attach a buffer to) a language server, queued by
-/// `vim.lsp.start` after user Lua — directly, or through the `vim.lsp.enable`
+/// `nx.lsp.start` after user Lua — directly, or through the `nx.lsp.enable`
 /// FileType dispatcher — resolved the config. The root is resolved **in Lua**
-/// (string / `root_markers` upward search / a `function(bufnr, on_dir)`), so the
+/// (string / `root_markers` upward search / a `function(bufnr, done)`), so the
 /// server never re-resolves it; it only ensures the `(name, root)` client exists
 /// and binds `bufnr` to it. The server's analogue of [`PanelOp`] for LSP.
 #[derive(Clone, Debug)]
 pub enum LspOp {
-    /// `vim.lsp.start({name, cmd, root_dir}, {bufnr, filetype})`.
+    /// `nx.lsp.start({name, cmd, root_dir}, {bufnr, filetype})`.
     Start {
-        /// The config name (`vim.lsp.config('<name>', …)`), the client identity.
+        /// The config name (`nx.lsp.config('<name>', …)`), the client identity.
         name: String,
         /// The full server argv (program + args). The server may override this
         /// with `$NXVIM_LSP_CMD` (the test/mock hook), as the old built-in table did.
@@ -190,7 +190,7 @@ pub enum LspOp {
         /// capabilities at `initialize` (Phase 2). `None` when the config adds none.
         capabilities: Option<serde_json::Value>,
     },
-    /// A `vim.lsp.buf.*` language-feature request (definition, references,
+    /// A `nx.lsp.*` language-feature request (definition, references,
     /// hover, …) on the current buffer. `kind` is `LspReqKind::as_u16` — the same
     /// int that rides the request token — so the wire stays one number; the server
     /// reads `self.editor.cursor` at apply time (the tick the key fired).
@@ -198,15 +198,15 @@ pub enum LspOp {
         /// `LspReqKind::as_u16` of the position-family feature to request.
         kind: u16,
     },
-    /// `vim.lsp.buf.format()` — request `textDocument/formatting`.
+    /// `nx.lsp.format()` — request `textDocument/formatting`.
     Format,
-    /// `vim.lsp.buf.rename(name)` — request `textDocument/rename` with `new_name`.
+    /// `nx.lsp.rename(name)` — request `textDocument/rename` with `new_name`.
     Rename {
-        /// The new identifier (the required argument; `vim.lsp.buf.rename()` with
-        /// no name is rejected in Lua, never reaching this op).
+        /// The new identifier (the required argument; `nx.lsp.rename()` with no name
+        /// prompts via `nx.ui.input` in Lua, so a non-empty name always reaches here).
         new_name: String,
     },
-    /// `vim.lsp.buf.code_action()` — request `textDocument/codeAction` at the cursor.
+    /// `nx.lsp.code_action()` — request `textDocument/codeAction` at the cursor.
     CodeAction,
     /// `vim.diagnostic.goto_next()` / `goto_prev()` — move the cursor to the next
     /// (`forward`) or previous diagnostic in the current buffer, wrapping.
@@ -807,16 +807,16 @@ pub struct InlayHintMirrorData {
     pub client_id: u64,
 }
 
-/// One LSP client mirrored into `vim.lsp._clients[id]` so `on_attach` (and any
-/// Lua) can read `client.server_capabilities` (Phase 7b Slice 3). Pushed once per
-/// server when it finishes `initialize`; the server translates its `ProviderCaps`
-/// into these booleans so nxvim-lua stays free of the LSP crate.
+/// One LSP client mirrored into `nx.lsp._clients[id]` so `on_attach` (and any
+/// Lua) can read `client.server_capabilities`. Pushed once per server when it
+/// finishes `initialize`; the server translates its `ProviderCaps` into these
+/// booleans so nxvim-lua stays free of the LSP crate.
 #[derive(Clone, Debug)]
 pub struct LspClientData {
     /// The numeric client id, stable per server instance — the handle
-    /// `LspAttach`'s `args.data.client_id` resolves through `get_client_by_id`.
+    /// `LspAttach`'s `args.data.client_id` resolves through `nx.lsp._clients`.
     pub id: u64,
-    /// The config name (`vim.lsp.config('<name>', …)`), which the default
+    /// The config name (`nx.lsp.config('<name>', …)`), which the default
     /// `LspAttach` autocmd uses to find the config's `on_attach`.
     pub name: String,
     /// Per-feature provider flags, surfaced as the camelCase

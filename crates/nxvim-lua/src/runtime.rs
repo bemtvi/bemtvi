@@ -428,7 +428,7 @@ pub(crate) struct Shared {
     /// Terminal-open requests from `nx.terminal.open`, applied to the core
     /// (`Editor::open_terminal`) after the chunk.
     pub(crate) terminal_ops: Vec<TerminalOpenReq>,
-    /// Server-start requests from `vim.lsp.start` (driven by `vim.lsp.enable`),
+    /// Server-start requests from `nx.lsp.start` (driven by `nx.lsp.enable`),
     /// drained by the server into its `LspManager` after the chunk.
     pub(crate) lsp_ops: Vec<LspOp>,
     /// Async-runtime requests from `nx.schedule` / `nx.timer` (`vim.schedule` /
@@ -819,7 +819,7 @@ impl LuaRuntime {
         set.call((bufnr, list))
     }
 
-    /// Mirror one LSP client into `vim.lsp._clients[id]` (the Rust→Lua client
+    /// Mirror one LSP client into `nx.lsp._clients[id]` (the Rust→Lua client
     /// registry) so `get_client_by_id` — and the `LspAttach` `on_attach` it feeds
     /// — can read `client.server_capabilities`. Pushed once per server when it
     /// finishes `initialize`. The provider flags become the camelCase
@@ -845,7 +845,7 @@ impl LuaRuntime {
         set.call((client.id, client.name.clone(), caps))
     }
 
-    /// Forget an LSP client (`vim.lsp._clients[id] = nil`) when its server exits,
+    /// Forget an LSP client (`nx.lsp._clients[id] = nil`) when its server exits,
     /// so a stale `get_client_by_id` after a `LspDetach` returns `nil`.
     pub fn remove_lsp_client(&self, id: u64) -> mlua::Result<()> {
         let lsp: Table = self.nx()?.get("lsp")?;
@@ -866,7 +866,7 @@ impl LuaRuntime {
 
     /// Run the config's `on_exit(code, signal, client)` hook for client `id`
     /// (Phase 3), when its server exits. Called while the client is still in
-    /// `vim.lsp._clients` (before [`Self::remove_lsp_client`]). `code`/`signal`
+    /// `nx.lsp._clients` (before [`Self::remove_lsp_client`]). `code`/`signal`
     /// are the child's exit status (`signal` is unix-only).
     pub fn run_lsp_on_exit(
         &self,
@@ -926,7 +926,7 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take the server-start requests queued by `vim.lsp.start` since the last
+        /// Take the server-start requests queued by `nx.lsp.start` since the last
         /// drain, for the server to apply to its `LspManager`.
         take_lsp_ops -> Vec<LspOp> = lsp_ops
     }
@@ -1814,7 +1814,7 @@ impl LuaRuntime {
     /// Fire an autocmd with buffer context *and* an `args.data` payload — the
     /// `{ client_id = … }` table neovim's `LspAttach`/`LspDetach` carry. The
     /// server fires these at the attach (didOpen) and detach (didClose / server
-    /// exit) moments; the default `nxvim.lsp.enable` autocmd reads `client_id` to
+    /// exit) moments; the default `nxnx.lsp.enable` autocmd reads `client_id` to
     /// resolve the client and run the config's `on_attach`.
     pub fn fire_autocmd_data(
         &self,
@@ -1905,7 +1905,7 @@ impl LuaRuntime {
     /// `nvim_buf_get_name(0)` / `expand('%')`. The server pushes this immediately
     /// before firing a buffer/mode autocmd so a callback can resolve the buffer
     /// that fired. `filetype` is the buffer's detected filetype (`""` when none),
-    /// which `vim.lsp.enable` reads to start a server for the already-open buffer.
+    /// which `nx.lsp.enable` reads to start a server for the already-open buffer.
     /// (Interim until a real per-bufnr registry exists.)
     pub fn set_buf_snapshot(&self, bufnr: u64, name: &str, filetype: &str) -> mlua::Result<()> {
         let set: mlua::Function = self.nx()?.get("_set_cur_buf")?;

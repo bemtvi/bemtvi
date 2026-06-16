@@ -37,21 +37,22 @@ nx.complete.setup {
 }
 
 --------------------------------------------------------------------------------
--- Attach lua-language-server to `lua` buffers. `nx.lsp.config` / `nx.lsp.enable`
--- (the eventual declarative user API) isn't wired yet, so a `FileType` autocmd
--- starts the server via the raw bridge — exactly the dispatch that API will own.
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "lua",
-  callback = function(args)
-    nx._lsp_start(
-      "lua_ls",                 -- a name for the server
-      { "lua-language-server" }, -- the spawn argv (must be on PATH)
-      vim.fn.getcwd(),          -- the root dir
-      "lua",                    -- the language id
-      args.buf,                 -- the buffer to bind
-      nil,
-      nil,
-      nil
-    )
+-- Attach lua-language-server to `lua` buffers via the declarative nx.lsp control
+-- surface: nx.lsp.config registers the server, nx.lsp.enable activates it, and the
+-- engine starts it on the first `lua` buffer (resolving the root upward from the
+-- file through root_markers). on_attach runs once the server has bound the buffer —
+-- the place to set buffer-local LSP keymaps.
+nx.lsp.config("lua_ls", {
+  cmd = { "lua-language-server" },
+  filetypes = { "lua" },
+  root_markers = { ".luarc.json", ".luarc.jsonc", ".git" },
+  on_attach = function(_client, bufnr)
+    local function map(lhs, fn) nx.keymap.set("n", lhs, fn, { buffer = bufnr }) end
+    map("gd", nx.lsp.definition)
+    map("gr", nx.lsp.references)
+    map("K", nx.lsp.hover)
+    map("<leader>rn", nx.lsp.rename)
+    map("<leader>ca", nx.lsp.code_action)
   end,
 })
+nx.lsp.enable("lua_ls")

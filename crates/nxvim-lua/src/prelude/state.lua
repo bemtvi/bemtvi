@@ -1189,16 +1189,16 @@ end
 
 -- Wrap the context-binding LSP / diagnostic bridges (Rust funnels that drain
 -- against the current buffer/window) so they honor the call-context lock. Done
--- here, before lsp.lua defines the `nx.lsp.buf.*` wrappers that route through
+-- here, before lsp.lua defines the `nx.lsp.*` verb wrappers that route through
 -- them, so every entry is covered at the single chokepoint. (These native
 -- bridges are `nx._*` — installed from Rust before the prelude loads — so they
 -- exist on `nx` to be wrapped.)
 do
   local guards = {
     _lsp_buf = "an LSP buf request",
-    _lsp_buf_format = "nx.lsp.buf.format",
-    _lsp_buf_code_action = "nx.lsp.buf.code_action",
-    _lsp_buf_rename = "nx.lsp.buf.rename",
+    _lsp_buf_format = "nx.lsp.format",
+    _lsp_buf_code_action = "nx.lsp.code_action",
+    _lsp_buf_rename = "nx.lsp.rename",
     _diagnostic_goto = "a diagnostic jump",
     _diagnostic_setloclist = "nx.diagnostic.setloclist",
   }

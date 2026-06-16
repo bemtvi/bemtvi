@@ -1,4 +1,4 @@
-//! Document sync and server lifecycle: draining `vim.lsp.start`, per-buffer
+//! Document sync and server lifecycle: draining `nx.lsp.start`, per-buffer
 //! `didOpen`/`didChange`/`didSave`/`didClose`, `LspAttach`/`LspDetach`
 //! emission, ingesting [`LspEvent`]s, and the `:LspInfo` dump.
 
@@ -13,15 +13,15 @@ use super::*;
 use crate::EditHost;
 
 impl EditHost {
-    /// Apply one [`LspOp`] drained from the Lua runtime — a `vim.lsp.start` queued
-    /// by user Lua (directly, or through the `vim.lsp.enable` `FileType`
+    /// Apply one [`LspOp`] drained from the Lua runtime — a `nx.lsp.start` queued
+    /// by user Lua (directly, or through the `nx.lsp.enable` `FileType`
     /// dispatcher). Ensures the `(name, root)` server exists and binds `bufnr` to
     /// it; the next [`EditHost::sync_lsp`] sends `didOpen`. Phase 7a's replacement
     /// for the built-in auto-spawn: a server starts *only* via this path.
     pub(crate) fn apply_lsp_op(&mut self, op: LspOp) {
         let start = match op {
             LspOp::Start { .. } => op,
-            // `vim.lsp.buf.*` routes into the existing native request paths. No
+            // `nx.lsp.*` verbs route into the existing native request paths. No
             // cursor threading: `request_lsp` reads `self.editor.cursor` here, on
             // the same input tick the Lua keymap RHS fired.
             LspOp::BufRequest { kind } => {
@@ -224,7 +224,7 @@ impl EditHost {
     }
 
     /// Drive LSP document sync for the *current* buffer this frame: for a buffer a
-    /// `vim.lsp.start` already bound to a server, send `didOpen`/`didChange`/
+    /// `nx.lsp.start` already bound to a server, send `didOpen`/`didChange`/
     /// `didSave` as its state requires. Called from `redraw()` alongside
     /// `refresh_highlights`. Never spawns (that is [`EditHost::apply_lsp_op`]) and
     /// never blocks: every send is a fire-and-forget [`LspNotify`].
@@ -232,7 +232,7 @@ impl EditHost {
         self.reap_closed_lsp_buffers();
 
         let buffer = self.editor.current_buffer_id();
-        // Only buffers a `vim.lsp.start` bound to a server are synced — there is no
+        // Only buffers a `nx.lsp.start` bound to a server are synced — there is no
         // auto-start (Phase 7a: LSP startup is 100% user Lua).
         let Some(key) = self.lsp_states.get(&buffer).and_then(|s| s.server.clone()) else {
             return;
@@ -510,7 +510,7 @@ impl EditHost {
                 init_result,
             } => {
                 // Assign a client id once per server, reused across respawns so the
-                // `client_id` Lua sees stays stable (and `vim.lsp._clients` isn't
+                // `client_id` Lua sees stays stable (and `nx.lsp._clients` isn't
                 // leaked one entry per restart).
                 let client_id = self
                     .lsp_servers
@@ -532,7 +532,7 @@ impl EditHost {
                         inlay_hints: caps.providers.inlay_hints,
                     },
                 );
-                // Mirror the client into `vim.lsp._clients[id]` so `on_attach` can
+                // Mirror the client into `nx.lsp._clients[id]` so `on_attach` can
                 // read `client.server_capabilities` once `LspAttach` resolves it.
                 let client = LspClientData {
                     id: client_id,

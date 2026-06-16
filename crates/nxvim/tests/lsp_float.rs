@@ -160,7 +160,7 @@ async fn hover_reply_opens_the_content_float() {
     );
     let (rpc, mut incoming) = start(&dir).await;
 
-    let lines = await_float(&rpc, &mut incoming, "nx.lsp.buf.hover()", "scripted hover").await;
+    let lines = await_float(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
     assert!(
         lines.iter().any(|l| l.contains("foo")),
         "hover float should carry the markup, got {lines:?}"
@@ -185,7 +185,7 @@ async fn signature_help_reply_opens_the_content_float() {
     let lines = await_float(
         &rpc,
         &mut incoming,
-        "nx.lsp.buf.signature_help()",
+        "nx.lsp.signature_help()",
         "fn foo(a: i32, b: i32)",
     )
     .await;
@@ -212,7 +212,7 @@ async fn empty_hover_echoes_instead_of_an_empty_float() {
     let mut saw_empty_hover = false;
     let mut last_message = String::new();
     for _ in 0..200 {
-        exec_lua(&rpc, "nx.lsp.buf.hover()").await;
+        exec_lua(&rpc, "nx.lsp.hover()").await;
         nxvim_test_harness::barrier(&rpc).await;
         if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
             assert!(
